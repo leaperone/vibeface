@@ -996,6 +996,10 @@ table "scheduler_sessions" {
     null = false
     type = text
   }
+  column "scope" {
+    null = false
+    type = text
+  }
   column "next_sequence" {
     null = false
     type = integer
@@ -1020,7 +1024,15 @@ table "scheduler_sessions" {
     null = false
     type = integer
   }
-  column "sdk_config" {
+  column "stable_fingerprint" {
+    null = true
+    type = text
+  }
+  column "runtime_fingerprint" {
+    null = true
+    type = text
+  }
+  column "provider" {
     null = true
     type = text
   }
@@ -1033,7 +1045,7 @@ table "scheduler_sessions" {
     type = text
   }
   primary_key {
-    columns = [column.conversation_id]
+    columns = [column.conversation_id, column.scope]
   }
 }
 table "scheduler_jobs" {

@@ -197,7 +197,7 @@ fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
     Ok(())
 }
 
-const SESSION_COLUMNS: &str = "conversation_id,next_sequence,active,native_id,covers,owner_epoch,sdk_config,permission_version,native_token,shown";
+const SESSION_COLUMNS: &str = "conversation_id,next_sequence,active,native_id,covers,owner_epoch,stable_fingerprint,permission_version,native_token,shown,scope,runtime_fingerprint,provider";
 
 fn query_sessions(
     connection: &Connection,
@@ -205,7 +205,7 @@ fn query_sessions(
     params: impl rusqlite::Params,
 ) -> Result<Vec<SchedulerSession>> {
     let mut statement = connection.prepare(&format!(
-        "SELECT {SESSION_COLUMNS} FROM scheduler_sessions WHERE {filter} ORDER BY conversation_id"
+        "SELECT {SESSION_COLUMNS} FROM scheduler_sessions WHERE {filter} ORDER BY conversation_id,scope"
     ))?;
     let rows = statement
         .query_map(params, |r| {
@@ -218,38 +218,61 @@ fn query_sessions(
                     native_token: r.get(8)?,
                     covers: VersionVector::new(),
                     owner_epoch: r.get(5)?,
-                    sdk_config: r.get(6)?,
+                    stable_fingerprint: r.get(6)?,
                     permission_version: r.get(7)?,
                     shown: Default::default(),
+                    scope: SessionScope::Main,
+                    runtime_fingerprint: r.get(11)?,
+                    provider: None,
                 },
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(9)?,
+                r.get::<_, String>(10)?,
+                r.get::<_, Option<String>>(12)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter()
-        .map(|(session, covers, shown)| {
+        .map(|(session, covers, shown, scope, provider)| {
             Ok(SchedulerSession {
                 covers: serde_json::from_str(&covers)?,
                 shown: serde_json::from_str(&shown)?,
+                scope: SessionScope::from_storage_key(&scope)?,
+                provider: provider.as_deref().map(super::enum_from).transpose()?,
                 ..session
             })
         })
         .collect()
 }
 
+fn load_scoped_session(connection: &Connection, key: &SessionKey) -> Result<SchedulerSession> {
+    Ok(query_sessions(
+        connection,
+        "conversation_id=? AND scope=?",
+        params![key.conversation_id, key.scope.storage_key()],
+    )?
+    .pop()
+    .unwrap_or_else(|| SchedulerSession::in_scope(&key.conversation_id, key.scope.clone())))
+}
+
 fn load_session(connection: &Connection, conversation: &str) -> Result<SchedulerSession> {
-    Ok(
-        query_sessions(connection, "conversation_id=?", [conversation])?
-            .pop()
-            .unwrap_or_else(|| SchedulerSession::new(conversation)),
+    load_scoped_session(
+        connection,
+        &SessionKey {
+            conversation_id: conversation.into(),
+            scope: SessionScope::Main,
+        },
     )
+}
+
+fn load_job_session(connection: &Connection, job: &SchedulerJob) -> Result<SchedulerSession> {
+    load_scoped_session(connection, &job.session_key())
 }
 
 fn save_session(connection: &Connection, session: &SchedulerSession) -> Result<()> {
     connection.execute(
         &format!(
-            "INSERT OR REPLACE INTO scheduler_sessions({SESSION_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?)"
+            "INSERT OR REPLACE INTO scheduler_sessions({SESSION_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
         ),
         params![
             session.conversation_id,
@@ -258,13 +281,110 @@ fn save_session(connection: &Connection, session: &SchedulerSession) -> Result<(
             session.native_id,
             serde_json::to_string(&session.covers)?,
             session.owner_epoch,
-            session.sdk_config,
+            session.stable_fingerprint,
             session.permission_version,
             session.native_token,
             serde_json::to_string(&session.shown)?,
+            session.scope.storage_key(),
+            session.runtime_fingerprint,
+            session.provider.map(|provider| super::enum_text(&provider)),
         ],
     )?;
     Ok(())
+}
+
+fn context_projection_from(session: &SchedulerSession) -> Option<ContextProjection> {
+    let mut context = session.shown.context.clone()?;
+    let pending_generation = context
+        .session_status
+        .as_ref()
+        .is_some_and(|status| status.pending_generation);
+    context.session_status = Some(SessionStatusProjection {
+        resumable: !matches!(session.scope, SessionScope::Routine { .. })
+            && session.native_id.is_some()
+            && !session.covers.is_empty(),
+        pending_generation,
+    });
+    Some(context)
+}
+
+fn job_hold_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    job: &SchedulerJob,
+    provider: Provider,
+    limits: &crate::config::SchedulingLimits,
+) -> Result<Option<QueueHoldReason>> {
+    if !matches!(job.state, JobState::Queued) {
+        return Ok(None);
+    }
+    let key = job.session_key();
+    let session = load_scoped_session(connection, &key)?;
+    if session.active.is_some() {
+        return Ok(Some(QueueHoldReason::ActiveTurn));
+    }
+    if matches!(key.scope, SessionScope::Main)
+        && conversation_from(connection, network, &job.conversation_id)?
+            .is_some_and(|conversation| conversation.owner.as_deref() == Some(local))
+        && !query_jobs(
+            connection,
+            "conversation_id=? AND state='steering'",
+            [&job.conversation_id],
+        )?
+        .is_empty()
+    {
+        return Ok(Some(QueueHoldReason::SteeringSettlement));
+    }
+    let checks = pending_checks_from(connection)?;
+    let mut pending = Vec::with_capacity(checks.len());
+    for check in &checks {
+        if let Some(job) = load_job(connection, &check.conversation_id, &check.trigger)? {
+            pending.push(job);
+        }
+    }
+    if pending.iter().any(|job| job.session_key() == key) {
+        return Ok(Some(QueueHoldReason::PendingCheck));
+    }
+    let active = query_sessions(connection, "active IS NOT NULL", [])?;
+    let mut instance_busy = active.iter().any(|session| {
+        session.conversation_id == key.conversation_id && session.provider == Some(provider)
+    });
+    for pending_job in &pending {
+        if pending_job.conversation_id == key.conversation_id
+            && load_job_session(connection, pending_job)?.provider == Some(provider)
+        {
+            instance_busy = true;
+        }
+    }
+    if crate::providers::ProviderDescriptor::for_provider(provider).concurrency
+        == crate::providers::ConcurrencyMode::Serial
+        && instance_busy
+    {
+        return Ok(Some(QueueHoldReason::ProviderSerial));
+    }
+    if job.kind == TriggerKind::AgentTask {
+        let active_tasks = active
+            .iter()
+            .filter(|session| {
+                session.conversation_id == key.conversation_id
+                    && matches!(session.scope, SessionScope::Task { .. })
+            })
+            .count();
+        let pending_tasks = pending
+            .iter()
+            .filter(|job| {
+                job.conversation_id == key.conversation_id && job.kind == TriggerKind::AgentTask
+            })
+            .count();
+        if active_tasks + pending_tasks >= limits.task_limit {
+            return Ok(Some(QueueHoldReason::TaskLimit));
+        }
+    }
+    if active.len() + checks.len() >= limits.machine_slots {
+        return Ok(Some(QueueHoldReason::MachineSlot));
+    }
+    Ok(None)
 }
 
 pub(crate) fn pending_checks_from(connection: &Connection) -> Result<Vec<PendingCheck>> {
@@ -380,7 +500,10 @@ fn holds_turn(
     job: &SchedulerJob,
 ) -> Result<bool> {
     if job.kind == TriggerKind::AgentTask {
-        return Ok(true);
+        return Ok(
+            super::reduce::work_from(connection, network, &job.reply_to)?
+                .is_some_and(|work| work.target_node == local && work.outcome.is_none()),
+        );
     }
     Ok(
         conversation_from(connection, network, &session.conversation_id)?.is_some_and(|c| {
@@ -712,10 +835,10 @@ impl Store {
         trigger: &str,
         attempt_id: &str,
     ) -> Result<Vec<StagedMemory>> {
-        let session = load_session(&self.connection, conversation)?;
         let Some(job) = load_job(&self.connection, conversation, trigger)? else {
             return Ok(Vec::new());
         };
+        let session = load_job_session(&self.connection, &job)?;
         ensure!(
             job.state
                 .attempt()
@@ -743,8 +866,8 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut session = load_session(&tx, conversation)?;
         let job = load_job(&tx, conversation, trigger)?.context("scheduler job missing")?;
+        let mut session = load_job_session(&tx, &job)?;
         ensure!(
             job.state
                 .attempt()
@@ -783,8 +906,8 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut session = load_session(&tx, conversation)?;
         let job = load_job(&tx, conversation, trigger)?.context("scheduler job missing")?;
+        let mut session = load_job_session(&tx, &job)?;
         ensure!(
             job.state
                 .attempt()
@@ -1492,6 +1615,15 @@ fn end_job_from(
     if session.active.as_deref() == Some(job.trigger.as_str()) {
         session.active = None;
     }
+    if matches!(session.scope, SessionScope::Routine { .. }) {
+        session.native_id = None;
+        session.native_token = None;
+        session.covers.clear();
+        session.shown.bot = None;
+        session.shown.works.clear();
+        session.shown.memory = None;
+        session.shown.dynamic = None;
+    }
     if !matches!(&job.state, JobState::Interrupted { .. })
         || pending_checks_from(connection)?
             .iter()
@@ -1527,6 +1659,7 @@ fn recover_session(
         JobState::Claimed { .. } => {
             job.state = JobState::Queued;
             session.active = None;
+            session.shown.staged_memories.clear();
             save_job(connection, &job)?;
         }
         JobState::Running { .. } | JobState::Cancelling { .. } => {
@@ -1653,6 +1786,18 @@ impl Store {
         load_job(&self.connection, conversation, trigger)
     }
 
+    pub(crate) fn scheduler_job_hold(
+        &self,
+        network: &str,
+        local: &str,
+        job: &SchedulerJob,
+        provider: Provider,
+        limits: &crate::config::SchedulingLimits,
+    ) -> Result<Option<QueueHoldReason>> {
+        job_hold_from(&self.connection, network, local, job, provider, limits)
+    }
+
+    #[cfg(test)]
     pub(crate) fn scheduler_queue_hold(
         &self,
         network: &str,
@@ -1661,9 +1806,8 @@ impl Store {
         state: &JobState,
     ) -> Result<Option<QueueHoldReason>> {
         let session = load_session(&self.connection, conversation)?;
-        let owned = conversation_from(&self.connection, network, conversation)?
-            .is_some_and(|conversation| conversation.owner.as_deref() == Some(local));
-        let steering = owned
+        let steering = conversation_from(&self.connection, network, conversation)?
+            .is_some_and(|conversation| conversation.owner.as_deref() == Some(local))
             && !query_jobs(
                 &self.connection,
                 "conversation_id=? AND state='steering'",
@@ -1673,20 +1817,67 @@ impl Store {
         Ok(queue_hold_reason(state, session.active.is_some(), steering))
     }
 
+    pub(crate) fn scheduler_job_context_projection(
+        &self,
+        job: &SchedulerJob,
+    ) -> Result<Option<ContextProjection>> {
+        let session = load_job_session(&self.connection, job)?;
+        Ok(context_projection_from(&session).filter(|context| {
+            job.state
+                .attempt()
+                .is_some_and(|attempt| attempt.id == context.attempt_id)
+        }))
+    }
+
+    pub(crate) fn scheduler_memory_staged_count(&self, conversation: &str) -> Result<usize> {
+        Ok(query_sessions(
+            &self.connection,
+            "conversation_id=? AND active IS NOT NULL",
+            [conversation],
+        )?
+        .iter()
+        .map(|session| session.shown.staged_memories.len())
+        .sum())
+    }
+
+    pub(crate) fn scheduler_session_status(
+        &self,
+        key: &SessionKey,
+        config: Option<&SessionConfig>,
+    ) -> Result<SessionStatusProjection> {
+        let session = load_scoped_session(&self.connection, key)?;
+        Ok(SessionStatusProjection {
+            resumable: !matches!(key.scope, SessionScope::Routine { .. })
+                && session.native_id.is_some(),
+            pending_generation: session.active.is_some()
+                && config.is_some_and(|config| {
+                    session.stable_fingerprint.as_deref()
+                        != Some(config.stable_fingerprint.as_str())
+                        || session.runtime_fingerprint.as_deref()
+                            != Some(config.runtime_fingerprint.as_str())
+                        || session.provider != Some(config.provider)
+                }),
+        })
+    }
+
     pub(crate) fn scheduler_context_projection(
         &self,
         conversation: &str,
     ) -> Result<Option<ContextProjection>> {
-        Ok(load_session(&self.connection, conversation)?.shown.context)
+        let session = load_session(&self.connection, conversation)?;
+        Ok(context_projection_from(&session))
     }
 
     pub(crate) fn scheduler_memory_conflicts(
         &self,
         conversation: &str,
     ) -> Result<Vec<MemoryConflict>> {
-        Ok(load_session(&self.connection, conversation)?
-            .shown
-            .memory_conflicts)
+        Ok(
+            query_sessions(&self.connection, "conversation_id=?", [conversation])?
+                .into_iter()
+                .flat_map(|session| session.shown.memory_conflicts)
+                .collect(),
+        )
     }
 
     pub(crate) fn record_compiled_context(
@@ -1709,7 +1900,18 @@ impl Store {
                 session.active.as_deref() == Some(trigger) && !job.state.terminal(),
                 "scheduler attempt is no longer active"
             );
-            session.shown.context = Some(context.clone());
+            ensure!(
+                session.provider == Some(context.provider)
+                    && session.shown.session_generation == context.session_generation,
+                "compiled context does not match the claimed session"
+            );
+            let mut context = context.clone();
+            context.session_status = Some(SessionStatusProjection {
+                resumable: !matches!(session.scope, SessionScope::Routine { .. })
+                    && session.native_id.is_some(),
+                pending_generation: false,
+            });
+            session.shown.context = Some(context);
             Ok(())
         })?;
         Ok(())
@@ -1772,6 +1974,21 @@ impl Store {
         pending_conversations_from(&self.connection)
     }
 
+    pub fn pending_scheduler_sessions(&self) -> Result<Vec<SessionKey>> {
+        let mut jobs = query_jobs(
+            &self.connection,
+            "state IN ('queued','claimed','running','cancelling')",
+            [],
+        )?;
+        jobs.sort_by(|a, b| a.priority().cmp(&b.priority()));
+        let mut seen = std::collections::BTreeSet::new();
+        Ok(jobs
+            .into_iter()
+            .map(|job| job.session_key())
+            .filter(|key| seen.insert(key.clone()))
+            .collect())
+    }
+
     pub fn recover_scheduler_jobs(
         &mut self,
         identity: &LocalIdentity,
@@ -1789,52 +2006,74 @@ impl Store {
         Ok(())
     }
 
-    /// Human messages go first.
+    /// Fixture convenience; production claims always carry the captured provider configuration.
+    #[cfg(test)]
     pub fn claim_next(
         &mut self,
         identity: &LocalIdentity,
         network: &str,
         conversation: &str,
         boot: &str,
-        sdk_config: &str,
+        fingerprint: &str,
     ) -> Result<Option<ClaimedJob>> {
+        self.recover_scheduler_jobs(identity, network, boot)?;
+        let mut queued = queued_jobs(&self.connection, conversation)?;
+        queued.sort_by(|a, b| a.priority().cmp(&b.priority()));
+        let Some(job) = queued.first() else {
+            return Ok(None);
+        };
+        let config = SessionConfig {
+            stable_fingerprint: fingerprint.into(),
+            runtime_fingerprint: fingerprint.into(),
+            provider: Provider::Codex,
+        };
+        self.claim_next_in_session(
+            identity,
+            network,
+            &job.session_key(),
+            boot,
+            &config,
+            &crate::config::SchedulingLimits::default(),
+        )
+    }
+
+    /// Claim and every resource gate share one transaction. A held background candidate never
+    /// blocks a runnable human message, and ties remain stable across concurrent consumers.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the local session and captured execution policy"
+    )]
+    pub fn claim_next_in_session(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        key: &SessionKey,
+        boot: &str,
+        config: &SessionConfig,
+        limits: &crate::config::SchedulingLimits,
+    ) -> Result<Option<ClaimedJob>> {
+        limits.validate()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut session = load_session(&tx, conversation)?;
-        recover_session(&tx, &self.blob_dir, identity, network, &mut session, boot)?;
         let local = identity.device_id()?;
-        let current = conversation_from(&tx, network, conversation)?;
-        let owner_epoch = current.as_ref().map_or(0, |c| c.owner_epoch);
-        let owned = current.and_then(|c| c.owner) == Some(local.clone());
-        // A message whose steer is unsettled keeps its place here; nothing behind it runs first.
-        // A conversation that moved away still hands its queue on.
-        if session.active.is_some()
-            || owned
-                && !query_jobs(
-                    &tx,
-                    "conversation_id=? AND state='steering'",
-                    [conversation],
-                )?
-                .is_empty()
-        {
+        for mut session in query_sessions(&tx, "active IS NOT NULL", [])? {
+            recover_session(&tx, &self.blob_dir, identity, network, &mut session, boot)?;
             save_session(&tx, &session)?;
-            tx.commit()?;
-            return Ok(None);
         }
-        if !owned {
-            hand_off_from(&tx, network, conversation)?;
-        }
-        let mut queued = queued_jobs(&tx, conversation)?;
-        queued.sort_by_key(|job| {
-            (
-                !matches!(job.kind, TriggerKind::Human | TriggerKind::Answer),
-                job.sequence,
-            )
-        });
-        let deleted = super::bots::bot_deleted_from(&tx, network, conversation)?;
+        let mut queued = query_jobs(&tx, "state='queued'", [])?;
+        queued.sort_by(|a, b| a.priority().cmp(&b.priority()));
         let mut selected = None;
         for mut job in queued {
+            let owned = conversation_from(&tx, network, &job.conversation_id)?
+                .and_then(|conversation| conversation.owner)
+                .as_deref()
+                == Some(local.as_str());
+            if !owned && job.kind != TriggerKind::AgentTask {
+                hand_off_from(&tx, network, &job.conversation_id)?;
+                continue;
+            }
+            let deleted = super::bots::bot_deleted_from(&tx, network, &job.conversation_id)?;
             if deleted {
                 let outcome = JobOutcome::Cancelled(BOT_DELETED.into());
                 let change = TaskJobChange::Ended {
@@ -1861,6 +2100,12 @@ impl Store {
                 TriggerKind::Schedule if !holds_schedule_claim(&tx, network, &local, &job)? => {
                     Some("这次定时已由另一台设备领取")
                 }
+                TriggerKind::AgentTask
+                    if super::reduce::work_from(&tx, network, &job.reply_to)?
+                        .is_none_or(|work| work.target_node != local) =>
+                {
+                    Some("任务不属于这台设备")
+                }
                 TriggerKind::AgentTask if super::work::run_finished(&tx, &job.reply_to)? => {
                     Some("任务结果已由你确认")
                 }
@@ -1870,7 +2115,7 @@ impl Store {
                 | TriggerKind::Answer
                 | TriggerKind::BotMessage
                 | TriggerKind::Schedule
-                    if replied_from(&tx, network, conversation, &job.reply_to)? =>
+                    if replied_from(&tx, network, &job.conversation_id, &job.reply_to)? =>
                 {
                     Some("已在别处回复")
                 }
@@ -1884,49 +2129,78 @@ impl Store {
                 save_job(&tx, &job)?;
                 continue;
             }
+            if job_hold_from(&tx, network, &local, &job, config.provider, limits)?.is_some() {
+                continue;
+            }
             selected = Some(job);
             break;
         }
-        let Some(mut job) = selected else {
-            save_session(&tx, &session)?;
+        let Some(mut job) = selected.filter(|job| job.session_key() == *key) else {
             tx.commit()?;
             return Ok(None);
         };
-        let invalidation = if session.sdk_config.as_deref() != Some(sdk_config)
+        let mut session = load_job_session(&tx, &job)?;
+        let owner_epoch = if job.kind == TriggerKind::AgentTask {
+            0
+        } else {
+            conversation_from(&tx, network, &job.conversation_id)?.map_or(0, |c| c.owner_epoch)
+        };
+        let invalidation = if session.stable_fingerprint.as_deref()
+            != Some(config.stable_fingerprint.as_str())
+            || session.runtime_fingerprint.as_deref() != Some(config.runtime_fingerprint.as_str())
+            || session.provider != Some(config.provider)
             || session.owner_epoch != owner_epoch
         {
             let reason = if session.owner_epoch != owner_epoch {
                 "conversation_owner_changed"
+            } else if session.provider != Some(config.provider) {
+                "provider_changed"
+            } else if session.stable_fingerprint.as_deref()
+                != Some(config.stable_fingerprint.as_str())
+            {
+                "stable_prompt_changed"
             } else {
-                "stable_prompt_or_provider_changed"
+                "runtime_configuration_changed"
             };
-            let generation = session.shown.session_generation.saturating_add(1);
+            let generation = session
+                .shown
+                .session_generation
+                .checked_add(1)
+                .context("scheduler session generation overflow")?;
             let handoff_revision = crate::crypto::digest(&serde_json::to_vec(&(
-                session.sdk_config.as_deref(),
-                sdk_config,
+                session.stable_fingerprint.as_deref(),
+                &config.stable_fingerprint,
+                session.runtime_fingerprint.as_deref(),
+                &config.runtime_fingerprint,
                 generation,
                 &job.basis,
             ))?);
-            let invalidation = Some(SessionInvalidation {
-                old_config: session.sdk_config.clone(),
-                new_config: sdk_config.into(),
+            let invalidation = SessionInvalidation {
+                old_stable_fingerprint: session.stable_fingerprint.clone(),
+                new_stable_fingerprint: config.stable_fingerprint.clone(),
+                old_runtime_fingerprint: session.runtime_fingerprint.clone(),
+                new_runtime_fingerprint: config.runtime_fingerprint.clone(),
+                source_provider: session.provider,
+                target_provider: config.provider,
                 reason: reason.into(),
                 generation,
                 handoff_revision,
-            });
-            session.native_id = None;
-            session.native_token = None;
+            };
+            fence(&mut session)?;
             session.covers.clear();
             let mut lineage = std::mem::take(&mut session.shown.session_lineage);
-            if let Some(old_config) = session.sdk_config.clone() {
+            if let (Some(stable_fingerprint), Some(runtime_fingerprint), Some(provider)) = (
+                session.stable_fingerprint.clone(),
+                session.runtime_fingerprint.clone(),
+                session.provider,
+            ) {
                 lineage.push(SessionLineage {
                     generation: session.shown.session_generation,
-                    fingerprint: old_config,
+                    stable_fingerprint,
+                    runtime_fingerprint,
+                    provider,
                     reason: reason.into(),
-                    handoff_revision: invalidation
-                        .as_ref()
-                        .map(|value| value.handoff_revision.clone())
-                        .unwrap_or_default(),
+                    handoff_revision: invalidation.handoff_revision.clone(),
                 });
             }
             if lineage.len() > 8 {
@@ -1937,14 +2211,16 @@ impl Store {
                 session_lineage: lineage,
                 ..Shown::default()
             };
-            session.sdk_config = Some(sdk_config.into());
+            session.stable_fingerprint = Some(config.stable_fingerprint.clone());
+            session.runtime_fingerprint = Some(config.runtime_fingerprint.clone());
+            session.provider = Some(config.provider);
             session.owner_epoch = owner_epoch;
-            invalidation
+            Some(invalidation)
         } else {
             None
         };
         job.basis = log::version_vector_from(&tx, network)?;
-        let resumable = job.kind != TriggerKind::AgentTask
+        let resumable = !matches!(session.scope, SessionScope::Routine { .. })
             && session.native_id.is_some()
             && session
                 .covers
@@ -1952,19 +2228,17 @@ impl Store {
                 .all(|(author, seq)| job.basis.get(author).is_some_and(|have| have >= seq));
         let previous_native_id = resumable.then(|| session.native_id.clone()).flatten();
         let previous_token = resumable.then(|| session.native_token.clone()).flatten();
-        // A thread that never started a turn has seen nothing: the prompt carries the context.
         let covers = resumable
             .then(|| session.covers.clone())
             .filter(|covers| !covers.is_empty());
-        let session_generation = session.shown.session_generation;
-        let session_lineage = session.shown.session_lineage.clone();
-        let shown = match covers {
-            Some(_) => session.shown.clone(),
-            None => Shown {
-                session_generation,
-                session_lineage,
+        let shown = if covers.is_some() {
+            session.shown.clone()
+        } else {
+            Shown {
+                session_generation: session.shown.session_generation,
+                session_lineage: session.shown.session_lineage.clone(),
                 ..Shown::default()
-            },
+            }
         };
         job.state = JobState::Claimed {
             attempt: ManagerAttempt {
@@ -1997,8 +2271,8 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut session = load_session(&tx, conversation)?;
         let mut job = load_job(&tx, conversation, trigger)?.context("scheduler job missing")?;
+        let mut session = load_job_session(&tx, &job)?;
         ensure!(
             job.state
                 .attempt()
@@ -2047,24 +2321,23 @@ impl Store {
                 "scheduler attempt is no longer active"
             );
             job.state.attempt().context("scheduler attempt missing")?;
-            if job.kind != TriggerKind::AgentTask {
-                if session.native_id.as_deref() != Some(native_id) {
-                    session.covers.clear();
-                    let session_generation = session.shown.session_generation;
-                    let session_lineage = session.shown.session_lineage.clone();
-                    session.shown = Shown {
-                        session_generation,
-                        session_lineage,
-                        context: session.shown.context.take(),
-                        memory_conflicts: std::mem::take(&mut session.shown.memory_conflicts),
-                        ..Shown::default()
-                    };
-                }
-                session.native_id = Some(native_id.into());
-                session.native_token = Some(token.into());
-                if sent {
-                    session.covers = job.basis.clone();
-                }
+            if session.native_id.as_deref() != Some(native_id) {
+                session.covers.clear();
+                let session_generation = session.shown.session_generation;
+                let session_lineage = session.shown.session_lineage.clone();
+                session.shown = Shown {
+                    session_generation,
+                    session_lineage,
+                    staged_memories: std::mem::take(&mut session.shown.staged_memories),
+                    context: session.shown.context.take(),
+                    memory_conflicts: std::mem::take(&mut session.shown.memory_conflicts),
+                    ..Shown::default()
+                };
+            }
+            session.native_id = Some(native_id.into());
+            session.native_token = Some(token.into());
+            if sent {
+                session.covers = job.basis.clone();
             }
             Ok(())
         })?;
@@ -2081,7 +2354,6 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut session = load_session(&tx, conversation)?;
         let Some(mut job) = load_job(&tx, conversation, trigger)? else {
             return Ok(None);
         };
@@ -2106,6 +2378,7 @@ impl Store {
                 }
             }
         }
+        let mut session = load_job_session(&tx, &job)?;
         if matches!(job.state, JobState::Queued) {
             let evidence = "用户在开始前取消".to_owned();
             let outcome = JobOutcome::Cancelled(evidence.clone());
@@ -2232,10 +2505,10 @@ impl Store {
         trigger: &str,
         attempt_id: &str,
     ) -> Result<bool> {
-        let session = load_session(&self.connection, conversation)?;
         let Some(job) = self.scheduler_job(conversation, trigger)? else {
             return Ok(false);
         };
+        let session = load_job_session(&self.connection, &job)?;
         let Some(attempt) = job.state.attempt() else {
             return Ok(false);
         };
@@ -2268,8 +2541,8 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut session = load_session(&tx, conversation)?;
         let job = load_job(&tx, conversation, trigger)?.context("scheduler job missing")?;
+        let mut session = load_job_session(&tx, &job)?;
         ensure!(
             job.state
                 .attempt()
@@ -2319,10 +2592,11 @@ impl Store {
         if turn_id.is_some()
             && let Some(job) = query_jobs(&tx, "attempt_id=?", [attempt_id])?.pop()
             && !job.state.terminal()
-            && job.kind != TriggerKind::AgentTask
         {
-            let mut session = load_session(&tx, &job.conversation_id)?;
-            if session.native_id.as_deref() == Some(thread_id) {
+            let mut session = load_job_session(&tx, &job)?;
+            if session.active.as_deref() == Some(job.trigger.as_str())
+                && session.native_id.as_deref() == Some(thread_id)
+            {
                 session.covers = job.basis;
                 let mut shown = shown.clone();
                 shown.staged_memories.extend(

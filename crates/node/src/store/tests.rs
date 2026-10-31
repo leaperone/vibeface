@@ -6649,6 +6649,7 @@ fn compiled_context_tracks_observed_turn_state_without_private_values() -> Resul
             dynamic_bytes: 200,
             invalidation_reason: None,
             stage: ContextStage::Compiled,
+            session_status: None,
         };
         store.record_compiled_context("c", &trigger, &attempt, &projection)?;
         assert_eq!(
@@ -8216,5 +8217,640 @@ fn open_works_list_only_what_still_wants_the_user() -> Result<()> {
         ["late"],
         "a refusal arriving after the chat moved on waits for its report"
     );
+    Ok(())
+}
+
+fn isolated_task(store: &mut Store, net: &Net, work_id: &str) -> Result<WorkSpec> {
+    let spec = WorkSpec {
+        work_id: work_id.into(),
+        conversation: "c".into(),
+        trigger: message_trigger("m1"),
+        target: net.a.device_id()?,
+        dispatcher: net.a.device_id()?,
+        call_ref: work_id.into(),
+        kind: WorkKind::Task,
+        cwd: "/tmp".into(),
+        title: work_id.into(),
+        prompt: "read the task".into(),
+        continues: None,
+        parent: None,
+        thread: None,
+    };
+    assert!(store.accept_work(&net.a, &net.network, spec.clone(), 4)?.1);
+    Ok(spec)
+}
+
+fn isolated_claim(
+    store: &mut Store,
+    net: &Net,
+    scope: crate::scheduling::SessionScope,
+    provider: Provider,
+    limits: crate::config::SchedulingLimits,
+) -> Result<Option<crate::scheduling::ClaimedJob>> {
+    store.claim_next_in_session(
+        &net.a,
+        &net.network,
+        &crate::scheduling::SessionKey {
+            conversation_id: "c".into(),
+            scope,
+        },
+        "boot",
+        &crate::scheduling::SessionConfig {
+            stable_fingerprint: "stable".into(),
+            runtime_fingerprint: "runtime".into(),
+            provider,
+        },
+        &limits,
+    )
+}
+
+#[test]
+fn parallel_sessions_keep_native_tokens_shown_and_memory_writers_separate() -> Result<()> {
+    use crate::scheduling::{SessionScope, task_trigger};
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    let limits = crate::config::SchedulingLimits::default();
+    let task1 = isolated_task(&mut store, &net, "parallel-1")?;
+    isolated_task(&mut store, &net, "parallel-2")?;
+    say(&mut store, &net, "parallel-human", true)?;
+    assert!(
+        isolated_claim(
+            &mut store,
+            &net,
+            SessionScope::Task {
+                work_id: task1.work_id.clone()
+            },
+            Provider::Codex,
+            limits
+        )?
+        .is_none(),
+        "human admission wins even over an older task"
+    );
+    let main = isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Main,
+        Provider::Codex,
+        limits,
+    )?
+    .context("main")?;
+    let first = isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Task {
+            work_id: task1.work_id.clone(),
+        },
+        Provider::Codex,
+        limits,
+    )?
+    .context("first task")?;
+    let second = isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Task {
+            work_id: "parallel-2".into(),
+        },
+        Provider::Codex,
+        limits,
+    )?
+    .context("second task")?;
+    assert_eq!(store.scheduler_jobs("c")?.len(), 3);
+    assert!(!store.accept_work(&net.a, &net.network, task1, 5)?.1);
+    assert_eq!(
+        store.scheduler_jobs("c")?.len(),
+        3,
+        "retry keeps the same task job"
+    );
+    for (index, claimed) in [&main, &first, &second].into_iter().enumerate() {
+        let attempt = claimed.job.state.attempt().context("attempt")?;
+        let native = format!("native-{index}");
+        store.mark_started("c", &claimed.job.trigger, &attempt.id)?;
+        store.save_scheduler_native_id(
+            "c",
+            &claimed.job.trigger,
+            &attempt.id,
+            &native,
+            &format!("token-{index}"),
+            false,
+        )?;
+        let shown = Shown {
+            bot: Some(format!("bot-{index}")),
+            memory: Some([(format!("memory-{index}"), format!("digest-{index}"))].into()),
+            ..Shown::default()
+        };
+        store.record_manager_turn(&attempt.id, "fixture", &native, Some("turn"), &shown)?;
+    }
+    let main_attempt = main.job.state.attempt().context("main attempt")?;
+    store.stage_memory(
+        &net.network,
+        "c",
+        &main.job.trigger,
+        &main_attempt.id,
+        "parallel-memory",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "prefers isolated tasks".into(),
+        },
+        6,
+    )?;
+    assert_eq!(store.scheduler_memory_staged_count("c")?, 1);
+    let first_attempt = first.job.state.attempt().context("first attempt")?;
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &first.job.trigger,
+        &first_attempt.id,
+        JobOutcome::Completed,
+        "task done",
+        7,
+    )?;
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &first.job.trigger,
+        &first_attempt.id,
+        JobOutcome::Completed,
+        "task done",
+        8,
+    )?;
+    assert_eq!(
+        store
+            .staged_memory_overlay("c", &main.job.trigger, &main_attempt.id)?
+            .len(),
+        1,
+        "task completion leaves the main writer alone"
+    );
+    assert!(store.memories(&net.network, "c")?.is_empty());
+    for (index, claimed) in [&main, &first, &second].into_iter().enumerate() {
+        let (native, token, shown): (String, String, String) = store.connection.query_row(
+            "SELECT native_id,native_token,shown FROM scheduler_sessions WHERE conversation_id='c' AND scope=?",
+            [claimed.job.session_scope().storage_key()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+        assert_eq!(native, format!("native-{index}"));
+        assert_eq!(token, format!("token-{index}"));
+        let shown: Shown = serde_json::from_str(&shown)?;
+        assert_eq!(shown.bot, Some(format!("bot-{index}")));
+        assert_eq!(
+            shown.memory,
+            Some([(format!("memory-{index}"), format!("digest-{index}"))].into())
+        );
+    }
+    store.request_manager_cancel(&net.a, &net.network, "c", &main.job.trigger)?;
+    assert!(!store.manager_attempt_allowed(
+        &net.network,
+        &net.a.device_id()?,
+        "c",
+        &main.job.trigger,
+        &main_attempt.id
+    )?);
+    assert!(store.manager_attempt_allowed(
+        &net.network,
+        &net.a.device_id()?,
+        "c",
+        &second.job.trigger,
+        &second.job.state.attempt().context("second attempt")?.id
+    )?);
+    assert!(matches!(
+        store
+            .scheduler_job("c", &task_trigger("parallel-2"))?
+            .context("second")?
+            .state,
+        JobState::Running { .. }
+    ));
+    let finished = store.context(&net.network, "c", None)?.events.into_iter().filter(|event| {
+        matches!(&event.event.body, EventBody::WorkFinished { work_id, .. } if work_id == "parallel-1")
+    }).count();
+    assert_eq!(finished, 1);
+    Ok(())
+}
+
+#[test]
+fn serial_provider_gates_only_its_actual_bot_instance() -> Result<()> {
+    use crate::scheduling::{QueueHoldReason, SessionConfig, SessionKey, SessionScope};
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    second_bot(&mut store, &net, "other")?;
+    let limits = crate::config::SchedulingLimits::default();
+    say(&mut store, &net, "serial-human", true)?;
+    isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Main,
+        Provider::Cursor,
+        limits,
+    )?
+    .context("main")?;
+    isolated_task(&mut store, &net, "serial-task")?;
+    let task = store
+        .scheduler_job("c", "task:serial-task")?
+        .context("task")?;
+    assert_eq!(
+        store.scheduler_job_hold(
+            &net.network,
+            &net.a.device_id()?,
+            &task,
+            Provider::Cursor,
+            &limits
+        )?,
+        Some(QueueHoldReason::ProviderSerial)
+    );
+    assert!(
+        isolated_claim(
+            &mut store,
+            &net,
+            task.session_scope(),
+            Provider::Cursor,
+            limits
+        )?
+        .is_none()
+    );
+    super::scheduler::admit_from(
+        &store.connection,
+        &net.network,
+        "d",
+        "work:other",
+        TriggerKind::WorkResult,
+        "other",
+    )?;
+    let other = store
+        .claim_next_in_session(
+            &net.a,
+            &net.network,
+            &SessionKey {
+                conversation_id: "d".into(),
+                scope: SessionScope::Main,
+            },
+            "boot",
+            &SessionConfig {
+                stable_fingerprint: "stable".into(),
+                runtime_fingerprint: "runtime".into(),
+                provider: Provider::Cursor,
+            },
+            &limits,
+        )?
+        .context("other bot is not this Cursor instance")?;
+    assert_eq!(other.job.conversation_id, "d");
+    Ok(())
+}
+
+#[test]
+fn held_tasks_leave_room_for_humans_and_machine_slots_are_real() -> Result<()> {
+    use crate::scheduling::{QueueHoldReason, SessionScope};
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    let limits = crate::config::SchedulingLimits {
+        machine_slots: 2,
+        task_limit: 1,
+    };
+    isolated_task(&mut store, &net, "limited-1")?;
+    isolated_task(&mut store, &net, "limited-2")?;
+    isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Task {
+            work_id: "limited-1".into(),
+        },
+        Provider::Codex,
+        limits,
+    )?
+    .context("first")?;
+    let task = store
+        .scheduler_job("c", "task:limited-2")?
+        .context("second")?;
+    assert_eq!(
+        store.scheduler_job_hold(
+            &net.network,
+            &net.a.device_id()?,
+            &task,
+            Provider::Codex,
+            &limits
+        )?,
+        Some(QueueHoldReason::TaskLimit)
+    );
+    say(&mut store, &net, "priority-human", true)?;
+    isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Main,
+        Provider::Codex,
+        limits,
+    )?
+    .context("human bypasses held task")?;
+    let more_tasks = crate::config::SchedulingLimits {
+        machine_slots: 2,
+        task_limit: 2,
+    };
+    assert_eq!(
+        store.scheduler_job_hold(
+            &net.network,
+            &net.a.device_id()?,
+            &task,
+            Provider::Codex,
+            &more_tasks
+        )?,
+        Some(QueueHoldReason::MachineSlot)
+    );
+    assert!(
+        isolated_claim(
+            &mut store,
+            &net,
+            task.session_scope(),
+            Provider::Codex,
+            more_tasks
+        )?
+        .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn restart_recovers_each_scope_and_unknown_turns_are_never_replayed() -> Result<()> {
+    use crate::scheduling::{QueueHoldReason, SessionScope};
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    let limits = crate::config::SchedulingLimits {
+        machine_slots: 3,
+        task_limit: 2,
+    };
+    say(&mut store, &net, "restart-human", true)?;
+    isolated_task(&mut store, &net, "restart-task")?;
+    let main = isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Main,
+        Provider::Codex,
+        limits,
+    )?
+    .context("main")?;
+    let task = isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Task {
+            work_id: "restart-task".into(),
+        },
+        Provider::Codex,
+        limits,
+    )?
+    .context("task")?;
+    let main_attempt = main.job.state.attempt().context("main attempt")?;
+    store.mark_started("c", &main.job.trigger, &main_attempt.id)?;
+    store.recover_scheduler_jobs(&net.a, &net.network, "new-boot")?;
+    assert!(matches!(
+        store
+            .scheduler_job("c", &main.job.trigger)?
+            .context("main")?
+            .state,
+        JobState::Interrupted { .. }
+    ));
+    assert!(matches!(
+        store
+            .scheduler_job("c", &task.job.trigger)?
+            .context("task")?
+            .state,
+        JobState::Queued
+    ));
+    assert_eq!(store.pending_checks()?.len(), 1);
+    say(&mut store, &net, "after-restart-human", true)?;
+    let next = store
+        .scheduler_job("c", "message:after-restart-human")?
+        .context("next")?;
+    assert_eq!(
+        store.scheduler_job_hold(
+            &net.network,
+            &net.a.device_id()?,
+            &next,
+            Provider::Codex,
+            &limits
+        )?,
+        Some(QueueHoldReason::PendingCheck)
+    );
+    let config = crate::scheduling::SessionConfig {
+        stable_fingerprint: "stable".into(),
+        runtime_fingerprint: "runtime".into(),
+        provider: Provider::Codex,
+    };
+    let recovered = store
+        .claim_next_in_session(
+            &net.a,
+            &net.network,
+            &task.job.session_key(),
+            "new-boot",
+            &config,
+            &limits,
+        )?
+        .context("unstarted task can run in its own scope")?;
+    assert_ne!(
+        recovered.job.state.attempt().context("new attempt")?.id,
+        task.job.state.attempt().context("old attempt")?.id
+    );
+    assert_eq!(
+        store.pending_checks()?.len(),
+        1,
+        "claiming another scope does not clear unknown evidence"
+    );
+    store.resolve_pending_check(&main_attempt.id)?;
+    assert_eq!(
+        store.scheduler_job_hold(
+            &net.network,
+            &net.a.device_id()?,
+            &next,
+            Provider::Codex,
+            &limits
+        )?,
+        None
+    );
+    assert!(matches!(
+        store
+            .scheduler_job("c", &main.job.trigger)?
+            .context("old job")?
+            .state,
+        JobState::Interrupted { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_routine_is_ephemeral_and_keeps_the_main_session_untouched() -> Result<()> {
+    use crate::scheduling::{SessionConfig, SessionScope};
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    let (saved, _) = store.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "routine",
+        save_schedule(None, "Digest", 5),
+        Provider::Codex,
+        3,
+    )?;
+    let BotChange::Schedule { schedule_id, .. } = saved.change else {
+        panic!("schedule")
+    };
+    let due = store.admit_due_schedules(&net.a, &net.network, 1_001)?;
+    assert_eq!(due.len(), 1);
+    say(&mut store, &net, "routine-main", true)?;
+    let limits = crate::config::SchedulingLimits::default();
+    let main = isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Main,
+        Provider::Codex,
+        limits,
+    )?
+    .context("main")?;
+    let main_attempt = main.job.state.attempt().context("main attempt")?;
+    store.save_scheduler_native_id(
+        "c",
+        &main.job.trigger,
+        &main_attempt.id,
+        "main-native",
+        "main-token",
+        true,
+    )?;
+    let trigger = schedule_trigger(&schedule_id, 1_000);
+    let routine_key = crate::scheduling::SessionKey {
+        conversation_id: "c".into(),
+        scope: SessionScope::Routine {
+            trigger: trigger.clone(),
+        },
+    };
+    let config = SessionConfig {
+        stable_fingerprint: "stable".into(),
+        runtime_fingerprint: "runtime".into(),
+        provider: Provider::Codex,
+    };
+    let routine = store
+        .claim_next_in_session(&net.a, &net.network, &routine_key, "boot", &config, &limits)?
+        .context("routine runs independently")?;
+    assert!(routine.previous_native_id.is_none());
+    assert!(routine.previous_token.is_none());
+    assert!(routine.covers.is_none());
+    assert!(routine.shown.memory.is_none());
+    let attempt = routine.job.state.attempt().context("routine attempt")?;
+    store.save_scheduler_native_id(
+        "c",
+        &trigger,
+        &attempt.id,
+        "routine-native",
+        "routine-token",
+        true,
+    )?;
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt.id,
+        JobOutcome::Completed,
+        "digest",
+        2_000,
+    )?;
+    let routine_cache: (Option<String>, Option<String>) = store.connection.query_row("SELECT native_id,native_token FROM scheduler_sessions WHERE conversation_id='c' AND scope=?", [routine_key.scope.storage_key()], |row| Ok((row.get(0)?,row.get(1)?)))?;
+    assert_eq!(routine_cache, (None, None));
+    let main_cache: (String,String) = store.connection.query_row("SELECT native_id,native_token FROM scheduler_sessions WHERE conversation_id='c' AND scope='main'", [], |row| Ok((row.get(0)?,row.get(1)?)))?;
+    assert_eq!(main_cache, ("main-native".into(), "main-token".into()));
+    assert_eq!(
+        store
+            .message(&net.network, "c", &routine.job.message_id)?
+            .context("ordinary routine event")?
+            .text,
+        "digest"
+    );
+    Ok(())
+}
+
+#[test]
+fn stable_runtime_and_provider_changes_have_distinct_session_lineage() -> Result<()> {
+    use crate::scheduling::{SessionConfig, SessionKey, SessionScope};
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    let limits = crate::config::SchedulingLimits::default();
+    let key = SessionKey {
+        conversation_id: "c".into(),
+        scope: SessionScope::Main,
+    };
+    let old = SessionConfig {
+        stable_fingerprint: "stable-one".into(),
+        runtime_fingerprint: "runtime-one".into(),
+        provider: Provider::Codex,
+    };
+    say(&mut store, &net, "config-one", true)?;
+    let first = store
+        .claim_next_in_session(&net.a, &net.network, &key, "boot", &old, &limits)?
+        .context("first")?;
+    let attempt = first.job.state.attempt().context("attempt")?;
+    store.save_scheduler_native_id(
+        "c",
+        &first.job.trigger,
+        &attempt.id,
+        "old-native",
+        "old-token",
+        true,
+    )?;
+    let new = SessionConfig {
+        stable_fingerprint: "stable-two".into(),
+        runtime_fingerprint: "runtime-two".into(),
+        provider: Provider::Cursor,
+    };
+    let status = store.scheduler_session_status(&key, Some(&new))?;
+    assert!(status.resumable && status.pending_generation);
+    assert!(
+        store.manager_attempt_allowed(
+            &net.network,
+            &net.a.device_id()?,
+            "c",
+            &first.job.trigger,
+            &attempt.id
+        )?,
+        "configuration observation does not fence an active old turn"
+    );
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &first.job.trigger,
+        &attempt.id,
+        JobOutcome::Completed,
+        "done",
+        5,
+    )?;
+    say(&mut store, &net, "config-two", true)?;
+    let second = store
+        .claim_next_in_session(&net.a, &net.network, &key, "boot", &new, &limits)?
+        .context("second")?;
+    let invalidation = second.invalidation.context("invalidation")?;
+    assert_eq!(invalidation.reason, "provider_changed");
+    assert_eq!(
+        invalidation.old_stable_fingerprint.as_deref(),
+        Some("stable-one")
+    );
+    assert_eq!(invalidation.new_stable_fingerprint, "stable-two");
+    assert_eq!(
+        invalidation.old_runtime_fingerprint.as_deref(),
+        Some("runtime-one")
+    );
+    assert_eq!(invalidation.new_runtime_fingerprint, "runtime-two");
+    assert_eq!(invalidation.source_provider, Some(Provider::Codex));
+    assert_eq!(invalidation.target_provider, Provider::Cursor);
+    assert_eq!(second.shown.session_generation, 2);
+    assert!(second.previous_native_id.is_none() && second.previous_token.is_none());
+    assert_eq!(
+        second.shown.session_lineage[0].stable_fingerprint,
+        "stable-one"
+    );
+    assert_eq!(
+        second.shown.session_lineage[0].runtime_fingerprint,
+        "runtime-one"
+    );
+    assert_eq!(second.shown.session_lineage[0].provider, Provider::Codex);
+    assert!(!store.manager_attempt_allowed(
+        &net.network,
+        &net.a.device_id()?,
+        "c",
+        &first.job.trigger,
+        &attempt.id
+    )?);
     Ok(())
 }

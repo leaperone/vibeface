@@ -26,8 +26,7 @@ pub enum TriggerKind {
     BotMessage,
 }
 
-/// The durable lane a trigger occupies. A lane is an explanation and routing key for
-/// projections; it never grants a second writer to a shared session or Memory store.
+/// The source of a trigger, independent of the local session that owns its writer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentLane {
@@ -55,8 +54,66 @@ impl TriggerKind {
 pub enum QueueHoldReason {
     ActiveTurn,
     SteeringSettlement,
+    ProviderSerial,
+    TaskLimit,
+    MachineSlot,
+    PendingCheck,
+    BackendConfigPending,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionScope {
+    Main,
+    Task { work_id: String },
+    Routine { trigger: String },
+}
+
+impl SessionScope {
+    pub fn storage_key(&self) -> String {
+        match self {
+            Self::Main => "main".into(),
+            Self::Task { work_id } => format!("task:{work_id}"),
+            Self::Routine { trigger } => format!("routine:{trigger}"),
+        }
+    }
+
+    pub fn from_storage_key(key: &str) -> anyhow::Result<Self> {
+        if key == "main" {
+            return Ok(Self::Main);
+        }
+        if let Some(work_id) = key.strip_prefix("task:") {
+            vibeface_protocol::validate_id(work_id).map_err(anyhow::Error::msg)?;
+            return Ok(Self::Task {
+                work_id: work_id.into(),
+            });
+        }
+        if let Some(trigger) = key.strip_prefix("routine:")
+            && parse_schedule_trigger(trigger).is_some()
+        {
+            return Ok(Self::Routine {
+                trigger: trigger.into(),
+            });
+        }
+        anyhow::bail!("invalid scheduler session scope")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct SessionKey {
+    pub conversation_id: String,
+    pub scope: SessionScope,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    pub stable_fingerprint: String,
+    pub runtime_fingerprint: String,
+    pub provider: Provider,
+}
+
+#[cfg(test)]
 pub fn queue_hold_reason(
     state: &JobState,
     active: bool,
@@ -340,6 +397,34 @@ pub struct SchedulerJob {
 }
 
 impl SchedulerJob {
+    pub fn session_scope(&self) -> SessionScope {
+        match self.kind {
+            TriggerKind::AgentTask => SessionScope::Task {
+                work_id: self.reply_to.clone(),
+            },
+            TriggerKind::Schedule => SessionScope::Routine {
+                trigger: self.trigger.clone(),
+            },
+            _ => SessionScope::Main,
+        }
+    }
+
+    pub fn session_key(&self) -> SessionKey {
+        SessionKey {
+            conversation_id: self.conversation_id.clone(),
+            scope: self.session_scope(),
+        }
+    }
+
+    pub fn priority(&self) -> (bool, u64, &str, &str) {
+        (
+            !matches!(self.kind, TriggerKind::Human | TriggerKind::Answer),
+            self.sequence,
+            &self.conversation_id,
+            &self.trigger,
+        )
+    }
+
     pub fn receipt(&self, network: &str) -> AdmissionReceipt {
         AdmissionReceipt {
             network_id: network.into(),
@@ -405,8 +490,12 @@ pub struct ClaimedJob {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionInvalidation {
-    pub old_config: Option<String>,
-    pub new_config: String,
+    pub old_stable_fingerprint: Option<String>,
+    pub new_stable_fingerprint: String,
+    pub old_runtime_fingerprint: Option<String>,
+    pub new_runtime_fingerprint: String,
+    pub source_provider: Option<Provider>,
+    pub target_provider: Provider,
     pub reason: String,
     pub generation: u64,
     pub handoff_revision: String,
@@ -416,7 +505,9 @@ pub struct SessionInvalidation {
 #[serde(deny_unknown_fields)]
 pub struct SessionLineage {
     pub generation: u64,
-    pub fingerprint: String,
+    pub stable_fingerprint: String,
+    pub runtime_fingerprint: String,
+    pub provider: Provider,
     pub reason: String,
     pub handoff_revision: String,
 }
@@ -429,6 +520,9 @@ pub struct Shown {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<BTreeMap<String, String>>,
     pub works: BTreeMap<String, String>,
+    /// Digests of the bounded memory rows actually delivered to this native session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<BTreeMap<String, String>>,
     /// The last dynamic Context digest sent on this local native session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic: Option<String>,
@@ -472,6 +566,15 @@ pub struct ContextProjection {
     pub dynamic_bytes: usize,
     pub invalidation_reason: Option<String>,
     pub stage: ContextStage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_status: Option<SessionStatusProjection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionStatusProjection {
+    pub resumable: bool,
+    pub pending_generation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -525,6 +628,7 @@ pub enum JobOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct SchedulerSession {
     pub conversation_id: String,
+    pub scope: SessionScope,
     pub next_sequence: u64,
     pub active: Option<String>,
     /// The SDK's own session, cached for this conversation on this Node only. `covers` is the
@@ -537,14 +641,17 @@ pub(crate) struct SchedulerSession {
     /// Moves with `covers`: what the native session's turns were shown of the bot and works.
     pub shown: Shown,
     pub owner_epoch: u64,
-    pub sdk_config: Option<String>,
+    pub stable_fingerprint: Option<String>,
+    pub runtime_fingerprint: Option<String>,
+    pub provider: Option<Provider>,
     pub permission_version: u64,
 }
 
 impl SchedulerSession {
-    pub fn new(conversation: &str) -> Self {
+    pub fn in_scope(conversation: &str, scope: SessionScope) -> Self {
         Self {
             conversation_id: conversation.into(),
+            scope,
             next_sequence: 1,
             active: None,
             native_id: None,
@@ -552,7 +659,9 @@ impl SchedulerSession {
             covers: VersionVector::new(),
             shown: Shown::default(),
             owner_epoch: 0,
-            sdk_config: None,
+            stable_fingerprint: None,
+            runtime_fingerprint: None,
+            provider: None,
             permission_version: 1,
         }
     }
