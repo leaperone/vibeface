@@ -1,5 +1,3 @@
-//! Chat-driven bot settings and memory, plus directly signed user memory control.
-//! Automatic changes stand on the user's message and memory commits only on completion.
 use super::{Store, bots::bot_for_conversation_from, log, message_from};
 use crate::{
     crypto::digest,

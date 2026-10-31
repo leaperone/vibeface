@@ -1511,8 +1511,6 @@ def fixture_paid_principals(run, initial, bot, tool):
 
 
 def javascript_dependencies(content):
-    # A user string can contain the words import/export; only treat tokens outside
-    # identifiers, member access and string delimiters as module syntax.
     boundary = rb"(?<![\w$.'\"`])"
     static = boundary + rb"(?:import|export)\s*(?:[^;\"'`]*?\bfrom\s*)?[\"'`]([^\"'`]+)[\"'`]"
     dynamic = boundary + rb"import\s*\(\s*[\"'`]([^\"'`]+)[\"'`]"

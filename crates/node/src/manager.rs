@@ -470,10 +470,8 @@ where
     }
 }
 
-/// The instructions a bot's thread runs with: how to reach Node tools, their catalog, then
-/// `instructions`. They stay out of each turn's prompt: Codex takes them as the thread's
-/// developer instructions, Claude Code and pi as session/system instructions, and opencode as
-/// a user-turn prefix.
+/// Stable Bot instructions and the Node tool catalog. The adapter uses native instructions
+/// or a user-turn prefix.
 /// Node tools go through the CLI in the bot's shell, whose environment carries the turn's scope.
 pub fn bot_instructions(
     tool_cli: Option<&Path>,

@@ -4428,8 +4428,6 @@ fn bot_settings_refuse_secrets() -> Result<()> {
     Ok(())
 }
 
-/// A key this Node knows never leaves it in a reply, a bot message or a work result, while what
-/// the user signed stays exactly as signed.
 #[test]
 fn shared_records_never_carry_a_known_credential() -> Result<()> {
     let key = "fake-shared-record-credential-0123456789";
@@ -5467,7 +5465,6 @@ fn the_pending_list_holds_exactly_the_unanswered_questions() -> Result<()> {
     Ok(())
 }
 
-/// The version of a session as its bot's chat lists it.
 fn session_version(store: &Store, net: &Net, session: &str) -> Result<String> {
     for scope in ["c", "d"] {
         if let Some(row) = store
@@ -8012,9 +8009,6 @@ fn the_prompt_never_carries_the_users_device_signature() -> Result<()> {
     Ok(())
 }
 
-/// Only what wants the user is read, however long the history: a failure stays until a later
-/// work ends, a completed bot reply follows it or the user closes it, and a refusal leaves the
-/// same way once the bot answered its report.
 #[test]
 fn open_works_list_only_what_still_wants_the_user() -> Result<()> {
     use crate::work::{Dispatch, DispatchState};

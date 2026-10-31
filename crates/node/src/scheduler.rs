@@ -329,7 +329,6 @@ async fn turn(
     scope: SessionScope,
 ) -> Result<Option<Value>> {
     let _work = node.maintenance.enter()?;
-    // A turn whose reply could not be recorded must not start; queued jobs wait.
     if !node.writable() {
         return Ok(None);
     }
