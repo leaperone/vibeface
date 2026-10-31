@@ -834,7 +834,7 @@ jobs:
     needs: [plan]
     uses: ./.github/workflows/release-apps.yml
     with:
-      version: ${{ needs.plan.outputs.version }}
+      version: v${{ needs.plan.outputs.version }}
       prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
 
   publish:
