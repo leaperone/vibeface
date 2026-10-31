@@ -119,7 +119,7 @@ test('scheduler observations distinguish waiting, stopping, publishing, history 
 
 test('losing the entry makes active tasks stale without claiming every target is offline', () => {
   const work: WorkRecord = { work_id: 'w', trigger: '', target_node: 'mac', cwd: '', title: '', prompt: '', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null }
-  const state = cardState(work, [unready], 'running')
+  const state = cardState(work, [unready], { state: 'running', outcome: null })
   assert.equal(state, 'running', 'the last target report is still online')
   assert.equal(taskStale(state, false), true)
   assert.equal(staleTaskLabel, '状态未知')

@@ -37,7 +37,7 @@ export function TasksScreen() {
   const bot = workspace.bots[0]
   const groups: Record<TaskGroup, OpenWork[]> = { attention: [], working: [], waiting: [] }
   for (const work of visibleWorks) {
-    const state = cardState(work, lookup.nodes, projection(work)?.state)
+    const state = cardState(work, lookup.nodes, projection(work))
     const asking = state === 'running' && workApproval({ work, conversationId: work.conversation_id, questions: shared?.questions ?? [], answered: shared?.answered ?? {} })
     groups[taskGroup(taskStale(state, Boolean(shared?.connectionOnline && read)) ? 'unknown' : state, Boolean(asking))].push(work)
   }
@@ -80,7 +80,7 @@ type Lookup = { nodes: NodeInfo[]; directory: ReturnType<typeof useDevice>['dire
 type TaskBot = Pick<BotRecord, 'bot_id' | 'conversation_id' | 'name' | 'avatar'>
 
 function TaskRow({ work, projected, waiting, bot, lookup, connected, progress }: { work: OpenWork; waiting: boolean; projected?: Extract<OverviewTask, { kind: 'work' | 'dispatch' }>; bot?: TaskBot; lookup: Lookup; connected: boolean; progress: string }) {
-  const shown = cardState(work, lookup.nodes, projected?.state)
+  const shown = cardState(work, lookup.nodes, projected)
   const rawState = shown === 'running' && waiting ? 'waiting' : shown
   const failed = needsLook(rawState) && rawState !== 'dispatch_unverified'
   const stale = taskStale(rawState, connected)
@@ -92,7 +92,8 @@ function TaskRow({ work, projected, waiting, bot, lookup, connected, progress }:
   const device = nodeName(work.target_node, lookup)
   const title = work.title || '任务'
   const href = bot ? `/b/${bot.bot_id}/work/${work.work_id}` as const : undefined
-  const line = failed || rawState === 'dispatch_unverified' ? workFailure(work) : progress
+  const failure = work.outcome === rawState || work.state === rawState ? work : { failure: projected?.failure, failure_reason: projected?.reason ?? null }
+  const line = failed || rawState === 'dispatch_unverified' ? workFailure(failure) : progress
   // The whole row opens the task, so the touch target is the row, not a line of text; the bot's name is only a label.
   const frame = cn('min-h-16 flex-row items-center gap-3 rounded-xl border bg-card px-4 py-2.5 shadow-xs dark:border-line-strong', active ? 'border-brand/25' : 'border-border')
   const body = <>

@@ -549,7 +549,7 @@ test('both task overviews preserve known records, show their coverage and only n
     shared.overview = workspaceModel.parseWorkspaceOverview({
       bots: [parityBot, { bot_id: 'other', conversation_id: 'other-chat', name: '另一个 Bot' }],
       tasks: shared.openWorks.slice(0, 256), truncated: true, consistency: 'partial', checks: [{ check_id: 'other-process', conversation_id: 'other-chat', trigger: 'message:remote' }],
-      coverage: { source: 'workspace_overview', truncated: true, remote_owners: [{ owner: 'remote', reason: 'remote_scheduler_not_queried' }] },
+      coverage: { source: 'workspace_overview', truncated: true, omitted_tasks: 1, omitted_questions: 2, remote_owners: [{ owner: 'remote', reason: 'remote_scheduler_not_queried' }] },
     })
     const dependencies = {
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: () => [] },
@@ -568,6 +568,9 @@ test('both task overviews preserve known records, show their coverage and only n
       assert.equal(cards.length, 257, `${platform} keeps the row outside the bounded overview`)
       assert.equal((cards[256].props.work as WorkRecord).prompt, '完整请求 256')
       assert.match(componentText(elements), /总览已截断/)
+      assert.match(componentText(elements), /本次总览未返回 1 项任务/)
+      assert.match(componentText(elements), /本次总览未返回 2 项问题/)
+      assert.doesNotMatch(componentText(elements), /另有.*未列出/)
       assert.match(componentText(elements), /远端调度尚未查询/)
       assert.doesNotMatch(componentText(elements), /0 项.*未列出/)
       assert.equal(elements.some(({ type }) => type === 'ConfirmCard'), false, 'another Bot program check cannot settle against the active conversation')
@@ -597,6 +600,48 @@ test('both task overviews preserve known records, show their coverage and only n
       const empty = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceEmpty' : 'MobileEmpty'))
       assert.ok(empty && typeof empty.type === 'function')
       assert.match(platform === 'web' ? String(empty.props.title) : componentText(empty.type(empty.props)), /当前记录没有未完成的任务/)
+    } finally { app.close() }
+  }
+})
+
+test('both task overviews retain failure outcomes and causes across unordered snapshots', () => {
+  for (const platform of ['web', 'native']) {
+    const shared = parityShared()
+    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../../apps/mobile/src/features/home/tasks.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: () => [] },
+      '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+      '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
+      '@vibeface/client/lib/errors.ts': errors, './inbox': { useInbox: () => [] }, './workspace-shell': { useCreateBot: () => () => {} },
+      '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') }, '@/components/kit': { providerIcons: { codex: 'CodexIcon' } },
+    })
+    try {
+      for (const observedFailure of [true, false]) {
+        const running = { ...parityWork({ summary: '', result_text: '完整输出', failure_reason: '旧快照记录的说明' }), conversation_id: 'chat' }
+        const failed = { ...running, state: 'finished' as const, outcome: 'failed' as const, failure_reason: '这次执行失败，已保留改动' }
+        shared.openWorks = [observedFailure ? running : failed]
+        shared.overview = workspaceModel.parseWorkspaceOverview({ bots: [parityBot], tasks: [{ ...(observedFailure ? failed : running), kind: 'work' }] })
+        const elements = app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen')
+        const card = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'TaskOverviewCard' : 'TaskRow'))
+        assert.ok(card && typeof card.type === 'function')
+        const text = componentText(card.type(card.props))
+        assert.match(text, /失败/, `${platform} uses the outcome rather than treating finished as success`)
+        assert.match(text, /这次执行失败，已保留改动/)
+        assert.doesNotMatch(text, /旧快照记录的说明/)
+        assert.doesNotMatch(text, /已完成/)
+        assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceMasthead' : 'MobileMasthead'))?.props.attention, 1)
+        assert.equal((card.props.work as WorkRecord).result_text, '完整输出')
+      }
+      for (const [known, observed] of [['completed', 'unverified'], ['unverified', 'completed'], ['completed', 'failed'], ['failed', 'completed']] as const) {
+        shared.openWorks = [{ ...parityWork({ state: known === 'unverified' ? 'unverified' : 'finished', outcome: known, summary: '' }), conversation_id: 'chat' }]
+        shared.overview = workspaceModel.parseWorkspaceOverview({ bots: [parityBot], tasks: [{ ...parityWork({ state: observed === 'unverified' ? 'unverified' : 'finished', outcome: observed }), conversation_id: 'chat', kind: 'work' }] })
+        const elements = app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen')
+        const card = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'TaskOverviewCard' : 'TaskRow'))
+        assert.ok(card && typeof card.type === 'function')
+        const text = componentText(card.type(card.props))
+        assert.match(text, /待确认|状态未知/)
+        assert.doesNotMatch(text, /已完成/)
+        assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceMasthead' : 'MobileMasthead'))?.props.attention, 1)
+      }
     } finally { app.close() }
   }
 })

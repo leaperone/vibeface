@@ -1,7 +1,7 @@
 import { asProvider, type MembershipView, type ProviderId } from "../lib/node.ts"
 import type { LiveProgress } from "../lib/progress.ts"
 import { confirmReason } from "./model.ts"
-import type { NodeInfo, OverviewCoverage, SessionHandoff, WorkRecord } from "./types.ts"
+import type { NodeInfo, OverviewCoverage, OverviewTask, SessionHandoff, WorkRecord } from "./types.ts"
 
 const stateNames: Record<string, string> = {
   accepted: "已接收",
@@ -185,9 +185,16 @@ export const fixOnDeviceLabel = (device: string) => `去设置「${device}」`
 /** Where a task card sits on the tasks page, in both apps. */
 export type TaskGroup = "attention" | "working" | "waiting"
 export const taskGroups: readonly { group: TaskGroup; title: string }[] = [{ group: "attention", title: "需要留意" }, { group: "working", title: "进行中" }, { group: "waiting", title: "等待中" }]
-/** The state a task card shows: the overview names a failed work only as finished, so its outcome says how. */
-export const cardState = (work: WorkRecord, nodes: NodeInfo[], projected?: string) =>
-  confirmReason(work, nodes) ? "awaiting_confirmation" : work.outcome ?? work.stop ?? (work.state === "finished" ? "unknown" : projected ?? work.state)
+/** DAG results survive an older running read; unknown or conflicting results have no ordering proof. */
+export function cardState(work: WorkRecord, nodes: NodeInfo[], projected?: Pick<OverviewTask, "state" | "outcome">): string {
+  if (work.state === "unverified" || work.outcome === "unverified" || work.state === "dispatch_unverified") return shownState(work, nodes)
+  if (projected && (projected.outcome === "unverified" || ["unknown", "unverified", "dispatch_unverified"].includes(projected.state))) return projected.outcome === "unverified" ? "unverified" : projected.state
+  if ((work.state === "finished" && !work.outcome) || (projected?.state === "finished" && !projected.outcome)) return "unknown"
+  if (work.outcome && projected?.outcome && work.outcome !== projected.outcome) return "unknown"
+  const outcome = work.outcome ?? projected?.outcome
+  if (outcome) return outcome
+  return confirmReason(work, nodes) ? "awaiting_confirmation" : work.stop ?? projected?.state ?? work.state
+}
 export const needsLook = (state: string) => ["failed", "rejected", "dispatch_rejected", "dispatch_unverified"].includes(state)
 /** A task that failed, was never taken or awaits the person's confirmation needs them; one out of their hands or held on them waits; the rest work. */
 export const taskGroup = (state: string, heldOnPerson: boolean): TaskGroup =>
@@ -227,7 +234,7 @@ export function overviewScope(coverage: OverviewCoverage): string[] {
   if (!coverage.complete || coverage.consistency === "partial") notes.push("部分记录，不代表全部任务")
   if (coverage.truncated) notes.push("总览已截断，保留其他已知任务")
   const omitted = [["任务", coverage.omitted_tasks], ["问题", coverage.omitted_questions], ["检查", coverage.omitted_checks], ["派发", coverage.omitted_dispatches], ["投递", coverage.omitted_deliveries], ["调度记录", coverage.omitted_jobs]] as const
-  for (const [label, count] of omitted) if (count !== null && count > 0) notes.push(`另有 ${count} 项${label}未列出`)
+  for (const [label, count] of omitted) if (count !== null && count > 0) notes.push(`本次总览未返回 ${count} 项${label}`)
   if (coverage.remote_owners.some((owner) => owner.reason === "remote_scheduler_not_queried" || owner.status === "remote_scheduler_not_queried")) notes.push("远端调度尚未查询")
   if (coverage.unreachable_nodes.length) notes.push("部分设备不可达，状态可能滞后")
   return notes

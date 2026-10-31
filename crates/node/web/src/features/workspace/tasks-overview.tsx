@@ -56,7 +56,7 @@ export function TasksOverview() {
   const matchesBot = (conversationId: string, projectedBotId?: string | null) => botFilter === "all" || projectedBotId === botFilter || botIds.get(conversationId) === botFilter
   for (const work of tasks) {
     const item = projection(work)
-    const state = cardState(work, workspace.nodes, item?.state)
+    const state = cardState(work, workspace.nodes, item)
     const asking = state === "running" && workApproval({ work, conversationId: work.conversation_id, questions: openQuestions, answered: workspace.answered })
     if (matchesBot(work.conversation_id, item?.bot?.bot_id)) groups[taskGroup(taskStale(state, workspace.connectionOnline && read) ? "unknown" : state, Boolean(asking))].push(work)
   }
@@ -137,7 +137,7 @@ function OverviewSection({ title, count, children }: { title: string; count: num
 }
 
 function TaskOverviewCard({ work, projected, bot, waiting, lookup, connected, progress }: { work: OpenWork; projected?: ProjectedWork; bot?: { bot_id: string; name: string }; waiting: boolean; lookup: { nodes: NodeInfo[]; directory: MembershipView | null }; connected: boolean; progress: string }) {
-  const shown = cardState(work, lookup.nodes, projected?.state)
+  const shown = cardState(work, lookup.nodes, projected)
   const state = shown === "running" && waiting ? "waiting" : shown
   const stale = taskStale(state, connected)
   const unknown = state === "unknown" || state === "unverified" || state === "accepted_waiting_sync" || state === "dispatch_rejected" || state === "dispatch_unverified"
@@ -146,7 +146,8 @@ function TaskOverviewCard({ work, projected, bot, waiting, lookup, connected, pr
   const failed = needsLook(state) && state !== "dispatch_unverified"
   const Icon = failed ? CircleX : stale || unknown ? CircleQuestionMark : taskActive(state) ? LoaderCircle : ListChecks
   const DeviceIcon = Laptop
-  const line = needsLook(state) ? workFailure(work) || (failed ? "这个任务没有成功。" : "") : progress
+  const failure = work.outcome === state || work.state === state ? work : { failure: projected?.failure, failure_reason: projected?.reason ?? null }
+  const line = needsLook(state) ? workFailure(failure) || (failed ? "这个任务没有成功。" : "") : progress
   const device = nodeName(work.target_node, lookup, "未知设备")
   const project = work.cwd ? projectName(work.cwd) : "未指定项目"
   const iconSurface = failed ? "bg-danger-soft text-danger" : stale || unknown ? "bg-warning-soft text-warning" : taskActive(state) ? "bg-brand-soft text-brand" : "bg-muted text-muted-foreground"
