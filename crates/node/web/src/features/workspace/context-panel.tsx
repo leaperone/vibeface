@@ -1,13 +1,17 @@
 "use client"
 
-import { useLayoutEffect, useRef } from "react"
+import { useLayoutEffect, useRef, useState } from "react"
 import { BrainCircuit, ChevronLeft, CircleCheck, CircleDashed, CircleHelp, CircleQuestionMark, CircleX, Cpu, EyeOff, Laptop, ListChecks, MessageCircle, MessagesSquare, ScrollText, Unplug, UserRound, type LucideIcon } from "lucide-react"
 import { Link } from "@tanstack/react-router"
 import { Button } from "@/components/ui/button"
-import { Details, SettingsGroup, SettingsRow, StatusPill, type Tone } from "@/components/app/kit"
+import { Details, SettingsGroup, SettingsRow, StatusPill, useAction, type Tone } from "@/components/app/kit"
+import { Textarea } from "@/components/ui/textarea"
+import { messageOf } from "@vibeface/client/lib/node.ts"
+import { newId } from "@vibeface/client/workspace/storage.ts"
+import { memoryBase, memoryResultLabel, memorySaved, memorySyncConflictLabel, type MemoryControls } from "@vibeface/client/workspace/memory.ts"
 import { formatWhen, changeTitle, scheduleFrequency } from "@vibeface/client/workspace/bot-settings.ts"
 import { contextCoverageLabels, contextIndexLabels, contextInvalidation, contextStages, memoryConflictLabel, memoryOrigins, nativeSessionObservation, nodeName, schedulerStatus, shownState, taskLabel } from "@vibeface/client/workspace/labels.ts"
-import type { BotChange, BotRecord, BotSettings, ContextProjection, ConversationPayload, CoordinationCheck, NodeInfo, Question, WorkRecord } from "@vibeface/client/workspace/types.ts"
+import type { BotChange, BotRecord, BotSettings, ContextProjection, ConversationPayload, CoordinationCheck, MemoryBase, MemoryControlResult, NodeInfo, Question, WorkRecord } from "@vibeface/client/workspace/types.ts"
 import { CollaborationPanel } from "./collaboration-panel"
 import { cn } from "@/lib/utils"
 
@@ -17,12 +21,12 @@ type ContextPanelProps = {
   nodes: readonly NodeInfo[]
   connected: boolean
   onBack: () => void
+  memory: MemoryControls
 }
 
 const continuityProviderLabels: Record<string, string> = { codex: "Codex", cursor: "Cursor", claude: "Claude Code", pi: "pi", opencode: "opencode" }
 
-/** A read-only view of the fields already present in one ConversationPayload. */
-export function ContextPanel({ bot, data, nodes, connected, onBack }: ContextPanelProps) {
+export function ContextPanel({ bot, data, nodes, connected, onBack, memory }: ContextPanelProps) {
   const root = useRef<HTMLDivElement>(null)
   useLayoutEffect(() => {
     root.current?.closest<HTMLElement>('[data-slot="sheet-content"]')?.scrollTo({ top: 0, behavior: "auto" })
@@ -39,7 +43,7 @@ export function ContextPanel({ bot, data, nodes, connected, onBack }: ContextPan
       <Button type="button" variant="ghost" size="icon" className="-ms-2 shrink-0" aria-label="返回 Bot 设置" title="返回 Bot 设置" onClick={onBack}><ChevronLeft aria-hidden="true" /></Button>
       <div className="min-w-0 flex-1 pt-1">
         <h2 className="text-heading font-semibold">上下文和会话</h2>
-        <p className="truncate text-meta text-muted-foreground">只读摘要，随当前聊天更新</p>
+        <p className="truncate text-meta text-muted-foreground">共享摘要和持久记忆，随当前聊天更新</p>
       </div>
       <StatusPill tone="info" icon={MessagesSquare}>共享事实</StatusPill>
     </header>
@@ -63,7 +67,7 @@ export function ContextPanel({ bot, data, nodes, connected, onBack }: ContextPan
         <li><span className="font-medium text-foreground">编译摘要：</span>只包含版本指纹和覆盖数量，不包含完整提示词或 AI 原生会话。</li>
       </ul>
     </Details>
-    <AgentContinuity data={data} nodes={nodes} connected={connected} />
+    <AgentContinuity data={data} nodes={nodes} connected={connected} memory={memory} />
 
     <SettingsGroup title="Bot 身份">
       <SettingsRow icon={UserRound} label="Bot" description="当前聊天" children={<span className="max-w-44 truncate" title={bot.name}>{bot.name}</span>} />
@@ -129,7 +133,7 @@ export function ContextPanel({ bot, data, nodes, connected, onBack }: ContextPan
 
 type ContinuityStatus = { tone: Tone; icon: LucideIcon; label: string; detail: string }
 
-function AgentContinuity({ data, nodes, connected }: { data: ConversationPayload; nodes: readonly NodeInfo[]; connected: boolean }) {
+function AgentContinuity({ data, nodes, connected, memory }: { data: ConversationPayload; nodes: readonly NodeInfo[]; connected: boolean; memory: MemoryControls }) {
   const scheduler = data.scheduler
   const remote = scheduler?.remote
   const context = scheduler?.context
@@ -175,7 +179,7 @@ function AgentContinuity({ data, nodes, connected }: { data: ConversationPayload
         <ContinuityStat label="外部归属" value={data.sessions.length} />
         <ContinuityStat label="后台工作" value={scheduler?.jobs.length ?? null} />
       </div>
-      <MemorySummary settings={data.bot_settings} context={context} />
+      <MemorySummary key={memory?.conversationId} settings={data.bot_settings} context={context} memory={memory} />
       {data.bot_settings.schedules.length ? <Details label={`查看定时任务 · ${data.bot_settings.schedules.length}`}>
         <ul className="grid gap-2">{data.bot_settings.schedules.map((schedule) => <li key={schedule.schedule_id} className={cn("grid gap-1 rounded-lg border bg-card px-3 py-2", !schedule.enabled && "text-muted-foreground")}>
           <div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate font-medium" title={schedule.name}>{schedule.name}</span><StatusPill tone={schedule.enabled ? "info" : "neutral"}>{schedule.enabled ? "启用" : "已暂停"}</StatusPill></div>
@@ -207,7 +211,24 @@ function ContextDetails({ context }: { context: ContextProjection }) {
   </Details>
 }
 
-export function MemorySummary({ settings, context }: { settings: BotSettings; context?: ContextProjection | null }) {
+export function MemorySummary({ settings, context, memory }: { settings: BotSettings; context?: ContextProjection | null; memory: MemoryControls }) {
+  const [draft, setDraft] = useState<{ memory_id: string; base: MemoryBase; text: string; result: MemoryControlResult | null } | null>(null)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [notice, setNotice] = useState("")
+  const { busy, run, error, clear } = useAction()
+  const start = (entry?: BotSettings['memory'][number]) => {
+    clear(); setNotice(""); setConfirmDelete(false)
+    setDraft({ memory_id: entry?.memory_id ?? newId(), base: memoryBase(entry?.metadata ?? null), text: entry?.text ?? "", result: null })
+  }
+  const save = (after: string | null) => {
+    if (!draft) return
+    void run("memory", async () => {
+      const result = await memory.controlMemory(memory.conversationId, draft.memory_id, draft.base, after)
+      setNotice(memoryResultLabel(result))
+      if (memorySaved(result)) { setDraft(null); setConfirmDelete(false) }
+      else setDraft({ ...draft, result })
+    })
+  }
   return <div className="grid gap-3">
     <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
       <ContinuityStat label="已保存记忆" value={settings.memory.length} />
@@ -215,19 +236,37 @@ export function MemorySummary({ settings, context }: { settings: BotSettings; co
       <ContinuityStat label="提交冲突" value={settings.memory_conflicts?.length ?? null} />
       <ContinuityStat label="本轮省略" value={context?.coverage.memory_omitted ?? null} />
     </div>
-    <p className="text-meta text-muted-foreground">待提交和冲突来自负责设备最近的观察。待提交记忆只在本轮成功后保存；失败、中断或结果未知时丢弃。省略的记忆仍可按需读取。</p>
+    <p className="text-meta text-muted-foreground">待提交和提交冲突来自负责设备最近的观察。Bot 待提交记忆只在本轮成功后保存。由你维护的记忆始终受保护。省略的记忆仍可按需读取。</p>
+    <Button type="button" variant="outline" className="justify-self-start" disabled={!memory?.writable || busy !== null || draft !== null} onClick={() => start()}>新增记忆</Button>
+    {draft ? <div className="grid gap-3 rounded-xl border p-3">
+      <label className="grid gap-2"><span className="text-meta font-medium">记忆内容</span><Textarea aria-label="记忆内容" rows={3} value={draft.text} disabled={busy !== null} onChange={(event) => setDraft({ ...draft, text: event.target.value })} /></label>
+      <p className="text-meta text-muted-foreground">最多 500 个字符。保存后由你维护，Bot 不会自动覆盖或恢复已删除的记忆。</p>
+      {draft.result && !memorySaved(draft.result) ? <div className="grid gap-2 text-meta" role="status"><p>{draft.result.current?.text ?? '当前记忆已删除或这台设备尚无记录。'}</p><Button type="button" variant="outline" className="justify-self-start" disabled={busy !== null} onClick={() => { setDraft({ ...draft, base: memoryBase(draft.result?.current?.metadata ?? null), result: null }); setConfirmDelete(false); clear(); setNotice("") }}>按当前版本继续编辑</Button></div> : null}
+      <div className="flex flex-wrap gap-2">
+        <Button type="button" disabled={!memory?.writable || busy !== null || !draft.text.trim()} onClick={() => save(draft.text)}>{busy ? '正在查明结果…' : '保存记忆'}</Button>
+        {draft.base.version !== null ? <Button type="button" variant="outline" disabled={!memory?.writable || busy !== null} onClick={() => setConfirmDelete(true)}>删除记忆</Button> : null}
+        <Button type="button" variant="ghost" disabled={busy !== null} onClick={() => { setDraft(null); setConfirmDelete(false); clear() }}>取消编辑</Button>
+      </div>
+      {confirmDelete ? <div className="flex flex-wrap items-center gap-2"><p className="text-meta">删除后 Bot 不会自动恢复这条记忆。</p><Button type="button" variant="destructive" disabled={!memory?.writable || busy !== null} onClick={() => save(null)}>确认删除记忆</Button><Button type="button" variant="ghost" disabled={busy !== null} onClick={() => setConfirmDelete(false)}>保留记忆</Button></div> : null}
+    </div> : null}
+    {error ? <p role="alert" className="text-meta text-destructive">{messageOf(error)} 草稿已保留，重试会先查明原操作结果。</p> : null}
+    {notice ? <p role="status" className="text-meta">{notice}</p> : null}
     {settings.memory.length ? <Details label={`查看已保存记忆 · ${settings.memory.length}`}>
       <ul className="grid gap-2">{settings.memory.map((entry) => <li key={entry.memory_id} className="grid gap-2 rounded-lg border bg-card px-3 py-2">
         <p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{entry.text}</p>
-        {entry.metadata ? <>
-          <p className="text-meta text-muted-foreground">{memoryOrigins[entry.metadata.origin]} · {entry.metadata.user_controlled ? '由你维护，受保护' : 'Bot 可更新'} · {entry.metadata.essential ? '优先带入上下文' : '按需读取'}</p>
-          <Details label="记忆版本"><p className="break-all font-mono text-meta">数据版本 {entry.metadata.epoch} · {entry.metadata.revision}</p>{entry.metadata.source_event_hash ? <p className="break-all font-mono text-meta">来源事件 {entry.metadata.source_event_hash}</p> : null}</Details>
-        </> : <p className="text-meta text-muted-foreground">来源与版本未提供</p>}
+        <p className="text-meta text-muted-foreground">{memoryOrigins[entry.metadata.origin]} · {entry.metadata.user_controlled ? '由你维护，受保护' : 'Bot 可更新'} · {entry.metadata.essential ? '优先带入上下文' : '按需读取'}</p>
+        <Details label="记忆版本"><p className="break-all font-mono text-meta">数据版本 {entry.metadata.epoch} · 维护版本 {entry.metadata.control_revision} · {entry.metadata.revision}</p><p className="break-all font-mono text-meta">来源事件 {entry.metadata.source_event_hash}</p></Details>
+        <Button type="button" variant="outline" className="justify-self-start" disabled={!memory?.writable || busy !== null || draft !== null} onClick={() => start(entry)}>{entry.metadata.user_controlled ? '编辑记忆' : '编辑并接管'}</Button>
       </li>)}</ul>
     </Details> : <p className="text-meta text-muted-foreground">暂无已保存记忆</p>}
     {settings.memory_conflicts?.length ? <Details label={`查看记忆冲突 · ${settings.memory_conflicts.length}`}>
       <ul className="grid gap-2">{settings.memory_conflicts.map((conflict) => <li key={`${conflict.call_ref}:${conflict.memory_id}`} className="grid gap-1"><p>{memoryConflictLabel(conflict.reason)}</p><p className="break-all font-mono text-meta">记忆 {conflict.memory_id} · 数据版本 {conflict.expected_epoch} / {conflict.actual_epoch}</p><p className="break-all font-mono text-meta">预期 {conflict.expected_revision || '尚无版本'} · 当前 {conflict.actual_revision || '已移除'}</p></li>)}</ul>
     </Details> : null}
+    <Details label={`查看同步冲突 · ${settings.memory_sync_conflicts.items.length}${settings.memory_sync_conflicts.has_more ? '+' : ''}`}>
+      <p className="text-meta text-muted-foreground">同步冲突记录共享历史中的其他分支，不代表未保存草稿或本轮待办。</p>
+      {settings.memory_sync_conflicts.items.length ? <ul className="grid gap-2">{settings.memory_sync_conflicts.items.map((conflict) => <li key={`${conflict.memory_id}:${conflict.losing_revision}`} className="grid gap-1"><p>{memorySyncConflictLabel(conflict.reason)}</p><p className="break-all font-mono text-meta">记忆 {conflict.memory_id}</p><p className="break-all font-mono text-meta">当前 {conflict.winning_revision} · 其他分支 {conflict.losing_revision}</p></li>)}</ul> : <p className="text-meta text-muted-foreground">当前入口未发现同步冲突</p>}
+      {settings.memory_sync_conflicts.has_more ? <p className="text-meta text-muted-foreground">仅显示前 50 项同步冲突</p> : null}
+    </Details>
   </div>
 }
 

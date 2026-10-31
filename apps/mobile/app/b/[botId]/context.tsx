@@ -4,13 +4,14 @@ import { useCallback, useRef, useState, type ReactNode } from 'react'
 import { ScrollView, View } from 'react-native'
 import { messageOf, providerNames } from '@vibeface/client/lib/node.ts'
 import { formatWhen, scheduleFrequency } from '@vibeface/client/workspace/bot-settings.ts'
-import { contextCoverageLabels, contextIndexLabels, contextInvalidation, contextStages, externalSessionLabels, externalSessionStatus, memoryConflictLabel, memoryOrigins, nativeSessionObservation, nodeName, queueHoldLabels, schedulerStatus, shownState, staleTaskLabel, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { contextCoverageLabels, contextIndexLabels, contextInvalidation, contextStages, externalSessionLabels, externalSessionStatus, nativeSessionObservation, nodeName, queueHoldLabels, schedulerStatus, shownState, staleTaskLabel, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
 import { awaitsAnswer } from '@vibeface/client/workspace/questions.ts'
 import type { BotRecord, ConversationPayload, ManagerJob } from '@vibeface/client/workspace/types.ts'
 import { Details, EmptyState, providerIcons, SettingsGroup, SettingsRow } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Text } from '@/components/ui/text'
 import { useLive } from '@/data/live'
+import { MemorySummary } from '@/features/chat/memory-summary'
 
 /** Read the selected Bot's parsed shared snapshot without acknowledging its chat. */
 export default function BotContext() {
@@ -42,7 +43,7 @@ export default function BotContext() {
     action={shared?.connectionOnline && bot ? <Button variant="outline" onPress={() => setRetry((value) => value + 1)}><Text>重新读取</Text></Button> : undefined} className="flex-1 justify-center" /></>
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-5 p-4 pb-10">
     <Stack.Screen options={{ title: '上下文和协作' }} />
-    <View className="gap-1"><Text role="heading" className="text-title font-semibold">{bot.name}</Text><Text className="text-meta text-muted-foreground">当前 Bot 的共享记录，只读查看。</Text></View>
+    <View className="gap-1"><Text role="heading" className="text-title font-semibold">{bot.name}</Text><Text className="text-meta text-muted-foreground">当前 Bot 的共享记录和持久记忆。</Text></View>
     {!shared.synced || !shared.connectionOnline ? <Text className="text-meta text-warning">{!shared.connectionOnline ? '连接已断开，显示最近记录；当前状态未知。' : '当前连接尚未完成首读，显示已知记录。'}</Text> : null}
     {readError ? <View className="gap-2"><Text className="text-danger">{readError}</Text><Button variant="outline" className="self-start" onPress={() => setRetry((value) => value + 1)}><Text>重新读取</Text></Button></View> : null}
     <ContextRecords bot={bot} data={data} shared={shared} />
@@ -96,16 +97,7 @@ function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: Conversat
       <Fold label="最近消息摘要">{data.messages.length ? data.messages.slice(-4).map((message) => <View key={message.message_id} className="gap-1"><Text className="text-meta font-medium">{message.sender?.name ?? (message.role === 'user' ? '你' : 'Bot')} · {formatWhen(message.created_at_ms)}</Text><Text selectable>{message.text}</Text></View>) : <Text className="text-muted-foreground">当前记录没有聊天消息</Text>}</Fold>
     </SettingsGroup>
     <SettingsGroup title="持久记忆和定时任务">
-      <SettingsRow icon={ListChecks} label={`已保存记忆 · ${data.bot_settings.memory.length}`} description={`待提交 ${data.bot_settings.memory_staged_count ?? '未提供'} · 提交冲突 ${data.bot_settings.memory_conflicts?.length ?? '未提供'} · 本轮省略 ${context?.coverage.memory_omitted ?? '未提供'}`} />
-      <View className="px-4 py-2"><Text className="text-meta text-muted-foreground">待提交和冲突来自负责设备最近的观察。待提交记忆只在本轮成功后保存；失败、中断或结果未知时丢弃。省略的记忆仍可按需读取。</Text></View>
-      <Fold label={`查看已保存记忆 · ${data.bot_settings.memory.length}`}>{data.bot_settings.memory.length ? data.bot_settings.memory.map((entry) => <View key={entry.memory_id} className="gap-2">
-        <Text selectable>{entry.text}</Text>
-        {entry.metadata ? <>
-          <Text className="text-meta text-muted-foreground">{memoryOrigins[entry.metadata.origin]} · {entry.metadata.user_controlled ? '由你维护，受保护' : 'Bot 可更新'} · {entry.metadata.essential ? '优先带入上下文' : '按需读取'}</Text>
-          <Details label="记忆版本"><Text selectable className="font-mono text-meta">数据版本 {entry.metadata.epoch} · {entry.metadata.revision}</Text>{entry.metadata.source_event_hash ? <Text selectable className="font-mono text-meta">来源事件 {entry.metadata.source_event_hash}</Text> : null}</Details>
-        </> : <Text className="text-meta text-muted-foreground">来源与版本未提供</Text>}
-      </View>) : <Text className="text-muted-foreground">当前记录没有已保存记忆</Text>}</Fold>
-      {data.bot_settings.memory_conflicts?.length ? <Fold label={`查看记忆冲突 · ${data.bot_settings.memory_conflicts.length}`}>{data.bot_settings.memory_conflicts.map((conflict) => <View key={`${conflict.call_ref}:${conflict.memory_id}`} className="gap-1"><Text>{memoryConflictLabel(conflict.reason)}</Text><Text selectable className="font-mono text-meta">记忆 {conflict.memory_id} · 数据版本 {conflict.expected_epoch} / {conflict.actual_epoch}</Text><Text selectable className="font-mono text-meta">预期 {conflict.expected_revision || '尚无版本'} · 当前 {conflict.actual_revision || '已移除'}</Text></View>)}</Fold> : null}
+      <View className="p-4"><MemorySummary key={bot.conversation_id} settings={data.bot_settings} context={context} memory={shared} /></View>
       <Fold label={`定时任务 · ${data.bot_settings.schedules.length}`}>{data.bot_settings.schedules.length ? data.bot_settings.schedules.map((schedule) => <View key={schedule.schedule_id} className="gap-1"><Text className="font-medium">{schedule.name} · {schedule.enabled ? '启用' : '已暂停'}</Text><Text className="text-meta text-muted-foreground">{scheduleFrequency(schedule)}{schedule.next_run_at_ms === null ? ' · 尚未安排下一次运行' : ` · 下次 ${formatWhen(schedule.next_run_at_ms)}`}</Text><Text selectable>{schedule.prompt}</Text></View>) : <Text className="text-muted-foreground">当前记录没有待执行定时任务</Text>}</Fold>
     </SettingsGroup>
     <SettingsGroup title="问题和检查">

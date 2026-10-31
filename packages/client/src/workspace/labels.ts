@@ -27,7 +27,7 @@ export const contextCoverageLabels: Record<string, string> = {
   attachments_omitted: '附件', memory_omitted: '记忆', checkpoint_omitted: '历史检查点', handoff_omitted: '交接摘要', pending_checks_omitted: '结果待确认',
 }
 export const contextIndexLabels: Record<string, string> = { skills: 'Skill', schedules: '定时任务', memory: '记忆索引', sessions: '外部会话', sent: '发出的消息', bots: 'Bot' }
-export const memoryOrigins: Record<NonNullable<MemoryEntry['metadata']>['origin'], string> = { agent: 'Bot 记录', user: '你记录', review: '记忆整理', import: '导入' }
+export const memoryOrigins: Record<NonNullable<MemoryEntry['metadata']>['origin'], string> = { agent: 'Bot 记录', user: '你记录', review: '记忆整理' }
 export const memoryConflictLabel = (reason: string) => reason === 'user_controlled' ? '受用户保护，未自动覆盖' : reason === 'epoch_changed' ? '数据版本已变化，未覆盖现有记忆' : reason === 'revision_changed' ? '记忆已被更新，未覆盖新值' : '提交冲突，未覆盖现有记忆'
 export const queueHoldLabels: Record<QueueHoldReason, string> = {
   active_turn: '等待当前回合结束', steering_settlement: '等待补充消息结清', provider_serial: '等待 AI 空闲',

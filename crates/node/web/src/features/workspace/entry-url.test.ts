@@ -5,13 +5,14 @@ import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
-import { entryAddress, entryJson, entryKey, messageOf, parseEntry, parseInfo, providerIds, providerNames } from "@vibeface/client/lib/node.ts"
+import { entryAddress, entryJson, entryKey, messageOf, parseEntry, parseInfo, providerNames } from "@vibeface/client/lib/node.ts"
 import type { ReadyConnection } from "@vibeface/client/lib/node.ts"
 import type { WorkRecord } from "@vibeface/client/workspace/types.ts"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
 import { botCopy, folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
 import { agentName, answerLabel, approvalTask, awaitsAnswer, declined, foldAnswers, projectName, questionMeta, questionOpen, questionParts, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
+import * as nodeModel from "@vibeface/client/lib/node.ts"
 import * as errors from "@vibeface/client/lib/errors.ts"
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
 import { awaitsDevice, botReach, canSend, composerHint, reachDevice, starters } from "@vibeface/client/chat/protocol.ts"
@@ -28,7 +29,7 @@ import { inboxItems } from "@vibeface/client/workspace/inbox.ts"
 
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
-  works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [], questions: [], sessions: [],
+  works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], questions: [], sessions: [],
 }
 test("attachment names are signed clean and files once each in content order", () => {
   assert.equal(attachmentName("../etc/pass\\wd\u0007\n.txt"), "..etcpasswd.txt")
@@ -180,7 +181,7 @@ test("workspace preserves bot and message requests while routing native decision
     const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
     const require = (specifier: string) => {
       if (specifier === "react") return react
-      if (specifier.endsWith("/lib/node.ts")) return { messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause), providerIds, providerNames }
+      if (specifier.endsWith("/lib/node.ts")) return { ...nodeModel, messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause) }
       if (specifier === "react/jsx-runtime") return { jsx: () => null }
       return load(resolve(dirname(filename), specifier))
     }
@@ -640,7 +641,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     useEffect: effect, useLayoutEffect: effect,
   }
   const jsx = (type: unknown, props: Props) => { const element = { type, props }; elements.push(element); return element }
-  const ui = new Proxy({}, { get: (_target, name) => String(name) })
+  const ui = new Proxy({}, { get: (_target, name) => name === 'useAction' ? () => ({ busy: null, error: null, run() {}, clear() {} }) : String(name) })
   const module: { exports: Record<string, unknown> } = { exports: {} }
   const useFocusEffect = (run: () => (() => void) | void) => {
     const index = cursor++, previous = focusEffects.get(index)
@@ -649,7 +650,16 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       focusEffects.set(index, { run, cleanup: focused ? run() ?? undefined : undefined })
     })
   }
-  const require = (specifier: string) => specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
+  const require = (specifier: string): unknown => {
+    if (specifier === '@/features/chat/memory-summary') {
+      const filename = fileURLToPath(new URL('../../../../../../apps/mobile/src/features/chat/memory-summary.tsx', import.meta.url))
+      const compiled = transpileModule(readFileSync(filename, 'utf8'), { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
+      const memoryModule = { exports: {} }
+      new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInNewContext({ Error, TextEncoder, ...globals })(memoryModule.exports, require, memoryModule)
+      return memoryModule.exports
+    }
+    return specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
+  }
   const filename = fileURLToPath(new URL(path, import.meta.url))
   const source = readFileSync(filename, 'utf8') + (filename.endsWith('/data/live.tsx') ? '\nexport { Live }\n' : '')
   const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
@@ -1076,7 +1086,7 @@ test('native context and task detail keep selection errors and foreign payloads 
 test('native context renders shared memory, external attribution, scheduler states and honest sent records', () => {
   const shared = parityShared()
   shared.data = parseConversation({ ...context,
-    bot_settings: { skills: [], memory: [{ memory_id: 'm', text: '共享笔记' }], schedules: [] },
+    bot_settings: { skills: [], memory: [{ memory_id: 'm', text: '共享笔记', metadata: { epoch: 11, revision: 'a'.repeat(64), control_revision: 0, source_event_hash: 'b'.repeat(64), origin: 'agent', user_controlled: false, essential: true } }], memory_sync_conflicts: { items: [], has_more: false }, schedules: [] },
     scheduler: { jobs: [{ trigger: 'message:p', state: 'publishing' }, { trigger: 'message:d', state: 'completed' }], unanswered: [] },
     sessions: [{ node: 'worker', agent: 'codex', session_id: 'external', cwd: '/shared', summary: '外部摘要', muted: true, created_at_ms: 1 }],
     sent: [{ message_id: 'sent', to: 'chat', text: '协作请求', created_at_ms: 2 }],
@@ -1117,9 +1127,9 @@ test('context on both platforms separates compilation, sending, native cache and
       native_token: 'private-native-token', rendered: 'private-prompt',
     }
     shared.data = parseConversation({ ...context, scheduler: { jobs: [], unanswered: [], context: projection }, bot_settings: {
-      skills: [], schedules: [], memory_staged_count: 2,
+      skills: [], schedules: [], memory_staged_count: 2, memory_sync_conflicts: { items: [], has_more: false },
       memory_conflicts: [{ call_ref: 'remember', memory_id: 'memory', expected_epoch: 9, actual_epoch: 9, expected_revision: 'old', actual_revision: 'new', reason: 'revision_changed' }],
-      memory: [{ memory_id: 'memory', text: '已保存的事实', metadata: { epoch: 9, revision: 'new', origin: 'user', user_controlled: true, essential: true, source_event_hash: 'source' } }],
+      memory: [{ memory_id: 'memory', text: '已保存的事实', metadata: { epoch: 11, revision: 'a'.repeat(64), control_revision: 1, origin: 'user', user_controlled: true, essential: true, source_event_hash: 'b'.repeat(64) } }],
     } })
     const dependencies = {
       'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot' }) }, '@/data/live': { useLive: () => shared },
@@ -1128,7 +1138,7 @@ test('context on both platforms separates compilation, sending, native cache and
       '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') }, '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, SettingsGroup: 'SettingsGroup', SettingsRow: 'SettingsRow', Details: 'Details' },
     }
     const app = componentHarness(platform === 'web' ? './context-panel.tsx' : '../../../../../../apps/mobile/app/b/[botId]/context.tsx', dependencies)
-    const render = () => nestedElements(app.render(platform === 'web' ? 'ContextPanel' : 'default', { bot: parityBot, data: shared.data, nodes: shared.nodes, connected: shared.connectionOnline, onBack() {} }), ['AgentContinuity', 'ContinuityLayer', 'ContextDetails', 'MemorySummary', 'ContinuityStat', 'ContextRecords', 'Fold'])
+    const render = () => nestedElements(app.render(platform === 'web' ? 'ContextPanel' : 'default', { bot: parityBot, data: shared.data, nodes: shared.nodes, connected: shared.connectionOnline, memory: shared, onBack() {} }), ['AgentContinuity', 'ContinuityLayer', 'ContextDetails', 'MemorySummary', 'ContinuityStat', 'ContextRecords', 'Fold'])
     try {
       let elements = render()
       const text = componentText(elements)

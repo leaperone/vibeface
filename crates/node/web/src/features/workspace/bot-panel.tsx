@@ -108,7 +108,7 @@ export function BotPanelButton() {
             <SheetDescription className="text-meta">在聊天里说一声就能改</SheetDescription>
           </span>
         </SheetHeader>
-        {view ? contextOpen && workspace.data ? <ContextPanel bot={bot} data={workspace.data} nodes={workspace.nodes} connected={workspace.connectionOnline} onBack={() => { refocus.current = "context"; setContextOpen(false) }} /> : <div className="grid gap-6 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+        {view ? contextOpen && workspace.data ? <ContextPanel bot={bot} data={workspace.data} nodes={workspace.nodes} connected={workspace.connectionOnline} memory={workspace} onBack={() => { refocus.current = "context"; setContextOpen(false) }} /> : <div className="grid gap-6 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
           <SettingsGroup>
             <AvatarPicker botId={bot.bot_id} avatar={look.avatar} face={look.face} disabled={!workspace.writable} busy={look.pending} pick={look.pick} />
           </SettingsGroup>
@@ -170,7 +170,7 @@ export function BotPanelButton() {
               </SettingsRow>
             })}
           </SettingsGroup> : null}
-          <SettingsGroup title="持久记忆"><div className="p-4"><MemorySummary settings={view} context={workspace.data?.scheduler?.context} /></div></SettingsGroup>
+          <SettingsGroup title="持久记忆"><div className="p-4"><MemorySummary key={workspace.conversationId} settings={view} context={workspace.data?.scheduler?.context} memory={workspace} /></div></SettingsGroup>
           {view.skills.length ? <SettingsGroup title={botCopy.skills(bot.skills, view.skills.length)}>
             {view.skills.map((skill) => <SettingsRow key={skill.skill_id} icon={BookOpen} label={<span title={skill.name}>{skill.name}</span>} description={skill.description || undefined} />)}
           </SettingsGroup> : null}

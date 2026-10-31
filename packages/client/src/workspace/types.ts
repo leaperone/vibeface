@@ -134,6 +134,7 @@ export type ConversationRecords = {
   memory?: MemoryEntry[]
   memory_staged_count?: number | null
   memory_conflicts?: MemoryConflict[] | null
+  memory_sync_conflicts?: MemorySyncConflicts
   messages: TranscriptMessage[]
   works: WorkRecord[]
   last_message: LastMessage | null
@@ -169,13 +170,26 @@ export type BotModels = Partial<Record<ProviderId, string>>
 export type BotSkill = { name: string; description: string; body: string }
 /** Runs at `first_run_at_ms`, then every `every_minutes` when set; without it, once. `depth` > 0 is a reminder the bot set itself. */
 export type BotSchedule = { name: string; prompt: string; first_run_at_ms: number; every_minutes?: number; enabled: boolean; depth?: number }
-export type MemoryEntry = {
-  memory_id: string; text: string
-  metadata?: {
-    epoch: number; revision: string; origin: 'agent' | 'user' | 'review' | 'import'
-    user_controlled: boolean; essential: boolean; source_event_hash: string | null
-  }
+export type MemoryVersion = { revision: string; control_revision: number; source_event_hash: string }
+export type MemoryBase = { epoch: number; version: MemoryVersion | null }
+export type MemoryMetadata = MemoryVersion & {
+  epoch: number; origin: 'agent' | 'user' | 'review'; user_controlled: boolean; essential: boolean
 }
+export type MemoryState = { memory_id: string; text: string | null; metadata: MemoryMetadata }
+export type MemoryEntry = MemoryState & { text: string }
+export type MemoryControlResult = {
+  state: 'applied' | 'already_recorded' | 'superseded' | 'conflict'
+  operation_id: string; current: MemoryState | null
+}
+export type MemoryStateResult = {
+  current: MemoryState | null; receipt: null | 'recorded' | 'superseded' | 'not_seen_here'
+}
+export type MemorySyncConflict = {
+  memory_id: string; losing_revision: string; winning_revision: string
+  losing_event_hash: string; winning_event_hash: string
+  reason: 'user_protected' | 'concurrent_automatic' | 'concurrent_user'
+}
+export type MemorySyncConflicts = { items: MemorySyncConflict[]; has_more: boolean }
 /** null: every shared skill, later ones included. */
 export type SkillSet = string[] | null
 type SkillsEdit = { before: SkillSet; after: SkillSet }
@@ -201,7 +215,7 @@ type SkillSummary = { skill_id: string; name: string; description: string }
 export type ScheduleView = BotSchedule & { schedule_id: string; next_run_at_ms: number | null }
 export type ScheduleAction = "pause" | "resume" | "delete"
 /** This bot's schedules still ahead, its notes, and the skill library every bot shares. */
-export type BotSettings = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[]; memory_staged_count?: number | null; memory_conflicts?: MemoryConflict[] | null }
+export type BotSettings = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[]; memory_sync_conflicts: MemorySyncConflicts; memory_staged_count?: number | null; memory_conflicts?: MemoryConflict[] | null }
 export type ConversationPayload = {
   conversation: ConversationSummary | null
   messages: TranscriptMessage[]

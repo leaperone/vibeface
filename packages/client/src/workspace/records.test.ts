@@ -18,7 +18,7 @@ const shown = parseConversation({
   conversation: { conversation_id: "chat", title: "", owner: "gateway", owner_epoch: 1 },
   messages: [message("m1", 1), message("m3", 3)], works: [work("w1"), work("w2")],
   deliveries: [{ state: "dispatch_waiting", work_id: "w9", target_node: "worker", cwd: "/w" }, { state: "stop_waiting", work_id: "w1", target_node: "worker" }],
-  scheduler: { jobs: [{ trigger: "a", state: "queued" }], unanswered: ["m1"] }, checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [],
+  scheduler: { jobs: [{ trigger: "a", state: "queued" }], unanswered: ["m1"] }, checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [],
   questions: [], sessions: [],
 }, "chat")
 const records = (extra: Record<string, unknown> = {}) => {
@@ -47,7 +47,7 @@ test("a pushed message lands in rank order and the push replaces deliveries, che
 test("the owner's jobs stay through a push of this device's records and replace its undelivered copy", () => {
   const away = parseConversation({
     conversation: { conversation_id: "chat", title: "", owner: "owner", owner_epoch: 1 },
-    messages: [], works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [], questions: [], sessions: [],
+    messages: [], works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], questions: [], sessions: [],
     scheduler: { jobs: [{ trigger: "message:m1", state: "running", source_node: "owner" }], unanswered: [], remote: { owner: "owner", reachable: true } },
   }, "chat")
   assert.deepEqual(away.scheduler?.remote, { owner: "owner", reachable: true })
@@ -68,8 +68,9 @@ test("context state and queue reasons survive records without replacing a remote
     native_token: 'must-not-enter-client-state', rendered: 'private context',
   }
   const conflict = { call_ref: 'remember', memory_id: 'memory', expected_epoch: 9, actual_epoch: 9, expected_revision: '', actual_revision: 'new', reason: 'revision_changed' }
-  const memory = { memory_id: 'memory', text: '已保存的事实', metadata: { epoch: 9, revision: 'new', origin: 'user', user_controlled: true, essential: false, source_event_hash: 'event', native_token: 'private-memory-token' } }
-  const update = records({ context, memory: [memory], memory_staged_count: 2, memory_conflicts: [conflict], jobs: [{ trigger: 'a', state: 'queued', lane: 'main', hold_reason: 'active_turn', pending_check: false, context }] })
+  const memory = { memory_id: 'memory', text: '已保存的事实', metadata: { epoch: 11, revision: 'c'.repeat(64), control_revision: 1, origin: 'user', user_controlled: true, essential: false, source_event_hash: 'd'.repeat(64), native_token: 'private-memory-token' } }
+  const sync = { items: [{ memory_id: 'memory', losing_revision: 'a'.repeat(64), winning_revision: 'c'.repeat(64), losing_event_hash: 'b'.repeat(64), winning_event_hash: 'd'.repeat(64), reason: 'user_protected', text: 'private-conflict-text', signature: 'private-conflict-signature' }], has_more: true }
+  const update = records({ context, memory: [memory], memory_staged_count: 2, memory_conflicts: [conflict], memory_sync_conflicts: sync, jobs: [{ trigger: 'a', state: 'queued', lane: 'main', hold_reason: 'active_turn', pending_check: false, context }] })
   const next = mergeConversation(shown, update)
   assert.equal(next.scheduler?.context?.stage, 'compiled')
   assert.equal(next.scheduler?.context?.coverage.messages_omitted, 3)
@@ -81,17 +82,27 @@ test("context state and queue reasons survive records without replacing a remote
   assert.equal(next.scheduler?.jobs[0].context?.session_generation, 2)
   assert.deepEqual(next.bot_settings.memory_conflicts, [conflict])
   assert.equal(next.bot_settings.memory_staged_count, 2)
-  assert.deepEqual(next.bot_settings.memory[0].metadata, { epoch: 9, revision: 'new', origin: 'user', user_controlled: true, essential: false, source_event_hash: 'event' })
+  assert.equal(next.bot_settings.memory_sync_conflicts.items[0].reason, 'user_protected')
+  assert.equal(next.bot_settings.memory_sync_conflicts.has_more, true)
+  assert.deepEqual(next.bot_settings.memory[0].metadata, { epoch: 11, revision: 'c'.repeat(64), control_revision: 1, origin: 'user', user_controlled: true, essential: false, source_event_hash: 'd'.repeat(64) })
   assert(!JSON.stringify(next).includes('must-not-enter-client-state'))
   assert(!JSON.stringify(next).includes('private context'))
   assert(!JSON.stringify(next).includes('private-native-id'))
   assert(!JSON.stringify(next).includes('private-memory-token'))
-  const away = { ...next, scheduler: next.scheduler && { ...next.scheduler, remote: { owner: 'owner', reachable: true } } }
-  const local = records({ context: { ...context, stage: 'failed', session_generation: 3 }, memory: [], memory_staged_count: 0, memory_conflicts: [] })
+  assert(!JSON.stringify(next).includes('private-conflict-text'))
+  assert(!JSON.stringify(next).includes('private-conflict-signature'))
+  const away = { ...next, scheduler: next.scheduler && { ...next.scheduler, remote: { owner: 'owner', reachable: false } } }
+  const local = records({ context: { ...context, stage: 'failed', session_generation: 3 }, memory: [], memory_sync_conflicts: { items: [], has_more: false }, memory_staged_count: 0, memory_conflicts: [] })
   const remote = mergeConversation(away, local)
   assert.equal(remote.scheduler?.context?.session_generation, 2)
   assert.equal(remote.bot_settings.memory_staged_count, 2)
   assert.deepEqual(remote.bot_settings.memory_conflicts, [conflict])
+  assert.deepEqual(remote.bot_settings.memory_sync_conflicts, { items: [], has_more: false }, 'gateway sync history updates even when the owner cannot answer')
+  assert.deepEqual(mergeConversation(away, records({ memory_conflicts: null })).bot_settings.memory_sync_conflicts, next.bot_settings.memory_sync_conflicts, 'an absent sync page never replaces the last gateway page with owner observations')
+  assert.throws(() => records({ memory_sync_conflicts: null }))
+  assert.throws(() => records({ memory_sync_conflicts: { ...sync, has_more: 'yes' } }))
+  assert.throws(() => records({ memory_sync_conflicts: { ...sync, items: [{ ...sync.items[0], reason: 'unknown' }] } }))
+  assert.throws(() => records({ memory_sync_conflicts: { ...sync, items: Array.from({ length: 51 }, () => sync.items[0]) } }))
   assert.deepEqual(remote.bot_settings.memory, [], 'DAG memory changes still update through this gateway')
   assert.equal(mergeConversation(next, records({ context: null })).scheduler?.context, null)
   assert.throws(() => records({ context: { ...context, stage: 'invented' } }))

@@ -24,6 +24,7 @@ export function mergeConversation(shown: ConversationPayload, records: Conversat
     },
     bot_settings: { ...shown.bot_settings,
       ...(records.memory === undefined ? {} : { memory: records.memory }),
+      ...(records.memory_sync_conflicts === undefined ? {} : { memory_sync_conflicts: records.memory_sync_conflicts }),
       ...(!shown.scheduler?.remote && records.memory_staged_count !== undefined ? { memory_staged_count: records.memory_staged_count } : {}),
       ...(!shown.scheduler?.remote && records.memory_conflicts !== undefined ? { memory_conflicts: records.memory_conflicts } : {}),
     },

@@ -5,8 +5,9 @@ import type {
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, DispatchState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
   BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome, Busy,
   WorkPhase, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation, OverviewConversation, OverviewSession,
-  AgentLane, QueueHoldReason, ContextProjection, ManagerJob, MemoryConflict, MemoryEntry,
+  AgentLane, QueueHoldReason, ContextProjection, ManagerJob, MemoryConflict,
 } from "./types.ts"
+import { parseMemoryEntry, parseMemorySyncConflicts } from "./memory.ts"
 import { answerId, questionOpen } from "./questions.ts"
 import { providerIds, type ProviderId } from "../lib/node.ts"
 import { failureKinds, type FailureKind } from "../lib/errors.ts"
@@ -138,18 +139,6 @@ function memoryConflicts(value: unknown): MemoryConflict[] | null {
     const data = record(value)
     return { call_ref: text(data.call_ref), memory_id: text(data.memory_id), expected_epoch: number(data.expected_epoch), actual_epoch: number(data.actual_epoch), expected_revision: text(data.expected_revision), actual_revision: text(data.actual_revision), reason: text(data.reason) }
   })
-}
-function memoryEntry(value: unknown): MemoryEntry {
-  const entry = record(value)
-  const base = { memory_id: text(entry.memory_id), text: text(entry.text) }
-  if (entry.metadata == null) return base
-  const metadata = record(entry.metadata), origin = metadata.origin
-  if (origin !== 'agent' && origin !== 'user' && origin !== 'review' && origin !== 'import') throw new Error('未知的记忆来源。')
-  return { ...base, metadata: {
-    epoch: number(metadata.epoch), revision: text(metadata.revision), origin,
-    user_controlled: flag(metadata.user_controlled), essential: flag(metadata.essential),
-    source_event_hash: metadata.source_event_hash == null ? null : text(metadata.source_event_hash),
-  } }
 }
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   if (value == null) return null
@@ -619,9 +608,10 @@ export function parseRecords(value: unknown): ConversationRecords {
     deliveries: list(data.deliveries), checks: list(data.checks).map(coordinationCheck),
     jobs: scheduler?.jobs ?? [], unanswered: scheduler?.unanswered ?? [],
     ...(data.context === undefined ? {} : { context: contextProjection(data.context) }),
-    ...(data.memory === undefined ? {} : { memory: list(data.memory).map(memoryEntry) }),
+    ...(data.memory === undefined ? {} : { memory: list(data.memory).map(parseMemoryEntry) }),
     ...(data.memory_staged_count === undefined ? {} : { memory_staged_count: data.memory_staged_count === null ? null : number(data.memory_staged_count) }),
     ...(data.memory_conflicts === undefined ? {} : { memory_conflicts: memoryConflicts(data.memory_conflicts) }),
+    ...(data.memory_sync_conflicts === undefined ? {} : { memory_sync_conflicts: parseMemorySyncConflicts(data.memory_sync_conflicts) }),
     sent: list(data.sent).map(sentBotMessage), open_works: list(data.open_works).map(openWork),
   }
 }
@@ -724,7 +714,8 @@ function botSettings(value: unknown): BotSettings {
       const view = record(item)
       return { ...schedule(view), schedule_id: text(view.schedule_id), next_run_at_ms: view.next_run_at_ms == null ? null : number(view.next_run_at_ms) }
     }),
-    memory: list(data.memory).map(memoryEntry),
+    memory: list(data.memory).map(parseMemoryEntry),
+    memory_sync_conflicts: parseMemorySyncConflicts(data.memory_sync_conflicts),
     ...(data.memory_staged_count === undefined ? {} : { memory_staged_count: data.memory_staged_count === null ? null : number(data.memory_staged_count) }),
     ...(data.memory_conflicts === undefined ? {} : { memory_conflicts: memoryConflicts(data.memory_conflicts) }),
   }

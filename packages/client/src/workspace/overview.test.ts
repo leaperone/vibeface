@@ -29,7 +29,7 @@ test("the conversation parser keeps WorkProjection relation and phase fields", (
   const parsed = parseConversation({
     conversation: { conversation_id: "chat-1", title: "Bot", owner: "gateway", owner_epoch: 1 }, messages: [],
     works: [work()], deliveries: [], checks: [], local_node: "gateway", changes: [], overwritten: [], questions: [], sessions: [], sent: [],
-    bot_settings: { skills: [], schedules: [], memory: [] },
+    bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } },
   }, "chat-1")
   assert.deepEqual(parsed.works[0] && {
     dispatcher: parsed.works[0].dispatcher, call_ref: parsed.works[0].call_ref, parent: parsed.works[0].parent,

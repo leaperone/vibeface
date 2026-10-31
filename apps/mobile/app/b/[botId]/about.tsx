@@ -16,8 +16,9 @@ import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@/data/context'
-import { memoryOrigins, nodeName } from '@vibeface/client/workspace/labels.ts'
+import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { useLive } from '@/data/live'
+import { MemorySummary } from '@/features/chat/memory-summary'
 
 export default function BotAbout() {
   const { botId } = useLocalSearchParams<{ botId: string }>()
@@ -106,9 +107,7 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
       </View>)}
     </Section> : null}
     {view ? <Section icon={NotebookPen} title="持久记忆" count={view.memory.length}>
-      <Text className="text-meta text-muted-foreground">已保存 {view.memory.length} · 待提交 {view.memory_staged_count ?? '未提供'} · 提交冲突 {view.memory_conflicts?.length ?? '未提供'} · 本轮省略 {shared.data?.scheduler?.context?.coverage.memory_omitted ?? '未提供'}</Text>
-      {view.memory.map((note) => <View key={note.memory_id} className="gap-1"><Text selectable numberOfLines={2} className="text-meta">{note.text}</Text>{note.metadata ? <Text className="text-meta text-muted-foreground">{memoryOrigins[note.metadata.origin]} · {note.metadata.user_controlled ? '由你维护，受保护' : 'Bot 可更新'} · {note.metadata.essential ? '优先带入上下文' : '按需读取'}</Text> : null}</View>)}
-      <SettingsRow icon={MessagesSquare} label="查看记忆版本和冲突" description="待提交内容在本轮成功后保存，省略的记忆仍可读取。" href={`/b/${bot.bot_id}/context`} />
+      <MemorySummary key={bot.conversation_id} settings={view} context={shared.data?.scheduler?.context} memory={shared} />
     </Section> : null}
     {view?.skills.length ? <Section icon={BookOpen} title={botCopy.skills(bot.skills, view.skills.length)}>
       {view.skills.map((skill) => <View key={skill.skill_id} className="gap-0.5">
