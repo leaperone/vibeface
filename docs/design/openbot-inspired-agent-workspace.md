@@ -87,3 +87,9 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 现有 `docs/design/agent-direct-app-server.md` 声称已删除 executor，但当前 `crates/node/src/runtime/executor.rs` 仍有 `Executor` trait 和 Provider 选择实现。本设计以当前源码为准。
 
 参考报告实际位于 `/Users/harry/.vibe/planning/Volumes/ssd/project/vibeface/openbot-source-comparison-2026-10-30_11-31-26/reports/openbot-vibeface-comparison.md`。任务指定的两个同名路径不存在，因此没有把不存在的路径当作证据。
+
+## 本轮 UI 交付切片
+
+本轮先把已有投影做成一个可读的个人工作台，不新增 Node RPC 或共享事实字段。Web 和手机任务页共享同一组概念：需要留意、进行中、等待中、Bot 归属、目标设备、执行步骤、审批和未知结果。任务详情继续使用现有的 `Question`、`PendingCheck`、`WorkProgress` 和失败原因；未知结果仍然要求核对，不能用重试按钮掩盖。
+
+上下文面板把共享聊天事实、Bot 持久记忆和定时任务、Provider session 交接线索以及 owner 可达性分开显示。协作面板把本机队列、Bot 消息和 `dispatch_work` 分开显示，并把交接记录放在同一条可读时间线上。浏览器操控、远程画面、手机投屏、团队设备池和新的执行权限仍不属于这条 UI 交付切片。
