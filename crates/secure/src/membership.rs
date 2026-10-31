@@ -255,8 +255,8 @@ pub struct RootCheckpoint {
     /// rotation. Only a veto resting on all of them stops the new directory, so whether a veto
     /// counts depends on nothing that arrives after it.
     pub heads: Vec<String>,
-    /// When the root signed it; a new directory takes effect `RECOVERY_DELAY_MS` later, and a
-    /// rotation retires a sibling recovery only if signed before that one's time.
+    /// When the root signed it; a new directory normally takes effect `RECOVERY_DELAY_MS` later.
+    /// A rotation retires a sibling recovery only if signed before that one's natural deadline.
     pub issued_at_ms: u64,
     pub signature: String,
 }
@@ -409,7 +409,7 @@ impl RootCheckpoint {
         Ok(digest(&canonical_json(self)?))
     }
 
-    /// When a new directory takes effect unless vetoed.
+    /// The new directory's natural activation time, unless approved earlier or vetoed.
     pub fn effective_at_ms(&self) -> u64 {
         self.issued_at_ms.saturating_add(RECOVERY_DELAY_MS)
     }
@@ -1532,8 +1532,8 @@ impl VerifiedMembership {
         Ok(serde_json::to_string(&self.state)?)
     }
 
-    /// An unsigned `GovernanceEvent` for `{"type":"grant",...}`, `{"type":"revoke",...}` or
-    /// `{"type":"veto","checkpoint":...,"at_ms":...}`.
+    /// An unsigned `GovernanceEvent` for `{"type":"grant",...}`, `{"type":"revoke",...}`,
+    /// `{"type":"veto","checkpoint":...,"at_ms":...}` or the same shape with `"type":"approve"`.
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = governanceTemplate))]
     pub fn governance_template(&self, issuer: &str, action_json: &str) -> crate::Result<String> {
         js((|| {
