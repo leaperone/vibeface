@@ -1,5 +1,5 @@
 import { Link } from 'expo-router'
-import { ArrowUpRight, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, LoaderCircle, ListChecks, Wifi, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { ArrowUpRight, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Inbox, Laptop, LoaderCircle, ListChecks, Wifi, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useEffect } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -20,7 +20,9 @@ import { cn } from '@/lib/utils'
 /** The personal task projection; only open and unsettled work is available without loading every Bot conversation. */
 export function TasksScreen() {
   const shared = useLive()
-  const attention = useInbox().filter((item) => item.kind === 'question' && !item.done || item.kind === 'confirm' && item.check.kind === 'process')
+  const inbox = useInbox()
+  const attention = inbox.filter((item) => item.kind === 'question' && !item.done || item.kind === 'confirm' && item.check.kind === 'process')
+  const pending = inbox.filter((item) => !(item.kind === 'question' && item.done)).length
   const workspace = useWorkspace()
   const { directory } = useDevice()
   useEffect(() => { if (!shared) return; shared.setView('tasks'); return () => shared.setView('other') }, [shared?.generation])
@@ -46,7 +48,7 @@ export function TasksScreen() {
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
     <MobileMasthead attention={read ? groups.attention.length + attention.length + otherChecks.length : null} working={read ? groups.working.length : null} waiting={read ? groups.waiting.length : null} online={Boolean(shared?.connectionOnline)} />
     <Text className="text-meta text-muted-foreground">{[...(overview ? overviewScope(overview.coverage) : ['尚未读取任务记录']), ...(!read ? ['当前连接尚未完成首读'] : !shared?.connectionOnline ? ['连接已断开，显示最近记录'] : [])].join(' · ')}</Text>
-    {attention.length ? <Link href="/inbox" asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-3 rounded-xl border border-warning/25 bg-warning-soft px-4 py-3"><Icon as={CircleQuestionMark} className="size-5 text-warning" /><Text className="min-w-0 flex-1">{attention.length} 项问题或程序待确认</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Pressable></Link> : null}
+    <Link href="/inbox" asChild><Pressable accessibilityRole="link" accessibilityLabel={pending ? `${pending} 件事等你决定` : '查看待处理'} className={`min-h-11 flex-row items-center gap-3 rounded-xl border px-4 py-3 active:bg-muted ${pending ? 'border-warning/25 bg-warning-soft' : 'border-border bg-card'}`}><Icon as={pending ? CircleQuestionMark : Inbox} className={`size-5 ${pending ? 'text-warning' : 'text-muted-foreground'}`} /><Text className="min-w-0 flex-1">{pending ? `${pending} 件事等你决定` : '查看待处理'}</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Pressable></Link>
     {otherChecks.map((check) => <View key={`${check.conversation_id}:${check.item_id}`} className="gap-2 rounded-xl border border-border bg-card p-4"><Text className="font-medium">{check.work_id ? '任务状态待确认' : '程序状态待确认'} · {check.bot?.name ?? '已删除的 Bot'}</Text>{check.bot ? <Link href={`/b/${check.bot.bot_id}`} asChild><Pressable accessibilityRole="link" className="min-h-11 justify-center"><Text>打开 {check.bot.name}</Text></Pressable></Link> : null}</View>)}
     {loading ? <View accessibilityLabel="正在读取任务" className="gap-2">
       {[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-3">

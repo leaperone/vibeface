@@ -602,6 +602,10 @@ test('both task overviews preserve known records, show their coverage and only n
       const empty = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceEmpty' : 'MobileEmpty'))
       assert.ok(empty && typeof empty.type === 'function')
       assert.match(platform === 'web' ? String(empty.props.title) : componentText(empty.type(empty.props)), /当前记录没有未完成的任务/)
+      if (platform === 'native') {
+        assert.equal(elements.some(({ type, props }) => type === 'Link' && props.href === '/inbox'), true, 'the incoming mobile inbox entry remains available with no pending items')
+        assert.equal(elements.some(({ props }) => props.accessibilityLabel === '查看待处理'), true)
+      }
     } finally { app.close() }
   }
 })

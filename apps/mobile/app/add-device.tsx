@@ -7,7 +7,7 @@ import { Pressable, ScrollView, Share, View } from 'react-native'
 import { useDevice, type Invitation } from '@vibeface/client/identity/context.tsx'
 import { addDeviceCopy, deviceCopy, joinCopy } from '@vibeface/client/identity/copy.ts'
 import { ErrorText } from '@/components/action'
-import { EmptyState } from '@/components/kit'
+import { Details, EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Segmented } from '@/components/ui/segmented'
@@ -93,24 +93,26 @@ export default function AddDevice() {
           <Button variant="ghost" size="icon" accessibilityLabel="分享链接" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}><Icon as={Share2} /></Button>
         </View>
         <View className="flex-row items-center gap-3"><Step n={2} /><Icon as={Laptop} className="size-4 text-muted-foreground" /><Text className="shrink">{addDeviceCopy.openThere}</Text></View>
-        <Pressable accessibilityRole="link" onPress={() => void openURL(joinCopy.installGuide).catch(() => {})} className="min-h-11 flex-row flex-wrap items-center gap-1.5">
-          <Icon as={Download} className="size-4 text-muted-foreground" />
-          <Text className="text-meta text-muted-foreground">{addDeviceCopy.installThere}</Text>
-          <Text className="text-meta font-medium underline">{addDeviceCopy.installHow}</Text>
-        </Pressable>
-        <View className="gap-2 border-t border-border pt-3">
-          <View className="flex-row items-center gap-1.5"><Icon as={SquareTerminal} className="size-4 text-muted-foreground" /><Text className="shrink text-meta text-muted-foreground">{addDeviceCopy.orCommand}</Text></View>
-          <View className="flex-row items-center gap-2">
-            <Button variant="outline" disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(addDeviceCopy.command(result.link)).then(() => setCopied('command')))}>
-              <Icon as={copied === 'command' ? Check : Copy} /><Text>{copied === 'command' ? '已复制' : addDeviceCopy.copyCommand}</Text>
-            </Button>
-            <Button variant="ghost" size="icon" accessibilityLabel="分享命令" onPress={() => { void Share.share({ message: addDeviceCopy.command(result.link) }).catch(() => {}) }}><Icon as={Share2} /></Button>
+        <Details label="安装电脑">
+          <Pressable accessibilityRole="link" onPress={() => void openURL(joinCopy.installGuide).catch(() => {})} className="min-h-11 flex-row flex-wrap items-center gap-1.5">
+            <Icon as={Download} className="size-4 text-muted-foreground" />
+            <Text className="text-meta text-muted-foreground">{addDeviceCopy.installThere}</Text>
+            <Text className="text-meta font-medium underline">{addDeviceCopy.installHow}</Text>
+          </Pressable>
+          <View className="gap-2 border-t border-border pt-3">
+            <View className="flex-row items-center gap-1.5"><Icon as={SquareTerminal} className="size-4 text-muted-foreground" /><Text className="shrink text-meta text-muted-foreground">{addDeviceCopy.orCommand}</Text></View>
+            <View className="flex-row items-center gap-2">
+              <Button variant="outline" disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(addDeviceCopy.command(result.link)).then(() => setCopied('command')))}>
+                <Icon as={copied === 'command' ? Check : Copy} /><Text>{copied === 'command' ? '已复制' : addDeviceCopy.copyCommand}</Text>
+              </Button>
+              <Button variant="ghost" size="icon" accessibilityLabel="分享命令" onPress={() => { void Share.share({ message: addDeviceCopy.command(result.link) }).catch(() => {}) }}><Icon as={Share2} /></Button>
+            </View>
           </View>
-        </View>
+        </Details>
       </View>}
       <View className="gap-1.5">
         <View className="flex-row items-center gap-1.5"><Icon as={ScanEye} className="size-4 text-muted-foreground" /><Text className="shrink text-meta text-muted-foreground">{addDeviceCopy.compare}</Text></View>
-        <View className="flex-row items-center gap-1.5"><Icon as={Clock} className="size-4 text-muted-foreground" /><Text className="shrink text-meta text-muted-foreground">只发给自己的设备，10 分钟内有效</Text></View>
+        <View className="flex-row items-center gap-1.5"><Icon as={Clock} className="size-4 text-muted-foreground" /><Text className="shrink text-meta text-muted-foreground">只给自己的设备，10 分钟有效</Text></View>
       </View>
     </View> : null}
     <ErrorText error={error} />
