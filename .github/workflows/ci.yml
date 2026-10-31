@@ -836,7 +836,6 @@ jobs:
     with:
       version: ${{ needs.plan.outputs.version }}
       prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
-    secrets: inherit
 
   publish:
     # ci-gate needs jobs that are skipped on tags; without !cancelled() a skipped ancestor skips this.
