@@ -4,8 +4,9 @@ import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { answerLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject } from '@vibeface/client/workspace/questions.ts'
-import { ArrowUp, CircleAlert, CircleCheck, CircleSlash, CircleX, FolderOpen, Hand, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, Laptop, PencilLine, RotateCw, TriangleAlert, type LucideIcon } from 'lucide-react-native'
-import { useState } from 'react'
+import type { AnswerResult } from '@vibeface/client/workspace/types.ts'
+import { ArrowUp, Circle, CircleAlert, CircleCheck, CircleDot, CircleSlash, CircleX, FolderOpen, Hand, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, Laptop, RotateCw, TriangleAlert, type LucideIcon } from 'lucide-react-native'
+import { useId, useRef, useState, type ComponentRef } from 'react'
 import { Pressable, TextInput, View } from 'react-native'
 import { ErrorText } from '@/components/action'
 import { ActionCard, providerIcons, type Tone } from '@/components/kit'
@@ -25,68 +26,69 @@ const looks: Record<Question['severity'], { icon: LucideIcon; tone: Tone }> = {
   info: { icon: Info, tone: 'info' },
 }
 
+type Selection = { kind: 'none' } | { kind: 'choice'; label: string } | { kind: 'custom' }
+
 /**
- * One numbered choice per row and a free answer as the last row, as on the web; an approval keeps that row too. An answer sent but not
- * confirmed offers 再试 in place of the choices. Answered or closed, it folds to one line, which says so when another device's answer won.
- * `answer`: the chat's message answering it, which shows here instead of as a bubble. `inTask`: inside the task's own page, which already
- * names the task, device and folder.
+ * Select or write an answer locally, then send it, as on the web.
+ * Answered or closed, it shows the result. `answer`: the chat's message answering it, shown here instead of as a bubble.
+ * `inTask`: inside the task's own page, which already names the task, device and folder.
  */
 export function QuestionCard({ question, answer, inTask = false }: { question: Question; answer?: string; inTask?: boolean }) {
   const workspace = useWorkspace()
   const shared = useLive()
   const { ready } = useDevice()
+  const fieldId = useId()
   const [text, setText] = useState('')
+  const [selection, setSelection] = useState<Selection>(question.choices.length ? { kind: 'none' } : { kind: 'custom' })
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState('')
-  const [failed, setFailed] = useState<string | null>(null)
-  const [beaten, setBeaten] = useState(false)
-  const standing = answer ?? question.answer?.text
-  const settled = settledAnswer(standing, shared?.answered[question.question_id], question.answer?.author, ready?.principal.device_id)
-  const { ask, lines } = questionParts(question.text)
+  const [result, setResult] = useState<AnswerResult | null>(null)
+  const running = useRef(false)
+  const attempted = useRef('')
+  const textRef = useRef<ComponentRef<typeof TextInput>>(null)
+  const id = question.question_id
+  const standing = question.answer?.text ?? answer
+  const settled = settledAnswer(standing, shared?.answered[id] ?? result?.text, question.answer?.author, ready?.principal.device_id)
+  const raced = result?.status === 'already_answered' && settled?.text === result.text && result.text !== attempted.current
+  const elsewhere = settled?.elsewhere || raced
+  const warned = settled?.beaten || raced
+  const { ask, detail } = questionParts(question.text)
   const member = workspace.members.find((item) => item.device_id === question.about.node)
   // Read back later, an answered approval says which task on which device it settled.
   const heldTask = inTask ? null : approvalTask(question, [...shared?.openWorks ?? [], ...shared?.data?.works ?? []])
   const about = heldTask ? `${heldTask} · ${member?.name ?? '另一台设备'}` : undefined
-  const elsewhere = settled && (settled.elsewhere || beaten)
-  const warned = settled && (settled.beaten || beaten)
-  if (settled) return <Settled icon={warned ? CircleAlert : declined(settled.text) ? CircleX : CircleCheck} className={warned ? 'text-warning' : declined(settled.text) ? 'text-danger' : 'text-success'} ask={ask} about={about}>
-    {elsewhere ? `已由另一端回答：${settled.text}` : declined(settled.text) ? answerLabel(settled.text) : settled.text}
-  </Settled>
-  if (question.closed) return <Settled icon={CircleSlash} ask={ask} about={about}>已失效</Settled>
-  const pending = shared?.pendingAnswers.find((item) => item.question_id === question.question_id)
+  if (settled) return <Settled icon={warned ? CircleAlert : declined(settled.text) ? CircleX : CircleCheck} className={warned ? 'text-warning' : declined(settled.text) ? 'text-danger' : 'text-success'} ask={ask} detail={detail} about={about}>{elsewhere ? `已由另一端回答：${settled.text}` : answerLabel(settled.text)}</Settled>
+  if (question.closed) return <Settled icon={CircleSlash} ask={ask} detail={detail} about={about}>已失效</Settled>
 
+  const pending = shared?.pendingAnswers.find((item) => item.question_id === id)
+  const disabled = !shared?.writable || busy !== null
   const send = async (key: string, value: string) => {
+    if (disabled || running.current || pending && value !== pending.text) return
+    running.current = true
+    attempted.current = value.trim()
     setBusy(key)
     setError('')
-    setFailed(null)
     try {
-      const result = await workspace.actions.answer(question, value)
-      if (result.status === 'already_answered' && result.text !== value.trim()) {
-        setBeaten(true)
-        return
-      }
+      setResult(await workspace.actions.answer(question, value))
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success)
-      // Stays busy until the answer arrives and folds or removes the card, so it never flashes back to open.
     } catch (caught) {
       setError(humanError(caught instanceof Error ? caught.message : '', undefined, '这次回答'))
-      setFailed(key)
+    } finally {
+      running.current = false
       setBusy(null)
     }
   }
-  const typed = () => {
-    const value = text.trim()
-    const numbered = /^[1-9]$/.test(value) ? question.choices[Number(value) - 1] : undefined
-    void (numbered ? send(`choice:${numbered.label}`, numbered.label) : send('text', value))
+  const submit = () => {
+    if (disabled || running.current) return
+    if (selection.kind === 'none') { setError('选一个回答，或自己写回答。'); return }
+    if (selection.kind === 'custom' && !text.trim()) { setError('写下你的回答。'); textRef.current?.focus(); return }
+    void send('answer', selection.kind === 'choice' ? selection.label : text)
   }
   const { approval, task, local } = questionMeta(question, shared?.openWorks ?? [], workspace.bots, ready?.entry.device_id)
   const project = question.about.cwd ? sharedProject(question.about.cwd, question.about.node, shared?.nodes ?? []) : null
   const { icon, tone } = looks[question.severity]
-  // A read-only device cannot answer: the choices and the answer row stay visible but take no input, as on the web.
-  const disabled = busy !== null || !shared?.writable
   return <ActionCard icon={approval ? Hand : icon} tone={tone} title={ask}>
-    {lines.length ? <View className="gap-1">{lines.map((line, index) => <Text key={index} className="font-medium">
-      {line.label ? <Text className="text-muted-foreground">{line.label}  </Text> : null}{line.value}
-    </Text>)}</View> : null}
+    {detail ? <Text className="text-body">{detail}</Text> : null}
     {inTask ? null : <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
       {task ? <Link href={`/b/${task.bot_id}/work/${task.work_id}`} asChild>
         <Pressable accessibilityRole="link" accessibilityLabel={`任务 ${task.title}`} hitSlop={8} className="min-w-0 flex-row items-center gap-1 active:opacity-60">
@@ -98,45 +100,50 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
       {project ? <Meta icon={FolderOpen} label="项目">{project.name}</Meta> : null}
       {local ? null : <Meta icon={member ? deviceIcon(member) : Laptop} label="设备">{member?.name ?? '另一台设备'}</Meta>}
     </View>}
-    {pending ? <View role="status" className="flex-row flex-wrap items-center gap-x-2">
-      <Icon as={CircleAlert} className="size-4 text-warning" />
-      <Text numberOfLines={1} className="min-w-0 shrink text-meta">{pending.text}</Text>
-      <Text className="text-meta text-muted-foreground">· 没确认送达 ·</Text>
-      <Button variant="ghost" disabled={disabled} onPress={() => void send('retry', pending.text)}><Icon as={busy === 'retry' ? LoaderCircle : RotateCw} /><Text>再试</Text></Button>
-    </View> : <View accessibilityRole="radiogroup" accessibilityLabel="选一个回答" className="gap-2">
-      {question.choices.map((choice, index) => {
-        const key = `choice:${choice.label}`
-        return <Pressable key={choice.label} accessibilityRole="button" accessibilityState={{ disabled }} disabled={disabled} onPress={() => void send(key, choice.label)}
-          className={cn(row, 'active:bg-muted', disabled && 'opacity-50')}>
-          <View className={cn(badge, 'bg-muted')}>
-            {busy === key ? <Icon as={LoaderCircle} className="size-4 text-muted-foreground" /> : <Text className="text-meta font-semibold text-muted-foreground">{index + 1}</Text>}
-          </View>
-          <Text className="min-w-0 flex-1 font-medium">{choice.label}</Text>
+    {pending ? <View role="status" className="gap-2">
+      <Text className="text-body">{pending.text}</Text>
+      <Text className="text-meta text-muted-foreground">{busy !== null ? '正在发送' : '没确认送达'}</Text>
+      <Button variant="outline" className="min-h-11 self-start" disabled={disabled} accessibilityState={{ disabled, busy: busy === 'retry' }} onPress={() => void send('retry', pending.text)}>
+        <Icon as={busy === 'retry' ? LoaderCircle : RotateCw} /><Text>再试</Text>
+      </Button>
+    </View> : <View className="gap-2">
+      {question.choices.length ? <View accessibilityRole="radiogroup" accessibilityLabel="选一个回答" className="gap-2">
+        {question.choices.map((choice, index) => {
+          const checked = selection.kind === 'choice' && selection.label === choice.label
+          return <Pressable key={index} accessibilityRole="radio" accessibilityLabel={choice.label} accessibilityState={{ checked, disabled }} disabled={disabled} onPress={() => { setSelection({ kind: 'choice', label: choice.label }); setError('') }}
+            className={cn(row, 'active:bg-muted', checked && 'border-ring', disabled && 'opacity-50')}>
+            <Icon as={checked ? CircleDot : Circle} className="mt-0.5 size-4 text-muted-foreground" />
+            <Text className="min-w-0 flex-1 font-medium">{choice.label}</Text>
+          </Pressable>
+        })}
+        <Pressable accessibilityRole="radio" accessibilityLabel="自己写回答" accessibilityState={{ checked: selection.kind === 'custom', disabled }} disabled={disabled} onPress={() => { setSelection({ kind: 'custom' }); setError('') }} className={cn(row, 'active:bg-muted', selection.kind === 'custom' && 'border-ring', disabled && 'opacity-50')}>
+          <Icon as={selection.kind === 'custom' ? CircleDot : Circle} className="mt-0.5 size-4 text-muted-foreground" /><Text>自己写回答</Text>
         </Pressable>
-      })}
-      <View className={cn(row, 'pe-1', disabled && 'opacity-50')}>
-        <View className={cn(badge, 'bg-muted')}><Icon as={PencilLine} className="size-4 text-muted-foreground" /></View>
-        <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel="其他回答" placeholder={question.choices.length ? '其他回答' : '输入回答'} placeholderTextColorClassName="accent-muted-foreground"
-          className="min-h-11 min-w-0 flex-1 font-sans text-body text-foreground" value={text} maxLength={4000} editable={!disabled}
-          returnKeyType="send" submitBehavior="blurAndSubmit" onChangeText={setText} onSubmitEditing={() => { if (!disabled && text.trim()) typed() }} />
-        <Button variant="ghost" size="icon" accessibilityLabel="发送回答" disabled={disabled || !text.trim()} onPress={typed}>
-          <Icon as={busy === 'text' ? LoaderCircle : ArrowUp} />
-        </Button>
-      </View>
+      </View> : null}
+      {selection.kind === 'custom' ? <View className="gap-1.5">
+        <Text nativeID={`${fieldId}-label`} className="text-meta font-medium">你的回答</Text>
+        <TextInput ref={textRef} {...caret} maxFontSizeMultiplier={2} accessibilityLabel="你的回答" accessibilityLabelledBy={`${fieldId}-label`} accessibilityHint={error || '发送会回答本题，让 Bot 按回答继续处理。'} placeholder="写下你的选择、条件或需要澄清的问题" placeholderTextColorClassName="accent-muted-foreground"
+          className="min-h-24 rounded-lg border border-border bg-card p-3 font-sans text-body text-foreground" value={text} maxLength={4000} editable={!disabled}
+          multiline textAlignVertical="top" submitBehavior="newline" onChangeText={(value) => { setText(value); setError('') }} />
+      </View> : null}
+      <Text className="text-meta text-muted-foreground">发送会回答本题，让 Bot 按回答继续处理。</Text>
+      <Button variant={selection.kind === 'none' ? 'outline' : 'default'} className="min-h-11 self-start" accessibilityLabel="发送回答" disabled={disabled} accessibilityState={{ disabled, busy: busy === 'answer' }} onPress={submit}>
+        <Icon as={busy === 'answer' ? LoaderCircle : ArrowUp} /><Text>发送回答</Text>
+      </Button>
     </View>}
-    <ErrorText error={pending && failed !== 'retry' ? '' : error} />
+    <ErrorText error={error} />
   </ActionCard>
 }
 
-const row = 'min-h-12 flex-row items-center gap-3 rounded-lg border border-border bg-card px-3 py-2'
-const badge = 'min-h-7 min-w-7 items-center justify-center rounded-md'
+const row = 'min-h-12 flex-row items-start gap-3 rounded-lg border border-border bg-card px-3 py-3'
 
-function Settled({ icon, className, ask, about, children }: { icon: LucideIcon; className?: string; ask: string; about?: string; children: string }) {
-  return <View className="min-h-9 flex-row items-start gap-2 py-2">
+function Settled({ icon, className, ask, detail, about, children }: { icon: LucideIcon; className?: string; ask: string; detail: string; about?: string; children: string }) {
+  return <View role="status" className="min-h-9 flex-row items-start gap-2 py-2">
     <Icon as={icon} className={cn('mt-0.5 size-4 text-muted-foreground', className)} />
     <View className="min-w-0 flex-1 gap-0.5">
       {about ? <View className="min-w-0 flex-row items-center gap-1"><Icon as={ListChecks} className="size-3.5 text-muted-foreground" /><Text numberOfLines={1} className="shrink text-meta text-muted-foreground">{about}</Text></View> : null}
       <Text className="text-meta text-muted-foreground"><Text className="text-meta text-muted-foreground" numberOfLines={1}>{ask}</Text>{' · '}<Text className="text-meta">{children}</Text></Text>
+      {detail ? <Text className="text-meta text-muted-foreground">{detail}</Text> : null}
     </View>
   </View>
 }
