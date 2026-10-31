@@ -1498,8 +1498,11 @@ def fixture_paid_principals(run, initial, bot, tool):
 
 
 def javascript_dependencies(content):
-    static = rb"\b(?:import|export)\s*(?:[^;\"'`]*?\bfrom\s*)?[\"'`]([^\"'`]+)[\"'`]"
-    dynamic = rb"\bimport\s*\(\s*[\"'`]([^\"'`]+)[\"'`]"
+    # A user string can contain the words import/export; only treat tokens outside
+    # identifiers, member access and string delimiters as module syntax.
+    boundary = rb"(?<![\w$.'\"`])"
+    static = boundary + rb"(?:import|export)\s*(?:[^;\"'`]*?\bfrom\s*)?[\"'`]([^\"'`]+)[\"'`]"
+    dynamic = boundary + rb"import\s*\(\s*[\"'`]([^\"'`]+)[\"'`]"
     return [address.decode() for pattern in (static, dynamic) for address in re.findall(pattern, content)]
 
 
