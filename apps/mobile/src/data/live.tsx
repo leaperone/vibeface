@@ -41,6 +41,7 @@ function lastSeen(me: string | undefined): LastSeen | null {
 }
 
 type Shared = ReturnType<typeof useShared>
+type ChatVisit = { id: string; workspace: Shared; started: boolean }
 const SharedContext = createContext<Shared | null>(null)
 
 /** The shared workspace while a member connection is up, for screens that call its actions directly; null before that. */
@@ -181,24 +182,36 @@ function Live({ children }: { children: ReactNode }) {
     if (!bot) throw new Error(botCopy.notFound)
     if (workspace.conversationId !== id) await workspace.selectBot(bot)
   }
-  // A chat opened from the kept list before the first read finds no bot yet; it is selected once its bot arrives.
-  const waiting = useRef<string | null>(null)
-  const arrived = waiting.current !== null && shared.bots.some((bot) => bot.conversation_id === waiting.current)
+  const focused = useRef<ChatVisit | null>(null)
+  const currentVisit = (visit: ChatVisit) => focused.current === visit && visit.workspace.isCurrent() && latest.current.generation === visit.workspace.generation
+  const activate = async (visit: ChatVisit) => {
+    if (!currentVisit(visit) || visit.started || !latest.current.bots.some((bot) => bot.conversation_id === visit.id)) return
+    visit.started = true
+    try {
+      await select(visit.id)
+      if (currentVisit(visit)) latest.current.setView('chat')
+    } catch { visit.started = false }
+  }
+  // A kept route waits for its Bot; it cannot expose the previous selection as a visible chat.
   useEffect(() => {
-    const id = waiting.current
-    if (!arrived || !id) return
-    waiting.current = null
-    void select(id).catch(() => {})
-  }, [arrived])
+    if (focused.current) void activate(focused.current)
+  }, [shared.bots, shared.generation])
   const actions = useMemo<WorkspaceActions>(() => {
     return {
       join: (invitation, name) => device.join(invitation, name),
       cancelJoin: device.cancelJoin,
       open(id) {
-        let closed = false
-        latest.current.setView('chat')
-        void select(id).catch((cause) => { if (!closed && cause instanceof Error && cause.message === botCopy.notFound) waiting.current = id })
-        return () => { closed = true; waiting.current = null; latest.current.setView('other') }
+        const workspace = latest.current
+        if (!workspace.isCurrent()) return () => {}
+        const visit = { id, workspace, started: false }
+        focused.current = visit
+        workspace.setView('other')
+        void activate(visit)
+        return () => {
+          if (focused.current !== visit) return
+          focused.current = null
+          if (workspace.isCurrent() && latest.current.generation === workspace.generation) latest.current.setView('other')
+        }
       },
       async send(id, text, attachments) {
         await select(id)

@@ -1,6 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ChevronLeft, Circle, CircleCheck, CircleDot, CircleQuestionMark, CircleStop, FolderOpen, Laptop, Link2, ListChecks, Play, RotateCw, SearchCheck, Settings, X } from "lucide-react"
+import { Bot, ChevronLeft, Circle, CircleCheck, CircleDot, CircleQuestionMark, CircleStop, FolderOpen, Laptop, Link2, ListChecks, Play, RotateCw, SearchCheck, Settings, X } from "lucide-react"
 import { BusyIcon, Details, DetailRow, EmptyState, InlineError, StatusPill, toast, useAction, type Tone } from "@/components/app/kit"
 import { Markdown } from "@/components/app/markdown"
 import { Button } from "@/components/ui/button"
@@ -12,11 +12,11 @@ import { workChecks, type WorkCheck } from "@vibeface/client/workspace/model.ts"
 import { BackOnline, confirmText } from "./task-activity"
 import { ActionButton } from "./present"
 import { QuestionCard } from "./question-card"
-import { fixOnDevice, fixOnDeviceLabel, nodeName, progressLabel, promptSummary, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, followUp, followUpCopy, type FollowUp } from "@vibeface/client/workspace/labels.ts"
+import { fixOnDevice, fixOnDeviceLabel, nodeName, parseSummarySteps, progressLabel, promptSummary, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, followUp, followUpCopy, type FollowUp, type SummaryStep } from "@vibeface/client/workspace/labels.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import { CopyDiagnostics } from "@/features/identity/device-controls"
-import { projectName, questionOpen } from "@vibeface/client/workspace/questions.ts"
+import { projectName, workApproval } from "@vibeface/client/workspace/questions.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 
 const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
@@ -61,7 +61,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const lookup = { nodes: workspace.nodes, directory }
   const work = workspace.data?.works.find((item) => item.work_id === workId)
   // A running turn held on an approval reads as 需要你同意, as in the chat, and the question is answered right here.
-  const asking = work?.thread_id ? workspace.data?.questions.find((question) => questionOpen(question) && question.about.request_id && question.about.session_id === work.thread_id) : undefined
+  const asking = work ? workApproval({ work, conversationId: workspace.data?.conversation?.conversation_id ?? "", questions: workspace.data?.questions ?? [], answered: workspace.answered }) : undefined
   const shown = work ? shownState(work, workspace.nodes) : ""
   const state = shown === "running" && asking ? "waiting" : shown
   const [confirming, setConfirming] = useState(false)
@@ -115,13 +115,14 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       <Button asChild variant="ghost" size="icon" className="max-md:hidden"><Link {...leave} aria-label="关闭" title="关闭"><X aria-hidden="true" /></Link></Button>
     </header>
     {!work ? <EmptyState icon={ListChecks} title="找不到这个任务" /> : <div className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-4">
+      {workspace.selectedBot?.bot_id === botId ? <Link to="/b/$botId" params={{ botId }} className="flex min-h-11 w-fit items-center gap-1.5 rounded-md text-meta font-medium underline-offset-4 hover:underline"><Bot aria-hidden="true" className="size-4" /><span className="sr-only">所属 Bot </span>{workspace.selectedBot.name}</Link> : null}
       {device || work.cwd || agent ? <p className="flex min-w-0 items-center gap-x-3 text-meta text-muted-foreground">
         {agent && AgentIcon ? <span className="flex shrink-0 items-center gap-1.5"><AgentIcon aria-hidden="true" className="size-4 shrink-0" />{providerNames[agent]}</span> : null}
         {device ? <span className="flex min-w-0 items-center gap-1.5"><Laptop aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">设备 </span><span className="truncate">{nodeName(device, lookup)}</span></span> : null}
         {work.cwd ? <span className="flex min-w-0 items-center gap-1.5" title={work.cwd}><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project} </span><span className="truncate">{projectName(work.cwd)}</span></span> : null}
       </p> : null}
       {progress?.status && taskActive(state) && progress.status !== "awaiting_input" && progressLabel(progress.status) !== "进行中" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
-      {plan ? <Details label={`执行步骤 · ${plan.length}`} open={taskActive(state)}><SummarySteps steps={plan} /></Details> : !progress?.text && work.summary && taskActive(state) ? <Summary text={work.summary} /> : null}
+      {plan ? <Details label={`最近步骤摘要 · ${plan.length}`} open={taskActive(state)}><SummarySteps steps={plan} /></Details> : !progress?.text && work.summary && taskActive(state) ? <p className="whitespace-pre-wrap break-words">{work.summary}</p> : null}
       {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}
       {asked.summary ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">交代的事</h3><p className="break-words">{asked.summary}</p></section> : null}
       {result && !taskActive(state) && !check ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">{failed || !work.result_text ? "原因" : "结果"}</h3>{!failed && work.result_text ? <Markdown text={result} /> : <p className={`whitespace-pre-wrap break-words ${failed ? "text-danger" : ""}`}>{result}</p>}</section> : null}
@@ -167,31 +168,15 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
 
 const followUpIcons: Record<FollowUp, typeof Circle> = { check: SearchCheck, resume: Play, retry: RotateCw }
 
-// A plan's progress arrives as one line per step, marked done, current or to do.
-const steps: Record<string, { icon: typeof Circle; className: string; label: string }> = {
-  "✓": { icon: CircleCheck, className: "text-success", label: "已完成" },
-  "→": { icon: CircleDot, className: "text-info", label: "进行中" },
-  "·": { icon: Circle, className: "text-muted-foreground", label: "待做" },
-}
-
-type SummaryStep = { marker: keyof typeof steps; text: string }
-
-function parseSummarySteps(text: string): SummaryStep[] | null {
-  if (!text) return null
-  const lines = text.split("\n")
-  if (!lines.length || !lines.every((line) => steps[line.slice(0, 1)] && line[1] === " ")) return null
-  return lines.map((line) => ({ marker: line.slice(0, 1) as keyof typeof steps, text: line.slice(2) }))
+const steps: Record<SummaryStep["state"], { icon: typeof Circle; className: string; label: string }> = {
+  done: { icon: CircleCheck, className: "text-success", label: "已完成" },
+  current: { icon: CircleDot, className: "text-info", label: "进行中" },
+  pending: { icon: Circle, className: "text-muted-foreground", label: "待做" },
 }
 
 function SummarySteps({ steps: items }: { steps: SummaryStep[] }) {
   return <ol className="grid gap-1.5">{items.map((item, index) => {
-    const step = steps[item.marker]
-    return <li key={`${item.marker}:${index}`} className={cn("flex min-w-0 items-start gap-2", item.marker === "·" && "text-muted-foreground")}><step.icon aria-hidden="true" className={cn("mt-0.5 size-4 shrink-0", step.className)} /><span className="sr-only">{step.label} </span><span className="break-words">{item.text}</span></li>
+    const step = steps[item.state]
+    return <li key={`${item.state}:${index}`} className={cn("flex min-w-0 items-start gap-2", item.state === "pending" && "text-muted-foreground")}><step.icon aria-hidden="true" className={cn("mt-0.5 size-4 shrink-0", step.className)} /><span className="sr-only">{step.label} </span><span className="break-words">{item.text}</span></li>
   })}</ol>
-}
-
-/** A task's summary; a plan shows each step with an icon for where it stands. */
-function Summary({ text }: { text: string }) {
-  const parsed = parseSummarySteps(text)
-  return parsed ? <SummarySteps steps={parsed} /> : <p className="whitespace-pre-wrap break-words">{text}</p>
 }
