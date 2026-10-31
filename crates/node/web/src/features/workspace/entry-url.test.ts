@@ -306,6 +306,8 @@ test("workspace preserves bot and message requests while routing native decision
     assert.deepEqual(controls, [{ method: "interrupt_work", conversation_id: "chat", work_id: "work" }])
     const [question, other] = render().questions
     assert.equal(question.text, "要不要继续")
+    connection.principal.can_manage = false
+    assert.equal(render().writable, true, "an ordinary joined member can answer without manager authority")
     await assert.rejects(render().answer(question, "  "), /不能为空/)
     await assert.rejects(render().answer(question, " 继续 "), /connection lost/)
     assert.deepEqual(JSON.parse(JSON.stringify(render().pendingAnswers)), [{ question_id: "q1", text: "继续" }], "an unknown outcome waits in the outbox")
@@ -322,6 +324,13 @@ test("workspace preserves bot and message requests while routing native decision
     answerOutcome = "already_answered"
     assert.equal((await render().answer(other, "继续")).text, "停下", "the answer that stood first is the one shown")
     assert.equal(signed.at(-1), 'attestation|network|other|{"type":"message_posted","message_id":"a-s1","role":"user","text":"继续","report_results":true,"answers":"s1"}', "an answer is signed for its question's chat")
+    const memberPrincipal = connection.principal, beforeLocal = answers.length
+    connection.principal = { ...memberPrincipal, source: "local_session", can_manage: false }
+    assert.equal(render().writable, false)
+    await assert.rejects(render().answer(question, "允许"), /本机管理不能发送/)
+    assert.equal(answers.length, beforeLocal, "a local session without membership never writes a new answer")
+    connection.principal = memberPrincipal
+    connection.principal.can_manage = true
     // After a new connection the outbox asks the questions list before sending an unknown answer again.
     const later = { ...questionRow, question_id: "q2" }, elsewhere = { ...questionRow, question_id: "q3" }
     questionRows = [later, elsewhere]
@@ -599,7 +608,7 @@ test("question cards select locally, send exact answers only on confirmation, an
   const toasts: { text: string; action?: { label: string; onClick(): void } }[] = [], visited: unknown[] = []
   const kit = new Proxy({ useAction: () => ({ busy: actionBusy, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const router = { Link: 'Link', useNavigate: () => (target: unknown) => { visited.push(target) } }
-  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, answerLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
+  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'web', source: 'membership', can_manage: false } } }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, answerLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
   const longChoice = '只在本机验证完整配置并保留现有服务，检查通过后再决定是否发布'
   const question = { question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '\n是否允许继续？\n已完成本机检查。\n\n线上结果未知。', choices: [{ label: '允许' }, { label: longChoice }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
   type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void } }
@@ -736,7 +745,7 @@ test("mobile questions select before sending, preserve literal text and retry on
     const app = componentHarness('../../../../../../apps/mobile/src/features/chat/question-card.tsx', {
       '@/data/context': { useWorkspace: () => ({ members: [], bots: [], actions: { answer: (...args: unknown[]) => { sent.push(args); return hold.promise } } }) },
       '@/data/live': { useLive: () => shared },
-      '@vibeface/client/identity/context.tsx': { useDevice: () => ({}) },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'mobile', source: 'membership', can_manage: false } } }) },
       '@vibeface/client/workspace/questions.ts': { answerLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject },
       '@vibeface/client/lib/errors.ts': errors,
       'expo-haptics': { notificationAsync: async () => {}, NotificationFeedbackType: { Success: 'success' } },
@@ -789,6 +798,36 @@ test("mobile questions select before sending, preserve literal text and retry on
       shared.answered = { mobile: '允许' }
       assert.ok(render({ question: { ...question, closed: 'request_lost', answer: { text: '停下' } } }).some(({ props }) => props.children === '已由另一端回答：停下'), 'standing answers precede closed and pending state')
     } finally { app.close() }
+  }
+})
+
+test("remounted question cards identify the answer author and reserve warning styling for a lost race", () => {
+  const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' && 'props' in node ? text((node as { props: { children?: unknown } }).props.children) : ''
+  for (const platform of ['web', 'mobile']) {
+    for (const scenario of [{ author: 'phone', mine: undefined, elsewhere: true, warned: false }, { author: 'gateway', mine: undefined, elsewhere: true, warned: false }, { author: 'self', mine: undefined, elsewhere: false, warned: false }, { author: 'phone', mine: '停下', elsewhere: true, warned: true }, { author: 'phone', mine: '继续', elsewhere: true, warned: false }]) {
+      const question = { question_id: 'remount', text: '继续吗？\n线上结果未知。', choices: [{ label: '允许' }], severity: 'attention', about: { node: 'worker', session_id: 's', cwd: '' }, answer: { text: '继续', author: scenario.author }, closed: 'request_lost' }
+      const shared = { writable: true, nodes: [], answered: scenario.mine === undefined ? {} : { remount: scenario.mine }, pendingAnswers: [{ question_id: 'remount', text: '旧草稿' }], bots: [], openWorks: [] }
+      const app = componentHarness(platform === 'web' ? './question-card.tsx' : '../../../../../../apps/mobile/src/features/chat/question-card.tsx', {
+        '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared },
+        '@/data/context': { useWorkspace: () => ({ members: [], bots: [] }) },
+        '@/data/live': { useLive: () => shared },
+        '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { principal: { device_id: 'self', source: 'membership', can_manage: false } } }) },
+        '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备' },
+        '@vibeface/client/workspace/questions.ts': { answerLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject },
+        '@/components/app/kit': { useAction: () => ({ busy: null, error: null }) },
+        '@tanstack/react-router': { useNavigate: () => () => {} },
+      })
+      try {
+        const elements = app.render('QuestionCard', { question, answer: '过时的折叠答案' })
+        const settled = elements.find(({ props }) => props.ask === '继续吗？')
+        assert.ok(settled, `${platform} returns the standing answer before closed or pending state`)
+        assert.equal(text(settled.props.children), scenario.elsewhere ? '已由另一端回答：继续' : '已回答 · 继续')
+        const marker = settled.props.mark as { props: { className: string } } | undefined
+        const className = platform === 'web' ? marker?.props.className : settled.props.className
+        assert.equal(String(className).includes('text-warning'), scenario.warned, `${platform}: another author alone is not a failed race`)
+        assert.equal(elements.some(({ type }) => type === 'Button' || type === 'input' || type === 'TextInput'), false)
+      } finally { app.close() }
+    }
   }
 })
 

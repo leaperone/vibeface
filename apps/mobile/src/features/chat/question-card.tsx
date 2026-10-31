@@ -48,14 +48,16 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const textRef = useRef<ComponentRef<typeof TextInput>>(null)
   const id = question.question_id
   const standing = question.answer?.text ?? answer
-  const settled = settledAnswer(standing, shared?.answered[id] ?? result?.text)
-  const elsewhere = settled?.elsewhere || result?.status === 'already_answered' && settled?.text === result.text && result.text !== attempted.current
+  const settled = settledAnswer(standing, shared?.answered[id] ?? result?.text, question.answer?.author, ready?.principal.device_id)
+  const raced = result?.status === 'already_answered' && settled?.text === result.text && result.text !== attempted.current
+  const elsewhere = settled?.elsewhere || raced
+  const warned = settled?.beaten || raced
   const { ask, detail } = questionParts(question.text)
   const member = workspace.members.find((item) => item.device_id === question.about.node)
   // Read back later, an answered approval says which task on which device it settled.
   const heldTask = inTask ? null : approvalTask(question, [...shared?.openWorks ?? [], ...shared?.data?.works ?? []])
   const about = heldTask ? `${heldTask} · ${member?.name ?? '另一台设备'}` : undefined
-  if (settled) return <Settled icon={elsewhere ? CircleAlert : declined(settled.text) ? CircleX : CircleCheck} className={elsewhere ? 'text-warning' : declined(settled.text) ? 'text-danger' : 'text-success'} ask={ask} detail={detail} about={about}>{elsewhere ? `已由另一端回答：${settled.text}` : answerLabel(settled.text)}</Settled>
+  if (settled) return <Settled icon={warned ? CircleAlert : declined(settled.text) ? CircleX : CircleCheck} className={warned ? 'text-warning' : declined(settled.text) ? 'text-danger' : 'text-success'} ask={ask} detail={detail} about={about}>{elsewhere ? `已由另一端回答：${settled.text}` : answerLabel(settled.text)}</Settled>
   if (question.closed) return <Settled icon={CircleSlash} ask={ask} detail={detail} about={about}>已失效</Settled>
 
   const pending = shared?.pendingAnswers.find((item) => item.question_id === id)

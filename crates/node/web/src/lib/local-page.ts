@@ -30,7 +30,7 @@ export const localPage: LocalPage = {
     try { response = await fetch('/api/local/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', cache: 'no-store', credentials: 'omit', signal }) }
     catch (cause) { if (signal.aborted) throw cause; return null }
     if (response.status === 404) return null
-    if (!response.ok) throw new Error('无法读取这台电脑的本机设置。请检查本机地址并刷新页面。')
+    if (!response.ok) throw new Error('无法读取这台电脑的本机设置。检查本机地址并刷新页面。')
     return parseLocalSetup(await response.json(), url.origin)
   },
   localEntry: localBrowserEntry,
