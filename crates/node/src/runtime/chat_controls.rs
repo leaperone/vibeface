@@ -245,6 +245,7 @@ impl Runtime {
                 EventBody::MessagePosted { message_id: id, .. } => message_id = Some(id.clone()),
                 EventBody::QuestionAsked { .. }
                 | EventBody::QuestionClosed { .. }
+                | EventBody::SessionAttributed { .. }
                 | EventBody::NotificationAcked { .. } => {}
                 body => match body.work_id() {
                     Some(id) => work_id = Some(id.into()),

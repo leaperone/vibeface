@@ -482,6 +482,7 @@ fn insert_event(
             event,
             seen_at_ms,
             &rank(lamport, event.created_at_ms, &envelope.hash),
+            true,
         )?;
     }
     Ok(settled)
@@ -591,6 +592,7 @@ pub(crate) fn recompute(connection: &Connection, view: &AuthorizationView) -> Re
             &event,
             row.get(3)?,
             &rank(row.get(1)?, row.get(2)?, &hash),
+            false,
         )?;
     }
     Ok(true)
