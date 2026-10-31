@@ -21,7 +21,7 @@ Vibeface 使用你已经安装并登录的程序，或本机服务中明确配�
 
 ### Codex
 
-Node 可以连接已有 Codex App Server 的指定 socket，也可以用本机 `codex` 启动自己的 App Server。连接已有服务时沿用该服务的环境；由 Node 启动时，使用本机程序和显式配置的 `CODEX_HOME`。后台服务需要能找到相应程序与登录数据。
+Node 可以连接已有 Codex App Server 的指定 socket，也可以用本机 `codex` 启动自己的 App Server。连接已有服务时沿用该服务的环境；由 Node 启动时，使用 Node-owned 的 `CODEX_HOME`、sessions 和 hooks 根，不复用用户的交互目录。后台服务需要能找到相应程序，并在 Node-owned 根中完成登录或配置。
 
 这不意味着 Node 能接管任意已打开的 Codex 会话。连接方式、路径和工作条件见 [使用 Codex SDK](node.md#使用-codex-sdk) 与 [配置 SDK 与 App Server](deployment.md#配置-sdk-与-app-server)。
 

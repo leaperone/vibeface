@@ -23,6 +23,7 @@ export type DispatchState = "dispatch_waiting" | "dispatch_rejected" | "dispatch
 /** A stop this device still carries: its device has not confirmed it, or the deadline passed. */
 export type StopState = "stop_waiting" | "stop_timed_out"
 export type WorkOutcome = "completed" | "failed" | "interrupted" | "rejected" | "unverified"
+export type ResolvedModel = { provider: ProviderId; model: string | null }
 export type WorkRecord = {
   work_id: string
   trigger: string
@@ -45,6 +46,10 @@ export type WorkRecord = {
   dispatcher?: string
   /** The caller's idempotency key; absent in snapshots from older Nodes. */
   call_ref?: string
+  /** The dispatcher's optional model override. */
+  model?: string
+  /** The model frozen by the accepting Node. */
+  resolved?: ResolvedModel
   /** A follow-up work continues the prior work's provider session. */
   continues?: string
   /** The causal parent work, if this was dispatched as a child. */

@@ -1524,7 +1524,7 @@ impl Executor for Opencode {
                 }
             }
             // ponytail: opencode takes no effort per message; a model variant would carry it.
-            let model = match parse_model(args["model"].as_str().unwrap_or_default()) {
+            let model = match parse_model(work.execution_model().unwrap_or_default()) {
                 Ok(model) => model,
                 Err(failure) => return reject(failure),
             };
@@ -2370,6 +2370,8 @@ mod tests {
             dispatcher: target.into(),
             call_ref: "w-1".into(),
             kind: WorkKind::Agent(Provider::Opencode),
+            model: Some("fake/m".into()),
+            resolved: None,
             cwd: place.dir.join("work").display().to_string(),
             title: "t".into(),
             prompt: prompt.into(),

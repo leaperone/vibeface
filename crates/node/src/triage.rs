@@ -611,6 +611,15 @@ pub struct HookFile {
 
 /// The hook files under `home`, Codex's under `codex_home`.
 pub fn hook_files(home: &Path, codex_home: &Path) -> Vec<HookFile> {
+    hook_files_with_claude_root(home, &home.join(".claude"), codex_home)
+}
+
+/// Hook files when the caller already resolved the provider-owned Claude config root.
+pub fn hook_files_with_claude_root(
+    home: &Path,
+    claude_home: &Path,
+    codex_home: &Path,
+) -> Vec<HookFile> {
     Provider::ALL
         .into_iter()
         .filter_map(|agent| match agent.watch()? {
@@ -618,6 +627,7 @@ pub fn hook_files(home: &Path, codex_home: &Path) -> Vec<HookFile> {
                 agent,
                 path: match agent {
                     Provider::Codex => codex_home.join(file),
+                    Provider::Claude => claude_home.join("settings.json"),
                     _ => home.join(file),
                 },
                 events,

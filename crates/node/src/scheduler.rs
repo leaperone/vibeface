@@ -416,6 +416,31 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     drop(launch_claim);
     let mut job = claimed.job;
     let trigger = job.trigger.clone();
+    let readiness = if job.kind == TriggerKind::AgentTask {
+        let work_id = trigger
+            .strip_prefix("task:")
+            .context("agent task trigger has no work ID")?;
+        let work = node
+            .store
+            .lock()
+            .await
+            .works(&network, &conversation)?
+            .into_iter()
+            .find(|work| work.work_id == work_id)
+            .context("agent task work is not stored on this device")?;
+        if let Some(resolved) = work.resolved {
+            ensure!(
+                resolved.provider == provider,
+                "agent task provider changed before its turn started"
+            );
+            settings.model = resolved.model.unwrap_or_default();
+            node.provider_readiness(provider, &settings.model).await
+        } else {
+            readiness
+        }
+    } else {
+        readiness
+    };
     let attempt = job
         .state
         .attempt()
@@ -1586,6 +1611,7 @@ pub(crate) fn dispatch_row(dispatch: &Dispatch) -> Value {
 
 pub(crate) fn work_row(work: &WorkProjection) -> Value {
     json!({"work_id":work.work_id,"target_node":work.target_node,"kind":work.kind,"cwd":work.cwd,
+        "model":work.model,"resolved":work.resolved,
         "prompt":prefix(&work.prompt,500),"phase":work.phase,"progress":prefix(&work.summary,500),
         "outcome":work.outcome,"result":prefix(&work.result_text,1_000),
         "failure_reason":work.failure_reason,"failure":work.failure})

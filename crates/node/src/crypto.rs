@@ -545,6 +545,9 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             trigger,
             dispatcher,
             call_ref,
+            kind,
+            model,
+            resolved,
             continues,
             parent,
             thread,
@@ -561,6 +564,29 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             }
             id(call_ref)?;
             decode32(dispatcher)?;
+            if let Some(model) = model {
+                crate::model::validate_model(model)?;
+            }
+            if let Some(resolved) = resolved {
+                let role = if *kind == WorkKind::Task {
+                    crate::providers::Role::Agent
+                } else {
+                    crate::providers::Role::Execution
+                };
+                if let WorkKind::Agent(provider) = kind {
+                    ensure!(
+                        resolved.provider == *provider,
+                        "resolved work provider does not match its agent"
+                    );
+                }
+                ensure!(
+                    resolved.provider.supports().contains(&role),
+                    "resolved work provider cannot run this kind"
+                );
+                if let Some(model) = &resolved.model {
+                    crate::model::validate_model(model)?;
+                }
+            }
             for work in continues.iter().chain(parent.iter()).chain(thread.iter()) {
                 id(work)?;
             }
@@ -743,6 +769,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
 mod tests {
 
     use super::*;
+    use crate::providers::Provider;
     #[test]
     fn hmac_matches_rfc_4231() {
         assert_eq!(
@@ -998,6 +1025,46 @@ mod tests {
         );
         event.prev = Some(digest(b"c"));
         assert!(identity.sign_event(event).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_agent_work_provider_matches_the_selected_executor() -> Result<()> {
+        let identity = LocalIdentity::generate();
+        let network = identity.fixture_network_id()?;
+        let event = |provider| Event {
+            version: WIRE_VERSION,
+            network_id: network.clone(),
+            scope_id: "conversation".into(),
+            author: identity.device_id().unwrap(),
+            seq: 1,
+            prev: None,
+            deps: vec![],
+            created_at_ms: 0,
+            body: EventBody::WorkDispatched {
+                work_id: "work-1".into(),
+                trigger: "message:m-1".into(),
+                dispatcher: identity.device_id().unwrap(),
+                call_ref: "call-1".into(),
+                kind: WorkKind::Agent(Provider::Codex),
+                model: None,
+                resolved: Some(ResolvedModel {
+                    provider,
+                    model: None,
+                }),
+                cwd: "/tmp".into(),
+                title: "run".into(),
+                prompt: "run".into(),
+                continues: None,
+                parent: None,
+                thread: None,
+            },
+            blobs: vec![],
+        };
+        identity
+            .sign_event(event(Provider::Codex))
+            .expect("matching frozen provider should be valid");
+        assert!(identity.sign_event(event(Provider::Claude)).is_err());
         Ok(())
     }
 }

@@ -1309,7 +1309,7 @@ impl Executor for Pi {
             if let Origin::Fork(file) = &origin {
                 launch_args.extend(["--fork".into(), file.display().to_string()]);
             }
-            if let Some(model) = args["model"].as_str().filter(|model| !model.is_empty()) {
+            if let Some(model) = work.execution_model().filter(|model| !model.is_empty()) {
                 launch_args.extend(["--model".into(), model.into()]);
             }
             if let Some(effort) = args["effort"].as_str() {
@@ -1693,6 +1693,8 @@ mod tests {
             dispatcher: target.into(),
             call_ref: work_id.into(),
             kind: WorkKind::Agent(Provider::Pi),
+            model: None,
+            resolved: None,
             cwd: cwd.display().to_string(),
             title: "t".into(),
             prompt: "do it".into(),

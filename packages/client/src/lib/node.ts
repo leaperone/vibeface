@@ -61,6 +61,7 @@ export type AppServer = { mode: AppServerMode; socket: string | null; link: AppS
  */
 export type ProviderStatus = {
   provider: ProviderId; roles: ProviderRole[]; supports: ProviderRole[]; bin: string; app_server: AppServer | null
+  execution_model: string; execution_readiness: ProviderReadiness
   /** Whether its program is on that device. */
   installed: boolean
   /** Codex only: the Codex folder and the sessions folder the device uses. */
@@ -335,7 +336,7 @@ export function parseProvider(value: unknown): ProviderStatus {
     home: typeof v.home === 'string' ? v.home : null, sessions: typeof v.sessions === 'string' ? v.sessions : null,
     env: array(v.env).map(row => { const r = record(row); return { name: text(r.name), set: boolean(r.set), inherited: boolean(r.inherited), required: boolean(r.required) } }),
     state: oneOf(v.state, providerStates), issues: array(v.issues).map(parseIssue),
-    readiness: parseProviderReadiness(v.readiness),
+    readiness: parseProviderReadiness(v.readiness), execution_model: typeof v.execution_model === 'string' ? v.execution_model : '', execution_readiness: parseProviderReadiness(v.execution_readiness ?? v.readiness),
     probe: { provider: oneOf(probe.provider, providerIds), config_id: text(probe.config_id), checked_at_ms: probe.checked_at_ms, launch: launchState, authentication: oneOf(probe.authentication, ['unverified', 'authenticated', 'not_required', 'sign_in_required']), catalog: parseProviderModels(probe.catalog), version: probe.version === null ? null : text(probe.version) },
   }
 }

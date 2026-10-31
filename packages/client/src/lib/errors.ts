@@ -7,7 +7,7 @@ import { nodeJoinCopy } from '../identity/copy.ts'
 const codes: Record<string, string> = {
   target_not_member: '那台电脑不在我的设备里，访问地址不会转发给它。',
   target_unreachable: '访问地址连不上那台电脑。它可能关机或断网了，稍后会自动重试。',
-  codex_missing: '没找到这台电脑上的 Codex 目录。装好 Codex，或手动填写 Codex 目录。',
+  codex_missing: '没找到这台电脑上的 Codex 目录或程序。装好 Codex，或在设备页填写程序路径。',
 }
 
 const malformed = /invalid|is required|must be|missing/i
@@ -32,7 +32,7 @@ const patterns: [RegExp, string][] = [
   [/has no sessions folder/i, '这台电脑的 Codex 还没有会话记录。先用 Codex 跑一次对话，再回来重试。'],
   [/explicit App Server socket/i, '还没填 Codex 的连接路径。'],
   [/App Server socket must be an absolute path/i, '连接路径要是绝对路径。'],
-  [/explicit absolute CODEX_HOME/i, '由 Vibeface 启动前，先填 Codex 目录。'],
+  [/explicit absolute CODEX_HOME/i, 'Codex 目录由 Vibeface 在这台设备上隔离管理。'],
   [/Codex SDK|Codex rejected|Codex turn failed|App Server/i, 'Codex 没能完成这次回复。再发一次，还不行就到设备页检查 Codex。'],
   [/peer (did not answer|is unreachable|connection closed|closed the stream|stream failed)|target connection closed|client target refused/i, '另一台设备没有回应，可能关机或断网了。等它上线后再试。'],
   [/client disconnected|client channel idle|membership state closed/i, '连接断开了，正在重新连接。'],

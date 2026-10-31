@@ -679,6 +679,14 @@ impl Runtime {
         if let WorkKind::Agent(provider) = kind {
             provider.check_work(args)?;
         }
+        let requested_model = optional("model")
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty());
+        if target != local && requested_model.is_some() {
+            bail!(
+                "a remote task uses the target Bot's model; omit model or dispatch locally with an execution provider"
+            );
+        }
         if let (Some(thread), WorkKind::Agent(provider)) = (&thread, kind) {
             match self.ran_on(network, thread).await? {
                 Some(ran) if ran != provider => bail!(
@@ -701,6 +709,8 @@ impl Runtime {
             dispatcher: local.clone(),
             call_ref: call_ref.into(),
             kind,
+            model: requested_model,
+            resolved: None,
             // A thread's directory is only informational and may be unknown.
             cwd: match &thread {
                 Some(_) => optional("cwd").unwrap_or_default(),
@@ -716,6 +726,7 @@ impl Runtime {
             let dispatch = self.send_dispatch(network, spec, false).await?;
             return Ok(dispatch_row(&dispatch));
         }
+        let spec = self.resolve_work_model(network, spec).await?;
         let (record, created) = self.accept_dispatch(network, spec.clone()).await?;
         let thread = match &spec.continues {
             None => thread,
@@ -745,7 +756,8 @@ impl Runtime {
         };
         Ok(
             json!({"work_id":record.work_id,"call_ref":call_ref,"state":record.state,
-            "may_send":may_send,"send_by_ms":record.send_by_ms,"cwd":spec.cwd,"thread_id":thread}),
+            "may_send":may_send,"send_by_ms":record.send_by_ms,"cwd":spec.cwd,"thread_id":thread,
+            "model":spec.model,"resolved":spec.resolved}),
         )
     }
 

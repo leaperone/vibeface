@@ -308,8 +308,8 @@ struct Hooks {
     action: HooksAction,
     #[command(flatten)]
     local: LocalNode,
-    /// Home directory holding the coding agents' hook and extension files, Codex's included;
-    /// defaults to `$HOME`, with Codex's in `$CODEX_HOME` when set.
+    /// Explicit home directory holding the user's coding-agent hook and extension files.
+    /// Without it, Codex and Claude hooks use this Node's private Provider roots; other extensions use HOME.
     #[arg(long, value_name = "DIR", value_parser = config::absolute_path)]
     home: Option<PathBuf>,
     /// Show what would change without writing.
@@ -1976,32 +1976,6 @@ async fn hook(options: Hook) -> Result<()> {
     Ok(())
 }
 
-/// The home folder `vibeface hooks` edits and Codex's folder in it. `--home` holds every file,
-/// Codex's too; without it, `$HOME`, and Codex's folder is found as Codex finds it: `CODEX_HOME`,
-/// which must be an existing folder, else `$HOME/.codex`.
-fn hook_homes(home: Option<&Path>, host: &vibeface::discovery::Host) -> Result<(PathBuf, PathBuf)> {
-    if let Some(home) = home {
-        return Ok((home.to_owned(), home.join(".codex")));
-    }
-    let home = host
-        .home
-        .clone()
-        .filter(|home| home.is_absolute())
-        .context("HOME is not an absolute path; pass --home")?;
-    let codex_home = match host.codex_home.clone() {
-        Some(codex_home) => {
-            ensure!(
-                codex_home.is_absolute() && codex_home.is_dir(),
-                "CODEX_HOME {} is not an existing absolute folder",
-                codex_home.display()
-            );
-            codex_home
-        }
-        None => home.join(".codex"),
-    };
-    Ok((home, codex_home))
-}
-
 async fn hooks(options: Hooks, host: vibeface::discovery::Host) -> Result<()> {
     use vibeface::triage;
     if let HooksAction::Test = options.action {
@@ -2019,16 +1993,30 @@ async fn hooks(options: Hooks, host: vibeface::discovery::Host) -> Result<()> {
         println!("Node received the test event {}", result["event_id"]);
         return Ok(());
     }
-    let (home, codex_home) = hook_homes(options.home.as_deref(), &host)?;
     let program = std::env::current_exe()?;
     let data_dir = match options.local.data.data_dir.canonicalize() {
         Ok(dir) => dir,
         Err(_) => options.local.data.data_dir.clone(),
     };
+    let home = options
+        .home
+        .clone()
+        .or_else(|| host.home.clone())
+        .context("HOME is not an absolute path; pass --home")?;
+    let claude_home = options
+        .home
+        .as_deref()
+        .map(|home| home.join(".claude"))
+        .unwrap_or_else(|| data_dir.join("providers/claude"));
+    let codex_home = options
+        .home
+        .as_deref()
+        .map(|home| home.join(".codex"))
+        .unwrap_or_else(|| data_dir.join("providers/codex"));
     let stamp = vibeface::runtime::now_ms();
     // Every file is read and checked before any is written: one that cannot change leaves all.
     let mut planned = Vec::new();
-    for file in triage::hook_files(&home, &codex_home) {
+    for file in triage::hook_files_with_claude_root(&home, &claude_home, &codex_home) {
         let mut settings: Value = match fs::read(&file.path) {
             Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => Value::Null,
             Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
@@ -2962,7 +2950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hooks_install_finds_codex_as_codex_does_and_home_holds_every_file() {
+    async fn hooks_install_uses_node_owned_provider_roots_by_default() {
         use vibeface::discovery::Host;
         let dir = std::env::temp_dir().join(format!("vibeface-hooks-{}", uuid::Uuid::new_v4()));
         let (home, codex, data) = (dir.join("home"), dir.join("codex"), dir.join("data"));
@@ -2997,26 +2985,22 @@ mod tests {
             !codex.exists() && !home.exists(),
             "--home keeps CODEX_HOME and $HOME untouched"
         );
-        assert!(
-            run(env(home.clone(), Some(codex.clone())), None)
-                .await
-                .is_err()
-                && !home.exists(),
-            "a CODEX_HOME that does not exist is refused before anything is written"
-        );
+        run(env(home.clone(), Some(codex.clone())), None)
+            .await
+            .unwrap();
+        assert!(data.join("providers/codex/hooks.json").is_file());
+        assert!(data.join("providers/claude/settings.json").is_file());
+        assert!(!home.join(".claude").exists() && !home.join(".codex").exists() && !codex.exists());
         fs::create_dir_all(&codex).unwrap();
         run(env(home.clone(), Some(codex.clone())), None)
             .await
             .unwrap();
-        assert!(codex.join("hooks.json").is_file());
-        assert!(home.join(".claude/settings.json").is_file());
+        assert!(data.join("providers/codex/hooks.json").is_file());
+        assert!(data.join("providers/claude/settings.json").is_file());
         assert!(
-            !home.join(".codex").exists(),
-            "CODEX_HOME moves Codex's files"
+            !codex.join("hooks.json").exists() && !home.join(".claude").exists(),
+            "default hooks do not touch the user's Provider roots"
         );
-        let plain = dir.join("plain");
-        run(env(plain.clone(), None), None).await.unwrap();
-        assert!(plain.join(".codex/hooks.json").is_file());
         fs::remove_dir_all(dir).unwrap();
     }
 

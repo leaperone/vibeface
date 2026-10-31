@@ -53,7 +53,7 @@ function issueText(provider: ProviderId, issue: ProviderIssue): string {
   }
 }
 
-type Change = { bot?: boolean; execution?: boolean; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
+type Change = { bot?: boolean; execution?: boolean; execution_model?: string; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
 
 function AiSettings() {
   const { ready } = useDevice()
@@ -144,6 +144,8 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
       {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
       <View className="gap-4 border-t border-border p-4">
         {manager ? <AssistantDetails key={`${manager.provider}:${JSON.stringify([manager.model, manager.reasoning_effort, manager.backup])}`} fields={['model']} manager={manager} models={models} working={working} save={saveAssistant} /> : null}
+        {execution ? <ExecutionDetails key={`${item.execution_model}:${item.provider}`} model={item.execution_model} models={models} working={working}
+          save={(model) => change('execution_model', { execution_model: model })} /> : null}
         {item.env.some((row) => row.required) ? <Variables item={item} required working={working} change={change} /> : null}
         {/* As on the web: connection, program and other variables are for whoever needs them; a problem in them opens the fold. */}
         <Details label="高级" open={Boolean(issue && issue.code !== 'env_missing')}>
@@ -248,7 +250,7 @@ function AssistantDetails({ fields, manager, models, working, save }: { fields: 
   return <View className="gap-3">
     {fields.includes('model') ? <><Field label={copy.label}>
       {models && !typing
-        ? <ModelPicker models={models} value={draft.model} working={working} pick={(model) => setDraft({ ...draft, model })} other={() => { setTyping(true); setDraft({ ...draft, model: '' }) }} />
+        ? <ModelPicker models={models} value={draft.model} working={working} copy={copy} pick={(model) => setDraft({ ...draft, model })} other={() => { setTyping(true); setDraft({ ...draft, model: '' }) }} />
         : <View className="flex-row items-center gap-2">
           {input('model', copy.label, cursor ? 'auto' : copy.default)}
           {models ? <Button variant="ghost" size="icon" accessibilityLabel={copy.pick} disabled={working}
@@ -270,10 +272,28 @@ function AssistantDetails({ fields, manager, models, working, save }: { fields: 
   </View>
 }
 
+function ExecutionDetails({ model, models, working, save }: { model: string; models: ModelChoice[] | null; working: boolean; save(model: string): Promise<boolean> }) {
+  const [draft, setDraft] = useState(model)
+  const [chosen, setTyping] = useState<boolean | null>(null)
+  useEffect(() => { setDraft(model); setTyping(null) }, [model])
+  const typing = chosen ?? modelTyped(model, models)
+  const dirty = draft.trim() !== model
+  return <View className="gap-2">
+    <Field label={deviceCopy.executionModel.label}>
+      {models && !typing ? <ModelPicker models={models} value={draft} working={working} copy={deviceCopy.executionModel} pick={setDraft} other={() => { setTyping(true); setDraft('') }} />
+        : <View className="flex-row items-center gap-2">
+          <Input accessibilityLabel={deviceCopy.executionModel.label} className="min-w-0 flex-1" autoCapitalize="none" autoCorrect={false} placeholder={deviceCopy.executionModel.default} value={draft} editable={!working} onChangeText={setDraft} />
+          {models ? <Button variant="ghost" size="icon" accessibilityLabel={deviceCopy.executionModel.pick} disabled={working}
+            onPress={() => { setTyping(false); setDraft(models.some((choice) => choice.id === draft) ? draft : '') }}><Icon as={List} /></Button> : null}
+        </View>}
+    </Field>
+    {dirty ? <Button variant="outline" className="self-start" disabled={working} onPress={() => void save(draft.trim())}><Text>保存</Text></Button> : null}
+  </View>
+}
+
 /** The web's model dropdown as a phone shows one: the choice in a row that opens the list in place. */
-function ModelPicker({ models, value, working, pick, other }: { models: ModelChoice[]; value: string; working: boolean; pick(model: string): void; other(): void }) {
+function ModelPicker({ models, value, working, copy = deviceCopy.botModel, pick, other }: { models: ModelChoice[]; value: string; working: boolean; copy?: typeof deviceCopy.botModel; pick(model: string): void; other(): void }) {
   const [open, setOpen] = useState(false)
-  const copy = deviceCopy.botModel
   const options: [string, string][] = [['', copy.default], ...models.map((model): [string, string] => [model.id, model.name])]
   const shown = options.find(([id]) => id === value)?.[1] ?? value
   const choose = (next: () => void) => { setOpen(false); next() }

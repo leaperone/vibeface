@@ -2038,6 +2038,7 @@ pub(super) mod tests {
             "/tmp/vf-{}.sock",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         );
+        configuration.providers.codex_app_server.mode = crate::providers::AppServerMode::System;
         configuration.providers.codex_app_server.socket = Some(socket.into());
         configuration.providers.execution = [crate::providers::Provider::Codex].into();
         configuration.network = network;
@@ -2271,6 +2272,8 @@ pub(super) mod tests {
                 dispatcher: local,
                 call_ref: "r".into(),
                 kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
+                model: None,
+                resolved: None,
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -2339,6 +2342,8 @@ pub(super) mod tests {
             dispatcher: local,
             call_ref: work_id.into(),
             kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
+            model: None,
+            resolved: None,
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".into(),
@@ -2433,6 +2438,8 @@ pub(super) mod tests {
                 dispatcher: local,
                 call_ref: "late".into(),
                 kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
+                model: None,
+                resolved: None,
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -3713,6 +3720,8 @@ pub(super) mod tests {
                 dispatcher: local,
                 call_ref: "r".into(),
                 kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
+                model: None,
+                resolved: None,
                 cwd: "/w".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -3762,6 +3771,8 @@ pub(super) mod tests {
                 dispatcher: local.clone(),
                 call_ref: "r".into(),
                 kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
+                model: None,
+                resolved: None,
                 cwd: "/w".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -4044,6 +4055,8 @@ pub(super) mod tests {
                 dispatcher: node.identity.device_id()?,
                 call_ref: "r".into(),
                 kind: crate::model::WorkKind::Task,
+                model: None,
+                resolved: None,
                 cwd: "/w".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -4209,6 +4222,8 @@ pub(super) mod tests {
                 dispatcher: local,
                 call_ref: "w-earlier".into(),
                 kind: crate::model::WorkKind::Agent(Provider::Claude),
+                model: None,
+                resolved: None,
                 cwd: String::new(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -4410,6 +4425,8 @@ pub(super) mod tests {
                 dispatcher: local,
                 call_ref: "w-codex".into(),
                 kind: WorkKind::Agent(Provider::Codex),
+                model: None,
+                resolved: None,
                 cwd: String::new(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -5560,7 +5577,10 @@ pub(super) mod tests {
                 "declined"
             );
             assert_eq!(saved()?, None, "a declined proposal writes nothing");
-            assert_eq!(node.triage.config().codex_sessions, None);
+            assert_eq!(
+                node.triage.config().codex_sessions,
+                Some(dir.join("providers/codex/sessions"))
+            );
 
             let asked = node
                 .propose_provider_config(

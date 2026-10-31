@@ -2658,14 +2658,15 @@ mod tests {
         };
         let codex_key = "fixture-codex-secret-0123456789";
         let cursor_key = "fixture-cursor-secret-0123456789";
-        let codex_home = dir.join("codex-home");
-        config::private_dir(&codex_home)?;
+        let user_codex_home = dir.join("user-codex-home");
+        config::private_dir(&user_codex_home)?;
+        let node_codex_home = dir.join("providers/codex");
         std::fs::write(
-            codex_home.join("config.toml"),
+            node_codex_home.join("config.toml"),
             "model_provider='fixture'\n[model_providers.fixture]\nenv_key='FIXTURE_PROVIDER_KEY'\n",
         )?;
         let set_codex = json!({"provider":"codex","bot":true,"bin":"/fixture/codex",
-            "env":{"FIXTURE_CODEX_KEY":codex_key,"CODEX_HOME":codex_home}});
+            "env":{"FIXTURE_CODEX_KEY":codex_key,"CODEX_HOME":user_codex_home}});
         let mut member = session(&client)?;
         assert!(
             dispatch(&node, &mut member, "configure_provider", set_codex.clone())
@@ -2697,6 +2698,7 @@ mod tests {
         assert_eq!(codex["provider"], "codex");
         assert_eq!(codex["roles"], json!(["agent", "execution"]));
         assert_eq!(codex["bin"], "/fixture/codex");
+        assert_eq!(codex["home"], node_codex_home.to_string_lossy().as_ref());
         assert!(codex["env"].as_array().unwrap().contains(
             &json!({"name":"FIXTURE_CODEX_KEY","set":true,"inherited":false,"required":false})
         ));
@@ -2705,8 +2707,12 @@ mod tests {
         ));
         assert_eq!(
             (codex["state"].clone(), codex["issues"].clone()),
-            (json!("starting"), json!([])),
-            "the system App Server runs with its own program and variables"
+            (
+                json!("needs_setup"),
+                json!([{"code":"bin_missing","path":"/fixture/codex"},
+                    {"code":"env_missing","name":"FIXTURE_PROVIDER_KEY"}])
+            ),
+            "spawn uses the Node-owned program and provider root"
         );
         assert_eq!(read["providers"][1]["env"][0]["set"], true);
         assert_eq!(
@@ -2717,7 +2723,7 @@ mod tests {
             (json!("off"), json!([])),
             "Cursor runs nothing until a role is enabled"
         );
-        assert_eq!(codex["app_server"]["mode"], "system");
+        assert_eq!(codex["app_server"]["mode"], "spawn");
         assert_eq!(read["providers"][1]["app_server"], Value::Null);
         let spawn = json!({"provider":"codex","app_server":{"mode":"spawn","socket":null}});
         let moved = dispatch(&node, &mut owner, "configure_provider", spawn).await?;

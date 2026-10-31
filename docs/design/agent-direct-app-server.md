@@ -56,10 +56,10 @@ Node 不再有执行层：删除 `executor` 命名、Node 发 `turn/start` 的�
 
 ### 2.1a 用哪个 App Server
 
-App Server 由部署配置显式选择。执行默认关闭；启用时在 `providers.codex_app_server` 选择 `system` 并提供 socket，或选择 `spawn` 并在 Provider 环境设置 `CODEX_HOME`。配置步骤见[部署配置](../deployment.md#配置-sdk-与-app-server)。
+App Server 由部署配置显式选择。执行默认关闭；启用后缺少 mode 默认为 `spawn`，Node 使用自己的 `<data-dir>/providers/codex` 根。只有明确选择 `system` 并提供绝对 socket 才连接外部服务。配置步骤见[部署配置](../deployment.md#配置-sdk-与-app-server)。
 
 - `system`：Node 只连接明确配置的 socket，不搜索用户 home 或其他运行中的会话。它不启动或结束外部 App Server，只重连同一个配置入口。
-- `spawn`：沿用原来的托管方式，`codex_bin` 和 `provider-env.json` 里的 Codex 变量只在这个模式传给 App Server。
+- `spawn`：Node 注入 Node-owned `CODEX_HOME`，覆盖普通 Provider 环境里的同名值；用户凭证不会被复制。
 - Agent 的 `VIBEFACE_CODEX_SOCKET` 固定是 `/tmp/vibeface-<identity>/app-server.sock`，Node 把它软链到正在用的 socket，切换模式或 App Server 换位置时 Agent 的环境不用变。
 - 线程被另一个进程写着时（Codex 报 `already has an active writer`），写请求按“没有发出”报错，不自动重发；观察改为读取 turn，不再反复 `thread/resume`。
 - 网页的 `test_codex_app_server` 做一次独立握手，返回与状态相同的 `{state, socket, user_agent | reason | candidates}`。
@@ -219,4 +219,4 @@ vibeface hooks test --data-dir <数据目录>
 vibeface hooks uninstall --data-dir <数据目录> [--home <目录>] [--dry-run]
 ```
 
-`install` 只修改 home 下各产品的 hook 与扩展文件（`.claude/settings.json`、pi 和 opencode 的扩展）以及 Codex 目录下的 `hooks.json`。不给 `--home` 时 home 是 `$HOME`，Codex 目录是 `CODEX_HOME`（须是已有目录），没设时 `$HOME/.codex`；给 `--home` 时 Codex 目录是 `<目录>/.codex`。先备份原文件，只追加本工具的条目，重复执行不会重复添加。`uninstall` 只删本工具的条目。`--dry-run` 展示将要修改的内容。`test` 仅向明确指定的 Node 发送测试事件。Codex 的 hook 功能仍须由部署者在配置中开启。
+`install` 默认修改 Node-owned 的 Claude/Codex hook 根以及本机扩展目录，不读取用户交互会话。给 `--home` 才显式修改用户目录；该模式不代表 Bot 会接入用户会话。先备份原文件，只追加本工具的条目，重复执行不会重复添加。`uninstall` 只删本工具的条目。`--dry-run` 展示将要修改的内容。`test` 仅向明确指定的 Node 发送测试事件。Codex 的 hook 功能仍须由部署者在配置中开启。

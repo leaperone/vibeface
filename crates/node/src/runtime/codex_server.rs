@@ -1323,6 +1323,7 @@ mod tests {
         let local = Local {
             switches: crate::providers::Providers {
                 execution: [Provider::Codex].into(),
+                execution_models: BTreeMap::new(),
                 codex_app_server: crate::providers::AppServer {
                     mode: AppServerMode::System,
                     socket: Some(control.clone()),
@@ -1334,7 +1335,7 @@ mod tests {
         assert_eq!(
             local.switches.codex_app_server.mode,
             AppServerMode::System,
-            "the system App Server is the default"
+            "an explicit system App Server remains usable"
         );
         let identity = LocalIdentity::generate();
         let (events, _events) = mpsc::unbounded_channel();
@@ -1393,6 +1394,7 @@ mod tests {
         let local = Local {
             switches: crate::providers::Providers {
                 execution: [Provider::Codex].into(),
+                execution_models: BTreeMap::new(),
                 codex_app_server: crate::providers::AppServer {
                     mode: AppServerMode::System,
                     socket: Some(candidate.clone()),

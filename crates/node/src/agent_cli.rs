@@ -9,6 +9,19 @@ use vibeface_bridge::{
 };
 use vibeface_protocol::now_ms;
 
+fn outgoing_model(tracked: &Value, args: &Value) -> Option<String> {
+    match tracked.get("resolved") {
+        Some(Value::Object(resolved)) => resolved
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        _ => tracked["model"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| args["model"].as_str().map(str::to_owned)),
+    }
+}
+
 /// Registers the work with the Node (`track`); a work the Node runs on Codex is sent here.
 /// The CLI reports its thread before the send, sends the prompt with `clientUserMessageId` =
 /// work ID and reports how the send ended (`bind`). Without `thread` the work starts a turn in
@@ -134,7 +147,7 @@ where
         thread_id: thread,
         text: args["prompt"].as_str().unwrap_or_default().into(),
         client_id: work_id.clone(),
-        model: args["model"].as_str().map(str::to_owned),
+        model: outgoing_model(&tracked, &args),
         effort: args["effort"].as_str().map(str::to_owned),
         images: serde_json::from_value(args["images"].clone()).unwrap_or_default(),
         start_only: existing.is_none(),
@@ -228,6 +241,29 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt as _, StreamExt as _};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn outgoing_model_uses_the_frozen_result_before_request_fallbacks() {
+        let args = json!({"model":"requested"});
+        assert_eq!(
+            outgoing_model(
+                &json!({"resolved":{"model":"execution-default"},"model":null}),
+                &args
+            ),
+            Some("execution-default".into())
+        );
+        assert_eq!(
+            outgoing_model(
+                &json!({"resolved":{"model":null},"model":"requested"}),
+                &args
+            ),
+            None
+        );
+        assert_eq!(
+            outgoing_model(&json!({"model":null}), &args),
+            Some("requested".into())
+        );
+    }
 
     #[tokio::test]
     async fn direct_and_discovered_thread_calls_derive_the_same_title_and_directory() -> Result<()>

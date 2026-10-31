@@ -2511,6 +2511,8 @@ mod tests {
                 dispatcher: ia.device_id()?,
                 call_ref: "remote".into(),
                 kind: WorkKind::Agent(crate::providers::Provider::Codex),
+                model: None,
+                resolved: None,
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),

@@ -593,8 +593,8 @@ impl Provider {
 #[serde(rename_all = "snake_case")]
 pub enum AppServerMode {
     #[default]
-    System,
     Spawn,
+    System,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
@@ -613,6 +613,10 @@ pub struct AppServer {
 pub struct Providers {
     /// The providers dispatched work runs on.
     pub execution: BTreeSet<Provider>,
+    /// A device-local default model for dispatched work on each provider. Empty values follow
+    /// the provider's own default and are omitted when settings are saved.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub execution_models: BTreeMap<Provider, String>,
     #[serde(default)]
     pub codex_app_server: AppServer,
 }
@@ -635,6 +639,14 @@ impl Providers {
                 provider.label()
             );
         }
+        for (provider, model) in &self.execution_models {
+            ensure!(
+                provider.supports().contains(&Role::Execution),
+                "{} does not execute dispatched work here yet",
+                provider.label()
+            );
+            crate::model::validate_model(model)?;
+        }
         ensure!(
             !self.app_server_used(codex_agent)
                 || self.codex_app_server.mode != AppServerMode::System
@@ -649,6 +661,22 @@ impl Providers {
             );
         }
         Ok(())
+    }
+
+    /// The configured execution override, or the provider's own default when it is empty.
+    pub fn execution_model(&self, provider: Provider) -> String {
+        self.execution_models
+            .get(&provider)
+            .map_or_else(|| provider.model(""), |model| provider.model(model))
+    }
+
+    /// Resolves one execution request without consulting mutable settings again after it is
+    /// persisted into a work record.
+    pub fn resolve_execution_model(&self, provider: Provider, requested: Option<&str>) -> String {
+        requested
+            .filter(|model| !model.trim().is_empty())
+            .map(|model| provider.model(model.trim()))
+            .unwrap_or_else(|| self.execution_model(provider))
     }
 }
 
@@ -812,6 +840,29 @@ pub struct Local {
     pub env: ProviderEnv,
 }
 
+/// Private provider storage owned by one Node. It is derived from the Node data directory and is
+/// never part of shared settings or work records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderRoots {
+    pub codex_home: PathBuf,
+    pub codex_sessions: PathBuf,
+    pub claude_config: PathBuf,
+    pub claude_projects: PathBuf,
+}
+
+impl ProviderRoots {
+    pub fn new(data_dir: &Path) -> Self {
+        let codex_home = data_dir.join("providers/codex");
+        let claude_config = data_dir.join("providers/claude");
+        Self {
+            codex_sessions: codex_home.join("sessions"),
+            claude_projects: claude_config.join("projects"),
+            codex_home,
+            claude_config,
+        }
+    }
+}
+
 impl Local {
     pub fn bin(&self, provider: Provider) -> PathBuf {
         self.bins
@@ -828,17 +879,6 @@ impl Local {
 
     pub fn validate(&self, codex_agent: bool) -> Result<()> {
         self.switches.validate(codex_agent)?;
-        if self.switches.app_server_used(codex_agent)
-            && self.switches.codex_app_server.mode == AppServerMode::Spawn
-        {
-            ensure!(
-                self.env
-                    .get(Provider::Codex)
-                    .get("CODEX_HOME")
-                    .is_some_and(|home| std::path::Path::new(home).is_absolute()),
-                "set an explicit absolute CODEX_HOME before starting a managed App Server"
-            );
-        }
         Ok(())
     }
     /// The variables reach only an App Server the Node starts; the system one keeps its own.
@@ -1035,15 +1075,13 @@ mod tests {
         };
         assert!(local.switches.execution.is_empty() && local.switches.validate(false).is_ok());
         assert!(local.codex_target(false) == CodexTarget::Off);
-        assert!(local.validate(true).is_err());
+        assert!(local.validate(true).is_ok());
         local.switches.execution.insert(Provider::Codex);
-        assert!(local.validate(false).is_err());
-        local.switches.codex_app_server.socket = Some("/configured/app-server.sock".into());
         assert!(local.validate(false).is_ok());
-        assert!(matches!(local.codex_target(false), CodexTarget::System(_)));
+        assert!(matches!(local.codex_target(false), CodexTarget::Spawn(_)));
         local.switches.execution.clear();
         assert!(local.validate(true).is_ok());
-        assert!(matches!(local.codex_target(true), CodexTarget::System(_)));
+        assert!(matches!(local.codex_target(true), CodexTarget::Spawn(_)));
         assert!(local.codex_target(false) == CodexTarget::Off);
         local.switches.execution.insert(Provider::Cursor);
         assert!(
@@ -1075,8 +1113,8 @@ mod tests {
             bins: BTreeMap::new(),
             env,
         };
-        assert!(local.switches.validate(false).is_err());
-        assert!(local.codex_target(false) == CodexTarget::Off);
+        assert!(local.switches.validate(false).is_ok());
+        assert!(matches!(local.codex_target(false), CodexTarget::Spawn(_)));
         local.switches.codex_app_server = AppServer {
             mode: AppServerMode::Spawn,
             socket: Some("/tmp/kept.sock".into()),
@@ -1090,6 +1128,43 @@ mod tests {
         local.switches.codex_app_server.socket = Some("relative.sock".into());
         assert!(local.switches.validate(false).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn execution_model_overrides_are_separate_from_the_bot_and_clear_to_provider_default() {
+        let mut providers = Providers::default();
+        providers
+            .execution_models
+            .insert(Provider::Codex, "fixture-execution".into());
+        assert_eq!(
+            providers.execution_model(Provider::Codex),
+            "fixture-execution"
+        );
+        assert_eq!(
+            providers.resolve_execution_model(Provider::Codex, None),
+            "fixture-execution"
+        );
+        assert_eq!(
+            providers.resolve_execution_model(Provider::Codex, Some("fixture-request")),
+            "fixture-request"
+        );
+        providers.execution_models.remove(&Provider::Codex);
+        assert_eq!(providers.execution_model(Provider::Codex), "");
+    }
+
+    #[test]
+    fn provider_roots_are_derived_inside_the_node_data_directory() {
+        let roots = ProviderRoots::new(Path::new("/private/node"));
+        assert_eq!(
+            roots.codex_home,
+            PathBuf::from("/private/node/providers/codex")
+        );
+        assert_eq!(roots.codex_sessions, roots.codex_home.join("sessions"));
+        assert_eq!(
+            roots.claude_config,
+            PathBuf::from("/private/node/providers/claude")
+        );
+        assert_eq!(roots.claude_projects, roots.claude_config.join("projects"));
     }
 
     #[test]
@@ -1138,7 +1213,7 @@ mod tests {
             local.bin(Provider::Cursor),
             PathBuf::from("cursor-sdk-bridge")
         );
-        assert!(local.launches(Provider::Claude) && !local.launches(Provider::Codex));
+        assert!(local.launches(Provider::Claude) && local.launches(Provider::Codex));
         Ok(())
     }
 }

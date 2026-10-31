@@ -157,6 +157,12 @@ function optionalWorkFields(data: Record<string, unknown>): Partial<WorkRecord> 
   }
   const kind = workKind(data.kind)
   if (kind !== undefined) fields.kind = kind
+  if (typeof data.model === "string") fields.model = data.model
+  if (data.resolved != null) {
+    const resolved = record(data.resolved)
+    if (!providerIds.includes(resolved.provider as ProviderId)) throw new Error("冻结模型的 provider 无法识别。")
+    fields.resolved = { provider: resolved.provider as ProviderId, model: resolved.model == null ? null : text(resolved.model) }
+  }
   if (data.phase != null) fields.phase = workPhase(data.phase)
   return fields
 }

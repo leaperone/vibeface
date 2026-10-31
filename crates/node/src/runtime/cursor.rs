@@ -642,7 +642,7 @@ impl Executor for CursorExecutor {
         network: &'a str,
         work: &'a WorkSpec,
         thread: Option<&'a str>,
-        args: &'a Value,
+        _args: &'a Value,
     ) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
             ensure!(
@@ -670,7 +670,7 @@ impl Executor for CursorExecutor {
             let turn = match self.turn(
                 &instance,
                 owner.workspace.clone(),
-                args["model"].as_str().unwrap_or_default().into(),
+                work.execution_model().unwrap_or_default().into(),
                 None,
                 None,
             ) {
@@ -1181,6 +1181,8 @@ mod tests {
             dispatcher: device,
             call_ref: call_ref.into(),
             kind: WorkKind::Agent(Provider::Cursor),
+            model: None,
+            resolved: None,
             cwd: workspace.display().to_string(),
             title: "cursor work".into(),
             prompt: prompt.into(),

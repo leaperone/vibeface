@@ -274,6 +274,7 @@ impl Runtime {
         network: &str,
         spec: WorkSpec,
     ) -> Result<(WorkRecord, bool)> {
+        let spec = self.resolve_work_model(network, spec).await?;
         if self
             .store
             .lock()
@@ -307,6 +308,84 @@ impl Runtime {
         Ok((record, created))
     }
 
+    /// Resolves a work model exactly once at the accepting Node. The request model remains in
+    /// `WorkSpec.model`; the result is persisted separately and is never accepted from a peer.
+    pub(super) async fn resolve_work_model(
+        &self,
+        network: &str,
+        mut spec: WorkSpec,
+    ) -> Result<WorkSpec> {
+        match spec.kind {
+            WorkKind::Agent(provider) => {
+                ensure!(
+                    spec.target == self.identity.device_id()?,
+                    "an execution work targets another Node"
+                );
+                if let Some(resolved) = &spec.resolved {
+                    ensure!(
+                        resolved.provider == provider,
+                        "resolved work provider does not match its agent"
+                    );
+                    if let Some(model) = &resolved.model {
+                        crate::model::validate_model(model)?;
+                    }
+                    return Ok(spec);
+                }
+                let requested = spec
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty());
+                let providers = self.providers();
+                let resolved = providers
+                    .switches
+                    .resolve_execution_model(provider, requested);
+                crate::model::validate_model(&resolved)?;
+                spec.model = requested.map(str::to_owned);
+                spec.resolved = Some(ResolvedModel {
+                    provider,
+                    model: (!resolved.is_empty()).then_some(resolved),
+                });
+            }
+            WorkKind::Task => {
+                ensure!(
+                    spec.model
+                        .as_deref()
+                        .is_none_or(|model| model.trim().is_empty()),
+                    "a remote task uses the target Bot's model; omit model"
+                );
+                let manager = self
+                    .manager()
+                    .context("this device has no bot to take the task")?;
+                let bot = self
+                    .store
+                    .lock()
+                    .await
+                    .bot_for_conversation(network, &spec.conversation)?;
+                if let Some(resolved) = &spec.resolved {
+                    ensure!(
+                        resolved.provider == manager.provider,
+                        "resolved task provider does not match this Bot"
+                    );
+                    if let Some(model) = &resolved.model {
+                        crate::model::validate_model(model)?;
+                    }
+                    return Ok(spec);
+                }
+                let model = crate::scheduler::bot_model(&manager, bot.as_ref())
+                    .unwrap_or_else(|| manager.model.clone());
+                let model = manager.provider.model(model.trim());
+                crate::model::validate_model(&model)?;
+                spec.model = None;
+                spec.resolved = Some(ResolvedModel {
+                    provider: manager.provider,
+                    model: (!model.is_empty()).then_some(model),
+                });
+            }
+        }
+        Ok(spec)
+    }
+
     /// Another Node's dispatch. The dispatcher may be ahead of this Node, so a refusal is retried
     /// once after syncing from it; a second refusal is final and the dispatcher reports it.
     pub(super) async fn accept_remote_dispatch(
@@ -323,6 +402,10 @@ impl Runtime {
         ensure!(
             spec.work_id == WorkSpec::id(&spec.conversation, &spec.trigger, &spec.call_ref),
             "work ID does not match its call"
+        );
+        ensure!(
+            spec.resolved.is_none(),
+            "a remote dispatcher cannot provide a resolved model"
         );
         let first = self.accept_dispatch(network, spec.clone()).await;
         let record = match first {

@@ -26,7 +26,9 @@ impl CodexMissing {
 }
 impl std::fmt::Display for CodexMissing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("no Codex folder found on this computer: install Codex so $HOME/.codex exists, set CODEX_HOME for the Node, or enter the Codex folder")
+        f.write_str(
+            "no Codex program found on this computer: install Codex or set its program path",
+        )
     }
 }
 impl std::error::Error for CodexMissing {}
@@ -55,22 +57,6 @@ impl Host {
             codex_home: dir(CODEX_HOME),
             home: dir("HOME"),
             path: std::env::var_os("PATH"),
-        }
-    }
-
-    /// `CODEX_HOME` of the Node's environment when set, else `$HOME/.codex`; it must exist.
-    pub fn codex_home(&self) -> Result<PathBuf> {
-        let home = match &self.codex_home {
-            Some(home) => home.clone(),
-            None => match &self.home {
-                Some(home) => home.join(".codex"),
-                None => bail!(CodexMissing),
-            },
-        };
-        if home.is_absolute() && home.is_dir() {
-            Ok(home)
-        } else {
-            bail!(CodexMissing)
         }
     }
 
@@ -321,8 +307,8 @@ impl Paths {
     }
 }
 
-/// What this computer supplies for the uses that are on and miss a path. `codex` also counts
-/// Codex as in use when it is about to be. Fails only when Codex is needed and has no folder.
+/// What this computer supplies for the uses that are on and miss a program path. `codex` also
+/// counts Codex as in use when it is about to be. External session scanning needs an explicit root.
 pub fn missing(target: &Target, codex: bool, host: &Host) -> Result<Paths> {
     let local = &*target.local;
     let codex = codex
@@ -332,43 +318,14 @@ pub fn missing(target: &Target, codex: bool, host: &Host) -> Result<Paths> {
                 .as_ref()
                 .is_some_and(|m| m.provider.on_app_server()),
         );
-    let home_set = local.env.get(Provider::Codex).contains_key(CODEX_HOME);
     let mut paths = Paths::default();
     let server = &local.switches.codex_app_server;
-    let mut spawn = server.mode == AppServerMode::Spawn;
-    if codex {
-        if server.mode == AppServerMode::System && server.socket.is_none() {
-            let home = host.codex_home()?;
-            match control_socket(&home) {
-                Some(socket) => {
-                    paths.app_server = Some(AppServer {
-                        mode: AppServerMode::System,
-                        socket: Some(socket),
-                    })
-                }
-                None => {
-                    spawn = true;
-                    paths.app_server = Some(AppServer {
-                        mode: AppServerMode::Spawn,
-                        socket: None,
-                    });
-                    if !home_set {
-                        paths.codex_home = Some(home);
-                    }
-                }
-            }
-        } else if spawn && !home_set {
-            paths.codex_home = Some(host.codex_home()?);
-        }
-    }
+    let spawn = server.mode == AppServerMode::Spawn;
+    // A missing socket never means "find the user's App Server". The Node injects its own
+    // provider root at runtime; a system server is an explicit socket-only opt-in.
     if target.triage.codex_sessions.is_none() {
         if target.triage.scan_codex_sessions {
-            match sessions_dir(&host.codex_home()?) {
-                Some(sessions) => paths.codex_sessions = Some(sessions),
-                None => bail!("this computer's Codex folder has no sessions folder yet"),
-            }
-        } else if codex {
-            paths.codex_sessions = host.codex_home().ok().as_deref().and_then(sessions_dir);
+            bail!("set an explicit Codex sessions directory before scanning external sessions");
         }
     }
     let bot = target.manager.as_ref().map(|manager| manager.provider);
@@ -515,38 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_home_from_the_environment_comes_before_the_home_folder() -> Result<()> {
-        let root = scratch("order");
-        let home = root.join("home");
-        let env_home = root.join("env-codex");
-        std::fs::create_dir_all(home.join(".codex"))?;
-        std::fs::create_dir_all(&env_home)?;
-        let host = Host {
-            codex_home: Some(env_home.clone()),
-            home: Some(home.clone()),
-            path: None,
-        };
-        assert_eq!(host.codex_home()?, env_home);
-        let host = Host {
-            codex_home: None,
-            ..host
-        };
-        assert_eq!(host.codex_home()?, home.join(".codex"));
-        let missing_env = Host {
-            codex_home: Some(root.join("absent")),
-            home: Some(home),
-            path: None,
-        };
-        assert!(
-            missing_env.codex_home().is_err(),
-            "a CODEX_HOME that does not exist is an error, not a reason to look elsewhere"
-        );
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn without_a_codex_folder_turning_codex_on_fails_clearly() -> Result<()> {
+    fn missing_discovery_never_adopts_a_user_codex_folder() -> Result<()> {
         let root = scratch("none");
         let host = Host {
             codex_home: None,
@@ -559,28 +485,18 @@ mod tests {
             manager: &mut manager,
             triage: &mut triage,
         };
-        let error = missing(&target, true, &host).unwrap_err();
-        assert!(
-            error.downcast_ref::<CodexMissing>().is_some(),
-            "the client channel can tag it"
-        );
-        let error = error.to_string();
-        assert!(error.contains("no Codex folder found"), "{error}");
-        assert!(
-            !error.contains(&root.to_string_lossy().into_owned()),
-            "the error names no local path"
-        );
+        assert!(missing(&target, true, &host)?.is_empty());
         assert!(
             missing(&target, false, &host)?.is_empty(),
             "nothing is looked up while Codex is not in use"
         );
-        assert!(missing(&target, true, &Host::default()).is_err());
+        assert!(missing(&target, true, &Host::default())?.is_empty());
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
     #[test]
-    fn a_running_app_server_is_used_and_otherwise_the_node_starts_its_own() -> Result<()> {
+    fn missing_system_socket_never_adopts_the_users_app_server() -> Result<()> {
         let root = scratch("socket");
         let codex = root.join(".codex");
         std::fs::create_dir_all(codex.join("sessions"))?;
@@ -599,15 +515,9 @@ mod tests {
             true,
             &host,
         )?;
-        assert_eq!(
-            found.app_server,
-            Some(AppServer {
-                mode: AppServerMode::Spawn,
-                socket: None
-            })
-        );
-        assert_eq!(found.codex_home.as_ref(), Some(&codex));
-        assert_eq!(found.codex_sessions, Some(codex.join("sessions")));
+        assert_eq!(found.app_server, None);
+        assert_eq!(found.codex_home, None);
+        assert_eq!(found.codex_sessions, None);
 
         std::fs::create_dir_all(codex.join("app-server-control"))?;
         let socket = codex.join("app-server-control/app-server-control.sock");
@@ -621,23 +531,14 @@ mod tests {
             true,
             &host,
         )?;
-        assert_eq!(
-            found.app_server,
-            Some(AppServer {
-                mode: AppServerMode::System,
-                socket: Some(socket)
-            })
-        );
-        assert_eq!(
-            found.codex_home, None,
-            "the system App Server keeps its own folder"
-        );
+        assert_eq!(found.app_server, None);
+        assert_eq!(found.codex_home, None);
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
     #[test]
-    fn what_startup_finds_is_saved_and_read_back() -> Result<()> {
+    fn startup_does_not_save_user_provider_paths() -> Result<()> {
         let root = scratch("startup");
         let codex = root.join(".codex");
         std::fs::create_dir_all(codex.join("sessions"))?;
@@ -656,13 +557,12 @@ mod tests {
         complete_saved(&dir, &host)?;
         let saved = Config::load(&dir)?;
         assert_eq!(saved.providers.codex_app_server.mode, AppServerMode::Spawn);
-        assert_eq!(saved.triage.codex_sessions, Some(codex.join("sessions")));
-        assert_eq!(
+        assert_eq!(saved.triage.codex_sessions, None);
+        assert!(
             ProviderEnv::load(&dir)?
                 .get(crate::providers::Provider::Codex)
                 .get(CODEX_HOME)
-                .map(PathBuf::from),
-            Some(codex.clone())
+                .is_none()
         );
         let before = std::fs::read(dir.join("config.json"))?;
         complete_saved(&dir, &host)?;

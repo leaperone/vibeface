@@ -346,8 +346,7 @@ fn projects_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     let home = env
         .get("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".claude")))?;
+        .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from))?;
     Some(home.join("projects"))
 }
 
@@ -1150,7 +1149,7 @@ impl Executor for Claude {
                 cwd: &cwd,
                 session: &session,
                 resume: thread.is_some(),
-                model: args["model"].as_str().unwrap_or_default(),
+                model: work.execution_model().unwrap_or_default(),
                 // Claude Code's lowest effort is `low`.
                 effort: args["effort"].as_str().map(|effort| match effort {
                     "none" | "minimal" => "low",
@@ -2121,6 +2120,8 @@ mod tests {
             dispatcher: local,
             call_ref: call_ref.into(),
             kind: WorkKind::Agent(Provider::Claude),
+            model: None,
+            resolved: None,
             cwd: place.dir.join("work").display().to_string(),
             title: "t".into(),
             prompt: prompt.into(),

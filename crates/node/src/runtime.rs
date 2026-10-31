@@ -4,7 +4,7 @@ use crate::{
     identity::{AuthorizationView, GovernanceAction, IdentityKind, NetworkState},
     maintenance::Gate,
     model::*,
-    providers::Provider,
+    providers::{Provider, ProviderRoots},
     store::{Store, WriteState},
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -160,6 +160,8 @@ fn workspace_work_summary(work: &WorkProjection, source: &str) -> Value {
         "target_node": work.target_node,
         "dispatcher": work.dispatcher,
         "call_ref": work.call_ref,
+        "model": work.model,
+        "resolved": work.resolved,
         "parent": work.parent,
         "continues": work.continues,
         "thread": work.thread,
@@ -278,6 +280,8 @@ mod workspace_overview_tests {
             title: "title".into(),
             prompt: "provider secret".into(),
             call_ref: "call-ref".into(),
+            model: None,
+            resolved: None,
             continues: None,
             parent: None,
             thread: None,
@@ -420,6 +424,25 @@ fn id(v: &Value, key: &str) -> Result<String> {
     Ok(s.into())
 }
 impl Runtime {
+    pub(crate) fn enforce_provider_roots(&self, local: &mut crate::providers::Local) -> Result<()> {
+        let roots = ProviderRoots::new(&self.data_dir);
+        local.env.apply(
+            Provider::Codex,
+            BTreeMap::from([(
+                crate::discovery::CODEX_HOME.into(),
+                Some(roots.codex_home.to_string_lossy().into_owned()),
+            )]),
+        )?;
+        local.env.apply(
+            Provider::Claude,
+            BTreeMap::from([(
+                "CLAUDE_CONFIG_DIR".into(),
+                Some(roots.claude_config.to_string_lossy().into_owned()),
+            )]),
+        )?;
+        Ok(())
+    }
+
     pub async fn open(dir: &Path) -> Result<Self> {
         let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
         ensure!(
@@ -430,7 +453,16 @@ impl Runtime {
         let process_lock = Arc::new(config::lock_data_dir(dir)?);
         let host = crate::discovery::Host::current();
         crate::discovery::complete_saved(dir, &host)?;
-        let config = Config::load(dir)?;
+        let mut config = Config::load(dir)?;
+        let provider_roots = ProviderRoots::new(dir);
+        for directory in [
+            provider_roots.codex_home.as_path(),
+            provider_roots.codex_sessions.as_path(),
+            provider_roots.claude_config.as_path(),
+            provider_roots.claude_projects.as_path(),
+        ] {
+            config::private_dir(directory)?;
+        }
         let entry_token = ((config.public_entry
             && config.network.relay_mode == crate::net::RelayServiceMode::Forward)
             || config.network.entry.is_some())
@@ -449,11 +481,29 @@ impl Runtime {
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
         vibeface_bridge::agent::SdkBridge::kill_orphan(&dir.join(cursor::PIDFILE));
-        let providers = Arc::new(std::sync::Mutex::new(crate::providers::Local {
+        let mut local = crate::providers::Local {
             switches: config.providers.clone(),
             bins: config.bins.clone(),
             env: crate::providers::ProviderEnv::load(dir)?,
-        }));
+        };
+        local.env.apply(
+            Provider::Codex,
+            BTreeMap::from([(
+                crate::discovery::CODEX_HOME.into(),
+                Some(provider_roots.codex_home.to_string_lossy().into_owned()),
+            )]),
+        )?;
+        local.env.apply(
+            Provider::Claude,
+            BTreeMap::from([(
+                "CLAUDE_CONFIG_DIR".into(),
+                Some(provider_roots.claude_config.to_string_lossy().into_owned()),
+            )]),
+        )?;
+        if !config.triage.scan_codex_sessions {
+            config.triage.codex_sessions = Some(provider_roots.codex_sessions.clone());
+        }
+        let providers = Arc::new(std::sync::Mutex::new(local));
         let codex_agent = config
             .manager
             .as_ref()

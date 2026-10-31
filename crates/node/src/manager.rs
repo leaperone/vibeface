@@ -887,7 +887,7 @@ pub(crate) fn secret_values(config: &ManagerConfig) -> Vec<String> {
     values
 }
 /// The variables the active model provider of Codex's configuration reads; `env` is what this
-/// Node sets for Codex, which may point it at another `CODEX_HOME`.
+/// Node sets for Codex, including its Node-owned `CODEX_HOME`.
 pub(crate) fn provider_environment_keys(env: &BTreeMap<String, String>) -> Result<Vec<String>> {
     let home = env.get("CODEX_HOME").map(PathBuf::from);
     let Some(home) = home else {

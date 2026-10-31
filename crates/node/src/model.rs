@@ -79,6 +79,15 @@ pub enum WorkKind {
     Task,
 }
 
+/// The model choice frozen by the Node that accepts a work. `None` means the provider's
+/// intrinsic default, and is deliberately different from a request that was never resolved.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedModel {
+    pub provider: Provider,
+    pub model: Option<String>,
+}
+
 impl From<WorkKind> for String {
     fn from(kind: WorkKind) -> String {
         match kind {
@@ -787,6 +796,12 @@ pub enum EventBody {
         dispatcher: DeviceId,
         call_ref: String,
         kind: WorkKind,
+        /// The dispatcher's optional model override. The target never treats this as resolved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// The target's frozen provider/model choice.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved: Option<ResolvedModel>,
         cwd: String,
         /// A short line for the user; `prompt` is what the work gets.
         title: String,
@@ -1210,6 +1225,8 @@ pub struct WorkProjection {
     pub title: String,
     pub prompt: String,
     pub call_ref: String,
+    pub model: Option<String>,
+    pub resolved: Option<ResolvedModel>,
     pub continues: Option<String>,
     pub parent: Option<String>,
     /// The existing thread a send went into; `thread_id` is the thread the work runs in.

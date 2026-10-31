@@ -90,7 +90,7 @@ function PathField({ id, label, value, display, placeholder, working, busy, onSa
   </form>
 }
 
-const placeholders = { home: "例如 ~/.codex", socket: "例如 ~/.codex/app-server-control/app-server-control.sock" }
+const placeholders = { socket: "例如 ~/.codex/app-server-control/app-server-control.sock" }
 
 /**
  * Where Codex work runs: the App Server already running on this computer, at its socket, or one the device starts with the
@@ -129,8 +129,7 @@ function AppServerSettings({ server, home, sessions, display, working, blocked, 
       {server.mode === "system"
         ? <PathField id="codex-socket" label="连接路径" value={server.socket} display={display} placeholder={placeholders.socket} working={working} busy={busy.endsWith(":socket")}
             onSave={(path) => save("socket", { app_server: { mode: "system", socket: path || null } })} />
-        : <PathField id="codex-home" label="Codex 目录" value={home} display={display} placeholder={placeholders.home} working={working} busy={busy.endsWith(":home")}
-            onSave={(path) => save("home", { env: { CODEX_HOME: path || null } })} />}
+        : <p className="grid gap-1"><span className="font-medium">Node-owned Codex 目录</span><FolderPath path={home ?? ""} shown={home ? display[home] : "由 Node 创建"} /></p>}
       {sessions ? <p className="grid gap-1"><span className="font-medium">会话目录</span><span className="flex min-w-0 text-foreground"><FolderPath path={sessions} shown={display[sessions]} /></span></p> : null}
       {children}
     </Details>
@@ -138,14 +137,13 @@ function AppServerSettings({ server, home, sessions, display, working, blocked, 
 }
 
 /**
- * When the device found no Codex on this computer: the folder or the running App Server's socket, typed in, turns on what was asked in one write.
- * `onboarding`: only the folder; the socket stays on the device page.
+ * When the device found no Codex on this computer: an explicit system socket can still be entered here.
+ * The spawn runtime directory is always Node-owned.
  */
 function ManualCodex({ onboarding, working, busy, save }: { onboarding: boolean; working: boolean; busy: string; save(key: string, change: Omit<Change, "provider">): Promise<boolean> }) {
   return <Details label="手动填写">
     <div className="grid gap-3">
-      <PathField id="manual-codex-home" label="Codex 目录" value={null} display={{}} placeholder={placeholders.home} working={working} busy={busy.endsWith(":home")}
-        onSave={(path) => save("home", { app_server: { mode: "spawn", socket: null }, env: { CODEX_HOME: path } })} />
+      <p className="text-meta text-muted-foreground">Codex 运行目录由 Node 自动隔离管理。</p>
       {onboarding ? null : <PathField id="manual-codex-socket" label="连接路径" value={null} display={{}} placeholder={placeholders.socket} working={working} busy={busy.endsWith(":socket")}
         onSave={(path) => save("socket", { app_server: { mode: "system", socket: path } })} />}
     </div>
@@ -163,7 +161,7 @@ function openProvider(provider: ProviderId) {
   target?.focus({ preventScroll: true })
 }
 
-type Change = { provider: ProviderId; bot?: boolean; execution?: boolean; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
+type Change = { provider: ProviderId; bot?: boolean; execution?: boolean; execution_model?: string; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
 type Failure = { at: ProviderId | "roots" | null; cause: unknown }
 
 /**
@@ -427,6 +425,8 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
       <div className="grid gap-4 px-4 sm:ps-12 pt-1 pb-4">
         {manager ? <BotDetails key={`${manager.provider}:${JSON.stringify([manager.model, manager.reasoning_effort, manager.backup])}`} fields={["model"]} manager={manager} models={models} display={display} working={working}
           busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
+        {execution ? <ExecutionDetails key={`${item.execution_model}:${item.provider}`} model={item.execution_model} models={models} working={working}
+          busy={busy === `${item.provider}:execution_model`} save={(model) => change("execution_model", { execution_model: model })} /> : null}
         {keys.length ? <ul className="grid gap-1" aria-label={terms.secret.label}>{keys.map((row) => envRow(row, true))}</ul> : null}
 
         {/* Connection, folders, program and variables are for whoever needs them; a problem in them opens the fold. */}
@@ -543,6 +543,31 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
     </label> : <p className="text-meta text-muted-foreground">推理强度由 AI 服务决定</p> : null}
     {fields.includes("model") ? <Details label="备用策略"><BackupPolicyEditor policy={draft.backup} disabled={working} change={(backup) => setDraft({ ...draft, backup })} /></Details> : null}
     {fields.includes("workspace") ? field("workspace", folderLabels.botRun) : null}
+    {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
+  </form>
+}
+
+function ExecutionDetails({ model, models, working, busy, save }: { model: string; models: ModelChoice[] | null; working: boolean; busy: boolean; save(model: string): Promise<boolean> }) {
+  const [draft, setDraft] = useState(model)
+  const [chosen, setTyping] = useState<boolean | null>(null)
+  useEffect(() => { setDraft(model); setTyping(null) }, [model])
+  const typing = chosen ?? modelTyped(model, models)
+  const dirty = draft.trim() !== model
+  return <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void save(draft.trim()) }}>
+    {models && !typing ? <label className="grid gap-1 text-meta">{deviceCopy.executionModel.label}
+      <NativeSelect className="w-full" name="execution_model" value={draft} disabled={working}
+        onChange={(event) => { const value = event.target.value; if (value === other) { setTyping(true); setDraft("") } else setDraft(value) }}>
+        <NativeSelectOption value="">{deviceCopy.executionModel.default}</NativeSelectOption>
+        {models.map((choice) => <NativeSelectOption key={choice.id} value={choice.id}>{choice.name}</NativeSelectOption>)}
+        <NativeSelectOption value={other}>{deviceCopy.executionModel.other}</NativeSelectOption>
+      </NativeSelect>
+    </label> : <div className="flex min-w-0 items-end gap-2">
+      <label className="grid min-w-0 flex-1 gap-1 text-meta">{deviceCopy.executionModel.label}
+        <Input name="execution_model" value={draft} disabled={working} placeholder={deviceCopy.executionModel.default} onChange={(event) => setDraft(event.target.value)} />
+      </label>
+      {models ? <Button type="button" variant="ghost" size="icon" aria-label={deviceCopy.executionModel.pick} title={deviceCopy.executionModel.pick} disabled={working}
+        onClick={() => { setTyping(false); setDraft(models.some((choice) => choice.id === draft) ? draft : "") }}><List aria-hidden="true" /></Button> : null}
+    </div>}
     {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
   </form>
 }

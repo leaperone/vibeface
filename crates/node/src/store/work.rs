@@ -227,6 +227,7 @@ impl Store {
                 ("dispatcher", work.dispatcher == spec.dispatcher),
                 ("call_ref", work.call_ref == spec.call_ref),
                 ("agent", work.kind == spec.kind),
+                ("model", work.model == spec.model),
                 ("cwd", work.cwd == spec.cwd),
                 ("title", work.title == spec.title),
                 ("prompt", work.prompt == spec.prompt),

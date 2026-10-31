@@ -27,6 +27,8 @@ pub struct ProviderChange {
     bot: Option<bool>,
     /// Whether this provider executes dispatched work.
     execution: Option<bool>,
+    /// The device default model for dispatched work. Empty clears the override.
+    execution_model: Option<String>,
     /// The provider's program; empty restores its default.
     bin: Option<PathBuf>,
     /// Which Codex App Server to use.
@@ -97,6 +99,24 @@ impl ProviderChange {
                 target.local.switches.execution.remove(&provider);
             }
             None => {}
+        }
+        if let Some(model) = self.execution_model {
+            ensure!(
+                provider.supports().contains(&Role::Execution),
+                "{} does not execute dispatched work here yet",
+                provider.label()
+            );
+            let model = provider.model(model.trim());
+            crate::model::validate_model(&model)?;
+            if model.is_empty() {
+                target.local.switches.execution_models.remove(&provider);
+            } else {
+                target
+                    .local
+                    .switches
+                    .execution_models
+                    .insert(provider, model);
+            }
         }
         if let Some(bin) = self.bin {
             let trimmed = PathBuf::from(bin.to_string_lossy().trim());
@@ -277,6 +297,13 @@ impl Runtime {
             .filter(|manager| manager.provider == provider)
             .map_or("", |manager| manager.model.as_str());
         let readiness = probe.readiness(model);
+        let execution_model = local
+            .switches
+            .execution_models
+            .get(&provider)
+            .cloned()
+            .unwrap_or_default();
+        let execution_readiness = probe.readiness(&execution_model);
         let state = if roles.is_empty() {
             "off"
         } else {
@@ -291,6 +318,7 @@ impl Runtime {
             "home":codex.then(|| configured.get(discovery::CODEX_HOME)),
             "sessions":codex.then(|| self.triage.config().codex_sessions),
             "env":env, "state":state, "issues":issues, "probe":probe, "readiness":readiness,
+            "execution_model":execution_model, "execution_readiness":execution_readiness,
         })
     }
 
@@ -418,6 +446,7 @@ impl Runtime {
             manager: &mut manager,
             triage: &mut triage,
         })?;
+        self.enforce_provider_roots(&mut next)?;
         let filled = discovery::missing(
             &Target {
                 local: &mut next,
@@ -690,6 +719,10 @@ impl ProposalInput {
     }
 
     fn paths(self) -> Result<Paths> {
+        ensure!(
+            self.codex_home.is_none(),
+            "the Codex runtime directory is owned by this Node"
+        );
         let existing = |path: Option<PathBuf>, what: &str, kind: fn(&Path) -> bool| {
             path.map(|path| {
                 ensure!(

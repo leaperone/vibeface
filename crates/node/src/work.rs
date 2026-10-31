@@ -15,6 +15,12 @@ pub struct WorkSpec {
     pub dispatcher: DeviceId,
     pub call_ref: String,
     pub kind: WorkKind,
+    /// The dispatcher's optional model override. The target resolves it once on acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Filled only by the accepting Node; never supplied by a remote dispatcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<ResolvedModel>,
     pub cwd: String,
     pub title: String,
     pub prompt: String,
@@ -32,6 +38,15 @@ impl WorkSpec {
             "work-{}",
             digest(&serde_json::to_vec(&(conversation, trigger, call_ref)).expect("strings"))
         )
+    }
+
+    /// The model an executor must use after registration. A resolved provider default is an
+    /// intentional `None`, so callers must not fall back to mutable dispatch arguments.
+    pub fn execution_model(&self) -> Option<&str> {
+        match &self.resolved {
+            Some(resolved) => resolved.model.as_deref(),
+            None => self.model.as_deref(),
+        }
     }
 }
 
@@ -270,6 +285,8 @@ pub fn accept(spec: WorkSpec, at: i64) -> (WorkRecord, EventBody) {
         dispatcher: spec.dispatcher.clone(),
         call_ref: spec.call_ref.clone(),
         kind: spec.kind,
+        model: spec.model.clone(),
+        resolved: spec.resolved.clone(),
         cwd: spec.cwd.clone(),
         title: spec.title.clone(),
         prompt: spec.prompt.clone(),
@@ -643,6 +660,8 @@ mod tests {
                 dispatcher: "t".into(),
                 call_ref: "r".into(),
                 kind: WorkKind::Agent(crate::providers::Provider::Codex),
+                model: None,
+                resolved: None,
                 cwd: "/tmp".into(),
                 title: "do".into(),
                 prompt: "do".into(),
@@ -653,6 +672,36 @@ mod tests {
             0,
         )
         .0
+    }
+
+    #[test]
+    fn a_resolved_provider_default_does_not_fall_back_to_the_request_after_freeze() {
+        let mut spec = WorkSpec {
+            work_id: "w".into(),
+            conversation: "c".into(),
+            trigger: "message:m".into(),
+            target: "t".into(),
+            dispatcher: "t".into(),
+            call_ref: "r".into(),
+            kind: WorkKind::Agent(crate::providers::Provider::Codex),
+            model: Some("request-model".into()),
+            resolved: Some(ResolvedModel {
+                provider: crate::providers::Provider::Codex,
+                model: None,
+            }),
+            cwd: "/tmp".into(),
+            title: "do".into(),
+            prompt: "do".into(),
+            continues: None,
+            parent: None,
+            thread: None,
+        };
+        assert_eq!(spec.execution_model(), None);
+        spec.resolved = Some(ResolvedModel {
+            provider: crate::providers::Provider::Codex,
+            model: Some("frozen-model".into()),
+        });
+        assert_eq!(spec.execution_model(), Some("frozen-model"));
     }
 
     fn running() -> WorkRecord {
