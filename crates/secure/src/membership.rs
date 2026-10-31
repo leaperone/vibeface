@@ -839,10 +839,11 @@ fn vetoed(parent: &EpochView, checkpoint: &RootCheckpoint, hash: &str) -> bool {
 }
 
 /// Whether an approval in `parent` makes `checkpoint` take effect before its deadline.
-fn approved(parent: &EpochView, checkpoint: &RootCheckpoint, hash: &str) -> bool {
+fn approved(parent: &EpochView, checkpoint: &RootCheckpoint, hash: &str, now_ms: u64) -> bool {
     checkpoint.directory.is_some()
         && parent.approvals.iter().any(|approval| {
             approval.checkpoint == hash
+                && approval.at_ms <= now_ms
                 && approval.at_ms < checkpoint.effective_at_ms()
                 && checkpoint
                     .heads
@@ -1164,6 +1165,7 @@ impl NetworkState {
                             &epochs[epoch.parent.expect("only genesis has no parent")].view,
                             checkpoint,
                             checkpoint_hash,
+                            now_ms,
                         )
                         || now_ms >= epoch.effective_at_ms =>
                 {
@@ -2466,6 +2468,7 @@ mod tests {
         let event = approve(&a, &before, &checkpoint, T + 1)?;
         assert!(state.append(event)?);
 
+        assert_eq!(state.project_at(T)?.epoch, 1);
         let view = state.project_at(T + 2)?;
         assert_eq!(view.epoch, 2);
         assert!(view.manager(&id(&found)).is_ok());
@@ -2486,7 +2489,8 @@ mod tests {
         let merged = state.merge(&approved)?;
         assert_eq!(merged, approved);
         assert_eq!(approved.merge(&state)?, merged);
-        assert_eq!(merged.project_at(T)?.epoch, 2);
+        assert_eq!(merged.project_at(T)?.epoch, 1);
+        assert_eq!(merged.project_at(T + 2)?.epoch, 2);
         Ok(())
     }
 

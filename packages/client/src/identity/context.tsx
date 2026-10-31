@@ -906,6 +906,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         return
       }
     }
+    if (before.detached) { await refreshDirectory().catch(() => {}); return }
     await refreshDirectory()
   }
   /**

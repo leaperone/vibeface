@@ -108,7 +108,7 @@ export function RecoveryPendingCard() {
     <Button key={`cancel-${confirming ?? 'busy'}`} type="button" variant="ghost" autoFocus disabled={busy} onClick={() => setConfirming(null)}>取消</Button>
     <Button key={confirming ?? 'busy'} type="button" variant={confirming === 'stop' ? 'destructive' : 'default'} className={confirming === 'stop' ? 'bg-destructive text-primary-foreground shadow-xs hover:bg-destructive/88 focus-visible:border-ring focus-visible:ring-ring/50 dark:bg-destructive dark:hover:bg-destructive/88 dark:focus-visible:ring-ring/50' : undefined} disabled={busy} aria-busy={busy || undefined} onClick={() => void run(async () => {
       if (confirming === 'confirm') {
-        await (device as typeof device & { approveRecovery(checkpoint: string): Promise<void> }).approveRecovery(pending.checkpoint)
+        await device.approveRecovery(pending.checkpoint)
         toast(recoveryCopy.confirmDone, { tone: 'success' })
       } else {
         await device.vetoRecovery(pending.checkpoint)

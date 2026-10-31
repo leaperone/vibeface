@@ -197,7 +197,7 @@ export function RecoveryPendingCard() {
   const changes = recoveryChanges(pending, device.directory?.members ?? [])
   const confirm = () => Alert.alert(recoveryCopy.confirmAsk, recoveryCopy.confirmNote, [
     { text: '取消', style: 'cancel' },
-    { text: recoveryCopy.confirm, onPress: () => void run('confirm', async () => { await (device as typeof device & { approveRecovery(checkpoint: string): Promise<void> }).approveRecovery(pending.checkpoint); Alert.alert(recoveryCopy.confirmDone) }) },
+    { text: recoveryCopy.confirm, onPress: () => void run('confirm', async () => { await device.approveRecovery(pending.checkpoint); Alert.alert(recoveryCopy.confirmDone) }) },
   ])
   const stop = () => Alert.alert(recoveryCopy.stopAsk, recoveryCopy.stopNote, [
     { text: '取消', style: 'cancel' },
