@@ -102,6 +102,7 @@ function LogRow({ record, bot, work, computer }: { record: LogRecord; bot?: stri
       <View className="gap-1 px-4 pb-4">
         <Text className="text-meta text-muted-foreground">级别 · {quiet ? '外部输出' : levelLabels[record.level]}</Text>
         <Text selectable className="font-mono text-meta text-muted-foreground">事件 · {record.event}</Text>
+        {record.message !== title ? <Text selectable className="font-mono text-meta text-muted-foreground">原文 · {record.message}</Text> : null}
         {record.conversation_id ? <Text selectable className="font-mono text-meta text-muted-foreground">对话 · {record.conversation_id}</Text> : null}
         {record.work_id ? <Text selectable className="font-mono text-meta text-muted-foreground">任务 · {record.work_id}</Text> : null}
         {record.thread_id ? <Text selectable className="font-mono text-meta text-muted-foreground">会话 · {record.thread_id}</Text> : null}
