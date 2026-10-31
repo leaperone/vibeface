@@ -16,7 +16,7 @@ import { openWorksFromOverview, overviewFromWorkspace } from "@vibeface/client/w
 import { cardState, needsLook, nodeName, staleTaskLabel, taskActive, taskGroup, taskGroups, taskLabel, taskProgress, taskStale, type TaskGroup } from "@vibeface/client/workspace/labels.ts"
 import { projectName } from "@vibeface/client/workspace/questions.ts"
 import { workFailure } from "@vibeface/client/lib/errors.ts"
-import type { NodeInfo, OpenWork, OverviewTask } from "@vibeface/client/workspace/types.ts"
+import type { NodeInfo, OpenWorkCard, OverviewTask } from "@vibeface/client/workspace/types.ts"
 import { useInbox } from "./inbox"
 import { ConfirmCard } from "./task-activity"
 import { QuestionCard } from "./question-card"
@@ -50,7 +50,7 @@ export function TasksOverview() {
   const waitingSessions = new Set(openQuestions.filter((question) => question.about.request_id).map((question) => question.about.session_id))
   const projected = new Map(overview.tasks.filter((task): task is ProjectedWork => task.kind === "work" || task.kind === "dispatch").filter((task) => task.work_id).map((task) => [task.work_id!, task]))
   const tasks = overviewWorks.filter((work) => projected.has(work.work_id) && !attentionWorkIds.has(work.work_id))
-  const groups: Record<TaskGroup, OpenWork[]> = { attention: [], working: [], waiting: [] }
+  const groups: Record<TaskGroup, OpenWorkCard[]> = { attention: [], working: [], waiting: [] }
   const botIds = new Map(workspace.bots.map((bot) => [bot.conversation_id, bot.bot_id]))
   const matchesBot = (conversationId: string, projectedBotId?: string | null) => botFilter === "all" || projectedBotId === botFilter || botIds.get(conversationId) === botFilter
   for (const work of tasks) {
@@ -71,7 +71,7 @@ export function TasksOverview() {
   const visibleCount = noticed + (visible("working") ? groups.working.length : 0) + (visible("waiting") ? groups.waiting.length : 0)
   const hasContent = visibleCount > 0
   const emptyLabel = filter === "all" && botFilter === "all" ? "没有未完成的任务" : "没有符合筛选的任务"
-  const card = (work: OpenWork) => <TaskOverviewCard key={work.work_id} work={work} projected={projected.get(work.work_id)} lookup={lookup} connected={workspace.connectionOnline} progress={taskProgress(work, workspace.liveProgress)} />
+  const card = (work: OpenWorkCard) => <TaskOverviewCard key={work.work_id} work={work} projected={projected.get(work.work_id)} lookup={lookup} connected={workspace.connectionOnline} progress={taskProgress(work, workspace.liveProgress)} />
   const bot = workspace.bots.find((item) => item.bot_id === botFilter) ?? workspace.selectedBot ?? workspace.bots[0]
 
   if (workspace.incomplete && !workspace.nodes.length) return <div className="mx-auto grid w-full max-w-(--page-width) gap-3" aria-busy="true"><Skeleton className="h-20" /><Skeleton className="h-20" /><Skeleton className="h-20" /></div>
@@ -131,7 +131,7 @@ function OverviewSection({ title, count, children }: { title: string; count: num
   </section>
 }
 
-function TaskOverviewCard({ work, projected, lookup, connected, progress }: { work: OpenWork; projected?: ProjectedWork; lookup: { nodes: NodeInfo[]; directory: MembershipView | null }; connected: boolean; progress: string }) {
+function TaskOverviewCard({ work, projected, lookup, connected, progress }: { work: OpenWorkCard; projected?: ProjectedWork; lookup: { nodes: NodeInfo[]; directory: MembershipView | null }; connected: boolean; progress: string }) {
   const state = cardState(work, lookup.nodes, projected?.state)
   const stale = taskStale(state, connected)
   const unknown = state === "unknown" || state === "unverified" || state === "accepted_waiting_sync" || state === "dispatch_rejected" || state === "dispatch_unverified"

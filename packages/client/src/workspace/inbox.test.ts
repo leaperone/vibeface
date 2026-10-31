@@ -3,7 +3,7 @@ import test from 'node:test'
 import { availability, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
 import { chatTaskState, deviceForm, deviceOnline, entryLabel, fixOnDevice, formName, promptSummary, taskLabel } from './labels.ts'
-import type { BotRecord, NodeInfo, Question, WorkRecord } from './types.ts'
+import type { BotRecord, NodeInfo, Question, WorkCard } from './types.ts'
 
 const question = (id: string, closed = false): Question => ({
   question_id: id, conversation_id: 'c', bot: { bot_id: 'b', name: '助手' }, severity: 'normal', text: id, choices: [], about: { kind: 'general' },
@@ -56,7 +56,7 @@ test('a different pending recovery gets a fresh confirmation card', () => {
 test('a failed task waits in 待处理 under its bot until something follows it up, naming its device', () => {
   const failed = source(false)
   const work = { work_id: 'w1', conversation_id: 'c', trigger: '', target_node: 'mac', cwd: '/w', title: '跑测试', prompt: '', state: 'finished', summary: '', outcome: 'failed', result_text: '', failure_reason: 'timed out' } as const
-  failed.workspace.openWorks = [work, { ...work, work_id: 'w2', outcome: null, state: 'running' }, { ...work, work_id: 'w3', title: '', outcome: null, state: 'dispatch_rejected' }]
+  failed.workspace.openWorks = [{ ...work, resolved: { provider: 'codex', model: null } }, { ...work, work_id: 'w2', outcome: null, state: 'running', resolved: { provider: 'codex', model: null } }, { ...work, work_id: 'w3', title: '', outcome: null, state: 'dispatch_rejected' }]
   failed.workspace.bots = [botRecord]
   assert.deepEqual(inboxItems(failed).filter((item) => item.kind === 'failed').map((item) => [item.key, item.title, item.meta]), [['failed:w1', '跑测试', 'Mac'], ['failed:w3', '任务没有完成', 'Mac']], 'a refused dispatch waits like a failure')
 })
@@ -85,7 +85,7 @@ test('a phone asking to join reads as a phone, and only a computer has an online
 })
 
 test('a task done itself waits on a child still running, down the chain, and only then', () => {
-  const work = (work_id: string, extra: Partial<WorkRecord> = {}): WorkRecord => ({ work_id, trigger: '', target_node: 'mac', cwd: '/w', title: work_id, prompt: '', state: 'finished', summary: '', outcome: 'completed', result_text: '', failure_reason: null, ...extra })
+  const work = (work_id: string, extra: Partial<WorkCard> = {}): WorkCard => ({ work_id, target_node: 'mac', cwd: '/w', title: work_id, state: 'finished', summary: '', outcome: 'completed', failure_reason: null, ...extra })
   const parent = work('p')
   assert.equal(chatTaskState(parent, [parent]), 'completed')
   assert.equal(chatTaskState(parent, [parent, work('c', { parent: 'p', state: 'running', outcome: null })]), 'awaiting_children')

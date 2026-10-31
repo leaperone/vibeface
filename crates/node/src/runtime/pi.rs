@@ -1704,7 +1704,10 @@ mod tests {
             call_ref: work_id.into(),
             kind: WorkKind::Agent(Provider::Pi),
             model: None,
-            resolved: None,
+            resolved: crate::model::ResolvedModel {
+                provider: Provider::Pi,
+                model: None,
+            },
             cwd: cwd.display().to_string(),
             title: "t".into(),
             prompt: "do it".into(),
@@ -1743,10 +1746,12 @@ mod tests {
     /// Dispatches the pi work `w-1` on `node`; the Node sends it itself.
     async fn dispatch(node: &Arc<Runtime>, network: &str, dir: &Path) -> Result<()> {
         let spec = spec("w-1", &node.identity.device_id()?, dir);
-        node.store
-            .lock()
-            .await
-            .accept_work(&node.identity, network, spec.clone(), now_ms())?;
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            network,
+            spec.clone(),
+            now_ms(),
+        )?;
         let pi = node.pi.clone();
         let sends = (node.start_work(pi.as_ref(), network, &spec, None, &Value::Null)).await?;
         ensure!(!sends, "the Node sends a pi work itself");
@@ -2171,10 +2176,12 @@ mod tests {
             thread: Some(session.clone()),
             ..spec("w-3", &node.identity.device_id()?, &elsewhere)
         };
-        node.store
-            .lock()
-            .await
-            .accept_work(&node.identity, &network, moved.clone(), now_ms())?;
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            &network,
+            moved.clone(),
+            now_ms(),
+        )?;
         let refused = node.start_work(pi.as_ref(), &network, &moved, Some(&session), &Value::Null);
         let refused = refused
             .await
@@ -2191,10 +2198,12 @@ mod tests {
             cwd: String::new(),
             ..spec("w-2", &node.identity.device_id()?, &dir)
         };
-        node.store
-            .lock()
-            .await
-            .accept_work(&node.identity, &network, spec.clone(), now_ms())?;
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            &network,
+            spec.clone(),
+            now_ms(),
+        )?;
         (node.start_work(pi.as_ref(), &network, &spec, Some(&session), &Value::Null)).await?;
         let deadline = Instant::now() + Duration::from_secs(20);
         let record = loop {

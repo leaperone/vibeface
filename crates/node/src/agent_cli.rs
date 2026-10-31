@@ -9,17 +9,16 @@ use vibeface_bridge::{
 };
 use vibeface_protocol::now_ms;
 
-fn outgoing_model(tracked: &Value, args: &Value) -> Option<String> {
-    match tracked.get("resolved") {
-        Some(Value::Object(resolved)) => resolved
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        _ => tracked["model"]
-            .as_str()
-            .map(str::to_owned)
-            .or_else(|| args["model"].as_str().map(str::to_owned)),
-    }
+fn outgoing_model(tracked: &Value) -> Result<Option<String>> {
+    let value = tracked
+        .get("resolved")
+        .context("the Node returned no frozen model selection")?;
+    value
+        .get("model")
+        .context("the frozen model selection has no model")?;
+    let resolved: crate::model::ResolvedModel = serde_json::from_value(value.clone())
+        .context("the Node returned an invalid frozen model selection")?;
+    Ok(resolved.model)
 }
 
 /// Registers the work with the Node (`track`); a work the Node runs on Codex is sent here.
@@ -98,6 +97,7 @@ where
     if tracked["may_send"] != true {
         return Ok(tracked);
     }
+    let model = outgoing_model(&tracked)?;
     let work_id = tracked["work_id"]
         .as_str()
         .context("the Node returned no work ID")?
@@ -147,7 +147,7 @@ where
         thread_id: thread,
         text: args["prompt"].as_str().unwrap_or_default().into(),
         client_id: work_id.clone(),
-        model: outgoing_model(&tracked, &args),
+        model,
         effort: args["effort"].as_str().map(str::to_owned),
         images: serde_json::from_value(args["images"].clone()).unwrap_or_default(),
         start_only: existing.is_none(),
@@ -243,26 +243,28 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    fn outgoing_model_uses_the_frozen_result_before_request_fallbacks() {
-        let args = json!({"model":"requested"});
+    fn outgoing_model_requires_the_frozen_selection_and_keeps_the_provider_default() -> Result<()> {
         assert_eq!(
             outgoing_model(
-                &json!({"resolved":{"model":"execution-default"},"model":null}),
-                &args
-            ),
+                &json!({"resolved":{"provider":"codex","model":"execution-default"},"model":"request"})
+            )?,
             Some("execution-default".into())
         );
         assert_eq!(
             outgoing_model(
-                &json!({"resolved":{"model":null},"model":"requested"}),
-                &args
-            ),
+                &json!({"resolved":{"provider":"codex","model":null},"model":"request"})
+            )?,
             None
         );
-        assert_eq!(
-            outgoing_model(&json!({"model":null}), &args),
-            Some("requested".into())
-        );
+        for tracked in [
+            json!({"model":"request"}),
+            json!({"resolved":null}),
+            json!({"resolved":{"provider":"codex"}}),
+            json!({"resolved":{"provider":"unknown","model":null}}),
+        ] {
+            assert!(outgoing_model(&tracked).is_err());
+        }
+        Ok(())
     }
 
     #[tokio::test]

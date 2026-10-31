@@ -1,6 +1,6 @@
 use super::{Access, Changed, Runtime, now_ms};
 use crate::model::{WorkKind, WorkOutcome, WorkProjection};
-use crate::scheduling::{JobOutcome, JobState, PendingCheck};
+use crate::scheduling::{JobOutcome, JobState, PendingCheck, SchedulerJob, TriggerKind};
 use crate::work::{Probe, WorkState};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -35,6 +35,38 @@ pub(crate) struct ActiveManager {
 }
 
 impl Runtime {
+    pub(crate) async fn finish_incompatible_tasks(
+        &self,
+        network: &str,
+        conversation: Option<&str>,
+    ) -> Result<Vec<SchedulerJob>> {
+        let _controls = self.manager_controls.lock().await;
+        let current = self.manager().map(|manager| manager.provider);
+        let providers = self.providers();
+        let ended = self.store.lock().await.refuse_queued_tasks(
+            &self.identity,
+            network,
+            conversation,
+            crate::scheduler::boot_id(),
+            now_ms(),
+            |accepted| match crate::scheduler::task_start_failure(current, accepted.provider) {
+                Some(failure) => Ok(Some((
+                    self.provider_generation(accepted.provider, &providers)?,
+                    failure,
+                ))),
+                None => Ok(None),
+            },
+        )?;
+        for job in &ended {
+            self.publish_changed(network, &job.conversation_id, Changed::Job(&job.trigger));
+            self.publish_changed(network, &job.conversation_id, Changed::Work(&job.reply_to));
+        }
+        if !ended.is_empty() {
+            self.wake_scheduler()?;
+        }
+        Ok(ended)
+    }
+
     pub async fn register_manager_attempt(
         &self,
         token: String,
@@ -69,6 +101,30 @@ impl Runtime {
             &self.identity.device_id()?,
             &access,
         )?;
+        if job.kind == TriggerKind::AgentTask {
+            let runtime = job.runtime.as_ref().context("task runtime missing")?;
+            ensure!(
+                runtime.provider == provider,
+                "task runtime provider mismatch"
+            );
+            if let Some(failure) = crate::scheduler::task_start_failure(
+                self.manager().map(|manager| manager.provider),
+                runtime.provider,
+            ) {
+                return Err(crate::manager::ManagerError {
+                    stage: vibeface_bridge::failure::ProviderStage::Validate,
+                    outcome: crate::manager::ManagerFailure::Failed,
+                    start: crate::manager::StartEvidence::NotStarted,
+                    session_id: None,
+                    failure,
+                }
+                .into());
+            }
+            self.store
+                .lock()
+                .await
+                .mark_started(scope, trigger, attempt_id)?;
+        }
         let (cancel, receiver) = watch::channel(false);
         let active = Arc::new(ActiveManager {
             access: access.clone(),

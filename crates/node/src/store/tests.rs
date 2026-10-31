@@ -11,6 +11,83 @@ use crate::{
 use serde_json::json;
 use vibeface_bridge::failure::{ExecFailure, ProviderStage};
 
+impl Store {
+    pub(crate) fn accept_work_fixture(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        spec: WorkSpec,
+        at: i64,
+    ) -> Result<(crate::work::WorkRecord, bool)> {
+        let WorkSpec {
+            work_id,
+            conversation,
+            trigger,
+            target,
+            dispatcher,
+            call_ref,
+            kind,
+            model,
+            resolved,
+            cwd,
+            title,
+            prompt,
+            continues,
+            parent,
+            thread,
+        } = spec;
+        let kind = match kind {
+            WorkKind::Agent(provider) => crate::work::RequestedWorkKind::Agent(Some(provider)),
+            WorkKind::Task => crate::work::RequestedWorkKind::Task,
+        };
+        let request = crate::work::WorkRequest {
+            work_id,
+            conversation,
+            trigger,
+            target,
+            dispatcher,
+            call_ref,
+            kind,
+            model,
+            cwd,
+            title,
+            prompt,
+            continues,
+            parent,
+            thread,
+        };
+        let admitted = self.accept_work(identity, network, request, resolved, at)?;
+        Ok((admitted.record, admitted.created))
+    }
+
+    pub(crate) fn claim_next_fixture(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        conversation: &str,
+        boot: &str,
+        config: &str,
+    ) -> Result<Option<crate::scheduling::ClaimedJob>> {
+        self.claim_next(identity, network, conversation, boot, |_, accepted| {
+            let accepted = accepted.cloned().unwrap_or(ResolvedModel {
+                provider: Provider::Codex,
+                model: None,
+            });
+            Ok(Some((
+                config.into(),
+                crate::scheduling::RuntimeSelection {
+                    provider: accepted.provider,
+                    model: accepted.model,
+                    reasoning_effort: None,
+                },
+                "fixture-generation".into(),
+                (),
+            )))
+        })
+        .map(|claimed| claimed.map(|(claimed, ())| claimed))
+    }
+}
+
 struct Net {
     network: String,
     a: LocalIdentity,
@@ -488,7 +565,7 @@ fn scheduler_configuration_failure_or_startup_wait_does_not_claim_the_job() -> R
     say(&mut store, &net, "m1", true)?;
     assert!(
         store
-            .claim_next(&net.a, &net.network, "c", "boot", |_| anyhow::bail!(
+            .claim_next::<()>(&net.a, &net.network, "c", "boot", |_, _| anyhow::bail!(
                 "invalid frozen provider"
             ))
             .is_err()
@@ -502,7 +579,7 @@ fn scheduler_configuration_failure_or_startup_wait_does_not_claim_the_job() -> R
     ));
     assert!(
         store
-            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(None))?
+            .claim_next::<()>(&net.a, &net.network, "c", "boot", |_, _| Ok(None))?
             .is_none()
     );
     assert!(matches!(
@@ -513,11 +590,21 @@ fn scheduler_configuration_failure_or_startup_wait_does_not_claim_the_job() -> R
         JobState::Queued
     ));
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", |job| {
+        .claim_next::<()>(&net.a, &net.network, "c", "boot", |job, _| {
             assert_eq!(job.trigger, "message:m1");
-            Ok(Some("frozen-provider-and-model".into()))
+            Ok(Some((
+                "frozen-provider-and-model".into(),
+                crate::scheduling::RuntimeSelection {
+                    provider: Provider::Codex,
+                    model: None,
+                    reasoning_effort: None,
+                },
+                "fixture-generation".into(),
+                (),
+            )))
         })?
-        .context("claimed")?;
+        .context("claimed")?
+        .0;
     assert!(matches!(claimed.job.state, JobState::Claimed { .. }));
     Ok(())
 }
@@ -550,9 +637,7 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
         3,
     )?;
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot-1", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot-1", "cfg")?
         .context("job")?;
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &claimed.job.trigger, &attempt)?;
@@ -580,9 +665,7 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
     );
 
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot-1", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot-1", "cfg")?
         .context("job")?;
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &claimed.job.trigger, &attempt)?;
@@ -679,9 +762,7 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     let local = net.a.device_id()?;
     say(&mut store, &net, "m1", true)?;
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("job")?;
     let (trigger, attempt) = (
         claimed.job.trigger.clone(),
@@ -744,9 +825,7 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     assert!(!store.steer_host_active("c", &attempt)?);
     assert!(
         store
-            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
-                "cfg".into()
-            )))?
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
             .is_none()
     );
     assert!(store.scheduler_maintenance_idle().is_err());
@@ -771,9 +850,7 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
             .is_none()
     );
     let next = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("job")?;
     assert_eq!(next.job.trigger, message_trigger("quiet"));
 
@@ -822,9 +899,7 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     )?;
     assert!(
         store
-            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
-                "cfg".into()
-            )))?
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
             .is_none()
     );
     assert!(store.scheduler_job("c", &message_trigger("m4"))?.is_none());
@@ -876,7 +951,10 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         call_ref: "call-1".into(),
         kind: WorkKind::Agent(Provider::Codex),
         model: None,
-        resolved: None,
+        resolved: crate::model::ResolvedModel {
+            provider: Provider::Codex,
+            model: None,
+        },
         cwd: "/tmp".into(),
         title: "t".into(),
         prompt: "p".into(),
@@ -884,14 +962,24 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         parent: None,
         thread: None,
     };
-    assert!(store.accept_work(&net.a, &net.network, spec.clone(), 3)?.1);
-    assert!(!store.accept_work(&net.a, &net.network, spec.clone(), 4)?.1);
+    assert!(
+        store
+            .accept_work_fixture(&net.a, &net.network, spec.clone(), 3)?
+            .1
+    );
+    assert!(
+        !store
+            .accept_work_fixture(&net.a, &net.network, spec.clone(), 4)?
+            .1
+    );
     let moved = WorkSpec {
         thread: Some("other".into()),
         ..spec.clone()
     };
     assert!(
-        store.accept_work(&net.a, &net.network, moved, 4).is_err(),
+        store
+            .accept_work_fixture(&net.a, &net.network, moved, 4)
+            .is_err(),
         "the same work ID into another thread is a different request"
     );
     let id = spec.work_id.clone();
@@ -962,16 +1050,15 @@ fn dispatches_the_dag_lacks_reach_the_bot_once() -> Result<()> {
     let (local, trigger) = (net.a.device_id()?, message_trigger("m1"));
     let dispatch = |call: &str| -> Result<Dispatch> {
         Ok(Dispatch {
-            spec: WorkSpec {
+            spec: crate::work::WorkRequest {
                 work_id: WorkSpec::id("c", &trigger, call),
                 conversation: "c".into(),
                 trigger: trigger.clone(),
                 target: net.b.device_id()?,
                 dispatcher: local.clone(),
                 call_ref: call.into(),
-                kind: WorkKind::Task,
+                kind: crate::work::RequestedWorkKind::Task,
                 model: None,
-                resolved: None,
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -1093,7 +1180,10 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
             call_ref: call.into(),
             kind: WorkKind::Agent(Provider::Codex),
             model: None,
-            resolved: None,
+            resolved: crate::model::ResolvedModel {
+                provider: Provider::Codex,
+                model: None,
+            },
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".into(),
@@ -1111,7 +1201,7 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
             .outcome)
     };
     let remote = spec("remote", &net.b)?;
-    store.accept_work(&net.b, &net.network, remote.clone(), 3)?;
+    store.accept_work_fixture(&net.b, &net.network, remote.clone(), 3)?;
     let unknown = store.unverify_removed_works(&net.a, &net.network, &[net.b.device_id()?], 4)?;
     assert_eq!(unknown, vec![("c".to_owned(), remote.work_id.clone())]);
     let work = store
@@ -1160,7 +1250,7 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
     );
 
     let local = spec("local", &net.a)?;
-    store.accept_work(&net.a, &net.network, local.clone(), 7)?;
+    store.accept_work_fixture(&net.a, &net.network, local.clone(), 7)?;
     let (_, receipt) = store.apply_work_signal(
         &net.a,
         &net.network,
@@ -1242,7 +1332,7 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
     );
 
     let running = spec("running", &net.a)?;
-    store.accept_work(&net.a, &net.network, running.clone(), 12)?;
+    store.accept_work_fixture(&net.a, &net.network, running.clone(), 12)?;
     for signal in [
         Signal::ThreadCreated("th".into()),
         Signal::TurnStarted {
@@ -1463,9 +1553,7 @@ fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
     store.append_event(&net.a, &net.network, "c", moved, vec![], 3)?;
     assert!(
         store
-            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
-                "cfg".into()
-            )))?
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
             .is_none()
     );
     let trigger = message_trigger("m1");
@@ -1480,9 +1568,7 @@ fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
 
 fn answered(store: &mut Store, net: &Net, at: i64) -> Result<SchedulerJob> {
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("job")?;
     let trigger = claimed.job.trigger.clone();
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
@@ -1502,9 +1588,7 @@ fn answered(store: &mut Store, net: &Net, at: i64) -> Result<SchedulerJob> {
 fn replied_elsewhere(store: &mut Store, net: &Net, identity: &LocalIdentity) -> Result<()> {
     assert!(
         store
-            .claim_next(identity, &net.network, "c", "boot", |_| Ok(Some(
-                "cfg".into()
-            )))?
+            .claim_next_fixture(identity, &net.network, "c", "boot", "cfg")?
             .is_none(),
         "a message answered in the shared record does not run again"
     );
@@ -1618,9 +1702,7 @@ fn a_move_fences_the_old_owners_running_turn() -> Result<()> {
         2,
     )?;
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("job")?;
     let trigger = claimed.job.trigger.clone();
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
@@ -2270,9 +2352,7 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
     );
 
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("schedule job")?;
     assert_eq!(
         (claimed.job.kind, claimed.job.trigger.as_str()),
@@ -2315,9 +2395,7 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
     )?;
     assert!(
         store
-            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
-                "cfg".into()
-            )))?
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
             .is_none()
     );
     assert!(matches!(
@@ -2495,9 +2573,7 @@ fn a_reminder_runs_once_and_never_again_after_restart_or_sync() -> Result<()> {
         vec![("c".to_owned(), trigger.clone())]
     );
     let claimed = origin
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("reminder job")?;
     assert_eq!(claimed.job.kind, TriggerKind::Schedule);
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
@@ -2590,9 +2666,7 @@ fn a_schedule_time_runs_once_across_owners() -> Result<()> {
         due
     );
     let running = b_side
-        .claim_next(&net.b, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.b, &net.network, "c", "boot", "cfg")?
         .context("b runs the time")?;
     assert_eq!(running.job.trigger, trigger);
     b_side.append_event(
@@ -2625,9 +2699,7 @@ fn a_schedule_time_runs_once_across_owners() -> Result<()> {
     );
     assert!(
         a_side
-            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
-                "cfg".into()
-            )))?
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
             .is_none()
     );
     assert!(matches!(
@@ -2999,9 +3071,7 @@ fn a_paused_schedule_is_not_run_and_a_deleted_one_stays_deleted() -> Result<()> 
     assert!(origin.schedule(&net.network, &schedule_id)?.is_none());
     assert!(
         origin
-            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
-                "cfg".into()
-            )))?
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
             .is_none()
     );
     let mut other = store(&net)?;
@@ -3046,9 +3116,7 @@ fn a_bot_message_wakes_the_other_bot_once() -> Result<()> {
     assert!(send(&mut origin, "s2", "c", "To myself", 11).is_err());
     assert_eq!(origin.scheduler_jobs("d")?.len(), 1);
     let claimed = origin
-        .claim_next(&net.a, &net.network, "d", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "d", "boot", "cfg")?
         .context("bot message job")?;
     assert_eq!(
         (claimed.job.kind, claimed.job.trigger.as_str()),
@@ -3548,9 +3616,7 @@ fn a_deleted_bot_stops_everywhere_and_stays_deleted() -> Result<()> {
     );
     assert!(
         origin
-            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
-                "cfg".into()
-            )))?
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
             .is_none()
     );
     assert!(
@@ -3754,7 +3820,10 @@ fn shared_records_never_carry_a_known_credential() -> Result<()> {
         call_ref: "call-1".into(),
         kind: WorkKind::Agent(Provider::Codex),
         model: None,
-        resolved: None,
+        resolved: crate::model::ResolvedModel {
+            provider: Provider::Codex,
+            model: None,
+        },
         cwd: "/tmp".into(),
         title: "t".into(),
         prompt: "p".into(),
@@ -3763,7 +3832,7 @@ fn shared_records_never_carry_a_known_credential() -> Result<()> {
         thread: None,
     };
     let id = spec.work_id.clone();
-    origin.accept_work(&net.a, &net.network, spec, 6)?;
+    origin.accept_work_fixture(&net.a, &net.network, spec, 6)?;
     for (signal, at) in [
         (Signal::ThreadCreated("t".into()), 7),
         (
@@ -4990,9 +5059,7 @@ fn a_failed_turn_shares_its_kind_and_keeps_the_raw_detail_local() -> Result<()> 
             2,
         )?;
         let claimed = store
-            .claim_next(&net.a, &net.network, "c", "boot-1", |_| {
-                Ok(Some("cfg".into()))
-            })?
+            .claim_next_fixture(&net.a, &net.network, "c", "boot-1", "cfg")?
             .context("job")?;
         let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
         store.mark_started("c", &claimed.job.trigger, &attempt)?;
@@ -5056,9 +5123,7 @@ fn a_bot_thinks_until_its_reply_runs_and_rests_once_it_ends() -> Result<()> {
     assert_eq!(store.busy_conversations()?.get("c"), Some(&Busy::Thinking));
 
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot-1", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot-1", "cfg")?
         .context("job")?;
     assert_eq!(
         store.busy_conversations()?.get("c"),
@@ -5089,9 +5154,7 @@ fn a_bot_thinks_until_its_reply_runs_and_rests_once_it_ends() -> Result<()> {
         "the second message still waits"
     );
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot-1", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot-1", "cfg")?
         .context("job")?;
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &claimed.job.trigger, &attempt)?;
@@ -5215,7 +5278,10 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
             call_ref: format!("call-{i}"),
             kind: WorkKind::Agent(Provider::Codex),
             model: None,
-            resolved: None,
+            resolved: crate::model::ResolvedModel {
+                provider: Provider::Codex,
+                model: None,
+            },
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".repeat(600),
@@ -5223,7 +5289,7 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
             parent: None,
             thread: None,
         };
-        store.accept_work(&net.a, &net.network, spec, 200 + i)?;
+        store.accept_work_fixture(&net.a, &net.network, spec, 200 + i)?;
     }
     let context = store.context(&net.network, "c", None)?;
     let works = store.works(&net.network, "c")?;
@@ -5459,9 +5525,7 @@ fn a_queued_turn_reads_the_reply_ahead_of_it() -> Result<()> {
         )?;
     }
     let first = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("first turn")?;
     let attempt = first.job.state.attempt().context("attempt")?.id.clone();
     store.finish_job(
@@ -5475,9 +5539,7 @@ fn a_queued_turn_reads_the_reply_ahead_of_it() -> Result<()> {
         4,
     )?;
     let second = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("second turn")?;
     assert_eq!(second.job.trigger, message_trigger("m2"));
     let read = store.context(&net.network, "c", Some(&second.job.basis))?;
@@ -5505,9 +5567,7 @@ fn a_refused_turn_start_leaves_its_messages_for_the_next_turn() -> Result<()> {
         |store: &mut Store, id: &str, started: bool| -> Result<crate::scheduling::ClaimedJob> {
             say(store, &net, id, true)?;
             let claimed = store
-                .claim_next(&net.a, &net.network, "c", "boot", |_| {
-                    Ok(Some("cfg".into()))
-                })?
+                .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
                 .context("job")?;
             let trigger = claimed.job.trigger.clone();
             let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
@@ -5550,9 +5610,7 @@ fn a_refused_turn_start_leaves_its_messages_for_the_next_turn() -> Result<()> {
     );
     say(&mut store, &net, "m3", true)?;
     let third = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("job")?;
     assert_eq!(third.previous_native_id.as_deref(), Some("thread"));
     assert_eq!(
@@ -5594,9 +5652,7 @@ fn a_move_hands_the_queue_on_without_a_claim() -> Result<()> {
     assert_eq!(handed(&store)?, std::slice::from_ref(&trigger));
     assert!(
         store
-            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
-                "cfg".into()
-            )))?
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
             .is_none()
     );
     store.fence_moved_turns(&net.network, &local)?;
@@ -5612,9 +5668,7 @@ fn a_new_owner_replies_to_what_the_old_one_left_unanswered_once() -> Result<()> 
     let local = net.a.device_id()?;
     say(&mut a_side, &net, "m1", true)?;
     let first = a_side
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("job")?;
     let (t1, a1) = (
         first.job.trigger.clone(),
@@ -5654,9 +5708,7 @@ fn a_new_owner_replies_to_what_the_old_one_left_unanswered_once() -> Result<()> 
     assert_eq!(markers, 1, "a settled steer is recorded once");
     say(&mut a_side, &net, "m3", true)?;
     let third = a_side
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("job")?;
     let (t3, a3) = (
         third.job.trigger.clone(),
@@ -5788,9 +5840,7 @@ fn a_new_owner_declines_what_the_old_one_left_unanswered_once() -> Result<()> {
         [message_trigger("m2").as_str()]
     );
     let claimed = b_side
-        .claim_next(&net.b, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.b, &net.network, "c", "boot", "cfg")?
         .context("job")?;
     assert_eq!(claimed.job.trigger, message_trigger("m2"));
     assert!(matches!(
@@ -5817,7 +5867,10 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
             call_ref: format!("call-{i}"),
             kind: WorkKind::Agent(Provider::Codex),
             model: None,
-            resolved: None,
+            resolved: crate::model::ResolvedModel {
+                provider: Provider::Codex,
+                model: None,
+            },
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".repeat(300),
@@ -5827,7 +5880,7 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
         })
     };
     for i in 0..3 {
-        store.accept_work(&net.a, &net.network, work(i)?, 10 + i as i64)?;
+        store.accept_work_fixture(&net.a, &net.network, work(i)?, 10 + i as i64)?;
     }
     let local = net.a.device_id()?;
     let render = |store: &Store, trigger: &str, resumed: Option<&VersionVector>, thread| {
@@ -5871,7 +5924,7 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
     assert_eq!(listed(&data, "/works", "work_id").len(), 3);
     assert_eq!(data["trigger"]["unavailable_tools"], json!([]));
 
-    store.accept_work(&net.a, &net.network, work(3)?, 20)?;
+    store.accept_work_fixture(&net.a, &net.network, work(3)?, 20)?;
     store.append_event(
         &net.a,
         &net.network,
@@ -5932,7 +5985,7 @@ fn a_new_session_key_opens_a_new_thread_shown_everything() -> Result<()> {
     let mut turn = |id: &str, key: &str| -> Result<crate::scheduling::ClaimedJob> {
         say(&mut store, &net, id, true)?;
         let claimed = store
-            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(key.into())))?
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", key)?
             .context("job")?;
         let trigger = claimed.job.trigger.clone();
         let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
@@ -6372,7 +6425,10 @@ fn a_streamed_event_reads_only_the_runs_on_its_thread() -> Result<()> {
             call_ref: format!("call-{i}"),
             kind: WorkKind::Agent(Provider::Codex),
             model: None,
-            resolved: None,
+            resolved: crate::model::ResolvedModel {
+                provider: Provider::Codex,
+                model: None,
+            },
             cwd: format!("/tmp/{thread}"),
             title: "t".into(),
             prompt: "p".into(),
@@ -6380,7 +6436,7 @@ fn a_streamed_event_reads_only_the_runs_on_its_thread() -> Result<()> {
             parent: None,
             thread: Some(thread.into()),
         };
-        store.accept_work(&net.a, &net.network, spec, 10 + i as i64)?;
+        store.accept_work_fixture(&net.a, &net.network, spec, 10 + i as i64)?;
     }
     let on = |thread| -> Result<Vec<String>> {
         Ok(store
@@ -6474,7 +6530,10 @@ fn work_status_pages_newest_first_within_a_byte_cap() -> Result<()> {
             call_ref: format!("call-{i}"),
             kind: WorkKind::Agent(Provider::Codex),
             model: None,
-            resolved: None,
+            resolved: crate::model::ResolvedModel {
+                provider: Provider::Codex,
+                model: None,
+            },
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".repeat(2_000),
@@ -6482,7 +6541,7 @@ fn work_status_pages_newest_first_within_a_byte_cap() -> Result<()> {
             parent: None,
             thread: None,
         };
-        store.accept_work(&net.a, &net.network, spec, 10 + i)?;
+        store.accept_work_fixture(&net.a, &net.network, spec, 10 + i)?;
     }
     let works = store.works(&net.network, "c")?;
     let mut seen = Vec::new();
@@ -7157,7 +7216,10 @@ fn open_works_list_only_what_still_wants_the_user() -> Result<()> {
             call_ref: id.into(),
             kind: WorkKind::Task,
             model: None,
-            resolved: None,
+            resolved: crate::model::ResolvedModel {
+                provider: crate::providers::Provider::Codex,
+                model: None,
+            },
             cwd: "/w".into(),
             title: id.into(),
             prompt: "p".into(),
@@ -7284,16 +7346,15 @@ fn open_works_list_only_what_still_wants_the_user() -> Result<()> {
     let trigger = message_trigger("m1");
     let refused = |call: &str| -> Result<Dispatch> {
         Ok(Dispatch {
-            spec: WorkSpec {
+            spec: crate::work::WorkRequest {
                 work_id: WorkSpec::id("c", &trigger, call),
                 conversation: "c".into(),
                 trigger: trigger.clone(),
                 target: net.b.device_id()?,
                 dispatcher: net.a.device_id()?,
                 call_ref: call.into(),
-                kind: WorkKind::Task,
+                kind: crate::work::RequestedWorkKind::Task,
                 model: None,
-                resolved: None,
                 cwd: "/w".into(),
                 title: call.into(),
                 prompt: "p".into(),
@@ -7432,9 +7493,7 @@ fn a_submitted_runtime_is_frozen_and_only_proven_unstarted_failure_is_retryable(
     conversation(&mut store, &net)?;
     say(&mut store, &net, "m1", true)?;
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("job")?;
     let runtime = submitted_runtime(&claimed)?;
     let trigger = &claimed.job.trigger;
@@ -7480,9 +7539,13 @@ fn a_submitted_runtime_is_frozen_and_only_proven_unstarted_failure_is_retryable(
     );
     say(&mut store, &net, "m2", true)?;
     let next = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("changed-model-and-effort".into()))
-        })?
+        .claim_next_fixture(
+            &net.a,
+            &net.network,
+            "c",
+            "boot",
+            "changed-model-and-effort",
+        )?
         .context("job")?;
     assert_eq!(next.session_generation, 2);
     assert_eq!(
@@ -7548,9 +7611,7 @@ fn a_restarted_reply_waits_for_history_then_records_the_recovered_result_once() 
         conversation(&mut store, &net)?;
         say(&mut store, &net, "m1", true)?;
         let claimed = store
-            .claim_next(&net.a, &net.network, "c", "boot-1", |_| {
-                Ok(Some("cfg".into()))
-            })?
+            .claim_next_fixture(&net.a, &net.network, "c", "boot-1", "cfg")?
             .context("job")?;
         let runtime = submitted_runtime(&claimed)?;
         store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
@@ -7568,9 +7629,7 @@ fn a_restarted_reply_waits_for_history_then_records_the_recovered_result_once() 
             store.recover_scheduler_jobs(&net.a, &net.network, "boot-2")?;
             assert!(
                 store
-                    .claim_next(&net.a, &net.network, "c", "boot-2", |_| Ok(Some(
-                        "new-settings".into()
-                    )))?
+                    .claim_next_fixture(&net.a, &net.network, "c", "boot-2", "new-settings")?
                     .is_none()
             );
             assert!(
@@ -7632,9 +7691,7 @@ fn an_unknown_process_reply_keeps_partial_text_until_the_user_confirms() -> Resu
     conversation(&mut store, &net)?;
     say(&mut store, &net, "m1", true)?;
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("job")?;
     let runtime = submitted_runtime(&claimed)?;
     store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
@@ -7691,9 +7748,7 @@ fn native_compaction_advances_lineage_and_keeps_the_resumable_session() -> Resul
     conversation(&mut store, &net)?;
     say(&mut store, &net, "m1", true)?;
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("job")?;
     let runtime = submitted_runtime(&claimed)?;
     store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
@@ -7740,9 +7795,7 @@ fn native_compaction_advances_lineage_and_keeps_the_resumable_session() -> Resul
     )?;
     say(&mut store, &net, "m2", true)?;
     let next = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("job")?;
     assert_eq!(next.previous_native_id.as_deref(), Some("thread"));
     assert_eq!(next.previous_token.as_deref(), Some("token"));
@@ -7760,9 +7813,7 @@ fn a_proven_unstarted_backup_gets_a_new_permission_and_keeps_delivery_identity()
     conversation(&mut store, &net)?;
     say(&mut store, &net, "m1", true)?;
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("job")?;
     let mut runtime = submitted_runtime(&claimed)?;
     let original_permission = claimed
@@ -7873,13 +7924,445 @@ fn a_proven_unstarted_backup_gets_a_new_permission_and_keeps_delivery_identity()
     )?;
     say(&mut store, &net, "m2", true)?;
     let next = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_| {
-            Ok(Some("cfg".into()))
-        })?
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("next primary job")?;
     assert!(next.previous_native_id.is_none());
     assert!(next.previous_token.is_none());
     assert!(next.covers.is_none());
     assert_eq!(next.session_generation, runtime.session_generation + 1);
+    Ok(())
+}
+
+fn admission_request(
+    net: &Net,
+    scope: &str,
+    call_ref: &str,
+    kind: crate::work::RequestedWorkKind,
+) -> Result<crate::work::WorkRequest> {
+    Ok(crate::work::WorkRequest {
+        work_id: WorkSpec::id(scope, "message:m1", call_ref),
+        conversation: scope.into(),
+        trigger: "message:m1".into(),
+        target: net.a.device_id()?,
+        dispatcher: net.b.device_id()?,
+        call_ref: call_ref.into(),
+        kind,
+        model: None,
+        cwd: "/tmp".into(),
+        title: "task".into(),
+        prompt: "work".into(),
+        continues: None,
+        parent: None,
+        thread: None,
+    })
+}
+
+#[test]
+fn work_admission_returns_the_durable_selection_and_compares_the_original_request() -> Result<()> {
+    use crate::work::RequestedWorkKind;
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let request = admission_request(&net, "c", "implicit", RequestedWorkKind::Agent(None))?;
+    let frozen = ResolvedModel {
+        provider: Provider::Codex,
+        model: None,
+    };
+    let first = store.accept_work(&net.a, &net.network, request.clone(), frozen.clone(), 3)?;
+    assert!(first.created);
+    let retried = store.accept_work(
+        &net.a,
+        &net.network,
+        request.clone(),
+        ResolvedModel {
+            provider: Provider::Claude,
+            model: Some("changed".into()),
+        },
+        4,
+    )?;
+    assert!(!retried.created);
+    assert_eq!(retried.spec, first.spec);
+    assert_eq!(retried.spec.resolved, frozen);
+    assert_eq!(retried.spec.execution_model(), None);
+    let mut changes = vec![];
+    let mut changed = request.clone();
+    changed.kind = RequestedWorkKind::Agent(Some(Provider::Claude));
+    changes.push(changed);
+    let mut changed = request.clone();
+    changed.prompt.push('!');
+    changes.push(changed);
+    let mut changed = request.clone();
+    changed.model = Some("request-model".into());
+    changes.push(changed);
+    let mut changed = request.clone();
+    changed.thread = Some("another-thread".into());
+    changes.push(changed);
+    for changed in changes {
+        assert!(store.accepted_work(&net.network, &changed).is_err());
+        assert!(
+            store
+                .accept_work(&net.a, &net.network, changed, frozen.clone(), 5)
+                .is_err()
+        );
+    }
+    assert_eq!(store.work_records()?.len(), 1);
+    assert_eq!(
+        store
+            .context(&net.network, "c", None)?
+            .events
+            .iter()
+            .filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. }))
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrent_implicit_admissions_return_the_same_transaction_winner() -> Result<()> {
+    use crate::work::RequestedWorkKind;
+    let net = net()?;
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.artifacts")
+        .join(format!("admission-{}", uuid::Uuid::new_v4()));
+    crate::config::private_dir(&dir)?;
+    let path = dir.join("store.sqlite3");
+    let mut first = Store::open(&path)?;
+    first.install_trust_bundle(&net.network, &net.state)?;
+    conversation(&mut first, &net)?;
+    let mut second = Store::open(&path)?;
+    let request = admission_request(&net, "c", "concurrent", RequestedWorkKind::Agent(None))?;
+    let barrier = std::sync::Barrier::new(2);
+    let (a, b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            barrier.wait();
+            first.accept_work(
+                &net.a,
+                &net.network,
+                request.clone(),
+                ResolvedModel {
+                    provider: Provider::Codex,
+                    model: Some("model-a".into()),
+                },
+                3,
+            )
+        });
+        let b = scope.spawn(|| {
+            barrier.wait();
+            second.accept_work(
+                &net.a,
+                &net.network,
+                request.clone(),
+                ResolvedModel {
+                    provider: Provider::Claude,
+                    model: Some("model-b".into()),
+                },
+                4,
+            )
+        });
+        (
+            a.join().expect("first admission"),
+            b.join().expect("second admission"),
+        )
+    });
+    let result = (|| -> Result<()> {
+        let (a, b) = (a?, b?);
+        assert_ne!(a.created, b.created);
+        assert_eq!(a.spec, b.spec);
+        assert_eq!(
+            first
+                .accepted_work(&net.network, &request)?
+                .context("accepted")?
+                .spec,
+            a.spec
+        );
+        assert_eq!(first.work_records()?.len(), 1);
+        assert_eq!(
+            first
+                .context(&net.network, "c", None)?
+                .events
+                .iter()
+                .filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. }))
+                .count(),
+            1
+        );
+        Ok(())
+    })();
+    drop((first, second));
+    std::fs::remove_dir_all(dir)?;
+    result
+}
+
+#[test]
+fn refusing_an_unstarted_task_is_atomic_idempotent_and_preserves_another_active_turn() -> Result<()>
+{
+    use crate::work::RequestedWorkKind;
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    say(&mut store, &net, "m1", true)?;
+    let active = store
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "human-config")?
+        .context("human claim")?;
+    let attempt = active.job.state.attempt().context("attempt")?;
+    store.mark_started("c", &active.job.trigger, &attempt.id)?;
+    let active_before = serde_json::to_value(
+        store
+            .scheduler_job("c", &active.job.trigger)?
+            .context("active job")?,
+    )?;
+    let session = |store: &Store| -> Result<String> {
+        Ok(store.connection.query_row("SELECT json_array(active,native_id,covers,owner_epoch,sdk_config,permission_version,native_token,shown,session_generation,handoff_revision,handoff_source) FROM scheduler_sessions WHERE conversation_id='c'", [], |row| row.get(0))?)
+    };
+    let before = session(&store)?;
+    let request = admission_request(&net, "c", "refused", RequestedWorkKind::Task)?;
+    let frozen = ResolvedModel {
+        provider: Provider::Codex,
+        model: Some("frozen-model".into()),
+    };
+    store.accept_work(&net.a, &net.network, request.clone(), frozen.clone(), 4)?;
+    store.create_conversation(
+        &net.a,
+        &net.network,
+        "foreign-target",
+        "other",
+        net.a
+            .owner_fixture(&net.network, "foreign-target", &net.a.device_id()?)?,
+        4,
+    )?;
+    let mut foreign =
+        admission_request(&net, "foreign-target", "foreign", RequestedWorkKind::Task)?;
+    foreign.target = net.b.device_id()?;
+    let foreign_id = foreign.work_id.clone();
+    store.accept_work(&net.b, &net.network, foreign, frozen.clone(), 4)?;
+    let refusal = |_: &ResolvedModel| {
+        Ok(Some((
+            "refusal-generation".into(),
+            ExecFailure::new(FailureKind::NoBot, "disabled"),
+        )))
+    };
+    let ended = store.refuse_queued_tasks(&net.a, &net.network, Some("c"), "boot", 5, refusal)?;
+    assert_eq!(ended.len(), 1);
+    let refused = &ended[0];
+    assert!(
+        matches!(&refused.state, JobState::Failed { failure, .. } if failure.kind == FailureKind::NoBot)
+    );
+    assert!(refused.retryable());
+    let runtime = refused.runtime.as_ref().context("refusal runtime")?;
+    assert_eq!(runtime.provider, frozen.provider);
+    assert_eq!(runtime.model, frozen.model);
+    assert_eq!(runtime.execution, TurnExecution::NotStarted);
+    assert_eq!(runtime.stage, ProviderStage::Validate);
+    assert_eq!(runtime.reasoning_effort, None);
+    assert!(!refused.pending_check && !refused.tool_calls);
+    assert_eq!(session(&store)?, before);
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .scheduler_job("c", &active.job.trigger)?
+                .context("active job")?
+        )?,
+        active_before
+    );
+    assert!(
+        store
+            .refuse_queued_tasks(&net.a, &net.network, None, "boot", 6, refusal)?
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .scheduler_job("c", &refused.trigger)?
+            .context("refused")?
+            .runtime,
+        refused.runtime
+    );
+    assert_eq!(store.scheduler_jobs("c")?.len(), 2);
+    assert!(matches!(
+        store
+            .scheduler_job(
+                "foreign-target",
+                &crate::scheduling::task_trigger(&foreign_id)
+            )?
+            .context("foreign task")?
+            .state,
+        JobState::Queued
+    ));
+    assert_eq!(store.pending_checks()?.len(), 0);
+    let events = store.context(&net.network, "c", None)?.events;
+    assert_eq!(events.iter().filter(|event| matches!(&event.event.body, EventBody::WorkFinished { work_id, .. } if work_id == &request.work_id)).count(), 1);
+    assert_eq!(events.iter().filter(|event| matches!(&event.event.body, EventBody::WorkProgress { work_id, .. } if work_id == &request.work_id)).count(), 0);
+    let retried = store.accept_work(
+        &net.a,
+        &net.network,
+        request,
+        ResolvedModel {
+            provider: Provider::Claude,
+            model: None,
+        },
+        7,
+    )?;
+    assert!(!retried.created);
+    assert_eq!(retried.spec.resolved, frozen);
+    assert_eq!(store.scheduler_jobs("c")?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn task_preparation_cannot_replace_the_accepted_selection_or_leave_a_partial_claim() -> Result<()> {
+    use crate::{scheduling::RuntimeSelection, work::RequestedWorkKind};
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let request = admission_request(&net, "c", "prepared", RequestedWorkKind::Task)?;
+    let frozen = ResolvedModel {
+        provider: Provider::Codex,
+        model: None,
+    };
+    store.accept_work(&net.a, &net.network, request.clone(), frozen.clone(), 3)?;
+    assert!(
+        store
+            .claim_next(&net.a, &net.network, "c", "boot", |_, accepted| {
+                assert_eq!(accepted, Some(&frozen));
+                Ok(Some((
+                    "wrong-key".into(),
+                    RuntimeSelection {
+                        provider: Provider::Codex,
+                        model: Some("mutable-default".into()),
+                        reasoning_effort: None,
+                    },
+                    "generation".into(),
+                    (),
+                )))
+            })
+            .is_err()
+    );
+    let trigger = crate::scheduling::task_trigger(&request.work_id);
+    let unclaimed = store
+        .scheduler_job("c", &trigger)?
+        .context("unclaimed task")?;
+    assert!(matches!(unclaimed.state, JobState::Queued));
+    assert_eq!(unclaimed.runtime, None);
+    let (claimed, ()) = store
+        .claim_next(&net.a, &net.network, "c", "boot", |_, accepted| {
+            let accepted = accepted.context("frozen selection")?;
+            Ok(Some((
+                "key-for-provider-default".into(),
+                RuntimeSelection {
+                    provider: accepted.provider,
+                    model: accepted.model.clone(),
+                    reasoning_effort: None,
+                },
+                "generation".into(),
+                (),
+            )))
+        })?
+        .context("claim")?;
+    let runtime = claimed.job.runtime.context("initial runtime")?;
+    assert_eq!(runtime.model, None);
+    assert_eq!(runtime.execution, TurnExecution::NotStarted);
+    assert_eq!(
+        runtime.delivery_id,
+        claimed.job.state.attempt().context("attempt")?.id
+    );
+    assert_eq!(runtime.session_generation, claimed.session_generation);
+    Ok(())
+}
+
+#[test]
+fn queued_task_refusal_does_not_downgrade_uncertain_started_tools_or_pending_checks() -> Result<()>
+{
+    use crate::work::RequestedWorkKind;
+    let net = net()?;
+    let mut store = store(&net)?;
+    for evidence in ["unknown", "started", "tools", "pending"] {
+        let scope = format!("guard-{evidence}");
+        store.create_conversation(
+            &net.a,
+            &net.network,
+            &scope,
+            evidence,
+            net.a
+                .owner_fixture(&net.network, &scope, &net.a.device_id()?)?,
+            1,
+        )?;
+        let request = admission_request(&net, &scope, evidence, RequestedWorkKind::Task)?;
+        store.accept_work(
+            &net.a,
+            &net.network,
+            request.clone(),
+            ResolvedModel {
+                provider: Provider::Codex,
+                model: Some("frozen".into()),
+            },
+            3,
+        )?;
+        let claimed = store
+            .claim_next_fixture(&net.a, &net.network, &scope, "boot", "key")?
+            .context("claim")?;
+        let trigger = claimed.job.trigger;
+        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+        store.mark_started(&scope, &trigger, &attempt)?;
+        match evidence {
+            "started" => {
+                store.update_turn_runtime(
+                    &scope,
+                    &trigger,
+                    &attempt,
+                    ProviderStage::Run,
+                    TurnExecution::Started,
+                )?;
+            }
+            "tools" => {
+                store.record_manager_tool_call(&scope, &trigger, &attempt)?;
+            }
+            "pending" => {
+                store.finish_job(
+                    &net.a,
+                    &net.network,
+                    &scope,
+                    &trigger,
+                    &attempt,
+                    JobOutcome::Interrupted {
+                        failure: ExecFailure::new(FailureKind::Transport, "unknown send"),
+                        process_unconfirmed: true,
+                    },
+                    "",
+                    4,
+                )?;
+            }
+            _ => {}
+        }
+        store.connection.execute(
+            "UPDATE scheduler_jobs SET state='queued' WHERE conversation_id=? AND trigger=?",
+            params![scope, trigger],
+        )?;
+        let before =
+            serde_json::to_value(store.scheduler_job(&scope, &trigger)?.context("guarded")?)?;
+        let checks = serde_json::to_value(store.pending_checks()?)?;
+        assert!(
+            store
+                .refuse_queued_tasks(&net.a, &net.network, Some(&scope), "boot", 5, |_| Ok(Some(
+                    (
+                        "generation".into(),
+                        ExecFailure::new(FailureKind::NoBot, "disabled")
+                    )
+                )))?
+                .is_empty()
+        );
+        assert_eq!(
+            serde_json::to_value(store.scheduler_job(&scope, &trigger)?.context("guarded")?)?,
+            before
+        );
+        assert_eq!(serde_json::to_value(store.pending_checks()?)?, checks);
+        assert_eq!(
+            store
+                .context(&net.network, &scope, None)?
+                .events
+                .iter()
+                .filter(|event| matches!(event.event.body, EventBody::WorkFinished { .. }))
+                .count(),
+            0
+        );
+    }
     Ok(())
 }

@@ -800,8 +800,7 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
         /// The target's frozen provider/model choice.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        resolved: Option<ResolvedModel>,
+        resolved: ResolvedModel,
         cwd: String,
         /// A short line for the user; `prompt` is what the work gets.
         title: String,
@@ -1226,7 +1225,7 @@ pub struct WorkProjection {
     pub prompt: String,
     pub call_ref: String,
     pub model: Option<String>,
-    pub resolved: Option<ResolvedModel>,
+    pub resolved: ResolvedModel,
     pub continues: Option<String>,
     pub parent: Option<String>,
     /// The existing thread a send went into; `thread_id` is the thread the work runs in.

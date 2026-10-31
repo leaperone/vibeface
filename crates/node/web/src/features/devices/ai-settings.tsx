@@ -413,7 +413,7 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
     <div className="grid gap-1 px-4 pb-3 sm:ps-12">
       {'issue' in item.readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.readiness.issue)}</p> : null}
       {item.setup && (bot || execution) && ["needs_setup", "unverified"].includes(item.readiness.state) ? <div className="grid gap-2 text-meta">
-        <p>在这台 Node 的电脑上运行以下命令，为私有目录登录或配置，然后检查可用性。本机 CLI 的其他目录登录状态不会自动复制。</p>
+        <p>在运行 AI 的电脑上执行以下命令，登录或配置后再检查可用性。其他目录中的登录状态不会自动复制。</p>
         <FolderPath path={item.setup.directory} shown={display[item.setup.directory]} />
         <div className="flex min-w-0 gap-2">
           <Input readOnly aria-label={`${name} 私有目录登录命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />

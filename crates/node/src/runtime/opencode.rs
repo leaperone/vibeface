@@ -2397,7 +2397,10 @@ mod tests {
             call_ref: "w-1".into(),
             kind: WorkKind::Agent(Provider::Opencode),
             model: Some("fake/m".into()),
-            resolved: None,
+            resolved: crate::model::ResolvedModel {
+                provider: Provider::Opencode,
+                model: Some("fake/m".into()),
+            },
             cwd: place.dir.join("work").display().to_string(),
             title: "t".into(),
             prompt: prompt.into(),
@@ -2439,7 +2442,7 @@ mod tests {
     /// Registers the work `w-1` and has the Node start it on opencode.
     async fn dispatch(node: &Arc<Runtime>, network: &str, spec: &WorkSpec) -> Result<()> {
         let at = now_ms();
-        (node.store.lock().await).accept_work(&node.identity, network, spec.clone(), at)?;
+        (node.store.lock().await).accept_work_fixture(&node.identity, network, spec.clone(), at)?;
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();
         let sends = (node.start_work(opencode.as_ref(), network, spec, None, &args)).await?;
@@ -3166,13 +3169,17 @@ mod tests {
             .context("the work's session")?
             .to_owned();
         let second = WorkSpec {
+            resolved: crate::model::ResolvedModel {
+                provider: Provider::Opencode,
+                model: Some("fake/other".into()),
+            },
             work_id: "w-2".into(),
             call_ref: "w-2".into(),
             prompt: "again".into(),
             thread: Some(session.clone()),
             ..first
         };
-        (node.store.lock().await).accept_work(
+        (node.store.lock().await).accept_work_fixture(
             &node.identity,
             &network,
             second.clone(),
@@ -3227,7 +3234,7 @@ mod tests {
         };
         for work in [&unsure, &second] {
             let mut store = node.store.lock().await;
-            store.accept_work(&node.identity, &network, work.clone(), now_ms())?;
+            store.accept_work_fixture(&node.identity, &network, work.clone(), now_ms())?;
         }
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();
@@ -3266,7 +3273,7 @@ mod tests {
         };
         for work in [&first, &second] {
             let mut store = node.store.lock().await;
-            store.accept_work(&node.identity, &network, work.clone(), now_ms())?;
+            store.accept_work_fixture(&node.identity, &network, work.clone(), now_ms())?;
         }
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();

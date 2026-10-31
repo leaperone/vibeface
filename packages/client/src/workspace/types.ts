@@ -24,7 +24,7 @@ export type DispatchState = "dispatch_waiting" | "dispatch_rejected" | "dispatch
 export type StopState = "stop_waiting" | "stop_timed_out"
 export type WorkOutcome = "completed" | "failed" | "interrupted" | "rejected" | "unverified"
 export type ResolvedModel = { provider: ProviderId; model: string | null }
-export type WorkRecord = {
+type WorkFields = {
   work_id: string
   trigger: string
   target_node: string
@@ -32,8 +32,6 @@ export type WorkRecord = {
   /** A few words for the user; `prompt` is what the agent was asked to do. */
   title: string
   prompt: string
-  /** A dispatch delivery shows as a work row until its target answers. */
-  state: WorkState | DispatchState
   summary: string
   outcome: WorkOutcome | null
   result_text: string
@@ -48,8 +46,6 @@ export type WorkRecord = {
   call_ref?: string
   /** The dispatcher's optional model override. */
   model?: string
-  /** The model frozen by the accepting Node. */
-  resolved?: ResolvedModel
   /** A follow-up work continues the prior work's provider session. */
   continues?: string
   /** The causal parent work, if this was dispatched as a child. */
@@ -64,6 +60,13 @@ export type WorkRecord = {
   /** A stop sent while the device was unreachable: still retrying, or past its deadline. */
   stop?: StopState
 }
+export type WorkRecord = WorkFields & (
+  | { state: WorkState; resolved: ResolvedModel }
+  | { state: DispatchState; resolved?: never }
+)
+/** The fields a task card can read from either full work or an overview summary. */
+export type WorkCard = Pick<WorkRecord, "work_id" | "target_node" | "cwd" | "title" | "state" | "summary" | "outcome" | "failure_reason" | "failure" | "kind" | "dispatcher" | "call_ref" | "continues" | "parent" | "thread" | "thread_id" | "turn_id" | "phase" | "stop">
+export type OpenWorkCard = WorkCard & { conversation_id: string }
 export const providerStages = ['validate', 'install', 'launch', 'authentication', 'model_list', 'session_start', 'turn_start', 'run', 'read_back', 'interrupt', 'compact', 'handoff', 'record'] as const
 export type ProviderStage = typeof providerStages[number]
 export type TurnRuntime = {

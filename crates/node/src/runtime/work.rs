@@ -3,7 +3,8 @@
 use super::*;
 use crate::scheduling::task_trigger;
 use crate::work::{
-    Dispatch, DispatchState, Probe, Signal, StopRequest, WorkRecord, WorkSpec, WorkState,
+    Dispatch, DispatchState, Probe, RequestedWorkKind, Signal, StopRequest, WorkAdmission,
+    WorkRecord, WorkRequest, WorkSpec, WorkState,
 };
 use vibeface_bridge::{
     codex::{ExecEvent, StartReport},
@@ -139,12 +140,17 @@ impl Runtime {
     /// Every dispatch, local or from another Node, passes the same checks: the trigger chain
     /// carries the user's signed message or their permission to continue, the directory is in
     /// this Node's roots, and an agent task has an Agent to run it.
-    async fn authorize_dispatch(&self, network: &str, spec: &WorkSpec) -> Result<()> {
+    fn authorize_dispatch(
+        &self,
+        store: &Store,
+        network: &str,
+        spec: &WorkRequest,
+        kind: WorkKind,
+    ) -> Result<()> {
         // A send goes into a thread that already exists, often outside the roots; it picks no directory.
         if spec.thread.is_none() {
             self.allowed_path(&spec.cwd)?;
         }
-        let store = self.store.lock().await;
         let conversation = store
             .conversation(network, &spec.conversation)?
             .context("conversation not found")?;
@@ -217,7 +223,7 @@ impl Runtime {
                     .context("agent task not found on this device")?;
                 ensure!(
                     spec.dispatcher == spec.target
-                        && matches!(spec.kind, WorkKind::Agent(_))
+                        && matches!(kind, WorkKind::Agent(_))
                         && task.kind == WorkKind::Task
                         && task.conversation == spec.conversation
                         && spec.parent.as_deref() == Some(task.work_id.as_str())
@@ -236,7 +242,7 @@ impl Runtime {
                 "a continuation keeps the original conversation"
             );
             match original.kind {
-                _ if original.kind == spec.kind => {}
+                _ if original.kind == kind => {}
                 WorkKind::Agent(ran) => bail!(
                     "work {} ran on {}; continue it with agent {} or leave agent out",
                     original.work_id,
@@ -247,10 +253,10 @@ impl Runtime {
             }
         }
         ensure!(
-            spec.kind == WorkKind::Task || spec.dispatcher == spec.target,
+            kind == WorkKind::Task || spec.dispatcher == spec.target,
             "another device takes work only as a task for its bot"
         );
-        if spec.kind == WorkKind::Task {
+        if kind == WorkKind::Task {
             ensure!(
                 spec.dispatcher != spec.target,
                 "an agent task goes to another device"
@@ -266,40 +272,61 @@ impl Runtime {
         Ok(())
     }
 
-    /// Records the dispatch. Its provider then starts it (see `Executor::start`); an agent task
-    /// is queued for this device's bot. A retry of the same `work_id` returns the existing
-    /// record and `false`, so it never starts a second turn.
     pub(super) async fn accept_dispatch(
         self: &Arc<Self>,
         network: &str,
-        mut spec: WorkSpec,
-    ) -> Result<(WorkRecord, bool)> {
-        spec.model = spec
+        mut request: WorkRequest,
+        args: &Value,
+    ) -> Result<WorkAdmission> {
+        request.model = request
             .model
             .as_deref()
             .map(str::trim)
             .filter(|model| !model.is_empty())
             .map(str::to_owned);
+        ensure!(
+            request.target == self.identity.device_id()?,
+            "work targets another Node"
+        );
+        ensure!(
+            request.work_id
+                == WorkSpec::id(&request.conversation, &request.trigger, &request.call_ref),
+            "work ID does not match its call"
+        );
         let _settings = self.manager_controls.lock().await;
-        {
+        let admitted = {
             let mut store = self.store.lock().await;
-            if store.work_record(&spec.work_id)?.is_some() {
-                return store.accept_work(&self.identity, network, spec, now_ms());
+            if let Some(existing) = store.accepted_work(network, &request)? {
+                existing
+            } else {
+                let first = (|| {
+                    let proposed = self.resolve_work_model(&store, network, &request)?;
+                    let kind = match request.kind {
+                        RequestedWorkKind::Agent(_) => {
+                            proposed.provider.check_work(args)?;
+                            WorkKind::Agent(proposed.provider)
+                        }
+                        RequestedWorkKind::Task => WorkKind::Task,
+                    };
+                    self.authorize_dispatch(&store, network, &request, kind)?;
+                    store.accept_work(&self.identity, network, request.clone(), proposed, now_ms())
+                })();
+                match first {
+                    Ok(admitted) => admitted,
+                    Err(error) => match store.accepted_work(network, &request)? {
+                        Some(existing) => existing,
+                        None => return Err(error),
+                    },
+                }
             }
-        }
-        let spec = self.resolve_work_model(network, spec).await?;
-        self.authorize_dispatch(network, &spec).await?;
-        let (record, created) =
-            self.store
-                .lock()
-                .await
-                .accept_work(&self.identity, network, spec, now_ms())?;
+        };
+        let record = &admitted.record;
         tracing::info!(
             event = "work.dispatched",
             conversation_id = record.conversation,
             work_id = record.work_id,
             kind = ?record.kind,
-            created,
+            created = admitted.created,
             "work dispatched to this device"
         );
         self.publish_changed(
@@ -307,86 +334,73 @@ impl Runtime {
             &record.conversation,
             Changed::Work(&record.work_id),
         );
-        if created && record.kind == WorkKind::Task {
+        if admitted.created && record.kind == WorkKind::Task {
             self.wake_scheduler()?;
         }
-        Ok((record, created))
+        Ok(admitted)
     }
 
-    pub(super) async fn resolve_work_model(
+    fn resolve_work_model(
         &self,
+        store: &Store,
         network: &str,
-        mut spec: WorkSpec,
-    ) -> Result<WorkSpec> {
-        match spec.kind {
-            WorkKind::Agent(provider) => {
-                ensure!(
-                    spec.target == self.identity.device_id()?,
-                    "an execution work targets another Node"
-                );
-                if let Some(resolved) = &spec.resolved {
-                    ensure!(
-                        resolved.provider == provider,
-                        "resolved work provider does not match its agent"
-                    );
-                    if let Some(model) = &resolved.model {
-                        crate::model::validate_model(model)?;
+        request: &WorkRequest,
+    ) -> Result<ResolvedModel> {
+        let (provider, model) = match request.kind {
+            RequestedWorkKind::Agent(agent) => {
+                let provider = self.executing_from(
+                    store,
+                    network,
+                    agent,
+                    request.thread.as_deref(),
+                    request.continues.as_deref(),
+                )?;
+                if let Some(thread) = &request.thread {
+                    match self.ran_on_from(store, network, thread)? {
+                        Some(ran) if ran != provider => bail!(
+                            "this device's {} works ran in this session; set agent to {} or leave agent out",
+                            ran.label(),
+                            ran.name()
+                        ),
+                        None if !provider.work().any_thread => bail!(
+                            "{} takes work only in sessions this device's works ran in; leave agent out for a Codex thread, and dispatch without thread for a session the user opened",
+                            provider.label()
+                        ),
+                        _ => {}
                     }
-                    return Ok(spec);
+                    ensure!(
+                        store.native_thread_conversation(thread)?.is_none(),
+                        "this thread is a bot's own reply thread; message that bot with message_bot instead"
+                    );
                 }
-                let requested = spec
-                    .model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|model| !model.is_empty());
-                let providers = self.providers();
-                let resolved = providers
+                let model = self
+                    .providers()
                     .switches
-                    .resolve_execution_model(provider, requested);
-                crate::model::validate_model(&resolved)?;
-                spec.model = requested.map(str::to_owned);
-                spec.resolved = Some(ResolvedModel {
-                    provider,
-                    model: (!resolved.is_empty()).then_some(resolved),
-                });
+                    .resolve_execution_model(provider, request.model.as_deref());
+                (provider, model)
             }
-            WorkKind::Task => {
+            RequestedWorkKind::Task => {
                 ensure!(
-                    spec.model
-                        .as_deref()
-                        .is_none_or(|model| model.trim().is_empty()),
+                    request.model.is_none(),
                     "a remote task uses the target Bot's model; omit model"
                 );
-                let manager = self
-                    .manager()
-                    .context("this device has no bot to take the task")?;
-                let bot = self
-                    .store
-                    .lock()
-                    .await
-                    .bot_for_conversation(network, &spec.conversation)?;
-                if let Some(resolved) = &spec.resolved {
-                    ensure!(
-                        resolved.provider == manager.provider,
-                        "resolved task provider does not match this Bot"
-                    );
-                    if let Some(model) = &resolved.model {
-                        crate::model::validate_model(model)?;
-                    }
-                    return Ok(spec);
-                }
+                let manager = self.manager().ok_or_else(|| {
+                    ExecFailure::new(
+                        FailureKind::NoBot,
+                        "this device has no bot to take the task",
+                    )
+                })?;
+                let bot = store.bot_for_conversation(network, &request.conversation)?;
                 let model = crate::scheduler::bot_model(&manager, bot.as_ref())
                     .unwrap_or_else(|| manager.model.clone());
-                let model = manager.provider.model(model.trim());
-                crate::model::validate_model(&model)?;
-                spec.model = None;
-                spec.resolved = Some(ResolvedModel {
-                    provider: manager.provider,
-                    model: (!model.is_empty()).then_some(model),
-                });
+                (manager.provider, manager.provider.model(model.trim()))
             }
-        }
-        Ok(spec)
+        };
+        crate::model::validate_model(&model)?;
+        Ok(ResolvedModel {
+            provider,
+            model: (!model.is_empty()).then_some(model),
+        })
     }
 
     /// Another Node's dispatch. The dispatcher may be ahead of this Node, so a refusal is retried
@@ -397,7 +411,11 @@ impl Runtime {
         origin: &str,
         input: &Value,
     ) -> Result<Value> {
-        let spec: WorkSpec = serde_json::from_value(input["spec"].clone())?;
+        let spec: WorkRequest = serde_json::from_value(input["spec"].clone())?;
+        ensure!(
+            spec.kind == RequestedWorkKind::Task,
+            "another device takes work only as a task for its bot"
+        );
         ensure!(
             spec.dispatcher == origin && spec.target == self.identity.device_id()?,
             "a dispatch names its sender and this device"
@@ -406,18 +424,16 @@ impl Runtime {
             spec.work_id == WorkSpec::id(&spec.conversation, &spec.trigger, &spec.call_ref),
             "work ID does not match its call"
         );
-        ensure!(
-            spec.resolved.is_none(),
-            "a remote dispatcher cannot provide a resolved model"
-        );
-        let first = self.accept_dispatch(network, spec.clone()).await;
+        let first = self
+            .accept_dispatch(network, spec.clone(), &Value::Null)
+            .await;
         let record = match first {
-            Ok((record, _)) => Ok(record),
+            Ok(admitted) => Ok(admitted.record),
             Err(_) => {
                 self.sync_peer(network, origin).await?;
-                self.accept_dispatch(network, spec)
+                self.accept_dispatch(network, spec, &Value::Null)
                     .await
-                    .map(|(record, _)| record)
+                    .map(|admitted| admitted.record)
             }
         };
         Ok(match record {
@@ -435,7 +451,7 @@ impl Runtime {
     pub(super) async fn send_dispatch(
         self: &Arc<Self>,
         network: &str,
-        spec: WorkSpec,
+        spec: WorkRequest,
         notify: bool,
     ) -> Result<Dispatch> {
         let dispatch = self.store.lock().await.save_dispatch(&Dispatch {

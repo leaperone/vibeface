@@ -6,7 +6,7 @@ use crate::{
         bots::created_bot_id,
     },
     tools::{Effect, Tool, ToolFailure},
-    work::WorkSpec,
+    work::{RequestedWorkKind, WorkRequest, WorkSpec},
 };
 
 impl Runtime {
@@ -651,31 +651,19 @@ impl Runtime {
                 args["continues"].is_null(),
                 "thread and continues are exclusive"
             );
-            ensure!(
-                self.store
-                    .lock()
-                    .await
-                    .native_thread_conversation(thread)?
-                    .is_none(),
-                "this thread is a bot's own reply thread; message that bot with message_bot instead"
-            );
         }
         let agent: Option<Provider> =
             serde_json::from_value(args["agent"].clone()).context("agent names a provider")?;
         let work_id = WorkSpec::id(scope, &manager.trigger, call_ref);
-        // A retry keeps the provider the first call settled on, whatever the switches say now.
-        let retried = (self.store.lock().await.work_record(&work_id)?).map(|run| run.kind);
-        let kind = match (agent, retried) {
-            (agent, Some(kind)) if target == local => agent.map_or(kind, WorkKind::Agent),
-            _ if target == local => WorkKind::Agent(self.executing(network, args).await?),
-            (None, _) => WorkKind::Task,
-            (Some(_), _) => {
-                bail!("agent picks a provider of this device; another device's bot picks its own")
-            }
+        let kind = if target == local {
+            RequestedWorkKind::Agent(agent)
+        } else {
+            ensure!(
+                agent.is_none(),
+                "agent picks a provider of this device; another device's bot picks its own"
+            );
+            RequestedWorkKind::Task
         };
-        if let WorkKind::Agent(provider) = kind {
-            provider.check_work(args)?;
-        }
         let requested_model = optional("model")
             .map(|model| model.trim().to_owned())
             .filter(|model| !model.is_empty());
@@ -684,21 +672,7 @@ impl Runtime {
                 "a remote task uses the target Bot's model; omit model or dispatch locally with an execution provider"
             );
         }
-        if let (Some(thread), WorkKind::Agent(provider)) = (&thread, kind) {
-            match self.ran_on(network, thread).await? {
-                Some(ran) if ran != provider => bail!(
-                    "this device's {} works ran in this session; set agent to {} or leave agent out",
-                    ran.label(),
-                    ran.name()
-                ),
-                None if !provider.work().any_thread => bail!(
-                    "{} takes work only in sessions this device's works ran in; leave agent out for a Codex thread, and dispatch without thread for a session the user opened",
-                    provider.label()
-                ),
-                _ => {}
-            }
-        }
-        let spec = WorkSpec {
+        let request = WorkRequest {
             work_id,
             conversation: scope.into(),
             trigger: manager.trigger.clone(),
@@ -707,7 +681,6 @@ impl Runtime {
             call_ref: call_ref.into(),
             kind,
             model: requested_model,
-            resolved: None,
             // A thread's directory is only informational and may be unknown.
             cwd: match &thread {
                 Some(_) => optional("cwd").unwrap_or_default(),
@@ -720,20 +693,11 @@ impl Runtime {
             thread: thread.clone(),
         };
         if target != local {
-            let dispatch = self.send_dispatch(network, spec, false).await?;
+            let dispatch = self.send_dispatch(network, request, false).await?;
             return Ok(dispatch_row(&dispatch));
         }
-        let mut spec = spec;
-        let (record, created) = self.accept_dispatch(network, spec.clone()).await?;
-        spec.resolved = self
-            .store
-            .lock()
-            .await
-            .works(network, scope)?
-            .into_iter()
-            .find(|work| work.work_id == record.work_id)
-            .context("accepted work projection missing")?
-            .resolved;
+        let admitted = self.accept_dispatch(network, request, args).await?;
+        let (spec, record, created) = (admitted.spec, admitted.record, admitted.created);
         let thread = match &spec.continues {
             None => thread,
             Some(original) => self
@@ -782,21 +746,40 @@ impl Runtime {
     /// one the work it continues ran on; else the bot's own provider when it executes work
     /// here, else the first one that does.
     async fn executing(&self, network: &str, args: &Value) -> Result<Provider> {
-        use vibeface_bridge::failure::{ExecFailure, FailureKind};
         let agent: Option<Provider> =
             serde_json::from_value(args["agent"].clone()).context("agent names a provider")?;
-        let earlier = match (agent, args["thread"].as_str(), args["continues"].as_str()) {
+        let store = self.store.lock().await;
+        self.executing_from(
+            &store,
+            network,
+            agent,
+            args["thread"].as_str(),
+            args["continues"].as_str(),
+        )
+    }
+
+    pub(super) fn executing_from(
+        &self,
+        store: &Store,
+        network: &str,
+        agent: Option<Provider>,
+        thread: Option<&str>,
+        continues: Option<&str>,
+    ) -> Result<Provider> {
+        use vibeface_bridge::failure::{ExecFailure, FailureKind};
+        let earlier = match (agent, thread, continues) {
             (Some(_), _, _) => None,
-            (None, Some(thread), _) => (self.ran_on(network, thread).await?).or_else(|| {
+            (None, Some(thread), _) => self.ran_on_from(store, network, thread)?.or_else(|| {
                 Provider::ALL
                     .into_iter()
                     .find(|provider| provider.work().any_thread)
             }),
-            (None, None, Some(original)) => (self.store.lock().await.work_record(original)?)
-                .and_then(|run| match run.kind {
+            (None, None, Some(original)) => {
+                store.work_record(original)?.and_then(|run| match run.kind {
                     WorkKind::Agent(provider) => Some(provider),
                     WorkKind::Task => None,
-                }),
+                })
+            }
             (None, None, None) => None,
         };
         let execution = self.providers().switches.execution;
@@ -820,8 +803,12 @@ impl Runtime {
     }
 
     /// The provider this device's works in a session of this network ran on.
-    async fn ran_on(&self, network: &str, thread: &str) -> Result<Option<Provider>> {
-        let store = self.store.lock().await;
+    pub(super) fn ran_on_from(
+        &self,
+        store: &Store,
+        network: &str,
+        thread: &str,
+    ) -> Result<Option<Provider>> {
         let runs = store.work_records_on_thread(thread)?;
         Ok(runs.iter().find_map(|run| match run.kind {
             WorkKind::Agent(provider)
@@ -1312,7 +1299,7 @@ mod tests {
         let (node, admin, dir) = node().await?;
         bot(&node, &admin, "c", "Ops", &[]).await?;
         let network = node.store.lock().await.network()?.context("network")?;
-        let (trigger, attempt) = claim_reply(&node, &admin, "c", "trigger").await?;
+        let (trigger, attempt) = claim_reply(&node, &admin, "c", "trigger", "boot").await?;
         let claimed = node
             .store
             .lock()
@@ -1485,16 +1472,15 @@ mod tests {
             .switches
             .execution_models
             .insert(Provider::Codex, "first".into());
-        let spec = WorkSpec {
+        let spec = WorkRequest {
             work_id: WorkSpec::id("c", "message:m1", "frozen"),
             conversation: "c".into(),
             trigger: "message:m1".into(),
             target: node.identity.device_id()?,
             dispatcher: node.identity.device_id()?,
             call_ref: "frozen".into(),
-            kind: WorkKind::Agent(Provider::Codex),
+            kind: RequestedWorkKind::Agent(Some(Provider::Codex)),
             model: None,
-            resolved: None,
             cwd: dir.display().to_string(),
             title: "work".into(),
             prompt: "go".into(),
@@ -1502,7 +1488,11 @@ mod tests {
             parent: None,
             thread: None,
         };
-        assert!(node.accept_dispatch(&network, spec.clone()).await?.1);
+        assert!(
+            node.accept_dispatch(&network, spec.clone(), &Value::Null)
+                .await?
+                .created
+        );
         node.providers
             .lock()
             .unwrap()
@@ -1510,45 +1500,45 @@ mod tests {
             .execution_models
             .insert(Provider::Codex, "changed".into());
         let (left, right) = tokio::join!(
-            node.accept_dispatch(&network, spec.clone()),
-            node.accept_dispatch(&network, spec.clone())
+            node.accept_dispatch(&network, spec.clone(), &Value::Null),
+            node.accept_dispatch(&network, spec.clone(), &Value::Null)
         );
-        assert!(!left?.1 && !right?.1);
+        assert!(!left?.created && !right?.created);
         let works = node.store.lock().await.works(&network, "c")?;
         assert_eq!(works.len(), 1);
-        assert_eq!(
-            works[0]
-                .resolved
-                .as_ref()
-                .and_then(|resolved| resolved.model.as_deref()),
-            Some("first")
-        );
-        let explicit = WorkSpec {
-            work_id: "explicit".into(),
+        assert_eq!(works[0].resolved.model.as_deref(), Some("first"));
+        let explicit = WorkRequest {
+            work_id: WorkSpec::id("c", "message:m1", "explicit"),
             call_ref: "explicit".into(),
             model: Some("  chosen  ".into()),
             ..spec.clone()
         };
-        assert!(node.accept_dispatch(&network, explicit.clone()).await?.1);
+        assert!(
+            node.accept_dispatch(&network, explicit.clone(), &Value::Null)
+                .await?
+                .created
+        );
         assert!(
             !node
                 .accept_dispatch(
                     &network,
-                    WorkSpec {
+                    WorkRequest {
                         model: Some("chosen".into()),
                         ..explicit.clone()
-                    }
+                    },
+                    &Value::Null,
                 )
                 .await?
-                .1
+                .created
         );
         assert!(
             node.accept_dispatch(
                 &network,
-                WorkSpec {
+                WorkRequest {
                     model: Some("other".into()),
                     ..explicit
-                }
+                },
+                &Value::Null,
             )
             .await
             .is_err()

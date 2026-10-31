@@ -5,7 +5,7 @@ import type { ReplyStatus } from "../chat/types.ts"
 import type {
   AnswerResult, BotReadiness, CloseReason, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, DispatchState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
-  BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome, Busy,
+  BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, OpenWorkCard, WorkCard, SkillSet, SteerOutcome, Busy,
   WorkPhase, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation, OverviewConversation, OverviewSession,
 } from "./types.ts"
 import { answerId, questionOpen } from "./questions.ts"
@@ -150,29 +150,28 @@ function workKind(value: unknown): WorkRecord["kind"] {
   if (value === "task" || providerIds.includes(value as ProviderId)) return value as WorkRecord["kind"]
   throw new Error("任务类型无法识别。")
 }
-function optionalWorkFields(data: Record<string, unknown>): Partial<WorkRecord> {
-  const fields: Partial<WorkRecord> = {}
+function optionalWorkFields(data: Record<string, unknown>): Partial<Omit<WorkRecord, "state" | "resolved">> {
+  const fields: Partial<Omit<WorkRecord, "state" | "resolved">> = {}
   for (const key of ["dispatcher", "call_ref", "continues", "parent", "thread", "thread_id", "turn_id"] as const) {
     if (data[key] != null) fields[key] = text(data[key])
   }
   const kind = workKind(data.kind)
   if (kind !== undefined) fields.kind = kind
   if (typeof data.model === "string") fields.model = data.model
-  if (data.resolved != null) {
-    const resolved = record(data.resolved)
-    if (!providerIds.includes(resolved.provider as ProviderId)) throw new Error("冻结模型的 provider 无法识别。")
-    fields.resolved = { provider: resolved.provider as ProviderId, model: resolved.model == null ? null : text(resolved.model) }
-  }
   if (data.phase != null) fields.phase = workPhase(data.phase)
   return fields
 }
 function work(value: unknown): WorkRecord {
   const data = record(value)
-  return {
+  const common = {
     work_id: text(data.work_id), trigger: text(data.trigger), target_node: text(data.target_node), cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: text(data.prompt),
-    state: workState(data.state), summary: text(data.summary), outcome: workOutcome(data.outcome), result_text: text(data.result_text),
+    summary: text(data.summary), outcome: workOutcome(data.outcome), result_text: text(data.result_text),
     failure_reason: data.failure_reason == null ? null : text(data.failure_reason), ...failure(data.failure), ...optionalWorkFields(data),
   }
+  const state = workState(data.state)
+  if (state === "dispatch_waiting" || state === "dispatch_rejected" || state === "dispatch_unverified") return { ...common, state }
+  const resolved = record(data.resolved)
+  return { ...common, state, resolved: { provider: provider(resolved.provider), model: resolved.model === null ? null : text(resolved.model) } }
 }
 /** Requests this device still carries: an untaken dispatch shows as its own task row, a stop marks its work. */
 export function withDeliveries(works: WorkRecord[], value: unknown): WorkRecord[] {
@@ -197,7 +196,7 @@ function coordinationCheck(value: unknown): CoordinationCheck {
  * its device is known to be offline, or its App Server disconnected for a Codex turn; an unknown device is not judged.
  * A task runs in its device's bot, which reports without the App Server, so only offline applies to it.
  */
-export function confirmReason(item: WorkRecord, nodes: readonly NodeInfo[]): ConfirmReason | null {
+export function confirmReason(item: Pick<WorkCard, "state" | "outcome" | "target_node" | "kind">, nodes: readonly NodeInfo[]): ConfirmReason | null {
   if (item.state === "unverified") return "unverified"
   if (item.outcome || item.state === "finished" || item.state.startsWith("dispatch_")) return null
   const node = nodes.find((candidate) => candidate.device_id === item.target_node)
@@ -215,7 +214,7 @@ export function pendingChecks(data: Pick<ConversationPayload, "works" | "checks"
 }
 export type WorkCheck = Extract<PendingCheck, { kind: "work" }>
 /** Each work waiting for confirmation; works one offline device or one disconnected Codex holds share one card, where the first of them stood. */
-export function workChecks(works: readonly OpenWork[], nodes: readonly NodeInfo[]): PendingCheck[] {
+export function workChecks(works: readonly OpenWorkCard[], nodes: readonly NodeInfo[]): PendingCheck[] {
   const checks = works.flatMap((item): WorkCheck[] => {
     const reason = confirmReason(item, nodes)
     return reason ? [{ kind: "work", check_id: `work:${item.work_id}`, detail: item.failure_reason ?? "", work_id: item.work_id, target_node: item.target_node, conversation_id: item.conversation_id, title: item.title, reason }] : []
@@ -236,7 +235,7 @@ export function parseOpenWorks(value: unknown): OpenWork[] {
 }
 
 export type WorkspaceOverviewInput = {
-  openWorks: readonly OpenWork[]
+  openWorks: readonly OpenWorkCard[]
   bots: readonly BotRecord[]
   questions: readonly Question[]
   nodes: readonly NodeInfo[]
@@ -329,7 +328,7 @@ function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "
   }
 }
 
-function openOverviewWork(work: OpenWork, bots: ReadonlyMap<string, OverviewBot>, nodes: ReadonlyMap<string, OverviewNode>): OverviewTask | null {
+function openOverviewWork(work: OpenWorkCard, bots: ReadonlyMap<string, OverviewBot>, nodes: ReadonlyMap<string, OverviewNode>): OverviewTask | null {
   const bot = bots.get(work.conversation_id) ?? null, node = nodes.get(work.target_node) ?? null
   const unsafeCompleted = work.outcome === "completed" && (work.state === "unverified" || (node !== null && (!node.online || node.revoked)))
   // A failure stays listed until a later work of its conversation ends, as the Node lists it.
@@ -342,10 +341,10 @@ function openOverviewWork(work: OpenWork, bots: ReadonlyMap<string, OverviewBot>
   return { ...overviewTaskBase(work, bot, node, "event"), kind: "work" }
 }
 
-function overviewCheck(check: PendingCheck, workById: ReadonlyMap<string, OpenWork>, bots: ReadonlyMap<string, OverviewBot>, nodes: ReadonlyMap<string, OverviewNode>): OverviewTask {
-  const works = check.kind === "device" ? check.works.flatMap((item) => { const work = workById.get(item.work_id); return work ? [work] : [] }) : check.kind === "work" ? [workById.get(check.work_id)].filter((work): work is OpenWork => Boolean(work)) : []
+function overviewCheck(check: PendingCheck, workById: ReadonlyMap<string, OpenWorkCard>, bots: ReadonlyMap<string, OverviewBot>, nodes: ReadonlyMap<string, OverviewNode>): OverviewTask {
+  const works = check.kind === "device" ? check.works.flatMap((item) => { const work = workById.get(item.work_id); return work ? [work] : [] }) : check.kind === "work" ? [workById.get(check.work_id)].filter((work): work is OpenWorkCard => Boolean(work)) : []
   const first = works[0]
-  const fallback: OpenWork = first ?? {
+  const fallback: OpenWorkCard = first ?? {
     work_id: check.kind === "work" ? check.work_id : "",
     conversation_id: check.kind === "work" ? check.conversation_id : "",
     title: check.kind === "work" ? check.title : "待确认",
@@ -353,7 +352,7 @@ function overviewCheck(check: PendingCheck, workById: ReadonlyMap<string, OpenWo
     state: "unverified",
     outcome: "unverified",
     target_node: check.kind === "work" || check.kind === "device" ? check.target_node : "",
-    cwd: "", prompt: "", trigger: "", result_text: "", failure_reason: check.detail,
+    cwd: "", failure_reason: check.detail,
   }
   const bot = fallback.conversation_id ? bots.get(fallback.conversation_id) ?? null : null
   const node = fallback.target_node ? nodes.get(fallback.target_node) ?? null : null
@@ -530,8 +529,8 @@ export function parseWorkspaceOverview(value: unknown): WorkspaceOverview {
 }
 
 /** Adapt bounded overview work rows for existing task cards and inbox checks. */
-export function openWorksFromOverview(overview: WorkspaceOverview): OpenWork[] {
-  return overview.tasks.flatMap((task): OpenWork[] => {
+export function openWorksFromOverview(overview: WorkspaceOverview): OpenWorkCard[] {
+  return overview.tasks.flatMap((task): OpenWorkCard[] => {
     if ((task.kind !== "work" && task.kind !== "dispatch") || !task.work_id) return []
     const state: WorkRecord["state"] = task.state === "accepted_waiting_sync" ? "dispatch_waiting"
       : task.state === "unknown" ? "unverified"
@@ -539,8 +538,8 @@ export function openWorksFromOverview(overview: WorkspaceOverview): OpenWork[] {
           : task.state
     const outcome = task.outcome === "completed" && state === "unverified" ? "unverified" : task.outcome
     return [{
-      work_id: task.work_id, conversation_id: task.conversation_id, trigger: "", target_node: task.target_node ?? "", cwd: task.cwd, title: task.title, prompt: "",
-      state, summary: task.summary, outcome, result_text: "", failure_reason: task.reason, ...failure(task.failure), kind: task.work_kind ?? undefined,
+      work_id: task.work_id, conversation_id: task.conversation_id, target_node: task.target_node ?? "", cwd: task.cwd, title: task.title,
+      state, summary: task.summary, outcome, failure_reason: task.reason, ...failure(task.failure), kind: task.work_kind ?? undefined,
       dispatcher: task.dispatcher ?? undefined, call_ref: task.call_ref ?? undefined, continues: task.continues ?? undefined, parent: task.parent ?? undefined,
       thread: task.thread ?? undefined, thread_id: task.thread_id ?? undefined, turn_id: task.turn_id ?? undefined, phase: task.phase ?? undefined,
       ...(task.state === "stop_waiting" || task.state === "stop_timed_out" ? { stop: task.state } : {}),

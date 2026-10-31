@@ -135,7 +135,7 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
     <View className="gap-1 px-4 pb-3">
       {'issue' in item.readiness ? <Text className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.readiness.issue)}</Text> : null}
       {item.setup && (assistant || execution) && ['needs_setup', 'unverified'].includes(item.readiness.state) ? <View className="gap-2">
-        <Text className="text-meta text-muted-foreground">在这台 Node 的电脑上运行以下命令，为私有目录登录或配置，然后检查可用性。本机 CLI 的其他目录登录状态不会自动复制。</Text>
+        <Text className="text-meta text-muted-foreground">在运行 AI 的电脑上执行以下命令，登录或配置后再检查可用性。其他目录中的登录状态不会自动复制。</Text>
         <Text selectable className="font-mono text-meta text-muted-foreground">{item.setup.directory}</Text>
         <CopyableId value={item.setup.command} label={`${name} 私有目录登录命令`} />
       </View> : null}

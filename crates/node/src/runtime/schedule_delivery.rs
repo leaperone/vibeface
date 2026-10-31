@@ -99,13 +99,14 @@ impl Runtime {
     }
 
     /// Stops for good once this Node's log forks: a turn would act without a record.
-    async fn schedule_tick(self: &Arc<Self>) -> Result<()> {
+    pub(super) async fn schedule_tick(self: &Arc<Self>) -> Result<()> {
         if !self.writable() {
             return Ok(());
         }
         let Some(network) = self.store.lock().await.network()? else {
             return Ok(());
         };
+        self.finish_incompatible_tasks(&network, None).await?;
         // A conversation that moved to a newer owner stops its turn here; a cancel the SDK does
         // not confirm ends as interrupted and waits for reconciliation like any other.
         let moved = self

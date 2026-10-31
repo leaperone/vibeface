@@ -1494,15 +1494,95 @@ impl Store {
         Ok(())
     }
 
+    pub fn refuse_queued_tasks(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        conversation: Option<&str>,
+        boot: &str,
+        at: i64,
+        mut refusal: impl FnMut(&ResolvedModel) -> Result<Option<(String, ExecFailure)>>,
+    ) -> Result<Vec<SchedulerJob>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let local = identity.device_id()?;
+        authorize_node_from(&tx, network, &local)?;
+        let queued = query_jobs(
+            &tx,
+            "kind='agent_task' AND state='queued' AND (?1 IS NULL OR conversation_id=?1)
+             AND EXISTS(SELECT 1 FROM works w WHERE w.network_id=?2 AND w.target_node=?3
+                AND w.work_id=scheduler_jobs.reply_to AND w.conversation_id=scheduler_jobs.conversation_id
+                AND w.dispatch IS NOT NULL)",
+            params![conversation, network, local],
+        )?;
+        let mut ended = Vec::new();
+        for mut job in queued {
+            if job.pending_check
+                || job.tool_calls
+                || job
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.execution != TurnExecution::NotStarted)
+            {
+                continue;
+            }
+            if super::work::run_finished(&tx, &job.reply_to)? {
+                continue;
+            }
+            let work = super::reduce::work_from(&tx, network, &job.reply_to)?
+                .context("agent task work missing")?;
+            let Some((generation, failure)) = refusal(&work.resolved)? else {
+                continue;
+            };
+            let mut session = load_session(&tx, &job.conversation_id)?;
+            let attempt = ManagerAttempt {
+                id: uuid::Uuid::new_v4().to_string(),
+                boot: boot.into(),
+                permission_version: session.permission_version,
+            };
+            job.runtime = Some(TurnRuntime {
+                provider: work.resolved.provider,
+                model: work.resolved.model,
+                reasoning_effort: None,
+                generation,
+                session_generation: session.session_generation,
+                delivery_id: attempt.id.clone(),
+                stage: ProviderStage::Validate,
+                execution: TurnExecution::NotStarted,
+                attempted_at_ms: at,
+                switched_from: None,
+                switch_reason: None,
+            });
+            job.state = JobState::Claimed { attempt };
+            ended.push(end_job_from(
+                &tx,
+                &self.blob_dir,
+                identity,
+                network,
+                &mut session,
+                job,
+                JobOutcome::Failed(failure),
+                "",
+                at,
+            )?);
+        }
+        tx.commit()?;
+        Ok(ended)
+    }
+
     /// Human messages go first.
-    pub fn claim_next(
+    pub fn claim_next<T>(
         &mut self,
         identity: &LocalIdentity,
         network: &str,
         conversation: &str,
         boot: &str,
-        configure: impl FnOnce(&SchedulerJob) -> Result<Option<String>>,
-    ) -> Result<Option<ClaimedJob>> {
+        prepare: impl FnOnce(
+            &SchedulerJob,
+            Option<&ResolvedModel>,
+        ) -> Result<Option<(String, RuntimeSelection, String, T)>>,
+    ) -> Result<Option<(ClaimedJob, T)>> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1597,11 +1677,26 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         };
-        let Some(sdk_config) = configure(&job)? else {
+        let accepted = match job.kind {
+            TriggerKind::AgentTask => Some(
+                super::reduce::work_from(&tx, network, &job.reply_to)?
+                    .context("agent task work missing")?
+                    .resolved,
+            ),
+            _ => None,
+        };
+        let Some((sdk_config, selection, generation, prepared)) = prepare(&job, accepted.as_ref())?
+        else {
             save_session(&tx, &session)?;
             tx.commit()?;
             return Ok(None);
         };
+        if let Some(accepted) = &accepted {
+            ensure!(
+                selection.provider == accepted.provider && selection.model == accepted.model,
+                "prepared task selection differs from accepted work"
+            );
+        }
         job.basis = log::version_vector_from(&tx, network)?;
         if session.sdk_config.as_deref() != Some(sdk_config.as_str())
             || session.owner_epoch != owner_epoch
@@ -1643,21 +1738,41 @@ impl Store {
                 permission_version: session.permission_version,
             },
         };
+        let attempt = job
+            .state
+            .attempt()
+            .context("claimed scheduler attempt missing")?;
+        job.runtime = Some(TurnRuntime {
+            provider: selection.provider,
+            model: selection.model,
+            reasoning_effort: selection.reasoning_effort,
+            generation,
+            session_generation: session.session_generation,
+            delivery_id: attempt.id.clone(),
+            stage: ProviderStage::Validate,
+            execution: TurnExecution::NotStarted,
+            attempted_at_ms: crate::runtime::now_ms(),
+            switched_from: None,
+            switch_reason: None,
+        });
         session.active = Some(job.trigger.clone());
         save_job(&tx, &job)?;
         save_session(&tx, &session)?;
         tx.commit()?;
-        Ok(Some(ClaimedJob {
-            job,
-            previous_native_id,
-            previous_token,
-            covers,
-            shown,
-            session_generation: session.session_generation,
-            handoff_revision: session.handoff_revision,
-            handoff_source: session.handoff_source,
-            previous_runtime,
-        }))
+        Ok(Some((
+            ClaimedJob {
+                job,
+                previous_native_id,
+                previous_token,
+                covers,
+                shown,
+                session_generation: session.session_generation,
+                handoff_revision: session.handoff_revision,
+                handoff_source: session.handoff_source,
+                previous_runtime,
+            },
+            prepared,
+        )))
     }
 
     fn update_attempt(
