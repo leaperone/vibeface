@@ -174,7 +174,7 @@ export const recoveryCopy = {
   added: '新设备',
   confirm: '立即生效',
   confirmAsk: '现在让这次找回立即生效？',
-  confirmNote: '请先确认是本人找回。新设备会立即获得管理权限，标为丢失的设备会被移出。',
+  confirmNote: '请先确认是你在找回。新设备会立即获得管理权限，标为丢失的设备会被移出。',
   confirmDone: '已立即生效',
   itsMe: '是我，收起提醒',
   /** 是我 only hides the reminder here; the recovery still takes effect when its wait ends. */
