@@ -23,7 +23,7 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 
 | 对象 | 当前事实和工作区用途 |
 | --- | --- |
-| `open_works` | `Store::open_works(network, scope)` 按 SQL 找出存在 dispatch 且没有结束记录、结果为 `unverified`，或仍待本人看的失败工作；后者是会话里最近结束的失败或被拒工作，之后没有更晚结束的工作、Bot 没有对它做出后续回复（它的结果报告轮的回复，或对失败之后本人消息的回复；派发它的那一轮的回复不算），也没有本人在待处理关掉它（`NotificationAcked`，`client_id = "inbox"`）。本机被拒的派发（未接收）同样列出，直到本人关掉、Bot 对它的报告轮写出已完成的回复，或派发它的那一轮之后本人发的消息有了已完成的回复（派发轮内直接得知被拒时没有报告轮）。已完成的工作不在此列表。 |
+| `open_works` | `Store::open_works(network, scope)` 按 SQL 找出存在 dispatch 且没有结束记录、结果为 `unverified`，或仍待本人看的失败工作；后者是会话里最近结束的失败或被拒工作，之后没有更晚结束的工作、Bot 没有对它做出后续回复（它的结果报告轮的回复，或对失败之后本人消息的回复；派发它的那一轮的回复不算），也没有本人在待处理关掉它（`NotificationAcked`，`client_id = "inbox"`）。本机被拒的派发（未接收）同样列出，直到本人关掉、Bot 对它的报告轮写出已完成的回复，或在派发轮内直接得知被拒、没有报告轮时，派发它的那一轮之后本人发的消息有了已完成的回复。已完成的工作不在此列表。 |
 | `ConversationPayload` | 客户端快照包含 `conversation`、`messages`、`works`、`scheduler`、`checks`、`local_node`、`changes`、`overwritten`、`bot_settings`、`questions`、`sessions`、`sent`。工作区从这些字段建立链接，不另建任务事实。 |
 | `scheduler_jobs` | job 主键语义为 `(conversation_id, trigger)`。`trigger` 可为 `message:<id>`、`work:<id>`、`task:<id>`、`bot_message:<id>` 或 `schedule:<id>:<slot>`。job 还保存 `kind`、顺序、`basis` 版本向量、`reply_to`、固定 `message_id` 和状态。 |
 | `scheduler_sessions` | 本机 Provider resume 指针，含 `native_id`、`native_token`、`covers`、`owner_epoch`、`sdk_config`、`permission_version`、`active` 和下一序号。它不是完整 transcript，也不是同步到 DAG 的上下文。 |
