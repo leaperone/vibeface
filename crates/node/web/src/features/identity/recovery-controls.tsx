@@ -98,7 +98,7 @@ export function PhoneRecovery() {
 export function RecoveryPendingCard() {
   const device = useDevice()
   const { busy, error, run } = useGenerationRun()
-  // Both manager decisions are irreversible, so each takes one confirmation, as on the phone.
+  // Either decision changes access, so both require confirmation, as on the phone.
   const [confirming, setConfirming] = useState<'confirm' | 'stop' | null>(null)
   const pending = device.pendingRecovery
   if (!pending) return null

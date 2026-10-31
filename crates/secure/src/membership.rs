@@ -845,18 +845,22 @@ fn vetoed(parent: &EpochView, checkpoint: &RootCheckpoint, hash: &str) -> bool {
         })
 }
 
-/// Whether an approval in `parent` makes `checkpoint` take effect before its deadline.
-fn approved(parent: &EpochView, checkpoint: &RootCheckpoint, hash: &str, now_ms: u64) -> bool {
-    checkpoint.directory.is_some()
-        && parent.approvals.iter().any(|approval| {
-            approval.checkpoint == hash
-                && approval.at_ms <= now_ms
+/// The first valid confirmation time, including one ahead of this replica's clock.
+fn approval_at(parent: &EpochView, checkpoint: &RootCheckpoint, hash: &str) -> Option<u64> {
+    parent
+        .approvals
+        .iter()
+        .filter(|approval| {
+            checkpoint.directory.is_some()
+                && approval.checkpoint == hash
                 && approval.at_ms < checkpoint.effective_at_ms()
                 && checkpoint
                     .heads
                     .iter()
                     .all(|head| approval.ancestors.contains(head))
         })
+        .map(|approval| approval.at_ms)
+        .min()
 }
 
 /// Whether a sibling checkpoint signed at `issued_at_ms` retires the recovery `earlier`.
@@ -1018,7 +1022,12 @@ impl NetworkState {
         let live = live(&epochs);
         let pending = pending(&epochs, live).map(|index| PendingRecovery {
             checkpoint: epochs[index].checkpoint.clone().unwrap_or_default(),
-            effective_at_ms: epochs[index].effective_at_ms,
+            effective_at_ms: approval_at(
+                &epochs[live].view,
+                &self.checkpoints[index - 1],
+                epochs[index].checkpoint.as_deref().unwrap_or_default(),
+            )
+            .unwrap_or(epochs[index].effective_at_ms),
             members: epochs[index].view.members.values().cloned().collect(),
         });
         let stopped = epochs
@@ -1168,12 +1177,12 @@ impl NetworkState {
                 Standing::Pending | Standing::Waiting => Standing::Waiting,
                 Standing::Live
                     if epoch.rotation
-                        || approved(
+                        || approval_at(
                             &epochs[epoch.parent.expect("only genesis has no parent")].view,
                             checkpoint,
                             checkpoint_hash,
-                            now_ms,
                         )
+                        .is_some_and(|at| at <= now_ms)
                         || now_ms >= epoch.effective_at_ms =>
                 {
                     Standing::Live
@@ -2476,6 +2485,7 @@ mod tests {
         assert!(state.append(event)?);
 
         assert_eq!(state.project_at(T)?.epoch, 1);
+        assert_eq!(state.project_at(T)?.pending.unwrap().effective_at_ms, T + 1);
         let view = state.project_at(T + 2)?;
         assert_eq!(view.epoch, 2);
         assert!(view.manager(&id(&found)).is_ok());
@@ -2498,6 +2508,30 @@ mod tests {
         assert_eq!(approved.merge(&state)?, merged);
         assert_eq!(merged.project_at(T)?.epoch, 1);
         assert_eq!(merged.project_at(T + 2)?.epoch, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn an_approval_needs_the_recovery_management_heads() -> Result<()> {
+        let (root, manager, node, mut state) = setup()?;
+        state.append(GovernanceEvent::grant(
+            &manager,
+            &state.project_at(T)?,
+            Member::client(&identity(), "other", true)?,
+        )?)?;
+        let (_, _, checkpoint) = recovering(&state, &root, &node, T)?;
+        state.recover_at(checkpoint.clone(), T)?;
+        let valid = approve(&manager, &state.project_at(T)?, &checkpoint, T + 1)?;
+        let mut missing = valid.clone();
+        missing.parents.clear();
+        state.append(missing.sign(&manager)?)?;
+        assert_eq!(state.project_at(T + 2)?.epoch, 1);
+        assert_eq!(
+            state.project_at(T + 2)?.pending.unwrap().checkpoint,
+            checkpoint.hash()?
+        );
+        state.append(valid)?;
+        assert_eq!(state.project_at(T + 2)?.epoch, 2);
         Ok(())
     }
 

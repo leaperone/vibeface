@@ -897,8 +897,9 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       if (!after) throw cause
       view = after
     }
-    if (view.members.some(member => member.device_id === own().deviceId)) await refreshDirectory()
-    else await refreshDirectory().catch(() => {})
+    setDirectory(view)
+    // A later refresh failure cannot undo the signed result, even if this manager lost access.
+    await refreshDirectory().catch(() => {})
   }
   /**
    * The app tries the entry Node where the ticket says it listens on the LAN, then this page's own entry: a scanned

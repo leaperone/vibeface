@@ -1034,7 +1034,7 @@ async fn dispatch(
                 );
                 let now = crate::runtime::now_ms() as u64;
                 ensure!(
-                    at_ms.abs_diff(now) <= RECOVERY_SKEW_MS,
+                    *at_ms <= now && now - *at_ms <= RECOVERY_SKEW_MS,
                     "this device's clock is too far from this Node's clock"
                 );
                 let pending = view
@@ -1046,10 +1046,21 @@ async fn dispatch(
                     *at_ms < pending.effective_at_ms,
                     "this recovery is already due"
                 );
+                let checkpoint = checkpoint.clone();
+                let epoch = event.epoch;
                 state.append(event)?;
+                let approved = state.project_at(now)?;
+                ensure!(
+                    approved.epoch > epoch && !approved.stopped.contains(&checkpoint),
+                    "this recovery approval did not take effect"
+                );
                 node.install_membership(state).await?;
             }
-            authentication(node, session).await
+            // The approved directory can remove its signer before the reply is sent.
+            let state = node.membership_state().await?;
+            let now = crate::runtime::now_ms() as u64;
+            let view = state.project_at(now)?;
+            Ok(json!({"state":state,"view":view,"now_ms":now}))
         }
         "recovery_state" => {
             // The recovery root may not be a member any more, so it proves itself
@@ -3435,6 +3446,52 @@ mod tests {
             },
         )?
         .sign(&manager)?;
+        for action in [
+            GovernanceAction::Approve {
+                checkpoint: "0".repeat(64),
+                at_ms: now,
+            },
+            GovernanceAction::Approve {
+                checkpoint: checkpoint.hash()?,
+                at_ms: now + 30_000,
+            },
+            GovernanceAction::Approve {
+                checkpoint: checkpoint.hash()?,
+                at_ms: now - RECOVERY_SKEW_MS - 1,
+            },
+        ] {
+            let mut invalid = event.clone();
+            invalid.action = action;
+            let invalid = invalid.sign(&manager)?;
+            assert!(
+                dispatch(
+                    &node,
+                    &mut session,
+                    "approve_recovery",
+                    json!({"event":invalid})
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(node.membership_state().await?.events.len(), 0);
+            assert_eq!(node.membership_state().await?.project()?.epoch, 1);
+        }
+        let mut stranger = Session {
+            device_id: LocalIdentity::generate().device_id()?,
+            cookie: None,
+            subscribed: None,
+            observation: None,
+        };
+        assert!(
+            dispatch(
+                &node,
+                &mut stranger,
+                "approve_recovery",
+                json!({"event":event})
+            )
+            .await
+            .is_err()
+        );
         let first = dispatch(
             &node,
             &mut session,
