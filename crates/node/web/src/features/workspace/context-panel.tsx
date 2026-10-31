@@ -89,8 +89,8 @@ export function ContextPanel({ bot, data, nodes, onBack }: ContextPanelProps) {
         </ul>
       </Details> : <p className="px-4 pb-3 text-meta text-muted-foreground">还没有工作</p>}
       <div className="grid gap-2 px-4 py-3">
-        <div className="flex flex-wrap items-center gap-2"><StatusPill tone="warning" icon={EyeOff}>检查点不可见</StatusPill><span className="text-meta text-muted-foreground">没有从聊天或本机会话猜测</span></div>
-        <Details label="为什么看不到检查点"><p>当前快照没有共享检查点字段。这里不会补造完整上下文，也不会显示原生会话令牌或 Provider 原始输出。</p></Details>
+        <div className="flex flex-wrap items-center gap-2"><StatusPill tone="warning" icon={EyeOff}>完整历史摘要未提供</StatusPill><span className="text-meta text-muted-foreground">不从聊天或本机会话猜测</span></div>
+        <Details label="为什么没有完整历史摘要"><p>当前快照没有共享检查点字段。这里不会补造完整上下文，也不会显示原生会话令牌或 Provider 原始输出。</p></Details>
       </div>
     </SettingsGroup>
 
@@ -133,36 +133,36 @@ function AgentContinuity({ data, nodes }: { data: ConversationPayload; nodes: re
   const remote = scheduler?.remote
   const openJobs = scheduler?.jobs.filter((job) => schedulerStatus(job.state).group !== "history") ?? []
   const status: ContinuityStatus = remote?.reachable === false
-    ? { tone: "warning", icon: Unplug, label: "远端状态未知", detail: "owner 不可达时，排队和回复结果不能视为已执行。" }
+    ? { tone: "warning", icon: Unplug, label: "其他设备状态未知", detail: "负责设备不可达时，排队和回复状态尚不清楚。" }
     : scheduler
-      ? { tone: "info", icon: openJobs.length ? Cpu : CircleCheck, label: openJobs.length === 1 ? schedulerStatus(openJobs[0].state).label : openJobs.length ? `${openJobs.length} 项未结观察` : "状态已读取", detail: [scheduler.provider ? providerLabel(scheduler.provider) : null, scheduler.model || "设备默认模型"].filter(Boolean).join(" · ") }
-      : { tone: "neutral", icon: CircleDashed, label: "调度状态未提供", detail: "Bot 身份和共享事实仍会保留。" }
+      ? { tone: "info", icon: openJobs.length ? Cpu : CircleCheck, label: openJobs.length === 1 ? schedulerStatus(openJobs[0].state).label : openJobs.length ? `${openJobs.length} 项后台工作未结束` : "状态已读取", detail: [scheduler.provider ? providerLabel(scheduler.provider) : null, scheduler.model || "设备默认模型"].filter(Boolean).join(" · ") }
+      : { tone: "neutral", icon: CircleDashed, label: "后台工作状态未提供", detail: "Bot 身份和共享事实仍会保留。" }
   const owner = data.conversation?.owner
   const ownerName = nodeName(owner ?? undefined, { nodes })
   const ownerLabel = remote?.owner
-    ? remote.reachable === false ? "远端 owner 不可达" : `远端 owner · ${nodeName(remote.owner, { nodes })}`
-    : owner === data.local_node ? "本机 owner"
-      : owner ? `最近已知 owner · ${ownerName}`
-        : "owner 未知"
-  return <SettingsGroup title="长期 Agent" footer="共享事实与外部会话归属分别记录。Bot 自身原生会话状态当前未提供。">
+    ? remote.reachable === false ? "负责设备不可达" : `负责设备 · ${nodeName(remote.owner, { nodes })}`
+    : owner === data.local_node ? "由本机负责"
+      : owner ? `最近已知负责设备 · ${ownerName}`
+        : "负责设备未知"
+  return <SettingsGroup title="长期 Agent" footer="共享记录与外部会话分别保留。Bot 自身会话的状态当前未提供。">
     <div className="grid gap-4 p-4">
       <div className="flex min-w-0 items-start gap-3">
         <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-brand-soft text-brand ring-1 ring-brand/20"><BrainCircuit aria-hidden="true" className="size-5" /></span>
         <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 flex-wrap items-center gap-2"><h3 className="min-w-0 flex-1 font-medium">持续身份与调度观察</h3><StatusPill tone={status.tone} icon={status.icon}>{status.label}</StatusPill></div>
+          <div className="flex min-w-0 flex-wrap items-center gap-2"><h3 className="min-w-0 flex-1 font-medium">持续身份与后台工作</h3><StatusPill tone={status.tone} icon={status.icon}>{status.label}</StatusPill></div>
           <p className="mt-1 text-meta text-muted-foreground">{status.detail}</p>
         </div>
       </div>
       <ol className="grid gap-2 sm:grid-cols-3" aria-label="长期 Agent 的上下文层次">
         <ContinuityLayer step="1" label="共享事实" detail={`${data.messages.length} 条消息 · ${data.works.length} 项工作`} tone="success" status="已记录" />
         <ContinuityLayer step="2" label="外部会话" detail={`${data.sessions.length} 条归属记录`} tone="info" status="外部归属" />
-        <ContinuityLayer step="3" label="Bot 原生会话" detail="当前快照未提供状态" tone="warning" status="未提供" />
+        <ContinuityLayer step="3" label="Bot 自身会话" detail="当前记录未提供状态" tone="warning" status="未提供" />
       </ol>
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
         <ContinuityStat label="持久记忆" value={data.bot_settings.memory.length} />
         <ContinuityStat label="定时任务" value={data.bot_settings.schedules.length} />
         <ContinuityStat label="外部归属" value={data.sessions.length} />
-        <ContinuityStat label="调度观察" value={scheduler?.jobs.length ?? null} />
+        <ContinuityStat label="后台工作" value={scheduler?.jobs.length ?? null} />
       </div>
       {data.bot_settings.memory.length ? <Details label={`查看持久记忆 · ${data.bot_settings.memory.length}`}>
         <ul className="grid gap-2">{data.bot_settings.memory.map((entry) => <li key={entry.memory_id} className="rounded-lg border bg-card px-3 py-2 whitespace-pre-wrap [overflow-wrap:anywhere]">{entry.text}</li>)}</ul>

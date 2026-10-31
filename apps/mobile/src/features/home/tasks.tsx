@@ -5,7 +5,7 @@ import { Pressable, ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
-import { cardState, needsLook, nodeName, overviewScope, staleTaskLabel, taskActive, taskAgent, taskGroup, taskGroups, taskLabel, taskProgress, taskStale, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
+import { cardState, needsLook, nodeName, overviewScope, staleTaskLabel, taskActive, taskAgent, taskGroup, taskGroups, taskLabel, taskProgress, taskStale, unrepresentedOverviewChecks, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
 import { workApproval } from '@vibeface/client/workspace/questions.ts'
 import { openWorksFromOverview, overviewFromWorkspace } from '@vibeface/client/workspace/model.ts'
 import type { BotRecord, NodeInfo, OpenWork, OverviewTask } from '@vibeface/client/workspace/types.ts'
@@ -41,13 +41,13 @@ export function TasksScreen() {
     const asking = state === 'running' && workApproval({ work, conversationId: work.conversation_id, questions: shared?.questions ?? [], answered: shared?.answered ?? {} })
     groups[taskGroup(taskStale(state, Boolean(shared?.connectionOnline && read)) ? 'unknown' : state, Boolean(asking))].push(work)
   }
-  const otherChecks = overview?.tasks.filter((task) => task.kind === 'check' && !task.work_id && !task.work_ids.length && task.conversation_id !== shared?.conversationId) ?? []
+  const otherChecks = overview ? unrepresentedOverviewChecks(overview, visibleWorks, lookup.nodes).filter((task) => task.conversation_id !== shared?.conversationId) : []
 
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
     <MobileMasthead attention={read ? groups.attention.length + attention.length + otherChecks.length : null} working={read ? groups.working.length : null} waiting={read ? groups.waiting.length : null} online={Boolean(shared?.connectionOnline)} />
     <Text className="text-meta text-muted-foreground">{[...(overview ? overviewScope(overview.coverage) : ['尚未读取任务记录']), ...(!read ? ['当前连接尚未完成首读'] : !shared?.connectionOnline ? ['连接已断开，显示最近记录'] : [])].join(' · ')}</Text>
     {attention.length ? <Link href="/inbox" asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-3 rounded-xl border border-warning/25 bg-warning-soft px-4 py-3"><Icon as={CircleQuestionMark} className="size-5 text-warning" /><Text className="min-w-0 flex-1">{attention.length} 项问题或程序待确认</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Pressable></Link> : null}
-    {otherChecks.map((check) => <View key={`${check.conversation_id}:${check.item_id}`} className="gap-2 rounded-xl border border-border bg-card p-4"><Text className="font-medium">程序状态待确认 · {check.bot?.name ?? '已删除的 Bot'}</Text>{check.summary ? <Text className="text-meta text-muted-foreground">{check.summary}</Text> : null}{check.bot ? <Link href={`/b/${check.bot.bot_id}`} asChild><Pressable accessibilityRole="link" className="min-h-11 justify-center"><Text>打开 {check.bot.name}</Text></Pressable></Link> : null}</View>)}
+    {otherChecks.map((check) => <View key={`${check.conversation_id}:${check.item_id}`} className="gap-2 rounded-xl border border-border bg-card p-4"><Text className="font-medium">{check.work_id ? '任务状态待确认' : '程序状态待确认'} · {check.bot?.name ?? '已删除的 Bot'}</Text>{check.bot ? <Link href={`/b/${check.bot.bot_id}`} asChild><Pressable accessibilityRole="link" className="min-h-11 justify-center"><Text>打开 {check.bot.name}</Text></Pressable></Link> : null}</View>)}
     {loading ? <View accessibilityLabel="正在读取任务" className="gap-2">
       {[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-3">
         <Skeleton className="size-8 rounded-lg" />
@@ -63,7 +63,7 @@ export function TasksScreen() {
 function MobileMasthead({ attention, working, waiting, online }: { attention: number | null; working: number | null; waiting: number | null; online: boolean }) {
   return <View className="overflow-hidden rounded-2xl border border-brand/15 bg-brand-soft/60 p-4"><View className="gap-3">
     <View className="flex-row flex-wrap items-center gap-2"><Text className="text-meta font-semibold uppercase tracking-[1.5px] text-brand">个人任务总览</Text><View className="flex-row items-center gap-1 rounded-full border border-border bg-background/60 px-2 py-1"><Icon as={online ? Wifi : WifiOff} className={online ? 'size-3.5 text-success' : 'size-3.5 text-warning'} /><Text className={cn('text-meta font-medium', online ? 'text-success' : 'text-warning')}>{online ? '在线' : '待连接'}</Text></View></View>
-    <View className="gap-1"><Text role="heading" className="text-title font-semibold">掌握每个 Bot 的下一步</Text><Text className="text-meta leading-5 text-muted-foreground">{attention === null ? '当前连接的任务数量尚未确认。' : '查看已知任务的执行、等待和核对状态。'}</Text></View>
+    <View className="gap-1"><Text role="heading" className="text-title font-semibold">掌握每个 Bot 的下一步</Text><Text className="text-meta leading-5 text-muted-foreground">{attention === null ? '当前连接的任务数量尚未确认。' : '查看已知任务的执行、等待和待确认状态。'}</Text></View>
     <View className="flex-row gap-2"><MobileMetric label="需要留意" value={attention} tone={attention ? 'warning' : 'neutral'} /><MobileMetric label="进行中" value={working} tone={working ? 'info' : 'neutral'} /><MobileMetric label="等待中" value={waiting} tone="neutral" /></View>
   </View></View>
 }

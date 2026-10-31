@@ -21,6 +21,7 @@ import { primaryLane } from "@vibeface/client/identity/connection-lane.ts"
 import * as taskLabels from "@vibeface/client/workspace/labels.ts"
 import * as workspaceModel from "@vibeface/client/workspace/model.ts"
 import * as workspaceQuestions from "@vibeface/client/workspace/questions.ts"
+import { inboxItems } from "@vibeface/client/workspace/inbox.ts"
 
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
@@ -539,6 +540,7 @@ const parityShared = () => ({
   generation: 1, isCurrent: () => true, synced: true, connectionOnline: true, conversationId: 'chat', data: paritySnapshot(context),
   bots: [parityBot], selectedBot: parityBot, nodes: [parityNode], openWorks: [{ ...parityWork(), conversation_id: 'chat' }],
   overview: workspaceModel.parseWorkspaceOverview({}), questions: [] as ReturnType<typeof parseConversation>['questions'], answered: {} as Record<string, string>, liveProgress: [], writable: true,
+  writeState: { state: 'writable' as const, conflicts: [] }, notifications: [], messagePending: null, messageBusy: false,
   setView(_view: string) {}, selectBot: async (_bot: typeof parityBot) => {}, interruptWork: async (_work: string) => {}, sendMessage: async () => true,
 })
 
@@ -571,7 +573,7 @@ test('both task overviews preserve known records, show their coverage and only n
       assert.match(componentText(elements), /本次总览未返回 1 项任务/)
       assert.match(componentText(elements), /本次总览未返回 2 项问题/)
       assert.doesNotMatch(componentText(elements), /另有.*未列出/)
-      assert.match(componentText(elements), /远端调度尚未查询/)
+      assert.match(componentText(elements), /尚未读取其他设备的后台工作/)
       assert.doesNotMatch(componentText(elements), /0 项.*未列出/)
       assert.equal(elements.some(({ type }) => type === 'ConfirmCard'), false, 'another Bot program check cannot settle against the active conversation')
       assert.equal(elements.some(({ type, props }) => type === 'Link' && (platform === 'web' ? (props.params as { botId?: string })?.botId === 'other' : props.href === '/b/other')), true)
@@ -646,6 +648,56 @@ test('both task overviews retain failure outcomes and causes across unordered sn
   }
 })
 
+test('both task overviews reconcile raw confirmations and only fold task process checks on the same device', () => {
+  for (const platform of ['web', 'native']) {
+    const shared = parityShared()
+    shared.conversationId = 'other-chat'
+    const entry = { ...parityNode, device_id: 'entry', local: true }
+    const inbox = () => inboxItems({ device: { ready: null, joins: [], pendingRecovery: null, rotateHint: false }, workspace: shared })
+    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../../apps/mobile/src/features/home/tasks.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: inbox },
+      '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+      '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
+      '@vibeface/client/lib/errors.ts': errors, './inbox': { useInbox: inbox }, './workspace-shell': { useCreateBot: () => () => {} },
+      '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') }, '@/components/kit': { providerIcons: { codex: 'CodexIcon' } },
+    })
+    const render = () => app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen')
+    const count = (elements: ReturnType<typeof render>) => elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceMasthead' : 'MobileMasthead'))?.props.attention
+    try {
+      for (const unreachable of ['offline', 'disconnected']) {
+        shared.nodes = [entry, { ...parityNode, online: unreachable !== 'offline', capabilities: { ...parityNode.capabilities, codex_connected: unreachable !== 'disconnected' } }]
+        shared.openWorks = [{ ...parityWork({ summary: '' }), conversation_id: 'chat' }]
+        shared.overview = workspaceModel.parseWorkspaceOverview({ bots: [parityBot], tasks: [{ ...shared.openWorks[0], kind: 'work', state: 'finished', outcome: 'failed', failure_reason: '总览记录的失败原因' }] })
+        const elements = render()
+        assert.equal(elements.some(({ type }) => type === 'ConfirmCard'), false, `${platform} cannot offer settlement for an already failed work`)
+        const card = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'TaskOverviewCard' : 'TaskRow'))
+        assert.ok(card && typeof card.type === 'function')
+        assert.match(componentText(card.type(card.props)), /失败.*总览记录的失败原因/)
+        assert.equal(count(elements), 1)
+      }
+      const unknown = { ...parityWork({ kind: 'task', state: 'unverified', outcome: 'unverified', target_node: 'entry' }), conversation_id: 'chat' }
+      const checks = [{ check_id: 'process-work', conversation_id: 'chat', trigger: 'task:work' }]
+      for (const variant of ['same', 'outside-bound', 'missing', 'other-conversation', 'other-device', 'running']) {
+        const known = variant === 'other-conversation' ? { ...unknown, conversation_id: 'different-chat' } : variant === 'other-device' ? { ...unknown, target_node: 'worker' } : variant === 'running' ? { ...unknown, state: 'running' as const, outcome: null } : unknown
+        shared.nodes = [entry, parityNode]
+        shared.openWorks = variant === 'missing' ? [] : [known]
+        shared.overview = workspaceModel.parseWorkspaceOverview({ bots: [parityBot], tasks: variant === 'outside-bound' || variant === 'missing' ? [] : [{ ...known, kind: 'task' }], checks })
+        const elements = render()
+        assert.equal(count(elements), ['same', 'outside-bound', 'missing'].includes(variant) ? 1 : variant === 'running' ? 1 : 2, `${platform} ${variant} preserves exactly the represented checks`)
+        if (variant === 'same' || variant === 'outside-bound') {
+          if (platform === 'web') assert.equal(elements.filter(({ type }) => type === 'ConfirmCard').length, 1, 'the real unknown work keeps its confirmation action')
+          assert.doesNotMatch(componentText(elements), /程序状态待确认|任务状态待确认/)
+        }
+        if (variant === 'missing') {
+          assert.match(componentText(elements), /任务状态待确认/)
+          assert.equal(elements.some(({ type }) => type === 'ConfirmCard'), false, 'a bounded-out work keeps navigation rather than a settlement against the active Bot')
+          assert.equal(elements.some(({ type, props }) => type === 'Link' && (platform === 'web' ? (props.params as { botId?: string })?.botId === 'bot' : props.href === '/b/bot')), true)
+        }
+      }
+    } finally { app.close() }
+  }
+})
+
 test('both task details bind approval to current unfinished work and keep stops above approval', () => {
   for (const platform of ['web', 'native']) {
     const shared = parityShared()
@@ -702,8 +754,8 @@ test('context shows scheduler observations without promising native resume or re
     data.scheduler!.jobs = [{ trigger: 'message:publish', state: 'publishing' }]
     assert.match(componentText(continuity.type(continuity.props)), /回复同步中/)
     data.scheduler = null
-    assert.match(componentText(continuity.type(continuity.props)), /调度状态未提供/)
-    assert.equal(elements.some(({ type, props }) => typeof type === 'function' && type.name === 'ContinuityStat' && props.label === '调度观察' && props.value === null), true)
+    assert.match(componentText(continuity.type(continuity.props)), /后台工作状态未提供/)
+    assert.equal(elements.some(({ type, props }) => typeof type === 'function' && type.name === 'ContinuityStat' && props.label === '后台工作' && props.value === null), true)
   } finally { app.close() }
 
   const collaboration = componentHarness('./collaboration-panel.tsx', { ...dependencies,
@@ -716,8 +768,8 @@ test('context shows scheduler observations without promising native resume or re
   })
   try {
     const elements = collaboration.render('CollaborationPanel', { data: records, botId: 'bot' })
-    assert.equal(elements.find(({ type, props }) => typeof type === 'function' && type.name === 'Section' && props.title === '未结调度观察')?.props.count, 3)
-    assert.equal(elements.some(({ type, props }) => type === 'Details' && props.label === '调度历史 · 1'), true)
+    assert.equal(elements.find(({ type, props }) => typeof type === 'function' && type.name === 'Section' && props.title === '未结束的后台工作')?.props.count, 3)
+    assert.equal(elements.some(({ type, props }) => type === 'Details' && props.label === '后台工作历史 · 1'), true)
     const publishing = elements.find(({ type, props }) => typeof type === 'function' && type.name === 'JobRow' && (props.job as { state: string }).state === 'publishing')
     assert.ok(publishing && typeof publishing.type === 'function')
     assert.match(componentText(publishing.type(publishing.props)), /回复同步中/)
@@ -734,7 +786,7 @@ test('context shows scheduler observations without promising native resume or re
     const sent = elements.find(({ type }) => typeof type === 'function' && type.name === 'SentMessage')
     assert.ok(sent && typeof sent.type === 'function')
     const sentTree = sent.type(sent.props)
-    assert.match(componentText(sentTree), /投递和回复状态未提供/)
+    assert.match(componentText(sentTree), /对方是否收到或回复尚不清楚/)
     assert.equal(elements.some(({ type, props }) => type === 'Link' && (props.params as { botId?: string })?.botId === 'bot'), true)
   } finally { collaboration.close() }
 })
@@ -819,15 +871,15 @@ test('native context renders shared memory, external attribution, scheduler stat
     const records = elements.find(({ type }) => typeof type === 'function' && type.name === 'ContextRecords')
     assert.ok(records && typeof records.type === 'function')
     records.type(records.props)
-    assert.equal(elements.some(({ props }) => props.label === 'Bot 自身原生会话' && String(props.description).includes('未提供')), true)
+    assert.equal(elements.some(({ props }) => props.label === 'Bot 自身会话' && String(props.description).includes('未提供')), true)
     assert.equal(elements.some(({ props }) => String(props.description).includes('已静音 · 设备不可达')), true)
-    assert.equal(elements.some(({ props }) => props.label === '调度历史 · 1'), true)
+    assert.equal(elements.some(({ props }) => props.label === '后台工作历史 · 1'), true)
     const job = elements.find(({ type, props }) => typeof type === 'function' && type.name === 'JobObservation' && (props.job as { state: string }).state === 'publishing')
     assert.ok(job && typeof job.type === 'function')
     assert.match(componentText(job.type(job.props)), /回复同步中/)
     const message = elements.find(({ type }) => typeof type === 'function' && type.name === 'MessageRecord')
     assert.ok(message && typeof message.type === 'function')
-    assert.match(componentText(message.type(message.props)), /投递和回复状态未提供/)
+    assert.match(componentText(message.type(message.props)), /对方是否收到或回复尚不清楚/)
     assert.equal(elements.some(({ props }) => props.href === '/b/bot'), true)
   } finally { app.close() }
 })

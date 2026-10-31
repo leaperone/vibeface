@@ -24,10 +24,10 @@ function schedulerTone(state: string): Tone {
 }
 
 function triggerKind(trigger: string) {
-  if (trigger.startsWith("bot_message:")) return { label: "Bot 协作消息", detail: "message_bot" }
-  if (trigger.startsWith("task:")) return { label: "执行工作", detail: "dispatch_work" }
+  if (trigger.startsWith("bot_message:")) return { label: "Bot 协作消息", detail: "Bot 之间的消息" }
+  if (trigger.startsWith("task:")) return { label: "执行工作", detail: "执行任务" }
   if (trigger.startsWith("work:")) return { label: "工作结果", detail: "结果记录" }
-  if (trigger.startsWith("schedule:")) return { label: "定时任务", detail: "schedule" }
+  if (trigger.startsWith("schedule:")) return { label: "定时任务", detail: "定时提醒" }
   if (trigger.startsWith("message:")) return { label: "用户消息", detail: "普通消息" }
   return { label: "队列项目", detail: "未知触发" }
 }
@@ -59,23 +59,23 @@ function OwnerCard({ data, nodes }: { data: ConversationPayload; nodes: ReturnTy
   const label = remote
     ? remote.reachable ? "远端可达" : "远端不可达，状态未知"
     : owner === data.local_node
-      ? "本机 owner"
+      ? "由本机负责"
       : ownerNode?.online === true
-        ? "owner 可达"
+        ? "负责设备可达"
         : ownerNode?.online === false
-          ? "owner 不可达，状态未知"
+          ? "负责设备不可达，状态未知"
           : owner
-            ? "owner 状态未知"
-            : "owner 未知"
+            ? "负责设备状态未知"
+            : "负责设备未知"
   return <Card size="sm" className="border-transparent bg-linear-to-br from-info-soft/35 via-card to-card ring-1 ring-border/70">
     <CardContent className="grid gap-3">
       <div className="flex min-w-0 flex-wrap items-center gap-2">
         {reachable === false ? <Unplug aria-hidden="true" className="size-4 shrink-0 text-warning" /> : owner === data.local_node ? <Laptop aria-hidden="true" className="size-4 shrink-0 text-success" /> : <Laptop aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />}
-        <span className="min-w-0 flex-1 font-medium">运行 owner</span>
+        <span className="min-w-0 flex-1 font-medium">负责设备</span>
         <StatusPill tone={tone}>{label}</StatusPill>
       </div>
       <p className="text-meta text-muted-foreground">
-        {remoteOwner ? <><span className="font-medium text-foreground">{nodeName(remoteOwner, { nodes })}</span>{remote ? " · 远端会话" : owner === data.local_node ? " · 本机会话" : " · 最近已知 owner"}</> : "当前没有可确认的 owner。"}
+        {remoteOwner ? <><span className="font-medium text-foreground">{nodeName(remoteOwner, { nodes })}</span>{remote ? " · 其他设备负责" : owner === data.local_node ? " · 本机负责" : " · 最近已知负责设备"}</> : "当前没有可确认的负责设备。"}
       </p>
       {remote && !remote.reachable ? <p role="status" className="flex items-start gap-2 text-meta text-warning"><Unplug aria-hidden="true" className="mt-0.5 size-4 shrink-0" />远端不可达时，排队和回复结果不能视为已执行。</p> : null}
     </CardContent>
@@ -95,7 +95,7 @@ function JobRow({ job, data, botId, nodes }: { job: ManagerJob; data: Conversati
       <StatusPill tone={schedulerTone(job.state)}>{schedulerStatus(data.scheduler?.remote?.reachable === false && schedulerStatus(job.state).group !== "history" ? "unknown" : job.state).label}</StatusPill>
     </div>
     <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-meta text-muted-foreground">
-      <span>{job.source_node ? `来自 ${nodeName(job.source_node, { nodes })}` : data.scheduler?.remote ? "远端 owner" : "本机排队"}</span>
+      <span>{job.source_node ? `来自 ${nodeName(job.source_node, { nodes })}` : data.scheduler?.remote ? "其他设备负责" : "本机记录"}</span>
       {job.pending_check ? <StatusPill tone="warning" icon={CircleQuestionMark}>需要确认</StatusPill> : null}
       {job.failure ? <span className="min-w-0 truncate text-danger" title={job.failure.detail}>{job.failure.detail}</span> : null}
     </div>
@@ -146,10 +146,10 @@ function SessionRows({ sessions, nodes, connected }: { sessions: SessionHandoff[
 
 function SentMessage({ sent, botName, botId }: { sent: SentBotMessage; botName: string; botId?: string }) {
   const body = <Card size="sm"><CardContent className="grid gap-2">
-    <div className="flex min-w-0 flex-wrap items-center gap-2"><Send aria-hidden="true" className="size-4 shrink-0 text-info" /><span className="min-w-0 flex-1 truncate font-medium">发给 {botName}</span><StatusPill tone="info">message_bot · 协作消息</StatusPill></div>
+    <div className="flex min-w-0 flex-wrap items-center gap-2"><Send aria-hidden="true" className="size-4 shrink-0 text-info" /><span className="min-w-0 flex-1 truncate font-medium">发给 {botName}</span><StatusPill tone="info">协作消息</StatusPill></div>
     <p className="line-clamp-4 whitespace-pre-wrap break-words text-meta">{sent.text}</p>
     <time className="text-meta text-muted-foreground" dateTime={new Date(sent.created_at_ms).toISOString()}>{when(sent.created_at_ms)}</time>
-    <p className="text-meta text-muted-foreground">这是已写入的消息记录，投递和回复状态未提供。</p>
+    <p className="text-meta text-muted-foreground">这里只记录了发出的消息，对方是否收到或回复尚不清楚。</p>
   </CardContent></Card>
   return botId ? <Link to="/b/$botId" params={{ botId }} className="block rounded-xl outline-none focus-visible:ring-3 focus-visible:ring-ring/50">{body}</Link> : body
 }
@@ -173,7 +173,7 @@ function CollaborationMessages({ data, botNames }: { data: ConversationPayload; 
         return <SentMessage key={`sent:${message.message_id}`} sent={message} botName={target?.name ?? "另一个 Bot"} botId={target?.bot_id} />
       })}
     </div>
-    <p className="px-1 text-meta text-muted-foreground">协作消息不会自动变成执行工作。执行工作只来自 dispatch_work，通过任务详情查看。</p>
+    <p className="px-1 text-meta text-muted-foreground">协作消息与任务分别记录，执行情况在任务详情中查看。</p>
   </Section>
 }
 
@@ -186,11 +186,11 @@ export function CollaborationPanel({ data, botId, className }: CollaborationPane
   const history = jobs.filter((job) => schedulerStatus(job.state).group === "history")
   return <div className={cn("grid min-w-0 gap-5", className)}>
     <OwnerCard data={data} nodes={workspace.nodes} />
-    {scheduler ? <Section title="未结调度观察" count={open.length}>
-      <p className="px-1 text-meta text-muted-foreground">显示最近观察，不代表实际执行顺序。远端记录可能只包含近期部分项目。</p>
-      {open.length ? <ul className="grid gap-2">{open.map((job) => <JobRow key={job.trigger} job={job} data={data} botId={botId} nodes={workspace.nodes} />)}</ul> : <Card size="sm"><CardContent className="py-5 text-meta text-muted-foreground">{scheduler.remote?.reachable === false ? "远端不可达，当前调度状态未知。" : "当前记录没有未结调度项目。"}</CardContent></Card>}
-      {history.length ? <Details label={`调度历史 · ${history.length}`}><ul className="grid gap-2">{history.map((job) => <JobRow key={job.trigger} job={job} data={data} botId={botId} nodes={workspace.nodes} />)}</ul></Details> : null}
-    </Section> : <Card size="sm"><CardContent className="flex items-start gap-2 py-4 text-meta text-muted-foreground"><Unplug aria-hidden="true" className="mt-0.5 size-4 shrink-0" />调度状态暂未提供。</CardContent></Card>}
+    {scheduler ? <Section title="未结束的后台工作" count={open.length}>
+      <p className="px-1 text-meta text-muted-foreground">显示最近状态，不代表实际执行顺序。其他设备可能只显示近期部分记录。</p>
+      {open.length ? <ul className="grid gap-2">{open.map((job) => <JobRow key={job.trigger} job={job} data={data} botId={botId} nodes={workspace.nodes} />)}</ul> : <Card size="sm"><CardContent className="py-5 text-meta text-muted-foreground">{scheduler.remote?.reachable === false ? "负责设备不可达，当前后台工作状态未知。" : "当前记录没有未结束的后台工作。"}</CardContent></Card>}
+      {history.length ? <Details label={`后台工作历史 · ${history.length}`}><ul className="grid gap-2">{history.map((job) => <JobRow key={job.trigger} job={job} data={data} botId={botId} nodes={workspace.nodes} />)}</ul></Details> : null}
+    </Section> : <Card size="sm"><CardContent className="flex items-start gap-2 py-4 text-meta text-muted-foreground"><Unplug aria-hidden="true" className="mt-0.5 size-4 shrink-0" />后台工作状态暂未提供。</CardContent></Card>}
     <Unanswered ids={scheduler?.unanswered ?? []} data={data} botId={botId} />
     <SessionRows sessions={data.sessions} nodes={workspace.nodes} connected={workspace.connectionOnline && workspace.synced} />
     <CollaborationMessages data={data} botNames={botNames} />

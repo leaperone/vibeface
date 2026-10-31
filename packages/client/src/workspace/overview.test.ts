@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { openWorksFromOverview, overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
-import { cardState, overviewScope, taskGroup, taskLabel } from "./labels.ts"
+import { cardState, overviewScope, taskGroup, taskLabel, unrepresentedOverviewChecks } from "./labels.ts"
 import type { BotRecord, NodeInfo, OpenWork, Question } from "./types.ts"
 
 const bot = (conversation_id: string, bot_id = `bot-${conversation_id}`, name = conversation_id): BotRecord => ({
@@ -129,7 +129,7 @@ test("a bounded overview adds observations without deleting known work or replac
   const notes = overviewScope(overview.coverage).join(" · ")
   assert.match(notes, /部分记录/)
   assert.match(notes, /截断/)
-  assert.match(notes, /远端调度尚未查询/)
+  assert.match(notes, /尚未读取其他设备的后台工作/)
   assert.doesNotMatch(notes, /0 项|另有/, "unknown omission counts are not fabricated")
   assert.match(overviewScope({ ...overview.coverage, omitted_tasks: 3 }).join(" · "), /本次总览未返回 3 项任务/)
 })
@@ -183,4 +183,21 @@ test("unordered work snapshots retain terminal outcomes and leave ambiguous resu
   assert.equal(cardState(work({ state: "finished", outcome: "rejected" }), online, observed({})), "rejected", "retrying an existing DAG work ID returns its original result")
   const merged = openWorksFromOverview(parseWorkspaceOverview({ tasks: [{ ...work(), kind: "work", state: "finished", outcome: "failed" }] }), [running])
   assert.equal(merged[0], running, "display reconciliation never rewrites complete request, output or causal fields")
+})
+
+test("overview task checks only fold into a visible unverified work on this conversation and device", () => {
+  const known = work({ kind: "task", state: "unverified", outcome: "unverified", target_node: "entry" })
+  const nodes = [node("entry", true, true), node("worker")]
+  const overview = parseWorkspaceOverview({ checks: [{ check_id: "process-work", conversation_id: known.conversation_id, trigger: `task:${known.work_id}` }, { check_id: "process-chat", conversation_id: known.conversation_id, trigger: "message:one" }] })
+  assert.equal(overview.tasks[0]?.work_id, known.work_id)
+  assert.deepEqual(overview.tasks[0]?.kind === "check" && overview.tasks[0].work_ids, [known.work_id])
+  const ids = (works: OpenWork[], available = nodes) => unrepresentedOverviewChecks(overview, works, available).map((check) => check.check_id)
+  assert.deepEqual(ids([known]), ["process-chat"])
+  assert.deepEqual(ids([]), ["process-work", "process-chat"], "a bounded-out work cannot hide the only available check")
+  assert.deepEqual(ids([{ ...known, conversation_id: "other-chat" }]), ["process-work", "process-chat"])
+  assert.deepEqual(ids([{ ...known, target_node: "worker" }]), ["process-work", "process-chat"])
+  assert.deepEqual(ids([known], []), ["process-work", "process-chat"], "the check device must be known, not guessed")
+  assert.deepEqual(ids([{ ...known, state: "running", outcome: null }]), ["process-work", "process-chat"], "an active task does not replace a separate process check")
+  const bounded = parseWorkspaceOverview({ tasks: [{ ...known, kind: "task" }], checks: [{ check_id: "process-work", conversation_id: known.conversation_id, trigger: `task:${known.work_id}` }] })
+  assert.deepEqual(unrepresentedOverviewChecks(bounded, openWorksFromOverview(bounded, []), nodes), [], "an overview-only unverified work also represents its local task check")
 })

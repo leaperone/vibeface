@@ -13,7 +13,7 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import type { MembershipView } from "@vibeface/client/lib/node.ts"
 import { openWorksFromOverview, overviewFromWorkspace } from "@vibeface/client/workspace/model.ts"
-import { cardState, needsLook, nodeName, overviewScope, staleTaskLabel, taskActive, taskGroup, taskGroups, taskLabel, taskProgress, taskStale, type TaskGroup } from "@vibeface/client/workspace/labels.ts"
+import { cardState, needsLook, nodeName, overviewScope, staleTaskLabel, taskActive, taskGroup, taskGroups, taskLabel, taskProgress, taskStale, unrepresentedOverviewChecks, type TaskGroup } from "@vibeface/client/workspace/labels.ts"
 import { projectName, workApproval } from "@vibeface/client/workspace/questions.ts"
 import { workFailure } from "@vibeface/client/lib/errors.ts"
 import type { NodeInfo, OpenWork, OverviewTask } from "@vibeface/client/workspace/types.ts"
@@ -40,7 +40,18 @@ export function TasksOverview() {
   const overview = workspace.overview ?? localOverview
   const overviewWorks = openWorksFromOverview(overview, workspace.openWorks)
   const read = workspace.synced
-  const attention = inbox.filter((item): item is Extract<InboxItem, { kind: "question" | "confirm" }> => item.kind === "confirm" || item.kind === "question" && !item.done)
+  const projected = new Map([...localOverview.tasks, ...overview.tasks].filter((task): task is ProjectedWork => (task.kind === "work" || task.kind === "dispatch") && Boolean(task.work_id)).map((task) => [JSON.stringify([task.conversation_id, task.work_id]), task]))
+  const projection = (work: OpenWork) => projected.get(JSON.stringify([work.conversation_id, work.work_id]))
+  const needsConfirmation = (check: { conversation_id: string; work_id: string; target_node: string }) => {
+    const work = overviewWorks.find((work) => work.conversation_id === check.conversation_id && work.work_id === check.work_id && work.target_node === check.target_node)
+    return !work || !["completed", "failed", "interrupted", "rejected"].includes(cardState(work, workspace.nodes, projection(work)))
+  }
+  const attention = inbox.filter((item): item is Extract<InboxItem, { kind: "question" | "confirm" }> => item.kind === "confirm" || item.kind === "question" && !item.done).flatMap((item): Extract<InboxItem, { kind: "question" | "confirm" }>[] => {
+    if (item.kind !== "confirm" || item.check.kind === "process") return [item]
+    if (item.check.kind === "work") return needsConfirmation(item.check) ? [item] : []
+    const works = item.check.works.filter(needsConfirmation)
+    return works.length ? [{ ...item, check: { ...item.check, works } }] : []
+  })
   const attentionWorkIds = new Set<string>()
   for (const item of attention) {
     if (item.kind !== "confirm") continue
@@ -48,8 +59,6 @@ export function TasksOverview() {
     if (item.check.kind === "device") for (const work of item.check.works) attentionWorkIds.add(JSON.stringify([work.conversation_id, work.work_id]))
   }
   const openQuestions = attention.filter((item): item is Extract<InboxItem, { kind: "question" }> => item.kind === "question").map((item) => item.question)
-  const projected = new Map([...localOverview.tasks, ...overview.tasks].filter((task): task is ProjectedWork => (task.kind === "work" || task.kind === "dispatch") && Boolean(task.work_id)).map((task) => [JSON.stringify([task.conversation_id, task.work_id]), task]))
-  const projection = (work: OpenWork) => projected.get(JSON.stringify([work.conversation_id, work.work_id]))
   const tasks = overviewWorks.filter((work) => !attentionWorkIds.has(JSON.stringify([work.conversation_id, work.work_id])))
   const groups: Record<TaskGroup, OpenWork[]> = { attention: [], working: [], waiting: [] }
   const botIds = new Map(workspace.bots.map((bot) => [bot.conversation_id, bot.bot_id]))
@@ -69,7 +78,7 @@ export function TasksOverview() {
     }
     return matchesBot(check.kind === "work" ? check.conversation_id : workspace.selectedBot?.conversation_id ?? "") ? [item] : []
   })
-  const otherChecks = overview.tasks.filter((task) => task.kind === "check" && !task.work_id && !task.work_ids.length && task.conversation_id !== workspace.conversationId && matchesBot(task.conversation_id, task.bot?.bot_id))
+  const otherChecks = unrepresentedOverviewChecks(overview, overviewWorks, workspace.nodes).filter((task) => task.conversation_id !== workspace.conversationId && matchesBot(task.conversation_id, task.bot?.bot_id))
   const visible = (group: TaskGroup) => filter === "all" || filter === group
   const noticed = visible("attention") ? visibleAttention.length + groups.attention.length + otherChecks.length : 0
   const visibleCount = noticed + (visible("working") ? groups.working.length : 0) + (visible("waiting") ? groups.waiting.length : 0)
@@ -88,7 +97,7 @@ export function TasksOverview() {
       const count = group === "attention" ? noticed : groups[group].length
       return count ? <OverviewSection key={group} title={title} count={count}>
         {group === "attention" ? visibleAttention.map((item) => <div key={item.key}>{item.kind === "question" ? <QuestionCard question={item.question} inbox from="tasks" /> : <ConfirmCard check={item.check} inbox from="tasks" />}</div>) : null}
-        {group === "attention" ? otherChecks.map((check) => <Card key={`${check.conversation_id}:${check.item_id}`}><CardContent className="grid gap-2"><p className="font-medium">程序状态待确认</p><p className="text-meta text-muted-foreground">{check.bot?.name ?? "已删除的 Bot"} · {check.summary || "请到所属 Bot 查看"}</p>{check.bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: check.bot.bot_id }}>打开 {check.bot.name}</Link></Button> : null}</CardContent></Card>) : null}
+        {group === "attention" ? otherChecks.map((check) => <Card key={`${check.conversation_id}:${check.item_id}`}><CardContent className="grid gap-2"><p className="font-medium">{check.work_id ? "任务状态待确认" : "程序状态待确认"}</p><p className="text-meta text-muted-foreground">{check.bot?.name ?? "已删除的 Bot"} · 请到所属 Bot 查看</p>{check.bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: check.bot.bot_id }}>打开 {check.bot.name}</Link></Button> : null}</CardContent></Card>) : null}
         {groups[group].map(card)}
       </OverviewSection> : null
     })}

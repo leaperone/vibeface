@@ -450,9 +450,11 @@ function parseOverviewSession(value: unknown): OverviewSession {
 function parseOverviewCheck(value: unknown): OverviewTask {
   const data = record(value), checkId = text(data.check_id), conversationId = text(data.conversation_id), reason = nullableText(data.unknown_reason) ?? "process_unconfirmed"
   const bot = data.bot == null ? null : parseOverviewBot(data.bot)
+  const trigger = data.trigger == null ? "" : text(data.trigger)
+  const workId = trigger.startsWith("task:") ? trigger.slice(5) || null : null
   return {
-    kind: "check", item_id: checkId, check_id: checkId, work_ids: [], work_id: null, conversation_id: conversationId, bot,
-    title: "待确认", summary: data.trigger == null ? "" : text(data.trigger), cwd: "", state: "unknown", outcome: "unverified",
+    kind: "check", item_id: checkId, check_id: checkId, work_ids: workId ? [workId] : [], work_id: workId, conversation_id: conversationId, bot,
+    title: "待确认", summary: trigger, cwd: "", state: "unknown", outcome: "unverified",
     target_node: null, dispatcher: null, call_ref: null, work_kind: null, parent: null, continues: null, thread: null, thread_id: null, turn_id: null, phase: null,
     reason, node: null, navigation: bot ? { bot_id: bot.bot_id, conversation_id: conversationId } : null, source: "local_check",
   }

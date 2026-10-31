@@ -19,9 +19,6 @@ import { useWorkspace } from '@/data/context'
 import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { useLive } from '@/data/live'
 
-/**
- * Bot settings and a read-only entry to its shared context. The face and project are picked here; other settings change in chat.
- */
 export default function BotAbout() {
   const { botId } = useLocalSearchParams<{ botId: string }>()
   const shared = useLive()
@@ -59,7 +56,7 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
         <Text className="text-meta text-muted-foreground">在聊天里说一声就能改</Text>
       </View>
     </View>
-    <SettingsGroup><SettingsRow icon={MessagesSquare} label="上下文和协作" description="共享摘要、外部会话归属和调度观察" href={`/b/${bot.bot_id}/context`} /></SettingsGroup>
+    <SettingsGroup><SettingsRow icon={MessagesSquare} label="上下文和协作" description="共享摘要、外部会话记录和后台工作" href={`/b/${bot.bot_id}/context`} /></SettingsGroup>
     {owner || models.length ? <SettingsGroup>
       {owner ? <SettingsRow icon={Laptop} label="运行设备">
         {ownerNode && !ownerNode.online ? <Icon as={WifiOff} accessibilityLabel="离线" className="size-4 text-warning" /> : null}

@@ -59,14 +59,14 @@ function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: Conversat
   const history = jobs.filter((job) => schedulerStatus(job.state).group === 'history')
   const ownerNode = nodes.find((node) => node.device_id === owner)
   const connected = shared.connectionOnline && shared.synced
-  const reach = !connected ? '状态未知，显示最近归属' : remote?.reachable === false ? '远端不可达，调度状态未知' : ownerNode?.revoked ? '设备已撤权' : ownerNode?.online === false ? '设备不可达' : ownerNode?.online ? '设备可达' : '设备可达性未知'
+  const reach = !connected ? '状态未知，显示最近归属' : remote?.reachable === false ? '负责设备不可达，后台工作状态未知' : ownerNode?.revoked ? '设备已撤权' : ownerNode?.online === false ? '设备不可达' : ownerNode?.online ? '设备可达' : '设备可达性未知'
   const botNames = new Map(shared.bots.map((item) => [item.conversation_id, item]))
   const incoming = data.messages.filter((message) => message.role === 'bot' && message.sender)
   return <>
     <SettingsGroup title="Bot 身份">
       <SettingsRow icon={Bot} label={bot.name} description="共享聊天身份" href={`/b/${bot.bot_id}`} />
       <SettingsRow icon={Laptop} label="负责设备" description={reach}><Text className="max-w-[50%] text-muted-foreground">{owner ? nodeName(owner, { nodes }) : '归属未知'}</Text></SettingsRow>
-      <SettingsRow icon={MessagesSquare} label="Bot 自身原生会话" description="当前快照未提供其状态，外部归属记录不能证明它可续接。" />
+      <SettingsRow icon={MessagesSquare} label="Bot 自身会话" description="当前记录未提供它的状态，外部会话记录不代表它仍可继续。" />
     </SettingsGroup>
     <SettingsGroup title="共享摘要">
       <SettingsRow icon={MessagesSquare} label="消息" description={`${data.messages.length} 条已加载消息`} href={`/b/${bot.bot_id}`} />
@@ -96,10 +96,10 @@ function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: Conversat
         <Details label="归属记录详情"><Text selectable className="font-mono text-meta">{session.session_id}</Text><Text className="text-meta text-muted-foreground">这是外部会话的归属记录。设备可达不代表会话仍在运行，也不提供 Bot 自身会话的恢复状态。</Text></Details>
       </View>) : <SettingsRow icon={MessagesSquare} label="尚无外部会话归属记录" description="Bot 自身运行不会自动建立这类外部记录。" />}
     </SettingsGroup>
-    <SettingsGroup title="调度观察">
-      <SettingsRow icon={CalendarClock} label={scheduler ? remote?.reachable === false || !connected ? '调度状态未知' : open.length ? `${open.length} 项未结观察` : '当前没有未结观察' : '调度状态未提供'} description="显示最近观察，不代表实际执行顺序。远端记录可能只包含近期部分项目。" />
+    <SettingsGroup title="后台工作">
+      <SettingsRow icon={CalendarClock} label={scheduler ? remote?.reachable === false || !connected ? '后台工作状态未知' : open.length ? `${open.length} 项后台工作未结束` : '当前记录没有未结束的后台工作' : '后台工作状态未提供'} description="显示最近状态，不代表实际执行顺序。其他设备可能只显示近期部分记录。" />
       {open.map((job) => <JobObservation key={job.trigger} job={job} unknown={!connected || remote?.reachable === false} />)}
-      {history.length ? <Fold label={`调度历史 · ${history.length}`}>{history.map((job) => <JobObservation key={job.trigger} job={job} unknown={false} />)}</Fold> : null}
+      {history.length ? <Fold label={`后台工作历史 · ${history.length}`}>{history.map((job) => <JobObservation key={job.trigger} job={job} unknown={false} />)}</Fold> : null}
       {scheduler?.unanswered.length ? <SettingsRow icon={CircleHelp} label={`${scheduler.unanswered.length} 条消息未等到回复`} description="回到对话查看和处理。" href={`/b/${bot.bot_id}`} /> : null}
     </SettingsGroup>
     <SettingsGroup title="Bot 协作消息">
@@ -111,7 +111,7 @@ function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: Conversat
       {data.sent.map((message) => <MessageRecord key={`sent:${message.message_id}`} icon={Send} label={`发给 ${botNames.get(message.to)?.name ?? '另一个 Bot'}`} text={message.text} time={message.created_at_ms} bot={botNames.get(message.to)} sent />)}
       {!incoming.length && !data.sent.length ? <SettingsRow icon={MessagesSquare} label="当前记录没有 Bot 协作消息" /> : null}
     </SettingsGroup>
-    <Text className="text-meta text-muted-foreground">这里显示当前快照中的记录。共享检查点、完整执行历史和 Bot 原生会话状态未提供。回答、停止和结算仍在原有对话与任务详情中进行。</Text>
+    <Text className="text-meta text-muted-foreground">这里显示当前已加载的记录。完整历史摘要、执行过程和 Bot 自身会话状态未提供。回答、停止和结算仍在原有对话与任务详情中进行。</Text>
   </>
 }
 
@@ -120,9 +120,9 @@ function Fold({ label, children }: { label: string; children: ReactNode }) {
 }
 
 function JobObservation({ job, unknown }: { job: ManagerJob; unknown: boolean }) {
-  return <View className="gap-1 px-4 py-3"><Text className="font-medium">{unknown ? '状态未知' : schedulerStatus(job.state).label}{job.pending_check ? ' · 需要确认' : ''}</Text><Details label="调度记录详情"><Text selectable className="font-mono text-meta">{job.trigger}</Text>{job.failure ? <Text selectable className="text-danger">{job.failure.detail}</Text> : null}</Details></View>
+  return <View className="gap-1 px-4 py-3"><Text className="font-medium">{unknown ? '状态未知' : schedulerStatus(job.state).label}{job.pending_check ? ' · 需要确认' : ''}</Text><Details label="后台工作详情"><Text selectable className="font-mono text-meta">{job.trigger}</Text>{job.failure ? <Text selectable className="text-danger">{job.failure.detail}</Text> : null}</Details></View>
 }
 
 function MessageRecord({ icon, label, text, time, bot, sent }: { icon: LucideIcon; label: string; text: string; time: number; bot?: BotRecord; sent?: boolean }) {
-  return <View className="gap-2 p-4"><SettingsRow icon={icon} label={label} description={formatWhen(time)} href={bot ? `/b/${bot.bot_id}` : undefined} /><Text selectable>{text}</Text>{sent ? <Text className="text-meta text-muted-foreground">这是已写入的消息记录，投递和回复状态未提供。</Text> : null}</View>
+  return <View className="gap-2 p-4"><SettingsRow icon={icon} label={label} description={formatWhen(time)} href={bot ? `/b/${bot.bot_id}` : undefined} /><Text selectable>{text}</Text>{sent ? <Text className="text-meta text-muted-foreground">这里只记录了发出的消息，对方是否收到或回复尚不清楚。</Text> : null}</View>
 }
