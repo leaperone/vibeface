@@ -1124,7 +1124,7 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
         (
             Some(WorkOutcome::Unverified),
             WorkStatus::Unverified,
-            Some("设备已移除，无法核对")
+            Some("设备已移除，结果无法确认。")
         ),
         "a removed device's work is not written off as never run"
     );
