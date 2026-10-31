@@ -1,5 +1,5 @@
 import { Stack, useLocalSearchParams } from 'expo-router'
-import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, Cpu, FolderOpen, Inbox, Laptop, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, Cpu, FolderOpen, Inbox, Laptop, MessagesSquare, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, WifiOff, type LucideIcon } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Alert, Pressable, ScrollView, View } from 'react-native'
 import { botCopy, folderLabels, formatIn, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
@@ -20,8 +20,7 @@ import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { useLive } from '@/data/live'
 
 /**
- * A bot as the web's bot panel shows it: where it runs and on which model first, then its project, face, what it does, its schedules,
- * notes and the shared skills. The face and project are picked here; the rest changes by asking it in the chat.
+ * Bot settings and a read-only entry to its shared context. The face and project are picked here; other settings change in chat.
  */
 export default function BotAbout() {
   const { botId } = useLocalSearchParams<{ botId: string }>()
@@ -60,6 +59,7 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
         <Text className="text-meta text-muted-foreground">在聊天里说一声就能改</Text>
       </View>
     </View>
+    <SettingsGroup><SettingsRow icon={MessagesSquare} label="上下文和协作" description="共享摘要、外部会话归属和调度观察" href={`/b/${bot.bot_id}/context`} /></SettingsGroup>
     {owner || models.length ? <SettingsGroup>
       {owner ? <SettingsRow icon={Laptop} label="运行设备">
         {ownerNode && !ownerNode.online ? <Icon as={WifiOff} accessibilityLabel="离线" className="size-4 text-warning" /> : null}

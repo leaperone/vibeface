@@ -449,11 +449,12 @@ function parseOverviewSession(value: unknown): OverviewSession {
 }
 function parseOverviewCheck(value: unknown): OverviewTask {
   const data = record(value), checkId = text(data.check_id), conversationId = text(data.conversation_id), reason = nullableText(data.unknown_reason) ?? "process_unconfirmed"
+  const bot = data.bot == null ? null : parseOverviewBot(data.bot)
   return {
-    kind: "check", item_id: checkId, check_id: checkId, work_ids: [], work_id: null, conversation_id: conversationId, bot: null,
+    kind: "check", item_id: checkId, check_id: checkId, work_ids: [], work_id: null, conversation_id: conversationId, bot,
     title: "待确认", summary: data.trigger == null ? "" : text(data.trigger), cwd: "", state: "unknown", outcome: "unverified",
     target_node: null, dispatcher: null, call_ref: null, work_kind: null, parent: null, continues: null, thread: null, thread_id: null, turn_id: null, phase: null,
-    reason, node: null, navigation: null, source: "local_check",
+    reason, node: null, navigation: bot ? { bot_id: bot.bot_id, conversation_id: conversationId } : null, source: "local_check",
   }
 }
 function parseOverviewRelation(value: unknown): OverviewRelation {
@@ -488,7 +489,7 @@ export function parseWorkspaceOverview(value: unknown): WorkspaceOverview {
   const stops = new Map(deliveries.filter((delivery) => delivery.work_id && (delivery.state === "stop_waiting" || delivery.state === "stop_timed_out")).map((delivery) => [JSON.stringify([delivery.conversation_id, delivery.work_id]), delivery]))
   const mergedTasks = tasks.map((task) => {
     const stop = task.work_id ? stops.get(JSON.stringify([task.conversation_id, task.work_id])) : undefined
-    return stop && task.kind !== "check" ? { ...task, state: stop.state, outcome: stop.outcome, reason: stop.reason ?? task.reason, cwd: task.cwd || stop.cwd } : task
+    return stop && task.kind !== "check" && !task.outcome && task.state !== "unknown" && task.state !== "unverified" && task.state !== "finished" ? { ...task, state: stop.state, reason: stop.reason ?? task.reason, cwd: task.cwd || stop.cwd } : task
   })
   const extraDeliveries = deliveries.filter((delivery) => {
     if (!delivery.work_id) return true
@@ -497,7 +498,7 @@ export function parseWorkspaceOverview(value: unknown): WorkspaceOverview {
   })
   return {
     schema: nullableNumber(data.schema), generated_at_ms: generatedAt, network_epoch: networkEpoch, heads, consistency,
-    bots, conversations: list(data.conversations ?? []).map(parseOverviewConversation), tasks: [...mergedTasks, ...extraDeliveries, ...list(data.checks ?? []).map(parseOverviewCheck)], questions: list(data.questions ?? []).filter((question) => {
+    bots, conversations: list(data.conversations ?? []).map(parseOverviewConversation), tasks: [...mergedTasks, ...extraDeliveries, ...list(data.checks ?? []).map((check) => parseOverviewCheck(named(record(check))))], questions: list(data.questions ?? []).filter((question) => {
       const raw = record(question)
       return raw.answer == null && raw.closed == null && raw.state !== "answered" && raw.state !== "closed"
     }).map(parseOverviewQuestion), jobs: list(data.jobs ?? []).map(parseOverviewJob),

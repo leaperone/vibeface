@@ -1,47 +1,25 @@
 "use client"
 
-import { Bot, CircleQuestionMark, Clock3, Laptop, ListChecks, Send, Unplug } from "lucide-react"
+import { Bot, CircleQuestionMark, Clock3, Laptop, Send, Unplug } from "lucide-react"
 import { Link } from "@tanstack/react-router"
 import { Card, CardContent } from "@/components/ui/card"
 import { Details, DetailRow, StatusPill, type Tone } from "@/components/app/kit"
 import { Message } from "@/features/chat/elements/message"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { nodeName, shownState, taskLabel } from "@vibeface/client/workspace/labels.ts"
+import { externalSessionLabels, externalSessionStatus, nodeName, schedulerStatus } from "@vibeface/client/workspace/labels.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import { providerNames } from "@vibeface/client/lib/node.ts"
-import { questionOpen } from "@vibeface/client/workspace/questions.ts"
-import type { ConversationPayload, ManagerJob, Question, SessionHandoff, SentBotMessage, WorkRecord } from "@vibeface/client/workspace/types.ts"
+import type { ConversationPayload, ManagerJob, SessionHandoff, SentBotMessage } from "@vibeface/client/workspace/types.ts"
 import { cn } from "@/lib/utils"
 
 /** A read-only view of this conversation's local scheduler and Bot-to-Bot records. */
-export type CollaborationPanelProps = { data?: ConversationPayload | null; botId?: string; className?: string; showWork?: boolean; showQuestions?: boolean }
-
-const schedulerLabels: Record<string, string> = {
-  queued: "排队中",
-  claimed: "已领取",
-  running: "执行中",
-  steering: "补充中",
-  cancelling: "停止中",
-  steered: "已补充",
-  completed: "已完成",
-  failed: "失败",
-  cancelled: "已取消",
-  interrupted: "已中断",
-  pending_delivery: "等待设备接收",
-}
-
-const terminalStates = new Set(["steered", "completed", "failed", "cancelled", "interrupted"])
-const activeStates = new Set(["queued", "claimed", "running", "steering", "cancelling"])
-
-function schedulerLabel(state: string) {
-  return schedulerLabels[state] ?? "未知状态"
-}
+export type CollaborationPanelProps = { data: ConversationPayload; botId: string; className?: string }
 
 function schedulerTone(state: string): Tone {
   if (state === "failed" || state === "interrupted") return "danger"
   if (state === "cancelled") return "warning"
-  if (terminalStates.has(state)) return "success"
-  if (activeStates.has(state)) return "info"
+  if (schedulerStatus(state).group === "history") return "success"
+  if (schedulerStatus(state).group === "open") return "info"
   return "neutral"
 }
 
@@ -114,7 +92,7 @@ function JobRow({ job, data, botId, nodes }: { job: ManagerJob; data: Conversati
         <span className="block truncate font-medium" title={job.trigger}>{kind.label}</span>
         <span className="block truncate text-meta text-muted-foreground">{kind.detail}</span>
       </span>
-      <StatusPill tone={schedulerTone(job.state)}>{schedulerLabel(job.state)}</StatusPill>
+      <StatusPill tone={schedulerTone(job.state)}>{schedulerStatus(data.scheduler?.remote?.reachable === false && schedulerStatus(job.state).group !== "history" ? "unknown" : job.state).label}</StatusPill>
     </div>
     <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-meta text-muted-foreground">
       <span>{job.source_node ? `来自 ${nodeName(job.source_node, { nodes })}` : data.scheduler?.remote ? "远端 owner" : "本机排队"}</span>
@@ -129,30 +107,6 @@ function JobRow({ job, data, botId, nodes }: { job: ManagerJob; data: Conversati
       {job.reply_message_id ? <DetailRow label="回复编号" value={job.reply_message_id} mono /> : null}
       {job.outcome ? <DetailRow label="补充结果" value={job.outcome} /> : null}
     </Details>
-  </li>
-}
-
-function WorkRow({ work, botId, nodes }: { work: WorkRecord; botId?: string; nodes: ReturnType<typeof useWorkspace>["nodes"] }) {
-  const state = shownState(work, nodes)
-  return <li className="grid min-w-0 gap-2 rounded-xl border bg-card p-3 shadow-xs transition-[transform,box-shadow] duration-200 hover:-translate-y-0.5 hover:shadow-sm">
-    <div className="flex min-w-0 flex-wrap items-center gap-2">
-      <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-info-soft text-info"><ListChecks aria-hidden="true" className="size-4" /></span>
-      <span className="min-w-0 flex-1">
-        <span className="block min-w-0 truncate font-medium" title={work.title || work.prompt}>{work.title || "执行工作"}</span>
-        <span className="block text-meta text-muted-foreground">dispatch_work · {nodeName(work.target_node, { nodes })}</span>
-      </span>
-      <StatusPill tone={state === "failed" || state === "rejected" ? "danger" : state === "awaiting_confirmation" || state === "unverified" ? "warning" : state === "completed" ? "success" : "info"}>{taskLabel(state)}</StatusPill>
-    </div>
-    {work.summary ? <p className="line-clamp-3 whitespace-pre-wrap break-words text-meta text-muted-foreground">{work.summary}</p> : null}
-    <div className="flex flex-wrap items-center gap-2">
-      {botId ? <Link to="/b/$botId/work/$workId" params={{ botId, workId: work.work_id }} className="hit-area relative w-fit text-meta font-medium text-foreground underline-offset-4 hover:underline">打开任务详情</Link> : null}
-      <Details>
-        <DetailRow label="任务编号" value={work.work_id} mono />
-        <DetailRow label="任务状态" value={work.state} mono />
-        {work.outcome ? <DetailRow label="结果" value={work.outcome} /> : null}
-        {work.stop ? <DetailRow label="停止请求" value={work.stop} /> : null}
-      </Details>
-    </div>
   </li>
 }
 
@@ -171,35 +125,21 @@ function Unanswered({ ids, data, botId }: { ids: string[]; data: ConversationPay
   </Section>
 }
 
-function QuestionRows({ questions, botId }: { questions: Question[]; botId?: string }) {
-  if (!questions.length) return null
-  return <Section title="问题与确认" count={questions.length}>
-    <Card size="sm"><CardContent className="grid gap-1">
-      {questions.map((question) => {
-        const open = questionOpen(question)
-        const target = question.bot?.bot_id ?? botId
-        const status = open ? "待回答" : question.answer ? "已回答" : "已失效"
-        const tone: Tone = open ? "warning" : question.answer ? "success" : "neutral"
-        const body = <><span className="flex min-w-0 items-center gap-2"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="min-w-0 flex-1 truncate font-medium" title={question.text}>{question.text}</span><StatusPill tone={tone}>{status}</StatusPill></span><span className="ps-6 text-meta text-muted-foreground">{question.bot?.name ?? "当前 Bot"} · {when(question.created_at_ms)}</span></>
-        return target ? <Link key={question.question_id} to="/b/$botId" params={{ botId: target }} className="hit-area relative grid min-w-0 gap-1 rounded-lg px-2 py-2 text-start hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50">{body}</Link> : <div key={question.question_id} className="grid min-w-0 gap-1 px-2 py-2">{body}</div>
-      })}
-    </CardContent></Card>
-  </Section>
-}
-
-function SessionRows({ sessions, nodes }: { sessions: SessionHandoff[]; nodes: ReturnType<typeof useWorkspace>["nodes"] }) {
-  if (!sessions.length) return null
-  return <Section title="会话交接" count={sessions.length}>
+function SessionRows({ sessions, nodes, connected }: { sessions: SessionHandoff[]; nodes: ReturnType<typeof useWorkspace>["nodes"]; connected: boolean }) {
+  return <Section title="Bot 关注的外部会话" count={sessions.length}>
     <Card size="sm"><CardContent className="grid gap-3">
       {sessions.map((session) => {
         const Icon = providerIcons[session.agent]
+        const reach = connected ? externalSessionStatus(session, nodes) : "unknown"
         return <div key={`${session.node}:${session.session_id}`} className={cn("grid min-w-0 gap-1 rounded-lg border border-dashed p-3", session.muted && "text-muted-foreground")}>
-          <div className="flex min-w-0 items-center gap-2"><span className="grid size-7 shrink-0 place-items-center rounded-lg bg-muted"><Icon aria-hidden="true" className="size-4" /></span><span className="min-w-0 flex-1 truncate font-medium">{session.muted ? "已停止关注" : "接手会话"} · {providerNames[session.agent]}</span><StatusPill tone={session.muted ? "neutral" : "info"}>{session.muted ? "已静音" : "关注中"}</StatusPill></div>
+          <div className="flex min-w-0 items-center gap-2"><span className="grid size-7 shrink-0 place-items-center rounded-lg bg-muted"><Icon aria-hidden="true" className="size-4" /></span><span className="min-w-0 flex-1 truncate font-medium">{providerNames[session.agent]}</span><StatusPill tone={session.muted ? "neutral" : "info"}>{session.muted ? "已静音" : "关注中"}</StatusPill><StatusPill tone={reach === "revoked" ? "danger" : reach === "offline" ? "warning" : "neutral"}>{externalSessionLabels[reach]}</StatusPill></div>
           <p className="ps-9 text-meta text-muted-foreground">{nodeName(session.node, { nodes })} · {session.cwd || "未记录项目"}</p>
           {session.summary ? <p className="ps-9 line-clamp-3 whitespace-pre-wrap break-words text-meta text-muted-foreground">{session.summary}</p> : null}
           <time className="ps-9 text-meta text-muted-foreground" dateTime={new Date(session.created_at_ms).toISOString()}>{when(session.created_at_ms)}</time>
+          <Details label="查看归属记录详情" className="ps-9"><DetailRow label="外部会话编号" value={session.session_id} mono /><p>这是外部会话归属记录。设备可达不代表会话仍在运行，也不能证明 Bot 自身原生会话可续接。</p></Details>
         </div>
       })}
+      {!sessions.length ? <p className="text-meta text-muted-foreground">尚无外部会话归属记录。Bot 自身运行不会自动建立这类外部记录。</p> : null}
     </CardContent></Card>
   </Section>
 }
@@ -209,6 +149,7 @@ function SentMessage({ sent, botName, botId }: { sent: SentBotMessage; botName: 
     <div className="flex min-w-0 flex-wrap items-center gap-2"><Send aria-hidden="true" className="size-4 shrink-0 text-info" /><span className="min-w-0 flex-1 truncate font-medium">发给 {botName}</span><StatusPill tone="info">message_bot · 协作消息</StatusPill></div>
     <p className="line-clamp-4 whitespace-pre-wrap break-words text-meta">{sent.text}</p>
     <time className="text-meta text-muted-foreground" dateTime={new Date(sent.created_at_ms).toISOString()}>{when(sent.created_at_ms)}</time>
+    <p className="text-meta text-muted-foreground">这是已写入的消息记录，投递和回复状态未提供。</p>
   </CardContent></Card>
   return botId ? <Link to="/b/$botId" params={{ botId }} className="block rounded-xl outline-none focus-visible:ring-3 focus-visible:ring-ring/50">{body}</Link> : body
 }
@@ -232,29 +173,26 @@ function CollaborationMessages({ data, botNames }: { data: ConversationPayload; 
         return <SentMessage key={`sent:${message.message_id}`} sent={message} botName={target?.name ?? "另一个 Bot"} botId={target?.bot_id} />
       })}
     </div>
-    <p className="px-1 text-meta text-muted-foreground">协作消息不会自动变成执行工作。执行工作只来自 dispatch_work，并在上方任务详情中单独展示。</p>
+    <p className="px-1 text-meta text-muted-foreground">协作消息不会自动变成执行工作。执行工作只来自 dispatch_work，通过任务详情查看。</p>
   </Section>
 }
 
-export function CollaborationPanel({ data: supplied, botId: suppliedBotId, className, showWork = true, showQuestions = true }: CollaborationPanelProps = {}) {
+export function CollaborationPanel({ data, botId, className }: CollaborationPanelProps) {
   const workspace = useWorkspace()
-  const data = supplied === undefined ? workspace.data : supplied
-  const botId = suppliedBotId ?? workspace.selectedBot?.bot_id
   const botNames = new Map(workspace.bots.map((bot) => [bot.conversation_id, { bot_id: bot.bot_id, name: bot.name }]))
-  if (!data) return <Card className={cn("min-w-0", className)}><CardContent className="py-6 text-meta text-muted-foreground">连接后才能查看协作状态。</CardContent></Card>
   const scheduler = data.scheduler
   const jobs = scheduler?.jobs ?? []
-  const works = data.works
-  const questions = data.questions
+  const open = jobs.filter((job) => schedulerStatus(job.state).group !== "history")
+  const history = jobs.filter((job) => schedulerStatus(job.state).group === "history")
   return <div className={cn("grid min-w-0 gap-5", className)}>
     <OwnerCard data={data} nodes={workspace.nodes} />
-    {scheduler ? <Section title="会话队列" count={jobs.length}>
-      {jobs.length ? <ul className="grid gap-2">{jobs.map((job) => <JobRow key={job.trigger} job={job} data={data} botId={botId} nodes={workspace.nodes} />)}</ul> : <Card size="sm"><CardContent className="py-5 text-meta text-muted-foreground">当前会话没有排队项目。</CardContent></Card>}
-    </Section> : <Card size="sm"><CardContent className="flex items-start gap-2 py-4 text-meta text-muted-foreground"><Unplug aria-hidden="true" className="mt-0.5 size-4 shrink-0" />队列状态暂不可见。</CardContent></Card>}
-    {showWork && works.length ? <Section title="执行工作" count={works.length}><ul className="grid gap-2">{works.map((work) => <WorkRow key={work.work_id} work={work} botId={botId} nodes={workspace.nodes} />)}</ul></Section> : null}
+    {scheduler ? <Section title="未结调度观察" count={open.length}>
+      <p className="px-1 text-meta text-muted-foreground">显示最近观察，不代表实际执行顺序。远端记录可能只包含近期部分项目。</p>
+      {open.length ? <ul className="grid gap-2">{open.map((job) => <JobRow key={job.trigger} job={job} data={data} botId={botId} nodes={workspace.nodes} />)}</ul> : <Card size="sm"><CardContent className="py-5 text-meta text-muted-foreground">{scheduler.remote?.reachable === false ? "远端不可达，当前调度状态未知。" : "当前记录没有未结调度项目。"}</CardContent></Card>}
+      {history.length ? <Details label={`调度历史 · ${history.length}`}><ul className="grid gap-2">{history.map((job) => <JobRow key={job.trigger} job={job} data={data} botId={botId} nodes={workspace.nodes} />)}</ul></Details> : null}
+    </Section> : <Card size="sm"><CardContent className="flex items-start gap-2 py-4 text-meta text-muted-foreground"><Unplug aria-hidden="true" className="mt-0.5 size-4 shrink-0" />调度状态暂未提供。</CardContent></Card>}
     <Unanswered ids={scheduler?.unanswered ?? []} data={data} botId={botId} />
-    {showQuestions ? <QuestionRows questions={questions} botId={botId} /> : null}
-    <SessionRows sessions={data.sessions} nodes={workspace.nodes} />
+    <SessionRows sessions={data.sessions} nodes={workspace.nodes} connected={workspace.connectionOnline && workspace.synced} />
     <CollaborationMessages data={data} botNames={botNames} />
   </div>
 }

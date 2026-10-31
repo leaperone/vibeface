@@ -151,4 +151,12 @@ test("task confirmation outranks a running projection while delivery, stop and r
   }
   const ended = parseWorkspaceOverview({ tasks: [{ ...running, kind: "work", state: "finished", outcome: "completed", remote_reachable: false }] })
   assert.equal(ended.tasks[0]?.outcome, "completed", "offline now does not invalidate an already recorded result")
+  const stopped = parseWorkspaceOverview({
+    bots: [bot("chat-1")], tasks: [{ ...running, kind: "work", state: "finished", outcome: "completed" }, { ...running, work_id: "unknown", kind: "work", state: "unverified", outcome: "unverified" }],
+    deliveries: [{ work_id: running.work_id, conversation_id: running.conversation_id, state: "stop_waiting" }, { work_id: "unknown", conversation_id: running.conversation_id, state: "stop_waiting" }],
+    checks: [{ check_id: "process", conversation_id: "chat-1" }],
+  })
+  assert.equal(stopped.tasks[0]?.outcome, "completed", "a pending stop does not erase a terminal result")
+  assert.equal(stopped.tasks[1]?.outcome, "unverified", "a stop does not replace an unknown result with an active state")
+  assert.deepEqual(stopped.tasks[2]?.navigation, { bot_id: "bot-chat-1", conversation_id: "chat-1" })
 })

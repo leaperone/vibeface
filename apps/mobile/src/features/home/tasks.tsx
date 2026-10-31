@@ -5,8 +5,8 @@ import { Pressable, ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
-import { cardState, needsLook, nodeName, staleTaskLabel, taskActive, taskAgent, taskGroup, taskGroups, taskLabel, taskProgress, taskStale, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
-import { awaitsAnswer } from '@vibeface/client/workspace/questions.ts'
+import { cardState, needsLook, nodeName, overviewScope, staleTaskLabel, taskActive, taskAgent, taskGroup, taskGroups, taskLabel, taskProgress, taskStale, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
+import { workApproval } from '@vibeface/client/workspace/questions.ts'
 import { openWorksFromOverview, overviewFromWorkspace } from '@vibeface/client/workspace/model.ts'
 import type { BotRecord, NodeInfo, OpenWork, OverviewTask } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
@@ -25,22 +25,29 @@ export function TasksScreen() {
   const { directory } = useDevice()
   useEffect(() => { if (!shared) return; shared.setView('tasks'); return () => shared.setView('other') }, [shared?.generation])
   const works = shared?.openWorks ?? []
-  const loading = Boolean(shared && !shared.synced && !works.length)
+  const read = Boolean(shared?.synced)
   const lookup = { nodes: shared?.nodes ?? [], directory }
   const localOverview = shared ? overviewFromWorkspace({ openWorks: works, bots: shared.bots, questions: shared.questions, nodes: lookup.nodes }) : null
   const overview = shared?.overview ?? localOverview
   type ProjectedWork = Extract<OverviewTask, { kind: 'work' | 'dispatch' }>
-  const projected = new Map(overview?.tasks.filter((task): task is ProjectedWork => (task.kind === 'work' || task.kind === 'dispatch') && Boolean(task.work_id)).map((task) => [task.work_id!, task]))
-  const overviewWorks = shared?.overview ? openWorksFromOverview(shared.overview, works) : works
-  const visibleWorks = overview ? overviewWorks.filter((work) => projected.has(work.work_id)) : overviewWorks
+  const projected = new Map([...(localOverview?.tasks ?? []), ...(overview?.tasks ?? [])].filter((task): task is ProjectedWork => (task.kind === 'work' || task.kind === 'dispatch') && Boolean(task.work_id)).map((task) => [JSON.stringify([task.conversation_id, task.work_id]), task]))
+  const projection = (work: OpenWork) => projected.get(JSON.stringify([work.conversation_id, work.work_id]))
+  const visibleWorks = overview ? openWorksFromOverview(overview, works) : works
+  const loading = !read && Boolean(shared?.connectionOnline) && !visibleWorks.length
   const bot = workspace.bots[0]
-  const held = new Set((shared?.questions ?? []).filter((question) => awaitsAnswer(question, shared?.answered ?? {}) && question.about.request_id).map((question) => question.about.session_id))
   const groups: Record<TaskGroup, OpenWork[]> = { attention: [], working: [], waiting: [] }
-  for (const work of visibleWorks) groups[taskGroup(cardState(work, lookup.nodes, projected.get(work.work_id)?.state), held.has(work.thread_id ?? ''))].push(work)
+  for (const work of visibleWorks) {
+    const state = cardState(work, lookup.nodes, projection(work)?.state)
+    const asking = state === 'running' && workApproval({ work, conversationId: work.conversation_id, questions: shared?.questions ?? [], answered: shared?.answered ?? {} })
+    groups[taskGroup(taskStale(state, Boolean(shared?.connectionOnline && read)) ? 'unknown' : state, Boolean(asking))].push(work)
+  }
+  const otherChecks = overview?.tasks.filter((task) => task.kind === 'check' && !task.work_id && !task.work_ids.length && task.conversation_id !== shared?.conversationId) ?? []
 
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
-    <MobileMasthead attention={groups.attention.length + attention.length} working={groups.working.length} waiting={groups.waiting.length} online={Boolean(shared?.connectionOnline)} />
+    <MobileMasthead attention={read ? groups.attention.length + attention.length + otherChecks.length : null} working={read ? groups.working.length : null} waiting={read ? groups.waiting.length : null} online={Boolean(shared?.connectionOnline)} />
+    <Text className="text-meta text-muted-foreground">{[...(overview ? overviewScope(overview.coverage) : ['尚未读取任务记录']), ...(!read ? ['当前连接尚未完成首读'] : !shared?.connectionOnline ? ['连接已断开，显示最近记录'] : [])].join(' · ')}</Text>
     {attention.length ? <Link href="/inbox" asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-3 rounded-xl border border-warning/25 bg-warning-soft px-4 py-3"><Icon as={CircleQuestionMark} className="size-5 text-warning" /><Text className="min-w-0 flex-1">{attention.length} 项问题或程序待确认</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Pressable></Link> : null}
+    {otherChecks.map((check) => <View key={`${check.conversation_id}:${check.item_id}`} className="gap-2 rounded-xl border border-border bg-card p-4"><Text className="font-medium">程序状态待确认 · {check.bot?.name ?? '已删除的 Bot'}</Text>{check.summary ? <Text className="text-meta text-muted-foreground">{check.summary}</Text> : null}{check.bot ? <Link href={`/b/${check.bot.bot_id}`} asChild><Pressable accessibilityRole="link" className="min-h-11 justify-center"><Text>打开 {check.bot.name}</Text></Pressable></Link> : null}</View>)}
     {loading ? <View accessibilityLabel="正在读取任务" className="gap-2">
       {[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-3">
         <Skeleton className="size-8 rounded-lg" />
@@ -48,32 +55,33 @@ export function TasksScreen() {
       </View>)}
     </View> : visibleWorks.length ? taskGroups.map(({ group, title }) => groups[group].length ? <View key={group} className="gap-2">
       <Text role="heading" className="px-1 text-heading font-semibold">{title} <Text className="text-muted-foreground">{groups[group].length}</Text></Text>
-      {groups[group].map((work) => <TaskRow key={work.work_id} work={work} projected={projected.get(work.work_id)} bot={workspace.bots.find((item) => item.conversation_id === work.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline)} progress={taskProgress(work, shared?.liveProgress ?? [])} />)}
-    </View> : null) : attention.length ? null : <MobileEmpty bot={bot} />}
+      {groups[group].map((work) => <TaskRow key={JSON.stringify([work.conversation_id, work.work_id])} work={work} projected={projection(work)} waiting={Boolean(workApproval({ work, conversationId: work.conversation_id, questions: shared?.questions ?? [], answered: shared?.answered ?? {} }))} bot={shared?.bots.find((item) => item.conversation_id === work.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline && read)} progress={taskProgress(work, shared?.liveProgress ?? [])} />)}
+    </View> : null) : attention.length || otherChecks.length ? null : <MobileEmpty bot={bot} read={read} />}
   </ScrollView>
 }
 
-function MobileMasthead({ attention, working, waiting, online }: { attention: number; working: number; waiting: number; online: boolean }) {
+function MobileMasthead({ attention, working, waiting, online }: { attention: number | null; working: number | null; waiting: number | null; online: boolean }) {
   return <View className="overflow-hidden rounded-2xl border border-brand/15 bg-brand-soft/60 p-4"><View className="gap-3">
     <View className="flex-row flex-wrap items-center gap-2"><Text className="text-meta font-semibold uppercase tracking-[1.5px] text-brand">个人任务总览</Text><View className="flex-row items-center gap-1 rounded-full border border-border bg-background/60 px-2 py-1"><Icon as={online ? Wifi : WifiOff} className={online ? 'size-3.5 text-success' : 'size-3.5 text-warning'} /><Text className={cn('text-meta font-medium', online ? 'text-success' : 'text-warning')}>{online ? '在线' : '待连接'}</Text></View></View>
-    <View className="gap-1"><Text role="heading" className="text-title font-semibold">掌握每个 Bot 的下一步</Text><Text className="text-meta leading-5 text-muted-foreground">执行、等待和协作状态会在这里汇合。</Text></View>
+    <View className="gap-1"><Text role="heading" className="text-title font-semibold">掌握每个 Bot 的下一步</Text><Text className="text-meta leading-5 text-muted-foreground">{attention === null ? '当前连接的任务数量尚未确认。' : '查看已知任务的执行、等待和核对状态。'}</Text></View>
     <View className="flex-row gap-2"><MobileMetric label="需要留意" value={attention} tone={attention ? 'warning' : 'neutral'} /><MobileMetric label="进行中" value={working} tone={working ? 'info' : 'neutral'} /><MobileMetric label="等待中" value={waiting} tone="neutral" /></View>
   </View></View>
 }
 
-function MobileMetric({ label, value, tone }: { label: string; value: number; tone: 'neutral' | 'warning' | 'info' }) {
-  return <View className="min-w-0 flex-1 gap-0.5 rounded-xl border border-border/70 bg-background/55 px-3 py-2"><Text className="text-meta text-muted-foreground">{label}</Text><Text className={cn('text-lg font-semibold', tone === 'warning' ? 'text-warning' : tone === 'info' ? 'text-info' : 'text-foreground')}>{value}</Text></View>
+function MobileMetric({ label, value, tone }: { label: string; value: number | null; tone: 'neutral' | 'warning' | 'info' }) {
+  return <View className="min-w-0 flex-1 gap-0.5 rounded-xl border border-border/70 bg-background/55 px-3 py-2"><Text className="text-meta text-muted-foreground">{label}</Text><Text className={cn('text-lg font-semibold', tone === 'warning' ? 'text-warning' : tone === 'info' ? 'text-info' : 'text-foreground')}>{value ?? '待确认'}</Text></View>
 }
 
-function MobileEmpty({ bot }: { bot?: Pick<BotRecord, 'bot_id' | 'name'> }) {
-  return <View className="items-center gap-3 rounded-2xl border border-dashed border-brand/25 bg-brand-soft/35 px-6 py-12"><View className="size-16 items-center justify-center rounded-2xl bg-brand-soft"><Icon as={ListChecks} className="size-8 text-brand" /></View><Text className="text-meta font-semibold uppercase tracking-[1.5px] text-brand">随时开始</Text><Text role="heading" className="text-center text-heading font-semibold">还没有需要盯住的任务</Text><Text className="max-w-[300px] text-center text-meta leading-5 text-muted-foreground">从 Bot 对话里发出第一条请求后，执行步骤和协作消息会在这里汇合。</Text>{bot ? <Link href={`/b/${bot.bot_id}`} asChild><Pressable accessibilityRole="link" accessibilityLabel={`打开 ${bot.name}`} className="mt-2 min-h-11 flex-row items-center gap-2 rounded-xl bg-brand px-4 py-2.5 active:opacity-80"><Text className="font-medium text-brand-foreground">打开 {bot.name}</Text><Icon as={ArrowUpRight} className="size-4 text-brand-foreground" /></Pressable></Link> : null}</View>
+function MobileEmpty({ bot, read }: { bot?: Pick<BotRecord, 'bot_id' | 'name'>; read: boolean }) {
+  return <View className="items-center gap-3 rounded-2xl border border-dashed border-brand/25 bg-brand-soft/35 px-6 py-12"><View className="size-16 items-center justify-center rounded-2xl bg-brand-soft"><Icon as={ListChecks} className="size-8 text-brand" /></View><Text role="heading" className="text-center text-heading font-semibold">{read ? '当前记录没有未完成的任务' : '任务状态尚未读取'}</Text><Text className="max-w-[300px] text-center text-meta leading-5 text-muted-foreground">{read ? '这里展示当前设备已知的任务。Bot 的协作记录在上下文和协作中查看。' : '连接并完成首读后，才能确认是否有任务。'}</Text>{bot ? <Link href={`/b/${bot.bot_id}`} asChild><Pressable accessibilityRole="link" accessibilityLabel={`打开 ${bot.name}`} className="mt-2 min-h-11 flex-row items-center gap-2 rounded-xl bg-brand px-4 py-2.5 active:opacity-80"><Text className="font-medium text-brand-foreground">打开 {bot.name}</Text><Icon as={ArrowUpRight} className="size-4 text-brand-foreground" /></Pressable></Link> : null}</View>
 }
 
 type Lookup = { nodes: NodeInfo[]; directory: ReturnType<typeof useDevice>['directory'] }
 type TaskBot = Pick<BotRecord, 'bot_id' | 'conversation_id' | 'name' | 'avatar'>
 
-function TaskRow({ work, projected, bot, lookup, connected, progress }: { work: OpenWork; projected?: Extract<OverviewTask, { kind: 'work' | 'dispatch' }>; bot?: TaskBot; lookup: Lookup; connected: boolean; progress: string }) {
-  const rawState = cardState(work, lookup.nodes, projected?.state)
+function TaskRow({ work, projected, waiting, bot, lookup, connected, progress }: { work: OpenWork; waiting: boolean; projected?: Extract<OverviewTask, { kind: 'work' | 'dispatch' }>; bot?: TaskBot; lookup: Lookup; connected: boolean; progress: string }) {
+  const shown = cardState(work, lookup.nodes, projected?.state)
+  const rawState = shown === 'running' && waiting ? 'waiting' : shown
   const failed = needsLook(rawState) && rawState !== 'dispatch_unverified'
   const stale = taskStale(rawState, connected)
   const state = stale ? staleTaskLabel : taskLabel(rawState)

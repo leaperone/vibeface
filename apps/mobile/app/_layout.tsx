@@ -15,7 +15,7 @@ import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { useWorkspace } from '@/data/context'
-import { LiveWorkspace } from '@/data/live'
+import { LiveWorkspace, useLive } from '@/data/live'
 import { HomeList } from '@/features/home/list'
 import { openedLink } from '@/lib/join-link'
 import { useWide } from '@/lib/layout'
@@ -35,6 +35,7 @@ export default function RootLayout() {
 
 function Screens() {
   const workspace = useWorkspace()
+  const shared = useLive()
   const [background, foreground] = useCSSVariable(['--background', '--foreground']) as [string, string]
   // Mid-rotation, UIKit can show the window behind a view that has not resized yet; paint it the page colour, not white.
   useEffect(() => { void SystemUI.setBackgroundColorAsync(background) }, [background])
@@ -59,7 +60,7 @@ function Screens() {
       {/* Kept mounted and hidden when narrow, so a rotation only flips its display. */}
       {ready ? <View className="w-80 border-e border-border bg-background" style={{ display: wide ? 'flex' : 'none' }}><HomeList sidebar /></View> : null}
       <View className="flex-1">
-        <Stack screenOptions={{
+        <Stack screenListeners={({ route }) => ({ focus: () => shared?.setView(route.name === 'b/[botId]' ? 'chat' : route.name === 'tasks' ? 'tasks' : 'other') })} screenOptions={{
           headerShadowVisible: false,
           // iOS draws its glass bar with a soft scroll edge; Android's bar is a plain surface in the page colour.
           ...Platform.OS === 'android' ? { headerStyle: { backgroundColor: background } } : {},
@@ -77,6 +78,7 @@ function Screens() {
             <Stack.Screen name="index" options={{ title: '消息', headerLargeTitle: true }} />
             <Stack.Screen name="b/[botId]" options={{ title: '', ...root }} />
             <Stack.Screen name="b/[botId]/about" options={{ title: '' }} />
+            <Stack.Screen name="b/[botId]/context" options={{ title: '上下文和协作' }} />
             <Stack.Screen name="b/[botId]/work/[workId]" options={{ title: '任务' }} />
             <Stack.Screen name="tasks" options={{ title: '任务', ...root }} />
             <Stack.Screen name="new-bot" options={{ title: '新 Bot', presentation: 'modal', headerLeft: Close }} />
