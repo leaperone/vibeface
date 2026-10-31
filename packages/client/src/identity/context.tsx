@@ -69,7 +69,7 @@ type DeviceContextValue = {
   pendingRecovery: PendingRecovery | null; dismissPendingRecovery(): void
   /** Stops the recovery `checkpoint` names; resolves once it is stopped, also when an earlier try already stopped it. */
   vetoRecovery(checkpoint: string): Promise<void>
-  /** Confirms the recovery `checkpoint` now; resolves once it is active, also when an earlier try already did it. */
+  /** Confirms a pending recovery; resolves only after its signed directory proves it took effect. */
   approveRecovery(checkpoint: string): Promise<void>
   /** Left by a stop on this device until the recovery key changes: whoever started it holds the file. */
   rotateHint: boolean; dismissRotateHint(): void
@@ -863,51 +863,42 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     await refreshDirectory()
   }
   /**
-   * Confirms the recovery `checkpoint` immediately. The directory is read before signing and
-   * again after an unknown write, so a retry never signs a second event.
+   * Confirms the recovery `checkpoint` immediately. An unknown write is checked against the
+   * same checkpoint chain, without signing another event.
    */
   async function approveRecovery(checkpoint: string) {
     const connection = managing(), request = scoped()
-    const read = async () => {
-      let response: Record<string, unknown>
-      try { response = record(await request('directory')) }
-      catch (cause) {
-        // An approval may remove this manager before its reply arrives. Authentication still
-        // tells us that the session lost membership, which is a completed approval outcome.
-        try {
-          const auth = record(await request('authenticate'))
-          return { event: null, pending: false, detached: auth.principal === null }
-        } catch { throw cause }
-      }
-      const now = nodeNow(response) ?? Date.now()
-      const verified = verifyState(response.state, connection.principal.network_id, now)
+    const before = record(await request('directory')), now = nodeNow(before) ?? Date.now()
+    const verified = verifyState(before.state, connection.principal.network_id, now)
+    let event: Record<string, unknown>, epoch: number, checkpoints: unknown[]
+    try {
+      const view = parseView(JSON.parse(verified.viewJson()))
+      if (view.pending?.checkpoint !== checkpoint) throw new Error('这次找回已不在等待确认，请刷新设备列表。')
+      epoch = view.epoch
+      checkpoints = array(record(before.state).checkpoints)
+      event = record(JSON.parse(verified.governanceTemplate(own().deviceId, JSON.stringify({ type: 'approve', checkpoint, at_ms: now }))))
+    } finally { verified.free() }
+    const confirmed = (value: unknown) => {
+      const response = record(value)
+      const verified = verifyState(response.state, connection.principal.network_id, nodeNow(response))
       try {
         const view = parseView(JSON.parse(verified.viewJson()))
-        const event = view.pending?.checkpoint === checkpoint
-          ? JSON.parse(verified.governanceTemplate(own().deviceId, JSON.stringify({ type: 'approve', checkpoint, at_ms: now }))) as Record<string, unknown>
-          : null
-        return { event, pending: view.pending?.checkpoint === checkpoint, detached: false }
+        const chain = array(record(response.state).checkpoints)
+        if (view.stopped.includes(checkpoint)) throw new Error('这次找回已被拦下或作废。')
+        if (view.epoch <= epoch || view.pending?.checkpoint === checkpoint || !checkpoints.every(item => chain.some(next => same(item, next)))) throw new Error('还无法确认这次找回已生效，请刷新设备列表后检查。')
+        return view
       } finally { verified.free() }
     }
-    const before = await read(), event = before.event
-    if (event) {
-      event.signature = await signClient('identity-governance', governancePayload(JSON.stringify(event)))
-      try {
-        const answer = record(await request('approve_recovery', { event }))
-        // `authentication` is allowed to return no principal after the approved directory
-        // removes this manager; that is still a successful write.
-        if (answer.principal === null) { await refreshDirectory().catch(() => {}); return }
-      }
-      catch (cause) {
-        // Whether it landed is unknown; a reread that no longer waits on it means it did.
-        const after = await read().catch(() => null)
-        if (!after || after.event || after.pending) throw cause
-        await refreshDirectory().catch(() => {})
-        return
-      }
+    event.signature = await signClient('identity-governance', governancePayload(JSON.stringify(event)))
+    let view: MembershipView
+    try { view = confirmed(await request('approve_recovery', { event })) }
+    catch (cause) {
+      const after = await request('directory').then(confirmed).catch(() => null)
+      if (!after) throw cause
+      view = after
     }
-    if (before.detached) { await refreshDirectory().catch(() => {}); return }
-    await refreshDirectory()
+    if (view.members.some(member => member.device_id === own().deviceId)) await refreshDirectory()
+    else await refreshDirectory().catch(() => {})
   }
   /**
    * The app tries the entry Node where the ticket says it listens on the LAN, then this page's own entry: a scanned

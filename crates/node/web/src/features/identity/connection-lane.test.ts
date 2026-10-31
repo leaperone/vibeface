@@ -5,7 +5,7 @@ import { dirname, extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createContext, Script } from 'node:vm'
 import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
-import type { ConnectionEntry } from '@vibeface/client/lib/node.ts'
+import type { ConnectionEntry, MembershipView } from '@vibeface/client/lib/node.ts'
 import { primaryLane, shouldAutoConnect } from '@vibeface/client/identity/connection-lane.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
@@ -62,6 +62,14 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const managed = { value: [] as Record<string, unknown>[] }
   const inviteState = { value: 'open' }
   const holds = new Map<string, ReturnType<typeof deferred>>()
+  const signatures: string[] = []
+  const directory: { state: { genesis: typeof genesis; checkpoints: unknown[]; events: unknown[] }; view: MembershipView; now_ms: number } = {
+    state: { genesis, checkpoints: [], events: [] },
+    view: { ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: management }, { device_id: target, kind: 'node', name: 'node', manage: false }] },
+    now_ms: Date.now(),
+  }
+  const views = new Map<unknown, MembershipView>()
+  const receipt = () => { views.set(directory.state, directory.view); return { ...directory, heads: {} } }
   const sockets: { entry: ConnectionEntry; close(): void; drop(): void }[] = []
   // As the Node sends it.
   const sessionEntry = { address: 'https://node.example', device_id: target, local: true }
@@ -95,7 +103,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   let initialized = !bootstrap && local !== 'fresh'
   const transport = {
     validTarget: (value: string) => value, validEndpoint: (value: string) => value, joinTicket,
-    initClient: async () => ({ deviceId: key }), signClient: async () => 'signature',
+    initClient: async () => ({ deviceId: key }), signClient: async (purpose: string) => { signatures.push(purpose); return 'signature' },
     replaceClient: async () => { calls.push('replace-key'); key = freshKey; return { deviceId: key } },
     parseJoinLink: async () => ({ origin: entry.address, entryId: target, inviteId, inviteHash: 'h'.repeat(64), secret: 'one-time-secret' }),
     async connectDevice(candidate: ConnectionEntry, options: { onClose?(cause: Error): void; signal?: AbortSignal }) {
@@ -126,9 +134,9 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
         if (method === 'join') return joinRequest('pending', { device_id: params.public_key })
         if (method === 'join_status' && !params.join_id) return { requests: managed.value }
         if (method === 'approve') return joinRequest('confirming', { device_id: remote, admin_id: subject, admin_nonce: params.admin_nonce })
-        if (method === 'directory') return { state: { genesis }, view: secure.verifiedView() }
+        if (method === 'directory' || method === 'approve_recovery') return receipt()
         if (method === 'join_status') return params.reveal ? { ...joinStatus.value, joiner_nonce: params.reveal } : joinStatus.value.status === 'joined' ? { ...joinStatus.value, state: { genesis } } : joinStatus.value
-        if (method === 'recovery_state' || method === 'directory') return { state: { genesis, checkpoints: [], events: [] }, view: membership, heads: {} }
+        if (method === 'recovery_state') return { state: { genesis, checkpoints: [], events: [] }, view: membership, heads: {} }
         return {}
       } }
     },
@@ -137,13 +145,13 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const secure = {
     verifyAuthentication: () => { verifications++; return { auth: { local_auto_access: true }, principal: { source: localSession && !management ? 'local_session' : 'membership', network_id: network, device_id: subject, epoch: 1, can_manage: management }, view: membership } },
     verifyRemoval: () => false,
-    verifiedView: () => ({ ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: false }, { device_id: target, kind: 'node', name: 'node', manage: false }] }),
+    verifiedView: (state?: unknown) => views.get(state) ?? directory.view,
     openPackage: async () => ({ networkId: network, material: { genesis, checkpoints: [], events: [] }, root: { deviceId: () => network, sign: () => 'signature' }, release() { released++ } }),
     Identity: { generate: () => ({ deviceId: () => network, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
     createGenesis: () => JSON.stringify(genesis), joinCommit: () => 'd'.repeat(64), shortCode: () => '123456', ticketEncode: () => 'vibeface1test',
     governancePayload: () => new Uint8Array(), inviteSigningPayload: () => new Uint8Array(),
     sealPackage: () => new Uint8Array([1, 2, 3]),
-    verifyState: () => ({ free() {}, viewJson: () => JSON.stringify(membership), governanceTemplate: (issuer: string, action: string) => JSON.stringify({ issuer, action: JSON.parse(action) }), createRecoveryCheckpoint: () => JSON.stringify({ epoch: 2 }), createKeyRotation: () => JSON.stringify({ epoch: 2 }) }),
+    verifyState: (state: unknown = directory.state) => ({ free() {}, viewJson: () => JSON.stringify(views.get(state) ?? directory.view), governanceTemplate: (issuer: string, action: string) => JSON.stringify({ issuer, action: JSON.parse(action) }), createRecoveryCheckpoint: () => JSON.stringify({ epoch: 2 }), createKeyRotation: () => JSON.stringify({ epoch: 2 }) }),
   }
   const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }
   const sandbox = createContext({
@@ -198,10 +206,158 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     afterRender.splice(0).forEach(run => run())
     return props.value
   }
-  return { render, secure, calls, requests, setupRequests, joinStatus, inviteState, managed, holds, sockets, stored, timers, location, openHash, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, secure, calls, requests, setupRequests, joinStatus, inviteState, managed, holds, directory, receipt, signatures, sockets, stored, timers, location, openHash, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
 const notMember = { principal: null, initialized: true, network_id: network, revoked: false }
+const recoveryCheckpoint = '8'.repeat(64)
+function recoveryApprovalHarness() {
+  const app = deviceHarness({ management: true, saved: true })
+  app.directory.state.checkpoints = [{ epoch: 2, signature: 'ancestor' }, { epoch: 3, signature: 'recovery' }]
+  app.directory.view = { ...app.directory.view, epoch: 2, pending: { checkpoint: recoveryCheckpoint, effective_at_ms: app.directory.now_ms + 60000, members: app.directory.view.members } }
+  return app
+}
+function approvedDirectory(app: ReturnType<typeof recoveryApprovalHarness>, change: Partial<MembershipView> = {}) {
+  app.directory.state = { ...app.directory.state, events: [{ type: 'approve', checkpoint: recoveryCheckpoint }] }
+  app.directory.view = { ...app.directory.view, epoch: 3, pending: null, ...change }
+  return app.receipt()
+}
+
+for (const detached of [false, true]) test(`recovery approval verifies its signed receipt${detached ? ' even after this manager is removed' : ''}`, async () => {
+  const app = recoveryApprovalHarness()
+  try {
+    app.render(); await settle(); app.render()
+    const reply = deferred(); app.holds.set('approve_recovery', reply)
+    const approval = app.render().approveRecovery(recoveryCheckpoint)
+    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const answer = approvedDirectory(app, detached ? { members: [] } : {})
+    if (detached) {
+      const unavailable = deferred(); unavailable.promise.catch(() => {}); unavailable.reject(new Error('this manager was removed'))
+      app.holds.set('directory', unavailable)
+    }
+    reply.resolve(answer)
+    await approval
+    assert.deepEqual(app.signatures, ['identity-governance'])
+    assert.deepEqual(plain(app.requests.find(request => request.method === 'approve_recovery')?.params.event), { issuer: subject, action: { type: 'approve', checkpoint: recoveryCheckpoint, at_ms: app.directory.now_ms }, signature: 'signature' })
+    if (!detached) {
+      await assert.rejects(app.render().approveRecovery(recoveryCheckpoint), /等待确认/)
+      assert.equal(app.requests.filter(request => request.method === 'approve_recovery').length, 1)
+      assert.equal(app.signatures.length, 1)
+    }
+  } finally { app.close() }
+})
+
+for (const landed of [true, false]) test(`a lost recovery approval reply ${landed ? 'resolves with signed evidence' : 'preserves the request error'} without signing again`, async () => {
+  const app = recoveryApprovalHarness()
+  try {
+    app.render(); await settle(); app.render()
+    const reply = deferred(); app.holds.set('approve_recovery', reply)
+    const approval = app.render().approveRecovery(recoveryCheckpoint)
+    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    if (landed) approvedDirectory(app)
+    const cause = new Error('approval reply lost')
+    reply.reject(cause)
+    if (landed) await approval
+    else await assert.rejects(approval, error => error === cause)
+    assert.deepEqual(app.signatures, ['identity-governance'])
+    assert.equal(app.requests.filter(request => request.method === 'approve_recovery').length, 1)
+  } finally { app.close() }
+})
+
+for (const principal of [null, { network_id: network }]) test(`a failed first directory read rejects recovery approval even with principal ${principal === null ? 'null' : 'present'}`, async () => {
+  const app = recoveryApprovalHarness()
+  try {
+    app.render(); await settle(); app.render()
+    const authentications = app.calls.filter(call => call === 'authenticate').length
+    const read = deferred(), auth = deferred(); auth.resolve({ principal })
+    app.holds.set('directory', read); app.holds.set('authenticate', auth)
+    const approval = app.render().approveRecovery(recoveryCheckpoint)
+    app.holds.delete('directory')
+    const cause = new Error('directory unavailable'); read.reject(cause)
+    await assert.rejects(approval, error => error === cause)
+    assert.deepEqual(app.signatures, [])
+    assert.equal(app.requests.some(request => request.method === 'approve_recovery'), false)
+    assert.equal(app.calls.filter(call => call === 'authenticate').length, authentications)
+  } finally { app.close() }
+})
+
+for (const principal of [null, { network_id: network }]) test(`a lost recovery approval reply stays unknown when directory fails and principal is ${principal === null ? 'null' : 'present'}`, async () => {
+  const app = recoveryApprovalHarness()
+  try {
+    app.render(); await settle(); app.render()
+    const authentications = app.calls.filter(call => call === 'authenticate').length
+    const reply = deferred(); app.holds.set('approve_recovery', reply)
+    const approval = app.render().approveRecovery(recoveryCheckpoint)
+    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const read = deferred(), auth = deferred(); read.promise.catch(() => {}); read.reject(new Error('directory unavailable')); auth.resolve({ principal })
+    app.holds.set('directory', read); app.holds.set('authenticate', auth)
+    const cause = new Error('approval reply lost'); reply.reject(cause)
+    await assert.rejects(approval, error => error === cause)
+    assert.deepEqual(app.signatures, ['identity-governance'])
+    assert.equal(app.requests.filter(request => request.method === 'approve_recovery').length, 1)
+    assert.equal(app.calls.filter(call => call === 'authenticate').length, authentications)
+  } finally { app.close() }
+})
+
+for (const lost of [false, true]) test(`a ${lost ? 'lost' : 'successful'} recovery approval reply rejects an invalid signed state`, async () => {
+  const app = recoveryApprovalHarness()
+  try {
+    const before = app.directory.state, verify = app.secure.verifyState
+    app.secure.verifyState = (state = app.directory.state) => { if (state !== before) throw new Error('invalid signed state'); return verify(state) }
+    app.render(); await settle(); app.render()
+    const reply = deferred(); app.holds.set('approve_recovery', reply)
+    const approval = app.render().approveRecovery(recoveryCheckpoint)
+    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const answer = approvedDirectory(app), cause = new Error('approval reply lost')
+    if (lost) reply.reject(cause)
+    else reply.resolve(answer)
+    await assert.rejects(approval, error => lost ? error === cause : error instanceof Error && error.message === 'invalid signed state')
+    assert.deepEqual(app.signatures, ['identity-governance'])
+  } finally { app.close() }
+})
+
+for (const status of ['missing', 'different', 'stopped', 'rotated', 'active'] as const) test(`recovery approval rejects a ${status} pending target before signing`, async () => {
+  const app = recoveryApprovalHarness()
+  try {
+    app.render(); await settle(); app.render()
+    app.directory.view = { ...app.directory.view, pending: status === 'different' && app.directory.view.pending ? { ...app.directory.view.pending, checkpoint: '9'.repeat(64) } : null }
+    if (status === 'stopped' || status === 'rotated') app.directory.view.stopped = [recoveryCheckpoint]
+    if (status === 'rotated' || status === 'active') app.directory.view.epoch = 3
+    await assert.rejects(app.render().approveRecovery(recoveryCheckpoint), /等待确认/)
+    assert.deepEqual(app.signatures, [])
+    assert.equal(app.requests.some(request => request.method === 'approve_recovery'), false)
+  } finally { app.close() }
+})
+
+for (const lost of [false, true]) for (const outcome of ['pending', 'vetoed', 'rotated', 'missing-target', 'missing-ancestor', 'different-target', 'same-epoch', 'unsigned-state', 'unsigned-view', 'invalid-view'] as const) test(`a ${lost ? 'lost' : 'successful'} recovery approval reply cannot confirm ${outcome}`, async () => {
+  const app = recoveryApprovalHarness()
+  try {
+    app.render(); await settle(); app.render()
+    const reply = deferred(); app.holds.set('approve_recovery', reply)
+    const approval = app.render().approveRecovery(recoveryCheckpoint)
+    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    let answer: unknown = app.receipt()
+    if (outcome === 'unsigned-state') answer = { principal: null, view: { ...app.directory.view, epoch: 3, pending: null } }
+    else if (outcome === 'unsigned-view') answer = { ...app.receipt(), view: { ...app.directory.view, epoch: 3, pending: null } }
+    else if (outcome !== 'pending') {
+      const stopped = outcome === 'vetoed' || outcome === 'rotated'
+      approvedDirectory(app, { epoch: outcome === 'same-epoch' || outcome === 'vetoed' ? 2 : 3, stopped: stopped ? [recoveryCheckpoint] : [] })
+      const chain = app.directory.state.checkpoints
+      if (outcome === 'missing-target') app.directory.state.checkpoints = chain.slice(0, -1)
+      if (outcome === 'missing-ancestor') app.directory.state.checkpoints = chain.slice(1)
+      if (outcome === 'different-target') app.directory.state.checkpoints = [chain[0], { epoch: 3, signature: 'other-recovery' }]
+      if (outcome === 'rotated') app.directory.state.checkpoints = [...chain, { epoch: 4, signature: 'rotation' }]
+      if (outcome === 'invalid-view') app.directory.view.epoch = 0
+      answer = app.receipt()
+    }
+    const cause = new Error('approval reply lost')
+    if (lost) reply.reject(cause)
+    else reply.resolve(answer)
+    await assert.rejects(approval, error => lost ? error === cause : error instanceof Error)
+    assert.deepEqual(app.signatures, ['identity-governance'])
+    assert.equal(app.requests.filter(request => request.method === 'approve_recovery').length, 1)
+  } finally { app.close() }
+})
 
 test('fresh localhost discovers its one-time capability and creates the network through recover', async () => {
   const app = deviceHarness({ local: 'fresh', saved: true })
