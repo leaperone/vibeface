@@ -581,12 +581,10 @@ where
     );
     let secrets = secret_values(config);
     let start = std::sync::Mutex::new(StartEvidence::NotStarted);
-    let stage = std::sync::Mutex::new(ProviderStage::Launch);
+    let stage = vibeface_bridge::failure::ProviderTrace::new("codex", ProviderStage::Launch);
     let error = |outcome, session_id: Option<&str>, failure: ExecFailure| -> anyhow::Error {
         ManagerError {
-            stage: *stage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            stage: stage.current(),
             outcome,
             start: *start
                 .lock()
@@ -625,7 +623,7 @@ where
             },
         )
     })?;
-    *stage.lock().unwrap() = ProviderStage::SessionStart;
+    stage.enter(ProviderStage::SessionStart);
     let mut env = config.tool_env.clone();
     if let Some(token) = &config.tool_token {
         env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
@@ -685,7 +683,7 @@ where
         }
     };
     let native = Some(thread.as_str());
-    *stage.lock().unwrap() = ProviderStage::Record;
+    stage.enter(ProviderStage::Record);
     if let Err(e) = persist_session(thread.clone()).await {
         // A stop fences the attempt, so saving its thread fails then.
         return Err(if *cancel.borrow() {
@@ -714,7 +712,7 @@ where
     if *cancel.borrow() {
         return Err(stopped(native));
     }
-    *stage.lock().unwrap() = ProviderStage::TurnStart;
+    stage.enter(ProviderStage::TurnStart);
     *start.lock().unwrap() = StartEvidence::Unknown;
     let turn = match session.request("turn/start", turn_params).await {
         Ok(reply) => reply["turn"]["id"].as_str().map(str::to_owned),
@@ -730,7 +728,7 @@ where
     .context("Codex started a turn without an ID")
     .map_err(|e| error(ManagerFailure::Unknown, native, own(e.to_string())))?;
     *start.lock().unwrap() = StartEvidence::Started;
-    *stage.lock().unwrap() = ProviderStage::Record;
+    stage.enter(ProviderStage::Record);
     if let Some(record) = &config.codex_turn
         && let Err(e) = (record.record)(thread.clone(), Some(turn.clone())).await
     {
@@ -746,14 +744,14 @@ where
             own(format!("record the Codex turn: {e}")),
         ));
     }
-    *stage.lock().unwrap() = ProviderStage::Run;
+    stage.enter(ProviderStage::Run);
     let mut answer = Answer::default();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
     let outcome = loop {
         let message = tokio::select! {
             biased;
             _ = agent::wait_for_cancel(&mut cancel) => {
-                *stage.lock().unwrap() = ProviderStage::Interrupt;
+                stage.enter(ProviderStage::Interrupt);
                 break if stop_turn(&mut session, &thread, &turn).await {
                     Err(error(ManagerFailure::Cancelled, native, own("Codex turn interrupted".into())))
                 } else {

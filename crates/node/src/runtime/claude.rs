@@ -640,12 +640,10 @@ where
     );
     let secrets = manager::secret_values(config);
     let start = std::sync::Mutex::new(manager::StartEvidence::NotStarted);
-    let stage = std::sync::Mutex::new(ProviderStage::SessionStart);
+    let stage = vibeface_bridge::failure::ProviderTrace::new("claude", ProviderStage::SessionStart);
     let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
         ManagerError {
-            stage: *stage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            stage: stage.current(),
             outcome,
             start: *start
                 .lock()
@@ -685,7 +683,7 @@ where
     };
     let session = resumed.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
     let native = Some(session.as_str());
-    *stage.lock().unwrap() = ProviderStage::Record;
+    stage.enter(ProviderStage::Record);
     if let Err(e) = persist_session(session.clone()).await {
         // A stop fences the attempt, so saving its session fails then.
         return Err(if *cancel.borrow() {
@@ -732,17 +730,17 @@ where
         instructions: &instructions,
         env: &env,
     };
-    *stage.lock().unwrap() = ProviderStage::Launch;
+    stage.enter(ProviderStage::Launch);
     let mut process = launch
         .spawn()
         .map_err(|failure| error(ManagerFailure::Failed, native, failure))?;
     let sent = async {
-        *stage.lock().unwrap() = ProviderStage::Record;
+        stage.enter(ProviderStage::Record);
         processes.track(process.group, bin)?;
         if let Some(started) = &config.process_started {
             started(process.group).await?;
         }
-        *stage.lock().unwrap() = ProviderStage::TurnStart;
+        stage.enter(ProviderStage::TurnStart);
         *start.lock().unwrap() = manager::StartEvidence::Unknown;
         send(&process.stdin, &user_frame(prompt, &message)).await
     }
@@ -758,7 +756,7 @@ where
         let line = tokio::select! {
             biased;
             _ = agent::wait_for_cancel(&mut cancel) => {
-                *stage.lock().unwrap() = ProviderStage::Interrupt;
+                stage.enter(ProviderStage::Interrupt);
                 break if process.stop(&mut turn).await {
                     Err(error(ManagerFailure::Cancelled, native, own("Claude Code turn interrupted")))
                 } else {
@@ -803,7 +801,7 @@ where
             }
         }
         if turn.session.is_some() {
-            *stage.lock().unwrap() = ProviderStage::Run;
+            stage.enter(ProviderStage::Run);
             *start.lock().unwrap() = manager::StartEvidence::Started;
         }
         if let Some(ending) = turn.ending.take() {
@@ -1568,7 +1566,7 @@ mod tests {
             tokio::sync::watch::channel(false).1,
         )
         .await;
-        let error = result.unwrap_err();
+        let error = result.err().context("expected locator failure")?;
         let error = error
             .downcast_ref::<ManagerError>()
             .context("structured error")?;

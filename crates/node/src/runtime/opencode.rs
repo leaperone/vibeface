@@ -841,12 +841,11 @@ impl Opencode {
             .context("manager workspace must be an existing absolute directory")?;
         let secrets = manager::secret_values(config);
         let start = std::sync::Mutex::new(manager::StartEvidence::NotStarted);
-        let stage = std::sync::Mutex::new(ProviderStage::Validate);
+        let stage =
+            vibeface_bridge::failure::ProviderTrace::new("opencode", ProviderStage::Validate);
         let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
             ManagerError {
-                stage: *stage
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                stage: stage.current(),
                 outcome,
                 start: *start
                     .lock()
@@ -877,10 +876,10 @@ impl Opencode {
             return Err(stopped(previous));
         }
         let model = parse_model(&config.model).map_err(|failure| failed(previous, failure))?;
-        *stage.lock().unwrap() = ProviderStage::Launch;
+        stage.enter(ProviderStage::Launch);
         let (conn, _serving) =
             (self.conn().await).map_err(|e| failed(previous, launch_failure(&e)))?;
-        *stage.lock().unwrap() = ProviderStage::SessionStart;
+        stage.enter(ProviderStage::SessionStart);
         let resumed = match previous {
             Some(id) => self.session(&conn, id).await.map_err(|e| {
                 failed(
@@ -933,7 +932,7 @@ impl Opencode {
             }
         };
         let native = Some(session.as_str());
-        *stage.lock().unwrap() = ProviderStage::Record;
+        stage.enter(ProviderStage::Record);
         if let Err(e) = persist_session(session.clone()).await {
             // A stop fences the attempt, so saving its session fails then.
             return Err(if *cancel.borrow() {
@@ -955,7 +954,7 @@ impl Opencode {
         if let Some(token) = &config.tool_token {
             env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
         }
-        *stage.lock().unwrap() = ProviderStage::SessionStart;
+        stage.enter(ProviderStage::SessionStart);
         self.environment(&conn, &session, &env)
             .await
             .map_err(|e| failed(native, own(&format!("set the tool environment: {e}"))))?;
@@ -1002,7 +1001,7 @@ impl Opencode {
         if *cancel.borrow() {
             return Err(stopped(native));
         }
-        *stage.lock().unwrap() = ProviderStage::TurnStart;
+        stage.enter(ProviderStage::TurnStart);
         *start.lock().unwrap() = manager::StartEvidence::Unknown;
         match self.send(&conn, &session, &first).await {
             Sent::Taken => {}
@@ -1017,7 +1016,7 @@ impl Opencode {
         }
         *start.lock().unwrap() = manager::StartEvidence::Started;
         self.touch(&session);
-        *stage.lock().unwrap() = ProviderStage::Record;
+        stage.enter(ProviderStage::Record);
         if let Some(turn) = &config.codex_turn
             && let Err(e) = (turn.record)(session.clone(), Some(message.clone())).await
         {
@@ -1032,7 +1031,7 @@ impl Opencode {
                 own(&format!("record the opencode turn: {e}")),
             ));
         }
-        *stage.lock().unwrap() = ProviderStage::Run;
+        stage.enter(ProviderStage::Run);
         let mut seen = Seen::default();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
         let mut ticks = tokio::time::interval(TICK);
@@ -1041,7 +1040,7 @@ impl Opencode {
             let check = tokio::select! {
                 biased;
                 _ = agent::wait_for_cancel(&mut cancel) => {
-                    *stage.lock().unwrap() = ProviderStage::Interrupt;
+                    stage.enter(ProviderStage::Interrupt);
                     let last = self.close(&session);
                     break if self.stop_run(&conn, &session, &last).await {
                         Err(error(ManagerFailure::Cancelled, native, own("opencode run stopped")))

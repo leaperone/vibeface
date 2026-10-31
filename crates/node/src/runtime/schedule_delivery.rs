@@ -45,6 +45,9 @@ impl Runtime {
         let node = self.clone();
         tokio::spawn(async move {
             if let Some(manager) = node.manager() {
+                if manager.provider.on_app_server() {
+                    node.codex.ready().await;
+                }
                 node.probe_provider(manager.provider).await;
             }
         });

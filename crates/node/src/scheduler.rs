@@ -208,13 +208,12 @@ pub(crate) fn bot_model(
     bot?.model(device.provider).map(str::to_owned)
 }
 
-/// A failed reply names the model the bot set only when the provider refused the request or
-/// did not know the model, which that model may cause.
+/// The submitted model explains a provider's refusal or unknown-model response.
 fn model_noted(failure: ExecFailure, model: Option<&str>) -> ExecFailure {
     match model {
         Some(model) if matches!(failure.kind, FailureKind::NoModel | FailureKind::Rejected) => {
             ExecFailure {
-                detail: format!("{}（这个 bot 设定的模型是 {model}）", failure.detail),
+                detail: format!("{}（本回合提交的模型是 {model}）", failure.detail),
                 ..failure
             }
         }
@@ -929,7 +928,12 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                 process_unconfirmed: true,
             }
         } else {
-            JobOutcome::Failed(model_noted(failure, bot_model.as_deref()))
+            JobOutcome::Failed(model_noted(
+                failure,
+                job.runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.model.as_deref()),
+            ))
         };
         let text = partial.lock().expect("partial text").text();
         job = node.store.lock().await.finish_job(

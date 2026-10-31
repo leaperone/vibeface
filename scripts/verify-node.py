@@ -1084,6 +1084,8 @@ def fixture_codex(arguments):
                         error = {"code": -32600, "message": "thread not found: " + str(thread_id)}
                     elif method == "thread/resume" and not thread["turns"]:
                         error = {"code": -32600, "message": "no rollout found for thread id " + thread_id}
+                    elif method == "turn/start" and thread.get("bot") and params.get("model") == "fixture-quota-before-start":
+                        error = {"code": -32000, "message": "quota exceeded before the fixture accepted a turn"}
                     elif method == "turn/start" and thread.get("bot"):
                         if thread["status"]["type"] == "active":
                             error = {"code": -32600, "message": "a turn is already running"}
@@ -2566,6 +2568,56 @@ def bot_settings_checks(run, a, network, passed):
            reminder=reminder_id, paused=paused["schedule_id"])
 
 
+def provider_runtime_checks(run, workspace, node, network, passed):
+    original = node.client.call("node_settings")["settings"]
+    scope = "provider-runtime-check"
+    node.client.rpc("create_bot", bot_id=scope, conversation_id=scope, name="Runtime check",
+                    instructions="Reply without tools", project={"target_node": node.device_id, "cwd": str(workspace)})
+    settings = copy.deepcopy(original)
+    settings["manager"]["model"] = "fixture-quota-before-start"
+    settings["manager"]["backup"] = {"automatic": False, "candidates": [
+        {"provider": "codex", "model": "fixture-model", "reasoning_effort": "medium"}]}
+    tools_before = len(fixture_records(run, "manager-tools.jsonl"))
+    try:
+        node.client.call("configure_node", settings)
+        disabled = node.client.rpc("message", conversation_id=scope, message_id="runtime-default-off",
+                                   text=json.dumps({"chat_agent": True, "tools": []}))
+        failed = wait_for("disabled backup records the original refusal", lambda:
+            next((job for job in node.client.rpc("conversation", conversation_id=scope)["scheduler"]["jobs"]
+                  if job["trigger"] == disabled["trigger"] and job["state"] == "failed"), None))
+        require(failed["runtime"]["execution"] == "not_started" and failed["retryable"]
+                and failed["runtime"]["stage"] == "turn_start" and failed["runtime"]["switched_from"] is None,
+                "a refused unstarted turn has safe evidence and no implicit backup")
+        settings["manager"]["backup"]["automatic"] = True
+        node.client.call("configure_node", settings)
+        sent = node.client.rpc("message", conversation_id=scope, message_id="runtime-explicit-backup",
+                               text=json.dumps({"chat_agent": True, "tools": []}))
+        completed = wait_for("explicit backup completes exactly one accepted turn", lambda:
+            next((job for job in node.client.rpc("conversation", conversation_id=scope)["scheduler"]["jobs"]
+                  if job["trigger"] == sent["trigger"] and job["state"] == "completed"), None))
+        runtime = completed["runtime"]
+        attempts = [row["message"]["params"] for row in fixture_records(run, "codex-rpc.jsonl")
+                    if row["message"].get("method") == "turn/start"
+                    and row["message"]["params"].get("clientUserMessageId") == runtime["delivery_id"]]
+        require([attempt["model"] for attempt in attempts] == ["fixture-quota-before-start", "fixture-model"]
+                and attempts[1]["effort"] == "medium" and runtime["reasoning_effort"] == "medium"
+                and runtime["model"] == "fixture-model" and runtime["execution"] == "started"
+                and runtime["switched_from"]["model"] == "fixture-quota-before-start"
+                and runtime["switch_reason"] == "quota" and not completed["retryable"],
+                "the durable runtime binds the one allowed fallback and submitted effort to the same delivery")
+        require(len(fixture_records(run, "manager-tools.jsonl")) == tools_before,
+                "neither the refused turn nor the backup repeats a tool effect")
+        node.client.call("configure_node", original)
+        frozen = next(job for job in node.client.rpc("conversation", conversation_id=scope)["scheduler"]["jobs"]
+                      if job["trigger"] == sent["trigger"])
+        require(frozen["runtime"] == runtime, "later settings never rewrite a historical turn runtime")
+        passed("backup is off by default; an explicit unstarted quota fallback sends once with frozen model and effort",
+               attempts=len(attempts), accepted_turns=1, tool_effects=0)
+    finally:
+        node.client.call("configure_node", original)
+        node.client.rpc("delete_bot", bot_id=scope, conversation_id=scope)
+
+
 def chat_agent_acceptance(options):
     binary = options.binary.resolve(strict=True)
     module = options.crypto_module.resolve(strict=True)
@@ -2602,6 +2654,7 @@ def chat_agent_acceptance(options):
         schema = fixture_schema_check()
         passed("the fake App Server answers every client request in the pinned schema",
                client_requests=len(schema["client_requests"]))
+        provider_runtime_checks(run, workspace, a, network, passed)
         bot_checks(run, workspace, a, network, passed, outsider)
         work_checks(run, workspace, a, network, passed)
         triage_checks(run, workspace, a, network, passed)

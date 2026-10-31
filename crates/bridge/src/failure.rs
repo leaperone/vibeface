@@ -22,6 +22,58 @@ pub enum ProviderStage {
     Record,
 }
 
+pub struct ProviderTrace {
+    provider: &'static str,
+    stage: std::sync::Mutex<(ProviderStage, std::time::Instant)>,
+}
+
+impl ProviderTrace {
+    pub fn new(provider: &'static str, stage: ProviderStage) -> Self {
+        Self {
+            provider,
+            stage: std::sync::Mutex::new((stage, std::time::Instant::now())),
+        }
+    }
+
+    pub fn current(&self) -> ProviderStage {
+        self.stage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+    }
+
+    pub fn enter(&self, next: ProviderStage) {
+        let previous = {
+            let mut stage = self
+                .stage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut *stage, (next, std::time::Instant::now()))
+        };
+        self.record(previous);
+    }
+
+    fn record(&self, (stage, since): (ProviderStage, std::time::Instant)) {
+        tracing::info!(
+            event = "provider.stage.finished",
+            provider = self.provider,
+            ?stage,
+            elapsed_ms = since.elapsed().as_secs_f64() * 1000.0,
+            "provider stage ended"
+        );
+    }
+}
+
+impl Drop for ProviderTrace {
+    fn drop(&mut self) {
+        let stage = *self
+            .stage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.record(stage);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {

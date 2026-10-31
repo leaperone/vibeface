@@ -811,12 +811,10 @@ impl Pi {
         );
         let secrets = crate::manager::secret_values(config);
         let start = std::sync::Mutex::new(crate::manager::StartEvidence::NotStarted);
-        let stage = std::sync::Mutex::new(ProviderStage::SessionStart);
+        let stage = vibeface_bridge::failure::ProviderTrace::new("pi", ProviderStage::SessionStart);
         let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
             ManagerError {
-                stage: *stage
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                stage: stage.current(),
                 outcome,
                 start: *start
                     .lock()
@@ -898,11 +896,11 @@ impl Pi {
             return Err(stopped(previous));
         }
         let (mut process, after) = self.open(&launch, &session).await.map_err(|failure| {
-            *stage.lock().unwrap() = failure.stage;
+            stage.enter(failure.stage);
             error(failure.outcome, previous, failure.failure)
         })?;
         let native = Some(session.as_str());
-        *stage.lock().unwrap() = ProviderStage::Record;
+        stage.enter(ProviderStage::Record);
         if let Some(turn) = &config.codex_turn
             && let Err(e) = self.record_reply(&session, &turn.client_id, prompt)
         {
@@ -953,7 +951,7 @@ impl Pi {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
         let within = PREFLIGHT.min(Duration::from_secs(config.timeout_secs));
         let prompt = json!({"type":"prompt","message":prompt});
-        *stage.lock().unwrap() = ProviderStage::TurnStart;
+        stage.enter(ProviderStage::TurnStart);
         *start.lock().unwrap() = crate::manager::StartEvidence::Unknown;
         let turn = match process
             .begin(after.as_deref(), prompt, within, &mut cancel)
@@ -988,7 +986,7 @@ impl Pi {
                 stopping: Default::default(),
             },
         );
-        *stage.lock().unwrap() = ProviderStage::Record;
+        stage.enter(ProviderStage::Record);
         let recorded = match &config.codex_turn {
             Some(record) => (record.record)(session.clone(), Some(turn.clone())).await,
             None => Ok(()),
@@ -1002,12 +1000,12 @@ impl Pi {
                 Err(error(kind, native, own(format!("record the pi turn: {e}"))))
             }
             Ok(()) => {
-                *stage.lock().unwrap() = ProviderStage::Run;
+                stage.enter(ProviderStage::Run);
                 loop {
                     let event = tokio::select! {
                         biased;
                         _ = agent::wait_for_cancel(&mut cancel) => {
-                            *stage.lock().unwrap() = ProviderStage::Interrupt;
+                            stage.enter(ProviderStage::Interrupt);
                             break match process.stop(&mut seen).await {
                                 true => Err(error(ManagerFailure::Cancelled, native, own("pi turn stopped".into()))),
                                 false => Err(error(ManagerFailure::Unknown, native, own("pi did not confirm the stop".into()))),
