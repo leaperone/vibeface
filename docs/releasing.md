@@ -95,7 +95,7 @@ nightly 表示开发预发布，需选择 Nightly 更新渠道或手动下载，
 1. 通过 PR 更新 workspace 版本及 `Cargo.lock`，完成检查并合并到 `main`。
 2. 按上述格式在已合并的提交创建并推送 `v<version>` tag。tag 必须与 Cargo 版本完全相同，且指向已进入 `main` 的提交；CI 拒绝其他后缀或格式。
 3. 查看 tag 触发的 CI，确认质量检查和三个平台的包验收全部成功。
-4. 发布任务创建相应渠道的 draft Release，上传三个包和三个 checksum，核对资产清单并重新下载逐字节比较，最后按渠道公开 Release。恢复已有 draft 时也会校正预发布和 Latest 属性。
+4. 发布任务创建相应渠道的 draft Release，上传三个 Node 包、三个 checksum 和 Android APK 资产，核对资产清单并重新下载逐字节比较，最后按渠道公开 Release。恢复已有 draft 时也会校正预发布和 Latest 属性。
 
 只有发布任务拥有 `contents: write` 权限。失败留下的 draft 可以在修复原因后重跑；公开 Release 不会被覆盖。同名公开版本需要更正时，使用新的版本和 tag。合并 PR 不会自动推送 tag。
 
