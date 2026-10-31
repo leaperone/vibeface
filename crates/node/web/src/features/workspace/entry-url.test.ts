@@ -1195,9 +1195,6 @@ test("question cards select locally, send exact answers only on confirmation, an
   const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'web', source: 'membership', can_manage: false } } }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, answerLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
   const longChoice = '只在本机验证完整配置并保留现有服务，检查通过后再决定是否发布'
   const question = { question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '\n是否允许继续？\n已完成本机检查。\n\n线上结果未知。', choices: [{ label: '允许' }, { label: longChoice }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
-  type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void } }
-  const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' && 'props' in node ? text((node as Element).props.children) : ''
-  const words = (elements: Element[]) => elements.map(({ props }) => text(props.children)).join('')
   const render = (props: object = {}) => app.render('QuestionCard', { question, ...props })
   const choose = (value: string) => {
     const option = render().find(({ type, props }) => type === 'input' && props.value === value)
@@ -1205,7 +1202,7 @@ test("question cards select locally, send exact answers only on confirmation, an
     option.props.onChange({})
   }
   const send = async (props: object = {}) => {
-    const button = render(props).find(({ type, props }) => type === 'Button' && text(props.children).includes('发送回答'))
+    const button = render(props).find(({ type, props }) => type === 'Button' && componentText(props.children).includes('发送回答'))
     assert.ok(button?.props.onClick)
     button.props.onClick(); await settleComponent()
   }
@@ -1217,7 +1214,7 @@ test("question cards select locally, send exact answers only on confirmation, an
   const plain = (value: unknown) => JSON.parse(JSON.stringify(value))
   try {
     let elements = render()
-    assert.match(words(elements), /web[^]*工作电脑/, 'the context identifies its project and device')
+    assert.match(componentText(elements), /web[^]*工作电脑/, 'the context identifies its project and device')
     assert.equal(elements.filter(({ type, props }) => type === 'input' && props.type === 'radio').length, 4, 'three real choices and one custom mode')
     assert.equal(elements.filter(({ type }) => type === 'input').every(({ props }) => props.checked === false), true, 'no answer is recommended or selected by default')
     assert.equal(elements.some(({ type }) => type === 'textarea' || type === 'form'), false)
@@ -1225,7 +1222,7 @@ test("question cards select locally, send exact answers only on confirmation, an
     assert.ok(elements.some(({ props }) => props.text === '已完成本机检查。\n\n线上结果未知。'), 'the decision context keeps its paragraphs')
     await send()
     assert.equal(sent.length, 0)
-    assert.match(words(render()), /选一个回答，或自己写回答。/)
+    assert.match(componentText(render()), /选一个回答，或自己写回答。/)
     choose('允许')
     assert.equal(sent.length, 0, 'selecting approval never sends it')
     assert.equal(render().find(({ type, props }) => type === 'input' && props.value === '允许')?.props.checked, true)
@@ -1240,7 +1237,7 @@ test("question cards select locally, send exact answers only on confirmation, an
       write(value)
       const input = render().find(({ type }) => type === 'textarea')
       assert.ok(input?.props.id)
-      assert.equal(render().some(({ type, props }) => type === 'label' && props.htmlFor === input.props.id && text(props.children) === '你的回答'), true)
+      assert.equal(render().some(({ type, props }) => type === 'label' && props.htmlFor === input.props.id && componentText(props.children) === '你的回答'), true)
       assert.equal(input.props.onKeyDown, undefined, 'Enter and IME stay native textarea input')
       await send()
       assert.deepEqual(plain(sent.at(-1)), [question, value], 'custom text is literal, including digits and newlines')
@@ -1265,30 +1262,30 @@ test("question cards select locally, send exact answers only on confirmation, an
     workspace.pendingAnswers = [{ question_id: 'q1', text: '继续\n原文' }]
     elements = render()
     assert.equal(elements.some(({ type }) => type === 'input' || type === 'textarea'), false, 'a pending answer cannot be replaced')
-    assert.match(words(elements), /没确认送达/)
-    const retry = elements.find(({ type, props }) => type === 'Button' && text(props.children).includes('再试'))
+    assert.match(componentText(elements), /没确认送达/)
+    const retry = elements.find(({ type, props }) => type === 'Button' && componentText(props.children).includes('再试'))
     assert.ok(retry?.props.onClick)
     retry.props.onClick(); await settleComponent()
     assert.deepEqual(plain(sent.at(-1)), [question, '继续\n原文'], 'unknown results retry their original text')
     actionBusy = 'retry'
     elements = render()
-    assert.match(words(elements), /正在发送/)
-    assert.doesNotMatch(words(elements), /没确认送达/)
+    assert.match(componentText(elements), /正在发送/)
+    assert.doesNotMatch(componentText(elements), /没确认送达/)
     assert.equal(elements.find(({ type }) => type === 'Button')?.props.disabled, true)
     actionBusy = null
     workspace.answered = { q1: '允许' }
     elements = render({ question: { ...question, closed: 'request_lost', answer: { text: '停下' } }, answer: '过时答案' })
-    assert.match(words(elements), /已由另一端回答：停下/, 'the network winner takes precedence over a folded answer, closed state and pending retry')
+    assert.match(componentText(elements), /已由另一端回答：停下/, 'the network winner takes precedence over a folded answer, closed state and pending retry')
     assert.equal(elements.some(({ type }) => type === 'Button' || type === 'input'), false)
     workspace.pendingAnswers = []
     elements = render()
-    assert.match(words(elements), /已回答 · 允许/, 'a shared answer folds the card immediately')
-    assert.doesNotMatch(words(elements), /升级依赖/, 'an ordinary question names no held task')
+    assert.match(componentText(elements), /已回答 · 允许/, 'a shared answer folds the card immediately')
+    assert.doesNotMatch(componentText(elements), /升级依赖/, 'an ordinary question names no held task')
     elements = render({ question: { ...question, about: { ...question.about, request_id: 'r' } } })
-    assert.match(words(elements), /升级依赖[^]*工作电脑/)
+    assert.match(componentText(elements), /升级依赖[^]*工作电脑/)
     workspace.answered = {}
     elements = render({ question: { ...question, closed: 'request_lost' } })
-    assert.match(words(elements), /已失效/)
+    assert.match(componentText(elements), /已失效/)
     assert.equal(elements.some(({ type }) => type === 'Button' || type === 'input'), false)
     const four = { ...question, choices: [...question.choices, { label: '先核对发布目标' }] }
     assert.equal(render({ question: four }).filter(({ type, props }) => type === 'input' && props.type === 'radio').length, 5, 'four alternatives remain complete')
@@ -1341,7 +1338,7 @@ test("mobile questions select before sending, preserve literal text and retry on
       assert.ok(typeof onPress === 'function', `missing mobile control ${label}`)
       onPress()
     }
-    const words = () => render().map(({ props }) => props.children).filter((child) => typeof child === 'string').join('')
+    const words = () => componentText(render())
     try {
       assert.equal(render().filter(({ props }) => props.accessibilityRole === 'radio').length, 5)
       press('发送回答')
@@ -1386,7 +1383,6 @@ test("mobile questions select before sending, preserve literal text and retry on
 })
 
 test("remounted question cards identify the answer author and reserve warning styling for a lost race", () => {
-  const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' && 'props' in node ? text((node as { props: { children?: unknown } }).props.children) : ''
   for (const platform of ['web', 'mobile']) {
     for (const scenario of [{ author: 'phone', mine: undefined, elsewhere: true, warned: false }, { author: 'gateway', mine: undefined, elsewhere: true, warned: false }, { author: 'self', mine: undefined, elsewhere: false, warned: false }, { author: 'phone', mine: '停下', elsewhere: true, warned: true }, { author: 'phone', mine: '继续', elsewhere: true, warned: false }]) {
       const question = { question_id: 'remount', text: '继续吗？\n线上结果未知。', choices: [{ label: '允许' }], severity: 'attention', about: { node: 'worker', session_id: 's', cwd: '' }, answer: { text: '继续', author: scenario.author }, closed: 'request_lost' }
@@ -1405,7 +1401,7 @@ test("remounted question cards identify the answer author and reserve warning st
         const elements = app.render('QuestionCard', { question, answer: '过时的折叠答案' })
         const settled = elements.find(({ props }) => props.ask === '继续吗？')
         assert.ok(settled, `${platform} returns the standing answer before closed or pending state`)
-        assert.equal(text(settled.props.children), scenario.elsewhere ? '已由另一端回答：继续' : '已回答 · 继续')
+        assert.equal(componentText(settled.props.children), scenario.elsewhere ? '已由另一端回答：继续' : '已回答 · 继续')
         const marker = settled.props.mark as { props: { className: string } } | undefined
         const className = platform === 'web' ? marker?.props.className : settled.props.className
         assert.equal(String(className).includes('text-warning'), scenario.warned, `${platform}: another author alone is not a failed race`)
