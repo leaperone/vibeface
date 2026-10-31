@@ -101,7 +101,13 @@ export function memoryController(options: {
 }) {
   const submit = async (item: OutboxItem, unknown: boolean): Promise<MemoryControlResult> => {
     const original = request(item)
-    const result = parseMemoryControlResult(await options.rpc(item.method, item.params), original.memory_id, original.operation_id)
+    let response: unknown
+    try { response = await options.rpc(item.method, item.params) }
+    catch (caught) {
+      if (!unknown && caught instanceof Error && 'responded' in caught && caught.responded === true) await options.outbox.delete(item.key)
+      throw caught
+    }
+    const result = parseMemoryControlResult(response, original.memory_id, original.operation_id)
     if (!unknown || result.state !== 'conflict') await options.outbox.delete(item.key)
     return result
   }

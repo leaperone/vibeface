@@ -47,6 +47,50 @@ test('Memory create signs only the frozen body and accepts the matching current 
   assert.deepEqual(await client.outbox.all(), [])
 })
 
+test('fresh Memory rejection lets the user correct the same memory without retrying the refused draft', async () => {
+  for (const code of ['credential', 'quota']) {
+    const rejected = Object.assign(new Error(code), { responded: true })
+    const calls: { method: string; after: unknown }[] = []
+    const client = memoryClient(async (method, params) => {
+      calls.push({ method, after: params.after })
+      if (calls.length === 1) throw rejected
+      return { state: 'applied', operation_id: operationId, current: memoryState(operationId, '改正后的草稿') }
+    })
+    const base = memoryBase(memoryMetadata)
+    await assert.rejects(client.controlMemory('chat', 'memory', base, '原草稿'), (caught) => caught === rejected)
+    assert.deepEqual(await client.outbox.all(), [], 'a fresh explicit refusal cannot keep the editable draft blocked')
+    const corrected = await client.controlMemory('chat', 'memory', base, '改正后的草稿')
+    assert.equal(corrected.current?.text, '改正后的草稿')
+    assert.deepEqual(client.signed.map(body => body.after), ['原草稿', '改正后的草稿'])
+    assert.deepEqual(calls, [{ method: 'control_memory', after: '原草稿' }, { method: 'control_memory', after: '改正后的草稿' }])
+    assert.deepEqual(await client.outbox.all(), [])
+  }
+})
+
+test('unknown Memory retry rejection still needs a receipt before discarding the original operation', async () => {
+  const rejected = Object.assign(new Error('credential'), { responded: true })
+  const writes: Record<string, unknown>[] = []
+  let recorded = false
+  const client = memoryClient(async (method, params) => {
+    if (method === 'memory_state') return recorded ? { receipt: 'recorded', current: memoryState(operationId) } : { receipt: 'not_seen_here', current: memoryState() }
+    writes.push(structuredClone(params))
+    if (writes.length === 1) throw new Error('timeout')
+    throw rejected
+  })
+  const base = memoryBase(memoryMetadata)
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '原草稿'), /timeout/)
+  const original = await client.outbox.all()
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '原草稿'), (caught) => caught === rejected)
+  assert.deepEqual(await client.outbox.all(), original)
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '改正后的草稿'), (caught) => caught === rejected)
+  assert.deepEqual(await client.outbox.all(), original)
+  assert.deepEqual(writes, [original[0].params, original[0].params, original[0].params])
+  assert.equal(client.signed.length, 1)
+  recorded = true
+  assert.equal((await client.controlMemory('chat', 'memory', base, '原草稿')).state, 'already_recorded')
+  assert.deepEqual(await client.outbox.all(), [])
+})
+
 test('Memory deletion signs the observed base and retains the tombstone in its result', async () => {
   const client = memoryClient(async () => ({ state: 'applied', operation_id: operationId, current: memoryState(operationId, null) }))
   await assert.rejects(client.controlMemory('chat', 'memory', memoryBase(null), null), /需要当前版本/)
