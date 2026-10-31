@@ -31,6 +31,8 @@ test('a recovery wait reads in whole hours and as a day people say', () => {
   assert.equal(hoursUntil(now + 60_000, now), 1)
   assert.equal(recoveryCopy.left(now + 2 * hour, now), '剩余 2 小时')
   assert.equal(recoveryCopy.left(now - 1, now), '马上生效')
+  assert.match(recoveryCopy.confirmNote, /管理设备/)
+  assert.match(recoveryCopy.confirmNote, /不可撤销/)
   assert.equal(whenText(new Date(2026, 9, 27, 23, 5).getTime(), now), '今天 23:05')
   assert.equal(whenText(new Date(2026, 9, 28, 9, 0).getTime(), now), '明天 09:00')
   assert.equal(whenText(new Date(2026, 9, 29, 22, 30).getTime(), now), '后天 22:30')

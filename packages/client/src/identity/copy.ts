@@ -169,6 +169,10 @@ export const recoveryCopy = {
   effectiveIn: (at: number, now = Date.now()) => `${hoursUntil(at, now)} 小时后生效`,
   outIfNotStopped: '不拦下，到时划掉的设备会被移出',
   added: '新设备',
+  confirm: '立即生效',
+  confirmAsk: '现在让这次找回立即生效？',
+  confirmNote: '这是管理设备的确认；确认后不可撤销，现有设备会按恢复文件更新。',
+  confirmDone: '已立即生效',
   itsMe: '是我，收起提醒',
   /** 是我 only hides the reminder here; the recovery still takes effect when its wait ends. */
   itsMeDone: (at: number, now = Date.now()) => `已收起提醒。找回仍会在${whenText(at, now)} 生效`,
