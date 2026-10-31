@@ -17,6 +17,7 @@ export const Route = createFileRoute('/')({
 function HomePage() {
   return (
     <SiteLayout>
+      <div className="landing">
         <section className="landing-hero" aria-labelledby="hero-title">
           <div className="hero-copy-block">
             <p className="hero-kicker">自己的设备，自己的 Agent <span aria-hidden="true">/</span> Nightly</p>
@@ -120,6 +121,7 @@ function HomePage() {
           </ol>
           <p className="nightly-note">当前为 Nightly。正式版前不保留协议、数据格式和 API 的向后兼容。<a href="https://github.com/leaperone/vibeface/releases">查看 Nightly Releases <ArrowUpRight size={14} aria-hidden="true" /></a></p>
         </section>
+      </div>
     </SiteLayout>
   )
 }
