@@ -1,7 +1,6 @@
 import { ArrowRightLeft, Download, FlaskConical, LoaderCircle, ScrollText } from 'lucide-react-native'
 import { ScrollView, View } from 'react-native'
 import { useExperiments, experimentsCopy } from '@vibeface/client/lib/experiments.ts'
-import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { ErrorText } from '@/components/action'
 import { SettingsGroup, SettingsRow } from '@/components/kit'
 import { Button } from '@/components/ui/button'
@@ -10,17 +9,18 @@ import { Switch } from '@/components/ui/switch'
 import { Text } from '@/components/ui/text'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { mobilePlatform } from '@/platform'
+import { useLive } from '@/data/live'
 import { useRun } from '@/lib/use-run'
 
 export default function Lab() {
   const device = useDevice()
-  const shared = useShared()
+  const shared = useLive()
   const [experiments, setExperiments] = useExperiments(mobilePlatform.storage)
   const { busy, error, status, run } = useRun()
-  const canInspect = device.ready?.principal.can_manage === true || device.ready?.principal.source === 'local_session'
+  const canInspect = Boolean(shared) && (device.ready?.principal.can_manage === true || device.ready?.principal.source === 'local_session')
   const exportDiagnostics = () => void run('diagnostics', async () => {
     const files = mobilePlatform.files
-    if (!files) throw new Error('这台设备不能保存诊断包。')
+    if (!files || !shared) throw new Error('设备暂时离线，不能导出诊断包。')
     const bundle = await shared.diagnostics(Date.now() - 86_400_000)
     const name = `vibeface-diagnostics-${new Date().toISOString().slice(0, 10)}.json`
     await files.save(new TextEncoder().encode(JSON.stringify(bundle ?? null)), name)

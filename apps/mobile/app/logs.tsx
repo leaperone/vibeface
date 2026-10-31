@@ -1,16 +1,16 @@
 import { CircleAlert, CircleX, RefreshCw, ScrollText } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { ScrollView, View } from 'react-native'
-import type { LogLevel, LogRecord, LogSource } from '@vibeface/client/lib/web-log.ts'
+import type { LogFilter, LogLevel, LogRecord, LogSource } from '@vibeface/client/lib/web-log.ts'
 import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { ErrorText } from '@/components/action'
 import { Details, EmptyState, Skeleton } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useRun } from '@/lib/use-run'
+import { useLive } from '@/data/live'
 
 const sourceLabels: Record<LogSource, string> = { node: '设备', web: '网页', agent: 'Bot', cli: '命令行', codex: 'Codex', cursor: 'Cursor' }
 const levelLabels: Record<LogLevel, string> = { trace: '跟踪', debug: '调试', info: '信息', warn: '有问题', error: '错误' }
@@ -47,22 +47,28 @@ function timeOf(ms: number) {
 
 export default function Logs() {
   const device = useDevice()
-  const shared = useShared()
+  const shared = useLive()
   const allowed = device.ready?.principal.can_manage === true || device.ready?.principal.source === 'local_session'
   const [records, setRecords] = useState<LogRecord[] | null>(null)
   const { busy, error, run } = useRun()
-  const read = useRef(shared.logs)
-  read.current = shared.logs
+  const read = useRef(shared?.logs)
+  read.current = shared?.logs
+  const readLogs = (filter: LogFilter) => {
+    const logs = read.current
+    if (!logs) throw new Error('设备暂时离线。')
+    return logs(filter)
+  }
   useEffect(() => {
-    if (!allowed) return
-    void run('load', async () => setRecords((await read.current({ limit: 100 })).reverse()))
-  }, [allowed, shared.generation])
+    if (!allowed || !shared) return
+    void run('load', async () => setRecords((await readLogs({ limit: 100 })).reverse()))
+  }, [allowed, shared?.generation])
+  if (!shared) return <EmptyState icon={ScrollText} title="设备暂时离线" className="flex-1 justify-center" />
   if (!allowed) return <EmptyState icon={ScrollText} title="只有管理设备能看日志" className="flex-1 justify-center" />
   const works = [...shared.openWorks, ...(shared.data?.works ?? [])]
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-3 p-4 pb-10">
     <View className="flex-row items-center justify-between gap-3">
       <Text className="text-meta text-muted-foreground">只读显示最近 100 条</Text>
-      <Button variant="ghost" size="icon" accessibilityLabel="刷新日志" disabled={busy !== null} onPress={() => void run('load', async () => setRecords((await read.current({ limit: 100 })).reverse()))}>
+      <Button variant="ghost" size="icon" accessibilityLabel="刷新日志" disabled={busy !== null} onPress={() => void run('load', async () => setRecords((await readLogs({ limit: 100 })).reverse()))}>
         <Icon as={RefreshCw} className={busy === 'load' ? 'animate-spin' : undefined} />
       </Button>
     </View>
