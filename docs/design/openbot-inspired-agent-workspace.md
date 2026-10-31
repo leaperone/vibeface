@@ -39,13 +39,19 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 
 ### 总览和任务详情
 
-总览默认读取 `open_works`，按 Bot conversation 分组。卡片显示 Bot、任务标题、目标 Node、`kind`、状态、最近摘要和是否需要核对。`dispatch_waiting` 不能显示为已接收，`unverified` 不能排到列表末尾或显示为已完成。
+总览优先读取 `workspace_overview`，没有总览快照时从 `open_works` 推导。页面按需要留意、进行中、等待中分组，Web 另提供 Bot 筛选。卡片显示 Bot、任务标题、目标 Node、`kind`、状态、最近摘要和是否需要核对。`dispatch_waiting` 不能显示为已接收，`unverified` 和离线待核对工作优先放到需要留意。
+
+总览来自当前 Node 已知的记录。远端 scheduler 未查询、尚未同步和达到返回上限都需要明确展示，不能把局部快照标成全网络实时任务。已有 `open_works` 不应因为总览截断而从页面消失。首次读取前或冷启动离线时，任务集合未知，不能显示确定的空任务结论。
 
 详情按 `trigger` 和 `reply_to` 说明来源，按 scheduler job 展示排队、领取、执行、取消和回复状态，按 `summary` 与 `WorkProgress` 展示阶段摘要，再展示 `Question`、`PendingCheck`、结果和失败原因。审批卡只代表已有问题或核对记录，不新增绕过设备签名、Bot 轮次或 Node 授权的批准接口。工作区新增的步骤和状态卡只使用经过清理的摘要；Provider token、隐藏命令输出和原始 diff 不应由新增投影引入。当前已有任务详情仍会展示用户交代的 prompt、结果文本、失败原因和项目路径，设计不能把这些现有字段描述成完全不存在。
 
+审批只关联尚未结束的工作，避免复用同一 Provider session 的新审批出现在旧任务里。Web 和手机都可展开真实的步骤摘要；普通摘要保留原文，不生成额外步骤、百分比或完整执行历史。手机详情也需直接显示所属 Bot。
+
 ### 上下文和会话
 
-上下文页展示消息、决定、checkpoint 摘要、开放工作和 Bot 设置变更。会话页可以列出 `sessions` 的设备、Provider、session ID、目录、摘要和静音状态，但不展示 native token。
+上下文页整理已返回的消息、开放工作、Bot 设置、持久记忆和定时任务。当前 `ConversationPayload` 未提供 checkpoint 或完整 decisions，页面不能把未提供的数据显示为零或已清空。
+
+`sessions` 来自外部会话的 `SessionAttributed` 归属记录。页面可列出设备、Provider、session ID、目录和静音状态，但它不证明 Bot 自身的原生运行会话存在或不存在，也不证明该会话仍可续接。没有归属记录时，只能说明没有已接入的外部会话。原生 resume token 不进入工作区。
 
 页面必须区分共享聊天事实、Node 本地的 `scheduler_sessions` 指针和 Provider 自己的历史。原生 session 丢失时显示“从共享记录重建”或“原生会话不可用”，不能声称 KV context 已迁移。
 
@@ -53,7 +59,11 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 
 队列按 job `sequence` 排序，并保留人类消息优先规则。跨 conversation 的并行状态按各自 Node 和 job 展示，不合并成未定义的全局并发限制。
 
+快照未提供执行顺序字段时，UI 只能显示观察到的调用状态，不能称为实际排队顺序。`queued`、`cancelling` 和已写回复但尚待同步的 `publishing` 使用各自的状态文案。历史调用与等待执行的调用分开，不能统一标为正在运行。
+
 `message_bot` 是 Bot 间消息，显示发送方、接收方、正文、hops 和投递状态。`dispatch_work` 是在某个 Node 上执行的工作，显示 dispatcher、target、work ID、结果和回执。两者可以关联，但不能互换。Bot 消息没有工作结果，工作派发也不等于聊天消息。
+
+当前消息快照未返回 hops 和投递回执，已有消息记录不能被标成目标已接收或已回复。手机上下文和协作视图复用同一份已认证快照，保持这些边界，不另建频道事实或执行权限。
 
 ## 未知结果和用户动作
 
