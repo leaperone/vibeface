@@ -3858,6 +3858,20 @@ pub(super) mod tests {
         scope: &str,
         id: &str,
     ) -> Result<(String, String)> {
+        let (trigger, attempt) = claim_reply(node, admin, scope, id).await?;
+        node.store
+            .lock()
+            .await
+            .mark_started(scope, &trigger, &attempt)?;
+        Ok((trigger, attempt))
+    }
+
+    pub(in crate::runtime) async fn claim_reply(
+        node: &Runtime,
+        admin: &LocalIdentity,
+        scope: &str,
+        id: &str,
+    ) -> Result<(String, String)> {
         let network = node.network_id().await?;
         let posted = admin.attest(
             &network,
@@ -3911,7 +3925,6 @@ pub(super) mod tests {
                 switch_reason: None,
             },
         )?;
-        store.mark_started(scope, &trigger, &attempt)?;
         Ok((trigger, attempt))
     }
 

@@ -233,7 +233,7 @@ mod tests {
     async fn direct_and_discovered_thread_calls_derive_the_same_title_and_directory() -> Result<()>
     {
         let dir =
-            std::env::temp_dir().join(format!("vf-cli-thread-{}", uuid::Uuid::new_v4().simple()));
+            std::path::PathBuf::from(format!("/tmp/vf-cli-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir)?;
         let socket = dir.join("app.sock");
         let listener = tokio::net::UnixListener::bind(&socket)?;

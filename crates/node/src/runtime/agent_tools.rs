@@ -1042,7 +1042,7 @@ pub(crate) fn work_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::triage::tests::{bot, node, start_reply};
+    use crate::runtime::triage::tests::{bot, claim_reply, node, start_reply};
 
     async fn post(
         node: &Runtime,
@@ -1294,7 +1294,21 @@ mod tests {
         let (node, admin, dir) = node().await?;
         bot(&node, &admin, "c", "Ops", &[]).await?;
         let network = node.store.lock().await.network()?.context("network")?;
-        let (trigger, attempt) = start_reply(&node, &admin, "trigger").await?;
+        let (trigger, attempt) = claim_reply(&node, &admin, "c", "trigger").await?;
+        let claimed = node
+            .store
+            .lock()
+            .await
+            .scheduler_job("c", &trigger)?
+            .context("claimed job")?;
+        assert!(matches!(
+            claimed.state,
+            crate::scheduling::JobState::Claimed { .. }
+        ));
+        assert_eq!(
+            claimed.runtime.context("claimed runtime")?.execution,
+            TurnExecution::NotStarted
+        );
         let idle = Access {
             network_id: network.clone(),
             human: false,

@@ -1075,7 +1075,7 @@ mod tests {
         config::private_write(&locator_path, &locator_bytes)?;
         node.providers.lock().unwrap().env.apply(
             Provider::Cursor,
-            BTreeMap::from([("CURSOR_API_KEY".into(), Some(String::new()))]),
+            BTreeMap::from([("CURSOR_API_KEY".into(), None)]),
         )?;
         assert_eq!(
             probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
