@@ -293,6 +293,8 @@ test("workspace activities merge same-source job observations without hiding new
   }
   const completed = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "completed", outcome: "answered" as const } }] }).activities
   assert.equal(completed.length, 0, "confirmed completed history is hidden after observations are merged")
+  const failed = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "failed", outcome: "unknown" as const } }] }).activities
+  assert.equal(failed[0]?.kind === "turn" && failed[0].state, "failed", "a newer terminal observation is not hidden by queued overview data")
   const unknown = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "queued", pending_check: true } }] }).activities
   assert.equal(unknown[0]?.kind === "turn" && unknown[0].state, "unknown", "a pending check stays uncertain")
   for (const state of ["reconciling", "publishing"]) {
@@ -300,8 +302,8 @@ test("workspace activities merge same-source job observations without hiding new
     assert.equal(observed[0]?.kind === "turn" && observed[0].state, state, `${state} is not treated as an old queued observation`)
   }
   const steeredOverview = parseWorkspaceOverview({ jobs: [{ job_id: "job-3", conversation_id: "chat-1", trigger: "message:ordinary", state: "steered", source_node: "entry" }] })
-  assert.equal(workspaceActivities({ ...input, overview: steeredOverview, jobs: [{ ...local, job: { ...local.job, state: "steered", outcome: "answered" as const } }] }).activities.length, 0)
-  assert.equal(workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "steered", outcome: "answered" as const } }] }).activities.length, 0, "a known terminal observation is hidden after merging an old queued read")
+  assert.equal(workspaceActivities({ ...input, overview: steeredOverview, jobs: [{ ...local, job: { ...local.job, state: "steered", outcome: "answered" as const } }] }).activities.length, 0, "steered history remains hidden after reconciliation")
+  assert.equal(workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "steered", outcome: "answered" as const } }] }).activities.length, 0, "steered history remains hidden without an overview duplicate")
   const overviewRunning = parseWorkspaceOverview({ jobs: [{ job_id: "job-2", conversation_id: "chat-1", trigger: "message:ordinary", state: "running", source_node: "entry" }] })
   const failedConflict = workspaceActivities({ ...input, overview: overviewRunning, jobs: [{ ...local, job: { ...local.job, state: "failed", retryable: true } }] }).activities
   assert.equal(failedConflict[0]?.kind === "turn" && failedConflict[0].state, "unknown", "an active and terminal observation has no ordering proof")
@@ -365,4 +367,16 @@ test("overview-only questions remain one attention item instead of attaching to 
   const view = workspaceActivities({ works: [running, sibling], questions: [], checks: [], overview, nodes: [node("worker")], read: true, connected: true, answered: {} })
   assert.deepEqual(view.activities.filter((activity) => activity.kind === "attention").map((activity) => activity.id), ["attention:overview-question:overview-q"])
   assert.equal(view.activities.filter((activity) => activity.kind === "work").some((activity) => activity.facts.overviewQuestions.length > 0), false)
+})
+
+test("workspace activities dedupe overview and live scheduler jobs by trusted source", () => {
+  const overview = parseWorkspaceOverview({ jobs: [{ job_id: "job-queue", conversation_id: "chat-1", trigger: "message:queue", state: "queued", source_node: "entry" }] })
+  const view = workspaceActivities({
+    works: [], questions: [], checks: [], overview,
+    jobs: [{ conversation_id: "chat-1", job: { trigger: "message:queue", state: "running" } }],
+    nodes: [node("entry", true, true)], read: true, connected: true,
+  })
+  const turns = view.activities.filter((activity): activity is Extract<typeof view.activities[number], { kind: "turn" }> => activity.kind === "turn")
+  assert.deepEqual(turns.map((activity) => activity.id), ["turn:chat-1:local:message:queue"])
+  assert.equal(turns[0]?.job.state, "running", "the live conversation snapshot wins over an older overview job")
 })
