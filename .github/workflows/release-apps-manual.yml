@@ -32,10 +32,6 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: release-macos-${{ github.sha }}
-          path: release
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
           name: release-android-${{ github.sha }}
           path: release
       - name: Upload assets to existing GitHub Release
