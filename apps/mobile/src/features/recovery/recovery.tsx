@@ -53,7 +53,7 @@ export function RecoveryRestore({ link }: { link?: string | null }) {
   const [password, setPassword] = useState('')
   const [name, setName] = useState(defaultName)
   const submit = () => void run('restore', async () => {
-    if (!picked || !target) throw new Error('请选择恢复文件。')
+    if (!picked || !target) throw new Error('选一个恢复文件。')
     const typed = password
     // A failed try keeps the chosen file and name; only the typed password leaves the screen.
     setPassword('')
@@ -309,7 +309,7 @@ export function ReplaceRecovery() {
   // A failed try keeps what was typed; a change to any field takes the old error away.
   const change = <T,>(set: (value: T) => void) => (value: T) => { set(value); clear() }
   const submit = () => void run('replace', async () => {
-    if (!picked) throw new Error('请选择恢复文件。')
+    if (!picked) throw new Error('选一个恢复文件。')
     setTried(true)
     await device.replaceRecoveryFile({ file: picked.file, oldPassword, password: passphrase(password) })
     setOldPassword(''); setPassword(''); setTried(false)

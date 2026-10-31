@@ -1,6 +1,6 @@
 import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
-import { ArrowRightLeft, BellRing, Bot, Crown, FileKey, FlaskConical, KeyRound, LogOut, MessageSquareShare, Monitor, Moon, Palette, Plus, RotateCcw, ShieldAlert, ShieldCheck, Sun, TriangleAlert, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { ArrowRightLeft, BellRing, Bot, ChevronUp, Crown, FileKey, FlaskConical, KeyRound, LogOut, MessageSquareShare, Monitor, Moon, Palette, Plus, RotateCcw, ShieldAlert, ShieldCheck, Sun, TriangleAlert, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { Appearance, Platform, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
@@ -35,6 +35,7 @@ export default function Settings() {
   const { busy, error, run } = useRun()
   const scroll = useRef<ScrollViewInstance>(null)
   const reveal = useRef(false)
+  const devicesAt = useRef(0)
   const sole = soleManager(device.directory?.members ?? [], device.identity?.deviceId)
   const otherClient = device.directory?.members.some((member) => member.kind === 'client' && member.device_id !== device.identity?.deviceId)
   const manager = device.ready?.principal.can_manage === true
@@ -47,17 +48,17 @@ export default function Settings() {
     {/* The home header already shows the connection; only a computer that does not answer is called out here, above the devices. */}
     <OfflineBar />
     <JoinRequests />
-    {workspace.members.length || manager ? <SettingsGroup title="我的设备">
+    {workspace.members.length || manager ? <View onLayout={(event) => { devicesAt.current = event.nativeEvent.layout.y }}><SettingsGroup title="我的设备">
       {workspace.members.map((member) => <MemberRow key={member.device_id} member={member} />)}
       {manager ? <SettingsRow href="/add-device" icon={Plus} label="添加设备" />
         : device.ready ? <SettingsRow disabled icon={Crown} label={addOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))} /> : null}
-    </SettingsGroup> : null}
+    </SettingsGroup></View> : null}
     {/* As on the web: a computer's bots live in its detail above, and a session that waits for you reaches you here. */}
     {device.ready ? <SettingsGroup title={waitingCopy.title}>
       <Notifications />
       {manager ? <SettingsRow href="/external-chat" icon={MessageSquareShare} label={waitingCopy.forward} /> : null}
     </SettingsGroup> : null}
-    {manager ? <SecurityStatus /> : null}
+    {manager ? <SecurityStatus toDevices={() => scroll.current?.scrollTo({ y: Math.max(0, devicesAt.current - 16), animated: true })} /> : null}
     <SettingsGroup title="外观">
       <SettingsRow icon={Palette} label="主题">
         {/* A theme change repaints the whole app, which stalls any slide under it; like iOS's own appearance picker, it applies at once.
@@ -118,16 +119,18 @@ function CurrentRecoveryFile() {
 }
 
 /** 安全 in one group, as on the web: management devices, a waiting recovery (also after 是我 hid it), the recovery file and password. */
-function SecurityStatus() {
+function SecurityStatus({ toDevices }: { toDevices(): void }) {
   const { directory, recoverySince, nodeClockOffset } = useDevice()
   const managers = directory?.members.filter((member) => member.manage).length ?? 0
   const pending = directory?.pending
   const tabular = { fontVariant: ['tabular-nums' as const] }
   return <SettingsGroup title={securityCopy.title}>
-    {directory ? <><SettingsRow icon={Crown} label={securityCopy.managers}>
+    {/* The devices are listed at the top of this page, where a phone is made a management device from its own row. */}
+    {directory ? <><SettingsRow icon={Crown} label={securityCopy.managers} onPress={toDevices}>
       <View className="flex-row items-center gap-1">
         {managers === 1 ? <Icon as={TriangleAlert} className="size-4 text-warning" /> : null}
         <Text className={managers === 1 ? 'text-meta text-warning' : 'text-meta text-muted-foreground'} style={tabular}>{securityCopy.managerCount(managers)}</Text>
+        <Icon as={ChevronUp} className="text-muted-foreground" />
       </View>
     </SettingsRow>
     {pending ? <SettingsRow href="/inbox" icon={ShieldAlert} tone="danger" label={securityCopy.recovery}>
