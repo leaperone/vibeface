@@ -43,7 +43,7 @@ export function TasksScreen() {
   }
   const otherChecks = activityView.groups.attention.flatMap((activity) => {
     if (activity.kind !== 'attention' || activity.conversation_id === shared?.conversationId || !('kind' in activity.attention) || activity.attention.kind !== 'check') return []
-    return [activity.attention as Extract<OverviewTask, { kind: 'check' }>]
+    return [activity.attention]
   })
 
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">

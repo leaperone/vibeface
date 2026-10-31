@@ -9,7 +9,7 @@ import { entryAddress, entryJson, entryKey, messageOf, parseEntry, parseInfo, pr
 import * as nodeSettings from "@vibeface/client/lib/node.ts"
 import type { NodeSettingsResponse, ProviderReadiness, ProviderStatus, ReadyConnection } from "@vibeface/client/lib/node.ts"
 import type { WorkRecord } from "@vibeface/client/workspace/types.ts"
-import { nodeName } from "@vibeface/client/workspace/labels.ts"
+import { cardState, nodeName, taskGroup } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
 import { botCopy, folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
 import { agentName, answerLabel, attentionLabel, approvalTask, awaitsAnswer, declined, foldAnswers, projectName, questionMeta, questionOpen, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
@@ -70,12 +70,12 @@ test("works, reply status and pending checks keep their exact shape", () => {
   assert.deepEqual(parsed.works[0].resolved, { provider: "codex", model: null })
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, resolved: undefined }] }), "accepted work requires its frozen selection")
   const offline = parseNodes({ nodes: [{ device_id: "worker", name: "工作电脑", local: false, online: false, revoked: false }] })
-  assert.equal(taskLabels.cardState(parsed.works[0], offline, { state: "running", outcome: null }), "awaiting_confirmation", "the last overview state cannot make an offline task look active")
-  assert.equal(taskLabels.taskGroup(taskLabels.cardState(parsed.works[0], offline, { state: "running", outcome: null }), false), "attention")
-  assert.equal(taskLabels.cardState(parsed.works[0], [{ ...offline[0], online: true }], { state: "running", outcome: null }), "running")
-  assert.equal(taskLabels.cardState({ ...parsed.works[0], state: "unverified", outcome: "unverified" }, [], { state: "unverified", outcome: "unverified" }), "awaiting_confirmation")
-  assert.equal(taskLabels.cardState({ ...parsed.works[0], outcome: "failed" }, offline, { state: "finished", outcome: "failed" }), "failed")
-  assert.equal(taskLabels.cardState({ ...parsed.works[0], state: "dispatch_waiting" }, offline, { state: "dispatch_waiting", outcome: null }), "dispatch_waiting")
+  assert.equal(cardState(parsed.works[0], offline, { state: "running", outcome: null }), "awaiting_confirmation", "the last overview state cannot make an offline task look active")
+  assert.equal(taskGroup(cardState(parsed.works[0], offline, { state: "running", outcome: null }), false), "attention")
+  assert.equal(cardState(parsed.works[0], [{ ...offline[0], online: true }], { state: "running", outcome: null }), "running")
+  assert.equal(cardState({ ...parsed.works[0], state: "unverified", outcome: "unverified" }, [], { state: "unverified", outcome: "unverified" }), "awaiting_confirmation")
+  assert.equal(cardState({ ...parsed.works[0], outcome: "failed" }, offline, { state: "finished", outcome: "failed" }), "failed")
+  assert.equal(cardState({ ...parsed.works[0], state: "dispatch_waiting" }, offline, { state: "dispatch_waiting", outcome: null }), "dispatch_waiting")
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "waiting_approval" }] }), "approval states are gone")
   assert.equal(parseConversation({ ...context, works: [{ ...work, title: undefined }] }).works[0].title, "", "a dispatch row without a title still parses")
   assert.equal(parsed.messages[0].status, "stopped")
@@ -317,6 +317,8 @@ test("workspace preserves bot and message requests while routing native decision
     assert.deepEqual(controls, [{ method: "interrupt_work", conversation_id: "chat", work_id: "work" }])
     const [question, other] = render().questions
     assert.equal(question.text, "要不要继续")
+    connection.principal.can_manage = false
+    assert.equal(render().writable, true, "an ordinary joined member can answer without manager authority")
     await assert.rejects(render().answer(question, "  "), /不能为空/)
     await assert.rejects(render().answer(question, " 继续 "), /connection lost/)
     assert.deepEqual(JSON.parse(JSON.stringify(render().pendingAnswers)), [{ question_id: "q1", text: "继续" }], "an unknown outcome waits in the outbox")
@@ -333,6 +335,13 @@ test("workspace preserves bot and message requests while routing native decision
     answerOutcome = "already_answered"
     assert.equal((await render().answer(other, "继续")).text, "停下", "the answer that stood first is the one shown")
     assert.equal(signed.at(-1), 'attestation|network|other|{"type":"message_posted","message_id":"a-s1","role":"user","text":"继续","report_results":true,"answers":"s1"}', "an answer is signed for its question's chat")
+    const memberPrincipal = connection.principal, beforeLocal = answers.length
+    connection.principal = { ...memberPrincipal, source: "local_session", can_manage: false }
+    assert.equal(render().writable, false)
+    await assert.rejects(render().answer(question, "允许"), /本机管理不能发送/)
+    assert.equal(answers.length, beforeLocal, "a local session without membership never writes a new answer")
+    connection.principal = memberPrincipal
+    connection.principal.can_manage = true
     // After a new connection the outbox asks the questions list before sending an unknown answer again.
     const later = { ...questionRow, question_id: "q2" }, elsewhere = { ...questionRow, question_id: "q3" }
     questionRows = [later, elsewhere]
@@ -497,7 +506,7 @@ test("workspace preserves bot and message requests while routing native decision
         '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/inbox.ts': { inboxItems }, '@vibeface/client/workspace/labels.ts': taskLabels,
         '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers }, '@vibeface/client/workspace/storage.ts': { storageOf }, '@vibeface/client/workspace/types.ts': { isSessionNotification: () => false },
         '@/platform': { mobilePlatform: { storage: browser.localStorage } }, './context': { WorkspaceProvider: 'NativeWorkspace' },
-      })
+      }, {}, 'Live')
       type NativeWorkspace = import('../../../../../../apps/mobile/src/data/types.ts').Workspace
       let native: NativeWorkspace
       const mobile = () => {
@@ -518,7 +527,7 @@ test("workspace preserves bot and message requests while routing native decision
         'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme: 'light' }) },
         '@/data/context': { useWorkspace: () => native }, '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
         '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/home.ts': { unreachable },
-        '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+        '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
         '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
         '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
       }, { requestAnimationFrame: (run: () => void) => run(), setInterval: () => 1, clearInterval() {} })
@@ -661,8 +670,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   }
   const require = (specifier: string) => specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
   const filename = fileURLToPath(new URL(path, import.meta.url))
-  const exported = privateExport || (filename.endsWith('/data/live.tsx') ? 'Live' : '')
-  const source = readFileSync(filename, 'utf8') + (exported ? `\nexport { ${exported} }\n` : '')
+  const source = readFileSync(filename, 'utf8') + (privateExport ? `\nexport { ${privateExport} }\n` : '')
   const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
   new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInNewContext({ Map, Error, TextEncoder, ...globals })(module.exports, require, module)
   return {
@@ -815,7 +823,11 @@ function componentText(node: unknown): string {
 
 const parityBot = parseBot({ bot_id: 'bot', conversation_id: 'chat', name: '项目 Bot', instructions: '', models: {}, skills: null, avatar: null, avatar_version: null, event_hash: 'bot-event', last_message: null, busy: null })
 const parityNode = { device_id: 'worker', name: '工作设备', online: true, local: false, revoked: false, capabilities: { manager: 'codex', manager_state: 'ready' as const, relay: false, roots: [], codex_connected: true } }
-const parityWork = (extra: Partial<WorkRecord> = {}): WorkRecord => parseConversation({ ...context, works: [{ work_id: 'work', trigger: 'message:one', target_node: 'worker', cwd: '/project', title: '核对项目', prompt: '完整请求', state: 'running', summary: '✓ 读记录\n→ 核对结果\n· 等待同步', outcome: null, result_text: '', failure_reason: null, kind: 'codex', thread_id: 'session', resolved: { provider: 'codex', model: null }, ...extra }] }).works[0]!
+const parityWork = (extra: Partial<WorkRecord> = {}) => {
+  const work = parseConversation({ ...context, works: [{ resolved: { provider: 'codex', model: null }, work_id: 'work', trigger: 'message:one', target_node: 'worker', cwd: '/project', title: '核对项目', prompt: '完整请求', state: 'running', summary: '✓ 读记录\n→ 核对结果\n· 等待同步', outcome: null, result_text: '', failure_reason: null, kind: 'codex', thread_id: 'session', ...extra }] }).works[0]
+  assert.ok(work && work.resolved)
+  return work
+}
 const paritySnapshot = (value: unknown) => value === null ? null : parseConversation(value)
 const parityShared = () => ({
   generation: 1, isCurrent: () => true, synced: true, connectionOnline: true, conversationId: 'chat', data: paritySnapshot(context),
@@ -1086,6 +1098,19 @@ test('context shows scheduler observations without promising native resume or re
     assert.match(componentText(tree), /正在查询上次回复/)
     assert.match(componentText(tree), /Codex · 提交模型 frozen-model/)
     assert.doesNotMatch(componentText(tree), /new-device-default|Claude Code/)
+    data.scheduler = parseConversation({ ...context, scheduler: { provider: 'codex', model: 'current-model', unanswered: [], jobs: [{ trigger: 'message:reconcile', state: 'reconciling', runtime: { provider: 'claude', model: 'frozen-model', reasoning_effort: 'high', generation: 'generation', session_generation: 1, delivery_id: 'delivery', stage: 'read_back', execution: 'unknown', attempted_at_ms: 1, switched_from: null, switch_reason: null } }] } }).scheduler
+    tree = continuity.type(continuity.props)
+    assert.match(componentText(tree), /正在查询上次回复/)
+    assert.match(componentText(tree), /Claude Code.*frozen-model/)
+    assert.doesNotMatch(componentText(tree), /current-model/)
+    const runtime = data.scheduler?.jobs[0]?.runtime
+    assert.ok(runtime)
+    for (const state of ['publishing', 'pending_delivery']) {
+      data.scheduler = parseConversation({ ...context, scheduler: { unanswered: [], jobs: [{ trigger: 'message:history', state: 'completed', runtime: { ...runtime, model: 'newer-history', attempted_at_ms: 2 } }, { trigger: 'message:active', state, runtime }] } }).scheduler
+      tree = continuity.type(continuity.props)
+      assert.match(componentText(tree), /Claude Code.*frozen-model/)
+      assert.doesNotMatch(componentText(tree), /newer-history/)
+    }
     data.scheduler = null
     assert.match(componentText(continuity.type(continuity.props)), /后台工作状态未提供/)
     assert.equal(elements.some(({ type, props }) => typeof type === 'function' && type.name === 'ContinuityStat' && props.label === '后台工作' && props.value === null), true)
