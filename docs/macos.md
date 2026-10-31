@@ -30,4 +30,4 @@ open .artifacts/macos/Vibeface.app
 
 ## CI 与发版
 
-PR 打上 `macos` 标签或手动 `workflow_dispatch` 触发 `.github/workflows/macos.yml`，上传构建 artifact。版本 tag 的 `ci` 发布流程会额外生成并上传 `vibeface-<ver>-macos-arm64.zip` 与 `.sha256`；当前没有 Developer ID 证书，产物不签名、不公证。
+PR 打上 `macos` 标签或手动 `workflow_dispatch` 触发 `.github/workflows/macos.yml`，上传构建 artifact。版本 tag 或手动触发 `.github/workflows/release-apps.yml` 会把 macOS 与 Android 资产上传到 vibeface 自己的 GitHub Release。当前没有 Developer ID 证书，macOS 产物会跳过签名和公证并在日志中提示。

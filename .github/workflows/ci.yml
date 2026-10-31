@@ -833,7 +833,7 @@ jobs:
   publish:
     # ci-gate needs jobs that are skipped on tags; without !cancelled() a skipped ancestor skips this.
     if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.plan.result == 'success' && needs.ci-gate.result == 'success' && needs.package.result == 'success' }}
-    needs: [plan, ci-gate, package, release-android, release-macos]
+    needs: [plan, ci-gate, package]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -850,14 +850,6 @@ jobs:
           pattern: node-package-*-${{ github.sha }}
           path: packages
           merge-multiple: true
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-android-${{ github.sha }}
-          path: packages
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-macos-${{ github.sha }}
-          path: packages
       - name: Verify all assets before publishing
         run: |
           [[ "$RELEASE_TAG" == "v$VERSION" ]]
@@ -865,10 +857,10 @@ jobs:
           archives=(packages/*.tar.gz)
           checksums=(packages/*.tar.gz.sha256)
           files=(packages/*)
-          [[ "${#archives[@]}" == 3 && "${#checksums[@]}" == 5 && "${#files[@]}" == 10 ]]
+          [[ "${#archives[@]}" == 3 && "${#checksums[@]}" == 3 && "${#files[@]}" == 6 ]]
           for archive in "${archives[@]}"; do
             name="$(basename "$archive")"
-            [[ "$name" == "vibeface-$VERSION-"*.tar.gz || "$name" == "vibeface-$VERSION-"*.zip ]]
+            [[ "$name" == "vibeface-$VERSION-"*.tar.gz ]]
             (cd packages && sha256sum -c "$name.sha256")
           done
       - name: Upload complete draft and publish
@@ -896,65 +888,3 @@ jobs:
           done
           gh release edit "$RELEASE_TAG" --draft=false "${release_flags[@]}"
 
-  release-macos:
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-    needs: [plan]
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {persist-credentials: false}
-      - name: Build macOS app archive
-        env:
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          scripts/build-macos-app.sh .artifacts/macos
-          cd .artifacts/macos
-          ditto -c -k --sequesterRsrc --keepParent Vibeface.app "vibeface-$VERSION-macos-arm64.zip"
-          shasum -a 256 "vibeface-$VERSION-macos-arm64.zip" > "vibeface-$VERSION-macos-arm64.zip.sha256"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: release-macos-${{ github.sha }}
-          path: |
-            .artifacts/macos/vibeface-*.zip
-            .artifacts/macos/vibeface-*.zip.sha256
-          if-no-files-found: error
-
-  release-android:
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-    needs: [plan]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {persist-credentials: false}
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
-        with: {targets: aarch64-linux-android,x86_64-linux-android}
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
-        with: {version: 11.9.0}
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with: {node-version: '24', cache: pnpm, cache-dependency-path: pnpm-lock.yaml}
-      - name: Prepare Android toolchain
-        run: |
-          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
-          cargo install cargo-ndk --locked
-      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6
-      - run: pnpm install --frozen-lockfile
-      - run: scripts/build-mobile-secure.sh android
-      - name: Build release APK
-        working-directory: apps/mobile
-        run: |
-          npx expo prebuild --platform android --no-install
-          cd android && ./gradlew assembleRelease --build-cache -PreactNativeArchitectures=arm64-v8a,x86_64
-      - name: Name and checksum release APK
-        env:
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          mkdir -p .artifacts/android
-          cp apps/mobile/android/app/build/outputs/apk/release/app-release.apk ".artifacts/android/vibeface-$VERSION-android.apk"
-          shasum -a 256 ".artifacts/android/vibeface-$VERSION-android.apk" > ".artifacts/android/vibeface-$VERSION-android.apk.sha256"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: release-android-${{ github.sha }}
-          path: .artifacts/android/vibeface-*
-          if-no-files-found: error
