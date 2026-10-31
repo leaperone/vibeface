@@ -329,7 +329,7 @@ fn finish_failed(
     finish(record, outcome, reason, kind)
 }
 
-const DISCONNECTED: &str = "和执行设备断开了。等它重连后确认结果。";
+const DISCONNECTED: &str = "AI 工具断开了。重连后再确认结果。";
 /// The Agent bound a thread, then no turn showed up by the window's end. Its `turn/start` may
 /// still be in flight, so the work is neither started nor refused.
 const SEND_UNSEEN: &str = "发送时限过了还没看到这次回合，不知道是否已开始";
