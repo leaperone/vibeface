@@ -12,7 +12,7 @@ import { workChecks, type WorkCheck } from "@vibeface/client/workspace/model.ts"
 import { BackOnline, confirmText } from "./task-activity"
 import { ActionButton } from "./present"
 import { QuestionCard } from "./question-card"
-import { fixOnDevice, fixOnDeviceLabel, nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, followUp, followUpCopy, type FollowUp } from "@vibeface/client/workspace/labels.ts"
+import { fixOnDevice, fixOnDeviceLabel, nodeName, progressLabel, promptSummary, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, followUp, followUpCopy, type FollowUp } from "@vibeface/client/workspace/labels.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import { CopyDiagnostics } from "@/features/identity/device-controls"
@@ -99,6 +99,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   // App Server cannot withdraw one input steered into a turn, so stopping one stops every work sharing it.
   const sharing = work?.turn_id ? (workspace.data?.works ?? []).filter((item) => item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
   const stop = canStop ? () => workspace.interruptWork(work.work_id) : null
+  const asked = promptSummary(work?.prompt ?? "", work?.title ?? "")
 
   return <div ref={layer} className="contents">
   {/* Clicking it must not move focus to the page behind, or React hands focus back there instead of to the task link. */}
@@ -121,7 +122,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       {progress?.status && taskActive(state) && progress.status !== "awaiting_input" && progressLabel(progress.status) !== "进行中" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
       {!progress?.text && work.summary && taskActive(state) ? <Summary text={work.summary} /> : null}
       {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}
-      {work.prompt ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">交代的事</h3><p className="line-clamp-6 whitespace-pre-wrap break-words" title={work.prompt}>{work.prompt}</p></section> : null}
+      {asked.summary ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">交代的事</h3><p className="break-words">{asked.summary}</p></section> : null}
       {result && !taskActive(state) && !check ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">{failed || !work.result_text ? "原因" : "结果"}</h3>{!failed && work.result_text ? <Markdown text={result} /> : <p className={`whitespace-pre-wrap break-words ${failed ? "text-danger" : ""}`}>{result}</p>}</section> : null}
       {check ? <section className="grid gap-3 rounded-xl border border-warning-border bg-warning-soft p-3">
         <h3 className="flex items-center gap-2 font-medium"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0 text-warning" />还不知道做完没有</h3>
@@ -152,6 +153,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
         </div><InlineError error={action.error} />
       </div> : null}
       <Details>
+        {asked.folded ? <DetailRow label="交代的原文" value={<span className="whitespace-pre-wrap break-words">{work.prompt}</span>} /> : null}
         {failed && work.result_text ? <DetailRow label="已有输出" value={<span className="whitespace-pre-wrap break-words">{work.result_text}</span>} /> : null}
         {work.failure_reason && (check || rawError(work.failure_reason)) ? <DetailRow label={check ? "说明" : "原始错误"} value={<span className="break-words">{work.failure_reason}</span>} /> : null}
         {work.cwd ? <DetailRow label="文件夹" value={work.cwd} mono /> : null}
