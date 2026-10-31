@@ -155,16 +155,140 @@ pub enum CapabilitySupport {
     Manual,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPersistence {
+    AppServer,
+    Process,
+    ProviderStore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StablePromptPlacement {
+    ThreadInstructions,
+    SessionInstructions,
+    TurnInstructions,
+    UserTurnPrefix,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicContextPlacement {
+    UserTurn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextStreamMode {
+    Snapshot,
+    DeltaAndSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelEvidence {
+    AppServerTurnEnd,
+    ProviderTerminal,
+    ProviderTerminalOrManagedProcessExit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationStatus {
+    Confirmed,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessEvidence {
+    BinaryDiscovery,
+    LaunchPrerequisites,
+    AppServerHandshake,
+    AppServerStarting,
+    AppServerUnavailable,
+    ManagedLaunchFailed,
+    ConfigurationInvalid,
+    AuthenticationNotObserved,
+    ModelCatalogNotObserved,
+    ReadinessNotObserved,
+    PrerequisitesRejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderObservation {
+    pub status: ObservationStatus,
+    pub evidence: ReadinessEvidence,
+}
+
+impl ProviderObservation {
+    pub fn new(status: ObservationStatus, evidence: ReadinessEvidence) -> Self {
+        Self { status, evidence }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderReadiness {
+    pub installed: ProviderObservation,
+    pub launchable: ProviderObservation,
+    pub authenticated: ProviderObservation,
+    pub model_known: ProviderObservation,
+    pub ready: ProviderObservation,
+}
+
+impl ProviderReadiness {
+    pub fn from_prerequisites(installed: bool, launchable: ProviderObservation) -> Self {
+        Self {
+            installed: ProviderObservation::new(
+                if installed {
+                    ObservationStatus::Confirmed
+                } else {
+                    ObservationStatus::Rejected
+                },
+                ReadinessEvidence::BinaryDiscovery,
+            ),
+            launchable,
+            authenticated: ProviderObservation::new(
+                ObservationStatus::Unknown,
+                ReadinessEvidence::AuthenticationNotObserved,
+            ),
+            model_known: ProviderObservation::new(
+                ObservationStatus::Unknown,
+                ReadinessEvidence::ModelCatalogNotObserved,
+            ),
+            ready: ProviderObservation::new(
+                if launchable.status == ObservationStatus::Rejected {
+                    ObservationStatus::Rejected
+                } else {
+                    ObservationStatus::Unknown
+                },
+                if launchable.status == ObservationStatus::Rejected {
+                    ReadinessEvidence::PrerequisitesRejected
+                } else {
+                    ReadinessEvidence::ReadinessNotObserved
+                },
+            ),
+        }
+    }
+}
+
 /// The provider facts used by the prompt compiler and scheduler. This is a description of a
 /// provider adapter, not a permission grant. Tool effects and workspace checks remain in the Node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderDescriptor {
     pub provider: Provider,
-    pub sessions: String,
+    pub sessions: SessionPersistence,
     pub prompt_mode: PromptMode,
+    pub stable_prompt: StablePromptPlacement,
+    pub dynamic_context: DynamicContextPlacement,
     pub tool_mode: ToolMode,
     pub skill_injection: SkillInjection,
+    pub workspace_required: bool,
     pub sandbox: SandboxMode,
     pub steer: bool,
     pub concurrency: ConcurrencyMode,
@@ -172,67 +296,132 @@ pub struct ProviderDescriptor {
     pub usage: CapabilitySupport,
     pub approvals: CapabilitySupport,
     pub model_catalog: CapabilitySupport,
+    pub streaming: bool,
+    pub cancel: bool,
+    pub resume_local_session: bool,
+    pub text_stream_mode: TextStreamMode,
+    pub cancel_confirmation_evidence: CancelEvidence,
 }
 
 impl ProviderDescriptor {
     pub fn for_provider(provider: Provider) -> Self {
-        let (sessions, skill_injection, sandbox, concurrency, compaction, model_catalog) =
-            match provider {
-                Provider::Codex => (
-                    "app_server",
-                    SkillInjection::Folder,
-                    SandboxMode::FullAccess,
-                    ConcurrencyMode::Parallel,
-                    CompactionMode::Native,
-                    CapabilitySupport::Supported,
-                ),
-                Provider::Cursor => (
-                    "process",
-                    SkillInjection::Folder,
-                    SandboxMode::ProviderControlled,
-                    ConcurrencyMode::Serial,
-                    CompactionMode::Handoff,
-                    CapabilitySupport::Manual,
-                ),
-                Provider::Claude => (
-                    "process",
-                    SkillInjection::Plugin,
-                    SandboxMode::ProviderControlled,
-                    ConcurrencyMode::Serial,
-                    CompactionMode::Native,
-                    CapabilitySupport::Manual,
-                ),
-                Provider::Pi => (
-                    "process",
-                    SkillInjection::Folder,
-                    SandboxMode::ProviderControlled,
-                    ConcurrencyMode::Serial,
-                    CompactionMode::Request,
-                    CapabilitySupport::Manual,
-                ),
-                Provider::Opencode => (
-                    "store",
-                    SkillInjection::PromptIndex,
-                    SandboxMode::ProviderControlled,
-                    ConcurrencyMode::Serial,
-                    CompactionMode::Handoff,
-                    CapabilitySupport::Manual,
-                ),
-            };
-        Self {
-            provider,
-            sessions: sessions.into(),
-            prompt_mode: provider.prompt_mode(),
-            tool_mode: ToolMode::DynamicCatalog,
+        let (
+            sessions,
+            prompt_mode,
+            stable_prompt,
             skill_injection,
             sandbox,
-            steer: provider.supports_steer(),
+            steer,
             concurrency,
-            compaction,
-            usage: CapabilitySupport::Supported,
-            approvals: CapabilitySupport::Supported,
             model_catalog,
+            text_stream_mode,
+            cancel_confirmation_evidence,
+        ) = match provider {
+            Provider::Codex => (
+                SessionPersistence::AppServer,
+                PromptMode::Thread,
+                StablePromptPlacement::ThreadInstructions,
+                SkillInjection::Folder,
+                SandboxMode::FullAccess,
+                true,
+                ConcurrencyMode::Parallel,
+                CapabilitySupport::Supported,
+                TextStreamMode::Snapshot,
+                CancelEvidence::AppServerTurnEnd,
+            ),
+            Provider::Cursor => (
+                SessionPersistence::Process,
+                PromptMode::Turn,
+                StablePromptPlacement::TurnInstructions,
+                SkillInjection::Folder,
+                SandboxMode::ProviderControlled,
+                false,
+                ConcurrencyMode::Serial,
+                CapabilitySupport::Unsupported,
+                TextStreamMode::DeltaAndSnapshot,
+                CancelEvidence::ProviderTerminal,
+            ),
+            Provider::Claude => (
+                SessionPersistence::Process,
+                PromptMode::Thread,
+                StablePromptPlacement::SessionInstructions,
+                SkillInjection::Plugin,
+                SandboxMode::ProviderControlled,
+                false,
+                ConcurrencyMode::Serial,
+                CapabilitySupport::Unsupported,
+                TextStreamMode::Snapshot,
+                CancelEvidence::ProviderTerminalOrManagedProcessExit,
+            ),
+            Provider::Pi => (
+                SessionPersistence::Process,
+                PromptMode::Thread,
+                StablePromptPlacement::SessionInstructions,
+                SkillInjection::Folder,
+                SandboxMode::ProviderControlled,
+                true,
+                ConcurrencyMode::Serial,
+                CapabilitySupport::Unsupported,
+                TextStreamMode::DeltaAndSnapshot,
+                CancelEvidence::ProviderTerminalOrManagedProcessExit,
+            ),
+            Provider::Opencode => (
+                SessionPersistence::ProviderStore,
+                PromptMode::Thread,
+                StablePromptPlacement::UserTurnPrefix,
+                SkillInjection::PromptIndex,
+                SandboxMode::ProviderControlled,
+                true,
+                ConcurrencyMode::Serial,
+                CapabilitySupport::Unsupported,
+                TextStreamMode::DeltaAndSnapshot,
+                CancelEvidence::ProviderTerminalOrManagedProcessExit,
+            ),
+        };
+        Self {
+            provider,
+            sessions,
+            prompt_mode,
+            stable_prompt,
+            dynamic_context: DynamicContextPlacement::UserTurn,
+            tool_mode: ToolMode::DynamicCatalog,
+            skill_injection,
+            workspace_required: true,
+            sandbox,
+            steer,
+            concurrency,
+            compaction: CompactionMode::Handoff,
+            usage: if provider == Provider::Cursor {
+                CapabilitySupport::Supported
+            } else {
+                CapabilitySupport::Unsupported
+            },
+            approvals: CapabilitySupport::Unsupported,
+            model_catalog,
+            streaming: true,
+            cancel: true,
+            resume_local_session: true,
+            text_stream_mode,
+            cancel_confirmation_evidence,
         }
+    }
+
+    pub fn check_steer(&self) -> Result<()> {
+        ensure!(
+            self.steer,
+            "{} cannot steer a running turn",
+            self.provider.label()
+        );
+        Ok(())
+    }
+
+    pub fn compact_or_handoff(&self) -> Result<CompactionMode> {
+        ensure!(
+            self.compaction == CompactionMode::Handoff,
+            "{} has no Node compaction adapter",
+            self.provider.label()
+        );
+        Ok(CompactionMode::Handoff)
     }
 }
 
@@ -389,10 +578,7 @@ impl Provider {
 
     /// Whether a queued user message can join the bot's running reply.
     pub fn supports_steer(self) -> bool {
-        match self {
-            Provider::Codex | Provider::Pi | Provider::Opencode => true,
-            Provider::Cursor | Provider::Claude => false,
-        }
+        self.descriptor().steer
     }
 
     /// `vibeface hooks install` sets this up; `None` when the Node does not watch the
@@ -420,12 +606,7 @@ impl Provider {
     }
 
     pub fn prompt_mode(self) -> PromptMode {
-        match self {
-            Provider::Codex | Provider::Claude | Provider::Pi | Provider::Opencode => {
-                PromptMode::Thread
-            }
-            Provider::Cursor => PromptMode::Turn,
-        }
+        self.descriptor().prompt_mode
     }
 
     /// Name prefixes of the variables the Node sets itself for this provider's processes.
@@ -461,31 +642,12 @@ impl Provider {
         }
     }
 
+    pub fn descriptor(self) -> ProviderDescriptor {
+        ProviderDescriptor::for_provider(self)
+    }
+
     pub fn capabilities(self) -> Value {
-        let codex = self == Provider::Codex;
-        json!({
-            "verified": false,
-            "streaming": true,
-            "cancel": true,
-            "steer": self.supports_steer(),
-            "resume_local_session": true,
-            // Codex's and Claude Code's runners send whole text; the others stream it as well.
-            "text_stream_mode": match self {
-                Provider::Codex | Provider::Claude => "snapshot",
-                _ => "delta_and_snapshot",
-            },
-            "cancel_request": true,
-            "cancel_confirmation": true,
-            "cancel_confirmation_evidence": if codex {
-                "app_server_turn_end"
-            } else if self == Provider::Cursor {
-                "provider_terminal"
-            } else {
-                "provider_terminal_or_managed_process_exit"
-            },
-            "native_steer": self.supports_steer(),
-            "run_reconcile": false,
-        })
+        json!(self.descriptor())
     }
 }
 
@@ -1072,7 +1234,78 @@ mod tests {
             assert_eq!(descriptor.provider, provider);
             assert_eq!(descriptor.prompt_mode, provider.prompt_mode());
             assert_eq!(descriptor.steer, provider.supports_steer());
-            assert!(!descriptor.sessions.is_empty());
+            assert!(descriptor.workspace_required);
+            assert_eq!(
+                descriptor.stable_prompt,
+                match provider {
+                    Provider::Codex => StablePromptPlacement::ThreadInstructions,
+                    Provider::Cursor => StablePromptPlacement::TurnInstructions,
+                    Provider::Claude | Provider::Pi => StablePromptPlacement::SessionInstructions,
+                    Provider::Opencode => StablePromptPlacement::UserTurnPrefix,
+                }
+            );
+            assert_eq!(
+                descriptor.dynamic_context,
+                DynamicContextPlacement::UserTurn
+            );
+            assert_eq!(
+                descriptor.compact_or_handoff().unwrap(),
+                CompactionMode::Handoff
+            );
+            let summary = provider.capabilities();
+            assert_eq!(summary, serde_json::to_value(&descriptor).unwrap());
+            assert!(summary.get("observed").is_none());
+            assert!(summary.get("env").is_none());
+        }
+    }
+
+    #[test]
+    fn readiness_requires_observed_authentication_and_model_evidence() {
+        let handshake = ProviderObservation::new(
+            ObservationStatus::Confirmed,
+            ReadinessEvidence::AppServerHandshake,
+        );
+        let observed = ProviderReadiness::from_prerequisites(false, handshake);
+        assert_eq!(observed.installed.status, ObservationStatus::Rejected);
+        assert_eq!(observed.launchable.status, ObservationStatus::Confirmed);
+        assert_eq!(observed.authenticated.status, ObservationStatus::Unknown);
+        assert_eq!(observed.model_known.status, ObservationStatus::Unknown);
+        assert_eq!(observed.ready.status, ObservationStatus::Unknown);
+        let prerequisites = ProviderObservation::new(
+            ObservationStatus::Unknown,
+            ReadinessEvidence::LaunchPrerequisites,
+        );
+        let present = ProviderReadiness::from_prerequisites(true, prerequisites);
+        assert_eq!(present.installed.status, ObservationStatus::Confirmed);
+        assert_eq!(present.launchable.status, ObservationStatus::Unknown);
+        assert_eq!(present.ready.status, ObservationStatus::Unknown);
+        let missing = ProviderReadiness::from_prerequisites(
+            false,
+            ProviderObservation::new(
+                ObservationStatus::Rejected,
+                ReadinessEvidence::PrerequisitesRejected,
+            ),
+        );
+        assert_eq!(missing.ready.status, ObservationStatus::Rejected);
+        assert_eq!(missing.authenticated.status, ObservationStatus::Unknown);
+    }
+
+    #[test]
+    fn undeclared_steer_and_native_compaction_are_rejected() {
+        for provider in Provider::ALL {
+            assert_eq!(
+                provider.descriptor().check_steer().is_ok(),
+                provider.supports_steer()
+            );
+            let mut descriptor = provider.descriptor();
+            for compaction in [
+                CompactionMode::Native,
+                CompactionMode::Request,
+                CompactionMode::Unsupported,
+            ] {
+                descriptor.compaction = compaction;
+                assert!(descriptor.compact_or_handoff().is_err());
+            }
         }
     }
 

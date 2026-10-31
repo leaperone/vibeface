@@ -5,7 +5,7 @@
 //! prompting, blanks model keys and injects only that turn's Node tool credentials.
 use super::executor::{Executor, SteerAck, SteerTrace};
 use super::*;
-use crate::manager::{self, ManagerConfig, ManagerError, ManagerFailure};
+use crate::manager::{self, ManagerConfig, ManagerError, ManagerFailure, Sdk};
 use crate::scheduling::{SteerOutcome, SteerTarget};
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec, WorkState};
 use futures_util::future::BoxFuture;
@@ -38,7 +38,7 @@ const MAX_OUTPUT: usize = 65_536;
 /// The Node's opencode serve and the bot turns running on it.
 pub struct Opencode {
     dir: PathBuf,
-    launch: std::sync::Mutex<Launch>,
+    launch: Arc<std::sync::Mutex<LaunchState>>,
     serve: Mutex<Option<Serve>>,
     http: reqwest::Client,
     /// Bot turns in progress by session: what a steer joins.
@@ -48,6 +48,7 @@ pub struct Opencode {
     answered: std::sync::Mutex<BTreeSet<String>>,
     /// Uses of the serve in progress; while any lasts, a changed launch waits.
     users: Arc<std::sync::atomic::AtomicUsize>,
+    unresolved_uses: std::sync::Mutex<HashMap<String, Use>>,
     /// Sessions a work is being sent into now.
     starting: std::sync::Mutex<BTreeSet<String>>,
     /// Works whose start runs in this process and has yet to claim its session.
@@ -89,6 +90,26 @@ impl Drop for Use {
 struct Launch {
     bin: PathBuf,
     env: BTreeMap<String, String>,
+}
+
+struct LaunchState {
+    current: Launch,
+    pending: Option<Launch>,
+    leases: usize,
+}
+
+pub struct OpencodeLease(Arc<std::sync::Mutex<LaunchState>>);
+
+impl Drop for OpencodeLease {
+    fn drop(&mut self) {
+        let mut launch = self.0.lock().expect("launch");
+        launch.leases -= 1;
+        if launch.leases == 0
+            && let Some(pending) = launch.pending.take()
+        {
+            launch.current = pending;
+        }
+    }
 }
 
 /// How to reach one serve.
@@ -176,12 +197,25 @@ struct TurnGuard<'a> {
     owner: &'a Opencode,
     session: String,
     events: tokio::task::JoinHandle<()>,
+    serving: Option<Use>,
+    start: &'a std::sync::Mutex<manager::StartEvidence>,
+    terminal: bool,
 }
 
 impl Drop for TurnGuard<'_> {
     fn drop(&mut self) {
         self.events.abort();
         self.owner.live.lock().expect("live").remove(&self.session);
+        if !self.terminal
+            && *self.start.lock().unwrap() != manager::StartEvidence::NotStarted
+            && let Some(serving) = self.serving.take()
+        {
+            self.owner
+                .unresolved_uses
+                .lock()
+                .expect("unresolved uses")
+                .insert(format!("session:{}", self.session), serving);
+        }
     }
 }
 
@@ -203,7 +237,11 @@ impl Opencode {
         kill_orphan(&dir.join(PIDFILE));
         Ok(Self {
             dir,
-            launch: std::sync::Mutex::new(Launch { bin, env }),
+            launch: Arc::new(std::sync::Mutex::new(LaunchState {
+                current: Launch { bin, env },
+                pending: None,
+                leases: 0,
+            })),
             serve: Mutex::new(None),
             http: reqwest::Client::builder()
                 .no_proxy()
@@ -212,6 +250,7 @@ impl Opencode {
             live: Default::default(),
             answered: Default::default(),
             users: Default::default(),
+            unresolved_uses: Default::default(),
             starting: Default::default(),
             sending: Default::default(),
             cancelled_inputs: Default::default(),
@@ -221,7 +260,61 @@ impl Opencode {
     /// The program and variables of the next serve; one running with others is replaced when
     /// next used while nothing else uses it.
     pub(crate) fn set_launch(&self, bin: PathBuf, env: BTreeMap<String, String>) {
-        *self.launch.lock().expect("launch") = Launch { bin, env };
+        let next = Launch { bin, env };
+        let mut launch = self.launch.lock().expect("launch");
+        if launch.current == next {
+            launch.pending = None;
+        } else if launch.leases > 0 {
+            launch.pending = Some(next);
+        } else {
+            launch.current = next;
+            launch.pending = None;
+        }
+    }
+
+    pub(crate) fn lease(
+        &self,
+        bin: &Path,
+        env: &BTreeMap<String, String>,
+    ) -> Result<OpencodeLease> {
+        ensure!(
+            !self.configuration_pending(bin, env),
+            "opencode launch change waits for active turns"
+        );
+        let mut launch = self.launch.lock().expect("launch");
+        ensure!(
+            launch.current.bin == bin && launch.current.env == *env && launch.pending.is_none(),
+            "opencode launch changed; capture its configuration again"
+        );
+        launch.leases += 1;
+        Ok(OpencodeLease(self.launch.clone()))
+    }
+
+    pub(crate) fn configuration_pending(&self, bin: &Path, env: &BTreeMap<String, String>) -> bool {
+        let expected = Launch {
+            bin: bin.to_owned(),
+            env: env.clone(),
+        };
+        {
+            let launch = self.launch.lock().expect("launch");
+            if launch.current != expected || launch.pending.is_some() {
+                return true;
+            }
+        }
+        if self.users.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return false;
+        }
+        match self.serve.try_lock() {
+            Ok(serve) => serve.as_ref().is_some_and(|serve| serve.launch != expected),
+            Err(_) => true,
+        }
+    }
+
+    pub(crate) fn release_work(&self, work_id: &str) {
+        self.unresolved_uses
+            .lock()
+            .expect("unresolved uses")
+            .remove(&format!("work:{work_id}"));
     }
 
     /// Stops the serve; the Node calls this when it shuts down.
@@ -234,9 +327,25 @@ impl Opencode {
     /// The running serve and a use of it. A serve is started first when there is none or it
     /// died, and also when its launch changed and nothing else uses it: runs on it go on.
     async fn conn(&self) -> Result<(Conn, Use)> {
+        self.conn_for(None).await
+    }
+
+    async fn conn_for(&self, expected: Option<Launch>) -> Result<(Conn, Use)> {
         use std::sync::atomic::Ordering::SeqCst;
-        let launch = self.launch.lock().expect("launch").clone();
         let mut serve = self.serve.lock().await;
+        let launch = self.launch.lock().expect("launch").current.clone();
+        if let Some(expected) = &expected {
+            ensure!(
+                &launch == expected,
+                "opencode launch changed; capture its configuration again"
+            );
+        }
+        if let (Some(expected), Some(running)) = (&expected, serve.as_ref()) {
+            ensure!(
+                running.launch == *expected || self.users.load(SeqCst) == 0,
+                "opencode launch change waits for active turns"
+            );
+        }
         if let Some(running) = serve.as_mut()
             && (running.launch == launch || self.users.load(SeqCst) > 0)
             && running
@@ -546,7 +655,7 @@ impl Opencode {
         session: &str,
         tool_env: &BTreeMap<String, String>,
     ) -> Result<()> {
-        let launch = self.launch.lock().expect("launch").clone();
+        let launch = self.launch.lock().expect("launch").current.clone();
         let mut variables: BTreeMap<String, String> = std::env::vars_os()
             .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
             .chain(launch.env)
@@ -737,26 +846,36 @@ impl Opencode {
     /// Whether no run or queued input remains in a reply's session; a running turn is aborted. Runs
     /// end with their serve, and the Node stops the serve of an earlier run when it opens.
     pub(crate) async fn run_ended(&self, session: &str) -> bool {
-        let Some(conn) = self.running().await else {
-            return true;
-        };
-        match self.session(&conn, session).await {
-            Ok(Some(_)) => {}
-            Ok(None) => return true,
-            Err(_) => return false,
-        }
-        let pending = match self.inbox(&conn, session).await {
-            Ok(items) => !items.is_empty(),
-            Err(_) => return false,
-        };
-        match self.busy(&conn, session).await {
-            Ok(false) => !pending,
-            Ok(true) => {
-                let _ = self.abort(&conn, session).await;
-                false
+        let ended = async {
+            let Some(conn) = self.running().await else {
+                return true;
+            };
+            match self.session(&conn, session).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return true,
+                Err(_) => return false,
             }
-            Err(_) => false,
+            let pending = match self.inbox(&conn, session).await {
+                Ok(items) => !items.is_empty(),
+                Err(_) => return false,
+            };
+            match self.busy(&conn, session).await {
+                Ok(false) => !pending,
+                Ok(true) => {
+                    let _ = self.abort(&conn, session).await;
+                    false
+                }
+                Err(_) => false,
+            }
         }
+        .await;
+        if ended {
+            self.unresolved_uses
+                .lock()
+                .expect("unresolved uses")
+                .remove(&format!("session:{session}"));
+        }
+        ended
     }
 
     /// One bot turn in its session on the serve. The session is created and saved before
@@ -814,8 +933,20 @@ impl Opencode {
             return Err(stopped(previous));
         }
         let model = parse_model(&config.model).map_err(|failure| failed(previous, failure))?;
-        let (conn, _serving) =
-            (self.conn().await).map_err(|e| failed(previous, launch_failure(&e)))?;
+        let expected = match &config.sdk {
+            Sdk::Opencode { bin, .. } => Launch {
+                bin: bin.clone(),
+                env: config.provider_env.clone(),
+            },
+            _ => {
+                return Err(failed(
+                    previous,
+                    own("opencode needs its captured launch configuration"),
+                ));
+            }
+        };
+        let (conn, serving) = (self.conn_for(Some(expected)).await)
+            .map_err(|e| failed(previous, launch_failure(&e)))?;
         let resumed = match previous {
             Some(id) => self.session(&conn, id).await.map_err(|e| {
                 failed(
@@ -901,10 +1032,13 @@ impl Opencode {
             events_tx,
             up,
         );
-        let _guard = TurnGuard {
+        let mut guard = TurnGuard {
             owner: self,
             session: session.clone(),
             events: tokio::spawn(follow),
+            serving: Some(serving),
+            start: &start,
+            terminal: false,
         };
         // Progress is best effort: the turn goes on without the stream after a while.
         let _ = tokio::time::timeout(Duration::from_secs(5), ready).await;
@@ -953,6 +1087,7 @@ impl Opencode {
             && let Err(e) = (turn.record)(session.clone(), Some(message.clone())).await
         {
             let kind = if self.stop_run(&conn, &session, &message).await {
+                guard.terminal = true;
                 ManagerFailure::Failed
             } else {
                 ManagerFailure::Unknown
@@ -973,6 +1108,7 @@ impl Opencode {
                 _ = agent::wait_for_cancel(&mut cancel) => {
                     let last = self.close(&session);
                     break if self.stop_run(&conn, &session, &last).await {
+                        guard.terminal = true;
                         Err(error(ManagerFailure::Cancelled, native, own("opencode run stopped")))
                     } else {
                         Err(unknown(native, "opencode did not confirm the stop"))
@@ -981,6 +1117,7 @@ impl Opencode {
                 _ = tokio::time::sleep_until(deadline) => {
                     let last = self.close(&session);
                     let kind = if self.stop_run(&conn, &session, &last).await {
+                        guard.terminal = true;
                         ManagerFailure::Failed
                     } else {
                         ManagerFailure::Unknown
@@ -995,7 +1132,7 @@ impl Opencode {
                         {
                             // Not knowing what was shown, the run must not go on unseen.
                             let last = self.close(&session);
-                            self.stop_run(&conn, &session, &last).await;
+                            guard.terminal = self.stop_run(&conn, &session, &last).await;
                             break Err(unknown(native, &e.to_string()));
                         }
                         matches!(
@@ -1019,6 +1156,7 @@ impl Opencode {
                 continue;
             }
             if (self.running().await).is_none_or(|now| now.started_ms != conn.started_ms) {
+                guard.terminal = true;
                 self.close(&session);
                 let lost = ExecFailure::new(
                     FailureKind::Lost,
@@ -1028,6 +1166,7 @@ impl Opencode {
             }
             let errored = seen.error.is_some();
             if let Ok(Some(messages)) = self.settled(&conn, &session, errored).await {
+                guard.terminal = true;
                 break Ok(messages);
             }
         }?;
@@ -1434,7 +1573,7 @@ async fn follow(node: std::sync::Weak<Runtime>, network: String, work_id: String
 /// opencode works run on the Node's serve: the Node creates the session, journals it and sends
 /// the work itself under a message ID made from the work ID.
 impl Executor for Opencode {
-    fn start<'a>(
+    fn start_or_resume<'a>(
         &'a self,
         node: &'a Arc<Runtime>,
         network: &'a str,
@@ -1458,7 +1597,8 @@ impl Executor for Opencode {
                 Ok(model) => model,
                 Err(failure) => return reject(failure),
             };
-            let (conn, serving) = match self.conn().await {
+            let expected = self.launch.lock().expect("launch").current.clone();
+            let (conn, serving) = match self.conn_for(Some(expected)).await {
                 Ok(conn) => conn,
                 Err(error) => return reject(launch_failure(&error)),
             };
@@ -1583,9 +1723,27 @@ impl Executor for Opencode {
                 }
             }
             let follower = follow(Arc::downgrade(node), network.to_owned(), id.to_owned());
+            let owner = node.opencode.clone();
+            let held_work = id.to_owned();
+            let runtime = Arc::downgrade(node);
             tokio::spawn(async move {
                 follower.await;
-                drop(serving);
+                let Some(node) = runtime.upgrade() else {
+                    return;
+                };
+                let store = node.store.lock().await;
+                let finished = store
+                    .work_record(&held_work)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.state.finished());
+                if !finished {
+                    owner
+                        .unresolved_uses
+                        .lock()
+                        .expect("unresolved uses")
+                        .insert(format!("work:{held_work}"), serving);
+                }
             });
             Ok(false)
         })
@@ -1693,7 +1851,7 @@ impl Executor for Opencode {
         })
     }
 
-    fn steer<'a>(
+    fn send_turn<'a>(
         &'a self,
         into: &'a SteerTarget,
         message_id: &'a str,
@@ -2284,9 +2442,17 @@ mod tests {
 
     fn bot(place: &Place, server: &Arc<Opencode>, client: &str, turns: &Turns) -> ManagerConfig {
         let turns = turns.clone();
+        let launch = server.launch.lock().expect("launch").current.clone();
+        let lease = Arc::new(
+            server
+                .lease(&launch.bin, &launch.env)
+                .expect("fixture launch"),
+        );
         ManagerConfig {
             sdk: Sdk::Opencode {
                 server: server.clone(),
+                bin: launch.bin,
+                launch: Some(lease),
             },
             workspace: place.dir.join("work"),
             model: "fake/m".into(),
@@ -2296,7 +2462,7 @@ mod tests {
             instructions: "Answer briefly.".into(),
             tool_env: BTreeMap::from([("VIBEFACE_NODE_URL".into(), "http://127.0.0.1:9".into())]),
             tool_token: Some("tool-token-fixture".into()),
-            provider_env: BTreeMap::new(),
+            provider_env: launch.env,
             process_started: None,
             codex_turn: Some(CodexTurn {
                 client_id: client.into(),
@@ -2523,7 +2689,7 @@ mod tests {
                 turn_id,
             };
             assert_eq!(
-                server.steer(&into, "m-1", "also this").await,
+                server.send_turn(&into, "m-1", "also this").await,
                 SteerAck::Accepted
             );
             into
@@ -2543,7 +2709,7 @@ mod tests {
             Some(SteerTrace::NotArrived)
         );
         assert_eq!(
-            server.steer(&into, "m-3", "late").await,
+            server.send_turn(&into, "m-3", "late").await,
             SteerAck::Refused("the reply already ended".into())
         );
         Ok(())
@@ -2663,7 +2829,7 @@ mod tests {
                 };
                 assert_eq!(
                     server
-                        .steer(&target, &format!("m-{index}"), &format!("only-{index}"))
+                        .send_turn(&target, &format!("m-{index}"), &format!("only-{index}"))
                         .await,
                     SteerAck::Accepted
                 );
@@ -3192,13 +3358,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unknown_turn_keeps_its_serve_until_read_back_confirms_it_ended() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let (conn, serving) = server.conn().await?;
+        let session = server
+            .create(&conn, place.dir.to_str().unwrap(), None)
+            .await
+            .expect("fixture session");
+        let start = std::sync::Mutex::new(manager::StartEvidence::Started);
+        drop(TurnGuard {
+            owner: &server,
+            session: session.clone(),
+            events: tokio::spawn(async {}),
+            serving: Some(serving),
+            start: &start,
+            terminal: false,
+        });
+        assert_eq!(server.users.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut expected = server.launch.lock().expect("launch").current.clone();
+        expected
+            .env
+            .insert("VIBEFACE_FAKE_LAUNCH".into(), "after-unknown".into());
+        server.set_launch(expected.bin.clone(), expected.env.clone());
+        assert!(server.configuration_pending(&expected.bin, &expected.env));
+        assert!(server.run_ended(&session).await);
+        assert_eq!(server.users.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!server.configuration_pending(&expected.bin, &expected.env));
+        server.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_changed_launch_waits_until_nothing_runs_on_the_serve() -> Result<()> {
         let place = Place::new().await?;
         let server = place.opencode()?;
+        let old = server.launch.lock().expect("launch").current.clone();
+        let captured = server.lease(&old.bin, &old.env)?;
+        assert!(
+            server.serve.lock().await.is_none(),
+            "capturing configuration does not launch a provider"
+        );
         let (running, serving) = server.conn().await?;
-        let Launch { bin, mut env } = server.launch.lock().expect("launch").clone();
+        let Launch { bin, mut env } = old;
         env.insert("VIBEFACE_FAKE_LAUNCH".into(), "2".into());
+        let expected = Launch {
+            bin: bin.clone(),
+            env: env.clone(),
+        };
         server.set_launch(bin, env);
+        assert!(server.configuration_pending(&expected.bin, &expected.env));
+        assert!(server.lease(&expected.bin, &expected.env).is_err());
+        assert!(server.launch.lock().expect("launch").pending.is_some());
+        drop(captured);
+        assert!(
+            server.conn_for(Some(expected.clone())).await.is_err(),
+            "a new generation cannot run with the active generation's environment"
+        );
         let (during, _) = server.conn().await?;
         assert_eq!(
             (during.base, during.started_ms),
@@ -3206,7 +3422,7 @@ mod tests {
             "a run in progress keeps its serve"
         );
         drop(serving);
-        let (after, _) = server.conn().await?;
+        let (after, _) = server.conn_for(Some(expected)).await?;
         assert_ne!(
             (after.base, after.started_ms),
             (running.base, running.started_ms),

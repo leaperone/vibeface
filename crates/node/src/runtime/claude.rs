@@ -995,7 +995,7 @@ async fn follow(
 /// continues, with its prompt as a user message whose ID comes from the work ID too. The
 /// Node starts the process itself, so the dispatching Agent sends nothing.
 impl Executor for Claude {
-    fn start<'a>(
+    fn start_or_resume<'a>(
         &'a self,
         node: &'a Arc<Runtime>,
         network: &'a str,
@@ -1146,7 +1146,12 @@ impl Executor for Claude {
         })
     }
 
-    fn steer<'a>(&'a self, _: &'a SteerTarget, _: &'a str, _: &'a str) -> BoxFuture<'a, SteerAck> {
+    fn send_turn<'a>(
+        &'a self,
+        _: &'a SteerTarget,
+        _: &'a str,
+        _: &'a str,
+    ) -> BoxFuture<'a, SteerAck> {
         Box::pin(async {
             SteerAck::Refused(
                 "Claude Code takes no message into a running turn: a user message sent then waits for a turn of its own"
@@ -2044,7 +2049,7 @@ mod tests {
     struct Unstartable;
 
     impl Executor for Unstartable {
-        fn start<'a>(
+        fn start_or_resume<'a>(
             &'a self,
             _: &'a Arc<Runtime>,
             _: &'a str,
@@ -2063,7 +2068,7 @@ mod tests {
             unreachable!()
         }
 
-        fn steer<'a>(
+        fn send_turn<'a>(
             &'a self,
             _: &'a SteerTarget,
             _: &'a str,

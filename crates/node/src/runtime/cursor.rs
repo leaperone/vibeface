@@ -465,7 +465,7 @@ impl CursorExecutor {
 }
 
 impl Executor for CursorExecutor {
-    fn start<'a>(
+    fn start_or_resume<'a>(
         &'a self,
         node: &'a Arc<Runtime>,
         network: &'a str,
@@ -615,7 +615,7 @@ impl Executor for CursorExecutor {
         })
     }
 
-    fn steer<'a>(
+    fn send_turn<'a>(
         &'a self,
         _: &'a crate::scheduling::SteerTarget,
         _: &'a str,

@@ -28,6 +28,16 @@ pub enum CursorInstance {
         network: String,
         conversation: String,
     },
+    Task {
+        network: String,
+        conversation: String,
+        work_id: String,
+    },
+    Routine {
+        network: String,
+        conversation: String,
+        trigger: String,
+    },
     Work {
         network: String,
         conversation: String,
@@ -46,6 +56,26 @@ impl CursorInstance {
                 "bot:{}:{network}:{}:{conversation}",
                 network.len(),
                 conversation.len()
+            ),
+            Self::Task {
+                network,
+                conversation,
+                work_id,
+            } => format!(
+                "task:{}:{network}:{}:{conversation}:{}:{work_id}",
+                network.len(),
+                conversation.len(),
+                work_id.len()
+            ),
+            Self::Routine {
+                network,
+                conversation,
+                trigger,
+            } => format!(
+                "routine:{}:{network}:{}:{conversation}:{}:{trigger}",
+                network.len(),
+                conversation.len(),
+                trigger.len()
             ),
             Self::Work {
                 network,
@@ -75,7 +105,10 @@ pub enum Sdk {
     },
     /// Turns run on this Node's Codex App Server at `socket`; `vibeface tool` reads the turn
     /// from the Shell environment the thread was created with.
-    Codex { socket: PathBuf },
+    Codex {
+        socket: PathBuf,
+        launch: Option<Arc<std::sync::Mutex<crate::runtime::codex_server::CodexLease>>>,
+    },
     /// Each turn is one `claude -p` process; `processes` records its group.
     Claude {
         bin: PathBuf,
@@ -90,6 +123,8 @@ pub enum Sdk {
     /// environment the serve's plugin gives the session's shells.
     Opencode {
         server: Arc<crate::runtime::opencode::Opencode>,
+        bin: PathBuf,
+        launch: Option<Arc<crate::runtime::opencode::OpencodeLease>>,
     },
 }
 
@@ -143,6 +178,42 @@ pub struct ManagerConfig {
 }
 
 impl ManagerConfig {
+    /// Only the digest leaves this device; configured environment values stay private.
+    pub(crate) fn runtime_fingerprint(&self, local: &crate::providers::Local) -> Result<String> {
+        let launch = match &self.sdk {
+            Sdk::Cursor {
+                sdk_bin,
+                owner,
+                local_store_root,
+                ..
+            } => json!({"bin":sdk_bin,"owner":owner,"local_store_root":local_store_root}),
+            Sdk::Codex { socket, launch } => {
+                let lease = launch
+                    .as_ref()
+                    .map(|lease| lease.lock().expect("Codex lease"));
+                let target = lease.as_ref().map(|lease| lease.target());
+                match target {
+                    Some(crate::providers::CodexTarget::System(path)) => {
+                        json!({"mode":"system","socket":path,"agent_socket":socket})
+                    }
+                    Some(crate::providers::CodexTarget::Spawn(launch)) => {
+                        json!({"mode":"spawn","bin":launch.bin,"agent_socket":socket})
+                    }
+                    _ => json!({"mode":"direct","socket":socket}),
+                }
+            }
+            Sdk::Claude { bin, .. } | Sdk::Pi { bin, .. } => json!({"bin":bin}),
+            Sdk::Opencode { bin, .. } => json!({"bin":bin}),
+        };
+        let environment_digest = crate::crypto::digest(&serde_json::to_vec(&self.provider_env)?);
+        Ok(crate::crypto::digest(&serde_json::to_vec(&json!({
+            "provider":self.sdk.provider(), "launch":launch,
+            "workspace":self.workspace,"model":self.model,
+            "environment_digest":environment_digest,
+            "execution":local.switches.execution,
+        }))?))
+    }
+
     pub fn for_cursor_instance(
         mut self,
         instance: CursorInstance,
@@ -306,8 +377,15 @@ where
                     .into()
                 })
         }
-        Sdk::Codex { socket } => {
-            run_codex(
+        Sdk::Codex { socket, launch } => {
+            if let (Some(lease), Some(turn)) = (launch, &config.codex_turn) {
+                lease
+                    .lock()
+                    .expect("Codex lease")
+                    .bind_turn(&turn.client_id)
+                    .map_err(ManagerError::not_started)?;
+            }
+            let result = run_codex(
                 config,
                 socket,
                 prompt,
@@ -316,7 +394,17 @@ where
                 cancel,
                 progress,
             )
-            .await
+            .await;
+            if result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<ManagerError>())
+                .is_some_and(ManagerError::uncertain)
+                && let Some(lease) = launch
+            {
+                lease.lock().expect("Codex lease").retain_until_read_back();
+            }
+            result
         }
         Sdk::Claude { bin, processes } => {
             crate::runtime::claude::run_bot(
@@ -343,7 +431,7 @@ where
             )
             .await
         }
-        Sdk::Opencode { server } => {
+        Sdk::Opencode { server, .. } => {
             server
                 .run_turn(
                     config,
@@ -644,7 +732,13 @@ where
                 .map_err(|e| failed(native, own(format!("record the Codex turn: {e}"))))?;
             turn.client_id.clone()
         }
-        None => uuid::Uuid::new_v4().to_string(),
+        None => match &config.sdk {
+            Sdk::Codex {
+                launch: Some(lease),
+                ..
+            } => lease.lock().expect("Codex lease").client_id().to_owned(),
+            _ => uuid::Uuid::new_v4().to_string(),
+        },
     };
     let mut turn_params = json!({"threadId":thread,"clientUserMessageId":client_id,
         "input":[{"type":"text","text":prompt,"text_elements":[]}]});
@@ -936,7 +1030,10 @@ mod tests {
 
     fn codex(workspace: PathBuf, socket: PathBuf) -> ManagerConfig {
         ManagerConfig {
-            sdk: Sdk::Codex { socket },
+            sdk: Sdk::Codex {
+                socket,
+                launch: None,
+            },
             workspace,
             model: String::new(),
             timeout_secs: 5,
@@ -949,6 +1046,74 @@ mod tests {
             process_started: None,
             codex_turn: None,
         }
+    }
+
+    #[test]
+    fn runtime_identity_uses_the_captured_sdk_and_private_environment() -> Result<()> {
+        let mut config = codex(
+            "/fixture/workspace".into(),
+            "/fixture/app-server.sock".into(),
+        );
+        config
+            .provider_env
+            .insert("FIXTURE_MODEL_KEY".into(), "private-fixture-value".into());
+        let mut local = crate::providers::Local {
+            switches: Default::default(),
+            bins: BTreeMap::new(),
+            env: Default::default(),
+        };
+        let original = config.runtime_fingerprint(&local)?;
+        assert_eq!(original.len(), 64);
+        assert!(!original.contains("private-fixture-value"));
+        local
+            .bins
+            .insert(crate::providers::Provider::Codex, "/another/codex".into());
+        assert_eq!(
+            config.runtime_fingerprint(&local)?,
+            original,
+            "the captured direct SDK still uses its original socket"
+        );
+        config
+            .provider_env
+            .insert("FIXTURE_MODEL_KEY".into(), "changed-fixture-value".into());
+        let changed = config.runtime_fingerprint(&local)?;
+        assert_ne!(original, changed);
+        config.model = "fixture-model".into();
+        assert_ne!(changed, config.runtime_fingerprint(&local)?);
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_task_and_routine_instances_do_not_share_the_bot_or_work_store() {
+        let network = "network".to_owned();
+        let conversation = "conversation".to_owned();
+        let instances = [
+            CursorInstance::Bot {
+                network: network.clone(),
+                conversation: conversation.clone(),
+            },
+            CursorInstance::Task {
+                network: network.clone(),
+                conversation: conversation.clone(),
+                work_id: "same".into(),
+            },
+            CursorInstance::Routine {
+                network: network.clone(),
+                conversation: conversation.clone(),
+                trigger: "same".into(),
+            },
+            CursorInstance::Work {
+                network,
+                conversation,
+                root_work: "same".into(),
+            },
+            CursorInstance::Coordination,
+        ];
+        let keys: std::collections::BTreeSet<_> = instances
+            .into_iter()
+            .map(|instance| instance.key())
+            .collect();
+        assert_eq!(keys.len(), 5);
     }
 
     #[derive(Clone, Copy, PartialEq)]

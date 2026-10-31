@@ -25,6 +25,14 @@ fn last_answer(turn: &Value) -> String {
         .into()
 }
 
+fn missing_thread(error: &CodexError) -> bool {
+    error.answered
+        && error
+            .message
+            .to_ascii_lowercase()
+            .starts_with("thread not found")
+}
+
 /// Whether a turn carries the user message the caller sent with this `clientUserMessageId`.
 pub(crate) fn sent_by(turn: &Value, client_id: &str) -> bool {
     turn["items"]
@@ -172,7 +180,10 @@ impl CodexServer {
         {
             Ok(reply) => reply,
             // Only the App Server saying it has no such thread makes the turn missing.
-            Err(error) if error.answered => return Ok(Probe::Missing),
+            Err(error) if missing_thread(&error) => {
+                self.inner.release(&format!("manager:{client_id}"));
+                return Ok(Probe::Missing);
+            }
             Err(error) => return Err(error),
         };
         let turns = reply["thread"]["turns"]
@@ -183,39 +194,67 @@ impl CodexServer {
             Some(turn) => turns.iter().find(|t| t["id"] == turn),
             None => match turns.iter().find(|t| sent_by(t, client_id)) {
                 Some(found) => Some(found),
-                None => return Ok(Probe::NotStarted),
+                None => {
+                    self.inner.release(&format!("manager:{client_id}"));
+                    return Ok(Probe::NotStarted);
+                }
             },
         };
         let Some(found) = found else {
+            self.inner.release(&format!("manager:{client_id}"));
             return Ok(Probe::Missing);
         };
         let snapshot = turn_snapshot(found);
         let turn_id = snapshot.id.unwrap_or_default();
-        Ok(match snapshot.status {
+        let probe = match snapshot.status {
             Some(TurnStatus::InProgress) => Probe::Running { turn_id, epoch },
-            Some(status) => Probe::Terminal {
+            Some(
+                status @ (TurnStatus::Completed | TurnStatus::Interrupted | TurnStatus::Failed),
+            ) => Probe::Terminal {
                 turn_id,
                 status,
                 text: last_answer(found),
                 error: snapshot.error,
             },
-            None => Probe::Missing,
-        })
+            _ => {
+                return Err(CodexError {
+                    uncertain: false,
+                    answered: true,
+                    message: "Codex did not report a known turn status".into(),
+                });
+            }
+        };
+        if !matches!(probe, Probe::Running { .. }) {
+            self.inner.release(&format!("manager:{client_id}"));
+        }
+        Ok(probe)
     }
 }
 
 /// A Codex work is sent by the coordination Agent on its own App Server connection; the Node's
 /// client reads, stops and steers turns.
 impl Executor for CodexServer {
-    fn start<'a>(
+    fn model_catalog(&self) -> BoxFuture<'_, Option<Vec<ModelChoice>>> {
+        Box::pin(self.models())
+    }
+
+    fn start_or_resume<'a>(
         &'a self,
-        _: &'a Arc<Runtime>,
+        node: &'a Arc<Runtime>,
         _: &'a str,
-        _: &'a WorkSpec,
+        work: &'a WorkSpec,
         _: Option<&'a str>,
         _: &'a Value,
     ) -> BoxFuture<'a, Result<bool>> {
-        Box::pin(async { Ok(true) })
+        Box::pin(async move {
+            let expected = node.providers().codex_target(
+                node.manager()
+                    .is_some_and(|manager| manager.provider.on_app_server()),
+            );
+            self.inner
+                .hold(format!("work:{}", work.work_id), &expected)?;
+            Ok(true)
+        })
     }
 
     fn probe<'a>(&'a self, work: &'a WorkRecord) -> BoxFuture<'a, Result<Probe>> {
@@ -237,7 +276,7 @@ impl Executor for CodexServer {
         })
     }
 
-    fn steer<'a>(
+    fn send_turn<'a>(
         &'a self,
         into: &'a SteerTarget,
         message_id: &'a str,
@@ -282,7 +321,7 @@ impl Executor for CodexServer {
 /// The Node's own client observes, probes and interrupts; the coordination Agent sends turns on
 /// its own connection to the same App Server. That App Server is the one already running on this
 /// computer, whose sessions the owner shares, or one the Node starts itself.
-pub(crate) struct CodexServer {
+pub struct CodexServer {
     client: CodexClient,
     inner: Arc<Inner>,
     /// Wakes sends waiting for the client to connect.
@@ -300,7 +339,7 @@ struct Inner {
     client: CodexClient,
     /// The socket the client connects to; the supervisor moves it.
     endpoint: tokio::sync::watch::Sender<Option<PathBuf>>,
-    target: std::sync::Mutex<CodexTarget>,
+    target: std::sync::Mutex<TargetState>,
     /// Wakes the supervisor for a new target.
     changed: tokio::sync::Notify,
     /// Where an App Server the Node starts listens.
@@ -312,6 +351,62 @@ struct Inner {
     link: std::sync::Mutex<Link>,
     group: std::sync::Mutex<Option<i32>>,
     stopping: std::sync::atomic::AtomicBool,
+}
+
+struct TargetState {
+    current: CodexTarget,
+    applied: Option<CodexTarget>,
+    pending: Option<CodexTarget>,
+    leases: BTreeSet<String>,
+}
+
+/// An unknown turn keeps its launch until read-back proves it ended.
+pub struct CodexLease {
+    inner: Arc<Inner>,
+    id: String,
+    retained: bool,
+    target: CodexTarget,
+}
+
+impl CodexLease {
+    pub(crate) fn target(&self) -> &CodexTarget {
+        &self.target
+    }
+
+    pub(crate) fn client_id(&self) -> &str {
+        self.id.strip_prefix("manager:").expect("manager lease")
+    }
+
+    pub(crate) fn bind_turn(&mut self, client_id: &str) -> Result<()> {
+        ensure!(
+            !self.retained,
+            "read back the unknown Codex turn before reusing its launch"
+        );
+        let id = format!("manager:{client_id}");
+        if id != self.id {
+            let mut target = self.inner.target.lock().expect("target lock");
+            ensure!(
+                !target.leases.contains(&id),
+                "Codex turn already holds its launch"
+            );
+            ensure!(target.leases.remove(&self.id), "Codex launch lease ended");
+            target.leases.insert(id.clone());
+            self.id = id;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retain_until_read_back(&mut self) {
+        self.retained = true;
+    }
+}
+
+impl Drop for CodexLease {
+    fn drop(&mut self) {
+        if !self.retained {
+            self.inner.release(&self.id);
+        }
+    }
 }
 
 /// The App Server as the settings page shows it.
@@ -433,6 +528,40 @@ fn socket_dir(identity: &LocalIdentity, data_dir: &Path) -> Result<PathBuf> {
 }
 
 impl Inner {
+    fn hold(&self, id: String, expected: &CodexTarget) -> Result<()> {
+        let mut target = self.target.lock().expect("target lock");
+        ensure!(
+            *expected != CodexTarget::Off,
+            "Codex App Server is not configured"
+        );
+        ensure!(
+            &target.current == expected
+                && target.pending.is_none()
+                && target
+                    .applied
+                    .as_ref()
+                    .is_none_or(|applied| applied == expected),
+            "Codex launch changed; wait for active turns and capture its configuration again"
+        );
+        ensure!(
+            target.leases.insert(id),
+            "Codex turn already holds its launch; read it back before retrying"
+        );
+        Ok(())
+    }
+
+    fn release(&self, id: &str) {
+        let mut target = self.target.lock().expect("target lock");
+        if target.leases.remove(id)
+            && target.leases.is_empty()
+            && let Some(pending) = target.pending.take()
+        {
+            target.current = pending;
+            self.set_link(Link::Starting);
+            self.changed.notify_one();
+        }
+    }
+
     fn stopping(&self) -> bool {
         self.stopping.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -452,6 +581,8 @@ impl Inner {
             {
                 tracing::warn!(event = "app_server.link_failed", %error, "the Agent's App Server link was not updated");
             }
+        } else {
+            let _ = std::fs::remove_file(&self.agent_socket);
         }
         self.endpoint.send_replace(socket);
     }
@@ -551,6 +682,7 @@ impl Inner {
                 return false;
             }
         };
+        self.target.lock().expect("target lock").applied = Some(CodexTarget::Spawn(launch.clone()));
         self.set_link(Link::Starting);
         let limit = tokio::time::sleep(START_LIMIT);
         tokio::pin!(limit);
@@ -601,6 +733,7 @@ impl Inner {
             }
         };
         let _ = std::fs::remove_file(&self.pidfile);
+        self.target.lock().expect("target lock").applied = None;
         replaced
     }
 
@@ -612,6 +745,8 @@ impl Inner {
             });
         }
         self.point(Some(socket.clone()));
+        self.target.lock().expect("target lock").applied =
+            Some(CodexTarget::System(socket.clone()));
         let mut away = 0;
         loop {
             if self.wait(1).await {
@@ -643,7 +778,7 @@ impl Inner {
     async fn supervise(self: Arc<Self>) {
         let mut backoff = 1;
         while !self.stopping() {
-            let target = self.target.lock().expect("target lock").clone();
+            let target = self.target.lock().expect("target lock").current.clone();
             let started = Instant::now();
             let replaced = match &target {
                 CodexTarget::Off => {
@@ -684,10 +819,16 @@ impl CodexServer {
             CodexTarget::System(socket) => Some(socket.clone()),
             _ => None,
         };
+        let applied = named.as_ref().map(|_| target.clone());
         let inner = Inner {
             client: client.clone(),
             endpoint,
-            target: std::sync::Mutex::new(target),
+            target: std::sync::Mutex::new(TargetState {
+                current: target,
+                applied,
+                pending: None,
+                leases: BTreeSet::new(),
+            }),
             changed: tokio::sync::Notify::new(),
             spawn_socket: directory.join("codex.sock"),
             agent_socket: directory.join("app-server.sock"),
@@ -719,7 +860,7 @@ impl CodexServer {
     /// Whether the client is connected, waiting up to `READY_WAIT` while the supervisor and the
     /// client's backoff bring it up. With Codex turned off it does not wait.
     pub(crate) async fn ready(&self) -> bool {
-        if *self.inner.target.lock().expect("target lock") == CodexTarget::Off {
+        if self.inner.target.lock().expect("target lock").current == CodexTarget::Off {
             return false;
         }
         let up = async {
@@ -736,7 +877,12 @@ impl CodexServer {
 
     /// The App Server the current target uses, as `CodexTarget::server` names it.
     pub(crate) fn server(&self) -> String {
-        self.inner.target.lock().expect("target lock").server()
+        self.inner
+            .target
+            .lock()
+            .expect("target lock")
+            .current
+            .server()
     }
 
     /// The socket the coordination Agent connects to; it follows the App Server in use.
@@ -744,16 +890,45 @@ impl CodexServer {
         self.inner.agent_socket.clone()
     }
 
-    /// Switches to `target`. A new launch ends the App Server the Node started; the system App
-    /// Server is left running whatever the target.
+    /// Switches after active turns end. The system App Server is always left running.
     pub(crate) fn retarget(&self, target: CodexTarget) {
-        let mut current = self.inner.target.lock().expect("target lock");
-        if *current == target {
+        let mut state = self.inner.target.lock().expect("target lock");
+        if state.current == target {
+            state.pending = None;
             return;
         }
-        *current = target;
+        if !state.leases.is_empty() {
+            state.pending = Some(target);
+            return;
+        }
+        state.current = target;
+        state.pending = None;
         self.inner.set_link(Link::Starting);
         self.inner.changed.notify_one();
+    }
+
+    pub(crate) fn lease(&self, id: String, expected: &CodexTarget) -> Result<CodexLease> {
+        self.inner.hold(id.clone(), expected)?;
+        Ok(CodexLease {
+            inner: self.inner.clone(),
+            id,
+            retained: false,
+            target: expected.clone(),
+        })
+    }
+
+    pub(crate) fn release_work(&self, work_id: &str) {
+        self.inner.release(&format!("work:{work_id}"));
+    }
+
+    pub(crate) fn configuration_pending(&self, expected: &CodexTarget) -> bool {
+        let target = self.inner.target.lock().expect("target lock");
+        target.current != *expected
+            || target.pending.is_some()
+            || target
+                .applied
+                .as_ref()
+                .is_some_and(|applied| applied != expected)
     }
 
     pub(crate) async fn link(&self) -> Link {
@@ -775,7 +950,13 @@ impl CodexServer {
     /// A fresh handshake with the App Server the current target uses, beside the client's own
     /// connection. A live one the client is backing off from is retried now.
     pub(crate) async fn test(&self) -> Link {
-        let target = self.inner.target.lock().expect("target lock").clone();
+        let target = self
+            .inner
+            .target
+            .lock()
+            .expect("target lock")
+            .current
+            .clone();
         let candidates = match &target {
             CodexTarget::Off => return Link::Off,
             CodexTarget::Spawn(_) => vec![self.inner.spawn_socket.clone()],
@@ -881,6 +1062,19 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_refusal_does_not_prove_an_unknown_turn_ended() {
+        let error = |message: &str, answered| CodexError {
+            uncertain: false,
+            answered,
+            message: message.into(),
+        };
+        assert!(missing_thread(&error("thread not found: fixture", true)));
+        assert!(!missing_thread(&error("authentication required", true)));
+        assert!(!missing_thread(&error("server request rejected", true)));
+        assert!(!missing_thread(&error("thread not found", false)));
+    }
 
     #[test]
     fn model_choices_take_the_name_thread_start_uses_and_skip_hidden_ones() {
@@ -1085,11 +1279,35 @@ mod tests {
             "only Codex variables reach it"
         );
 
+        let expected = local.codex_target(false);
+        let mut bot = server.lease("manager:capture-fixture".into(), &expected)?;
+        server.inner.hold("work:fixture-work".into(), &expected)?;
+
         local.env.apply(
             Provider::Codex,
             BTreeMap::from([("CPA_API_KEY".into(), Some("fixture-replaced-key".into()))]),
         )?;
         server.retarget(local.codex_target(false));
+        bot.bind_turn("fixture-bot")?;
+        assert!(bot.target() == &expected);
+        assert_eq!(bot.client_id(), "fixture-bot");
+        assert!(group_alive(pid.parse()?));
+        assert!(server.inner.target.lock().unwrap().pending.is_some());
+        assert!(
+            server
+                .lease("manager:new-generation".into(), &local.codex_target(false))
+                .is_err()
+        );
+        bot.retain_until_read_back();
+        assert!(bot.bind_turn("another-turn").is_err());
+        drop(bot);
+        server.inner.release("manager:fixture-bot");
+        assert!(
+            group_alive(pid.parse()?),
+            "the dispatched work still uses the old launch"
+        );
+        assert!(server.inner.target.lock().unwrap().pending.is_some());
+        server.release_work("fixture-work");
         let second = lines(&out, 2).await;
         assert!(second[1].ends_with(" fixture-replaced-key none"));
         assert!(ended(pid.parse()?).await, "the old App Server ends");

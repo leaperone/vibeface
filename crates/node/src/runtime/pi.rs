@@ -1081,7 +1081,7 @@ impl Runtime {
 /// work that continues another one runs in a fork of that one's session, and one given a
 /// thread goes on in that session, which one of this device's works ran in.
 impl Executor for Pi {
-    fn start<'a>(
+    fn start_or_resume<'a>(
         &'a self,
         node: &'a Arc<Runtime>,
         network: &'a str,
@@ -1299,7 +1299,7 @@ impl Executor for Pi {
         })
     }
 
-    fn steer<'a>(
+    fn send_turn<'a>(
         &'a self,
         into: &'a SteerTarget,
         message_id: &'a str,
@@ -1711,7 +1711,7 @@ mod tests {
                 turn_id,
             };
             assert_eq!(
-                pi.steer(&into, "m-1", "also this").await,
+                pi.send_turn(&into, "m-1", "also this").await,
                 SteerAck::Accepted
             );
             into
@@ -1727,7 +1727,7 @@ mod tests {
             Some(SteerTrace::NotArrived)
         );
         assert_eq!(
-            pi.steer(&into, "m-3", "late").await,
+            pi.send_turn(&into, "m-3", "late").await,
             SteerAck::Refused("the pi turn is not running".into())
         );
         std::fs::remove_dir_all(&dir)?;
