@@ -245,6 +245,7 @@ impl Runtime {
                 EventBody::MessagePosted { message_id: id, .. } => message_id = Some(id.clone()),
                 EventBody::QuestionAsked { .. }
                 | EventBody::QuestionClosed { .. }
+                | EventBody::SessionAttributed { .. }
                 | EventBody::NotificationAcked { .. } => {}
                 body => match body.work_id() {
                     Some(id) => work_id = Some(id.into()),
@@ -286,6 +287,7 @@ impl Runtime {
             "busy":store.busy_conversations()?.remove(scope),
             "questions":store.conversation_questions(network, scope)?,
             "sent":store.sent_bot_messages(network, scope)?,
+            "open_works":open_works(&store, network, Some(scope))?,
             "notifications":notifications,
             "deliveries":deliveries(&store, network, scope)?,
             "checks":without_work_checks(checks, &works),
@@ -319,7 +321,8 @@ fn deliveries(store: &Store, network: &str, scope: &str) -> Result<Vec<Value>> {
         let spec = &dispatch.spec;
         deliveries.push(
             json!({"work_id":spec.work_id,"target_node":spec.target,"state":dispatch.state.name(),
-            "kind":spec.kind,"title":spec.title,"cwd":spec.cwd,"reason":dispatch.state.reason()}),
+            "kind":spec.kind,"title":spec.title,"cwd":spec.cwd,"reason":dispatch.state.reason(),
+            "failure":dispatch.state.failure(),"trigger":spec.trigger,"prompt":spec.prompt}),
         );
     }
     for stop in store.stop_requests()? {
@@ -329,4 +332,25 @@ fn deliveries(store: &Store, network: &str, scope: &str) -> Result<Vec<Value>> {
         }
     }
     Ok(deliveries)
+}
+
+/// Works in `scope`, or every conversation, that want the user, as `open_works` lists them: the
+/// DAG's open works and unanswered failures, then this Node's refused dispatches still unanswered.
+pub(super) fn open_works(store: &Store, network: &str, scope: Option<&str>) -> Result<Vec<Value>> {
+    let mut works = store
+        .open_works(network, scope)?
+        .into_iter()
+        .map(|work| Ok(serde_json::to_value(work)?))
+        .collect::<Result<Vec<_>>>()?;
+    for dispatch in store.open_dispatches(network, scope)? {
+        let spec = &dispatch.spec;
+        works.push(
+            json!({"work_id":spec.work_id,"conversation_id":spec.conversation,
+            "target_node":spec.target,"trigger":spec.trigger,"dispatcher":spec.dispatcher,
+            "kind":spec.kind,"cwd":spec.cwd,"title":spec.title,"prompt":spec.prompt,
+            "call_ref":spec.call_ref,"state":dispatch.state.name(),"summary":"","outcome":null,
+            "result_text":"","failure_reason":dispatch.state.reason(),"failure":dispatch.state.failure()}),
+        );
+    }
+    Ok(works)
 }

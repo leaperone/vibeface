@@ -7,7 +7,8 @@ use std::{
 };
 use tokio::sync::watch;
 use vibeface_bridge::agent::{
-    AgentFailure, AgentRunError, NativeStatus, SdkBridge, SdkTurn, ToolCallbackConfig,
+    AgentFailure, AgentRunError, NativeStatus, SdkBridge, SdkTurn, StartEvidence,
+    ToolCallbackConfig,
 };
 use vibeface_bridge::failure::FailureKind;
 
@@ -111,7 +112,13 @@ async fn one_bridge_serves_consecutive_turns_and_is_replaced_when_it_dies() {
         workspace: root.join("workspace"),
         local_store_root: root.join("cursor-instance"),
         api_key: "fixture-api-key".into(),
-        env: BTreeMap::from([("FAKE_BRIDGE_LOG".into(), log.display().to_string())]),
+        env: BTreeMap::from([
+            ("FAKE_BRIDGE_LOG".into(), log.display().to_string()),
+            (
+                "FAKE_BRIDGE_SEND_LOG".into(),
+                root.join("sends.log").display().to_string(),
+            ),
+        ]),
         model: "fixture-model".into(),
         timeout_secs: 10,
         custom_tools: BTreeMap::new(),
@@ -177,6 +184,29 @@ async fn one_bridge_serves_consecutive_turns_and_is_replaced_when_it_dies() {
     );
     assert!(gone(last).await, "the bridge with the old variables ends");
     let last = relaunched;
+
+    let sends_before = std::fs::read_to_string(root.join("sends.log")).unwrap();
+    let before_send = bridge
+        .run(
+            &turn,
+            "must-not-send",
+            None,
+            |_| async { anyhow::bail!("fixture persist rejected before Send") },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await
+        .err()
+        .expect("persist callback refuses the run");
+    assert_eq!(before_send.start, StartEvidence::NotStarted);
+    assert!(
+        before_send.session_id.is_some(),
+        "a created agent alone is not a started model turn"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("sends.log")).unwrap(),
+        sends_before
+    );
 
     bridge.stop().await;
     assert!(gone(last).await);
@@ -367,6 +397,11 @@ async fn owners_have_private_bridges_and_one_crash_does_not_stop_the_other_fifte
                 Ok(_) => panic!("cancelled owner unexpectedly completed"),
             };
             assert_eq!(error.outcome, AgentFailure::Unknown);
+            assert_ne!(
+                error.start,
+                StartEvidence::NotStarted,
+                "a sent Cursor run never restores its charge"
+            );
         } else {
             assert_eq!(
                 result.unwrap().unwrap().output,

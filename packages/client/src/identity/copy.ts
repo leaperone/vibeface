@@ -3,14 +3,18 @@ import type { Member, PendingRecovery } from '../lib/node.ts'
 /** Join, recovery and device copy the web and the phone show word for word. */
 export const joinCopy = {
   waiting: '等待批准',
+  /** The join request reached one of the person's devices. */
+  reached: '已连上你的设备',
   showCode: '正在生成安全码…',
-  compareCode: '两边的安全码一致，就在那边点允许',
+  compareCode: (admin?: string) => `两边的安全码一致，就在${admin ? `「${admin}」` : '那边'}上点允许`,
   linkSource: (from = '已有设备') => `链接来自${from}上的“添加设备”`,
   byLink: '用加入链接',
   scan: '扫码加入',
   paste: '或粘贴加入链接',
   pasteFirst: '粘贴加入链接',
   linkFilled: '已填入加入链接',
+  /** A manager turned this join down; the link it came with is spent. */
+  rejected: '管理设备拒绝了这次加入。确认是自己的设备后，在管理设备上重新生成链接再试。',
   notLink: '这不是有效的加入链接',
   deviceName: '这台设备的名字',
   join: '加入',
@@ -40,8 +44,8 @@ const nodeJoinReasons: [string, string][] = [
   ['already belongs to a personal network', '这台电脑已经在一个网络里了，不用再加入。'],
   ['another join is already running', '这台电脑正在用终端命令加入。等它结束后再试。'],
   ['another join is in progress', '这条链接上次用的是另一个名字。改回上次的名字再加入，会接着等批准。'],
-  ['invite link', '这不是有效的加入链接。请从管理设备的“添加设备”重新复制。'],
-  ['Vibeface ticket', '这不是有效的加入链接。请从管理设备的“添加设备”重新复制。'],
+  ['invite link', '这不是有效的加入链接。到管理设备的“添加设备”重新复制。'],
+  ['Vibeface ticket', '这不是有效的加入链接。到管理设备的“添加设备”重新复制。'],
 ]
 export const nodeJoinFailure = (reason: string) => nodeJoinReasons.find(([pattern]) => reason.includes(pattern))?.[1] ?? nodeJoinCopy.failed
 
@@ -80,13 +84,18 @@ export const addDeviceCopy = {
   installHow: '怎么装',
   orCommand: '或在那台电脑的终端运行',
   /** The browser could not write to the clipboard; the text below opens selected instead. */
-  copyFailed: '没能复制，请手动选中下面的内容',
+  copyFailed: '没能复制，手动选中下面的内容',
   compare: '新设备出现安全码后，回这里比对',
+  /** After a computer joins: its AI is the next thing to set up. */
+  setUpAi: '去配置它的 AI',
+  addAnother: '再添加一台',
   /** The Node numbers a name another device already has, so one suggested name is enough. */
   command: (link: string) => `vibeface join '${link}' --name '我的电脑'`,
 }
 /** Where a device without management goes to add one; `managers`: the names of the management devices. */
 export const addOnManager = (managers: readonly string[]) => managers.length === 1 ? `在管理设备「${managers[0]}」上添加` : '在管理设备上添加'
+export const setUpOnManager = (managers: readonly string[]) => managers.length === 1 ? `在管理设备「${managers[0]}」上设置` : '在管理设备上设置'
+export const editOnManager = (managers: readonly string[]) => managers.length === 1 ? `在管理设备「${managers[0]}」上修改` : '在管理设备上修改'
 
 /** Settings' two red rows each say what they cost before either is tapped. */
 export const exitCopy = { leave: '要用加入链接才能回来', reset: '清除本机数据，回到欢迎页' }
@@ -127,9 +136,9 @@ export function whenText(at: number, now = Date.now()) {
 }
 
 export const recoveryCopy = {
-  scope: '只找回设备和管理权限，不含对话',
+  scope: '找回后，对话会从你的其他电脑同步过来',
   whichLost: '哪台设备丢了？',
-  delay: '2 天后生效，期间你的其他设备可以拦下',
+  delay: '默认 2 天后生效，管理设备可确认立即生效，也可拦下',
   cancelLate: '如果已经提交，取消不会撤回。',
   connectTo: '连接到哪台电脑',
   manual: '手动填写',
@@ -147,12 +156,16 @@ export const recoveryCopy = {
   waiting: '找回等待生效',
   left: (at: number, now = Date.now()) => at > now ? `剩余 ${hoursUntil(at, now)} 小时` : '马上生效',
   autoEnter: '生效后自动进入',
-  managersSee: '你的管理设备会看到提醒',
+  managersSee: '你的管理设备会看到提醒，可确认立即生效',
+  closeOk: '可以关掉页面，到时在这个网址打开',
+  samePassword: '密码不变，生效后旧文件作废',
   stopped: '这次找回被拦下了',
   stoppedNote: '新恢复文件用不了，旧文件仍然有效',
   saveNew: '保存新的恢复文件',
   recovered: '已找回，旧文件已作废',
   why: '设备都丢了时，用它和恢复密码找回',
+  /** Beside 用恢复文件找回 on the way in: a browser that only cleared its data joins again by link instead. */
+  whenLost: '设备都丢了时',
   passwordWhy: '设备都丢了时，用它和恢复文件找回',
   onlyCopy: '只能在这一步下载，之后补不回',
   keptApart: '已把文件和密码分开保存',
@@ -160,7 +173,13 @@ export const recoveryCopy = {
   effectiveIn: (at: number, now = Date.now()) => `${hoursUntil(at, now)} 小时后生效`,
   outIfNotStopped: '不拦下，到时划掉的设备会被移出',
   added: '新设备',
-  itsMe: '是我在找回',
+  confirm: '立即生效',
+  confirmAsk: '现在让这次找回立即生效？',
+  confirmNote: '请先确认是你在找回。新设备会立即获得管理权限，标为丢失的设备会被移出。',
+  confirmDone: '已立即生效',
+  itsMe: '是我，收起提醒',
+  /** 是我 only hides the reminder here; the recovery still takes effect when its wait ends. */
+  itsMeDone: (at: number, now = Date.now()) => `已收起提醒。找回仍会在${whenText(at, now)} 生效`,
   stop: '拦下',
   stopAsk: '拦下这次找回？',
   stopNote: '拦下后对方的新恢复文件用不了，设备保持不变',
@@ -187,23 +206,37 @@ export function recoveryChanges(pending: PendingRecovery, current: Member[]) {
 export const deviceCopy = {
   offline: '确认它开着，并且已联网',
   manageHint: '能添加、移除设备，改设置，拦下找回',
+  /** Turning management off waits for a confirmation; `left`: management devices after it. */
+  unmanageAsk: (name: string) => `取消「${name}」的管理权限？`,
+  unmanageNote: (left: number) => left === 1 ? '之后只剩 1 台管理设备。它丢了或清了数据，就只能用恢复文件找回' : `之后还有 ${left} 台管理设备`,
+  unmanage: '取消管理',
+  /** Under a request's safety code, on the web and the phone alike. */
+  compareCode: '和新设备上的比对，不一致就拒绝，可能不是你的设备',
+  rejected: (name: string) => `已拒绝「${name}」`,
+  addedManager: (name: string) => `已添加「${name}」为管理设备`,
   /** 可用文件夹: what it is, and during setup that it can wait. */
   folders: (later: boolean) => later ? 'Bot 能读写的项目文件夹，可稍后添加' : 'Bot 能读写的项目文件夹',
   /** A computer's bot as `botReadiness` reports it; `null`: it has none set up. */
-  botStatus: { ready: '能运行 Bot', starting: 'Bot 启动中', needs_setup: 'Bot 需设置', none: '还没配置 Bot' },
+  botStatus: { ready: '能运行 Bot', starting: 'Bot 启动中', needs_setup: 'Bot 需设置', none: '还没配置 Bot', unknown: '离线，状态未知' },
+  /** An offline computer reports nothing, so no bot there is unknown rather than none. */
+  botState: (bot: 'ready' | 'starting' | 'needs_setup' | null | undefined, online: boolean | undefined) => bot ?? (online === false ? 'unknown' as const : 'none' as const),
   /** This computer has a provider installed but no use of any turned on, as a computer that just joined starts. */
   aiOff: '这台电脑的 AI 还没开',
-  removeNotice: (bot: boolean) => ['移除后它无法再连接，要再用需重新加入', bot ? '上面的 Bot 会停止' : null, '对话记录会保留'].filter(Boolean).join('，'),
+  /** Ends on what removal cannot do: whatever already reached that device stays there. */
+  removeNotice: (bot: boolean) => `${['移除后它无法再连接，要再用需重新加入', bot ? '上面的 Bot 会停止' : null, '对话记录会保留'].filter(Boolean).join('，')}。它已经拿到的内容删不掉。`,
   /**
-   * A provider's two uses on a device: one provider runs the bot, any number execute tasks. `note` is the line shown
-   * above the providers; `hint` says it again for one provider's control.
+   * A provider's two uses on a device: one provider runs the bot, any number execute tasks. `note` is the short phrase beside each use
+   * on the one line above the providers; `hint` says the whole of it for one provider's control.
    */
   roles: {
-    bot: { label: '运行 Bot', note: '只选一个，Bot 用它回复聊天', hint: (provider: string) => `Bot 用这台设备的 ${provider} 回复聊天` },
-    execution: { label: '执行任务', note: '可开多个，Bot 派的任务交给它做', hint: (provider: string) => `Bot 派的任务用这台设备的 ${provider} 来做` },
+    bot: { label: '运行 Bot', note: '选一个', hint: (provider: string) => `Bot 用这台设备的 ${provider} 回复聊天` },
+    /** A task reaches a device as its bot's turn, so turning this on with no bot runs one too. */
+    execution: { label: '执行任务', note: '可多个', hint: (provider: string) => `派来的任务由这台设备的 Bot 交给 ${provider} 做` },
   },
   /** How Codex work reaches an App Server: the one already running on that computer, or one Vibeface starts. */
   appServer: { system: '用已在运行的', spawn: '由 Vibeface 启动', useSpawn: '改由 Vibeface 启动' },
+  /** The bot's model: a choice from the list its provider gives, with 其他… and 从列表选 switching to and from typing it. */
+  botModel: { label: 'Bot 模型', default: '默认', other: '其他…', pick: '从列表选' },
 }
 
 /** Settings → 会话等你时: how a session that needs the person reaches them. `outlets`: where it shows by default. */
@@ -219,4 +252,24 @@ export const waitingCopy = {
   /** The home tip after joining: one tap asks the system, closing it keeps it closed. */
   notifyTip: '会话等你时提醒你',
   notifyOn: '打开通知',
+}
+
+/** Settings → 安全: how many devices can manage, whether a recovery waits, when the recovery password last changed. */
+export const securityCopy = {
+  title: '安全',
+  managers: '管理设备',
+  managerCount: (count: number) => `${count} 台`,
+  recovery: '找回',
+  noRecovery: '无待生效',
+  recoveryIn: (at: number, now = Date.now()) => `${hoursUntil(at, now)} 小时后生效`,
+  password: '恢复密码',
+  changedOn: (at: number) => `${new Date(at).toLocaleDateString('zh-CN')} 设置`,
+}
+
+/** The strength line under a new recovery password; `weak` ones are refused. */
+export const passwordCopy = {
+  label: { weak: '太弱', fair: '可用', strong: '较强' },
+  short: '至少 8 个字符',
+  common: '太常见了，换一个',
+  simple: '少于 12 个字符时，要混用字母、数字或符号',
 }

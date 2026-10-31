@@ -4,7 +4,6 @@ import { questionOpen } from "./questions.ts"
 import type { BotRecord, ConversationPayload, ConversationRecords, NotificationRecord, OpenWork, Question, WorkRecord } from "./types.ts"
 
 const delivery = (item: WorkRecord) => item.state.startsWith("dispatch_")
-const open = (item: WorkRecord) => !delivery(item) && (item.outcome === null || item.outcome === "unverified")
 
 function upsert<T>(items: T[], changed: T[], key: (item: T) => string): T[] {
   const next = items.map((item) => changed.find((candidate) => key(candidate) === key(item)) ?? item)
@@ -37,8 +36,7 @@ export function mergeBots(bots: BotRecord[], records: ConversationRecords): BotR
   return bots.map((bot) => bot.conversation_id === records.conversation_id ? { ...bot, last_message: records.last_message ?? bot.last_message, busy: records.busy } : bot)
 }
 
-/** Works no result has settled yet, across conversations: a settled one leaves the list. */
+/** The network's works that want the person, with this conversation's share replaced by what the Node lists now. */
 export function mergeOpenWorks(works: OpenWork[], records: ConversationRecords): OpenWork[] {
-  const changed = records.works.map((item) => ({ ...item, conversation_id: records.conversation_id }))
-  return upsert(works, changed, (item) => item.work_id).filter(open)
+  return [...works.filter((item) => item.conversation_id !== records.conversation_id), ...records.open_works]
 }

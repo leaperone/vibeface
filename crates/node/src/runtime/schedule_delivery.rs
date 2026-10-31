@@ -2,11 +2,19 @@
 //! A message for another owner waits in the outbox until `peers` delivers it.
 use super::*;
 use crate::scheduling::{
-    JobOutcome, JobState, PendingCheck, SchedulerJob, SteerOutcome, SteerTarget,
+    JobOutcome, JobState, PendingCheck, SchedulerJob, SteerOutcome, SteerTarget, TriggerKind,
 };
 use executor::{SteerAck, SteerTrace};
 use futures_util::FutureExt;
 use vibeface_bridge::failure::{ExecFailure, FailureKind};
+
+/// The jobs a chat shows. An agent task runs in its bot's conversation, but it is that work: its
+/// card and details show it, and the chat never takes it for a reply or stops it as one.
+fn chat_jobs(jobs: Vec<SchedulerJob>) -> Vec<SchedulerJob> {
+    jobs.into_iter()
+        .filter(|job| job.kind != TriggerKind::AgentTask)
+        .collect()
+}
 
 fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
     let mut value = serde_json::to_value(job)?;
@@ -413,7 +421,7 @@ impl Runtime {
         self.require_scope(&access, scope).await?;
         let store = self.store.lock().await;
         let checks = store.pending_checks()?;
-        let all = store.scheduler_jobs(scope)?;
+        let all = chat_jobs(store.scheduler_jobs(scope)?);
         let mut jobs = Vec::new();
         for job in &all[all.len().saturating_sub(MAX_OWNER_JOBS)..] {
             let mut value = job_value(job, &checks)?;
@@ -506,7 +514,7 @@ impl Runtime {
             .conversation(network, scope)?
             .and_then(|conversation| conversation.owner);
         let mut jobs = Vec::new();
-        for job in store.scheduler_jobs(scope)? {
+        for job in chat_jobs(store.scheduler_jobs(scope)?) {
             let mut value = job_value(&job, &checks)?;
             value["manager"] = manager.clone();
             jobs.push(value);

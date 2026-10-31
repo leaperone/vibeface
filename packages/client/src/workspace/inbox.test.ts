@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import type { JoinRequest } from '../lib/node.ts'
+import { availability, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
-import { deviceForm, deviceOnline, formName } from './labels.ts'
-import type { NodeInfo, Question } from './types.ts'
+import { chatTaskState, deviceForm, deviceOnline, entryLabel, fixOnDevice, formName, promptSummary, taskLabel } from './labels.ts'
+import type { BotRecord, NodeInfo, Question, WorkRecord } from './types.ts'
 
 const question = (id: string, closed = false): Question => ({
   question_id: id, conversation_id: 'c', bot: { bot_id: 'b', name: '助手' }, severity: 'normal', text: id, choices: [], about: { kind: 'general' },
@@ -14,6 +14,7 @@ const join = (status: JoinRequest['status']): JoinRequest => ({
   admin_id: null, admin_nonce: null, joiner_nonce: null, reason: null, expires_at_ms: 1,
 })
 const unready: NodeInfo = { device_id: 'mac', name: 'Mac', local: true, online: true, revoked: false, capabilities: { manager: 'codex', manager_state: 'needs_setup', relay: false, roots: [] } }
+const botRecord: BotRecord = { bot_id: 'b', conversation_id: 'c', name: '助手', instructions: '', models: {}, skills: null, avatar: null, avatar_version: null, event_hash: 'h', last_message: null, busy: null }
 
 const source = (manage: boolean, answered: Record<string, string> = {}): InboxSource => ({
   device: { ready: { principal: { network_id: 'n', device_id: 'me', epoch: 1, source: 'membership', can_manage: manage }, entry: { device_id: 'mac' } }, joins: [join('pending'), join('joined')], pendingRecovery: null, rotateHint: false },
@@ -36,14 +37,97 @@ test('待处理 counts the same items wherever it shows: open questions, joins t
   assert.deepEqual(inboxItems(starting).find((item) => item.kind === 'setup'), { key: 'setup', kind: 'setup', device: 'pc', title: '运行 Bot 的设备需设置' }, 'one device starting does not hide another that needs setup')
 })
 
+test('a different pending recovery gets a fresh confirmation card', () => {
+  const current = source(true)
+  const recovery = { checkpoint: 'first', effective_at_ms: 1, members: [] }
+  current.device.pendingRecovery = recovery
+  const first = inboxItems(current).find((item) => item.kind === 'recovery')
+  assert.ok(first)
+  current.device.pendingRecovery = { ...recovery, effective_at_ms: 2 }
+  assert.equal(inboxItems(current).find((item) => item.kind === 'recovery')?.key, first.key)
+  current.device.pendingRecovery = { ...recovery, checkpoint: 'replacement' }
+  const replacement = inboxItems(current).find((item) => item.kind === 'recovery')
+  assert.ok(replacement)
+  assert.notEqual(replacement.key, first.key)
+  current.device.pendingRecovery = null
+  assert.equal(inboxItems(current).some((item) => item.kind === 'recovery'), false)
+})
+
+test('a failed task waits in 待处理 under its bot until something follows it up, naming its device', () => {
+  const failed = source(false)
+  const work = { work_id: 'w1', conversation_id: 'c', trigger: '', target_node: 'mac', cwd: '/w', title: '跑测试', prompt: '', state: 'finished', summary: '', outcome: 'failed', result_text: '', failure_reason: 'timed out' } as const
+  failed.workspace.openWorks = [work, { ...work, work_id: 'w2', outcome: null, state: 'running' }, { ...work, work_id: 'w3', title: '', outcome: null, state: 'dispatch_rejected' }]
+  failed.workspace.bots = [botRecord]
+  assert.deepEqual(inboxItems(failed).filter((item) => item.kind === 'failed').map((item) => [item.key, item.title, item.meta]), [['failed:w1', '跑测试', 'Mac'], ['failed:w3', '任务没有完成', 'Mac']], 'a refused dispatch waits like a failure')
+})
+
+test('a session handoff reminder points at its Bot and keeps its text', () => {
+  const handoff = source(true)
+  handoff.workspace.bots = [botRecord]
+  handoff.workspace.notifications = [{ notification_id: 'n-session', kind: 'session_attributed', text: 'tests fail', conversation_id: 'c' }]
+  const item = inboxItems(handoff).find((entry) => entry.kind === 'session')
+  assert.equal(item?.kind, 'session')
+  if (item?.kind === 'session') assert.deepEqual([item.bot.bot_id, item.notification.text], ['b', 'tests fail'])
+})
+
 test('a phone asking to join reads as a phone, and only a computer has an online state', () => {
   assert.equal(formName[deviceForm('client', join('pending').name)], '手机')
   assert.equal(formName[deviceForm('client', 'Chrome')], '浏览器')
   assert.equal(formName[deviceForm('client', '我的 iPad')], '平板')
   assert.equal(formName[deviceForm('node', '我的手机')], '电脑')
   assert.equal(deviceOnline('client', undefined, false, true), undefined, 'no device knows whether a browser on another connection is open')
+  assert.equal(deviceOnline('client', undefined, false, true, true), true, 'the browser in hand is online while connected')
+  assert.equal(deviceOnline('client', undefined, false, false, true), false)
   assert.equal(deviceOnline('node', { online: false }, true, true), false)
   assert.equal(deviceOnline('node', undefined, true, true), true, 'the connected computer is online before the device list arrives')
   assert.equal(deviceOnline('node', { online: true }, true, false), false, 'the computer this device lost reads offline, not its last report')
   assert.equal(deviceOnline('node', { online: true }, false, false), undefined, 'another computer is unknown while this device is offline')
+})
+
+test('a task done itself waits on a child still running, down the chain, and only then', () => {
+  const work = (work_id: string, extra: Partial<WorkRecord> = {}): WorkRecord => ({ work_id, trigger: '', target_node: 'mac', cwd: '/w', title: work_id, prompt: '', state: 'finished', summary: '', outcome: 'completed', result_text: '', failure_reason: null, ...extra })
+  const parent = work('p')
+  assert.equal(chatTaskState(parent, [parent]), 'completed')
+  assert.equal(chatTaskState(parent, [parent, work('c', { parent: 'p', state: 'running', outcome: null })]), 'awaiting_children')
+  assert.equal(taskLabel('awaiting_children'), '等子任务')
+  assert.equal(chatTaskState(parent, [parent, work('c', { parent: 'p' }), work('g', { parent: 'c', state: 'accepted', outcome: null })]), 'awaiting_children', 'a grandchild still running holds it too')
+  assert.equal(chatTaskState(parent, [parent, work('c', { parent: 'p' })]), 'completed', 'finished children do not')
+  assert.equal(chatTaskState(work('f', { outcome: 'failed' }), [work('c', { parent: 'f', state: 'running', outcome: null })]), 'failed', 'a failure still reads as one')
+})
+
+test('the device to fix a refused task is chosen by its kind, not its words', () => {
+  assert.equal(fixOnDevice({ failure: 'no_bot' }), true)
+  assert.equal(fixOnDevice({ failure: 'quota' }), false)
+  assert.equal(fixOnDevice({}), false)
+})
+
+test('the capsule names the computer from the directory once it lists it, not by the name it had before joining', () => {
+  const directory = { members: [{ device_id: 'b', kind: 'node' as const, name: '工作电脑', manage: false }] }
+  assert.equal(entryLabel({ joined: true, directory, entryId: 'b', ownName: '我的 Mac', address: 'http://127.0.0.1:1' }), '工作电脑')
+  assert.equal(entryLabel({ joined: true, directory: null, entryId: 'b', ownName: '我的 Mac', address: 'http://127.0.0.1:1' }), null)
+  assert.equal(entryLabel({ joined: false, directory: null, entryId: 'b', ownName: '我的 Mac', address: 'http://127.0.0.1:1' }), '我的 Mac')
+})
+
+test('a provider shows whether it can be used before any use is picked', () => {
+  const provider = (extra: Partial<ProviderStatus>) => ({ state: 'off', installed: true, env: [], ...extra }) as Pick<ProviderStatus, 'state' | 'installed' | 'env'>
+  assert.equal(availability(provider({})), 'ready')
+  assert.equal(availability(provider({ installed: false })), 'missing')
+  assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: false, required: true }] })), 'needs_setup')
+  assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: true, required: true }] })), 'ready')
+  assert.equal(availability(provider({ state: 'starting' })), 'starting')
+})
+
+test('a task page shows a summary of what it was asked and folds the rest', () => {
+  assert.deepEqual(promptSummary('修好登录页', '修好登录页'), { summary: '', folded: false }, 'a prompt that is its title adds nothing')
+  assert.deepEqual(promptSummary('看看依赖', '检查依赖'), { summary: '看看依赖', folded: false })
+  assert.deepEqual(promptSummary('## 目标\n把测试跑通\n细节…', '跑测试'), { summary: '目标', folded: true })
+  assert.deepEqual(promptSummary('{"task":"build"}', '构建'), { summary: '', folded: true }, 'machine text only shows under 详细信息')
+  const long = promptSummary('很'.repeat(100), '长任务')
+  assert.equal(long.summary.length, 80)
+  assert.equal(long.folded, true)
+  assert.deepEqual(promptSummary('[紧急] 修好登录页', '修登录'), { summary: '[紧急] 修好登录页', folded: false }, 'plain words that open with a bracket still show')
+  assert.deepEqual(promptSummary('[1, 2]', '列表'), { summary: '', folded: true }, 'a JSON array is machine text')
+  assert.deepEqual(promptSummary('{"step":1}\n{"step":2}', '两步'), { summary: '', folded: true }, 'JSON lines are machine text too')
+  const emoji = promptSummary('👨‍👩‍👧'.repeat(100), '一家人')
+  assert.equal(emoji.summary, `${'👨‍👩‍👧'.repeat(79)}…`, 'the cut keeps whole emoji')
 })

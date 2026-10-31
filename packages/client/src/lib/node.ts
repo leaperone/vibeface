@@ -11,6 +11,9 @@ export type ConnectionEntry =
   | { kind: 'local'; address: string; device_id: string }
   | { kind: 'lan'; addrs: string[]; device_id: string }
 export type PublicIdentity = { deviceId: string }
+/** A Web entry forwards a session to any Node in the network, so a manager reaches another computer through the one it is on. */
+export const throughEntry = (via: ConnectionEntry, deviceId: string): ConnectionEntry | undefined =>
+  via.kind === 'gateway' ? { kind: 'gateway', address: via.address, device_id: deviceId } : undefined
 export type ClientPrincipal = { network_id: string; device_id: string; epoch: number } & ({ source: 'membership'; can_manage: boolean } | { source: 'local_session'; can_manage: false })
 export type EntryInfo = { device_id: string; name: string; version: string; initialized: boolean; network_id: string | null; connection_entry?: ConnectionEntry }
 export type ReadyConnection = {
@@ -34,7 +37,7 @@ type JoinStatus = 'pending' | 'confirming' | 'joined' | 'rejected' | 'withdrawn'
 /** One join request as the entry Node stores it; `code` is filled in once both nonces are known. */
 export type JoinRequest = {
   join_id: string; status: JoinStatus; network_id: string; invite_id: string; device_id: string; kind: 'node' | 'client'; name: string; commit: string
-  admin_id: string | null; admin_nonce: string | null; joiner_nonce: string | null; reason: string | null; expires_at_ms: number; code?: string
+  admin_id: string | null; admin_name?: string; admin_nonce: string | null; joiner_nonce: string | null; reason: string | null; expires_at_ms: number; code?: string
 }
 export type LocalSetup = { kind: 'uninitialized'; entry: ConnectionEntry; capability: string } | { kind: 'initialized'; entry: ConnectionEntry; removed: boolean; local_launch?: { url: string; device_id: string; token: string } }
 export type ManagerSettings = { provider: ProviderId; workspace: string; model: string }
@@ -157,6 +160,7 @@ export function parseJoinRequest(value: unknown): JoinRequest {
     join_id: text(v.join_id), status: v.status as JoinStatus, network_id: validTarget(v.network_id), invite_id: v.invite_id, device_id: validTarget(v.device_id),
     kind: v.kind, name: text(v.name), commit: validTarget(v.commit), admin_id: hex32(v.admin_id), admin_nonce: hex32(v.admin_nonce), joiner_nonce: hex32(v.joiner_nonce),
     reason: typeof v.reason === 'string' ? v.reason : null, expires_at_ms: integer(v.expires_at_ms),
+    ...(typeof v.admin_name === 'string' ? { admin_name: v.admin_name } : {}),
   }
 }
 export function parseLocalSetup(value: unknown, origin: string): LocalSetup {
@@ -190,6 +194,17 @@ export function folderSuggestions(response: NodeSettingsResponse): { path: strin
 export function botOnChange(response: NodeSettingsResponse, provider: ProviderStatus): { bot: true; execution?: true } {
   const first = response.settings.manager === null && !response.settings.roots.length && !response.providers.some((item) => item.roles.includes('execution'))
   return first && provider.supports.includes('execution') ? { bot: true, execution: true } : { bot: true }
+}
+
+/**
+ * Whether a provider can be used, shown before any use is picked: an unused one reads ready once its program is here and
+ * the keys it needs are set, `missing` without its program. A used one keeps the state the device reports.
+ */
+export type Availability = Exclude<ProviderStatus['state'], 'off'> | 'missing'
+export function availability(item: Pick<ProviderStatus, 'state' | 'installed' | 'env'>): Availability {
+  if (item.state !== 'off') return item.state
+  if (!item.installed) return 'missing'
+  return item.env.some((row) => row.required && !row.set && !row.inherited) ? 'needs_setup' : 'ready'
 }
 
 /** Providers in use or on the device get a row; the others fold away until someone looks for one. */
@@ -246,6 +261,8 @@ export function parseProviderModels(value: unknown): ModelChoice[] | null {
   const models = array(v.models).map((item) => { const model = record(item, '模型'); return { id: text(model.id), name: text(model.name), default: model.default === true } })
   return models.length ? models : null
 }
+/** Whether `model` is typed rather than picked: it is set and the list does not have it. */
+export const modelTyped = (model: string, models: ModelChoice[] | null) => Boolean(model) && !models?.some((choice) => choice.id === model)
 export function parseAppServerLink(value: unknown): AppServerLink {
   const v = record(value, 'App Server 状态')
   switch (v.state) {

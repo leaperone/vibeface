@@ -97,9 +97,17 @@ pub enum AgentFailure {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartEvidence {
+    NotStarted,
+    Started,
+    Unknown,
+}
+
 #[derive(Debug)]
 pub struct AgentRunError {
     pub outcome: AgentFailure,
+    pub start: StartEvidence,
     pub session_id: Option<String>,
     pub failure: ExecFailure,
 }
@@ -538,6 +546,7 @@ impl SdkBridge {
             secrets.extend(turn.callback_token.as_deref());
             AgentRunError {
                 outcome,
+                start: StartEvidence::NotStarted,
                 session_id: previous_session_id.map(str::to_owned),
                 failure: ExecFailure {
                     detail: redact_text(failure.detail, &secrets),
@@ -748,6 +757,13 @@ impl SdkBridge {
             }
             AgentRunError {
                 outcome,
+                start: if !send_started {
+                    StartEvidence::NotStarted
+                } else if state.run_id.is_some() {
+                    StartEvidence::Started
+                } else {
+                    StartEvidence::Unknown
+                },
                 session_id: agent_id,
                 failure: ExecFailure {
                     detail: redact_text(failure.detail, &secrets),

@@ -1,4 +1,5 @@
-import type { MembershipView } from "../lib/node.ts"
+import { asProvider, type MembershipView, type ProviderId } from "../lib/node.ts"
+import type { LiveProgress } from "../lib/progress.ts"
 import { confirmReason } from "./model.ts"
 import type { NodeInfo, WorkRecord } from "./types.ts"
 
@@ -66,6 +67,16 @@ export function addressName(address: string) {
   try { return new URL(address).hostname } catch { return address }
 }
 
+/**
+ * The connected computer's name for the connection capsule. A member reads it from the directory; until the directory
+ * lists that computer it is `null`, since the computer's own name may predate its join. Before joining, its own name.
+ */
+export function entryLabel(input: { joined: boolean; directory: Pick<MembershipView, "members"> | null | undefined; entryId: string | undefined; ownName: string | undefined; address: string }): string | null {
+  const member = input.directory?.members.find((item) => item.device_id === input.entryId)?.name
+  if (member) return member
+  return input.joined ? null : input.ownName || addressName(input.address)
+}
+
 /** Joins and members carry only node or client, so a client named like a tablet or a phone counts as one, everywhere it shows. */
 export type DeviceForm = "computer" | "tablet" | "phone" | "browser"
 export const deviceForm = (kind: "node" | "client", name: string): DeviceForm =>
@@ -74,25 +85,37 @@ export const formName: Record<DeviceForm, string> = { computer: "电脑", tablet
 
 /**
  * A computer's reachability as the Node reports it; `entry` marks the computer this device connects through, online
- * before that read. A browser or phone has none: only the Node it happens to be connected to would know. While this
- * device is offline the last report is stale: the computer it lost reads offline, the others unknown.
+ * before that read. Another browser or phone has none: only the Node it happens to be connected to would know; `self`,
+ * the device in hand, is online while its connection is. While this device is offline the last report is stale: the
+ * computer it lost reads offline, the others unknown.
  */
-export const deviceOnline = (kind: "node" | "client", node: Pick<NodeInfo, "online"> | undefined, entry: boolean, connected: boolean) =>
-  kind !== "node" ? undefined : !connected ? (entry ? false : undefined) : node?.online ?? entry
+export const deviceOnline = (kind: "node" | "client", node: Pick<NodeInfo, "online"> | undefined, entry: boolean, connected: boolean, self = false) =>
+  kind !== "node" ? (self ? connected : undefined) : !connected ? (entry ? false : undefined) : node?.online ?? entry
 export const hostOf = (address: string) => { try { return new URL(address).host } catch { return "" } }
 
 const taskStates: Record<string, string> = {
   pending_delivery: "等待中", queued: "等待中", claimed: "准备中", accepted: "准备中", running: "运行中", waiting: "需要你同意",
   cancelling: "停止中", interrupting: "停止中", completed: "已完成", failed: "失败", cancelled: "已停止", interrupted: "已中断",
   pending_check: "待确认", unknown: "待确认", starting: "准备中", finished: "已完成", unverified: "待确认", awaiting_confirmation: "待确认",
-  dispatch_waiting: "等设备接收", dispatch_rejected: "未接收", dispatch_unverified: "结果未知", accepted_waiting_sync: "等待同步", stop_waiting: "停止中", stop_timed_out: "还在尝试停止",
+  dispatch_waiting: "等设备接收", dispatch_rejected: "未接收", awaiting_children: "等子任务", dispatch_unverified: "结果未知", accepted_waiting_sync: "等待同步", stop_waiting: "停止中", stop_timed_out: "还在尝试停止",
 }
 export const taskLabel = (state: string) => taskStates[state] ?? stateNames[state] ?? state
 /** A task still running when this device went offline may have moved on since; it reads unknown, not running. */
 export const taskStale = (state: string, connected: boolean) => !connected && taskActive(state)
 export const staleTaskLabel = "状态未知"
 /** A task that stopped without a cause of its own: stopped by hand, or its device or app went away mid-turn. Nothing redoes it. */
-export const interruptedCopy = { reason: "中途停下了，不会自动重做", resume: "让 Bot 接着做", ask: (title: string) => `接着做「${title}」` }
+export const interruptedCopy = { reason: "中途停下了，不会自动重做" }
+/** A task sent to a device that is offline starts once that device is back. */
+export const taskCopy = { away: "离线，上线后开始" }
+/** What the person asks the bot after a task ended badly, in both apps. */
+export type FollowUp = "check" | "resume" | "retry"
+export const followUpCopy: Record<FollowUp, { action: string; ask: (title: string) => string }> = {
+  check: { action: "让 Bot 查结果", ask: (title) => `看看「${title}」做完了没有，先不要重做` },
+  resume: { action: "让 Bot 接着做", ask: (title) => `接着做「${title}」` },
+  retry: { action: "让 Bot 再试", ask: (title) => `再试一次「${title}」` },
+}
+/** An unknown outcome may have done its writes, so the bot checks it rather than running it again; a stopped task goes on. */
+export const followUp = (state: string, unknown: boolean): FollowUp => unknown ? "check" : state === "interrupted" ? "resume" : "retry"
 
 // Live progress reports provider words such as "running" or "awaiting_input"; anything unknown reads as plain progress.
 const progressStates: Record<string, string> = {
@@ -102,9 +125,81 @@ const progressStates: Record<string, string> = {
 export const progressLabel = (status: string) => progressStates[status] ?? (/[\u4e00-\u9fff]/.test(status) ? status : "进行中")
 
 /**
+ * Who runs a task, the same on every card: a provider names itself; an agent task runs as its device's bot turn, so
+ * it names the provider that bot runs on there.
+ */
+export const taskAgent = (work: Pick<WorkRecord, "kind" | "target_node">, nodes: readonly NodeInfo[]): ProviderId | null =>
+  work.kind === "task" ? asProvider(nodes.find((node) => node.device_id === work.target_node)?.capabilities?.manager) : work.kind ?? null
+/** A task's newest step: what it recorded, else the last line or status its device streams, as another device's bot records none. */
+export function taskProgress(work: Pick<WorkRecord, "work_id" | "target_node" | "summary">, live: readonly LiveProgress[]) {
+  if (work.summary) return work.summary
+  const stream = live.find((item) => item.kind === "native" && item.work_id === work.work_id && item.target_node === work.target_node)
+  const line = stream?.text.trim().split("\n").at(-1) ?? ""
+  if (line) return line
+  const status = stream?.status ? progressLabel(stream.status) : ""
+  return status === "进行中" ? "" : status
+}
+
+/**
  * A work only the person can settle now reads as awaiting confirmation; a finished one as its outcome; a stop not yet
  * confirmed as that stop, which keeps being retried.
  */
 export const shownState = (work: WorkRecord, nodes: NodeInfo[] = []) =>
   confirmReason(work, nodes) ? "awaiting_confirmation" : work.outcome ?? work.stop ?? work.state
 export const taskActive = (state: string) => ["accepted", "running", "interrupting", "dispatch_waiting", "stop_waiting", "stop_timed_out"].includes(state)
+/**
+ * A chat task's state: one that completed while a work it dispatched, or that work's own, still runs waits on them. No record
+ * says so, so this reads only the works this device holds; a child not synced yet does not hold its parent.
+ */
+export function chatTaskState(work: WorkRecord, works: readonly WorkRecord[], nodes: NodeInfo[] = []): string {
+  const state = shownState(work, nodes)
+  if (state !== "completed") return state
+  const seen = new Set([work.work_id])
+  const open = (id: string): boolean => works.some((child) => {
+    if (child.parent !== id || seen.has(child.work_id)) return false
+    seen.add(child.work_id)
+    const shown = shownState(child, nodes)
+    return taskActive(shown) || shown === "awaiting_confirmation" || open(child.work_id)
+  })
+  return open(work.work_id) ? "awaiting_children" : state
+}
+
+/** A failed work, or a dispatch its device refused: the person sees it until something follows it up. */
+export const failedWork = (work: Pick<WorkRecord, "outcome" | "state">) => work.outcome === "failed" || work.outcome === "rejected" || work.state === "dispatch_rejected"
+/** A failure fixed in its device's settings: no bot there to take it, or the AI service there not set up. */
+export const fixOnDevice = (work: Pick<WorkRecord, "failure">) =>
+  ["missing_key", "auth_failed", "missing_binary", "execution_disabled", "no_model", "no_bot"].includes(work.failure ?? "")
+/** A prompt whose whole text or first line parses as JSON is machine text; plain words that merely open with "[" or "{" are not. */
+function machineText(text: string) {
+  if (!/^[{[]/.test(text)) return false
+  const parses = (value: string) => { try { JSON.parse(value); return true } catch { return false } }
+  return parses(text) || parses(text.split(/\r?\n/, 1)[0])
+}
+/** Characters as a person sees them, so a cut never splits an emoji; Hermes without `Intl.Segmenter` falls back to code points. */
+function graphemes(text: string): string[] {
+  return typeof Intl !== "undefined" && typeof Intl.Segmenter === "function" ? Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text), (part) => part.segment) : Array.from(text)
+}
+/**
+ * What a task was asked, short enough for its page: the first plain line, cut at 80 characters. Machine text such as JSON gives none,
+ * and neither does a line that only repeats the title. `folded`: the prompt says more than the summary, so its text waits in 详细信息.
+ */
+export function promptSummary(prompt: string, title: string): { summary: string; folded: boolean } {
+  const text = prompt.trim()
+  const first = machineText(text) ? "" : text.split(/\r?\n/).map((line) => line.replace(/^#+\s*/, "").trim()).find(Boolean) ?? ""
+  const chars = graphemes(first)
+  const cut = chars.length > 80 ? `${chars.slice(0, 79).join("")}…` : first
+  const summary = cut === title.trim() ? "" : cut
+  return { summary, folded: summary !== text && text !== title.trim() }
+}
+export const fixOnDeviceLabel = (device: string) => `去设置「${device}」`
+
+/** Where a task card sits on the tasks page, in both apps. */
+export type TaskGroup = "attention" | "working" | "waiting"
+export const taskGroups: readonly { group: TaskGroup; title: string }[] = [{ group: "attention", title: "需要留意" }, { group: "working", title: "进行中" }, { group: "waiting", title: "等待中" }]
+/** The state a task card shows: the overview names a failed work only as finished, so its outcome says how. */
+export const cardState = (work: WorkRecord, nodes: NodeInfo[], projected?: string) =>
+  work.outcome === "failed" || work.outcome === "rejected" ? work.outcome : projected ?? shownState(work, nodes)
+export const needsLook = (state: string) => ["failed", "rejected", "dispatch_rejected", "dispatch_unverified"].includes(state)
+/** A task that failed, was never taken or awaits the person's confirmation needs them; one out of their hands or held on them waits; the rest work. */
+export const taskGroup = (state: string, heldOnPerson: boolean): TaskGroup =>
+  needsLook(state) || state === "awaiting_confirmation" ? "attention" : state === "unverified" || heldOnPerson || !taskActive(state) ? "waiting" : "working"

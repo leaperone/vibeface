@@ -9,7 +9,12 @@ const required = [
   'download/index.html',
   'community/index.html',
   'security/index.html',
+  'docs/overview/index.html',
+  'docs/comparison/index.html',
   'docs/install/index.html',
+  'docs/bot-and-execution/index.html',
+  'docs/history-sync/index.html',
+  'docs/privacy-security/index.html',
   'docs/node/index.html',
   'docs/deployment/index.html',
   'docs/troubleshooting/index.html',
@@ -56,6 +61,17 @@ for (const [key, value] of Object.entries(search.raw)) index.import(key, value)
 for (const query of ['恢复包', '安全码']) {
   const result = await index.searchAsync(query, { index: 'content', limit: 10 })
   if (!result.some((group) => group.result.length > 0)) fail(`search index does not match ${query}`)
+}
+for (const [query, url] of [
+  ['长期 Bot 聊天', '/docs/overview'],
+  ['工作方式', '/docs/comparison'],
+  ['协调角色', '/docs/bot-and-execution'],
+  ['逐字流式进度', '/docs/history-sync'],
+  ['被盗管理设备', '/docs/privacy-security'],
+]) {
+  const result = await index.searchAsync(query, { index: 'content', limit: 30 })
+  const matchesPage = result.some((group) => group.result.some((id) => index.get(id)?.url?.split('#', 1)[0] === url))
+  if (!matchesPage) fail(`search index does not match ${query} in ${url}`)
 }
 
 console.log(`checked ${htmlFiles.length} HTML pages, ${required.length} required outputs, and Chinese search terms`)

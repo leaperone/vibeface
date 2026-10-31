@@ -1,15 +1,15 @@
 import * as Clipboard from 'expo-clipboard'
 import * as DocumentPicker from 'expo-document-picker'
 import { File } from 'expo-file-system'
-import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, ClipboardPaste, Download, FileCheck, FileKey, FileWarning, Hand, Hourglass, Laptop, LifeBuoy, QrCode, ShieldAlert, ShieldX, X, type LucideIcon } from 'lucide-react-native'
+import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, ClipboardPaste, Download, FileCheck, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, LifeBuoy, QrCode, Shield, ShieldAlert, ShieldCheck, ShieldX, X, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useState } from 'react'
 import { Alert, Pressable, View } from 'react-native'
 import { Link } from 'expo-router'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
-import { recoveryChanges, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
+import { passwordCopy, recoveryChanges, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
 import { entryAddress, messageOf, type ConnectionEntry } from '@vibeface/client/lib/node.ts'
 import { recoveryTarget } from '@vibeface/client/identity/recovery-link.ts'
-import { passphrase, recoveryFileStem, type RecoveryFile } from '@vibeface/client/lib/secure.ts'
+import { passphrase, passwordStrength, recoveryFileStem, type RecoveryFile } from '@vibeface/client/lib/secure.ts'
 import { ErrorText } from '@/components/action'
 import { ActionCard, Panel } from '@/components/kit'
 import { Button } from '@/components/ui/button'
@@ -53,7 +53,7 @@ export function RecoveryRestore({ link }: { link?: string | null }) {
   const [password, setPassword] = useState('')
   const [name, setName] = useState(defaultName)
   const submit = () => void run('restore', async () => {
-    if (!picked || !target) throw new Error('请选择恢复文件。')
+    if (!picked || !target) throw new Error('选一个恢复文件。')
     const typed = password
     // A failed try keeps the chosen file and name; only the typed password leaves the screen.
     setPassword('')
@@ -182,6 +182,7 @@ function UnsavedRecoveryFile() {
   if (!unsavedRecovery || !save) return null
   return <View className="gap-3 border-t border-border pt-4">
     <View className="flex-row items-center gap-2"><Icon as={FileKey} className="size-4 text-muted-foreground" /><Text role="heading" className="font-medium">{recoveryCopy.saveNew}</Text></View>
+    {hint(KeyRound, recoveryCopy.samePassword)}
     <SaveRecoveryFile code={unsavedRecovery.code} saved={false} onSaved={(saved) => { if (saved) forgetUnsavedRecovery() }} save={save} />
     <ErrorText error={error} />
   </View>
@@ -194,12 +195,17 @@ export function RecoveryPendingCard() {
   const pending = device.pendingRecovery
   if (!pending) return null
   const changes = recoveryChanges(pending, device.directory?.members ?? [])
+  const confirm = () => Alert.alert(recoveryCopy.confirmAsk, recoveryCopy.confirmNote, [
+    { text: '取消', style: 'cancel' },
+    { text: recoveryCopy.confirm, onPress: () => void run('confirm', async () => { await device.approveRecovery(pending.checkpoint); Alert.alert(recoveryCopy.confirmDone) }) },
+  ])
   const stop = () => Alert.alert(recoveryCopy.stopAsk, recoveryCopy.stopNote, [
     { text: '取消', style: 'cancel' },
     { text: recoveryCopy.stop, style: 'destructive', onPress: () => void run('stop', () => device.vetoRecovery(pending.checkpoint)) },
   ])
   return <ActionCard icon={ShieldAlert} tone="danger" title={recoveryCopy.pending} actions={<>
-    <Button variant="ghost" disabled={busy !== null} onPress={device.dismissPendingRecovery}><Text>{recoveryCopy.itsMe}</Text></Button>
+    <Button disabled={busy !== null} onPress={confirm}><Icon as={ShieldCheck} /><Text>{recoveryCopy.confirm}</Text></Button>
+    <Button variant="ghost" disabled={busy !== null} onPress={() => { device.dismissPendingRecovery(); Alert.alert(recoveryCopy.itsMeDone(pending.effective_at_ms - device.nodeClockOffset)) }}><Text>{recoveryCopy.itsMe}</Text></Button>
     <Button variant="destructive" disabled={busy !== null} onPress={stop}><Icon as={Hand} /><Text>{busy ? '处理中' : recoveryCopy.stop}</Text></Button>
   </>}>
     {hint(Hourglass, recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset), 'text-danger')}
@@ -261,6 +267,7 @@ export function RecoveryWaiting() {
       {hint(CalendarClock, `${whenText(at)} ${recoveryCopy.autoEnter}`)}
     </>}
     {hint(BellRing, recoveryCopy.managersSee)}
+    {hint(Laptop, recoveryCopy.closeOk)}
     {/* Saving the new file is a separate thing to do now, not part of the wait. */}
     <UnsavedRecoveryFile />
   </Panel>
@@ -280,25 +287,42 @@ export function RecoveredStep() {
   </Panel>
 }
 
+/** Under a new recovery password, as on the web: an icon and a word for how hard it is to guess, and why a weak one is refused. */
+function PasswordStrength({ password, tried }: { password: string; tried: boolean }) {
+  const strength = password ? passwordStrength(password) : null
+  if (!strength || strength.level === 'weak' && strength.problem === 'short' && !tried) return <Text className={tried ? 'text-meta text-danger' : 'text-meta text-muted-foreground'}>{passwordCopy.short}</Text>
+  const tone = strength.level === 'weak' ? 'text-danger' : strength.level === 'strong' ? 'text-success' : 'text-muted-foreground'
+  return <View className="flex-row items-center gap-1.5">
+    <Icon as={strength.level === 'weak' ? ShieldX : strength.level === 'strong' ? ShieldCheck : Shield} className={`size-4 ${tone}`} />
+    <Text className={`shrink text-meta ${tone}`}>{passwordCopy.label[strength.level]}{strength.level === 'weak' ? ` · ${passwordCopy[strength.problem]}` : ''}</Text>
+  </View>
+}
+
 /** A new recovery file under a new password; every older file stops working. */
 export function ReplaceRecovery() {
   const device = useDevice()
-  const { busy, error, status, run } = useRun()
+  const { busy, error, status, run, clear } = useRun()
   const [picked, setPicked] = useState<PickedFile | null>(null)
   const [oldPassword, setOldPassword] = useState('')
   const [password, setPassword] = useState('')
+  const [tried, setTried] = useState(false)
+  // A failed try keeps what was typed; a change to any field takes the old error away.
+  const change = <T,>(set: (value: T) => void) => (value: T) => { set(value); clear() }
   const submit = () => void run('replace', async () => {
-    if (!picked) throw new Error('请选择恢复文件。')
-    const typed = { oldPassword, password }
-    setOldPassword(''); setPassword('')
-    await device.replaceRecoveryFile({ file: picked.file, oldPassword: typed.oldPassword, password: passphrase(typed.password) })
+    if (!picked) throw new Error('选一个恢复文件。')
+    setTried(true)
+    await device.replaceRecoveryFile({ file: picked.file, oldPassword, password: passphrase(password) })
+    setOldPassword(''); setPassword(''); setTried(false)
   }, recoveryCopy.replaced)
   const locked = busy !== null || Boolean(device.review)
   return <View className="gap-4">
     <Text className="text-meta text-muted-foreground">{recoveryCopy.replaceHint}</Text>
-    <FilePick picked={picked} onPick={setPicked} disabled={locked} />
-    <Input {...passwordProps} accessibilityLabel="旧密码" placeholder="旧密码" value={oldPassword} onChangeText={setOldPassword} editable={!locked} />
-    <Input {...passwordProps} accessibilityLabel="新密码" placeholder="新密码（至少 8 个字符）" value={password} onChangeText={setPassword} editable={!locked} />
+    <FilePick picked={picked} onPick={change(setPicked)} disabled={locked} />
+    <Input {...passwordProps} accessibilityLabel="旧密码" placeholder="旧密码" value={oldPassword} onChangeText={change(setOldPassword)} editable={!locked} />
+    <View className="gap-1.5">
+      <Input {...passwordProps} accessibilityLabel="新密码" placeholder="新密码" value={password} onChangeText={change(setPassword)} editable={!locked} />
+      <PasswordStrength password={password} tried={tried} />
+    </View>
     {status ? <Text role="status" className="text-meta text-success">{status}</Text> : null}
     <ErrorText error={error} />
     <Button disabled={locked || !picked || !oldPassword || !password} onPress={submit}>

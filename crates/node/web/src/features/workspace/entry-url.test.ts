@@ -11,10 +11,15 @@ import type { WorkRecord } from "@vibeface/client/workspace/types.ts"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
 import { folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
-import { agentName, awaitsAnswer, foldAnswers, projectName, questionMeta, questionOpen, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
-import { awaitsDevice, botReach, canSend, composerHint, starters } from "@vibeface/client/chat/protocol.ts"
+import { agentName, answerLabel, approvalTask, awaitsAnswer, declined, foldAnswers, projectName, questionMeta, questionOpen, questionParts, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
+import * as errors from "@vibeface/client/lib/errors.ts"
+import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
+import { awaitsDevice, botReach, canSend, composerHint, reachDevice, starters } from "@vibeface/client/chat/protocol.ts"
+import { setUpOnManager } from "@vibeface/client/identity/copy.ts"
 import { chatTimeline, firstUnread } from "@vibeface/client/chat/timeline.ts"
 import { primaryLane } from "@vibeface/client/identity/connection-lane.ts"
+import * as taskLabels from "@vibeface/client/workspace/labels.ts"
+import * as workspaceModel from "@vibeface/client/workspace/model.ts"
 
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
@@ -86,7 +91,7 @@ test("works, reply status and pending checks keep their exact shape", () => {
   const delivered = parseConversation({ ...context, works: [work], deliveries: [
     { work_id: "new", target_node: "other", state: "dispatch_rejected", kind: "codex", title: "新任务", cwd: "/p", reason: "project unavailable" },
     { work_id: "work", target_node: "worker", state: "stop_timed_out" },
-    { work_id: "lost", target_node: "gone", state: "dispatch_unverified", kind: "task", title: "旧任务", cwd: "/p", reason: "设备已移除，无法核对" },
+    { work_id: "lost", target_node: "gone", state: "dispatch_unverified", kind: "task", title: "旧任务", cwd: "/p", reason: "设备已移除，结果无法确认。" },
   ] })
   assert.equal(delivered.works[0].stop, "stop_timed_out")
   assert.equal(delivered.works[2].state, "dispatch_unverified")
@@ -512,15 +517,74 @@ const pendingResult = () => {
 }
 const settleComponent = () => new Promise(setImmediate)
 
+test("task filters keep the counts, device confirmations and empty state within the selected Bot", () => {
+  const bots = [{ bot_id: "a", conversation_id: "chat-a", name: "Bot A" }, { bot_id: "b", conversation_id: "chat-b", name: "Bot B" }]
+  const work = (conversation_id: string) => ({ kind: "work", work_id: conversation_id, check_id: conversation_id, conversation_id, target_node: "offline", title: conversation_id, detail: "", reason: "offline" })
+  let inbox = [
+    { key: "device", kind: "confirm", check: { kind: "device", works: [work("chat-a"), work("chat-b")] } },
+    { key: "question-b", kind: "question", done: false, question: { conversation_id: "chat-b", bot: bots[1], about: {} } },
+    { key: "process", kind: "confirm", check: { kind: "process", check_id: "process", detail: "still running" } },
+  ]
+  const workspace = { bots, selectedBot: bots[1], openWorks: [], nodes: [], questions: [], liveProgress: [], connectionOnline: true }
+  const app = componentHarness("./tasks-overview.tsx", {
+    "@vibeface/client/workspace/context.tsx": { useWorkspace: () => workspace },
+    "@vibeface/client/identity/context.tsx": { useDevice: () => ({ directory: null }) },
+    "@vibeface/client/workspace/labels.ts": taskLabels,
+    "@vibeface/client/workspace/model.ts": workspaceModel,
+    "./inbox": { useInbox: () => inbox },
+    "./workspace-shell": { useCreateBot: () => () => {} },
+  })
+  const named = (elements: ReturnType<typeof app.render>, name: string) => elements.find(({ type }) => typeof type === "function" && type.name === name)
+  try {
+    let elements = app.render("TasksOverview")
+    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 3)
+    const selectBot = named(elements, "TaskFilters")?.props.onBotFilter
+    assert.ok(typeof selectBot === "function")
+    selectBot("a")
+    elements = app.render("TasksOverview")
+    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 1)
+    const checks = elements.filter(({ type }) => type === "ConfirmCard").map(({ props }) => props.check)
+    assert.deepEqual(JSON.parse(JSON.stringify(checks)), [{ kind: "device", works: [work("chat-a")] }])
+    assert.equal(elements.some(({ type }) => type === "QuestionCard"), false)
+    assert.equal(elements.find(({ props }) => props.role === "status")?.props.children, "1 项任务")
+    inbox = inbox.filter((item) => item.kind === "question")
+    elements = app.render("TasksOverview")
+    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 0)
+    assert.equal(named(elements, "WorkspaceEmpty")?.props.title, "没有符合筛选的任务")
+  } finally { app.close() }
+})
+
+test("mobile task attention counts unanswered questions and program checks and opens their inbox", () => {
+  let inbox: unknown[] = [{ kind: "question", done: false }, { kind: "confirm", check: { kind: "process" } }, { kind: "question", done: true }]
+  const app = componentHarness("../../../../../../apps/mobile/src/features/home/tasks.tsx", {
+    "@/data/live": { useLive: () => null, useInbox: () => inbox },
+    "@/data/context": { useWorkspace: () => ({ bots: [] }) },
+    "@vibeface/client/identity/context.tsx": { useDevice: () => ({ directory: null }) },
+    "@vibeface/client/workspace/labels.ts": taskLabels,
+  })
+  try {
+    let elements = app.render("TasksScreen")
+    const attention = () => elements.find(({ type }) => typeof type === "function" && type.name === "MobileMasthead")?.props.attention
+    const empty = () => elements.some(({ type }) => typeof type === "function" && type.name === "MobileEmpty")
+    assert.equal(attention(), 2)
+    assert.equal(elements.some(({ type, props }) => type === "Link" && props.href === "/inbox"), true)
+    assert.equal(empty(), false)
+    inbox = []
+    elements = app.render("TasksScreen")
+    assert.equal(attention(), 0)
+    assert.equal(empty(), true)
+  } finally { app.close() }
+})
+
 test("question cards answer with a choice or typed text, retry an unconfirmed answer as sent and fold once answered", async () => {
   const sent: unknown[][] = []
   const workspace = { generation: 1, writable: true, nodes: [], answered: {} as Record<string, string>, pendingAnswers: [] as { question_id: string; text: string }[], announce() {},
-    bots: [{ bot_id: 'bot', conversation_id: 'chat', name: '项目 Bot' }],
+    bots: [{ bot_id: 'bot', conversation_id: 'chat', name: '项目 Bot' }], openWorks: [], data: { works: [{ work_id: 'w', thread_id: 's', title: '升级依赖', outcome: 'completed' }] },
     answer: async (...args: unknown[]) => { sent.push(args); return { status: 'answered', text: args[1] } } }
   const toasts: { text: string; action?: { label: string; onClick(): void } }[] = [], visited: unknown[] = []
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const router = { Link: 'Link', useNavigate: () => (target: unknown) => { visited.push(target) } }
-  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, questionMeta, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
+  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, answerLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
   const question = { question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '要不要继续', choices: [{ label: '继续' }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null }
   type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void; onSubmit?: (event: unknown) => void } }
   const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' && 'props' in node ? text((node as Element).props.children) : ''
@@ -556,6 +620,9 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
     assert.match(words(elements), /已回答 · 停下/, 'an answer that just landed folds the card at once')
     assert.equal(elements.some(({ props }) => props.role === 'status'), true, 'and is announced')
     assert.equal(toasts.length, 0, 'answering in the chat itself needs no toast')
+    assert.doesNotMatch(words(elements), /升级依赖/, 'a question that held no task names none')
+    elements = app.render('QuestionCard', { question: { ...question, about: { ...question.about, request_id: 'r' } } })
+    assert.match(words(elements), /升级依赖[^]*工作电脑/, 'an answered approval names the task it held and its device, even once that task finished')
     workspace.answered = {}
     labelled(app.render('QuestionCard', { question: { ...question, question_id: 'q2' }, inbox: true }), '继续')?.props.onClick?.()
     await settleComponent()
@@ -570,7 +637,7 @@ test("any entrance stops an unfinished task once, after a confirming second tap,
   const data = { local_node: 'worker', works: [] as unknown[], questions: [] }
   const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data, interruptWork: async (work: string) => { stopped.push(work) } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
-  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '', taskStale: () => false, staleTaskLabel: '', progressLabel: () => '', shownState: (work: { state: string }) => work.state }, '@vibeface/client/workspace/questions.ts': { projectName, questionOpen } }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', promptSummary, taskActive: () => true, taskLabel: () => '', taskStale: () => false, staleTaskLabel: '', progressLabel: () => '', shownState: (work: { state: string }) => work.state, taskAgent: () => null, followUp, followUpCopy }, '@vibeface/client/lib/errors.ts': errors, '@vibeface/client/workspace/questions.ts': { projectName, questionOpen } }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
   const stop = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'destructive')
   const ask = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'outline' && [props.children].flat().some((child) => typeof child === 'string' && child.includes('停止')))
   try {
@@ -603,7 +670,7 @@ test("below lg the task panel is a modal dialog that makes the rest of the page 
   const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data: { local_node: 'worker', questions: [], works: [{ work_id: 'work', target_node: 'worker', cwd: '/p', title: '整理日志', prompt: '', state: 'completed', summary: '', outcome: 'completed', result_text: '好了', failure_reason: null }] } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: () => Promise.resolve() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   let wide = false
-  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', taskActive: () => false, taskLabel: () => '', taskStale: () => false, staleTaskLabel: '', progressLabel: () => '', shownState: (work: { state: string }) => work.state }, '@vibeface/client/workspace/questions.ts': { projectName, questionOpen } }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: (query: string) => ({ matches: query === '(min-width: 1024px)' && wide }) } })
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', promptSummary, taskActive: () => false, taskLabel: () => '', taskStale: () => false, staleTaskLabel: '', progressLabel: () => '', shownState: (work: { state: string }) => work.state, taskAgent: () => null, followUp, followUpCopy }, '@vibeface/client/lib/errors.ts': errors, '@vibeface/client/workspace/questions.ts': { projectName, questionOpen } }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: (query: string) => ({ matches: query === '(min-width: 1024px)' && wide }) } })
   // A page shaped like the shell: the panel's layer beside the chat, a header above, a sidebar and the toast region outside.
   type Node = { name: string; attributes: Set<string>; parentElement: Node | null; children: Node[]; hasAttribute(name: string): boolean; setAttribute(name: string): void; removeAttribute(name: string): void }
   const node = (name: string, children: Node[] = [], attributes: string[] = []): Node => {
@@ -688,7 +755,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, canSend, composerHint, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject } }, { setInterval: () => 1, clearInterval() {} })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, canSend, composerHint, reachDevice, starters }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -828,7 +895,7 @@ test("a segmented control is one Tab stop whose arrow keys move and select, wrap
   assert.deepEqual(render().filter(({ props }) => props.role === 'radio').map(({ props }) => props.tabIndex), [0, -1, -1], "with nothing checked the first option takes the Tab stop")
 })
 
-for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears submitted passwords before waiting and keeps the chosen file and name`, async () => {
+for (const mode of ['restore']) test(`recovery ${mode} clears submitted passwords before waiting and keeps the chosen file and name`, async () => {
   let generation = 1, work = pendingResult()
   class Input { value = 'test-only-value'; files: object[] = [{}]; checked = false }
   const fields = new Map(['bundle', 'password', 'old_password', 'confirmation', 'name', 'bootstrap', 'address', 'device_id', 'relay'].map(name => [name, new Input()]))
@@ -860,7 +927,33 @@ for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears subm
     password.value = 'another test-only-value'
     submit(); await settleComponent()
     assert.equal(password.value, '')
-    assert.equal(render().find(({ props }) => props.error)?.props.error, '请选择恢复文件。')
+    assert.equal(render().find(({ props }) => props.error)?.props.error, '选一个恢复文件。')
+  } finally { app.close() }
+})
+
+test('changing the recovery password keeps what was typed when it fails, and clears it once the new file is made', async () => {
+  let work = pendingResult()
+  class Input { value = 'test-only-value'; files: object[] = [{}]; checked = false }
+  const fields = new Map(['bundle', 'password', 'old_password'].map(name => [name, new Input()]))
+  const passwords = ['password', 'old_password'].map(name => fields.get(name))
+  const form = { elements: { namedItem: (name: string) => fields.get(name) }, querySelectorAll: () => passwords }
+  const device = { connectionGeneration: () => 1, ready: null, review: null, entry: null, replaceRecoveryFile: () => work.promise }
+  const app = componentHarness('../identity/recovery-controls.tsx', {
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/lib/node.ts': { parseEntry: (value: unknown) => value, messageOf: (cause: Error) => cause.message },
+    '@vibeface/client/lib/secure.ts': { passphrase: (value: string) => value, passwordStrength: () => ({ level: 'strong' }) }, '@/lib/device-name': { defaultBrowserName: () => 'browser' },
+  }, { HTMLInputElement: Input, HTMLTextAreaElement: Input })
+  const render = () => app.render('RecoveryControls', { only: 'passphrase' })
+  const form_ = () => render().find(({ type }) => type === 'form')?.props
+  const submit = () => form_()?.onSubmit?.({ preventDefault() {}, currentTarget: form })
+  try {
+    render(); submit()
+    work.reject(new Error('旧密码不对')); await settleComponent()
+    assert.ok(passwords.every(field => field?.value === 'test-only-value'), 'a failed try keeps both passwords')
+    assert.equal(render().find(({ props }) => props.error)?.props.error, '旧密码不对')
+    form_()?.onChange?.({})
+    assert.equal(render().some(({ props }) => props.error), false, 'a change takes the old error away')
+    work = pendingResult(); submit(); work.resolve(undefined); await settleComponent()
+    assert.ok(passwords.every(field => field?.value === ''), 'a new file clears both passwords')
   } finally { app.close() }
 })
 
@@ -872,7 +965,7 @@ test("conversation blocks sending until an online node can run the manager Agent
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, canSend, composerHint, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject } }, { setInterval: () => 1, clearInterval() {} })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, canSend, composerHint, reachDevice, starters }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()
@@ -900,7 +993,7 @@ test("an owner's reply on its way keeps its streamed text until the reply lands"
     generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages, scheduler: { jobs: [job], unanswered: [] } }, messagePending: null, messageBusy: false,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [progress], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     refresh: async () => {},
-  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, canSend, composerHint, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject } }, { setInterval: () => 1, clearInterval() {} })
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, canSend, composerHint, reachDevice, starters }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const streamed = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { message?: { state?: string; text: string } }[]).filter((entry) => entry.message?.state === 'streaming').map((entry) => entry.message?.text).join()
   try {
     assert.equal(streamed(), "partial answer")
@@ -919,7 +1012,7 @@ test("a closed question neither waits on the person nor hides 思考中", () => 
     generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages: [ask], questions, scheduler: { jobs: [job], unanswered: [] } }, messagePending: null, messageBusy: false,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true, answered: {},
     refresh: async () => {},
-  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, canSend, composerHint, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject } }, { setInterval: () => 1, clearInterval() {} })
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, canSend, composerHint, reachDevice, starters }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const thinking = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { key: string }[]).some((entry) => entry.key === 'activity')
   try {
     assert.equal(thinking(), true, "a question its device closed is not the bot's status")

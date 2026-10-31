@@ -112,6 +112,8 @@ export type ConversationRecords = {
   jobs: ManagerJob[]
   unanswered: string[]
   sent: SentBotMessage[]
+  /** The conversation's works that want the person, as the Node lists them now; replaces its share of `open_works`. */
+  open_works: OpenWork[]
 }
 /**
  * What only the person can settle; nothing is resent.
@@ -123,6 +125,8 @@ export type PendingCheck =
   | { kind: "device"; check_id: string; detail: string; target_node: string; reason: "offline" | "disconnected"; works: Extract<PendingCheck, { kind: "work" }>[] }
   | { kind: "process"; check_id: string; detail: string }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
+export const sessionNotificationKind = "session_attributed"
+export const isSessionNotification = (item: Pick<NotificationRecord, "kind">) => item.kind === sessionNotificationKind
 export type FieldEdit = { before: string; after: string }
 /** A bot's model on one provider; empty follows the device's default. */
 export type ModelEdit = FieldEdit & { provider: ProviderId }
@@ -176,7 +180,7 @@ export type ConversationPayload = {
   sent: SentBotMessage[]
 }
 export type SentBotMessage = { message_id: string; to: string; text: string; created_at_ms: number }
-/** "chat" while a conversation route is on screen; reading it then acknowledges its notifications. */
+/** "chat" while a conversation route is on screen; reading it acknowledges ordinary notifications. */
 export type WorkspaceView = "chat" | "tasks" | "other"
 /** One version of an event, as a Node keeps it when two copies of a device wrote the same place. */
 export type ConflictVersion = { hash: string; scope_id: string; created_at_ms: number; body: Record<string, unknown> }
@@ -223,6 +227,7 @@ type OverviewTaskCommon = {
   turn_id: string | null
   phase: WorkPhase | null
   reason: string | null
+  failure?: FailureKind
   node: OverviewNode | null
   navigation: OverviewNavigation | null
   source: "event" | "dag" | "local_dispatch" | "local_check" | "remote_owner"
@@ -358,4 +363,10 @@ export type TriageSettings = {
   device_id: string
   decision_tokens: { token_id: string; label: string; created_ms: number }[]
   outbox: { pending: number; delivered: number; dead: number }
+  status: {
+    budget: { day: string; used: number; limit: number; retry_at_ms: number; paused_reason: "budget_exhausted" | null }
+    pending_events: number
+    inflight_events: number
+    unknown_events: number
+  }
 }

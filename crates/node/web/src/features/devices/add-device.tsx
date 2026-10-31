@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react"
-import { CircleAlert, CircleCheck, Clock, Copy, Download, Link2, Monitor, Plus, Smartphone, SquareTerminal } from "lucide-react"
+import { CircleAlert, CircleCheck, Clock, Copy, Download, Laptop, Link2, Plus, Smartphone, SquareTerminal } from "lucide-react"
+import { Link } from "@tanstack/react-router"
 import qrcode from "qrcode-generator"
 import { BusyIcon, Details, InlineError, PageActions, Segmented } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -8,9 +9,9 @@ import { Textarea } from "@/components/ui/textarea"
 import { terms } from "@/lib/glossary"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import type { Invitation } from "@vibeface/client/identity/context.tsx"
-import { addDeviceCopy, joinCopy } from "@vibeface/client/identity/copy.ts"
+import { addDeviceCopy, deviceCopy, joinCopy } from "@vibeface/client/identity/copy.ts"
 import { messageOf } from "@vibeface/client/lib/node.ts"
-import { JoinRequests, useOpenJoins } from "./join"
+import { JoinRequests, useOpenJoins, type Added } from "./join"
 
 /** `image`: the QR code of `qr`, which a phone's camera opens when the link is public, and the Vibeface app scans otherwise. */
 type Share = Invitation & { image: string | null }
@@ -21,15 +22,20 @@ function share(invitation: Invitation): Share {
   return { ...invitation, image }
 }
 
-const kinds = [{ value: "phone", label: addDeviceCopy.phone, icon: Smartphone }, { value: "computer", label: addDeviceCopy.computer, icon: Monitor }] as const
+const kinds = [{ value: "phone", label: addDeviceCopy.phone, icon: Smartphone }, { value: "computer", label: addDeviceCopy.computer, icon: Laptop }] as const
 type Kind = (typeof kinds)[number]["value"]
 
-/** "添加设备": one link the new device opens (a QR for phones, a command for computers), then both sides compare the safety code. `opening`: arrived from a hint that asked for it. */
-export function AddDevice({ opening = false, onOpened, onOpenChange }: { opening?: boolean; onOpened?(): void; onOpenChange?(open: boolean): void }) {
+/**
+ * "添加设备": one link the new device opens (a QR for phones, a command for computers), then both sides compare the safety code.
+ * `opening`: arrived from a hint that asked for it, for that kind of device; `manage`: that hint asked for another management device.
+ */
+export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening?: Kind; manage?: boolean; onOpened?(): void; onOpenChange?(open: boolean): void }) {
   const device = useDevice()
   const { ready } = device
   const generation = device.connectionGeneration()
   const [open, setOpen] = useState(false)
+  // Kept for this opening only: the hint's search is cleared once the sheet is up.
+  const [asManager, setAsManager] = useState(false)
   useEffect(() => onOpenChange?.(open), [open])
   const [result, setResult] = useState<Share | null>(null)
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
@@ -38,7 +44,7 @@ export function AddDevice({ opening = false, onOpened, onOpenChange }: { opening
   const [error, setError] = useState("")
   const [status, setStatus] = useState("")
   // This page allowed the device, so it says so where the link was rather than only in a toast.
-  const [added, setAdded] = useState<string | null>(null)
+  const [added, setAdded] = useState<Added | null>(null)
   // "已复制" shows for a moment on the button that copied.
   const [copied, setCopied] = useState<"link" | "command" | null>(null)
   // The browser refused the clipboard: the raw text opens, selected, for a manual copy.
@@ -100,6 +106,8 @@ export function AddDevice({ opening = false, onOpened, onOpenChange }: { opening
   const show = () => { setOpen(true); if (!result && !requests) generate() }
   useEffect(() => {
     if (!opening || !ready?.principal.can_manage) return
+    setKind(opening)
+    setAsManager(Boolean(manage))
     show()
     onOpened?.()
   }, [opening, ready])
@@ -110,16 +118,19 @@ export function AddDevice({ opening = false, onOpened, onOpenChange }: { opening
       <Button type="button" variant="ghost" size="icon" className="md:hidden" aria-label="添加设备" title="添加设备" onClick={show}><Plus aria-hidden="true" /></Button>
       <Button type="button" variant={requests ? "outline" : "default"} className="max-md:hidden" onClick={show}><Plus aria-hidden="true" />添加设备</Button>
     </PageActions>
-    <Sheet open={open} onOpenChange={(next) => { setOpen(next); if (!next) setAdded(null) }}>
+    <Sheet open={open} onOpenChange={(next) => { setOpen(next); if (!next) { setAdded(null); setAsManager(false) } }}>
       {/* A waiting request leads the sheet; its first control is 设为管理设备, which should not take focus on its own. */}
       <SheetContent ref={sheet} className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); sheet.current?.focus() } }}>
         <SheetHeader className="pr-14"><SheetTitle tabIndex={-1} className="outline-none">添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
         <div className="grid gap-6 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
           {/* A device already asking is the next thing to act on, so it comes before a new link. */}
-          <JoinRequests issuing={result !== null} onAllowed={(name) => { setAdded(name); setResult(null); setError(""); setCopyFailed(false) }} />
+          <JoinRequests issuing={result !== null} manage={asManager} onAllowed={(device) => { setAdded(device); setAsManager(false); setResult(null); setError(""); setCopyFailed(false) }} />
           {added && !requests ? <div className="grid gap-3">
-            <p role="status" className="flex min-w-0 items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" /><span className="truncate" title={added}>已添加「{added}」</span></p>
-            <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Plus} />再添加一台</Button>
+            <p role="status" className="flex min-w-0 items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" /><span className="truncate" title={added.name}>{added.manage ? deviceCopy.addedManager(added.name) : `已添加「${added.name}」`}</span></p>
+            <div className="flex flex-wrap gap-2">
+              {added.kind === "node" ? <Button asChild><Link to="/devices/$deviceId" params={{ deviceId: added.id }} onClick={() => setOpen(false)}><terms.ai.icon aria-hidden="true" />{addDeviceCopy.setUpAi}</Link></Button> : null}
+              <Button type="button" variant={added.kind === "node" ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Plus} />{addDeviceCopy.addAnother}</Button>
+            </div>
           </div> : !result || (used && !requests) ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
           {result && !used ? <div className="grid gap-3">
             <Segmented label="新设备是" labels fill value={kind} options={[...kinds]} onChange={(next) => { setKind(next); setCopied(null); setCopyFailed(false); setError(""); setShown("link") }} />
@@ -130,7 +141,7 @@ export function AddDevice({ opening = false, onOpened, onOpenChange }: { opening
             </> : <>
               <ol className="grid gap-3">
                 <li className="flex min-w-0 items-center gap-3"><Step n={1} />{copyButton("link", result.link, "复制链接", true)}</li>
-                <li className="flex min-w-0 items-start gap-3"><Step n={2} /><Monitor aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><span className="min-w-0">{addDeviceCopy.openThere}</span></li>
+                <li className="flex min-w-0 items-start gap-3"><Step n={2} /><Laptop aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><span className="min-w-0 [overflow-wrap:anywhere]">{addDeviceCopy.openThere}</span></li>
               </ol>
               <p className="flex min-w-0 flex-wrap items-center gap-x-1.5 text-meta text-muted-foreground">
                 <Download aria-hidden="true" className="size-4 shrink-0" />{addDeviceCopy.installThere}

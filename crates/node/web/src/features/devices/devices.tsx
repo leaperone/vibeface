@@ -1,18 +1,18 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, Check, ChevronRight, Copy, Info, Monitor, Pencil, ShieldAlert, Smartphone, Tablet, X, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Check, ChevronRight, Copy, Info, Pencil, ShieldAlert, Smartphone, Tablet, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
-import { addOnManager, anotherManager, deviceCopy, soleBrowserManagerText } from "@vibeface/client/identity/copy.ts"
+import { addOnManager, anotherManager, editOnManager, deviceCopy, soleBrowserManagerText } from "@vibeface/client/identity/copy.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { deviceForm, deviceOnline, isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { terms } from "@/lib/glossary"
 import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
 import { botReadiness } from "@vibeface/client/workspace/model.ts"
-import { entryAddress, type Member } from "@vibeface/client/lib/node.ts"
+import { entryAddress, throughEntry, type Member } from "@vibeface/client/lib/node.ts"
 import { AiSettings } from "./ai-settings"
 import { JoinRequests } from "./join"
 import { localCopy } from "@/features/workspace/local-session"
@@ -33,11 +33,11 @@ export function useDeviceRows(): DeviceRow[] {
   const rank = (row: DeviceRow) => row.browser ? 0 : row.entry ? 1 : row.kind === "node" ? 2 : deviceForm(row.kind, row.name) === "browser" ? 4 : 3
   return ids.map((id): DeviceRow => {
     const member = members.find((item) => item.device_id === id), node = nodes.find((item) => item.device_id === id)
-    const kind = member?.kind ?? "node", entry = id === ready?.entry.device_id
+    const kind = member?.kind ?? "node", entry = id === ready?.entry.device_id, browser = id === identity?.deviceId
     return {
       id, member, node, kind, name: member?.name || node?.name || (kind === "node" ? "电脑" : "浏览器"),
-      entry, browser: id === identity?.deviceId,
-      online: deviceOnline(kind, node, entry, connectionOnline), bot: botReadiness(node), admin: member?.manage ?? false,
+      entry, browser,
+      online: deviceOnline(kind, node, entry, connectionOnline, browser), bot: botReadiness(node), admin: member?.manage ?? false,
     }
   }).sort((a, b) => rank(a) - rank(b))
 }
@@ -46,7 +46,7 @@ export function useDeviceRows(): DeviceRow[] {
 export function deviceIcon(row: Pick<DeviceRow, "kind" | "name">): LucideIcon {
   if (row.kind === "node") return terms.thisComputer.icon
   const form = deviceForm(row.kind, row.name)
-  return form === "tablet" ? Tablet : form === "phone" ? Smartphone : Monitor
+  return form === "tablet" ? Tablet : form === "phone" ? Smartphone : terms.browser.icon
 }
 
 function Tag({ children, title }: { children: ReactNode; title?: string }) {
@@ -108,15 +108,16 @@ function SoleBrowserManager({ rows }: { rows: DeviceRow[] }) {
   const { ready } = useDevice()
   const admins = rows.filter((row) => row.admin)
   const sole = admins.length === 1 ? admins[0] : null
-  if (!sole || sole.kind !== "client" || deviceForm(sole.kind, sole.name) !== "browser") return null
+  // Only a manager can act on it; anywhere else it is a risk to a device this one cannot help.
+  if (!ready?.principal.can_manage || !sole || sole.kind !== "client" || deviceForm(sole.kind, sole.name) !== "browser") return null
   const next = rows.find((row) => row.kind === "client" && !row.admin)
   const link = "hit-area relative shrink-0 font-medium text-foreground underline underline-offset-4"
   return <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-1 text-meta text-warning">
     <ShieldAlert aria-hidden="true" className="size-4 shrink-0" />
     <span className="min-w-0">{soleBrowserManagerText(sole.browser ? "这个浏览器" : `「${sole.name}」`)}</span>
-    {ready?.principal.can_manage ? next
+    {next
       ? <Link to="/devices/$deviceId" params={{ deviceId: next.id }} className={link}>{anotherManager}</Link>
-      : <Link to="/devices" search={{ add: true }} className={link}>{anotherManager}</Link> : null}
+      : <Link to="/devices" search={{ add: true, manage: true }} className={link}>{anotherManager}</Link>}
   </p>
 }
 
@@ -166,6 +167,8 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   const navigate = useNavigate()
   const action = useAction()
   const [removing, setRemoving] = useState(false)
+  // Taking management away asks first; giving it does not.
+  const [unmanaging, setUnmanaging] = useState(false)
   const row = rows.find((item) => item.id === deviceId)
   const entryName = rows.find((item) => item.entry)?.name
   const copied = writeState.conflicts.some((item) => item.author === deviceId) || Boolean(row?.entry && writeState.state === "forked")
@@ -175,7 +178,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   if (!row) return device.directory ? <EmptyState icon={terms.myDevices.icon} title="找不到这个设备" action={<Button asChild variant="outline"><Link to="/devices">回到设备列表</Link></Button>} /> : <div className="mx-auto grid w-full max-w-(--page-width) gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
   const Icon = deviceIcon(row)
   const address = row.entry && ready ? entryAddress(ready.entry) : ""
-  const saved = device.entries.find((item) => item.device_id === row.id)
+  const target = device.entries.find((item) => item.device_id === row.id) ?? (ready && row.member ? throughEntry(ready.entry, row.id) : undefined)
 
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     <header className="flex items-center gap-4">
@@ -185,6 +188,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
         <div className="flex flex-wrap items-center gap-2">
           {row.online !== undefined ? <Online online={row.online} /> : null}
           {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
+          {row.browser && entryName ? <Tag title={`连在「${entryName}」上`}><terms.thisComputer.icon aria-hidden="true" className="size-3.5" />{entryName}</Tag> : null}
           {row.admin ? <Tag title={terms.admin.label}><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.tag}</Tag> : null}
         </div>
         {row.online === false ? <p className="text-meta text-muted-foreground">{entryName && !row.entry ? `确认它开着，并且能连到「${entryName}」` : deviceCopy.offline}</p> : null}
@@ -198,9 +202,10 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
 
     {row.kind === "node" && !copied ? row.entry && (canManage || localSession) ? <Section title={terms.ai.label} bare><AiSettings /></Section> : <Section title={terms.ai.label}>
       <div className="grid gap-1">
-        <p>{deviceCopy.botStatus[row.bot ?? "none"]}</p>
-        <p className="text-meta text-muted-foreground">{canManage ? "连到它后才能修改" : `只有${terms.admin.label}能修改`}</p>
-        {canManage && saved ? <Button type="button" variant="outline" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(saved))}><ArrowRightLeft aria-hidden="true" />切换到它</Button> : null}
+        <p>{deviceCopy.botStatus[deviceCopy.botState(row.bot, row.online)]}</p>
+        {canManage && target ? <Button type="button" variant="outline" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(target))}><ArrowRightLeft aria-hidden="true" />切换到它</Button>
+          : <p className="text-meta text-muted-foreground">{canManage ? "连到它后才能修改" : editOnManager(rows.filter((item) => item.admin).map((item) => item.name))}</p>}
+        {action.errorKey === "switch" ? <InlineError error={action.error} /> : null}
       </div>
     </Section> : null}
 
@@ -222,6 +227,21 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       {action.errorKey === "local" ? <InlineError error={action.error} /> : null}
     </Section> : null}
 
+    {canManage && row.member?.kind === "client" && !row.browser ? <SettingsGroup>
+      <SettingsRow icon={terms.admin.icon} label={unmanaging ? deviceCopy.unmanageAsk(row.name) : terms.admin.label} tone={unmanaging ? "danger" : undefined} stacked={unmanaging}
+        description={unmanaging ? deviceCopy.unmanageNote(rows.filter((item) => item.admin && item.id !== row.id).length) : deviceCopy.manageHint}>
+        {unmanaging ? <>
+          <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setUnmanaging(false)}>取消</Button>
+          <Button type="button" size="sm" variant="destructive" disabled={action.busy !== null} aria-busy={action.busy === "manage" || undefined} onClick={() => void action.run("manage", async () => { await device.setManage(row.id, false); setUnmanaging(false) }, "已取消管理")}>
+            <BusyIcon busy={action.busy === "manage"} />{deviceCopy.unmanage}
+          </Button>
+        </> : <input type="checkbox" role="switch" className="switch" aria-label={terms.admin.label} checked={row.admin}
+          disabled={action.busy !== null || row.admin && !rows.some((item) => item.admin && item.id !== row.id)}
+          onChange={(event) => { if (!event.target.checked) setUnmanaging(true); else void action.run("manage", () => device.setManage(row.id, true), "已设为管理设备") }} />}
+      </SettingsRow>
+      {action.errorKey === "manage" ? <div className="px-4 py-3"><InlineError error={action.error} /></div> : null}
+    </SettingsGroup> : null}
+
     <SettingsGroup>
       <SettingsDisclosure icon={Info} label="详细信息">
         <div className="grid gap-3 text-meta text-muted-foreground">
@@ -229,12 +249,6 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
           <DetailRow label="设备编号" value={row.id} mono />
         </div>
       </SettingsDisclosure>
-      {canManage && row.member?.kind === "client" && !row.browser ? <SettingsRow icon={terms.admin.icon} label={terms.admin.label} description={deviceCopy.manageHint}>
-        <input type="checkbox" role="switch" className="switch" aria-label={terms.admin.label} checked={row.admin}
-          disabled={action.busy !== null || row.admin && !rows.some((item) => item.admin && item.id !== row.id)}
-          onChange={(event) => { const manage = event.target.checked; void action.run("manage", () => device.setManage(row.id, manage), "已保存") }} />
-      </SettingsRow> : null}
-      {action.errorKey === "manage" ? <div className="px-4 py-3"><InlineError error={action.error} /></div> : null}
       {canManage && row.member && !row.entry && !row.browser ? <SettingsRow icon={RemoveIcon} tone="danger" label={terms.remove.label} description={removing ? deviceCopy.removeNotice(Boolean(row.bot)) : undefined} stacked onClick={removing ? undefined : () => setRemoving(true)}>
         {removing ? <>
           <Button type="button" size="sm" variant="ghost" onClick={() => setRemoving(false)}>取消</Button>

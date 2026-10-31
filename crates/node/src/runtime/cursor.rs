@@ -8,7 +8,7 @@ use std::sync::{Mutex as StdMutex, PoisonError, Weak, atomic::Ordering};
 use tokio::sync::{Mutex, watch};
 use vibeface_bridge::{
     agent::{
-        AgentFailure, AgentRunError, NativeStatus, RunStarted, SdkBridge, SdkTurn,
+        AgentFailure, AgentRunError, NativeStatus, RunStarted, SdkBridge, SdkTurn, StartEvidence,
         ToolCallbackConfig,
     },
     failure::{ExecFailure, FailureKind},
@@ -271,6 +271,9 @@ impl CursorExecutor {
                 }),
                 None => Some(Signal::Probed(Probe::Missing)),
             },
+            Err(error) if error.start == StartEvidence::NotStarted => {
+                Some(Signal::StartRejected(error.failure))
+            }
             Err(error) if error.outcome == AgentFailure::Cancelled => match id {
                 Some(turn_id) => Some(Signal::TurnCompleted {
                     turn_id,
@@ -278,11 +281,8 @@ impl CursorExecutor {
                     text: String::new(),
                     error: None,
                 }),
-                None => Some(Signal::StartRejected(error.failure)),
+                None => Some(Signal::Probed(Probe::Missing)),
             },
-            Err(error) if error.outcome == AgentFailure::Failed && id.is_none() => {
-                Some(Signal::StartRejected(error.failure))
-            }
             Err(_) if id.is_some() => Some(Signal::Disconnected),
             Err(_) => Some(Signal::Probed(Probe::Missing)),
         };
@@ -869,6 +869,77 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn cursor_start_rejection_requires_explicit_not_started_evidence() -> Result<()> {
+        let (node, dir, network, workspace) = cursor_node().await?;
+        for (call_ref, start, outcome) in [
+            (
+                "not-started",
+                StartEvidence::NotStarted,
+                AgentFailure::Failed,
+            ),
+            ("started", StartEvidence::Started, AgentFailure::Failed),
+            ("unknown", StartEvidence::Unknown, AgentFailure::Failed),
+            (
+                "cancelled-after-start",
+                StartEvidence::Started,
+                AgentFailure::Cancelled,
+            ),
+        ] {
+            let spec = work(&node, &workspace, call_ref, "fixture prompt")?;
+            node.store.lock().await.accept_work(
+                &node.identity,
+                &network,
+                spec.clone(),
+                now_ms(),
+            )?;
+            node.signal_work(
+                &network,
+                &spec.work_id,
+                Signal::ThreadCreated("fixture-agent".into()),
+            )
+            .await?;
+            node.cursor_executor
+                .finish(
+                    &node,
+                    &network,
+                    &spec.work_id,
+                    Err(AgentRunError {
+                        outcome,
+                        start,
+                        session_id: Some("fixture-agent".into()),
+                        failure: ExecFailure::new(
+                            FailureKind::Lost,
+                            "fixture run handle was not recorded",
+                        ),
+                    }),
+                )
+                .await;
+            let record = node
+                .store
+                .lock()
+                .await
+                .work_record(&spec.work_id)?
+                .context("finished Cursor classification")?;
+            if start == StartEvidence::NotStarted {
+                assert_eq!(
+                    record.state,
+                    WorkState::Finished {
+                        outcome: WorkOutcome::Rejected
+                    }
+                );
+            } else {
+                assert!(
+                    matches!(record.state, WorkState::Unverified { handle: None, thread: Some(ref thread), .. } if thread == "fixture-agent"),
+                    "a missing run handle cannot prove the model never started: {record:?}"
+                );
+            }
+        }
+        node.shutdown().await;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[tokio::test]

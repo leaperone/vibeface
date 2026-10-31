@@ -169,6 +169,9 @@ fn workspace_work_summary(work: &WorkProjection, source: &str) -> Value {
     if let Some(reason) = workspace_bounded_opt(work.failure_reason.as_deref(), 512) {
         row["failure_reason"] = json!(reason);
     }
+    if let Some(failure) = work.failure {
+        row["failure"] = json!(failure);
+    }
     if work.outcome == Some(WorkOutcome::Unverified) {
         row["unknown_reason"] = json!("work_result_unverified");
     }
@@ -427,6 +430,7 @@ impl Runtime {
         .transpose()?;
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
+        store.recover_triage()?;
         store.attach_process_lock(process_lock.clone());
         let have_wakeup = Arc::new(tokio::sync::Notify::new());
         store.on_log_head_written({
@@ -823,20 +827,20 @@ impl Runtime {
             .map(|conversation| (conversation.conversation_id.as_str(), conversation))
             .collect();
 
-        let all_works = conversations
+        // Without finished works only what still wants the user is read, not whole histories.
+        let mut shown_works = Vec::new();
+        let mut omitted_finished = 0;
+        for conversation in &conversations {
+            let scope = &conversation.conversation_id;
+            if include_finished {
+                shown_works.extend(store.works(network, scope)?);
+            } else {
+                shown_works.extend(store.open_works(network, Some(scope))?);
+                omitted_finished += store.finished_works(network, scope)?;
+            }
+        }
+        let mut tasks = shown_works
             .iter()
-            .try_fold(Vec::new(), |mut all, conversation| {
-                all.extend(store.works(network, &conversation.conversation_id)?);
-                Ok::<_, anyhow::Error>(all)
-            })?;
-        let work_ids: BTreeSet<_> = all_works.iter().map(|work| work.work_id.as_str()).collect();
-        let mut tasks = all_works
-            .iter()
-            .filter(|work| {
-                include_finished
-                    || work.outcome.is_none()
-                    || work.outcome == Some(WorkOutcome::Unverified)
-            })
             .map(|work| workspace_work_summary(work, "dag"))
             .collect::<Vec<_>>();
 
@@ -848,12 +852,24 @@ impl Runtime {
                     && scope_filter.is_none_or(|scope| scope == dispatch.spec.conversation)
             })
             .collect::<Vec<_>>();
+        // A refusal the user closed or the bot answered is finished like a failed work.
+        let open_refusals: BTreeSet<_> = store
+            .open_dispatches(network, None)?
+            .into_iter()
+            .map(|dispatch| dispatch.spec.work_id)
+            .collect();
         let mut deliveries = Vec::new();
         for dispatch in &dispatches {
             let spec = &dispatch.spec;
+            if !include_finished
+                && matches!(dispatch.state, crate::work::DispatchState::Rejected { .. })
+                && !open_refusals.contains(&spec.work_id)
+            {
+                continue;
+            }
             let state = dispatch.state.name();
             let waiting_sync = dispatch.state == crate::work::DispatchState::Accepted
-                && !work_ids.contains(spec.work_id.as_str());
+                && store.work(network, &spec.work_id)?.is_none();
             if waiting_sync || dispatch.state != crate::work::DispatchState::Accepted {
                 let unknown_reason = if waiting_sync {
                     Some("accepted_waiting_sync")
@@ -886,6 +902,9 @@ impl Runtime {
                 if let Some(reason) = dispatch.state.reason() {
                     task["failure_reason"] = json!(workspace_bounded(reason, 512));
                 }
+                if let Some(failure) = dispatch.state.failure() {
+                    task["failure"] = json!(failure);
+                }
                 tasks.push(task);
                 deliveries.push(json!({
                     "work_id": spec.work_id,
@@ -896,6 +915,7 @@ impl Runtime {
                     "title": workspace_bounded(&spec.title, 256),
                     "cwd": workspace_bounded(&spec.cwd, 512),
                     "reason": dispatch.state.reason().map(|reason| workspace_bounded(reason, 512)),
+                    "failure": dispatch.state.failure(),
                 }));
             }
         }
@@ -911,7 +931,7 @@ impl Runtime {
                 "requested_at_ms": stop.requested_at_ms,
                 "deadline_ms": stop.deadline_ms,
             });
-            if let Some(work) = all_works.iter().find(|work| work.work_id == stop.work_id) {
+            if let Some(work) = store.work(network, &stop.work_id)? {
                 delivery["cwd"] = json!(workspace_bounded(&work.cwd, 512));
             }
             deliveries.push(delivery);
@@ -1017,7 +1037,7 @@ impl Runtime {
         drop(store);
 
         let mut relations = Vec::new();
-        for work in &all_works {
+        for work in &shown_works {
             if !include_finished
                 && work.outcome.is_some()
                 && work.outcome != Some(WorkOutcome::Unverified)
@@ -1041,16 +1061,6 @@ impl Runtime {
         let omitted_sessions = sessions.len().saturating_sub(limit);
         let omitted_deliveries = deliveries.len().saturating_sub(limit);
         let omitted_relations = relations.len().saturating_sub(limit);
-        let omitted_finished = if include_finished {
-            0
-        } else {
-            all_works
-                .iter()
-                .filter(|work| {
-                    work.outcome.is_some() && work.outcome != Some(WorkOutcome::Unverified)
-                })
-                .count()
-        };
         let truncated = omitted_tasks > 0
             || omitted_questions > 0
             || omitted_jobs > 0
@@ -1275,7 +1285,8 @@ impl Runtime {
             "conversation" => self.conversation_snapshot(&access, &input).await,
             "open_works" => {
                 ensure!(access.human, "only clients list open works");
-                Ok(json!({"works":self.store.lock().await.open_works(network)?}))
+                let store = self.store.lock().await;
+                Ok(json!({"works":chat_controls::open_works(&store, network, None)?}))
             }
             "workspace_overview" => self.workspace_overview(&access, &input).await,
             "message" => self.accept_chat_message(&access, &input).await,
@@ -1311,6 +1322,30 @@ impl Runtime {
             "notifications" => Ok(
                 json!({"notifications":self.store.lock().await.pending_notifications(network,field(&input,"client_id")?)?}),
             ),
+            "dismiss_work" => {
+                ensure!(access.human, "only clients close failed works");
+                let scope = scope.context("conversation_id is required")?;
+                let work_id = id(&input, "work_id")?;
+                let failed = {
+                    let store = self.store.lock().await;
+                    if store.closed_in_inbox(network, &work_id)? {
+                        return Ok(json!({"dismissed":true}));
+                    }
+                    store.failed_work(network, &scope, &work_id)?
+                };
+                ensure!(failed, "这个任务没有失败，不用关掉");
+                self.append(
+                    network,
+                    &scope,
+                    EventBody::NotificationAcked {
+                        notification_id: work_id,
+                        client_id: INBOX_CLIENT.into(),
+                        attestation: Some(attestation(&input)?),
+                    },
+                )
+                .await?;
+                Ok(json!({"dismissed":true}))
+            }
             "ack" => {
                 ensure!(access.human, "only clients acknowledge notifications");
                 let notification = id(&input, "notification_id")?;

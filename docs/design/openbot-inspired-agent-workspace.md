@@ -23,7 +23,7 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 
 | 对象 | 当前事实和工作区用途 |
 | --- | --- |
-| `open_works` | `Store::open_works(network)` 从所有 conversation 找出存在 dispatch 且没有结束记录，或结果为 `unverified` 的 `WorkProjection`。已确定完成或失败的工作不在此列表。 |
+| `open_works` | `Store::open_works(network, scope)` 按 SQL 找出存在 dispatch 且没有结束记录、结果为 `unverified`，或仍待本人看的失败工作；后者是会话里最近结束的失败或被拒工作，之后没有更晚结束的工作、Bot 没有对它做出后续回复（它的结果报告轮的回复，或对失败之后本人消息的回复；派发它的那一轮的回复不算），也没有本人在待处理关掉它（`NotificationAcked`，`client_id = "inbox"`）。本机被拒的派发（未接收）同样列出，直到本人关掉、Bot 对它的报告轮写出已完成的回复，或在没有报告轮时（派发轮内直接得知被拒，或关掉了结果汇报），派发它的那一轮之后本人发的消息有了已完成的回复。已完成的工作不在此列表。 |
 | `ConversationPayload` | 客户端快照包含 `conversation`、`messages`、`works`、`scheduler`、`checks`、`local_node`、`changes`、`overwritten`、`bot_settings`、`questions`、`sessions`、`sent`。工作区从这些字段建立链接，不另建任务事实。 |
 | `scheduler_jobs` | job 主键语义为 `(conversation_id, trigger)`。`trigger` 可为 `message:<id>`、`work:<id>`、`task:<id>`、`bot_message:<id>` 或 `schedule:<id>:<slot>`。job 还保存 `kind`、顺序、`basis` 版本向量、`reply_to`、固定 `message_id` 和状态。 |
 | `scheduler_sessions` | 本机 Provider resume 指针，含 `native_id`、`native_token`、`covers`、`owner_epoch`、`sdk_config`、`permission_version`、`active` 和下一序号。它不是完整 transcript，也不是同步到 DAG 的上下文。 |
@@ -87,3 +87,9 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 现有 `docs/design/agent-direct-app-server.md` 声称已删除 executor，但当前 `crates/node/src/runtime/executor.rs` 仍有 `Executor` trait 和 Provider 选择实现。本设计以当前源码为准。
 
 参考报告实际位于 `/Users/harry/.vibe/planning/Volumes/ssd/project/vibeface/openbot-source-comparison-2026-10-30_11-31-26/reports/openbot-vibeface-comparison.md`。任务指定的两个同名路径不存在，因此没有把不存在的路径当作证据。
+
+## 本轮 UI 交付切片
+
+本轮先把已有投影做成一个可读的个人工作台，不新增 Node RPC 或共享事实字段。Web 和手机任务页共享同一组概念：需要留意、进行中、等待中、Bot 归属、目标设备、执行步骤、审批和未知结果。任务详情继续使用现有的 `Question`、`PendingCheck`、`WorkProgress` 和失败原因；未知结果仍然要求核对，不能用重试按钮掩盖。
+
+上下文面板把共享聊天事实、Bot 持久记忆和定时任务、Provider session 交接线索以及 owner 可达性分开显示。协作面板把本机队列、Bot 消息和 `dispatch_work` 分开显示，并把交接记录放在同一条可读时间线上。浏览器操控、远程画面、手机投屏、团队设备池和新的执行权限仍不属于这条 UI 交付切片。

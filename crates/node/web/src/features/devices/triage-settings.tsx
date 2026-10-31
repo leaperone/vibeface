@@ -109,6 +109,12 @@ export function TriageSettings() {
 
   return <>
     {header}
+    <div role="status" aria-label="分诊状态" className="grid gap-1 px-4 py-3 text-meta text-muted-foreground sm:ps-15">
+      <p className="tabular-nums">分诊今日已用 {settings.status.budget.used} / {settings.status.budget.limit} 次</p>
+      <p>{settings.status.budget.paused_reason ? "今日额度已用完，分诊暂停，" : "额度重置时间："}{new Date(settings.status.budget.retry_at_ms).toLocaleString("zh-CN")}{settings.status.budget.paused_reason ? "后恢复。" : "。"}</p>
+      <p>待审阅 {settings.status.pending_events} · 审阅中 {settings.status.inflight_events} · 待确认 {settings.status.unknown_events}</p>
+      {settings.status.unknown_events ? <p>结果待确认的事件不会自动重试。</p> : null}
+    </div>
     {connected ? <>
     <SettingsRow icon={MessageCircleQuestionMark} label="默认去向" stacked>
       <Segmented label="默认去向" labels fill value={config.default_outlet} disabled={Boolean(busy)} options={outletOptions} onChange={(value) => void save("default", { default_outlet: value })} />

@@ -8,10 +8,10 @@ import { entryAddress } from '@vibeface/client/lib/node.ts'
 import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
 import { inboxItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
-import { addressName, deviceOnline } from '@vibeface/client/workspace/labels.ts'
+import { addressName, deviceOnline, entryLabel } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness, parseBots, parsePrimary } from '@vibeface/client/workspace/model.ts'
 import { storageOf } from '@vibeface/client/workspace/storage.ts'
-import type { BotRecord } from '@vibeface/client/workspace/types.ts'
+import { isSessionNotification, type BotRecord } from '@vibeface/client/workspace/types.ts'
 import { awaitsAnswer, foldAnswers } from '@vibeface/client/workspace/questions.ts'
 import { mobilePlatform } from '@/platform'
 import { WorkspaceProvider } from './context'
@@ -46,11 +46,11 @@ const SharedContext = createContext<Shared | null>(null)
 /** The shared workspace while a member connection is up, for screens that call its actions directly; null before that. */
 export const useLive = () => useContext(SharedContext)
 
-/** 待处理, item for item as the web lists it; nothing before a member connection. */
+/** 手机可处理的待处理项；会话提醒由网页 Bell 承载；没有连接时不返回列表。 */
 export function useInbox(): InboxItem[] {
   const device = useDevice()
   const shared = useLive()
-  return shared ? inboxItems({ device, workspace: shared }) : []
+  return shared ? inboxItems({ device, workspace: shared }).filter((item) => item.kind !== 'session') : []
 }
 
 /** The real network behind the screens: the shared device and workspace providers, reshaped for `useWorkspace`. */
@@ -66,12 +66,14 @@ function useConnection(): { session: Session; connection: Connection } {
   // A recovery still waiting, or one whose new file is not confirmed as saved yet, holds the phone on the join screen.
   const session: Session = device.recovery || device.ready && device.recovered ? { phase: 'unjoined' }
     : access.kind === 'member' || access.kind === 'resuming' || access.kind === 'loading' && device.entries.length ? { phase: 'ready' }
-    : device.joining ? { phase: 'joining', code: device.joining.code ?? null }
+    : device.joining ? { phase: 'joining', code: device.joining.code ?? null, admin: device.joining.admin }
     : { phase: 'unjoined' }
   const { link } = device
-  const state: Connection['state'] = link.kind === 'online' ? (link.catchingUp ? 'syncing' : 'online') : link.kind === 'offline' ? 'offline' : 'connecting'
   const entry = device.ready?.entry ?? device.entry
-  return { session, connection: { state, entry: device.ready?.info.name ?? (entry ? device.entryName(entry) || addressName(entryAddress(entry)) : ''), direct: entry?.kind === 'lan' } }
+  const name = device.ready ? entryLabel({ joined: device.ready.principal.source === 'membership', directory: device.directory, entryId: device.ready.entry.device_id, ownName: device.ready.info.name, address: entryAddress(device.ready.entry) })
+    : entry ? device.entryName(entry) || addressName(entryAddress(entry)) : ''
+  const state: Connection['state'] = name === null ? 'connecting' : link.kind === 'online' ? (link.catchingUp ? 'syncing' : 'online') : link.kind === 'offline' ? 'offline' : 'connecting'
+  return { session, connection: { state, entry: name ?? '', direct: entry?.kind === 'lan' } }
 }
 
 function Device({ children }: { children: ReactNode }) {
@@ -137,7 +139,7 @@ function Live({ children }: { children: ReactNode }) {
     const timeline = chatTimeline(data.messages, data.questions, new Set(jobs.filter((job) => job.state === 'steered').map((job) => job.message_id)))
     // An answer is a user message, shown inside its question instead of as a bubble, as on the web.
     const folded = foldAnswers(data.messages, data.questions)
-    const unread = firstUnread(timeline, shared.fresh, (question) => awaitsAnswer(question, answered, folded.answers))
+    const unread = firstUnread(timeline, shared.fresh, (question) => awaitsAnswer(question, answered, folded.answers) && shared.fresh.has(`question:${question.question_id}`))
     const messages: ChatMessage[] = timeline.messages.map((message) => {
       const detail = message.status === 'failed' ? jobs.find((job) => job.reply_message_id === message.message_id)?.failure?.detail : undefined
       return detail ? { ...message, detail } : message
@@ -162,13 +164,13 @@ function Live({ children }: { children: ReactNode }) {
     }
   }
 
-  const unread = unreadCounts(notifications, questions.filter((question) => awaitsAnswer(question, answered)))
+  const unread = unreadCounts(notifications.filter((item) => !isSessionNotification(item)), questions.filter((question) => awaitsAnswer(question, answered)))
 
   const directory: Member[] = (device.directory?.members ?? []).map((member) => {
     const node = nodes.find((item) => item.device_id === member.device_id), entry = member.device_id === device.ready?.entry.device_id
     return {
       device_id: member.device_id, name: member.name, kind: member.kind === 'node' ? 'node' : 'client', admin: member.manage,
-      online: deviceOnline(member.kind, node, entry, shared.connectionOnline),
+      online: deviceOnline(member.kind, node, entry, shared.connectionOnline, member.device_id === me),
       current: member.device_id === me, entry, bot: botReadiness(node),
     }
   })

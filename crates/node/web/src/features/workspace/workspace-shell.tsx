@@ -2,18 +2,20 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Bell, ChevronLeft, CircleAlert, Hand, LoaderCircle, Plus, RefreshCw, RotateCw, ShieldAlert, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "@/lib/utils"
 import { claimFocus, CountBadge, Dot, EmptyState, PageActionsSlot, PrimaryMark, Skeleton, toast, Wordmark } from "@/components/app/kit"
 import { BotFace, botMood } from "@/components/app/bot-face"
 import { moodLabel } from "@vibeface/client/avatar/mood.ts"
+import type { Mood } from "@vibeface/client/avatar/face.ts"
 import { useOpenJoins } from "@/features/devices/join"
 import { AiOffHint } from "@/features/devices/ai-off-hint"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
+import { RecoveryAlert } from "@/features/identity/recovery-controls"
 import { Button } from "@/components/ui/button"
 import {
   Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupAction, SidebarGroupContent, SidebarGroupLabel, SidebarHeader,
@@ -25,7 +27,7 @@ import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
 import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
 import { backTo } from "@vibeface/client/workspace/home.ts"
-import { addressName, hostOf } from "@vibeface/client/workspace/labels.ts"
+import { addressName, entryLabel, hostOf, isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { entryAddress, entryKey } from "@vibeface/client/lib/node.ts"
 import { unreachableText } from "@vibeface/client/lib/transport.ts"
 import { LocalSession } from "./local-session"
@@ -46,6 +48,17 @@ const CreateBot = createContext<() => void>(() => {})
 /** Opens the new-bot form from anywhere inside the workspace. */
 export const useCreateBot = () => useContext(CreateBot)
 
+const moodIcons: Partial<Record<Mood, LucideIcon>> = { thinking: LoaderCircle, replying: LoaderCircle, waiting: Hand }
+
+/** What a bot is doing beside its name, in words with an icon so the face's color is never the only sign. Idle and offline say nothing here; the face shows offline. */
+export function MoodTag({ mood }: { mood: Mood }) {
+  const Icon = moodIcons[mood]
+  if (!Icon) return moodLabel[mood] ? <span className="sr-only">，{moodLabel[mood]}</span> : null
+  return <span className={cn("flex shrink-0 items-center gap-1 text-meta", mood === "waiting" ? "text-warning" : "text-muted-foreground")}>
+    <span className="sr-only">，</span><Icon aria-hidden="true" className={cn("size-3.5", Icon === LoaderCircle && "animate-spin motion-reduce:animate-none")} />{moodLabel[mood]}
+  </span>
+}
+
 const JOINS_SEEN = "vibeface.joins-seen"
 const titles: Record<string, string> = { "/": "消息", "/inbox": terms.inbox.label, "/tasks": terms.task.label, "/devices": terms.myDevices.label, "/settings": terms.settings.label, "/settings/logs": "日志", "/settings/lab": "实验室", "/settings/lab/transfers": "文件传输实验" }
 
@@ -53,7 +66,13 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   const workspace = useWorkspace()
   // A question answered here stays on screen, collapsed, until the next read; it no longer counts.
   const waiting = waitingItems(useInbox()).length
-  const { setOpenMobile, isMobile, open: sidebarOpen } = useSidebar()
+  // A recovery about to take over outranks every other waiting item, so 待处理 shows a red shield instead of a count.
+  const device = useDevice()
+  const recovering = Boolean(device.pendingRecovery)
+  // A browser joins on this computer's lasting page, never the temporary origin this session opened on, or it would hold a second identity.
+  const lasting = device.ready?.info.connection_entry
+  const home = lasting && isLoopback(entryAddress(lasting)) ? `http://localhost:${new URL(entryAddress(lasting)).port}` : undefined
+  const { setOpenMobile, isMobile } = useSidebar()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const chatRoute = pathname.startsWith("/b/")
   const taskOpen = /^\/b\/[^/]+\/work\//.test(pathname)
@@ -65,13 +84,16 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   // A chat link to a bot this network does not have; the conversation open before must not stand in for it.
   const missingBot = routeBot !== undefined && workspace.bots.length > 0 && !workspace.bots.some((bot) => bot.bot_id === decodeURIComponent(routeBot))
   const botTitle = chatRoute && !missingBot && workspace.selectedBot
-  const title = chatRoute ? "对话" : titles[pathname] ?? (pathname.startsWith("/devices") ? terms.myDevices.label : "")
+  // On a phone the back button stands in for the sidebar, so a device's page is titled by the device.
+  const deviceId = /^\/devices\/([^/]+)$/.exec(pathname)?.[1]
+  const deviceName = isMobile && deviceId ? device.directory?.members.find((member) => member.device_id === decodeURIComponent(deviceId))?.name : undefined
+  const title = chatRoute ? "对话" : deviceName || (titles[pathname] ?? (pathname.startsWith("/devices") ? terms.myDevices.label : ""))
   const navigate = useNavigate()
   const joins = useOpenJoins()
   const [actionsSlot, setActionsSlot] = useState<HTMLElement | null>(null)
-  // The phone's home lists 待处理 itself; elsewhere the header carries it whenever the sidebar is out of sight.
+  // The phone's home lists 待处理 itself; every other page keeps the Bell in the header.
   const phoneHome = isMobile && pathname === "/"
-  const inboxInHeader = (isMobile || !sidebarOpen) && !phoneHome && pathname !== "/inbox"
+  const inboxInHeader = pathname !== "/inbox"
   const devicesAttention = joins.length > 0 || workspace.nodes.some((node) => !node.revoked && !node.online)
 
   useEffect(() => { setOpenMobile(false) }, [pathname, setOpenMobile])
@@ -108,7 +130,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           <SidebarGroup className="pb-0">
             <SidebarMenu>
               <NavItem to="/tasks" icon={terms.task.icon} label={terms.task.label} active={pathname === "/tasks"} />
-              <NavItem to="/inbox" icon={terms.inbox.icon} label={terms.inbox.label} active={pathname === "/inbox"} badge={waiting || undefined} />
+              <NavItem to="/inbox" icon={terms.inbox.icon} label={terms.inbox.label} active={pathname === "/inbox"} badge={waiting || undefined} alert={recovering} />
             </SidebarMenu>
           </SidebarGroup>
           <SidebarGroup>
@@ -123,11 +145,13 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
                   const mood = botMood(bot, workspace)
                   return <SidebarMenuItem key={bot.bot_id}>
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
-                      <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name}>
+                      <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name} className="group/bot">
                         <BotFace bot={bot} mood={mood} size={28} className="size-7!" />
-                        <span className="min-w-0 flex-1 truncate">{bot.name}{moodLabel[mood] ? <span className="sr-only">，{moodLabel[mood]}</span> : null}</span>
-                        {workspace.primary === bot.conversation_id ? <PrimaryMark /> : null}
-                        {marked ? <Dot label="有新进展" /> : null}
+                        <span className="min-w-0 flex-1 truncate">{bot.name}</span>
+                        {/* The star waits for a pointer on the row; a touch screen has none, so it stays there. */}
+                        {workspace.primary === bot.conversation_id ? <span className="flex transition-opacity duration-150 [@media(hover:hover)]:opacity-0 group-hover/bot:opacity-100 group-focus-visible/bot:opacity-100"><PrimaryMark /></span> : null}
+                        {/* One status: a decision waiting outranks news, which outranks what the bot is doing. */}
+                        {mood !== "waiting" && marked ? <Dot label="有新进展" /> : <MoodTag mood={mood} />}
                       </Link>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
@@ -165,21 +189,28 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           <div className="col-start-3 flex items-center justify-end ps-2 empty:hidden">
           {phoneHome ? <div className="-me-3 flex">
             <Button asChild variant="ghost" size="icon" className="relative">
+              <Link to="/inbox" aria-label={recovering ? `${terms.inbox.label}，有人在找回` : waiting ? `${terms.inbox.label} ${waiting}` : terms.inbox.label} title={terms.inbox.label}>
+                <Bell aria-hidden="true" />
+                {recovering ? <ShieldAlert aria-hidden="true" className="absolute top-0.5 right-0.5 size-4! rounded-full bg-background text-danger" /> : waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 ease-out" /> : null}
+              </Link>
+            </Button>
+            <Button asChild variant="ghost" size="icon" className="relative">
               <Link to="/devices" aria-label={devicesAttention ? `${terms.myDevices.label}，需要留意` : terms.myDevices.label} title={terms.myDevices.label}>
                 <terms.myDevices.icon aria-hidden="true" />
-                {devicesAttention ? <Dot tone="warning" className="absolute top-1.5 right-1.5 ring-2 ring-background" /> : null}
+                {devicesAttention ? <CircleAlert aria-hidden="true" className="absolute top-1 right-1 size-3! rounded-full bg-background text-warning" /> : null}
               </Link>
             </Button>
             <Button asChild variant="ghost" size="icon"><Link to="/settings" aria-label={terms.settings.label} title={terms.settings.label}><terms.settings.icon aria-hidden="true" /></Link></Button>
           </div> : inboxInHeader ? <Button asChild variant="ghost" size="icon" className="relative -me-3">
-            <Link to="/inbox" aria-label={waiting ? `${terms.inbox.label} ${waiting}` : terms.inbox.label} title={terms.inbox.label}>
-              <terms.inbox.icon aria-hidden="true" />
-              {waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 ease-out md:-top-0.5 md:-right-0.5" /> : null}
+            <Link to="/inbox" aria-label={recovering ? `${terms.inbox.label}，有人在找回` : waiting ? `${terms.inbox.label} ${waiting}` : terms.inbox.label} title={terms.inbox.label}>
+              <Bell aria-hidden="true" />
+              {recovering ? <ShieldAlert aria-hidden="true" className="absolute top-0.5 right-0.5 size-4! rounded-full bg-background text-danger md:-top-0.5 md:-right-0.5" /> : waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 ease-out md:-top-0.5 md:-right-0.5" /> : null}
             </Link>
           </Button> : null}
           </div>
         </header>
-        {workspace.joined ? null : <LocalSession onJoin={() => void navigate({ to: "/join" })} />}
+        {workspace.joined ? null : <LocalSession onJoin={() => { if (home && home !== window.location.origin) window.location.assign(`${home}/join`); else void navigate({ to: "/join" }) }} />}
+        {pathname === "/inbox" ? null : <RecoveryAlert />}
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
         {/* Kept laid out while hidden so the chat keeps its scroll position across pages. */}
         <div className={cn("flex min-h-0 min-w-0 flex-1", !chatRoute && "invisible absolute inset-x-0 top-14 bottom-0")} inert={!chatRoute} aria-hidden={!chatRoute || undefined}>
@@ -197,14 +228,15 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   )
 }
 
-function NavItem({ to, icon: Icon, label, active, badge, dot }: { to: string; icon: LucideIcon; label: string; active: boolean; badge?: number; dot?: boolean }) {
+function NavItem({ to, icon: Icon, label, active, badge, dot, alert }: { to: string; icon: LucideIcon; label: string; active: boolean; badge?: number; dot?: boolean; alert?: boolean }) {
   return <SidebarMenuItem>
     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
       <Link to={to} aria-current={active ? "page" : undefined}>
         <Icon aria-hidden="true" />
         <span className="flex-1">{label}</span>
-        {badge ? <CountBadge count={badge} /> : null}
-        {dot ? <Dot tone="warning" label="需要留意" /> : null}
+        {alert ? <span className="flex items-center gap-1 text-meta font-medium text-danger"><ShieldAlert aria-hidden="true" className="size-4!" />找回</span> : badge ? <CountBadge count={badge} /> : null}
+        {/* A shape, not only a color, so it reads without telling colors apart. */}
+        {dot ? <CircleAlert role="img" aria-label="需要留意" className="size-4! text-warning" /> : null}
       </Link>
     </SidebarMenuButton>
   </SidebarMenuItem>
@@ -216,13 +248,11 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
   const device = useDevice()
   const { link, entrances } = device
   const address = device.ready ? entryAddress(device.ready.entry) : ""
-  const entryId = device.ready?.entry.device_id
-  const entryName = device.directory?.members.find((member) => member.device_id === entryId)?.name || workspace.info?.name
-  const name = entryName || addressName(address)
+  const name = entryLabel({ joined: workspace.joined, directory: device.directory, entryId: device.ready?.entry.device_id, ownName: workspace.info?.name, address })
   // Devices of another network this browser opened before; the current network fails over by itself.
   const others = device.entries.filter((item) => item.kind !== "local" && !device.directory?.members.some((member) => member.device_id === item.device_id))
-  const state: { label: string; icon: LucideIcon; tone: string; encrypted?: boolean } = link.kind === "connecting"
-    ? { label: entrances.length > 1 ? "切换中" : "连接中", icon: ArrowRightLeft, tone: "text-info" }
+  const state: { label: string; icon: LucideIcon; tone: string; encrypted?: boolean } = link.kind === "connecting" || name === null
+    ? { label: entrances.length > 1 && name !== null ? "切换中" : "连接中", icon: ArrowRightLeft, tone: "text-info" }
     : !workspace.connectionOnline || link.kind === "offline"
       ? { label: "离线", icon: WifiOff, tone: "text-muted-foreground" }
       : workspace.writeState.state === "forked"
@@ -234,10 +264,10 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
         : { label: "在线", icon: Wifi, tone: "text-success", encrypted: true }
   return <Popover.Root>
     <Popover.Trigger asChild>
-      <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent active:bg-sidebar-accent max-md:h-11" aria-label={`${name} · ${state.encrypted ? `${terms.encrypted.label} · ` : ""}${state.label}`}>
+      <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent active:bg-sidebar-accent max-md:h-11" aria-label={name === null ? state.label : `${name} · ${state.encrypted ? `${terms.encrypted.label} · ` : ""}${state.label}`}>
         <state.icon aria-hidden="true" className={cn("size-4 shrink-0", state.tone)} />
-        <span className="min-w-0 flex-1 truncate">{name}</span>
-        <span className={cn("shrink-0", state.tone)}>{state.label}</span>
+        <span className={cn("min-w-0 flex-1 truncate", name === null && state.tone)}>{name ?? state.label}</span>
+        {name === null ? null : <span className={cn("shrink-0", state.tone)}>{state.label}</span>}
       </button>
     </Popover.Trigger>
     <Popover.Portal>

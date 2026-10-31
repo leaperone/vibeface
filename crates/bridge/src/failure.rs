@@ -19,6 +19,8 @@ pub enum FailureKind {
     ExecutionDisabled,
     /// No model is chosen, or the provider does not know it.
     NoModel,
+    /// The target device runs no bot to take a task.
+    NoBot,
     /// Another Codex process is writing the thread.
     WriterBusy,
     /// The provider refused the request; nothing ran.

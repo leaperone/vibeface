@@ -1,14 +1,13 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { Archive, ArchiveRestore, Camera, CircleCheck, CirclePlus, FileKey, Hourglass, KeyRound, Laptop, LifeBuoy, Link2, LoaderCircle, LogIn, MessageSquareLock, MonitorSmartphone, MonitorX, QrCode, RotateCcw, Settings2, ShieldAlert, ShieldCheck, X } from 'lucide-react'
-import { cn } from '@/lib/utils'
-import { AuthPage, Details, EmptyState, InlineError, Panel, PasswordInput, claimFocus, SafetyCode, Skeleton, Steps, WaitingDot } from '@/components/app/kit'
+import { AuthPage, Details, EmptyState, InlineError, Panel, PasswordInput, claimFocus, SafetyCode, Skeleton, Steps } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { addressName, hostOf } from '@vibeface/client/workspace/labels.ts'
 import { entryAddress, entryKey, messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
 import { spentInvite, spentInviteText } from '@vibeface/client/lib/errors.ts'
-import { passphrase, recoveryCode } from '@vibeface/client/lib/secure.ts'
+import { passphrase, passwordStrength, recoveryCode } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName, defaultComputerName, lastBrowserName, rememberBrowserName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
 import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
@@ -19,7 +18,7 @@ import { webPlatform } from '@/lib/platform'
 
 const NOT_JOINED = notJoined(webPlatform.self)
 const BROWSER_REMOVED = removedText(webPlatform.self)
-import { RecoveryControls, RecoveryReview, RecoveryWaiting, SaveRecoveryFile } from './recovery-controls'
+import { PasswordStrength, RecoveryControls, RecoveryReview, RecoveryWaiting, SaveRecoveryFile } from './recovery-controls'
 import { CopyDiagnostics } from './device-controls'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
 
@@ -27,9 +26,10 @@ type Lane = 'local' | 'invite' | 'saved' | 'recovery'
 type Purpose = 'empty' | 'link' | 'invalid'
 const value = (form: HTMLFormElement, key: string) => { const field = form.elements.namedItem(key); return field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement ? field.value : '' }
 
-function purposeOf(invitation: string): Purpose {
+/** `decodes`: whether the ticket in it reads as one, checked as it is pasted, as on the phone. */
+function purposeOf(invitation: string, decodes: (link: string) => boolean): Purpose {
   if (!invitation.trim()) return 'empty'
-  return joinTicket(invitation) ? 'link' : 'invalid'
+  return joinTicket(invitation) && decodes(invitation) ? 'link' : 'invalid'
 }
 
 type Detector = { detect(source: HTMLVideoElement): Promise<Array<{ rawValue: string }>> }
@@ -92,10 +92,10 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
 }
 
 /** The code appears once the device that sent the link shows its own, so until then the next step is over there. */
-function JoinCode({ code }: { code?: string }) {
+function JoinCode({ code, admin }: { code?: string; admin?: string }) {
   if (!code) return <p role="status" className="flex items-center gap-2 text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 shrink-0 animate-spin" />{joinCopy.showCode}</p>
   return <>
-    <p role="status" className="flex items-center gap-2 text-muted-foreground"><WaitingDot />{joinCopy.compareCode}</p>
+    <p role="status" className="flex items-center gap-2 text-muted-foreground"><Hourglass aria-hidden="true" className="size-4 shrink-0" />{joinCopy.compareCode(admin)}</p>
     <SafetyCode code={code} />
   </>
 }
@@ -107,7 +107,8 @@ function NodeJoin() {
   const [cancelling, setCancelling] = useState(false)
   return <Panel icon={Hourglass} title={joining.status === 'joined' ? '已加入' : joinCopy.waiting}>
     {joining.status === 'joined' ? <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />正在打开这台电脑</p> : <>
-      <JoinCode code={joining.code} />
+      {joining.code ? <Reached /> : null}
+      <JoinCode code={joining.code} admin={joining.admin} />
       <Button type="button" variant="ghost" className="-ms-3 w-fit" disabled={cancelling} onClick={() => { setCancelling(true); device.cancelNodeJoin().catch(() => setCancelling(false)) }}>
         {cancelling ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}{cancelling ? '正在取消' : '取消'}
       </Button>
@@ -171,7 +172,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const local = !localSetup ? 'none' : localSetup.kind === 'uninitialized' || memberHere ? 'open' : 'join'
   const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, local, rejoined: device.rejoined, removed })
   const active = lane ?? suggested
-  const purpose = purposeOf(invitation)
+  // The ticket decoder loads with this browser's key; until then only the link's shape is checked.
+  const purpose = purposeOf(invitation, (link) => !device.identity || device.linkTarget(link) !== null)
   const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed', 'restarting'].includes(device.phase)
   const thisComputer = device.localSetup?.kind === 'uninitialized'
   const linking = busy || ['connecting', 'reconnecting'].includes(device.phase)
@@ -191,7 +193,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     if (!checkable) return
     let live = true
     void device.checkInvite(invitation).then((state) => {
-      if (live && (state === 'used' || state === 'expired')) { setInvitation(''); setError(spentInviteText) }
+      // A join that just ended spent the link too; its own reason (say, 拒绝) stays, not 已用过.
+      if (live && (state === 'used' || state === 'expired')) { setInvitation(''); setError((current) => current || spentInviteText) }
     })
     return () => { live = false }
   }, [invitation, checkable, thisComputer])
@@ -219,7 +222,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       try {
         if (!thisComputer) { rememberBrowserName(value(form, 'name')); return await device.join(invitation, value(form, 'name')) }
         // The entry spent the invite on the cancelled request, so it cannot be used again.
-        if (await device.joinThisComputer(invitation, value(form, 'name')) === 'cancelled') { setInvitation(''); setNotice('已取消。这条链接已用过，要加入请在已有设备上重新添加。') }
+        if (await device.joinThisComputer(invitation, value(form, 'name')) === 'cancelled') { setInvitation(''); setNotice('已取消。这条链接已用过，要加入就在已有设备上重新添加。') }
       } catch (cause) {
         // A spent link only fails again, so the field opens for a new one.
         if (cause instanceof Error && spentInvite.test(cause.message)) setInvitation('')
@@ -244,14 +247,14 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => { if (setup) setCreating(true); chooseLane('local') }}>{setup ? <CirclePlus aria-hidden="true" /> : <Laptop aria-hidden="true" />}{setup ? startCopy.create : local === 'open' ? computerName : localCopy.manage}</Button> : null}
       {active !== 'saved' && device.entries.length > 0 && !removed ? <Button variant="ghost" type="button" onClick={() => chooseLane('saved')}><MonitorSmartphone aria-hidden="true" />用过的地址</Button> : null}
       {active !== 'invite' && !choosing ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />{joinCopy.byLink}</Button> : null}
-      {active !== 'recovery' ? <Button variant="ghost" type="button" onClick={() => chooseLane('recovery')}><ArchiveRestore aria-hidden="true" />用恢复文件找回</Button> : null}
+      {active !== 'recovery' ? <Button variant="ghost" type="button" onClick={() => chooseLane('recovery')}><ArchiveRestore aria-hidden="true" />用恢复文件找回<span className="text-meta font-normal">{recoveryCopy.whenLost}</span></Button> : null}
     </div>
   </div> : null
 
   let body: ReactNode
   // The join card holds its own failure, next to where a new link goes in.
   let alertInBody = false
-  if (device.phase === 'blocked') body = <EmptyState icon={ShieldAlert} title="请在这台电脑上打开，或用加入链接" />
+  if (device.phase === 'blocked') body = <EmptyState icon={ShieldAlert} title="在这台电脑上打开，或用加入链接" />
   else if (device.phase === 'key_lost') body = <Panel icon={ShieldAlert} title="需要重新加入">
     <p className="text-muted-foreground">这个浏览器保存的登录信息不见了。</p>
     <Button type="button" className="w-fit justify-self-end" disabled={busy} onClick={() => void run(device.replaceLostKey)}>重新开始</Button>
@@ -301,7 +304,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
           {purpose !== 'link' && scanFirst ? <Button type="button" className="w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />{joinCopy.scan}</Button> : null}
           {purpose === 'empty' || purpose === 'invalid' ? <>
             <Textarea ref={scanFirst ? undefined : claimFocus} className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-label="加入链接" aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder={scanFirst ? joinCopy.paste : joinCopy.pasteFirst} onChange={(event) => setInvitation(event.target.value)} />
-            {purpose === 'invalid' ? <InlineError error="这不是有效的加入链接" /> : null}
+            {purpose === 'invalid' ? <InlineError error={joinCopy.notLink} /> : null}
             {scannable && !scanFirst ? <Button type="button" variant="ghost" className="-ms-3 w-fit text-muted-foreground" onClick={() => setScanning(true)}><Camera aria-hidden="true" />{joinCopy.scan}</Button> : null}
           </> : <p className="flex min-h-11 items-center gap-2 rounded-lg bg-muted/60 ps-3">
             <Link2 aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
@@ -382,24 +385,28 @@ type Run = (action: () => Promise<void>) => Promise<void>
 /** Step 2: the recovery password; the file is sealed with it right away. */
 function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; disabled: boolean; names: Names; onBack(): void; run: Run }) {
   const device = useDevice()
-  const [short, setShort] = useState(false)
+  const [password, setPassword] = useState('')
+  const [tried, setTried] = useState(false)
+  const weak = passwordStrength(password).level === 'weak'
   return <Panel icon={KeyRound} title="设置恢复密码">
     <p className="-mt-2 flex items-center gap-2 text-meta text-muted-foreground"><LifeBuoy aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.passwordWhy}</p>
     <form className="grid gap-4" noValidate onSubmit={(event) => {
       event.preventDefault()
       const form = event.currentTarget
       const input = form.elements.namedItem('password') as HTMLInputElement
-      if ([...input.value].length < 8) { setShort(true); input.focus(); return }
+      if (passwordStrength(input.value).level === 'weak') { setTried(true); input.focus(); return }
       void run(async () => {
         try { await device.createLocalNetwork(names.browser, passphrase(value(form, 'password')), names.computer) }
-        finally { form.reset() }
+        finally { form.reset(); setPassword('') }
       })
     }}>
       <fieldset disabled={busy || disabled} className="grid gap-4">
-        <Field label="恢复密码">
-          <PasswordInput name="password" autoComplete="new-password" aria-invalid={short || undefined} aria-describedby="password-hint" onChange={() => setShort(false)} />
-          <span id="password-hint" className={cn('font-normal', short ? 'text-danger' : 'text-muted-foreground')}>至少 8 个字符</span>
-        </Field>
+        <div className="grid gap-1.5">
+          <Field label="恢复密码">
+            <PasswordInput name="password" autoComplete="new-password" aria-invalid={tried && weak || undefined} aria-describedby="password-hint" onChange={(event) => { setPassword(event.target.value); setTried(false) }} />
+          </Field>
+          <PasswordStrength id="password-hint" password={password} tried={tried} />
+        </div>
         <div className="flex justify-between gap-2">
           <Button type="button" variant="ghost" className="-ms-3" onClick={onBack}>上一步</Button>
           <Button type="submit" aria-busy={busy || undefined}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}下一步</Button>
@@ -436,10 +443,15 @@ function BrowserJoin() {
   const device = useDevice()
   const joining = device.joining!
   return <Panel icon={Hourglass} title="等待批准">
-    {device.info ? <p className="flex items-center gap-2 text-meta text-muted-foreground"><ShieldCheck aria-hidden="true" className="size-4 shrink-0 text-success" />已连上你的设备</p> : null}
-    <JoinCode code={joining.code} />
+    {device.info ? <Reached /> : null}
+    <JoinCode code={joining.code} admin={joining.admin} />
     {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
     <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={device.cancelJoin}>取消</Button>
     <Details><CopyDiagnostics lines={[['这个浏览器', device.identity?.deviceId], ['加入请求', joining.join_id]]} /></Details>
   </Panel>
+}
+
+/** The request reached one of the person's devices; both join pages say it the same way. */
+function Reached() {
+  return <p className="flex items-center gap-2 text-meta text-muted-foreground"><ShieldCheck aria-hidden="true" className="size-4 shrink-0 text-success" />{joinCopy.reached}</p>
 }

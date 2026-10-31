@@ -1,5 +1,5 @@
 import { useId, type ReactNode } from 'react'
-import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Cpu, Minus, NotebookPen, Plus, Repeat, ScrollText, Smile, TriangleAlert, Undo2, type LucideIcon } from 'lucide-react'
+import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Cpu, Minus, Trash2, NotebookPen, Plus, Repeat, ScrollText, Smile, TriangleAlert, Undo2, type LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { Details } from '@/components/app/kit'
@@ -8,6 +8,7 @@ import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { ActionButton } from '@/features/workspace/present'
+import { openSchedule } from '@/features/workspace/bot-panel'
 import type { AvatarEdit } from '@vibeface/client/workspace/types.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
 import { changeTitle, formatWhen, lineDiff, overwriteCopy, restoreRequest, scheduleDetail, scheduleFrequency, type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
@@ -155,12 +156,16 @@ function ScheduleRow({ before, after, current }: { before: BotSchedule | null; a
   const frequency = scheduleFrequency(after), previous = before ? scheduleFrequency(before) : frequency
   const next = once ? after.first_run_at_ms : current?.enabled ? current.next_run_at_ms : null
   const detail = scheduleDetail(after)
-  return <Row icon={icon} label={after.name} tag={tag}>
+  // One still listed opens the bot panel on it, where it is paused, resumed or deleted.
+  const label = current ? <button type="button" className="rounded-sm text-left underline-offset-4 outline-none hover:underline focus-visible:ring-3 focus-visible:ring-ring/50" onClick={() => openSchedule(current.schedule_id)}>{after.name}</button> : after.name
+  return <Row icon={icon} label={label} tag={tag}>
     {before && before.name !== after.name ? <BeforeAfter className="text-meta" before={before.name} after={after.name} /> : null}
     {previous !== frequency ? <BeforeAfter className="text-meta" before={previous} after={frequency} /> : null}
     <p className="flex flex-wrap items-center gap-x-2 text-meta text-muted-foreground tabular-nums">
       {previous === frequency ? <span>{frequency}</span> : null}
-      {!after.enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-4" />已暂停</span>
+      {/* A repeating schedule no longer listed was deleted since; one listed says whether it is paused now, not then. */}
+      {!once && !current ? <span className="inline-flex items-center gap-1"><Trash2 aria-hidden="true" className="size-4" />现已删除</span>
+        : !(current ?? after).enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-4" />{current && after.enabled ? '现已暂停' : '已暂停'}</span>
         : next !== null ? <span>{once ? '' : '下次 '}{formatWhen(next)}</span> : null}
     </p>
     {detail ? <Details label="要做的事"><p className="whitespace-pre-wrap text-foreground [word-break:normal] [overflow-wrap:anywhere]">{detail}</p></Details> : null}

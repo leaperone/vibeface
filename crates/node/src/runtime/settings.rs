@@ -376,6 +376,12 @@ impl Runtime {
         let _save = self.config_save.lock().await;
         let _work = self.maintenance.enter()?;
         self.authorize_settings_write(subject, local_cookie).await?;
+        let mut change = change;
+        // Tasks reach a device only through its bot (see `authorize_dispatch`), so a provider set
+        // to execute them on a device with no bot also runs the bot there.
+        if change.execution == Some(true) && change.bot.is_none() && self.manager().is_none() {
+            change.bot = Some(true);
+        }
         let default = match change.bot {
             Some(true) if self.manager().is_none() => Some(self.default_manager(change.provider)?),
             _ => None,
@@ -533,8 +539,9 @@ impl Runtime {
                 "invalid manager model"
             );
             ensure!(
-                manager.provider != Provider::Cursor || !manager.model.trim().is_empty(),
-                "Cursor SDK requires a model"
+                !manager.provider.needs_model() || !manager.model.trim().is_empty(),
+                "{} requires a model",
+                manager.provider.label()
             );
             self.ensure_default_workspace(&manager.workspace)?;
             manager.workspace = manager

@@ -23,6 +23,7 @@ import type {
   AnswerResult, ConversationPayload, NodeInfo, NotificationRecord, PendingAnswer, Question,
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, WriteState, WriteStatus, OpenWork, ScheduleAction, WorkspaceOverview,
 } from "./types.ts"
+import { isSessionNotification } from "./types.ts"
 
 const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
   aligning: "正在和你的其他设备同步，稍后就能发送。",
@@ -86,7 +87,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const [messageBusy, setMessageBusy] = useState(false)
   const [liveProgress, setLiveProgress] = useState<LiveProgress[]>([])
   const [interrupted, setInterrupted] = useState<InterruptedReply[]>([])
-  /** Replies of the open chat that were unread when it came on screen, by event hash; the chat marks where they start. */
+  /**
+   * What was on the open chat when it came on screen: its unread replies by event hash and its questions as `question:<id>`.
+   * The chat marks where the unread ones start; a question asked while the chat is open is seen as it arrives.
+   */
   const [fresh, setFresh] = useState<ReadonlySet<string>>(new Set<string>())
   /** The chat on screen and the connection it was read over; another connection is another visit. */
   const onScreen = useRef<{ id: string; connection: ReadyConnection } | null>(null)
@@ -101,6 +105,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const messagesRef = useRef<PendingMessage[]>([])
   const botCreationRef = useRef<PendingBot | null>(null)
   const notificationsRef = useRef<NotificationRecord[]>([])
+  const ackNotificationRef = useRef<(notification: NotificationRecord) => Promise<void>>(async () => {})
   const inFlight = useRef(new Set<string>())
   const refreshingRef = useRef(false)
   const refreshingConnection = useRef<ReadyConnection | null>(null)
@@ -108,7 +113,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const refreshRef = useRef<() => Promise<void>>(async () => {})
   const current = () => alive.current && connection.isCurrent()
-  const requireCurrent = () => { if (!current()) throw new Error("连接换了，请再查一次。") }
+  const requireCurrent = () => { if (!current()) throw new Error("连接换了。再查一次。") }
   const requireContext = (id = activeId.current) => {
     requireCurrent()
     const context = dataRef.current
@@ -116,7 +121,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     return context
   }
   const requireBotContext = (id = activeId.current) => {
-    if (!bots.some((bot) => bot.conversation_id === id)) throw new Error("请先选一个 Bot。")
+    if (!bots.some((bot) => bot.conversation_id === id)) throw new Error("还没选 Bot。先选一个。")
     return requireContext(id)
   }
   const showError = (caught: unknown, action?: string, retry?: () => void) => { if (current()) setError({ text: messageOf(caught, action), retry }) }
@@ -172,7 +177,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const sequence = ++readSequence.current
     const next = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
     requireCurrent()
-    if (activeId.current !== id) throw new Error("对话有更新，请再查一次。")
+    if (activeId.current !== id) throw new Error("对话有更新。再查一次。")
     // A newer read of this conversation shows its own result; this one is still a fresh read for the caller.
     if (sequence !== readSequence.current) return next
     return showConversation(id, next)
@@ -189,7 +194,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (viewRef.current !== "chat" || !platform.foreground()) onScreen.current = null
     else if (onScreen.current?.id !== id || onScreen.current.connection !== connection) {
       onScreen.current = { id, connection }
-      setFresh(new Set(notificationsRef.current.filter((item) => item.conversation_id === id && unreadReply(item)).map((item) => item.notification_id)))
+      setFresh(new Set([...notificationsRef.current.filter((item) => item.conversation_id === id && unreadReply(item)).map((item) => item.notification_id), ...next.questions.map((question) => `question:${question.question_id}`)]))
     }
     // A message or an answer settles once the Node's own history holds it.
     const admitted = (item: PendingMessage) => item.conversation_id === id && next.messages.some((message) => message.message_id === item.message_id)
@@ -215,7 +220,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       return !job || (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state)
     }))
     if (joined && current() && readConnection.current === connection && viewRef.current === "chat" && platform.foreground()) {
-      const seen = notificationsRef.current.filter((item) => item.conversation_id === id)
+      const seen = notificationsRef.current.filter((item) => item.conversation_id === id && !isSessionNotification(item))
       for (const notification of seen) {
         try {
           await signedWrite("ack", notification.notification_id, "ack", { notification_id: notification.notification_id, attestation: await attest(notification.conversation_id, { type: "notification_acked", notification_id: notification.notification_id, client_id: clientId }) })
@@ -233,7 +238,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const enabled = readStorage(networkKey("notify", networkId), false)
     setNotificationButton(permission === "unsupported" ? { label: `不支持${notifier.name}`, disabled: true, state: "unsupported" }
       : permission === "granted" ? { label: enabled ? `${notifier.name}已开启` : "启用此网络提醒", disabled: enabled, state: enabled ? "on" : "off" }
-      : permission === "denied" ? { label: `请在设置里允许${notifier.name}`, disabled: true, state: "denied" }
+      : permission === "denied" ? { label: `在设置里允许${notifier.name}`, disabled: true, state: "denied" }
       : { label: `开启${notifier.name}`, disabled: false, state: "off" })
   }
   const notify = async (items: NotificationRecord[]) => {
@@ -241,11 +246,17 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const seen = new Set(readStorage<string[]>(networkKey("seen", networkId), []))
     for (const item of items) {
       if (seen.has(item.notification_id)) continue
+      if (isSessionNotification(item) && platform.sessionNotifications === false) continue
       seen.add(item.notification_id)
       if (viewRef.current === "chat" && item.conversation_id === activeId.current && platform.foreground()) continue
       try {
-        notifier.show({ title: item.kind === "question" ? "Vibeface · 需要你回答" : "Vibeface · 进展", body: item.text, tag: item.notification_id }, () => {
-          if (current()) openConversation(item.conversation_id)
+        notifier.show({ title: item.kind === "question" ? "Vibeface · 需要你回答" : isSessionNotification(item) ? "Vibeface · 接手会话" : "Vibeface · 进展", body: item.text, tag: item.notification_id }, () => {
+          if (!current()) return
+          if (isSessionNotification(item)) {
+            void ackNotificationRef.current(item).then(() => { if (current()) openConversation(item.conversation_id) }, () => {})
+          } else {
+            openConversation(item.conversation_id)
+          }
         })
       } catch { /* The persisted inbox remains available when system alerts fail. */ }
     }
@@ -355,6 +366,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (state === "superseded" && current()) setNoticeText(faceSuperseded)
       return state !== "unsent"
     }
+    // Only what still wants the person is listed, so a missing one is closed or answered either way.
+    if (item.method === "dismiss_work") return !parseOpenWorks(await connection.rpc("open_works")).some((work) => work.work_id === item.params.work_id)
     if (item.method === "answer") return !parseQuestions(await connection.rpc("questions")).some((question) => question.question_id === item.params.question_id)
     const id = String(item.params.conversation_id)
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
@@ -439,10 +452,23 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const withMutation = async <T,>(key: string, work: () => Promise<T>) => {
     requireWritable()
     const mutations = inFlight.current
-    if (mutations.has(key)) throw new Error("上一个操作还没结束，请稍等。")
+    if (mutations.has(key)) throw new Error("上一个操作还没结束。稍等一下。")
     mutations.add(key)
     try { return await work() } finally { mutations.delete(key) }
   }
+  const ackNotification = (notification: NotificationRecord) => withMutation(`ack:${notification.notification_id}`, async () => {
+    requireCurrent()
+    if (!notificationsRef.current.some((item) => item.notification_id === notification.notification_id)) return
+    await signedWrite("ack", notification.notification_id, "ack", {
+      notification_id: notification.notification_id,
+      client_id: clientId,
+      attestation: await attest(notification.conversation_id, { type: "notification_acked", notification_id: notification.notification_id, client_id: clientId }),
+    })
+    requireCurrent()
+    notificationsRef.current = notificationsRef.current.filter((item) => item.notification_id !== notification.notification_id)
+    setNotifications(notificationsRef.current)
+  })
+  ackNotificationRef.current = ackNotification
   const clearMessages = () => { if (current()) { setError(null); setNoticeText("") } }
   const run = async (action: () => Promise<void>, label?: string) => {
     clearMessages()
@@ -528,11 +554,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     botCreationRef.current = null; setPendingBot(null)
   }
   const checkRejectedBot = async (pending: PendingBot): Promise<BotRecord | null> => {
-    if (pending.submission?.state !== "rejected" || pending.submission.entry_node !== connection.entry.device_id) throw new Error("请回到原来的设备确认 Bot 是否建好，内容已保留。")
+    if (pending.submission?.state !== "rejected" || pending.submission.entry_node !== connection.entry.device_id) throw new Error("内容已保留。回到原来的设备确认 Bot 是否建好。")
     const known = parseBots(await connection.rpc("bots"))
     requireCurrent()
     const match = known.find((bot) => bot.bot_id === pending.bot_id || bot.conversation_id === pending.conversation_id)
-    if (match && (match.bot_id !== pending.bot_id || match.conversation_id !== pending.conversation_id || match.name !== pending.name || match.instructions !== pending.instructions || !sameProject(match.project, pending.project))) throw new Error("找到了这个 Bot，请先确认它是否已经建好。")
+    if (match && (match.bot_id !== pending.bot_id || match.conversation_id !== pending.conversation_id || match.name !== pending.name || match.instructions !== pending.instructions || !sameProject(match.project, pending.project))) throw new Error("找到了这个 Bot。先确认它是否已经建好。")
     clearPendingBot()
     if (!match) setNoticeText("确认没建成，可以修改后再试。")
     return match ?? null
@@ -545,7 +571,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     await refreshRef.current()
   }
   const sendMessage = (input: string, files: AttachmentFile[] = []) => withMutation(`message:${activeId.current}`, async () => {
-    if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("请先选一个 Bot。")
+    if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("还没选 Bot。先选一个。")
     const text = inputText(input, "消息内容", 65536)
     setMessageBusy(true)
     try { return await submitMessage(text, files) } finally { if (current()) setMessageBusy(false) }
@@ -572,14 +598,14 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     logs: async (filter: LogFilter) => { requireCurrent(); return parseLogs(await connection.request("logs", filter)) },
     confirmWritable: async () => { requireCurrent(); setWriteState(parseWriteStatus(await connection.request("confirm_writable"))); scheduleRefresh() },
     syncText: !data ? "发一条消息开始对话。" : "已加载这台电脑上的记录。",
-    refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton,
+    refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton, ackNotification,
     selectBot,
     createBot: (input: { name: string; instructions: string; project?: BotProject }) => withMutation("create-bot", async () => {
       const name = inputText(input.name, "Bot 名称", 512), instructions = input.instructions.trim()
       if (new TextEncoder().encode(instructions).length > 8192) throw new Error("职责说明不能超过 8192 字节。")
-      if (new TextEncoder().encode(JSON.stringify([name, instructions, input.project ?? null])).length > 12000) throw new Error("内容太长了，请缩短名称或说明。")
+      if (new TextEncoder().encode(JSON.stringify([name, instructions, input.project ?? null])).length > 12000) throw new Error("内容太长了。缩短名称或说明。")
       const prior = botCreationRef.current
-      if (prior && (prior.name !== name || prior.instructions !== instructions || !sameProject(prior.project, input.project))) throw new Error("Bot 还没确认建好，内容已保留，请原样重试。")
+      if (prior && (prior.name !== name || prior.instructions !== instructions || !sameProject(prior.project, input.project))) throw new Error("Bot 还没确认建好，内容已保留。原样重试。")
       if (prior?.submission?.state === "rejected") {
         const known = await checkRejectedBot(prior)
         if (known) { await selectBot(known); return known }
@@ -608,7 +634,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       }
       const bot = parseBot(record(response).bot)
       requireCurrent()
-      if (bot.bot_id !== request.bot_id || bot.conversation_id !== request.conversation_id || bot.name !== request.name || bot.instructions !== request.instructions || !sameProject(bot.project, request.project)) throw new Error("Bot 创建结果和填写的内容不一致，请检查。")
+      if (bot.bot_id !== request.bot_id || bot.conversation_id !== request.conversation_id || bot.name !== request.name || bot.instructions !== request.instructions || !sameProject(bot.project, request.project)) throw new Error("Bot 创建结果和填写的内容不一致。检查后再试。")
       clearPendingBot()
       await selectBot(bot)
       return bot
@@ -630,7 +656,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       const job = record(receipt.job)
       if (receipt.publication_pending === true) setNoticeText("本轮已有结果，正在补齐发布；未提交停止请求。")
       else if (receipt.cancel_requested === true) setNoticeText(stopped(job.state))
-      else setNoticeText("现在停不了，请再查一次。")
+      else setNoticeText("现在停不了。再查一次。")
       if (activeId.current === id) await refreshRef.current()
     }),
     /** Replying or declining is keyed by message, so an unknown outcome is settled by reading the conversation again. */
@@ -698,10 +724,19 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       setNoticeText(`已换到 ${nodes.find((node) => node.device_id === scheduler)?.name || "另一台电脑"}`)
       if (activeId.current === id) await refreshRef.current()
     }),
+    /** Closes a failed task in 待处理 on every device; a retry of the same close writes nothing more. */
+    dismissWork: (conversationId: string, workId: string) => withMutation(`dismiss:${workId}`, async () => {
+      const attestation = await attest(conversationId, { type: "notification_acked", notification_id: workId, client_id: "inbox" })
+      await signedWrite("dismiss", workId, "dismiss_work", { conversation_id: conversationId, work_id: workId, attestation })
+      requireCurrent()
+      openWorksRef.current = openWorksRef.current.filter((item) => item.work_id !== workId)
+      setOpenWorks(openWorksRef.current)
+      if (viewRef.current === "tasks") scheduleRefresh()
+    }),
     interruptWork: (workId: string) => withMutation(`work-control:${workId}`, async () => {
       const id = activeId.current, context = requireBotContext(id)
       const work = context.works.find((item) => item.work_id === workId)
-      if (!work || work.outcome || !["accepted", "running"].includes(work.state)) throw new Error("这个任务现在停不了，请再查一次。")
+      if (!work || work.outcome || !["accepted", "running"].includes(work.state)) throw new Error("这个任务现在停不了。再查一次。")
       let receipt: Record<string, unknown>
       try { receipt = record(await connection.rpc("interrupt_work", { conversation_id: id, work_id: workId })) }
       catch (caught) { requireControlRefresh(caught); throw caught }
@@ -766,18 +801,18 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       requireCurrent()
       const result = parseArtifactPage(await connection.rpc("read_artifact", { conversation_id: id, blob_hash: hash, offset, limit: 65536 }), hash, offset)
       requireCurrent()
-      if (activeId.current !== id) throw new Error("对话已切换，请在原对话中重新打开产物。")
+      if (activeId.current !== id) throw new Error("对话已切换。回到原对话重新打开产物。")
       return result
     },
     releaseMessagePending: () => withMutation(`message:${activeId.current}`, async () => {
       requireCurrent()
       const id = activeId.current, original = messagesRef.current.find((item) => item.conversation_id === id)
-      if (!original) throw new Error("原消息还在发送，请稍等。")
-      if (original.rejected === undefined) throw new Error("只有设备明确返回失败后才能放弃。断线或超时请重新发送或再查一次。")
+      if (!original) throw new Error("原消息还在发送。稍等一下。")
+      if (original.rejected === undefined) throw new Error("只有设备明确返回失败后才能放弃。断线或超时就重新发送或再查一次。")
       const complete = await readConversation(id)
       requireContext(id)
       const still = messagesRef.current.find((item) => item.conversation_id === id)
-      if (still?.message_id !== original.message_id || complete.messages.some((item) => item.message_id === original.message_id)) throw new Error("原消息状态有变化，请再查一次。")
+      if (still?.message_id !== original.message_id || complete.messages.some((item) => item.message_id === original.message_id)) throw new Error("原消息状态有变化。再查一次。")
       requireWritable()
       await outbox.delete(outboxKey("message", original.message_id))
       await outboxChanged()

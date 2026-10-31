@@ -18,7 +18,7 @@ function database() {
     const request = indexedDB.open('vibeface-device', 1)
     request.onupgradeneeded = () => request.result.createObjectStore('keys')
     request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(new Error('无法打开这个浏览器的存储。请允许这个网站保存数据后重试。'))
+    request.onerror = () => reject(new Error('无法打开这个浏览器的存储。允许这个网站保存数据后重试。'))
   })
 }
 
@@ -35,7 +35,7 @@ async function keys<T>(mode: IDBTransactionMode, operation: (store: IDBObjectSto
         if (request.error?.name === 'ConstraintError') { result = false; event.preventDefault(); event.stopPropagation() }
       }
       transaction.oncomplete = () => resolve(result)
-      transaction.onerror = () => reject(new Error('无法在这个浏览器里保存登录信息。请允许这个网站保存数据后重试。'))
+      transaction.onerror = () => reject(new Error('无法在这个浏览器里保存登录信息。允许这个网站保存数据后重试。'))
       transaction.onabort = transaction.onerror
     })
   } finally { db.close() }
@@ -45,7 +45,7 @@ let device: StoredKey | undefined
 /** The device key is a non-extractable Ed25519 CryptoKey; page scripts can only ask it to sign. */
 const browserKeys: DeviceKeys = {
   async load({ replaceLostKey }) {
-    if (!globalThis.isSecureContext || !globalThis.crypto?.subtle || !globalThis.indexedDB) throw new Error('这个地址不能安全保存登录信息。请在这台电脑上直接打开，或换成 HTTPS 地址。')
+    if (!globalThis.isSecureContext || !globalThis.crypto?.subtle || !globalThis.indexedDB) throw new Error('这个地址不能安全保存登录信息。在这台电脑上直接打开，或换成 HTTPS 地址。')
     await init()
     let record = await keys<StoredKey | undefined>('readonly', store => store.get('device'))
     if (!record) {
@@ -54,19 +54,19 @@ const browserKeys: DeviceKeys = {
       if (created && !replaceLostKey) throw Object.assign(new Error(lostKeyMessage), { code: 'key_lost' })
       let pair: CryptoKeyPair
       try { pair = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']) as CryptoKeyPair }
-      catch { throw new Error('这个浏览器版本太旧。请更新浏览器后重试。') }
+      catch { throw new Error('这个浏览器版本太旧。更新浏览器后重试。') }
       const candidate: StoredKey = { privateKey: pair.privateKey, deviceId: hex(await crypto.subtle.exportKey('raw', pair.publicKey)), created_at: Date.now() }
       await keys('readwrite', store => store.add(candidate, 'device'))
       record = await keys<StoredKey | undefined>('readonly', store => store.get('device'))
       try { localStorage.setItem('vibeface.device-created', 'true') } catch {}
     }
-    if (!record || !(record.privateKey instanceof CryptoKey) || record.privateKey.extractable) throw new Error('这个浏览器保存的登录信息坏了。请重新加入。')
+    if (!record || !(record.privateKey instanceof CryptoKey) || record.privateKey.extractable) throw new Error('这个浏览器保存的登录信息坏了。需要重新加入。')
     device = record
     return { deviceId: record.deviceId }
   },
   async remove() { await keys('readwrite', store => store.delete('device')); device = undefined },
   async sign(message) {
-    if (!device) throw new Error('这个浏览器还没准备好。请刷新页面。')
+    if (!device) throw new Error('这个浏览器还没准备好。刷新页面再试。')
     return hex(await crypto.subtle.sign({ name: 'Ed25519' }, device.privateKey, new Uint8Array(message)))
   },
 }

@@ -22,6 +22,7 @@ pub(crate) mod questions;
 mod reduce;
 pub(crate) mod scheduler;
 mod sync;
+pub(crate) mod triage;
 pub use sync::{MAX_PULL_BYTES, MAX_PULL_EVENTS};
 #[cfg(test)]
 mod tests;
@@ -721,24 +722,22 @@ impl Store {
     pub fn works(&self, network: &str, scope: &str) -> Result<Vec<WorkProjection>> {
         reduce::works_from(&self.connection, network, scope)
     }
-    /// Works in every conversation that have no result yet or whose result waits for the user.
-    pub fn open_works(&self, network: &str) -> Result<Vec<WorkProjection>> {
-        let mut statement = self.connection.prepare(
-            "SELECT DISTINCT conversation_id FROM works WHERE network_id=? AND dispatch IS NOT NULL
-             AND (finish IS NULL OR json_extract(finish,'$.outcome')='unverified')",
-        )?;
-        let scopes = statement
-            .query_map([network], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut open = Vec::new();
-        for scope in scopes {
-            open.extend(
-                self.works(network, &scope)?
-                    .into_iter()
-                    .filter(|work| work.outcome.is_none_or(|o| o == WorkOutcome::Unverified)),
-            );
-        }
-        Ok(open)
+    pub fn work(&self, network: &str, work_id: &str) -> Result<Option<WorkProjection>> {
+        reduce::work_from(&self.connection, network, work_id)
+    }
+    /// How many works in `scope` ended with a result nobody has to settle.
+    pub fn finished_works(&self, network: &str, scope: &str) -> Result<usize> {
+        Ok(self.connection.query_row(
+            "SELECT count(*) FROM works WHERE network_id=? AND conversation_id=? AND dispatch IS NOT NULL
+             AND finish IS NOT NULL AND json_extract(finish,'$.outcome')<>'unverified'",
+            params![network, scope],
+            |r| r.get(0),
+        )?)
+    }
+    /// Works in `scope`, or every conversation, that want the user: see
+    /// [`reduce::open_works_from`].
+    pub fn open_works(&self, network: &str, scope: Option<&str>) -> Result<Vec<WorkProjection>> {
+        reduce::open_works_from(&self.connection, network, scope)
     }
     /// This database file as the filesystem knows it: inode and creation time. Copying the data
     /// directory or restoring it from a backup writes a new file, so the values change.

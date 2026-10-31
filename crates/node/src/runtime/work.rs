@@ -43,14 +43,21 @@ impl Runtime {
         signal: Signal,
     ) -> Result<WorkRecord> {
         let quiet = matches!(signal, Signal::Text(_) | Signal::Progress { .. });
-        let (record, receipt) = self.store.lock().await.apply_work_signal(
-            &self.identity,
-            network,
-            work_id,
-            signal,
-            now_ms(),
-        )?;
-        if !quiet {
+        let (before, (record, receipt)) = {
+            let mut store = self.store.lock().await;
+            let before = if quiet {
+                None
+            } else {
+                store
+                    .work_record(work_id)?
+                    .map(|record| record.state.name())
+            };
+            let applied =
+                store.apply_work_signal(&self.identity, network, work_id, signal, now_ms())?;
+            (before, applied)
+        };
+        // A probe that finds the turn where it was changes nothing; only a new state is logged.
+        if !quiet && before != Some(record.state.name()) {
             let thread_id = record.state.thread();
             let (conversation_id, state) = (record.conversation.as_str(), record.state.name());
             match &record.state {
@@ -248,10 +255,13 @@ impl Runtime {
                 spec.dispatcher != spec.target,
                 "an agent task goes to another device"
             );
-            ensure!(
-                self.manager().is_some(),
-                "this device has no bot to take the task"
-            );
+            if self.manager().is_none() {
+                return Err(ExecFailure::new(
+                    FailureKind::NoBot,
+                    "this device has no bot to take the task",
+                )
+                .into());
+            }
         }
         Ok(())
     }
@@ -987,7 +997,7 @@ impl Runtime {
                 .connected(*epoch.as_ref().unwrap_or(&self.codex.epoch()));
             epoch?;
         } else {
-            self.drop_codex_requests();
+            self.drop_codex_requests().await?;
         }
         let Some(network) = self.store.lock().await.network()? else {
             return Ok(());

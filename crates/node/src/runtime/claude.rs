@@ -634,9 +634,13 @@ where
         "manager workspace must be an existing absolute directory"
     );
     let secrets = manager::secret_values(config);
+    let start = std::sync::Mutex::new(manager::StartEvidence::NotStarted);
     let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
         ManagerError {
             outcome,
+            start: *start
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             session_id: session.map(str::to_owned),
             failure: ExecFailure {
                 detail: manager::redact_string(failure.detail, &secrets),
@@ -717,6 +721,7 @@ where
         if let Some(started) = &config.process_started {
             started(process.group).await?;
         }
+        *start.lock().unwrap() = manager::StartEvidence::Unknown;
         send(&process.stdin, &user_frame(prompt, &message)).await
     }
     .await;
@@ -773,6 +778,9 @@ where
             {
                 break 'turn Err(error(ManagerFailure::Unknown, native, own(&e.to_string())));
             }
+        }
+        if turn.session.is_some() {
+            *start.lock().unwrap() = manager::StartEvidence::Started;
         }
         if let Some(ending) = turn.ending.take() {
             break Ok(ending);

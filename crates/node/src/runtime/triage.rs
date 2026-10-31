@@ -9,6 +9,7 @@ use crate::{
     model::{Choice, EventBody, Subject},
     net,
     providers::Provider,
+    store::triage::{BudgetStatus, TriageAdmission},
     triage::{self, AgentEvent, Delivery, OutboxEntry, RequestKind, Severity, TriageConfig},
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -56,6 +57,10 @@ pub(crate) struct TriageState {
     /// App Server threads nobody drives (`codex exec`, sub-agents); no bot is given them.
     background: std::sync::Mutex<HashSet<String>>,
     started_ms: i64,
+    turn: tokio::sync::Mutex<()>,
+    active: std::sync::Mutex<Option<String>>,
+    budget_warning: std::sync::Mutex<Option<BudgetStatus>>,
+    mutations: tokio::sync::Mutex<()>,
 }
 
 impl TriageState {
@@ -69,6 +74,10 @@ impl TriageState {
             threads: Default::default(),
             background: Default::default(),
             started_ms: now_ms(),
+            turn: Default::default(),
+            active: Default::default(),
+            budget_warning: Default::default(),
+            mutations: Default::default(),
         }
     }
     pub(super) fn config(&self) -> TriageConfig {
@@ -86,6 +95,14 @@ impl TriageState {
     }
 }
 
+struct ActiveTriage<'a>(&'a TriageState);
+
+impl Drop for ActiveTriage<'_> {
+    fn drop(&mut self) {
+        *lock(&self.0.active) = None;
+    }
+}
+
 /// A request a session holds until it is answered.
 #[derive(Clone, Serialize)]
 struct HeldRequest {
@@ -98,6 +115,7 @@ struct HeldRequest {
     /// `None` while a question holds it for the user. A hook's stays: the hook waits only so long.
     answer_by_ms: Option<i64>,
     question_id: Option<String>,
+    fallback_reason: Option<&'static str>,
     #[serde(flatten)]
     reply: Reply,
 }
@@ -279,13 +297,6 @@ fn from_name<T: DeserializeOwned>(name: String) -> Result<T> {
     Ok(serde_json::from_value(Value::String(name))?)
 }
 
-fn queued(connection: &Connection) -> Result<Vec<AgentEvent>> {
-    let mut statement =
-        connection.prepare("SELECT event FROM triage_queue ORDER BY ts_ms,event_id")?;
-    let rows = statement.query_map([], |r| r.get::<_, String>(0))?;
-    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
-}
-
 /// The bot that owns this device's session. A thread this device's work bound counts at
 /// once: the App Server can ask before the turn's start is recorded. A bot's own reply thread
 /// belongs to its conversation. A deleted bot owns neither, so they go to the primary bot.
@@ -435,6 +446,7 @@ impl Runtime {
             received_ms: now,
             answer_by_ms: Some(now + HOOK_ANSWER_WITHIN.as_millis() as i64),
             question_id: None,
+            fallback_reason: None,
             reply: Reply::Hook {
                 answer: tokio::sync::watch::channel(None).0,
                 waited: false,
@@ -525,24 +537,11 @@ impl Runtime {
         {
             return Ok(json!({"status":"foreign","event_id":event.event_id}));
         }
-        let first = store.connection.execute(
-            "INSERT INTO triage_seen(event_id,ts_ms) VALUES(?,?) ON CONFLICT(event_id) DO NOTHING",
-            params![event.event_id, now_ms()],
-        )?;
-        if first == 0 {
-            return Ok(json!({"status":"duplicate","event_id":event.event_id}));
+        let event_id = event.event_id.clone();
+        if !store.queue_triage_event(event, now_ms())? {
+            return Ok(json!({"status":"duplicate","event_id":event_id}));
         }
-        store.connection.execute(
-            "INSERT INTO triage_queue(ts_ms,event_id,request_id,event) VALUES(?,?,?,?)
-             ON CONFLICT(ts_ms,event_id) DO UPDATE SET request_id=excluded.request_id,event=excluded.event",
-            params![
-                event.ts_ms.max(0),
-                event.event_id,
-                event.request_id,
-                serde_json::to_string(&event)?
-            ],
-        )?;
-        Ok(json!({"status":"accepted","event_id":event.event_id}))
+        Ok(json!({"status":"accepted","event_id":event_id}))
     }
 
     /// Gives a session this device runs and no bot owns to the primary bot, written once.
@@ -596,6 +595,7 @@ impl Runtime {
             received_ms: now_ms(),
             answer_by_ms: Some(now_ms() + AGENT_ANSWER_WITHIN.as_millis() as i64),
             question_id: None,
+            fallback_reason: None,
             reply: Reply::AppServer {
                 rpc_id: json!(handed.id),
                 method: handed.method.clone(),
@@ -603,6 +603,11 @@ impl Runtime {
                 params: handed.params.clone(),
             },
         };
+        if let Some(previous) = lock(&self.triage.requests).get(&request_id) {
+            request.received_ms = previous.received_ms;
+            request.answer_by_ms = previous.answer_by_ms;
+            request.fallback_reason = previous.fallback_reason;
+        }
         // Asked again, the App Server never got the earlier answer.
         lock(&self.triage.answered).remove(&request_id);
         let standing = async {
@@ -673,18 +678,17 @@ impl Runtime {
         let waiting = match &queued {
             Ok(result) if result["status"] == "accepted" => true,
             // Its event still waits for the Agent from the earlier connection.
-            Ok(result) if result["status"] == "duplicate" => self
-                .store
-                .lock()
-                .await
-                .connection
-                .query_row(
-                    "SELECT 1 FROM triage_queue WHERE event_id=?",
-                    [result["event_id"].as_str().unwrap_or_default()],
-                    |_| Ok(()),
-                )
-                .optional()
-                .is_ok_and(|queued| queued.is_some()),
+            Ok(result) if result["status"] == "duplicate" => {
+                let attached = self.store.lock().await.attach_triage_request(
+                    result["event_id"].as_str().unwrap_or_default(),
+                    &request_id,
+                );
+                if let Err(error) = &attached {
+                    tracing::warn!(event = "request.unrouted", %error, request = %request_id,
+                        "App Server request could not rejoin its pending event");
+                }
+                attached.unwrap_or(false)
+            }
             _ => false,
         };
         if !waiting {
@@ -716,6 +720,11 @@ impl Runtime {
                 return (answered.get(request_id).cloned())
                     .context("no request is waiting with this ID");
             };
+            if result.is_none() {
+                tracing::info!(event = "request.fallback", request = %request_id,
+                    reason = request.fallback_reason.unwrap_or("unanswered"),
+                    "held request reached its fallback");
+            }
             let (result, decision) = match (result, &request.reply) {
                 (Some(result), _) => {
                     let decision = result
@@ -788,8 +797,7 @@ impl Runtime {
         self.store
             .lock()
             .await
-            .connection
-            .execute("DELETE FROM triage_queue WHERE request_id=?", [request_id])?;
+            .finish_triage_request(request_id, by != "fallback")?;
         Ok(outcome)
     }
 
@@ -821,15 +829,25 @@ impl Runtime {
     }
 
     /// The connection that carried the held App Server requests is gone, and so are they.
-    pub(crate) fn drop_codex_requests(&self) {
-        lock(&self.triage.requests).retain(|request_id, request| {
-            let lost = matches!(request.reply, Reply::AppServer { .. });
-            if lost {
-                tracing::info!(event = "request.lost", request = %request_id, method = request.origin(),
-                    "App Server request lost with its connection");
+    pub(crate) async fn drop_codex_requests(&self) -> Result<()> {
+        let lost: Vec<_> = {
+            let mut requests = lock(&self.triage.requests);
+            let lost: Vec<_> = requests
+                .iter()
+                .filter(|(_, request)| matches!(request.reply, Reply::AppServer { .. }))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &lost {
+                requests.remove(id);
             }
-            !lost
-        });
+            lost
+        };
+        let mut store = self.store.lock().await;
+        for id in lost {
+            tracing::info!(event = "request.lost", request = %id, "App Server request lost with its connection");
+            store.finish_triage_request(&id, false)?;
+        }
+        Ok(())
     }
 
     /// Once the App Server finished observing this device's threads after a connect, any request
@@ -971,25 +989,40 @@ impl Runtime {
     }
 
     async fn pending_events(&self) -> Result<Vec<AgentEvent>> {
-        queued(&self.store.lock().await.connection)
+        self.store.lock().await.triage_events(None)
     }
 
     /// One turn of this device's coordination Agent; it acts through the `vibeface` CLI.
-    async fn coordination_turn(&self, prompt: impl FnOnce(&str) -> Result<String>) -> Result<()> {
-        let Some(settings) = self.manager() else {
-            return Ok(());
-        };
+    async fn coordination_turn(
+        &self,
+        attempt: Option<&str>,
+        prompt: impl FnOnce(&str) -> Result<String>,
+    ) -> Result<()> {
+        let settings = self
+            .manager()
+            .context("no coordination Agent is configured")
+            .map_err(manager::ManagerError::not_started)?;
         self.manager_backend_ready(settings.provider).await;
-        let program = std::env::current_exe()?;
-        let cli = format!("'{}'", program.to_string_lossy().replace('\'', r"'\''"));
-        let config = ManagerConfig {
+        let program = std::env::current_exe()
+            .map_err(|error| manager::ManagerError::not_started(error.into()))?;
+        let mut cli = format!("'{}'", program.to_string_lossy().replace('\'', r"'\''"));
+        let mut config = ManagerConfig {
             tool_cli: Some(program),
-            ..self.manager_config(settings)?
+            ..self
+                .manager_config(settings)
+                .map_err(manager::ManagerError::not_started)?
         }
         .for_cursor_instance(
             CursorInstance::Coordination,
             self.cursor_store_root(&CursorInstance::Coordination),
         );
+        if let Some(attempt) = attempt {
+            config
+                .tool_env
+                .insert("VIBEFACE_TRIAGE_ATTEMPT".into(), attempt.into());
+            cli = format!("VIBEFACE_TRIAGE_ATTEMPT={attempt} {cli}");
+        }
+        let prompt = prompt(&cli).map_err(manager::ManagerError::not_started)?;
         let (_cancel, cancel) = tokio::sync::watch::channel(false);
         // Kept before the turn starts, so its hooks, scans and App Server events are known.
         let record = |thread: String| async move {
@@ -1000,71 +1033,107 @@ impl Runtime {
             )?;
             Ok(())
         };
-        manager::run_manager(&config, &prompt(&cli)?, None, record, cancel, |_| async {
-            Ok(())
-        })
-        .await
-        .map(|_| ())
+        manager::run_manager(&config, &prompt, None, record, cancel, |_| async { Ok(()) })
+            .await
+            .map(|_| ())
     }
 
     /// Hands waiting events, each with the bot that owns its session, to one turn of the
-    /// coordination Agent. It answers through `vibeface triage` and `vibeface respond`;
-    /// what it leaves alone is dropped after the turn, and a request it neither answered nor
-    /// raised gets the fallback answer.
+    /// coordination Agent. It answers through `vibeface triage` and `vibeface respond`.
     async fn wake_agent(&self) -> Result<()> {
+        let Ok(_turn) = self.triage.turn.try_lock() else {
+            return Ok(());
+        };
         if self.manager().is_none() {
             return Ok(());
         }
-        let fresh: Vec<AgentEvent> = self
-            .pending_events()
-            .await?
-            .into_iter()
-            .take(BATCH)
-            .collect();
-        if fresh.is_empty() {
-            return Ok(());
-        }
         let network = self.network_id().await?;
+        let admission = {
+            let _mutations = self.triage.mutations.lock().await;
+            self.store.lock().await.admit_triage(
+                &network,
+                &self.boot,
+                BATCH,
+                self.config.daily_decision_limit,
+                now_ms(),
+            )?
+        };
+        let attempt = match admission {
+            TriageAdmission::Empty => return Ok(()),
+            TriageAdmission::Paused(status) => {
+                let pending = self.pending_events().await?;
+                let mut requests = lock(&self.triage.requests);
+                for event in &pending {
+                    if let Some(id) = &event.request_id
+                        && let Some(request) = requests.get_mut(id)
+                    {
+                        request.fallback_reason = Some("budget_exhausted");
+                    }
+                }
+                let mut warning = lock(&self.triage.budget_warning);
+                if warning.as_ref() != Some(&status) {
+                    tracing::warn!(
+                        event = "triage.budget_exhausted",
+                        day = status.day,
+                        used = status.used,
+                        limit = status.limit,
+                        retry_at_ms = status.retry_at_ms,
+                        reason = "budget_exhausted",
+                        "triage paused until its daily budget resets"
+                    );
+                    *warning = Some(status);
+                }
+                return Ok(());
+            }
+            TriageAdmission::Claimed(attempt) => attempt,
+        };
+        *lock(&self.triage.budget_warning) = None;
+        *lock(&self.triage.active) = Some(attempt.id().into());
+        let _active = ActiveTriage(&self.triage);
+        let fresh = attempt.events();
+        for event in fresh {
+            if let Some(id) = &event.request_id
+                && let Some(request) = lock(&self.triage.requests).get_mut(id)
+            {
+                request.fallback_reason = None;
+            }
+        }
         let mut offered = Vec::new();
         let mut bots = Vec::new();
-        let reserved = {
-            let mut store = self.store.lock().await;
-            let mut seen = HashSet::new();
-            for event in &fresh {
-                let owner = owner(&store, &network, event)?;
-                let bot = match &owner {
-                    Some(scope) => store.bot_for_conversation(&network, scope)?,
-                    None => None,
-                };
-                let name = match (&owner, &bot) {
-                    (_, Some(bot)) => Some(bot.name.clone()),
-                    (Some(scope), None) => store.conversation(&network, scope)?.map(|c| c.title),
-                    (None, None) => None,
-                };
-                if let Some(bot) = bot
-                    && seen.insert(bot.conversation_id.clone())
-                {
-                    let notes = store.memories(&network, &bot.conversation_id)?;
-                    bots.push(bot_context(&bot, &notes));
+        let turn = async {
+            let store = self.store.lock().await;
+            let prepared = (|| -> Result<()> {
+                let mut seen = HashSet::new();
+                for event in fresh {
+                    let owner = owner(&store, &network, event)?;
+                    let bot = match &owner {
+                        Some(scope) => store.bot_for_conversation(&network, scope)?,
+                        None => None,
+                    };
+                    let name = match (&owner, &bot) {
+                        (_, Some(bot)) => Some(bot.name.clone()),
+                        (Some(scope), None) => {
+                            store.conversation(&network, scope)?.map(|c| c.title)
+                        }
+                        (None, None) => None,
+                    };
+                    if let Some(bot) = bot
+                        && seen.insert(bot.conversation_id.clone())
+                    {
+                        let notes = store.memories(&network, &bot.conversation_id)?;
+                        bots.push(bot_context(&bot, &notes));
+                    }
+                    offered.push((
+                        shared_event(event, &self.settings_snapshot().roots),
+                        json!({"conversation_id":owner,"name":name}),
+                    ));
                 }
-                offered.push((
-                    shared_event(event, &self.settings_snapshot().roots),
-                    json!({"conversation_id":owner,"name":name}),
-                ));
-            }
-            // A count of its own under the same daily limit, so triage never starves bot turns.
-            store.reserve_budget(
-                &format!("triage:{network}"),
-                1,
-                self.config.daily_decision_limit,
-            )
-        };
-        if let Err(error) = reserved {
-            self.settle_offered(&fresh).await?;
-            return Err(error.context("no coordination turn"));
-        }
-        let turn = self
-            .coordination_turn(|cli| {
+                Ok(())
+            })()
+            .map_err(manager::ManagerError::not_started);
+            drop(store);
+            prepared?;
+            self.coordination_turn(Some(attempt.id()), |cli| {
                 triage::wake_prompt(
                     &offered,
                     &bots,
@@ -1073,8 +1142,16 @@ impl Runtime {
                     HOOK_ANSWER_WITHIN.as_secs(),
                 )
             })
-            .await;
-        self.settle_offered(&fresh).await?;
+            .await
+        }
+        .await;
+        let _mutations = self.triage.mutations.lock().await;
+        let turn = if turn.is_ok() {
+            self.settle_offered(fresh).await
+        } else {
+            turn
+        };
+        self.store.lock().await.finish_triage(attempt, &turn)?;
         turn
     }
 
@@ -1088,26 +1165,68 @@ impl Runtime {
                     self.answer_request(request_id, None, "fallback").await?;
                 }
             }
-            dequeue(&self.store.lock().await.connection, event)?;
         }
         Ok(())
+    }
+
+    pub(super) async fn triage_status(&self) -> Result<Value> {
+        let network = self.store.lock().await.network()?.unwrap_or_default();
+        let active = lock(&self.triage.active).clone();
+        Ok(serde_json::to_value(
+            self.store.lock().await.triage_status(
+                &network,
+                &self.boot,
+                active.as_deref(),
+                self.config.daily_decision_limit,
+                now_ms(),
+            )?,
+        )?)
     }
 
     /// `/api/triage`, the Agents' side: `requests`, `respond`, `events`, `raise` and `dismiss`.
     pub(crate) async fn triage_command(&self, input: Value) -> Result<Value> {
         let network = self.network_id().await?;
         let action = super::field(&input, "action")?;
+        let attempt = input
+            .get("_attempt")
+            .map(|value| value.as_str().context("invalid triage attempt context"))
+            .transpose()?;
+        let _mutations = if matches!(action, "respond" | "raise" | "dismiss") {
+            Some(self.triage.mutations.lock().await)
+        } else {
+            None
+        };
+        let active = lock(&self.triage.active).clone();
+        let context = attempt.map(|id| (self.boot.as_str(), id));
+        let current = attempt.is_none() || attempt == active.as_deref();
         if action == "requests" {
-            let requests: Vec<HeldRequest> =
+            let mut requests: Vec<HeldRequest> =
                 lock(&self.triage.requests).values().cloned().collect();
+            if attempt.is_some() {
+                ensure!(current, "triage attempt is no longer active");
+                let events = self.store.lock().await.triage_events(context)?;
+                requests.retain(|request| {
+                    events
+                        .iter()
+                        .any(|event| event.request_id.as_deref() == Some(&request.request_id))
+                });
+            }
             return Ok(json!({"requests":requests}));
         }
         if action == "respond" {
             let request_id = super::field(&input, "request_id")?;
             let result = input.get("result").cloned().context("result is required")?;
+            if let Some(done) = lock(&self.triage.answered).get(request_id) {
+                return Ok(done.clone());
+            }
+            ensure!(current, "triage attempt is no longer active");
             if let Some(node) = input["node"].as_str()
                 && node != self.identity.device_id()?
             {
+                ensure!(
+                    attempt.is_none(),
+                    "a triage attempt only answers its local requests"
+                );
                 return self
                     .peer_request(
                         &network,
@@ -1116,19 +1235,37 @@ impl Runtime {
                     )
                     .await;
             }
+            let human_question = attempt.is_none()
+                && lock(&self.triage.requests)
+                    .get(request_id)
+                    .is_some_and(|request| request.question_id.is_some());
+            ensure!(
+                human_question
+                    || self
+                        .store
+                        .lock()
+                        .await
+                        .triage_events(context)?
+                        .iter()
+                        .any(|event| event.request_id.as_deref() == Some(request_id)),
+                "request is not available to this triage attempt"
+            );
             return self
                 .answer_request(request_id, Some(Ok(result)), "agent")
                 .await;
         }
         if action == "events" {
             let since = input["since"].as_i64().unwrap_or(0);
-            let events: Vec<_> = self
-                .pending_events()
-                .await?
+            ensure!(current, "triage attempt is no longer active");
+            let store = self.store.lock().await;
+            let events: Vec<_> = store
+                .triage_events(context)?
                 .into_iter()
                 .filter(|event| event.ts_ms >= since)
                 .collect();
-            return Ok(json!({"events":events}));
+            let unknown = store
+                .unknown_triage_events(active.as_deref().map(|id| (self.boot.as_str(), id)))?;
+            return Ok(json!({"events":events,"unknown_events":unknown}));
         }
         let event_id = super::id(&input, "event_id")?;
         {
@@ -1145,9 +1282,12 @@ impl Runtime {
                 return Ok(serde_json::from_str(&handled)?);
             }
         }
+        ensure!(current, "triage attempt is no longer active");
         let event = self
-            .pending_events()
-            .await?
+            .store
+            .lock()
+            .await
+            .triage_events(context)?
             .into_iter()
             .find(|event| event.event_id == event_id)
             .context("no pending event with this ID")?;
@@ -1161,6 +1301,10 @@ impl Runtime {
                         .context("choices must be labels")?;
                 let request_id = input["request_id"].as_str().map(str::to_owned);
                 if let Some(request_id) = &request_id {
+                    ensure!(
+                        event.request_id.as_deref() == Some(request_id),
+                        "request does not belong to this event"
+                    );
                     ensure!(
                         lock(&self.triage.requests).contains_key(request_id),
                         "no request is waiting with this ID"
@@ -1440,7 +1584,7 @@ impl Runtime {
             let cutoff = now_ms() - SEEN_TTL_MS;
             store
                 .connection
-                .execute("DELETE FROM triage_seen WHERE ts_ms<?", [cutoff])?;
+                .execute("DELETE FROM triage_seen WHERE ts_ms<? AND NOT EXISTS(SELECT 1 FROM triage_queue q WHERE q.event_id=triage_seen.event_id)", [cutoff])?;
             store
                 .connection
                 .execute("DELETE FROM triage_handled WHERE ts_ms<?", [cutoff])?;
@@ -1515,7 +1659,7 @@ impl Runtime {
             "codex_sessions":config.codex_sessions,
             "webhook_secret_set":self.webhook_secret()?.is_some(),
             "decision_url":self.decision_url(), "device_id":self.identity.device_id()?,
-            "decision_tokens":tokens, "outbox":outbox,
+            "decision_tokens":tokens, "outbox":outbox, "status":self.triage_status().await?,
         }))
     }
 
@@ -2001,7 +2145,7 @@ pub(super) mod tests {
         let ready = json!({"id":initialize["id"],"result":{"userAgent":"codex/fixture"}});
         server.send(ready.to_string().into()).await?;
         assert_eq!(read(&mut server).await["method"], "initialized");
-        let params = json!({"threadId":"t-1","command":"rm -rf build","reason":"clean the build"});
+        let params = json!({"threadId":"t-1","itemId":"fixture-approval","command":"rm -rf build","reason":"clean the build"});
         let request =
             json!({"id":41,"method":"item/commandExecution/requestApproval","params":params});
         server.send(request.to_string().into()).await?;
@@ -2614,6 +2758,17 @@ pub(super) mod tests {
                 .as_str()
                 .unwrap()
                 .to_owned();
+            let deadline = lock(&node.triage.requests)[&request_id].answer_by_ms;
+            node.store
+                .lock()
+                .await
+                .finish_triage_request(&request_id, false)?;
+            node.on_codex_request(&handed).await;
+            assert_eq!(
+                lock(&node.triage.requests)[&request_id].answer_by_ms,
+                deadline,
+                "a repeated live App Server request keeps its original deadline"
+            );
             assert_eq!(
                 requests["requests"][0]["method"],
                 "item/commandExecution/requestApproval"
@@ -3139,7 +3294,7 @@ pub(super) mod tests {
             let handed = ask_approval(&node, &mut server, 51).await?;
             node.on_codex_request(&handed).await;
             let (question, request_id) = raise_for(&node).await?;
-            node.drop_codex_requests();
+            node.drop_codex_requests().await?;
             let again = ask_approval(&node, &mut server, 52).await?;
             node.on_codex_request(&again).await;
             let asked = unanswered(&node).await?;
@@ -3199,7 +3354,7 @@ pub(super) mod tests {
             let handed = ask_approval(&node, &mut server, 61).await?;
             node.on_codex_request(&handed).await;
             let (question, _) = raise_for(&node).await?;
-            node.drop_codex_requests();
+            node.drop_codex_requests().await?;
             node.close_lost_questions().await?;
             assert!(
                 unanswered(&node).await?.is_empty(),
@@ -4262,9 +4417,23 @@ pub(super) mod tests {
         result
     }
 
-    /// An App Server fixture whose turns complete at once; it passes on every request it gets.
+    #[derive(Clone, Copy)]
+    enum CoordinationReply {
+        Complete,
+        Refused,
+        Failed,
+        Unknown,
+    }
+
     fn coordination_app_server(
         node: &Runtime,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
+        coordination_server(node, CoordinationReply::Complete)
+    }
+
+    fn coordination_server(
+        node: &Runtime,
+        response: CoordinationReply,
     ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
         use futures_util::{SinkExt as _, StreamExt as _};
         let listener = tokio::net::UnixListener::bind(named_socket(node))?;
@@ -4284,6 +4453,18 @@ pub(super) mod tests {
                         if request.get("id").is_none() {
                             continue;
                         }
+                        let _ = sent.send(request.clone());
+                        if request["method"] == "turn/start" {
+                            match response {
+                                CoordinationReply::Unknown => break,
+                                CoordinationReply::Refused => {
+                                    let reply = json!({"id":request["id"],"error":{"code":-32602,"message":"fixture refused before model start"}});
+                                    let _ = server.send(reply.to_string().into()).await;
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
                         let result = match request["method"].as_str() {
                             Some("initialize") => json!({"userAgent":"codex/fixture"}),
                             Some("thread/start") => json!({"thread":{"id":"coord-thread"}}),
@@ -4294,12 +4475,11 @@ pub(super) mod tests {
                         if request["method"] == "turn/start" {
                             replies.push(json!({"method":"turn/completed","params":{
                                 "threadId":"coord-thread",
-                                "turn":{"id":"coord-turn","status":"completed"}}}));
+                                "turn":{"id":"coord-turn","status":if matches!(response, CoordinationReply::Failed) { "failed" } else { "completed" }}}}));
                         }
                         for reply in replies {
                             let _ = server.send(reply.to_string().into()).await;
                         }
-                        let _ = sent.send(request);
                     }
                 });
             }
@@ -4349,7 +4529,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn coordination_turns_have_their_own_daily_budget() -> Result<()> {
+    async fn coordination_budget_keeps_unoffered_events_and_request_deadlines() -> Result<()> {
         let (node, admin, dir) = node().await?;
         let result = async {
             with_agent(&node);
@@ -4371,35 +4551,659 @@ pub(super) mod tests {
                 "the last turn of the day runs"
             );
 
+            let mut deferred = turn("s-deferred", "t-deferred", "/tmp");
+            deferred.event_id = AgentEvent::id_for(
+                &node.identity.device_id()?,
+                deferred.agent,
+                &deferred.session_id,
+                &deferred.turn_id,
+                deferred.event,
+            );
+            let deferred_id = deferred.event_id.clone();
+            node.ingest_agent_event(deferred).await?;
             let held = node.ingest_agent_event(asks_permission("s2")).await?;
             let request_id = held["request_id"]
                 .as_str()
                 .context("a held request")?
                 .to_owned();
-            let refused = node.wake_agent().await.expect_err("no budget is left");
-            assert!(format!("{refused:#}").contains("budget"), "{refused:#}");
+            node.wake_agent().await?;
+            assert_eq!(
+                node.triage_status().await?["budget"]["paused_reason"],
+                "budget_exhausted"
+            );
             assert!(
                 turn_starts(&mut requests).is_empty(),
                 "no turn past the budget"
             );
             assert!(
-                !node
-                    .triage
+                node.triage
                     .requests
                     .lock()
                     .unwrap()
                     .contains_key(&request_id),
-                "a held request gets the fallback answer at once"
+                "a budget refusal must not shorten the request deadline"
             );
             node.store
                 .lock()
                 .await
                 .reserve_budget(&network, limit, limit)
                 .context("the bots' own turns keep their whole budget")?;
-            assert!(
-                node.pending_events().await?.is_empty(),
-                "its events are dropped"
+            let pending = node.pending_events().await?;
+            assert_eq!(pending.len(), 2, "events were not offered to the model");
+            assert!(pending.iter().any(|event| event.event_id == deferred_id));
+            let deadline = lock(&node.triage.requests)[&request_id].answer_by_ms;
+            node.wake_agent().await?;
+            assert_eq!(
+                lock(&node.triage.requests)[&request_id].answer_by_ms,
+                deadline
             );
+            assert_eq!(
+                lock(&node.triage.requests)[&request_id].fallback_reason,
+                Some("budget_exhausted")
+            );
+            lock(&node.triage.requests)
+                .get_mut(&request_id)
+                .unwrap()
+                .answer_by_ms = Some(now_ms() - 1);
+            node.expire_requests().await?;
+            node.expire_requests().await?;
+            assert_eq!(
+                lock(&node.triage.answered).len(),
+                1,
+                "deadline fallback happens once"
+            );
+            let retained = node.pending_events().await?;
+            assert_eq!(
+                retained.len(),
+                2,
+                "an expired request still leaves its event for review"
+            );
+            assert!(
+                retained
+                    .iter()
+                    .all(|event| event.request_id.is_none() && event.hold.is_none())
+            );
+            node.store.lock().await.connection.execute(
+                "UPDATE budget_days SET used=0 WHERE network_id=? AND day=date('now')",
+                [&triage],
+            )?;
+            node.wake_agent().await?;
+            node.wake_agent().await?;
+            assert_eq!(
+                turn_starts(&mut requests).len(),
+                1,
+                "budget recovery reviews the saved batch once"
+            );
+            assert!(node.pending_events().await?.is_empty());
+            assert_eq!(
+                node.ingest_agent_event(turn("s-deferred", "t-deferred", "/tmp"))
+                    .await?["status"],
+                "duplicate"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn triage_refunds_only_live_proven_unstarted_reservations_on_the_original_day()
+    -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            node.ingest_agent_event(turn("first", "one", "/tmp"))
+                .await?;
+            node.ingest_agent_event(turn("second", "two", "/tmp"))
+                .await?;
+            let network = node.network_id().await?;
+            let original = now_ms() - 86_400_000;
+            let refused = Err(manager::ManagerError::not_started(anyhow::anyhow!(
+                "fixture before start"
+            )));
+            let mut store = node.store.lock().await;
+            let TriageAdmission::Claimed(attempt) =
+                store.admit_triage(&network, &node.boot, 1, 1, original)?
+            else {
+                bail!("first admission");
+            };
+            let event = attempt.events()[0].clone();
+            assert_eq!(
+                store
+                    .triage_status(&network, &node.boot, Some(attempt.id()), 1, original)?
+                    .budget
+                    .used,
+                1
+            );
+            store.reserve_budget(&format!("triage:{network}"), 7, 100)?;
+            dequeue(&store.connection, &event)?;
+            store.finish_triage(attempt, &refused)?;
+            assert_eq!(
+                store
+                    .triage_status(&network, &node.boot, None, 1, original)?
+                    .budget
+                    .used,
+                0,
+                "refund the original UTC day"
+            );
+            assert_eq!(
+                store
+                    .triage_status(&network, &node.boot, None, 100, now_ms())?
+                    .budget
+                    .used,
+                7,
+                "today's unrelated charge stays"
+            );
+            let pending = store.triage_events(None)?;
+            assert_eq!(
+                pending.len(),
+                1,
+                "release does not resurrect a removed event"
+            );
+            assert_ne!(pending[0].event_id, event.event_id);
+            let TriageAdmission::Claimed(attempt) =
+                store.admit_triage(&network, &node.boot, 1, 100, now_ms())?
+            else {
+                bail!("same-day admission");
+            };
+            store.finish_triage(attempt, &refused)?;
+            assert_eq!(
+                store
+                    .triage_status(&network, &node.boot, None, 100, now_ms())?
+                    .budget
+                    .used,
+                7,
+                "same-day release refunds exactly one reservation"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn concurrent_triage_admissions_keep_the_daily_cap() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            for index in 0..4 {
+                node.ingest_agent_event(turn(&format!("session-{index}"), "turn", "/tmp"))
+                    .await?;
+            }
+            let network = node.network_id().await?;
+            let barrier = Arc::new(std::sync::Barrier::new(4));
+            let mut tasks = Vec::new();
+            for _ in 0..4 {
+                let mut store = crate::store::Store::open(dir.join("node.sqlite3"))?;
+                let network = network.clone();
+                let boot = node.boot.clone();
+                let barrier = barrier.clone();
+                tasks.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    store.admit_triage(&network, &boot, 1, 1, now_ms())
+                }));
+            }
+            let mut claimed = 0;
+            let mut paused = 0;
+            let mut reservation = None;
+            for task in tasks {
+                match task.join().expect("concurrent SQLite admission")? {
+                    TriageAdmission::Claimed(attempt) => {
+                        claimed += 1;
+                        reservation = Some(attempt);
+                    }
+                    TriageAdmission::Paused(_) => paused += 1,
+                    TriageAdmission::Empty => bail!("unclaimed events remain"),
+                }
+            }
+            assert_eq!((claimed, paused), (1, 3));
+            assert_eq!(node.triage_status().await?["budget"]["used"], 1);
+            assert_eq!(node.pending_events().await?.len(), 3);
+            let mut release_store = crate::store::Store::open(dir.join("node.sqlite3"))?;
+            let mut reserve_store = crate::store::Store::open(dir.join("node.sqlite3"))?;
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let release_barrier = barrier.clone();
+            let release = std::thread::spawn(move || {
+                release_barrier.wait();
+                release_store.finish_triage(
+                    reservation.expect("one reservation"),
+                    &Err(manager::ManagerError::not_started(anyhow::anyhow!(
+                        "not sent"
+                    ))),
+                )
+            });
+            barrier.wait();
+            let admission = reserve_store.admit_triage(&network, &node.boot, 1, 1, now_ms())?;
+            release.join().expect("concurrent SQLite release")?;
+            let expected_used = u64::from(matches!(admission, TriageAdmission::Claimed(_)));
+            assert_eq!(
+                node.triage_status().await?["budget"]["used"],
+                expected_used,
+                "concurrent release and admission conserve exactly their own charge"
+            );
+            assert_eq!(
+                node.pending_events().await?.len(),
+                4 - expected_used as usize
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn triage_local_setup_failures_release_their_reservation_without_handing_over_events()
+    -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            node.settings
+                .lock()
+                .unwrap()
+                .manager
+                .as_mut()
+                .unwrap()
+                .workspace = dir.join("absent-workspace");
+            node.ingest_agent_event(turn("local-failure", "t", "/tmp"))
+                .await?;
+            let error = node
+                .wake_agent()
+                .await
+                .expect_err("invalid manager workspace");
+            assert_eq!(
+                error
+                    .downcast_ref::<manager::ManagerError>()
+                    .context("setup evidence")?
+                    .start,
+                manager::StartEvidence::NotStarted
+            );
+            let status = node.triage_status().await?;
+            assert_eq!(status["budget"]["used"], 0);
+            assert_eq!(status["pending_events"], 1);
+            assert_eq!(status["unknown_events"], 0);
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn triage_start_evidence_controls_refunds_and_automatic_retries() -> Result<()> {
+        for (reply, expected_start, charged, pending) in [
+            (
+                CoordinationReply::Refused,
+                manager::StartEvidence::NotStarted,
+                0,
+                1,
+            ),
+            (
+                CoordinationReply::Failed,
+                manager::StartEvidence::Started,
+                1,
+                0,
+            ),
+            (
+                CoordinationReply::Unknown,
+                manager::StartEvidence::Unknown,
+                1,
+                0,
+            ),
+        ] {
+            let (node, admin, dir) = node().await?;
+            let result = async {
+                with_agent(&node);
+                bot(&node, &admin, "c", "前端", &[]).await?;
+                let mut calls = coordination_server(&node, reply)?;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while node.codex.status().await["connection"]["state"] != "connected" {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await?;
+                node.ingest_agent_event(turn("s", "t", "/tmp")).await?;
+                let error = node
+                    .wake_agent()
+                    .await
+                    .expect_err("controlled provider failure");
+                assert_eq!(
+                    error
+                        .downcast_ref::<manager::ManagerError>()
+                        .context("manager start evidence")?
+                        .start,
+                    expected_start
+                );
+                let status = node.triage_status().await?;
+                assert_eq!(status["budget"]["used"], charged);
+                assert_eq!(status["pending_events"], pending);
+                assert_eq!(status["unknown_events"], 1 - pending);
+                assert_eq!(turn_starts(&mut calls).len(), 1);
+                let retry = node.wake_agent().await;
+                if pending == 1 {
+                    assert!(retry.is_err(), "only proven not-started rows are retryable");
+                    assert_eq!(turn_starts(&mut calls).len(), 1);
+                    assert_eq!(node.triage_status().await?["budget"]["used"], 0);
+                } else {
+                    retry?;
+                    assert!(
+                        turn_starts(&mut calls).is_empty(),
+                        "started or unknown is never replayed"
+                    );
+                    assert_eq!(
+                        node.triage_command(json!({"action":"events"})).await?["unknown_events"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            cleanup(node, dir).await?;
+            result?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn triage_claims_gate_late_mutators_and_keep_handled_results_read_only() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let queued = node.ingest_agent_event(turn("ordinary", "t", "/tmp")).await?;
+            let held = node.ingest_agent_event(asks_permission("request")).await?;
+            let network = node.network_id().await?;
+            let TriageAdmission::Claimed(attempt) = node.store.lock().await.admit_triage(&network, &node.boot, BATCH, 100, now_ms())? else { bail!("admission"); };
+            let id = attempt.id().to_owned();
+            *lock(&node.triage.active) = Some(id.clone());
+            let raise = json!({"action":"raise","event_id":queued["event_id"],"severity":"attention","question":"继续吗？"});
+            let respond = json!({"action":"respond","request_id":held["request_id"],"result":{"behavior":"allow"}});
+            for action in [&raise, &respond, &json!({"action":"dismiss","event_id":queued["event_id"]})] {
+                assert!(node.triage_command(action.clone()).await.is_err(), "an unscoped caller cannot change a claimed row");
+                let mut late = action.clone(); late["_attempt"] = json!("old-attempt");
+                assert!(node.triage_command(late).await.is_err(), "an older attempt cannot mutate the current one");
+            }
+            assert!(unanswered(&node).await?.is_empty());
+            assert!(lock(&node.triage.answered).is_empty());
+            assert_eq!(node.triage_command(json!({"action":"events","_attempt":id})).await?["events"].as_array().unwrap().len(), 2);
+            let mut current = raise.clone(); current["_attempt"] = json!(id);
+            let raised = node.triage_command(current.clone()).await?;
+            let mut current_response = respond.clone(); current_response["_attempt"] = json!(id);
+            assert_eq!(node.triage_command(current_response).await?["answered"], true);
+            let retained = node.store.lock().await.triage_events(Some((&node.boot, &id)))?;
+            assert_eq!(retained.len(), 1, "respond keeps its claimed event until the turn is settled");
+            assert_eq!(retained[0].event_id, held["event_id"].as_str().unwrap());
+            assert!(retained[0].request_id.is_none() && retained[0].hold.is_none());
+            assert_eq!(unanswered(&node).await?.len(), 1, "the active claim can ask its question");
+            *lock(&node.triage.active) = None;
+            assert_eq!(node.triage_command(current).await?, raised, "a late repeated action only reads its original result");
+            assert_eq!(unanswered(&node).await?.len(), 1);
+            node.store.lock().await.finish_triage(attempt, &Ok(()))?;
+            assert!(node.store.lock().await.unknown_triage_events(None)?.is_empty(), "a complete turn settles the retained response event");
+
+            let failed_response = node.ingest_agent_event(asks_permission("respond-before-failure")).await?;
+            let TriageAdmission::Claimed(attempt) = node.store.lock().await.admit_triage(&network, &node.boot, BATCH, 100, now_ms())? else { bail!("respond before failure claim"); };
+            let failed_id = attempt.id().to_owned();
+            *lock(&node.triage.active) = Some(failed_id.clone());
+            let response = json!({"action":"respond","_attempt":failed_id,"request_id":failed_response["request_id"],"result":{"behavior":"allow"}});
+            let answered = node.triage_command(response.clone()).await?;
+            assert_eq!(answered["answered"], true);
+            let failure = Err(manager::ManagerError {
+                outcome: manager::ManagerFailure::Failed,
+                start: manager::StartEvidence::Started,
+                session_id: Some("fixture-started-turn".into()),
+                failure: vibeface_bridge::failure::ExecFailure::new(vibeface_bridge::failure::FailureKind::Rejected, "fixture failed after responding"),
+            }.into());
+            node.store.lock().await.finish_triage(attempt, &failure)?;
+            *lock(&node.triage.active) = None;
+            let unknown_response = node.store.lock().await.unknown_triage_events(None)?;
+            assert_eq!(unknown_response.len(), 1, "a failed turn retains the already-sent response's claim");
+            assert_eq!(unknown_response[0].event_id, failed_response["event_id"].as_str().unwrap());
+            assert!(unknown_response[0].request_id.is_none() && unknown_response[0].hold.is_none());
+            assert_eq!(node.triage_command(response).await?, answered, "the same process only reads its first response result");
+            assert_eq!(node.triage_status().await?["budget"]["used"], 2, "a model failure after responding keeps its charge");
+
+            let unknown = node.ingest_agent_event(turn("uncertain", "t", "/tmp")).await?;
+            let held = node.ingest_agent_event(asks_permission("uncertain-request")).await?;
+            let TriageAdmission::Claimed(attempt) = node.store.lock().await.admit_triage(&network, &node.boot, BATCH, 100, now_ms())? else { bail!("unknown admission"); };
+            let stale = attempt.id().to_owned();
+            *lock(&node.triage.active) = Some(stale.clone());
+            let failure = Err(anyhow::anyhow!("unknown provider result"));
+            node.store.lock().await.finish_triage(attempt, &failure)?;
+            for action in [
+                json!({"action":"dismiss","event_id":unknown["event_id"],"_attempt":stale}),
+                json!({"action":"raise","event_id":unknown["event_id"],"_attempt":stale,"severity":"attention","question":"不应提问"}),
+                json!({"action":"respond","request_id":held["request_id"],"_attempt":stale,"result":{"behavior":"allow"}}),
+            ] { assert!(node.triage_command(action).await.is_err(), "Unknown rows are fenced even within the same boot"); }
+            assert_eq!(unanswered(&node).await?.len(), 1);
+            assert_eq!(lock(&node.triage.answered).len(), 2);
+            *lock(&node.triage.active) = None;
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn restarting_triage_fences_every_claim_and_still_reviews_new_pending_events()
+    -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let before = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let network = node.network_id().await?;
+            let mut calls = coordination_app_server(&node)?;
+            let answered_request = node.ingest_agent_event(asks_permission("respond-before-crash")).await?;
+            let TriageAdmission::Claimed(answered_attempt) = node.store.lock().await.admit_triage(&network, &node.boot, 1, 100, now_ms())? else { bail!("response claim"); };
+            *lock(&node.triage.active) = Some(answered_attempt.id().into());
+            assert_eq!(node.triage_command(json!({"action":"respond","_attempt":answered_attempt.id(),"request_id":answered_request["request_id"],"result":{"behavior":"allow"}})).await?["answered"], true);
+            let retained = node.store.lock().await.triage_events(Some((&node.boot, answered_attempt.id())))?;
+            assert_eq!(retained.len(), 1, "a sent response keeps its durable claim before finish");
+            assert!(retained[0].request_id.is_none());
+            drop(answered_attempt);
+            *lock(&node.triage.active) = None;
+            for session in ["before-send", "accepted", "action", "unreviewed", "pending"] {
+                node.ingest_agent_event(turn(session, "t", "/tmp")).await?;
+            }
+            let TriageAdmission::Claimed(before_send) =
+                node.store
+                    .lock()
+                    .await
+                    .admit_triage(&network, &node.boot, 1, 100, now_ms())?
+            else {
+                bail!("before-send claim");
+            };
+            drop(before_send);
+            let TriageAdmission::Claimed(accepted) =
+                node.store
+                    .lock()
+                    .await
+                    .admit_triage(&network, &node.boot, 1, 100, now_ms())?
+            else {
+                bail!("accepted claim");
+            };
+            node.coordination_turn(Some(accepted.id()), |_| {
+                Ok("controlled accepted prompt".into())
+            })
+            .await?;
+            assert_eq!(turn_starts(&mut calls).len(), 1);
+            drop(accepted);
+            let TriageAdmission::Claimed(after_action) =
+                node.store
+                    .lock()
+                    .await
+                    .admit_triage(&network, &node.boot, 2, 100, now_ms())?
+            else {
+                bail!("action claim");
+            };
+            *lock(&node.triage.active) = Some(after_action.id().into());
+            let event = after_action.events()[0].event_id.clone();
+            let action = json!({"action":"dismiss","event_id":event,"_attempt":after_action.id()});
+            let dismissed = node.triage_command(action.clone()).await?;
+            drop(after_action);
+            Ok::<_, anyhow::Error>((action, dismissed, answered_request))
+        }
+        .await;
+        let _ = std::fs::remove_file(named_socket(&node));
+        drop(node);
+        let reopened = Arc::new(Runtime::reopen(&dir).await?);
+        let result = async {
+            let (old_action, dismissed, answered_request) = before?;
+            with_agent(&reopened);
+            let mut calls = coordination_app_server(&reopened)?;
+            let status = reopened.triage_status().await?;
+            assert_eq!(status["budget"]["used"], 4, "no crash restores refund authority");
+            assert_eq!(status["unknown_events"], 4, "reserve, accepted, response and action-before-finish crashes remain observable");
+            assert_eq!(status["pending_events"], 1);
+            assert_eq!(reopened.triage_command(old_action).await?, dismissed, "a completed action is only read back");
+            let unknown = reopened.triage_command(json!({"action":"events"})).await?["unknown_events"].as_array().unwrap().clone();
+            assert!(unknown.iter().any(|event| event["event_id"] == answered_request["event_id"] && event["request_id"].is_null()), "reopening retains the response claim without a reply transport");
+            assert!(lock(&reopened.triage.answered).is_empty());
+            assert!(reopened.triage_command(json!({"action":"respond","request_id":answered_request["request_id"],"result":{"behavior":"allow"}})).await.is_err(), "a restart does not resend the old response");
+            for event in &unknown {
+                for action in [
+                    json!({"action":"dismiss","event_id":event["event_id"]}),
+                    json!({"action":"raise","event_id":event["event_id"],"severity":"attention","question":"迟到"}),
+                ] { assert!(reopened.triage_command(action).await.is_err(), "an older boot cannot mutate its unknown claim"); }
+            }
+            reopened.wake_agent().await?;
+            reopened.wake_agent().await?;
+            assert_eq!(turn_starts(&mut calls).len(), 1, "only the positive Pending control starts");
+            assert_eq!(reopened.triage_status().await?["budget"]["used"], 5);
+            assert_eq!(reopened.triage_status().await?["unknown_events"], 4);
+            assert!(unanswered(&reopened).await?.is_empty(), "no previous action was replayed");
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        cleanup(reopened, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn restarting_triage_retains_orphan_events_without_recreating_request_transports()
+    -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let before = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let held = node.ingest_agent_event(asks_permission("orphan")).await?;
+            node.ingest_agent_event(turn("ordinary", "t", "/tmp"))
+                .await?;
+            Ok::<_, anyhow::Error>(held["request_id"].as_str().context("request")?.to_owned())
+        }
+        .await;
+        drop(node);
+        let reopened = Arc::new(Runtime::reopen(&dir).await?);
+        let result = async {
+            let request = before?;
+            with_agent(&reopened);
+            let pending = reopened.pending_events().await?;
+            assert_eq!(pending.len(), 2);
+            assert!(pending.iter().all(|event| event.request_id.is_none() && event.hold.is_none()));
+            assert!(lock(&reopened.triage.requests).is_empty());
+            assert!(lock(&reopened.triage.answered).is_empty());
+            assert!(reopened.triage_command(json!({"action":"respond","request_id":request,"result":{"behavior":"allow"}})).await.is_err());
+            assert_eq!(reopened.wait_request(&request).await, undecided());
+            let mut calls = coordination_app_server(&reopened)?;
+            reopened.wake_agent().await?;
+            reopened.wake_agent().await?;
+            assert_eq!(turn_starts(&mut calls).len(), 1, "retained events have one review without a phantom reply");
+            assert!(lock(&reopened.triage.answered).is_empty());
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        cleanup(reopened, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn triage_private_claims_roundtrip_but_external_and_malformed_metadata_are_rejected()
+    -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let ingress = turn("codec", "turn", "/tmp");
+            let mut forged = serde_json::to_value(&ingress)?;
+            forged["_triage"] = json!({"attempt":"forged","boot":"forged","state":"in_flight"});
+            assert!(
+                serde_json::from_value::<AgentEvent>(forged).is_err(),
+                "external ingress cannot supply an internal claim"
+            );
+            node.ingest_agent_event(ingress).await?;
+            let network = node.network_id().await?;
+            let mut store = node.store.lock().await;
+            let pending = store.triage_events(None)?;
+            let raw: String =
+                store
+                    .connection
+                    .query_row("SELECT event FROM triage_queue", [], |row| row.get(0))?;
+            assert!(
+                serde_json::from_str::<AgentEvent>(&raw).is_ok(),
+                "Pending is the ordinary final-domain event shape"
+            );
+            let TriageAdmission::Claimed(attempt) =
+                store.admit_triage(&network, &node.boot, 1, 100, now_ms())?
+            else {
+                bail!("codec claim");
+            };
+            assert_eq!(
+                store.triage_events(Some((&node.boot, attempt.id())))?,
+                pending,
+                "InFlight preserves the event exactly"
+            );
+            let encoded: String =
+                store
+                    .connection
+                    .query_row("SELECT event FROM triage_queue", [], |row| row.get(0))?;
+            let mut invalid: Value = serde_json::from_str(&encoded)?;
+            invalid["_triage"]["unexpected"] = json!(true);
+            store
+                .connection
+                .execute("UPDATE triage_queue SET event=?", [invalid.to_string()])?;
+            assert!(
+                store.triage_events(None).is_err(),
+                "the private claim is parsed strictly"
+            );
+            store
+                .connection
+                .execute("UPDATE triage_queue SET event=?", [&encoded])?;
+            let unknown = Err(anyhow::anyhow!("unknown"));
+            store.finish_triage(attempt, &unknown)?;
+            assert_eq!(
+                store.unknown_triage_events(None)?,
+                pending,
+                "Unknown preserves the event exactly"
+            );
+            assert!(store.triage_events(None)?.is_empty());
+            store.connection.execute(
+                "UPDATE triage_seen SET ts_ms=?",
+                [now_ms() - SEEN_TTL_MS - 1],
+            )?;
+            drop(store);
+            lock(&node.triage.config).scan_codex_sessions = false;
+            node.scan_sources().await?;
+            assert_eq!(
+                node.ingest_agent_event(turn("codec", "turn", "/tmp"))
+                    .await?["status"],
+                "duplicate",
+                "a queued Unknown event keeps its deduplication marker past the normal seen TTL"
+            );
+            let status = node.triage_settings().await?["status"].clone();
+            let diagnostics = node.diagnostics(&network, (None, None)).await?;
+            assert_eq!(
+                diagnostics["triage"], status,
+                "settings and diagnostics derive one budget snapshot"
+            );
+            assert_eq!(status["unknown_events"], 1);
+            assert!(!status.to_string().contains("/tmp"));
+            assert!(!status.to_string().contains("codec"));
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -4414,7 +5218,8 @@ pub(super) mod tests {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
             coordination_app_server(&node)?;
-            node.coordination_turn(|_| Ok("triage".into())).await?;
+            node.coordination_turn(None, |_| Ok("triage".into()))
+                .await?;
             *node.triage.config.lock().unwrap() = TriageConfig {
                 scan_codex_sessions: false,
                 ..Default::default()

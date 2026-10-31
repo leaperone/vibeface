@@ -81,6 +81,12 @@ function Triage() {
     </View> : null}
   </>
   return <View className="gap-6">
+    <View accessibilityLabel="分诊状态" className="gap-1">
+      <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>分诊今日已用 {settings.status.budget.used} / {settings.status.budget.limit} 次</Text>
+      <Text className="text-meta text-muted-foreground">{settings.status.budget.paused_reason ? '今日额度已用完，分诊暂停，' : '额度重置时间：'}{new Date(settings.status.budget.retry_at_ms).toLocaleString('zh-CN')}{settings.status.budget.paused_reason ? '后恢复。' : '。'}</Text>
+      <Text className="text-meta text-muted-foreground">待审阅 {settings.status.pending_events} · 审阅中 {settings.status.inflight_events} · 待确认 {settings.status.unknown_events}</Text>
+      {settings.status.unknown_events ? <Text className="text-meta text-muted-foreground">结果待确认的事件不会自动重试。</Text> : null}
+    </View>
     {connected ? <Field label="默认去向"><Segmented options={outlets.map(([value, label, icon]) => ({ value, label, icon }))} value={config.default_outlet} disabled={busy !== ''}
       onChange={(value) => void save('default', { default_outlet: value })} /></Field> : null}
     {/* The two folds sit together as one list of extras under the choice above. */}

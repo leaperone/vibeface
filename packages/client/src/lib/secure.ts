@@ -4,8 +4,8 @@ import type { ClientPrincipal, MembershipView, PublicIdentity } from './node.ts'
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { fatal: true })
-const notRecoveryFile = '这不是恢复文件。请选名字以 vibeface-recovery 开头的文件。'
-const damagedRecoveryFile = '这个恢复文件已损坏。请选下载时的那个文件。'
+const notRecoveryFile = '这不是恢复文件。选名字以 vibeface-recovery 开头的文件。'
+const damagedRecoveryFile = '这个恢复文件已损坏。选下载时的那个文件。'
 /** What the device already trusts before it reads an authentication answer. */
 export type AuthenticationTrust = { kind: 'network'; networkId: string } | { kind: 'root'; networkId: string; genesis: unknown; checkpoint?: unknown } | { kind: 'local'; networkId: string; nodeId: string }
 /** A recovery file as the platform hands it over: a browser `File` or a phone's picked document. */
@@ -47,7 +47,7 @@ export function secureKit(secure: SecureApi) {
   function verifyRemoval(value: unknown, nodeId: string, networkId: string): boolean {
     const auth = record(value)
     if (auth.node_revoked !== true) return false
-    if (networkId && auth.network_id !== networkId) throw new Error('这台电脑属于另一组设备。请先确认连接的是自己的设备。')
+    if (networkId && auth.network_id !== networkId) throw new Error('这台电脑属于另一组设备。确认连的是自己的设备。')
     if (!verifiedView(auth.state, text(auth.network_id), nodeNow(auth)).revoked.some(item => item.device_id === nodeId)) throw new Error('设备说它已被移出，但记录没通过校验。')
     return true
   }
@@ -71,7 +71,7 @@ export function secureKit(secure: SecureApi) {
     } catch { throw new Error(notRecoveryFile) }
     let cleartext: Uint8Array
     try { cleartext = secure.recoveryOpen(encoder.encode(JSON.stringify(envelope)), password) }
-    catch { throw new Error('打不开恢复文件。请确认密码，并选下载时的那个文件。') }
+    catch { throw new Error('打不开恢复文件。检查密码，并选下载时的那个文件。') }
     let payload: Record<string, unknown>
     try { payload = record(JSON.parse(decoder.decode(cleartext)), '恢复内容') } finally { cleartext.fill(0) }
     let root: SecureIdentity | undefined
@@ -94,8 +94,32 @@ export function secureKit(secure: SecureApi) {
   }
 }
 
+/** Passwords people pick first; a trailing run of digits or symbols does not make one new. */
+const COMMON = new Set(['password', 'passw0rd', 'p@ssw0rd', 'iloveyou', 'sunshine', 'princess', 'football', 'baseball', 'superman', 'welcome', 'letmein', 'monkey', 'dragon', 'master', 'admin', 'qwerty', 'abc123', 'woaini', 'woaini1314', 'vibeface', 'recovery'])
+/** Keyboard and counting runs; a password inside one, either way round, is a pattern, not a secret. */
+const RUNS = ['abcdefghijklmnopqrstuvwxyz', '01234567890', 'qwertyuiop', 'asdfghjkl', 'zxcvbnm', '1qaz2wsx3edc4rfv5tgb', 'qazwsxedcrfvtgbyhn']
+export type PasswordProblem = 'short' | 'common' | 'simple'
+export type PasswordStrength = { level: 'weak'; problem: PasswordProblem } | { level: 'fair' | 'strong' }
+/**
+ * How hard a new recovery password is to guess offline, by the rule docs/node.md#备份与恢复 states: at least 8
+ * characters, not a common password or a keyboard, counting or repeated run, and under 12 characters it mixes letters,
+ * digits and other characters. 16 or more, or 12 or more mixing two kinds, is strong.
+ */
+export function passwordStrength(password: string): PasswordStrength {
+  const chars = [...password]
+  if (chars.length < 8) return { level: 'weak', problem: 'short' }
+  const lower = password.toLowerCase()
+  if (COMMON.has(lower) || COMMON.has(lower.replace(/[^a-z]+$/, '')) || new Set(chars).size <= 3 || RUNS.some((run) => run.includes(lower) || [...run].reverse().join('').includes(lower))) return { level: 'weak', problem: 'common' }
+  const kinds = [/[a-z]/i, /\d/, /[^a-z\d]/i].filter((kind) => kind.test(password)).length
+  if (chars.length < 12 && kinds < 2) return { level: 'weak', problem: 'simple' }
+  return { level: chars.length >= 16 || kinds >= 2 && chars.length >= 12 ? 'strong' : 'fair' }
+}
+const passwordProblems: Record<PasswordProblem, string> = { short: '恢复密码至少 8 个字符。', common: '这个恢复密码太常见了，换一个。', simple: '恢复密码少于 12 个字符时，要混用字母、数字或符号。' }
+/** A new recovery password, or the reason it is refused. */
 export function passphrase(password: string): string {
-  if ([...password].length < 8 || encoder.encode(password).length > 1024) throw new Error('恢复密码需要至少 8 个字符。')
+  if (encoder.encode(password).length > 1024) throw new Error('恢复密码太长了。')
+  const strength = passwordStrength(password)
+  if (strength.level === 'weak') throw new Error(passwordProblems[strength.problem])
   return password
 }
 /** The code a person matches between the settings page and a file name; never the key itself. */

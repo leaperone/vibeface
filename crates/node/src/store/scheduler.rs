@@ -472,7 +472,7 @@ fn hand_off_from(connection: &Connection, network: &str, conversation: &str) -> 
 
 /// A new owner answering a message the old one left unanswered writes its own reply, beside any
 /// status reply the old owner already wrote.
-fn reply_message_id(conversation: &str, trigger: &str, owner_epoch: u64) -> String {
+pub(super) fn reply_message_id(conversation: &str, trigger: &str, owner_epoch: u64) -> String {
     format!(
         "reply-{}",
         crate::crypto::digest(
@@ -1340,9 +1340,10 @@ impl Store {
     }
 
     /// Each busy conversation on this device; a reply running outranks messages still waiting.
+    /// An agent task runs in its bot's conversation but is that work, not a reply in the chat.
     pub fn busy_conversations(&self) -> Result<std::collections::BTreeMap<String, Busy>> {
         let mut statement = self.connection.prepare(
-            "SELECT conversation_id,state FROM scheduler_jobs WHERE state IN ('queued','claimed','running','cancelling','steering')
+            "SELECT conversation_id,state FROM scheduler_jobs WHERE state IN ('queued','claimed','running','cancelling','steering') AND kind<>'agent_task'
              UNION ALL SELECT conversation_id,'queued' FROM scheduler_outbox",
         )?;
         let rows =

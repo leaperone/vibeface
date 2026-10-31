@@ -3,9 +3,8 @@
 file written the way pi writes it.
 
 PI_CODING_AGENT_SESSION_DIR holds the sessions. FAKE_PI_LOG gets one JSON line per start and
-per prompt. FAKE_PI_MODE picks the turn: "reply" (a tool call, then "Hello"), "wait" (streams
-until a steer or an abort), "crash" (exits mid-turn) or "refuse" (no API key). Standard library
-only.
+per prompt. FAKE_PI_MODE picks "reply", "wait", "crash", "fail", "fail-key", "refuse",
+"refuse-model" or "prompt-lost". Standard library only.
 """
 import json
 import os
@@ -131,10 +130,10 @@ def turn(text):
         stream("Hel")
         stream("lo")
         end(reply(f"done: {text}" if GATE_DIR else "Hello", "stop"))
-    elif MODE == "fail":
+    elif MODE in ("fail", "fail-key"):
         start("assistant")
         failed = reply("fixture failure", "error")
-        failed["errorMessage"] = "fixture failure"
+        failed["errorMessage"] = "No API key found for fake." if MODE == "fail-key" else "fixture failure"
         end(failed)
     elif MODE == "wait":
         start("assistant")
@@ -189,6 +188,11 @@ for line in sys.stdin:
         if MODE == "refuse":
             respond(command, error="No API key found for fake.")
             continue
+        if MODE == "refuse-model":
+            respond(command, error="No model found for fake.")
+            continue
+        if MODE == "prompt-lost":
+            os._exit(1)
         running[0] = True
         respond(command, {"disposition": "started"})
         threading.Thread(target=turn, args=(command["message"],), daemon=True).start()

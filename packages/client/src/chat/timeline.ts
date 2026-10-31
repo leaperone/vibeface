@@ -61,7 +61,8 @@ export function messageTimes(messages: readonly Pick<TranscriptMessage, "message
 
 /**
  * Where 新消息 starts: the first, in the order shown, of the replies that were unread when the chat came on screen
- * (`fresh`, by event hash) and the asides still `waiting` on the person. The badge counted exactly these.
+ * (`fresh`, by event hash) and the asides still `waiting` on the person that were there then; one asked while the chat
+ * is open is seen as it arrives.
  */
 export function firstUnread<M extends Pick<TranscriptMessage, "message_id" | "event_hash">, A>(
   timeline: { messages: readonly M[]; before: ReadonlyMap<string, readonly A[]>; rest: readonly A[] }, fresh: ReadonlySet<string>, waiting: (aside: A) => boolean,

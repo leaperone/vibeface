@@ -1,5 +1,5 @@
 import type { TranscriptMessage } from "../chat/types.ts"
-import type { BotRecord, NodeInfo, OpenWork, Question } from "./types.ts"
+import type { BotRecord, NodeInfo, OpenWork, Question, WorkRecord } from "./types.ts"
 import { providerNames, type ProviderId } from "../lib/node.ts"
 
 /** Each question has one answer ID, so the web, Grok and every retry write the same message. */
@@ -11,14 +11,32 @@ export function answerBody(questionId: string, text: string) {
 }
 
 /**
- * What a settled question shows. `standing`: the answer the network holds. `mine`: what this browser answered.
- * When answers raced and another side's won, `elsewhere` says so instead of the person's text vanishing.
+ * What a settled question shows. `standing`: the answer the network holds. `mine`: what this device answered.
+ * `author` wrote the standing answer and `self` is this device, so a card mounted later still tells another device's answer from its own.
+ * `elsewhere`: another device answered. `beaten`: this device answered too and the other side's text won, which the card warns about
+ * instead of letting the person's text vanish.
  */
-export function settledAnswer(standing: string | undefined, mine: string | undefined) {
+export function settledAnswer(standing: string | undefined, mine: string | undefined, author?: string, self?: string) {
   const text = standing ?? mine
   if (text === undefined) return undefined
-  return { text, elsewhere: standing !== undefined && mine !== undefined && standing !== mine }
+  const beaten = standing !== undefined && mine !== undefined && standing !== mine
+  const other = standing !== undefined && author !== undefined && self !== undefined && author !== self
+  return { text, elsewhere: beaten || other, beaten }
 }
+
+/** A question's first line asks; the lines after it list what the answer applies to, each split at its first "：" into a label and a value. */
+export function questionParts(text: string): { ask: string; lines: { label: string | null; value: string }[] } {
+  const [ask = text, ...rest] = text.split(/\r?\n/).filter((line) => line.trim())
+  return { ask, lines: rest.map((line) => {
+    const colon = line.indexOf("：")
+    return colon > 0 ? { label: line.slice(0, colon), value: line.slice(colon + 1) } : { label: null, value: line }
+  }) }
+}
+
+/** An answer that turns the request down, so it reads as refused, not agreed. */
+export const declined = (answer: string) => /^(拒绝|不允许|不同意|不行|不要|否|取消)|^(deny|decline|no)\b/i.test(answer.trim())
+/** How a settled answer reads: a bare refusal says only that; a refusal with words keeps them. */
+export const answerLabel = (answer: string) => declined(answer) ? /^(拒绝|不允许|不同意|不行|不要|否|取消|deny|decline|no)$/i.test(answer.trim()) ? "已拒绝" : `已拒绝 · ${answer}` : `已回答 · ${answer}`
 
 /** Nobody answered it and the device that asked did not close it. */
 export const questionOpen = (question: Question) => question.answer === null && question.closed === null
@@ -36,6 +54,12 @@ export function questionMeta(question: Question, works: readonly OpenWork[], bot
   const work = approval ? works.find((item) => item.thread_id === question.about.session_id && !item.outcome) : undefined
   const bot = work && bots.find((item) => item.conversation_id === work.conversation_id)
   return { approval, task: work && bot ? { bot_id: bot.bot_id, work_id: work.work_id, title: work.title || "任务" } : null, local: question.about.node === entry }
+}
+
+/** The task an approval held, by title, for its answered line; any work on its session counts, finished or not, the latest first. */
+export function approvalTask(question: Question, works: readonly Pick<WorkRecord, "thread_id" | "title">[]): string | null {
+  const work = question.about.request_id ? [...works].reverse().find((item) => item.thread_id === question.about.session_id) : undefined
+  return work ? work.title || "任务" : null
 }
 
 /** What 待处理 lists: open questions, urgent ones first, then newest first. */

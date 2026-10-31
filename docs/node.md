@@ -7,7 +7,7 @@ description: 管理自己的设备、个人网络和本机 Agent。
 
 本文的命令默认使用数据目录 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定其他绝对路径，见[部署配置](deployment.md)。涉及安装的步骤还使用 `VIBEFACE_INSTALL_ROOT` 和 `VIBEFACE_BIN_DIR`，先设置这两个变量。
 
-本文使用 `vibeface` 管理自己的设备。HTTP 与同步协议见 [协议参考](node-protocol.md)，出问题时见 [排障](troubleshooting.md)。
+本文使用 `vibeface` 管理自己的设备。先理解用途可阅读 [产品概览](overview.md)，Bot 分工与本机复用见 [Bot 与任务执行](bot-and-execution.md)。HTTP 与同步协议见 [协议参考](node-protocol.md)，出问题时见 [排障](troubleshooting.md)。
 
 ## 安装制品
 
@@ -54,13 +54,13 @@ bash scripts/build-web.sh
 
 `./vibeface access` 保留为备用入口。不要公开它输出的初始化链接。后续连接自动核验设备编号和成员授权，不输入账号密码。个人根私钥留在可信客户端及加密恢复包，不作为节点间的长期共享密码。
 
-默认只监听本机。`http://127.0.0.1:4790` 和 `http://localhost:4790` 可用于本机初始化。`http://0.0.0.0:4790` 可打开服务，但不能自动取得初始化授权。保存密钥的网页客户端必须处于浏览器认可的安全上下文，推荐固定使用 `http://localhost:4790` 或可信 HTTPS 页面。
+网页 HTTP 入口默认只监听本机，Node 间 iroh UDP 传输默认绑定全接口。`http://127.0.0.1:4790` 和 `http://localhost:4790` 可用于本机初始化。`http://0.0.0.0:4790` 可打开服务，但不能自动取得初始化授权。保存密钥的网页客户端必须处于浏览器认可的安全上下文，推荐固定使用 `http://localhost:4790` 或可信 HTTPS 页面。
 
 `init` 不覆盖现有身份和配置。数据目录默认为 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定，包含本机身份、配置、私有授权记录和 `node.sqlite3`。不同 Node 使用独立数据目录，同一目录同时只允许运行一个进程。
 
 ### 本机自动访问
 
-个人网络建立后，`local_auto_access` 默认开启。在本机打开当前节点的 localhost 网页，先尝试原有签名身份。需要本机会话时，点击**打开本机访问**，网页重新取得短期入口并导航到独立回环页面，无需配对新的永久成员。一次性 token 放在 URL fragment 中，页面清除后兑换绑定浏览器 Noise 公钥的 HttpOnly 会话。会话保存在数据目录的 `local-sessions.json`（只存 cookie 摘要），Node 重启后刷新页面即可继续，无需重新兑换；会话失效或本机访问被关闭后，重新打开本机网页并点击该入口。本机会话在网页顶部显示为“本机管理”。
+个人网络建立后，`local_auto_access` 默认开启。在本机打开当前节点的 localhost 网页，先尝试原有签名身份。需要本机会话时，点击**打开本机访问**，网页重新取得短期入口并导航到独立回环页面，无需配对新的永久成员。一次性 token 放在 URL fragment 中，页面清除后兑换绑定浏览器 Noise 公钥的 HttpOnly 会话。会话保存在数据目录的 `local-sessions.json`（只存 cookie 摘要），Node 重启后刷新页面即可继续，无需重新兑换；会话失效或本机访问被关闭后，重新打开本机网页并点击该入口。本机会话在网页顶部显示为“本机管理”；网页入口是回环地址时，点其中的**加入**会转到 `http://localhost:<listen 端口>/join` 加入，让浏览器身份留在之后常用的地址上；`serve` 在网页只听回环或全部接口时也只打印这个地址。
 
 `vibeface access` 保留为备用方式，它输出的链接先打开 `http://localhost:<listen 端口>`。这个浏览器已在该地址加入时直接沿用已加入的身份，不开本机会话；没加入时才转到回环页面开本机会话。两个地址是不同 origin，浏览器存储各自独立。
 
@@ -72,17 +72,17 @@ bash scripts/build-web.sh
 
 ## 配置管理 Agent
 
-协调 Agent 理解用户指令，用宿主 SDK 的 Shell 和文件工具读取本机，通过 Node 的 `dispatch_work` 工具派发工作来修改代码：交给本机或另一台设备上打开了执行任务的 Agent，或把任务交给另一台设备的协调 Agent，由它在那台设备上执行并回传结果。SDK 会话缓存与共享聊天分开保存。`manager.workspace` 是 SDK 的本机工作目录，项目选择来自 `roots`。
+协调 Agent 理解用户指令，用宿主 SDK 的 Shell 和文件工具读取本机，通过 Node 的 `dispatch_work` 工具派发工作来修改代码：交给本机打开了执行任务的 Agent，或把任务交给另一台设备的协调 Agent（Bot），由它在那台设备上执行并回传结果，所以接任务的设备要运行 Bot。SDK 会话缓存与共享聊天分开保存。`manager.workspace` 是 SDK 的本机工作目录，项目选择来自 `roots`。
 
 通过 `manager.model` 选择账户实际可用的模型。`auto` 或默认模型不保证响应速度，实际延迟取决于 Provider、模型和网络。
 
-在签名管理浏览器或可信本机会话打开设备页的 **AI**。Codex、Cursor、Claude Code、pi 和 opencode 各占一行：点某一行的 Bot 图标，由它运行 Bot，再点一次关闭 Bot；各行的任务图标开关本机执行任务，Bot 和执行任务可分别选择。Bot 所在服务的**设置**默认只显示模型和需要的密钥；连接方式、Bot 工作文件夹、程序路径和环境变量收在**设置 → 高级**里，出问题时自动展开。允许 Agent 访问的项目目录在**可用文件夹**里。默认 Agent 工作目录为当前数据目录下的 `manager-workspace`，首次选择 Bot 时自动建立为私有目录。自定义工作目录须已存在，且与项目编辑目录分开。修改只影响当前节点的本机配置，新操作立即读取，已运行任务不会重启或自动取消。
+在签名管理浏览器或可信本机会话打开设备页的 **AI**。Codex、Cursor、Claude Code、pi 和 opencode 各占一行：点某一行的 Bot 图标，由它运行 Bot，再点一次关闭 Bot；各行的任务图标开关本机执行任务，Bot 和执行任务可分别选择；没有 Bot 时打开执行任务会让这个服务同时运行 Bot，因为派来的任务由 Bot 接下。Bot 所在服务的**设置**默认只显示模型和需要的密钥；连接方式、Bot 工作文件夹、程序路径和环境变量收在**设置 → 高级**里，出问题时自动展开。允许 Agent 访问的项目目录在**可用文件夹**里。默认 Agent 工作目录为当前数据目录下的 `manager-workspace`，首次选择 Bot 时自动建立为私有目录。自定义工作目录须已存在，且与项目编辑目录分开。修改只影响当前节点的本机配置，新操作立即读取，已运行任务不会重启或自动取消。
 
 网页在每个服务那一行列出所需程序和准备状态。Codex 打开执行任务且选择由 Vibeface 启动时，Node 启动私有 App Server，但不会安装 Provider、执行账户登录、调用模型或扩大节点角色。程序可用也不代表 Provider 已登录。确认安装和授权前提后，再通过真实对话核验。下面的初始化参数是可选备用方式，字段说明见 [本机配置](node-protocol.md#本机配置)。
 
 ### 使用 Cursor SDK
 
-从 [Cursor SDK Bridge v1.0.37 发布页](https://github.com/cursor/sdk-bridge/releases/tag/v1.0.37) 下载对应平台的 standalone 包，用发布页的校验文件核对后解压。可执行文件位于 `bin/cursor-sdk-bridge`。例如，Apple Silicon Mac 的包名是 `cursor-sdk-bridge-standalone-darwin-arm64.tar.gz`。
+从 [Cursor SDK Bridge v1.2.0 发布页](https://github.com/cursor/sdk-bridge/releases/tag/v1.2.0) 下载对应平台的 standalone 包，用发布页的 `SHA256SUMS.txt` 核对后解压。可执行文件位于 `bin/cursor-sdk-bridge`。例如，Apple Silicon Mac 的包名是 `cursor-sdk-bridge-standalone-darwin-arm64.tar.gz`。此处指向官方发布包，不代表已在你的环境完成模型调用验收。
 
 在运行 Node 的环境中配置 `CURSOR_API_KEY`。不要把密钥写进命令行、URL、Git 或聊天记录。模型使用账户实际可用的名称。
 
@@ -99,9 +99,9 @@ bash scripts/build-web.sh
 
 Cursor 使用 SDK 原生自定义工具回调连接 Rust Node。产品链路不启动 MCP Server，也不要求 Bot 或浏览器支持 MCP。协调工具限定到当前个人网络及机器人聊天，本机工作使用 SDK 宿主工具。Agent 不能替本人授权自动后续。
 
-Cursor 的 Bot、协调 Agent 和任务会话分别使用独立的 SDK Bridge 进程与私有存储。任务通过 `dispatch_work` 的 `agent: "cursor"` 选择 Cursor，`continues` 或本机已有任务的 `thread` 可续接原会话；同一会话一次只运行一项工作。当前 Cursor 任务支持文本提示和模型选择，不支持图片、推理档位或运行中插话。
+Cursor 的 Bot、协调 Agent 和任务会话分别使用独立的 SDK Bridge 进程与私有 JSONL 存储。同一 Bot 的回合串行运行，不同 Bot 可以并行。任务通过 `dispatch_work` 的 `agent: "cursor"` 选择 Cursor，`continues` 或本机已有任务的 `thread` 可续接原会话；同一会话一次只运行一项工作。当前 Cursor 任务支持文本提示和模型选择，不支持图片、推理档位或运行中插话。
 
-已设置 `CURSOR_API_KEY` 且选择 Cursor 运行 Bot 时，Node 会预热协调 Agent；任务按需启动自己的 Bridge。启动失败按 1 至 30 秒退避，空闲进程会回收，原生会话仍保留。任务先保存原生 Agent ID，再发送提示，取得 Run ID 后立即保存。断流或重启后只按已知 Run ID 核对结果；无法确认的任务保持待核对，不重发提示。设置变更只影响后续操作，不回收正在运行的任务。
+已设置 `CURSOR_API_KEY` 且选择 Cursor 运行 Bot 时，Node 会预热协调 Agent；任务按需启动自己的 Bridge。一个 Bridge 退出只影响对应的 Bot、协调 Agent 或任务会话。启动失败按 1 至 30 秒退避，空闲进程会回收，JSONL 历史保留供后续续接。任务先保存原生 Agent ID，再发送提示，取得 Run ID 后立即保存。断流或重启后只按已知 Run ID 核对结果；无法确认的任务保持待核对，不重发提示。设置变更只影响后续操作，不回收正在运行的任务。进程和存储边界见[协议说明](node-protocol.md)。
 
 ### 使用 Codex SDK
 
@@ -137,11 +137,11 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 ### 回答本人自己开的会话
 
-`vibeface hooks install --home <home>` 写入各产品的监听入口，已打开的会话重启后加载：
+`vibeface hooks install` 写入各产品的监听入口，已打开的会话重启后加载。文件默认在 `$HOME` 下，Codex 的在 Codex 目录（`CODEX_HOME`，须是已有目录；没设时 `~/.codex`）。给 `--home <目录>` 时全部写在该目录下，Codex 的在 `<目录>/.codex`，不看 `CODEX_HOME`：
 
 | 产品 | 写入 | Bot 能回答 |
 |---|---|---|
-| Codex | `.codex/hooks.json` | 只上报；App Server 上的请求由 Bot 直接回答 |
+| Codex | `<Codex 目录>/hooks.json` | 只上报；App Server 上的请求由 Bot 直接回答 |
 | Claude Code | `.claude/settings.json` 的 hooks | 权限请求和提问 |
 | pi | `.pi/agent/extensions/vibeface.ts` | 一轮结束后替本人发下一条消息；本人已接着输入时丢弃 |
 | opencode | `.config/opencode/plugins/vibeface.ts` | 权限请求和提问 |
@@ -180,7 +180,7 @@ vibeface join 'https://gateway.example/join#vibeface1…' --name '<设备显示�
 
 命令显示 6 位安全码并等待批准；在管理设备上比对安全码一致后点**一致，允许**，命令完成加入。Node 原本没在运行时，再启动它（后台服务用 `vibeface service start`）。`--name` 必须明确指定设备名，不读取系统主机名。设备名和已有设备或进行中的请求重名时，Node 自动加序号，例如“我的电脑 2”，重试同一请求沿用该名称。连接中断或按了 Ctrl-C 时，用同一链接、名称和目录重跑，命令先核对原请求，不重新创建；Node 正在运行时，按 Ctrl-C 不会取消加入，批准后照样完成。链接已用过、过期或被拒绝时，命令说明原因，请在管理设备上重新生成链接。
 
-任何管理设备都能撤销设备，也能在设备详情页把已加入的浏览器或手机设为管理设备或取消，至少保留一台。在设备详情页点设备名可以给任何一台自己的设备改名，改名同样由管理设备签名。浏览器或手机在设置里断开时会撤销自己并删除本机设备密钥，之后要用加入链接作为新设备加入；唯一的管理设备不能这样断开，需先把另一台设备设为管理设备。Node 不代替本人签署授权，Agent 不能添加设备、扩大权限或撤销设备。浏览器设备私钥不可导出，清除站点数据后需要重新加入。
+任何管理设备都能撤销设备，也能在设备详情页把已加入的浏览器或手机设为管理设备或取消，至少保留一台。设为管理设备立即生效；取消要先确认，确认里写出之后还剩几台，只剩 1 台时提醒它丢了或清了数据就只能用恢复文件找回。管理设备不能取消自己的管理权限，所以网络里始终至少有一台。在设备详情页点设备名可以给任何一台自己的设备改名，改名同样由管理设备签名。浏览器或手机在设置里断开时会撤销自己并删除本机设备密钥，之后要用加入链接作为新设备加入；唯一的管理设备不能这样断开，需先把另一台设备设为管理设备。Node 不代替本人签署授权，Agent 不能添加设备、扩大权限或撤销设备。浏览器设备私钥不可导出，清除站点数据后需要重新加入。
 
 ## 开放局域网入口
 
@@ -483,7 +483,7 @@ Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool
 
 协调 Agent 的 Shell 完全访问本机，可以改文件、跑 git 和 gh。它用 `vibeface codex call <method> [json]` 调用 App Server 的读取和线程管理方法，开始、引导或停止回合的方法（`turn/start`、`turn/steer`、`turn/interrupt`、`thread/start`、`thread/fork`、`thread/compact/start`、`thread/shellCommand`、`thread/revert`、`thread/inject_items`、`review/start`）一律拒绝，改用 `dispatch_work`、`codex send` 和 `interrupt_work`，让每个回合都是 Node 登记过的工作；`vibeface codex send <thread> <text> --id <id>` 给已有会话插话（回合进行中时 steer，否则开新回合）。这条消息是本轮的一项工作，与 `dispatch_work` 相同：发送前向 Node 登记，`--id` 即 `call_ref`，Node 观察它所在的回合，结束后结果作为 `work_result` 轮回到 Bot；同一轮同一 `--id` 再次执行只回读、绝不重发，换了内容或会话则拒绝。会话的目录取自线程，不受 `roots` 限制。它只能在 Bot 的一轮里运行，因为它要用这一轮的工具令牌；Cursor 的 Shell 没有这个令牌，Cursor 回合用带 `thread` 的 `dispatch_work` 工具做同样的事。`vibeface codex watch <thread>` 查看事件，`vibeface log <level> <message> --conversation <id>` 把它遇到的问题写进 Node 日志（经本机监听器的 `/api/log`，边界与 `/api/hooks` 相同）。Socket 路径在 `VIBEFACE_CODEX_SOCKET`。
 
-Codex 默认 bypass，正常不会发起请求。仍发起的请求（审批、提问、登录等）由 Node 挂起并立即唤醒协调 Agent：它用 `vibeface requests` 查看，`vibeface respond <request_id> '<result-json>'` 回答，同一请求只回答一次。需要本人拍板时，它用 `vibeface triage raise --event-id <ID> --request-id <请求> --question <问题> --choice 批准 --choice 拒绝` 在拥有该会话的 Bot 聊天里提问，按项目设置也经 webhook 转发 Grok Bot。提问挂住请求直到有回答；回答作为一轮交给该 Bot，它在 120 秒内用 `vibeface respond <请求> '<result-json>' --node <设备>` 应答。没有协调 Agent，或它 120 秒内既没回答也没提问时，Node 按方法拒绝并记录。等待回答的 hook 挂起的请求同样经 `vibeface requests` 和 `vibeface respond` 处理，30 秒内没有回答时交回会话自己决定。没有协调 Agent 时分诊事件直接丢弃。协调 Agent 每次被唤醒分诊都计数，上限同为 `daily_decision_limit`，但与 Bot 的自动轮次分开记账，不占它们的额度；用完时不唤醒，挂起的请求立即兜底，分诊事件丢弃。协调 Agent 能看到拥有该会话的 Bot 的说明开头和最新记忆，各有长度上限。hook 挂起的 `continue` 只在执行本人已要求的事时代发；下一步需要本人决定、难以撤销或需要本人未给的授权时，改为提问。不是 Bot 发起的交互会话由运行它的设备归给主 Bot；Bot 每轮能看到名下的会话，自己判断后用 `hand_over_session` 转给其他 Bot 或不再关注；`codex exec`、子代理等后台会话不处理，见 [聊天里的提问与回答](design/questions-in-chat.md)。
+Codex 默认 bypass，正常不会发起请求。仍发起的请求（审批、提问、登录等）由 Node 挂起并立即唤醒协调 Agent：它用 `vibeface requests` 查看，`vibeface respond <request_id> '<result-json>'` 回答，同一请求只回答一次。需要本人拍板时，它用 `vibeface triage raise --event-id <ID> --request-id <请求> --question <问题> --choice 批准 --choice 拒绝` 在拥有该会话的 Bot 聊天里提问，按项目设置也经 webhook 转发 Grok Bot。提问挂住请求直到有回答；回答作为一轮交给该 Bot，它在 120 秒内用 `vibeface respond <请求> '<result-json>' --node <设备>` 应答。没有协调 Agent，或它 120 秒内既没回答也没提问时，Node 按方法拒绝并记录。等待回答的 hook 挂起的请求同样经 `vibeface requests` 和 `vibeface respond` 处理，30 秒内没有回答时交回会话自己决定。没有协调 Agent 时分诊事件直接丢弃。协调 Agent 每次启动分诊都预占一次额度，上限同为 `daily_decision_limit`，但与 Bot 的自动轮次分开记账，不占它们的额度。额度用完时保留未审阅事件，挂起请求仍按原期限兜底；额度恢复后只重新审阅事件，不重放原工具或已执行的工作。只有当前进程确认模型未启动时才退还原日额度；启动后失败、结果未知或 Node 重启时不退款，也不自动重跑该批事件。设置和诊断包显示已用额度、上限、下次尝试时间，以及待审阅、处理中和结果未知的事件数。协调 Agent 能看到拥有该会话的 Bot 的说明开头和最新记忆，各有长度上限。hook 挂起的 `continue` 只在执行本人已要求的事时代发；下一步需要本人决定、难以撤销或需要本人未给的授权时，改为提问。不是 Bot 发起的交互会话由运行它的设备归给主 Bot；Bot 每轮能看到名下的会话，自己判断后用 `hand_over_session` 转给其他 Bot 或不再关注；`codex exec`、子代理等后台会话不处理，见 [聊天里的提问与回答](design/questions-in-chat.md)。
 
 Node 默认不启用 Codex。启用 Codex Bot 或任务执行时，缺的路径由 Node 从本机找出并写进配置，设备设置里显示并可修改；Bot 也能用 `propose_provider_config` 提议路径、打开执行或添加可用文件夹（`roots`），经聊天里的「允许 / 不允许」卡片同意后由 Node 写入。首次设置时打开 Codex 运行 Bot 会同时打开执行任务，并可一键添加家目录下常见的项目文件夹（`node_settings.suggested_roots`）。`providers.codex_app_server.mode` 为 `system` 时只连接配置的 socket，不启动也不结束服务，见 [Agent 直连 App Server](design/agent-direct-app-server.md#21a-用哪个-app-server)。设为 `spawn` 时 Node 托管自己的 `codex app-server`：用 `bins.codex` 启动它，Socket 位于私有的 `/tmp/vibeface-<identity>/` 目录，以避免 macOS Unix Socket 路径长度限制。App Server 运行在独立进程组，进程组号写入数据目录的 `codex-app-server.pid`。Node 启动时先结束上次遗留的进程组，正常退出时一并停止它，异常退出则退避重启。要指定系统 App Server 的 socket，设置 `providers.codex_app_server.socket`。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中工作的实际状态。
 
@@ -505,7 +505,7 @@ Codex 结束一轮不等于交付目标已经达成，由本人核对产物后�
 
 管理 SDK 已返回明确结果时，Node 先将最终结果保存到本机。历史依赖暂未补齐或最终事件暂时写入失败时，只补发最终记录，不重新调用 SDK。
 
-管理轮重启或 SDK 进程退出无法确认时，原轮进入终态 `interrupted`，不重跑原触发，也不冻结会话。管理 SDK 的文件系统只读、网络仅限本机回环，但未确认退出的进程仍可能经回环访问本机服务；Node 工具权限已封存，原生工作经 `dispatch_work` 登记后单独观察。因此仍登记一条管理进程待核对，关联它的进程组、原生 turn 和 Agent 任务。原生 turn 结果未知时登记原生待核对。同一工作只显示一条待核对：另一台设备代为执行的任务结果未知时，只显示该工作的一条，结清它时一并结清那一轮管理进程。
+管理轮重启或 SDK 进程退出无法确认时，原轮进入终态 `interrupted`，不重跑原触发，也不冻结会话。协调 Agent 可以完全访问宿主机；Codex 使用 `danger-full-access`，Claude Code 使用 `bypassPermissions`。封存 Node 工具权限不能证明未确认退出的进程已停止，也不能收回宿主工具权限。原生工作经 `dispatch_work` 登记后单独观察。因此仍登记一条管理进程待核对，关联它的进程组、原生 turn 和 Agent 任务。原生 turn 结果未知时登记原生待核对。同一工作只显示一条待核对：另一台设备代为执行的任务结果未知时，只显示该工作的一条，结清它时一并结清那一轮管理进程。详细边界见 [执行权限与项目目录](privacy-security.md#执行权限与项目目录)。
 
 每条待核对记录有三个选择：「不确定，再查一次」只读查询原设备，管理进程项只确认进程组是否已退出，原生项补查原 turn；「做完了」和「没做完」由本人检查实际进程、项目产物和外部副作用后提交，备注可选。工作的选择带本人签名，成为该工作的结果，其他入口看到同一结果。原 turn 的结果可读时直接显示。进程运行期间对本机服务的副作用只能由本人确认。模型不能结清待核对，确认也不重放原任务。失联不能证明远端进程已停止。
 
@@ -592,15 +592,23 @@ vibeface service uninstall
 
 ## 备份与恢复
 
-在可信管理客户端导出加密恢复包，选择足够强且独立保存的密码。密码只保护恢复材料，不发送给 Node，不作为节点连接密码。
+建网时网页生成加密恢复文件，下载并确认与密码分开保存后才建网。之后在管理设备的**设置 → 找回 → 换恢复密码**，用当前恢复文件和旧密码换新密码，同时下载新文件，旧文件随即作废；网页不单独导出恢复文件。密码只保护恢复材料，不发送给 Node，不作为节点连接密码。
 
-恢复包用于恢复个人根身份、必要的解密材料及建立新的管理授权。客户端恢复时生成新的设备密钥，不复制丢失设备的日常身份。恢复记录使用更高的授权 epoch，获知恢复记录的 Node 拒绝过期授权。
+恢复密码只输一次，网页和手机按同一规则检查是否足够强，输入框下方用图标和一个词显示强度（太弱、可用、较强），太弱的不接受：
 
-恢复根身份不会自动找回聊天正文、工程文件或 Codex 会话的隐藏状态。业务历史仍需可达的授权副本或独立数据备份。缺少材料时明确停止，不创建看似相同的新身份替代原网络。
+- 少于 8 个字符。
+- 常见密码（如 `password`、`iloveyou`，结尾加数字或符号也算），只有 3 种以内的字符，或键盘、数字、字母上的连续一串（如 `12345678`、`qwertyui`、`abcdefgh`，正反都算）。
+- 少于 12 个字符且只用字母、数字、其他字符中的一类。
+
+16 个字符以上，或 12 个字符以上且混用两类，显示较强。设置 → 安全显示管理设备有几台、有没有等待生效的找回，以及当前恢复密码的设置日期。
+
+恢复包包含个人网络的恢复签名身份与成员授权记录，用于建立新的管理授权。客户端恢复时生成新的设备密钥，不复制丢失设备的日常身份。更换成员目录的找回先保存新恢复文件再提交，默认有 48 小时等待期，原目录中的有效管理设备可否决，也可在提醒卡片上点“立即生效”并再次确认。发起方不能撤回。等待期间，管理设备的网页每个页面顶部都有红色横条，侧栏“待处理”显示红色盾牌，待处理里的卡片可以**拦下**。卡片上的**是我，收起提醒**只在这台设备本次打开期间收起提醒，不放行，找回仍在等待期结束后生效；设置 → 安全仍显示它。发起找回的页面每 10 秒查一次结果，被拦下或生效后自动更新。等待记录只保存在发起找回的网址里，换一个网址（如从本机端口换到网页端口）打开看不到，要在原网址查看。恢复生效后使用更高的授权 epoch，获知生效记录的 Node 拒绝过期授权。只轮换恢复密钥的操作立即生效，详见 [撤销与恢复](privacy-security.md#撤销与恢复)。
+
+恢复身份不会自动找回聊天正文、工程文件或 Codex 会话的隐藏状态。业务历史仍需可达的授权副本或独立数据备份，详见 [同步与备份](history-sync.md#同步与备份各自负责什么)。缺少材料时明确停止，不创建看似相同的新身份替代原网络。
 
 从备份、快照或旧磁盘恢复的 Node 启动后先与其他成员 Node 对齐，每台其他 Node 都确认它没有漏掉以前写过的内容才开始写入；还没确认的 Node 都连不上时保持只读，由本人在网页上确认“不是从备份恢复的”后才写。同一数据目录的两份副本都写了内容时，两份都停止写入，分叉后的内容在移除这台设备前都不计入；移除时保留当前连接的电脑上的那份，再用新数据目录重新加入。处理方法见 [排障](troubleshooting.md#写入状态)。
 
-在**我的设备**中移除丢失设备。收到签名撤销记录的端点拒绝后续操作，已建立会话也重新验权。离线分区收到记录前不能立即生效，撤销不能抹除对方已经读过的数据，也不强制停止已运行的外部进程。被移除设备上还没有结果的工作由会话的调度设备记为待确认（“设备已移除，无法核对”），由你确认做完没有，不会一直挂起，也不会当作没执行；还在等它接收的派发显示“结果未知”，Bot 会收到一次通知。
+在**我的设备**中移除丢失设备。收到签名撤销记录的端点拒绝后续操作，已建立会话也重新验权。离线分区收到记录前不能立即生效，撤销不能抹除对方已经读过的数据，也不强制停止已运行的外部进程；移除前的确认会说明“它已经拿到的内容删不掉”。被移除设备上还没有结果的工作由会话的调度设备记为待确认（“设备已移除，结果无法确认。”），由你确认做完没有，不会一直挂起，也不会当作没执行；还在等它接收的派发显示“结果未知”，Bot 会收到一次通知。
 
 停掉 Node 后备份完整数据目录，保留 SQLite 数据库及未合并的 WAL。模型 key、本机私钥和 SDK session 留在本机，不进入共享 DAG。完整目录备份含敏感信息，按本机凭证保管。不要复制运行中的 SQLite 文件来实现节点同步。
 

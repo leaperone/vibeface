@@ -9,6 +9,8 @@ import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Details, EmptyState, InlineError, Segmented, Skeleton, toast } from '@/components/app/kit'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import { knownError } from '@vibeface/client/lib/errors.ts'
+import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import type { LogFilter, LogLevel, LogRecord, LogSource } from '@vibeface/client/lib/web-log.ts'
 
 export const Route = createFileRoute('/_app/settings_/logs')({ component: LogsPage })
@@ -37,7 +39,7 @@ const turnEnded: Record<string, string> = { completed: 'Bot 回复完成', faile
 const workStates: Record<string, string> = { accepted: '任务已接下', starting: '任务准备开始', running: '任务进行中', interrupting: '任务正在停止', unverified: '任务结果待确认' }
 const workOutcomes: Record<string, string> = { completed: '任务完成', failed: '任务失败', interrupted: '任务已中断', rejected: '任务被拒绝', unverified: '任务结果待确认' }
 /** Plain titles for the stable event names the device and this page write; others show their own message. */
-const eventTitles: Record<string, string | ((fields: Fields) => string)> = {
+const eventTitles: Record<string, string | ((fields: Fields, name: (device?: string) => string) => string)> = {
   'agent.turn.started': 'Bot 开始回复',
   'lan.off': '局域网发现没有启动',
   'agent.turn.finished': (f) => turnEnded[String(f.state)] ?? (f.error ? 'Bot 回复没能保存' : 'Bot 回复结束'),
@@ -57,8 +59,8 @@ const eventTitles: Record<string, string | ((fields: Fields) => string)> = {
   'schedule.skipped_late': '错过了定时，已跳过',
   'session.attributed': '新会话归给主 Bot',
   'sync.event_rejected': '拒收了一条不合规的记录',
-  'work.dispatched': (f) => f.target ? '任务已交给其他设备' : '收到任务',
-  'work.dispatch_rejected': '其他设备拒绝了任务',
+  'work.dispatched': (f, name) => f.target ? `任务已交给「${name(str(f.target))}」` : '收到任务',
+  'work.dispatch_rejected': (f, name) => `「${name(str(f.target))}」拒绝了任务`,
   'work.turn_started': '任务开始执行',
   'work.start_failed': '任务没能开始',
   'work.start_unknown': '不确定任务是否开始',
@@ -121,13 +123,25 @@ const eventTitles: Record<string, string | ((fields: Fields) => string)> = {
   'web.unhandled_rejection': '网页出错',
 }
 
-/** A short title, plus the reason when the record carries one. */
-function describe(record: LogRecord): { title: string; detail?: string } {
+/** What each Bot tool does, for 'Bot 使用工具'; the tool's own name stays under 技术详情. */
+const toolNames: Record<string, string> = {
+  apply_provider_config: '应用 AI 设置', bind_work: '关联任务', call_lookup: '查调用结果', configure_bot: '配置 Bot', context: '读取上下文',
+  create_bot: '创建 Bot', delete_bot: '删除 Bot', dispatch_work: '派任务', fetch_url: '打开网页', forget: '忘掉一条记忆', hand_over_session: '交接会话',
+  interrupt_work: '停止任务', list_bots: '查看 Bot', list_sessions: '查看会话', message_bot: '给 Bot 发消息', nodes: '查看设备',
+  propose_provider_config: '提议 AI 设置', read_bot: '读取 Bot', read_skill: '读取技能', recall: '回想记忆', remember: '记下一条记忆', remind: '设提醒',
+  remove_schedule: '删除定时任务', remove_skill: '删除技能', save_schedule: '保存定时任务', save_skill: '保存技能', track_work: '跟进任务',
+  update_profile: '更新资料', wait_work: '等任务结果', work_status: '查任务状态',
+}
+
+/** A short title, plus the reason when the record carries one; English the page cannot translate stays under 技术详情. */
+function describe(record: LogRecord, name: (device?: string) => string): { title: string; detail?: string } {
   const fields = record.fields ?? {}
   const known = eventTitles[record.event]
-  const title = typeof known === 'function' ? known(fields) : known
-  if (!title) return { title: record.message || record.event }
-  const detail = str(fields.error) ?? str(fields.reason) ?? str(fields.detail) ?? str(fields.tool) ?? (record.source === 'web' ? record.message : undefined)
+  const title = typeof known === 'function' ? known(fields, name) : known
+  if (!title) return { title: knownError(record.message) ?? record.message ?? record.event }
+  const tool = str(fields.tool)
+  const reason = str(fields.error) ?? str(fields.reason) ?? str(fields.detail) ?? (record.source === 'web' ? record.message : undefined)
+  const detail = [tool ? toolNames[tool] : undefined, reason ? knownError(reason) : undefined].filter(Boolean).join('：') || undefined
   return { title, detail: detail === title ? undefined : detail }
 }
 const SHOWN = 500
@@ -189,7 +203,7 @@ function LogsPage() {
       : <>
         <p className="text-meta text-muted-foreground" aria-live="polite">{records.length >= SHOWN ? `最新 ${SHOWN} 条` : `共 ${records.length} 条`}</p>
         <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">
-          {records.map((record, index) => <LogRow key={`${record.ts_ms}-${index}`} record={record} chat={workspace.bots.find((bot) => bot.conversation_id === record.conversation_id)?.name} task={record.work_id ? works.find((work) => work.work_id === record.work_id)?.title : undefined} open={open === index} onToggle={() => setOpen(open === index ? null : index)} onCopyAll={copyAll} />)}
+          {records.map((record, index) => <LogRow key={`${record.ts_ms}-${index}`} record={record} name={(id) => nodeName(id, { nodes: workspace.nodes, directory: device.directory })} chat={workspace.bots.find((bot) => bot.conversation_id === record.conversation_id)?.name} task={record.work_id ? works.find((work) => work.work_id === record.work_id)?.title : undefined} open={open === index} onToggle={() => setOpen(open === index ? null : index)} onCopyAll={copyAll} />)}
         </ul>
       </>}
   </div>
@@ -202,23 +216,23 @@ function time(ms: number) {
 }
 
 /** `chat` and `task`: the names shown instead of their IDs, which stay under the technical details. */
-function LogRow({ record, chat, task, open, onToggle, onCopyAll }: { record: LogRecord; chat?: string; task?: string; open: boolean; onToggle(): void; onCopyAll(filter: LogFilter, what: string): Promise<void> }) {
+function LogRow({ record, name, chat, task, open, onToggle, onCopyAll }: { record: LogRecord; name: (device?: string) => string; chat?: string; task?: string; open: boolean; onToggle(): void; onCopyAll(filter: LogFilter, what: string): Promise<void> }) {
   const outside = external(record)
   const alert = outside ? undefined : alertLook[record.level]
   const quiet = outside || record.level === 'debug' || record.level === 'trace'
-  const { title, detail } = describe(record)
-  const Icon = alert?.icon ?? sourceIcon[record.source]
+  const { title, detail } = describe(record, name)
+  const Icon = alert?.icon ?? (record.source === 'node' ? undefined : sourceIcon[record.source])
   const names: Array<[string, string | undefined]> = [['对话', chat], ['任务', task]]
   const ids: Array<[string, string | undefined]> = [['事件', record.event], ['原文', record.message === title ? undefined : record.message], ['对话', record.conversation_id], ['任务', record.work_id], ['会话', record.thread_id]]
   return <li>
     <button type="button" aria-expanded={open} onClick={onToggle} className="interactive-row flex w-full items-start gap-3 px-4 py-3 text-left">
-      {alert ? <Icon aria-label={alert.label} className={cn('mt-0.5 size-4 shrink-0', alert.tone)} /> : <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />}
+      {!Icon ? <span aria-hidden="true" className="size-4 shrink-0" /> : alert ? <Icon aria-label={alert.label} className={cn('mt-0.5 size-4 shrink-0', alert.tone)} /> : <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />}
       <span className="grid min-w-0 flex-1 gap-1">
         <span className={cn('break-words', !open && 'line-clamp-2', quiet && 'text-muted-foreground', outside && 'font-mono text-meta')}>{title}</span>
         {detail ? <span className={cn('break-words text-meta text-muted-foreground', !open && 'line-clamp-1')}>{detail}</span> : null}
         <span className="flex min-w-0 items-center gap-2 text-meta text-muted-foreground">
           <time className="shrink-0 tabular-nums" dateTime={new Date(record.ts_ms).toISOString()}>{time(record.ts_ms)}</time>
-          <span className="shrink-0">{sourceLabel[record.source]}</span>
+          {record.source === 'node' ? null : <span className="shrink-0">{sourceLabel[record.source]}</span>}
         </span>
       </span>
       <ChevronDown aria-hidden="true" className={cn('mt-0.5 size-4 shrink-0 text-muted-foreground transition-transform duration-200', open && 'rotate-180')} />

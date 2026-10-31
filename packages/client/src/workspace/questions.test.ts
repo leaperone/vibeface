@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { parseAnswer, parseConversation, parseOpenWorks, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
-import { answerBody, awaitsAnswer, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, settledAnswer, sharedProject } from "./questions.ts"
+import { answerBody, answerLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, questionParts, settledAnswer, sharedProject } from "./questions.ts"
 
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/path/to/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
@@ -86,18 +86,26 @@ test("questions and hand-offs sit where they happened in the chat", () => {
 })
 
 test("questions go to the web, or to the web and Grok; nothing else", () => {
-  const settings = (default_outlet: string) => ({ default_outlet, projects: [], webhook_url: null, scan_codex_sessions: false, codex_sessions: null, webhook_secret_set: false, decision_url: "", device_id: "d", decision_tokens: [], outbox: { pending: 0, delivered: 0, dead: 0 } })
+  const status = { budget: { day: "2026-10-30", used: 100, limit: 100, retry_at_ms: 1793404800000, paused_reason: "budget_exhausted" }, pending_events: 2, inflight_events: 0, unknown_events: 1 }
+  const settings = (default_outlet: string) => ({ default_outlet, projects: [], webhook_url: null, scan_codex_sessions: false, codex_sessions: null, webhook_secret_set: false, decision_url: "", device_id: "d", decision_tokens: [], outbox: { pending: 0, delivered: 0, dead: 0 }, status })
   assert.equal(parseTriageSettings(settings("both")).default_outlet, "both")
   assert.equal(parseTriageSettings(settings("record")).default_outlet, "record")
   for (const old of ["webhook", "off"]) assert.throws(() => parseTriageSettings(settings(old)), /无法识别/)
+  assert.deepEqual(parseTriageSettings(settings("record")).status, status)
+  assert.throws(() => parseTriageSettings({ ...settings("record"), status: { ...status, budget: { ...status.budget, paused_reason: "retry" } } }), /暂停原因无法识别/)
+  assert.throws(() => parseTriageSettings({ ...settings("record"), status: { ...status, unknown_events: -1 } }), /数字不对/)
 })
 
 test("an answer replaced by another side's says so instead of vanishing", () => {
   assert.equal(settledAnswer(undefined, undefined), undefined, "an open question has nothing settled")
-  assert.deepEqual(settledAnswer(undefined, "继续"), { text: "继续", elsewhere: false }, "this browser's answer shows before the network has it")
-  assert.deepEqual(settledAnswer("继续", "继续"), { text: "继续", elsewhere: false })
-  assert.deepEqual(settledAnswer("停下", undefined), { text: "停下", elsewhere: false }, "an answer given elsewhere with nothing tried here")
-  assert.deepEqual(settledAnswer("停下", "继续"), { text: "停下", elsewhere: true }, "the other side's answer won the race")
+  assert.deepEqual(settledAnswer(undefined, "继续"), { text: "继续", elsewhere: false, beaten: false }, "this browser's answer shows before the network has it")
+  assert.deepEqual(settledAnswer("继续", "继续"), { text: "继续", elsewhere: false, beaten: false })
+  assert.deepEqual(settledAnswer("停下", undefined), { text: "停下", elsewhere: false, beaten: false }, "an answer given elsewhere with nothing tried here")
+  assert.deepEqual(settledAnswer("停下", "继续"), { text: "停下", elsewhere: true, beaten: true }, "the other side's answer won the race")
+  assert.deepEqual(settledAnswer("停下", undefined, "phone", "web"), { text: "停下", elsewhere: true, beaten: false }, "a card mounted later still sees another device signed the answer")
+  assert.deepEqual(settledAnswer("停下", undefined, "web", "web"), { text: "停下", elsewhere: false, beaten: false }, "this device's own answer reads as answered")
+  assert.deepEqual(settledAnswer(undefined, "继续", "phone", "web"), { text: "继续", elsewhere: false, beaten: false }, "nothing stands yet, so no author to compare")
+  assert.deepEqual(settledAnswer("继续", "继续", "phone", "web"), { text: "继续", elsewhere: true, beaten: false }, "the same words written first on another device read as its answer, without a warning")
 })
 
 test("only an open question waits on the person: a closed one is no count and no reason to hide 思考中", () => {
@@ -118,4 +126,17 @@ test("an approval card names the task its request holds and leaves the device th
   assert.deepEqual(questionMeta(approval, works, bots, "gateway"), { approval: true, task: { bot_id: "bot", work_id: "w1", title: "任务" }, local: false })
   assert.equal(questionMeta(approval, works, [], "worker").task, null, "a task whose bot is gone has nowhere to link")
   assert.deepEqual(questionMeta(question, works, bots, "gateway"), { approval: false, task: null, local: false }, "a plain question holds no task")
+})
+
+test("a refused request reads as refused, never as agreed", () => {
+  for (const answer of ["拒绝", "不允许", "No", "deny", "拒绝，先别改"]) assert.ok(declined(answer), answer)
+  for (const answer of ["允许", "同意", "nothing to add", "继续"]) assert.ok(!declined(answer), answer)
+  assert.equal(answerLabel("拒绝"), "已拒绝")
+  assert.equal(answerLabel("拒绝，先别改"), "已拒绝 · 拒绝，先别改")
+  assert.equal(answerLabel("允许"), "已回答 · 允许")
+})
+
+test('a question asks on its first line and lists what it applies to after it', () => {
+  assert.deepEqual(questionParts('要运行这个命令吗？\n\n命令：npm test\n在项目里'), { ask: '要运行这个命令吗？', lines: [{ label: '命令', value: 'npm test' }, { label: null, value: '在项目里' }] })
+  assert.deepEqual(questionParts('继续吗？'), { ask: '继续吗？', lines: [] })
 })

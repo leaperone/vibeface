@@ -12,7 +12,7 @@ import { rawError } from "@vibeface/client/lib/errors.ts"
 
 export type Tone = "neutral" | "success" | "warning" | "danger" | "info"
 
-const toneText: Record<Tone, string> = {
+export const toneText: Record<Tone, string> = {
   neutral: "text-muted-foreground", success: "text-success", warning: "text-warning", danger: "text-danger", info: "text-info",
 }
 const toneSurface: Record<Tone, string> = {
@@ -140,15 +140,15 @@ function RowLead({ icon: Icon, label, description, tone = "neutral" }: { icon: L
 
 /** One settings row: icon, label, then its value or control at the end. With `onClick` the whole row is a button; `expanded` marks one that folds out below itself. */
 /** `stacked`: on a phone the control gets its own full line under the label, lined up with it. */
-export function SettingsRow({ icon, label, description, tone, children, onClick, expanded, className, stacked = false, ref }: {
-  icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: keyof typeof rowTile; children?: ReactNode; onClick?: () => void; expanded?: boolean; className?: string; stacked?: boolean; ref?: Ref<HTMLButtonElement>
+export function SettingsRow({ id, icon, label, description, tone, children, onClick, expanded, className, stacked = false, ref }: {
+  id?: string; icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: keyof typeof rowTile; children?: ReactNode; onClick?: () => void; expanded?: boolean; className?: string; stacked?: boolean; ref?: Ref<HTMLButtonElement>
 }) {
   const end = children ? <span className={cn("ms-auto flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2 text-meta text-muted-foreground", stacked && "max-sm:basis-full max-sm:ps-11")}>{children}</span> : null
-  if (onClick) return <button ref={ref} type="button" aria-expanded={expanded} onClick={onClick} className={cn(rowLayout, "interactive-row", className)}>
+  if (onClick) return <button id={id} ref={ref} type="button" aria-expanded={expanded} onClick={onClick} className={cn(rowLayout, "interactive-row", className)}>
     <RowLead icon={icon} label={label} description={description} tone={tone} />{end}
     {expanded === undefined ? null : <ChevronDown aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200", !end && "ms-auto", expanded && "rotate-180")} />}
   </button>
-  return <div className={cn(rowLayout, className)}><RowLead icon={icon} label={label} description={description} tone={tone} />{end}</div>
+  return <div id={id} className={cn(rowLayout, className)}><RowLead icon={icon} label={label} description={description} tone={tone} />{end}</div>
 }
 
 /** A row that folds out what it holds below itself, inside the same card. */

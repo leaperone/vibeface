@@ -216,8 +216,10 @@ def gate(needs, plan=None, delivery_live=False):
         raise ValueError("CI plan did not succeed")
     if plan is None:
         plan = json.loads(needs["plan"]["outputs"]["plan"])
-    expected = scope_plan(set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"])
-    if any(plan[key] != value for key, value in expected.items()):
+    expected = scope_plan(
+        set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"]
+    )
+    if any(plan.get(key) != value for key, value in expected.items()):
         raise ValueError("Required coverage differs from the selected CI scope and scenario")
     if delivery_live and plan["event"] != "workflow_dispatch":
         raise ValueError("Live delivery proofs require explicit workflow_dispatch")
