@@ -870,9 +870,9 @@ jobs:
           [[ "$RELEASE_TAG" == "v$VERSION" ]]
           shopt -s nullglob
           archives=(packages/*.tar.gz)
-          checksums=(packages/*.tar.gz.sha256)
+          checksums=(packages/*.tar.gz.sha256 packages/*.zip.sha256 packages/*.dmg.sha256 packages/*.apk.sha256)
           files=(packages/*)
-          [[ "${#archives[@]}" == 3 && "${#checksums[@]}" == 3 && "${#files[@]}" == 13 ]]
+          [[ "${#archives[@]}" == 3 && "${#checksums[@]}" == 6 && "${#files[@]}" == 13 ]]
           for archive in "${archives[@]}"; do
             name="$(basename "$archive")"
             [[ "$name" == "vibeface-$VERSION-"*.tar.gz ]]
