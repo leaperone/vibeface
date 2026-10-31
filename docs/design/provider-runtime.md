@@ -41,7 +41,11 @@ Provider 能原生压缩时记录压缩状态，否则通过有界上下文交�
 
 ## 当前实现
 
-Bot 模型和执行任务默认模型是两个独立设置。执行任务在 Node 接纳边界按显式请求、`providers.execution_models`、Provider 默认的顺序解析，并把 `model` 请求值与 `resolved { provider, model }` 冻结到 `WorkDispatched` 和投影。重试先回读原工作并比较完整请求，只有新工作读取当前设置。远端任务不接受发起端显式模型，由目标 Bot 冻结自己的 Provider 与模型。停用 Bot 暂停尚未启动的任务，但相同接纳请求仍返回原状态；切换 Provider 不改变已有任务的冻结选择。调度先解析冻结选择，再计算会话身份和 claim。`resolved.model=null` 固定 Provider 默认语义，不再读取之后修改的 Node 默认，也不保证 Provider 内部型号永久不变。
+Bot 模型和执行任务默认模型是两个独立设置。执行任务在 Node 接纳边界按显式请求、`providers.execution_models`、Provider 默认的顺序解析，并把 `model` 请求值与接纳时生成的 `resolved { provider, model }` 冻结到 `WorkDispatched` 和投影。`resolved.model=null` 明确选择 Provider 默认，与缺少整个 `resolved` 不同，不保证 Provider 内部的默认型号永久不变。远端任务不接受发起端显式模型，由目标 Bot 冻结自己的 Provider 和模型。
+
+同一请求重试先比较并回读已接纳记录，之后关闭执行、切换 Bot Provider 或修改模型不会改变原接纳结果，也不会再次入队或发送。首次并发接纳由 Store 事务裁决，所有成功返回都使用已持久化的同一选择。本机省略 `agent` 的请求在首次接纳时选择 Provider，后续重试沿用该选择；显式更换 Provider 或请求内容则拒绝。
+
+Bot 关闭时暂停尚未启动的 Task，已有接纳请求仍回原记录。切换 Bot Provider 不修改已接纳 Task 的冻结选择。调度在 claim 前读取该选择、计算 readiness 和会话身份；配置失败不保留 claimed job，启动中继续等待。原任务不因切换 Provider 而静默改用新的设备默认。
 
 Codex 默认使用 Node-owned `<data-dir>/providers/codex`、sessions 和 hook 根，并由 Node 启动独立 App Server。Claude 使用 Node-owned `CLAUDE_CONFIG_DIR`、transcript 和 hook 根。Codex system 只有通过显式 socket 才接入外部服务，并共享该服务的会话。pi 只固定 `<data-dir>/providers/pi/sessions`，保留本机认证配置。OpenCode 使用 `<data-dir>/providers/opencode` 中的私有 XDG 数据、配置、状态和缓存，强制数据库与配置目录；外部 config override 和项目配置不参与该服务。启动和 session Shell 环境使用相同根。
 

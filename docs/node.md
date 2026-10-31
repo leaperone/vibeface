@@ -137,7 +137,7 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 ### 回答本人自己开的会话
 
-`vibeface hooks install` 写入各产品的监听入口，已打开的会话重启后加载。Codex 默认写入 `<data-dir>/providers/codex/hooks.json`，Claude 默认写入 `<data-dir>/providers/claude/settings.json`；pi 与 opencode 的扩展仍写入下表所列的用户目录。给 `--home <目录>` 时全部写在该目录下，Codex 的在 `<目录>/.codex`，不看 `CODEX_HOME`：
+`vibeface hooks install` 写入各产品的监听入口，已打开的会话重启后加载。Codex 默认写入 `<data-dir>/providers/codex/hooks.json`，Claude 默认写入 `<data-dir>/providers/claude/settings.json`；pi 和 opencode 的扩展仍写入本机用户目录。给 `--home <目录>` 时，这四种产品的文件全部写在该目录下，Codex 的在 `<目录>/.codex`，不看 `CODEX_HOME`：
 
 | 产品 | 写入 | Bot 能回答 |
 |---|---|---|
@@ -485,7 +485,7 @@ Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool
 
 Codex 默认 bypass，正常不会发起请求。仍发起的请求（审批、提问、登录等）由 Node 挂起并立即唤醒协调 Agent：它用 `vibeface requests` 查看，`vibeface respond <request_id> '<result-json>'` 回答，同一请求只回答一次。需要本人拍板时，它用 `vibeface triage raise --event-id <ID> --request-id <请求> --question <问题> --choice 批准 --choice 拒绝` 在拥有该会话的 Bot 聊天里提问，按项目设置也经 webhook 转发 Grok Bot。提问挂住请求直到有回答；回答作为一轮交给该 Bot，它在 120 秒内用 `vibeface respond <请求> '<result-json>' --node <设备>` 应答。没有协调 Agent，或它 120 秒内既没回答也没提问时，Node 按方法拒绝并记录。等待回答的 hook 挂起的请求同样经 `vibeface requests` 和 `vibeface respond` 处理，30 秒内没有回答时交回会话自己决定。没有协调 Agent 时分诊事件直接丢弃。协调 Agent 每次启动分诊都预占一次额度，上限同为 `daily_decision_limit`，但与 Bot 的自动轮次分开记账，不占它们的额度。额度用完时保留未审阅事件，挂起请求仍按原期限兜底；额度恢复后只重新审阅事件，不重放原工具或已执行的工作。只有当前进程确认模型未启动时才退还原日额度；启动后失败、结果未知或 Node 重启时不退款，也不自动重跑该批事件。设置和诊断包显示已用额度、上限、下次尝试时间，以及待审阅、处理中和结果未知的事件数。协调 Agent 能看到拥有该会话的 Bot 的说明开头和最新记忆，各有长度上限。hook 挂起的 `continue` 只在执行本人已要求的事时代发；下一步需要本人决定、难以撤销或需要本人未给的授权时，改为提问。不是 Bot 发起的交互会话由运行它的设备归给主 Bot；Bot 每轮能看到名下的会话，自己判断后用 `hand_over_session` 转给其他 Bot 或不再关注；`codex exec`、子代理等后台会话不处理，见 [聊天里的提问与回答](design/questions-in-chat.md)。
 
-Node 默认不启用 Codex。启用 Codex Bot 或任务执行时，缺少的程序路径由 Node 从本机找出并写进配置，设备设置里显示并可修改；Bot 也能用 `propose_provider_config` 提议显式 App Server socket、会话扫描目录或添加可用文件夹（`roots`），经聊天里的「允许 / 不允许」卡片同意后由 Node 写入。首次设置时打开 Codex 运行 Bot 会同时打开执行任务，并可一键添加家目录下常见的项目文件夹（`node_settings.suggested_roots`）。`providers.codex_app_server.mode` 缺省为 `spawn`。spawn 时 Node 托管自己的 `codex app-server`，使用 `<data-dir>/providers/codex` 和私有的 `/tmp/vibeface-<identity>/` socket；不会扫描用户 control socket、sessions 或 hooks。`system` 只连接明确配置的 socket，不启动或结束外部服务。App Server 运行在独立进程组，进程组号写入数据目录的 `codex-app-server.pid`。Node 启动时先结束上次遗留的进程组，正常退出时一并停止它，异常退出则退避重启。要指定系统 App Server 的 socket，设置 `providers.codex_app_server.socket`。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中工作的实际状态。
+Node 默认不启用 Codex。启用 Codex Bot 或任务执行时，缺少的程序路径由 Node 从本机找出并写进配置，设备设置里显示并可修改；Bot 也能用 `propose_provider_config` 提议显式 App Server socket、会话扫描目录或添加可用文件夹（`roots`），经聊天里的「允许 / 不允许」卡片同意后由 Node 写入。首次设置时打开 Codex 运行 Bot 会同时打开执行任务，并可一键添加家目录下常见的项目文件夹（`node_settings.suggested_roots`）。整个 `providers.codex_app_server` 对象省略时默认 `spawn`，提供对象时 `mode` 必填。spawn 时 Node 托管自己的 `codex app-server`，使用 `<data-dir>/providers/codex` 和私有的 `/tmp/vibeface-<identity>/` socket；不会扫描用户 control socket、sessions 或 hooks。`system` 只连接明确配置的 socket，不启动或结束外部服务。App Server 运行在独立进程组，进程组号写入数据目录的 `codex-app-server.pid`。Node 启动时先结束上次遗留的进程组，正常退出时一并停止它，异常退出则退避重启。连接系统 App Server 时，同时设置 `providers.codex_app_server.mode` 为 `system` 和显式的绝对 `socket`；`init --codex-socket` 会同时保存两者。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中工作的实际状态。
 
 App Server 重启或重连后，Node 只读复查未结束的工作，不重发旧指令。读不到原 turn 的工作标为“待核对”，由本人附证据结清。
 

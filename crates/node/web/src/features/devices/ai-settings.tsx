@@ -45,7 +45,6 @@ function issueText(provider: ProviderId, issue: ProviderIssue): string {
 }
 
 const modes: { value: AppServerMode; label: string; icon: LucideIcon }[] = [{ value: "system", label: deviceCopy.appServer.system, icon: Monitor }, { value: "spawn", label: deviceCopy.appServer.spawn, icon: Play }]
-const spawnServer = { mode: "spawn", socket: null } as const
 
 /** One line for an App Server state, from the device or a fresh test. */
 function LinkLine({ link, prefix = "" }: { link: AppServerLink; prefix?: string }) {
@@ -90,47 +89,52 @@ function PathField({ id, label, value, display, placeholder, working, busy, onSa
   </form>
 }
 
-const placeholders = { socket: "例如 ~/.codex/app-server-control/app-server-control.sock" }
+const placeholders = { socket: "App Server socket 的绝对路径" }
 
-/**
- * Where Codex work runs: the App Server already running on this computer, at its socket, or one the device starts with the
- * Codex folder. The device fills both in from this computer when they are missing; the paths stay folded until one is missing or broken.
- * `children`: other paths the provider uses, folded with these.
- */
 function AppServerSettings({ server, home, sessions, display, working, blocked, busy, save, test, children }: {
   server: AppServer; home: string | null; sessions: string | null; display: Display; working: boolean; blocked: boolean; busy: string
   save(key: string, change: Omit<Change, "provider">): Promise<boolean>; test(): Promise<AppServerLink | null>; children?: ReactNode
 }) {
+  const [draft, setDraft] = useState({ mode: server.mode, socket: server.socket ?? "" })
   const [tested, setTested] = useState<AppServerLink | null>(null)
   const [testing, setTesting] = useState(false)
+  useEffect(() => setDraft({ mode: server.mode, socket: server.socket ?? "" }), [server.mode, server.socket])
   useEffect(() => setTested(null), [server.mode, server.socket])
+  const dirty = draft.mode !== server.mode || draft.socket.trim() !== (server.socket ?? "")
   const link = server.link
   const shown = tested ?? link
-  const setMode = (mode: AppServerMode) => void save("app_server", { app_server: { mode, socket: server.socket } })
   // Opens by itself when a path needs attention and stays open after it is fixed, so a saved field does not fold away under the cursor.
-  const needsPaths = blocked || (server.mode === "system" ? !server.socket : !home) || ["not_found", "handshake_failed", "launch_failed"].includes(link.state)
+  const needsPaths = blocked || (draft.mode === "spawn" && !home) || ["not_found", "handshake_failed", "launch_failed"].includes(link.state)
   const [pathsOpen, setPathsOpen] = useState(needsPaths)
   useEffect(() => { if (needsPaths) setPathsOpen(true) }, [needsPaths])
   const runTest = async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }
 
   return <div className="grid gap-3">
-    <div className="grid gap-2">
+    <form className="grid gap-2" onSubmit={(event) => {
+      event.preventDefault()
+      if (dirty) void save("app_server", { app_server: { mode: draft.mode, socket: draft.socket.trim() || null } })
+    }}>
       <p className="text-meta font-medium text-muted-foreground">连接方式</p>
       <div className="flex min-w-0 flex-wrap items-center gap-2">
-        <Segmented label="连接方式" labels fill value={server.mode} options={modes} disabled={working} onChange={setMode} />
-        <Button type="button" variant="ghost" disabled={working || testing || blocked || link.state === "off"} onClick={() => void runTest()}>
+        <Segmented label="连接方式" labels fill value={draft.mode} options={modes} disabled={working} onChange={(mode) => setDraft({ ...draft, mode })} />
+        {dirty ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy.endsWith(":app_server")} />保存</Button> : null}
+        <Button type="button" variant="ghost" disabled={working || testing || dirty || blocked || link.state === "off"} onClick={() => void runTest()}>
           <BusyIcon busy={testing} icon={PlugZap} />测试连接
         </Button>
       </div>
-      {server.mode === "system" ? <p className="text-meta text-muted-foreground">共享所选外部 App Server 的会话，不隔离该服务的数据。</p> : null}
-      {blocked ? null : <LinkLine link={shown} prefix={tested ? "测试：" : ""} />}
-      {shown.state === "handshake_failed" || shown.state === "launch_failed" ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
-    </div>
+      {draft.mode === "system" ? <div className="grid gap-1">
+        <label htmlFor="codex-socket" className="text-meta font-medium text-muted-foreground">连接路径</label>
+        <Input id="codex-socket" name="socket" className="min-w-0 font-mono" placeholder={placeholders.socket} required pattern="/.*" maxLength={4096} spellCheck={false}
+          value={draft.socket} disabled={working} onChange={(event) => setDraft({ ...draft, socket: event.target.value })} />
+        <p className="text-meta text-muted-foreground">填写运行 Codex 的电脑上的绝对路径。</p>
+        <p className="text-meta text-muted-foreground">共享所选外部 App Server 的会话，不隔离该服务的数据。</p>
+      </div> : null}
+      {dirty ? <p role="status" className="text-meta text-muted-foreground">保存后可测试连接</p>
+        : blocked ? null : <LinkLine link={shown} prefix={tested ? "测试：" : ""} />}
+      {!dirty && (shown.state === "handshake_failed" || shown.state === "launch_failed") ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
+    </form>
     <Details label="路径" open={pathsOpen || needsPaths || undefined}>
-      {server.mode === "system"
-        ? <PathField id="codex-socket" label="连接路径" value={server.socket} display={display} placeholder={placeholders.socket} working={working} busy={busy.endsWith(":socket")}
-            onSave={(path) => save("socket", { app_server: { mode: "system", socket: path || null } })} />
-        : <p className="grid gap-1"><span className="font-medium">Node-owned Codex 目录</span><FolderPath path={home ?? ""} shown={home ? display[home] : "由 Node 创建"} /></p>}
+      {draft.mode === "spawn" ? <p className="grid gap-1"><span className="font-medium">Node-owned Codex 目录</span><FolderPath path={home ?? ""} shown={home ? display[home] : "由 Node 创建"} /></p> : null}
       {sessions ? <p className="grid gap-1"><span className="font-medium">会话目录</span><span className="flex min-w-0 text-foreground"><FolderPath path={sessions} shown={display[sessions]} /></span></p> : null}
       {children}
     </Details>
@@ -402,7 +406,7 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
       {issue.code === "app_server_not_found" && server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
-          onClick={() => void change("app_server", { app_server: spawnServer })}>{deviceCopy.appServer.useSpawn}</button>
+          onClick={() => void change("app_server", { app_server: { mode: "spawn", socket: server.socket } })}>{deviceCopy.appServer.useSpawn}</button>
         : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={issue.code === "bin_missing" ? install[item.provider] : guide[item.provider]} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
         : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={() => openProvider(item.provider)}>去设置</button>}
     </p> : null}

@@ -56,7 +56,7 @@ Node 保留 `runtime/executor.rs` 定义的多 Provider 执行器。`WorkKind::A
 
 ### 2.1a 用哪个 App Server
 
-App Server 由部署配置显式选择。执行默认关闭；启用后缺少 mode 默认为 `spawn`，Node 使用自己的 `<data-dir>/providers/codex` 根。只有明确选择 `system` 并提供绝对 socket 才连接外部服务。配置步骤见[部署配置](../deployment.md#配置-sdk-与-app-server)。
+App Server 由部署配置显式选择。执行默认关闭；整个 `codex_app_server` 对象省略时默认 `spawn`，提供对象时 `mode` 必填。Node 使用自己的 `<data-dir>/providers/codex` 根。只有明确选择 `system` 并提供绝对 socket 才连接外部服务，`init --codex-socket` 同时选择该模式。配置步骤见[部署配置](../deployment.md#配置-sdk-与-app-server)。
 
 - `system`：Node 只连接明确配置的 socket，不搜索用户 home 或其他运行中的会话。它不启动或结束外部 App Server，只重连同一个配置入口。该模式共享外部服务的会话，不属于默认私有目录隔离保证。
 - `spawn`：Node 注入 Node-owned `CODEX_HOME`，覆盖普通 Provider 环境里的同名值；用户凭证不会被复制。
@@ -219,4 +219,4 @@ vibeface hooks test --data-dir <数据目录>
 vibeface hooks uninstall --data-dir <数据目录> [--home <目录>] [--dry-run]
 ```
 
-`install` 默认修改 Node-owned 的 Claude/Codex hook 根以及本机扩展目录，不读取用户交互会话。给 `--home` 才显式修改用户目录；该模式不代表 Bot 会接入用户会话。先备份原文件，只追加本工具的条目，重复执行不会重复添加。`uninstall` 只删本工具的条目。`--dry-run` 展示将要修改的内容。`test` 仅向明确指定的 Node 发送测试事件。Codex 的 hook 功能仍须由部署者在配置中开启。
+`install` 默认修改 Node-owned 的 Claude/Codex hook 根，pi 和 opencode 的扩展仍写入本机用户目录。给 `--home` 时，这四种产品的 hook 和扩展都写入指定目录下；该参数只改变文件位置。先备份原文件，只追加本工具的条目，重复执行不会重复添加。`uninstall` 只删本工具的条目。`--dry-run` 展示将要修改的内容。`test` 仅向明确指定的 Node 发送测试事件。Codex 的 hook 功能仍须由部署者在配置中开启。

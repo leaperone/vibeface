@@ -211,31 +211,43 @@ const links: Record<AppServerLink['state'], [string, LucideIcon, string]> = {
 
 /** Where Codex work runs: the App Server already running on that computer, or one the device starts. */
 function AppServerSettings({ server, working, save, test }: { server: AppServer; working: boolean; save(key: string, change: Change): Promise<boolean>; test(): Promise<AppServerLink | null> }) {
-  const [socket, setSocket] = useState(server.socket ?? '')
+  const [draft, setDraft] = useState({ mode: server.mode, socket: server.socket ?? '' })
+  const [invalid, setInvalid] = useState(false)
   const [tested, setTested] = useState<AppServerLink | null>(null)
   const [testing, setTesting] = useState(false)
-  useEffect(() => setSocket(server.socket ?? ''), [server.socket])
+  useEffect(() => { setDraft({ mode: server.mode, socket: server.socket ?? '' }); setInvalid(false) }, [server.mode, server.socket])
   useEffect(() => setTested(null), [server.mode, server.socket])
+  const dirty = draft.mode !== server.mode || draft.socket.trim() !== (server.socket ?? '')
+  const saveConnection = () => {
+    const socket = draft.socket.trim()
+    if (draft.mode === 'system' && !socket.startsWith('/')) { setInvalid(true); return }
+    setInvalid(false)
+    void save('app_server', { app_server: { mode: draft.mode, socket: socket || null } })
+  }
   const shown = tested ?? server.link
   const [tone, icon, label] = links[shown.state]
   return <Field label="连接方式">
     <View accessibilityRole="radiogroup" className="flex-row gap-1 self-start rounded-lg bg-muted p-1">
-      {modes.map(([mode, text, modeIcon]) => <Button key={mode} accessibilityRole="radio" accessibilityState={{ checked: server.mode === mode }} disabled={working}
-        variant={server.mode === mode ? 'outline' : 'ghost'} onPress={() => { if (mode !== server.mode) void save('app_server', { app_server: { mode, socket: server.socket } }) }}>
+      {modes.map(([mode, text, modeIcon]) => <Button key={mode} accessibilityRole="radio" accessibilityState={{ checked: draft.mode === mode }} disabled={working}
+        variant={draft.mode === mode ? 'outline' : 'ghost'} onPress={() => { setDraft({ ...draft, mode }); setInvalid(false) }}>
         <Icon as={modeIcon} /><Text>{text}</Text>
       </Button>)}
     </View>
+    {draft.mode === 'system' ? <Input accessibilityLabel="App Server socket 的绝对路径" placeholder="App Server socket 的绝对路径" autoCapitalize="none" autoCorrect={false}
+      className="font-mono" value={draft.socket} editable={!working} onChangeText={(socket) => { setDraft({ ...draft, socket }); setInvalid(false) }} /> : null}
+    {draft.mode === 'system' ? <Text className="text-meta text-muted-foreground">共享所选外部 App Server 的会话，不隔离该服务的数据。</Text> : null}
+    {invalid ? <Text role="alert" className="text-meta text-warning">填写运行 Codex 的电脑上的绝对路径。</Text> : null}
     <View className="flex-row flex-wrap items-center gap-2">
-      <Icon as={icon} className={cn('size-4', tone)} />
-      <Text className={cn('shrink text-meta', tone)}>{tested ? '测试：' : ''}{label}</Text>
-      <Button variant="ghost" disabled={working || testing || server.link.state === 'off'} onPress={async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }}>
+      {dirty ? <Button variant="outline" disabled={working} onPress={saveConnection}><Text>保存</Text></Button> : null}
+      <Button variant="ghost" disabled={working || testing || dirty || server.link.state === 'off'} onPress={async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }}>
         <Icon as={testing ? LoaderCircle : PlugZap} /><Text>测试连接</Text>
       </Button>
     </View>
-    {shown.state === 'handshake_failed' || shown.state === 'launch_failed' ? <Text selectable className="font-mono text-meta text-muted-foreground">{shown.reason}</Text> : null}
-    {server.mode === 'system' ? <Text className="text-meta text-muted-foreground">共享所选外部 App Server 的会话，不隔离该服务的数据。</Text> : null}
-    {server.mode === 'system' ? <SaveRow value={socket} saved={server.socket ?? ''} placeholder="App Server socket 的绝对路径" mono working={working} onChange={setSocket}
-      onSave={() => void save('socket', { app_server: { mode: 'system', socket: socket.trim() || null } })} /> : null}
+    {dirty ? <Text className="text-meta text-muted-foreground">保存后可测试连接</Text> : <View className="flex-row items-center gap-2">
+      <Icon as={icon} className={cn('size-4', tone)} />
+      <Text className={cn('shrink text-meta', tone)}>{tested ? '测试：' : ''}{label}</Text>
+    </View>}
+    {!dirty && (shown.state === 'handshake_failed' || shown.state === 'launch_failed') ? <Text selectable className="font-mono text-meta text-muted-foreground">{shown.reason}</Text> : null}
   </Field>
 }
 

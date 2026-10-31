@@ -86,7 +86,7 @@ pi 的认证目录不变，只有 session 目录固定为 `<data-dir>/providers/
 }
 ```
 
-安装 hooks 默认改 Node-owned 的 Claude/Codex 根，不读取用户交互会话。改用户目录时显式使用 `--home`；该模式只改变 hook 文件位置，不让 Bot 接入用户会话。写入的文件见 [回答本人自己开的会话](node.md#回答本人自己开的会话)：
+安装 hooks 默认改 Node-owned 的 Claude/Codex 根，pi 和 opencode 的扩展仍写入本机用户目录。`--home` 将这四种产品的 hook 和扩展改写到指定目录下，只改变文件位置。写入的文件见 [回答本人自己开的会话](node.md#回答本人自己开的会话)：
 
 ```sh
 vibeface hooks install [--home '<包含各 Agent 配置的目录>']
