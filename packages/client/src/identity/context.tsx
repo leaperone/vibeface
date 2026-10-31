@@ -69,6 +69,8 @@ type DeviceContextValue = {
   pendingRecovery: PendingRecovery | null; dismissPendingRecovery(): void
   /** Stops the recovery `checkpoint` names; resolves once it is stopped, also when an earlier try already stopped it. */
   vetoRecovery(checkpoint: string): Promise<void>
+  /** Confirms a pending recovery; resolves only after its signed directory proves it took effect. */
+  approveRecovery(checkpoint: string): Promise<void>
   /** Left by a stop on this device until the recovery key changes: whoever started it holds the file. */
   rotateHint: boolean; dismissRotateHint(): void
   /** The Node's clock minus this browser's, as of the last directory: times in the directory are on the Node's clock. */
@@ -861,6 +863,45 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     await refreshDirectory()
   }
   /**
+   * Confirms the recovery `checkpoint` immediately. An unknown write is checked against the
+   * same checkpoint chain, without signing another event.
+   */
+  async function approveRecovery(checkpoint: string) {
+    const connection = managing(), request = scoped()
+    const before = record(await request('directory')), now = nodeNow(before) ?? Date.now()
+    const verified = verifyState(before.state, connection.principal.network_id, now)
+    let event: Record<string, unknown>, epoch: number, checkpoints: unknown[]
+    try {
+      const view = parseView(JSON.parse(verified.viewJson()))
+      if (view.pending?.checkpoint !== checkpoint) throw new Error('这次找回已不在等待确认，请刷新设备列表。')
+      epoch = view.epoch
+      checkpoints = array(record(before.state).checkpoints)
+      event = record(JSON.parse(verified.governanceTemplate(own().deviceId, JSON.stringify({ type: 'approve', checkpoint, at_ms: now }))))
+    } finally { verified.free() }
+    const confirmed = (value: unknown) => {
+      const response = record(value)
+      const verified = verifyState(response.state, connection.principal.network_id, nodeNow(response))
+      try {
+        const view = parseView(JSON.parse(verified.viewJson()))
+        const chain = array(record(response.state).checkpoints)
+        if (view.stopped.includes(checkpoint)) throw new Error('这次找回已被拦下或作废。')
+        if (view.epoch <= epoch || view.pending?.checkpoint === checkpoint || !checkpoints.every(item => chain.some(next => same(item, next)))) throw new Error('还无法确认这次找回已生效，请刷新设备列表后检查。')
+        return view
+      } finally { verified.free() }
+    }
+    event.signature = await signClient('identity-governance', governancePayload(JSON.stringify(event)))
+    let view: MembershipView
+    try { view = confirmed(await request('approve_recovery', { event })) }
+    catch (cause) {
+      const after = await request('directory').then(confirmed).catch(() => null)
+      if (!after) throw cause
+      view = after
+    }
+    setDirectory(view)
+    // A later refresh failure cannot undo the signed result, even if this manager lost access.
+    await refreshDirectory().catch(() => {})
+  }
+  /**
    * The app tries the entry Node where the ticket says it listens on the LAN, then this page's own entry: a scanned
    * code's address is only a hint, the device key is the check.
    */
@@ -1392,7 +1433,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效，请重新开始创建。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('这一步已失效，请重新选择恢复文件。'); await sensitive.current.recover(members) },
     cancelSensitive,
-    pendingRecovery, vetoRecovery, nodeClockOffset, rotateHint,
+    pendingRecovery, vetoRecovery, approveRecovery, nodeClockOffset, rotateHint,
     dismissRotateHint() { if (ready) setRotateHint(ready.principal.network_id, null) },
     dismissPendingRecovery() { if (!ready || !pendingRecovery) return; hideRecovery(ready.principal.network_id, pendingRecovery.checkpoint); setDismissals(count => count + 1) },
     recovery, dismissRecovery, recovered, unsavedRecovery, downloadUnsavedRecovery,

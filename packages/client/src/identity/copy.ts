@@ -138,7 +138,7 @@ export function whenText(at: number, now = Date.now()) {
 export const recoveryCopy = {
   scope: '找回后，对话会从你的其他电脑同步过来',
   whichLost: '哪台设备丢了？',
-  delay: '2 天后生效，期间你的其他设备可以拦下',
+  delay: '默认 2 天后生效，管理设备可确认立即生效，也可拦下',
   cancelLate: '如果已经提交，取消不会撤回。',
   connectTo: '连接到哪台电脑',
   manual: '手动填写',
@@ -156,7 +156,7 @@ export const recoveryCopy = {
   waiting: '找回等待生效',
   left: (at: number, now = Date.now()) => at > now ? `剩余 ${hoursUntil(at, now)} 小时` : '马上生效',
   autoEnter: '生效后自动进入',
-  managersSee: '你的管理设备会看到提醒',
+  managersSee: '你的管理设备会看到提醒，可确认立即生效',
   closeOk: '可以关掉页面，到时在这个网址打开',
   samePassword: '密码不变，生效后旧文件作废',
   stopped: '这次找回被拦下了',
@@ -173,6 +173,10 @@ export const recoveryCopy = {
   effectiveIn: (at: number, now = Date.now()) => `${hoursUntil(at, now)} 小时后生效`,
   outIfNotStopped: '不拦下，到时划掉的设备会被移出',
   added: '新设备',
+  confirm: '立即生效',
+  confirmAsk: '现在让这次找回立即生效？',
+  confirmNote: '请先确认是你在找回。新设备会立即获得管理权限，标为丢失的设备会被移出。',
+  confirmDone: '已立即生效',
   itsMe: '是我，收起提醒',
   /** 是我 only hides the reminder here; the recovery still takes effect when its wait ends. */
   itsMeDone: (at: number, now = Date.now()) => `已收起提醒。找回仍会在${whenText(at, now)} 生效`,
