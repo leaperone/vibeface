@@ -614,7 +614,7 @@ pub struct Providers {
     /// The providers dispatched work runs on.
     pub execution: BTreeSet<Provider>,
     /// A device-local default model for dispatched work on each provider. Empty values follow
-    /// the provider's own default and are omitted when settings are saved.
+    /// the provider's own default; the settings entry point removes empty overrides.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub execution_models: BTreeMap<Provider, String>,
     #[serde(default)]
