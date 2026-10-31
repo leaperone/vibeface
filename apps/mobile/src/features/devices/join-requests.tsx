@@ -63,14 +63,13 @@ function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: bo
       <Button disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow()}><Text>{busy === 'allow' ? '处理中' : '一致，允许'}</Text></Button>
     </>}
   </>}>
-    <Text className="text-meta text-muted-foreground">{elsewhere ? '正在另一台管理设备上处理' : asking ? '点“显示安全码”，新设备上会出现同样的码' : request.code ? deviceCopy.compareCode : '等新设备显示安全码'}</Text>
+    <Text className="text-meta text-muted-foreground">{elsewhere ? '正在另一台管理设备上处理' : asking ? '两边显示同样的安全码，再允许' : request.code ? deviceCopy.compareCode : '等新设备显示安全码'}</Text>
     {request.code ? <SafetyCode code={request.code} /> : asking ? null : <Skeleton className="h-8 w-40" />}
     {request.kind === 'client' && !asking && !elsewhere ? <View className="flex-row items-center gap-3">
       <View className="min-w-0 flex-1">
         <Text>设为管理设备</Text>
-        <Text className="text-meta text-muted-foreground">{deviceCopy.manageHint}</Text>
       </View>
-      <Switch accessibilityLabel="设为管理设备" value={manage} disabled={busy !== null} onValueChange={setManage} />
+      <Switch accessibilityLabel="设为管理设备" accessibilityHint={deviceCopy.manageHint} value={manage} disabled={busy !== null} onValueChange={setManage} />
     </View> : null}
     <ErrorText error={error} />
   </ActionCard>
