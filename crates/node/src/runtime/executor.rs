@@ -32,6 +32,14 @@ pub(crate) enum SteerTrace {
 
 /// One provider's turns on this device.
 pub(crate) trait Executor: Send + Sync {
+    fn model_catalog(&self) -> BoxFuture<'_, Option<Vec<super::codex_server::ModelChoice>>> {
+        Box::pin(async { None })
+    }
+
+    fn compact_or_handoff(&self, provider: Provider) -> Result<crate::providers::CompactionMode> {
+        provider.descriptor().compact_or_handoff()
+    }
+
     /// Starts `work`, registered just now, in `thread` when there is one: the thread it names
     /// or that of the work it continues. `args` are `dispatch_work`'s, whose model it takes,
     /// with effort and images only as `Provider::work` says. The thread is journaled
@@ -40,7 +48,7 @@ pub(crate) trait Executor: Send + Sync {
     /// `bind_work`. An error means nothing was started: the provider records nothing itself,
     /// and `Runtime::start_work` rejects the work with it, an `ExecFailure` keeping its kind.
     /// Once something may run, it returns `Ok` and the follower and probes settle the work.
-    fn start<'a>(
+    fn start_or_resume<'a>(
         &'a self,
         node: &'a Arc<Runtime>,
         network: &'a str,
@@ -55,7 +63,7 @@ pub(crate) trait Executor: Send + Sync {
     /// confirms the stop.
     fn interrupt<'a>(&'a self, work: &'a WorkRecord) -> BoxFuture<'a, Result<()>>;
     /// Sends a message into the running turn `into`, keyed by `message_id`.
-    fn steer<'a>(
+    fn send_turn<'a>(
         &'a self,
         into: &'a SteerTarget,
         message_id: &'a str,
@@ -70,6 +78,20 @@ pub(crate) trait Executor: Send + Sync {
 }
 
 impl Runtime {
+    pub(crate) async fn provider_models(
+        &self,
+        provider: Provider,
+    ) -> Option<Vec<super::codex_server::ModelChoice>> {
+        self.executor(provider).ok()?.model_catalog().await
+    }
+
+    pub(crate) fn compact_or_handoff(
+        &self,
+        provider: Provider,
+    ) -> Result<crate::providers::CompactionMode> {
+        self.executor(provider)?.compact_or_handoff(provider)
+    }
+
     /// Has `executor` start a work registered just now. A start that fails rejects the work, so
     /// the Agent sees the failure and dispatches again under a new `call_ref`; a retry of this
     /// one finds the work and starts nothing.
@@ -81,7 +103,10 @@ impl Runtime {
         thread: Option<&str>,
         args: &Value,
     ) -> Result<bool> {
-        let error = match executor.start(self, network, work, thread, args).await {
+        let error = match executor
+            .start_or_resume(self, network, work, thread, args)
+            .await
+        {
             Ok(may_send) => return Ok(may_send),
             Err(error) => error,
         };

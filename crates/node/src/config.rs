@@ -8,11 +8,11 @@ use std::{
 };
 
 /// Bumped whenever stored data stops being readable by the previous build.
-pub const DATA_EPOCH: u32 = 8;
+pub const DATA_EPOCH: u32 = 11;
 /// SHA-256 over the migration files (`migrations/*.sql`, by name) that `DATA_EPOCH` stores.
 /// Any schema change fails a test until both constants change together.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
-    "840dd84cf861f2da087d86e516dc9771d415d4221847f866a382d2e34b439ba5";
+    "67eaf7ba9a422bf6e801abb41f93362a5536663e931421e1c12c4717e2032856";
 /// Bumped whenever a release package stops being installable by the previous updater.
 pub const UPDATE_PROTOCOL: u32 = 1;
 pub fn data_epoch_marker() -> Vec<u8> {
@@ -23,6 +23,36 @@ pub const DEFAULT_LOCAL_LISTEN: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4791);
 
 pub const UNNAMED_NODE: &str = "Node";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulingLimits {
+    pub machine_slots: usize,
+    pub task_limit: usize,
+}
+
+impl Default for SchedulingLimits {
+    fn default() -> Self {
+        Self {
+            machine_slots: 4,
+            task_limit: 2,
+        }
+    }
+}
+
+impl SchedulingLimits {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=32).contains(&self.machine_slots),
+            "machine_slots must be between 1 and 32"
+        );
+        ensure!(
+            (1..=self.machine_slots).contains(&self.task_limit),
+            "task_limit must be between 1 and machine_slots"
+        );
+        Ok(())
+    }
+}
 
 pub const NO_HOME: &str =
     "no data directory: HOME is unset or not absolute; pass --data-dir or set VIBEFACE_DATA_DIR";
@@ -85,6 +115,8 @@ pub struct Config {
     pub bins: std::collections::BTreeMap<crate::providers::Provider, PathBuf>,
     pub timeout_secs: u64,
     pub daily_decision_limit: u64,
+    #[serde(default)]
+    pub scheduling: SchedulingLimits,
     /// Where triaged local sessions go; the webhook secret is a separate private file.
     #[serde(default)]
     pub triage: crate::triage::TriageConfig,
@@ -116,6 +148,7 @@ impl Config {
             bins: Default::default(),
             timeout_secs: 600,
             daily_decision_limit: 20,
+            scheduling: Default::default(),
             triage: Default::default(),
             providers: Default::default(),
         }
@@ -149,6 +182,7 @@ impl Config {
         }
     }
     pub fn validate(&self) -> Result<()> {
+        self.scheduling.validate()?;
         self.network.validate()?;
         let url = http_origin(&self.public_url)?;
         let local_origin = url.host_str().is_some_and(|h| {
@@ -331,6 +365,31 @@ pub fn lock_data_dir(dir: &Path) -> Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduling_limits_bound_all_coordinator_reservations() {
+        assert!(SchedulingLimits::default().validate().is_ok());
+        for limits in [
+            SchedulingLimits {
+                machine_slots: 0,
+                task_limit: 1,
+            },
+            SchedulingLimits {
+                machine_slots: 33,
+                task_limit: 1,
+            },
+            SchedulingLimits {
+                machine_slots: 2,
+                task_limit: 0,
+            },
+            SchedulingLimits {
+                machine_slots: 2,
+                task_limit: 3,
+            },
+        ] {
+            assert!(limits.validate().is_err());
+        }
+    }
 
     #[test]
     fn schema_changes_bump_the_data_epoch() {

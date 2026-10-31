@@ -10,12 +10,13 @@ import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { availability, botOnChange, folderSuggestions, type Availability, modelTyped, parseAppServerLink, parseNodeSettings, parseProviderModels, type ModelChoice, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { availability, botOnChange, folderSuggestions, type Availability, modelTyped, parseAppServerLink, parseNodeSettings, parseProviderModels, type ModelChoice, providerGroups, providerNames, providerObservationLabels, providerObservationStates, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
 const states: Record<Availability, { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: "可用", tone: "success", icon: CircleCheck },
+  unverified: { label: "未验证，可尝试", tone: "neutral", icon: CircleDashed },
   needs_setup: { label: "需设置", tone: "warning", icon: CircleAlert },
   starting: { label: "启动中", tone: "neutral", icon: LoaderCircle },
   missing: { label: "未安装", tone: "neutral", icon: CircleDashed },
@@ -226,7 +227,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   const [models, setModels] = useState<{ provider: ProviderId; list: ModelChoice[] } | null>(null)
   const botProvider = response?.providers.find((item) => item.roles.includes("agent"))
   useEffect(() => {
-    if (!ready?.isCurrent() || botProvider?.state !== "ready") return
+    if (!ready?.isCurrent() || botProvider?.state !== "ready" && botProvider?.state !== "unverified") return
     let live = true
     const provider = botProvider.provider
     ready.request("provider_models", { provider }).then(parseProviderModels).then((list) => { if (live) setModels(list ? { provider, list } : null) }, () => {})
@@ -411,6 +412,10 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
         <ChevronRight aria-hidden="true" className="size-4 transition-transform duration-200" />设置
       </summary>
       <div className="grid gap-4 px-4 sm:ps-12 pt-1 pb-4">
+        <Details label="能力验证">
+          <p>程序和密钥已配置，不代表登录或模型已经验证。未验证时可以尝试运行。</p>
+          {item.observed ? <ul className="grid gap-1">{Object.entries(item.observed).map(([key, observation]) => <li key={key}>{providerObservationLabels[key]} · {providerObservationStates[observation.status]}</li>)}</ul> : <p>验证记录未提供。</p>}
+        </Details>
         {manager ? <BotDetails key={`${manager.provider}:${manager.model}`} fields={["model"]} manager={manager} models={models} display={display} working={working}
           busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
         {keys.length ? <ul className="grid gap-1" aria-label={terms.secret.label}>{keys.map((row) => envRow(row, true))}</ul> : null}

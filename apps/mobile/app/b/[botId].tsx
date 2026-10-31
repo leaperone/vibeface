@@ -208,7 +208,7 @@ export default function ChatScreen() {
             <Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /><Text className="text-meta text-muted-foreground">主 Bot</Text>
           </View> : null}
         </View>
-        {reach === 'ready' ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
+        {reach === 'ready' || reach === 'unverified' ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
           {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="outline" className="rounded-full" style={{ borderColor: tint.edge }} onPress={() => setDraft({ text: example })}><Text className="text-muted-foreground">{example}</Text></Button>)}
         </View> : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted-foreground" /><Text className="text-muted-foreground">Bot 正在启动</Text></View> : <>
           <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="text-muted-foreground" /><Text className="text-muted-foreground">Bot 还不能回复</Text></View>

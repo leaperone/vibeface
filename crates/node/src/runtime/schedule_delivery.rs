@@ -1,8 +1,8 @@
-//! Local scheduling: the owner Node drains its durable admissions one conversation at a time.
 //! A message for another owner waits in the outbox until `peers` delivers it.
 use super::*;
 use crate::scheduling::{
-    JobOutcome, JobState, PendingCheck, SchedulerJob, SteerOutcome, SteerTarget, TriggerKind,
+    JobOutcome, JobState, PendingCheck, SchedulerJob, SessionKey, SteerOutcome, SteerTarget,
+    TriggerKind,
 };
 use executor::{SteerAck, SteerTrace};
 use futures_util::FutureExt;
@@ -18,9 +18,15 @@ fn chat_jobs(jobs: Vec<SchedulerJob>) -> Vec<SchedulerJob> {
 
 fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
     let mut value = serde_json::to_value(job)?;
+    value["lane"] = json!(job.kind.lane());
     value["reply_message_id"] = json!(job.message_id);
     value["message_id"] = json!(job.trigger.strip_prefix("message:"));
-    value["pending_check"] = json!(checks.iter().any(|check| check.trigger == job.trigger));
+    value["pending_check"] = json!(
+        checks
+            .iter()
+            .any(|check| check.conversation_id == job.conversation_id
+                && check.trigger == job.trigger)
+    );
     if let JobState::Failed { failure, .. } | JobState::Interrupted { failure, .. } = &job.state {
         value["failure"]["detail"] = json!(crate::logging::scrub(&failure.detail));
     }
@@ -28,6 +34,66 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
 }
 
 impl Runtime {
+    pub(super) async fn scheduler_context_observation(
+        &self,
+        network: &str,
+        key: &SessionKey,
+    ) -> Result<Option<crate::scheduling::ContextProjection>> {
+        let desired = crate::scheduler::session_configuration(self, network, key)
+            .await
+            .ok();
+        let store = self.store.lock().await;
+        let mut context = store.scheduler_scoped_context_projection(key)?;
+        if let Some(context) = &mut context {
+            context.session_status = desired
+                .as_ref()
+                .map(|config| store.scheduler_session_status(key, Some(config)))
+                .transpose()?;
+        }
+        Ok(context)
+    }
+
+    pub(super) fn scheduler_job_projection(
+        &self,
+        store: &Store,
+        network: &str,
+        job: &SchedulerJob,
+        checks: &[PendingCheck],
+    ) -> Result<Value> {
+        let mut value = job_value(job, checks)?;
+        let local = self.identity.device_id()?;
+        value["source_node"] = json!(local);
+        value["owner_epoch"] = json!(
+            store
+                .conversation(network, &job.conversation_id)?
+                .map_or(0, |conversation| conversation.owner_epoch)
+        );
+        let hold = self
+            .manager()
+            .map(|manager| -> Result<_> {
+                let hold = store.scheduler_job_hold(
+                    network,
+                    &local,
+                    job,
+                    manager.provider,
+                    &self.config.scheduling,
+                )?;
+                Ok(hold.or_else(|| {
+                    (matches!(job.state, JobState::Queued)
+                        && self.provider_configuration_pending(manager.provider, &self.providers()))
+                    .then_some(crate::scheduling::QueueHoldReason::BackendConfigPending)
+                }))
+            })
+            .transpose()?
+            .flatten();
+        value["hold_reason"] = json!(hold);
+        value["context"] = json!(store.scheduler_job_context_projection(job)?);
+        if let Some(fields) = value.as_object_mut() {
+            fields.remove("basis");
+        }
+        Ok(value)
+    }
+
     pub(super) fn scheduler_manager_metadata(&self) -> Value {
         let Some(manager) = &self.manager() else {
             return Value::Null;
@@ -117,16 +183,23 @@ impl Runtime {
             let mut store = self.store.lock().await;
             store.recover_scheduler_jobs(&self.identity, &network, crate::scheduler::boot_id())?;
             let mut abandoned = Vec::new();
-            for scope in store.pending_scheduler_conversations()? {
-                if workers.contains(&(network.clone(), scope.clone())) {
+            for key in store.pending_scheduler_sessions()? {
+                if workers.contains(&(network.clone(), key.clone())) {
                     continue;
                 }
-                for job in store.scheduler_jobs(&scope)? {
+                for job in store.scheduler_jobs(&key.conversation_id)? {
+                    if job.session_key() != key {
+                        continue;
+                    }
                     if let JobState::Claimed { attempt }
                     | JobState::Running { attempt }
                     | JobState::Cancelling { attempt } = &job.state
                     {
-                        abandoned.push((scope.clone(), job.trigger.clone(), attempt.id.clone()));
+                        abandoned.push((
+                            key.conversation_id.clone(),
+                            job.trigger.clone(),
+                            attempt.id.clone(),
+                        ));
                     }
                 }
             }
@@ -156,22 +229,22 @@ impl Runtime {
         // After recovery, so a reply left running by an earlier process is never a target.
         self.steer_messages(&network).await?;
         if self.manager().is_some() {
-            let scopes = self.store.lock().await.pending_scheduler_conversations()?;
-            for scope in scopes {
-                self.start_schedule_consumer(network.clone(), scope).await;
+            let sessions = self.store.lock().await.pending_scheduler_sessions()?;
+            for key in sessions {
+                self.start_schedule_consumer(network.clone(), key).await;
             }
         }
         Ok(())
     }
 
-    async fn start_schedule_consumer(self: &Arc<Self>, network: String, scope: String) {
-        let key = (network.clone(), scope.clone());
+    async fn start_schedule_consumer(self: &Arc<Self>, network: String, session: SessionKey) {
+        let key = (network.clone(), session.clone());
         if !self.schedule_workers.lock().await.insert(key.clone()) {
             return;
         }
         let node = self.clone();
         tokio::spawn(async move {
-            let result = std::panic::AssertUnwindSafe(node.drain_schedule(&network, &scope))
+            let result = std::panic::AssertUnwindSafe(node.drain_schedule(&network, &session))
                 .catch_unwind()
                 .await;
             match result {
@@ -184,6 +257,7 @@ impl Runtime {
                         "conversation scheduler panicked; durable state retained"
                     )
                 }
+                Ok(Ok(true)) => node.schedule_wakeup.notify_one(),
                 _ => {}
             }
             node.schedule_workers.lock().await.remove(&key);
@@ -191,7 +265,9 @@ impl Runtime {
         });
     }
 
-    async fn drain_schedule(self: &Arc<Self>, network: &str, scope: &str) -> Result<()> {
+    async fn drain_schedule(self: &Arc<Self>, network: &str, key: &SessionKey) -> Result<bool> {
+        let scope = key.conversation_id.as_str();
+        let mut ran = false;
         loop {
             let access = Access {
                 network_id: network.into(),
@@ -199,10 +275,13 @@ impl Runtime {
                 conversation_id: Some(scope.into()),
                 manager: None,
             };
-            let Some(result) = crate::scheduler::run(self.clone(), access, scope.into()).await?
+            let Some(result) =
+                crate::scheduler::run(self.clone(), access, scope.into(), key.scope.clone())
+                    .await?
             else {
-                return Ok(());
+                return Ok(ran);
             };
+            ran = true;
             if let Some(trigger) = result["trigger"].as_str() {
                 self.publish_changed(network, scope, Changed::Job(trigger));
             }
@@ -228,6 +307,7 @@ impl Runtime {
         else {
             return Ok(());
         };
+        provider.descriptor().check_steer()?;
         let executor = self.executor(provider)?;
         let candidates = self
             .store
@@ -252,7 +332,7 @@ impl Runtime {
                 continue;
             }
             self.publish_changed(network, scope, Changed::Job(trigger));
-            let steer = executor.steer(&candidate.into, &candidate.message_id, &candidate.text);
+            let steer = executor.send_turn(&candidate.into, &candidate.message_id, &candidate.text);
             match tokio::time::timeout(STEER_WAIT, steer)
                 .await
                 .unwrap_or(SteerAck::Unknown)
@@ -419,19 +499,30 @@ impl Runtime {
             manager: None,
         };
         self.require_scope(&access, scope).await?;
+        let context = self
+            .scheduler_context_observation(
+                network,
+                &SessionKey {
+                    conversation_id: scope.into(),
+                    scope: crate::scheduling::SessionScope::Main,
+                },
+            )
+            .await?;
         let store = self.store.lock().await;
         let checks = store.pending_checks()?;
         let all = chat_jobs(store.scheduler_jobs(scope)?);
         let mut jobs = Vec::new();
         for job in &all[all.len().saturating_sub(MAX_OWNER_JOBS)..] {
-            let mut value = job_value(job, &checks)?;
-            if let Some(fields) = value.as_object_mut() {
-                fields.remove("basis");
-            }
+            let mut value = self.scheduler_job_projection(&store, network, job, &checks)?;
             value["replied"] = json!(store.message(network, scope, &job.message_id)?.is_some());
             jobs.push(value);
         }
-        Ok(json!({"jobs":jobs,"manager":self.scheduler_manager_metadata()}))
+        Ok(
+            json!({"jobs":jobs,"manager":self.scheduler_manager_metadata(),
+            "context":context,
+            "memory_staged_count":store.scheduler_memory_staged_count(scope)?,
+            "memory_conflicts":store.scheduler_memory_conflicts(scope)?}),
+        )
     }
 
     /// When another device schedules the conversation, its jobs join `jobs` for display only,
@@ -492,7 +583,8 @@ impl Runtime {
             jobs.push(job);
         }
         Ok(Some((
-            json!({"owner":owner,"reachable":true}),
+            json!({"owner":owner,"reachable":true,"context":reply["context"],
+                "memory_staged_count":reply["memory_staged_count"],"memory_conflicts":reply["memory_conflicts"]}),
             reply["manager"].clone(),
         )))
     }
@@ -515,7 +607,7 @@ impl Runtime {
             .and_then(|conversation| conversation.owner);
         let mut jobs = Vec::new();
         for job in chat_jobs(store.scheduler_jobs(scope)?) {
-            let mut value = job_value(&job, &checks)?;
+            let mut value = self.scheduler_job_projection(&store, network, &job, &checks)?;
             value["manager"] = manager.clone();
             jobs.push(value);
         }

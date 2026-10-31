@@ -217,9 +217,9 @@ export const deviceCopy = {
   /** 可用文件夹: what it is, and during setup that it can wait. */
   folders: (later: boolean) => later ? 'Bot 能读写的项目文件夹，可稍后添加' : 'Bot 能读写的项目文件夹',
   /** A computer's bot as `botReadiness` reports it; `null`: it has none set up. */
-  botStatus: { ready: '能运行 Bot', starting: 'Bot 启动中', needs_setup: 'Bot 需设置', none: '还没配置 Bot', unknown: '离线，状态未知' },
+  botStatus: { ready: '能运行 Bot', unverified: 'Bot 未验证，可尝试', starting: 'Bot 启动中', needs_setup: 'Bot 需设置', none: '还没配置 Bot', unknown: '离线，状态未知' },
   /** An offline computer reports nothing, so no bot there is unknown rather than none. */
-  botState: (bot: 'ready' | 'starting' | 'needs_setup' | null | undefined, online: boolean | undefined) => bot ?? (online === false ? 'unknown' as const : 'none' as const),
+  botState: (bot: 'ready' | 'unverified' | 'starting' | 'needs_setup' | null | undefined, online: boolean | undefined) => bot ?? (online === false ? 'unknown' as const : 'none' as const),
   /** This computer has a provider installed but no use of any turned on, as a computer that just joined starts. */
   aiOff: '这台电脑的 AI 还没开',
   /** Ends on what removal cannot do: whatever already reached that device stays there. */

@@ -8,7 +8,12 @@ use crate::{
     providers::Provider,
     scheduling::TriggerKind,
 };
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+/// Version of the Effect/offered rules, independent of per-attempt token fences.
+pub const PERMISSION_POLICY_VERSION: u64 = 1;
 
 /// Event types `context` filters by; see `EventBody::kind`.
 const EVENT_TYPES: [&str; 12] = [
@@ -28,6 +33,9 @@ const EVENT_TYPES: [&str; 12] = [
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
+    Search,
+    Describe,
+    Call,
     Nodes,
     Context,
     DispatchWork,
@@ -60,7 +68,8 @@ pub enum Tool {
     WaitWork,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Effect {
     Read,
     /// Starts or stops work, or hands a session on; needs a live agent invocation.
@@ -83,8 +92,41 @@ impl Effect {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolSearch {
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "search_limit")]
+    limit: usize,
+}
+
+fn search_limit() -> usize {
+    20
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolDescribe {
+    tool: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolCall {
+    tool: String,
+    arguments: serde_json::Map<String, Value>,
+    #[serde(default)]
+    call_ref: Option<String>,
+}
+
 impl Tool {
-    pub const ALL: [Tool; 30] = [
+    pub const ALL: [Tool; 33] = [
+        Tool::Search,
+        Tool::Describe,
+        Tool::Call,
         Tool::Nodes,
         Tool::Context,
         Tool::DispatchWork,
@@ -123,6 +165,9 @@ impl Tool {
 
     pub fn name(self) -> &'static str {
         match self {
+            Tool::Search => "tool_search",
+            Tool::Describe => "tool_describe",
+            Tool::Call => "tool_call",
             Tool::Nodes => "nodes",
             Tool::Context => "context",
             Tool::DispatchWork => "dispatch_work",
@@ -158,7 +203,10 @@ impl Tool {
 
     pub fn effect(self) -> Effect {
         match self {
-            Tool::Nodes
+            Tool::Search
+            | Tool::Describe
+            | Tool::Call
+            | Tool::Nodes
             | Tool::Context
             | Tool::WorkStatus
             | Tool::CallLookup
@@ -190,6 +238,100 @@ impl Tool {
         }
     }
 
+    pub fn initially_exposed(self) -> bool {
+        self.discovery() || matches!(self, Tool::Context | Tool::ReadSkill | Tool::CallLookup)
+    }
+
+    fn discovery(self) -> bool {
+        matches!(self, Tool::Search | Tool::Describe | Tool::Call)
+    }
+
+    fn catalog_visible(self, kind: Option<TriggerKind>) -> bool {
+        !self.discovery()
+            && self.schema().is_some()
+            && kind.map_or(self.effect() == Effect::Read, |kind| {
+                self.effect().offered(kind)
+            })
+    }
+
+    /// Resolve the target before the router checks its effect, invocation and lease.
+    pub fn resolve_call(name: &str, args: Value) -> Result<(Self, Value)> {
+        let tool = Self::parse(name).context("unknown or unavailable coordination tool")?;
+        ensure!(args.is_object(), "tool arguments must be an object");
+        if tool != Self::Call {
+            return Ok((tool, args));
+        }
+        let mut call: ToolCall =
+            serde_json::from_value(args).context("invalid tool_call arguments")?;
+        let target = Self::parse(&call.tool).context("unknown or unavailable coordination tool")?;
+        ensure!(
+            !target.discovery() && target.schema().is_some(),
+            "tool_call requires a public tool; discovery and internal tools cannot be nested"
+        );
+        if let Some(call_ref) = call.call_ref {
+            ensure!(
+                call.arguments
+                    .get("call_ref")
+                    .is_none_or(|argument| argument.as_str() == Some(call_ref.as_str())),
+                "tool_call call_ref must match arguments.call_ref"
+            );
+            call.arguments.insert("call_ref".into(), json!(call_ref));
+        }
+        ensure!(
+            !target.needs_call_ref()
+                || call.arguments.get("call_ref").is_some_and(Value::is_string),
+            "{} requires call_ref; preserve it and query call_lookup after any uncertain result",
+            target.name()
+        );
+        Ok((target, Value::Object(call.arguments)))
+    }
+
+    pub fn search(args: Value, kind: Option<TriggerKind>) -> Result<Value> {
+        let search: ToolSearch =
+            serde_json::from_value(args).context("invalid tool_search arguments")?;
+        ensure!(search.query.len() <= 256, "query exceeds 256 bytes");
+        ensure!((1..=30).contains(&search.limit), "limit must be 1-30");
+        let query = search.query.to_lowercase();
+        let catalog: Vec<Value> = Self::ALL
+            .into_iter()
+            .filter(|tool| tool.catalog_visible(kind))
+            .filter_map(|tool| {
+                let (description, _, _) = tool.schema()?;
+                let text = format!("{} {description}", tool.name()).to_lowercase();
+                query
+                    .split_whitespace()
+                    .all(|word| text.contains(word))
+                    .then(|| {
+                        json!({"name":tool.name(),"description":description,
+                        "effect":tool.effect(),"requires_call_ref":tool.needs_call_ref()})
+                    })
+            })
+            .collect();
+        let tools: Vec<_> = catalog
+            .iter()
+            .skip(search.offset)
+            .take(search.limit)
+            .collect();
+        let end = search.offset.saturating_add(tools.len());
+        let more = end < catalog.len();
+        Ok(json!({"tools":tools,"more":more,"next":more.then_some(end)}))
+    }
+
+    pub fn describe(args: Value, kind: Option<TriggerKind>) -> Result<Value> {
+        let describe: ToolDescribe =
+            serde_json::from_value(args).context("invalid tool_describe arguments")?;
+        let tool = Self::parse(&describe.tool)
+            .filter(|tool| tool.catalog_visible(kind))
+            .context("unknown or unavailable coordination tool")?;
+        let (description, properties, required) =
+            tool.schema().context("tool has no public schema")?;
+        Ok(
+            json!({"name":tool.name(),"description":description,"effect":tool.effect(),
+            "requires_call_ref":tool.needs_call_ref(),
+            "input_schema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}}),
+        )
+    }
+
     /// Description, properties and required fields the agent sees. `track_work`, `bind_work` and
     /// `wait_work` are the steps `vibeface tool dispatch_work` takes and are not offered on their own.
     pub fn schema(self) -> Option<(&'static str, Value, &'static [&'static str])> {
@@ -207,15 +349,33 @@ impl Tool {
         };
         let executors = || json!(Provider::executing(|_| true));
         Some(match self {
+            Tool::Search => (
+                "Search the tools this turn may use by name or description. An empty query lists them; next is the offset for another page. Describe a result before calling it.",
+                json!({"query":{"type":"string","maxLength":256},
+                    "offset":{"type":"integer","minimum":0},
+                    "limit":{"type":"integer","minimum":1,"maximum":30}}),
+                &[],
+            ),
+            Tool::Describe => (
+                "Read one available tool's full input schema, effect and call_ref requirement.",
+                json!({"tool":string()}),
+                &["tool"],
+            ),
+            Tool::Call => (
+                "Call a tool from tool_describe through the Node's normal permission and retry checks. arguments must match its input schema. call_ref can be supplied here or in arguments; both must agree. Discovery and internal tools cannot be nested.",
+                json!({"tool":string(),"arguments":{"type":"object"},"call_ref":string()}),
+                &["tool", "arguments"],
+            ),
             Tool::Nodes => (
                 "List personal Nodes, device names and allowed roots.",
                 json!({}),
                 &[],
             ),
             Tool::Context => (
-                "Read this conversation's events as of this turn, in shared order: the newest, or those before or after the event an author and seq name (a message in your prompt gives both). types keeps only those event types. more says further events lie that way. A long event is cut short; at with its author and seq reads that event alone, its body as body_json text from byte offset up to next_offset, the pages joined giving the whole body. With blob_hash, read an attachment instead: offset counts bytes, limit KiB; text comes back as text, other files as data_base64, and one not on this device yet as pending_download.",
+                "Read this conversation's events as of this turn, in shared order: the newest, or those before or after the event an author and seq name (a message in your prompt gives both). types filters event kinds, author filters the signing device, and keyword finds a literal substring in visible body text (ASCII case insensitive). more says further matching events lie that way; next is their before or after cursor. A long event is cut short; at with its author and seq reads that event alone, its body as body_json text from byte offset up to next_offset, the pages joined giving the whole body. With blob_hash, read an attachment instead: offset counts bytes, limit KiB; text comes back as text, other files as data_base64, and one not on this device yet as pending_download.",
                 json!({"at":position(),"before":position(),"after":position(),
                 "types":{"type":"array","items":{"type":"string","enum":EVENT_TYPES},"uniqueItems":true},
+                "author":string(),"keyword":{"type":"string","minLength":1,"maxLength":256},
                 "limit":{"type":"integer","minimum":1,"maximum":100},
                 "blob_hash":string(),"offset":{"type":"integer","minimum":0}}),
                 &[],
@@ -296,7 +456,7 @@ impl Tool {
                 &["call_ref", "memory_id"],
             ),
             Tool::Recall => (
-                "List this bot's notes, or those containing query. bot.memory already holds them unless some were omitted.",
+                "Read this bot's committed notes and the current turn's staged changes, optionally filtered by query. memory_context carries a bounded snapshot or delta; omitted notes remain available here.",
                 json!({"query":string()}),
                 &[],
             ),

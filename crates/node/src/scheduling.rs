@@ -26,6 +26,111 @@ pub enum TriggerKind {
     BotMessage,
 }
 
+/// The source of a trigger, independent of the local session that owns its writer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLane {
+    Main,
+    Task,
+    ScheduleRoutine,
+    BotMessage,
+}
+
+impl TriggerKind {
+    pub const fn lane(self) -> AgentLane {
+        match self {
+            Self::Human | Self::Answer | Self::WorkResult => AgentLane::Main,
+            Self::AgentTask => AgentLane::Task,
+            Self::Schedule => AgentLane::ScheduleRoutine,
+            Self::BotMessage => AgentLane::BotMessage,
+        }
+    }
+}
+
+/// Why a queued job is waiting. This is projection metadata only. The durable job state and
+/// existing `Unverified` handling remain the source of truth for execution.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueHoldReason {
+    ActiveTurn,
+    SteeringSettlement,
+    ProviderSerial,
+    TaskLimit,
+    MachineSlot,
+    PendingCheck,
+    BackendConfigPending,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionScope {
+    Main,
+    Task { work_id: String },
+    Routine { trigger: String },
+}
+
+impl SessionScope {
+    pub fn storage_key(&self) -> String {
+        match self {
+            Self::Main => "main".into(),
+            Self::Task { work_id } => format!("task:{work_id}"),
+            Self::Routine { trigger } => format!("routine:{trigger}"),
+        }
+    }
+
+    pub fn from_storage_key(key: &str) -> anyhow::Result<Self> {
+        if key == "main" {
+            return Ok(Self::Main);
+        }
+        if let Some(work_id) = key.strip_prefix("task:") {
+            vibeface_protocol::validate_id(work_id).map_err(anyhow::Error::msg)?;
+            return Ok(Self::Task {
+                work_id: work_id.into(),
+            });
+        }
+        if let Some(trigger) = key.strip_prefix("routine:")
+            && parse_schedule_trigger(trigger).is_some()
+        {
+            return Ok(Self::Routine {
+                trigger: trigger.into(),
+            });
+        }
+        anyhow::bail!("invalid scheduler session scope")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct SessionKey {
+    pub conversation_id: String,
+    pub scope: SessionScope,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    pub stable_fingerprint: String,
+    pub runtime_fingerprint: String,
+    pub provider: Provider,
+}
+
+#[cfg(test)]
+pub fn queue_hold_reason(
+    state: &JobState,
+    active: bool,
+    steering_unsettled: bool,
+) -> Option<QueueHoldReason> {
+    if !matches!(state, JobState::Queued) {
+        return None;
+    }
+    if active {
+        return Some(QueueHoldReason::ActiveTurn);
+    }
+    if steering_unsettled {
+        return Some(QueueHoldReason::SteeringSettlement);
+    }
+    None
+}
+
 pub fn message_trigger(message_id: &str) -> String {
     format!("message:{message_id}")
 }
@@ -292,6 +397,34 @@ pub struct SchedulerJob {
 }
 
 impl SchedulerJob {
+    pub fn session_scope(&self) -> SessionScope {
+        match self.kind {
+            TriggerKind::AgentTask => SessionScope::Task {
+                work_id: self.reply_to.clone(),
+            },
+            TriggerKind::Schedule => SessionScope::Routine {
+                trigger: self.trigger.clone(),
+            },
+            _ => SessionScope::Main,
+        }
+    }
+
+    pub fn session_key(&self) -> SessionKey {
+        SessionKey {
+            conversation_id: self.conversation_id.clone(),
+            scope: self.session_scope(),
+        }
+    }
+
+    pub fn priority(&self) -> (bool, u64, &str, &str) {
+        (
+            !matches!(self.kind, TriggerKind::Human | TriggerKind::Answer),
+            self.sequence,
+            &self.conversation_id,
+            &self.trigger,
+        )
+    }
+
     pub fn receipt(&self, network: &str) -> AdmissionReceipt {
         AdmissionReceipt {
             network_id: network.into(),
@@ -350,6 +483,35 @@ pub struct ClaimedJob {
     pub covers: Option<VersionVector>,
     /// The bot and works the resumed native session was last shown; empty with no `covers`.
     pub shown: Shown,
+    /// Why a previously cached native session could not be reused for this claim.
+    pub invalidation: Option<SessionInvalidation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionInvalidation {
+    pub source_basis: VersionVector,
+    pub old_stable_fingerprint: Option<String>,
+    pub new_stable_fingerprint: String,
+    pub old_runtime_fingerprint: Option<String>,
+    pub new_runtime_fingerprint: String,
+    pub source_provider: Option<Provider>,
+    pub target_provider: Provider,
+    pub reason: String,
+    pub generation: u64,
+    pub handoff_revision: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionLineage {
+    pub source_basis: VersionVector,
+    pub generation: u64,
+    pub stable_fingerprint: String,
+    pub runtime_fingerprint: String,
+    pub provider: Provider,
+    pub reason: String,
+    pub handoff_revision: String,
 }
 
 /// Digests of the bot and of each work a Codex thread was last shown, kept on this Node with
@@ -358,6 +520,85 @@ pub struct ClaimedJob {
 pub struct Shown {
     pub bot: Option<String>,
     pub works: BTreeMap<String, String>,
+    /// Digests of the bounded memory rows actually delivered to this native session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<BTreeMap<String, String>>,
+    /// The last dynamic Context digest sent on this local native session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic: Option<String>,
+    /// Memory changes waiting for this attempt to complete.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub staged_memories: BTreeMap<String, StagedMemory>,
+    #[serde(default)]
+    pub session_generation: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_lineage: Vec<SessionLineage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextProjection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_conflicts: Vec<MemoryConflict>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextStage {
+    Compiled,
+    Started,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+    Unknown,
+}
+
+/// Only digests, counts and lifecycle facts leave the local session. The prompt, native
+/// session identifiers and credentials remain private.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContextProjection {
+    pub attempt_id: String,
+    pub provider: Provider,
+    pub stable_fingerprint: String,
+    pub dynamic_fingerprint: String,
+    pub session_generation: u64,
+    pub coverage: crate::agent_context::ContextCoverage,
+    pub stable_bytes: usize,
+    pub dynamic_bytes: usize,
+    pub invalidation_reason: Option<String>,
+    pub stage: ContextStage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_status: Option<SessionStatusProjection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionStatusProjection {
+    pub resumable: bool,
+    pub pending_generation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConflict {
+    pub call_ref: String,
+    pub memory_id: String,
+    pub expected_epoch: u32,
+    pub actual_epoch: u32,
+    pub expected_revision: String,
+    pub actual_revision: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagedMemory {
+    pub call_ref: String,
+    pub memory_id: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub base: crate::model::MemoryBase,
+    pub origin: crate::model::AutomaticMemoryOrigin,
+    pub essential: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -376,6 +617,7 @@ pub enum JobOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct SchedulerSession {
     pub conversation_id: String,
+    pub scope: SessionScope,
     pub next_sequence: u64,
     pub active: Option<String>,
     /// The SDK's own session, cached for this conversation on this Node only. `covers` is the
@@ -388,14 +630,17 @@ pub(crate) struct SchedulerSession {
     /// Moves with `covers`: what the native session's turns were shown of the bot and works.
     pub shown: Shown,
     pub owner_epoch: u64,
-    pub sdk_config: Option<String>,
+    pub stable_fingerprint: Option<String>,
+    pub runtime_fingerprint: Option<String>,
+    pub provider: Option<Provider>,
     pub permission_version: u64,
 }
 
 impl SchedulerSession {
-    pub fn new(conversation: &str) -> Self {
+    pub fn in_scope(conversation: &str, scope: SessionScope) -> Self {
         Self {
             conversation_id: conversation.into(),
+            scope,
             next_sequence: 1,
             active: None,
             native_id: None,
@@ -403,7 +648,9 @@ impl SchedulerSession {
             covers: VersionVector::new(),
             shown: Shown::default(),
             owner_epoch: 0,
-            sdk_config: None,
+            stable_fingerprint: None,
+            runtime_fingerprint: None,
+            provider: None,
             permission_version: 1,
         }
     }
@@ -436,5 +683,43 @@ pub struct ReplyTurn {
 impl PendingCheck {
     pub fn id(attempt_id: &str) -> String {
         format!("manager:{attempt_id}")
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+
+    #[test]
+    fn trigger_kinds_have_stable_lanes() {
+        assert_eq!(TriggerKind::Human.lane(), AgentLane::Main);
+        assert_eq!(TriggerKind::Answer.lane(), AgentLane::Main);
+        assert_eq!(TriggerKind::WorkResult.lane(), AgentLane::Main);
+        assert_eq!(TriggerKind::AgentTask.lane(), AgentLane::Task);
+        assert_eq!(TriggerKind::Schedule.lane(), AgentLane::ScheduleRoutine);
+        assert_eq!(TriggerKind::BotMessage.lane(), AgentLane::BotMessage);
+    }
+
+    #[test]
+    fn queued_jobs_explain_their_wait_boundary() {
+        assert_eq!(
+            queue_hold_reason(&JobState::Queued, true, false),
+            Some(QueueHoldReason::ActiveTurn)
+        );
+        assert_eq!(
+            queue_hold_reason(&JobState::Queued, false, true),
+            Some(QueueHoldReason::SteeringSettlement)
+        );
+        assert_eq!(
+            queue_hold_reason(
+                &JobState::Cancelled {
+                    attempt: None,
+                    evidence: "stopped".into()
+                },
+                true,
+                false
+            ),
+            None
+        );
     }
 }

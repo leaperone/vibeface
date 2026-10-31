@@ -11,8 +11,8 @@ export type NodeInfo = {
   revoked: boolean
   capabilities?: { manager: string | null; manager_state: BotReadiness | null; relay: boolean; roots: string[]; codex_connected?: boolean }
 }
-/** `ready` only when the bot's switch is on and its provider works; `starting` while it comes up; anything else needs the user. */
-export type BotReadiness = "ready" | "starting" | "needs_setup"
+/** `unverified` remains runnable while authentication or model availability has no evidence. */
+export type BotReadiness = "ready" | "starting" | "needs_setup" | "unverified"
 export type ConversationSummary = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }
 /** Where a work stands in the signed DAG. */
 export type WorkState = "accepted" | "running" | "interrupting" | "finished" | "unverified"
@@ -58,10 +58,14 @@ export type WorkRecord = {
   turn_id?: string
   /** A stop sent while the device was unreachable: still retrying, or past its deadline. */
   stop?: StopState
+  coordination_job?: ManagerJob | null
 }
 export type ManagerJob = {
   trigger: string
   state: string
+  context?: ContextProjection | null
+  lane?: AgentLane
+  hold_reason?: QueueHoldReason
   message_id?: string
   reply_message_id?: string
   /** A failed or interrupted reply's cause; `detail` is the original text, for 技术详情. */
@@ -69,12 +73,38 @@ export type ManagerJob = {
   pending_check?: boolean
   /** How the reply a steered message joined ended. */
   outcome?: SteerOutcome
-  /** The owner device that reported it; absent for this device's own jobs. */
+  /** The device that reported this observation. */
   source_node?: string
+}
+export type AgentLane = 'main' | 'task' | 'schedule_routine' | 'bot_message'
+export type QueueHoldReason = 'active_turn' | 'steering_settlement' | 'provider_serial' | 'task_limit' | 'machine_slot' | 'pending_check' | 'backend_config_pending'
+export type ContextProjection = {
+  attempt_id: string
+  provider: ProviderId
+  stable_fingerprint: string
+  dynamic_fingerprint: string
+  session_generation: number
+  coverage: {
+    messages_omitted: number; works_omitted: number; dispatches_omitted: number
+    questions_omitted: number; attachments_omitted: number; memory_omitted: number
+    checkpoint_omitted: number; handoff_omitted: number; pending_checks_omitted: number
+    bot_indexes_omitted: Record<string, number>
+    history_retrieval: string
+  }
+  stable_bytes: number
+  dynamic_bytes: number
+  invalidation_reason: string | null
+  stage: 'compiled' | 'started' | 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'unknown'
+  session_status?: { resumable: boolean; pending_generation: boolean } | null
+}
+export type MemoryConflict = {
+  call_ref: string; memory_id: string; expected_epoch: number; actual_epoch: number
+  expected_revision: string; actual_revision: string; reason: string
 }
 export type SteerOutcome = 'answered' | 'unfinished' | 'unknown'
 export type SchedulerSnapshot = {
   jobs: ManagerJob[]
+  context?: ContextProjection | null
   /** Messages a former scheduling device left unanswered; only listed on the device that schedules now. */
   unanswered: string[]
   provider?: string
@@ -100,6 +130,11 @@ export type OpenWork = WorkRecord & { conversation_id: string }
 /** What one change touched, pushed by the Node so the page merges it without a reload. */
 export type ConversationRecords = {
   conversation_id: string
+  context?: ContextProjection | null
+  memory?: MemoryEntry[]
+  memory_staged_count?: number | null
+  memory_conflicts?: MemoryConflict[] | null
+  memory_sync_conflicts?: MemorySyncConflicts
   messages: TranscriptMessage[]
   works: WorkRecord[]
   last_message: LastMessage | null
@@ -135,7 +170,26 @@ export type BotModels = Partial<Record<ProviderId, string>>
 export type BotSkill = { name: string; description: string; body: string }
 /** Runs at `first_run_at_ms`, then every `every_minutes` when set; without it, once. `depth` > 0 is a reminder the bot set itself. */
 export type BotSchedule = { name: string; prompt: string; first_run_at_ms: number; every_minutes?: number; enabled: boolean; depth?: number }
-type MemoryEntry = { memory_id: string; text: string }
+export type MemoryVersion = { revision: string; control_revision: number; source_event_hash: string }
+export type MemoryBase = { epoch: number; version: MemoryVersion | null }
+export type MemoryMetadata = MemoryVersion & {
+  epoch: number; origin: 'agent' | 'user' | 'review'; user_controlled: boolean; essential: boolean
+}
+export type MemoryState = { memory_id: string; text: string | null; metadata: MemoryMetadata }
+export type MemoryEntry = MemoryState & { text: string }
+export type MemoryControlResult = {
+  state: 'applied' | 'already_recorded' | 'superseded' | 'conflict'
+  operation_id: string; current: MemoryState | null
+}
+export type MemoryStateResult = {
+  current: MemoryState | null; receipt: null | 'recorded' | 'superseded' | 'not_seen_here'
+}
+export type MemorySyncConflict = {
+  memory_id: string; losing_revision: string; winning_revision: string
+  losing_event_hash: string; winning_event_hash: string
+  reason: 'user_protected' | 'concurrent_automatic' | 'concurrent_user'
+}
+export type MemorySyncConflicts = { items: MemorySyncConflict[]; has_more: boolean }
 /** null: every shared skill, later ones included. */
 export type SkillSet = string[] | null
 type SkillsEdit = { before: SkillSet; after: SkillSet }
@@ -161,7 +215,7 @@ type SkillSummary = { skill_id: string; name: string; description: string }
 export type ScheduleView = BotSchedule & { schedule_id: string; next_run_at_ms: number | null }
 export type ScheduleAction = "pause" | "resume" | "delete"
 /** This bot's schedules still ahead, its notes, and the skill library every bot shares. */
-export type BotSettings = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[] }
+export type BotSettings = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[]; memory_sync_conflicts: MemorySyncConflicts; memory_staged_count?: number | null; memory_conflicts?: MemoryConflict[] | null }
 export type ConversationPayload = {
   conversation: ConversationSummary | null
   messages: TranscriptMessage[]
@@ -207,6 +261,7 @@ export type OverviewTaskKind = "work" | "check" | "dispatch"
 export type OverviewNavigation = { bot_id: string; conversation_id: string; work_id?: string }
 
 type OverviewTaskCommon = {
+  coordination_job?: ManagerJob | null
   item_id: string
   work_id: string | null
   conversation_id: string
@@ -256,6 +311,9 @@ export type OverviewQuestion = {
 }
 
 export type OverviewJob = {
+  lane?: AgentLane
+  hold_reason?: QueueHoldReason
+  context?: ContextProjection | null
   job_id: string
   conversation_id: string | null
   trigger: string

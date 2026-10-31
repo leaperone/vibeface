@@ -318,11 +318,51 @@ impl Runtime {
     }
 
     async fn close_check(&self, network: &str, check: &PendingCheck) -> Result<()> {
+        if check
+            .codex_turn
+            .as_ref()
+            .is_some_and(|turn| !turn.server.is_empty())
+        {
+            ensure!(
+                !check.process_groups.iter().any(|group| group_alive(*group)),
+                "仍有协调进程在运行，请先停止它再确认。"
+            );
+        }
+        // The owner's stopped confirmation remains authoritative when the provider is unreachable.
+        let observed_running = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let Some(turn) = &check.codex_turn else {
+                return false;
+            };
+            if turn.server == super::opencode::SERVER {
+                return self.opencode.manager_running(&turn.thread).await == Some(true);
+            }
+            !turn.server.is_empty()
+                && turn.server == self.codex.server()
+                && matches!(
+                    self.codex
+                        .probe(&turn.thread, turn.turn.as_deref(), &check.attempt_id)
+                        .await,
+                    Ok(Probe::Running { .. })
+                )
+        })
+        .await
+        .unwrap_or(false);
+        ensure!(
+            !observed_running,
+            "Provider 仍在运行或有排队输入，请先停止后再确认。"
+        );
         self.fence_manager_attempt(&check.attempt_id).await?;
         self.store
             .lock()
             .await
             .resolve_pending_check(&check.attempt_id)?;
+        self.codex.release_manager(&check.attempt_id);
+        if let Some(turn) = &check.codex_turn
+            && turn.server == super::opencode::SERVER
+        {
+            self.opencode.release_manager(&turn.thread);
+        }
+        self.schedule_wakeup.notify_one();
         self.publish_changed(
             network,
             &check.conversation_id,
@@ -454,4 +494,53 @@ pub(super) fn group_alive(group: u32) -> bool {
     // SAFETY: kill with signal 0 performs only the existence and permission check.
     let result = unsafe { libc::kill(-group, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+
+    pub(in crate::runtime) async fn pending_manager(
+        node: &Runtime,
+        admin: &crate::crypto::LocalIdentity,
+        server: &str,
+        thread: &str,
+    ) -> Result<(Access, PendingCheck)> {
+        super::super::triage::tests::bot(node, admin, "c", "fixture", &[]).await?;
+        let (trigger, attempt) =
+            super::super::triage::tests::start_reply(node, admin, "confirm-stop").await?;
+        let network = node.store.lock().await.network()?.context("network")?;
+        let mut store = node.store.lock().await;
+        store.record_manager_turn(&attempt, server, thread, Some("turn"), &Default::default())?;
+        store.finish_job(
+            &node.identity,
+            &network,
+            "c",
+            &trigger,
+            &attempt,
+            crate::scheduling::JobOutcome::Interrupted {
+                failure: vibeface_bridge::failure::ExecFailure::new(
+                    vibeface_bridge::failure::FailureKind::Lost,
+                    "fixture lost its turn",
+                ),
+                process_unconfirmed: true,
+            },
+            "",
+            now_ms(),
+        )?;
+        let check = store
+            .pending_checks()?
+            .into_iter()
+            .find(|check| check.attempt_id == attempt)
+            .context("fixture pending check")?;
+        Ok((
+            Access {
+                network_id: network,
+                human: true,
+                conversation_id: Some("c".into()),
+                manager: None,
+            },
+            check,
+        ))
+    }
 }

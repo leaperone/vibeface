@@ -240,6 +240,9 @@ fn place(
             return pending(connection, network, envelope, dep);
         }
     }
+    if let Err(error) = authorize_memory(connection, network, event) {
+        return Ok(IngestStatus::Rejected(error.to_string()));
+    }
     if let Err(error) = authorize_cause(connection, network, event) {
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
@@ -260,6 +263,77 @@ fn place(
         event: event.clone(),
     });
     Ok(IngestStatus::Accepted)
+}
+
+fn memory_base(body: &EventBody) -> Option<(&str, &MemoryBase, Option<&str>)> {
+    match body {
+        EventBody::MemoryControlled {
+            memory_id, base, ..
+        } => Some((memory_id, base, None)),
+        EventBody::BotChanged {
+            change:
+                BotChange::Memory {
+                    memory_id,
+                    base,
+                    before,
+                    ..
+                },
+            ..
+        } => Some((memory_id, base, before.as_deref())),
+        _ => None,
+    }
+}
+
+pub(crate) fn validate_memory_base(
+    connection: &Connection,
+    network: &str,
+    scope: &str,
+    body: &EventBody,
+) -> Result<()> {
+    let Some((memory_id, base, before)) = memory_base(body) else {
+        return Ok(());
+    };
+    let Some(version) = &base.version else {
+        return Ok(());
+    };
+    let parent = event_from(connection, network, &version.source_event_hash)?
+        .context("memory base is not stored here")?;
+    ensure!(
+        parent.network_id == network && parent.scope_id == scope,
+        "memory base belongs to another scope"
+    );
+    let operation =
+        super::bot_settings::memory_operation(network, &version.source_event_hash, &parent)?
+            .context("memory base is not a memory operation")?;
+    ensure!(
+        operation.memory_id == memory_id
+            && operation.base.epoch == base.epoch
+            && operation.version == *version,
+        "memory base does not match its source event"
+    );
+    if matches!(body, EventBody::BotChanged { .. }) {
+        ensure!(
+            operation.after.as_deref() == before,
+            "automatic memory before does not match its base"
+        );
+    }
+    Ok(())
+}
+
+fn authorize_memory(connection: &Connection, network: &str, event: &Event) -> Result<()> {
+    if let Some((_, base, _)) = memory_base(&event.body)
+        && let Some(version) = &base.version
+    {
+        ensure!(
+            event
+                .prev
+                .iter()
+                .chain(&event.deps)
+                .any(|hash| hash == &version.source_event_hash),
+            "memory base must be a direct parent"
+        );
+    }
+    validate_memory_base(connection, network, &event.scope_id, &event.body)
 }
 
 /// The user's device signature on `cause` is what authorizes a write a bot makes for the user:
@@ -682,6 +756,12 @@ pub(crate) fn append_from(
             deps.push(message.event_hash);
         }
     }
+    if let Some((_, base, _)) = memory_base(&body)
+        && let Some(version) = &base.version
+        && prev.as_ref() != Some(&version.source_event_hash)
+    {
+        deps.push(version.source_event_hash.clone());
+    }
     let envelope = identity.sign_event(Event {
         version: WIRE_VERSION,
         network_id: network.into(),
@@ -695,6 +775,7 @@ pub(crate) fn append_from(
         blobs,
     })?;
     let event = check_event(network, &envelope).context("appended event is invalid")?;
+    authorize_memory(connection, network, &event)?;
     authorize_cause(connection, network, &event)?;
     authorize_owner(connection, network, &event)?;
     ensure!(

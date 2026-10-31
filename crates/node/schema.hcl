@@ -484,8 +484,36 @@ table "memories" {
     null = false
     type = integer
   }
+  column "epoch" {
+    null = false
+    type = integer
+  }
+  column "revision" {
+    null = false
+    type = text
+  }
+  column "control_revision" {
+    null = false
+    type = integer
+  }
+  column "origin" {
+    null = false
+    type = text
+  }
+  column "user_controlled" {
+    null = false
+    type = integer
+  }
+  column "essential" {
+    null = false
+    type = integer
+  }
+  column "source_event_hash" {
+    null = false
+    type = text
+  }
   primary_key {
-    columns = [column.network_id, column.memory_id]
+    columns = [column.network_id, column.conversation_id, column.memory_id]
   }
   index "memories_conversation" {
     columns = [column.network_id, column.conversation_id]
@@ -972,6 +1000,10 @@ table "scheduler_sessions" {
     null = false
     type = text
   }
+  column "scope" {
+    null = false
+    type = text
+  }
   column "next_sequence" {
     null = false
     type = integer
@@ -996,7 +1028,15 @@ table "scheduler_sessions" {
     null = false
     type = integer
   }
-  column "sdk_config" {
+  column "stable_fingerprint" {
+    null = true
+    type = text
+  }
+  column "runtime_fingerprint" {
+    null = true
+    type = text
+  }
+  column "provider" {
     null = true
     type = text
   }
@@ -1009,7 +1049,7 @@ table "scheduler_sessions" {
     type = text
   }
   primary_key {
-    columns = [column.conversation_id]
+    columns = [column.conversation_id, column.scope]
   }
 }
 table "scheduler_jobs" {

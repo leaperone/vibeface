@@ -465,7 +465,7 @@ impl CursorExecutor {
 }
 
 impl Executor for CursorExecutor {
-    fn start<'a>(
+    fn start_or_resume<'a>(
         &'a self,
         node: &'a Arc<Runtime>,
         network: &'a str,
@@ -615,7 +615,7 @@ impl Executor for CursorExecutor {
         })
     }
 
-    fn steer<'a>(
+    fn send_turn<'a>(
         &'a self,
         _: &'a crate::scheduling::SteerTarget,
         _: &'a str,
@@ -869,6 +869,92 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_cursor_manager_reports_its_native_start_before_seen_context() -> Result<()> {
+        let (node, dir, network, workspace) = cursor_node().await?;
+        let instance = CursorInstance::Bot {
+            network,
+            conversation: "start-state".into(),
+        };
+        let mut config = node
+            .manager_config(crate::config::ManagerSettings {
+                provider: Provider::Cursor,
+                workspace,
+                model: "fixture-model".into(),
+            })?
+            .for_cursor_instance(instance.clone(), node.cursor_store_root(&instance));
+        let persisted = Arc::new(std::sync::Mutex::new(None::<String>));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        config.codex_turn = Some(crate::manager::CodexTurn {
+            client_id: "start-state".into(),
+            fresh_prompt: None,
+            started: Some({
+                let persisted = persisted.clone();
+                let started = started.clone();
+                Arc::new(move |_| {
+                    assert!(persisted.lock().unwrap().is_some());
+                    started.notify_one();
+                    Box::pin(async { Ok(()) })
+                })
+            }),
+            record: {
+                let seen = seen.clone();
+                Arc::new(move |session, turn| {
+                    seen.lock().unwrap().push((session, turn));
+                    Box::pin(async { Ok(()) })
+                })
+            },
+        });
+        let next = config.clone();
+        let saved = persisted.clone();
+        let (cancel, receiver) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            crate::manager::run_manager(
+                &config,
+                "hang",
+                None,
+                move |session| {
+                    *saved.lock().unwrap() = Some(session);
+                    async { Ok(()) }
+                },
+                receiver,
+                |_| async { Ok(()) },
+            )
+            .await
+        });
+        let observed = tokio::time::timeout(Duration::from_secs(5), started.notified()).await;
+        let pending = !task.is_finished();
+        let seen_before_completion = seen.lock().unwrap().len();
+        cancel.send(true)?;
+        let interrupted = task.await?;
+        observed.context("native Cursor start callback")?;
+        assert!(pending);
+        assert_eq!(seen_before_completion, 0);
+        assert!(
+            interrupted
+                .err()
+                .context("expected interrupted Cursor turn")?
+                .downcast_ref::<crate::manager::ManagerError>()
+                .unwrap()
+                .cancelled()
+        );
+        let result = crate::manager::run_manager(
+            &next,
+            "finish",
+            None,
+            |_| async { Ok(()) },
+            tokio::sync::watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await?;
+        assert_eq!(result.output, "done: finish");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        node.shutdown().await;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[tokio::test]

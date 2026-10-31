@@ -732,11 +732,10 @@ async fn dispatch(
         }
         "provider_models" => {
             node_operator(node, session).await?;
-            let models = match params["provider"].as_str() {
-                Some("codex") => node.codex.models().await,
-                Some(_) => None,
-                None => bail!("provider is required"),
-            };
+            let provider =
+                serde_json::from_value::<crate::providers::Provider>(params["provider"].clone())
+                    .context("provider is required")?;
+            let models = node.provider_models(provider).await;
             Ok(json!({"models":models}))
         }
         "triage_settings" => {

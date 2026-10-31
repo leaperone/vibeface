@@ -167,11 +167,14 @@ python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --ar
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-auto-route --auto-route
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-queue --phase1
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-agent --chat-agent
+python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-memory --memory-sync
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-phase4 --phase4
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-public-entry --public-entry
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-discovery --discovery
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-phase5 --phase5
 ```
+
+Memory 签名、版本、归约或用户操作改动补跑 `--memory-sync`。它冻结 binary、JS 和 WASM，启动两台隔离 Node，用真实 WASM 用户签名和受控 Agent callback 验证用户编辑、删除墓碑、Agent 并发分支、跨入口旧签名重封装、完整版本与来源、共享冲突和重启后的签名日志重导入。该模式不调用真实模型，也不替代 Web/Mobile 渲染、默认同步专项或 `--phase1`。各进程专项串行运行，避免固定 UDP 端口竞争。
 
 身份、加入和浏览器网关改动跑 `--auto-route`，覆盖建网、目标与 Origin 校验、承诺加短码加入与授予管理权、承诺不符或拒绝作废、撤销、写入签名、CLI 加入、经另一台 Node 的 Gateway 跨入口访问、根恢复进入 48 小时等待、现有管理设备签名确认后立即生效、被现有管理设备拦下后旧恢复文件仍有效、空 Node 上的找回同样等待，以及未知写入不重放。
 

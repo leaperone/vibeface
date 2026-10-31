@@ -12,7 +12,7 @@ import { workChecks, type WorkCheck } from "@vibeface/client/workspace/model.ts"
 import { BackOnline, confirmText } from "./task-activity"
 import { ActionButton } from "./present"
 import { QuestionCard } from "./question-card"
-import { fixOnDevice, fixOnDeviceLabel, nodeName, parseSummarySteps, progressLabel, promptSummary, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, followUp, followUpCopy, type FollowUp, type SummaryStep } from "@vibeface/client/workspace/labels.ts"
+import { agentLaneLabels, contextStages, fixOnDevice, fixOnDeviceLabel, nodeName, parseSummarySteps, progressLabel, promptSummary, queueHoldLabels, schedulerStatus, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, followUp, followUpCopy, type FollowUp, type SummaryStep } from "@vibeface/client/workspace/labels.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import { CopyDiagnostics } from "@/features/identity/device-controls"
@@ -101,6 +101,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const sharing = work?.turn_id ? (workspace.data?.works ?? []).filter((item) => item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
   const stop = canStop ? () => workspace.interruptWork(work.work_id) : null
   const asked = promptSummary(work?.prompt ?? "", work?.title ?? "")
+  const coordination = work?.coordination_job
 
   return <div ref={layer} className="contents">
   {/* Clicking it must not move focus to the page behind, or React hands focus back there instead of to the task link. */}
@@ -121,6 +122,15 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
         {device ? <span className="flex min-w-0 items-center gap-1.5"><Laptop aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">设备 </span><span className="truncate">{nodeName(device, lookup)}</span></span> : null}
         {work.cwd ? <span className="flex min-w-0 items-center gap-1.5" title={work.cwd}><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project} </span><span className="truncate">{projectName(work.cwd)}</span></span> : null}
       </p> : null}
+      {work.kind === 'task' ? <Details label="协调回合">
+        {coordination ? <>
+          <p>{!workspace.connectionOnline || workspace.nodes.find((node) => node.device_id === device)?.online === false ? '当前状态未知，显示最近记录' : schedulerStatus(coordination.state).label}{coordination.lane ? ` · ${agentLaneLabels[coordination.lane]}` : ''}</p>
+          {coordination.hold_reason ? <p>{queueHoldLabels[coordination.hold_reason]}</p> : null}
+          {coordination.pending_check ? <p>执行结果需要核对，不能据此重发。</p> : null}
+          {coordination.context ? <p>会话代次 {coordination.context.session_generation} · {contextStages[coordination.context.stage].label}</p> : null}
+        </> : <p>执行设备尚未提供这个任务的协调回合观察。</p>}
+        <p className="text-meta text-muted-foreground">这里显示 Bot 的准备和排队情况，任务结果仍以上面的共享记录为准。</p>
+      </Details> : null}
       {progress?.status && taskActive(state) && progress.status !== "awaiting_input" && progressLabel(progress.status) !== "进行中" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
       {plan ? <Details label={`最近步骤摘要 · ${plan.length}`} open={taskActive(state)}><SummarySteps steps={plan} /></Details> : !progress?.text && work.summary && taskActive(state) ? <p className="whitespace-pre-wrap break-words">{work.summary}</p> : null}
       {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}

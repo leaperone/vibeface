@@ -2,7 +2,39 @@ import { asProvider, type MembershipView, type ProviderId } from "../lib/node.ts
 import type { LiveProgress } from "../lib/progress.ts"
 import { confirmReason } from "./model.ts"
 import { awaitsAnswer, workApproval } from "./questions.ts"
-import type { ManagerJob, NodeInfo, OpenWork, OverviewBot, OverviewCoverage, OverviewJob, OverviewTask, PendingCheck, Question, SessionHandoff, WorkRecord, WorkspaceActivity, WorkspaceActivityAttention, WorkspaceActivityFacts, WorkspaceActivityGroup, WorkspaceActivityJob, WorkspaceActivityView, WorkspaceOverview } from "./types.ts"
+import type { AgentLane, ContextProjection, ManagerJob, MemoryEntry, NodeInfo, OpenWork, OverviewBot, OverviewCoverage, OverviewJob, OverviewTask, PendingCheck, Question, QueueHoldReason, SessionHandoff, WorkRecord, WorkspaceActivity, WorkspaceActivityAttention, WorkspaceActivityFacts, WorkspaceActivityGroup, WorkspaceActivityJob, WorkspaceActivityView, WorkspaceOverview } from "./types.ts"
+
+export const contextStages = {
+  compiled: { label: '已编译', detail: '内容已准备，尚未确认 AI 开始执行。', tone: 'info' },
+  started: { label: '已发送', detail: 'AI 已确认开始这一轮。', tone: 'info' },
+  completed: { label: '本轮完成', detail: '本轮已结束，共享记录仍会保留。', tone: 'success' },
+  failed: { label: '本轮失败', detail: '执行失败，已保存的聊天记录仍会保留。', tone: 'danger' },
+  cancelled: { label: '已取消', detail: '本轮已取消，不代表此前的内容未发送。', tone: 'neutral' },
+  interrupted: { label: '已中断', detail: '本轮已中断，已保存的聊天记录仍会保留。', tone: 'warning' },
+  unknown: { label: '结果未知', detail: '先查明执行结果，请勿直接重试。', tone: 'warning' },
+} satisfies Record<ContextProjection['stage'], { label: string; detail: string; tone: 'info' | 'success' | 'danger' | 'neutral' | 'warning' }>
+
+export const contextInvalidation = (reason: string) => reason === 'conversation_owner_changed' ? '负责设备已变化' : reason === 'stable_prompt_changed' ? 'Bot 配置已变化' : reason === 'provider_changed' ? 'AI 产品已切换' : reason === 'runtime_configuration_changed' ? 'AI 运行环境已变化' : '原会话已失效'
+export function nativeSessionObservation(status: ContextProjection['session_status']) {
+  if (!status) return { label: '状态未知', detail: '当前续接状态未知。' }
+  if (status.pending_generation) return { label: '下轮重建', detail: '配置从下一轮生效，当前回合继续使用原配置。' }
+  return status.resumable
+    ? { label: '可尝试续接', detail: '本机保留续接缓存，继续执行时仍需确认。' }
+    : { label: '需要重建', detail: '下次执行需要建立会话。' }
+}
+export const contextCoverageLabels: Record<string, string> = {
+  messages_omitted: '消息', works_omitted: '工作', dispatches_omitted: '派发', questions_omitted: '问题',
+  attachments_omitted: '附件', memory_omitted: '记忆', checkpoint_omitted: '历史检查点', handoff_omitted: '交接摘要', pending_checks_omitted: '结果待确认',
+}
+export const contextIndexLabels: Record<string, string> = { skills: 'Skill', schedules: '定时任务', memory: '记忆索引', sessions: '外部会话', sent: '发出的消息', bots: 'Bot' }
+export const memoryOrigins: Record<NonNullable<MemoryEntry['metadata']>['origin'], string> = { agent: 'Bot 记录', user: '你记录', review: '记忆整理' }
+export const memoryConflictLabel = (reason: string) => reason === 'user_controlled' ? '受用户保护，未自动覆盖' : reason === 'epoch_changed' ? '数据版本已变化，未覆盖现有记忆' : reason === 'revision_changed' ? '记忆已被更新，未覆盖新值' : reason === 'capacity_exceeded' ? '记忆数量已达上限，未提交这条新增记忆' : '提交冲突，未覆盖现有记忆'
+export const queueHoldLabels: Record<QueueHoldReason, string> = {
+  active_turn: '等待当前回合结束', steering_settlement: '等待补充消息结清', provider_serial: '等待 AI 空闲',
+  task_limit: '等待 Bot 任务名额', machine_slot: '等待设备运行名额', pending_check: '等待确认上一轮结果',
+  backend_config_pending: '等待当前 AI 回合结束后切换配置',
+}
+export const agentLaneLabels: Record<AgentLane, string> = { main: '主对话', task: '独立任务', schedule_routine: '定时任务', bot_message: 'Bot 消息' }
 
 const stateNames: Record<string, string> = {
   accepted: "已接收",

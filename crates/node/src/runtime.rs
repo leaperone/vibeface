@@ -21,7 +21,7 @@ pub(crate) mod agent_tools;
 mod bots;
 mod chat_controls;
 pub mod claude;
-mod codex_server;
+pub(crate) mod codex_server;
 mod cursor;
 mod executor;
 mod followup;
@@ -250,6 +250,7 @@ fn workspace_job_summary(
         "conversation_id": job.conversation_id,
         "trigger": job.trigger,
         "kind": job.kind,
+        "lane": job.kind.lane(),
         "sequence": job.sequence,
         "state": job.state.name(),
         "message_id": job.message_id,
@@ -365,7 +366,7 @@ pub struct Runtime {
     pub events: broadcast::Sender<Update>,
     pub agent_tokens: Mutex<HashMap<String, Access>>,
     manager_controls: Mutex<HashMap<String, Arc<manager_control::ActiveManager>>>,
-    schedule_workers: Mutex<BTreeSet<(String, String)>>,
+    schedule_workers: Mutex<BTreeSet<(String, crate::scheduling::SessionKey)>>,
     schedule_wakeup: tokio::sync::Notify,
     observation: std::sync::Mutex<observation::ObservationState>,
     pub tool_url: std::sync::OnceLock<String>,
@@ -993,9 +994,24 @@ impl Runtime {
                 let epoch = conversation_by_id
                     .get(job.conversation_id.as_str())
                     .map_or(0, |conversation| conversation.owner_epoch);
-                workspace_job_summary(&job, &local, epoch, &pending_jobs)
+                let mut value = workspace_job_summary(&job, &local, epoch, &pending_jobs);
+                let observation = self.scheduler_job_projection(&store, network, &job, &checks)?;
+                value["hold_reason"] = observation["hold_reason"].clone();
+                value["context"] = observation["context"].clone();
+                Ok(value)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
+        for task in &mut tasks {
+            let Some(work_id) = task["work_id"].as_str() else {
+                continue;
+            };
+            let trigger = crate::scheduling::task_trigger(work_id);
+            task["coordination_job"] = jobs
+                .iter()
+                .find(|job| job["trigger"].as_str() == Some(trigger.as_str()))
+                .cloned()
+                .unwrap_or(Value::Null);
+        }
         let sessions = if include_sessions {
             store
                 .attributed_sessions_all(network)?
@@ -1341,6 +1357,8 @@ impl Runtime {
             "set_bot_project" => self.set_bot_project(&access, &input).await,
             "set_bot_avatar" => self.set_bot_avatar(&access, &input).await,
             "control_schedule" => self.control_schedule(&access, &input).await,
+            "control_memory" => self.control_memory(&access, &input).await,
+            "memory_state" => self.memory_state(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
             "reply_unanswered" => self.settle_unanswered(&access, &input, false).await,
             "dismiss_unanswered" => self.settle_unanswered(&access, &input, true).await,

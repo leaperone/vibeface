@@ -1,5 +1,8 @@
 use super::*;
-use crate::{scheduling::PendingCheck, work::DispatchState};
+use crate::{
+    scheduling::{PendingCheck, TriggerKind},
+    work::DispatchState,
+};
 
 const ARTIFACT_PAGE: usize = 65_536;
 /// Progress sources one conversation view follows, within the observer's own limit.
@@ -148,6 +151,11 @@ impl Runtime {
         let local = self.identity.device_id()?;
         let store = self.store.lock().await;
         let works = store.works(network, scope)?;
+        let task_jobs = task_observations(self, &store, network, scope, &checks)?;
+        let mut work_values = works
+            .iter()
+            .map(|work| work_view(work, &task_jobs))
+            .collect::<Result<Vec<_>>>()?;
         let checks = without_work_checks(checks, &works);
         let deliveries = deliveries(&store, network, scope)?;
         let conversation = store.conversation(network, scope)?;
@@ -194,30 +202,59 @@ impl Runtime {
                 value
             })
             .collect();
-        let memory = store.memories(network, scope)?;
+        let memory = memory_view(&store, network, scope)?;
+        let memory_sync_conflicts = store.memory_sync_conflicts(network, scope)?;
+        let memory_staged_count = store.scheduler_memory_staged_count(scope)?;
+        let memory_conflicts = store.scheduler_memory_conflicts(scope)?;
         let unanswered = store.unanswered_messages(network, &local, scope)?;
         drop(store);
+        self.refresh_task_contexts(network, &mut work_values)
+            .await?;
+        let local_context = self
+            .scheduler_context_observation(
+                network,
+                &crate::scheduling::SessionKey {
+                    conversation_id: scope.into(),
+                    scope: crate::scheduling::SessionScope::Main,
+                },
+            )
+            .await?;
         let (remote, metadata) = match owner {
             Some((remote, metadata)) if metadata.is_object() => (remote, metadata),
-            Some((remote, _)) => (remote, self.scheduler_manager_metadata()),
+            Some((remote, _)) => (remote, Value::Null),
             None => (Value::Null, self.scheduler_manager_metadata()),
+        };
+        let context = if remote.is_null() {
+            json!(local_context)
+        } else {
+            remote["context"].clone()
+        };
+        let (memory_staged_count, memory_conflicts) = if remote.is_null() {
+            (json!(memory_staged_count), json!(memory_conflicts))
+        } else {
+            (
+                remote["memory_staged_count"].clone(),
+                remote["memory_conflicts"].clone(),
+            )
         };
         Ok(json!({
             "conversation":conversation,
             "bot":bot,
             "messages":messages,
-            "works":works,
+            "works":work_values,
             "deliveries":deliveries,
             "changes":changes,
             "overwritten":overwritten,
             "sent":sent,
             "questions":questions,
             "sessions":sessions,
-            "bot_settings":{"skills":skills,"schedules":schedules,"memory":memory},
+            "bot_settings":{"skills":skills,"schedules":schedules,"memory":memory,
+                "memory_staged_count":memory_staged_count,"memory_conflicts":memory_conflicts,
+                "memory_sync_conflicts":memory_sync_conflicts},
             "checks":checks,
             "local_node":local,
             "scheduler":{"jobs":jobs,"unanswered":unanswered,"provider":metadata["provider"],"model":metadata["model"],
-                "capabilities":metadata["capabilities"],"remote":remote},
+                "capabilities":metadata["capabilities"],"remote":remote,"context":context},
             "observation_targets":targets,
         }))
     }
@@ -233,6 +270,15 @@ impl Runtime {
     ) -> Result<Option<Value>> {
         let scope = field(change, "conversation_id")?;
         let (jobs, checks) = self.scheduler_snapshot_jobs(network, scope).await?;
+        let context = self
+            .scheduler_context_observation(
+                network,
+                &crate::scheduling::SessionKey {
+                    conversation_id: scope.into(),
+                    scope: crate::scheduling::SessionScope::Main,
+                },
+            )
+            .await?;
         let store = self.store.lock().await;
         let mut message_id = None;
         let mut work_id = change["work_id"].as_str().map(str::to_owned);
@@ -269,16 +315,18 @@ impl Runtime {
         };
         let messages = message.map(|message| json!(message));
         let works = store.works(network, scope)?;
+        let task_jobs = task_observations(self, &store, network, scope, &checks)?;
         let changed: Vec<_> = works
             .iter()
             .filter(|work| work_id.as_deref() == Some(work.work_id.as_str()))
-            .collect();
+            .map(|work| work_view(work, &task_jobs))
+            .collect::<Result<_>>()?;
         let notifications: Vec<_> = store
             .pending_notifications(network, client)?
             .into_iter()
             .filter(|notification| notification.conversation_id == scope)
             .collect();
-        Ok(Some(json!({
+        let mut value = json!({
             "type":"records",
             "conversation_id":scope,
             "messages":messages.into_iter().collect::<Vec<_>>(),
@@ -292,9 +340,85 @@ impl Runtime {
             "deliveries":deliveries(&store, network, scope)?,
             "checks":without_work_checks(checks, &works),
             "jobs":jobs,
+            "context":context,
+            "memory":memory_view(&store, network, scope)?,
+            "memory_sync_conflicts":store.memory_sync_conflicts(network, scope)?,
+            "memory_staged_count":store.scheduler_memory_staged_count(scope)?,
+            "memory_conflicts":store.scheduler_memory_conflicts(scope)?,
             "unanswered":store.unanswered_messages(network, &self.identity.device_id()?, scope)?,
-        })))
+        });
+        drop(store);
+        if let Some(works) = value["works"].as_array_mut() {
+            self.refresh_task_contexts(network, works).await?;
+        }
+        Ok(Some(value))
     }
+}
+
+impl Runtime {
+    async fn refresh_task_contexts(&self, network: &str, works: &mut [Value]) -> Result<()> {
+        for work in works {
+            let Some(expected) = work["coordination_job"]["context"]["attempt_id"]
+                .as_str()
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let key = crate::scheduling::SessionKey {
+                conversation_id: field(work, "conversation_id")?.into(),
+                scope: crate::scheduling::SessionScope::Task {
+                    work_id: field(work, "work_id")?.into(),
+                },
+            };
+            work["coordination_job"]["context"] = json!(
+                self.scheduler_context_observation(network, &key)
+                    .await?
+                    .filter(|context| context.attempt_id == expected)
+            );
+        }
+        Ok(())
+    }
+}
+
+fn task_observations(
+    runtime: &Runtime,
+    store: &Store,
+    network: &str,
+    scope: &str,
+    checks: &[PendingCheck],
+) -> Result<BTreeMap<String, Value>> {
+    store
+        .scheduler_jobs(scope)?
+        .into_iter()
+        .filter(|job| job.kind == TriggerKind::AgentTask)
+        .map(|job| {
+            Ok((
+                job.reply_to.clone(),
+                runtime.scheduler_job_projection(store, network, &job, checks)?,
+            ))
+        })
+        .collect()
+}
+
+fn work_view(work: &WorkProjection, jobs: &BTreeMap<String, Value>) -> Result<Value> {
+    let mut value = serde_json::to_value(work)?;
+    if work.kind == crate::model::WorkKind::Task {
+        value["coordination_job"] = jobs.get(&work.work_id).cloned().unwrap_or(Value::Null);
+    }
+    Ok(value)
+}
+
+fn memory_view(store: &Store, network: &str, scope: &str) -> Result<Vec<Value>> {
+    Ok(store
+        .memory_records(network, scope)?
+        .into_iter()
+        .map(|record| {
+            json!({
+                "memory_id":record.entry.memory_id,"text":record.entry.text,
+                "metadata":record.metadata(),
+            })
+        })
+        .collect())
 }
 
 /// One card per work: an unverified agent task's coordination check is answered by its work card.
