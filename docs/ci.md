@@ -121,7 +121,6 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 | 最低 Rust 版本 | 安装 Cargo 声明的 MSRV，检查整个工作区 |
 | 原生 release 制品 | Linux x64、Linux ARM64、macOS ARM64，分别校验身份并启动网页进程 |
 | 单 Node 调度与事件日志验收 | Linux x64 一次，使用 `--phase1` |
-| Memory 用户控制与跨 Node 同步验收 | 使用 `--memory-sync`，真实签名、墓碑、并发与重启重放 |
 | 多 Node 同步、入口与投递验收 | Linux x64 一次，不带模式参数，四台 Node 经 iroh 和成员 relay 互连 |
 | 聊天 Agent 模拟协议验收 | macOS ARM64 一次，使用 `--chat-agent` |
 | 跨设备协作、换负责人与附件验收 | Linux x64 一次，使用 `--phase4` |

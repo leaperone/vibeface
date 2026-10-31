@@ -61,7 +61,7 @@ ScheduleControlled { schedule_id, action: pause | resume | delete, attestation }
 | forget {call_ref, memory_id} | 删除一条未被本人保护的值 |
 | recall {query?} | 查询已提交记忆和当前轮的 staged overlay |
 
-每条记忆最多 500 字符，每个 bot 最多 50 条有效记忆。疑似凭证的内容拒绝。essential memory 的 prompt budget 是 8192 字节，超出报告 omitted，不删除 Store 中的事实，也不推进省略记录的已发送版本。
+每条记忆最多 500 字符，本机新增或恢复时每个 bot 以 50 条有效记忆为接纳上限。完成事务逐条重检容量，超限只记录该条提交冲突，正常回复仍完成。不同离线 Node 的合法新增同步后可能超过 50 条，系统不为容量删除已签名事实。疑似凭证的内容拒绝。essential memory 的 prompt budget 是 8192 字节，超出报告 omitted，不删除 Store 中的事实，也不推进省略记录的已发送版本。
 
 remember 和 forget 先写当前 attempt 的 staging，保存完整 `MemoryBase {epoch, version}`，version 为空或为 `{revision, control_revision, source_event_hash}`。只有 completed 回合才与回复和 job 终态在同一事务追加事件。failed、cancelled、interrupted 和 unknown 丢弃 staging。提交时比较含墓碑的当前 epoch、revision 和 control_revision；版本变化或用户保护只记录本轮冲突，不发布失败提案。
 

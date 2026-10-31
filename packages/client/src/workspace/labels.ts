@@ -28,7 +28,7 @@ export const contextCoverageLabels: Record<string, string> = {
 }
 export const contextIndexLabels: Record<string, string> = { skills: 'Skill', schedules: '定时任务', memory: '记忆索引', sessions: '外部会话', sent: '发出的消息', bots: 'Bot' }
 export const memoryOrigins: Record<NonNullable<MemoryEntry['metadata']>['origin'], string> = { agent: 'Bot 记录', user: '你记录', review: '记忆整理' }
-export const memoryConflictLabel = (reason: string) => reason === 'user_controlled' ? '受用户保护，未自动覆盖' : reason === 'epoch_changed' ? '数据版本已变化，未覆盖现有记忆' : reason === 'revision_changed' ? '记忆已被更新，未覆盖新值' : '提交冲突，未覆盖现有记忆'
+export const memoryConflictLabel = (reason: string) => reason === 'user_controlled' ? '受用户保护，未自动覆盖' : reason === 'epoch_changed' ? '数据版本已变化，未覆盖现有记忆' : reason === 'revision_changed' ? '记忆已被更新，未覆盖新值' : reason === 'capacity_exceeded' ? '记忆数量已达上限，未提交这条新增记忆' : '提交冲突，未覆盖现有记忆'
 export const queueHoldLabels: Record<QueueHoldReason, string> = {
   active_turn: '等待当前回合结束', steering_settlement: '等待补充消息结清', provider_serial: '等待 AI 空闲',
   task_limit: '等待 Bot 任务名额', machine_slot: '等待设备运行名额', pending_check: '等待确认上一轮结果',
