@@ -425,22 +425,7 @@ fn id(v: &Value, key: &str) -> Result<String> {
 }
 impl Runtime {
     pub(crate) fn enforce_provider_roots(&self, local: &mut crate::providers::Local) -> Result<()> {
-        let roots = ProviderRoots::new(&self.data_dir);
-        local.env.apply(
-            Provider::Codex,
-            BTreeMap::from([(
-                crate::discovery::CODEX_HOME.into(),
-                Some(roots.codex_home.to_string_lossy().into_owned()),
-            )]),
-        )?;
-        local.env.apply(
-            Provider::Claude,
-            BTreeMap::from([(
-                "CLAUDE_CONFIG_DIR".into(),
-                Some(roots.claude_config.to_string_lossy().into_owned()),
-            )]),
-        )?;
-        Ok(())
+        ProviderRoots::new(&self.data_dir).apply(local)
     }
 
     pub async fn open(dir: &Path) -> Result<Self> {
@@ -460,6 +445,8 @@ impl Runtime {
             provider_roots.codex_sessions.as_path(),
             provider_roots.claude_config.as_path(),
             provider_roots.claude_projects.as_path(),
+            provider_roots.pi_sessions.as_path(),
+            provider_roots.opencode.as_path(),
         ] {
             config::private_dir(directory)?;
         }
@@ -486,20 +473,7 @@ impl Runtime {
             bins: config.bins.clone(),
             env: crate::providers::ProviderEnv::load(dir)?,
         };
-        local.env.apply(
-            Provider::Codex,
-            BTreeMap::from([(
-                crate::discovery::CODEX_HOME.into(),
-                Some(provider_roots.codex_home.to_string_lossy().into_owned()),
-            )]),
-        )?;
-        local.env.apply(
-            Provider::Claude,
-            BTreeMap::from([(
-                "CLAUDE_CONFIG_DIR".into(),
-                Some(provider_roots.claude_config.to_string_lossy().into_owned()),
-            )]),
-        )?;
+        provider_roots.apply(&mut local)?;
         if !config.triage.scan_codex_sessions {
             config.triage.codex_sessions = Some(provider_roots.codex_sessions.clone());
         }

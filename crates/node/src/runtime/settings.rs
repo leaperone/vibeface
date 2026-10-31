@@ -3,7 +3,7 @@ use super::codex_server::Link;
 use crate::config::{Config, ManagerSettings};
 use crate::discovery::{self, Paths, Target};
 use crate::manager::{ManagerConfig, Sdk};
-use crate::providers::{self, AppServer, AppServerMode, Provider, Role};
+use crate::providers::{self, AppServer, AppServerMode, Provider, ProviderRoots, Role};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -15,6 +15,45 @@ use std::path::{Path, PathBuf};
 pub struct NodeSettings {
     pub roots: Vec<PathBuf>,
     pub manager: Option<ManagerSettings>,
+}
+
+fn provider_setup(
+    provider: Provider,
+    local: &providers::Local,
+    roots: &ProviderRoots,
+) -> Option<Value> {
+    let directory = match provider {
+        Provider::Codex if local.launches(provider) => &roots.codex_home,
+        Provider::Claude => &roots.claude_config,
+        Provider::Opencode => &roots.opencode,
+        Provider::Codex | Provider::Cursor | Provider::Pi => return None,
+    };
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    let mut argv = vec!["env".to_owned()];
+    if provider == Provider::Opencode {
+        for name in [
+            "OPENCODE_CONFIG",
+            "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_CLI_CONFIG_CONTENT",
+            "OPENCODE_TEST_HOME",
+        ] {
+            argv.extend(["-u".into(), name.into()]);
+        }
+    }
+    argv.extend(
+        roots
+            .env(provider)
+            .into_iter()
+            .map(|(name, value)| quote(&format!("{name}={value}"))),
+    );
+    argv.push(quote(&local.bin(provider).to_string_lossy()));
+    argv.extend(match provider {
+        Provider::Codex => vec!["login".into()],
+        Provider::Claude => vec!["auth".into(), "login".into()],
+        Provider::Opencode => vec!["--standalone".into(), "auth".into(), "login".into()],
+        Provider::Cursor | Provider::Pi => unreachable!(),
+    });
+    Some(json!({"directory":directory,"command":argv.join(" ")}))
 }
 
 /// One change to a provider; absent fields keep their value. A variable set to a string is set
@@ -239,6 +278,8 @@ impl Runtime {
         settings: &NodeSettings,
     ) -> Value {
         let configured = local.env.get(provider);
+        let roots = ProviderRoots::new(&self.data_dir);
+        let runtime_env = roots.env(provider);
         let app_server = &local.switches.codex_app_server;
         let bot = settings
             .manager
@@ -260,6 +301,7 @@ impl Runtime {
         let names: BTreeSet<&String> = configured.keys().chain(&required).collect();
         let env: Vec<Value> = names
             .into_iter()
+            .filter(|name| !runtime_env.contains_key(*name))
             .map(|name| {
                 json!({"name":name,"set":configured.contains_key(name),
                     "inherited":inherited(name),"required":required.contains(name)})
@@ -310,6 +352,7 @@ impl Runtime {
             readiness.state()
         };
         let codex = provider.on_app_server();
+        let setup = provider_setup(provider, local, &roots);
         json!({
             "provider":provider, "roles":roles, "supports":provider.supports(),
             "installed":discovery::Host::current().installed(&bin), "bin":bin,
@@ -319,6 +362,7 @@ impl Runtime {
             "sessions":codex.then(|| self.triage.config().codex_sessions),
             "env":env, "state":state, "issues":issues, "probe":probe, "readiness":readiness,
             "execution_model":execution_model, "execution_readiness":execution_readiness,
+            "setup":setup,
         })
     }
 
@@ -992,5 +1036,89 @@ impl Runtime {
         };
         proposal.outcome = Some(outcome.clone());
         Ok(outcome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn private_setup_commands_run_with_the_same_roots_and_preserve_auth_environment() -> Result<()>
+    {
+        let dir = std::env::temp_dir().join(format!("vibeface-setup-'{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let bin = dir.join("fake provider");
+        std::fs::write(
+            &bin,
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+names = ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'OPENCODE_DB', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT', 'OPENCODE_CLI_CONFIG_CONTENT', 'OPENCODE_TEST_HOME']
+pathlib.Path(__file__).with_name('observed.json').write_text(json.dumps({'args': sys.argv[1:], 'env': {name: os.environ.get(name) for name in names}, 'auth': os.environ.get('FAKE_LOGIN_AUTH')}))
+"#,
+        )?;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700))?;
+        let local = providers::Local {
+            switches: providers::Providers::default(),
+            bins: Provider::ALL
+                .into_iter()
+                .map(|provider| (provider, bin.clone()))
+                .collect(),
+            env: providers::ProviderEnv::default(),
+        };
+        let roots = ProviderRoots::new(&dir);
+        for (provider, args) in [
+            (Provider::Codex, vec!["login"]),
+            (Provider::Claude, vec!["auth", "login"]),
+            (Provider::Opencode, vec!["--standalone", "auth", "login"]),
+        ] {
+            let setup = provider_setup(provider, &local, &roots).context("private setup")?;
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", setup["command"].as_str().context("command")?]);
+            command.env("FAKE_LOGIN_AUTH", "fixture-auth");
+            for name in [
+                "CODEX_HOME",
+                "CLAUDE_CONFIG_DIR",
+                "OPENCODE_DB",
+                "OPENCODE_CONFIG",
+                "OPENCODE_CONFIG_CONTENT",
+                "OPENCODE_CLI_CONFIG_CONTENT",
+                "OPENCODE_CONFIG_DIR",
+                "OPENCODE_TEST_HOME",
+                "XDG_DATA_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+            ] {
+                command.env(name, "/external/user");
+            }
+            assert!(command.status()?.success());
+            let observed: Value =
+                serde_json::from_slice(&std::fs::read(dir.join("observed.json"))?)?;
+            assert_eq!(observed["args"], json!(args));
+            assert_eq!(observed["auth"], "fixture-auth");
+            for (name, value) in roots.env(provider) {
+                if observed["env"].get(&name).is_some() {
+                    assert_eq!(observed["env"][name], value);
+                }
+            }
+            if provider == Provider::Opencode {
+                for name in [
+                    "OPENCODE_CONFIG",
+                    "OPENCODE_CONFIG_CONTENT",
+                    "OPENCODE_CLI_CONFIG_CONTENT",
+                    "OPENCODE_TEST_HOME",
+                ] {
+                    assert_eq!(observed["env"][name], Value::Null);
+                }
+            }
+        }
+        let mut system = local;
+        system.switches.codex_app_server.mode = AppServerMode::System;
+        assert!(provider_setup(Provider::Codex, &system, &roots).is_none());
+        assert!(provider_setup(Provider::Pi, &system, &roots).is_none());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

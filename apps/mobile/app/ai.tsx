@@ -7,7 +7,7 @@ import { deviceCopy } from '@vibeface/client/identity/copy.ts'
 import { availability, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, effortOptions, probeIssueText, providerGroups, providerNames, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { ErrorText } from '@/components/action'
-import { Details, EmptyState, Skeleton, providerIcons, toneText, type Tone } from '@/components/kit'
+import { CopyableId, Details, EmptyState, Skeleton, providerIcons, toneText, type Tone } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
@@ -134,6 +134,11 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
     </View> : null}
     <View className="gap-1 px-4 pb-3">
       {'issue' in item.readiness ? <Text className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.readiness.issue)}</Text> : null}
+      {item.setup && (assistant || execution) && ['needs_setup', 'unverified'].includes(item.readiness.state) ? <View className="gap-2">
+        <Text className="text-meta text-muted-foreground">在这台 Node 的电脑上运行以下命令，为私有目录登录或配置，然后检查可用性。本机 CLI 的其他目录登录状态不会自动复制。</Text>
+        <Text selectable className="font-mono text-meta text-muted-foreground">{item.setup.directory}</Text>
+        <CopyableId value={item.setup.command} label={`${name} 私有目录登录命令`} />
+      </View> : null}
       <Text className="text-meta text-muted-foreground">{item.probe.checked_at_ms === null ? '尚未主动检查' : `检查于 ${new Date(item.probe.checked_at_ms).toLocaleString()}`}</Text>
       <Button variant="ghost" className="self-start" disabled={busy !== ''} onPress={() => void probe()}><Icon as={busy === `${item.provider}:probe` ? LoaderCircle : PlugZap} /><Text>检查可用性</Text></Button>
       {manager && item.probe.catalog.state === 'available' && item.probe.catalog.coverage === 'partial' ? <Text className="text-meta text-muted-foreground">模型列表可能不完整，可手填其他模型。</Text> : null}
@@ -143,9 +148,13 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
       {item.supports.includes('agent') ? <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', assistant ? { bot: false } : botOnChange(response, item))} /> : null}
       {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
       <View className="gap-4 border-t border-border p-4">
-        {manager ? <AssistantDetails key={`${manager.provider}:${JSON.stringify([manager.model, manager.reasoning_effort, manager.backup])}`} fields={['model']} manager={manager} models={models} working={working} save={saveAssistant} /> : null}
-        {execution ? <ExecutionDetails key={`${item.execution_model}:${item.provider}`} model={item.execution_model} models={models} working={working}
-          save={(model) => change('execution_model', { execution_model: model })} /> : null}
+        {manager ? <Details label="运行 Bot" keepMounted>
+          <AssistantDetails key={`${manager.provider}:${JSON.stringify([manager.model, manager.reasoning_effort, manager.backup])}`} fields={['model']} manager={manager} models={models} working={working} save={saveAssistant} />
+        </Details> : null}
+        {execution ? <Details label="执行任务" keepMounted>
+          <ExecutionDetails key={`${item.execution_model}:${item.provider}`} model={item.execution_model} models={models} working={working}
+            save={(model) => change('execution_model', { execution_model: model })} />
+        </Details> : null}
         {item.env.some((row) => row.required) ? <Variables item={item} required working={working} change={change} /> : null}
         {/* As on the web: connection, program and other variables are for whoever needs them; a problem in them opens the fold. */}
         <Details label="高级" open={Boolean(issue && issue.code !== 'env_missing')}>
@@ -224,6 +233,7 @@ function AppServerSettings({ server, working, save, test }: { server: AppServer;
       </Button>
     </View>
     {shown.state === 'handshake_failed' || shown.state === 'launch_failed' ? <Text selectable className="font-mono text-meta text-muted-foreground">{shown.reason}</Text> : null}
+    {server.mode === 'system' ? <Text className="text-meta text-muted-foreground">共享所选外部 App Server 的会话，不隔离该服务的数据。</Text> : null}
     {server.mode === 'system' ? <SaveRow value={socket} saved={server.socket ?? ''} placeholder="App Server socket 的绝对路径" mono working={working} onChange={setSocket}
       onSave={() => void save('socket', { app_server: { mode: 'system', socket: socket.trim() || null } })} /> : null}
   </Field>

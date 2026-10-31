@@ -43,6 +43,7 @@ const MAX_OUTPUT: usize = 65_536;
 /// The Node's opencode serve and the bot turns running on it.
 pub struct Opencode {
     dir: PathBuf,
+    roots: ProviderRoots,
     launch: std::sync::Mutex<Launch>,
     serve: Mutex<Option<Serve>>,
     http: reqwest::Client,
@@ -208,6 +209,7 @@ impl Opencode {
         kill_orphan(&dir.join(PIDFILE));
         Ok(Self {
             dir,
+            roots: ProviderRoots::new(data_dir),
             launch: std::sync::Mutex::new(Launch { bin, env }),
             serve: Mutex::new(None),
             http: reqwest::Client::builder()
@@ -271,6 +273,18 @@ impl Opencode {
 
     async fn spawn(&self, launch: Launch) -> Result<Serve> {
         config::private_dir(&self.dir)?;
+        for (name, value) in self.roots.env(Provider::Opencode) {
+            if value == "true" {
+                continue;
+            }
+            let path = Path::new(&value);
+            config::private_dir(if name == "OPENCODE_DB" {
+                path.parent()
+                    .context("OpenCode database directory missing")?
+            } else {
+                path
+            })?;
+        }
         let dir = self.dir.canonicalize()?;
         let password = crate::crypto::random_hex(32);
         crate::logging::add_secret(&password);
@@ -284,6 +298,10 @@ impl Opencode {
         let mut command = std::process::Command::new(&launch.bin);
         command
             .envs(&launch.env)
+            .envs(self.roots.env(Provider::Opencode))
+            .env_remove("OPENCODE_CONFIG")
+            .env_remove("OPENCODE_CLI_CONFIG_CONTENT")
+            .env_remove("OPENCODE_TEST_HOME")
             .env("OPENCODE_SERVER_USERNAME", "opencode")
             .env("OPENCODE_SERVER_PASSWORD", &password)
             .env("OPENCODE_CONFIG_CONTENT", settings.to_string())
@@ -570,6 +588,15 @@ impl Opencode {
             .collect();
         variables.insert("OPENCODE_SERVER_PASSWORD".into(), String::new());
         variables.extend(tool_env.clone());
+        variables.extend(self.roots.env(Provider::Opencode));
+        for name in [
+            "OPENCODE_CONFIG",
+            "OPENCODE_CLI_CONFIG_CONTENT",
+            "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_TEST_HOME",
+        ] {
+            variables.insert(name.into(), String::new());
+        }
         let (status, body) = self
             .call(
                 conn,
@@ -779,7 +806,6 @@ impl Opencode {
             text: chain.text.clone(),
             error,
         };
-        // A run cut between steps leaves its last step finished for tools.
         let finished = |reply: &Value| {
             !reply["time"]["completed"].is_null()
                 && if infer_work_end {
@@ -2436,6 +2462,72 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn two_nodes_keep_opencode_database_and_shell_paths_private() -> Result<()> {
+        let place = Place::new().await?;
+        let user = place.dir.join("user");
+        std::fs::create_dir(&user)?;
+        let mut servers = Vec::new();
+        for name in ["node-a", "node-b"] {
+            let data = place.dir.join(name);
+            let mut env = place.env();
+            for key in [
+                "OPENCODE_DB",
+                "OPENCODE_CONFIG_DIR",
+                "XDG_DATA_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+                "OPENCODE_CONFIG",
+                "OPENCODE_TEST_HOME",
+            ] {
+                env.insert(key.into(), user.join(key).display().to_string());
+            }
+            let server = Arc::new(Opencode::open(&data, fixture(), env)?);
+            let (conn, _used) = server.conn().await?;
+            let session = server
+                .create(&conn, place.dir.to_str().context("directory")?, None)
+                .await?;
+            server
+                .environment(
+                    &conn,
+                    &session,
+                    &BTreeMap::from([(
+                        "OPENCODE_DB".into(),
+                        user.join("tool.db").display().to_string(),
+                    )]),
+                )
+                .await?;
+            let expected = ProviderRoots::new(&data).env(Provider::Opencode);
+            let recorded: Vec<Value> = place
+                .recorded("roots.jsonl")
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<std::result::Result<_, _>>()?;
+            let last = recorded.last().context("recorded launch")?;
+            for (key, value) in &expected {
+                if last.get(key).is_some() {
+                    assert_eq!(last[key], json!(value));
+                }
+            }
+            assert_eq!(last["OPENCODE_CONFIG"], Value::Null);
+            assert_eq!(last["OPENCODE_TEST_HOME"], Value::Null);
+            assert_eq!(last["fake_auth_present"], true);
+            assert!(Path::new(&expected["OPENCODE_DB"]).is_file());
+            let fake = place.fake.lock().unwrap();
+            let environment = &fake.sessions[&session].environment;
+            assert_eq!(environment["OPENCODE_DB"], expected["OPENCODE_DB"]);
+            assert_eq!(environment["OPENCODE_CONFIG"], "");
+            drop(fake);
+            servers.push(server);
+        }
+        assert_eq!(std::fs::read_dir(&user)?.count(), 0);
+        for server in servers {
+            server.stop().await;
+        }
+        Ok(())
     }
 
     #[tokio::test]

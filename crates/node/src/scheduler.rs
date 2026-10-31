@@ -17,7 +17,7 @@ use crate::{
     tools::Tool,
     work::Dispatch,
 };
-use anyhow::{Context as _, Result, bail, ensure};
+use anyhow::{Context as _, Result, ensure};
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -208,7 +208,26 @@ pub(crate) fn bot_model(
     bot?.model(device.provider).map(str::to_owned)
 }
 
-/// The submitted model explains a provider's refusal or unknown-model response.
+fn turn_settings(
+    mut settings: crate::config::ManagerSettings,
+    bot: Option<&Bot>,
+    resolved: Option<&crate::model::ResolvedModel>,
+) -> crate::config::ManagerSettings {
+    if let Some(resolved) = resolved {
+        if settings.provider != resolved.provider {
+            settings.reasoning_effort = None;
+        }
+        settings.provider = resolved.provider;
+        settings.model = resolved.model.clone().unwrap_or_default();
+    } else if let Some(model) = bot_model(&settings, bot) {
+        settings.model = model;
+    }
+    if let Some(effort) = bot.and_then(|bot| bot.reasoning_effort(settings.provider)) {
+        settings.reasoning_effort = Some(effort.to_owned());
+    }
+    settings
+}
+
 fn model_noted(failure: ExecFailure, model: Option<&str>) -> ExecFailure {
     match model {
         Some(model) if matches!(failure.kind, FailureKind::NoModel | FailureKind::Rejected) => {
@@ -335,112 +354,92 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     }
     let local_settings = node.settings_snapshot();
     let local_providers = node.providers();
-    let Some(mut settings) = local_settings.manager.clone() else {
-        bail!("this Node has no configured management SDK")
+    let Some(device_settings) = local_settings.manager.clone() else {
+        return Ok(None);
     };
     let network = access.network_id.clone();
-    // An unknown model is the provider's error to report.
-    let bot = node
-        .store
-        .lock()
-        .await
-        .bot_for_conversation(&network, &conversation)?;
-    let bot_model = bot_model(&settings, bot.as_ref());
-    if let Some(model) = &bot_model {
-        settings.model = model.clone();
+    let (bot, works) = {
+        let store = node.store.lock().await;
+        (
+            store.bot_for_conversation(&network, &conversation)?,
+            store.works(&network, &conversation)?,
+        )
+    };
+    let mut probes = BTreeMap::new();
+    for provider in crate::providers::Provider::ALL {
+        probes.insert(provider, node.provider_probe_snapshot(provider).await);
     }
-    if let Some(effort) = bot
-        .as_ref()
-        .and_then(|bot| bot.reasoning_effort(settings.provider))
-    {
-        settings.reasoning_effort = Some(effort.to_owned());
-    }
-    let provider = settings.provider;
-    let generation = node.provider_generation(provider, &local_providers)?;
-    let readiness = node.provider_readiness(provider, &settings.model).await;
-    if matches!(readiness, crate::providers::ProviderReadiness::Starting) {
-        return Ok(None);
-    }
-    let thread = provider.prompt_mode() == crate::providers::PromptMode::Thread;
-    // Claiming before the tool listener exists would turn a startup race into a failed job.
     let tool_url = node
         .tool_url
         .get()
         .context("local tool listener is not ready")?;
-    // A Codex thread keeps the Shell environment it was created with, tool URL included: when
-    // the Node could not get its earlier tool port back, a new thread starts. It lives on one
-    // App Server; another one starts a new thread too, and so do new thread instructions.
-    let server = match provider.sessions() {
-        crate::providers::Sessions::AppServer => node.codex.server(),
-        crate::providers::Sessions::Store(store) => store.to_owned(),
-        crate::providers::Sessions::Process => String::new(),
-    };
     let tool_cli = std::env::current_exe()?;
-    // A thread lists the tools once, with the guidance that holds for all its turns.
-    let guide = manager::bot_instructions(
-        Some(&tool_cli),
-        &provider.tools_for(TriggerKind::Human),
-        &thread_instructions(),
-    );
-    let instance = provider.instance_per_bot().then(|| CursorInstance::Bot {
-        network: network.clone(),
-        conversation: conversation.clone(),
-    });
-    let session_config = session_key(
-        &settings,
-        thread.then_some((tool_url.as_str(), server.as_str(), guide.as_str())),
-        instance
-            .as_ref()
-            .map(|instance| node.cursor_store_root(instance)),
-    )?;
-    let sdk_config = digest(&serde_json::to_vec(&(
-        session_config,
-        &generation,
-        &settings.model,
-        &settings.reasoning_effort,
-    ))?);
+    let mut selection = None;
     let claimed = {
         let mut store = node.store.lock().await;
         store.authorize_node(&network, &node.identity.device_id()?)?;
-        match store.claim_next(
-            &node.identity,
-            &network,
-            &conversation,
-            boot_id(),
-            &sdk_config,
-        )? {
+        match store.claim_next(&node.identity, &network, &conversation, boot_id(), |job| {
+            let resolved = if job.kind == TriggerKind::AgentTask {
+                Some(
+                    works
+                        .iter()
+                        .find(|work| work.work_id == job.reply_to)
+                        .context("agent task work is not stored on this device")?
+                        .resolved
+                        .as_ref()
+                        .context("agent task model was not resolved on acceptance")?,
+                )
+            } else {
+                None
+            };
+            let settings = turn_settings(device_settings, bot.as_ref(), resolved);
+            let provider = settings.provider;
+            let readiness = probes[&provider].readiness(&settings.model);
+            if matches!(readiness, crate::providers::ProviderReadiness::Starting) {
+                return Ok(None);
+            }
+            let generation = node.provider_generation(provider, &local_providers)?;
+            let thread = provider.prompt_mode() == crate::providers::PromptMode::Thread;
+            let server = match provider.sessions() {
+                crate::providers::Sessions::AppServer => node.codex.server(),
+                crate::providers::Sessions::Store(store) => store.to_owned(),
+                crate::providers::Sessions::Process => String::new(),
+            };
+            let guide = manager::bot_instructions(
+                Some(&tool_cli),
+                &provider.tools_for(TriggerKind::Human),
+                &thread_instructions(),
+            );
+            let instance = provider.instance_per_bot().then(|| CursorInstance::Bot {
+                network: network.clone(),
+                conversation: conversation.clone(),
+            });
+            let session_config = session_key(
+                &settings,
+                thread.then_some((tool_url.as_str(), server.as_str(), guide.as_str())),
+                instance
+                    .as_ref()
+                    .map(|instance| node.cursor_store_root(instance)),
+            )?;
+            let sdk_config = digest(&serde_json::to_vec(&(
+                session_config,
+                &generation,
+                &settings.model,
+                &settings.reasoning_effort,
+            ))?);
+            selection = Some((settings, generation, readiness, thread, server, instance));
+            Ok(Some(sdk_config))
+        })? {
             Some(claimed) => claimed,
             None => return Ok(None),
         }
     };
     drop(launch_claim);
+    let (settings, generation, readiness, thread, server, instance) =
+        selection.context("claimed scheduler configuration missing")?;
+    let provider = settings.provider;
     let mut job = claimed.job;
     let trigger = job.trigger.clone();
-    let readiness = if job.kind == TriggerKind::AgentTask {
-        let work_id = trigger
-            .strip_prefix("task:")
-            .context("agent task trigger has no work ID")?;
-        let work = node
-            .store
-            .lock()
-            .await
-            .works(&network, &conversation)?
-            .into_iter()
-            .find(|work| work.work_id == work_id)
-            .context("agent task work is not stored on this device")?;
-        if let Some(resolved) = work.resolved {
-            ensure!(
-                resolved.provider == provider,
-                "agent task provider changed before its turn started"
-            );
-            settings.model = resolved.model.unwrap_or_default();
-            node.provider_readiness(provider, &settings.model).await
-        } else {
-            readiness
-        }
-    } else {
-        readiness
-    };
     let attempt = job
         .state
         .attempt()
@@ -1898,6 +1897,44 @@ pub fn tools(kind: TriggerKind) -> BTreeMap<String, CustomToolConfig> {
 mod tests {
     use super::*;
     use crate::tools::Effect;
+
+    #[test]
+    fn task_selection_uses_frozen_provider_and_model_before_the_session_identity() -> Result<()> {
+        let settings = crate::config::ManagerSettings {
+            provider: crate::providers::Provider::Pi,
+            workspace: "/tmp".into(),
+            model: "new-default".into(),
+            reasoning_effort: Some("high".into()),
+            backup: Default::default(),
+        };
+        let frozen = crate::model::ResolvedModel {
+            provider: crate::providers::Provider::Claude,
+            model: Some("accepted".into()),
+        };
+        let selected = turn_settings(settings.clone(), None, Some(&frozen));
+        assert_eq!(selected.provider, frozen.provider);
+        assert_eq!(selected.model, "accepted");
+        assert_eq!(selected.reasoning_effort, None);
+        assert_ne!(
+            session_key(&selected, None, None)?,
+            session_key(&settings, None, None)?
+        );
+        let default = turn_settings(
+            settings.clone(),
+            None,
+            Some(&crate::model::ResolvedModel {
+                model: None,
+                ..frozen
+            }),
+        );
+        assert_eq!(default.model, "");
+        assert_ne!(
+            session_key(&default, None, None)?,
+            session_key(&selected, None, None)?
+        );
+        assert_eq!(turn_settings(settings, None, None).model, "new-default");
+        Ok(())
+    }
 
     #[test]
     fn backup_requires_explicit_policy_and_proven_no_execution() -> Result<()> {

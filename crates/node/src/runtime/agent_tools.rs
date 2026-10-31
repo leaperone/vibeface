@@ -664,12 +664,9 @@ impl Runtime {
             serde_json::from_value(args["agent"].clone()).context("agent names a provider")?;
         let work_id = WorkSpec::id(scope, &manager.trigger, call_ref);
         // A retry keeps the provider the first call settled on, whatever the switches say now.
-        let retried = match agent {
-            None => (self.store.lock().await.work_record(&work_id)?).map(|run| run.kind),
-            Some(_) => None,
-        };
+        let retried = (self.store.lock().await.work_record(&work_id)?).map(|run| run.kind);
         let kind = match (agent, retried) {
-            (None, Some(kind)) if target == local => kind,
+            (agent, Some(kind)) if target == local => agent.map_or(kind, WorkKind::Agent),
             _ if target == local => WorkKind::Agent(self.executing(network, args).await?),
             (None, _) => WorkKind::Task,
             (Some(_), _) => {
@@ -726,8 +723,17 @@ impl Runtime {
             let dispatch = self.send_dispatch(network, spec, false).await?;
             return Ok(dispatch_row(&dispatch));
         }
-        let spec = self.resolve_work_model(network, spec).await?;
+        let mut spec = spec;
         let (record, created) = self.accept_dispatch(network, spec.clone()).await?;
+        spec.resolved = self
+            .store
+            .lock()
+            .await
+            .works(network, scope)?
+            .into_iter()
+            .find(|work| work.work_id == record.work_id)
+            .context("accepted work projection missing")?
+            .resolved;
         let thread = match &spec.continues {
             None => thread,
             Some(original) => self
@@ -1443,6 +1449,110 @@ mod tests {
         assert!(created["bot_id"].as_str().is_some());
         assert_ne!(node.store.lock().await.version_vector(&network)?, before);
         node.finish_manager_attempt(&attempt).await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn epoch8_directory_is_rejected_before_loading_any_provider_or_history() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("vibeface-old-epoch-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        std::fs::write(dir.join("data-epoch.json"), br#"{"data_epoch":8}"#)?;
+        let error = Runtime::open(&dir)
+            .await
+            .err()
+            .context("old epoch must fail")?;
+        assert!(
+            error
+                .to_string()
+                .contains("requires an initialized data epoch 9 directory")
+        );
+        assert_eq!(std::fs::read_dir(&dir)?.count(), 1);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_execution_keeps_its_first_model_after_defaults_change() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        bot(&node, &admin, "c", "Bot", &[]).await?;
+        let network = node.store.lock().await.network()?.context("network")?;
+        post(&node, &admin, &network, "c", "m1", "go").await?;
+        node.settings.lock().unwrap().roots = vec![dir.clone()];
+        node.providers
+            .lock()
+            .unwrap()
+            .switches
+            .execution_models
+            .insert(Provider::Codex, "first".into());
+        let spec = WorkSpec {
+            work_id: WorkSpec::id("c", "message:m1", "frozen"),
+            conversation: "c".into(),
+            trigger: "message:m1".into(),
+            target: node.identity.device_id()?,
+            dispatcher: node.identity.device_id()?,
+            call_ref: "frozen".into(),
+            kind: WorkKind::Agent(Provider::Codex),
+            model: None,
+            resolved: None,
+            cwd: dir.display().to_string(),
+            title: "work".into(),
+            prompt: "go".into(),
+            continues: None,
+            parent: None,
+            thread: None,
+        };
+        assert!(node.accept_dispatch(&network, spec.clone()).await?.1);
+        node.providers
+            .lock()
+            .unwrap()
+            .switches
+            .execution_models
+            .insert(Provider::Codex, "changed".into());
+        let (left, right) = tokio::join!(
+            node.accept_dispatch(&network, spec.clone()),
+            node.accept_dispatch(&network, spec.clone())
+        );
+        assert!(!left?.1 && !right?.1);
+        let works = node.store.lock().await.works(&network, "c")?;
+        assert_eq!(works.len(), 1);
+        assert_eq!(
+            works[0]
+                .resolved
+                .as_ref()
+                .and_then(|resolved| resolved.model.as_deref()),
+            Some("first")
+        );
+        let explicit = WorkSpec {
+            work_id: "explicit".into(),
+            call_ref: "explicit".into(),
+            model: Some("  chosen  ".into()),
+            ..spec.clone()
+        };
+        assert!(node.accept_dispatch(&network, explicit.clone()).await?.1);
+        assert!(
+            !node
+                .accept_dispatch(
+                    &network,
+                    WorkSpec {
+                        model: Some("chosen".into()),
+                        ..explicit.clone()
+                    }
+                )
+                .await?
+                .1
+        );
+        assert!(
+            node.accept_dispatch(
+                &network,
+                WorkSpec {
+                    model: Some("other".into()),
+                    ..explicit
+                }
+            )
+            .await
+            .is_err()
+        );
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())

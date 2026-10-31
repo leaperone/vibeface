@@ -3914,7 +3914,9 @@ pub(super) mod tests {
             now_ms(),
         )?;
         let claimed = store
-            .claim_next(&node.identity, &network, scope, "boot", "cfg")?
+            .claim_next(&node.identity, &network, scope, "boot", |_| {
+                Ok(Some("cfg".into()))
+            })?
             .context("job")?;
         let trigger = claimed.job.trigger.clone();
         let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();

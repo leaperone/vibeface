@@ -224,6 +224,9 @@ test('node settings keep a neutral unchecked provider and parse explicit probe e
   const manager = { provider: 'claude', workspace: '/work', model: 'my-manual-model', reasoning_effort: null, backup: { automatic: false, candidates: [] } }
   const parsed = parseNodeSettings({ settings: { roots: [], manager }, defaults: { workspace: '/work' }, readiness: { manager: readiness }, providers: [provider], display_paths: {}, suggested_roots: [] })
   assert.equal(availability(parsed.providers[0]), 'unverified')
+  const setup = { directory: '/node/providers/claude', command: "env CLAUDE_CONFIG_DIR=/node/providers/claude claude auth login" }
+  assert.deepEqual(parseProvider({ ...provider, setup }).setup, setup)
+  assert.throws(() => parseProvider({ ...provider, setup: { directory: '/private', command: 7 } }))
   assert.deepEqual(parsed.settings.manager, manager)
   assert.throws(() => parseProvider({ ...provider, probe: { ...provider.probe, launch: { state: 'success' } } }))
   assert.throws(() => parseProvider({ ...provider, probe: { ...provider.probe, provider: 'pi' } }))

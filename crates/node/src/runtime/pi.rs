@@ -40,6 +40,7 @@ const STEER_LEAD: &str =
 pub struct Pi {
     /// Per session: its pointer (`<session>.json`) and the bot's instructions (`<session>.md`).
     dir: PathBuf,
+    sessions: PathBuf,
     processes: Arc<Processes>,
     live: std::sync::Mutex<HashMap<String, Live>>,
     /// Sessions a work resumes, from its start until its pi has ended.
@@ -411,7 +412,11 @@ impl Drop for Tracked {
 }
 
 impl Process {
-    fn spawn(launch: &Launch, processes: &Arc<Processes>) -> Result<Self, ExecFailure> {
+    fn spawn(
+        launch: &Launch,
+        processes: &Arc<Processes>,
+        sessions: &Path,
+    ) -> Result<Self, ExecFailure> {
         if !launch.cwd.is_dir() {
             return Err(ExecFailure::new(
                 FailureKind::Rejected,
@@ -419,11 +424,15 @@ impl Process {
             ));
         }
         let mut command = Command::new(&launch.bin);
+        config::private_dir(sessions)
+            .map_err(|error| ExecFailure::new(FailureKind::Rejected, error.to_string()))?;
         command
             .args(["--mode", "rpc", "--no-extensions"])
             .args(&launch.args)
+            .args(["--session-dir".as_ref(), sessions.as_os_str()])
             .current_dir(&launch.cwd)
             .envs(&launch.env)
+            .env("PI_CODING_AGENT_SESSION_DIR", sessions)
             .env(RUN_ENV, "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -604,6 +613,7 @@ impl Pi {
     pub(crate) fn new(data_dir: &Path) -> Self {
         Self {
             dir: data_dir.join("pi"),
+            sessions: ProviderRoots::new(data_dir).pi_sessions,
             processes: Arc::new(Processes::open(data_dir.join(PIDFILE))),
             live: Default::default(),
             resuming: Default::default(),
@@ -753,7 +763,7 @@ impl Pi {
             session_id: None,
             failure,
         };
-        let process = Process::spawn(launch, &self.processes)
+        let process = Process::spawn(launch, &self.processes, &self.sessions)
             .map_err(|failure| before_start(ProviderStage::Launch, failure))?;
         let opened = async {
             let state = match process.rpc.call(json!({"type":"get_state"}), ANSWER).await {
@@ -1754,6 +1764,49 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn two_nodes_force_private_pi_sessions_without_changing_auth_config() -> Result<()> {
+        let dir = scratch("private-sessions");
+        let user = dir.join("user");
+        std::fs::create_dir(&user)?;
+        for name in ["node-a", "node-b"] {
+            let data = dir.join(name);
+            let pi = Arc::new(Pi::new(&data));
+            let mut launch = launch(&dir, "reply", name);
+            launch.env.insert(
+                "PI_CODING_AGENT_SESSION_DIR".into(),
+                user.display().to_string(),
+            );
+            launch
+                .env
+                .insert("PI_CODING_AGENT_DIR".into(), user.display().to_string());
+            let (mut process, _) = pi.open(&launch, name).await?;
+            let (_cancel, mut cancel) = watch::channel(false);
+            assert!(matches!(
+                process
+                    .begin(
+                        None,
+                        json!({"type":"prompt", "message":"hello"}),
+                        ANSWER,
+                        &mut cancel
+                    )
+                    .await,
+                Begin::Started(_)
+            ));
+            let _ = process.end().await;
+            let pointer = pi.pointer(name)?.context("session pointer")?;
+            assert!(
+                pointer
+                    .file
+                    .starts_with(ProviderRoots::new(&data).pi_sessions)
+            );
+            assert!(pointer.file.is_file());
+        }
+        assert_eq!(std::fs::read_dir(&user)?.count(), 0);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[tokio::test]

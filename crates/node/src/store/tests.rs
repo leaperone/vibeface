@@ -481,6 +481,48 @@ fn the_same_message_id_queues_one_job() -> Result<()> {
 }
 
 #[test]
+fn scheduler_configuration_failure_or_startup_wait_does_not_claim_the_job() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    say(&mut store, &net, "m1", true)?;
+    assert!(
+        store
+            .claim_next(&net.a, &net.network, "c", "boot", |_| anyhow::bail!(
+                "invalid frozen provider"
+            ))
+            .is_err()
+    );
+    assert!(matches!(
+        store
+            .scheduler_job("c", "message:m1")?
+            .context("job")?
+            .state,
+        JobState::Queued
+    ));
+    assert!(
+        store
+            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(None))?
+            .is_none()
+    );
+    assert!(matches!(
+        store
+            .scheduler_job("c", "message:m1")?
+            .context("job")?
+            .state,
+        JobState::Queued
+    ));
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot", |job| {
+            assert_eq!(job.trigger, "message:m1");
+            Ok(Some("frozen-provider-and-model".into()))
+        })?
+        .context("claimed")?;
+    assert!(matches!(claimed.job.state, JobState::Claimed { .. }));
+    Ok(())
+}
+
+#[test]
 fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
@@ -508,7 +550,9 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
         3,
     )?;
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot-1", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot-1", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &claimed.job.trigger, &attempt)?;
@@ -536,7 +580,9 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
     );
 
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot-1", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot-1", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &claimed.job.trigger, &attempt)?;
@@ -633,7 +679,9 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     let local = net.a.device_id()?;
     say(&mut store, &net, "m1", true)?;
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     let (trigger, attempt) = (
         claimed.job.trigger.clone(),
@@ -696,7 +744,9 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     assert!(!store.steer_host_active("c", &attempt)?);
     assert!(
         store
-            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
+                "cfg".into()
+            )))?
             .is_none()
     );
     assert!(store.scheduler_maintenance_idle().is_err());
@@ -721,7 +771,9 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
             .is_none()
     );
     let next = store
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     assert_eq!(next.job.trigger, message_trigger("quiet"));
 
@@ -770,7 +822,9 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     )?;
     assert!(
         store
-            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
+                "cfg".into()
+            )))?
             .is_none()
     );
     assert!(store.scheduler_job("c", &message_trigger("m4"))?.is_none());
@@ -1070,7 +1124,7 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
         (
             Some(WorkOutcome::Unverified),
             WorkStatus::Unverified,
-            Some("设备已移除，无法核对")
+            Some("设备已移除，结果无法确认。")
         ),
         "a removed device's work is not written off as never run"
     );
@@ -1409,7 +1463,9 @@ fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
     store.append_event(&net.a, &net.network, "c", moved, vec![], 3)?;
     assert!(
         store
-            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
+                "cfg".into()
+            )))?
             .is_none()
     );
     let trigger = message_trigger("m1");
@@ -1424,7 +1480,9 @@ fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
 
 fn answered(store: &mut Store, net: &Net, at: i64) -> Result<SchedulerJob> {
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     let trigger = claimed.job.trigger.clone();
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
@@ -1444,7 +1502,9 @@ fn answered(store: &mut Store, net: &Net, at: i64) -> Result<SchedulerJob> {
 fn replied_elsewhere(store: &mut Store, net: &Net, identity: &LocalIdentity) -> Result<()> {
     assert!(
         store
-            .claim_next(identity, &net.network, "c", "boot", "cfg")?
+            .claim_next(identity, &net.network, "c", "boot", |_| Ok(Some(
+                "cfg".into()
+            )))?
             .is_none(),
         "a message answered in the shared record does not run again"
     );
@@ -1558,7 +1618,9 @@ fn a_move_fences_the_old_owners_running_turn() -> Result<()> {
         2,
     )?;
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     let trigger = claimed.job.trigger.clone();
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
@@ -2208,7 +2270,9 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
     );
 
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("schedule job")?;
     assert_eq!(
         (claimed.job.kind, claimed.job.trigger.as_str()),
@@ -2251,7 +2315,9 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
     )?;
     assert!(
         store
-            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
+                "cfg".into()
+            )))?
             .is_none()
     );
     assert!(matches!(
@@ -2429,7 +2495,9 @@ fn a_reminder_runs_once_and_never_again_after_restart_or_sync() -> Result<()> {
         vec![("c".to_owned(), trigger.clone())]
     );
     let claimed = origin
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("reminder job")?;
     assert_eq!(claimed.job.kind, TriggerKind::Schedule);
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
@@ -2522,7 +2590,9 @@ fn a_schedule_time_runs_once_across_owners() -> Result<()> {
         due
     );
     let running = b_side
-        .claim_next(&net.b, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.b, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("b runs the time")?;
     assert_eq!(running.job.trigger, trigger);
     b_side.append_event(
@@ -2555,7 +2625,9 @@ fn a_schedule_time_runs_once_across_owners() -> Result<()> {
     );
     assert!(
         a_side
-            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
+                "cfg".into()
+            )))?
             .is_none()
     );
     assert!(matches!(
@@ -2927,7 +2999,9 @@ fn a_paused_schedule_is_not_run_and_a_deleted_one_stays_deleted() -> Result<()> 
     assert!(origin.schedule(&net.network, &schedule_id)?.is_none());
     assert!(
         origin
-            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
+                "cfg".into()
+            )))?
             .is_none()
     );
     let mut other = store(&net)?;
@@ -2972,7 +3046,9 @@ fn a_bot_message_wakes_the_other_bot_once() -> Result<()> {
     assert!(send(&mut origin, "s2", "c", "To myself", 11).is_err());
     assert_eq!(origin.scheduler_jobs("d")?.len(), 1);
     let claimed = origin
-        .claim_next(&net.a, &net.network, "d", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "d", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("bot message job")?;
     assert_eq!(
         (claimed.job.kind, claimed.job.trigger.as_str()),
@@ -3472,7 +3548,9 @@ fn a_deleted_bot_stops_everywhere_and_stays_deleted() -> Result<()> {
     );
     assert!(
         origin
-            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
+                "cfg".into()
+            )))?
             .is_none()
     );
     assert!(
@@ -4912,7 +4990,9 @@ fn a_failed_turn_shares_its_kind_and_keeps_the_raw_detail_local() -> Result<()> 
             2,
         )?;
         let claimed = store
-            .claim_next(&net.a, &net.network, "c", "boot-1", "cfg")?
+            .claim_next(&net.a, &net.network, "c", "boot-1", |_| {
+                Ok(Some("cfg".into()))
+            })?
             .context("job")?;
         let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
         store.mark_started("c", &claimed.job.trigger, &attempt)?;
@@ -4976,7 +5056,9 @@ fn a_bot_thinks_until_its_reply_runs_and_rests_once_it_ends() -> Result<()> {
     assert_eq!(store.busy_conversations()?.get("c"), Some(&Busy::Thinking));
 
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot-1", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot-1", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     assert_eq!(
         store.busy_conversations()?.get("c"),
@@ -5007,7 +5089,9 @@ fn a_bot_thinks_until_its_reply_runs_and_rests_once_it_ends() -> Result<()> {
         "the second message still waits"
     );
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot-1", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot-1", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &claimed.job.trigger, &attempt)?;
@@ -5375,7 +5459,9 @@ fn a_queued_turn_reads_the_reply_ahead_of_it() -> Result<()> {
         )?;
     }
     let first = store
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("first turn")?;
     let attempt = first.job.state.attempt().context("attempt")?.id.clone();
     store.finish_job(
@@ -5389,7 +5475,9 @@ fn a_queued_turn_reads_the_reply_ahead_of_it() -> Result<()> {
         4,
     )?;
     let second = store
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("second turn")?;
     assert_eq!(second.job.trigger, message_trigger("m2"));
     let read = store.context(&net.network, "c", Some(&second.job.basis))?;
@@ -5417,7 +5505,9 @@ fn a_refused_turn_start_leaves_its_messages_for_the_next_turn() -> Result<()> {
         |store: &mut Store, id: &str, started: bool| -> Result<crate::scheduling::ClaimedJob> {
             say(store, &net, id, true)?;
             let claimed = store
-                .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+                .claim_next(&net.a, &net.network, "c", "boot", |_| {
+                    Ok(Some("cfg".into()))
+                })?
                 .context("job")?;
             let trigger = claimed.job.trigger.clone();
             let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
@@ -5460,7 +5550,9 @@ fn a_refused_turn_start_leaves_its_messages_for_the_next_turn() -> Result<()> {
     );
     say(&mut store, &net, "m3", true)?;
     let third = store
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     assert_eq!(third.previous_native_id.as_deref(), Some("thread"));
     assert_eq!(
@@ -5502,7 +5594,9 @@ fn a_move_hands_the_queue_on_without_a_claim() -> Result<()> {
     assert_eq!(handed(&store)?, std::slice::from_ref(&trigger));
     assert!(
         store
-            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(
+                "cfg".into()
+            )))?
             .is_none()
     );
     store.fence_moved_turns(&net.network, &local)?;
@@ -5518,7 +5612,9 @@ fn a_new_owner_replies_to_what_the_old_one_left_unanswered_once() -> Result<()> 
     let local = net.a.device_id()?;
     say(&mut a_side, &net, "m1", true)?;
     let first = a_side
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     let (t1, a1) = (
         first.job.trigger.clone(),
@@ -5558,7 +5654,9 @@ fn a_new_owner_replies_to_what_the_old_one_left_unanswered_once() -> Result<()> 
     assert_eq!(markers, 1, "a settled steer is recorded once");
     say(&mut a_side, &net, "m3", true)?;
     let third = a_side
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     let (t3, a3) = (
         third.job.trigger.clone(),
@@ -5690,7 +5788,9 @@ fn a_new_owner_declines_what_the_old_one_left_unanswered_once() -> Result<()> {
         [message_trigger("m2").as_str()]
     );
     let claimed = b_side
-        .claim_next(&net.b, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.b, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     assert_eq!(claimed.job.trigger, message_trigger("m2"));
     assert!(matches!(
@@ -5832,7 +5932,7 @@ fn a_new_session_key_opens_a_new_thread_shown_everything() -> Result<()> {
     let mut turn = |id: &str, key: &str| -> Result<crate::scheduling::ClaimedJob> {
         say(&mut store, &net, id, true)?;
         let claimed = store
-            .claim_next(&net.a, &net.network, "c", "boot", key)?
+            .claim_next(&net.a, &net.network, "c", "boot", |_| Ok(Some(key.into())))?
             .context("job")?;
         let trigger = claimed.job.trigger.clone();
         let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
@@ -7332,7 +7432,9 @@ fn a_submitted_runtime_is_frozen_and_only_proven_unstarted_failure_is_retryable(
     conversation(&mut store, &net)?;
     say(&mut store, &net, "m1", true)?;
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     let runtime = submitted_runtime(&claimed)?;
     let trigger = &claimed.job.trigger;
@@ -7378,13 +7480,9 @@ fn a_submitted_runtime_is_frozen_and_only_proven_unstarted_failure_is_retryable(
     );
     say(&mut store, &net, "m2", true)?;
     let next = store
-        .claim_next(
-            &net.a,
-            &net.network,
-            "c",
-            "boot",
-            "changed-model-and-effort",
-        )?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("changed-model-and-effort".into()))
+        })?
         .context("job")?;
     assert_eq!(next.session_generation, 2);
     assert_eq!(
@@ -7450,7 +7548,9 @@ fn a_restarted_reply_waits_for_history_then_records_the_recovered_result_once() 
         conversation(&mut store, &net)?;
         say(&mut store, &net, "m1", true)?;
         let claimed = store
-            .claim_next(&net.a, &net.network, "c", "boot-1", "cfg")?
+            .claim_next(&net.a, &net.network, "c", "boot-1", |_| {
+                Ok(Some("cfg".into()))
+            })?
             .context("job")?;
         let runtime = submitted_runtime(&claimed)?;
         store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
@@ -7468,7 +7568,9 @@ fn a_restarted_reply_waits_for_history_then_records_the_recovered_result_once() 
             store.recover_scheduler_jobs(&net.a, &net.network, "boot-2")?;
             assert!(
                 store
-                    .claim_next(&net.a, &net.network, "c", "boot-2", "new-settings")?
+                    .claim_next(&net.a, &net.network, "c", "boot-2", |_| Ok(Some(
+                        "new-settings".into()
+                    )))?
                     .is_none()
             );
             assert!(
@@ -7530,7 +7632,9 @@ fn an_unknown_process_reply_keeps_partial_text_until_the_user_confirms() -> Resu
     conversation(&mut store, &net)?;
     say(&mut store, &net, "m1", true)?;
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     let runtime = submitted_runtime(&claimed)?;
     store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
@@ -7587,7 +7691,9 @@ fn native_compaction_advances_lineage_and_keeps_the_resumable_session() -> Resul
     conversation(&mut store, &net)?;
     say(&mut store, &net, "m1", true)?;
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     let runtime = submitted_runtime(&claimed)?;
     store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
@@ -7634,7 +7740,9 @@ fn native_compaction_advances_lineage_and_keeps_the_resumable_session() -> Resul
     )?;
     say(&mut store, &net, "m2", true)?;
     let next = store
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     assert_eq!(next.previous_native_id.as_deref(), Some("thread"));
     assert_eq!(next.previous_token.as_deref(), Some("token"));
@@ -7652,7 +7760,9 @@ fn a_proven_unstarted_backup_gets_a_new_permission_and_keeps_delivery_identity()
     conversation(&mut store, &net)?;
     say(&mut store, &net, "m1", true)?;
     let claimed = store
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("job")?;
     let mut runtime = submitted_runtime(&claimed)?;
     let original_permission = claimed
@@ -7763,7 +7873,9 @@ fn a_proven_unstarted_backup_gets_a_new_permission_and_keeps_delivery_identity()
     )?;
     say(&mut store, &net, "m2", true)?;
     let next = store
-        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .claim_next(&net.a, &net.network, "c", "boot", |_| {
+            Ok(Some("cfg".into()))
+        })?
         .context("next primary job")?;
     assert!(next.previous_native_id.is_none());
     assert!(next.previous_token.is_none());

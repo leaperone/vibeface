@@ -15,7 +15,6 @@ import time
 import uuid
 
 MODE = os.environ.get("FAKE_PI_MODE", "reply")
-DIRECTORY = os.environ["PI_CODING_AGENT_SESSION_DIR"]
 GATE_DIR = os.environ.get("FAKE_PI_GATE_DIR")
 GATE_RELEASE = os.environ.get("FAKE_PI_GATE_RELEASE")
 out = threading.Lock()
@@ -39,13 +38,16 @@ def argument(name):
     return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else None
 
 
+DIRECTORY = argument("--session-dir") or os.environ["PI_CODING_AGENT_SESSION_DIR"]
+
+
 def read(path):
     with open(path) as file:
         lines = [json.loads(line) for line in file if line.strip()]
     return lines[0], lines[1:]
 
 
-log({"argv": sys.argv[1:], "run": os.environ.get("VIBEFACE_PI_RUN")})
+log({"argv": sys.argv[1:], "run": os.environ.get("VIBEFACE_PI_RUN"), "session_dir": DIRECTORY})
 os.makedirs(DIRECTORY, exist_ok=True)
 stamp = time.strftime("%Y-%m-%dT%H-%M-%S")
 if argument("--session"):

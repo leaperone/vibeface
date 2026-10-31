@@ -873,7 +873,6 @@ where
             return Err(error(ManagerFailure::Failed, native, failure));
         }
     }
-    // Only a completed native turn advances the session's covered prompt.
     if let Some(turn) = &config.codex_turn
         && let Err(e) = (turn.record)(session.clone(), Some(message)).await
     {

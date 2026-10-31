@@ -3623,7 +3623,7 @@ def phase4_acceptance(options):
         a.client.revoke(c.device_id, head(a, network, c.device_id))
         unknown = wait_for("A leaves the revoked device's work for the user", lambda: (lambda row: row if row["outcome"] == "unverified" else None)(
             works(a.client)[lost]), timeout=60)
-        require(unknown["failure_reason"] == "设备已移除，无法核对", "a removed device's work is not written off as never run")
+        require(unknown["failure_reason"] == "设备已移除，结果无法确认。", "a removed device's work is not written off as never run")
         require(delivery(a.client, lost) is None, "the unknown work drops its stop request")
         passed("offline-stop-and-revoke", stop="stop_timed_out", outcome=unknown["outcome"])
 

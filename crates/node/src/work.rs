@@ -346,7 +346,7 @@ fn finish_failed(
     finish(record, outcome, reason, kind)
 }
 
-const DISCONNECTED: &str = "执行器连接已断开，等待重新核对";
+const DISCONNECTED: &str = "AI 工具断开了。重连后再确认结果。";
 /// The Agent bound a thread, then no turn showed up by the window's end. Its `turn/start` may
 /// still be in flight, so the work is neither started nor refused.
 const SEND_UNSEEN: &str = "发送时限过了还没看到这次回合，不知道是否已开始";
@@ -672,6 +672,37 @@ mod tests {
             0,
         )
         .0
+    }
+
+    #[test]
+    fn final_work_dispatch_round_trips_and_epoch8_shape_rejects_model_fields() -> anyhow::Result<()>
+    {
+        #[derive(Serialize, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Epoch8Body {
+            WorkDispatched {
+                work_id: String,
+                trigger: String,
+                dispatcher: String,
+                call_ref: String,
+                kind: WorkKind,
+                cwd: String,
+                title: String,
+                prompt: String,
+            },
+        }
+        let old = serde_json::json!({"type":"work_dispatched", "work_id":"w", "trigger":"message:m", "dispatcher":"node", "call_ref":"call", "kind":"codex", "cwd":"/tmp", "title":"work", "prompt":"go"});
+        let _: Epoch8Body = serde_json::from_value(old.clone())?;
+        let mut new = old;
+        new["model"] = serde_json::json!("requested");
+        new["resolved"] = serde_json::json!({"provider":"codex", "model":"accepted"});
+        let body: EventBody = serde_json::from_value(new.clone())?;
+        assert_eq!(serde_json::to_value(body)?, new);
+        let error = serde_json::from_value::<Epoch8Body>(new)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("old shape must reject"))?;
+        assert!(error.to_string().contains("unknown field"));
+        Ok(())
     }
 
     #[test]

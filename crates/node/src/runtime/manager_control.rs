@@ -505,7 +505,7 @@ impl Runtime {
             Some(_) => bail!("这个结果已经不需要你确认了"),
             None => ensure!(
                 !self.target_vouches(network, &work).await?,
-                "它的设备还能报回结果，请等它报告"
+                "它的设备还在线。等它报回结果就行。"
             ),
         }
         let unvouched = work.outcome.is_none();
