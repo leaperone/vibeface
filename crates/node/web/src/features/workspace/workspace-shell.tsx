@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronLeft, CircleAlert, Hand, LoaderCircle, Plus, RefreshCw, RotateCw, ShieldAlert, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Bell, ChevronLeft, CircleAlert, Hand, LoaderCircle, Plus, RefreshCw, RotateCw, ShieldAlert, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "@/lib/utils"
@@ -72,7 +72,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   // A browser joins on this computer's lasting page, never the temporary origin this session opened on, or it would hold a second identity.
   const lasting = device.ready?.info.connection_entry
   const home = lasting && isLoopback(entryAddress(lasting)) ? `http://localhost:${new URL(entryAddress(lasting)).port}` : undefined
-  const { setOpenMobile, isMobile, open: sidebarOpen } = useSidebar()
+  const { setOpenMobile, isMobile } = useSidebar()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const chatRoute = pathname.startsWith("/b/")
   const taskOpen = /^\/b\/[^/]+\/work\//.test(pathname)
@@ -91,9 +91,9 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   const navigate = useNavigate()
   const joins = useOpenJoins()
   const [actionsSlot, setActionsSlot] = useState<HTMLElement | null>(null)
-  // The phone's home lists 待处理 itself; elsewhere the header carries it whenever the sidebar is out of sight.
+  // The phone's home lists 待处理 itself; every other page keeps the Bell in the header.
   const phoneHome = isMobile && pathname === "/"
-  const inboxInHeader = (isMobile || !sidebarOpen) && !phoneHome && pathname !== "/inbox"
+  const inboxInHeader = pathname !== "/inbox"
   const devicesAttention = joins.length > 0 || workspace.nodes.some((node) => !node.revoked && !node.online)
 
   useEffect(() => { setOpenMobile(false) }, [pathname, setOpenMobile])
@@ -189,6 +189,12 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           <div className="col-start-3 flex items-center justify-end ps-2 empty:hidden">
           {phoneHome ? <div className="-me-3 flex">
             <Button asChild variant="ghost" size="icon" className="relative">
+              <Link to="/inbox" aria-label={recovering ? `${terms.inbox.label}，有人在找回` : waiting ? `${terms.inbox.label} ${waiting}` : terms.inbox.label} title={terms.inbox.label}>
+                <Bell aria-hidden="true" />
+                {recovering ? <ShieldAlert aria-hidden="true" className="absolute top-0.5 right-0.5 size-4! rounded-full bg-background text-danger" /> : waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 ease-out" /> : null}
+              </Link>
+            </Button>
+            <Button asChild variant="ghost" size="icon" className="relative">
               <Link to="/devices" aria-label={devicesAttention ? `${terms.myDevices.label}，需要留意` : terms.myDevices.label} title={terms.myDevices.label}>
                 <terms.myDevices.icon aria-hidden="true" />
                 {devicesAttention ? <CircleAlert aria-hidden="true" className="absolute top-1 right-1 size-3! rounded-full bg-background text-warning" /> : null}
@@ -197,7 +203,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
             <Button asChild variant="ghost" size="icon"><Link to="/settings" aria-label={terms.settings.label} title={terms.settings.label}><terms.settings.icon aria-hidden="true" /></Link></Button>
           </div> : inboxInHeader ? <Button asChild variant="ghost" size="icon" className="relative -me-3">
             <Link to="/inbox" aria-label={recovering ? `${terms.inbox.label}，有人在找回` : waiting ? `${terms.inbox.label} ${waiting}` : terms.inbox.label} title={terms.inbox.label}>
-              <terms.inbox.icon aria-hidden="true" />
+              <Bell aria-hidden="true" />
               {recovering ? <ShieldAlert aria-hidden="true" className="absolute top-0.5 right-0.5 size-4! rounded-full bg-background text-danger md:-top-0.5 md:-right-0.5" /> : waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 ease-out md:-top-0.5 md:-right-0.5" /> : null}
             </Link>
           </Button> : null}

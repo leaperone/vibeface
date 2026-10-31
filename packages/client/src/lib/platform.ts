@@ -51,6 +51,8 @@ export type Platform = {
   storage: KeyValue
   outbox: OutboxStore
   notifier: Notifier
+  /** Whether this surface has a route for session handoff alerts. */
+  sessionNotifications?: boolean
   /** Calls `listener` each time the app comes back to the foreground. */
   onForeground(listener: () => void): () => void
   foreground(): boolean

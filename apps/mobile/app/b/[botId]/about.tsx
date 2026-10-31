@@ -57,7 +57,6 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
         {shared.primary === bot.conversation_id
           ? <View accessible accessibilityHint={botCopy.primaryHint} className="flex-row items-center gap-1"><Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /><Text className="text-meta text-muted-foreground">主 Bot</Text></View>
           : <ActionButton variant="outline" size="sm" icon={Star} accessibilityHint={botCopy.primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
-        <Text className="text-meta text-muted-foreground">在聊天里说一声就能改</Text>
       </View>
     </View>
     {owner || models.length ? <SettingsGroup>
