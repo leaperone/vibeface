@@ -24,7 +24,8 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
     value["pending_check"] = json!(
         checks
             .iter()
-            .any(|check| check.conversation_id == job.conversation_id && check.trigger == job.trigger)
+            .any(|check| check.conversation_id == job.conversation_id
+                && check.trigger == job.trigger)
     );
     value["retryable"] = json!(job.retryable() && value["pending_check"] != true);
     if let JobState::Failed { failure, .. }

@@ -899,7 +899,7 @@ async fn turn(
                         local_settings.clone(), provider_local.clone(), Some(selected),
                     ).await.map_err(ManagerError::not_started)?;
                     if node.provider_configuration_pending(next.session_config.provider, &provider_local) {
-                        return Err(ManagerError::not_started(anyhow::anyhow!("backup provider is starting")).into());
+                        return Err(ManagerError::not_started(anyhow::anyhow!("backup provider is starting")));
                     }
                     claimed = node.store.lock().await.switch_scheduler_session(
                         &conversation, &trigger, &attempt.id, &next.session_config,
