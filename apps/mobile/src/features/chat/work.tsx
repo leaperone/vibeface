@@ -1,12 +1,12 @@
 import { Link } from 'expo-router'
-import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Cpu, Hand, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Smile, TriangleAlert, Undo2, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Cpu, Hand, Hourglass, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Smile, TriangleAlert, Undo2, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { failureText, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
 import { providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
 import { changeTitle, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
-import { interruptedCopy, nodeName, shownState, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { chatTaskState, interruptedCopy, nodeName, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
@@ -56,7 +56,7 @@ export function useChatExtras(conversationId: string, botId: string) {
   const jobs = data.scheduler?.jobs ?? []
   const shown = new Set(data.messages.map((message) => message.message_id))
   data.works.forEach((work, index) => {
-    const state = shownState(work, shared.nodes)
+    const state = chatTaskState(work, data.works, shared.nodes)
     const shownAs = state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state
     const joined = work.turn_id ? data.works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id)?.title : undefined
     const scheduledReply = data.messages.find((message) => message.role !== 'user' && scheduleTrigger(message.in_reply_to) && message.in_reply_to === work.trigger)
@@ -87,7 +87,7 @@ export function useChatExtras(conversationId: string, botId: string) {
 function TaskCard({ work, state, stale, away, joined, botId, device, agent, progress }: { work: WorkRecord; state: string; stale: boolean; away: boolean; joined?: string; botId: string; device: string; agent: ProviderId | null; progress: string }) {
   const title = work.title || '任务'
   const active = taskActive(state)
-  const open = active || state === 'waiting' || state === 'awaiting_confirmation'
+  const open = active || state === 'waiting' || state === 'awaiting_confirmation' || state === 'awaiting_children'
   const failed = state === 'failed' || state === 'rejected' || state === 'dispatch_rejected'
   const href = `/b/${botId}/work/${work.work_id}` as const
   const meta = <View className="min-w-0 flex-row items-center gap-1">
@@ -118,7 +118,7 @@ function TaskCard({ work, state, stale, away, joined, botId, device, agent, prog
   return <Link href={href} asChild>
     <Pressable accessibilityRole="link" className="min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-2 shadow-xs active:bg-muted dark:border-line-strong">
       {/* Waiting on an answer, it only says so: the question card below asks. */}
-      <Icon as={state === 'waiting' ? Hand : away ? WifiOff : active && !stale ? LoaderCircle : CircleQuestionMark} className={cn('size-5', stale ? 'text-muted-foreground' : active ? 'text-foreground' : 'text-warning')} />
+      <Icon as={state === 'waiting' ? Hand : state === 'awaiting_children' ? Hourglass : away ? WifiOff : active && !stale ? LoaderCircle : CircleQuestionMark} className={cn('size-5', stale || state === 'awaiting_children' ? 'text-muted-foreground' : active ? 'text-foreground' : 'text-warning')} />
       <View className="min-w-0 flex-1 gap-0.5">
         <Text numberOfLines={1} className="font-medium">{title}</Text>
         {meta}

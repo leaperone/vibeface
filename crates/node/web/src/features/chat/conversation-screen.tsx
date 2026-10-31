@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDown, ArrowRightLeft, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, RotateCw, Send, Unplug, WifiOff } from 'lucide-react'
+import { ArrowDown, ArrowRightLeft, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Hourglass, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, RotateCw, Send, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, EmptyState, InlineError, PrimaryMark } from '@/components/app/kit'
 import { BotFace, botMood, botTint, useDark } from '@/components/app/bot-face'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
@@ -13,7 +13,7 @@ import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton, useCreateBot } from '@/features/workspace/workspace-shell'
 import { ConfirmCard } from '@/features/workspace/task-activity'
 import { QuestionCard } from '@/features/workspace/question-card'
-import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { chatTaskState, nodeName, progressLabel, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
 import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { botCopy, placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
@@ -77,11 +77,11 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   // A running turn paused on an approval reads as waiting; a steered input names the task it joined.
   const asking = new Set((data?.questions ?? []).filter((question) => questionOpen(question) && question.about.request_id).map((question) => question.about.session_id))
   const tasks: TaskRow[] = works.map((work, index) => {
-    const state = shownState(work, workspace.nodes)
+    const state = chatTaskState(work, works, workspace.nodes)
     const joined = work.turn_id ? works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id) : undefined
     return { id: work.work_id, state: state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state, device: work.target_node, summary: taskProgress(work, workspace.liveProgress), agent: taskAgent(work, workspace.nodes), trigger: work.trigger, work, joined: joined?.title }
   })
-  const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'waiting')
+  const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'waiting' || task.state === 'awaiting_children')
   const placed = new Set<string>()
   const taskRows = (task: TaskRow) => {
     placed.add(task.id)
@@ -334,6 +334,7 @@ function TaskCard({ task, botId, device, here, open, live, away }: { task: TaskR
     {task.state === 'waiting' ? <terms.approval.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : stale ? <CircleQuestionMark aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
       : away ? <WifiOff aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
+      : task.state === 'awaiting_children' ? <Hourglass aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
       : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className="size-5 shrink-0 animate-spin text-info" /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
     <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} label={stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)} agent={task.agent} className="text-meta" /></span>
       {task.joined ? <span className="flex min-w-0 items-center gap-1 text-meta text-muted-foreground"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">补充到「{task.joined}」</span></span>

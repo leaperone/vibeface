@@ -1,5 +1,5 @@
 import type { TranscriptMessage } from "../chat/types.ts"
-import type { BotRecord, NodeInfo, OpenWork, Question } from "./types.ts"
+import type { BotRecord, NodeInfo, OpenWork, Question, WorkRecord } from "./types.ts"
 import { providerNames, type ProviderId } from "../lib/node.ts"
 
 /** Each question has one answer ID, so the web, Grok and every retry write the same message. */
@@ -41,6 +41,12 @@ export function questionMeta(question: Question, works: readonly OpenWork[], bot
   const work = approval ? works.find((item) => item.thread_id === question.about.session_id && !item.outcome) : undefined
   const bot = work && bots.find((item) => item.conversation_id === work.conversation_id)
   return { approval, task: work && bot ? { bot_id: bot.bot_id, work_id: work.work_id, title: work.title || "任务" } : null, local: question.about.node === entry }
+}
+
+/** The task an approval held, by title, for its answered line; any work on its session counts, finished or not, the latest first. */
+export function approvalTask(question: Question, works: readonly Pick<WorkRecord, "thread_id" | "title">[]): string | null {
+  const work = question.about.request_id ? [...works].reverse().find((item) => item.thread_id === question.about.session_id) : undefined
+  return work ? work.title || "任务" : null
 }
 
 /** What 待处理 lists: open questions, urgent ones first, then newest first. */

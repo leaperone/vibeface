@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { CircleAlert, CircleCheck, Clock, Copy, Download, Laptop, Link2, Plus, Smartphone, SquareTerminal } from "lucide-react"
+import { Link } from "@tanstack/react-router"
 import qrcode from "qrcode-generator"
 import { BusyIcon, Details, InlineError, PageActions, Segmented } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -10,7 +11,7 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import type { Invitation } from "@vibeface/client/identity/context.tsx"
 import { addDeviceCopy, deviceCopy, joinCopy } from "@vibeface/client/identity/copy.ts"
 import { messageOf } from "@vibeface/client/lib/node.ts"
-import { JoinRequests, useOpenJoins } from "./join"
+import { JoinRequests, useOpenJoins, type Added } from "./join"
 
 /** `image`: the QR code of `qr`, which a phone's camera opens when the link is public, and the Vibeface app scans otherwise. */
 type Share = Invitation & { image: string | null }
@@ -43,7 +44,7 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
   const [error, setError] = useState("")
   const [status, setStatus] = useState("")
   // This page allowed the device, so it says so where the link was rather than only in a toast.
-  const [added, setAdded] = useState<{ name: string; manage: boolean } | null>(null)
+  const [added, setAdded] = useState<Added | null>(null)
   // "已复制" shows for a moment on the button that copied.
   const [copied, setCopied] = useState<"link" | "command" | null>(null)
   // The browser refused the clipboard: the raw text opens, selected, for a manual copy.
@@ -123,10 +124,13 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
         <SheetHeader className="pr-14"><SheetTitle tabIndex={-1} className="outline-none">添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
         <div className="grid gap-6 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
           {/* A device already asking is the next thing to act on, so it comes before a new link. */}
-          <JoinRequests issuing={result !== null} manage={asManager} onAllowed={(name, manage) => { setAdded({ name, manage }); setAsManager(false); setResult(null); setError(""); setCopyFailed(false) }} />
+          <JoinRequests issuing={result !== null} manage={asManager} onAllowed={(device) => { setAdded(device); setAsManager(false); setResult(null); setError(""); setCopyFailed(false) }} />
           {added && !requests ? <div className="grid gap-3">
             <p role="status" className="flex min-w-0 items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" /><span className="truncate" title={added.name}>{added.manage ? deviceCopy.addedManager(added.name) : `已添加「${added.name}」`}</span></p>
-            <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Plus} />再添加一台</Button>
+            <div className="flex flex-wrap gap-2">
+              {added.kind === "node" ? <Button asChild><Link to="/devices/$deviceId" params={{ deviceId: added.id }} onClick={() => setOpen(false)}><terms.ai.icon aria-hidden="true" />{addDeviceCopy.setUpAi}</Link></Button> : null}
+              <Button type="button" variant={added.kind === "node" ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Plus} />{addDeviceCopy.addAnother}</Button>
+            </div>
           </div> : !result || (used && !requests) ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
           {result && !used ? <div className="grid gap-3">
             <Segmented label="新设备是" labels fill value={kind} options={[...kinds]} onChange={(next) => { setKind(next); setCopied(null); setCopyFailed(false); setError(""); setShown("link") }} />

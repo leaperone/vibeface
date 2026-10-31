@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import type { JoinRequest } from '../lib/node.ts'
+import { availability, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
-import { deviceForm, deviceOnline, formName } from './labels.ts'
-import type { NodeInfo, Question } from './types.ts'
+import { chatTaskState, deviceForm, deviceOnline, entryLabel, fixOnDevice, formName, taskLabel } from './labels.ts'
+import type { NodeInfo, Question, WorkRecord } from './types.ts'
 
 const question = (id: string, closed = false): Question => ({
   question_id: id, conversation_id: 'c', bot: { bot_id: 'b', name: '助手' }, severity: 'normal', text: id, choices: [], about: { kind: 'general' },
@@ -50,8 +50,43 @@ test('a phone asking to join reads as a phone, and only a computer has an online
   assert.equal(formName[deviceForm('client', '我的 iPad')], '平板')
   assert.equal(formName[deviceForm('node', '我的手机')], '电脑')
   assert.equal(deviceOnline('client', undefined, false, true), undefined, 'no device knows whether a browser on another connection is open')
+  assert.equal(deviceOnline('client', undefined, false, true, true), true, 'the browser in hand is online while connected')
+  assert.equal(deviceOnline('client', undefined, false, false, true), false)
   assert.equal(deviceOnline('node', { online: false }, true, true), false)
   assert.equal(deviceOnline('node', undefined, true, true), true, 'the connected computer is online before the device list arrives')
   assert.equal(deviceOnline('node', { online: true }, true, false), false, 'the computer this device lost reads offline, not its last report')
   assert.equal(deviceOnline('node', { online: true }, false, false), undefined, 'another computer is unknown while this device is offline')
+})
+
+test('a task done itself waits on a child still running, down the chain, and only then', () => {
+  const work = (work_id: string, extra: Partial<WorkRecord> = {}): WorkRecord => ({ work_id, trigger: '', target_node: 'mac', cwd: '/w', title: work_id, prompt: '', state: 'finished', summary: '', outcome: 'completed', result_text: '', failure_reason: null, ...extra })
+  const parent = work('p')
+  assert.equal(chatTaskState(parent, [parent]), 'completed')
+  assert.equal(chatTaskState(parent, [parent, work('c', { parent: 'p', state: 'running', outcome: null })]), 'awaiting_children')
+  assert.equal(taskLabel('awaiting_children'), '等子任务')
+  assert.equal(chatTaskState(parent, [parent, work('c', { parent: 'p' }), work('g', { parent: 'c', state: 'accepted', outcome: null })]), 'awaiting_children', 'a grandchild still running holds it too')
+  assert.equal(chatTaskState(parent, [parent, work('c', { parent: 'p' })]), 'completed', 'finished children do not')
+  assert.equal(chatTaskState(work('f', { outcome: 'failed' }), [work('c', { parent: 'f', state: 'running', outcome: null })]), 'failed', 'a failure still reads as one')
+})
+
+test('the device to fix a refused task is chosen by its kind, not its words', () => {
+  assert.equal(fixOnDevice({ failure: 'no_bot' }), true)
+  assert.equal(fixOnDevice({ failure: 'quota' }), false)
+  assert.equal(fixOnDevice({}), false)
+})
+
+test('the capsule names the computer from the directory once it lists it, not by the name it had before joining', () => {
+  const directory = { members: [{ device_id: 'b', kind: 'node' as const, name: '工作电脑', manage: false }] }
+  assert.equal(entryLabel({ joined: true, directory, entryId: 'b', ownName: '我的 Mac', address: 'http://127.0.0.1:1' }), '工作电脑')
+  assert.equal(entryLabel({ joined: true, directory: null, entryId: 'b', ownName: '我的 Mac', address: 'http://127.0.0.1:1' }), null)
+  assert.equal(entryLabel({ joined: false, directory: null, entryId: 'b', ownName: '我的 Mac', address: 'http://127.0.0.1:1' }), '我的 Mac')
+})
+
+test('a provider shows whether it can be used before any use is picked', () => {
+  const provider = (extra: Partial<ProviderStatus>) => ({ state: 'off', installed: true, env: [], ...extra }) as Pick<ProviderStatus, 'state' | 'installed' | 'env'>
+  assert.equal(availability(provider({})), 'ready')
+  assert.equal(availability(provider({ installed: false })), 'missing')
+  assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: false, required: true }] })), 'needs_setup')
+  assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: true, required: true }] })), 'ready')
+  assert.equal(availability(provider({ state: 'starting' })), 'starting')
 })

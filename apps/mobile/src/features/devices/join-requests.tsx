@@ -13,6 +13,9 @@ import { Switch } from '@/components/ui/switch'
 import { Text } from '@/components/ui/text'
 import { useRun } from '@/lib/use-run'
 
+/** A device this screen just allowed in. */
+export type Added = { id: string; kind: 'node' | 'client'; name: string; manage: boolean }
+
 /** Requests an admin can still act on. */
 export const useOpenJoins = (): JoinRequest[] => openJoins(useDevice())
 
@@ -21,7 +24,7 @@ export const useOpenJoins = (): JoinRequest[] => openJoins(useDevice())
  * `issuing`: this screen just handed out a link, so it starts the comparison without a press.
  * `onAllowed`: the screen shows the added device itself.
  */
-export function JoinRequests({ issuing = false, onAllowed }: { issuing?: boolean; onAllowed?(name: string, manage: boolean): void }) {
+export function JoinRequests({ issuing = false, onAllowed }: { issuing?: boolean; onAllowed?(added: Added): void }) {
   const device = useDevice()
   const joins = useOpenJoins()
   // The code appears once the new device reveals its nonce; poll until every open request shows one.
@@ -39,7 +42,7 @@ export function JoinRequests({ issuing = false, onAllowed }: { issuing?: boolean
 const started = new Set<string>()
 
 /** Starting the comparison claims the request for this admin, so only the screen that issued the link does it on its own. */
-function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: boolean; onAllowed?(name: string, manage: boolean): void }) {
+function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: boolean; onAllowed?(added: Added): void }) {
   const device = useDevice()
   const { busy, error, run } = useRun()
   useEffect(() => {
@@ -52,7 +55,7 @@ function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: bo
   const asking = request.status === 'pending' && !auto
   // As on the web: one 一致，允许 after the codes match, with 设为管理设备 as a switch beside the request.
   const [manage, setManage] = useState(false)
-  const allow = () => run('allow', async () => { const asManager = request.kind === 'client' && manage; await device.approveJoin(request.join_id, asManager); onAllowed?.(request.name || '新设备', asManager) })
+  const allow = () => run('allow', async () => { const asManager = request.kind === 'client' && manage; await device.approveJoin(request.join_id, asManager); onAllowed?.({ id: request.device_id, kind: request.kind, name: request.name || '新设备', manage: asManager }) })
   return <ActionCard icon={deviceIcon({ kind: request.kind, name: request.name, current: false })} tone="info" title={`${request.name || '新设备'} 想加入`}
     meta={formName[deviceForm(request.kind, request.name)]} actions={<>
     <Button variant="ghost" disabled={busy !== null} onPress={() => void run('reject', () => device.rejectJoin(request.join_id))}><Text>拒绝</Text></Button>

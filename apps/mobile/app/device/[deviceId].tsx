@@ -1,5 +1,5 @@
 import { Stack, router, useLocalSearchParams } from 'expo-router'
-import { ArrowRightLeft, Bot, Check, Crown, MonitorSmartphone, Pencil, Sparkles, Trash2, X } from 'lucide-react-native'
+import { ArrowRightLeft, Bot, Check, Crown, Laptop, MonitorSmartphone, Pencil, Sparkles, Trash2, X } from 'lucide-react-native'
 import { useState } from 'react'
 import { Alert, Pressable, ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -30,6 +30,7 @@ export default function DeviceDetail() {
   if (!member) return <EmptyState icon={MonitorSmartphone} title="找不到这个设备" className="flex-1 justify-center" />
   const manageable = device.ready?.principal.can_manage === true && member.kind === 'client' && !member.current
   const removable = device.ready?.principal.can_manage === true && !member.admin && !member.current && !member.entry
+  const entryName = members.find((item) => item.entry)?.name
   const target = device.entries.find((item) => item.device_id === member.device_id) ?? (device.ready ? throughEntry(device.ready.entry, member.device_id) : undefined)
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: '' }} />
@@ -40,6 +41,7 @@ export default function DeviceDetail() {
         <View className="flex-row flex-wrap items-center gap-2">
           {member.online !== undefined ? <Online online={member.online} /> : null}
           {member.current || member.entry ? <View className={tag}><Text className="text-meta text-muted-foreground">{member.current ? self : '当前连接'}</Text></View> : null}
+          {member.current && entryName ? <View className={tag} accessibilityLabel={`连在「${entryName}」上`}><Icon as={Laptop} className="size-3.5 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{entryName}</Text></View> : null}
           {member.admin ? <View className={tag}><Icon as={Crown} className="size-3.5 text-muted-foreground" /><Text className="text-meta text-muted-foreground">管理</Text></View> : null}
         </View>
         {member.online === false ? <Text className="text-meta text-muted-foreground">{deviceCopy.offline}</Text> : null}
@@ -53,8 +55,8 @@ export default function DeviceDetail() {
         {switching.error ? <View className="basis-full ps-11"><ErrorText error={switching.error} /></View> : null}
       </SettingsRow> : null}
     </SettingsGroup> : null}
-    {manageable || removable ? <SettingsGroup>
-      {manageable ? <SettingsRow icon={Crown} label="管理设备" description={deviceCopy.manageHint}>
+    {manageable ? <SettingsGroup>
+      <SettingsRow icon={Crown} label="管理设备" description={deviceCopy.manageHint}>
         <Switch accessibilityLabel="管理设备" value={member.admin} disabled={busy !== null || member.admin && !members.some((item) => item.admin && item.device_id !== member.device_id)}
           onValueChange={(manage) => {
             if (manage) return void run('manage', () => device.setManage(member.device_id, true))
@@ -65,8 +67,14 @@ export default function DeviceDetail() {
             ])
           }} />
         {error && busy === null && !removing ? <View className="basis-full ps-11"><ErrorText error={error} /></View> : null}
-      </SettingsRow> : null}
-      {removable ? <SettingsRow icon={Trash2} tone="danger" label="移除设备" onPress={removing ? undefined : () => setRemoving(true)}>
+      </SettingsRow>
+    </SettingsGroup> : null}
+    <Details>
+      <Text className="text-meta text-muted-foreground">设备编号</Text>
+      <CopyableId value={member.device_id} label="设备编号" />
+    </Details>
+    {removable ? <SettingsGroup>
+      <SettingsRow icon={Trash2} tone="danger" label="移除设备" onPress={removing ? undefined : () => setRemoving(true)}>
         {removing ? <View className="basis-full gap-3 ps-11">
           <Text>{deviceCopy.removeNotice(member.bot !== null)}</Text>
           <ErrorText error={error} />
@@ -77,12 +85,8 @@ export default function DeviceDetail() {
             </Button>
           </View>
         </View> : null}
-      </SettingsRow> : null}
+      </SettingsRow>
     </SettingsGroup> : null}
-    <Details>
-      <Text className="text-meta text-muted-foreground">设备编号</Text>
-      <CopyableId value={member.device_id} label="设备编号" />
-    </Details>
   </ScrollView>
 }
 

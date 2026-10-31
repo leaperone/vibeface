@@ -12,7 +12,7 @@ import { rawError } from "@vibeface/client/lib/errors.ts"
 
 export type Tone = "neutral" | "success" | "warning" | "danger" | "info"
 
-const toneText: Record<Tone, string> = {
+export const toneText: Record<Tone, string> = {
   neutral: "text-muted-foreground", success: "text-success", warning: "text-warning", danger: "text-danger", info: "text-info",
 }
 const toneSurface: Record<Tone, string> = {

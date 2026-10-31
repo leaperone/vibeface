@@ -86,6 +86,9 @@ export const addDeviceCopy = {
   /** The browser could not write to the clipboard; the text below opens selected instead. */
   copyFailed: '没能复制，请手动选中下面的内容',
   compare: '新设备出现安全码后，回这里比对',
+  /** After a computer joins: its AI is the next thing to set up. */
+  setUpAi: '去配置它的 AI',
+  addAnother: '再添加一台',
   /** The Node numbers a name another device already has, so one suggested name is enough. */
   command: (link: string) => `vibeface join '${link}' --name '我的电脑'`,
 }

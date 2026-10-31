@@ -12,7 +12,7 @@ use crate::{
     scheduling::{JobOutcome, JobState, SchedulerJob, Shown, TriggerKind},
     store::Store,
     tools::Tool,
-    work::{Dispatch, DispatchState},
+    work::Dispatch,
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use futures_util::FutureExt;
@@ -1004,10 +1004,7 @@ pub(crate) fn dispatch_row(dispatch: &Dispatch) -> Value {
     let spec = &dispatch.spec;
     json!({"work_id":spec.work_id,"call_ref":spec.call_ref,"target_node":spec.target,"kind":spec.kind,
     "cwd":spec.cwd,"prompt":prefix(&spec.prompt,500),"state":dispatch.state.name(),
-    "reason":dispatch.state.reason(),"failure":match &dispatch.state {
-        DispatchState::Rejected { failure, .. } => *failure,
-        _ => None,
-    }})
+    "reason":dispatch.state.reason(),"failure":dispatch.state.failure()})
 }
 
 pub(crate) fn work_row(work: &WorkProjection) -> Value {
