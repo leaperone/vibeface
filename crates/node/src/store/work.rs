@@ -614,9 +614,9 @@ impl Store {
 
     /// This Node's refused dispatches in `scope`, or every conversation, that still want the
     /// user: not closed in 待处理 and not followed by a completed bot reply, from the reply of
-    /// their report turn on or to a message written after their dispatching turn's reply. A
-    /// refusal answered inside its dispatching turn has no report turn, so only then does the
-    /// second cover a retry the person asked for after it.
+    /// their report turn on or, only when there is no report turn (a refusal answered inside its
+    /// dispatching turn, or reports turned off), to a message written after their dispatching
+    /// turn's reply.
     pub fn open_dispatches(&self, network: &str, scope: Option<&str>) -> Result<Vec<Dispatch>> {
         query_dispatches(
             &self.connection,
