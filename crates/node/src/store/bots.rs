@@ -198,6 +198,22 @@ pub fn created_bot_id(scope: &str, trigger: &str, call_ref: &str) -> (String, St
     (format!("bot-{digest}"), format!("c-{digest}"))
 }
 
+/// Tools and chats name bots, so no two bots share a name, ignoring case and outer spaces.
+/// `except` is the conversation of a bot being renamed.
+pub(crate) fn ensure_name_free(
+    connection: &Connection,
+    network: &str,
+    name: &str,
+    except: Option<&str>,
+) -> Result<()> {
+    let wanted = name.trim().to_lowercase();
+    let taken = bots_from(connection, network)?.iter().any(|bot| {
+        Some(bot.conversation_id.as_str()) != except && bot.name.trim().to_lowercase() == wanted
+    });
+    ensure!(!taken, "已经有叫「{}」的 Bot 了，换个名字。", name.trim());
+    Ok(())
+}
+
 /// Bots with the name and instructions the chat last set.
 pub(crate) fn bots_from(connection: &Connection, network: &str) -> Result<Vec<Bot>> {
     bots_where(connection, network, "AND ?2=''", "")
@@ -255,6 +271,7 @@ impl Store {
             );
             return Ok(existing);
         }
+        ensure_name_free(&tx, network, &spec.name, None)?;
         ensure!(
             !log::scope_has_events(&tx, network, conversation)?,
             "a new Bot requires a new conversation scope"
@@ -340,6 +357,7 @@ impl Store {
             );
             return Ok((existing, false));
         }
+        ensure_name_free(&tx, network, name, None)?;
         let created: usize = tx.query_row(
             "SELECT COUNT(*) FROM bots WHERE network_id=? AND cause=?",
             params![network, serde_json::to_string(&cause)?],
@@ -440,6 +458,21 @@ impl Store {
 
     pub fn primary_bot(&self, network: &str) -> Result<Option<ScopeId>> {
         primary_bot_from(&self.connection, network)
+    }
+
+    /// The bot that takes over as primary once the primary bot is deleted: the earliest left.
+    pub fn primary_successor(&self, network: &str) -> Result<Option<ScopeId>> {
+        let primary = primary_bot_from(&self.connection, network)?;
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT conversation_id FROM bots b WHERE network_id=?1 AND conversation_id IS NOT ?2
+                 AND NOT EXISTS (SELECT 1 FROM bot_deletions d WHERE d.network_id=b.network_id AND d.conversation_id=b.conversation_id)
+                 ORDER BY rank LIMIT 1",
+                params![network, primary],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     pub fn bot_deleted(&self, network: &str, scope: &str) -> Result<bool> {

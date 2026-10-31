@@ -57,7 +57,7 @@ export function PromptInput({
   // Caught on pick: the upload would only refuse it after the person pressed Send.
   const unfits = (file: File) => !file.size || file.size > attachmentLimit
   const unfit = files.find(unfits)
-  const sendable = !disabled && !busy && Boolean(value.trim()) && !unfit
+  const sendable = !disabled && !busy && drafting && !unfit
   const limit = `${attachmentLimit / 2 ** 20} MiB`
   const note = hint || (disabled && value ? reason : '')
   // The box sizes itself to the text (field-sizing), already at its new height when this runs; CSS cannot ease
@@ -94,7 +94,7 @@ export function PromptInput({
             ref={textRef}
             id="message-text"
             name="text"
-            required
+            required={!files.length}
             maxLength={100000}
             value={value}
             placeholder={disabled && reason ? reason : files.length ? '给附件写句说明' : '发消息'}

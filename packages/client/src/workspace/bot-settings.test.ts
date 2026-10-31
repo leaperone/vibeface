@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { botModelRows, formatIn, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger, sortSchedules } from "./bot-settings.ts"
+import { botModelRows, firedAt, formatIn, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger, sortSchedules } from "./bot-settings.ts"
 import { parseBots, parseConversation } from "./model.ts"
 import type { BotChangeRecord, MemoryMetadata } from "./types.ts"
 import type { OutboxItem, OutboxStore } from "../lib/outbox.ts"
@@ -262,11 +262,11 @@ test("next runs read as a short time from now", () => {
 
 test("schedules sort by next run with paused ones last", () => {
   const rows = [
-    { id: "paused", enabled: false, next_run_at_ms: 1 },
-    { id: "later", enabled: true, next_run_at_ms: 300 },
-    { id: "none", enabled: true, next_run_at_ms: null },
-    { id: "soon", enabled: true, next_run_at_ms: 200 },
-    { id: "paused2", enabled: false, next_run_at_ms: null },
+    { id: "paused", enabled: false, next_run_at_ms: 1, first_run_at_ms: 0, every_minutes: 60 },
+    { id: "later", enabled: true, next_run_at_ms: 300, first_run_at_ms: 0, every_minutes: 60 },
+    { id: "none", enabled: true, next_run_at_ms: null, first_run_at_ms: 0, every_minutes: 60 },
+    { id: "soon", enabled: true, next_run_at_ms: 200, first_run_at_ms: 0, every_minutes: 60 },
+    { id: "paused2", enabled: false, next_run_at_ms: null, first_run_at_ms: 0, every_minutes: 60 },
   ]
   assert.deepEqual(sortSchedules(rows).map((row) => row.id), ["soon", "later", "none", "paused", "paused2"])
 })
@@ -398,4 +398,13 @@ test("a bot's picked face parses, none means the face its id gives, and a hue ou
   const [picked, plain] = parseBots({ bots: [{ ...bot, avatar }, { ...bot, avatar: null }] })
   assert.deepEqual([picked?.avatar, plain?.avatar], [avatar, null])
   assert.throws(() => parseBots({ bots: [{ ...bot, avatar: { ...avatar, hue: 70 } }] }))
+})
+
+test("a one-time reminder leaves the list once due and reads as fired from its reply", () => {
+  const once = { schedule_id: "s1", first_run_at_ms: 1_000, enabled: true, next_run_at_ms: 1_000 }, daily = { schedule_id: "s2", first_run_at_ms: 1_000, every_minutes: 1440, enabled: true, next_run_at_ms: 87_400_000 }
+  assert.deepEqual(sortSchedules([once, daily], 2_000), [daily])
+  assert.deepEqual(sortSchedules([once], 500), [once])
+  const messages = [{ in_reply_to: "message:m1", created_at_ms: 1 }, { in_reply_to: "schedule:s1:1000", created_at_ms: 1_200 }]
+  assert.equal(firedAt(messages, "s1"), 1_200)
+  assert.equal(firedAt(messages, "s2"), null)
 })

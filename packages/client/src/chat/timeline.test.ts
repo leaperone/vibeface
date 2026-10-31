@@ -107,3 +107,11 @@ test("a message from another day names the day, and another year the year", () =
   const times = messageTimes([{ message_id: "yesterday", created_at_ms: at(23, 59, 29) }, { message_id: "today", created_at_ms: at(23, 59, 29) + minute }], now)
   assert.deepEqual([...times.values()], ["10月29日 23:59", "00:00"])
 })
+
+test("another bot's message counts as unread and starts 新消息", () => {
+  const rows = [message("m1", 1, 10), { ...message("b1", 2, 20), role: "bot" as const }]
+  const counts = unreadCounts([{ notification_id: "h-b1", conversation_id: "chat", kind: "bot_message", text: "看一下备份" }], [])
+  assert.deepEqual(counts, { chat: 1 })
+  const timeline = chatTimeline(rows)
+  assert.equal(firstUnread(timeline, new Set(["h-b1"]), () => false), timeline.messages[1])
+})

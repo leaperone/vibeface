@@ -6,7 +6,7 @@ import { Markdown, PlainText } from '@/components/app/markdown'
 import { Details } from '@/components/app/kit'
 import { BotFace } from '@/components/app/bot-face'
 import { messageKey, replyStatusLabel } from '@vibeface/client/chat/protocol.ts'
-import { failureText, rawError, replyFailure } from '@vibeface/client/lib/errors.ts'
+import { botModel, failureText, rawError, replyFailure } from '@vibeface/client/lib/errors.ts'
 import type { TranscriptMessage } from '@vibeface/client/chat/types.ts'
 import { Artifact } from './artifact'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
@@ -40,7 +40,7 @@ export function FoldedText({ text }: { text: string }) {
 /**
  * One message: the person's in a bubble, the bot's as plain text across the full width, another bot's in a
  * card under its name. `time` shows under the last message of each minute. `schedule` names
- * the schedule whose run produced this reply. `retry` sends the person's message again after this reply failed.
+ * the schedule whose run produced this reply. `retry` is 重试 after this reply failed or was stopped.
  */
 /** `detail`: the device's own words for a failed reply, folded under its cause. */
 export function Message({ message, schedule, time: shown, retry, detail }: { message: ChatMessage; schedule?: string; time?: string; retry?: () => Promise<void>; detail?: string }) {
@@ -54,9 +54,10 @@ export function Message({ message, schedule, time: shown, retry, detail }: { mes
   const failed = ended === '失败'
   const cause = failed ? replyFailure(message.failure, detail) : failureText(message.failure)
   const raw = failed && detail ? rawError(detail) : ''
+  const again = retry ? <ActionButton variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11" action={retry}><RotateCcw aria-hidden="true" />重试</ActionButton> : null
   const time = when ? <time dateTime={when.toISOString()} className={shown ? `${user ? 'px-1 ' : ''}text-meta text-muted-foreground` : 'sr-only'}>{shown ?? full}</time> : null
   if (user) return <div className="flex min-w-0 flex-col items-end gap-1" data-message-id={messageKey(message)}>
-    <div title={full} className="min-w-0 max-w-[85%] rounded-2xl rounded-br-md bg-secondary px-4 py-2 text-secondary-foreground ring-1 ring-border/60 [overflow-wrap:anywhere] sm:max-w-[75%] data-[sending]:opacity-70" data-sending={message.state === 'sending' || message.state === 'queued' || message.state === 'merging' || undefined}><span className="sr-only">你：</span><FoldedText text={message.text} /></div>
+    {message.text ? <div title={full} className="min-w-0 max-w-[85%] rounded-2xl rounded-br-md bg-secondary px-4 py-2 text-secondary-foreground ring-1 ring-border/60 [overflow-wrap:anywhere] sm:max-w-[75%] data-[sending]:opacity-70" data-sending={message.state === 'sending' || message.state === 'queued' || message.state === 'merging' || undefined}><span className="sr-only">你：</span><FoldedText text={message.text} /></div> : null}
     {message.attachments?.map((file) => <div key={file.hash} className="w-full min-w-0 max-w-[85%] sm:max-w-[75%]"><Artifact file={file} /></div>)}
     {message.state === 'queued' ? <span className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Clock aria-hidden="true" className="size-3.5" />排队中</span>
       : message.state === 'merging' ? <span className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Merge aria-hidden="true" className="size-3.5" />Bot 正在看这条补充</span>
@@ -88,11 +89,11 @@ export function Message({ message, schedule, time: shown, retry, detail }: { mes
     {failed ? <span className="flex flex-wrap items-center gap-x-3 gap-y-1 text-meta">
       <span className="flex items-center gap-1 text-danger"><CircleX aria-hidden="true" className="size-4" />{ended}</span>
       {cause ? <span className="text-muted-foreground">{cause}</span> : null}
-      {retry ? <ActionButton variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11" action={retry}><RotateCcw aria-hidden="true" />再发一次</ActionButton> : null}
-      {/* The failure text points at the device's AI settings; the device running this chat holds them. */}
-      {owner ? <Button asChild variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11"><Link to="/devices/$deviceId" params={{ deviceId: owner }} search={{ bot: selectedBot?.bot_id }}><MonitorSmartphone aria-hidden="true" />检查设备</Link></Button> : null}
+      {again}
+      {/* The failure text points at the device's AI settings, which the device running this chat holds, unless the bot's own model caused it. */}
+      {owner && !botModel(detail) ? <Button asChild variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11"><Link to="/devices/$deviceId" params={{ deviceId: owner }} search={{ bot: selectedBot?.bot_id }}><MonitorSmartphone aria-hidden="true" />检查设备</Link></Button> : null}
     </span>
-      : ended ? <span className="flex flex-wrap items-center gap-1 text-meta text-muted-foreground"><CirclePause aria-hidden="true" className="size-4" />{ended}{cause ? <span>{cause}</span> : null}</span> : null}
+      : ended ? <span className="flex flex-wrap items-center gap-x-3 gap-y-1 text-meta text-muted-foreground"><span className="flex items-center gap-1"><CirclePause aria-hidden="true" className="size-4" />{ended}</span>{cause ? <span>{cause}</span> : null}{again}</span> : null}
     {raw ? <Details className="-mt-1">{raw}</Details> : null}
     {time}
   </div>

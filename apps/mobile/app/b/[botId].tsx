@@ -12,6 +12,7 @@ import { awaitsDevice, botReach, botCanSend, starters, reachDevice } from '@vibe
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
+import { outcomeUnknown } from '@vibeface/client/lib/errors.ts'
 import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
 import { unreachable } from '@vibeface/client/workspace/home.ts'
 import { botMood, BotFace, ScreenFaces, type FaceBot } from '@/components/bot-face'
@@ -156,6 +157,11 @@ export default function ChatScreen() {
     workspace.actions.send(id, text.trim(), files).catch(() => { unsettled.current = { text: text.trim(), seen: sent(text.trim()) }; setDraft({ text, files }) }).finally(() => setLaunching(false))
   }
   const rows = chat ? entries(chat, extras, bot, offline) : []
+  // 重试 on the newest reply once it failed or was stopped, as on the web.
+  const newest = chat?.messages.at(-1)
+  const asked = newest && ['failed', 'stopped'].includes(newest.status ?? '') ? newest.in_reply_to : undefined
+  const unknown = live?.data?.scheduler?.jobs.some((job) => job.message_id === asked && outcomeUnknown(job.failure?.kind, job.failure?.detail))
+  const retry = asked && live && !blocked && !unknown ? () => live.retryReply(asked) : undefined
   unreadIndex.current = rows.findIndex((row) => row.key === 'unread')
   const mood = offline ? 'asleep' : botMood(bot, workspace, live)
   // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
@@ -197,7 +203,7 @@ export default function ChatScreen() {
       ListFooterComponent={<View style={{ height: header }} />}
       // Inverted, so the leading item is the lower one: a card caused by the message above it stays close to it.
       ItemSeparatorComponent={({ leadingItem }: { leadingItem: Entry }) => <View className={'grouped' in leadingItem && leadingItem.grouped ? 'h-2' : 'attached' in leadingItem && leadingItem.attached ? 'h-3' : 'h-6'} />}
-      renderItem={({ item }) => 'message' in item ? <Message message={item.message} bot={bot} time={item.time} offline={offline} /> : <>{item.node}</>}
+      renderItem={({ item }) => 'message' in item ? <Message message={item.message} bot={bot} time={item.time} offline={offline} retry={item.message === newest ? retry : undefined} /> : <>{item.node}</>}
     />
     {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">

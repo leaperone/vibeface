@@ -10507,3 +10507,43 @@ fn rejected_backup_switches_leave_jobs_sessions_and_checks_unchanged() -> Result
     }
     Ok(())
 }
+
+#[test]
+fn bot_names_stay_unique_and_the_primary_has_a_named_successor() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    second_bot(&mut origin, &net, "Ops")?;
+    assert_eq!(
+        origin.primary_successor(&net.network)?.as_deref(),
+        Some("d")
+    );
+    let taken = origin
+        .create_bot_in_turn(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            "n1",
+            (" ops ", "", None),
+            5,
+        )
+        .unwrap_err();
+    assert!(
+        taken.to_string().contains("已经有叫「ops」的 Bot"),
+        "{taken}"
+    );
+    let renamed = origin
+        .change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            "r1",
+            rename("OPS"),
+            Provider::Codex,
+            6,
+        )
+        .unwrap_err();
+    assert!(renamed.to_string().contains("换个名字"), "{renamed}");
+    Ok(())
+}

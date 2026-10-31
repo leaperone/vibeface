@@ -7,7 +7,10 @@ import { requestKey } from "../lib/secure.ts"
 import type { Platform } from "../lib/platform.ts"
 import type { Tabs } from "../identity/context.tsx"
 import { mergeProgress, type LiveProgress } from "../lib/progress.ts"
-import { botReach, isQueuedReceipt, prepareSend } from "../chat/protocol.ts"
+import { isQueuedReceipt, prepareSend, retryText } from "../chat/protocol.ts"
+import { taskActive } from "./labels.ts"
+import { outcomeUnknown } from "../lib/errors.ts"
+import { botReach } from "../chat/protocol.ts"
 import { byRank, unreadReply } from "../chat/timeline.ts"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
@@ -566,17 +569,17 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       offset = Number(reply.offset)
     }
   }
-  const submitMessage = async (text: string, files: AttachmentFile[] = []) => {
+  const submitMessage = async (text: string, files: AttachmentFile[] = [], sent: Attachment[] = []) => {
     requireContext()
     const id = activeId.current
     const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
-    const prepared = prepareSend({ conversationId: id, text, pending: prior, reportResults: true })
+    const prepared = prepareSend({ conversationId: id, text, pending: prior, reportResults: true, files: files.length + sent.length > 0 || prior?.text === "" })
     if (!prepared.ok) throw new Error(prepared.error)
     const key = outboxKey("message", prepared.pending.message_id)
     let item = prior ? (await outbox.all()).find((entry) => entry.key === key) : undefined
     if (!item) {
       const { body } = prepared
-      const uploaded: Attachment[] = []
+      const uploaded: Attachment[] = [...sent]
       for (const file of files) uploaded.push(await uploadAttachment(id, file))
       const attachments = signedOrder(uploaded)
       const extra = attachments.length ? { attachments } : {}
@@ -631,13 +634,32 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     selectConversation(bot.conversation_id)
     await refreshRef.current()
   }
-  const sendMessage = (input: string, files: AttachmentFile[] = []) => withMutation(`message:${activeId.current}`, async () => {
+  /** `sent`: files already on the Node, which a retry sends again without uploading. */
+  const sendMessage = (input: string, files: AttachmentFile[] = [], sent: Attachment[] = []) => withMutation(`message:${activeId.current}`, async () => {
     if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("还没选 Bot。先选一个。")
     if (botReach(nodesRef.current) === "needs_setup") throw new Error("运行 Bot 的设备需设置。先检查 AI 服务登录和模型。")
-    const text = inputText(input, "消息内容", 65536)
     setMessageBusy(true)
-    try { return await submitMessage(text, files) } finally { if (current()) setMessageBusy(false) }
+    try { return await submitMessage(input, files, sent) } finally { if (current()) setMessageBusy(false) }
   })
+  /**
+   * 重试 for the newest reply, which failed or was stopped. The conversation is read again first, so a reply that went on since
+   * is not repeated; a reply that may have done part of its work is followed by a message asking the bot to check before redoing.
+   */
+  const retryReply = async (messageId: string) => {
+    const id = activeId.current
+    await refreshRef.current()
+    requireCurrent()
+    const shown = dataRef.current, messages = shown?.messages ?? []
+    const asked = messages.find((message) => message.message_id === messageId && message.role === "user")
+    const newest = messages.at(-1)
+    const job = shown?.scheduler?.jobs.find((item) => item.message_id === messageId)
+    if (activeId.current !== id || !asked || (newest?.message_id !== messageId && newest?.in_reply_to !== messageId) || !job || !["failed", "rejected", "cancelled", "interrupted"].includes(job.state) || outcomeUnknown(job.failure?.kind, job.failure?.detail)) {
+      setNoticeText("这条已经有新进展了，没有重发。")
+      return false
+    }
+    const traces = (shown?.works ?? []).some((work) => work.trigger === job.trigger) || (shown?.changes ?? []).some((change) => change.cause?.message_id === messageId)
+    return sendMessage(retryText(asked.text, job.failure?.kind, traces), [], asked.attachments ?? [])
+  }
   const incomplete = !data
   // The lists hold this connection's first full read and the Node is not aligning with other devices; until then an empty list means not yet known.
   const synced = readConnection.current === connection && writeState.state !== "aligning"
@@ -702,13 +724,17 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       await selectBot(bot)
       return bot
     }),
-    sendMessage,
+    sendMessage, retryReply,
     cancelManager: (trigger: string) => withMutation(`cancel-manager:${trigger}`, async () => {
       const id = activeId.current
       requireBotContext(id)
       const receipt = record(await connection.rpc("cancel_manager", { conversation_id: id, trigger }))
       requireCurrent()
-      const stopped = (state: unknown) => state === "cancelled" ? "已停止回复，已开始的任务会继续。" : "已请求停止回复，已开始的任务会继续。"
+      // The tasks it started go on, so the notice says how many still run; they show in the chat.
+      const stopped = (state: unknown) => {
+        const running = (dataRef.current?.works ?? []).filter((work) => taskActive(work.state)).length
+        return `${state === "cancelled" ? "已停止回复" : "正在停止回复"}${running ? `，还有 ${running} 项任务在跑。` : "。"}`
+      }
       if (receipt.unconfirmed === true) {
         // The owner did not answer in time; the stop is not sent again, the owner's state settles it.
         if (activeId.current === id) await refreshRef.current()
@@ -717,10 +743,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         return job?.state === "cancelled"
       }
       const job = record(receipt.job)
-      if (receipt.publication_pending === true) setNoticeText("本轮已有结果，正在补齐发布；未提交停止请求。")
-      else if (receipt.cancel_requested === true) setNoticeText(stopped(job.state))
-      else setNoticeText("现在停不了。再查一次。")
       if (activeId.current === id) await refreshRef.current()
+      if (receipt.publication_pending === true) setNoticeText("回复已经写完，正在发出来，停不了了。")
+      else if (receipt.cancel_requested === true) setNoticeText(stopped(job.state))
+      else setNoticeText("这次回复现在停不了。")
       return job.state === "cancelled" && receipt.publication_pending !== true
     }),
     /** Replying or declining is keyed by message, so an unknown outcome is settled by reading the conversation again. */

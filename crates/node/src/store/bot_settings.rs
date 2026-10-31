@@ -999,6 +999,7 @@ fn resolve(
                 *name != bot.name,
                 "the bot is already named {name}; nothing to change"
             );
+            super::bots::ensure_name_free(connection, network, name, Some(scope))?;
         }
         if let Some(instructions) = &instructions {
             validate_instructions(instructions)?;

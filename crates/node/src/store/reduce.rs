@@ -465,6 +465,7 @@ pub(crate) fn apply(
                 "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,attachments,sender) VALUES(?,?,?,?,?,?,?,?,?,'[]',?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,sender=excluded.sender WHERE excluded.rank<rank",
                 params![network, scope, message_id, hash, rank, event.author, text(Role::Bot)?, body, event.created_at_ms, serde_json::to_string(from)?],
             )?;
+            notify(connection, network, hash, scope, "bot_message", body, rank)?;
         }
         // Read from the log by rank; see `store::bots::primary_bot_from`.
         EventBody::ContextCheckpoint { .. } | EventBody::PrimaryBotSet { .. } => {}

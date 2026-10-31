@@ -6,7 +6,7 @@ import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { failureText, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
 import { botProviderNotice, canRetryJob, runtimeLabel } from '@vibeface/client/chat/protocol.ts'
 import { providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
-import { changeTitle, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
+import { changeTitle, firedAt, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { chatTaskState, interruptedCopy, nodeName, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
@@ -204,6 +204,7 @@ function ChangeCard({ records, schedules, overwritten }: { records: BotChangeRec
 }
 
 function ChangeRows({ change, conversationId, schedules, overwritten }: { change: BotChange; conversationId: string; schedules: readonly ScheduleView[]; overwritten: readonly Overwritten[] }) {
+  const messages = useLive()?.data?.messages ?? []
   if (change.kind === 'profile') {
     const note = (field: Overwritten['field']) => {
       const item = overwritten.find((entry) => entry.field === field)
@@ -241,7 +242,8 @@ function ChangeRows({ change, conversationId, schedules, overwritten }: { change
   if (!next) return <ChangeRow icon={icon} label={before!.name} tag={tag} removed />
   const current = schedules.find((schedule) => schedule.schedule_id === change.schedule_id)
   const at = once ? next.first_run_at_ms : current?.enabled ? current.next_run_at_ms : null
-  const when = at !== null ? `${once ? '' : '下次 '}${formatWhen(at)}` : ''
+  const fired = once ? firedAt(messages, change.schedule_id) : null
+  const when = fired !== null ? `已提醒 ${formatWhen(fired)}` : at !== null ? `${once ? '' : '下次 '}${formatWhen(at)}` : ''
   return <ChangeRow icon={icon} label={next.name} tag={tag}>
     <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{[scheduleFrequency(next), next.enabled ? when : '已暂停'].filter(Boolean).join(' · ')}</Text>
     <Text numberOfLines={2} className="text-meta text-muted-foreground">{next.prompt}</Text>
