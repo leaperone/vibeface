@@ -5792,6 +5792,131 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn thread_dispatch_retries_read_the_durable_work_before_execution_and_native_state()
+    -> Result<()> {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let (node, admin, dir) = node().await?;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let turns = Arc::new(std::sync::Mutex::new(BTreeMap::<String, Value>::new()));
+        let listener = tokio::net::UnixListener::bind(named_socket(&node))?;
+        let seen = requests.clone();
+        let server = tokio::spawn(async move {
+            let mut sessions = tokio::task::JoinSet::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                let seen = seen.clone();
+                let turns = turns.clone();
+                sessions.spawn(async move {
+                    let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else { return; };
+                    let mut direct = false;
+                    while let Some(Ok(message)) = server.next().await {
+                        let Ok(request) = serde_json::from_slice::<Value>(&message.into_data()) else { continue; };
+                        if request["method"] == "initialize" { direct = request["params"]["clientInfo"]["title"] == "Vibeface Agent CLI"; }
+                        if direct || request["method"].as_str().is_some_and(|method| method.starts_with("turn/")) { seen.lock().unwrap().push(request.clone()); }
+                        let thread = request["params"]["threadId"].as_str().unwrap_or_default();
+                        let result = {
+                        let mut turns = turns.lock().unwrap();
+                        match request["method"].as_str() {
+                            Some("initialize") => json!({"userAgent":"codex/fixture"}),
+                            Some("thread/read") if thread == "missing" => json!({"thread":null}),
+                            Some("thread/read") if thread == "sub" => json!({"thread":{"id":"sub","source":{"subAgent":{}},"parentThreadId":"lead"}}),
+                            Some("turn/start") => {
+                                let turn = json!({"id":format!("turn-{thread}"),"status":"inProgress","items":[{"type":"userMessage","clientId":request["params"]["clientUserMessageId"]}]});
+                                turns.insert(thread.into(), turn.clone());
+                                json!({"turn":turn})
+                            }
+                            Some("thread/read" | "thread/resume") => json!({"thread":{"id":thread,"cwd":"/work/original","source":"cli","status":{"type":"idle"},"turns":turns.get(thread).cloned().into_iter().collect::<Vec<_>>()}}),
+                            _ => json!({}),
+                        }
+                        };
+                        if request.get("id").is_some() {
+                            let _ = server.send(json!({"id":request["id"],"result":result}).to_string().into()).await;
+                        }
+                    }
+                });
+            }
+        });
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "Bot", &[]).await?;
+            let network = node.network_id().await?;
+            let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
+            node.register_manager_attempt("thread-retry-token".into(), Access { network_id: network.clone(), human: false, conversation_id: Some("c".into()), manager: None }, &attempt, &trigger, Provider::Codex).await?;
+            let access = node.agent_tokens.lock().await.get("thread-retry-token").cloned().context("access")?;
+            let mut original = Vec::new();
+            for (call, explicit, model) in [("explicit", true, Some("frozen")), ("implicit", false, Some("frozen")), ("explicit-default", true, None), ("implicit-default", false, None)] {
+                {
+                    let mut providers = node.providers.lock().unwrap();
+                    match model { Some(model) => { providers.switches.execution_models.insert(Provider::Codex, model.into()); }, None => { providers.switches.execution_models.remove(&Provider::Codex); } }
+                }
+                let mut args = json!({"thread":format!("t-{call}"),"prompt":"\n follow up \nmore","call_ref":call});
+                if explicit { args["agent"] = json!("codex"); }
+                let first = node.tool(access.clone(), "dispatch_work", args.clone()).await?;
+                let expected = json!({"provider":"codex","model":model});
+                let work = node.store.lock().await.works(&network, "c")?.into_iter().find(|work| first["work_id"].as_str() == Some(work.work_id.as_str())).context("accepted work")?;
+                assert_eq!(work.cwd, "/work/original");
+                assert_eq!(work.title, "follow up");
+                assert_eq!(json!(work.resolved), expected);
+                original.push((args, first["work_id"].clone(), expected));
+            }
+            for (thread, reason) in [("missing", "was not returned"), ("sub", "parent thread lead")] {
+                let failure = node.tool(access.clone(), "dispatch_work", json!({"thread":thread,"prompt":"p","call_ref":thread})).await.expect_err("invalid native thread must not create work");
+                assert!(failure.to_string().contains(reason), "{failure:#}");
+                assert_eq!(node.store.lock().await.work_records()?.len(), 4);
+            }
+            node.signal_work(&network, original[0].1.as_str().context("work id")?, crate::work::Signal::TurnCompleted { turn_id: "turn-t-explicit".into(), status: vibeface_bridge::turn::TurnStatus::Completed, text: "done".into(), error: None }).await?;
+            node.signal_work(&network, original[1].1.as_str().context("work id")?, crate::work::Signal::Disconnected).await?;
+            assert!(matches!(node.store.lock().await.work_record(original[0].1.as_str().context("work id")?)?.context("finished")?.state, crate::work::WorkState::Finished { .. }));
+            assert!(matches!(node.store.lock().await.work_record(original[1].1.as_str().context("work id")?)?.context("unknown")?.state, crate::work::WorkState::Unverified { .. }));
+            {
+                let _controls = node.manager_controls.lock().await;
+                node.providers.lock().unwrap().switches.execution.clear();
+                node.providers.lock().unwrap().switches.execution_models.insert(Provider::Codex, "changed-default".into());
+                node.settings.lock().unwrap().manager = None;
+            }
+            let before = requests.lock().unwrap().clone();
+            assert_eq!(before.iter().filter(|request| request["method"] == "turn/start").count(), 4);
+            for (args, work_id, expected) in &original {
+                for (tool, input) in [("dispatch_work", args.clone()), ("tool_call", json!({"name":"dispatch_work","arguments":args,"call_ref":args["call_ref"]}))] {
+                    let retried = node.tool(access.clone(), tool, input).await?;
+                    assert_eq!(&retried["work_id"], work_id);
+                    assert_eq!(&retried["resolved"], expected);
+                    assert_eq!(retried["may_send"], false);
+                }
+                for (field, value) in [("title", json!("changed title")), ("prompt", json!("changed prompt")), ("thread", json!("changed-thread")), ("model", json!("changed model")), ("agent", json!("claude"))] {
+                    let mut changed = args.clone(); changed[field] = value;
+                    let failure = node.tool(access.clone(), "dispatch_work", changed).await.expect_err("Store must reject changed payloads");
+                    assert!(failure.to_string().contains("different request"), "{field}: {failure:#}");
+                }
+                let mut changed_cwd = args.clone(); changed_cwd["cwd"] = json!("/still-ignored");
+                assert_eq!(node.tool(access.clone(), "dispatch_work", changed_cwd).await?["work_id"], *work_id);
+            }
+            assert_eq!(*requests.lock().unwrap(), before);
+            let failure = node.tool(access.clone(), "dispatch_work", json!({"thread":"fresh","prompt":"p","call_ref":"no-ready"})).await.expect_err("ready None must not create work");
+            assert!(failure.to_string().contains("no execution agent"), "{failure:#}");
+            assert_eq!(*requests.lock().unwrap(), before);
+            server.abort();
+            let _ = std::fs::remove_file(named_socket(&node));
+            node.providers.lock().unwrap().switches.execution.insert(Provider::Codex);
+            for (args, work_id, expected) in &original {
+                let retried = tokio::time::timeout(Duration::from_secs(2), node.tool(access.clone(), "dispatch_work", args.clone())).await??;
+                assert_eq!(&retried["work_id"], work_id);
+                assert_eq!(&retried["resolved"], expected);
+                assert_eq!(retried["may_send"], false);
+            }
+            let store = node.store.lock().await;
+            assert_eq!(store.work_records()?.len(), 4);
+            assert_eq!(store.context(&network, "c", None)?.events.iter().filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. })).count(), 4);
+            drop(store);
+            node.finish_manager_attempt(&attempt).await;
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        server.abort();
+        node.shutdown().await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
     async fn admitted_local_retries_keep_the_frozen_selection_after_models_and_permissions_change()
     -> Result<()> {
         let (node, admin, dir) = node().await?;
@@ -5872,6 +5997,7 @@ pub(super) mod tests {
                 let network = node.network_id().await?;
                 let (human_trigger, _) = claim_reply(&node, &admin, "c", "human", crate::scheduler::boot_id()).await?;
                 let active = node.store.lock().await.scheduler_job("c", &human_trigger)?.context("active")?;
+                node.schedule_workers.lock().await.insert((network.clone(), "c".into()));
                 let before = node.store.lock().await.connection.query_row("SELECT json_array(active,permission_version,session_generation,sdk_config) FROM scheduler_sessions WHERE conversation_id='c'", [], |row| row.get::<_, String>(0))?;
                 let request = queued_task(&node, "c", "early-refusal", Provider::Pi, Some("fake/frozen")).await?;
                 {

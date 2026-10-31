@@ -151,43 +151,8 @@ impl Runtime {
                 work_status(&works, &dispatches, &args)
             }
             Tool::CallLookup => {
-                let manager = access
-                    .manager
-                    .as_ref()
-                    .context("call lookup requires an agent invocation")?;
-                let call_ref = field(&args, "call_ref")?;
-                let id = WorkSpec::id(&scope, &manager.trigger, call_ref);
-                let store = self.store.lock().await;
-                if let Some(work) = store
-                    .works(network, &scope)?
-                    .into_iter()
-                    .find(|work| work.work_id == id)
-                {
-                    return Ok(json!(work));
-                }
-                if let Some(dispatch) = store.dispatch(&id)? {
-                    return Ok(dispatch_row(&dispatch));
-                }
-                if let Some(change) =
-                    store.bot_change(network, &change_id(&scope, &manager.trigger, call_ref))?
-                {
-                    return Ok(json!(change));
-                }
-                if let Some(message) = store
-                    .bot_message(network, &bot_message_id(&scope, &manager.trigger, call_ref))?
-                {
-                    return Ok(json!(message));
-                }
-                let (bot_id, _) = created_bot_id(&scope, &manager.trigger, call_ref);
-                let bot = store
-                    .bots(network)?
-                    .into_iter()
-                    .find(|bot| bot.bot_id == bot_id);
-                Ok(match bot {
-                    Some(bot) => tool_bot(&bot),
-                    None => json!({"found":false,"call_ref":call_ref,
-                        "reason":"no confirmed record for this call_ref; an absent record does not authorize a new reference or prove no effect"}),
-                })
+                self.call_lookup(&access, &scope, field(&args, "call_ref")?)
+                    .await
             }
             Tool::Recall => {
                 let query = args["query"].as_str().map(str::to_lowercase);
@@ -417,6 +382,7 @@ impl Runtime {
                 let (access, scope) = (&access, scope.as_str());
                 crate::agent_cli::dispatch(
                     &args,
+                    |call_ref| async move { self.call_lookup(access, scope, &call_ref).await },
                     |args| async move { self.track_work(access, scope, &args).await },
                     |work_id, report| async move {
                         self.bind_work(network, scope, &work_id, report).await
@@ -425,7 +391,7 @@ impl Runtime {
                         Ok((self.ready_for(network, &args).await)
                             .map(|agent| agent.name().to_owned()))
                     },
-                    &socket,
+                    Some(&socket),
                 )
                 .await
             }
@@ -616,6 +582,46 @@ impl Runtime {
             rows.reverse();
         }
         Ok(json!({"events":rows,"more":more || cut}))
+    }
+
+    async fn call_lookup(&self, access: &Access, scope: &str, call_ref: &str) -> Result<Value> {
+        let network = access.network_id.as_str();
+        let manager = access
+            .manager
+            .as_ref()
+            .context("call lookup requires an agent invocation")?;
+        let id = WorkSpec::id(scope, &manager.trigger, call_ref);
+        let store = self.store.lock().await;
+        if let Some(work) = store
+            .works(network, scope)?
+            .into_iter()
+            .find(|work| work.work_id == id)
+        {
+            return Ok(json!(work));
+        }
+        if let Some(dispatch) = store.dispatch(&id)? {
+            return Ok(dispatch_row(&dispatch));
+        }
+        if let Some(change) =
+            store.bot_change(network, &change_id(scope, &manager.trigger, call_ref))?
+        {
+            return Ok(json!(change));
+        }
+        if let Some(message) =
+            store.bot_message(network, &bot_message_id(scope, &manager.trigger, call_ref))?
+        {
+            return Ok(json!(message));
+        }
+        let (bot_id, _) = created_bot_id(scope, &manager.trigger, call_ref);
+        let bot = store
+            .bots(network)?
+            .into_iter()
+            .find(|bot| bot.bot_id == bot_id);
+        Ok(match bot {
+            Some(bot) => tool_bot(&bot),
+            None => json!({"found":false,"call_ref":call_ref,
+                "reason":"no confirmed record for this call_ref; an absent record does not authorize a new reference or prove no effect"}),
+        })
     }
 
     /// Registers a dispatch before anything is sent, then has its provider start it. Only the
