@@ -185,17 +185,19 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `set_bot_project` | `conversation_id`、`project`（`{ target_node, cwd }` 或 `null`）、`attestation` | 本人换掉或清空机器人的项目文件夹，在它的会话写 `BotProjectSet`（签名事件体 `{"type":"bot_project_set", project}`），投影进 `bot_profiles` 的 `project` 字段，不建表、不改数据纪元；与当前相同时不写 |
 | `set_bot_avatar` | `conversation_id`、`version`（字符串或 `null`）、`avatar`（`{ outline, eyes, hue }` 或 `null`），两项必填；`attestation` | 本人给机器人挑长相或恢复默认，`version` 是本人看到的 `avatar_version`（`bots` 里的值）。当前已是 `avatar` 时不写并返回当前 bot；否则当前版本不等于 `version` 时拒绝（`the bot's face changed since you saw it; nothing was written`），客户端删掉这条待写、刷新、不重发；相等时在它的会话写 `BotAvatarSet`（签名事件体 `{"type":"bot_avatar_set", version, avatar}`），投影进 `bot_profiles` 的 `avatar` 字段，与聊天修改按 rank 后写者胜。任何修改都换新版本，改回原长相也一样，所以重放不会盖掉之后的修改。比较只在接收写入的 Node 上做，读取与追加在同一把存储锁内。返回 `{ bot }`，含新的 `avatar_version` |
 | `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project`、`attestation` | 创建机器人和它的会话，完整请求精确去重 |
+| `delete_bot` | `conversation_id`、`attestation` | 本人删除机器人，在它的会话写 `BotDeleted`；已删除时不写。本机停下它正在跑和排队的回合，并中断它派到本机的工作，其他设备收到删除后各自停下自己的。返回 `{ written, primary }`，`primary` 为删除后的主 Bot 会话 ID |
 | `control_schedule` | `conversation_id`、`schedule_id`、`action`（`pause`、`resume` 或 `delete`）、`attestation` | 本人暂停、恢复或删除一个 schedule，写 `ScheduleControlled`；已是该状态时不写，返回 `{ written }` |
 | `conversations` | 无 | 本地已知会话 |
-| `create_conversation` | `conversation_id`、`title`、首个负责人 | 以稳定 ID 创建会话 |
+| `create_conversation` | `conversation_id`、`title`、首个负责人 `scheduler_node` 及其签名 `owner_attestation` | 以稳定 ID 创建会话 |
 | `conversation` | `conversation_id` | 会话（含负责人与 `owner_epoch`）、机器人、消息、`works`（DAG 投影，含 `state`）、`deliveries`（本机还在转交的派发和停止请求）、`changes`、`bot_settings`、`sent`（本 bot 发给其他 bot 的消息 `{message_id, to, text, created_at_ms}`，`to` 是对方会话）、`checks`、`questions`（本会话的提问及回答）、`sessions`（归给本 Bot 的外来会话，含 `muted`）、`local_node`、调度队列和 `observation_targets`（本次观察进度的设备）。负责人是其他设备时，入口限时向它读取 `scheduler_jobs`，带 `source_node` 合并进调度队列，只用于显示、不写本地；`scheduler.remote` 为 `{owner, reachable}`，联系不上时 `reachable: false` |
+| `open_works` | 无 | 全网仍要本人看的工作 `{works}`：没有结果或结果未知的工作；每个会话最新结束的工作失败或被拒、且还没跟进的那一项；以及本机发出、被拒且还没跟进的派发。跟进指之后又有工作结束、本人在它结束后发的消息有了完成的回复、它的汇报回合回复完成，或本人在待处理关掉它。只在 SQL 里选出这些工作，不读整段历史。派发项的 `state` 为 `dispatch_rejected`，没有 `outcome`。只有本人客户端能调用 |
+| `workspace_overview` | 可选 `conversation_id`、`limit`（1 至 256，默认 256）、`include_finished`（默认 `false`）、`include_sessions`（默认 `true`）；不支持 `cursor` | 本机所知事实的有界只读汇总，只给本人客户端：`{schema: 1, generated_at_ms, network_epoch, heads, consistency, truncated, conversations, bots, tasks, questions, checks, jobs, sessions, deliveries, relations, coverage}`。只含未删除 Bot 的会话。不带 `include_finished` 时 `tasks` 只取 `open_works` 那部分工作，已结束的只按 SQL 计数进 `coverage.omitted_finished`；本机还没被接收、被拒（仍未跟进）或结果未知的派发，以及已接收但工作还没同步来的派发（`accepted_waiting_sync`）也列进 `tasks` 和 `deliveries`。各列表超过 `limit` 时截断，`truncated` 为 `true`，`coverage.omitted_*` 给出截掉的条数。负责人是其他设备的会话不去问它，列进 `coverage.remote_owners`，此时 `consistency` 为 `partial` |
 | `message` | `conversation_id`、`message_id`、`text`、可选 `attachments`、`report_results`、`attestation` | 保存本人消息并返回调度回执 |
 | `set_owner` | `conversation_id`、`scheduler_node`、`epoch`、`attestation` | 换会话负责人，`epoch` 必须等于当前 `owner_epoch + 1` |
 | `cancel_manager` | `conversation_id`、`trigger` | 请求停止指定管理轮，不停止已派发的工作；排队中的回合记为已停止并写一条 `stopped` 回复。本机不持有该回合时转给会话负责人，超时返回 `{cancel_requested: false, unconfirmed: true, owner}`，不重发，客户端重读会话对账 |
 | `reply_unanswered` | `conversation_id`、`message_ids` | 本机作为负责人，为其中仍未回复的消息排队回复，返回 `{receipts}`；重试不会再排 |
 | `dismiss_unanswered` | `conversation_id`、`message_ids` | 本机作为负责人，把其中仍未回复的消息记为开始前已取消，不再列出也不执行，返回 `{receipts}`；重试不会再记 |
 | `interrupt_work` | `conversation_id`、`work_id` | 中断工作及它委派出的工作；目标在其他 Node 时由入口转发和重试 |
-| `codex` | `method`、可选 `params`、`node` | 调用 App Server 名单里非 `hidden` 的方法，结果经 `sanitize`；`node` 为其他设备时经成员连接转发 |
 | `codex_state` | 可选 `node` | App Server 状态摘要 `{connection, threads: [{thread_id, name, status, cwd, plan, reasoning, token_usage}], rate_limits}`；网页不调用 App Server 方法 |
 | `questions` | 无 | 全网未回答的提问：`{questions: [{question_id, severity, text, choices: [{label}], about, conversation_id, bot, author, created_at_ms, answer}]}` |
 | `answer` | `question_id`、`text`、`attestation` | 写该提问唯一的回答消息 `a-<question_id>`，签名作用域是提问所在会话。会话里的回答按 `answer` 触发准入，或转交调度 Node。返回 `{status, question_id, message, receipt}`；已有不同回答时 `status = "already_answered"`，返回已有回答 |
@@ -212,7 +214,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 
 `changes` 按 rank 列出本会话的 bot 修改，每项为 `{ change_id, conversation_id, cause, event_hash, created_at_ms, change }`，`conversation_id` 是被修改的 bot 的会话，`cause` 为 `{ conversation_id, message_id }` 或 `null`（bot 自己定的提醒），`change` 即 `BotChanged.change`。`overwritten` 列出本会话里被另一台设备没看到就覆盖的修改，每项为 `{ change_id, field, provider?, by, value }`：`field` 为 `name`、`instructions`、`model`（带 `provider`）、`skills` 或 `avatar`，`by` 是当前值的写入设备，`value` 是当前值。它由已生效事件按 rank 现算，规则见 design/bot-config.md 第 3 节。`bot_settings` 为 `{ skills: [{ skill_id, name, description }], schedules: [{ schedule_id, name, prompt, first_run_at_ms, every_minutes?, enabled, depth?, next_run_at_ms }], memory: [{ memory_id, text }] }`，skill 是全网共用的库，schedules 只列本会话还会运行或已暂停的 schedule，暂停时 `next_run_at_ms` 为 `null`，没有 `every_minutes` 的是一次性提醒，`depth` 省略即 0。`messages` 中 `role=bot` 的是另一个 bot 发来的消息，带 `sender { conversation_id, name }`。
 
-`works` 的每项包含 `work_id`、`conversation_id`、`target_node`、`trigger`、`dispatcher`、`kind`、`cwd`、`title`、`prompt`、`phase`、`summary`、`thread_id`、`turn_id`、`outcome`、`result_text`、`failure_reason`、`failure` 和本机状态 `state`。网页以 `title` 为任务名，`prompt` 放在详细信息里。
+`works` 的每项包含 `work_id`、`conversation_id`、`target_node`、`trigger`、`dispatcher`、`kind`、`cwd`、`title`、`prompt`、`call_ref`、`continues`、`parent`、`thread`、`phase`、`summary`、`thread_id`、`turn_id`、`outcome`、`result_text`、`failure_reason`、`failure`，以及每台设备都从 DAG 推出的 `state`（`accepted`、`running`、`interrupting`、`finished` 或 `unverified`）。网页以 `title` 为任务名，`prompt` 作为“交代的事”显示在任务详情主区。
 
 ## 可靠调度回执
 

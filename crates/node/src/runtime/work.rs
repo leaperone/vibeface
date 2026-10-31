@@ -43,14 +43,21 @@ impl Runtime {
         signal: Signal,
     ) -> Result<WorkRecord> {
         let quiet = matches!(signal, Signal::Text(_) | Signal::Progress { .. });
-        let (record, receipt) = self.store.lock().await.apply_work_signal(
-            &self.identity,
-            network,
-            work_id,
-            signal,
-            now_ms(),
-        )?;
-        if !quiet {
+        let (before, (record, receipt)) = {
+            let mut store = self.store.lock().await;
+            let before = if quiet {
+                None
+            } else {
+                store
+                    .work_record(work_id)?
+                    .map(|record| record.state.name())
+            };
+            let applied =
+                store.apply_work_signal(&self.identity, network, work_id, signal, now_ms())?;
+            (before, applied)
+        };
+        // A probe that finds the turn where it was changes nothing; only a new state is logged.
+        if !quiet && before != Some(record.state.name()) {
             let thread_id = record.state.thread();
             let (conversation_id, state) = (record.conversation.as_str(), record.state.name());
             match &record.state {

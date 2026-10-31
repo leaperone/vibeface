@@ -10,7 +10,7 @@ import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 
 /** The ids support asks for, copied as one block instead of shown. */
-export function CopyDiagnostics({ lines }: { lines: Array<[string, ReactNode]> }) {
+export function CopyDiagnostics({ lines, label = '复制诊断信息' }: { lines: Array<[string, ReactNode]>; label?: string }) {
   const [copied, setCopied] = useState(false)
   useEffect(() => {
     if (!copied) return
@@ -19,7 +19,7 @@ export function CopyDiagnostics({ lines }: { lines: Array<[string, ReactNode]> }
   }, [copied])
   const text = lines.filter(([, value]) => value !== '' && value != null).map(([label, value]) => `${label}: ${value}`).join('\n')
   return <Button type="button" variant="outline" className="w-fit" onClick={() => { void navigator.clipboard?.writeText(text).then(() => setCopied(true)) }}>
-    {copied ? <Check aria-hidden="true" className="text-success" /> : <Copy aria-hidden="true" />}<span role={copied ? 'status' : undefined}>{copied ? '已复制' : '复制诊断信息'}</span>
+    {copied ? <Check aria-hidden="true" className="text-success" /> : <Copy aria-hidden="true" />}<span role={copied ? 'status' : undefined}>{copied ? '已复制' : label}</span>
   </Button>
 }
 

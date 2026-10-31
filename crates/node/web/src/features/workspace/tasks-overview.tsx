@@ -11,7 +11,7 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import type { MembershipView } from "@vibeface/client/lib/node.ts"
 import { openWorksFromOverview, overviewFromWorkspace } from "@vibeface/client/workspace/model.ts"
-import { cardState, needsLook, nodeName, staleTaskLabel, taskActive, taskGroup, taskGroups, taskLabel, taskStale, type TaskGroup } from "@vibeface/client/workspace/labels.ts"
+import { cardState, needsLook, nodeName, staleTaskLabel, taskActive, taskGroup, taskGroups, taskLabel, taskProgress, taskStale, type TaskGroup } from "@vibeface/client/workspace/labels.ts"
 import { projectName } from "@vibeface/client/workspace/questions.ts"
 import { workFailure } from "@vibeface/client/lib/errors.ts"
 import type { NodeInfo, OpenWork, OverviewTask } from "@vibeface/client/workspace/types.ts"
@@ -50,7 +50,7 @@ export function TasksOverview() {
   for (const work of tasks) groups[taskGroup(cardState(work, workspace.nodes, projected.get(work.work_id)?.state), waitingSessions.has(work.thread_id ?? ""))].push(work)
   const noticed = attention.length + groups.attention.length
   const hasContent = noticed > 0 || groups.working.length > 0 || groups.waiting.length > 0
-  const card = (work: OpenWork) => <TaskOverviewCard key={work.work_id} work={work} projected={projected.get(work.work_id)} lookup={lookup} readyDevice={ready?.entry.device_id} connected={workspace.connectionOnline} />
+  const card = (work: OpenWork) => <TaskOverviewCard key={work.work_id} work={work} projected={projected.get(work.work_id)} lookup={lookup} readyDevice={ready?.entry.device_id} connected={workspace.connectionOnline} progress={taskProgress(work, workspace.liveProgress)} />
   const bot = workspace.selectedBot ?? workspace.bots[0]
 
   if (workspace.incomplete && !workspace.nodes.length) return <div className="mx-auto grid w-full max-w-(--page-width) gap-3" aria-busy="true"><Skeleton className="h-20" /><Skeleton className="h-20" /><Skeleton className="h-20" /></div>
@@ -78,7 +78,7 @@ function OverviewSection({ title, count, children }: { title: string; count: num
   </section>
 }
 
-function TaskOverviewCard({ work, projected, lookup, readyDevice, connected }: { work: OpenWork; projected?: ProjectedWork; lookup: { nodes: NodeInfo[]; directory: MembershipView | null }; readyDevice?: string; connected: boolean }) {
+function TaskOverviewCard({ work, projected, lookup, readyDevice, connected, progress }: { work: OpenWork; projected?: ProjectedWork; lookup: { nodes: NodeInfo[]; directory: MembershipView | null }; readyDevice?: string; connected: boolean; progress: string }) {
   const state = cardState(work, lookup.nodes, projected?.state)
   const stale = taskStale(state, connected)
   const unknown = state === "unknown" || state === "unverified" || state === "accepted_waiting_sync" || state === "dispatch_rejected" || state === "dispatch_unverified"
@@ -87,7 +87,7 @@ function TaskOverviewCard({ work, projected, lookup, readyDevice, connected }: {
   const failed = needsLook(state) && state !== "dispatch_unverified"
   const Icon = failed ? CircleX : stale || unknown ? CircleQuestionMark : taskActive(state) ? LoaderCircle : ListChecks
   const DeviceIcon = work.target_node === readyDevice ? Laptop : Server
-  const line = needsLook(state) ? workFailure(work) || (failed ? "这个任务没有成功。" : "") : work.summary
+  const line = needsLook(state) ? workFailure(work) || (failed ? "这个任务没有成功。" : "") : progress
   const device = nodeName(work.target_node, lookup, "未知设备")
   const project = work.cwd ? projectName(work.cwd) : "未指定项目"
   const iconSurface = failed ? "bg-danger-soft text-danger" : stale || unknown ? "bg-warning-soft text-warning" : taskActive(state) ? "bg-brand-soft text-brand" : "bg-muted text-muted-foreground"

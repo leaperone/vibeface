@@ -827,20 +827,18 @@ impl Runtime {
             .map(|conversation| (conversation.conversation_id.as_str(), conversation))
             .collect();
 
-        let (all_works, shown_works) = conversations.iter().try_fold(
-            (Vec::new(), Vec::new()),
-            |(mut all, mut shown), conversation| {
-                let works = store.works(network, &conversation.conversation_id)?;
-                shown.extend(if include_finished {
-                    works.clone()
-                } else {
-                    store.open_works(network, Some(&conversation.conversation_id))?
-                });
-                all.extend(works);
-                Ok::<_, anyhow::Error>((all, shown))
-            },
-        )?;
-        let work_ids: BTreeSet<_> = all_works.iter().map(|work| work.work_id.as_str()).collect();
+        // Without finished works only what still wants the user is read, not whole histories.
+        let mut shown_works = Vec::new();
+        let mut omitted_finished = 0;
+        for conversation in &conversations {
+            let scope = &conversation.conversation_id;
+            if include_finished {
+                shown_works.extend(store.works(network, scope)?);
+            } else {
+                shown_works.extend(store.open_works(network, Some(scope))?);
+                omitted_finished += store.finished_works(network, scope)?;
+            }
+        }
         let mut tasks = shown_works
             .iter()
             .map(|work| workspace_work_summary(work, "dag"))
@@ -871,7 +869,7 @@ impl Runtime {
             }
             let state = dispatch.state.name();
             let waiting_sync = dispatch.state == crate::work::DispatchState::Accepted
-                && !work_ids.contains(spec.work_id.as_str());
+                && store.work(network, &spec.work_id)?.is_none();
             if waiting_sync || dispatch.state != crate::work::DispatchState::Accepted {
                 let unknown_reason = if waiting_sync {
                     Some("accepted_waiting_sync")
@@ -929,7 +927,7 @@ impl Runtime {
                 "requested_at_ms": stop.requested_at_ms,
                 "deadline_ms": stop.deadline_ms,
             });
-            if let Some(work) = all_works.iter().find(|work| work.work_id == stop.work_id) {
+            if let Some(work) = store.work(network, &stop.work_id)? {
                 delivery["cwd"] = json!(workspace_bounded(&work.cwd, 512));
             }
             deliveries.push(delivery);
@@ -1035,7 +1033,7 @@ impl Runtime {
         drop(store);
 
         let mut relations = Vec::new();
-        for work in &all_works {
+        for work in &shown_works {
             if !include_finished
                 && work.outcome.is_some()
                 && work.outcome != Some(WorkOutcome::Unverified)
@@ -1059,16 +1057,6 @@ impl Runtime {
         let omitted_sessions = sessions.len().saturating_sub(limit);
         let omitted_deliveries = deliveries.len().saturating_sub(limit);
         let omitted_relations = relations.len().saturating_sub(limit);
-        let omitted_finished = if include_finished {
-            0
-        } else {
-            all_works
-                .iter()
-                .filter(|work| {
-                    work.outcome.is_some() && work.outcome != Some(WorkOutcome::Unverified)
-                })
-                .count()
-        };
         let truncated = omitted_tasks > 0
             || omitted_questions > 0
             || omitted_jobs > 0

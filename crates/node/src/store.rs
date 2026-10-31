@@ -722,6 +722,18 @@ impl Store {
     pub fn works(&self, network: &str, scope: &str) -> Result<Vec<WorkProjection>> {
         reduce::works_from(&self.connection, network, scope)
     }
+    pub fn work(&self, network: &str, work_id: &str) -> Result<Option<WorkProjection>> {
+        reduce::work_from(&self.connection, network, work_id)
+    }
+    /// How many works in `scope` ended with a result nobody has to settle.
+    pub fn finished_works(&self, network: &str, scope: &str) -> Result<usize> {
+        Ok(self.connection.query_row(
+            "SELECT count(*) FROM works WHERE network_id=? AND conversation_id=? AND dispatch IS NOT NULL
+             AND finish IS NOT NULL AND json_extract(finish,'$.outcome')<>'unverified'",
+            params![network, scope],
+            |r| r.get(0),
+        )?)
+    }
     /// Works in `scope`, or every conversation, that want the user: see
     /// [`reduce::open_works_from`].
     pub fn open_works(&self, network: &str, scope: Option<&str>) -> Result<Vec<WorkProjection>> {

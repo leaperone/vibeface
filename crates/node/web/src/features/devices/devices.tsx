@@ -116,7 +116,7 @@ function SoleBrowserManager({ rows }: { rows: DeviceRow[] }) {
     <span className="min-w-0">{soleBrowserManagerText(sole.browser ? "这个浏览器" : `「${sole.name}」`)}</span>
     {ready?.principal.can_manage ? next
       ? <Link to="/devices/$deviceId" params={{ deviceId: next.id }} className={link}>{anotherManager}</Link>
-      : <Link to="/devices" search={{ add: true }} className={link}>{anotherManager}</Link> : null}
+      : <Link to="/devices" search={{ add: true, manage: true }} className={link}>{anotherManager}</Link> : null}
   </p>
 }
 
