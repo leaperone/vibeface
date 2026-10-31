@@ -4513,12 +4513,12 @@ pub(super) mod tests {
             instructed_bot(&node, &admin, "c", "前端", &instructions, &[]).await?;
             let network = node.network_id().await?;
             node.store.lock().await.connection.execute(
-                "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms) VALUES(?,?,?,?,?,?)",
-                params![network, "memory-1", "c", "用户每周五才发版", "r", now_ms()],
+                "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms,epoch,revision,origin,user_controlled,essential) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                params![network, "memory-1", "c", "用户每周五才发版", "r", now_ms(), crate::config::DATA_EPOCH, "r", serde_json::to_string(&crate::model::MemoryOrigin::Agent)?, false, true],
             )?;
             node.store.lock().await.connection.execute(
-                "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms) VALUES(?,?,?,?,?,?)",
-                params![network, "memory-2", "c", "长".repeat(500), "r", now_ms() + 1],
+                "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms,epoch,revision,origin,user_controlled,essential) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                params![network, "memory-2", "c", "长".repeat(500), "r", now_ms() + 1, crate::config::DATA_EPOCH, "r", serde_json::to_string(&crate::model::MemoryOrigin::Agent)?, false, true],
             )?;
             let mut requests = coordination_app_server(&node)?;
             node.ingest_agent_event(turn("s1", "t1", "/tmp")).await?;

@@ -509,7 +509,7 @@ pub(super) mod tests {
         super::super::triage::tests::bot(node, admin, "c", "fixture", &[]).await?;
         let (trigger, attempt) =
             super::super::triage::tests::start_reply(node, admin, "confirm-stop").await?;
-        let network = node.network_id().await?;
+        let network = node.store.lock().await.network()?.context("network")?;
         let mut store = node.store.lock().await;
         store.record_manager_turn(&attempt, server, thread, Some("turn"), &Default::default())?;
         store.finish_job(
