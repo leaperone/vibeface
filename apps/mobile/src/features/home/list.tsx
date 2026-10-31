@@ -1,7 +1,7 @@
 import { Link, usePathname, type Href } from 'expo-router'
-import { BellRing, Bot, ChevronRight, Inbox, ListChecks, Plus, Settings, ShieldAlert, Star, X } from 'lucide-react-native'
+import { BellRing, Bot, ChevronRight, Inbox, ListChecks, Plus, RotateCw, Settings, ShieldAlert, Star, WifiOff, X } from 'lucide-react-native'
 import { useState, type ReactNode } from 'react'
-import { Pressable, ScrollView, View } from 'react-native'
+import { Alert, Pressable, ScrollView, View } from 'react-native'
 import Animated, { FadeIn, FadeOut, LayoutAnimationConfig, LinearTransition, ReduceMotion } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
@@ -13,7 +13,7 @@ import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { recoveryCopy, waitingCopy } from '@vibeface/client/identity/copy.ts'
+import { offlineCopy, recoveryCopy, waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { moodLabel } from '@vibeface/client/avatar/mood.ts'
 import { useWorkspace } from '@/data/context'
 import { useInbox, useLive } from '@/data/live'
@@ -59,10 +59,10 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
       <Text role="heading" className="flex-1 text-title font-semibold">消息</Text>
       <ConnectionMenu connection={workspace.connection} />
       <Link href="/tasks" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('size-11 rounded-full', active('/tasks') && 'bg-muted')} accessibilityLabel="任务" accessibilityState={{ selected: active('/tasks') }}><Icon as={ListChecks} /></Button></Link>
-      <Link href="/new-bot" asChild><Button variant="ghost" size="icon" className="size-11 rounded-full" accessibilityLabel="新 Bot" disabled={!canCreate}><Icon as={Plus} /></Button></Link>
+      <NewBotButton className="size-11 rounded-full" />
       <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('-me-1 size-11 rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} className="size-5" /></Button></Link>
     </View> : null}
-    <OfflineBar className="mx-1 mb-2 mt-1" />
+    {empty === 'unreachable' && !bots.length ? null : <OfflineBar className="mx-1 mb-2 mt-1" />}
     {waiting ? <Item key="inbox" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1">
       <Link href="/inbox" replace={replace} asChild>
         <Pressable accessibilityState={{ selected: active('/inbox') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-2xl border px-3 py-2.5 active:opacity-70', device.pendingRecovery ? 'border-danger-border bg-danger-soft' : 'border-warning-border bg-warning-soft', active('/inbox') && (device.pendingRecovery ? 'border-danger' : 'border-warning'))}>
@@ -83,7 +83,8 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
           preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
         {index < bots.length - 1 ? <View className="ms-[68px] h-px bg-border" /> : null}
       </Item>
-    }) : empty === 'unreachable' ? null
+    }) : empty === 'unreachable' ? <View className="flex-1 justify-center"><EmptyState icon={WifiOff} title={offlineCopy.title(workspace.connection.entry)} action={
+      <Button className="min-h-11" onPress={device.retryNow}><Icon as={RotateCw} /><Text>{offlineCopy.retry}</Text></Button>} /></View>
     : empty === 'loading' ? <View accessibilityLabel="正在读取 Bot">{[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 px-3 py-2.5">
       <Skeleton className="size-11 rounded-full" />
       <View className="flex-1 gap-2"><Skeleton className="h-3.5 w-1/3 rounded-full" /><Skeleton className="h-3 w-2/3 rounded-full" /></View>
@@ -91,6 +92,16 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
       <Button className="min-h-11"><Icon as={Plus} /><Text>新 Bot</Text></Button>
     </Link> : undefined} /></View>}
   </ScrollView></LayoutAnimationConfig>
+}
+
+/** 新 Bot in a header. While a bot cannot be made it stays tappable and says why, instead of greying out without a word. */
+export function NewBotButton({ className }: { className?: string }) {
+  const shared = useLive()
+  const { connection } = useWorkspace()
+  if (shared && (shared.writable || shared.pendingBot)) return <Link href="/new-bot" asChild><Button variant="ghost" size="icon" className={className} accessibilityLabel="新 Bot"><Icon as={Plus} /></Button></Link>
+  const reason = shared ? shared.readOnlyNotice || shared.writeNotice || '稍等，正在同步' : `${offlineCopy.title(connection.entry)}，连上后才能新建`
+  return <Button variant="ghost" size="icon" className={cn('opacity-50', className)} accessibilityLabel="新 Bot" accessibilityState={{ disabled: true }} accessibilityHint={reason}
+    onPress={() => Alert.alert('暂时不能新建 Bot', reason)}><Icon as={Plus} /></Button>
 }
 
 const tipClosed = 'notify-tip-closed'

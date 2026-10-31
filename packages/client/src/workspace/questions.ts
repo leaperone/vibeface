@@ -20,6 +20,15 @@ export function settledAnswer(standing: string | undefined, mine: string | undef
   return { text, elsewhere: standing !== undefined && mine !== undefined && standing !== mine }
 }
 
+/** A question's first line asks; the lines after it list what the answer applies to, each split at its first "：" into a label and a value. */
+export function questionParts(text: string): { ask: string; lines: { label: string | null; value: string }[] } {
+  const [ask = text, ...rest] = text.split(/\r?\n/).filter((line) => line.trim())
+  return { ask, lines: rest.map((line) => {
+    const colon = line.indexOf("：")
+    return colon > 0 ? { label: line.slice(0, colon), value: line.slice(colon + 1) } : { label: null, value: line }
+  }) }
+}
+
 /** An answer that turns the request down, so it reads as refused, not agreed. */
 export const declined = (answer: string) => /^(拒绝|不允许|不同意|不行|不要|否|取消)|^(deny|decline|no)\b/i.test(answer.trim())
 /** How a settled answer reads: a bare refusal says only that; a refusal with words keeps them. */

@@ -44,7 +44,7 @@ const phoneKeys: DeviceKeys = {
     identity = undefined
   },
   async sign(message) {
-    if (!identity) throw new Error(`${self}还没准备好。请重新打开 Vibeface。`)
+    if (!identity) throw new Error(`${self}还没准备好，重新打开 Vibeface 再试。`)
     return identity.signMessage(message)
   },
 }
@@ -128,7 +128,7 @@ export const mobilePlatform: Platform = {
       file.create()
       file.write(bytes)
       const saved = await file.bytes()
-      if (saved.length !== bytes.length || await sha256(saved) !== await sha256(bytes)) throw new Error('保存后的文件摘要不一致，请重新取回。')
+      if (saved.length !== bytes.length || await sha256(saved) !== await sha256(bytes)) throw new Error('保存后的文件对不上，重新取回再试。')
       if (await Sharing.isAvailableAsync()) await Sharing.shareAsync(file.uri, { mimeType: 'application/octet-stream', dialogTitle: '导出文件副本' })
       return 'saved'
     },

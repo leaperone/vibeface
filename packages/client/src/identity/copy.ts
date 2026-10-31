@@ -94,6 +94,7 @@ export const addDeviceCopy = {
 }
 /** Where a device without management goes to add one; `managers`: the names of the management devices. */
 export const addOnManager = (managers: readonly string[]) => managers.length === 1 ? `在管理设备「${managers[0]}」上添加` : '在管理设备上添加'
+export const setUpOnManager = (managers: readonly string[]) => managers.length === 1 ? `在管理设备「${managers[0]}」上设置` : '在管理设备上设置'
 export const editOnManager = (managers: readonly string[]) => managers.length === 1 ? `在管理设备「${managers[0]}」上修改` : '在管理设备上修改'
 
 /** Settings' two red rows each say what they cost before either is tapped. */
