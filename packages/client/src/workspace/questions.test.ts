@@ -102,6 +102,9 @@ test("an answer replaced by another side's says so instead of vanishing", () => 
   assert.deepEqual(settledAnswer("继续", "继续"), { text: "继续", elsewhere: false })
   assert.deepEqual(settledAnswer("停下", undefined), { text: "停下", elsewhere: false }, "an answer given elsewhere with nothing tried here")
   assert.deepEqual(settledAnswer("停下", "继续"), { text: "停下", elsewhere: true }, "the other side's answer won the race")
+  assert.deepEqual(settledAnswer("停下", undefined, "phone", "web"), { text: "停下", elsewhere: true }, "a card mounted later still sees another device signed the answer")
+  assert.deepEqual(settledAnswer("停下", undefined, "web", "web"), { text: "停下", elsewhere: false }, "this device's own answer reads as answered")
+  assert.deepEqual(settledAnswer(undefined, "继续", "phone", "web"), { text: "继续", elsewhere: false }, "nothing stands yet, so no author to compare")
 })
 
 test("only an open question waits on the person: a closed one is no count and no reason to hide 思考中", () => {

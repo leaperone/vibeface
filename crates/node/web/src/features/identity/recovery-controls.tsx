@@ -307,7 +307,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         void run(async () => {
           let work: Promise<void>
           try {
-            if (!field(form, 'address').trim() || !field(form, 'device_id').trim()) throw new Error(`请在“${target ? recoveryCopy.connectTo : recoveryCopy.manual}”里填好要连的电脑。`)
+            if (!field(form, 'address').trim() || !field(form, 'device_id').trim()) throw new Error(`还没填要连的电脑。在“${target ? recoveryCopy.connectTo : recoveryCopy.manual}”里填好。`)
             work = device.beginRecovery({ file: fileOf(form), password: field(form, 'password'), name: field(form, 'name'), entry: parseEntry({ address: field(form, 'address'), device_id: field(form, 'device_id') }) })
           }
           finally { clearPasswords(form) }
@@ -334,7 +334,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {
           const file = fileOf(form)
-          if (!field(form, 'old_password')) throw new Error('请输入旧密码。')
+          if (!field(form, 'old_password')) throw new Error('还没输入旧密码。')
           setTried(true)
           await device.replaceRecoveryFile({ file, oldPassword: field(form, 'old_password'), password: passphrase(field(form, 'password')) })
           clearPasswords(form); setPassword(''); setTried(false)

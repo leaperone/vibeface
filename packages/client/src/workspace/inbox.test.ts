@@ -99,4 +99,8 @@ test('a task page shows a summary of what it was asked and folds the rest', () =
   const long = promptSummary('很'.repeat(100), '长任务')
   assert.equal(long.summary.length, 80)
   assert.equal(long.folded, true)
+  assert.deepEqual(promptSummary('[紧急] 修好登录页', '修登录'), { summary: '[紧急] 修好登录页', folded: false }, 'plain words that open with a bracket still show')
+  assert.deepEqual(promptSummary('[1, 2]', '列表'), { summary: '', folded: true }, 'a JSON array is machine text')
+  const emoji = promptSummary('👨‍👩‍👧'.repeat(100), '一家人')
+  assert.equal(emoji.summary, `${'👨‍👩‍👧'.repeat(79)}…`, 'the cut keeps whole emoji')
 })

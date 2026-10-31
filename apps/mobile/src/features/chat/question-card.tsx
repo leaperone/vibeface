@@ -41,7 +41,7 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const [failed, setFailed] = useState<string | null>(null)
   const [beaten, setBeaten] = useState(false)
   const standing = answer ?? question.answer?.text
-  const settled = settledAnswer(standing, shared?.answered[question.question_id])
+  const settled = settledAnswer(standing, shared?.answered[question.question_id], question.answer?.author, ready?.principal.device_id)
   const { ask, lines } = questionParts(question.text)
   const member = workspace.members.find((item) => item.device_id === question.about.node)
   // Read back later, an answered approval says which task on which device it settled.
@@ -80,6 +80,8 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const { approval, task, local } = questionMeta(question, shared?.openWorks ?? [], workspace.bots, ready?.entry.device_id)
   const project = question.about.cwd ? sharedProject(question.about.cwd, question.about.node, shared?.nodes ?? []) : null
   const { icon, tone } = looks[question.severity]
+  // A read-only device cannot answer: the choices and the answer row stay visible but take no input, as on the web.
+  const disabled = busy !== null || !shared?.writable
   return <ActionCard icon={approval ? Hand : icon} tone={tone} title={ask}>
     {lines.length ? <View className="gap-1">{lines.map((line, index) => <Text key={index} className="font-medium">
       {line.label ? <Text className="text-muted-foreground">{line.label}  </Text> : null}{line.value}
@@ -99,24 +101,24 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
       <Icon as={CircleAlert} className="size-4 text-warning" />
       <Text numberOfLines={1} className="min-w-0 shrink text-meta">{pending.text}</Text>
       <Text className="text-meta text-muted-foreground">· 没确认送达 ·</Text>
-      <Button variant="ghost" disabled={busy !== null || !shared?.writable} onPress={() => void send('retry', pending.text)}><Icon as={busy === 'retry' ? LoaderCircle : RotateCw} /><Text>再试</Text></Button>
+      <Button variant="ghost" disabled={disabled} onPress={() => void send('retry', pending.text)}><Icon as={busy === 'retry' ? LoaderCircle : RotateCw} /><Text>再试</Text></Button>
     </View> : <View accessibilityRole="radiogroup" accessibilityLabel="选一个回答" className="gap-2">
       {question.choices.map((choice, index) => {
         const key = `choice:${choice.label}`
-        return <Pressable key={choice.label} accessibilityRole="button" disabled={busy !== null} onPress={() => void send(key, choice.label)}
-          className={cn(row, 'active:bg-muted', busy !== null && 'opacity-50')}>
+        return <Pressable key={choice.label} accessibilityRole="button" accessibilityState={{ disabled }} disabled={disabled} onPress={() => void send(key, choice.label)}
+          className={cn(row, 'active:bg-muted', disabled && 'opacity-50')}>
           <View className={cn(badge, 'bg-muted')}>
             {busy === key ? <Icon as={LoaderCircle} className="size-4 text-muted-foreground" /> : <Text className="text-meta font-semibold text-muted-foreground">{index + 1}</Text>}
           </View>
           <Text className="min-w-0 flex-1 font-medium">{choice.label}</Text>
         </Pressable>
       })}
-      <View className={cn(row, 'pe-1', busy !== null && 'opacity-50')}>
+      <View className={cn(row, 'pe-1', disabled && 'opacity-50')}>
         <View className={cn(badge, 'bg-muted')}><Icon as={PencilLine} className="size-4 text-muted-foreground" /></View>
         <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel="其他回答" placeholder={question.choices.length ? '其他回答' : '输入回答'} placeholderTextColorClassName="accent-muted-foreground"
-          className="min-h-11 min-w-0 flex-1 font-sans text-body text-foreground" value={text} maxLength={4000} editable={busy === null}
-          returnKeyType="send" submitBehavior="blurAndSubmit" onChangeText={setText} onSubmitEditing={() => { if (text.trim()) typed() }} />
-        <Button variant="ghost" size="icon" accessibilityLabel="发送回答" disabled={busy !== null || !text.trim()} onPress={typed}>
+          className="min-h-11 min-w-0 flex-1 font-sans text-body text-foreground" value={text} maxLength={4000} editable={!disabled}
+          returnKeyType="send" submitBehavior="blurAndSubmit" onChangeText={setText} onSubmitEditing={() => { if (!disabled && text.trim()) typed() }} />
+        <Button variant="ghost" size="icon" accessibilityLabel="发送回答" disabled={disabled || !text.trim()} onPress={typed}>
           <Icon as={busy === 'text' ? LoaderCircle : ArrowUp} />
         </Button>
       </View>

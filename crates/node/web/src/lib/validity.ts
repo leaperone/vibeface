@@ -2,9 +2,9 @@ type Field = HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement
 
 function message(field: Field) {
   const state = field.validity
-  if (state.valueMissing) return field instanceof HTMLInputElement && field.type === 'file' ? '请选择文件' : '请填写这一项'
+  if (state.valueMissing) return field instanceof HTMLInputElement && field.type === 'file' ? '还没选文件' : '这一项还没填'
   if (state.tooShort && !(field instanceof HTMLSelectElement)) return `至少 ${field.minLength} 个字符`
-  if (state.typeMismatch) return '请填完整地址，例如 https://'
+  if (state.typeMismatch) return '地址不完整，例如 https://'
   if (state.patternMismatch) return '格式不对'
   return ''
 }

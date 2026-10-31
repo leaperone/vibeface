@@ -36,7 +36,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
   const answering = useRef(false)
   const id = question.question_id
   const standing = answer ?? question.answer?.text
-  const settled = settledAnswer(standing, workspace.answered[id])
+  const settled = settledAnswer(standing, workspace.answered[id], question.answer?.author, ready?.principal.device_id)
   const { ask, lines } = questionParts(question.text)
   const node = nodeName(question.about.node, { nodes: workspace.nodes, directory })
   // Read back later, an answered approval says which task on which device it settled.
