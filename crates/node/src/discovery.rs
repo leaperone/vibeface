@@ -323,10 +323,8 @@ pub fn missing(target: &Target, codex: bool, host: &Host) -> Result<Paths> {
     let spawn = server.mode == AppServerMode::Spawn;
     // A missing socket never means "find the user's App Server". The Node injects its own
     // provider root at runtime; a system server is an explicit socket-only opt-in.
-    if target.triage.codex_sessions.is_none() {
-        if target.triage.scan_codex_sessions {
-            bail!("set an explicit Codex sessions directory before scanning external sessions");
-        }
+    if target.triage.codex_sessions.is_none() && target.triage.scan_codex_sessions {
+        bail!("set an explicit Codex sessions directory before scanning external sessions");
     }
     let bot = target.manager.as_ref().map(|manager| manager.provider);
     for provider in Provider::ALL {
