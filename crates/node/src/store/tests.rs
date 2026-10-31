@@ -8967,7 +8967,12 @@ fn restart_recovers_each_scope_and_unknown_turns_are_never_replayed() -> Result<
         1,
         "claiming another scope does not clear unknown evidence"
     );
-    store.resolve_pending_check(&main_attempt.id)?;
+    let check = store
+        .pending_checks()?
+        .into_iter()
+        .find(|check| check.attempt_id == main_attempt.id)
+        .context("pending check")?;
+    store.confirm_manager_stopped(&net.a, &net.network, &check, crate::runtime::now_ms())?;
     assert_eq!(
         store.scheduler_job_hold(
             &net.network,
@@ -8983,7 +8988,7 @@ fn restart_recovers_each_scope_and_unknown_turns_are_never_replayed() -> Result<
             .scheduler_job("c", &main.job.trigger)?
             .context("old job")?
             .state,
-        JobState::Reconciling { .. }
+        JobState::Interrupted { .. }
     ));
     Ok(())
 }

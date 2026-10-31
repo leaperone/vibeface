@@ -1802,6 +1802,7 @@ fn recover_session(
                 crate::runtime::now_ms(),
             )?;
         }
+        JobState::Reconciling { .. } => {}
         _ => session.active = None,
     }
     Ok(())
@@ -3164,6 +3165,12 @@ impl Store {
             "scheduler attempt does not match"
         );
         if job.state.terminal() {
+            tx.execute(
+                "DELETE FROM pending_checks WHERE attempt_id=?",
+                [attempt_id],
+            )?;
+            forget_process(&tx, attempt_id)?;
+            tx.commit()?;
             return Ok(job);
         }
         ensure!(
@@ -3181,6 +3188,13 @@ impl Store {
             text,
             created_at_ms,
         )?;
+        if job.state.terminal() {
+            tx.execute(
+                "DELETE FROM pending_checks WHERE attempt_id=?",
+                [attempt_id],
+            )?;
+            forget_process(&tx, attempt_id)?;
+        }
         tx.commit()?;
         Ok(job)
     }
