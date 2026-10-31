@@ -14,6 +14,7 @@ import { useRun } from '@/lib/use-run'
 
 const sourceLabels: Record<LogSource, string> = { node: '设备', web: '网页', agent: 'Bot', cli: '命令行', codex: 'Codex', cursor: 'Cursor' }
 const levelLabels: Record<LogLevel, string> = { trace: '跟踪', debug: '调试', info: '信息', warn: '有问题', error: '错误' }
+const external = (record: LogRecord) => record.source === 'codex' || record.source === 'cursor'
 const eventTitles: Record<string, string> = {
   'agent.turn.started': 'Bot 开始回复',
   'agent.turn.finished': 'Bot 回复结束',
@@ -36,7 +37,7 @@ const textField = (fields: Record<string, unknown> | undefined, keys: string[]) 
   keys.map((key) => fields?.[key]).find((value): value is string => typeof value === 'string' && value.length > 0)
 
 function titleOf(record: LogRecord) {
-  if (eventTitles[record.event]) return eventTitles[record.event]
+  if (Object.prototype.hasOwnProperty.call(eventTitles, record.event)) return eventTitles[record.event]
   return /[一-鿿]/.test(record.message) ? record.message.split(/\r?\n/)[0] || '设备日志' : '收到一条设备日志'
 }
 
@@ -79,11 +80,12 @@ export default function Logs() {
 
 function LogRow({ record, bot, work, computer }: { record: LogRecord; bot?: string; work?: string; computer?: string }) {
   const title = titleOf(record)
+  const quiet = external(record)
   const message = record.message !== title && /[一-鿿]/.test(record.message) ? record.message : undefined
   const fields = record.fields && Object.keys(record.fields).length ? JSON.stringify(record.fields, null, 2) : ''
   return <View className="rounded-xl border border-border bg-card shadow-xs dark:border-line-strong">
     <View accessible accessibilityLabel={`${title}，${sourceLabels[record.source]}`} className="min-h-16 flex-row items-start gap-3 px-4 py-3">
-      <Icon as={record.level === 'error' ? CircleX : record.level === 'warn' ? CircleAlert : ScrollText} className={record.level === 'error' ? 'mt-0.5 size-4 text-danger' : record.level === 'warn' ? 'mt-0.5 size-4 text-warning' : 'mt-0.5 size-4 text-muted-foreground'} />
+      <Icon as={quiet ? ScrollText : record.level === 'error' ? CircleX : record.level === 'warn' ? CircleAlert : ScrollText} className={quiet ? 'mt-0.5 size-4 text-muted-foreground' : record.level === 'error' ? 'mt-0.5 size-4 text-danger' : record.level === 'warn' ? 'mt-0.5 size-4 text-warning' : 'mt-0.5 size-4 text-muted-foreground'} />
       <View className="min-w-0 flex-1 gap-1">
         <Text className="font-medium">{title}</Text>
         {message ? <Text numberOfLines={2} className="text-meta text-muted-foreground">{message}</Text> : null}
