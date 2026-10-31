@@ -857,10 +857,6 @@ jobs:
           merge-multiple: true
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: release-macos-${{ github.sha }}
-          path: packages
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
           name: release-android-${{ github.sha }}
           path: packages
       - name: Verify all assets before publishing
@@ -868,15 +864,15 @@ jobs:
           [[ "$RELEASE_TAG" == "v$VERSION" ]]
           shopt -s nullglob
           archives=(packages/*.tar.gz)
-          checksums=(packages/*.tar.gz.sha256 packages/*.zip.sha256 packages/*.dmg.sha256 packages/*.apk.sha256)
+          checksums=(packages/*.tar.gz.sha256 packages/*.apk.sha256)
           files=(packages/*)
-          [[ "${#archives[@]}" == 3 && "${#checksums[@]}" == 6 && "${#files[@]}" == 13 ]]
+          [[ "${#archives[@]}" == 3 && "${#checksums[@]}" == 4 && "${#files[@]}" == 9 ]]
           for archive in "${archives[@]}"; do
             name="$(basename "$archive")"
             [[ "$name" == "vibeface-$VERSION-"*.tar.gz ]]
             (cd packages && sha256sum -c "$name.sha256")
           done
-          for archive in packages/*.zip packages/*.dmg packages/*.apk; do
+          for archive in packages/*.apk; do
             (cd packages && sha256sum -c "$(basename "$archive").sha256")
           done
           [[ "$(find packages -maxdepth 1 -name '*.provenance.json' | wc -l)" == 1 ]]
