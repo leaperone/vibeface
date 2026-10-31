@@ -4199,6 +4199,10 @@ def phase4_acceptance(options):
         lost = dispatched(a, "p4-revoked")
         turn(a, r5["trigger"])
         wait_for("C's Agent runs the task", lambda: work_in(a.client, lost, "running"), timeout=60)
+        wait_for("C's fixture records the running task invocation", lambda: (lambda rows: rows if len(rows) == 1 else None)([
+            row for row in records(c)
+            if row.get("trigger") == "task:" + lost and row.get("kind") == "agent_task" and row.get("work_id") == lost
+        ]), timeout=60)
         c.stop(crash=True)
         stop = a.client.rpc("interrupt_work", conversation_id=conversation, work_id=lost)
         require(stop.get("waiting_for_device") and not stop["confirmed"], "a stop to an offline device waits for it")
