@@ -33,6 +33,7 @@ from pathlib import Path
 import shutil
 import signal
 import select
+import shlex
 import socket
 import struct
 import stat
@@ -860,10 +861,92 @@ def fixture_schema_check():
     return schema
 
 
+def native_provider_login(run, setup, command, bin_sha256):
+    home, program = run / "receiver/providers/codex", run / "native-codex"
+    require(isinstance(command, str) and 0 < len(command) <= 4096 and command == setup["command"],
+            "native login executes only the exact copied Node setup command")
+    require(setup["directory"] == str(home) and home.is_dir() and not home.is_symlink()
+            and home.resolve().is_relative_to(run.resolve()), "native login uses its existing private receiver root")
+    require(program.is_file() and not program.is_symlink() and program.stat().st_mode & 0o077 == 0
+            and file_sha256(program) == bin_sha256, "native login uses the unchanged controlled executable")
+    argv = shlex.split(command)
+    require(argv == ["env", "CODEX_HOME=" + str(home), str(program), "login"],
+            "native login accepts only the private root assignment and fixed fake login argv")
+    require(json.loads((run / "native-provider-stage.json").read_text()) == "signed_out"
+            and not fixture_records(run, "native-provider-login.jsonl"), "native synthetic login runs once before authentication")
+    result = subprocess.run(["/usr/bin/env", *argv[1:]], env={"PATH": os.defpath},
+                            capture_output=True, timeout=15)
+    records = fixture_records(run, "native-provider-login.jsonl")
+    require(result.returncode == 0 and len(records) == 1 and records[0]["args"] == ["login"]
+            and records[0]["codex_home"] == str(home)
+            and json.loads((run / "native-provider-stage.json").read_text()) == "ready",
+            "the controlled CLI records one private-root login and changes only fake authentication")
+    return {"executed": True, "private_root_verified": True, "controlled_bin_verified": True, "login_count": len(records)}
+
+
+def native_provider_selfcheck(options):
+    options.artifacts.mkdir(parents=True, exist_ok=True)
+    run = options.artifacts.resolve() / ("native-provider-selfcheck-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    checks = []
+    try:
+        home = run / "receiver/providers/codex"
+        home.mkdir(parents=True, mode=0o700)
+        program = fixture_wrapper(run, "native-codex", "--fixture-codex")
+        digest = file_sha256(program)
+        private_json(run / "native-provider-stage.json", "signed_out")
+        command = shlex.join(["env", "CODEX_HOME=" + str(home), str(program), "login"])
+        setup = {"directory": str(home), "command": command}
+        marker = run / "must-not-execute"
+        foreign = "env CODEX_HOME=/outside /usr/bin/true login"
+        for name, actual_setup, actual_command in (
+            ("foreign_root", {**setup, "directory": str(run / "foreign")}, command),
+            ("different_copied_command", setup, command + " "),
+            ("uncontrolled_command", {**setup, "command": foreign}, foreign),
+            ("shell_suffix", {**setup, "command": command + "; touch " + str(marker)}, command + "; touch " + str(marker)),
+        ):
+            try:
+                native_provider_login(run, actual_setup, actual_command, digest)
+            except (AssertionError, ValueError):
+                checks.append(name)
+            else:
+                raise AssertionError("native login must reject " + name)
+        missing = run / "missing-home"
+        home.rename(missing)
+        try:
+            try:
+                native_provider_login(run, setup, command, digest)
+            except AssertionError:
+                checks.append("missing_root")
+            else:
+                raise AssertionError("native login must reject a missing root")
+        finally:
+            missing.rename(home)
+        require(not fixture_records(run, "native-provider-login.jsonl") and not marker.exists()
+                and json.loads((run / "native-provider-stage.json").read_text()) == "signed_out",
+                "negative login calls have no execution or fake-state side effects")
+        require(native_provider_login(run, setup, command, digest)["login_count"] == 1, "private-root fake login actually executes")
+        checks.append("private_root_positive_real_call")
+        require(len(fixture_records(run, "native-provider-login.jsonl")) == 1, "one positive login invocation is recorded")
+        private_json(options.artifacts / "native-provider-selfcheck.json", {"status": "passed", "checks": checks, "real_provider_calls": 0})
+        print(json.dumps({"status": "passed", "checks": checks, "real_provider_calls": 0}), flush=True)
+    finally:
+        shutil.rmtree(run)
+
+
 def fixture_codex(arguments):
     """Implement the native App Server contract without loading a provider."""
-    fixture_schema_check()
     run = Path(arguments[arguments.index("--fixture-root") + 1])
+    if arguments == ["--fixture-codex", "--fixture-root", str(run), "login"]:
+        home = run / "receiver/providers/codex"
+        require(home.is_dir() and not home.is_symlink() and home.resolve().is_relative_to(run.resolve())
+                and os.environ.get("CODEX_HOME") == str(home)
+                and json.loads((run / "native-provider-stage.json").read_text()) == "signed_out",
+                "fake login only changes authentication in its assigned receiver root")
+        fixture_record(run, "native-provider-login.jsonl", {"pid": os.getpid(), "args": ["login"], "codex_home": str(home)})
+        private_json(run / "native-provider-stage.json", "ready")
+        return
+    fixture_schema_check()
     def provider_reply(method):
         path = run / "native-provider-stage.json"
         if not path.exists() or method not in ("account/read", "model/list"):
@@ -7096,7 +7179,7 @@ def e2e_fixture(options):
     relay = PkarrRelay() if options.fixture_kind == "delivery" else None
     rpc = DeliveryRpcSpy() if relay else None
     native_ready = False
-    native_provider = False
+    native_provider = None
     native_queue = None
 
     def details():
@@ -7185,15 +7268,23 @@ def e2e_fixture(options):
                             "native provider setup belongs to its initialized receiver and runs once")
                     private_json(run / "native-provider-stage.json", "signed_out")
                     client = nodes["receiver"].client
+                    (nodes["receiver"].directory / "providers/codex").mkdir(parents=True, exist_ok=True, mode=0o700)
+                    program = fixture_wrapper(run, "native-codex", "--fixture-codex")
                     client.call("configure_provider", {"provider": "codex", "bot": False, "execution": False,
-                        "bin": str(fixture_wrapper(run, "native-codex", "--fixture-codex")),
+                        "bin": str(program),
                         "app_server": SPAWN_APP_SERVER})
                     nodes["receiver"].stop()
                     nodes["receiver"].start()
                     client.connect()
                     client.authenticate()
-                    native_provider = True
+                    native_provider = {"bin_sha256": file_sha256(program)}
                     result = {"configured": True}
+                elif op == "native_provider_login":
+                    require(set(request) == {"op", "command"} and native_provider,
+                            "native login belongs only to its controlled initialized receiver")
+                    provider = next(item for item in nodes["receiver"].client.call("node_settings")["providers"]
+                                    if item["provider"] == "codex")
+                    result = native_provider_login(run, provider["setup"], request["command"], native_provider["bin_sha256"])
                 elif op == "native_provider_stage":
                     require(set(request) == {"op", "stage"} and native_provider
                             and request["stage"] in ("signed_out", "ready", "catalog_unknown"),
@@ -7235,6 +7326,8 @@ def e2e_fixture(options):
                     jobs = client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"] if native_queue else []
                     calls = [row for row in fixture_records(run) if native_queue and row["conversation_id"] == native_queue["conversation_id"]]
                     result = {"manager": {key: manager[key] for key in ("provider", "model", "reasoning_effort")} if manager is not None else None,
+                              "roles": provider["roles"], "execution_model": provider["execution_model"], "setup": provider["setup"],
+                              "login_count": len(fixture_records(run, "native-provider-login.jsonl")),
                               "readiness": provider["readiness"]["state"], "catalog": provider["probe"]["catalog"]["state"],
                               "authentication": provider["probe"]["authentication"],
                               "checked": provider["probe"]["checked_at_ms"] is not None,
@@ -7287,6 +7380,7 @@ if __name__ == "__main__":
         modes.add_argument("--public-entry", action="store_true", help="check a public entry that forwards browsers and decisions to a member Node through its relay")
         modes.add_argument("--phase5", action="store_true", help="check write protection after a restore, alone and as a copied data directory, status, logs and diagnostics")
         modes.add_argument("--e2e-fixture", action="store_true", help=argparse.SUPPRESS)
+        modes.add_argument("--native-provider-selfcheck", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--delivery-charity", action="store_true", help="check free discovery, charity transfer, loopback service boundaries and durable restart")
         modes.add_argument("--delivery", action="store_true", help="check the full paid delivery flow; requires a private local deployment configuration")
         modes.add_argument("--delivery-ui-selfcheck", action="store_true", help="check only the local UI controller schema without starting Nodes, UI, chain or proofs")
@@ -7302,7 +7396,9 @@ if __name__ == "__main__":
         arguments = parser.parse_args()
         try:
             require(30_000 <= arguments.delivery_ui_timeout_ms <= 86_400_000, "UI acceptance has a bounded explicit execution deadline")
-            if arguments.delivery_ui_selfcheck:
+            if arguments.native_provider_selfcheck:
+                native_provider_selfcheck(arguments)
+            elif arguments.delivery_ui_selfcheck:
                 delivery_ui_selfcheck(arguments)
             elif arguments.e2e_fixture:
                 require(arguments.fixture_port is not None, "e2e fixture requires its allocated port")

@@ -116,13 +116,18 @@ function providerInspection(value: Record<string, unknown>) {
   assert(typeof value.checked === 'boolean' && Array.isArray(value.jobs));
   assert(typeof value.running_invocations === 'number' && Number.isSafeInteger(value.running_invocations) && value.running_invocations >= 0);
   assert(typeof value.queued_invocations === 'number' && Number.isSafeInteger(value.queued_invocations) && value.queued_invocations >= 0);
-  return { manager,
+  assert(Array.isArray(value.roles) && value.roles.every(role => role === 'agent' || role === 'execution'));
+  assert(typeof value.execution_model === 'string');
+  assert(typeof value.login_count === 'number' && Number.isSafeInteger(value.login_count) && value.login_count >= 0);
+  const setup = record(value.setup);
+  return { manager, roles: value.roles, execution_model: value.execution_model, login_count: value.login_count,
+    setup: { directory: text(setup.directory), command: text(setup.command) },
     readiness: text(value.readiness), authentication: text(value.authentication), catalog: text(value.catalog), checked: value.checked,
     jobs: value.jobs.map((item: unknown) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state) }; }),
     running_invocations: value.running_invocations, queued_invocations: value.queued_invocations };
 }
 
-test('provider settings and queued cancellation work in the installed native app', { platforms: ['ios'], timeout: 360000 }, async ({ app, device, network, screen }) => {
+test('provider settings and queued cancellation work in the installed native app', { platforms: ['ios'], timeout: 600000 }, async ({ app, device, network, screen }) => {
   const simulator = process.env.VIBEFACE_E2E_SIMULATOR, appPath = process.env.VIBEFACE_E2E_IOS_APP;
   const source = process.env.VIBEFACE_E2E_SOURCE_COMMIT;
   const binary = process.env.VIBEFACE_E2E_BINARY, crypto = process.env.VIBEFACE_E2E_CRYPTO_MODULE;
@@ -172,6 +177,9 @@ test('provider settings and queued cancellation work in the installed native app
   };
   const inspect = async () => providerInspection(await network.call({ op: 'native_provider_inspect' }));
   const probe = () => screen.getByRole('button', '检查可用性', { exact: true }).first().click();
+  const codexRow = () => screen.getByRole('button', /^Codex，/);
+  const botDetails = screen.getByRole('button', '运行 Bot', { exact: true });
+  const executionDetails = screen.getByRole('button', '执行任务', { exact: true });
   const modelButton = () => screen.getByRole('button', /^设备默认模型，/);
   const select = async (name: string) => {
     await screen.scrollUntilVisible(modelButton(), { direction: 'down' });
@@ -179,10 +187,22 @@ test('provider settings and queued cancellation work in the installed native app
     await screen.getByRole('radio', name, { exact: true }).click();
   };
   const save = async (model: string, effort: string | null) => {
-    const button = screen.getByRole('button', '保存', { exact: true });
+    const button = screen.getByRole('button', '保存', { exact: true, visible: true });
     await screen.scrollUntilVisible(button, { direction: 'down' });
     await button.click();
     await expect.poll(async () => (await inspect()).manager, { timeout: 15000 }).toEqual({ provider: 'codex', model, reasoning_effort: effort });
+  };
+  const executionButton = () => screen.getByRole('button', /^执行任务默认模型，/);
+  const selectExecution = async (name: string) => {
+    await screen.scrollUntilVisible(executionButton(), { direction: 'down' });
+    await executionButton().click();
+    await screen.getByRole('radio', name, { exact: true }).click();
+  };
+  const saveExecution = async (model: string) => {
+    const button = screen.getByRole('button', '保存', { exact: true, visible: true });
+    await screen.scrollUntilVisible(button, { direction: 'down' });
+    await button.click();
+    await expect.poll(async () => (await inspect()).execution_model, { timeout: 15000 }).toBe(model);
   };
   const screenshot = async (name: string) => { await copyFile(await app.screenshot(name), join(publicPath, `${name}.png`)); };
   await openSettings();
@@ -193,23 +213,95 @@ test('provider settings and queued cancellation work in the installed native app
   expect((await inspect()).manager).toBeNull();
   await assert.rejects(network.call({ op: 'native_provider_queue' }));
   await initialProvider.click();
+  await screen.getByLabel('Codex 执行任务', { exact: true }).click();
+  await expect.poll(async () => (await inspect()).roles, { timeout: 15000 }).toEqual(['execution']);
+  expect((await inspect()).manager).toBeNull();
+  await probe();
+  await expect(codexRow()).toHaveAccessibleName('Codex，执行任务，需设置');
+  expect((await inspect()).authentication).toBe('sign_in_required');
+  const setup = (await inspect()).setup;
+  await expect(screen.getByText(setup.command, { exact: true })).toBeVisible();
+  await screen.getByRole('button', '复制Codex 私有目录登录命令', { exact: true }).click();
+  await expect.poll(() => device.clipboard()).toBe(setup.command);
+  const copied = await device.clipboard();
+  assert.equal(copied, setup.command);
+  await assert.rejects(network.call({ op: 'native_provider_login', command: copied + '; false' }));
+  await assert.rejects(network.call({ op: 'native_provider_login', command: copied, role: 'source' }));
+  expect((await inspect()).login_count).toBe(0);
+  expect((await inspect()).authentication).toBe('sign_in_required');
+  const login = await network.call({ op: 'native_provider_login', command: copied });
+  expect(login).toEqual({ executed: true, private_root_verified: true, controlled_bin_verified: true, login_count: 1 });
+  await probe();
+  await expect(codexRow()).toHaveAccessibleName('Codex，执行任务，可用');
+  await expect.poll(async () => (await inspect()).authentication).toBe('authenticated');
+  expect((await inspect()).catalog).toBe('available');
+  expect((await inspect()).manager).toBeNull();
+  await expect(executionDetails).not.toBeExpanded();
+  await executionDetails.click();
+  await expect(executionButton()).toHaveAccessibleName('执行任务默认模型，由 AI 服务决定');
+  await selectExecution('Native selectable');
+  await saveExecution('native-selectable');
+  expect((await inspect()).manager).toBeNull();
+  await screen.scrollUntilVisible(executionButton(), { direction: 'up' });
+  await executionButton().click();
+  await screen.getByRole('button', '其他…', { exact: true }).click();
+  await screen.getByRole('textbox', '执行任务默认模型', { exact: true }).fill('native-execution-custom');
+  await device.dismissKeyboard();
+  await saveExecution('native-execution-custom');
+  expect((await inspect()).manager).toBeNull();
+  await screen.scrollUntilVisible(screen.getByRole('button', '从列表选', { exact: true }), { direction: 'up' });
+  await screen.getByRole('button', '从列表选', { exact: true }).click();
+  await saveExecution('');
+  await expect(executionButton()).toHaveAccessibleName('执行任务默认模型，由 AI 服务决定');
+  expect((await inspect()).roles).toEqual(['execution']);
+  expect((await inspect()).manager).toBeNull();
+  await screen.scrollUntilVisible(executionDetails, { direction: 'up' });
+  await executionDetails.click();
+  await screen.scrollUntilVisible(screen.getByLabel('Codex 运行 Bot', { exact: true }), { direction: 'up' });
   await screen.getByLabel('Codex 运行 Bot', { exact: true }).click();
   await expect.poll(async () => (await inspect()).manager?.provider, { timeout: 15000 }).toBe('codex');
-  await expect(screen.getByRole('button', /^Codex，运行 Bot，(尚未确认|需设置)$/)).toBeVisible({ timeout: 30000 });
-  await probe();
-  await expect(screen.getByRole('button', 'Codex，运行 Bot，需设置', { exact: true })).toBeVisible();
-  expect((await inspect()).authentication).toBe('sign_in_required');
-  await network.call({ op: 'native_provider_stage', stage: 'ready' });
-  await probe();
-  const codex = screen.getByRole('button', 'Codex，运行 Bot，可用', { exact: true });
-  await expect(codex).toBeVisible();
-  await screen.getByRole('button', '运行 Bot', { exact: true }).click();
+  await openSettings();
+  await codexRow().click();
+  await expect(botDetails).not.toBeExpanded();
+  await expect(executionDetails).not.toBeExpanded();
+  await botDetails.click();
   await select('Native selectable');
   await screen.getByRole('button', 'high', { exact: true }).click();
+  await screen.scrollUntilVisible(botDetails, { direction: 'up' });
+  await botDetails.click();
+  await executionDetails.click();
+  await selectExecution('Native controlled');
+  await screen.scrollUntilVisible(executionDetails, { direction: 'up' });
+  await executionDetails.click();
+  await screen.scrollUntilVisible(botDetails, { direction: 'up' });
+  await botDetails.click();
+  await expect(modelButton()).toHaveAccessibleName('设备默认模型，Native selectable');
   await save('native-selectable', 'high');
+  expect((await inspect()).execution_model).toBe('');
+  await screen.scrollUntilVisible(modelButton(), { direction: 'up' });
+  await select('Native controlled');
+  await screen.scrollUntilVisible(botDetails, { direction: 'up' });
+  await botDetails.click();
+  await executionDetails.click();
+  await expect(executionButton()).toHaveAccessibleName('执行任务默认模型，Native controlled');
+  await saveExecution('native-controlled');
+  expect((await inspect()).manager).toEqual({ provider: 'codex', model: 'native-selectable', reasoning_effort: 'high' });
+  await screen.scrollUntilVisible(executionDetails, { direction: 'up' });
+  await executionDetails.click();
+  await screen.scrollUntilVisible(botDetails, { direction: 'up' });
+  await botDetails.click();
+  await expect(modelButton()).toHaveAccessibleName('设备默认模型，Native controlled');
+  await select('Native selectable');
+  await screen.scrollUntilVisible(botDetails, { direction: 'up' });
+  await botDetails.click();
+  await executionDetails.click();
+  await selectExecution('由 AI 服务决定');
+  await saveExecution('');
+  await expect(executionButton()).toHaveAccessibleName('执行任务默认模型，由 AI 服务决定');
+  expect((await inspect()).manager).toEqual({ provider: 'codex', model: 'native-selectable', reasoning_effort: 'high' });
   await openSettings();
-  await screen.getByRole('button', 'Codex，运行 Bot，可用', { exact: true }).click();
-  await screen.getByRole('button', '运行 Bot', { exact: true }).click();
+  await codexRow().click();
+  await botDetails.click();
   await expect(modelButton()).toHaveAccessibleName('设备默认模型，Native selectable');
   expect((await inspect()).manager?.reasoning_effort).toBe('high');
   await screenshot('provider-selectable');
@@ -236,9 +328,13 @@ test('provider settings and queued cancellation work in the installed native app
   await network.call({ op: 'native_provider_stage', stage: 'ready' });
   await screen.scrollUntilVisible(screen.getByRole('button', '检查可用性', { exact: true }).first(), { direction: 'up' });
   await probe();
-  await screen.scrollUntilVisible(screen.getByRole('button', '从列表选', { exact: true }), { direction: 'down' });
-  await screen.getByRole('button', '从列表选', { exact: true }).click();
+  await screen.scrollUntilVisible(typed, { direction: 'down' });
+  await typed.fill(' native-controlled ');
+  await device.dismissKeyboard();
+  await expect(screen.getByRole('button', 'high', { exact: true })).toBeHidden();
+  await save('native-controlled', null);
   await select('Native selectable');
+  await screen.getByRole('button', 'high', { exact: true }).click();
   await save('native-selectable', 'high');
   const queue = await network.call({ op: 'native_provider_queue' });
   await assert.rejects(network.call({ op: 'native_provider_queue' }));
@@ -262,6 +358,8 @@ test('provider settings and queued cancellation work in the installed native app
   expect(reopened.jobs).toEqual(after.jobs);
   expect(reopened.running_invocations).toBe(1);
   expect(reopened.queued_invocations).toBe(0);
+  expect(reopened.execution_model).toBe('');
+  expect(reopened.login_count).toBe(1);
   expect(await bundleManifest(installedPath)).toEqual(built);
   expect(await bundleManifest(resolve(root, 'crates/node/web/dist/client'))).toEqual(web);
   for (const [name, path] of Object.entries(inputs)) expect(createHash('sha256').update(await readFile(path)).digest('hex')).toBe(hashes[name]);
@@ -275,6 +373,13 @@ test('provider settings and queued cancellation work in the installed native app
     web_manifest_sha256: digest(web),
     real_pairing: true, installed_bundle_matches: true, known_sign_in_required: true, saved_model_high: true,
     provider_controlled_cleared_effort: true, unavailable_catalog_preserved_model_high: true, typed_model_saved: true,
+    execution_only_catalog_select: true, execution_only_custom_and_default: true,
+    default_collapsed_role_groups: true, role_drafts_survived_collapse: true,
+    bot_save_preserved_execution_draft: true, execution_save_preserved_bot_draft: true,
+    independent_execution_model_saved: true, execution_clear_preserved_bot: true,
+    private_login_command_copied_exactly: true, controlled_bin_and_private_codex_home_verified: true,
+    synthetic_login_count: reopened.login_count, native_authenticated_recheck: true, trimmed_controlled_cleared_effort: true,
+    real_provider_model_calls: 0, not_checked: ['real Provider authentication', 'Claude-specific native login'],
     running_trigger: runningTrigger, queued_trigger: queuedTrigger, jobs: reopened.jobs,
     running_invocations: reopened.running_invocations, queued_invocations: reopened.queued_invocations,
     native_cancelled_queue: true, native_stopped_running: true, reopened_without_execution: true }, null, 2)}\n`, { mode: 0o600 });
