@@ -255,20 +255,21 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 
 `bot_message:<message_id>` 由写入 `BotMessaged` 的发送方负责人接纳（对方会话也归它调度时），否则进 outbox，经 `deliver` 交给对方负责人。同步只存消息，不排 job。每个轮次有深度：本人消息和回答为 0，schedule 轮取其 `depth`，bot 消息轮取 `hops`，工作结果和 Agent 任务沿派发链继承；提醒和 bot 消息的深度为当前加一，超过 4 时拒绝。
 
-job 状态为 `queued`、`steering`、`claimed`、`running`、`cancelling`、`completed`、`failed`、`cancelled`、`interrupted` 或 `steered`，后五种是终态。Codex 回复进行中时，同一会话排队的用户消息（无附件、需要回复）先在本机记为 `steering`，再以消息 ID 为 `clientUserMessageId` 发 `turn/steer` 并入当前回合，发送前核对目标是本进程启动的回复且未被停止或移走；App Server 明确拒绝时回到 `queued`，其余（含超时）保持 `steering`。目标回复结束后才按线程回读结算：消息所在回合 `completed` 即 `steered`（`outcome=answered`），在其他终态回合即 `steered`（`outcome=unfinished`，随宿主回复的终态），线程里没有它且目标回合已结束即回到 `queued`，绝不重发；消息只出现在其他回合也算 `unfinished`。只有回读成功且读到目标回合才结算，读取失败或读不到目标回合保持 `steering`，连续 10 分钟读不到（中间读到一次即重新计时）则记为 `steered`（`outcome=unknown`，网页显示“不确定 Bot 看到了没有”）。未定期间本机仍拥有的会话不领取后续消息，会话已移走时排队消息照常交给新所有者；停止 `steering` 消息即停止它并入的回复。steer 记在本机调度状态，同步和恢复不会重放；结算为 `answered` 时在同一事务写一条 `message_steered`，让以后的负责人不把这条消息算作未回复。Cursor 始终排队。跨重启的 `running` 与 `cancelling` 进入 `interrupted` 并登记待核对，不自动重新调用 SDK。Bot 回答 `MessagePosted(assistant)` 与 job 终态在同一事务提交，`status` 为 `completed`、`failed`、`stopped` 或 `interrupted`，停止或中断时保留已输出的部分文字。`failed` 与 `interrupted` 带 `failure`（失败类别，见下），原始错误只留在本机 job 与 `node.log`，客户端按类别给出说明。
+job 状态为 `queued`、`steering`、`claimed`、`running`、`cancelling`、`reconciling`、`completed`、`failed`、`cancelled`、`interrupted` 或 `steered`，后五种是终态。Codex 回复进行中时，同一会话排队的用户消息（无附件、需要回复）先在本机记为 `steering`，再以消息 ID 为 `clientUserMessageId` 发 `turn/steer` 并入当前回合，发送前核对目标是本进程启动的回复且未被停止或移走；App Server 明确拒绝时回到 `queued`，其余（含超时）保持 `steering`。目标回复结束后才按线程回读结算：消息所在回合 `completed` 即 `steered`（`outcome=answered`），在其他终态回合即 `steered`（`outcome=unfinished`，随宿主回复的终态），线程里没有它且目标回合已结束即回到 `queued`，绝不重发；消息只出现在其他回合也算 `unfinished`。只有回读成功且读到目标回合才结算，读取失败或读不到目标回合保持 `steering`，连续 10 分钟读不到（中间读到一次即重新计时）则记为 `steered`（`outcome=unknown`，网页显示“不确定 Bot 看到了没有”）。未定期间本机仍拥有的会话不领取后续消息，会话已移走时排队消息照常交给新所有者；停止 `steering` 消息即停止它并入的回复。steer 记在本机调度状态，同步和恢复不会重放；结算为 `answered` 时在同一事务写一条 `message_steered`，让以后的负责人不把这条消息算作未回复。Cursor 始终排队。跨重启的 `running` 与 `cancelling` 进入 `reconciling` 并登记待核对，只查询原回合，不自动重新调用 SDK；查到结果或由本人确认后才记录终态。Bot 回答 `MessagePosted(assistant)` 与 job 终态在同一事务提交，`status` 为 `completed`、`failed`、`stopped` 或 `interrupted`，停止或中断时保留已输出的部分文字。`failed` 与 `interrupted` 带 `failure`（失败类别，见下），原始错误只留在本机 job 与 `node.log`，客户端按类别给出说明。
 
 失败类别 `failure` 取 `missing_key`、`auth_failed`、`quota`、`missing_binary`、`execution_disabled`、`no_model`、`no_bot`、`writer_busy`、`rejected`、`transport`、`timed_out`、`restarted`、`lost` 或 `unknown`。本仓库自己的错误在产生处直接给出类别；Cursor SDK 与 Codex App Server 的上游错误只在 `crates/bridge/src/failure.rs` 一处识别，Codex 回合错误先看 `codexErrorInfo`。回复、工作结果（`WorkFinished.failure`）、本机 job（`failure {kind, detail}`）和被拒的派发（含 `deliveries` 与 `workspace_overview.tasks`）都带同一类别。目标设备没有 Bot 接任务时拒绝派发并给出 `no_bot`；客户端按类别判断能否到那台设备的设置里修复，不匹配原因文字。
 
 ```text
 queued → claimed → running ─→ completed | failed
-             │        └─ cancelling ─→ cancelled（Provider 确认终态，或 CLI 进程确认已退出）
-             │                     └─→ interrupted（进程退出未确认，登记待核对）
-             └ 重启时 running / cancelling ─→ interrupted（登记待核对）
+             │        └─ cancelling ─→ cancelled（Provider 确认终态）
+             │                     └─→ reconciling（退出未确认，登记待核对）
+             └ 重启时 running / cancelling ─→ reconciling（登记待核对）
+reconciling ─ 查询原回合或本人确认后 → 终态
 ```
 
 Node 每隔几秒用 signal 0 检查待核对记下的进程组，Codex 回合则按记下的线程和回合 ID 复查 App Server，仍在运行就中断。都已结束时自动结清，相应的 agent 任务记为中断；仍有进程组存活时，`conversation.checks` 才列出这条，等本人一键确认。结果未知的工作由 `works[].state == "unverified"` 表示，卡片 ID 为 `work:<work_id>`。同一工作只显示一条：`kind=task` 的工作结果未知时，目标上那一轮管理进程的待核对不再单独显示，结清工作项时一并结清。模型不能结清待核对。
 
-Cursor 已发送的回合遇到 bridge 崩溃、断流或超时后记为 `interrupted` 并登记待核对，只退休该 Bot 的进程组。下轮等待旧进程组结束后才能启动新进程，其他 Bot 的回合继续。Node 不重发未知结果的提示，也不因本地进程结束把它改成成功或 Provider 已确认取消。
+Cursor 已发送的回合遇到 bridge 崩溃、断流或超时后记为 `reconciling` 并登记待核对，只退休该 Bot 的进程组。下轮等待旧进程组结束后才能启动新进程，其他 Bot 的回合继续。Node 不重发未知结果的提示，也不因本地进程结束把它改成成功或 Provider 已确认取消。
 
 负责人每轮结束后，最新检查点之后的消息超过 20000 字节或事件超过 400 条时写一条 `ContextCheckpoint`，事件以归属和进度为主的会话也会写。检查点不覆盖的部分既不超过最新约 10000 字节的消息，也不超过最新 200 条事件。写检查点时只读取最新检查点之后、它的 `covers` 没有覆盖的事件，结果与读取整个会话相同。检查点是确定性摘录，不是模型写的总结。`decisions` 是不截断区，记本人对提问的回答和本人确认的工作结果，后续检查点原样继承，只在超过 200 条时为限制事件大小丢最早的；`summary` 是滚动区，只保留最新的 6000 字节。`recent_user_requests` 是被覆盖的最近 20 条本人消息摘录，只是历史，不代表需要长期遵守的指令。提示放不下时检查点依次让出滚动摘要、较早的本人消息摘录和未完成工作，`decisions` 最后才省略，并给出 `decisions_omitted`。
 

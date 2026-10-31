@@ -2018,7 +2018,10 @@ pub(super) mod tests {
         config::Config,
         crypto::LocalIdentity,
         identity::{Genesis, Member, NetworkState},
+        model::{ResolvedModel, Role},
     };
+    use std::{collections::BTreeMap, sync::atomic::Ordering};
+    use vibeface_bridge::failure::FailureKind;
 
     async fn bare_node() -> Result<(Arc<Runtime>, PathBuf)> {
         node_at(LocalIdentity::generate(), Default::default()).await
