@@ -137,3 +137,8 @@ test("a refused request reads as refused, never as agreed", () => {
   assert.equal(answerLabel("拒绝，先别改"), "已拒绝 · 拒绝，先别改")
   assert.equal(answerLabel("允许"), "已回答 · 允许")
 })
+
+test('question details keep labels as readable text', () => {
+  assert.deepEqual(questionParts('要运行这个命令吗？\n\n命令：npm test\n在项目里'), { ask: '要运行这个命令吗？', detail: '命令：npm test\n在项目里' })
+  assert.deepEqual(questionParts('继续吗？'), { ask: '继续吗？', detail: '' })
+})

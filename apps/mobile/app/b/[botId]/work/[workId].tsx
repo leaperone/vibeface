@@ -4,10 +4,10 @@ import { useEffect, type ReactNode } from 'react'
 import { ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { outcomeUnknown, rawError, workFailure } from '@vibeface/client/lib/errors.ts'
-import { fixOnDevice, fixOnDeviceLabel, followUp, followUpCopy, interruptedCopy, nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, type FollowUp } from '@vibeface/client/workspace/labels.ts'
+import { fixOnDevice, fixOnDeviceLabel, followUp, followUpCopy, interruptedCopy, nodeName, progressLabel, promptSummary, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, type FollowUp } from '@vibeface/client/workspace/labels.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { projectName, questionOpen } from '@vibeface/client/workspace/questions.ts'
-import { confirmReason } from '@vibeface/client/workspace/model.ts'
+import { workChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { ActionButton } from '@/components/action'
 import { CopyableId, Details, EmptyState, providerIcons, toneText, type Tone } from '@/components/kit'
 import { Button } from '@/components/ui/button'
@@ -15,7 +15,7 @@ import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useLive } from '@/data/live'
 import { QuestionCard } from '@/features/chat/question-card'
-import { confirmText } from '@/features/chat/work'
+import { ConfirmCard } from '@/features/chat/work'
 import { cn } from '@/lib/utils'
 
 const tone = (state: string): Tone => state === 'failed' ? 'danger' : state === 'completed' ? 'success' : ['awaiting_confirmation', 'stop_timed_out'].includes(state) ? 'warning' : 'neutral'
@@ -50,6 +50,9 @@ export default function TaskDetail() {
   const sharing = work.turn_id ? data!.works.filter((item) => item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
   const active = taskActive(state)
   const next = followUp(state, unknown)
+  // Its device cannot say whether it finished, so the person settles it here as in the chat; nothing is re-run.
+  const check = state === 'awaiting_confirmation' ? workChecks([{ ...work, conversation_id: bot!.conversation_id }], shared.nodes).find((item): item is WorkCheck => item.kind === 'work') : undefined
+  const asked = promptSummary(work.prompt, work.title)
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: work.title || '任务' }} />
     <View className="gap-1">
@@ -65,11 +68,9 @@ export default function TaskDetail() {
         <Text selectable className="font-mono text-meta">{progress.text}</Text>
       </ScrollView> : null}
     </View>
-    {work.prompt ? <Section title="交代的事"><Text selectable numberOfLines={6}>{work.prompt}</Text></Section> : null}
+    {asked.summary ? <Section title="交代的事"><Text selectable>{asked.summary}</Text></Section> : null}
     {result && !active ? <Section title={!failed && (work.result_text || state === 'completed') ? '结果' : '原因'}><Text selectable className={cn(failed && 'text-danger')}>{result}</Text></Section> : null}
-    {state === 'awaiting_confirmation' ? <Text className="text-muted-foreground">
-      {confirmText({ reason: confirmReason(work, shared.nodes) ?? 'unverified', detail: work.failure_reason ?? '' }, nodeName(device, lookup))}请在对话或待处理里确认它做完了没有。
-    </Text> : null}
+    {check ? <ConfirmCard check={check} /> : null}
     {asking ? <QuestionCard key={asking.question_id} question={asking} inTask /> : null}
     {canStop && sharing.length ? <Section title="会一起停止">
       {sharing.map((item) => <View key={item.work_id} className="flex-row items-center gap-2">
@@ -85,6 +86,7 @@ export default function TaskDetail() {
     {failed || unknown || state === 'interrupted' ? <ActionButton variant="outline" className="self-start" icon={followUpIcons[next]} disabled={!shared.writable}
       action={async () => { if (await shared.sendMessage(followUpCopy[next].ask(work.title || '这个任务'))) router.back() }}>{followUpCopy[next].action}</ActionButton> : null}
     <Details>
+      {asked.folded ? <Detail label="交代的原文">{work.prompt}</Detail> : null}
       {failed && work.result_text ? <Detail label="已有输出">{work.result_text}</Detail> : null}
       {work.failure_reason && rawError(work.failure_reason) ? <Detail label="原始错误">{work.failure_reason}</Detail> : null}
       {work.cwd ? <Detail label="文件夹" mono>{work.cwd}</Detail> : null}

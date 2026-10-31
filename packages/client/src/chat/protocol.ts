@@ -28,6 +28,12 @@ export function botReach(nodes: NodeInfo[]): BotReach {
   if (nodes.some((node) => botReadiness(node) === 'needs_setup')) return 'needs_setup'
   return nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager) ? 'offline' : 'none'
 }
+/** The device a person goes to while the bot cannot reply: the one to set up, else the one that is offline. */
+export function reachDevice(nodes: NodeInfo[], reach: BotReach): string | undefined {
+  if (reach === 'needs_setup') return nodes.find((node) => botReadiness(node) === 'needs_setup')?.device_id
+  if (reach === 'offline') return nodes.find((node) => !node.revoked && !node.online && node.capabilities?.manager)?.device_id
+  return undefined
+}
 /** A device that exists but is not ready yet may become ready on its own; with none, setting one up rereads it. */
 export const awaitsDevice = (reach: BotReach) => reach === 'starting' || reach === 'offline' || reach === 'needs_setup'
 /** Why the box cannot send yet, short enough to stand in for its placeholder. */

@@ -169,6 +169,17 @@ export const failedWork = (work: Pick<WorkRecord, "outcome" | "state">) => work.
 /** A failure fixed in its device's settings: no bot there to take it, or the AI service there not set up. */
 export const fixOnDevice = (work: Pick<WorkRecord, "failure">) =>
   ["missing_key", "auth_failed", "missing_binary", "execution_disabled", "no_model", "no_bot"].includes(work.failure ?? "")
+/**
+ * What a task was asked, short enough for its page: the first plain line, cut at 80 characters. Machine text such as JSON gives none,
+ * and neither does a line that only repeats the title. `folded`: the prompt says more than the summary, so its text waits in 详细信息.
+ */
+export function promptSummary(prompt: string, title: string): { summary: string; folded: boolean } {
+  const text = prompt.trim()
+  const first = /^[{[]/.test(text) ? "" : text.split(/\r?\n/).map((line) => line.replace(/^#+\s*/, "").trim()).find(Boolean) ?? ""
+  const cut = first.length > 80 ? `${first.slice(0, 79)}…` : first
+  const summary = cut === title.trim() ? "" : cut
+  return { summary, folded: summary !== text && text !== title.trim() }
+}
 export const fixOnDeviceLabel = (device: string) => `去设置「${device}」`
 
 /** Where a task card sits on the tasks page, in both apps. */
