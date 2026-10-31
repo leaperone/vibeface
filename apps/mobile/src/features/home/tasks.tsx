@@ -7,7 +7,6 @@ import { providerNames } from '@vibeface/client/lib/node.ts'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
 import { cardState, needsLook, nodeName, staleTaskLabel, taskActive, taskAgent, taskGroup, taskGroups, taskLabel, taskProgress, taskStale, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
 import { awaitsAnswer } from '@vibeface/client/workspace/questions.ts'
-import { waitingItems } from '@vibeface/client/workspace/inbox.ts'
 import { openWorksFromOverview, overviewFromWorkspace } from '@vibeface/client/workspace/model.ts'
 import type { BotRecord, NodeInfo, OpenWork, OverviewTask } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
@@ -23,7 +22,7 @@ export function TasksScreen() {
   const shared = useLive()
   const inbox = useInbox()
   const attention = inbox.filter((item) => item.kind === 'question' && !item.done || item.kind === 'confirm' && item.check.kind === 'process')
-  const pending = waitingItems(inbox).length
+  const pending = inbox.filter((item) => !(item.kind === 'question' && item.done)).length
   const workspace = useWorkspace()
   const { directory } = useDevice()
   useEffect(() => { if (!shared) return; shared.setView('tasks'); return () => shared.setView('other') }, [shared?.generation])
@@ -43,7 +42,7 @@ export function TasksScreen() {
 
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
     <MobileMasthead attention={groups.attention.length + attention.length} working={groups.working.length} waiting={groups.waiting.length} online={Boolean(shared?.connectionOnline)} />
-    <Link href="/inbox" asChild><Pressable accessibilityRole="link" accessibilityLabel={pending ? `${pending} 件事等你决定` : '查看待处理'} className={cn('min-h-11 flex-row items-center gap-3 rounded-xl border px-4 py-3 active:bg-muted', pending ? 'border-warning/25 bg-warning-soft' : 'border-border bg-card')}><Icon as={pending ? CircleQuestionMark : Inbox} className={cn('size-5', pending ? 'text-warning' : 'text-muted-foreground')} /><Text className="min-w-0 flex-1">{pending ? `${pending} 件事等你决定` : '查看待处理'}</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Pressable></Link>
+    <Link href="/inbox" asChild><Pressable accessibilityRole="link" accessibilityLabel={pending ? `${pending} 件事等你决定` : '查看待处理'} className={`min-h-11 flex-row items-center gap-3 rounded-xl border px-4 py-3 active:bg-muted ${pending ? 'border-warning/25 bg-warning-soft' : 'border-border bg-card'}`}><Icon as={pending ? CircleQuestionMark : Inbox} className={`size-5 ${pending ? 'text-warning' : 'text-muted-foreground'}`} /><Text className="min-w-0 flex-1">{pending ? `${pending} 件事等你决定` : '查看待处理'}</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Pressable></Link>
     {loading ? <View accessibilityLabel="正在读取任务" className="gap-2">
       {[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-3">
         <Skeleton className="size-8 rounded-lg" />
