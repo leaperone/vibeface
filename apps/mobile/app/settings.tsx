@@ -58,10 +58,6 @@ export default function Settings() {
       {manager ? <SettingsRow href="/external-chat" icon={MessageSquareShare} label={waitingCopy.forward} /> : null}
     </SettingsGroup> : null}
     {manager ? <SecurityStatus /> : null}
-    {manager ? <SettingsGroup title="找回">
-      <CurrentRecoveryFile />
-      <SettingsRow href="/recovery" icon={KeyRound} label={recoveryCopy.rotate} />
-    </SettingsGroup> : null}
     <SettingsGroup title="外观">
       <SettingsRow icon={Palette} label="主题">
         {/* A theme change repaints the whole app, which stalls any slide under it; like iOS's own appearance picker, it applies at once.
@@ -121,15 +117,14 @@ function CurrentRecoveryFile() {
   return <SettingsRow icon={FileKey} label={recoveryCopy.file} description={`${recoveryCopy.codeLabel} ${code}`} />
 }
 
-/** 安全 at a glance, as on the web: management devices, a waiting recovery (also after 是我 hid it), and when the password was set. */
+/** 安全 in one group, as on the web: management devices, a waiting recovery (also after 是我 hid it), the recovery file and password. */
 function SecurityStatus() {
   const { directory, recoverySince, nodeClockOffset } = useDevice()
-  if (!directory) return null
-  const managers = directory.members.filter((member) => member.manage).length
-  const pending = directory.pending
+  const managers = directory?.members.filter((member) => member.manage).length ?? 0
+  const pending = directory?.pending
   const tabular = { fontVariant: ['tabular-nums' as const] }
   return <SettingsGroup title={securityCopy.title}>
-    <SettingsRow icon={Crown} label={securityCopy.managers}>
+    {directory ? <><SettingsRow icon={Crown} label={securityCopy.managers}>
       <View className="flex-row items-center gap-1">
         {managers === 1 ? <Icon as={TriangleAlert} className="size-4 text-warning" /> : null}
         <Text className={managers === 1 ? 'text-meta text-warning' : 'text-meta text-muted-foreground'} style={tabular}>{securityCopy.managerCount(managers)}</Text>
@@ -137,8 +132,11 @@ function SecurityStatus() {
     </SettingsRow>
     {pending ? <SettingsRow href="/inbox" icon={ShieldAlert} tone="danger" label={securityCopy.recovery}>
       <Text className="text-meta text-danger" style={tabular}>{securityCopy.recoveryIn(pending.effective_at_ms - nodeClockOffset)}</Text>
-    </SettingsRow> : <SettingsRow icon={ShieldCheck} label={securityCopy.recovery}><Text className="text-meta text-muted-foreground">{securityCopy.noRecovery}</Text></SettingsRow>}
-    {recoverySince ? <SettingsRow icon={KeyRound} label={securityCopy.password}><Text className="text-meta text-muted-foreground" style={tabular}>{securityCopy.changedOn(recoverySince)}</Text></SettingsRow> : null}
+    </SettingsRow> : <SettingsRow icon={ShieldCheck} label={securityCopy.recovery}><Text className="text-meta text-muted-foreground">{securityCopy.noRecovery}</Text></SettingsRow>}</> : null}
+    <CurrentRecoveryFile />
+    <SettingsRow href="/recovery" icon={KeyRound} label={securityCopy.password}>
+      {recoverySince ? <Text className="text-meta text-muted-foreground" style={tabular}>{securityCopy.changedOn(recoverySince)}</Text> : null}
+    </SettingsRow>
   </SettingsGroup>
 }
 

@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react"
 import { Link, useRouterState } from "@tanstack/react-router"
-import { Monitor, Smartphone, X } from "lucide-react"
+import { Laptop, Smartphone, X } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -32,7 +32,7 @@ export function SecondDeviceHint({ className }: { className?: string }) {
   if (!replied || dismissed || onDevices || !ready?.principal.can_manage || !directory || directory.revoked.length || rows.length > 2) return null
   // A loopback-only link opens on no phone; another computer still joins it with `vibeface join`.
   const localOnly = isLoopback(entryAddress(ready.entry)) && !entrances.some((entrance) => entrance.public)
-  const Icon = localOnly ? Monitor : Smartphone
+  const Icon = localOnly ? Laptop : Smartphone
   function dismiss() {
     closed = true
     try { localStorage.setItem(key, "dismissed") } catch {}

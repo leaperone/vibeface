@@ -27,7 +27,7 @@ import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
 import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
 import { backTo } from "@vibeface/client/workspace/home.ts"
-import { addressName, hostOf } from "@vibeface/client/workspace/labels.ts"
+import { addressName, hostOf, isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { entryAddress, entryKey } from "@vibeface/client/lib/node.ts"
 import { unreachableText } from "@vibeface/client/lib/transport.ts"
 import { LocalSession } from "./local-session"
@@ -67,7 +67,11 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   // A question answered here stays on screen, collapsed, until the next read; it no longer counts.
   const waiting = waitingItems(useInbox()).length
   // A recovery about to take over outranks every other waiting item, so 待处理 shows a red shield instead of a count.
-  const recovering = Boolean(useDevice().pendingRecovery)
+  const device = useDevice()
+  const recovering = Boolean(device.pendingRecovery)
+  // A browser joins on this computer's lasting page, never the temporary origin this session opened on, or it would hold a second identity.
+  const lasting = device.ready?.info.connection_entry
+  const home = lasting && isLoopback(entryAddress(lasting)) ? `http://localhost:${new URL(entryAddress(lasting)).port}` : undefined
   const { setOpenMobile, isMobile, open: sidebarOpen } = useSidebar()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const chatRoute = pathname.startsWith("/b/")
@@ -195,7 +199,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           </Button> : null}
           </div>
         </header>
-        {workspace.joined ? null : <LocalSession onJoin={() => void navigate({ to: "/join" })} />}
+        {workspace.joined ? null : <LocalSession onJoin={() => { if (home && home !== window.location.origin) window.location.assign(`${home}/join`); else void navigate({ to: "/join" }) }} />}
         {pathname === "/inbox" ? null : <RecoveryAlert />}
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
         {/* Kept laid out while hidden so the chat keeps its scroll position across pages. */}

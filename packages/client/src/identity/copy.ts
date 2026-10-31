@@ -6,7 +6,7 @@ export const joinCopy = {
   /** The join request reached one of the person's devices. */
   reached: '已连上你的设备',
   showCode: '正在生成安全码…',
-  compareCode: '两边的安全码一致，就在那边点允许',
+  compareCode: (admin?: string) => `两边的安全码一致，就在${admin ? `「${admin}」` : '那边'}上点允许`,
   linkSource: (from = '已有设备') => `链接来自${from}上的“添加设备”`,
   byLink: '用加入链接',
   scan: '扫码加入',
@@ -91,6 +91,7 @@ export const addDeviceCopy = {
 }
 /** Where a device without management goes to add one; `managers`: the names of the management devices. */
 export const addOnManager = (managers: readonly string[]) => managers.length === 1 ? `在管理设备「${managers[0]}」上添加` : '在管理设备上添加'
+export const editOnManager = (managers: readonly string[]) => managers.length === 1 ? `在管理设备「${managers[0]}」上修改` : '在管理设备上修改'
 
 /** Settings' two red rows each say what they cost before either is tapped. */
 export const exitCopy = { leave: '要用加入链接才能回来', reset: '清除本机数据，回到欢迎页' }
@@ -221,7 +222,8 @@ export const deviceCopy = {
    */
   roles: {
     bot: { label: '运行 Bot', note: '只选一个，Bot 用它回复聊天', hint: (provider: string) => `Bot 用这台设备的 ${provider} 回复聊天` },
-    execution: { label: '执行任务', note: '可开多个，Bot 派的任务交给它做', hint: (provider: string) => `Bot 派的任务用这台设备的 ${provider} 来做` },
+    /** A task reaches a device as its bot's turn, so turning this on with no bot runs one too. */
+    execution: { label: '执行任务', note: '可开多个，派来的任务由这台设备的 Bot 交给它做', hint: (provider: string) => `派来的任务由这台设备的 Bot 交给 ${provider} 做` },
   },
   /** How Codex work reaches an App Server: the one already running on that computer, or one Vibeface starts. */
   appServer: { system: '用已在运行的', spawn: '由 Vibeface 启动', useSpawn: '改由 Vibeface 启动' },

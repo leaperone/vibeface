@@ -4,6 +4,7 @@ import { useState } from 'react'
 import { Alert, Pressable, ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
+import { throughEntry } from '@vibeface/client/lib/node.ts'
 import { ErrorText } from '@/components/action'
 import { CopyableId, Details, EmptyState, Online, SettingsGroup, SettingsRow } from '@/components/kit'
 import { Button } from '@/components/ui/button'
@@ -29,7 +30,7 @@ export default function DeviceDetail() {
   if (!member) return <EmptyState icon={MonitorSmartphone} title="找不到这个设备" className="flex-1 justify-center" />
   const manageable = device.ready?.principal.can_manage === true && member.kind === 'client' && !member.current
   const removable = device.ready?.principal.can_manage === true && !member.admin && !member.current && !member.entry
-  const saved = device.entries.find((item) => item.device_id === member.device_id)
+  const target = device.entries.find((item) => item.device_id === member.device_id) ?? (device.ready ? throughEntry(device.ready.entry, member.device_id) : undefined)
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: '' }} />
     <View className="flex-row items-center gap-4">
@@ -48,7 +49,7 @@ export default function DeviceDetail() {
     {member.kind === 'node' ? <SettingsGroup>
       {member.entry && device.ready?.principal.can_manage ? <SettingsRow href="/ai" icon={Sparkles} label="Bot 与任务" />
         : <SettingsRow icon={Bot} label={deviceCopy.botStatus[deviceCopy.botState(member.bot, member.online)]} />}
-      {!member.entry && device.ready?.principal.can_manage && saved ? <SettingsRow icon={ArrowRightLeft} label="切换到它" disabled={switching.busy !== null} onPress={() => void switching.run('switch', () => device.connect(saved))}>
+      {!member.entry && device.ready?.principal.can_manage && target ? <SettingsRow icon={ArrowRightLeft} label="切换到它" disabled={switching.busy !== null} onPress={() => void switching.run('switch', () => device.connect(target))}>
         {switching.error ? <View className="basis-full ps-11"><ErrorText error={switching.error} /></View> : null}
       </SettingsRow> : null}
     </SettingsGroup> : null}

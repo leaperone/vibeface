@@ -486,20 +486,16 @@ async fn main() -> Result<()> {
             runtime.config.web_enabled &= !options.no_web;
             let runtime = Arc::new(runtime);
             runtime.start().await?;
-            if runtime.config.web_enabled {
-                eprintln!("Web: {}", runtime.config.public_url);
-            } else {
+            let config = &runtime.config;
+            if !config.web_enabled {
                 eprintln!("Web: disabled");
-            }
-            if runtime.config.web_enabled
-                && !runtime.config.public_entry
-                && (runtime.config.listen.ip().is_loopback()
-                    || runtime.config.listen.ip().is_unspecified())
+            } else if !config.public_entry
+                && (config.listen.ip().is_loopback() || config.listen.ip().is_unspecified())
             {
-                eprintln!(
-                    "Local setup: http://localhost:{}",
-                    runtime.config.listen.port()
-                );
+                // One local address: a browser joined on another origin keeps a separate identity.
+                eprintln!("Web: http://localhost:{}", config.listen.port());
+            } else {
+                eprintln!("Web: {}", config.public_url);
             }
             let mut terminate =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1579,8 +1575,8 @@ async fn join_through_running_node(options: &Join) -> Result<()> {
         if shown.as_ref() != Some(&status) {
             match &status {
                 NodeJoin::Waiting => println!("已提交加入请求，等待管理设备批准。"),
-                NodeJoin::Confirming { code } => {
-                    println!("安全码：{code}。在管理设备上比对一致后允许。")
+                NodeJoin::Confirming { code, admin } => {
+                    println!("安全码：{code}。在「{admin}」上比对一致后允许。")
                 }
                 NodeJoin::Joined => {
                     println!("已加入。这台电脑的 Vibeface 已开始同步，不用重启。");

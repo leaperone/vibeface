@@ -1,15 +1,16 @@
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router'
-import { FolderOpen, Laptop, Link2, ListChecks, Play, RotateCw, SearchCheck, Server, Square, type LucideIcon } from 'lucide-react-native'
+import { FolderOpen, Laptop, Link2, ListChecks, Play, RotateCw, SearchCheck, Settings, Square, type LucideIcon } from 'lucide-react-native'
 import { useEffect, type ReactNode } from 'react'
 import { ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { outcomeUnknown, rawError, workFailure } from '@vibeface/client/lib/errors.ts'
-import { followUp, followUpCopy, interruptedCopy, nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, type FollowUp } from '@vibeface/client/workspace/labels.ts'
+import { fixOnDevice, fixOnDeviceLabel, followUp, followUpCopy, interruptedCopy, nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, type FollowUp } from '@vibeface/client/workspace/labels.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { projectName, questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { confirmReason } from '@vibeface/client/workspace/model.ts'
 import { ActionButton } from '@/components/action'
 import { CopyableId, Details, EmptyState, providerIcons, toneText, type Tone } from '@/components/kit'
+import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useLive } from '@/data/live'
@@ -55,7 +56,7 @@ export default function TaskDetail() {
       {taskStale(state, shared.connectionOnline) ? <Text className="font-medium text-muted-foreground">{staleTaskLabel}</Text> : <Text className={cn('font-medium', toneText[tone(state)])}>{taskLabel(state)}</Text>}
       {device || work.cwd || agent ? <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
         {agent ? <Meta icon={providerIcons[agent]} label="AI">{providerNames[agent]}</Meta> : null}
-        {device ? <Meta icon={device === ready?.entry.device_id ? Laptop : Server} label="设备">{nodeName(device, lookup)}</Meta> : null}
+        {device ? <Meta icon={Laptop} label="设备">{nodeName(device, lookup)}</Meta> : null}
         {work.cwd ? <Meta icon={FolderOpen} label="项目">{projectName(work.cwd)}</Meta> : null}
       </View> : null}
       {progress?.status && active && progress.status !== 'awaiting_input' && progressLabel(progress.status) !== '进行中' ? <Text className="text-meta text-muted-foreground">{progressLabel(progress.status)}</Text> : null}
@@ -78,6 +79,9 @@ export default function TaskDetail() {
     {canStop ? <ActionButton variant="outline" className="self-start" icon={Square} iconClassName="fill-foreground" disabled={!shared.writable} action={() => shared.interruptWork(work.work_id)}>
       {sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : '停止任务'}
     </ActionButton> : null}
+    {failed && device && fixOnDevice(work) ? <Button variant="outline" className="self-start" onPress={() => router.push(device === ready?.entry.device_id ? '/ai' : `/device/${device}`)}>
+      <Icon as={Settings} /><Text>{fixOnDeviceLabel(nodeName(device, lookup))}</Text>
+    </Button> : null}
     {failed || unknown || state === 'interrupted' ? <ActionButton variant="outline" className="self-start" icon={followUpIcons[next]} disabled={!shared.writable}
       action={async () => { if (await shared.sendMessage(followUpCopy[next].ask(work.title || '这个任务'))) router.back() }}>{followUpCopy[next].action}</ActionButton> : null}
     <Details>

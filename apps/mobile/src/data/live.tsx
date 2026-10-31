@@ -66,7 +66,7 @@ function useConnection(): { session: Session; connection: Connection } {
   // A recovery still waiting, or one whose new file is not confirmed as saved yet, holds the phone on the join screen.
   const session: Session = device.recovery || device.ready && device.recovered ? { phase: 'unjoined' }
     : access.kind === 'member' || access.kind === 'resuming' || access.kind === 'loading' && device.entries.length ? { phase: 'ready' }
-    : device.joining ? { phase: 'joining', code: device.joining.code ?? null }
+    : device.joining ? { phase: 'joining', code: device.joining.code ?? null, admin: device.joining.admin }
     : { phase: 'unjoined' }
   const { link } = device
   const state: Connection['state'] = link.kind === 'online' ? (link.catchingUp ? 'syncing' : 'online') : link.kind === 'offline' ? 'offline' : 'connecting'

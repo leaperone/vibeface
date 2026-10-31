@@ -1,15 +1,14 @@
 import {
-  Ban, Bot, CircleAlert, CirclePause, CircleQuestionMark, Clock, Crown, FileKey, FolderOpen, Globe, Hand, Inbox,
-  Key, KeyRound, Laptop, Link, ListChecks, Lock, MessageSquareShare, Monitor, MonitorSmartphone, QrCode, RefreshCw, ScanEye, Server, Settings, ShieldCheck,
+  AppWindow, Ban, Bot, CircleAlert, CirclePause, CircleQuestionMark, Clock, Crown, FileKey, FolderOpen, Globe, Hand, Inbox,
+  Key, KeyRound, Laptop, Link, ListChecks, Lock, MessageSquareShare, MonitorSmartphone, QrCode, RefreshCw, ScanEye, Settings, ShieldCheck,
   Smartphone, Sparkles, Star, ArchiveRestore,
 } from "lucide-react"
 
 /** One icon and one word per concept, see docs/design/web-ux.md. */
 export const terms = {
   myDevices: { label: "我的设备", icon: MonitorSmartphone },
-  device: { label: "设备", icon: Server },
   thisComputer: { label: "这台电脑", icon: Laptop },
-  browser: { label: "浏览器", icon: Monitor },
+  browser: { label: "浏览器", icon: AppWindow },
   phone: { label: "手机", icon: Smartphone },
   address: { label: "访问地址", icon: Globe },
   canRunBot: { label: "能运行 Bot", icon: Bot },

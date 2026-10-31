@@ -12,7 +12,7 @@ export type Connection = { state: 'connecting' | 'online' | 'syncing' | 'offline
  */
 export type Session =
   | { phase: 'unjoined' }
-  | { phase: 'joining'; code: string | null }
+  | { phase: 'joining'; code: string | null; admin?: string }
   | { phase: 'ready' }
 
 /** A transcript message, or one this phone shows before the network holds it. `detail`: a failed reply's original error from the device. */

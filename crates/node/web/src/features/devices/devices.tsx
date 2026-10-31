@@ -1,18 +1,18 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, Check, ChevronRight, Copy, Info, Monitor, Pencil, ShieldAlert, Smartphone, Tablet, X, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Check, ChevronRight, Copy, Info, Pencil, ShieldAlert, Smartphone, Tablet, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
-import { addOnManager, anotherManager, deviceCopy, soleBrowserManagerText } from "@vibeface/client/identity/copy.ts"
+import { addOnManager, anotherManager, editOnManager, deviceCopy, soleBrowserManagerText } from "@vibeface/client/identity/copy.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { deviceForm, deviceOnline, isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { terms } from "@/lib/glossary"
 import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
 import { botReadiness } from "@vibeface/client/workspace/model.ts"
-import { entryAddress, type Member } from "@vibeface/client/lib/node.ts"
+import { entryAddress, throughEntry, type Member } from "@vibeface/client/lib/node.ts"
 import { AiSettings } from "./ai-settings"
 import { JoinRequests } from "./join"
 import { localCopy } from "@/features/workspace/local-session"
@@ -46,7 +46,7 @@ export function useDeviceRows(): DeviceRow[] {
 export function deviceIcon(row: Pick<DeviceRow, "kind" | "name">): LucideIcon {
   if (row.kind === "node") return terms.thisComputer.icon
   const form = deviceForm(row.kind, row.name)
-  return form === "tablet" ? Tablet : form === "phone" ? Smartphone : Monitor
+  return form === "tablet" ? Tablet : form === "phone" ? Smartphone : terms.browser.icon
 }
 
 function Tag({ children, title }: { children: ReactNode; title?: string }) {
@@ -108,15 +108,16 @@ function SoleBrowserManager({ rows }: { rows: DeviceRow[] }) {
   const { ready } = useDevice()
   const admins = rows.filter((row) => row.admin)
   const sole = admins.length === 1 ? admins[0] : null
-  if (!sole || sole.kind !== "client" || deviceForm(sole.kind, sole.name) !== "browser") return null
+  // Only a manager can act on it; anywhere else it is a risk to a device this one cannot help.
+  if (!ready?.principal.can_manage || !sole || sole.kind !== "client" || deviceForm(sole.kind, sole.name) !== "browser") return null
   const next = rows.find((row) => row.kind === "client" && !row.admin)
   const link = "hit-area relative shrink-0 font-medium text-foreground underline underline-offset-4"
   return <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-1 text-meta text-warning">
     <ShieldAlert aria-hidden="true" className="size-4 shrink-0" />
     <span className="min-w-0">{soleBrowserManagerText(sole.browser ? "这个浏览器" : `「${sole.name}」`)}</span>
-    {ready?.principal.can_manage ? next
+    {next
       ? <Link to="/devices/$deviceId" params={{ deviceId: next.id }} className={link}>{anotherManager}</Link>
-      : <Link to="/devices" search={{ add: true, manage: true }} className={link}>{anotherManager}</Link> : null}
+      : <Link to="/devices" search={{ add: true, manage: true }} className={link}>{anotherManager}</Link>}
   </p>
 }
 
@@ -177,7 +178,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   if (!row) return device.directory ? <EmptyState icon={terms.myDevices.icon} title="找不到这个设备" action={<Button asChild variant="outline"><Link to="/devices">回到设备列表</Link></Button>} /> : <div className="mx-auto grid w-full max-w-(--page-width) gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
   const Icon = deviceIcon(row)
   const address = row.entry && ready ? entryAddress(ready.entry) : ""
-  const saved = device.entries.find((item) => item.device_id === row.id)
+  const target = device.entries.find((item) => item.device_id === row.id) ?? (ready && row.member ? throughEntry(ready.entry, row.id) : undefined)
 
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     <header className="flex items-center gap-4">
@@ -201,8 +202,9 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
     {row.kind === "node" && !copied ? row.entry && (canManage || localSession) ? <Section title={terms.ai.label} bare><AiSettings /></Section> : <Section title={terms.ai.label}>
       <div className="grid gap-1">
         <p>{deviceCopy.botStatus[deviceCopy.botState(row.bot, row.online)]}</p>
-        <p className="text-meta text-muted-foreground">{canManage ? "连到它后才能修改" : `只有${terms.admin.label}能修改`}</p>
-        {canManage && saved ? <Button type="button" variant="outline" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(saved))}><ArrowRightLeft aria-hidden="true" />切换到它</Button> : null}
+        {canManage && target ? <Button type="button" variant="outline" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(target))}><ArrowRightLeft aria-hidden="true" />切换到它</Button>
+          : <p className="text-meta text-muted-foreground">{canManage ? "连到它后才能修改" : editOnManager(rows.filter((item) => item.admin).map((item) => item.name))}</p>}
+        {action.errorKey === "switch" ? <InlineError error={action.error} /> : null}
       </div>
     </Section> : null}
 

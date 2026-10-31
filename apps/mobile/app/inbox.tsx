@@ -1,6 +1,6 @@
 import { Link, type Href } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { Bot, ChevronRight, CircleAlert, CircleX, Copy, LoaderCircle, X, Inbox as InboxIcon, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
+import { Bot, ChevronRight, CircleAlert, CircleX, Copy, LoaderCircle, Settings, X, Inbox as InboxIcon, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
 import { useRef, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
@@ -14,6 +14,8 @@ import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import type { InboxItem } from '@vibeface/client/workspace/inbox.ts'
+import { workFailure } from '@vibeface/client/lib/errors.ts'
+import { fixOnDevice, fixOnDeviceLabel } from '@vibeface/client/workspace/labels.ts'
 import type { Question } from '@vibeface/client/workspace/types.ts'
 import { useInbox, useLive } from '@/data/live'
 import { useWide } from '@/lib/layout'
@@ -100,7 +102,10 @@ function ItemRow({ item, href, replace }: { item: Row; href: Href | null; replac
 /** A failure the person has seen to leaves the list by hand; the bot's later reply also clears it. */
 function Dismiss({ item, children }: { item: Extract<Row, { kind: 'failed' }>; children: ReactNode }) {
   const shared = useLive()
+  const device = useDevice()
   const { busy, error, run } = useAction()
+  const reason = workFailure(item.work)
+  const target = item.work.target_node
   return <View className="gap-1">
     <View className="flex-row items-center gap-1">
       <View className="min-w-0 flex-1">{children}</View>
@@ -108,6 +113,10 @@ function Dismiss({ item, children }: { item: Extract<Row, { kind: 'failed' }>; c
         <Icon as={busy ? LoaderCircle : X} className="text-muted-foreground" />
       </Button>
     </View>
+    {reason ? <Text numberOfLines={3} className="px-4 text-meta text-muted-foreground">{reason}</Text> : null}
+    {fixOnDevice(item.work) ? <Link href={target === device.ready?.entry.device_id ? '/ai' : `/device/${target}`} asChild>
+      <Button variant="ghost" className="self-start"><Icon as={Settings} /><Text>{fixOnDeviceLabel(item.meta ?? '')}</Text></Button>
+    </Link> : null}
     <ErrorText error={error} />
   </View>
 }

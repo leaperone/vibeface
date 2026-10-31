@@ -4,7 +4,7 @@ import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { answerLabel, declined, questionMeta, sharedProject } from '@vibeface/client/workspace/questions.ts'
-import { ArrowUp, CircleCheck, CircleSlash, CircleX, FolderOpen, Hand, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, Server, TriangleAlert, type LucideIcon } from 'lucide-react-native'
+import { ArrowUp, CircleCheck, CircleSlash, CircleX, FolderOpen, Hand, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, Laptop, PencilLine, TriangleAlert, type LucideIcon } from 'lucide-react-native'
 import { useState } from 'react'
 import { Pressable, TextInput, View } from 'react-native'
 import { ErrorText } from '@/components/action'
@@ -72,7 +72,7 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
       </Link> : null}
       {question.about.agent ? <Meta icon={providerIcons[question.about.agent]} label="来自">{providerNames[question.about.agent]}</Meta> : null}
       {project ? <Meta icon={FolderOpen} label="项目">{project.name}</Meta> : null}
-      {local ? null : <Meta icon={member ? deviceIcon(member) : Server} label="设备">{member?.name ?? '另一台设备'}</Meta>}
+      {local ? null : <Meta icon={member ? deviceIcon(member) : Laptop} label="设备">{member?.name ?? '另一台设备'}</Meta>}
     </View>}
     <View accessibilityRole="radiogroup" accessibilityLabel="选一个回答" className="gap-2">
       {question.choices.map((choice, index) => {

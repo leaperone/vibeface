@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react"
 import { useNavigate } from "@tanstack/react-router"
-import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, FolderOpen, Laptop, MessageCircle, MessagesSquare, NotebookPen, Pause, Play, Repeat, Server, Trash2, WifiOff } from "lucide-react"
+import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, FolderOpen, Laptop, MessageCircle, MessagesSquare, NotebookPen, Pause, Play, Repeat, Trash2, WifiOff } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import { EmptyState, SettingsGroup, SettingsRow, toast } from "@/components/app/kit"
@@ -34,7 +34,7 @@ export const openSchedule = (id: string) => showSchedule?.(id)
 /** The chat route's title: the bot's avatar and name as one button that opens a view of the bot where its face can be picked, schedules paused, resumed or deleted and the bot itself deleted (docs/design/bot-config.md section 5). */
 export function BotPanelButton() {
   const workspace = useWorkspace()
-  const { directory, ready } = useDevice()
+  const { directory } = useDevice()
   const [open, setOpen] = useState(false)
   // While the panel is open, rows keep their places: a paused schedule moves to the end only on the next open, not from under the pointer.
   const order = useRef<string[]>([])
@@ -113,7 +113,7 @@ export function BotPanelButton() {
             <AvatarPicker botId={bot.bot_id} avatar={look.avatar} face={look.face} disabled={!workspace.writable} busy={look.pending} pick={look.pick} />
           </SettingsGroup>
           <SettingsGroup>
-            {owner ? <SettingsRow icon={owner === ready?.entry.device_id ? Laptop : Server} label="运行设备">
+            {owner ? <SettingsRow icon={Laptop} label="运行设备">
               {ownerNode && !ownerNode.online ? <span className="inline-flex items-center gap-1 text-warning"><WifiOff aria-hidden="true" className="size-4" />离线</span> : null}
               <span className="max-w-48 truncate" title={deviceName}>{deviceName}</span>
             </SettingsRow> : null}

@@ -2,7 +2,7 @@
 
 import type { ReactNode } from "react"
 import { Link } from "@tanstack/react-router"
-import { Bot, ChevronRight, CircleQuestionMark, CircleX, FolderOpen, Laptop, ListChecks, LoaderCircle, MessageCircle, Plus, Server } from "lucide-react"
+import { Bot, ChevronRight, CircleQuestionMark, CircleX, FolderOpen, Laptop, ListChecks, LoaderCircle, MessageCircle, Plus } from "lucide-react"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { CountBadge, EmptyState, Skeleton, StatusPill, type Tone } from "@/components/app/kit"
@@ -28,7 +28,7 @@ const stateTone = (state: string): Tone => state === "failed" || state === "disp
 export function TasksOverview() {
   const workspace = useWorkspace()
   const createBot = useCreateBot()
-  const { directory, ready } = useDevice()
+  const { directory } = useDevice()
   const inbox = useInbox()
   type InboxItem = (typeof inbox)[number]
   const lookup = { nodes: workspace.nodes, directory }
@@ -50,7 +50,7 @@ export function TasksOverview() {
   for (const work of tasks) groups[taskGroup(cardState(work, workspace.nodes, projected.get(work.work_id)?.state), waitingSessions.has(work.thread_id ?? ""))].push(work)
   const noticed = attention.length + groups.attention.length
   const hasContent = noticed > 0 || groups.working.length > 0 || groups.waiting.length > 0
-  const card = (work: OpenWork) => <TaskOverviewCard key={work.work_id} work={work} projected={projected.get(work.work_id)} lookup={lookup} readyDevice={ready?.entry.device_id} connected={workspace.connectionOnline} progress={taskProgress(work, workspace.liveProgress)} />
+  const card = (work: OpenWork) => <TaskOverviewCard key={work.work_id} work={work} projected={projected.get(work.work_id)} lookup={lookup} connected={workspace.connectionOnline} progress={taskProgress(work, workspace.liveProgress)} />
   const bot = workspace.selectedBot ?? workspace.bots[0]
 
   if (workspace.incomplete && !workspace.nodes.length) return <div className="mx-auto grid w-full max-w-(--page-width) gap-3" aria-busy="true"><Skeleton className="h-20" /><Skeleton className="h-20" /><Skeleton className="h-20" /></div>
@@ -73,12 +73,12 @@ function WorkspaceEmpty({ bot, onCreate }: { bot?: { bot_id: string; name: strin
 
 function OverviewSection({ title, count, children }: { title: string; count: number; children: ReactNode }) {
   return <section className="grid gap-3" aria-labelledby={`tasks-${title}`}>
-    <div className="flex items-center gap-2 px-1"><span aria-hidden="true" className="h-5 w-1 rounded-full bg-brand" /><h2 id={`tasks-${title}`} className="text-heading font-semibold">{title}</h2><CountBadge count={count} label={`${count} 项`} /></div>
+    <div className="flex items-center gap-2 px-1"><h2 id={`tasks-${title}`} className="text-heading font-semibold">{title}</h2><CountBadge count={count} label={`${count} 项`} className="bg-muted text-muted-foreground" /></div>
     <div className="grid gap-3">{children}</div>
   </section>
 }
 
-function TaskOverviewCard({ work, projected, lookup, readyDevice, connected, progress }: { work: OpenWork; projected?: ProjectedWork; lookup: { nodes: NodeInfo[]; directory: MembershipView | null }; readyDevice?: string; connected: boolean; progress: string }) {
+function TaskOverviewCard({ work, projected, lookup, connected, progress }: { work: OpenWork; projected?: ProjectedWork; lookup: { nodes: NodeInfo[]; directory: MembershipView | null }; connected: boolean; progress: string }) {
   const state = cardState(work, lookup.nodes, projected?.state)
   const stale = taskStale(state, connected)
   const unknown = state === "unknown" || state === "unverified" || state === "accepted_waiting_sync" || state === "dispatch_rejected" || state === "dispatch_unverified"
@@ -86,7 +86,7 @@ function TaskOverviewCard({ work, projected, lookup, readyDevice, connected, pro
   const tone = stale ? "neutral" : stateTone(state)
   const failed = needsLook(state) && state !== "dispatch_unverified"
   const Icon = failed ? CircleX : stale || unknown ? CircleQuestionMark : taskActive(state) ? LoaderCircle : ListChecks
-  const DeviceIcon = work.target_node === readyDevice ? Laptop : Server
+  const DeviceIcon = Laptop
   const line = needsLook(state) ? workFailure(work) || (failed ? "这个任务没有成功。" : "") : progress
   const device = nodeName(work.target_node, lookup, "未知设备")
   const project = work.cwd ? projectName(work.cwd) : "未指定项目"

@@ -37,10 +37,10 @@ type WaitRecord = { entry: ConnectionEntry; networkId: string; genesis: unknown;
  * This device's own join request; `nonce` stays here until the manager has committed its nonce. `pinned` holds the
  * network, manager and manager nonce seen before the reveal; the short code uses only these.
  */
-type Joining = { entry: ConnectionEntry; join_id: string; invite_id: string; nonce: string; name: string; status: JoinRequest['status']; pinned?: JoinPin; code?: string; reason?: string | null }
+type Joining = { entry: ConnectionEntry; join_id: string; invite_id: string; nonce: string; name: string; status: JoinRequest['status']; pinned?: JoinPin; code?: string; admin?: string; reason?: string | null }
 type JoinPin = { network_id: string; admin_id: string; admin_nonce: string }
 /** This computer's own join, as the Node reports it while the manager approves. */
-type NodeJoining = { status: 'waiting' | 'confirming' | 'joined'; code?: string }
+type NodeJoining = { status: 'waiting' | 'confirming' | 'joined'; code?: string; admin?: string }
 /** What a manager fixed when it sent its nonce: the request it saw, so a later answer of the entry cannot change it. */
 type ApprovalPin = { nonce: string; device_id: string; invite_id: string; commit: string }
 /**
@@ -616,7 +616,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         if (reply.status === 'failed') throw new Error(nodeJoinFailure(typeof reply.reason === 'string' ? reply.reason : ''))
         if (reply.status === 'joined') break
         if (reply.status !== 'waiting' && reply.status !== 'confirming') throw new Error('这台电脑返回了未知的加入状态。')
-        setNodeJoining({ status: reply.status, code: typeof reply.code === 'string' ? reply.code : undefined })
+        setNodeJoining({ status: reply.status, code: typeof reply.code === 'string' ? reply.code : undefined, admin: typeof reply.admin === 'string' ? reply.admin : undefined })
         await new Promise(resolve => setTimeout(resolve, 2000))
       }
       setNodeJoining({ status: 'joined' })
@@ -965,7 +965,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       throw failure
     }
     const code = pin && status.joiner_nonce ? shortCode(pin.network_id, pending.invite_id, own().deviceId, pin.admin_id, pin.admin_nonce, pending.nonce) : undefined
-    const next = { ...mine, status: status.status, code }
+    const next = { ...mine, status: status.status, code, admin: status.admin_name }
     joiningRef.current = next; setJoining(next)
   }
   /**

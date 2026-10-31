@@ -897,6 +897,12 @@ async fn dispatch(
                 node.join_changed(&request.network_id);
             }
             let mut result = serde_json::to_value(&request)?;
+            if let Some(admin) = &request.admin_id {
+                let view = node.membership_state().await?.project()?;
+                if let Ok(member) = view.member(admin) {
+                    result["admin_name"] = json!(member.name);
+                }
+            }
             if request.status == JoinStatus::Joined {
                 let state = node.membership_state().await?;
                 state.project()?.member(&session.device_id)?;
@@ -1552,7 +1558,9 @@ impl JoinLink {
 pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkState> {
     let node = Runtime::open(dir).await?;
     let report = |progress| match progress {
-        NodeJoin::Confirming { code } => println!("安全码：{code}。在管理设备上比对一致后允许。"),
+        NodeJoin::Confirming { code, admin } => {
+            println!("安全码：{code}。在「{admin}」上比对一致后允许。")
+        }
         _ => println!("已提交加入请求，等待管理设备批准。"),
     };
     join_as_node(&node, link, name, report, &tokio::sync::Notify::new()).await
@@ -1564,7 +1572,7 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum NodeJoin {
     Waiting,
-    Confirming { code: String },
+    Confirming { code: String, admin: String },
     Joined,
     Failed { reason: String },
     Cancelled,
@@ -1872,7 +1880,11 @@ async fn join_as_node(
                         admin_nonce,
                         &pending.nonce,
                     )?;
-                    report(NodeJoin::Confirming { code });
+                    let admin = status["admin_name"]
+                        .as_str()
+                        .unwrap_or("管理设备")
+                        .to_owned();
+                    report(NodeJoin::Confirming { code, admin });
                     client
                         .call(
                             "join_status",
@@ -2800,6 +2812,28 @@ mod tests {
         assert_eq!(stopped["settings"]["manager"], Value::Null);
         assert_eq!(stopped["readiness"]["manager"], "disabled");
         assert_eq!(stopped["providers"][1]["state"], "off");
+        let executing = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","execution":true}),
+        )
+        .await?;
+        assert_eq!(
+            executing["settings"]["manager"]["provider"], "cursor",
+            "tasks reach a device through its bot, so executing them starts one"
+        );
+        assert_eq!(
+            executing["providers"][1]["roles"],
+            json!(["agent", "execution"])
+        );
+        dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","bot":false,"execution":false}),
+        )
+        .await?;
 
         drop(node);
         let reopened = Runtime::reopen(&dir).await?;

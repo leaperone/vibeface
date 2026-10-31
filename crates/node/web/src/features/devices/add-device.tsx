@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { CircleAlert, CircleCheck, Clock, Copy, Download, Link2, Monitor, Plus, Smartphone, SquareTerminal } from "lucide-react"
+import { CircleAlert, CircleCheck, Clock, Copy, Download, Laptop, Link2, Plus, Smartphone, SquareTerminal } from "lucide-react"
 import qrcode from "qrcode-generator"
 import { BusyIcon, Details, InlineError, PageActions, Segmented } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -21,7 +21,7 @@ function share(invitation: Invitation): Share {
   return { ...invitation, image }
 }
 
-const kinds = [{ value: "phone", label: addDeviceCopy.phone, icon: Smartphone }, { value: "computer", label: addDeviceCopy.computer, icon: Monitor }] as const
+const kinds = [{ value: "phone", label: addDeviceCopy.phone, icon: Smartphone }, { value: "computer", label: addDeviceCopy.computer, icon: Laptop }] as const
 type Kind = (typeof kinds)[number]["value"]
 
 /**
@@ -137,7 +137,7 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
             </> : <>
               <ol className="grid gap-3">
                 <li className="flex min-w-0 items-center gap-3"><Step n={1} />{copyButton("link", result.link, "复制链接", true)}</li>
-                <li className="flex min-w-0 items-start gap-3"><Step n={2} /><Monitor aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><span className="min-w-0 [overflow-wrap:anywhere]">{addDeviceCopy.openThere}</span></li>
+                <li className="flex min-w-0 items-start gap-3"><Step n={2} /><Laptop aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><span className="min-w-0 [overflow-wrap:anywhere]">{addDeviceCopy.openThere}</span></li>
               </ol>
               <p className="flex min-w-0 flex-wrap items-center gap-x-1.5 text-meta text-muted-foreground">
                 <Download aria-hidden="true" className="size-4 shrink-0" />{addDeviceCopy.installThere}

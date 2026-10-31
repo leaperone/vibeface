@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDown, ArrowRightLeft, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, RotateCw, Send, Server, Unplug, WifiOff } from 'lucide-react'
+import { ArrowDown, ArrowRightLeft, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, RotateCw, Send, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, EmptyState, InlineError, PrimaryMark } from '@/components/app/kit'
 import { BotFace, botMood, botTint, useDark } from '@/components/app/bot-face'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
@@ -352,7 +352,7 @@ function TaskMeta({ device, here, label, agent, quiet = false, className = '' }:
   return <span className={`flex min-w-0 shrink-0 items-center gap-1 text-muted-foreground ${className}`}>
     <span aria-hidden="true" className="hidden @sm:inline">·</span>
     {Agent ? <><Agent aria-hidden="true" className="size-3.5 shrink-0" /><span className="shrink-0">{by}</span>{here && quiet ? null : dot}</> : null}
-    {here ? <span className="sr-only">{device}</span> : <><Server aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">{device}</span>{quiet ? null : dot}</>}
+    {here ? <span className="sr-only">{device}</span> : <><Laptop aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">{device}</span>{quiet ? null : dot}</>}
     <span className={quiet ? 'sr-only' : 'shrink-0'}>{label}</span>
   </span>
 }

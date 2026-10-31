@@ -148,13 +148,13 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `logs` | 可选 `since_ms`、`until_ms`、`level`、`sources`、`conversation_id`、`work_id`、`text`、`limit` | 读本机日志，返回 `records`，最多 20000 条 |
 | `node_settings` | `{}` | 读取本机 `settings {roots, manager}`、`defaults`、`readiness {manager, missing}`（`missing` 列出 Bot 缺程序的产品）和 `providers`。`providers` 只列 `supports` 非空的产品，每项为 `{provider, roles, supports, installed, state, issues, bin, app_server, env}`，`bin` 是它实际运行的程序，`installed` 说明这台电脑上找得到这个程序（同启动时的查找）：`roles` 是它现在的用途（运行 Bot 为 `agent`，执行派发的工作为 `execution`），`state` 为 `ready`、`needs_setup`、`starting` 或 `off`（没有用途），`env` 只说明变量是否已设置。`display_paths` 把响应里位于主目录下的每个绝对路径映射为 `~/…` 写法，只用于显示；`configure_provider` 和 `configure_node` 收到的路径以 `~` 开头时按主目录展开 |
 | `configure_node` | `manager`、`roots` | 保存可用文件夹和当前 Bot 的模型和工作目录，路径开头的 `~` 按本机主目录展开；不能开关 Bot 或更换它的服务 |
-| `configure_provider` | `provider`，可选 `bot`、`execution`、`bin`、`app_server`、`env` | 唯一选择用途的方法。`bot: true` 让这个服务运行 Bot，保留已有的 Bot 设置，没有时用 `defaults`；Cursor 模型为空时取 `auto`，换到 Codex 时 `auto` 改为默认。`bot: false` 只在 Bot 运行于这个服务时关闭它。`bot` 和 `execution` 只用于 `supports` 含对应用途的产品，`app_server` 只用于 Codex；`bin` 为空时恢复默认程序。`env` 中字符串设置变量，`null` 删除，值只写入本机私有文件。`bin`、`app_server.socket` 和 `env.CODEX_HOME` 开头的 `~` 按本机主目录展开。写入前补齐所开用途缺的路径（同启动时的查找），找不到 Codex 目录时报 `no Codex folder found`，什么都不写。`providers[]` 中 Codex 另带 `home`（`CODEX_HOME`）和 `sessions`（会话目录） |
+| `configure_provider` | `provider`，可选 `bot`、`execution`、`bin`、`app_server`、`env` | 唯一选择用途的方法。`bot: true` 让这个服务运行 Bot，保留已有的 Bot 设置，没有时用 `defaults`；Cursor 模型为空时取 `auto`，换到 Codex 时 `auto` 改为默认。`bot: false` 只在 Bot 运行于这个服务时关闭它。任务只经目标设备的 Bot 到达，所以这台设备没有 Bot 时，`execution: true` 且未给 `bot` 会让这个服务同时运行 Bot。`bot` 和 `execution` 只用于 `supports` 含对应用途的产品，`app_server` 只用于 Codex；`bin` 为空时恢复默认程序。`env` 中字符串设置变量，`null` 删除，值只写入本机私有文件。`bin`、`app_server.socket` 和 `env.CODEX_HOME` 开头的 `~` 按本机主目录展开。写入前补齐所开用途缺的路径（同启动时的查找），找不到 Codex 目录时报 `no Codex folder found`，什么都不写。`providers[]` 中 Codex 另带 `home`（`CODEX_HOME`）和 `sessions`（会话目录） |
 | `provider_models` | `provider` | 读取这个服务能列出的模型，回 `models` 为 `[{id, name, default}]`，`id` 填进 Bot 模型。目前只有 Codex 经已连接的 App Server `model/list` 列出，略去隐藏模型；其他服务或未连接时为 `null`，网页保留手填 |
 | `local_access` | 可选 `enabled` | 查询或开关本机自动访问 |
 | `invite` | `record` | 管理设备登记签名邀请，返回 `join_id`、`entry_id`、`entry { relay_url, direct_addrs }` 和 `gateway_url` |
 | `join_check` | `secret` | 打开链接时询问入口还收不收它，回 `invite` 为 `open`、`used` 或 `expired`，不占用链接。必须持有 secret 才能问。没登记过的 secret 与过期的回答相同，回答也不超出 `join` 拒绝时给的信息。本设备已提交且仍在等待的请求回 `open` |
 | `join` | `secret`、`public_key`、`kind`、`name`、`commit` | 新设备提交加入请求，`public_key` 必须是本通道设备 |
-| `join_status` | 可选 `join_id`、`reveal` | 新设备查询或揭示随机数；不带 `join_id` 时管理设备列出所有入口上的待处理请求 |
+| `join_status` | 可选 `join_id`、`reveal` | 新设备查询或揭示随机数，请求已有 `admin_id` 时另带该管理设备的名字 `admin_name`；不带 `join_id` 时管理设备列出所有入口上的待处理请求 |
 | `join_withdraw` | `join_id` | 新设备撤回自己仍在等待的加入请求，只认提交该请求的设备；请求已结束时原样返回当前状态。网页和手机点“取消”时经当前通道发一次，不重试，回复丢失时请求按期过期 |
 | `approve` | `join_id` 加 `admin_nonce`、`event` 或 `reject: true` | 管理设备推进或拒绝加入，请求在其他入口时转发过去 |
 | `grant` | `event` | 管理设备签名改已加入设备的名称或客户端的 `manage`，`kind` 须与现有成员一致，`epoch` 须是生效 epoch，之后须仍有管理设备；新设备只经 `approve` 加入。同一事件重发不新增记录 |

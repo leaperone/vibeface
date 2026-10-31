@@ -10,7 +10,7 @@ import { entryAddress, messageOf, parseEntry } from '@vibeface/client/lib/node.t
 import { passphrase, passwordStrength, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName } from '@/lib/device-name'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
-import { passwordCopy, recoveryChanges, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
+import { passwordCopy, recoveryChanges, recoveryCopy, securityCopy, whenText } from '@vibeface/client/identity/copy.ts'
 import { recoveryEntry, recoveryLink } from '@vibeface/client/identity/recovery-link.ts'
 import { deviceIcon } from '@/features/devices/devices'
 
@@ -356,7 +356,9 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   if (only) return <div className="grid gap-4">{restoreForm}{passphraseForm}{done}</div>
   // Finding devices again lives on the connection page: here it would start a real two-day recovery against this person's own devices.
   return <>
-    <SettingsRow ref={row} icon={KeyRound} label="换恢复密码" expanded={open === 'passphrase'} className={open === 'passphrase' ? 'border-b-0' : undefined} onClick={() => setOpen(open === 'passphrase' ? undefined : 'passphrase')} />
+    <SettingsRow ref={row} icon={KeyRound} label={securityCopy.password} expanded={open === 'passphrase'} className={open === 'passphrase' ? 'border-b-0' : undefined} onClick={() => setOpen(open === 'passphrase' ? undefined : 'passphrase')}>
+      {device.recoverySince ? <time className="tabular-nums" dateTime={new Date(device.recoverySince).toISOString()}>{securityCopy.changedOn(device.recoverySince)}</time> : null}
+    </SettingsRow>
     {passphraseForm}
     {done}
     {unsaved}

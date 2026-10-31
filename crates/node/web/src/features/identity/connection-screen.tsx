@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { Archive, ArchiveRestore, Camera, CircleCheck, CirclePlus, FileKey, Hourglass, KeyRound, Laptop, LifeBuoy, Link2, LoaderCircle, LogIn, MessageSquareLock, MonitorSmartphone, MonitorX, QrCode, RotateCcw, Settings2, ShieldAlert, ShieldCheck, X } from 'lucide-react'
-import { AuthPage, Details, EmptyState, InlineError, Panel, PasswordInput, claimFocus, SafetyCode, Skeleton, Steps, WaitingDot } from '@/components/app/kit'
+import { AuthPage, Details, EmptyState, InlineError, Panel, PasswordInput, claimFocus, SafetyCode, Skeleton, Steps } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -92,10 +92,10 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
 }
 
 /** The code appears once the device that sent the link shows its own, so until then the next step is over there. */
-function JoinCode({ code }: { code?: string }) {
+function JoinCode({ code, admin }: { code?: string; admin?: string }) {
   if (!code) return <p role="status" className="flex items-center gap-2 text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 shrink-0 animate-spin" />{joinCopy.showCode}</p>
   return <>
-    <p role="status" className="flex items-center gap-2 text-muted-foreground"><WaitingDot />{joinCopy.compareCode}</p>
+    <p role="status" className="flex items-center gap-2 text-muted-foreground"><Hourglass aria-hidden="true" className="size-4 shrink-0" />{joinCopy.compareCode(admin)}</p>
     <SafetyCode code={code} />
   </>
 }
@@ -108,7 +108,7 @@ function NodeJoin() {
   return <Panel icon={Hourglass} title={joining.status === 'joined' ? '已加入' : joinCopy.waiting}>
     {joining.status === 'joined' ? <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />正在打开这台电脑</p> : <>
       {joining.code ? <Reached /> : null}
-      <JoinCode code={joining.code} />
+      <JoinCode code={joining.code} admin={joining.admin} />
       <Button type="button" variant="ghost" className="-ms-3 w-fit" disabled={cancelling} onClick={() => { setCancelling(true); device.cancelNodeJoin().catch(() => setCancelling(false)) }}>
         {cancelling ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}{cancelling ? '正在取消' : '取消'}
       </Button>
@@ -444,7 +444,7 @@ function BrowserJoin() {
   const joining = device.joining!
   return <Panel icon={Hourglass} title="等待批准">
     {device.info ? <Reached /> : null}
-    <JoinCode code={joining.code} />
+    <JoinCode code={joining.code} admin={joining.admin} />
     {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
     <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={device.cancelJoin}>取消</Button>
     <Details><CopyDiagnostics lines={[['这个浏览器', device.identity?.deviceId], ['加入请求', joining.join_id]]} /></Details>
