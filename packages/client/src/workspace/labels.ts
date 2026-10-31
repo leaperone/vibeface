@@ -250,8 +250,12 @@ const sameObservedJob = (left: WorkspaceActivityJob, right: WorkspaceActivityJob
   const leftSource = jobSource(left, localNode), rightSource = jobSource(right, localNode)
   return leftSource !== null && leftSource === rightSource
 }
-const terminalJobStates = new Set(["completed", "failed", "cancelled", "interrupted", "rejected"])
-const jobStateRank: Record<string, number> = { queued: 10, pending_delivery: 10, claimed: 20, running: 30, steering: 35, cancelling: 40, completed: 50, interrupted: 50, cancelled: 50, rejected: 55, failed: 55, unknown: 100, unverified: 100 }
+const terminalJobStates = new Set(["completed", "failed", "cancelled", "interrupted", "rejected", "steered"])
+const activeJobStates = new Set(["claimed", "running", "steering", "cancelling", "publishing", "reconciling"])
+const jobStateRank: Record<string, number> = {
+  queued: 10, pending_delivery: 10, claimed: 20, running: 30, steering: 35, cancelling: 40, publishing: 50,
+  completed: 60, interrupted: 60, cancelled: 60, steered: 60, rejected: 65, failed: 65, reconciling: 80, unknown: 100, unverified: 100,
+}
 const jobFailure = (job: ManagerJob | OverviewJob) => "failure" in job ? job.failure : undefined
 
 function mergeJobObservations(entries: readonly WorkspaceActivityJob[]): WorkspaceActivityJob {
@@ -261,21 +265,30 @@ function mergeJobObservations(entries: readonly WorkspaceActivityJob[]): Workspa
   const states = new Set(jobs.map((job) => job.state))
   const terminalStates = new Set(jobs.map((job) => job.state).filter((state) => terminalJobStates.has(state)))
   const outcomes = new Set(jobs.flatMap((job) => job.outcome ? [job.outcome] : []))
-  const uncertain = jobs.some((job) => job.pending_check === true) || states.has("unknown") || states.has("unverified") || terminalStates.size > 1 || outcomes.size > 1
-  const state = uncertain ? "unknown" : [...states].sort((left, right) => (jobStateRank[right] ?? 0) - (jobStateRank[left] ?? 0))[0] ?? "unknown"
+  const runtimes = jobs.flatMap((job) => job.runtime ? [job.runtime] : [])
+  const attemptIds = new Set(runtimes.map((runtime) => runtime.delivery_id))
+  const hasUnknownState = jobs.some((job) => !(job.state in jobStateRank))
+  const pendingCheck = jobs.some((job) => job.pending_check === true)
+  const queueStates = new Set(["queued", "pending_delivery"])
+  const recoveryStates = new Set(["claimed", "steering"])
+  const recoveryRollback = jobs.some((job) => queueStates.has(job.state)) && jobs.some((job) => recoveryStates.has(job.state))
+  const attemptConflict = attemptIds.size > 1
+  const uncertain = pendingCheck || hasUnknownState || states.has("unknown") || states.has("unverified") || terminalStates.size > 1 || outcomes.size > 1 || (terminalStates.size > 0 && jobs.some((job) => activeJobStates.has(job.state))) || recoveryRollback || attemptConflict || jobs.some((job) => job.state === "steered" && job.outcome === "unknown")
+  const state = uncertain ? "unknown" : [...states].sort((left, right) => jobStateRank[right]! - jobStateRank[left]!)[0] ?? "unknown"
   const primary = entries.find((entry) => entry.job.state === state) ?? entries[0]
-  const runtimes = jobs.flatMap((job) => job.runtime ? [job.runtime] : []).sort((left, right) => left.attempted_at_ms - right.attempted_at_ms)
   const failure = jobs.map(jobFailure).find(Boolean)
-  const retryable = jobs.some((job) => job.retryable === true)
+  const runtime = primary.job.runtime ?? runtimes[0]
+  const retryable = state === "failed" && !pendingCheck && runtime?.execution === "not_started" && jobs.some((job) => job.retryable === true)
   return {
     conversation_id: primary.conversation_id,
     job: {
       ...primary.job,
       state,
-      runtime: runtimes.at(-1) ?? primary.job.runtime,
+      ...(runtime ? { runtime } : {}),
       ...(failure ? { failure } : {}),
-      ...(retryable ? { retryable: true } : {}),
-      ...(uncertain ? { outcome: "unknown" as const, pending_check: true } : {}),
+      retryable,
+      ...(uncertain ? { outcome: "unknown" as const } : {}),
+      ...(pendingCheck ? { pending_check: true } : {}),
     },
   }
 }

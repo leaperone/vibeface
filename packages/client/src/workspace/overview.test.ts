@@ -295,7 +295,27 @@ test("workspace activities merge same-source job observations without hiding new
   assert.equal(completed[0]?.kind === "turn" && completed[0].state, "completed", "a newer terminal observation is not hidden by queued overview data")
   const unknown = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "queued", pending_check: true } }] }).activities
   assert.equal(unknown[0]?.kind === "turn" && unknown[0].state, "unknown", "a pending check stays uncertain")
+  for (const state of ["reconciling", "publishing"]) {
+    const observed = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state } }] }).activities
+    assert.equal(observed[0]?.kind === "turn" && observed[0].state, state, `${state} is not treated as an old queued observation`)
+  }
+  const steeredOverview = parseWorkspaceOverview({ jobs: [{ job_id: "job-3", conversation_id: "chat-1", trigger: "message:ordinary", state: "steered", source_node: "entry" }] })
+  assert.equal(workspaceActivities({ ...input, overview: steeredOverview, jobs: [{ ...local, job: { ...local.job, state: "steered", outcome: "answered" as const } }] }).activities[0]?.state, "steered")
+  assert.equal(workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "steered", outcome: "answered" as const } }] }).activities[0]?.state, "steered", "a terminal observation is not hidden by an old queued read")
   const overviewRunning = parseWorkspaceOverview({ jobs: [{ job_id: "job-2", conversation_id: "chat-1", trigger: "message:ordinary", state: "running", source_node: "entry" }] })
+  const failedConflict = workspaceActivities({ ...input, overview: overviewRunning, jobs: [{ ...local, job: { ...local.job, state: "failed", retryable: true } }] }).activities
+  assert.equal(failedConflict[0]?.kind === "turn" && failedConflict[0].state, "unknown", "an active and terminal observation has no ordering proof")
+  if (failedConflict[0]?.kind === "turn") assert.equal(failedConflict[0].job.retryable, false, "an uncertain merge cannot become retryable")
+  for (const [overviewState, localState] of [["claimed", "queued"], ["queued", "claimed"], ["steering", "queued"]] as const) {
+    const rollback = parseWorkspaceOverview({ jobs: [{ job_id: `job-${overviewState}`, conversation_id: "chat-1", trigger: "message:ordinary", state: overviewState, source_node: "entry" }] })
+    assert.equal(workspaceActivities({ ...input, overview: rollback, jobs: [{ ...local, job: { ...local.job, state: localState } }] }).activities[0]?.state, "unknown", `${overviewState} and ${localState} recovery reads have no ordering proof`)
+  }
+  const otherAttempt = parseWorkspaceOverview({ jobs: [{ job_id: "job-attempt", conversation_id: "chat-1", trigger: "message:ordinary", state: "running", source_node: "entry", runtime: { ...runtime, delivery_id: "different-attempt" } }] })
+  const attemptConflict = workspaceActivities({ ...input, overview: otherAttempt }).activities
+  assert.equal(attemptConflict[0]?.kind === "turn" && attemptConflict[0].state, "unknown", "different attempt identities remain uncertain")
+  if (attemptConflict[0]?.kind === "turn") assert.equal(attemptConflict[0].facts.jobs.length, 2)
+  const arbitrary = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "future_state" } }] }).activities
+  assert.equal(arbitrary[0]?.kind === "turn" && arbitrary[0].state, "unknown", "an unrecognized scheduler state stays conservative")
   assert.equal(workspaceActivities({ ...input, overview: overviewRunning, jobs: [{ ...local, job: { ...local.job, state: "queued" } }] }).activities[0]?.state, "running", "the overview observation can be newer without preferring the local source")
   assert.equal(workspaceActivities({ ...input, nodes: [] }).activities.length, 2, "an unknown local identity cannot prove a duplicate")
   assert.equal(workspaceActivities({ ...input, jobs: [{ ...local, conversation_id: "other-chat" }] }).activities.length, 2)
