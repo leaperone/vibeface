@@ -180,13 +180,15 @@ pnpm exec e2e run --config e2e.native.config.ts --grep '^provider ' \
   --trace off --video off --retries 0 > .artifacts/native/private/ui.log 2>&1
 ```
 
-该用例重新安装当前 App，逐项核对已安装 bundle 与构建 bundle 的文件摘要，包括实际可执行文件、打包 JavaScript 和原生库。它用 e2e Secret 从任务私有文件读取邀请，填写原生“加入链接”表单，再核对双方安全码并授予管理权限。邀请不会作为普通深链接参数传入 UI driver。
+该用例重新安装当前 App，逐项核对已安装 bundle 与构建 bundle 的文件摘要，包括实际可执行文件、打包 JavaScript 和原生库。它用 e2e Secret 从任务私有文件读取邀请，填写原生“加入链接”表单，再核对双方安全码并授予管理权限。邀请不会作为普通深链接参数传入 UI driver。iOS 的 TextInput 可把 placeholder 或值附在可访问名称后面，因此输入定位使用 textbox 角色和以字段名称开头、带分隔边界的正则，仍要求唯一匹配。已填写值、保存回读和私有命令剪贴板均作精确核对。
 
-原生设备页的“Bot 与任务”进入真实 AI 设置页。fixture 只配置受控程序与连接模式，并关闭 Bot 和执行角色，真实返回 `manager=null`。用例先确认未启用的 Codex 尚未主动检查，再由原生“运行 Bot”开关启用它。启用和已有 manager 的 Node 启动都会主动检查，不能把这些结果称为未检查。用例等待启动结束后，实际点击“检查可用性”确认已知未登录，然后通过受控 Codex App Server 观察模型目录，实际选择模型与 high 并保存。它还确认 Provider 控制强度时清除旧覆盖，以及目录不可用时保留旧模型和强度、允许手填保存。所有启用与保存均经已授权手机的正常接口执行。
+原生设备页的“Bot 与任务”进入真实 AI 设置页。fixture 只配置受控程序与连接模式，并关闭 Bot 和执行角色，真实返回 `manager=null`。用例先确认未启用的 Codex 尚未主动检查，再开启执行用途；依照 Node 的首次设置默认，这也开启 Bot，用例随后由原生界面关闭 Bot。启用和已有 manager 的 Node 启动都会主动检查，不能把这些结果称为未检查。用例在 execution-only 状态实际检查未登录提示，精确核对从界面复制的私有目录登录命令，由受限 fake CLI 完成一次合成登录，再主动检查并选择、手填和清空执行模型。之后开启 Bot，验证双角色草稿、独立保存、默认模型和 high。它还确认 Provider 控制强度时清除旧覆盖，包括带空白的手填已知模型，以及目录不可用时保留旧模型和强度。所有启用与保存均经已授权手机的正常接口执行。
 
 队列场景通过真实 Node API 准备一条运行中消息和一条排队消息。原生 UI 取消排队后，再通过原生“停止”结束运行中的消息并释放槽位。独立读取确认运行中的消息调用过一次，被取消的消息始终没有调用，离开再进入聊天后计数保持不变。受控 fixture 不调用真实模型，也不代替手机保存、取消或停止。
 
-native config 默认关闭 trace 和整段 video。原始日志、自动失败截图、e2e report、邀请、恢复文件、Node 数据与 driver 状态都属于私有材料，不能递归上传 `.artifacts/native/`。CI 只上传固定的 `provider.json`、`provider-selectable.png`、`provider-controlled.png` 和 `provider-typed.png`。截图只在配对后的设置页主动保存。最终收据只有在一个目标测试真实通过、fixture 退出、专属 simulator 删除和私有状态清理后才标为 `passed`。
+native config 默认关闭 trace 和整段 video。原始日志、自动失败截图、e2e report、邀请、恢复文件、Node 数据与 driver 状态都属于私有材料，不能递归上传 `.artifacts/native/`。CI 只上传固定的 `provider.json`、`provider-initial.png`、`provider-selectable.png`、`provider-controlled.png` 和 `provider-typed.png`。
+
+`provider-initial.png` 是唯一的配对前诊断图。它只在本次 CI 新建的专属 simulator 上，重新安装、清除钥匙串并启动 App 后主动拍摄，且早于首次 `secrets.get` 和邀请输入。用例核对 simulator 文件、实际 UUID、Booted 状态以及包含当前 run ID 和 attempt 的专属名称。此时 App 尚未接收邀请、登录命令或凭证，也没有旧应用数据；初始图只用于查看路由、系统弹窗和空表单。其他三张图仍只在配对后的设置页保存。诊断图不代表配对或表单验收通过。最终收据只有在一个目标测试真实通过、fixture 退出、专属 simulator 删除和私有状态清理后才标为 `passed`。
 
 失败收据与 stdout 只保留固定阶段、报告是否可读，以及从实际 e2e report 提取的受限错误码、已知 API 名和两个验收文件的行号。错误 message、stack、locator label、值和原始报告不会导出。报告尚未生成时仍保留失败阶段，完整私有日志随后按原清理规则删除。
 

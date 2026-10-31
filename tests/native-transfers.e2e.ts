@@ -134,7 +134,7 @@ test('provider settings and queued cancellation work in the installed native app
   assert(simulator && appPath && binary && crypto && source && /^[a-f0-9]{40}$/.test(source), 'Provider acceptance pins its source and actual artifacts');
   const publicPath = resolve(root, '.artifacts/native/public');
   await mkdir(publicPath, { recursive: true, mode: 0o700 });
-  for (const name of ['provider.json', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png']) {
+  for (const name of ['provider.json', 'provider-initial.png', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png']) {
     await unlink(join(publicPath, name)).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
   const wasm = crypto.replace(/\.js$/, '_bg.wasm');
@@ -159,9 +159,22 @@ test('provider settings and queued cancellation work in the installed native app
   expect(await bundleManifest(installedPath)).toEqual(built);
   await device.clearKeychain();
   await app.open();
-  await screen.getByLabel('加入链接').fill(secrets.get('nativeInvitation'), { timeout: 30000 });
+  const run = process.env.GITHUB_RUN_ID, attempt = process.env.GITHUB_RUN_ATTEMPT;
+  if (run !== undefined || attempt !== undefined) {
+    assert(run && attempt && /^[0-9]+$/.test(run) && /^[0-9]+$/.test(attempt));
+    assert.equal((await readFile(resolve(root, '.artifacts/native/simulator.txt'), 'utf8')).trim(), simulator);
+    const devices = record(record(JSON.parse((await execute('xcrun', ['simctl', 'list', 'devices', '--json'])).stdout)).devices);
+    const assigned = Object.values(devices).flatMap(rows => { assert(Array.isArray(rows)); return rows.map(record); }).filter(row => row.udid === simulator);
+    assert.equal(assigned.length, 1);
+    assert.equal(assigned[0].name, `vibeface-provider-${run}-${attempt}`);
+    assert.equal(assigned[0].state, 'Booted');
+    await copyFile(await app.screenshot('provider-initial'), join(publicPath, 'provider-initial.png'));
+  }
+  await screen.getByRole('textbox', /^加入链接(?:$|[\s,，])/).fill(secrets.get('nativeInvitation'), { timeout: 30000 });
   await expect(screen.getByText('已填入加入链接', { exact: true })).toBeVisible();
-  await screen.getByRole('textbox', '这台设备的名字').fill('VDP native receiver');
+  const deviceName = screen.getByRole('textbox', /^这台设备的名字(?:$|[\s,，])/);
+  await deviceName.fill('VDP native receiver');
+  await expect(deviceName).toHaveValue('VDP native receiver');
   await device.dismissKeyboard();
   await screen.getByRole('button', '加入', { exact: true }).click();
   const pairing = await network.call({ op: 'native_join' }), code = text(pairing.code);
@@ -247,7 +260,9 @@ test('provider settings and queued cancellation work in the installed native app
   await screen.scrollUntilVisible(executionButton(), { direction: 'up' });
   await executionButton().click();
   await screen.getByRole('button', '其他…', { exact: true }).click();
-  await screen.getByRole('textbox', '执行任务默认模型', { exact: true }).fill('native-execution-custom');
+  const executionInput = screen.getByRole('textbox', /^执行任务默认模型(?:$|[\s,，])/);
+  await executionInput.fill('native-execution-custom');
+  await expect(executionInput).toHaveValue('native-execution-custom');
   await device.dismissKeyboard();
   await saveExecution('native-execution-custom');
   expect((await inspect()).manager).toBeNull();
@@ -321,9 +336,10 @@ test('provider settings and queued cancellation work in the installed native app
   await expect(screen.getByText('模型列表暂不可用，可继续手填。已保存的模型保持不变。', { exact: true })).toBeVisible();
   expect((await inspect()).manager).toEqual({ provider: 'codex', model: 'native-selectable', reasoning_effort: 'high' });
   expect((await inspect()).catalog).toBe('unavailable');
-  const typed = screen.getByRole('textbox', '设备默认模型', { exact: true });
+  const typed = screen.getByRole('textbox', /^设备默认模型(?:$|[\s,，])/);
   await screen.scrollUntilVisible(typed, { direction: 'down' });
   await typed.fill('native-custom-model');
+  await expect(typed).toHaveValue('native-custom-model');
   await device.dismissKeyboard();
   await save('native-custom-model', 'high');
   await screenshot('provider-typed');
@@ -332,6 +348,7 @@ test('provider settings and queued cancellation work in the installed native app
   await probe();
   await screen.scrollUntilVisible(typed, { direction: 'down' });
   await typed.fill(' native-controlled ');
+  await expect(typed).toHaveValue(' native-controlled ');
   await device.dismissKeyboard();
   await expect(screen.getByRole('button', 'high', { exact: true })).toBeHidden();
   await save('native-controlled', null);
@@ -355,7 +372,7 @@ test('provider settings and queued cancellation work in the installed native app
   expect(after.queued_invocations).toBe(0);
   await device.openLink('vibeface://settings');
   await device.openLink(`vibeface://b/${botId}`);
-  await expect(screen.getByRole('textbox', '给 Bot 发消息', { exact: true })).toBeVisible();
+  await expect(screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/)).toBeVisible();
   const reopened = await inspect();
   expect(reopened.jobs).toEqual(after.jobs);
   expect(reopened.running_invocations).toBe(1);
@@ -395,7 +412,9 @@ test('receives a charity file through a real native pairing and verifies the sav
   await app.open();
   await device.openLink(`vibeface://join?link=${encodeURIComponent(network.invitation)}`);
   await expect(screen.getByText('已填入加入链接', { exact: true })).toBeVisible({ timeout: 30000 });
-  await screen.getByRole('textbox', '这台设备的名字').fill('VDP native receiver');
+  const deviceName = screen.getByRole('textbox', /^这台设备的名字(?:$|[\s,，])/);
+  await deviceName.fill('VDP native receiver');
+  await expect(deviceName).toHaveValue('VDP native receiver');
   await device.dismissKeyboard();
   await screen.getByRole('button', '加入', { exact: true }).click();
   const pairing = await network.call({ op: 'native_join' });
