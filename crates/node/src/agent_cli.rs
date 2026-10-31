@@ -1,6 +1,6 @@
 //! The coordination Agent's own path to the App Server. It talks to the socket directly; the
 //! Node only registers dispatched work before the send and settles it afterwards.
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{future::Future, path::Path};
 use vibeface_bridge::{
@@ -21,79 +21,158 @@ fn outgoing_model(tracked: &Value) -> Result<Option<String>> {
     Ok(resolved.model)
 }
 
+fn thread_arguments(args: &Value, cwd: &str) -> Value {
+    let mut args = args.clone();
+    args["cwd"] = json!(cwd);
+    if args["title"]
+        .as_str()
+        .is_none_or(|title| title.trim().is_empty())
+    {
+        let text = args["prompt"].as_str().unwrap_or_default();
+        let line = text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or(text);
+        args["title"] = json!(line.trim().chars().take(120).collect::<String>());
+    }
+    args
+}
+
+async fn readback<L, LF, T, TF>(args: &Value, lookup: &L, track: &T) -> Result<Option<Value>>
+where
+    L: Fn(String) -> LF,
+    LF: Future<Output = Result<Value>>,
+    T: Fn(Value) -> TF,
+    TF: Future<Output = Result<Value>>,
+{
+    let found = lookup(args["call_ref"].as_str().unwrap_or_default().to_owned()).await?;
+    if found["found"] == false {
+        return Ok(None);
+    }
+    ensure!(
+        found.get("conversation_id").is_some() && found.get("work_id").is_some(),
+        "call_ref has no confirmed work projection; preserve it and query call_lookup before retrying"
+    );
+    outgoing_model(&found)?;
+    let work: crate::model::WorkProjection =
+        serde_json::from_value(found).context("the Node returned an invalid work projection")?;
+    let args = if work.kind == crate::model::WorkKind::Agent(crate::providers::Provider::Codex)
+        && work.thread.is_some()
+        && args["thread"].is_string()
+    {
+        thread_arguments(args, &work.cwd)
+    } else {
+        args.clone()
+    };
+    let tracked = track(args).await?;
+    outgoing_model(&tracked)?;
+    ensure!(
+        tracked["may_send"] == false,
+        "durable work readback must not grant another send"
+    );
+    Ok(Some(tracked))
+}
+
 /// Registers the work with the Node (`track`); a work the Node runs on Codex is sent here.
 /// The CLI reports its thread before the send, sends the prompt with `clientUserMessageId` =
 /// work ID and reports how the send ended (`bind`). Without `thread` the work starts a turn in
 /// a new thread (or the one it continues); with `thread` it goes into that existing thread,
-/// steering its running turn or starting one, and the thread's directory is read first. Only
+/// steering its running turn or starting one. Durable retries are revalidated before readiness;
+/// a first dispatch reads the thread's directory before registering. Only
 /// the registration that created the work sends, and only inside its window. `ready` names the
 /// provider the Node runs the work on, after waiting for the Node's own App Server
 /// connection when that is Codex, so a send right after the Node starts is not refused while
-/// the App Server comes up. A send into a thread fails, with nothing registered, when `ready`
+/// the App Server comes up. A first send into a thread fails, with nothing registered, when `ready`
 /// cannot be asked: without the answer it would skip reading the thread.
-pub async fn dispatch<T, TF, B, BF, R, RF>(
+pub async fn dispatch<L, LF, T, TF, B, BF, R, RF>(
     args: &Value,
+    lookup: L,
     track: T,
     bind: B,
     ready: R,
-    socket: &Path,
+    socket: Option<&Path>,
 ) -> Result<Value>
 where
-    T: FnOnce(Value) -> TF,
+    L: Fn(String) -> LF,
+    LF: Future<Output = Result<Value>>,
+    T: Fn(Value) -> TF,
     TF: Future<Output = Result<Value>>,
     B: Fn(String, StartReport) -> BF,
     BF: Future<Output = Result<Value>>,
     R: Fn(Value) -> RF,
     RF: Future<Output = Result<Option<String>>>,
 {
+    let original = args;
     let mut args = args.clone();
     let existing = args["thread"].as_str().map(str::to_owned);
+    if existing.is_some()
+        && let Some(tracked) = readback(original, &lookup, &track).await?
+    {
+        return Ok(tracked);
+    }
     // A Codex send reads its thread before registering, so a missing thread leaves nothing
     // behind. The Node checks the session another provider would take the work in.
-    let readied = match &existing {
-        Some(thread) => Some(ready(args.clone()).await.with_context(|| {
-            format!("cannot ask the Node which agent has thread {thread}; nothing was registered or sent, so the send can be retried")
-        })?),
-        None => None,
-    };
-    if let (Some(thread), Some(Some("codex"))) = (&existing, readied.as_ref().map(Option::as_deref))
-    {
-        let mut session = DirectSession::connect(socket)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.message))?;
-        let read = session
-            .request("thread/read", json!({"threadId":thread}))
-            .await;
-        session.close().await;
-        let read = read
-            .map_err(|error| anyhow::anyhow!("cannot read thread {thread}: {}", error.message))?;
-        // Codex refuses direct input on a sub-agent; its parent thread drives it.
-        if let Some(sub_agent) = read["thread"]["source"].get("subAgent") {
-            match (read["thread"]["parentThreadId"].as_str())
-                .or(sub_agent["thread_spawn"]["parent_thread_id"].as_str())
-            {
-                Some(parent) => bail!(
-                    "thread {thread} is a Codex sub-agent and takes no direct input; send to its parent thread {parent} instead"
-                ),
-                None => bail!(
-                    "thread {thread} is a Codex sub-agent and takes no direct input; dispatch it without thread"
-                ),
+    let prepared = async {
+        let readied = match &existing {
+            Some(thread) => {
+                let agent = ready(args.clone()).await.with_context(|| {
+                    format!("cannot ask the Node which agent has thread {thread}; this attempt registered or sent nothing, so the send can be retried")
+                })?;
+                Some(agent.with_context(|| {
+                    format!("no execution agent is ready for thread {thread}; this attempt registered or sent nothing, so the send can be retried")
+                })?)
             }
+            None => None,
+        };
+        if let (Some(thread), Some("codex")) = (&existing, readied.as_deref()) {
+            let socket = socket.context("--socket or VIBEFACE_CODEX_SOCKET is required")?;
+            let mut session = DirectSession::connect(socket)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            let read = session
+                .request("thread/read", json!({"threadId":thread}))
+                .await;
+            session.close().await;
+            let read = read
+                .map_err(|error| anyhow::anyhow!("cannot read thread {thread}: {}", error.message))?;
+            ensure!(
+                read["thread"]["id"].as_str() == Some(thread.as_str()),
+                "thread {thread} was not returned by the App Server"
+            );
+            // Codex refuses direct input on a sub-agent; its parent thread drives it.
+            if let Some(sub_agent) = read["thread"]["source"].get("subAgent") {
+                match (read["thread"]["parentThreadId"].as_str())
+                    .or(sub_agent["thread_spawn"]["parent_thread_id"].as_str())
+                {
+                    Some(parent) => bail!(
+                        "thread {thread} is a Codex sub-agent and takes no direct input; send to its parent thread {parent} instead"
+                    ),
+                    None => bail!(
+                        "thread {thread} is a Codex sub-agent and takes no direct input; dispatch it without thread"
+                    ),
+                }
+            }
+            args = thread_arguments(&args, read["thread"]["cwd"].as_str().unwrap_or_default());
         }
-        args["cwd"] = json!(read["thread"]["cwd"].as_str().unwrap_or_default());
-        if args["title"]
-            .as_str()
-            .is_none_or(|title| title.trim().is_empty())
-        {
-            let text = args["prompt"].as_str().unwrap_or_default();
-            let line = text
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or(text);
-            args["title"] = json!(line.trim().chars().take(120).collect::<String>());
+        Ok::<_, anyhow::Error>(readied)
+    }.await;
+    let readied = match prepared {
+        Ok(readied) => readied,
+        Err(error) => {
+            return match readback(original, &lookup, &track).await? {
+                Some(tracked) => Ok(tracked),
+                None => Err(error),
+            };
         }
-    }
-    let tracked = track(args.clone()).await?;
+    };
+    let tracked = match track(args.clone()).await {
+        Ok(tracked) => tracked,
+        Err(error) => return match readback(original, &lookup, &track).await {
+            Ok(Some(tracked)) => Ok(tracked),
+            Ok(None) => Err(error.context("dispatch result is unknown; preserve call_ref and query call_lookup before retrying")),
+            Err(readback) => Err(error.context(format!("dispatch result is unknown; durable readback failed: {readback:#}; preserve call_ref"))),
+        },
+    };
     if tracked["may_send"] != true {
         return Ok(tracked);
     }
@@ -108,6 +187,13 @@ where
     if readied.is_none() {
         let _ = ready(args.clone()).await;
     }
+    let Some(socket) = socket else {
+        return fail(ExecFailure::new(
+            FailureKind::Transport,
+            "--socket or VIBEFACE_CODEX_SOCKET is required",
+        ))
+        .await;
+    };
     let mut session = match DirectSession::connect(socket).await {
         Ok(session) => session,
         Err(error) => return fail(error.failure()).await,
@@ -243,6 +329,27 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
+    fn thread_arguments_use_the_current_prompt_and_keep_explicit_titles() {
+        let args = json!({"prompt":format!("\n  {}  \nnext", "字".repeat(130)),"cwd":"ignored"});
+        let normalized = thread_arguments(&args, "/original");
+        assert_eq!(normalized["cwd"], "/original");
+        assert_eq!(normalized["title"], "字".repeat(120));
+        for title in [Value::Null, json!("  "), json!(42)] {
+            let mut args = args.clone();
+            args["title"] = title;
+            assert_eq!(
+                thread_arguments(&args, "/original")["title"],
+                "字".repeat(120)
+            );
+        }
+        let args = json!({"prompt":"changed","title":" explicit title "});
+        assert_eq!(
+            thread_arguments(&args, "/original")["title"],
+            " explicit title "
+        );
+    }
+
+    #[test]
     fn outgoing_model_requires_the_frozen_selection_and_keeps_the_provider_default() -> Result<()> {
         assert_eq!(
             outgoing_model(
@@ -320,13 +427,14 @@ mod tests {
             let observed = observed.clone();
             dispatch(
                 &args,
+                |_| async { Ok(json!({"found":false})) },
                 move |args| {
                     observed.lock().unwrap().push(args);
                     async { Ok(json!({"may_send":false,"work_id":"existing"})) }
                 },
                 |_, _| async { bail!("an existing call must not bind or send again") },
                 |_| async { Ok(Some("codex".to_owned())) },
-                &socket,
+                Some(&socket),
             )
             .await?;
         }
@@ -396,10 +504,11 @@ mod tests {
         let args = json!({"thread":"sub","prompt":"p","title":"t","call_ref":"r","agent":"codex"});
         let refused = dispatch(
             &args,
+            |_| async { Ok(json!({"found":false})) },
             track,
             |_, _| async { Ok(json!({})) },
             |_| async { Ok(Some("codex".to_owned())) },
-            &socket,
+            Some(&socket),
         )
         .await;
         std::fs::remove_dir_all(&dir)?;
@@ -428,15 +537,79 @@ mod tests {
         let args = json!({"thread":"t-1","prompt":"p","title":"t","call_ref":"r"});
         let failed = dispatch(
             &args,
+            |_| async { Ok(json!({"found":false})) },
             track,
             |_, _| async { Ok(json!({})) },
             |_| async { bail!("the Node did not answer") },
-            Path::new("/nonexistent/app.sock"),
+            Some(Path::new("/nonexistent/app.sock")),
         )
         .await;
         let failed = failed.expect_err("an unanswered ready is not a skipped read");
         assert!(failed.to_string().contains("can be retried"), "{failed:#}");
         assert!(!*tracked.lock().unwrap(), "no work was registered");
+        let failed = dispatch(
+            &args,
+            |_| async { Ok(json!({"found":false})) },
+            track,
+            |_, _| async { Ok(json!({})) },
+            |_| async { Ok(None) },
+            None,
+        )
+        .await
+        .expect_err("ready None is a first-dispatch failure");
+        assert!(
+            failed.to_string().contains("no execution agent"),
+            "{failed:#}"
+        );
+        assert!(!*tracked.lock().unwrap(), "no work was registered");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pending_dispatch_summary_cannot_authorize_another_admission() {
+        let args = json!({"thread":"t","prompt":"p","call_ref":"r"});
+        let failure = dispatch(
+            &args,
+            |_| async {
+                Ok(json!({"work_id":"w","call_ref":"r","state":"pending","prompt":"summary"}))
+            },
+            |_| async { bail!("must not track an unconfirmed work") },
+            |_, _| async { bail!("must not bind or send") },
+            |_| async { bail!("must not ask readiness") },
+            None,
+        )
+        .await
+        .expect_err("a pending dispatch has no frozen admission");
+        assert!(failure.to_string().contains("no confirmed work projection"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_track_with_no_durable_record_keeps_the_result_unknown() {
+        let args = json!({"thread":"t","prompt":"p","call_ref":"r","cwd":"/w","title":"p"});
+        let lookups = std::sync::atomic::AtomicUsize::new(0);
+        let tracks = std::sync::atomic::AtomicUsize::new(0);
+        let failed = dispatch(
+            &args,
+            |_| {
+                lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(json!({"found":false})) }
+            },
+            |_| {
+                tracks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { bail!("track response lost") }
+            },
+            |_, _| async { bail!("must not bind") },
+            |_| async { Ok(Some("pi".into())) },
+            None,
+        )
+        .await
+        .expect_err("an absent record cannot prove a failed write");
+        assert!(
+            failed.to_string().contains("result is unknown"),
+            "{failed:#}"
+        );
+        assert!(!failed.to_string().contains("can be retried"));
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(tracks.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

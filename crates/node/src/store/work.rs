@@ -205,6 +205,10 @@ fn matching_admission_from(
     request: &WorkRequest,
 ) -> Result<Option<WorkAdmission>> {
     let Some(record) = load_run(connection, &request.work_id)? else {
+        ensure!(
+            reduce::work_from(connection, network, &request.work_id)?.is_none(),
+            "work exists in shared history without admission on this Node; cannot register it again"
+        );
         return Ok(None);
     };
     let work = reduce::work_from(connection, network, &request.work_id)?

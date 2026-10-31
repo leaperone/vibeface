@@ -3,6 +3,7 @@ import test from "node:test"
 import { parseChanged } from "../lib/progress.ts"
 import { confirmReason, parseConversation, parseQuestions, parseRecords, workChecks } from "./model.ts"
 import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions } from "./records.ts"
+import { taskAgent } from "./labels.ts"
 import type { NodeInfo } from "./types.ts"
 
 const rank = (lamport: number) => `${String(lamport).padStart(20, "0")}:${"0".repeat(20)}:h${lamport}`
@@ -29,6 +30,13 @@ const records = (extra: Record<string, unknown> = {}) => {
   assert.equal(event.type, "records")
   return parseRecords(event.type === "records" ? event.value : null)
 }
+
+test("task labels use the accepted provider and leave summaries unknown", () => {
+  const accepted = records({ works: [work("frozen", { kind: "task", resolved: { provider: "claude", model: null } })] }).works[0]
+  assert.equal(taskAgent(accepted), "claude")
+  assert.equal(taskAgent({ kind: "task" }), null)
+  assert.equal(taskAgent({ kind: "pi" }), "pi")
+})
 
 test("a pushed message lands in rank order and the push replaces deliveries, checks, jobs and questions", () => {
   const next = mergeConversation(shown, records({

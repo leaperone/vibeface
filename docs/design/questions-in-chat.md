@@ -71,6 +71,12 @@ QuestionAsked {                       // 写在拥有该 session 的 Bot 会话
 	text: String,                     // 问题本身，≤1024 字节
 	choices: Vec<Choice>,             // ≤8；文字回答始终可用
 	about: Subject,
+	attention: AttentionRequest,
+}
+
+AttentionRequest {
+	kind: AttentionKind,             // question | approval | browser_takeover
+	device_id: Option<DeviceId>,      // 非空时必须等于 about.node；browser_takeover 必须提供
 }
 
 MessagePosted {                       // 现有事件，新增一个字段

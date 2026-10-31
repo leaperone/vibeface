@@ -36,7 +36,7 @@ export default function TaskDetail() {
   const lookup = { nodes: shared.nodes, directory }
   const state = shownState(work, shared.nodes)
   const device = work.target_node
-  const agent = taskAgent(work, shared.nodes)
+  const agent = taskAgent(work)
   const progress = shared.liveProgress.find((item) => item.kind === 'native' && item.work_id === workId && item.target_node === device)
   const canStop = state !== 'awaiting_confirmation' && !work.outcome && !work.stop && ['accepted', 'running'].includes(work.state)
   // A failed task's text is what it said before failing, so its cause leads and that text waits in 详细信息.

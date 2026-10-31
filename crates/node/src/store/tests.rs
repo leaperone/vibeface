@@ -8018,6 +8018,177 @@ fn work_admission_returns_the_durable_selection_and_compares_the_original_reques
     Ok(())
 }
 
+#[tokio::test]
+async fn a_shared_work_projection_cannot_create_another_local_admission() -> Result<()> {
+    use crate::work::RequestedWorkKind;
+    let net = net()?;
+    let mut origin = store(&net)?;
+    conversation(&mut origin, &net)?;
+    let mut request = admission_request(&net, "c", "synced", RequestedWorkKind::Agent(None))?;
+    request.thread = Some("t".into());
+    request.title = request.prompt.clone();
+    let frozen = ResolvedModel {
+        provider: Provider::Codex,
+        model: None,
+    };
+    assert!(origin.accepted_work(&net.network, &request)?.is_none());
+    assert!(
+        origin
+            .accept_work(&net.a, &net.network, request.clone(), frozen.clone(), 3)?
+            .created
+    );
+    let mut replica = store(&net)?;
+    let events = origin.events_from(&net.network, &net.a.device_id()?, 1, 500)?;
+    replica.ingest_events(&net.network, &events)?;
+    assert_eq!(replica.works(&net.network, "c")?.len(), 1);
+    assert!(replica.work_records()?.is_empty());
+    assert!(
+        replica
+            .accepted_work(&net.network, &request)
+            .unwrap_err()
+            .to_string()
+            .contains("without admission")
+    );
+    assert!(
+        replica
+            .accept_work(&net.a, &net.network, request.clone(), frozen.clone(), 4)
+            .is_err()
+    );
+    assert!(replica.work_records()?.is_empty());
+    assert_eq!(replica.works(&net.network, "c")?.len(), 1);
+    let projection = json!(replica.works(&net.network, "c")?[0]);
+    let mut args = json!(request);
+    args.as_object_mut().unwrap().remove("cwd");
+    args.as_object_mut().unwrap().remove("title");
+    let replica = std::cell::RefCell::new(replica);
+    let failure = crate::agent_cli::dispatch(
+        &args,
+        |_| std::future::ready(Ok(projection.clone())),
+        |args| {
+            std::future::ready((|| -> Result<serde_json::Value> {
+                let attempted = serde_json::from_value(args)?;
+                replica.borrow_mut().accept_work(
+                    &net.a,
+                    &net.network,
+                    attempted,
+                    frozen.clone(),
+                    4,
+                )?;
+                bail!("must not admit a projection without a local run")
+            })())
+        },
+        |_, _| async { bail!("must not bind or send") },
+        |_| async { bail!("must not ask readiness") },
+        None,
+    )
+    .await
+    .expect_err("a full projection is not a local admission");
+    assert!(
+        failure.to_string().contains("without admission"),
+        "{failure:#}"
+    );
+    let mut replica = replica.into_inner();
+    assert!(replica.work_records()?.is_empty());
+    let fresh = admission_request(&net, "c", "fresh", RequestedWorkKind::Task)?;
+    assert!(replica.accepted_work(&net.network, &fresh)?.is_none());
+    let accepted = replica.accept_work(&net.a, &net.network, fresh, frozen, 5)?;
+    assert!(accepted.created);
+    assert_eq!(replica.work_records()?.len(), 1);
+    assert_eq!(replica.works(&net.network, "c")?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dispatch_readback_revalidates_a_late_store_winner_and_a_lost_write_response() -> Result<()>
+{
+    use crate::work::{RequestedWorkKind, WorkRequest};
+    use std::{
+        cell::{Cell, RefCell},
+        future::ready,
+    };
+    for (before_ready, changed) in [(true, false), (true, true), (false, false)] {
+        let net = net()?;
+        let mut store = store(&net)?;
+        conversation(&mut store, &net)?;
+        let mut request = admission_request(&net, "c", "late", RequestedWorkKind::Agent(None))?;
+        if before_ready {
+            request.thread = Some("t".into());
+            request.title = request.prompt.clone();
+        }
+        let mut args = json!(request);
+        if before_ready {
+            args.as_object_mut().unwrap().remove("title");
+            args.as_object_mut().unwrap().remove("cwd");
+        }
+        if changed {
+            args["prompt"] = json!("changed");
+        }
+        let store = RefCell::new(store);
+        let lookups = Cell::new(0);
+        let tracks = Cell::new(0);
+        let ready_calls = Cell::new(0);
+        let frozen = ResolvedModel {
+            provider: Provider::Codex,
+            model: None,
+        };
+        let result = crate::agent_cli::dispatch(
+            &args,
+            |_| {
+                lookups.set(lookups.get() + 1);
+                ready((|| -> Result<serde_json::Value> {
+                    Ok(store.borrow().works(&net.network, "c")?.into_iter().find(|work| work.work_id == request.work_id).map(|work| json!(work)).unwrap_or_else(|| json!({"found":false})))
+                })())
+            },
+            |args| {
+                tracks.set(tracks.get() + 1);
+                ready((|| -> Result<serde_json::Value> {
+                    let attempted: WorkRequest = serde_json::from_value(args)?;
+                    let admitted = store.borrow_mut().accept_work(&net.a, &net.network, attempted, frozen.clone(), 4)?;
+                    if admitted.created { bail!("the durable write succeeded but its response was lost"); }
+                    Ok(json!({"work_id":admitted.spec.work_id,"resolved":admitted.spec.resolved,"may_send":false}))
+                })())
+            },
+            |_, _| async { bail!("readback must not bind or send") },
+            |_| {
+                ready_calls.set(ready_calls.get() + 1);
+                ready((|| -> Result<Option<String>> {
+                    assert!(store.borrow_mut().accept_work(&net.a, &net.network, request.clone(), frozen.clone(), 3)?.created);
+                    bail!("native readiness failed after a concurrent durable admission")
+                })())
+            },
+            None,
+        ).await;
+        if changed {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("changed: title, prompt")
+            );
+        } else {
+            let result = result?;
+            assert_eq!(result["work_id"], request.work_id);
+            assert_eq!(result["resolved"], json!(frozen));
+            assert_eq!(result["may_send"], false);
+        }
+        assert_eq!(lookups.get(), if before_ready { 2 } else { 1 });
+        assert_eq!(ready_calls.get(), usize::from(before_ready));
+        assert_eq!(tracks.get(), if before_ready { 1 } else { 2 });
+        let store = store.borrow();
+        assert_eq!(store.work_records()?.len(), 1);
+        assert_eq!(
+            store
+                .context(&net.network, "c", None)?
+                .events
+                .iter()
+                .filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. }))
+                .count(),
+            1
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn concurrent_implicit_admissions_return_the_same_transaction_winner() -> Result<()> {
     use crate::work::RequestedWorkKind;

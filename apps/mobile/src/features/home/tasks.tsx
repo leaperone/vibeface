@@ -82,7 +82,7 @@ function TaskRow({ work, projected, bot, lookup, connected, progress }: { work: 
   const active = taskActive(rawState) && !stale
   const unknown = !failed && (stale || rawState === 'unverified' || rawState === 'awaiting_confirmation' || rawState === 'unknown' || rawState === 'dispatch_unverified' || rawState === 'accepted_waiting_sync')
   const icon: LucideIcon = failed ? CircleX : unknown ? CircleQuestionMark : rawState === 'interrupted' ? CircleStop : active ? LoaderCircle : CircleCheck
-  const agent = taskAgent(work, lookup.nodes)
+  const agent = taskAgent(work)
   const device = nodeName(work.target_node, lookup)
   const title = work.title || '任务'
   const href = bot ? `/b/${bot.bot_id}/work/${work.work_id}` as const : undefined

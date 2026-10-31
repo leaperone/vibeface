@@ -531,14 +531,14 @@ async fn main() -> Result<()> {
         } => call_tool(name, json, call_ref).await,
         Action::Codex { socket, command } => {
             use vibeface::agent_cli::{Command, run};
-            let socket = || {
+            let required_socket = || {
                 socket
                     .clone()
                     .context("--socket or VIBEFACE_CODEX_SOCKET is required")
             };
             match command {
                 CodexCommand::Call { method, params } => {
-                    run(&socket()?, Command::Call { method, params }).await
+                    run(&required_socket()?, Command::Call { method, params }).await
                 }
                 CodexCommand::Send {
                     thread,
@@ -554,12 +554,12 @@ async fn main() -> Result<()> {
                     );
                     let args = json!({"thread":thread,"prompt":text,"call_ref":id,"agent":"codex",
                         "model":model,"effort":effort,"images":image});
-                    let result = dispatch_work(&args, &id, &socket()?).await?;
+                    let result = dispatch_work(&args, &id, socket.as_deref()).await?;
                     println!("{}", serde_json::to_string(&result)?);
                     Ok(())
                 }
                 CodexCommand::Watch { thread } => {
-                    run(&socket()?, Command::Watch { thread_id: thread }).await
+                    run(&required_socket()?, Command::Watch { thread_id: thread }).await
                 }
             }
         }
@@ -1684,9 +1684,8 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
         })?;
     let call_id = arguments["call_ref"].as_str().unwrap_or_default();
     let result = if tool == vibeface::tools::Tool::DispatchWork {
-        let socket = std::env::var_os("VIBEFACE_CODEX_SOCKET")
-            .context("VIBEFACE_CODEX_SOCKET is required")?;
-        dispatch_work(&arguments, call_id, Path::new(&socket)).await
+        let socket = std::env::var_os("VIBEFACE_CODEX_SOCKET");
+        dispatch_work(&arguments, call_id, socket.as_deref().map(Path::new)).await
     } else {
         post_tool(tool.name(), arguments.clone(), call_id).await
     }
@@ -1713,9 +1712,10 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
 }
 
 /// `dispatch_work` and `codex send`: the Node tracks and watches the work; the CLI sends it.
-async fn dispatch_work(arguments: &Value, call_id: &str, socket: &Path) -> Result<Value> {
+async fn dispatch_work(arguments: &Value, call_id: &str, socket: Option<&Path>) -> Result<Value> {
     vibeface::agent_cli::dispatch(
         arguments,
+        |call_ref| post_tool("call_lookup", json!({"call_ref":call_ref}), call_id),
         |args| post_tool("track_work", args, call_id),
         |work_id, report| {
             post_tool(

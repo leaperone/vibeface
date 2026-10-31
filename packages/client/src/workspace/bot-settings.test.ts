@@ -1,10 +1,18 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { formatIn, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger, sortSchedules } from "./bot-settings.ts"
+import { botModelRows, formatIn, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger, sortSchedules } from "./bot-settings.ts"
 import { parseBots, parseConversation } from "./model.ts"
 import type { BotChangeRecord } from "./types.ts"
 
 const at = (day: number, hour: number, minute = 0) => new Date(2026, 9, day, hour, minute).getTime()
+
+test("unknown running providers still show effort-only Bot preferences without duplicates", () => {
+  assert.deepEqual(botModelRows({ models: {}, reasoning_efforts: { codex: "high" } }, null), [["codex", ""]])
+  const bot = { models: { claude: "sonnet" }, reasoning_efforts: { codex: "high", claude: "low" } }
+  assert.deepEqual(botModelRows(bot, null), [["codex", ""], ["claude", "sonnet"]])
+  assert.deepEqual(botModelRows(bot, "pi"), [["pi", ""]])
+  assert.deepEqual(botModelRows({ models: {} }, null), [])
+})
 
 test("schedule frequency reads as plain words in local time", () => {
   const first = at(20, 9, 5)
