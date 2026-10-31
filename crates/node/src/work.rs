@@ -80,6 +80,12 @@ impl DispatchState {
             Self::Pending | Self::Accepted => None,
         }
     }
+    pub fn failure(&self) -> Option<FailureKind> {
+        match self {
+            Self::Rejected { failure, .. } => *failure,
+            _ => None,
+        }
+    }
 }
 
 /// A stop the user asked for, stored before anything is sent. For another Node's work it is

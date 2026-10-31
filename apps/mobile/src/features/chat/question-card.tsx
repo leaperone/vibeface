@@ -3,7 +3,7 @@ import { Link } from 'expo-router'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
-import { answerLabel, declined, questionMeta, sharedProject } from '@vibeface/client/workspace/questions.ts'
+import { answerLabel, approvalTask, declined, questionMeta, sharedProject } from '@vibeface/client/workspace/questions.ts'
 import { ArrowUp, CircleCheck, CircleSlash, CircleX, FolderOpen, Hand, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, Laptop, PencilLine, TriangleAlert, type LucideIcon } from 'lucide-react-native'
 import { useState } from 'react'
 import { Pressable, TextInput, View } from 'react-native'
@@ -38,8 +38,12 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState('')
   const settled = question.answer?.text ?? answer
-  if (settled !== undefined) return <Settled icon={declined(settled) ? CircleX : CircleCheck} className={declined(settled) ? 'text-danger' : 'text-success'} ask={question.text}>{declined(settled) ? answerLabel(settled) : settled}</Settled>
-  if (question.closed) return <Settled icon={CircleSlash} ask={question.text}>已失效</Settled>
+  const member = workspace.members.find((item) => item.device_id === question.about.node)
+  // Read back later, an answered approval says which task on which device it settled.
+  const heldTask = inTask ? null : approvalTask(question, [...shared?.openWorks ?? [], ...shared?.data?.works ?? []])
+  const about = heldTask ? `${heldTask} · ${member?.name ?? '另一台设备'}` : undefined
+  if (settled !== undefined) return <Settled icon={declined(settled) ? CircleX : CircleCheck} className={declined(settled) ? 'text-danger' : 'text-success'} ask={question.text} about={about}>{declined(settled) ? answerLabel(settled) : settled}</Settled>
+  if (question.closed) return <Settled icon={CircleSlash} ask={question.text} about={about}>已失效</Settled>
 
   const send = async (key: string, value: string) => {
     setBusy(key)
@@ -59,7 +63,6 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
     void (numbered ? send(`choice:${numbered.label}`, numbered.label) : send('text', value))
   }
   const { approval, task, local } = questionMeta(question, shared?.openWorks ?? [], workspace.bots, ready?.entry.device_id)
-  const member = workspace.members.find((item) => item.device_id === question.about.node)
   const project = question.about.cwd ? sharedProject(question.about.cwd, question.about.node, shared?.nodes ?? []) : null
   const { icon, tone } = looks[question.severity]
   return <ActionCard icon={approval ? Hand : icon} tone={tone} title={question.text}>
@@ -102,10 +105,13 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
 const row = 'min-h-12 flex-row items-center gap-3 rounded-lg border border-border bg-card px-3 py-2'
 const badge = 'min-h-7 min-w-7 items-center justify-center rounded-md'
 
-function Settled({ icon, className, ask, children }: { icon: LucideIcon; className?: string; ask: string; children: string }) {
+function Settled({ icon, className, ask, about, children }: { icon: LucideIcon; className?: string; ask: string; about?: string; children: string }) {
   return <View className="min-h-9 flex-row items-start gap-2 py-2">
     <Icon as={icon} className={cn('mt-0.5 size-4 text-muted-foreground', className)} />
-    <Text className="min-w-0 flex-1 text-meta text-muted-foreground"><Text className="text-meta text-muted-foreground" numberOfLines={1}>{ask}</Text>{' · '}<Text className="text-meta">{children}</Text></Text>
+    <View className="min-w-0 flex-1 gap-0.5">
+      {about ? <View className="min-w-0 flex-row items-center gap-1"><Icon as={ListChecks} className="size-3.5 text-muted-foreground" /><Text numberOfLines={1} className="shrink text-meta text-muted-foreground">{about}</Text></View> : null}
+      <Text className="text-meta text-muted-foreground"><Text className="text-meta text-muted-foreground" numberOfLines={1}>{ask}</Text>{' · '}<Text className="text-meta">{children}</Text></Text>
+    </View>
   </View>
 }
 

@@ -196,6 +196,17 @@ export function botOnChange(response: NodeSettingsResponse, provider: ProviderSt
   return first && provider.supports.includes('execution') ? { bot: true, execution: true } : { bot: true }
 }
 
+/**
+ * Whether a provider can be used, shown before any use is picked: an unused one reads ready once its program is here and
+ * the keys it needs are set, `missing` without its program. A used one keeps the state the device reports.
+ */
+export type Availability = Exclude<ProviderStatus['state'], 'off'> | 'missing'
+export function availability(item: Pick<ProviderStatus, 'state' | 'installed' | 'env'>): Availability {
+  if (item.state !== 'off') return item.state
+  if (!item.installed) return 'missing'
+  return item.env.some((row) => row.required && !row.set && !row.inherited) ? 'needs_setup' : 'ready'
+}
+
 /** Providers in use or on the device get a row; the others fold away until someone looks for one. */
 export function providerGroups(providers: readonly ProviderStatus[]): { shown: ProviderStatus[]; folded: ProviderStatus[] } {
   const shown = providers.filter((item) => item.installed || item.roles.length > 0)

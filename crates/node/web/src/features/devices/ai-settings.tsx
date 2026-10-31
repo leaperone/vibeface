@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ChangeEvent, type ComponentProps, type ReactNode } from "react"
 import { Asterisk, Braces, ChevronRight, CircleAlert, CircleCheck, CircleDashed, Download, ExternalLink, FolderOpen, FolderPlus, List, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { BusyIcon, Details, FolderPath, InlineError, Segmented, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
+import { BusyIcon, Details, FolderPath, InlineError, Segmented, Skeleton, toast, toneText, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
@@ -10,15 +10,15 @@ import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { botOnChange, folderSuggestions, modelTyped, parseAppServerLink, parseNodeSettings, parseProviderModels, type ModelChoice, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { availability, botOnChange, folderSuggestions, type Availability, modelTyped, parseAppServerLink, parseNodeSettings, parseProviderModels, type ModelChoice, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
-const states: Record<ProviderStatus["state"], { label: string; tone: Tone; icon: LucideIcon }> = {
+const states: Record<Availability, { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: "可用", tone: "success", icon: CircleCheck },
   needs_setup: { label: "需设置", tone: "warning", icon: CircleAlert },
   starting: { label: "启动中", tone: "neutral", icon: LoaderCircle },
-  off: { label: "未使用", tone: "neutral", icon: CircleDashed },
+  missing: { label: "未安装", tone: "neutral", icon: CircleDashed },
 }
 /** Where each provider's program comes from, and how the device uses it. */
 const install: Record<ProviderId, string> = {
@@ -281,22 +281,21 @@ const roles = {
 }
 
 /**
- * A chip for one use of a provider: its icon tells the two apart, and on, the chip is tinted so a phone without hover still reads it.
+ * A chip for one use of a provider: its glyph and label tell the two apart, and on, the chip is tinted so a phone without hover still reads it.
  * Only one provider runs the bot, so that chip draws a radio dot, picking it moves the bot here and picking it again turns it off; it stays a toggle
  * button for assistive tech for that reason. Executing tasks is a switch any provider can have on.
  * Never solid, so the page's own next step stays the only filled button.
  */
 function RoleToggle({ role, name, pressed, busy, disabled, onClick }: { role: keyof typeof roles; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
-  const { label, hint, icon: Icon } = roles[role]
+  const { label, hint } = roles[role]
   const one = role === "bot"
   return <Button type="button" size="sm" variant="outline" aria-pressed={pressed} aria-label={`${name} ${label}`} aria-description={hint(name)} title={hint(name)} disabled={disabled}
     className={cn("rounded-full", pressed ? "border-brand/30 bg-brand-soft hover:bg-brand-soft dark:border-brand/30 dark:bg-brand-soft dark:hover:bg-brand-soft" : "text-muted-foreground")} onClick={onClick}>
-    {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <Icon aria-hidden="true" />}
-    {one ? <span aria-hidden="true" className={cn("grid size-3.5 shrink-0 place-items-center rounded-full border-[1.5px] transition-colors", pressed ? "border-brand" : "border-muted-foreground/75")}>
+    {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : one ? <span aria-hidden="true" className={cn("grid size-3.5 shrink-0 place-items-center rounded-full border-[1.5px] transition-colors", pressed ? "border-brand" : "border-muted-foreground/75")}>
       <span className={cn("size-1.5 rounded-full bg-brand transition-transform", !pressed && "scale-0")} />
     </span> : <span aria-hidden="true" className={cn("relative h-3.5 w-6 shrink-0 rounded-full transition-colors", pressed ? "bg-brand" : "bg-muted-foreground/75")}>
       <span className={cn("absolute top-0.5 left-0.5 size-2.5 rounded-full bg-background transition-transform", pressed && "translate-x-2.5")} />
-    </span>}{label}
+    </span>}<span className="whitespace-nowrap">{label}</span>
   </Button>
 }
 
@@ -309,7 +308,8 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
   const bot = item.roles.includes("agent"), execution = item.roles.includes("execution")
   const botable = item.supports.includes("agent"), executable = item.supports.includes("execution")
   const manager = bot ? response.settings.manager : null
-  const state = states[item.state]
+  const usable = availability(item)
+  const state = states[usable]
   const [editing, setEditing] = useState<string | null>(null)
   const [deleting, setDeleting] = useState<string | null>(null)
   const [value, setValue] = useState("")
@@ -375,13 +375,15 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
             </li>
   }
   return <li>
-    <div className="flex min-h-14 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2">
-      <div className="flex items-center gap-3">
-        <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
-        <span className="font-medium whitespace-nowrap">{name}</span>
-        {item.state === "off" ? null : <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>}
+    <div className="flex min-h-14 items-center gap-3 px-4 py-2">
+      <Icon aria-hidden="true" className={cn("size-5 shrink-0", usable === "missing" ? "text-muted-foreground/60" : "text-muted-foreground")} />
+      <div className="grid min-w-0 flex-1">
+        <span className={cn("truncate font-medium", usable === "missing" && "text-muted-foreground")}>{name}</span>
+        <span className={cn("flex min-w-0 items-center gap-1 text-meta", toneText[state.tone])}>
+          <state.icon aria-hidden="true" className={cn("size-3.5 shrink-0", usable === "starting" && "animate-spin")} /><span className="truncate">{state.label}</span>
+        </span>
       </div>
-      <div className="ms-auto flex shrink-0 gap-2">
+      <div className="flex shrink-0 gap-2">
         {botable ? <RoleToggle role="bot" name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
           onClick={() => bot ? void change("bot", { bot: false }) : turnOn("bot")} /> : null}
         {executable ? <RoleToggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
