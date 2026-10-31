@@ -3849,10 +3849,19 @@ pub(super) mod tests {
         admin: &LocalIdentity,
         id: &str,
     ) -> Result<(String, String)> {
+        start_reply_in(node, admin, "c", id).await
+    }
+
+    async fn start_reply_in(
+        node: &Runtime,
+        admin: &LocalIdentity,
+        scope: &str,
+        id: &str,
+    ) -> Result<(String, String)> {
         let network = node.network_id().await?;
         let posted = admin.attest(
             &network,
-            "c",
+            scope,
             EventBody::MessagePosted {
                 message_id: id.into(),
                 role: crate::model::Role::User,
@@ -3871,7 +3880,7 @@ pub(super) mod tests {
         store.accept_message(
             &node.identity,
             &network,
-            "c",
+            scope,
             id,
             id,
             vec![],
@@ -3880,11 +3889,29 @@ pub(super) mod tests {
             now_ms(),
         )?;
         let claimed = store
-            .claim_next(&node.identity, &network, "c", "boot", "cfg")?
+            .claim_next(&node.identity, &network, scope, "boot", "cfg")?
             .context("job")?;
         let trigger = claimed.job.trigger.clone();
         let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
-        store.mark_started("c", &trigger, &attempt)?;
+        store.record_turn_runtime(
+            scope,
+            &trigger,
+            &attempt,
+            &crate::scheduling::TurnRuntime {
+                provider: Provider::Codex,
+                model: Some("fixture".into()),
+                reasoning_effort: None,
+                generation: node.provider_config_id(Provider::Codex),
+                session_generation: claimed.session_generation,
+                delivery_id: attempt.clone(),
+                stage: vibeface_bridge::failure::ProviderStage::Validate,
+                execution: crate::scheduling::TurnExecution::NotStarted,
+                attempted_at_ms: now_ms(),
+                switched_from: None,
+                switch_reason: None,
+            },
+        )?;
+        store.mark_started(scope, &trigger, &attempt)?;
         Ok((trigger, attempt))
     }
 
@@ -3894,14 +3921,22 @@ pub(super) mod tests {
         let result = async {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
-            let _requests = answering_app_server(&node)?;
-            while node.codex.status().await["connection"]["state"] != "connected" {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            bot(&node, &admin, "d", "后端", &[]).await?;
+            let mut requests =
+                scripted_app_server(&node, |request| match request["method"].as_str() {
+                    Some("thread/read") => json!({"result":{"thread":{"turns":[
+                    {"id":"turn","status":"completed","items":[]}]}}}),
+                    _ => json!({"result":{}}),
+                })?;
+            tokio::time::timeout(Duration::from_secs(5), connected(&node)).await?;
             let network = node.network_id().await?;
             assert_eq!(node.codex.server(), "system");
-            for (id, server) in [("m1", "own:"), ("m2", "system")] {
-                let (trigger, attempt) = start_reply(&node, &admin, id).await?;
+            let mut foreign_attempt = String::new();
+            for (scope, server) in [("c", "own:"), ("d", "system")] {
+                let (trigger, attempt) = start_reply_in(&node, &admin, scope, "m1").await?;
+                if server == "own:" {
+                    foreign_attempt = attempt.clone();
+                }
                 let mut store = node.store.lock().await;
                 store.record_manager_turn(
                     &attempt,
@@ -3920,7 +3955,7 @@ pub(super) mod tests {
                 store.finish_job(
                     &node.identity,
                     &network,
-                    "c",
+                    scope,
                     &trigger,
                     &attempt,
                     interrupted,
@@ -3928,6 +3963,7 @@ pub(super) mod tests {
                     now_ms(),
                 )?;
             }
+            node.reconcile_checks(&network).await?;
             node.reconcile_checks(&network).await?;
             let left = node.store.lock().await.pending_checks()?;
             let servers: Vec<_> = left
@@ -3938,7 +3974,39 @@ pub(super) mod tests {
             assert_eq!(
                 servers,
                 ["own:"],
-                "only the turn on this App Server was found gone"
+                "only this App Server's confirmed terminal turn is settled"
+            );
+            assert_eq!(
+                left[0].attempt_id, foreign_attempt,
+                "the original foreign attempt stays pending"
+            );
+            let store = node.store.lock().await;
+            let foreign = store
+                .scheduler_job("c", "message:m1")?
+                .context("foreign job")?;
+            assert!(matches!(
+                foreign.state,
+                crate::scheduling::JobState::Reconciling { .. }
+            ));
+            assert!(store.message(&network, "c", &foreign.message_id)?.is_none());
+            assert!(matches!(
+                store
+                    .scheduler_job("d", "message:m1")?
+                    .context("local job")?
+                    .state,
+                crate::scheduling::JobState::Completed { .. }
+            ));
+            let sent: Vec<_> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
+            assert_eq!(
+                sent.iter()
+                    .filter(|request| request["method"] == "thread/read")
+                    .count(),
+                1
+            );
+            assert!(
+                sent.iter().all(|request| request["method"] != "turn/start"
+                    && request["method"] != "turn/steer"),
+                "reconciliation never resends either prompt"
             );
             Ok::<_, anyhow::Error>(())
         }
@@ -4421,7 +4489,9 @@ pub(super) mod tests {
             node.finish_manager_attempt(&attempt).await;
             let refused = refused.expect_err("a call_ref with a slash");
             assert!(
-                refused.to_string().starts_with("call_ref must contain"),
+                refused
+                    .to_string()
+                    .starts_with("arguments.call_ref is invalid: id must contain"),
                 "{refused:#}"
             );
             assert_eq!(created?["name"], "2SOMEone/LEAPERone");
@@ -4440,13 +4510,13 @@ pub(super) mod tests {
         Unknown,
     }
 
-    fn coordination_app_server(
+    async fn coordination_app_server(
         node: &Runtime,
     ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
-        coordination_server(node, CoordinationReply::Complete)
+        coordination_server(node, CoordinationReply::Complete).await
     }
 
-    fn coordination_server(
+    async fn coordination_server(
         node: &Runtime,
         response: CoordinationReply,
     ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
@@ -4499,6 +4569,7 @@ pub(super) mod tests {
                 });
             }
         });
+        tokio::time::timeout(Duration::from_secs(5), connected(node)).await?;
         Ok(received)
     }
 
@@ -4525,7 +4596,7 @@ pub(super) mod tests {
                 "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms) VALUES(?,?,?,?,?,?)",
                 params![network, "memory-2", "c", "长".repeat(500), "r", now_ms() + 1],
             )?;
-            let mut requests = coordination_app_server(&node)?;
+            let mut requests = coordination_app_server(&node).await?;
             node.ingest_agent_event(turn("s1", "t1", "/tmp")).await?;
             node.wake_agent().await?;
             let prompt = turn_starts(&mut requests).concat();
@@ -4556,7 +4627,7 @@ pub(super) mod tests {
                 .lock()
                 .await
                 .reserve_budget(&triage, limit - 1, limit)?;
-            let mut requests = coordination_app_server(&node)?;
+            let mut requests = coordination_app_server(&node).await?;
 
             node.ingest_agent_event(turn("s1", "t1", "/tmp")).await?;
             node.wake_agent().await?;
@@ -4818,6 +4889,7 @@ pub(super) mod tests {
         let result = async {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
+            let mut calls = coordination_app_server(&node).await?;
             node.settings
                 .lock()
                 .unwrap()
@@ -4831,6 +4903,7 @@ pub(super) mod tests {
                 .wake_agent()
                 .await
                 .expect_err("invalid manager workspace");
+            assert!(error.to_string().contains("manager workspace"), "{error:#}");
             assert_eq!(
                 error
                     .downcast_ref::<manager::ManagerError>()
@@ -4842,6 +4915,7 @@ pub(super) mod tests {
             assert_eq!(status["budget"]["used"], 0);
             assert_eq!(status["pending_events"], 1);
             assert_eq!(status["unknown_events"], 0);
+            assert!(turn_starts(&mut calls).is_empty());
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -4875,13 +4949,7 @@ pub(super) mod tests {
             let result = async {
                 with_agent(&node);
                 bot(&node, &admin, "c", "前端", &[]).await?;
-                let mut calls = coordination_server(&node, reply)?;
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    while node.codex.status().await["connection"]["state"] != "connected" {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                })
-                .await?;
+                let mut calls = coordination_server(&node, reply).await?;
                 node.ingest_agent_event(turn("s", "t", "/tmp")).await?;
                 let error = node
                     .wake_agent()
@@ -5016,7 +5084,7 @@ pub(super) mod tests {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;
-            let mut calls = coordination_app_server(&node)?;
+            let mut calls = coordination_app_server(&node).await?;
             let answered_request = node.ingest_agent_event(asks_permission("respond-before-crash")).await?;
             let TriageAdmission::Claimed(answered_attempt) = node.store.lock().await.admit_triage(&network, &node.boot, 1, 100, now_ms())? else { bail!("response claim"); };
             *lock(&node.triage.active) = Some(answered_attempt.id().into());
@@ -5074,7 +5142,7 @@ pub(super) mod tests {
         let result = async {
             let (old_action, dismissed, answered_request) = before?;
             with_agent(&reopened);
-            let mut calls = coordination_app_server(&reopened)?;
+            let mut calls = coordination_app_server(&reopened).await?;
             let status = reopened.triage_status().await?;
             assert_eq!(status["budget"]["used"], 4, "no crash restores refund authority");
             assert_eq!(status["unknown_events"], 4, "reserve, accepted, response and action-before-finish crashes remain observable");
@@ -5127,7 +5195,7 @@ pub(super) mod tests {
             assert!(lock(&reopened.triage.answered).is_empty());
             assert!(reopened.triage_command(json!({"action":"respond","request_id":request,"result":{"behavior":"allow"}})).await.is_err());
             assert_eq!(reopened.wait_request(&request).await, undecided());
-            let mut calls = coordination_app_server(&reopened)?;
+            let mut calls = coordination_app_server(&reopened).await?;
             reopened.wake_agent().await?;
             reopened.wake_agent().await?;
             assert_eq!(turn_starts(&mut calls).len(), 1, "retained events have one review without a phantom reply");
@@ -5233,7 +5301,7 @@ pub(super) mod tests {
         let result = async {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
-            coordination_app_server(&node)?;
+            coordination_app_server(&node).await?;
             node.coordination_turn(None, |_| Ok("triage".into()))
                 .await?;
             *node.triage.config.lock().unwrap() = TriageConfig {

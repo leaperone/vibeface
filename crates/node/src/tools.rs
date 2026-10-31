@@ -479,7 +479,8 @@ impl Tool {
             validate_schema(&args, &schema, "arguments")?;
         }
         if let Some(call_ref) = args["call_ref"].as_str() {
-            vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
+            vibeface_protocol::validate_id(call_ref)
+                .map_err(|error| anyhow::anyhow!("arguments.call_ref is invalid: {error}"))?;
         }
         Ok((tool, args))
     }
@@ -735,6 +736,25 @@ mod tests {
             assert!(
                 Tool::invocation("tool_call", args.clone()).is_err(),
                 "{args}"
+            );
+        }
+        for (name, args) in [
+            ("create_bot", json!({"name":"Docs","call_ref":"bots/docs"})),
+            (
+                "tool_call",
+                json!({"name":"create_bot","arguments":{"name":"Docs","call_ref":"bots/docs"}}),
+            ),
+            (
+                "tool_call",
+                json!({"name":"create_bot","arguments":{"name":"Docs"},"call_ref":"bots/docs"}),
+            ),
+        ] {
+            let error = Tool::invocation(name, args).expect_err("invalid call reference");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("arguments.call_ref is invalid: id must contain"),
+                "{error:#}"
             );
         }
         assert!(!Tool::ConfigureBot.available(Some(TriggerKind::AgentTask)));
