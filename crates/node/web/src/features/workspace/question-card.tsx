@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
-import { answerLabel, attentionLabel, approvalTask, declined, questionMeta, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
+import { answerLabel, attentionLabel, approvalTask, declined, questionMeta, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import type { Question, Severity } from "@vibeface/client/workspace/types.ts"
@@ -37,8 +37,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
   const id = question.question_id
   const standing = answer ?? question.answer?.text
   const settled = settledAnswer(standing, workspace.answered[id])
-  // The first line asks; lines after it list what the answer applies to.
-  const [ask = question.text, ...lines] = question.text.split(/\r?\n/).filter((line) => line.trim())
+  const { ask, lines } = questionParts(question.text)
   const node = nodeName(question.about.node, { nodes: workspace.nodes, directory })
   // Read back later, an answered approval says which task on which device it settled.
   const heldTask = inTask ? null : approvalTask(question, [...workspace.openWorks, ...(workspace.data?.works ?? [])])
@@ -126,22 +125,21 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
   </ActionCard>
 }
 
-/** What an answer applies to, one line each: a label before "：" and its value. */
-function Lines({ lines, className }: { lines: string[]; className?: string }) {
+type QuestionLine = ReturnType<typeof questionParts>["lines"][number]
+
+/** What an answer applies to, one line each: a label and its value. */
+function Lines({ lines, className }: { lines: QuestionLine[]; className?: string }) {
   if (!lines.length) return null
-  return <ul className={cn("grid gap-1", className)}>{lines.map((line, index) => {
-    const colon = line.indexOf("：")
-    return <li key={index} className="flex min-w-0 flex-wrap gap-x-2 [overflow-wrap:anywhere]">
-      {colon > 0 ? <><span className="text-muted-foreground">{line.slice(0, colon)}</span><span className="min-w-0 font-medium text-foreground">{line.slice(colon + 1)}</span></> : <span className="font-medium text-foreground">{line}</span>}
-    </li>
-  })}</ul>
+  return <ul className={cn("grid gap-1", className)}>{lines.map((line, index) => <li key={index} className="flex min-w-0 flex-wrap gap-x-2 [overflow-wrap:anywhere]">
+      {line.label ? <span className="text-muted-foreground">{line.label}</span> : null}<span className="min-w-0 font-medium text-foreground">{line.value}</span>
+    </li>)}</ul>
 }
 
 /**
  * An answered or closed question as one line. With lines of detail, tapping the line opens them, so a phone without hover still sees what
  * the answer applied to. `focus`: answered here, the line takes the focus. `role`: "status" to announce it when it appears.
  */
-function Settled({ ask, lines, about, mark, focus = false, role, children }: { ask: string; lines: string[]; about?: ReactNode; mark: ReactNode; focus?: boolean; role?: "status"; children: ReactNode }) {
+function Settled({ ask, lines, about, mark, focus = false, role, children }: { ask: string; lines: QuestionLine[]; about?: ReactNode; mark: ReactNode; focus?: boolean; role?: "status"; children: ReactNode }) {
   const line = <span role={role} className="grid min-w-0 flex-1 gap-0.5">
     {about}
     <span className="flex min-w-0 flex-col gap-0.5 sm:flex-row sm:gap-2">

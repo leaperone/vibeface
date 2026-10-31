@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, roleLabel } from './protocol.ts'
+import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, roleLabel, reachDevice } from './protocol.ts'
 import type { ManagerJob, TurnRuntime } from '../workspace/types.ts'
 import { parseNodes, parseTurnRuntime } from '../workspace/model.ts'
 
@@ -29,6 +29,8 @@ test('chat rereads readiness only while a device that could reply is not ready y
   assert.equal(composerHint({ ...ready, bot: 'starting' }), 'Bot 正在启动')
   assert.equal(botReach([node(false, 'needs_setup')]), 'offline')
   assert.equal(botReach([node(false, 'needs_setup'), node(true, 'needs_setup'), node(true, 'ready')]), 'ready')
+  assert.equal(reachDevice([{ ...node(true, 'needs_setup'), device_id: 'setup' }, node(true, null)], 'needs_setup'), 'setup')
+  assert.equal(reachDevice([node(true, null)], 'none'), undefined)
   assert.equal(awaitsDevice('none'), false, 'with no device to wait on, setting one up rereads it')
   assert.equal(awaitsDevice('ready'), false)
   assert.equal(awaitsDevice('starting'), true)
@@ -43,6 +45,7 @@ test('a bot computer the Node lists offline with its last capabilities reads as 
   const reach = botReach(nodes)
   assert.equal(reach, 'offline')
   assert.equal(awaitsDevice(reach), true, 'the chat keeps rereading until the computer is back')
+  assert.equal(reachDevice(nodes, reach), 'mac', 'the chat points at the computer that is away, not the one it connects through')
   assert.equal(composerHint({ hasConversation: true, loaded: true, bot: reach }), '能运行 Bot 的设备离线了')
 })
 test('an explicit retry preserves the complete original message request', () => {

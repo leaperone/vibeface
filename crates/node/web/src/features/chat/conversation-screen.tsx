@@ -25,7 +25,8 @@ import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import type { ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
-import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, starters } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
+import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
 import { chatTimeline, firstUnread } from '@vibeface/client/chat/timeline.ts'
 import './chat.css'
 
@@ -63,7 +64,6 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
   const reach = botReach(workspace.nodes), agentReady = botCanSend(reach)
-  const unready = workspace.nodes.find((node) => botReadiness(node) === 'needs_setup')
   const sendDisabled = !workspace.writable || !bot || !agentReady || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
   const botBusy = activeJobs.length > 0
   const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
@@ -209,9 +209,9 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const targetHidden = useOffscreen(waitingTarget, entries.length)
   const reason = composerHint({ ...gate, bot: reach })
   const needsSetup = Boolean(bot && !agentReady)
-  const setupDevice = unready?.device_id ?? ready?.entry.device_id
+  const setupDevice = reachDevice(workspace.nodes, reach) ?? ready?.entry.device_id
   const away = reach === 'offline'
-  const setupTo = away || !setupDevice ? '/devices' : '/devices/$deviceId'
+  const setupTo = setupDevice ? '/devices/$deviceId' : '/devices'
   const canSetUp = ready?.principal.can_manage === true || ready?.principal.source === 'local_session'
 
   useEffect(() => {
@@ -268,7 +268,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
             : needsSetup ? <>
             <p className="flex items-center gap-1.5 text-muted-foreground"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
             {away || canSetUp ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot.bot_id }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
-              : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Crown aria-hidden="true" className="size-4 shrink-0" />请在管理设备上设置</p>}
+              : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Crown aria-hidden="true" className="size-4 shrink-0" />{setUpOnManager((directory?.members ?? []).filter((member) => member.manage).map((member) => member.name))}</p>}
           </>
             : <div className="flex flex-wrap justify-center gap-2">
               {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} type="button" variant="outline" className="rounded-full text-muted-foreground hover:text-foreground" style={{ borderColor: tint?.edge }} onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}

@@ -70,23 +70,27 @@ function TaskRow({ work, projected, bot, lookup, connected, progress }: { work: 
   const title = work.title || '任务'
   const href = bot ? `/b/${bot.bot_id}/work/${work.work_id}` as const : undefined
   const line = failed || rawState === 'dispatch_unverified' ? workFailure(work) : progress
-  return <View className={cn('min-h-16 flex-row items-center gap-3 rounded-xl border bg-card px-4 py-2.5 shadow-xs dark:border-line-strong', active ? 'border-brand/25' : 'border-border')}>
+  // The whole row opens the task, so the touch target is the row, not a line of text; the bot's name is only a label.
+  const frame = cn('min-h-16 flex-row items-center gap-3 rounded-xl border bg-card px-4 py-2.5 shadow-xs dark:border-line-strong', active ? 'border-brand/25' : 'border-border')
+  const body = <>
     {bot ? <BotFace bot={bot} mood="idle" size={28} still /> : <View className="size-8 items-center justify-center rounded-lg bg-muted"><Icon as={Bot} className="text-muted-foreground" /></View>}
     <View className="min-w-0 flex-1 gap-0.5">
       <View className="flex-row items-center gap-2">
-        {href ? <Link href={href} asChild><Pressable accessibilityRole="link" accessibilityLabel={`查看任务 ${title}`} className="min-h-9 min-w-0 flex-1 justify-center rounded-md active:opacity-60"><Text numberOfLines={1} className="font-medium">{title}</Text></Pressable></Link> : <Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{title}</Text>}
+        <Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{title}</Text>
         <View className="flex-row items-center gap-1">
           <Icon as={icon} className={cn('size-3.5', failed ? 'text-danger' : unknown ? 'text-warning' : active ? 'text-foreground' : 'text-muted-foreground')} />
           <Text numberOfLines={1} className={cn('text-meta', failed ? 'text-danger' : unknown ? 'text-warning' : 'text-muted-foreground')}>{state}</Text>
         </View>
       </View>
       <View className="flex-row flex-wrap items-center gap-x-1.5 gap-y-0.5">
-        {bot ? <Link href={`/b/${bot.bot_id}`} asChild><Pressable accessibilityRole="link" accessibilityLabel={`去对话 ${bot.name}`} className="min-h-7 max-w-[45%] flex-row items-center gap-1 rounded-md active:opacity-60"><Text numberOfLines={1} className="shrink text-meta text-muted-foreground underline">{bot.name}</Text></Pressable></Link> : <Text className="text-meta text-muted-foreground">已删除的 Bot</Text>}
+        <Text numberOfLines={1} className="max-w-[45%] shrink text-meta text-muted-foreground">{bot ? bot.name : '已删除的 Bot'}</Text>
         {agent ? <><Text className="text-meta text-muted-foreground">·</Text><Icon as={providerIcons[agent]} className="size-3.5 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{providerNames[agent]}</Text></> : null}
         <Text className="text-meta text-muted-foreground">·</Text><Icon as={Laptop} className="size-3.5 text-muted-foreground" /><Text numberOfLines={1} className="shrink text-meta text-muted-foreground">{device}</Text>
       </View>
       {line ? <Text numberOfLines={1} className={cn('text-meta', failed ? 'text-danger' : 'text-muted-foreground')}>{line}</Text> : null}
     </View>
-    {href ? <Link href={href} asChild><Pressable accessibilityRole="link" accessibilityLabel={`查看任务详情 ${title}`} className="size-11 items-center justify-center rounded-lg active:bg-muted"><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Pressable></Link> : null}
-  </View>
+    {href ? <Icon as={ChevronRight} className="size-4 text-muted-foreground" /> : null}
+  </>
+  return href ? <Link href={href} asChild><Pressable accessibilityRole="link" accessibilityLabel={[title, state, bot?.name, device, line].filter(Boolean).join('，')} className={cn(frame, 'active:bg-muted')}>{body}</Pressable></Link>
+    : <View className={frame}>{body}</View>
 }

@@ -8,9 +8,10 @@ import Animated, { useAnimatedStyle } from 'react-native-reanimated'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
-import { awaitsDevice, botReach, botCanSend, starters } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
 import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
 import { unreachable } from '@vibeface/client/workspace/home.ts'
 import { botMood, BotFace, ScreenFaces, type FaceBot } from '@/components/bot-face'
@@ -103,6 +104,10 @@ export default function ChatScreen() {
   // As on the web: until a device can reply, the empty chat says so and points a manager at the AI settings instead of offering starters.
   const reach = live ? botReach(live.nodes) : 'ready'
   const canSetUp = device.ready?.principal.can_manage === true
+  // As on the web: the device to set up, or the one that is away; this phone sets up only the computer it connects through, any other opens its page.
+  const target = live ? reachDevice(live.nodes, reach) : undefined
+  const entry = device.ready?.entry.device_id
+  const setupHref = reach === 'offline' ? (target ? `/device/${target}` as const : '/settings') : target && target !== entry ? `/device/${target}` as const : '/ai'
   // Nothing pushes a device's bot readiness, so while a device that could reply is not ready and this chat is on screen, read it again every 10s, or every 2s while it starts.
   const latestLive = useRef(live)
   latestLive.current = live
@@ -205,9 +210,9 @@ export default function ChatScreen() {
           {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="outline" className="rounded-full" style={{ borderColor: tint.edge }} onPress={() => setDraft({ text: example })}><Text className="text-muted-foreground">{example}</Text></Button>)}
         </View> : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted-foreground" /><Text className="text-muted-foreground">Bot 正在启动</Text></View> : <>
           <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="text-muted-foreground" /><Text className="text-muted-foreground">Bot 还不能回复</Text></View>
-          {reach === 'offline' ? null : canSetUp ? <Link href="/ai" asChild>
-            <Button><Icon as={Bot} /><Text>设置运行 Bot 的设备</Text></Button>
-          </Link> : <View className="flex-row items-center gap-1.5"><Icon as={Crown} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">请在管理设备上设置</Text></View>}
+          {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild>
+            <Button><Icon as={Bot} /><Text>{reach === 'offline' ? '查看设备' : '设置运行 Bot 的设备'}</Text></Button>
+          </Link> : <View className="flex-row items-center gap-1.5"><Icon as={Crown} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{setUpOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))}</Text></View>}
         </>}
       </View>
     </Animated.View>}

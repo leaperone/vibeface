@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { availability, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
-import { chatTaskState, deviceForm, deviceOnline, entryLabel, fixOnDevice, formName, taskLabel } from './labels.ts'
+import { chatTaskState, deviceForm, deviceOnline, entryLabel, fixOnDevice, formName, promptSummary, taskLabel } from './labels.ts'
 import type { NodeInfo, Question, WorkRecord } from './types.ts'
 
 const question = (id: string, closed = false): Question => ({
@@ -89,4 +89,14 @@ test('an installed provider remains unverified until the device confirms readine
   assert.equal(availability(provider({ readiness: { state: 'needs_setup', issue: { stage: 'authentication', code: 'sign_in_required' } } })), 'needs_setup')
   assert.equal(availability(provider({ readiness: { state: 'ready' } })), 'ready')
   assert.equal(availability(provider({ readiness: { state: 'starting' } })), 'starting')
+})
+
+test('a task page shows a summary of what it was asked and folds the rest', () => {
+  assert.deepEqual(promptSummary('修好登录页', '修好登录页'), { summary: '', folded: false }, 'a prompt that is its title adds nothing')
+  assert.deepEqual(promptSummary('看看依赖', '检查依赖'), { summary: '看看依赖', folded: false })
+  assert.deepEqual(promptSummary('## 目标\n把测试跑通\n细节…', '跑测试'), { summary: '目标', folded: true })
+  assert.deepEqual(promptSummary('{"task":"build"}', '构建'), { summary: '', folded: true }, 'machine text only shows under 详细信息')
+  const long = promptSummary('很'.repeat(100), '长任务')
+  assert.equal(long.summary.length, 80)
+  assert.equal(long.folded, true)
 })

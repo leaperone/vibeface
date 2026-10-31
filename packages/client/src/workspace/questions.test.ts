@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { parseAnswer, parseConversation, parseOpenWorks, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
-import { answerBody, answerLabel, attentionLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, settledAnswer, sharedProject } from "./questions.ts"
+import { answerBody, answerLabel, attentionLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, settledAnswer, sharedProject, questionParts } from "./questions.ts"
 
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/path/to/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
@@ -138,4 +138,9 @@ test('typed attention preserves the required device and distinguishes browser ta
   assert.equal(takeover.attention?.device_id, 'worker')
   assert.equal(questionMeta(approval, [], [], 'worker').approval, true)
   assert.throws(() => parseQuestions({ questions: [row('bad', 1, { attention: { kind: 'automatic_browser', device_id: 'worker' } })] }))
+})
+
+test('a question asks on its first line and lists what it applies to after it', () => {
+  assert.deepEqual(questionParts('要运行这个命令吗？\n\n命令：npm test\n在项目里'), { ask: '要运行这个命令吗？', lines: [{ label: '命令', value: 'npm test' }, { label: null, value: '在项目里' }] })
+  assert.deepEqual(questionParts('继续吗？'), { ask: '继续吗？', lines: [] })
 })

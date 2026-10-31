@@ -118,7 +118,7 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
       className="min-h-14 flex-row items-center gap-3 px-4 py-2 active:bg-muted/60" onPress={() => setOpen(!open)}>
       <Icon as={providerIcons[item.provider]} className={usable === 'missing' ? 'text-muted-foreground/60' : 'text-muted-foreground'} />
       <Text numberOfLines={1} className={cn('min-w-0 flex-1 font-medium', usable === 'missing' && 'text-muted-foreground')}>{name}</Text>
-      {using.map((role) => <Icon key={role.label} as={role.icon} className="size-4 text-brand" />)}
+      {using.map((role) => <Icon key={role.label} as={role.icon} className="size-4 text-muted-foreground" />)}
       <View className="flex-row items-center gap-1">
         <Icon as={state.icon} className={cn('size-4', toneText[state.tone])} />
         <Text className={cn('text-meta', toneText[state.tone])}>{state.label}</Text>
@@ -143,14 +143,21 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
       {item.supports.includes('agent') ? <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', assistant ? { bot: false } : botOnChange(response, item))} /> : null}
       {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
       <View className="gap-4 border-t border-border p-4">
-        {/* Keyed by the roles, so switching one drops a test result that no longer matches what runs. */}
-        {item.app_server ? <AppServerSettings key={item.roles.join()} server={item.app_server} working={working} save={change} test={test} /> : null}
-        <Field label="程序">
-          <SaveRow value={bin} saved={item.bin} placeholder={item.bin.split(/[\\/]/).pop() ?? ''} mono working={working} onChange={setBin} onSave={() => void change('bin', { bin: bin.trim() })} />
-        </Field>
-        {manager ? <AssistantDetails key={JSON.stringify(manager)} manager={manager} models={models} working={working} save={saveAssistant} /> : null}
-        <Variables item={item} working={working} change={change} />
-        {issue?.code === 'launch_failed' ? <Field label="启动失败原因"><Text selectable className="font-mono text-meta">{issue.detail}</Text></Field> : null}
+        {manager ? <AssistantDetails key={JSON.stringify(manager)} fields={['model']} manager={manager} models={models} working={working} save={saveAssistant} /> : null}
+        {item.env.some((row) => row.required) ? <Variables item={item} required working={working} change={change} /> : null}
+        {/* As on the web: connection, program and other variables are for whoever needs them; a problem in them opens the fold. */}
+        <Details label="高级" open={Boolean(issue && issue.code !== 'env_missing')}>
+          <View className="gap-4 pt-1">
+            {/* Keyed by the roles, so switching one drops a test result that no longer matches what runs. */}
+            {item.app_server ? <AppServerSettings key={item.roles.join()} server={item.app_server} working={working} save={change} test={test} /> : null}
+            {manager ? <AssistantDetails key={JSON.stringify(manager)} fields={['workspace']} manager={manager} models={models} working={working} save={saveAssistant} /> : null}
+            <Field label="程序">
+              <SaveRow value={bin} saved={item.bin} placeholder={item.bin.split(/[\\/]/).pop() ?? ''} mono working={working} onChange={setBin} onSave={() => void change('bin', { bin: bin.trim() })} />
+            </Field>
+            <Variables item={item} required={false} working={working} change={change} />
+          </View>
+        </Details>
+        {issue?.code === 'launch_failed' ? <Details label="启动失败原因"><Text selectable className="font-mono text-meta">{issue.detail}</Text></Details> : null}
       </View>
     </> : null}
     {error ? <View className="px-4 pb-3"><ErrorText error={error} /></View> : null}
@@ -222,21 +229,21 @@ function AppServerSettings({ server, working, save, test }: { server: AppServer;
 
 const assistantFields = ['model', 'workspace'] as const
 
-/** The bot's model and folder, inside the settings of the provider it runs on. */
-function AssistantDetails({ manager, models, working, save }: { manager: ManagerSettings; models: ModelChoice[] | null; working: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
+/** The bot's model or folder, as `fields` picks, inside the settings of the provider it runs on. */
+function AssistantDetails({ fields, manager, models, working, save }: { fields: readonly (typeof assistantFields)[number][]; manager: ManagerSettings; models: ModelChoice[] | null; working: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
   const [draft, setDraft] = useState(manager)
   const copy = deviceCopy.botModel
   // A model the list does not have stays typed in; 其他 opens the same field.
   const [chosen, setTyping] = useState<boolean | null>(null)
   const typing = chosen ?? modelTyped(manager.model, models)
   const cursor = manager.provider === 'cursor'
-  const dirty = assistantFields.some((key) => draft[key] !== manager[key]) || draft.reasoning_effort !== manager.reasoning_effort || JSON.stringify(draft.backup) !== JSON.stringify(manager.backup)
+  const dirty = fields.some((key) => draft[key] !== manager[key]) || fields.includes('model') && (draft.reasoning_effort !== manager.reasoning_effort || JSON.stringify(draft.backup) !== JSON.stringify(manager.backup))
   const selected = models?.find((model) => draft.model ? model.id === draft.model : model.default)
   const efforts = selected?.effort.state === 'provider_controlled' ? [] : selected?.effort.state === 'selectable' ? selected.effort.options : effortOptions(manager.provider)
   const input = (key: (typeof assistantFields)[number], label: string, placeholder?: string) => <Input accessibilityLabel={label} className={key === 'model' ? 'min-w-0 flex-1' : 'font-mono'} autoCapitalize="none" autoCorrect={false} placeholder={placeholder}
     value={draft[key]} editable={!working} onChangeText={(text) => setDraft({ ...draft, [key]: text })} />
   return <View className="gap-3">
-    <Field label={copy.label}>
+    {fields.includes('model') ? <><Field label={copy.label}>
       {models && !typing
         ? <ModelPicker models={models} value={draft.model} working={working} pick={(model) => setDraft({ ...draft, model })} other={() => { setTyping(true); setDraft({ ...draft, model: '' }) }} />
         : <View className="flex-row items-center gap-2">
@@ -252,7 +259,8 @@ function AssistantDetails({ manager, models, working, save }: { manager: Manager
       </View> : <Text className="text-meta text-muted-foreground">由 AI 服务决定</Text>}
     </Field>
     <Details label="备用策略"><BackupPolicyEditor policy={draft.backup} disabled={working} change={(backup) => setDraft({ ...draft, backup })} /></Details>
-    <Field label={folderLabels.botRun}>{input('workspace', folderLabels.botRun)}</Field>
+    </> : null}
+    {fields.includes('workspace') ? <Field label={folderLabels.botRun}>{input('workspace', folderLabels.botRun)}</Field> : null}
     {dirty ? <Button variant="outline" className="self-start" disabled={working || (cursor && !draft.model.trim()) || draft.backup.candidates.some((candidate) => !candidate.model.trim())}
       onPress={() => void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim(), backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } })}><Text>保存</Text></Button> : null}
   </View>
@@ -284,20 +292,23 @@ function ModelPicker({ models, value, working, pick, other }: { models: ModelCho
   </View>
 }
 
-/** Each variable says only whether it is set; a value is typed once and never shown again. */
-function Variables({ item, working, change }: { item: ProviderStatus; working: boolean; change(key: string, value: Change): Promise<boolean> }) {
+/**
+ * Each variable says only whether it is set; a value is typed once and never shown again. `required`: the keys the provider needs,
+ * named after their service; otherwise the rest under their own names, with a field to add one.
+ */
+function Variables({ item, required, working, change }: { item: ProviderStatus; required: boolean; working: boolean; change(key: string, value: Change): Promise<boolean> }) {
   const [editing, setEditing] = useState<string | null>(null)
   const [value, setValue] = useState('')
   const [newName, setNewName] = useState('')
   const [newValue, setNewValue] = useState('')
   const addName = newName.trim().toUpperCase()
   const set = (name: string, next: string | null) => change(`env:${name}`, { env: { [name]: next } })
-  return <Field label="环境变量">
-    {item.env.map((row) => {
+  const rows = item.env.filter((row) => row.required === required)
+  const list = rows.map((row) => {
       const missing = item.state === 'needs_setup' && !row.set && !row.inherited && row.required
       return <View key={row.name} className="gap-2 rounded-lg bg-muted/60 py-1 ps-3 pe-1">
         <View className="min-h-11 flex-row items-center gap-2">
-          <Text numberOfLines={1} className="min-w-0 flex-1 font-mono text-meta">{row.name}</Text>
+          <Text numberOfLines={1} className={cn('min-w-0 flex-1 text-meta', !required && 'font-mono')}>{required ? keyName(row.name) : row.name}</Text>
           <Text className={cn('text-meta', missing ? 'text-warning' : 'text-muted-foreground')}>{row.set ? '••••••' : row.inherited ? '沿用本机' : '未填'}</Text>
           <Button variant="ghost" size="icon" accessibilityLabel={`${row.set ? '替换' : '填写'} ${row.name}`} disabled={working} onPress={() => { setEditing(row.name); setValue('') }}><Icon as={Pencil} className="size-4" /></Button>
           {row.set ? <Button variant="ghost" size="icon" accessibilityLabel={`删除 ${row.name}`} disabled={working} onPress={() => void set(row.name, null)}><Icon as={Trash2} className="size-4" /></Button> : null}
@@ -308,7 +319,10 @@ function Variables({ item, working, change }: { item: ProviderStatus; working: b
           <Button variant="ghost" size="icon" accessibilityLabel="取消" onPress={() => { setEditing(null); setValue('') }}><Icon as={X} /></Button>
         </View> : null}
       </View>
-    })}
+    })
+  if (required) return <View className="gap-2">{list}</View>
+  return <Field label="环境变量">
+    {list}
     <Input accessibilityLabel="变量名" placeholder="变量名" className="font-mono" autoCapitalize="characters" autoCorrect={false} maxLength={256} value={newName} editable={!working} onChangeText={setNewName} />
     <View className="flex-row gap-2">
       <Input secureTextEntry accessibilityLabel="值" placeholder="值" className="min-w-0 flex-1" maxLength={4096} value={newValue} editable={!working} onChangeText={setNewValue} />
