@@ -11,6 +11,8 @@ using a controlled fixture App Server. It does not verify real provider model be
 --chat-agent checks direct App Server work through the Agent's Shell CLIs, request
 handling, triage, webhooks and decisions, and native event recovery with real Node
 processes and controlled provider protocol fixtures.
+--memory-sync checks signed user Memory controls, concurrent Agent changes, receipts,
+provenance and replay across two isolated Nodes with the same controlled fixtures.
 --web-only checks packaged Web resources through one isolated Node process.
 --auto-route checks the entry: joins, origins, revocation, unknown writes, recovery and forwarding
 through another member Gateway.
@@ -315,6 +317,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         break;
       }
       case 'attest': result = { device_id: client.deviceId, signature: client.sign('attestation', attestationPayload(input.network_id, input.scope_id, JSON.stringify(input.body))) }; break;
+      case 'request_key': result = createHash('sha256').update(attestationPayload(input.network_id, input.scope_id, JSON.stringify(input.body))).update(client.deviceId, 'utf8').digest('hex'); break;
       default: {
         const connection = connections.get(input.connection || 'main');
         if (!connection) throw new Error('no connection');
@@ -411,6 +414,11 @@ class Client:
             return self.command("attest", network_id=self.network_id, scope_id="bots", body=body)
         elif method == "control_schedule":
             body = {"type": "schedule_controlled", "schedule_id": arguments["schedule_id"], "action": arguments["action"]}
+        elif method == "control_memory":
+            body = {"type": "memory_controlled", "memory_id": arguments["memory_id"],
+                    "base": arguments["base"], "after": arguments["after"]}
+            arguments["operation_id"] = self.command("request_key", network_id=self.network_id,
+                                                     scope_id=arguments["conversation_id"], body=body)
         elif method == "set_owner":
             body = {"type": "conversation_owner", "scheduler_node": arguments["scheduler_node"], "epoch": arguments["epoch"]}
         elif method == "resolve" and arguments["check_id"].startswith("work:"):
@@ -1419,7 +1427,12 @@ def fixture_manager(run, initial, bot):
     if rename:
         tool("update_profile", {"call_ref": "rename", "name": rename.group(2).strip()})
     for action in directive.get("tools", []):
-        tool(action["name"], action["arguments"], expected=action.get("accepted", True),
+        arguments = action["arguments"]
+        if action.get("fixture_credential"):
+            require(action["name"] == "remember" and action.get("accepted") is False,
+                    "only the negative remember fixture constructs a synthetic credential")
+            arguments = {**arguments, "text": "api key sk-" + "a" * 40}
+        tool(action["name"], arguments, expected=action.get("accepted", True),
              rejection=action.get("rejection", "unknown"), discard=action.get("discard", False))
     sequence = 0
     gate = directive.get("gate")
@@ -2567,7 +2580,8 @@ def bot_settings_checks(run, a, network, passed):
         {"name": "save_schedule", "arguments": {"call_ref": "paused", "name": "Paused", "prompt": "Say the paused schedule ran.",
                                                 "first_run_at_ms": paused_at, "every_minutes": 5}},
         {"name": "remember", "arguments": {"call_ref": "note", "text": "The user prefers short replies."}},
-        {"name": "remember", "arguments": {"call_ref": "secret", "text": "api key sk-" + "a" * 40}, "accepted": False,
+        {"name": "remember", "arguments": {"call_ref": "secret", "text": "credential refusal fixture"},
+         "fixture_credential": True, "accepted": False,
          "rejection": "credential"},
         {"name": "fetch_url", "arguments": {"url": "http://127.0.0.1:1/"}, "accepted": False,
          "rejection": "local or private network"},
@@ -3051,6 +3065,351 @@ def phase1_acceptance(options):
         stop_fixture_processes(run)
         private_json(run / "report.json", report)
         print("REPORT " + str(run / "report.json"), flush=True)
+
+
+def memory_sync_acceptance(options):
+    source_binary, source_module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
+    options.artifacts.mkdir(parents=True, exist_ok=True)
+    run = options.artifacts.resolve() / ("memory-sync-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    frozen = {}
+    for source, name in ((source_binary, "vibeface"), (source_module, "vibeface_secure.mjs"),
+                         (source_module.with_name("vibeface_secure_bg.wasm"), "vibeface_secure_bg.wasm")):
+        digest = file_sha256(source)
+        shutil.copy2(source, run / name)
+        require(file_sha256(run / name) == digest, "Memory acceptance freezes each input before starting processes")
+        frozen[name] = digest
+    binary, module = run / "vibeface", run / "vibeface_secure.mjs"
+    binary.chmod(0o700)
+    workspace = run / "workspace"
+    workspace.mkdir(mode=0o700)
+    helper = run / "client.mjs"
+    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
+    helper.chmod(0o600)
+    nodes, clients, roots = [], [], {}
+    conversation, other_scope = "memory-sync-main", "memory-sync-other"
+    report = {"status": "running", "source_binary": str(source_binary), "frozen_sha256": frozen,
+              "script_sha256": file_sha256(Path(__file__).resolve()), "provider_calls": 0, "cases": {},
+              "coverage": "two real Node processes, WASM client signatures, controlled App Servers and iroh sync",
+              "not_checked": ["real provider models", "rendered Web and Mobile UI", "public NAT paths"]}
+
+    def passed(name, **evidence):
+        report["cases"][name] = evidence
+        print("PASS " + name, flush=True)
+
+    def state(client, memory_id, operation_id=None, *, scope=conversation):
+        return client.rpc("memory_state", conversation_id=scope, memory_id=memory_id,
+                          **({"operation_id": operation_id} if operation_id is not None else {}))
+
+    def base(current):
+        metadata = current["metadata"] if current else None
+        return {"epoch": metadata["epoch"] if metadata else DATA_EPOCH, "version": {
+            key: metadata[key] for key in ("revision", "control_revision", "source_event_hash")
+        } if metadata else None}
+
+    def signed(client, memory_id, current, after, *, scope=conversation):
+        arguments = {"conversation_id": scope, "memory_id": memory_id, "base": base(current), "after": after}
+        arguments["attestation"] = client.attestation("control_memory", arguments)
+        return {"method": "control_memory", **arguments}
+
+    def memory_events(node, *, scope=conversation, memory_id=None):
+        with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+            rows = connection.execute("SELECT hash,lamport,created_at_ms,envelope FROM events "
+                                      "WHERE network_id=? AND scope_id=? ORDER BY lamport,created_at_ms,hash",
+                                      (network, scope)).fetchall()
+        found = []
+        for event_hash, clock, at, envelope in rows:
+            event = json.loads(json.loads(envelope)["canonical_body"])
+            body = event["body"]
+            mutation = body if body["type"] == "memory_controlled" else body.get("change", {})
+            if (body["type"] == "memory_controlled" or mutation.get("kind") == "memory") and (
+                    memory_id is None or mutation["memory_id"] == memory_id):
+                found.append({"hash": event_hash, "lamport": clock, "created_at_ms": at, "event": event})
+        return found
+
+    def carriers(node, request):
+        expected = {"type": "memory_controlled", **{key: request[key] for key in ("memory_id", "base", "after", "attestation")}}
+        return [row for row in memory_events(node, scope=request["conversation_id"], memory_id=request["memory_id"])
+                if row["event"]["body"] == expected]
+
+    def control(client, request):
+        result = client.call("rpc", request)
+        current = result["current"]
+        counter = (request["base"]["version"] or {}).get("control_revision", 0) + 1
+        require(result == {"state": "applied", "operation_id": request["operation_id"], "current": current}
+                and current == {"memory_id": request["memory_id"], "text": request["after"], "metadata": {
+                    "epoch": DATA_EPOCH, "revision": request["operation_id"], "control_revision": counter,
+                    "source_event_hash": current["metadata"]["source_event_hash"], "origin": "user",
+                    "user_controlled": True, "essential": True}},
+                "a signed user control returns its stable version, protection and exact state")
+        require(state(client, request["memory_id"], request["operation_id"], scope=request["conversation_id"]) == {
+            "current": current, "receipt": "recorded"}, "the signed operation has an exact recorded receipt")
+        node = next(node for node in nodes if node.device_id == client.device_id)
+        sources = carriers(node, request)
+        require(len(sources) == 1 and current["metadata"]["source_event_hash"] == sources[0]["hash"],
+                "the returned source is the actual stored carrier of this exact client signature")
+        return current
+
+    def reconnect(node, client):
+        client.connect(node.device_id)
+        wait_for(f"Memory client authenticates at {node.name}", lambda: client.authenticate(network))
+        wait_for(f"{node.name} is aligned before Memory writes", lambda: node_status(node)["write_state"] == "writable", timeout=60)
+
+    def agent(label, actions):
+        receipt = a.client.rpc("message", conversation_id=conversation, message_id=label,
+                               text=json.dumps({"label": label, "tools": actions}), report_results=False)
+
+        def completed():
+            record = scheduler_record(a, network, receipt["trigger"])
+            if record and record["state"] in ("failed", "interrupted", "cancelled"):
+                raise RuntimeError("Memory fixture turn ended as " + record["state"] + ": " + record.get("detail", ""))
+            return record and record["state"] == "completed"
+        wait_for("the controlled Agent completes " + label, completed, timeout=60)
+        return [row for row in fixture_records(roots["A"], "manager-tools.jsonl") if row["trigger"] == receipt["trigger"]]
+
+    def conflicts(client):
+        return client.rpc("conversation", conversation_id=conversation)["bot_settings"]["memory_sync_conflicts"]
+
+    def provenance(node):
+        with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+            rows = connection.execute("SELECT m.conversation_id,m.memory_id,m.source_event_hash,m.changed_at_ms,e.created_at_ms "
+                                      "FROM memories m LEFT JOIN events e ON e.network_id=m.network_id AND e.hash=m.source_event_hash "
+                                      "WHERE m.network_id=? AND m.conversation_id IN (?,?) ORDER BY m.conversation_id,m.memory_id",
+                                      (network, conversation, other_scope)).fetchall()
+        require(all(changed_at == source_at for _, _, _, changed_at, source_at in rows),
+                "every Memory timestamp comes from its selected source carrier")
+        return rows
+
+    try:
+        for name in ("A", "B"):
+            node = Node(run, name, binary, workspace, helper)
+            nodes.append(node)
+            root = roots[name] = run / ("fixture-" + name)
+            root.mkdir(mode=0o700)
+            node.configure(timeout_secs=600, daily_decision_limit=100, app_server=SPAWN_APP_SERVER,
+                           manager=fixture_manager_settings(root, workspace),
+                           bins={"codex": str(fixture_wrapper(root, "fixture-codex", "--fixture-codex"))})
+            node.configure_network(relays=[], n0_relays=False, discovery=[])
+        a, b = nodes
+        a.start()
+        network = a.bootstrap()
+        b.pair(a)
+        b.start()
+        at_b = Client(b.url, helper, identity_file=a.client.identity_file)
+        clients.append(at_b)
+        at_b.network_id = network
+        reconnect(b, at_b)
+        for scope in (conversation, other_scope):
+            a.client.rpc("create_bot", bot_id=scope, conversation_id=scope, name=scope, instructions="",
+                         project={"target_node": a.device_id, "cwd": str(workspace)})
+        protected = {"memory-live-update": "remember", "memory-live-delete": "forget",
+                     "memory-tombstone-update": "remember", "memory-tombstone-delete": "forget"}
+        agent("memory-seed", [{"name": "remember", "arguments": {
+            "call_ref": memory_id, "memory_id": memory_id, "text": "Original Agent note " + memory_id}}
+            for memory_id in protected])
+        wait_for("both Nodes receive the Agent seed", lambda: converged(nodes, network), timeout=60)
+        seeds = {memory_id: state(a.client, memory_id)["current"] for memory_id in protected}
+        for memory_id, current in seeds.items():
+            rows = memory_events(a, memory_id=memory_id)
+            require(len(rows) == 1 and current == {"memory_id": memory_id, "text": "Original Agent note " + memory_id,
+                    "metadata": {"epoch": DATA_EPOCH, "revision": rows[0]["hash"], "control_revision": 0,
+                                 "source_event_hash": rows[0]["hash"], "origin": "agent",
+                                 "user_controlled": False, "essential": True}}
+                    and state(at_b, memory_id) == {"current": current, "receipt": None},
+                    "automatic Memory has the full envelope version and identical source on both Nodes")
+        passed("automatic-memory-signatures-and-metadata", memories=len(seeds))
+
+        at_b.close()
+        b.stop()
+        snapshot = run / "B-before-memory-controls"
+        shutil.copytree(b.directory, snapshot)
+        b.configure_network(bind=f"[::1]:{b.quic_port}")
+        b.start()
+        reconnect(b, at_b)
+        expected = {}
+        for memory_id, current in seeds.items():
+            request = signed(at_b, memory_id, current,
+                             None if "tombstone" in memory_id else "User protected note " + memory_id)
+            require(state(at_b, memory_id, request["operation_id"]) == {"current": current, "receipt": "not_seen_here"},
+                    "an unseen signed operation has no local receipt before its write")
+            expected[memory_id] = control(at_b, request)
+        actions = [{"name": tool, "arguments": {"call_ref": memory_id, "memory_id": memory_id,
+                    **({"text": "Stale Agent note " + memory_id} if tool == "remember" else {})}}
+                   for memory_id, tool in protected.items()]
+        agent("memory-stale", actions)
+        stale = {memory_id: state(a.client, memory_id)["current"] for memory_id in protected}
+        for memory_id, current in stale.items():
+            rows = [row for row in memory_events(a, memory_id=memory_id)
+                    if row["event"]["body"].get("cause", {}).get("message_id") == "memory-stale"]
+            require(len(rows) == 1 and current == {"memory_id": memory_id,
+                    "text": "Stale Agent note " + memory_id if protected[memory_id] == "remember" else None,
+                    "metadata": {"epoch": DATA_EPOCH, "revision": rows[0]["hash"], "control_revision": 0,
+                                 "source_event_hash": rows[0]["hash"], "origin": "agent",
+                                 "user_controlled": False, "essential": True}},
+                    "the stale Agent branch commits its own legitimate automatic update or deletion")
+        require_quiet("disjoint loopback paths preserve two genuinely different Memory branches", lambda:
+                      all(state(a.client, memory_id)["current"] == stale[memory_id]
+                          and state(at_b, memory_id)["current"] == expected[memory_id] for memory_id in protected))
+
+        original = signed(a.client, "memory-rewrapped", None, "Original signed user note")
+        require(state(a.client, original["memory_id"], original["operation_id"]) == {
+            "current": None, "receipt": "not_seen_here"}, "new user Memory has a verifiable absent base")
+        first = control(a.client, original)
+        duplicate = a.client.call("rpc", original)
+        require(duplicate == {"state": "already_recorded", "operation_id": original["operation_id"], "current": first},
+                "a recorded signed create retries without a new carrier")
+        newer = signed(a.client, original["memory_id"], first, "Newer signed user note")
+        expected[original["memory_id"]] = control(a.client, newer)
+        require(state(a.client, original["memory_id"], original["operation_id"])["receipt"] == "superseded",
+                "an older recorded user operation is distinguished from the current winner")
+        old_request = signed(a.client, original["memory_id"], first, "Uncommitted stale user draft")
+        rejected = a.client.call("rpc", old_request)
+        require(rejected == {"state": "conflict", "operation_id": old_request["operation_id"],
+                             "current": expected[original["memory_id"]]}
+                and state(a.client, original["memory_id"], old_request["operation_id"])["receipt"] == "not_seen_here",
+                "a stale local user base returns conflict without recording the draft")
+        a.client.call("rpc", {**newer, "operation_id": "0" * 64}, status=400)
+        target_clock = carriers(a, newer)[0]["lamport"]
+        for padding in range(32):
+            filler = signed(at_b, "memory-clock", state(at_b, "memory-clock")["current"], "Clock advance " + str(padding))
+            control(at_b, filler)
+            if carriers(b, filler)[0]["lamport"] > target_clock:
+                break
+        else:
+            raise AssertionError("bounded signed writes advance B beyond the newer user carrier")
+        require(state(at_b, original["memory_id"], original["operation_id"]) == {
+            "current": None, "receipt": "not_seen_here"}, "another entrance has not seen the original operation")
+        control(at_b, original)
+        rewrapped = carriers(b, original)
+        require(len(rewrapped) == 1 and rewrapped[0]["lamport"] > target_clock,
+                "the exact old client signature is genuinely rewrapped after the newer user carrier")
+        expected["memory-clock"] = state(at_b, "memory-clock")["current"]
+        passed("signed-user-controls-and-old-signature-rewrap", operation_id=original["operation_id"],
+               original_carrier=carriers(a, original)[0]["hash"], newer_clock=target_clock,
+               rewrapped_carrier=rewrapped[0]["hash"], rewrapped_clock=rewrapped[0]["lamport"])
+
+        carrier_request = signed(a.client, "memory-carrier", None, "One logical user operation")
+        carrier_a, carrier_b = control(a.client, carrier_request), control(at_b, carrier_request)
+        other_request = signed(a.client, original["memory_id"], None, "The other conversation's note", scope=other_scope)
+        other = control(a.client, other_request)
+        require(state(a.client, original["memory_id"], original["operation_id"], scope=other_scope) == {
+            "current": other, "receipt": "not_seen_here"}, "receipt lookup cannot cross the conversation boundary")
+        at_b.close()
+        b.stop()
+        b.configure_network(bind=f"127.0.0.1:{b.quic_port}")
+        b.start()
+        reconnect(b, at_b)
+        wait_for("opposite-order Memory histories converge", lambda: converged(nodes, network), timeout=60)
+        expected[carrier_request["memory_id"]] = {**carrier_a, "metadata": {**carrier_a["metadata"],
+            "source_event_hash": min(carrier_a["metadata"]["source_event_hash"], carrier_b["metadata"]["source_event_hash"])}}
+        for memory_id, current in expected.items():
+            require(state(a.client, memory_id) == state(at_b, memory_id) == {"current": current, "receipt": None},
+                    "both arrival directions select identical full Memory metadata and tombstones")
+        expected_conflicts = {memory_id: {"memory_id": memory_id,
+            "losing_revision": stale[memory_id]["metadata"]["revision"],
+            "winning_revision": expected[memory_id]["metadata"]["revision"],
+            "losing_event_hash": stale[memory_id]["metadata"]["source_event_hash"],
+            "winning_event_hash": expected[memory_id]["metadata"]["source_event_hash"], "reason": "user_protected"}
+            for memory_id in protected}
+        page = conflicts(a.client)
+        require(page == conflicts(at_b) and page["has_more"] is False and len(page["items"]) == len(expected_conflicts)
+                and {item["memory_id"]: item for item in page["items"]} == expected_conflicts,
+                "sync conflicts contain exactly the four losing branches and no body, signature or normal base history")
+        for client in (a.client, at_b):
+            require(client.call("rpc", original) == {"state": "superseded", "operation_id": original["operation_id"],
+                                                      "current": expected[original["memory_id"]]}
+                    and state(client, original["memory_id"], original["operation_id"])["receipt"] == "superseded"
+                    and state(client, original["memory_id"], scope=other_scope) == {"current": other, "receipt": None},
+                    "reconciled receipts preserve the newer value and isolate the same ID in another conversation")
+        passed("user-live-and-tombstone-beat-stale-agent-in-both-orders", conflicts=page,
+               metadata={memory_id: current["metadata"] for memory_id, current in expected.items()})
+
+        nonrepresentative = max((carrier_a, carrier_b), key=lambda current: current["metadata"]["source_event_hash"])
+        require(nonrepresentative["metadata"]["source_event_hash"] != expected["memory-carrier"]["metadata"]["source_event_hash"],
+                "the same signed operation has two distinct carrier hashes")
+        carrier_edit = signed(a.client, "memory-carrier", nonrepresentative, "Edited using the original carrier")
+        expected["memory-carrier"] = control(a.client, carrier_edit)
+        protected_attempts = agent("memory-protected-refusal", [
+            {"name": "remember", "arguments": {"call_ref": "protected-live", "memory_id": "memory-live-update",
+                                                "text": "Agent may not change user text"},
+             "accepted": False, "rejection": "user-controlled"},
+            {"name": "remember", "arguments": {"call_ref": "protected-tombstone", "memory_id": "memory-tombstone-update",
+                                                "text": "Agent may not resurrect user deletion"},
+             "accepted": False, "rejection": "user-controlled"}])
+        require(len([row for row in protected_attempts if row["name"] == "remember" and not row["accepted"]]) == 2,
+                "the real Agent tool refuses both protected live and deleted notes")
+        wait_for("the valid nonrepresentative-base edit synchronizes", lambda: converged(nodes, network), timeout=60)
+        require(conflicts(a.client) == conflicts(at_b) == page,
+                "duplicate carriers and the normal user base chain introduce no false sync conflict")
+        projection_provenance = provenance(a)
+        require(len(projection_provenance) == len(expected) + 1 and provenance(b) == projection_provenance,
+                "both Nodes retain the same source and changed_at for all live notes and tombstones")
+        passed("minimum-carrier-provenance-and-original-base", carriers=sorted(row["hash"] for row in carriers(a, carrier_request)),
+               accepted_base=nonrepresentative["metadata"]["source_event_hash"],
+               representative=min(carrier_a["metadata"]["source_event_hash"], carrier_b["metadata"]["source_event_hash"]))
+
+        memory_hashes = {scope: sorted(row["hash"] for row in memory_events(a, scope=scope))
+                         for scope in (conversation, other_scope)}
+        invocation_count = len(fixture_records(roots["A"]))
+        a.client.close()
+        at_b.close()
+        a.stop(crash=True)
+        b.stop()
+        b.directory.rename(run / "B-before-replay")
+        shutil.copytree(snapshot, b.directory)
+        a.start()
+        b.start()
+        reconnect(a, a.client)
+        reconnect(b, at_b)
+        wait_for("the restored old Node reimports the actual signed Memory log", lambda: converged(nodes, network), timeout=90)
+        for node, client in ((a, a.client), (b, at_b)):
+            require(all(state(client, memory_id) == {"current": current, "receipt": None}
+                        and state(client, memory_id, current["metadata"]["revision"]) == {"current": current, "receipt": "recorded"}
+                        for memory_id, current in expected.items())
+                    and state(client, original["memory_id"], original["operation_id"])["receipt"] == "superseded"
+                    and state(client, original["memory_id"], scope=other_scope) == {"current": other, "receipt": None}
+                    and conflicts(client) == page
+                    and provenance(node) == projection_provenance
+                    and {scope: sorted(row["hash"] for row in memory_events(node, scope=scope))
+                         for scope in (conversation, other_scope)} == memory_hashes,
+                    "restart and real log reimport preserve every value, tombstone, receipt, source and conflict")
+        require_quiet("restart and synchronization never replay the Agent or append a Memory operation", lambda:
+                      len(fixture_records(roots["A"])) == invocation_count
+                      and {scope: sorted(row["hash"] for row in memory_events(a, scope=scope))
+                           for scope in (conversation, other_scope)} == memory_hashes)
+        passed("restart-and-signed-log-replay-without-agent-effects", memories=len(expected),
+               memory_events=sum(len(hashes) for hashes in memory_hashes.values()), manager_invocations=invocation_count,
+               dag={node.name: verify_dag(node, network) for node in nodes})
+        report["status"] = "passed"
+    except BaseException as error:
+        report["status"] = "failed"
+        report["failure"] = {"type": type(error).__name__, "message": str(error), "traceback": traceback.format_exc()[-6000:]}
+        raise
+    finally:
+        cleanup_errors = []
+        for client in clients:
+            try:
+                client.close()
+            except BaseException as error:
+                cleanup_errors.append({"operation": "client.close", "type": type(error).__name__})
+        for node in reversed(nodes):
+            for operation, cleanup in (("client.close", node.client.close), ("node.stop", node.stop)):
+                try:
+                    cleanup()
+                except BaseException as error:
+                    cleanup_errors.append({"node": node.name, "operation": operation, "type": type(error).__name__})
+        for root in roots.values():
+            try:
+                stop_fixture_processes(root)
+            except BaseException as error:
+                cleanup_errors.append({"operation": "stop_fixture_processes", "type": type(error).__name__})
+        if cleanup_errors:
+            report["status"] = "failed"
+            report["cleanup_errors"] = cleanup_errors
+        private_json(run / "report.json", report)
+        print("REPORT " + str(run / "report.json"), flush=True)
+        if cleanup_errors and "failure" not in report:
+            raise RuntimeError("Memory fixture cleanup failed; see " + str(run / "report.json"))
 
 
 def web_acceptance(options):
@@ -7240,6 +7599,7 @@ if __name__ == "__main__":
         modes.add_argument("--web-only", action="store_true", help="check packaged Web resources without Node business or provider scenarios")
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
         modes.add_argument("--chat-agent", action="store_true", help="run direct App Server work, triage, decisions, cancellation and native observation process checks")
+        modes.add_argument("--memory-sync", action="store_true", help="check signed user Memory controls, cross-Node conflicts, provenance and replay")
         modes.add_argument("--auto-route", action="store_true", help="check entry joins, origins, forwarding, recovery and uncertain writes")
         modes.add_argument("--phase4", action="store_true", help="check cross-entrance coordination, agent tasks, owner moves, revocation, checks and attachments")
         modes.add_argument("--discovery", action="store_true", help="check discovery-only connection assistance, automatic normal-relay fallback, and headless Nodes")
@@ -7284,6 +7644,8 @@ if __name__ == "__main__":
                 web_acceptance(arguments)
             elif arguments.chat_agent:
                 chat_agent_acceptance(arguments)
+            elif arguments.memory_sync:
+                memory_sync_acceptance(arguments)
             elif arguments.phase1:
                 phase1_acceptance(arguments)
             else:
