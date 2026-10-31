@@ -3857,9 +3857,21 @@ def acceptance(options):
         def owner_job(state):
             view = at_c.rpc("conversation", conversation_id=conversation)
             job = next((row for row in view["scheduler"]["jobs"] if row["trigger"] == held["trigger"]), None)
+            remote = view["scheduler"]["remote"]
             return view if job and job["state"] == state and job.get("source_node") == a.device_id \
-                and view["scheduler"]["remote"] == {"owner": a.device_id, "reachable": True} else None
+                and set(remote) == {"owner", "reachable", "context", "memory_staged_count", "memory_conflicts"} \
+                and remote["owner"] == a.device_id and remote["reachable"] is True else None
         view = wait_for("C shows A's running reply", lambda: owner_job("running"), timeout=60)
+        remote = view["scheduler"]["remote"]
+        require((remote["context"] is None or isinstance(remote["context"], dict))
+                and type(remote["memory_staged_count"]) is int and remote["memory_staged_count"] >= 0
+                and isinstance(remote["memory_conflicts"], list)
+                and all(isinstance(conflict, dict) for conflict in remote["memory_conflicts"]),
+                "C receives the owner's typed context and Memory metadata")
+        require(remote["context"] == view["scheduler"]["context"]
+                and remote["memory_staged_count"] == view["bot_settings"]["memory_staged_count"]
+                and remote["memory_conflicts"] == view["bot_settings"]["memory_conflicts"],
+                "C uses the owner's context and Memory from the same response")
         require(view["observation_targets"] == [a.device_id] and view["scheduler"]["capabilities"]["cancel"] is True,
                 "C follows A's progress and offers A's stop")
         wait_for("C receives the text A's reply streams", lambda: [
