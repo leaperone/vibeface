@@ -142,3 +142,11 @@ vibeface wallet --data-dir <目录> revoke-key --intent-id <UUID> --gas-cap <原
 规范 ABI 为 [`crates/delivery/abi/Statement.sol`](../crates/delivery/abi/Statement.sol)，Rust 关系和字节约定见 [领域 API](../crates/delivery/API.md)。规范构建与真实证明入口见 [proof 构建说明](../proofs/delivery/README.md)。合约、只读结算观察器和本地部署工具见 [合约说明](../contracts/delivery/README.md)。
 
 `deploy-local.mjs` 只在字面回环地址启动独立测试链，部署正常 escrow、固定 verifier 和 TestToken，输出公开配置，不输出私钥。完整 Node 验收使用 [e2e 的付费模式](e2e.md#验证付费交付和实际结算)，在同一受限 Linux 环境生成真实证明、完成双窗口结算并只读复核原链。当前核心 CI 在整个 fixture 目录缺失时会跳过 receipt 验证并成功退出，这属于未完成的 proof 验收，不能用绿色 CI、always-true verifier 或其他 image 的证明替代。实际跳过范围见 [CI 说明](ci.md#可验证交付的核心检查)。
+
+## 小文件证明与结算实验
+
+实验从 4 KiB 单窗口合成文件开始，使用固定合成 S、R、P 测试身份、本机 `31337` 测试链和 TestToken。测试身份与接收密钥由公开 fixture 种子产生，不验证生产密钥保密。先生成并独立验证当前 image 的 KeyBinding、Source、Hold、Open 真实 receipt，再检验正常交付与资金状态。用于付款的证明必须绑定本次实际部署地址、条款和 manifest，生成后不能改写订单。
+
+对抗用例在发布交易仍待确认时，从公开 calldata 提取完整 E；随后让交易超时回滚或撤销发布块，检查退款、服务收入与 R 离线恢复原文件的实际结果。文件长度、SHA-256、交易回执和原链余额分别记录，不能用其中一项推断其他项。
+
+公开证据只包含 receipt、journal、seal、公开 manifest 和脱敏结果。私密 witness、接收私钥和临时钱包留在隔离任务目录。资源不足、未运行和验证失败须各自说明，开发模式、存根 verifier 或其他 image 的证明不算实验通过。

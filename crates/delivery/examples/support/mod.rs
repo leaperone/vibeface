@@ -6,7 +6,7 @@ pub struct Fixture {
     pub profile: ProofProfile,
     pub order: Order,
     pub encrypted: Vec<EncryptedWindow>,
-    pub lengths: Vec<usize>,
+    pub plaintexts: Vec<SecretBytes>,
 }
 
 pub fn sign(seed: u8, domain: &str, payload: &[u8]) -> PeerSignature {
@@ -76,7 +76,6 @@ pub fn fixture_with_profile(lengths: &[usize], profile: ProofProfile) -> Fixture
         valid_until: 700,
         action: BindingAction::Active,
     };
-    let binding_signature = sign(1, "delivery-key", &binding.signing_payload().unwrap());
     let terms = Terms {
         profile_id: profile.digest().unwrap(),
         guest_image_id: image,
@@ -99,22 +98,43 @@ pub fn fixture_with_profile(lengths: &[usize], profile: ProofProfile) -> Fixture
         priority_deadline: 350,
         payer_order_nonce: [0x66; 32],
     };
+    fixture_from_terms(
+        profile,
+        terms,
+        lengths
+            .iter()
+            .enumerate()
+            .map(|(index, length)| SecretBytes::new(plaintext(*length, index)))
+            .collect(),
+        Amount::from_u64(2),
+        Amount::from_u64(1),
+    )
+}
+
+pub fn fixture_from_terms(
+    profile: ProofProfile,
+    terms: Terms,
+    plaintexts: Vec<SecretBytes>,
+    delivery_fee: Amount,
+    reservation_fee: Amount,
+) -> Fixture {
+    let binding_signature = sign(1, "delivery-key", &terms.binding.signing_payload().unwrap());
     let mut offset = 0;
-    let encrypted: Vec<_> = lengths
+    let encrypted: Vec<_> = plaintexts
         .iter()
         .enumerate()
-        .map(|(index, length)| {
+        .map(|(index, plaintext)| {
             let value = encrypt_window(
                 &terms,
                 index as u16,
                 offset,
-                &plaintext(*length, index),
+                plaintext.as_bytes(),
                 &randomness(index),
-                Amount::from_u64(2),
-                Amount::from_u64(1),
+                delivery_fee,
+                reservation_fee,
             )
             .unwrap();
-            offset += *length as u64;
+            offset += plaintext.as_bytes().len() as u64;
             value
         })
         .collect();
@@ -144,7 +164,7 @@ pub fn fixture_with_profile(lengths: &[usize], profile: ProofProfile) -> Fixture
         profile,
         order,
         encrypted,
-        lengths: lengths.to_vec(),
+        plaintexts,
     }
 }
 
@@ -174,7 +194,7 @@ impl Fixture {
             Relation::Source => Witness::Source {
                 order: Box::new(self.order.clone()),
                 index,
-                plaintext: SecretBytes::new(plaintext(self.lengths[index_usize], index_usize)),
+                plaintext: SecretBytes::new(self.plaintexts[index_usize].as_bytes().to_vec()),
                 randomness: randomness(index_usize),
                 ciphertext: self.encrypted[index_usize].ciphertext.clone(),
                 capsule: self.encrypted[index_usize].capsule.clone(),

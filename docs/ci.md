@@ -5,13 +5,11 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 # 按改动选择 CI
 
-`.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。每次触发都生成计划，`ci-gate` 要求选中的任务全部成功。没有顶层 `paths` 筛选。
+`.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。常规 CI 触发时生成计划，`ci-gate` 要求选中的任务全部成功。没有顶层 `paths` 筛选。
 
-开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态。需要验证移动端或 macOS 时，从 Actions 手动运行对应 workflow。`main` push、定时、手动运行、merge queue 和 `v*` Tag 仍按各自计划检查；推送 `v*` Nightly Tag 才运行完整发布检查、原生制品和应用发布构建，合并后的制品与实际体验由开发者自行验收。
+## 每个 PR 的核心检查
 
-## main 与 merge queue 的核心检查
-
-开发分支 PR 不运行本节检查。`main` push 按路径运行核心检查；merge queue 无路径筛选，执行整个工作区的核心检查。
+Draft 与 Ready 使用相同规则。`main` push 也按路径运行核心检查；merge queue 无路径筛选，执行整个工作区的核心检查。
 
 | 改动 | 核心检查 |
 | --- | --- |
@@ -32,7 +30,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 改 `crates/node/migrations/` 下的 schema 必须同时提高 `crates/node/src/config.rs` 的 `DATA_EPOCH`，并更新相邻的 `DATA_EPOCH_SCHEMA_SHA256`；否则 Node 快速测试 `schema_changes_bump_the_data_epoch` 失败。存储 epoch 不变时旧数据库能打开，运行中才因缺列出错，自更新也会误判可原地升级。`install.sh` 中写死的 epoch 一并修改，由 `ci.py --self-test` 核对。
 
-Web 路径优先于 Node 路径，只有 `packages/client/src/avatar/face.ts` 与 `derived-faces.json` 例外：它们按 Node 路径选取，因为这组向量也是 Node Rust 测试的输入，核对 Node 由 bot ID 派生的长相与客户端一致；Node 受影响时 Web 检查照常运行。Node 对 Protocol、Bridge、Secure 的依赖用于向上扩展检查范围。离线模拟 PR 计划时按 `merge-base(base, head)..head` 的完整差异选取，删除与重命名包括旧、新路径。无法识别的输入选择整个工作区核心检查。
+Web 路径优先于 Node 路径，只有 `packages/client/src/avatar/face.ts` 与 `derived-faces.json` 例外：它们按 Node 路径选取，因为这组向量也是 Node Rust 测试的输入，核对 Node 由 bot ID 派生的长相与客户端一致；Node 受影响时 Web 检查照常运行。Node 对 Protocol、Bridge、Secure 的依赖用于向上扩展检查范围。PR 按 `merge-base(base, head)..head` 的完整差异选取，删除与重命名包括旧、新路径。无法识别的输入选择整个工作区核心检查。
 
 `delivery` 路径先于通用 Node 和 Cargo 路径匹配。它包括 `crates/delivery/`、`proofs/delivery/`、`contracts/delivery/`、`tests/fixtures/delivery-probe/`、`crates/node/src/delivery/`、发现实现、服务入口与本地钱包边界，以及两个 delivery 验收脚本。Delivery 领域库向上触发 Node 检查，因此 Rust 任务所需的 Web 和密码学资源仍会构建。完整工作区检查也要求 `delivery` 任务成功。
 
@@ -48,7 +46,7 @@ Linux 制品还使用 [e2e](e2e.md) 启动隔离 Node，在 Chromium 中验证�
 
 `scripts/check-delivery.py` 读取 `proofs/delivery/fixtures/manifest.json` 和四种关系的公开 Groth16 receipt。它通过规范入口重新编译 guest，核对 image ID、ELF SHA-256、唯一 `Statement.sol` 的 schema hash 和 47 槽 journal，再用本次构建的 host 验证 receipt。验证还要求 host 导出的 Groth16 seal 与对应公开 fixture 逐字一致，拒绝缺失或额外字段。旧 image、过期 schema、错误 journal、缺文件、dev mode 和跳过 guest 构建都会失败。
 
-现状：这 13 个证明夹具需要在 x86_64 大内存机器上生成，CI 的 11 GiB runner 和 ARM Mac 都生成不了，仓库暂不包含 `proofs/delivery/fixtures/`。目录不存在时，检查打印 `skipped: no public proof fixture`，跳过 receipt 验证和 `verify-delivery.mjs`，guest 重编、profile、跨语言向量和其余合约检查照常运行。目录一旦提交就恢复完整验证，目录存在但内容不全仍然失败。
+核心 fixture 要求四种关系各一份证明，共九个公开文件。下文完整 live 流程的十三份唯一证明是另一项验收。仓库暂不包含 `proofs/delivery/fixtures/`。目录不存在时，检查打印 `skipped: no public proof fixture`，跳过 receipt 验证和 `verify-delivery.mjs`，guest 重编、profile、跨语言向量和其余合约检查照常运行。目录一旦提交就恢复完整验证，目录存在但内容不全仍然失败。固定 11 GiB 环境是否能生成当前证明须以真实运行结果判断，文件较小不保证 Groth16 压缩所需内存较小。
 
 所有 receipt 还必须绑定产品的 `proofs/delivery/profile.json`。检查要求该文件与重编 guest 的 image、schema 相同，并固定为两个窗口、每窗 65,536 字节、总共 131,072 字节、64,000,000 cycles 和 16 GiB 内存上限。Rust fixture 命令显式读取该文件，以同一 ABI 生成 profile ID，再逐项核对 receipt；默认的 16 窗口测试 profile 不属于产品信任根。guest 不读取产品 profile 文件，避免 image 自引用。
 
@@ -75,7 +73,7 @@ python3 scripts/check-delivery.py --sandbox
 
 `--check-fixtures` 只核对公开文件结构和 schema，不验证证明。两个脚本的 `--self-test` 也只验证工具自身的正反例。整个 fixture 目录不存在时按上文跳过 receipt 验证；fixture 不全、缺编译器、依赖或 verifier 时退出失败，不能把未验证结果记为通过。
 
-开发分支 PR 不生成新的昂贵证明，也不为新容量或资源上限背书。显式手动选中的 `delivery_live` 按下文生成新的真实证明。修改密码关系或 guest 后，先验收新 image 的真实证明，再更新公开 fixture。生产 adapter 的 seal 验真只能证明该公开关系，不能单独证明托管合约已经收付款或用户已读。
+普通 PR 和扩展 CI 不生成新的昂贵证明，也不为新容量或资源上限背书。显式手动选中的 `delivery_live` 按下文生成新的真实证明。修改密码关系或 guest 后，先验收新 image 的真实证明，再更新公开 fixture。生产 adapter 的 seal 验真只能证明该公开关系，不能单独证明托管合约已经收付款或用户已读。
 
 当计划选中 `delivery` 时，Linux x64 package 任务还以本次打包的 Node 和 JS/WASM 执行 `verify-node.py --delivery-charity`。它先以 `--locked` 构建独立的 `tests/fixtures/delivery-probe`，产物放在 `.artifacts/delivery-probe/target`。probe 编译时包含当前产品的发现实现，进程验收重新核对该源码摘要。公网角色、不同个人网络的 Node、真实 loopback QUIC/Noise、免费发现、公益文件恢复及私人协议拒绝使用真实进程验证。CI 仅上传该模式的公开 `report.json`。
 
@@ -83,7 +81,31 @@ python3 scripts/check-delivery.py --sandbox
 
 ## 手动生成真实付费交付证据
 
-现有 `ci` 的手动入口提供 `delivery_live` 布尔选项，默认关闭。只有 `workflow_dispatch` 显式选中它时才运行 `delivery-live`，并额外要求该任务成功。开发分支 PR 不触发此入口；push、定时检查和节点默认付费开关沿用原规则。
+`delivery_small` 是默认关闭的独立小实验。显式选中后只运行 `delivery-small-prepare`、四关系证明 matrix 和 `delivery-small-accept`，跳过常规计划与 aggregate gate，不构建 Android 或运行 full live。两个实验选项不能同时选中。该次手动运行的成功不替代普通 PR 的最终 HEAD 检查。
+
+```sh
+gh workflow run ci.yml --ref <实验分支> -f delivery_small=true -f delivery_live=false
+# 从明确的同源运行续用已合格的公开分项。
+gh workflow run ci.yml --ref <同一提交的分支> -f delivery_small=true -f delivery_live=false -f delivery_small_resume_run=<run-id>
+# 本机只运行准备控制，不生成证明或可复用分项证书。
+python3 scripts/check-delivery.py --sandbox --prove-small prepare
+```
+
+`--prove-small` 必须指定 `prepare`、`relation-1` 至 `relation-4` 或 `accept`，不保留旧的无参数四证明入口。证明与续跑项要求真实 Actions 来源。`--resume-run` 仅供宿主选择一个明确的旧 run，不猜测分支最新运行。内部 `--resume-dir` 指向宿主已按 API、精确文件树和摘要检查的私有候选集合；容器中的 Python 用当前重编 host 验真全部合格候选后，才生成 Node 可读取的规范化目录。GH token 留在宿主，不进入容器环境、envfile 或新增挂载。
+
+小实验保持原来的 native Ubuntu x86_64 sandbox、11 GiB 内存、零 swap、64 PIDs、segment po2=20 和产品 profile。整个 small workflow 使用跨 ref 的串行 concurrency group，matrix `max-parallel: 1` 且 `fail-fast: false`。每项在 Docker build 前设置唯一绝对截止，所有子命令共用它，截止早于 hosted job 的六小时硬限，留出终止、清理和上传余量。该限制不保证任一证明能完成，也不续用证明中间的私密 checkpoint。
+
+`prepare` 使用封闭的公开测试部署配方，真实重建两个全新链与同一 4096 字节订单，逐字比较部署公开状态及四份 journal。它还完成四次 execute、八次空 stdin receipt decoder 控制和旧 image 的 PreTerms 反例。这些是非证明控制。四个证明项各自重建材料，只生成所选关系的一份真实 Groth16 receipt，或独立验真该关系已保存的合格分项。`accept` 不生成证明，先要求四份合格分项，再重放同一实际部署，完成正常 adapter 和原三条资金、恢复分支。缺项显式失败，不启动资金操作。
+
+公开 context 绑定当前干净 HEAD、实际 guest ELF/image/schema、原 profile 字节摘要、部署交易与区块、基线余额、订单和四份 journal。源码改变后不能自动续用旧分项。宿主通过当前仓库 Actions API 核对 workflow path、`workflow_dispatch`、head SHA、expiry、精确 artifact 名称、不可变 artifact ID 与 digest。允许同源 failed-job 重跑组合不同 producer attempt 的分项，不要求所有分项来自最新 attempt。相同关系的竞争候选全部独立验真后按固定来源顺序选择；冲突或声称合格但损坏的候选导致失败。只保留原 producer 与原证明资源，当前验证资源和导入 artifact ID 单独记录，不累计前驱图。
+
+同一 Held 快照分别验证正常 publish/open/withdraw 的 17 atoms、pending E 后超期失败并退款、成功 publish 后受控回滚并退款。每条分支记录实际 Token 余额、事件、交易回执和原生 gas，并由独立恢复程序只接收 Hold 与交易中实际观察到的 E，核对原文件字节和 SHA-256。公开固定的测试种子不为生产保密背书。恢复程序没有链参数，这不等于操作系统网络或文件访问隔离。快照分支不能相加为最终链上收入，Ganache 回滚不代表公网共识攻击。
+
+结果在 `.artifacts/vdp/canonical/small/<work-id>/public/`，每个阶段单独上传精确白名单。`context.json`、`summary.json` 和 `resources.json` 之外，合格关系项只有 `partials/relation-N/part.json` 及实际 `.json`、`.receipt` 两个证明文件。`VERIFIED_PARTIAL` 要求当前 host 的二进制正验、Node 单一构造的 intended wrong-journal 拒绝、全部控制、Node 清理和最终 cgroup 无 OOM 观察通过。Node 后续失败或资源 UNKNOWN/OOM 时，只能保留当前 host 已按实际 profile/context 独立验真的证明对，标为 `UNQUALIFIED`，不写可复用证书，也不满足缺项。未验真的字节永不上传。prepare 的 `PREPARED` 和本机 `local-control` 均不代表证明成功。
+
+完整验收候选通过独立二进制检查后，`proofs/` 恰好保留原四关系的九个文件，manifest 和核心 loader 不放宽。最终资源检查失败仍判整轮实验失败，但保留此前已独立验真的完整 bundle，摘要将 `VERIFIED_BUNDLE` 与整体 `FAIL` 分开。公开目录和文件分别为 `0755/0644`，私有目录和文件保持 `0700/0600`。原文、恢复文件、E、witness、接收秘密、私钥、vectors、Succinct checkpoint、calldata 与原始日志均不上传。CPU 是整个 sandbox 区间增量，`memory.peak` 是容器生命周期累计峰值，复用验证耗用不替代原证明耗用。任何证明、结算、恢复、清理或资源检查失败都不能报告完整实验通过。
+
+现有 `ci` 的手动入口提供 `delivery_live` 布尔选项，默认关闭。只有 `workflow_dispatch` 显式选中它时才运行 `delivery-live`，并额外要求该任务成功。普通 PR、push、定时检查和节点默认付费开关沿用原规则。
 
 该入口还通过 `mobile.yml` 的 `workflow_call` 构建同一提交的 Android release APK，不构建 iOS。Android 构建记录实际 APK 摘要、release variant、application id，以及 arm64-v8a 和 x86_64 两份安全库的 ELF ABI 与摘要。`delivery-live` 只接收同一 run、同一 SHA 的 Android、Linux x64 Node 包、Web 和 WASM，并重新核对源码、归档和原生库字节及生成资源的隐私收据。
 
@@ -113,7 +135,7 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 ## 定期、手动和发布检查
 
-每日 UTC 03:23 定时、Actions 中手动运行 `ci`、merge queue 和 `v*` tag 强制执行扩展检查，不受路径影响。开发分支 PR 不触发 `ci`。`v*` tag 还会构建 macOS 和 Android 发布资产；手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
+每日 UTC 03:23 定时、Actions 中手动运行 `ci`、`v*` tag 强制执行扩展检查，不受路径影响。`v*` tag 还会构建 macOS 和 Android 发布资产；手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
 
 | 扩展检查 | 执行范围 |
 | --- | --- |
@@ -137,7 +159,7 @@ CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK �
 
 ## 本地按改动补充验收
 
-开发者修改同步、恢复、调度或工具执行时，必须执行对应专项并记录命令及结果；不能只依赖下次定期运行。每次只跑相关模式。安装器或平台交付改动应额外手动触发 `ci`，确认目标平台制品。
+开发者修改同步、恢复、调度或工具执行时，除 PR 核心检查外，必须执行对应专项并记录命令及结果；不能只依赖下次定期运行。每次只跑相关模式。安装器或平台交付改动应额外手动触发 `ci`，确认目标平台制品。
 
 无需编译项目即可验证 CI 规则和发布隐私检查：
 
@@ -173,7 +195,7 @@ python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --ar
 python3 scripts/verify-node.py --binary "$binary" --crypto-module "$crypto" --artifacts .artifacts/local-phase5 --phase5
 ```
 
-身份、加入和浏览器网关改动跑 `--auto-route`，覆盖建网、目标与 Origin 校验、承诺加短码加入与授予管理权、承诺不符或拒绝作废、撤销、写入签名、CLI 加入、经另一台 Node 的 Gateway 跨入口访问、根恢复进入 48 小时等待、现有管理设备签名确认后立即生效、被现有管理设备拦下后旧恢复文件仍有效、空 Node 上的找回同样等待，以及未知写入不重放。
+身份、加入和浏览器网关改动跑 `--auto-route`，覆盖建网、目标与 Origin 校验、承诺加短码加入与授予管理权、承诺不符或拒绝作废、撤销、写入签名、CLI 加入、经另一台 Node 的 Gateway 跨入口访问、根恢复进入 48 小时等待、被现有管理设备拦下后旧恢复文件仍有效、空 Node 上的找回同样等待，以及未知写入不重放。
 
 Node 之间的传输、同步、地址簿、跨入口转发和投递改动跑默认模式（不带模式参数）。它启动四台真实 Node 和一台其他网络的 Node：P 运行成员 relay，B 只绑定 IPv6 loopback，其他 Node 只绑定 IPv4 loopback，协议族隔离使 B 必须经 relay 连接，A 负责调度。覆盖经 iroh 加入与同步、签名入口记录（浏览器 WASM 验签，伪造记录被拒）、四条跨入口转发路径与非成员拒绝、成员 Gateway 的 Origin 放行、调度 Node 离线时入口保留并投递且只执行一次、经另一入口重发得到原结果、崩溃与重启后不重放、relay 中断时直连继续而只经 relay 的 Node 在 relay 恢复后追平、入口切换后每条消息只出现一次，以及撤销后不再列出和转发。
 
@@ -191,16 +213,16 @@ CI 固定的 Chromium 用例覆盖指定 Web 流程；任务特定的页面验�
 
 ## 缓存与并发
 
-`ci` 工作流按事件类型和 Git ref 分组。开发分支 PR 不触发该工作流；主分支 push、定时、手动、merge queue 和 tag 不取消正在执行的同组运行。主分支核心检查可以与定时完整检查同时进行。各组仍遵循 GitHub 最多保留一个等待运行的规则。
+`ci` 工作流按事件类型和 Git ref 分组。PR 会取消同组中已被替代的运行；主分支 push、定时、手动和 tag 不取消正在执行的同组运行。主分支核心检查可以与定时完整检查同时进行。各组仍遵循 GitHub 最多保留一个等待运行的规则。
 
 Linux x64 制品任务使用 pnpm 缓存，并按 runner、架构和 `pnpm-lock.yaml` 缓存 Chromium 二进制。浏览器的系统依赖从 Ubuntu 官方镜像下载，沿用签名仓库配置。每次仍执行冻结依赖安装、浏览器与系统依赖安装以及完整浏览器用例。缓存只包含浏览器文件，不包含测试结果、Node 数据或下载的恢复文件。
 
-`ci` 工作流中的 Rust 缓存仅在 `refs/heads/main` 或显式 `workflow_dispatch` 时保存；自动 tag push 只读取缓存。手动运行可为相同 ref 的后续运行预热。新增 profile 或缓存 key 在首次保存前需要冷构建。
+`ci` 工作流中的 Rust 缓存仅在 `refs/heads/main` 或显式 `workflow_dispatch` 时保存；PR 和自动 tag push 只读取缓存。默认分支的缓存可供后续 PR 读取；手动运行可为相同 ref 的后续运行预热。新增 profile 或缓存 key 在首次保存前需要冷构建。
 
-Android 使用官方 Gradle 缓存动作和 Gradle build cache，保留 `arm64-v8a` 与 `x86_64` 的 release 构建。手动运行可以写入其 Git ref 的缓存。缓存命中仍需执行原构建和制品检查，不能替代本次提交的验收。
+Android 使用官方 Gradle 缓存动作和 Gradle build cache，保留 `arm64-v8a` 与 `x86_64` 的 release 构建。PR 只读 Gradle 缓存；手动运行可以写入其 Git ref 的缓存。缓存命中仍需执行原构建和制品检查，不能替代本次提交的验收。
 
 ## 合并门禁
 
-`ci-gate` 仍要求选中的任务成功，失败、取消、缺失或意外跳过均拒绝通过，并重新计算计划以防弱化覆盖。每次运行都使用固定名称汇总结果。它服务于 main、merge queue、定时、手动和 Tag 运行，不是开发分支 PR 的必需检查。
+`ci-gate` 要求选中的任务成功，失败、取消、缺失或意外跳过均拒绝通过，并重新计算计划以防弱化覆盖。每次运行都使用固定名称汇总结果。编辑 PR 标题、描述或 base 时也重新检查本次受影响范围，避免全跳过的运行缺少必需门禁。相同 PR 的新运行替代旧运行，核心与扩展检查的分层保持不变。
 
-GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate` 列为必需状态。开发分支可以直接合并；只有版本 Tag 的完整 gate、制品和发布检查仍是发布路径的一部分。
+GitHub 仓库须将 `ci-gate` 设置为必需检查，并要求更新到最新 base 或使用 merge queue，才能强制阻止未通过的合并。扩展检查已移出普通 PR；每日绿色不能替代本次 PR 核心检查，核心绿色也不能当作跨平台或完整进程验收通过。
