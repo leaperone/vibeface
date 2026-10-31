@@ -43,28 +43,35 @@ ScheduleControlled { schedule_id, action: pause | resume | delete, attestation }
 
 ## 3. 记忆
 
-每个 bot 的记忆是带版本的 BotChanged 投影。每条记录保留 epoch、revision、origin、user_controlled、essential 和 source event hash。revision 使用 reducer 写入的事件 rank，所以同一条记忆在各 Node 上有同一个冲突基准。
+每个 bot 的记忆由自动 `BotChanged` 和本人签名的 `MemoryControlled` 共同投影，主键为 `(network_id, conversation_id, memory_id)`。有效记录和删除墓碑使用同一套版本。
 
 | 字段 | 作用 |
 |---|---|
-| epoch | Memory 事件版本；投影取事件值与当前 DATA_EPOCH 的较大值，提交时按原值做冲突检查 |
-| revision | 当前事件 rank，staging 提交时必须仍然相同 |
-| origin | agent、user、review 或 import |
-| user_controlled | 防止自动 review 覆盖本人确认的事实 |
-| essential | 是否进入 essential memory block |
-| source_event_hash | 记录事实来源，不进入工具权限 |
+| epoch | 必须等于当前 DATA_EPOCH 11，不自动抬升旧事件格式 |
+| revision | 自动操作为完整事件 hash；本人操作为稳定 operation_id |
+| control_revision | 自动操作为 0；本人操作为签名 base 的计数加 1，新建为 1 |
+| origin | agent、user 或 review；自动事件只能声明 agent 或 review |
+| user_controlled | 本人接管后永久为 true，包含删除墓碑，自动修改不能覆盖 |
+| essential | 是否进入 essential memory block；本人操作固定为 true |
+| source_event_hash | 真实已验证来源；同一本人请求的多个封装取最小 hash，不改变逻辑版本 |
 
 | 工具 | 作用 |
 |---|---|
-| remember {call_ref, text, memory_id?} | 新记一条，或按 memory_id 改写 |
-| forget {call_ref, memory_id} | 删除一条 |
+| remember {call_ref, text, memory_id?} | 新记一条，或按 memory_id 改写未被本人保护的值 |
+| forget {call_ref, memory_id} | 删除一条未被本人保护的值 |
 | recall {query?} | 查询已提交记忆和当前轮的 staged overlay |
 
-每条记忆最多 500 字符，每个 bot 最多 50 条。疑似凭证的内容仍然拒绝。essential memory 的 prompt budget 是 8192 字节，超出只返回 omitted 数量，不删除 Store 中的事实。
+每条记忆最多 500 字符，每个 bot 最多 50 条有效记忆。疑似凭证的内容拒绝。essential memory 的 prompt budget 是 8192 字节，超出报告 omitted，不删除 Store 中的事实，也不推进省略记录的已发送版本。
 
-remember 和 forget 先写当前 attempt 的本机 staging。StagedMemory 带 base_epoch 和 base_revision。只有回合以 completed 结束时，它们才与回复和 job 终态在同一事务追加 BotChanged。failed、interrupted 和 unknown 都丢弃 staging。提交时如果 epoch、revision 或 user_controlled 状态变化，保留较新的记录并写本机冲突日志。
+remember 和 forget 先写当前 attempt 的 staging，保存完整 `MemoryBase {epoch, version}`，version 为空或为 `{revision, control_revision, source_event_hash}`。只有 completed 回合才与回复和 job 终态在同一事务追加事件。failed、cancelled、interrupted 和 unknown 丢弃 staging。提交时比较含墓碑的当前 epoch、revision 和 control_revision；版本变化或用户保护只记录本轮冲突，不发布失败提案。
 
-recall 会合并 committed records 和当前 attempt 的 staged overlay。staged 值只对当前回合可见，不会提前进入 DAG。跨 Node 同步只传 BotChanged 事件和 reducer 投影，不传本机 staging、Provider transcript 或 token。
+本人在现有 Context 或 Bot 面板新增、编辑接管或删除记忆，通过同一个客户端签名入口 `control_memory` 操作。本人操作永久保护该 ID，没有解除保护开关。共享仲裁先比较保护位，再比较 control_revision，最后按本人 operation_id 或自动 event rank 决胜。因此旧本人签名经另一入口重新封装不能覆盖后续编辑，任意自动操作也不能复活本人删除的记忆。未保护的自动操作之间仍按 rank 决胜；并发本人编辑和删除按同一用户顺序决胜，删除没有额外优先级。
+
+非空 base 必须对应已存已验签的直接父事件。远端验证来源，不以当前赢家做 CAS，所以到达顺序不改变合法性。新建的空 base 表示签名者未见版本，不要求封装 Node 的全部祖先都没有这个 ID。
+
+共享 `memory_sync_conflicts` 从 effective 逻辑操作和 base 链推导。同一用户签名的重复封装先折叠，赢家正常 base 链不算冲突，其他分支作为历史冲突显示，最多 50 条并带 has_more。它与 owner 的本轮 `memory_conflicts` 分开，owner 不可达时仍可展示入口已知共享冲突。冲突元数据不包含候选正文。
+
+`memory_state` 可读回墓碑并按 operation_id 对账。未知结果先查原操作，已被后续操作替代时显示 superseded。not_seen_here 只表示本入口未见，客户端仅在原 base 未变时原样重发，不替用户换 base 重签，不丢弃同 ID 未知请求。recall 只合并 committed records 和当前 attempt staging，跨 Node 不传 staging、Provider transcript 或 token。
 
 ## 4. bot 互发消息
 

@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=10`，数据库 `user_version=10`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
+协议版本为 `1`，数据格式 `data_epoch=11`，数据库 `user_version=11`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
 
 ## 身份与数据范围
 
@@ -79,8 +79,8 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 |---|---|
 | `identity.json` | 设备私钥，0600 |
 | `config.json` | 本机配置，0600 |
-| `data-epoch.json` | `{"data_epoch":10}`，程序拒绝其他 epoch |
-| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=10` |
+| `data-epoch.json` | `{"data_epoch":11}`，程序拒绝其他 epoch |
+| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=11` |
 | `bootstrap.json` | 建网前的一次性本机 capability，公共入口没有 |
 | `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；公共入口和使用它的成员 Node 各有一份 |
 | `blobs/sha256/<前两位>/<hash>` | 附件正文，`blobs/partial/` 为续传暂存 |
@@ -188,6 +188,8 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project`、`attestation` | 创建机器人和它的会话，完整请求精确去重 |
 | `delete_bot` | `conversation_id`、`attestation` | 本人删除机器人，在它的会话写 `BotDeleted`；已删除时不写。本机停下它正在跑和排队的回合，并中断它派到本机的工作，其他设备收到删除后各自停下自己的。返回 `{ written, primary }`，`primary` 为删除后的主 Bot 会话 ID |
 | `control_schedule` | `conversation_id`、`schedule_id`、`action`（`pause`、`resume` 或 `delete`）、`attestation` | 本人暂停、恢复或删除一个 schedule，写 `ScheduleControlled`；已是该状态时不写，返回 `{ written }` |
+| `control_memory` | `conversation_id`、`memory_id`、`base`、`after`、`attestation`、`operation_id` | 本人新增、接管编辑或删除记忆。签名体为 `{type:"memory_controlled", memory_id, base, after}`。返回 `{state, operation_id, current}`，state 为 applied、already_recorded、superseded 或 conflict。先核验签名和操作身份，再查 receipt，未见才在同一事务比较本机 base 并追加；conflict 不写入 |
+| `memory_state` | `conversation_id`、`memory_id`、可选 `operation_id` | 返回 `{current, receipt}`。current 为含墓碑的 `{memory_id, text, metadata}` 或 null。未指定操作时 receipt=null，否则为 recorded、superseded 或 not_seen_here。not_seen_here 只表示入口未见，不是全网未执行 |
 | `conversations` | 无 | 本地已知会话 |
 | `create_conversation` | `conversation_id`、`title`、首个负责人 `scheduler_node` 及其签名 `owner_attestation` | 以稳定 ID 创建会话 |
 | `conversation` | `conversation_id` | 会话（含负责人与 `owner_epoch`）、机器人、消息、`works`（DAG 投影，含 `state`）、`deliveries`（本机还在转交的派发和停止请求）、`changes`、`bot_settings`、`sent`（本 bot 发给其他 bot 的消息 `{message_id, to, text, created_at_ms}`，`to` 是对方会话）、`checks`、`questions`（本会话的提问及回答）、`sessions`（归给本 Bot 的外来会话，含 `muted`）、`local_node`、调度队列和 `observation_targets`（本次观察进度的设备）。负责人是其他设备时，入口限时向它读取 `scheduler_jobs`，带 `source_node` 合并进调度队列，只用于显示、不写本地；`scheduler.remote` 为 `{owner, reachable}`，联系不上时 `reachable: false` |
@@ -213,9 +215,13 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 
 `read_artifact` 默认按 UTF-8 文本分页，返回 `{ blob_hash, text, offset, next_offset, size }`，`limit` 为 4 至 65536 字节，偏移必须位于字符边界。`binary: true` 时每页 512 KiB，只读取请求的区间，返回 `{ blob_hash, offset, size, next_offset, data }`，`data` 为 base64。`next_offset` 为 `null` 时结束。浏览器拼好全部字节后用 SHA-256 与 `blob_hash` 比对，一致才保存文件。附件随引用它的消息由同步按哈希拉到其他成员 Node，还没拉到的入口读取失败，稍后再试。
 
-`changes` 按 rank 列出本会话的 bot 修改，每项为 `{ change_id, conversation_id, cause, event_hash, created_at_ms, change }`，`conversation_id` 是被修改的 bot 的会话，`cause` 为 `{ conversation_id, message_id }` 或 `null`（bot 自己定的提醒），`change` 即 `BotChanged.change`。`overwritten` 列出本会话里被另一台设备没看到就覆盖的修改，每项为 `{ change_id, field, provider?, by, value }`：`field` 为 `name`、`instructions`、`model`（带 `provider`）、`skills` 或 `avatar`，`by` 是当前值的写入设备，`value` 是当前值。它由已生效事件按 rank 现算，规则见 design/bot-config.md 第 3 节。`bot_settings` 为 `{ skills: [{ skill_id, name, description }], schedules: [{ schedule_id, name, prompt, first_run_at_ms, every_minutes?, enabled, depth?, next_run_at_ms }], memory: [{ memory_id, text }] }`，skill 是全网共用的库，schedules 只列本会话还会运行或已暂停的 schedule，暂停时 `next_run_at_ms` 为 `null`，没有 `every_minutes` 的是一次性提醒，`depth` 省略即 0。`messages` 中 `role=bot` 的是另一个 bot 发来的消息，带 `sender { conversation_id, name }`。
+`changes` 按 rank 列出本会话的 bot 修改，每项为 `{ change_id, conversation_id, cause, event_hash, created_at_ms, change }`，`conversation_id` 是被修改的 bot 的会话，`cause` 为 `{ conversation_id, message_id }` 或 `null`（bot 自己定的提醒），`change` 即 `BotChanged.change`。`overwritten` 列出本会话里被另一台设备没看到就覆盖的修改，每项为 `{ change_id, field, provider?, by, value }`：`field` 为 `name`、`instructions`、`model`（带 `provider`）、`skills` 或 `avatar`，`by` 是当前值的写入设备，`value` 是当前值。它由已生效事件按 rank 现算，规则见 design/bot-config.md 第 3 节。`bot_settings` 为 `{ skills: [{ skill_id, name, description }], schedules: [{ schedule_id, name, prompt, first_run_at_ms, every_minutes?, enabled, depth?, next_run_at_ms }], memory: [{ memory_id, text, metadata }], memory_staged_count, memory_conflicts, memory_sync_conflicts }`，skill 是全网共用的库，schedules 只列本会话还会运行或已暂停的 schedule，暂停时 `next_run_at_ms` 为 `null`，没有 `every_minutes` 的是一次性提醒，`depth` 省略即 0。`messages` 中 `role=bot` 的是另一个 bot 发来的消息，带 `sender { conversation_id, name }`。
 
 `works` 的每项包含 `work_id`、`conversation_id`、`target_node`、`trigger`、`dispatcher`、`kind`、`cwd`、`title`、`prompt`、`call_ref`、`continues`、`parent`、`thread`、`phase`、`summary`、`thread_id`、`turn_id`、`outcome`、`result_text`、`failure_reason`、`failure`，以及每台设备都从 DAG 推出的 `state`（`accepted`、`running`、`interrupting`、`finished` 或 `unverified`）。网页以 `title` 为任务名，`prompt` 作为“交代的事”显示在任务详情主区。
+
+Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, origin, user_controlled, essential}`。`base` 为 `{epoch, version}`，version 为 null 或 `{revision, control_revision, source_event_hash}`，删除必须有 version。epoch 必须为当前 11。用户 operation_id 使用 `SHA256(attestation 签名输入 ‖ 签名设备)`，入口重算后核对，签名字节和 Node 外层事件不参与。本人操作计数为 base 计数加一，空 base 为 1。自动计数固定 0，revision 为完整事件 hash；用户 revision 为 operation_id。CAS 比较 epoch/revision/control_revision，source 另验真实等价来源。相同操作的多个封装以最小 hash 作为来源代表，不改变逻辑版本。
+
+`memory_sync_conflicts` 为 `{items, has_more}`，最多 50 项。每项为 `{memory_id, losing_revision, winning_revision, losing_event_hash, winning_event_hash, reason}`，reason 为 user_protected、concurrent_automatic 或 concurrent_user。该页从入口 effective 历史的逻辑 base 链计算，同一本人操作先去重，赢家正常祖先排除，不包含候选正文。它与 owner 的本轮 `memory_conflicts` 独立，owner 不可达不影响入口共享冲突。
 
 ## 可靠调度回执
 
@@ -322,10 +328,13 @@ Event {
 | `session_attributed` | `node`、`agent`、`session_id`、`cwd`、`summary` | 运行该会话的 Node，写在接手 Bot 的会话；rank 最大者为准 |
 | `session_muted` | `node`、`session_id` | 运行该会话的 Node，写在当前接手 Bot 的会话：不再关注，新的 `session_attributed` 撤销 |
 | `bot_changed` | `change_id`、`cause`、`change` | 负责人 |
+| `memory_controlled` | `memory_id`、`base`、`after`、`attestation` | 本人客户端签名，入口 Node 封装；不运行模型 |
 | `context_checkpoint` | `covers`、`summary`、`recent_user_requests`、`open_work`、`decisions` | 负责人 |
 | `schedule_run_claimed` | `schedule_id`、`slot_ms`、`owner_epoch` | 负责人，写在 schedule 所在会话 |
 
-`bot_changed.change` 按 `kind` 区分：`profile { name?, instructions?, model?, skills?, avatar? }` 的每项为 `{ before, after }`，`avatar` 的两端为 `{ outline, eyes, hue }` 或 `null`（由 bot ID 派生）；`skill { skill_id, before, after }`、`schedule { schedule_id, before, after }` 与 `memory { memory_id, before, after }` 的 `after` 为 `null` 表示删除。skill 为 `{ name, description, body }`，名称最多 64 字符，说明最多 512 字节，正文最多 16 KiB；schedule 为 `{ name, prompt, first_run_at_ms, every_minutes?, enabled, depth? }`，名称最多 120 字符，说明最多 8 KiB，`every_minutes` 为 5 至 40320，省略时只运行一次。说明（instructions）最多 8192 字节。这个事件不带 `attestation`。`cause` 为 `{ conversation_id, message_id }`，入库时要求 `prev` 或 `deps` 中有该会话、该 `message_id` 且带 `attestation` 的本人消息，否则拒绝；带 `cause` 的 `conversation_owner` 与 `bot_created` 按同一规则核对，`conversation_owner` 还必须是 epoch 1 且 `prev` 是同一会话的 `conversation_created`。没有 `cause` 的只能是新建的一次性 schedule，且 `depth` 至少为 1。投影只比较 rank：名称、说明、模型、skill 和长相逐项后写者胜并合并进机器人定义，长相与 `bot_avatar_set` 共用一项，skill 全网按 `skill_id`、schedule 按 `schedule_id`、笔记按 `memory_id` 后写者胜并保留删除，`schedule_controlled` 按 rank 改 `enabled` 或删除，修改记录按 `change_id` 取 rank 最小者。
+`bot_changed.change` 按 `kind` 区分：`profile { name?, instructions?, model?, skills?, avatar? }` 的每项为 `{ before, after }`，`avatar` 的两端为 `{ outline, eyes, hue }` 或 `null`（由 bot ID 派生）；`skill { skill_id, before, after }`、`schedule { schedule_id, before, after }` 与 `memory { memory_id, before, after, base, origin, essential }` 的 `after` 为 `null` 表示删除。skill 为 `{ name, description, body }`，名称最多 64 字符，说明最多 512 字节，正文最多 16 KiB；schedule 为 `{ name, prompt, first_run_at_ms, every_minutes?, enabled, depth? }`，名称最多 120 字符，说明最多 8 KiB，`every_minutes` 为 5 至 40320，省略时只运行一次。说明（instructions）最多 8192 字节。这个事件不带 `attestation`。`cause` 为 `{ conversation_id, message_id }`，入库时要求 `prev` 或 `deps` 中有该会话、该 `message_id` 且带 `attestation` 的本人消息，否则拒绝；带 `cause` 的 `conversation_owner` 与 `bot_created` 按同一规则核对，`conversation_owner` 还必须是 epoch 1 且 `prev` 是同一会话的 `conversation_created`。没有 `cause` 的只能是新建的一次性 schedule，且 `depth` 至少为 1。其他配置投影比较 rank：名称、说明、模型、skill 和长相逐项后写者胜并合并进机器人定义，长相与 `bot_avatar_set` 共用一项，skill 全网按 `skill_id`、schedule 按 `schedule_id`；Memory 按 network/conversation/memory_id 隔离，用户永久优先，用户间比较 control_revision 再比较 operation_id，自动间按 rank 后写者胜，删除保留墓碑，`schedule_controlled` 按 rank 改 `enabled` 或删除，修改记录按 `change_id` 取 rank 最小者。
+
+自动 Memory origin 只接受 agent/review，不接受 user、import 或 user_controlled。所有非空 Memory base 必须指向 prev/deps 中已存、已验证的真实父事件，目标网络、会话、ID、epoch、revision 和 counter 一致，自动 before 还要等于该来源的值。入口把 source hash 加入直接依赖。导入不比较当前赢家，空 base 表示签名者未见版本，不检查封装事件全部祖先是否无此 ID。用户接管后永久保护，包含删除墓碑；未保护 Agent 并发仍 LWW，并发用户删除没有额外优先级。未知写先按 operation_id 读回，客户端保留原请求且不自动换 base 重签。
 
 `context_checkpoint`、没有 `cause` 的 `bot_changed`（bot 自设提醒）、`schedule_run_claimed` 和 `bot_messaged` 只能由对应会话的负责人写：前三者看写入的会话，`bot_messaged` 看发送方会话 `from.conversation_id`，写 `bot_messaged` 时 `deps` 也包含发送方会话里各作者的最新事件。入库和本机写入都按作者写入时的认知核对：只看作者自己此前的事件和每个 `deps` 所在日志到该依赖为止的 `conversation_owner`，其中 epoch 最大的若有一条指名作者即通过，否则拒绝并记 `sync.event_rejected` 日志。`schedule_run_claimed` 的 `owner_epoch` 还必须等于这个最大 epoch。作者还没看到的换负责人不算违规；乱序到达的事件先等依赖入库再核对，所以各副本结论一致。换负责人后旧负责人结束回合时只写回复，不再写检查点。同一 `(会话, schedule_id, slot_ms)` 的领取投影为 `schedule_claims`，`owner_epoch` 大者胜，相同时作者较小者胜，与到达顺序无关。
 

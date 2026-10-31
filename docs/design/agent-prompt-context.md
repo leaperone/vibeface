@@ -24,9 +24,17 @@ Provider session IDs, transcripts, tokens, environment values and credentials ne
 
 ## Memory
 
-Memory rows carry epoch, revision, origin, user_controlled, essential and source event hash. Revision is the event rank projected by the reducer. The reducer projects the greater of an event Memory epoch and the current data epoch, preserving a higher event epoch as the conflict baseline. This does not permit opening an older database directory.
+Memory rows use the scoped key `(network_id, conversation_id, memory_id)`. Their metadata contains epoch, revision, control_revision, origin, user_controlled, essential and source_event_hash. The epoch must match data epoch 11. Automatic revisions are full event hashes. User revisions are stable operation IDs derived from the canonical attestation payload and signer. A duplicate Node wrapper can change the representative source hash without changing the logical revision.
 
-remember and forget write an attempt-scoped staged overlay. Each mutation records the base epoch and base revision. A completed turn commits the mutation with the reply and job terminal state in one Store transaction. Failed, interrupted and unknown turns discard it. A changed revision, epoch or user-controlled value leaves the newer record intact and records a local conflict.
+remember and forget write an attempt-scoped staged overlay with the complete MemoryBase. A completed turn commits the mutations with its reply and terminal state in one Store transaction. Failed, cancelled, interrupted and unknown turns discard them. Local commit compares epoch, revision and control_revision, including tombstones. A changed base or protected record produces a local conflict and leaves the committed state intact. Source hashes prove the referenced version, but a different valid wrapper for that version does not cause a conflict.
+
+Direct user edits use a Required client-signed MemoryControlled event. New values, edits and deletions permanently protect that ID from automatic changes. A deletion retains a protected tombstone. The signed base determines the user counter, starting at 1 and increasing by one. User operations sort by counter and stable operation ID, above all automatic operations. Automatic operations retain rank ordering. Concurrent user edits and deletions use the same ordering; deletion has no extra priority.
+
+Each nonempty base names a verified direct parent with the same network, conversation, Memory ID, epoch and logical version. Import validates this historical source without comparing the current projection. An absent base means the signer had not seen a version. A later Node wrapper does not change that assertion. These rules keep replay and import independent of arrival order.
+
+control_memory verifies the signed request, checks its operation receipt, compares the local base and appends in one transaction. memory_state reads active values and tombstones and can reconcile an operation ID. recorded means the operation is current, superseded means it exists in history but has lost, and not_seen_here means only that this entry has not observed it. Clients retain unknown requests, read before retrying and never change the signed base automatically.
+
+Shared memory_sync_conflicts come from effective logical operations and their base chains. Duplicate user wrappers collapse into one operation. Normal ancestors of the winner are excluded. Other branches produce a stable page of at most 50 identifiers, versions, hashes and reasons, with has_more. The query computes the complete local set before limiting output. It does not publish candidate text. These historical synchronization conflicts are separate from the owner's local memory_conflicts at completion. An unreachable owner does not hide the entry's shared conflicts.
 
 Essential memory has an 8192-byte budget over the complete serialized block. The compiler reports omitted rows and keeps the omitted records available to recall. A bounded update does not delete omitted rows or advance their delivered revision. The per-session Memory digest map advances only from a recorded Provider turn, so a failed pre-send cannot suppress a later update. Recall returns the committed records plus the current turn's staged overlay.
 
@@ -48,6 +56,6 @@ The essential Memory budget covers the entire serialized block. A data-only Memo
 
 ## Data format
 
-The Store uses data_epoch 10 for Memory metadata and the scoped scheduler-session schema. It opens only the matching database epoch and does not migrate an older data directory. The migration hash is recorded in crates/node/src/config.rs. Protocol clients must treat another epoch as an incompatible data format.
+The Store uses data_epoch 11 for Memory metadata and the scoped scheduler-session schema. It opens only the matching database epoch and does not migrate an older data directory. The migration hash is recorded in crates/node/src/config.rs. Protocol clients must treat another epoch as an incompatible data format.
 
 This contract does not add a shared device pool, shared Provider account, remote screen control, phone projection or a second history store.
