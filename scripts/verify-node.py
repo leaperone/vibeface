@@ -35,6 +35,7 @@ from pathlib import Path
 import shutil
 import signal
 import select
+import shlex
 import socket
 import struct
 import stat
@@ -114,6 +115,7 @@ def maintenance(node, command):
 
 
 _port_base = [int(os.environ.get("VIBEFACE_PORT_BASE", "0"))]
+_assigned_ports = set()
 
 
 def available_port():
@@ -126,7 +128,10 @@ def available_port():
             try:
                 stream.bind(("127.0.0.1", port))
                 port = stream.getsockname()[1]
+                if port in _assigned_ports:
+                    continue
                 datagram.bind(("127.0.0.1", port))
+                _assigned_ports.add(port)
                 return port
             except OSError:
                 continue
@@ -404,6 +409,8 @@ class Client:
                     "instructions": arguments.get("instructions", "")}
             if arguments.get("project") is not None:
                 body["project"] = arguments["project"]
+        elif method == "delete_bot":
+            body = {"type": "bot_deleted"}
         elif method == "answer":
             scope = arguments.pop("scope_id")
             body = {"type": "message_posted", "message_id": "a-" + arguments["question_id"], "role": "user",
@@ -544,6 +551,7 @@ class Node:
         self.directory = run / name
         self.port = port if port is not None else available_port()
         require(0 < self.port < 65536, "Node listener uses a valid port")
+        _assigned_ports.add(self.port)
         self.quic_port = available_port() if port is not None else self.port
         self.local_port = available_port()
         self.url = f"http://127.0.0.1:{self.port}"
@@ -866,10 +874,110 @@ def fixture_schema_check():
     return schema
 
 
+def native_provider_login(run, setup, command, bin_sha256):
+    home, program = run / "receiver/providers/codex", run / "native-codex"
+    require(isinstance(command, str) and 0 < len(command) <= 4096 and command == setup["command"],
+            "native login executes only the exact copied Node setup command")
+    require(setup["directory"] == str(home) and home.is_dir() and not home.is_symlink()
+            and home.resolve().is_relative_to(run.resolve()), "native login uses its existing private receiver root")
+    require(program.is_file() and not program.is_symlink() and program.stat().st_mode & 0o077 == 0
+            and file_sha256(program) == bin_sha256, "native login uses the unchanged controlled executable")
+    argv = shlex.split(command)
+    require(argv == ["env", "CODEX_HOME=" + str(home), str(program), "login"],
+            "native login accepts only the private root assignment and fixed fake login argv")
+    require(json.loads((run / "native-provider-stage.json").read_text()) == "signed_out"
+            and not fixture_records(run, "native-provider-login.jsonl"), "native synthetic login runs once before authentication")
+    result = subprocess.run(["/usr/bin/env", *argv[1:]], env={"PATH": os.defpath},
+                            capture_output=True, timeout=15)
+    records = fixture_records(run, "native-provider-login.jsonl")
+    require(result.returncode == 0 and len(records) == 1 and records[0]["args"] == ["login"]
+            and records[0]["codex_home"] == str(home)
+            and json.loads((run / "native-provider-stage.json").read_text()) == "ready",
+            "the controlled CLI records one private-root login and changes only fake authentication")
+    return {"executed": True, "private_root_verified": True, "controlled_bin_verified": True, "login_count": len(records)}
+
+
+def native_provider_selfcheck(options):
+    options.artifacts.mkdir(parents=True, exist_ok=True)
+    run = options.artifacts.resolve() / ("native-provider-selfcheck-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    checks = []
+    try:
+        home = run / "receiver/providers/codex"
+        home.mkdir(parents=True, mode=0o700)
+        program = fixture_wrapper(run, "native-codex", "--fixture-codex")
+        digest = file_sha256(program)
+        private_json(run / "native-provider-stage.json", "signed_out")
+        command = shlex.join(["env", "CODEX_HOME=" + str(home), str(program), "login"])
+        setup = {"directory": str(home), "command": command}
+        marker = run / "must-not-execute"
+        foreign = "env CODEX_HOME=/outside /usr/bin/true login"
+        for name, actual_setup, actual_command in (
+            ("foreign_root", {**setup, "directory": str(run / "foreign")}, command),
+            ("different_copied_command", setup, command + " "),
+            ("uncontrolled_command", {**setup, "command": foreign}, foreign),
+            ("shell_suffix", {**setup, "command": command + "; touch " + str(marker)}, command + "; touch " + str(marker)),
+        ):
+            try:
+                native_provider_login(run, actual_setup, actual_command, digest)
+            except (AssertionError, ValueError):
+                checks.append(name)
+            else:
+                raise AssertionError("native login must reject " + name)
+        missing = run / "missing-home"
+        home.rename(missing)
+        try:
+            try:
+                native_provider_login(run, setup, command, digest)
+            except AssertionError:
+                checks.append("missing_root")
+            else:
+                raise AssertionError("native login must reject a missing root")
+        finally:
+            missing.rename(home)
+        require(not fixture_records(run, "native-provider-login.jsonl") and not marker.exists()
+                and json.loads((run / "native-provider-stage.json").read_text()) == "signed_out",
+                "negative login calls have no execution or fake-state side effects")
+        require(native_provider_login(run, setup, command, digest)["login_count"] == 1, "private-root fake login actually executes")
+        checks.append("private_root_positive_real_call")
+        require(len(fixture_records(run, "native-provider-login.jsonl")) == 1, "one positive login invocation is recorded")
+        private_json(options.artifacts / "native-provider-selfcheck.json", {"status": "passed", "checks": checks, "real_provider_calls": 0})
+        print(json.dumps({"status": "passed", "checks": checks, "real_provider_calls": 0}), flush=True)
+    finally:
+        shutil.rmtree(run)
+
+
 def fixture_codex(arguments):
     """Implement the native App Server contract without loading a provider."""
-    fixture_schema_check()
     run = Path(arguments[arguments.index("--fixture-root") + 1])
+    if arguments == ["--fixture-codex", "--fixture-root", str(run), "login"]:
+        home = run / "receiver/providers/codex"
+        require(home.is_dir() and not home.is_symlink() and home.resolve().is_relative_to(run.resolve())
+                and os.environ.get("CODEX_HOME") == str(home)
+                and json.loads((run / "native-provider-stage.json").read_text()) == "signed_out",
+                "fake login only changes authentication in its assigned receiver root")
+        fixture_record(run, "native-provider-login.jsonl", {"pid": os.getpid(), "args": ["login"], "codex_home": str(home)})
+        private_json(run / "native-provider-stage.json", "ready")
+        return
+    fixture_schema_check()
+    def provider_reply(method):
+        path = run / "native-provider-stage.json"
+        if not path.exists() or method not in ("account/read", "model/list"):
+            return None
+        require(path.is_file() and not path.is_symlink() and path.stat().st_size <= 64
+                and path.stat().st_mode & 0o077 == 0, "native provider stage is one private bounded task file")
+        stage = json.loads(path.read_text())
+        require(stage in ("signed_out", "ready", "catalog_unknown"), "native provider stage is fixed")
+        if method == "account/read":
+            return {"result": {"requiresOpenaiAuth": True,
+                               "account": None if stage == "signed_out" else {"type": "chatgpt"}}}
+        if stage == "catalog_unknown":
+            return {"error": {"code": -32000, "message": "controlled catalog unavailable"}}
+        return {"result": {"data": [
+            {"id": "native-selectable", "model": "native-selectable", "displayName": "Native selectable",
+             "isDefault": True, "supportedReasoningEfforts": [{"reasoningEffort": "medium"}, {"reasoningEffort": "high"}]},
+            {"id": "native-controlled", "model": "native-controlled", "displayName": "Native controlled",
+             "reasoningEffortConfigurable": False, "supportedReasoningEfforts": []}], "nextCursor": None}}
     address = arguments[arguments.index("--listen") + 1]
     require(address.startswith("unix://"), "fixture only binds its private Unix socket")
     socket_path = Path(address.removeprefix("unix://"))
@@ -939,12 +1047,15 @@ def fixture_codex(arguments):
         prompt = params["input"][0]["text"]
         guide = bot_guide.get(thread["id"], "")
         cli = re.search(r"Run:\n'(.*?)' tool TOOL_NAME", guide)
-        catalog = guide[guide.find("Available tools:\n"):] if cli else ""
+        catalog_start = guide.find("Available tools:\n")
+        catalog = guide[catalog_start:] if cli and catalog_start >= 0 else ""
+        advertised = re.findall(r"(?m)^(\w+)\n[^\n]*\nJSON schema: ([^\n]+)$", catalog)
         history = "\n".join(part.get("text", "") for past in thread["turns"] for item in past["items"]
                             if item["type"] == "userMessage" for part in item["content"])
         initial = {"prompt": prompt, "history": history, "tool_env": bot_env.get(thread["id"], {}), "cwd": thread["cwd"],
                    "session_id": thread["id"] if resumed else None, "tool_cli": cli and cli.group(1),
-                   "custom_tools": re.findall(r"(?m)^(\w+)\n[^\n]*\nJSON schema: ", catalog)}
+                   "custom_tools": [name for name, _ in advertised],
+                   "custom_tool_schemas": {name: json.loads(schema) for name, schema in advertised}}
         bot = BotTurn(stream, thread, turn)
         try:
             fixture_manager(run, initial, bot)
@@ -1066,7 +1177,12 @@ def fixture_codex(arguments):
                     thread_id = params.get("threadId")
                     thread = state["threads"].get(thread_id) if thread_id else None
                     if method in FIXTURE_CANNED:
-                        result = copy.deepcopy(FIXTURE_CANNED[method])
+                        observed = provider_reply(method)
+                        if observed is not None:
+                            error = observed.get("error")
+                            result = observed.get("result")
+                        else:
+                            result = copy.deepcopy(FIXTURE_CANNED[method])
                     elif method == "initialize":
                         result = {"userAgent": "controlled-fixture", "platformFamily": "unix", "platformOs": sys.platform}
                     elif method == "thread/loaded/list":
@@ -1092,6 +1208,8 @@ def fixture_codex(arguments):
                         error = {"code": -32600, "message": "thread not found: " + str(thread_id)}
                     elif method == "thread/resume" and not thread["turns"]:
                         error = {"code": -32600, "message": "no rollout found for thread id " + thread_id}
+                    elif method == "turn/start" and thread.get("bot") and params.get("model") == "fixture-quota-before-start":
+                        error = {"code": -32000, "message": "quota exceeded before the fixture accepted a turn"}
                     elif method == "turn/start" and thread.get("bot"):
                         if thread["status"]["type"] == "active":
                             error = {"code": -32600, "message": "a turn is already running"}
@@ -1181,7 +1299,7 @@ def fixture_codex(arguments):
         threading.Thread(target=connection, args=(stream,), daemon=True).start()
 
 
-READ_TOOLS = {"nodes", "context", "work_status", "call_lookup", "read_skill", "recall", "fetch_url", "list_bots", "read_bot", "list_sessions"}
+READ_TOOLS = {"nodes", "context", "history_search", "history_read", "work_status", "call_lookup", "read_skill", "recall", "fetch_url", "list_bots", "read_bot", "list_sessions"}
 WORK_TOOLS = {"dispatch_work", "interrupt_work", "hand_over_session", "propose_provider_config", "apply_provider_config"}
 WAKE_TOOLS = {"remind", "message_bot"}
 SETTINGS_TOOLS = {"update_profile", "save_skill", "remove_skill", "save_schedule", "remove_schedule", "remember", "forget",
@@ -1279,14 +1397,19 @@ def fixture_manager(run, initial, bot):
               "bot_prompt_markers": [marker for marker in
                   ("bot-alpha-instructions-sentinel", "bot-beta-instructions-sentinel") if marker in initial["history"]],
               "node_url": initial["tool_env"]["VIBEFACE_NODE_URL"]}
-    fixture_record(run, "manager-invocations.jsonl", record)
     # A held report keeps a failed task's result from being answered, so it waits on the person.
     if autonomous and (run / "fixture-hold-report").exists():
+        fixture_record(run, "manager-invocations.jsonl", record)
         bot.end("failed")
         return
     initial_tools = {"tool_search", "tool_describe", "tool_call", "context", "read_skill", "call_lookup"}
-    require(set(initial["custom_tools"]) == initial_tools,
-            "the provider initially receives discovery and the required history/skill/read-back tools")
+    require(set(initial["custom_tools"]) == initial_tools
+            and len(initial["custom_tools"]) == len(initial_tools),
+            "the provider initially receives exactly discovery and the required history/skill/read-back tools")
+    require(set(initial["custom_tool_schemas"]) == initial_tools,
+            "every initially exposed tool has exactly one advertised schema")
+    require(not (initial_tools & set(context["trigger"].get("unavailable_tools") or [])),
+            "the initial entrypoints remain available in every trigger")
     expected_tools = READ_TOOLS | WORK_TOOLS
     if kind != "agent_task":
         expected_tools |= WAKE_TOOLS
@@ -1339,9 +1462,13 @@ def fixture_manager(run, initial, bot):
 
     catalog, offset = set(), 0
     while True:
-        page = tool("tool_search", {"offset": offset, "limit": 30})
+        arguments = {"offset": offset, "limit": 30}
+        page = tool("tool_search", arguments)
+        cli_page = json.loads(fixture_cli(initial, "tool", "tool_search", "--json", json.dumps(arguments)).stdout)
+        require(cli_page == page, "the real CLI and direct API discover the same scoped tools")
         names = [row["name"] for row in page["tools"]]
-        require(not (catalog & set(names)), "tool discovery pages do not repeat entries")
+        require(len(names) == len(set(names)) and not (catalog & set(names)),
+                "tool discovery pages contain no duplicate entries")
         catalog.update(names)
         if not page["more"]:
             break
@@ -1349,6 +1476,23 @@ def fixture_manager(run, initial, bot):
                 "tool discovery has a forward-only bounded cursor")
         offset = page["next"]
     require(catalog == expected_tools, "dynamic discovery exposes exactly this turn's authorized domain tools")
+    for name in sorted(expected_tools):
+        schema = tool("tool_describe", {"tool": name})
+        require(schema["name"] == name and schema["description"]
+                and schema["input_schema"]["type"] == "object"
+                and schema["input_schema"]["additionalProperties"] is False,
+                "every discovered target exposes its actual bounded input schema")
+        described.add(name)
+        if name in initial_tools:
+            require(schema["input_schema"] == initial["custom_tool_schemas"][name],
+                    "initial domain schemas match the Node's authoritative descriptions")
+    for name in sorted((SETTINGS_TOOLS | WAKE_TOOLS) - expected_tools):
+        tool("tool_describe", {"tool": name}, expected=False, rejection="unknown or unavailable coordination tool")
+    fixture_record(run, "manager-catalogs.jsonl", {"conversation_id": context["conversation_id"],
+                   "trigger": trigger, "kind": kind, "advertised": sorted(initial["custom_tools"]),
+                   "available": sorted(catalog), "unavailable": sorted((SETTINGS_TOOLS | WAKE_TOOLS) - expected_tools),
+                   "cli_matches_api": True})
+    fixture_record(run, "manager-invocations.jsonl", record)
 
     def dispatch_cli(arguments, expected=True, rejection=""):
         """`vibeface tool dispatch_work` from the Agent's Shell: the CLI registers, then talks to the socket itself."""
@@ -2522,7 +2666,7 @@ def bot_settings_checks(run, a, network, passed):
         {"name": "update_profile", "arguments": {**profile, "name": "Other"}, "accepted": False,
          "rejection": "different change"},
         {"name": "update_profile", "arguments": {"call_ref": "model", "model": "other"}, "accepted": False,
-         "rejection": "only in Settings"},
+         "rejection": "arguments.model is not allowed"},
         {"name": "save_skill", "arguments": {"call_ref": "skill", "name": "Digest", "description": "Summarize commits",
                                              "body": "List yesterday's commits by author."}},
         {"name": "save_schedule", "arguments": schedule},
@@ -2530,7 +2674,12 @@ def bot_settings_checks(run, a, network, passed):
     ]}))
     first, retry = results(receipt["trigger"], "update_profile")[:2]
     lookup = results(receipt["trigger"], "call_lookup")[0]["result"]
-    require(first["result"] == retry["result"] == lookup and first["result"]["cause"]["message_id"] == "bot-settings",
+    first_change = {key: value for key, value in first["result"].items() if key != "call_record"}
+    looked_up_change = {key: value for key, value in lookup.items() if key != "call_record"}
+    require(first["result"] == retry["result"] and first_change == looked_up_change
+            and first["result"]["cause"]["message_id"] == "bot-settings"
+            and first["result"]["call_record"]["call_ref"] == lookup["call_record"]["call_ref"] == "profile"
+            and lookup["call_record"]["execution"] == "applied" and lookup["call_record"]["confirmation"] == "confirmed",
             "a retried or looked-up call_ref returns the one recorded change")
     view = snapshot()
     changes = view["changes"]
@@ -2644,6 +2793,58 @@ def bot_settings_checks(run, a, network, passed):
            reminder=reminder_id, paused=paused["schedule_id"])
 
 
+def provider_runtime_checks(run, workspace, node, network, passed):
+    original = node.client.call("node_settings")["settings"]
+    scope = "provider-runtime-check"
+    node.client.rpc("create_bot", bot_id=scope, conversation_id=scope, name="Runtime check",
+                    instructions="Reply without tools", project={"target_node": node.device_id, "cwd": str(workspace)})
+    settings = copy.deepcopy(original)
+    settings["manager"]["model"] = "fixture-quota-before-start"
+    settings["manager"]["backup"] = {"automatic": False, "candidates": [
+        {"provider": "codex", "model": "fixture-model", "reasoning_effort": "medium"}]}
+    tools_before = [row for row in fixture_records(run, "manager-tools.jsonl")
+                    if row["accepted"] and row["name"] in WORK_TOOLS | WAKE_TOOLS | SETTINGS_TOOLS]
+    try:
+        node.client.call("configure_node", settings)
+        disabled = node.client.rpc("message", conversation_id=scope, message_id="runtime-default-off",
+                                   text=json.dumps({"chat_agent": True, "tools": []}))
+        failed = wait_for("disabled backup records the original refusal", lambda:
+            next((job for job in node.client.rpc("conversation", conversation_id=scope)["scheduler"]["jobs"]
+                  if job["trigger"] == disabled["trigger"] and job["state"] == "failed"), None))
+        require(failed["runtime"]["execution"] == "not_started" and failed["retryable"]
+                and failed["runtime"]["stage"] == "turn_start" and failed["runtime"]["switched_from"] is None,
+                "a refused unstarted turn has safe evidence and no implicit backup")
+        settings["manager"]["backup"]["automatic"] = True
+        node.client.call("configure_node", settings)
+        sent = node.client.rpc("message", conversation_id=scope, message_id="runtime-explicit-backup",
+                               text=json.dumps({"chat_agent": True, "tools": []}))
+        completed = wait_for("explicit backup completes exactly one accepted turn", lambda:
+            next((job for job in node.client.rpc("conversation", conversation_id=scope)["scheduler"]["jobs"]
+                  if job["trigger"] == sent["trigger"] and job["state"] == "completed"), None))
+        runtime = completed["runtime"]
+        attempts = [row["message"]["params"] for row in fixture_records(run, "codex-rpc.jsonl")
+                    if row["message"].get("method") == "turn/start"
+                    and row["message"]["params"].get("clientUserMessageId") == runtime["delivery_id"]]
+        require([attempt["model"] for attempt in attempts] == ["fixture-quota-before-start", "fixture-model"]
+                and attempts[1]["effort"] == "medium" and runtime["reasoning_effort"] == "medium"
+                and runtime["model"] == "fixture-model" and runtime["execution"] == "started"
+                and runtime["switched_from"]["model"] == "fixture-quota-before-start"
+                and runtime["switch_reason"] == "quota" and not completed["retryable"],
+                "the durable runtime binds the one allowed fallback and submitted effort to the same delivery")
+        require([row for row in fixture_records(run, "manager-tools.jsonl")
+                 if row["accepted"] and row["name"] in WORK_TOOLS | WAKE_TOOLS | SETTINGS_TOOLS] == tools_before,
+                "neither the refused turn nor the backup repeats a tool effect")
+        node.client.call("configure_node", original)
+        frozen = next(job for job in node.client.rpc("conversation", conversation_id=scope)["scheduler"]["jobs"]
+                      if job["trigger"] == sent["trigger"])
+        require(frozen["runtime"] == runtime, "later settings never rewrite a historical turn runtime")
+        passed("backup is off by default; an explicit unstarted quota fallback sends once with frozen model and effort",
+               attempts=len(attempts), accepted_turns=1, tool_effects=0)
+    finally:
+        node.client.call("configure_node", original)
+        node.client.rpc("delete_bot", bot_id=scope, conversation_id=scope)
+
+
 def chat_agent_acceptance(options):
     binary = options.binary.resolve(strict=True)
     module = options.crypto_module.resolve(strict=True)
@@ -2680,6 +2881,7 @@ def chat_agent_acceptance(options):
         schema = fixture_schema_check()
         passed("the fake App Server answers every client request in the pinned schema",
                client_requests=len(schema["client_requests"]))
+        provider_runtime_checks(run, workspace, a, network, passed)
         bot_checks(run, workspace, a, network, passed, outsider)
         work_checks(run, workspace, a, network, passed)
         triage_checks(run, workspace, a, network, passed)
@@ -3655,9 +3857,21 @@ def acceptance(options):
         def owner_job(state):
             view = at_c.rpc("conversation", conversation_id=conversation)
             job = next((row for row in view["scheduler"]["jobs"] if row["trigger"] == held["trigger"]), None)
+            remote = view["scheduler"]["remote"]
             return view if job and job["state"] == state and job.get("source_node") == a.device_id \
-                and view["scheduler"]["remote"] == {"owner": a.device_id, "reachable": True} else None
+                and set(remote) == {"owner", "reachable", "context", "memory_staged_count", "memory_conflicts"} \
+                and remote["owner"] == a.device_id and remote["reachable"] is True else None
         view = wait_for("C shows A's running reply", lambda: owner_job("running"), timeout=60)
+        remote = view["scheduler"]["remote"]
+        require((remote["context"] is None or isinstance(remote["context"], dict))
+                and type(remote["memory_staged_count"]) is int and remote["memory_staged_count"] >= 0
+                and isinstance(remote["memory_conflicts"], list)
+                and all(isinstance(conflict, dict) for conflict in remote["memory_conflicts"]),
+                "C receives the owner's typed context and Memory metadata")
+        require(remote["context"] == view["scheduler"]["context"]
+                and remote["memory_staged_count"] == view["bot_settings"]["memory_staged_count"]
+                and remote["memory_conflicts"] == view["bot_settings"]["memory_conflicts"],
+                "C uses the owner's context and Memory from the same response")
         require(view["observation_targets"] == [a.device_id] and view["scheduler"]["capabilities"]["cancel"] is True,
                 "C follows A's progress and offers A's stop")
         wait_for("C receives the text A's reply streams", lambda: [
@@ -3937,7 +4151,8 @@ def phase4_acceptance(options):
         require(question["conversation_id"] == conversation, "B's question lands in the chat that owns the child's thread")
         task_turn = next(row for row in records(b) if row["trigger"] == "task:" + task)
         require(task_turn["kind"] == "agent_task", "B's own Agent runs the task")
-        refused = [row for row in records(b, "manager-tool-errors.jsonl") if row["trigger"] == "task:" + task]
+        refused = [row for row in records(b, "manager-tool-errors.jsonl")
+                   if row["trigger"] == "task:" + task and row["name"] == "answer_approval"]
         require(len(refused) == 1, "B's Agent has no tool to answer for the user")
         answered = a.client.rpc("answer", question_id=question_id, text="允许", scope_id=conversation)
         require(answered["status"] == "answered" and a.client.rpc("answer", question_id=question_id, text="允许",
@@ -3984,6 +4199,10 @@ def phase4_acceptance(options):
         lost = dispatched(a, "p4-revoked")
         turn(a, r5["trigger"])
         wait_for("C's Agent runs the task", lambda: work_in(a.client, lost, "running"), timeout=60)
+        wait_for("C's fixture records the running task invocation", lambda: (lambda rows: rows if len(rows) == 1 else None)([
+            row for row in records(c)
+            if row.get("trigger") == "task:" + lost and row.get("kind") == "agent_task" and row.get("work_id") == lost
+        ]), timeout=60)
         c.stop(crash=True)
         stop = a.client.rpc("interrupt_work", conversation_id=conversation, work_id=lost)
         require(stop.get("waiting_for_device") and not stop["confirmed"], "a stop to an offline device waits for it")
@@ -7478,6 +7697,8 @@ def e2e_fixture(options):
     relay = PkarrRelay() if options.fixture_kind == "delivery" else None
     rpc = DeliveryRpcSpy() if relay else None
     native_ready = False
+    native_provider = None
+    native_queue = None
 
     def details():
         return {"run": str(run), "nodes": {
@@ -7560,6 +7781,78 @@ def e2e_fixture(options):
                             "native and managing device must show the exact same revealed safety code")
                     client.grant(pending, manage=True)
                     result = {"approved": True}
+                elif op == "native_provider_setup":
+                    require(set(request) == {"op"} and native_ready and not native_provider,
+                            "native provider setup belongs to its initialized receiver and runs once")
+                    private_json(run / "native-provider-stage.json", "signed_out")
+                    client = nodes["receiver"].client
+                    (nodes["receiver"].directory / "providers/codex").mkdir(parents=True, exist_ok=True, mode=0o700)
+                    program = fixture_wrapper(run, "native-codex", "--fixture-codex")
+                    client.call("configure_provider", {"provider": "codex", "bot": False, "execution": False,
+                        "bin": str(program),
+                        "app_server": SPAWN_APP_SERVER})
+                    nodes["receiver"].stop()
+                    nodes["receiver"].start()
+                    client.connect()
+                    client.authenticate()
+                    native_provider = {"bin_sha256": file_sha256(program)}
+                    result = {"configured": True}
+                elif op == "native_provider_login":
+                    require(set(request) == {"op", "command"} and native_provider,
+                            "native login belongs only to its controlled initialized receiver")
+                    provider = next(item for item in nodes["receiver"].client.call("node_settings")["providers"]
+                                    if item["provider"] == "codex")
+                    result = native_provider_login(run, provider["setup"], request["command"], native_provider["bin_sha256"])
+                elif op == "native_provider_stage":
+                    require(set(request) == {"op", "stage"} and native_provider
+                            and request["stage"] in ("signed_out", "ready", "catalog_unknown"),
+                            "native provider stage has one fixed task scope and enum")
+                    private_json(run / "native-provider-stage.json", request["stage"])
+                    result = {"stage": request["stage"]}
+                elif op == "native_provider_queue":
+                    require(set(request) == {"op"} and native_provider and native_queue is None,
+                            "native provider queue is accepted once in its controlled receiver")
+                    client = nodes["receiver"].client
+                    manager = client.call("node_settings")["settings"]["manager"]
+                    require(manager is not None and manager["provider"] == "codex",
+                            "the native UI must enable the controlled manager before queue preparation")
+                    native_queue = {"bot_id": "native-provider", "conversation_id": "native-provider",
+                                    "running_trigger": "message:native-running", "queued_trigger": "message:native-queued"}
+                    client.rpc("create_bot", bot_id=native_queue["bot_id"], conversation_id=native_queue["conversation_id"],
+                               name="Native Provider", instructions="Controlled native acceptance", project=None)
+                    for label in ("native-running", "native-queued"):
+                        directive = {"phase1": True, "label": label}
+                        if label == "native-running":
+                            directive["gate"] = str(run / "native-never-release")
+                        receipt = client.rpc("message", conversation_id=native_queue["conversation_id"],
+                                             message_id=label, text=json.dumps(directive), report_results=False)
+                        require(receipt["trigger"] == "message:" + label, "native queue preserves the accepted trigger")
+                        wait_for("native message reaches its actual queue state", lambda:
+                            any(job["trigger"] == receipt["trigger"] and job["state"] == ("running" if label == "native-running" else "queued")
+                                for job in client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"]))
+                        if label == "native-running":
+                            wait_for("the native queue has one positive controlled invocation", lambda:
+                                len([row for row in fixture_records(run) if row["conversation_id"] == native_queue["conversation_id"]
+                                     and row["trigger"] == native_queue["running_trigger"]]) == 1)
+                    result = native_queue
+                elif op == "native_provider_inspect":
+                    require(set(request) == {"op"} and native_provider, "native inspection reads only its controlled receiver")
+                    client = nodes["receiver"].client
+                    settings = client.call("node_settings")
+                    provider = next(item for item in settings["providers"] if item["provider"] == "codex")
+                    manager = settings["settings"]["manager"]
+                    jobs = client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"] if native_queue else []
+                    calls = [row for row in fixture_records(run) if native_queue and row["conversation_id"] == native_queue["conversation_id"]]
+                    result = {"manager": {key: manager[key] for key in ("provider", "model", "reasoning_effort")} if manager is not None else None,
+                              "roles": provider["roles"], "execution_model": provider["execution_model"], "setup": provider["setup"],
+                              "login_count": len(fixture_records(run, "native-provider-login.jsonl")),
+                              "readiness": provider["readiness"]["state"], "catalog": provider["probe"]["catalog"]["state"],
+                              "authentication": provider["probe"]["authentication"],
+                              "checked": provider["probe"]["checked_at_ms"] is not None,
+                              "jobs": [{"trigger": row["trigger"], "state": row["state"]} for row in jobs
+                                       if row["trigger"] in (native_queue["running_trigger"], native_queue["queued_trigger"])],
+                              "running_invocations": sum(row["trigger"] == native_queue["running_trigger"] for row in calls),
+                              "queued_invocations": sum(row["trigger"] == native_queue["queued_trigger"] for row in calls)}
                 elif op == "native_send":
                     require(native_ready, "native delivery is scoped to the initialized fixture")
                     intent = str(uuid.uuid4())
@@ -7575,13 +7868,15 @@ def e2e_fixture(options):
             except Exception as error:
                 print(json.dumps({"ok": False, "error": type(error).__name__}), flush=True)
     finally:
-        for node in reversed(list(nodes.values())):
-            node.client.close()
-            node.stop()
-        if relay:
-            relay.close()
-        if rpc:
-            rpc.close()
+        cleanup_failed = False
+        actions = [action for node in reversed(list(nodes.values())) for action in (node.client.close, node.stop)]
+        actions += ([relay.close] if relay else []) + ([rpc.close] if rpc else []) + [lambda: stop_fixture_processes(run)]
+        for action in actions:
+            try:
+                action()
+            except Exception:
+                cleanup_failed = True
+        require(not cleanup_failed, "the fixture stops all of its own resources")
 
 
 if __name__ == "__main__":
@@ -7604,6 +7899,7 @@ if __name__ == "__main__":
         modes.add_argument("--public-entry", action="store_true", help="check a public entry that forwards browsers and decisions to a member Node through its relay")
         modes.add_argument("--phase5", action="store_true", help="check write protection after a restore, alone and as a copied data directory, status, logs and diagnostics")
         modes.add_argument("--e2e-fixture", action="store_true", help=argparse.SUPPRESS)
+        modes.add_argument("--native-provider-selfcheck", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--delivery-charity", action="store_true", help="check free discovery, charity transfer, loopback service boundaries and durable restart")
         modes.add_argument("--delivery", action="store_true", help="check the full paid delivery flow; requires a private local deployment configuration")
         modes.add_argument("--delivery-ui-selfcheck", action="store_true", help="check only the local UI controller schema without starting Nodes, UI, chain or proofs")
@@ -7619,7 +7915,9 @@ if __name__ == "__main__":
         arguments = parser.parse_args()
         try:
             require(30_000 <= arguments.delivery_ui_timeout_ms <= 86_400_000, "UI acceptance has a bounded explicit execution deadline")
-            if arguments.delivery_ui_selfcheck:
+            if arguments.native_provider_selfcheck:
+                native_provider_selfcheck(arguments)
+            elif arguments.delivery_ui_selfcheck:
                 delivery_ui_selfcheck(arguments)
             elif arguments.e2e_fixture:
                 require(arguments.fixture_port is not None, "e2e fixture requires its allocated port")

@@ -19,7 +19,7 @@ use vibeface::{
     local_access::Launcher,
     maintenance,
     net::{self, NetworkConfig, PublicEntry, RelayServiceMode},
-    providers::Provider,
+    providers::{AppServer, AppServerMode, Provider},
     runtime::Runtime,
     store::Store,
     update::{self, Update},
@@ -239,7 +239,8 @@ struct Init {
     /// default name. May be repeated.
     #[arg(long = "bin", value_name = "PROVIDER=PATH", value_parser = provider_bin)]
     bins: Vec<(Provider, PathBuf)>,
-    /// Socket of the running Codex App Server; found under the Codex folder when omitted.
+    /// Absolute socket of an external Codex App Server; selects system mode.
+    /// Omit to let the Node start its own server.
     #[arg(long)]
     codex_socket: Option<PathBuf>,
     /// iroh relay of another Node in the personal network, e.g. `https://relay.example`. May be repeated.
@@ -308,8 +309,8 @@ struct Hooks {
     action: HooksAction,
     #[command(flatten)]
     local: LocalNode,
-    /// Home directory holding the coding agents' hook and extension files, Codex's included;
-    /// defaults to `$HOME`, with Codex's in `$CODEX_HOME` when set.
+    /// Explicit home directory holding the user's coding-agent hook and extension files.
+    /// Without it, Codex and Claude hooks use this Node's private Provider roots; other extensions use HOME.
     #[arg(long, value_name = "DIR", value_parser = config::absolute_path)]
     home: Option<PathBuf>,
     /// Show what would change without writing.
@@ -325,7 +326,8 @@ struct Triage {
     local: LocalNode,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, serde::Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 enum TriageAction {
     /// Pending events as JSON.
     Events {
@@ -343,6 +345,9 @@ enum TriageAction {
         /// Hold this request until the question is answered.
         #[arg(long)]
         request_id: Option<String>,
+        /// Card kind, inferred from the held request when omitted.
+        #[arg(long, value_enum)]
+        attention_kind: Option<vibeface::model::AttentionKind>,
         /// An answer the user can pick; repeat for more.
         #[arg(long = "choice", value_name = "LABEL")]
         choices: Vec<String>,
@@ -526,14 +531,14 @@ async fn main() -> Result<()> {
         } => call_tool(name, json, call_ref).await,
         Action::Codex { socket, command } => {
             use vibeface::agent_cli::{Command, run};
-            let socket = || {
+            let required_socket = || {
                 socket
                     .clone()
                     .context("--socket or VIBEFACE_CODEX_SOCKET is required")
             };
             match command {
                 CodexCommand::Call { method, params } => {
-                    run(&socket()?, Command::Call { method, params }).await
+                    run(&required_socket()?, Command::Call { method, params }).await
                 }
                 CodexCommand::Send {
                     thread,
@@ -549,12 +554,12 @@ async fn main() -> Result<()> {
                     );
                     let args = json!({"thread":thread,"prompt":text,"call_ref":id,"agent":"codex",
                         "model":model,"effort":effort,"images":image});
-                    let result = dispatch_work(&args, &id, &socket()?).await?;
+                    let result = dispatch_work(&args, &id, socket.as_deref()).await?;
                     println!("{}", serde_json::to_string(&result)?);
                     Ok(())
                 }
                 CodexCommand::Watch { thread } => {
-                    run(&socket()?, Command::Watch { thread_id: thread }).await
+                    run(&required_socket()?, Command::Watch { thread_id: thread }).await
                 }
             }
         }
@@ -1076,7 +1081,12 @@ fn init(options: Init) -> Result<()> {
     configuration.local_listen = options.local_listen;
     configuration.web_enabled = !options.no_web;
     configuration.local_auto_access = !options.no_local_auto_access;
-    configuration.providers.codex_app_server.socket = options.codex_socket;
+    if let Some(socket) = options.codex_socket {
+        configuration.providers.codex_app_server = AppServer {
+            mode: AppServerMode::System,
+            socket: Some(socket),
+        };
+    }
     configuration.bins = options.bins.into_iter().collect();
     if let Some(url) = options.public_url {
         configuration.public_url = origin(&url)?.to_string().trim_end_matches('/').to_owned();
@@ -1128,6 +1138,8 @@ fn init(options: Init) -> Result<()> {
                 .canonicalize()
                 .context("resolve manager workspace")?,
             model: manager.model(options.model.as_deref().unwrap_or_default()),
+            reasoning_effort: None,
+            backup: Default::default(),
         });
     }
     let mut env = vibeface::providers::ProviderEnv::default();
@@ -1651,7 +1663,6 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
         arguments.is_object(),
         "tool arguments must be a JSON object"
     );
-    let tool = vibeface::tools::Tool::parse(&name).context("unknown coordination tool")?;
     let argument_ref = arguments["call_ref"].as_str();
     ensure!(
         call_ref
@@ -1661,29 +1672,50 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
         "--call-ref must match arguments.call_ref"
     );
     let call_ref = call_ref.or_else(|| argument_ref.map(String::from));
-    ensure!(
-        !tool.needs_call_ref() || call_ref.is_some(),
-        "{name} requires --call-ref; keep it and query call_lookup after any uncertain result"
-    );
     if let Some(call_ref) = &call_ref {
         arguments["call_ref"] = json!(call_ref);
     }
-    let call_id = call_ref.unwrap_or_default();
+    let (tool, arguments) =
+        vibeface::tools::Tool::invocation(&name, arguments.clone()).map_err(|error| {
+            let failure =
+                vibeface::tools::ToolFailure::new(&name, &arguments, "validation", false, &error);
+            eprintln!("{}", failure.response);
+            anyhow::Error::new(failure)
+        })?;
+    let call_id = arguments["call_ref"].as_str().unwrap_or_default();
     let result = if tool == vibeface::tools::Tool::DispatchWork {
-        let socket = std::env::var_os("VIBEFACE_CODEX_SOCKET")
-            .context("VIBEFACE_CODEX_SOCKET is required")?;
-        dispatch_work(&arguments, &call_id, Path::new(&socket)).await?
+        let socket = std::env::var_os("VIBEFACE_CODEX_SOCKET");
+        dispatch_work(&arguments, call_id, socket.as_deref().map(Path::new)).await
     } else {
-        post_tool(&name, arguments, &call_id).await?
-    };
+        post_tool(tool.name(), arguments.clone(), call_id).await
+    }
+    .map_err(|error| {
+        if error
+            .downcast_ref::<vibeface::tools::ToolFailure>()
+            .is_some()
+        {
+            return error;
+        }
+        let failure = vibeface::tools::ToolFailure::new(
+            tool.name(),
+            &arguments,
+            "execution",
+            tool.effect() != vibeface::tools::Effect::Read,
+            &error,
+        );
+        eprintln!("{}", failure.response);
+        anyhow::Error::new(failure)
+    })?;
+    let result = tool.annotate(&arguments, result);
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
 /// `dispatch_work` and `codex send`: the Node tracks and watches the work; the CLI sends it.
-async fn dispatch_work(arguments: &Value, call_id: &str, socket: &Path) -> Result<Value> {
+async fn dispatch_work(arguments: &Value, call_id: &str, socket: Option<&Path>) -> Result<Value> {
     vibeface::agent_cli::dispatch(
         arguments,
+        |call_ref| post_tool("call_lookup", json!({"call_ref":call_ref}), call_id),
         |args| post_tool("track_work", args, call_id),
         |work_id, report| {
             post_tool(
@@ -1720,10 +1752,20 @@ async fn post_tool(name: &str, arguments: Value, call_id: &str) -> Result<Value>
         .json(&json!({"toolName": name, "args": arguments, "agentId": "cli"}))
         .send()
         .await
-        .with_context(|| format!("reach local node tool API; preserve call_ref {call_id} and query call_lookup before retrying"))?;
+        .map_err(|error| {
+            let error = anyhow::Error::new(error).context(format!("reach local node tool API; preserve call_ref {call_id} and query call_lookup before retrying"));
+            let failure = vibeface::tools::ToolFailure::new(name, &arguments, "transport", true, &error);
+            eprintln!("{}", failure.response);
+            anyhow::Error::new(failure)
+        })?;
     let status = response.status();
     let body = bounded_body(response).await?;
     if !status.is_success() {
+        if let Ok(error) = serde_json::from_slice::<Value>(&body)
+            && error.get("call_record").is_some()
+        {
+            eprintln!("{}", serde_json::to_string(&error)?);
+        }
         let reason = serde_json::from_slice::<Value>(&body)
             .ok()
             .and_then(|error| error["error"].as_str().map(str::to_owned))
@@ -1935,32 +1977,6 @@ async fn hook(options: Hook) -> Result<()> {
     Ok(())
 }
 
-/// The home folder `vibeface hooks` edits and Codex's folder in it. `--home` holds every file,
-/// Codex's too; without it, `$HOME`, and Codex's folder is found as Codex finds it: `CODEX_HOME`,
-/// which must be an existing folder, else `$HOME/.codex`.
-fn hook_homes(home: Option<&Path>, host: &vibeface::discovery::Host) -> Result<(PathBuf, PathBuf)> {
-    if let Some(home) = home {
-        return Ok((home.to_owned(), home.join(".codex")));
-    }
-    let home = host
-        .home
-        .clone()
-        .filter(|home| home.is_absolute())
-        .context("HOME is not an absolute path; pass --home")?;
-    let codex_home = match host.codex_home.clone() {
-        Some(codex_home) => {
-            ensure!(
-                codex_home.is_absolute() && codex_home.is_dir(),
-                "CODEX_HOME {} is not an existing absolute folder",
-                codex_home.display()
-            );
-            codex_home
-        }
-        None => home.join(".codex"),
-    };
-    Ok((home, codex_home))
-}
-
 async fn hooks(options: Hooks, host: vibeface::discovery::Host) -> Result<()> {
     use vibeface::triage;
     if let HooksAction::Test = options.action {
@@ -1978,16 +1994,31 @@ async fn hooks(options: Hooks, host: vibeface::discovery::Host) -> Result<()> {
         println!("Node received the test event {}", result["event_id"]);
         return Ok(());
     }
-    let (home, codex_home) = hook_homes(options.home.as_deref(), &host)?;
     let program = std::env::current_exe()?;
     let data_dir = match options.local.data.data_dir.canonicalize() {
         Ok(dir) => dir,
         Err(_) => options.local.data.data_dir.clone(),
     };
+    let home = options
+        .home
+        .clone()
+        .or_else(|| host.home.clone())
+        .filter(|home| home.is_absolute())
+        .context("HOME is not an absolute path; pass --home")?;
+    let claude_home = options
+        .home
+        .as_deref()
+        .map(|home| home.join(".claude"))
+        .unwrap_or_else(|| data_dir.join("providers/claude"));
+    let codex_home = options
+        .home
+        .as_deref()
+        .map(|home| home.join(".codex"))
+        .unwrap_or_else(|| data_dir.join("providers/codex"));
     let stamp = vibeface::runtime::now_ms();
     // Every file is read and checked before any is written: one that cannot change leaves all.
     let mut planned = Vec::new();
-    for file in triage::hook_files(&home, &codex_home) {
+    for file in triage::hook_files_with_claude_root(&home, &claude_home, &codex_home) {
         let mut settings: Value = match fs::read(&file.path) {
             Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => Value::Null,
             Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
@@ -2144,20 +2175,7 @@ fn extensions(
 }
 
 async fn triage(options: Triage) -> Result<()> {
-    let body = match options.action {
-        TriageAction::Events { since } => json!({"action":"events","since":since}),
-        TriageAction::Raise {
-            event_id,
-            severity,
-            question,
-            request_id,
-            choices,
-        } => {
-            json!({"action":"raise","event_id":event_id,"severity":severity,"question":question,
-                "request_id":request_id,"choices":choices})
-        }
-        TriageAction::Dismiss { event_id } => json!({"action":"dismiss","event_id":event_id}),
-    };
+    let body = serde_json::to_value(options.action)?;
     post_triage(&options.local, body).await
 }
 
@@ -2165,6 +2183,75 @@ async fn triage(options: Triage) -> Result<()> {
 mod tests {
     use super::*;
     use clap::{CommandFactory, FromArgMatches};
+
+    #[test]
+    fn triage_attention_kind_parses_and_serializes_for_the_existing_request_boundary() {
+        let base = [
+            "vibeface",
+            "triage",
+            "raise",
+            "--event-id",
+            "event",
+            "--severity",
+            "attention",
+            "--question",
+            "Continue in this browser",
+            "--request-id",
+            "request",
+            "--choice",
+            "Continue",
+        ];
+        for (flag, expected) in [
+            (None, Value::Null),
+            (Some("question"), json!("question")),
+            (Some("approval"), json!("approval")),
+            (Some("browser-takeover"), json!("browser_takeover")),
+        ] {
+            let mut args = base.to_vec();
+            if let Some(flag) = flag {
+                args.extend(["--attention-kind", flag]);
+            }
+            let Some(Action::Triage(options)) = Cli::try_parse_from(args).unwrap().command else {
+                panic!("expected triage");
+            };
+            let body = serde_json::to_value(options.action).unwrap();
+            assert_eq!(
+                body,
+                json!({"action":"raise","event_id":"event","severity":"attention",
+                "question":"Continue in this browser","request_id":"request","choices":["Continue"],
+                "attention_kind":expected})
+            );
+            assert!(
+                body.get("device_id").is_none(),
+                "the event, not CLI input, chooses the device"
+            );
+        }
+        for unknown in ["browser_takeover", "unknown"] {
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain(["--attention-kind", unknown])).is_err()
+            );
+        }
+        for (action, expected) in [
+            (
+                TriageAction::Events { since: Some(12) },
+                json!({"action":"events","since":12}),
+            ),
+            (
+                TriageAction::Events { since: None },
+                json!({"action":"events","since":null}),
+            ),
+            (
+                TriageAction::Dismiss {
+                    event_id: "event".into(),
+                },
+                json!({"action":"dismiss","event_id":"event"}),
+            ),
+        ] {
+            let body = serde_json::to_value(action).unwrap();
+            assert_eq!(body, expected);
+            assert!(body.get("attention_kind").is_none());
+        }
+    }
 
     #[test]
     fn receiving_key_commands_require_an_explicit_stable_intent() {
@@ -2798,6 +2885,33 @@ mod tests {
     }
 
     #[test]
+    fn initialization_selects_system_only_for_an_explicit_codex_socket() {
+        for socket in [None, Some("/tmp/vibeface-fixture-codex.sock")] {
+            let dir =
+                std::env::temp_dir().join(format!("vibeface-cli-mode-{}", uuid::Uuid::new_v4()));
+            let mut args = vec!["vibeface", "init", "--data-dir", dir.to_str().unwrap()];
+            if let Some(socket) = socket {
+                args.extend(["--codex-socket", socket]);
+            }
+            let Some(Action::Init(options)) = Cli::try_parse_from(args).unwrap().command else {
+                panic!("expected init")
+            };
+            init(*options).unwrap();
+            let saved = Config::load(&dir).unwrap().providers.codex_app_server;
+            assert_eq!(
+                saved.mode,
+                if socket.is_some() {
+                    AppServerMode::System
+                } else {
+                    AppServerMode::Spawn
+                }
+            );
+            assert_eq!(saved.socket.as_deref(), socket.map(Path::new));
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
     fn private_creation_never_overwrites_existing_file() {
         let dir = std::env::temp_dir().join(format!("vibeface-cli-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&dir).unwrap();
@@ -2865,11 +2979,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hooks_install_finds_codex_as_codex_does_and_home_holds_every_file() {
+    async fn hooks_install_uses_node_owned_provider_roots_by_default() {
         use vibeface::discovery::Host;
         let dir = std::env::temp_dir().join(format!("vibeface-hooks-{}", uuid::Uuid::new_v4()));
         let (home, codex, data) = (dir.join("home"), dir.join("codex"), dir.join("data"));
-        let run = async |host: Host, home: Option<&Path>| {
+        let run = async |host: Host, home: Option<&Path>, dry_run: bool| {
             let mut args = vec![
                 "vibeface",
                 "hooks",
@@ -2879,6 +2993,9 @@ mod tests {
             ];
             if let Some(home) = home {
                 args.extend(["--home", home.to_str().unwrap()]);
+            }
+            if dry_run {
+                args.push("--dry-run");
             }
             let Some(Action::Hooks(options)) = Cli::try_parse_from(args).unwrap().command else {
                 panic!("expected hooks")
@@ -2890,8 +3007,13 @@ mod tests {
             codex_home,
             path: None,
         };
+        let invalid = run(env(PathBuf::from("relative-home"), None), None, true)
+            .await
+            .unwrap_err();
+        assert!(invalid.to_string().contains("HOME is not an absolute path"));
+        assert!(!data.exists());
         let given = dir.join("given");
-        run(env(home.clone(), Some(codex.clone())), Some(&given))
+        run(env(home.clone(), Some(codex.clone())), Some(&given), false)
             .await
             .unwrap();
         assert!(given.join(".codex/hooks.json").is_file());
@@ -2900,26 +3022,22 @@ mod tests {
             !codex.exists() && !home.exists(),
             "--home keeps CODEX_HOME and $HOME untouched"
         );
-        assert!(
-            run(env(home.clone(), Some(codex.clone())), None)
-                .await
-                .is_err()
-                && !home.exists(),
-            "a CODEX_HOME that does not exist is refused before anything is written"
-        );
-        fs::create_dir_all(&codex).unwrap();
-        run(env(home.clone(), Some(codex.clone())), None)
+        run(env(home.clone(), Some(codex.clone())), None, false)
             .await
             .unwrap();
-        assert!(codex.join("hooks.json").is_file());
-        assert!(home.join(".claude/settings.json").is_file());
+        assert!(data.join("providers/codex/hooks.json").is_file());
+        assert!(data.join("providers/claude/settings.json").is_file());
+        assert!(!home.join(".claude").exists() && !home.join(".codex").exists() && !codex.exists());
+        fs::create_dir_all(&codex).unwrap();
+        run(env(home.clone(), Some(codex.clone())), None, false)
+            .await
+            .unwrap();
+        assert!(data.join("providers/codex/hooks.json").is_file());
+        assert!(data.join("providers/claude/settings.json").is_file());
         assert!(
-            !home.join(".codex").exists(),
-            "CODEX_HOME moves Codex's files"
+            !codex.join("hooks.json").exists() && !home.join(".claude").exists(),
+            "default hooks do not touch the user's Provider roots"
         );
-        let plain = dir.join("plain");
-        run(env(plain.clone(), None), None).await.unwrap();
-        assert!(plain.join(".codex/hooks.json").is_file());
         fs::remove_dir_all(dir).unwrap();
     }
 

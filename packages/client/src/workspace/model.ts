@@ -1,9 +1,11 @@
 import type { Attachment, TranscriptMessage } from "../chat/types.ts"
+import { parseProviderReadiness } from "../lib/node.ts"
+import { providerStages, type ProviderStage, type TurnRuntime } from "./types.ts"
 import type { ReplyStatus } from "../chat/types.ts"
 import type {
   AnswerResult, BotReadiness, CloseReason, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, DispatchState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
-  BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome, Busy,
+  BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, OpenWorkCard, WorkCard, SkillSet, SteerOutcome, Busy,
   WorkPhase, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation, OverviewConversation, OverviewSession,
   AgentLane, QueueHoldReason, ContextProjection, ManagerJob, MemoryConflict,
 } from "./types.ts"
@@ -53,12 +55,13 @@ export function parseNodes(value: unknown): NodeInfo[] {
       device_id: text(data.device_id),
       name: typeof data.name === "string" ? data.name : "",
       local: flag(data.local), online: flag(data.online), revoked: flag(data.revoked),
-      capabilities: capabilities ? { manager: capabilities.manager == null ? null : text(capabilities.manager), manager_state: capabilities.manager == null ? null : readiness(capabilities.manager_state), relay: capabilities.relay === true, roots: texts(capabilities.roots), codex_connected: capabilities.codex != null && record(capabilities.codex).connected === true } : undefined,
+      capabilities: capabilities ? { manager: capabilities.manager == null ? null : text(capabilities.manager), manager_state: capabilities.manager == null ? null : readiness(capabilities.manager_state), manager_readiness: capabilities.manager_readiness == null ? null : parseProviderReadiness(capabilities.manager_readiness), relay: capabilities.relay === true, roots: texts(capabilities.roots), codex_connected: capabilities.codex != null && record(capabilities.codex).connected === true } : undefined,
     }
   })
 }
 function readiness(value: unknown): BotReadiness {
-  return value === "ready" || value === "starting" || value === "needs_setup" ? value : "unverified"
+  if (value === "ready" || value === "starting" || value === "unverified" || value === "needs_setup") return value
+  throw new Error("Bot 可用性状态无法识别。")
 }
 export function botReadiness(node: NodeInfo | undefined): BotReadiness | null {
   if (!node || node.revoked || !node.online || !node.capabilities?.manager) return null
@@ -96,6 +99,19 @@ function failure(value: unknown): { failure?: FailureKind } {
 }
 function attachments(value: unknown) { return value == null ? undefined : list(value).map((item) => { const file = record(item); return { hash: text(file.hash), size: number(file.size), name: text(file.name) } }) }
 function optionalText(value: unknown): string | undefined { return value == null ? undefined : text(value) }
+function recordOrNull(value: unknown) { return value == null ? null : record(value) }
+function providerStage(value: unknown): ProviderStage {
+  const stage = providerStages.find((stage) => stage === value)
+  if (!stage) throw new Error('回合阶段无法识别。')
+  return stage
+}
+export function parseTurnRuntime(value: unknown): TurnRuntime | null {
+  if (value == null) return null
+  const data = record(value), previous = recordOrNull(data.switched_from)
+  const nullable = (value: unknown) => value == null ? null : text(value)
+  if (data.execution !== 'not_started' && data.execution !== 'started' && data.execution !== 'unknown') throw new Error('回合执行状态无法识别。')
+  return { provider: provider(data.provider), model: nullable(data.model), reasoning_effort: nullable(data.reasoning_effort), generation: text(data.generation), session_generation: number(data.session_generation), delivery_id: text(data.delivery_id), stage: providerStage(data.stage), execution: data.execution, attempted_at_ms: number(data.attempted_at_ms), switched_from: previous ? { provider: provider(previous.provider), model: nullable(previous.model), reasoning_effort: nullable(previous.reasoning_effort) } : null, switch_reason: failureKind(data.switch_reason) ?? null }
+}
 function agentLane(value: unknown): AgentLane | undefined {
   switch (value) {
     case null: case undefined: return undefined
@@ -156,6 +172,7 @@ function managerJob(value: unknown): ManagerJob {
   return { trigger: text(job.trigger), state: text(job.state), lane: agentLane(job.lane), hold_reason: queueHold(job.hold_reason),
     message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id),
     failure: job.failure == null ? undefined : { kind: failureKind(record(job.failure).kind) ?? 'unknown', detail: text(record(job.failure).detail) },
+    runtime: parseTurnRuntime(job.runtime), retryable: job.retryable === true && recordOrNull(job.runtime)?.execution === 'not_started' && job.pending_check !== true,
     pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined, source_node: optionalText(job.source_node),
     ...(job.context === undefined ? {} : { context: contextProjection(job.context) }),
   }
@@ -190,24 +207,29 @@ function workKind(value: unknown): WorkRecord["kind"] {
   if (value === "task" || providerIds.includes(value as ProviderId)) return value as WorkRecord["kind"]
   throw new Error("任务类型无法识别。")
 }
-function optionalWorkFields(data: Record<string, unknown>): Partial<WorkRecord> {
-  const fields: Partial<WorkRecord> = {}
+function optionalWorkFields(data: Record<string, unknown>): Partial<Omit<WorkRecord, "state" | "resolved">> {
+  const fields: Partial<Omit<WorkRecord, "state" | "resolved">> = {}
   for (const key of ["dispatcher", "call_ref", "continues", "parent", "thread", "thread_id", "turn_id"] as const) {
     if (data[key] != null) fields[key] = text(data[key])
   }
   const kind = workKind(data.kind)
   if (kind !== undefined) fields.kind = kind
+  if (typeof data.model === "string") fields.model = data.model
   if (data.phase != null) fields.phase = workPhase(data.phase)
   if (data.coordination_job !== undefined) fields.coordination_job = data.coordination_job === null ? null : managerJob(data.coordination_job)
   return fields
 }
 function work(value: unknown): WorkRecord {
   const data = record(value)
-  return {
+  const common = {
     work_id: text(data.work_id), trigger: text(data.trigger), target_node: text(data.target_node), cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: text(data.prompt),
-    state: workState(data.state), summary: text(data.summary), outcome: workOutcome(data.outcome), result_text: text(data.result_text),
+    summary: text(data.summary), outcome: workOutcome(data.outcome), result_text: text(data.result_text),
     failure_reason: data.failure_reason == null ? null : text(data.failure_reason), ...failure(data.failure), ...optionalWorkFields(data),
   }
+  const state = workState(data.state)
+  if (state === "dispatch_waiting" || state === "dispatch_rejected" || state === "dispatch_unverified") return { ...common, state }
+  const resolved = record(data.resolved)
+  return { ...common, state, resolved: { provider: provider(resolved.provider), model: resolved.model === null ? null : text(resolved.model) } }
 }
 /** Requests this device still carries: an untaken dispatch shows as its own task row, a stop marks its work. */
 export function withDeliveries(works: WorkRecord[], value: unknown): WorkRecord[] {
@@ -232,7 +254,7 @@ function coordinationCheck(value: unknown): CoordinationCheck {
  * its device is known to be offline, or its App Server disconnected for a Codex turn; an unknown device is not judged.
  * A task runs in its device's bot, which reports without the App Server, so only offline applies to it.
  */
-export function confirmReason(item: WorkRecord, nodes: readonly NodeInfo[]): ConfirmReason | null {
+export function confirmReason(item: Pick<WorkCard, "state" | "outcome" | "target_node" | "kind">, nodes: readonly NodeInfo[]): ConfirmReason | null {
   if (item.state === "unverified") return "unverified"
   if (item.outcome || item.state === "finished" || item.state.startsWith("dispatch_")) return null
   const node = nodes.find((candidate) => candidate.device_id === item.target_node)
@@ -250,7 +272,7 @@ export function pendingChecks(data: Pick<ConversationPayload, "works" | "checks"
 }
 export type WorkCheck = Extract<PendingCheck, { kind: "work" }>
 /** Each work waiting for confirmation; works one offline device or one disconnected Codex holds share one card, where the first of them stood. */
-export function workChecks(works: readonly OpenWork[], nodes: readonly NodeInfo[]): PendingCheck[] {
+export function workChecks(works: readonly OpenWorkCard[], nodes: readonly NodeInfo[]): PendingCheck[] {
   const checks = works.flatMap((item): WorkCheck[] => {
     const reason = confirmReason(item, nodes)
     return reason ? [{ kind: "work", check_id: `work:${item.work_id}`, detail: item.failure_reason ?? "", work_id: item.work_id, target_node: item.target_node, conversation_id: item.conversation_id, title: item.title, reason }] : []
@@ -271,7 +293,7 @@ export function parseOpenWorks(value: unknown): OpenWork[] {
 }
 
 export type WorkspaceOverviewInput = {
-  openWorks: readonly OpenWork[]
+  openWorks: readonly OpenWorkCard[]
   bots: readonly BotRecord[]
   questions: readonly Question[]
   nodes: readonly NodeInfo[]
@@ -364,7 +386,7 @@ function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "
   }
 }
 
-function openOverviewWork(work: OpenWork, bots: ReadonlyMap<string, OverviewBot>, nodes: ReadonlyMap<string, OverviewNode>): OverviewTask | null {
+function openOverviewWork(work: OpenWorkCard, bots: ReadonlyMap<string, OverviewBot>, nodes: ReadonlyMap<string, OverviewNode>): OverviewTask | null {
   const bot = bots.get(work.conversation_id) ?? null, node = nodes.get(work.target_node) ?? null
   const unsafeCompleted = work.outcome === "completed" && work.state === "unverified"
   // A failure stays listed until a later work of its conversation ends, as the Node lists it.
@@ -377,10 +399,10 @@ function openOverviewWork(work: OpenWork, bots: ReadonlyMap<string, OverviewBot>
   return { ...overviewTaskBase(work, bot, node, "event"), kind: "work" }
 }
 
-function overviewCheck(check: PendingCheck, workById: ReadonlyMap<string, OpenWork>, bots: ReadonlyMap<string, OverviewBot>, nodes: ReadonlyMap<string, OverviewNode>): OverviewTask {
-  const works = check.kind === "device" ? check.works.flatMap((item) => { const work = workById.get(item.work_id); return work ? [work] : [] }) : check.kind === "work" ? [workById.get(check.work_id)].filter((work): work is OpenWork => Boolean(work)) : []
+function overviewCheck(check: PendingCheck, workById: ReadonlyMap<string, OpenWorkCard>, bots: ReadonlyMap<string, OverviewBot>, nodes: ReadonlyMap<string, OverviewNode>): OverviewTask {
+  const works = check.kind === "device" ? check.works.flatMap((item) => { const work = workById.get(item.work_id); return work ? [work] : [] }) : check.kind === "work" ? [workById.get(check.work_id)].filter((work): work is OpenWorkCard => Boolean(work)) : []
   const first = works[0]
-  const fallback: OpenWork = first ?? {
+  const fallback: OpenWorkCard = first ?? {
     work_id: check.kind === "work" ? check.work_id : "",
     conversation_id: check.kind === "work" ? check.conversation_id : "",
     title: check.kind === "work" ? check.title : "待确认",
@@ -388,7 +410,7 @@ function overviewCheck(check: PendingCheck, workById: ReadonlyMap<string, OpenWo
     state: "unverified",
     outcome: "unverified",
     target_node: check.kind === "work" || check.kind === "device" ? check.target_node : "",
-    cwd: "", prompt: "", trigger: "", result_text: "", failure_reason: check.detail,
+    cwd: "", failure_reason: check.detail,
   }
   const bot = fallback.conversation_id ? bots.get(fallback.conversation_id) ?? null : null
   const node = fallback.target_node ? nodes.get(fallback.target_node) ?? null : null
@@ -425,7 +447,7 @@ export function overviewFromWorkspace({ openWorks, bots, questions, nodes }: Wor
     const related = question.about.request_id ? openWorks.find((work) => work.thread_id === question.about.session_id && !work.outcome) : undefined
     return {
       kind: "question", question_id: question.question_id, conversation_id: question.conversation_id, bot,
-      text: question.text, severity: question.severity, choices: question.choices.map((choice) => ({ label: choice.label })),
+      attention: question.attention, text: question.text, severity: question.severity, choices: question.choices.map((choice) => ({ label: choice.label })),
       request_id: question.about.request_id ?? null, work_id: related?.work_id ?? null, about: question.about, created_at_ms: question.created_at_ms,
       state: "unanswered", navigation: bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id } : null,
     }
@@ -483,7 +505,7 @@ function parseOverviewQuestion(value: unknown): OverviewQuestion {
   const about = data.about == null ? null : subject(data.about)
   return {
     kind: "question", question_id: text(data.question_id), conversation_id: text(data.conversation_id), bot,
-    text: text(data.text), severity: severity(data.severity), choices: list(data.choices ?? []).map((choice) => ({ label: text(record(choice).label) })),
+    attention: data.attention == null ? undefined : parseAttention(data.attention), text: text(data.text), severity: severity(data.severity), choices: list(data.choices ?? []).map((choice) => ({ label: text(record(choice).label) })),
     request_id: nullableText(data.request_id ?? about?.request_id), work_id: nullableText(data.work_id), about, created_at_ms: number(data.created_at_ms), state: "unanswered",
     navigation: bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id } : null,
   }
@@ -493,6 +515,7 @@ function parseOverviewJob(value: unknown): OverviewJob {
   const state = data.remote_reachable === false || unknownReason ? "unknown" : data.state == null ? "unknown" : text(data.state)
   return {
     job_id: nullableText(data.job_id) ?? `${conversationId ?? ""}:${trigger}:${messageId ?? ""}`, conversation_id: conversationId, trigger, state,
+    runtime: parseTurnRuntime(data.runtime), retryable: data.retryable === true && recordOrNull(data.runtime)?.execution === "not_started" && data.pending_check !== true && state === "failed",
     message_id: messageId, reply_message_id: nullableText(data.reply_message_id), source_node: nullableText(data.source_node), pending_check: data.pending_check === true,
     outcome: state === "unknown" ? "unknown" : data.outcome === "answered" || data.outcome === "unfinished" || data.outcome === "unknown" ? data.outcome : null,
     unknown_reason: unknownReason, kind: nullableText(data.kind), sequence: nullableNumber(data.sequence), owner_epoch: nullableNumber(data.owner_epoch),
@@ -571,7 +594,7 @@ export function parseWorkspaceOverview(value: unknown): WorkspaceOverview {
 }
 
 /** Keep complete known work records and add observations only present in the bounded overview. Neither read orders the other. */
-export function openWorksFromOverview(overview: WorkspaceOverview, openWorks: readonly OpenWork[]): OpenWork[] {
+export function openWorksFromOverview(overview: WorkspaceOverview, openWorks: readonly OpenWorkCard[]): OpenWorkCard[] {
   const works = [...openWorks]
   const known = new Set(works.map((work) => JSON.stringify([work.conversation_id, work.work_id])))
   for (const task of overview.tasks) {
@@ -584,8 +607,8 @@ export function openWorksFromOverview(overview: WorkspaceOverview, openWorks: re
           : task.state
     const outcome = task.outcome === "completed" && state === "unverified" ? "unverified" : task.outcome
     works.push({
-      work_id: task.work_id, conversation_id: task.conversation_id, trigger: "", target_node: task.target_node ?? "", cwd: task.cwd, title: task.title, prompt: "",
-      state, summary: task.summary, outcome, result_text: "", failure_reason: task.reason, ...failure(task.failure), kind: task.work_kind ?? undefined,
+      work_id: task.work_id, conversation_id: task.conversation_id, target_node: task.target_node ?? "", cwd: task.cwd, title: task.title,
+      state, summary: task.summary, outcome, failure_reason: task.reason, ...failure(task.failure), kind: task.work_kind ?? undefined,
       dispatcher: task.dispatcher ?? undefined, call_ref: task.call_ref ?? undefined, continues: task.continues ?? undefined, parent: task.parent ?? undefined,
       thread: task.thread ?? undefined, thread_id: task.thread_id ?? undefined, turn_id: task.turn_id ?? undefined, phase: task.phase ?? undefined,
       ...(task.coordination_job === undefined ? {} : { coordination_job: task.coordination_job }),
@@ -676,10 +699,11 @@ function botChange(value: unknown): BotChange {
   const data = record(value)
   if (data.kind === "profile") {
     const name = edit(data.name), instructions = edit(data.instructions), model = modelEdit(data.model)
+    const effort = data.reasoning_effort == null ? undefined : (() => { const value = record(data.reasoning_effort); return { provider: provider(value.provider), before: value.before === null ? null : text(value.before), after: value.after === null ? null : text(value.after) } })()
     const skills = data.skills == null ? undefined : { before: skillSet(record(data.skills).before), after: skillSet(record(data.skills).after) }
     const face = data.avatar == null ? undefined : { before: avatar(record(data.avatar).before), after: avatar(record(data.avatar).after) }
-    if (!name && !instructions && !model && !skills && !face) throw new Error("Bot 修改记录是空的。")
-    return { kind: "profile", ...(name ? { name } : {}), ...(instructions ? { instructions } : {}), ...(model ? { model } : {}), ...(skills ? { skills } : {}), ...(face ? { avatar: face } : {}) }
+    if (!name && !instructions && !model && !effort && !skills && !face) throw new Error("Bot 修改记录是空的。")
+    return { kind: "profile", ...(name ? { name } : {}), ...(instructions ? { instructions } : {}), ...(model ? { model } : {}), ...(effort ? { reasoning_effort: effort } : {}), ...(skills ? { skills } : {}), ...(face ? { avatar: face } : {}) }
   }
   if (data.before == null && data.after == null) throw new Error("Bot 修改记录是空的。")
   switch (data.kind) {
@@ -701,6 +725,7 @@ function overwritten(value: unknown): Overwritten {
   switch (data.field) {
     case "name": case "instructions": return { ...base, field: data.field, value: text(data.value) }
     case "model": return { ...base, field: "model", provider: provider(data.provider), value: text(data.value) }
+    case "reasoning_effort": return { ...base, field: "reasoning_effort", provider: provider(data.provider), value: data.value === null ? null : text(data.value) }
     case "skills": return { ...base, field: "skills", value: skillSet(data.value) }
     case "avatar": return { ...base, field: "avatar", value: avatar(data.value) }
     default: throw new Error("被覆盖的设置无法识别。")
@@ -774,7 +799,7 @@ export function parseCreateBot(value: unknown): CreateBotRequest {
 }
 export function parseBot(value: unknown): BotRecord {
   const data = record(value), last = data.last_message == null ? null : record(data.last_message)
-  return { ...parseCreateBot(value), models: botModels(data.models), skills: skillSet(data.skills), avatar: avatar(data.avatar), avatar_version: data.avatar_version == null ? null : text(data.avatar_version), event_hash: text(data.event_hash), last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) }, busy: busy(data.busy) }
+  return { ...parseCreateBot(value), models: botModels(data.models), reasoning_efforts: botModels(data.reasoning_efforts ?? {}), skills: skillSet(data.skills), avatar: avatar(data.avatar), avatar_version: data.avatar_version == null ? null : text(data.avatar_version), event_hash: text(data.event_hash), last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) }, busy: busy(data.busy) }
 }
 const busy = (value: unknown): Busy => value === "thinking" || value === "replying" ? value : null
 export function parseBots(value: unknown): BotRecord[] {
@@ -821,13 +846,18 @@ function closeReason(value: unknown): CloseReason {
   if (value !== "request_lost") throw new Error("问题关闭的原因无法识别。")
   return value
 }
+function parseAttention(value: unknown): NonNullable<Question['attention']> {
+  const data = record(value)
+  if (data.kind !== 'question' && data.kind !== 'approval' && data.kind !== 'browser_takeover') throw new Error('请求类型无法识别。')
+  return { kind: data.kind, device_id: data.device_id === null ? null : text(data.device_id) }
+}
 function question(value: unknown): Question {
   const data = record(value)
   const bot = data.bot == null ? null : record(data.bot), answer = data.answer == null ? null : record(data.answer)
   return {
     question_id: text(data.question_id), conversation_id: text(data.conversation_id),
     bot: bot && { bot_id: text(bot.bot_id), name: text(bot.name) },
-    severity: severity(data.severity), text: text(data.text),
+    severity: severity(data.severity), attention: data.attention == null ? undefined : parseAttention(data.attention), text: text(data.text),
     choices: list(data.choices ?? []).map((item) => ({ label: text(record(item).label) })),
     about: subject(data.about), author: text(data.author), created_at_ms: number(data.created_at_ms),
     answer: answer && { message_id: text(answer.message_id), text: text(answer.text), author: text(answer.author), created_at_ms: number(answer.created_at_ms) },

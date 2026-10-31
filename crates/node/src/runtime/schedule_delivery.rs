@@ -27,7 +27,11 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
             .any(|check| check.conversation_id == job.conversation_id
                 && check.trigger == job.trigger)
     );
-    if let JobState::Failed { failure, .. } | JobState::Interrupted { failure, .. } = &job.state {
+    value["retryable"] = json!(job.retryable() && value["pending_check"] != true);
+    if let JobState::Failed { failure, .. }
+    | JobState::Interrupted { failure, .. }
+    | JobState::Reconciling { failure, .. } = &job.state
+    {
         value["failure"]["detail"] = json!(crate::logging::scrub(&failure.detail));
     }
     Ok(value)
@@ -106,6 +110,15 @@ impl Runtime {
     pub(super) fn start_schedule_delivery(self: &Arc<Self>) {
         let node = self.clone();
         tokio::spawn(async move {
+            if let Some(manager) = node.manager() {
+                if manager.provider.on_app_server() {
+                    node.codex.ready().await;
+                }
+                node.probe_provider(manager.provider).await;
+            }
+        });
+        let node = self.clone();
+        tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(3));
             loop {
                 tokio::select! {
@@ -152,13 +165,14 @@ impl Runtime {
     }
 
     /// Stops for good once this Node's log forks: a turn would act without a record.
-    async fn schedule_tick(self: &Arc<Self>) -> Result<()> {
+    pub(super) async fn schedule_tick(self: &Arc<Self>) -> Result<()> {
         if !self.writable() {
             return Ok(());
         }
         let Some(network) = self.store.lock().await.network()? else {
             return Ok(());
         };
+        self.finish_incompatible_tasks(&network, None).await?;
         // A conversation that moved to a newer owner stops its turn here; a cancel the SDK does
         // not confirm ends as interrupted and waits for reconciliation like any other.
         let moved = self

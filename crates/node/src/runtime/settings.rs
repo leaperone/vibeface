@@ -5,7 +5,7 @@ use crate::discovery::{self, Paths, Target};
 use crate::manager::{ManagerConfig, Sdk};
 use crate::providers::{
     self, AppServer, AppServerMode, ObservationStatus, Provider, ProviderObservation,
-    ProviderReadiness, ReadinessEvidence, Role,
+    ProviderReadiness, ProviderRoots, ReadinessEvidence, Role,
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,45 @@ pub struct NodeSettings {
     pub manager: Option<ManagerSettings>,
 }
 
+fn provider_setup(
+    provider: Provider,
+    local: &providers::Local,
+    roots: &ProviderRoots,
+) -> Option<Value> {
+    let directory = match provider {
+        Provider::Codex if local.launches(provider) => &roots.codex_home,
+        Provider::Claude => &roots.claude_config,
+        Provider::Opencode => &roots.opencode,
+        Provider::Codex | Provider::Cursor | Provider::Pi => return None,
+    };
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    let mut argv = vec!["env".to_owned()];
+    if provider == Provider::Opencode {
+        for name in [
+            "OPENCODE_CONFIG",
+            "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_CLI_CONFIG_CONTENT",
+            "OPENCODE_TEST_HOME",
+        ] {
+            argv.extend(["-u".into(), name.into()]);
+        }
+    }
+    argv.extend(
+        roots
+            .env(provider)
+            .into_iter()
+            .map(|(name, value)| quote(&format!("{name}={value}"))),
+    );
+    argv.push(quote(&local.bin(provider).to_string_lossy()));
+    argv.extend(match provider {
+        Provider::Codex => vec!["login".into()],
+        Provider::Claude => vec!["auth".into(), "login".into()],
+        Provider::Opencode => vec!["--standalone".into(), "auth".into(), "login".into()],
+        Provider::Cursor | Provider::Pi => unreachable!(),
+    });
+    Some(json!({"directory":directory,"command":argv.join(" ")}))
+}
+
 /// One change to a provider; absent fields keep their value. A variable set to a string is set
 /// or replaced, set to `null` is removed. Values are never read back.
 #[derive(Deserialize)]
@@ -30,6 +69,8 @@ pub struct ProviderChange {
     bot: Option<bool>,
     /// Whether this provider executes dispatched work.
     execution: Option<bool>,
+    /// The device default model for dispatched work. Empty clears the override.
+    execution_model: Option<String>,
     /// The provider's program; empty restores its default.
     bin: Option<PathBuf>,
     /// Which Codex App Server to use.
@@ -70,6 +111,9 @@ impl ProviderChange {
                     .take()
                     .or(default)
                     .context("no bot to start")?;
+                if chosen.provider != provider {
+                    chosen.reasoning_effort = None;
+                }
                 chosen.provider = provider;
                 chosen.model = provider.model(&chosen.model);
                 *target.manager = Some(chosen);
@@ -97,6 +141,25 @@ impl ProviderChange {
                 target.local.switches.execution.remove(&provider);
             }
             None => {}
+        }
+        if let Some(model) = self.execution_model {
+            ensure!(
+                provider.supports().contains(&Role::Execution),
+                "{} does not execute dispatched work here yet",
+                provider.label()
+            );
+            let model = model.trim();
+            if model.is_empty() {
+                target.local.switches.execution_models.remove(&provider);
+            } else {
+                let model = provider.model(model);
+                crate::model::validate_model(&model)?;
+                target
+                    .local
+                    .switches
+                    .execution_models
+                    .insert(provider, model);
+            }
         }
         if let Some(bin) = self.bin {
             let trimmed = PathBuf::from(bin.to_string_lossy().trim());
@@ -157,6 +220,8 @@ impl Runtime {
             provider,
             workspace: self.data_dir.canonicalize()?.join("manager-workspace"),
             model: provider.model(""),
+            reasoning_effort: None,
+            backup: Default::default(),
         })
     }
 
@@ -180,11 +245,7 @@ impl Runtime {
 
     /// A turn of the bot `settings` describe, in its provider's SDK on this Node. Its tools see
     /// the Node-wide shell environment; the caller adds what belongs to the turn.
-    pub(crate) fn manager_config(&self, settings: ManagerSettings) -> Result<ManagerConfig> {
-        self.manager_config_from(settings, &self.providers())
-    }
-
-    pub(crate) fn manager_config_from(
+    pub(crate) fn manager_config(
         &self,
         settings: ManagerSettings,
         local: &providers::Local,
@@ -226,6 +287,7 @@ impl Runtime {
             sdk,
             workspace: settings.workspace,
             model: settings.model,
+            reasoning_effort: settings.reasoning_effort,
             timeout_secs: self.config.timeout_secs,
             custom_tools: BTreeMap::new(),
             tool_cli: None,
@@ -243,19 +305,19 @@ impl Runtime {
         self.providers().env.get(provider).clone()
     }
 
-    /// Whether the bot's backend can take a turn, waiting a while for an App Server that is
-    /// still coming up with the Node.
     pub(crate) async fn manager_backend_ready(&self, provider: Provider) -> bool {
         !provider.on_app_server() || self.codex.ready().await
     }
 
-    async fn provider_status(
+    pub(crate) async fn provider_status(
         &self,
         provider: Provider,
         local: &providers::Local,
         settings: &NodeSettings,
     ) -> Value {
         let configured = local.env.get(provider);
+        let roots = ProviderRoots::new(&self.data_dir);
+        let runtime_env = roots.env(provider);
         let app_server = &local.switches.codex_app_server;
         let bot = settings
             .manager
@@ -282,14 +344,14 @@ impl Runtime {
         let names: BTreeSet<&String> = configured.keys().chain(&required).collect();
         let env: Vec<Value> = names
             .into_iter()
+            .filter(|name| !runtime_env.contains_key(*name))
             .map(|name| {
                 json!({"name":name,"set":configured.contains_key(name),
                     "inherited":inherited(name),"required":required.contains(name)})
             })
             .collect();
-        let mut starting = false;
         let link = if provider.on_app_server() {
-            Some(self.codex.link().await)
+            Some(self.codex.link().await.sanitized())
         } else {
             None
         };
@@ -310,10 +372,23 @@ impl Runtime {
                 Some(Link::HandshakeFailed { reason, .. }) => {
                     issues.push(json!({"code":"app_server_unreachable","detail":reason}))
                 }
-                Some(Link::Starting) => starting = true,
                 _ => {}
             }
         }
+        let probe = self.provider_probe_snapshot(provider).await;
+        let model = settings
+            .manager
+            .as_ref()
+            .filter(|manager| manager.provider == provider)
+            .map_or("", |manager| manager.model.as_str());
+        let readiness = probe.readiness(model);
+        let execution_model = local
+            .switches
+            .execution_models
+            .get(&provider)
+            .cloned()
+            .unwrap_or_default();
+        let execution_readiness = probe.readiness(&execution_model);
         let launchable = if !issues.is_empty() || executable_missing || environment_missing {
             ProviderObservation::new(
                 ObservationStatus::Rejected,
@@ -352,14 +427,11 @@ impl Runtime {
         let observed = ProviderReadiness::from_prerequisites(self.host.installed(&bin), launchable);
         let state = if roles.is_empty() {
             "off"
-        } else if !issues.is_empty() {
-            "needs_setup"
-        } else if starting {
-            "starting"
         } else {
-            "unverified"
+            readiness.state()
         };
         let codex = provider.on_app_server();
+        let setup = provider_setup(provider, local, &roots);
         json!({
             "provider":provider, "roles":roles, "supports":provider.supports(),
             "installed":observed.installed.status == ObservationStatus::Confirmed, "bin":bin,
@@ -368,8 +440,16 @@ impl Runtime {
                 "socket":app_server.socket,"link":link})),
             "home":codex.then(|| configured.get(discovery::CODEX_HOME)),
             "sessions":codex.then(|| self.triage.config().codex_sessions),
-            "env":env, "state":state, "issues":issues,
+            "env":env, "state":state, "issues":issues, "probe":probe, "readiness":readiness,
+            "execution_model":execution_model, "execution_readiness":execution_readiness,
+            "setup":setup,
         })
+    }
+
+    pub(crate) async fn refresh_provider_status(&self, provider: Provider) -> Value {
+        self.probe_provider(provider).await;
+        self.provider_status(provider, &self.providers(), &self.settings_snapshot())
+            .await
     }
 
     pub(crate) fn settings_snapshot(&self) -> NodeSettings {
@@ -379,15 +459,10 @@ impl Runtime {
             .clone()
     }
 
-    /// Whether the bot's provider works now (`ready`), is coming up (`starting`) or needs the
-    /// user (`needs_setup`); the bot switch alone does not make it run. `None` without a bot.
     pub(crate) async fn manager_state(&self) -> Option<Value> {
-        let settings = self.settings_snapshot();
-        let manager = settings.manager.as_ref()?;
-        let status = self
-            .provider_status(manager.provider, &self.providers(), &settings)
-            .await;
-        Some(status["state"].clone())
+        self.manager_readiness()
+            .await
+            .map(|readiness| json!(readiness.state()))
     }
 
     pub(crate) async fn node_settings(&self) -> Result<Value> {
@@ -395,24 +470,16 @@ impl Runtime {
         let default = self.default_manager(Provider::Codex)?;
         let defaults = json!({"workspace":default.workspace});
         let local = self.providers();
-        let mut missing = Vec::new();
-        if let Some(manager) = &settings.manager
-            && local.launches(manager.provider)
-            && !executable(&local.bin(manager.provider))
-        {
-            missing.push(manager.provider);
-        }
-        let readiness = if settings.manager.is_none() {
-            "disabled"
-        } else if missing.is_empty() {
-            "authentication_unverified"
-        } else {
-            "missing_prerequisites"
-        };
         let mut providers = Vec::new();
         for provider in Provider::ALL {
             providers.push(self.provider_status(provider, &local, &settings).await);
         }
+        let readiness = settings.manager.as_ref().and_then(|manager| {
+            providers
+                .iter()
+                .find(|status| status["provider"] == manager.provider.name())
+                .map(|status| status["readiness"].clone())
+        });
         let suggested: Vec<PathBuf> = self
             .host
             .project_folders()
@@ -420,7 +487,7 @@ impl Runtime {
             .filter(|folder| !settings.roots.contains(folder))
             .collect();
         let mut response = json!({"settings":settings,"defaults":defaults,
-            "readiness":{"manager":readiness,"missing":missing},"providers":providers,
+            "readiness":{"manager":readiness},"providers":providers,
             "suggested_roots":suggested});
         response["display_paths"] = json!(self.host.display_paths(&response));
         Ok(response)
@@ -474,8 +541,13 @@ impl Runtime {
             _ => None,
         };
         let change = change.expand(&self.host);
+        let provider = change.provider;
         self.write_providers(|target| change.apply(target, default))
             .await?;
+        drop(_work);
+        drop(_save);
+        self.apply_provider_launches().await?;
+        self.probe_provider(provider).await;
         self.node_settings().await
     }
 
@@ -498,6 +570,7 @@ impl Runtime {
             manager: &mut manager,
             triage: &mut triage,
         })?;
+        self.enforce_provider_roots(&mut next)?;
         let filled = discovery::missing(
             &Target {
                 local: &mut next,
@@ -521,6 +594,7 @@ impl Runtime {
             .is_some_and(|manager| manager.provider.on_app_server());
         next.validate(codex_agent)?;
         let manager_changed = manager != previous_manager;
+        let _active = self.manager_controls.lock().await;
         if manager_changed
             || next.switches != previous.switches
             || next.bins != previous.bins
@@ -550,19 +624,71 @@ impl Runtime {
         if triage != previous_triage {
             self.triage.set_config(triage);
         }
-        self.codex.retarget(next.codex_target(codex_agent));
-        (self.opencode).set_launch(
-            next.bin(Provider::Opencode),
-            next.env.get(Provider::Opencode).clone(),
-        );
         if manager_changed
-            || next.env.get(Provider::Cursor) != previous.env.get(Provider::Cursor)
-            || next.bin(Provider::Cursor) != previous.bin(Provider::Cursor)
+            || next.switches != previous.switches
+            || next.bins != previous.bins
+            || next.env != previous.env
         {
-            self.refresh_cursor();
+            self.pending_provider_launches
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        drop(_active);
         self.schedule_wakeup.notify_one();
         Ok(filled)
+    }
+
+    pub(crate) async fn apply_provider_launches(&self) -> Result<bool> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _save = self.config_save.lock().await;
+        if !self.pending_provider_launches.load(SeqCst) {
+            return Ok(true);
+        }
+        let active = self.manager_controls.lock().await;
+        if !active.is_empty() || self.triage.turn.try_lock().is_err() {
+            self.pending_provider_launches.store(true, SeqCst);
+            return Ok(false);
+        }
+        let store = self.store.lock().await;
+        let busy_work = match store.work_records() {
+            Ok(works) => works.iter().any(|work| {
+                matches!(
+                    work.kind,
+                    crate::model::WorkKind::Agent(Provider::Codex | Provider::Opencode)
+                ) && !work.state.finished()
+            }),
+            Err(error) => {
+                self.pending_provider_launches.store(true, SeqCst);
+                return Err(error);
+            }
+        };
+        let busy_job = match store.scheduler_jobs_all() {
+            Ok(jobs) => jobs.iter().any(|job| {
+                matches!(
+                    job.state.name(),
+                    "claimed" | "running" | "cancelling" | "reconciling" | "steering"
+                )
+            }),
+            Err(error) => {
+                self.pending_provider_launches.store(true, SeqCst);
+                return Err(error);
+            }
+        };
+        if busy_work || busy_job {
+            self.pending_provider_launches.store(true, SeqCst);
+            return Ok(false);
+        }
+        let local = self.providers();
+        let codex_agent = self
+            .manager()
+            .is_some_and(|manager| manager.provider.on_app_server());
+        self.codex.retarget(local.codex_target(codex_agent));
+        self.opencode.set_launch(
+            local.bin(Provider::Opencode),
+            local.env.get(Provider::Opencode).clone(),
+        );
+        self.refresh_cursor();
+        self.pending_provider_launches.store(false, SeqCst);
+        Ok(true)
     }
 
     /// Adds folders work may run in; the caller holds `config_save`.
@@ -616,6 +742,10 @@ impl Runtime {
         settings.roots.sort();
         settings.roots.dedup();
         if let Some(manager) = &mut settings.manager {
+            manager
+                .provider
+                .validate_reasoning_effort(manager.reasoning_effort.as_deref())?;
+            manager.backup.validate()?;
             manager.workspace = self.host.expand(&manager.workspace);
             ensure!(
                 manager.workspace.is_absolute(),
@@ -636,6 +766,7 @@ impl Runtime {
                 .canonicalize()
                 .context("manager workspace does not exist")?;
         }
+        let _active = self.manager_controls.lock().await;
         let mut configuration = Config::load(directory)?;
         configuration.manager = settings.manager.clone();
         configuration.roots = settings.roots.clone();
@@ -646,7 +777,17 @@ impl Runtime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = settings;
         if manager_changed {
-            self.refresh_cursor();
+            self.pending_provider_launches
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        drop(_active);
+        drop(_work);
+        drop(_save);
+        if manager_changed {
+            self.apply_provider_launches().await?;
+            if let Some(manager) = self.manager() {
+                self.probe_provider(manager.provider).await;
+            }
         }
         self.schedule_wakeup.notify_one();
         self.node_settings().await
@@ -702,6 +843,10 @@ impl ProposalInput {
     }
 
     fn paths(self) -> Result<Paths> {
+        ensure!(
+            self.codex_home.is_none(),
+            "the Codex runtime directory is owned by this Node"
+        );
         let existing = |path: Option<PathBuf>, what: &str, kind: fn(&Path) -> bool| {
             path.map(|path| {
                 ensure!(
@@ -828,6 +973,10 @@ impl Runtime {
         );
         let body = crate::model::EventBody::QuestionAsked {
             question_id: question_id.clone(),
+            attention: crate::model::AttentionRequest {
+                kind: crate::model::AttentionKind::Approval,
+                device_id: Some(device.clone()),
+            },
             severity: crate::model::Severity::Attention,
             text: self.proposal_text(&paths, &roots),
             choices: [ALLOW, DENY]
@@ -967,5 +1116,125 @@ impl Runtime {
         };
         proposal.outcome = Some(outcome.clone());
         Ok(outcome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn private_setup_commands_run_with_the_same_roots_and_preserve_auth_environment() -> Result<()>
+    {
+        let dir = std::env::temp_dir().join(format!("vibeface-setup-'{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let bin = dir.join("fake provider");
+        std::fs::write(
+            &bin,
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+names = ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'OPENCODE_DB', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT', 'OPENCODE_CLI_CONFIG_CONTENT', 'OPENCODE_TEST_HOME']
+pathlib.Path(__file__).with_name('observed.json').write_text(json.dumps({'args': sys.argv[1:], 'env': {name: os.environ.get(name) for name in names}, 'auth': os.environ.get('FAKE_LOGIN_AUTH')}))
+"#,
+        )?;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700))?;
+        let local = providers::Local {
+            switches: providers::Providers::default(),
+            bins: Provider::ALL
+                .into_iter()
+                .map(|provider| (provider, bin.clone()))
+                .collect(),
+            env: providers::ProviderEnv::default(),
+        };
+        let roots = ProviderRoots::new(&dir);
+        for (provider, args) in [
+            (Provider::Codex, vec!["login"]),
+            (Provider::Claude, vec!["auth", "login"]),
+            (Provider::Opencode, vec!["--standalone", "auth", "login"]),
+        ] {
+            let setup = provider_setup(provider, &local, &roots).context("private setup")?;
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", setup["command"].as_str().context("command")?]);
+            command.env("FAKE_LOGIN_AUTH", "fixture-auth");
+            for name in [
+                "CODEX_HOME",
+                "CLAUDE_CONFIG_DIR",
+                "OPENCODE_DB",
+                "OPENCODE_CONFIG",
+                "OPENCODE_CONFIG_CONTENT",
+                "OPENCODE_CLI_CONFIG_CONTENT",
+                "OPENCODE_CONFIG_DIR",
+                "OPENCODE_TEST_HOME",
+                "XDG_DATA_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+            ] {
+                command.env(name, "/external/user");
+            }
+            assert!(command.status()?.success());
+            let observed: Value =
+                serde_json::from_slice(&std::fs::read(dir.join("observed.json"))?)?;
+            assert_eq!(observed["args"], json!(args));
+            assert_eq!(observed["auth"], "fixture-auth");
+            for (name, value) in roots.env(provider) {
+                if observed["env"].get(&name).is_some() {
+                    assert_eq!(observed["env"][name], value);
+                }
+            }
+            if provider == Provider::Opencode {
+                for name in [
+                    "OPENCODE_CONFIG",
+                    "OPENCODE_CONFIG_CONTENT",
+                    "OPENCODE_CLI_CONFIG_CONTENT",
+                    "OPENCODE_TEST_HOME",
+                ] {
+                    assert_eq!(observed["env"][name], Value::Null);
+                }
+            }
+        }
+        let mut system = local;
+        system.switches.codex_app_server.mode = AppServerMode::System;
+        assert!(provider_setup(Provider::Codex, &system, &roots).is_none());
+        assert!(provider_setup(Provider::Pi, &system, &roots).is_none());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn clearing_a_cursor_execution_model_removes_the_override() {
+        let mut local = providers::Local {
+            switches: Default::default(),
+            bins: Default::default(),
+            env: Default::default(),
+        };
+        let mut manager = None;
+        let mut triage = Default::default();
+        for input in ["custom", "  ", "auto", ""] {
+            let change: ProviderChange = serde_json::from_value(json!({
+                "provider":"cursor", "execution_model":input,
+            }))
+            .unwrap();
+            change
+                .apply(
+                    Target {
+                        local: &mut local,
+                        manager: &mut manager,
+                        triage: &mut triage,
+                    },
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                local
+                    .switches
+                    .execution_models
+                    .get(&Provider::Cursor)
+                    .map(String::as_str),
+                (!input.trim().is_empty()).then_some(input)
+            );
+        }
+        assert_eq!(Provider::Cursor.model(""), "auto");
     }
 }

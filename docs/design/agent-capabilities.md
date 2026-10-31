@@ -47,7 +47,7 @@ ScheduleControlled { schedule_id, action: pause | resume | delete, attestation }
 
 | 字段 | 作用 |
 |---|---|
-| epoch | 必须等于当前 DATA_EPOCH 11，不自动抬升旧事件格式 |
+| epoch | 必须等于当前 DATA_EPOCH 12，不自动抬升旧事件格式 |
 | revision | 自动操作为完整事件 hash；本人操作为稳定 operation_id |
 | control_revision | 自动操作为 0；本人操作为签名 base 的计数加 1，新建为 1 |
 | origin | agent、user 或 review；自动事件只能声明 agent 或 review |

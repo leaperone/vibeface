@@ -7,7 +7,7 @@ import { providerNames } from '@vibeface/client/lib/node.ts'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
 import { cardState, needsLook, nodeName, overviewScope, schedulerStatus, staleTaskLabel, taskActive, taskAgent, taskGroups, taskLabel, taskProgress, taskStale, workspaceActivities, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
 import { openWorksFromOverview, overviewFromWorkspace } from '@vibeface/client/workspace/model.ts'
-import type { BotRecord, NodeInfo, OpenWork, OverviewTask, WorkspaceActivity } from '@vibeface/client/workspace/types.ts'
+import type { BotRecord, NodeInfo, OpenWorkCard, OverviewTask, WorkspaceActivity } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
 import { providerIcons, Skeleton } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
@@ -45,7 +45,7 @@ export function TasksScreen() {
   }
   const otherChecks = activityView.groups.attention.flatMap((activity) => {
     if (activity.kind !== 'attention' || activity.conversation_id === shared?.conversationId || !('kind' in activity.attention) || activity.attention.kind !== 'check') return []
-    return [activity.attention as Extract<OverviewTask, { kind: 'check' }>]
+    return [activity.attention]
   })
 
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
@@ -105,7 +105,7 @@ function MobileEmpty({ bot, read }: { bot?: Pick<BotRecord, 'bot_id' | 'name'>; 
 type Lookup = { nodes: NodeInfo[]; directory: ReturnType<typeof useDevice>['directory'] }
 type TaskBot = Pick<BotRecord, 'bot_id' | 'conversation_id' | 'name' | 'avatar'>
 
-function TaskRow({ work, projected, waiting, bot, lookup, connected, progress }: { work: OpenWork; waiting: boolean; projected?: Extract<OverviewTask, { kind: 'work' | 'dispatch' }>; bot?: TaskBot; lookup: Lookup; connected: boolean; progress: string }) {
+function TaskRow({ work, projected, waiting, bot, lookup, connected, progress }: { work: OpenWorkCard; waiting: boolean; projected?: Extract<OverviewTask, { kind: 'work' | 'dispatch' }>; bot?: TaskBot; lookup: Lookup; connected: boolean; progress: string }) {
   const shown = cardState(work, lookup.nodes, projected)
   const rawState = shown === 'running' && waiting ? 'waiting' : shown
   const failed = needsLook(rawState) && rawState !== 'dispatch_unverified'
@@ -114,7 +114,7 @@ function TaskRow({ work, projected, waiting, bot, lookup, connected, progress }:
   const active = taskActive(rawState) && !stale
   const unknown = !failed && (stale || rawState === 'unverified' || rawState === 'awaiting_confirmation' || rawState === 'unknown' || rawState === 'dispatch_unverified' || rawState === 'accepted_waiting_sync')
   const icon: LucideIcon = failed ? CircleX : unknown ? CircleQuestionMark : rawState === 'interrupted' ? CircleStop : active ? LoaderCircle : CircleCheck
-  const agent = taskAgent(work, lookup.nodes)
+  const agent = taskAgent(work)
   const device = nodeName(work.target_node, lookup)
   const title = work.title || '任务'
   const href = bot ? `/b/${bot.bot_id}/work/${work.work_id}` as const : undefined

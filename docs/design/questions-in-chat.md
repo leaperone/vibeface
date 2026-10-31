@@ -71,6 +71,12 @@ QuestionAsked {                       // 写在拥有该 session 的 Bot 会话
 	text: String,                     // 问题本身，≤1024 字节
 	choices: Vec<Choice>,             // ≤8；文字回答始终可用
 	about: Subject,
+	attention: AttentionRequest,
+}
+
+AttentionRequest {
+	kind: AttentionKind,             // question | approval | browser_takeover
+	device_id: Option<DeviceId>,      // 非空时必须等于 about.node；browser_takeover 必须提供
 }
 
 MessagePosted {                       // 现有事件，新增一个字段
@@ -112,7 +118,7 @@ SessionMuted {                        // 写在当前接手 Bot 的会话 scope�
 
 Agent 侧（CLI → `/api/triage`）：
 
-- `vibeface triage raise --event-id ID --severity S --question TEXT [--choice LABEL]... [--request-id R]`：写入拥有该 session 的 Bot 会话。同一 session 同一请求已有未答问题时返回原问题。带 `--request-id` 时请求挂起到回答为止，回答后再给 Bot 120 秒应答，超时按方法回退。
+- `vibeface triage raise --event-id ID --severity S --question TEXT [--choice LABEL]... [--request-id R] [--attention-kind question|approval|browser-takeover]`：写入拥有该 session 的 Bot 会话。同一 session 同一请求已有未答问题时返回原问题。需要本人在事件设备的浏览器继续操作时指定 `browser-takeover`；不传时根据挂起请求推断提问或审批。卡片类型不授予操作权限，也不能改变接管设备。带 `--request-id` 时请求挂起到回答为止，回答后再给 Bot 120 秒应答，超时按方法回退。
 - `vibeface triage dismiss --event-id ID`：不变。
 - `vibeface respond REQUEST_ID RESULT_JSON [--node DEVICE]`：带 `--node` 时经设备转发，应答仍只一次。本机 Node 地址参数为 `--node-url`。
 - 协调工具 `hand_over_session { node, session_id, version, to? | stop_following? }`：Bot 把名下的会话转给 `to`（Bot 的会话 ID 或名称），或不再关注；`version` 是 `bot.sessions` 里的版本，即最后改动归属的事件 hash 前 16 位。返回 `{node, session_id, conversation_id, muted, version, changed}`，状态已成立时 `changed = false`、不写事件；版本已变时拒绝。

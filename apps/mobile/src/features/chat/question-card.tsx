@@ -3,7 +3,7 @@ import { Link } from 'expo-router'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
-import { answerLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject } from '@vibeface/client/workspace/questions.ts'
+import { answerLabel, attentionLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject } from '@vibeface/client/workspace/questions.ts'
 import type { AnswerResult } from '@vibeface/client/workspace/types.ts'
 import { ArrowUp, Circle, CircleAlert, CircleCheck, CircleDot, CircleSlash, CircleX, FolderOpen, Hand, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, Laptop, RotateCw, TriangleAlert, type LucideIcon } from 'lucide-react-native'
 import { useId, useRef, useState, type ComponentRef } from 'react'
@@ -88,6 +88,8 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const project = question.about.cwd ? sharedProject(question.about.cwd, question.about.node, shared?.nodes ?? []) : null
   const { icon, tone } = looks[question.severity]
   return <ActionCard icon={approval ? Hand : icon} tone={tone} title={ask}>
+    <Text className="text-meta text-muted-foreground">{attentionLabel(question)}{question.attention?.device_id ? ` · 处理设备 ${workspace.members.find((item) => item.device_id === question.attention?.device_id)?.name ?? '运行设备'}` : ''}</Text>
+    {question.attention?.kind === 'browser_takeover' ? <Text className="text-meta text-muted-foreground">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</Text> : null}
     {detail ? <Text className="text-body">{detail}</Text> : null}
     {inTask ? null : <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
       {task ? <Link href={`/b/${task.bot_id}/work/${task.work_id}`} asChild>

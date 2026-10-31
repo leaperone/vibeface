@@ -16,7 +16,7 @@ import { openWorksFromOverview, overviewFromWorkspace } from "@vibeface/client/w
 import { cardState, needsLook, nodeName, overviewScope, staleTaskLabel, taskActive, taskGroups, taskLabel, taskProgress, taskStale, workspaceActivities, type TaskGroup } from "@vibeface/client/workspace/labels.ts"
 import { projectName } from "@vibeface/client/workspace/questions.ts"
 import { workFailure } from "@vibeface/client/lib/errors.ts"
-import type { NodeInfo, OpenWork, OverviewTask, WorkspaceActivity } from "@vibeface/client/workspace/types.ts"
+import type { NodeInfo, OpenWorkCard, OverviewTask, WorkspaceActivity } from "@vibeface/client/workspace/types.ts"
 import { useInbox } from "./inbox"
 import { ConfirmCard } from "./task-activity"
 import { QuestionCard } from "./question-card"
@@ -41,7 +41,7 @@ export function TasksOverview() {
   const overviewWorks = openWorksFromOverview(overview, workspace.openWorks)
   const read = workspace.synced
   const projected = new Map([...localOverview.tasks, ...overview.tasks].filter((task): task is ProjectedWork => (task.kind === "work" || task.kind === "dispatch") && Boolean(task.work_id)).map((task) => [JSON.stringify([task.conversation_id, task.work_id]), task]))
-  const projection = (work: OpenWork) => projected.get(JSON.stringify([work.conversation_id, work.work_id]))
+  const projection = (work: OpenWorkCard) => projected.get(JSON.stringify([work.conversation_id, work.work_id]))
   const needsConfirmation = (check: { conversation_id: string; work_id: string; target_node: string }) => {
     const work = overviewWorks.find((work) => work.conversation_id === check.conversation_id && work.work_id === check.work_id && work.target_node === check.target_node)
     return !work || !["completed", "failed", "interrupted", "rejected"].includes(cardState(work, workspace.nodes, projection(work)))
@@ -75,7 +75,6 @@ export function TasksOverview() {
   const noticed = visible("attention") ? visibleGroups.attention.length : 0
   const visibleCount = noticed + (visible("working") ? visibleGroups.working.length : 0) + (visible("waiting") ? visibleGroups.waiting.length : 0)
   const hasContent = visibleCount > 0
-  const pendingCount = visible("attention") ? visibleGroups.attention.length : 0
   const emptyLabel = !read ? workspace.connectionOnline ? "正在读取当前连接的任务" : "尚未读取任务，连接后再确认" : filter === "all" && botFilter === "all" ? "当前记录没有未完成的任务" : "没有符合筛选的任务"
   const renderedDeviceChecks = new Set<string>()
   const card = (activity: WorkspaceActivity) => {
@@ -99,7 +98,7 @@ export function TasksOverview() {
     <WorkspaceMasthead attention={read ? visibleGroups.attention.length : null} working={read ? visibleGroups.working.length : null} waiting={read ? visibleGroups.waiting.length : null} online={workspace.connectionOnline} />
     <p className="text-meta text-muted-foreground">{[...overviewScope(overview.coverage), ...(!read ? ["当前连接尚未完成首读"] : !workspace.connectionOnline ? ["连接已断开，显示最近记录"] : [])].join(" · ")}</p>
     <TaskFilters filter={filter} botFilter={botFilter} bots={workspace.bots} onFilter={setFilter} onBotFilter={setBotFilter} />
-    {pendingCount ? <Link to="/inbox" className="flex min-h-12 items-center gap-2 rounded-lg border px-3 py-2 font-medium hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0" /><span>待处理 {pendingCount} 项</span><ChevronRight aria-hidden="true" className="ms-auto size-4 shrink-0 text-muted-foreground" /></Link> : null}
+    {noticed ? <Link to="/inbox" className="flex min-h-12 items-center gap-2 rounded-lg border px-3 py-2 font-medium hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0" /><span>待处理 {noticed} 项</span><ChevronRight aria-hidden="true" className="ms-auto size-4 shrink-0 text-muted-foreground" /></Link> : null}
     {taskGroups.map(({ group, title }) => {
       if (!visible(group)) return null
       const count = visibleGroups[group].length
@@ -138,6 +137,7 @@ function TurnActivity({ activity }: { activity: Extract<WorkspaceActivity, { kin
 function AttentionActivity({ activity, bot, read }: { activity: Extract<WorkspaceActivity, { kind: "attention" }>; bot?: { bot_id: string; name: string }; read: boolean }) {
   const attention = activity.attention
   if (!attention) return null
+  if ("answer" in attention && "about" in attention) return <QuestionCard question={attention} inbox from="tasks" />
   if ("kind" in attention && attention.kind === "check") return <OverviewCheckCard check={attention} read={read} />
   if ("kind" in attention && (attention.kind === "work" || attention.kind === "device" || attention.kind === "process")) return <ConfirmCard check={attention} inbox from="tasks" />
   if ("question_id" in attention) return <Card><CardContent className="grid gap-2"><p className="font-medium">问题待确认</p><p className="text-meta text-muted-foreground">{attention.text}</p>{bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: bot.bot_id }}>打开 {bot.name}</Link></Button> : <p className="text-meta text-muted-foreground">{read ? "未找到所属 Bot" : "Bot 身份未加载"}</p>}</CardContent></Card>
@@ -170,7 +170,7 @@ function OverviewSection({ title, count, children }: { title: string; count: num
   </section>
 }
 
-function TaskOverviewCard({ work, projected, bot, waiting, lookup, connected, progress }: { work: OpenWork; projected?: ProjectedWork; bot?: { bot_id: string; name: string }; waiting: boolean; lookup: { nodes: NodeInfo[]; directory: MembershipView | null }; connected: boolean; progress: string }) {
+function TaskOverviewCard({ work, projected, bot, waiting, lookup, connected, progress }: { work: OpenWorkCard; projected?: ProjectedWork; bot?: { bot_id: string; name: string }; waiting: boolean; lookup: { nodes: NodeInfo[]; directory: MembershipView | null }; connected: boolean; progress: string }) {
   const shown = cardState(work, lookup.nodes, projected)
   const state = shown === "running" && waiting ? "waiting" : shown
   const stale = taskStale(state, connected)

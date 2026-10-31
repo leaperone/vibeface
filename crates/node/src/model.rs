@@ -79,6 +79,15 @@ pub enum WorkKind {
     Task,
 }
 
+/// The model choice frozen by the Node that accepts a work. `None` means the provider's
+/// intrinsic default, and is deliberately different from a request that was never resolved.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedModel {
+    pub provider: Provider,
+    pub model: Option<String>,
+}
+
 impl From<WorkKind> for String {
     fn from(kind: WorkKind) -> String {
         match kind {
@@ -158,6 +167,21 @@ pub struct Subject {
     /// session's hook, plugin or extension waits on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionKind {
+    Question,
+    Approval,
+    BrowserTakeover,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionRequest {
+    pub kind: AttentionKind,
+    pub device_id: Option<DeviceId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -342,6 +366,15 @@ pub struct ModelEdit {
     pub provider: Provider,
     pub before: String,
     pub after: String,
+}
+
+/// A bot's effort override on one provider; `None` follows the device's setting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningEffortEdit {
+    pub provider: Provider,
+    pub before: Option<String>,
+    pub after: Option<String>,
 }
 
 /// A bot's model per provider. The provider is device-local, so a device runs the entry of its
@@ -591,6 +624,8 @@ pub enum BotChange {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<ModelEdit>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<ReasoningEffortEdit>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         skills: Option<SkillsEdit>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         avatar: Option<AvatarEdit>,
@@ -790,6 +825,7 @@ impl BotChange {
                 name,
                 instructions,
                 model,
+                reasoning_effort,
                 skills,
                 avatar,
             } => {
@@ -797,6 +833,7 @@ impl BotChange {
                     name.is_some()
                         || instructions.is_some()
                         || model.is_some()
+                        || reasoning_effort.is_some()
                         || skills.is_some()
                         || avatar.is_some(),
                     "a profile change names a field"
@@ -807,6 +844,16 @@ impl BotChange {
                 if let Some(model) = model {
                     validate_model(&model.after)?;
                     anyhow::ensure!(model.before != model.after, "the model is unchanged");
+                }
+                if let Some(edit) = reasoning_effort {
+                    edit.provider
+                        .validate_reasoning_effort(edit.before.as_deref())?;
+                    edit.provider
+                        .validate_reasoning_effort(edit.after.as_deref())?;
+                    anyhow::ensure!(
+                        edit.before != edit.after,
+                        "the reasoning effort is unchanged"
+                    );
                 }
                 if let Some(skills) = skills {
                     validate_skill_set(&skills.after)?;
@@ -938,6 +985,11 @@ pub enum EventBody {
         dispatcher: DeviceId,
         call_ref: String,
         kind: WorkKind,
+        /// The dispatcher's optional model override. The target never treats this as resolved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// The target's frozen provider/model choice.
+        resolved: ResolvedModel,
         cwd: String,
         /// A short line for the user; `prompt` is what the work gets.
         title: String,
@@ -985,6 +1037,7 @@ pub enum EventBody {
     /// message `a-<question_id>`.
     QuestionAsked {
         question_id: String,
+        attention: AttentionRequest,
         severity: Severity,
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1262,6 +1315,7 @@ pub struct Bot {
     pub instructions: String,
     pub project: Option<BotProject>,
     pub models: BotModels,
+    pub reasoning_efforts: BTreeMap<Provider, String>,
     pub skills: SkillSet,
     pub avatar: Option<Avatar>,
     /// The start of the hash of the event that last set the face, `None` before any change.
@@ -1273,6 +1327,10 @@ impl Bot {
     /// The model this bot runs on `provider`; `None` follows the device's default.
     pub fn model(&self, provider: Provider) -> Option<&str> {
         self.models.get(&provider).map(String::as_str)
+    }
+
+    pub fn reasoning_effort(&self, provider: Provider) -> Option<&str> {
+        self.reasoning_efforts.get(&provider).map(String::as_str)
     }
 
     pub fn shown_avatar(&self) -> ShownAvatar {
@@ -1369,6 +1427,8 @@ pub struct WorkProjection {
     pub title: String,
     pub prompt: String,
     pub call_ref: String,
+    pub model: Option<String>,
+    pub resolved: ResolvedModel,
     pub continues: Option<String>,
     pub parent: Option<String>,
     /// The existing thread a send went into; `thread_id` is the thread the work runs in.

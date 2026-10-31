@@ -14,7 +14,7 @@ pub use vibeface_bridge::agent::{AgentFailure as ManagerFailure, StartEvidence};
 use vibeface_bridge::{
     agent::{self, AgentResult, CustomToolConfig, SdkBridge, SdkTurn},
     codex::DirectSession,
-    failure::{ExecFailure, FailureKind},
+    failure::{ExecFailure, FailureKind, ProviderStage},
     turn::{TurnStatus, turn_snapshot},
 };
 
@@ -164,6 +164,7 @@ pub struct ManagerConfig {
     pub sdk: Sdk,
     pub workspace: PathBuf,
     pub model: String,
+    pub reasoning_effort: Option<String>,
     pub timeout_secs: u64,
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
     pub tool_cli: Option<PathBuf>,
@@ -235,6 +236,7 @@ impl ManagerConfig {
 /// `outcome` is how certain the end is; `failure` why the turn failed.
 #[derive(Debug)]
 pub struct ManagerError {
+    pub stage: ProviderStage,
     pub outcome: ManagerFailure,
     pub start: StartEvidence,
     pub session_id: Option<String>,
@@ -242,7 +244,11 @@ pub struct ManagerError {
 }
 impl ManagerError {
     pub(crate) fn not_started(error: anyhow::Error) -> anyhow::Error {
+        Self::not_started_at(ProviderStage::Validate, error)
+    }
+    pub(crate) fn not_started_at(stage: ProviderStage, error: anyhow::Error) -> anyhow::Error {
         Self {
+            stage,
             outcome: ManagerFailure::Failed,
             start: StartEvidence::NotStarted,
             session_id: None,
@@ -290,11 +296,16 @@ where
         if let Some(id) = previous_session_id {
             vibeface_protocol::validate_id(id).map_err(anyhow::Error::msg)?;
         }
+        config
+            .sdk
+            .provider()
+            .validate_reasoning_effort(config.reasoning_effort.as_deref())?;
         Ok(())
     })()
     .map_err(ManagerError::not_started)?;
     if *cancel.borrow() {
         return Err(ManagerError {
+            stage: ProviderStage::Validate,
             outcome: ManagerFailure::Cancelled,
             start: StartEvidence::NotStarted,
             session_id: previous_session_id.map(str::to_owned),
@@ -312,7 +323,8 @@ where
             owner,
             local_store_root,
         } => {
-            let not_started = |kind, detail: &str| ManagerError {
+            let not_started = |stage, kind, detail: &str| ManagerError {
+                stage,
                 outcome: ManagerFailure::Failed,
                 start: StartEvidence::NotStarted,
                 session_id: previous_session_id.map(str::to_owned),
@@ -320,6 +332,7 @@ where
             };
             let bridge = bridge.as_ref().ok_or_else(|| {
                 not_started(
+                    ProviderStage::Launch,
                     FailureKind::MissingBinary,
                     "this Node has no Cursor SDK bridge yet",
                 )
@@ -327,38 +340,61 @@ where
             let (api_key, env) = crate::providers::cursor_launch(&config.provider_env);
             let api_key = api_key.ok_or_else(|| {
                 not_started(
+                    ProviderStage::Authentication,
                     FailureKind::MissingKey,
                     "CURSOR_API_KEY is required for the Cursor SDK manager",
                 )
             })?;
             let owner = owner.as_deref().ok_or_else(|| {
                 not_started(
+                    ProviderStage::Validate,
                     FailureKind::Unknown,
                     "Cursor SDK manager has no stable process owner",
                 )
             })?;
             let local_store_root = local_store_root.as_ref().ok_or_else(|| {
                 not_started(
+                    ProviderStage::Validate,
                     FailureKind::Unknown,
                     "Cursor SDK manager has no private native store",
                 )
             })?;
-            let native_run = Arc::new(std::sync::Mutex::new(None));
-            let run_started = config.codex_turn.as_ref().map(|turn| {
-                let native_run = native_run.clone();
-                let started = turn.started.clone();
-                let callback: agent::RunStarted = Arc::new(move |run_id| {
-                    *native_run.lock().expect("Cursor run") = Some(run_id.clone());
-                    let started = started.clone();
-                    Box::pin(async move {
-                        if let Some(started) = started {
-                            started(run_id).await?;
-                        }
-                        Ok(())
-                    })
+            let native_agent = Arc::new(std::sync::Mutex::new(None::<String>));
+            let record = config.codex_turn.as_ref().map(|turn| turn.record.clone());
+            let started = config
+                .codex_turn
+                .as_ref()
+                .and_then(|turn| turn.started.clone());
+            let record_for_start = record.clone();
+            let started_for_start = started.clone();
+            let run_started =
+                (record_for_start.is_some() || started_for_start.is_some()).then(|| {
+                    let native_agent = native_agent.clone();
+                    let record = record_for_start;
+                    let started = started_for_start;
+                    let callback: agent::RunStarted = Arc::new(move |run| {
+                        let native_agent = native_agent
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        let record = record.clone();
+                        let started = started.clone();
+                        Box::pin(async move {
+                            if let Some(record) = record {
+                                record(
+                                    native_agent.context("Cursor run has no persisted agent ID")?,
+                                    Some(run.clone()),
+                                )
+                                .await?;
+                            }
+                            if let Some(started) = started {
+                                started(run).await?;
+                            }
+                            Ok(())
+                        })
+                    });
+                    callback
                 });
-                callback
-            });
             let turn = SdkTurn {
                 owner: owner.into(),
                 executable: sdk_bin.clone(),
@@ -378,13 +414,35 @@ where
                     &turn,
                     prompt,
                     previous_session_id,
-                    persist_session,
+                    |id| {
+                        *native_agent
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.clone());
+                        let locator_turn = turn.clone();
+                        let record = record.clone();
+                        async move {
+                            persist_session(id.clone()).await?;
+                            if let Some(native) = &config.codex_turn {
+                                crate::runtime::record_cursor_reply(
+                                    &locator_turn,
+                                    &config.provider_env,
+                                    &native.client_id,
+                                    &id,
+                                )?;
+                            }
+                            if let Some(record) = record {
+                                record(id, None).await?;
+                            }
+                            Ok(())
+                        }
+                    },
                     cancel,
                     progress,
                 )
                 .await
                 .map_err(|error| -> anyhow::Error {
                     ManagerError {
+                        stage: error.stage,
                         outcome: error.outcome,
                         start: error.start,
                         session_id: error.session_id,
@@ -392,13 +450,6 @@ where
                     }
                     .into()
                 })?;
-            let run_id = native_run.lock().expect("Cursor run").take();
-            if let (Some(turn), Some(session), Some(run_id)) =
-                (&config.codex_turn, result.session_id.as_ref(), run_id)
-                && let Err(error) = (turn.record)(session.clone(), Some(run_id)).await
-            {
-                tracing::warn!(event = "cursor.turn_unrecorded", %error, "the next Cursor turn repeats what this one was shown");
-            }
             Ok(result)
         }
         Sdk::Codex { socket, launch } => {
@@ -489,6 +540,9 @@ pub fn bot_instructions(
     };
     let catalog = tools
         .iter()
+        .filter(|(name, _)| {
+            crate::tools::Tool::parse(name).is_some_and(crate::tools::Tool::initially_exposed)
+        })
         .map(|(name, spec)| {
             format!(
                 "{name}\n{}\nJSON schema: {}",
@@ -498,7 +552,7 @@ pub fn bot_instructions(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    let host = "Your shell has full access to this host: you can edit files and run git and gh. When this device runs Codex, `vibeface codex` calls its App Server. When a session asks something (an approval, a question, a login), `vibeface requests` lists the waiting requests and `vibeface respond REQUEST_ID 'RESULT_JSON'` answers one; raise a decision card with `vibeface triage raise --request-id` only when the user must decide, explaining the decision in plain words without the command itself.";
+    let host = "Your shell has full access to this host: you can edit files and run git and gh. When this device runs Codex, `vibeface codex` calls its App Server. When a session asks something (an approval, a question, a login), `vibeface requests` lists the waiting requests and `vibeface respond REQUEST_ID 'RESULT_JSON'` answers one; raise a decision card with `vibeface triage raise --request-id` only when the user must decide, explaining the decision in plain words without the command itself. Add `--attention-kind browser-takeover` when the user must continue in a browser on the event's device; omit it to infer question or approval from the held request. The card kind grants no authority.";
     let text = format!(
         "Node tools are available through your command-execution tool. Run:\n{executable} tool TOOL_NAME --json 'JSON_OBJECT'\n{discovery}For any tool whose schema requires call_ref, add --call-ref 'UNIQUE_INTENT_REFERENCE'. For tool_call the flag is passed to arguments.call_ref; when both are given they must agree. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {{\"call_ref\":\"THE_SAME_REFERENCE\"}}; never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. {host}\n\nAvailable tools:\n{catalog}"
     );
@@ -519,6 +573,9 @@ fn of_turn(message: &Value, thread: &str, turn: &str) -> bool {
 /// reasoning and the user's own messages stay out.
 fn codex_progress(message: &Value) -> Option<Value> {
     let method = message["method"].as_str()?;
+    if method == "item/completed" && message["params"]["item"]["type"] == "contextCompaction" {
+        return Some(json!({"type":"context_compacted"}));
+    }
     let shown = match method {
         "item/agentMessage/delta" | "turn/completed" => true,
         "item/started" | "item/completed" => matches!(
@@ -641,8 +698,10 @@ where
     );
     let secrets = secret_values(config);
     let start = std::sync::Mutex::new(StartEvidence::NotStarted);
+    let stage = vibeface_bridge::failure::ProviderTrace::new("codex", ProviderStage::Launch);
     let error = |outcome, session_id: Option<&str>, failure: ExecFailure| -> anyhow::Error {
         ManagerError {
+            stage: stage.current(),
             outcome,
             start: *start
                 .lock()
@@ -681,6 +740,7 @@ where
             },
         )
     })?;
+    stage.enter(ProviderStage::SessionStart);
     let mut env = config.tool_env.clone();
     if let Some(token) = &config.tool_token {
         env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
@@ -740,6 +800,7 @@ where
         }
     };
     let native = Some(thread.as_str());
+    stage.enter(ProviderStage::Record);
     if let Err(e) = persist_session(thread.clone()).await {
         // A stop fences the attempt, so saving its thread fails then.
         return Err(if *cancel.borrow() {
@@ -768,9 +829,13 @@ where
     if !config.model.is_empty() {
         turn_params["model"] = json!(config.model);
     }
+    if let Some(effort) = &config.reasoning_effort {
+        turn_params["effort"] = json!(effort);
+    }
     if *cancel.borrow() {
         return Err(stopped(native));
     }
+    stage.enter(ProviderStage::TurnStart);
     *start.lock().unwrap() = StartEvidence::Unknown;
     let turn = match session.request("turn/start", turn_params).await {
         Ok(reply) => reply["turn"]["id"].as_str().map(str::to_owned),
@@ -786,6 +851,7 @@ where
     .context("Codex started a turn without an ID")
     .map_err(|e| error(ManagerFailure::Unknown, native, own(e.to_string())))?;
     *start.lock().unwrap() = StartEvidence::Started;
+    stage.enter(ProviderStage::Record);
     if let Some(record) = &config.codex_turn
         && let Err(e) = (record.record)(thread.clone(), Some(turn.clone())).await
     {
@@ -801,12 +867,14 @@ where
             own(format!("record the Codex turn: {e}")),
         ));
     }
+    stage.enter(ProviderStage::Run);
     let mut answer = Answer::default();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
     let outcome = loop {
         let message = tokio::select! {
             biased;
             _ = agent::wait_for_cancel(&mut cancel) => {
+                stage.enter(ProviderStage::Interrupt);
                 break if stop_turn(&mut session, &thread, &turn).await {
                     Err(error(ManagerFailure::Cancelled, native, own("Codex turn interrupted".into())))
                 } else {
@@ -933,7 +1001,7 @@ pub(crate) fn secret_values(config: &ManagerConfig) -> Vec<String> {
     values
 }
 /// The variables the active model provider of Codex's configuration reads; `env` is what this
-/// Node sets for Codex, which may point it at another `CODEX_HOME`.
+/// Node sets for Codex, including its Node-owned `CODEX_HOME`.
 pub(crate) fn provider_environment_keys(env: &BTreeMap<String, String>) -> Result<Vec<String>> {
     let home = env.get("CODEX_HOME").map(PathBuf::from);
     let Some(home) = home else {
@@ -1044,6 +1112,8 @@ mod tests {
         assert!(guide.ends_with("standing rule"));
         let catalog = guide.split_once("Available tools:\n").unwrap().1;
         assert!(catalog.contains("tool_call\n"));
+        assert!(catalog.contains("context\n"));
+        assert!(catalog.contains("read_skill\n"));
         assert!(!catalog.contains("dispatch_work\n"));
         assert_eq!(
             bot_instructions(None, &tools, "standing rule"),
@@ -1059,6 +1129,7 @@ mod tests {
             },
             workspace,
             model: String::new(),
+            reasoning_effort: None,
             timeout_secs: 5,
             custom_tools: BTreeMap::new(),
             tool_cli: None,
@@ -1516,12 +1587,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_cursor_effort_is_rejected_before_launch() {
+        let mut config = codex(workspace(), PathBuf::from("/unused.sock"));
+        config.sdk = Sdk::Cursor {
+            bridge: None,
+            sdk_bin: "/unused-cursor".into(),
+            owner: None,
+            local_store_root: None,
+        };
+        config.reasoning_effort = Some("high".into());
+        let error = run_manager(
+            &config,
+            "hello",
+            None,
+            |_| async { panic!("must not persist") },
+            watch::channel(false).1,
+            |_| async { panic!("must not send") },
+        )
+        .await
+        .err()
+        .expect("expected failure");
+        let error = error.downcast_ref::<ManagerError>().unwrap();
+        assert_eq!(error.stage, ProviderStage::Validate);
+        assert_eq!(error.start, StartEvidence::NotStarted);
+        assert!(error.failure.detail.contains("effort"));
+    }
+
+    #[tokio::test]
     async fn a_turn_runs_on_the_app_server_and_is_recorded_before_it_starts() {
         let fake = fake_app_server(Turn::Answers);
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = recorded.clone();
         let config = ManagerConfig {
             model: "gpt-fixture".into(),
+            reasoning_effort: Some("high".into()),
             tool_cli: Some("/opt/vibeface".into()),
             instructions: "fixed-thread-guide".into(),
             tool_token: Some("turn-token-secret".into()),
@@ -1576,6 +1675,7 @@ mod tests {
         let turn = &fake.calls("turn/start")[0];
         assert_eq!(turn["clientUserMessageId"], "attempt-1");
         assert_eq!(turn["model"], "gpt-fixture");
+        assert_eq!(turn["effort"], "high");
         assert_eq!(
             turn["input"][0]["text"], "fixture",
             "the turn carries only its own prompt"
@@ -1642,6 +1742,7 @@ mod tests {
             .err()
             .unwrap();
             let error = error.downcast_ref::<ManagerError>().unwrap();
+            assert_eq!(error.stage, ProviderStage::Run);
             assert_eq!(error.outcome, expected, "{status}: {error}");
             assert_eq!(
                 error.start,
@@ -1701,6 +1802,10 @@ mod tests {
         assert_eq!(
             error.downcast_ref::<ManagerError>().unwrap().start,
             StartEvidence::Unknown
+        );
+        assert_eq!(
+            error.downcast_ref::<ManagerError>().unwrap().stage,
+            ProviderStage::TurnStart
         );
         assert_eq!(fake.calls("turn/start").len(), 1);
     }

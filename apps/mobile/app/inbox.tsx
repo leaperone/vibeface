@@ -21,7 +21,7 @@ import { useInbox, useLive } from '@/data/live'
 import { useWide } from '@/lib/layout'
 import { move } from '@/lib/motion'
 import { QuestionCard } from '@/features/chat/question-card'
-import { ConfirmCard } from '@/features/chat/work'
+import { ConfirmCard, PendingMessageCard } from '@/features/chat/work'
 import { JoinRequests } from '@/features/devices/join-requests'
 import { RecoveryPendingCard, RotateHintCard } from '@/features/recovery/recovery'
 
@@ -62,8 +62,9 @@ export default function Inbox() {
     {items.map((item) => item.kind === 'recovery' ? <RecoveryPendingCard key={item.key} />
       : item.kind === 'rotate' ? <RotateHintCard key={item.key} />
       : item.kind === 'confirm' ? <ConfirmCard key={item.key} check={item.check} />
+      : item.kind === 'undelivered' ? <PendingMessageCard key={item.key} />
       : item.kind === 'failed' ? <FailedCard key={item.key} item={item} replace={wide} />
-      : item.kind === 'write' || item.kind === 'undelivered' || item.kind === 'attention' || item.kind === 'setup' ? <ItemRow key={item.key} item={item} href={rowHref(item, shared?.selectedBot?.bot_id, device.ready?.entry.device_id)} replace={wide} />
+      : item.kind === 'write' || item.kind === 'attention' || item.kind === 'setup' ? <ItemRow key={item.key} item={item} href={rowHref(item, shared?.selectedBot?.bot_id, device.ready?.entry.device_id)} replace={wide} />
       : null)}
     {items.some((item) => item.kind === 'join') ? <JoinRequests /> : null}
     {open.length ? open.map((questions) => <Group key={questions[0].bot?.bot_id ?? ''} layout={move} className="gap-2">

@@ -7,7 +7,7 @@ import { nodeJoinCopy } from '../identity/copy.ts'
 const codes: Record<string, string> = {
   target_not_member: '那台电脑不在我的设备里，访问地址不会转发给它。',
   target_unreachable: '访问地址连不上那台电脑。它可能关机或断网了，稍后会自动重试。',
-  codex_missing: '没找到这台电脑上的 Codex 目录。装好 Codex，或手动填写 Codex 目录。',
+  codex_missing: '没找到这台电脑上的 Codex 目录或程序。装好 Codex，或在设备页填写程序路径。',
 }
 
 const malformed = /invalid|is required|must be|missing/i
@@ -32,7 +32,7 @@ const patterns: [RegExp, string][] = [
   [/has no sessions folder/i, '这台电脑的 Codex 还没有会话记录。先用 Codex 跑一次对话，再回来重试。'],
   [/explicit App Server socket/i, '还没填 Codex 的连接路径。'],
   [/App Server socket must be an absolute path/i, '连接路径要是绝对路径。'],
-  [/explicit absolute CODEX_HOME/i, '由 Vibeface 启动前，先填 Codex 目录。'],
+  [/explicit absolute CODEX_HOME/i, 'Codex 目录由 Vibeface 在这台设备上隔离管理。'],
   [/Codex SDK|Codex rejected|Codex turn failed|App Server/i, 'Codex 没能完成这次回复。再发一次，还不行就到设备页检查 Codex。'],
   [/peer (did not answer|is unreachable|connection closed|closed the stream|stream failed)|target connection closed|client target refused/i, '另一台设备没有回应，可能关机或断网了。等它上线后再试。'],
   [/client disconnected|client channel idle|membership state closed/i, '连接断开了，正在重新连接。'],
@@ -143,7 +143,7 @@ const failures: Record<FailureKind, string> = {
   no_bot: `那台设备还没设置 Bot。${settings}打开。`,
   writer_busy: '另一个进程正在写这个会话。等它结束后再试。',
   rejected: 'AI 服务拒绝了这次请求，没有执行。',
-  transport: '连不上 AI 服务，或连接中途断了。稍后再试。',
+  transport: '和 AI 服务的连接断了，结果未知。请先查询结果。',
   timed_out: 'AI 服务没有及时响应，结果未知。',
   restarted: '设备在中途重启了，这次没有重做。',
   lost: '执行的进程意外结束，不确定做完了没有。先看看有没有改动，再决定要不要重发。',
@@ -176,5 +176,5 @@ export function workFailure(work: { failure?: FailureKind; failure_reason: strin
  * unseen. Writes are not repeated on an unknown outcome, so the next step is checking the result, never a plain retry.
  */
 export function outcomeUnknown(kind: FailureKind | null | undefined, detail?: string | null): boolean {
-  return kind === 'timed_out' || kind === 'lost' || /outcome may be unknown|timed out/i.test(detail ?? '')
+  return kind === 'timed_out' || kind === 'lost' || kind === 'transport' || kind === 'restarted' || kind === 'unknown' || /outcome may be unknown|timed out/i.test(detail ?? '')
 }

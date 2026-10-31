@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import type { E2EConfig } from 'e2e';
 import { mobile } from '@e2e-dev/mobile';
@@ -23,8 +24,12 @@ export default {
     app: { appPath: resolve(app), bundleId: 'one.leaper.vibeface' } }],
   workers: 1,
   retries: 0,
+  trace: 'off',
+  video: 'off',
+  cleanupTimeout: 90000,
   timeout: 240000,
   launchTimeout: 240000,
   output: resolve(root, '.artifacts/native/e2e'),
   cache: { dir: resolve(root, '.artifacts/native/cache') },
+  secrets: { nativeInvitation: async () => (await readFile(invitation, 'utf8')).trim() },
 } satisfies E2EConfig;

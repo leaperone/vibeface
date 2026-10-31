@@ -8,11 +8,182 @@ use std::sync::{Mutex as StdMutex, PoisonError, Weak, atomic::Ordering};
 use tokio::sync::{Mutex, watch};
 use vibeface_bridge::{
     agent::{
-        AgentFailure, AgentRunError, NativeStatus, RunStarted, SdkBridge, SdkTurn, StartEvidence,
-        ToolCallbackConfig,
+        AgentFailure, AgentRunError, NativeRun, NativeStatus, RunStarted, SdkBridge, SdkTurn,
+        StartEvidence, ToolCallbackConfig,
     },
     failure::{ExecFailure, FailureKind},
 };
+
+fn native_probe(native: NativeRun) -> Probe {
+    match native.status {
+        NativeStatus::Running => Probe::Running {
+            turn_id: native.run_id,
+            epoch: 0,
+        },
+        NativeStatus::Completed => Probe::Terminal {
+            turn_id: native.run_id,
+            status: vibeface_bridge::turn::TurnStatus::Completed,
+            text: native.output.unwrap_or_default(),
+            error: None,
+        },
+        NativeStatus::Cancelled => Probe::Terminal {
+            turn_id: native.run_id,
+            status: vibeface_bridge::turn::TurnStatus::Interrupted,
+            text: native.output.unwrap_or_default(),
+            error: None,
+        },
+        NativeStatus::Failed { detail } => Probe::Terminal {
+            turn_id: native.run_id,
+            status: vibeface_bridge::turn::TurnStatus::Failed,
+            text: native.output.unwrap_or_default(),
+            error: Some(ExecFailure::upstream(detail, FailureKind::Unknown)),
+        },
+        NativeStatus::Unknown => Probe::Missing,
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyLocator {
+    agent: String,
+    owner: String,
+    workspace: PathBuf,
+    executable: PathBuf,
+    local_store_root: PathBuf,
+    provider_identity: String,
+}
+
+fn provider_identity(
+    api_key: &str,
+    env: &BTreeMap<String, String>,
+    configured_key: bool,
+) -> Result<String> {
+    Ok(crate::crypto::digest(&serde_json::to_vec(&(
+        api_key,
+        env,
+        configured_key,
+    ))?))
+}
+
+fn reply_locator_path(cursor_dir: &Path, client_id: &str) -> Result<PathBuf> {
+    vibeface_protocol::validate_id(client_id).map_err(anyhow::Error::msg)?;
+    Ok(cursor_dir.join("replies").join(format!(
+        "{}.json",
+        crate::crypto::digest(client_id.as_bytes())
+    )))
+}
+
+pub(crate) fn record_reply(
+    turn: &SdkTurn,
+    configured_env: &BTreeMap<String, String>,
+    client_id: &str,
+    agent: &str,
+) -> Result<()> {
+    vibeface_protocol::validate_id(agent).map_err(anyhow::Error::msg)?;
+    let instances = turn
+        .local_store_root
+        .parent()
+        .context("Cursor native store has no parent")?;
+    ensure!(
+        instances
+            .file_name()
+            .is_some_and(|name| name == "instances"),
+        "Cursor native store has no stable instance root"
+    );
+    let cursor_dir = instances
+        .parent()
+        .context("Cursor instance root has no parent")?;
+    ensure!(
+        cursor_dir.file_name().is_some_and(|name| name == "cursor"),
+        "Cursor instance root is outside its private data directory"
+    );
+    ensure!(
+        turn.local_store_root == instances.join(crate::crypto::digest(turn.owner.as_bytes())),
+        "Cursor native store does not match its owner"
+    );
+    let locator = ReplyLocator {
+        agent: agent.into(),
+        owner: turn.owner.clone(),
+        workspace: turn.workspace.clone(),
+        executable: turn.executable.clone(),
+        local_store_root: turn.local_store_root.clone(),
+        provider_identity: provider_identity(
+            &turn.api_key,
+            &turn.env,
+            configured_env.contains_key("CURSOR_API_KEY"),
+        )?,
+    };
+    let path = reply_locator_path(cursor_dir, client_id)?;
+    config::private_dir(
+        path.parent()
+            .context("Cursor reply locator has no parent")?,
+    )?;
+    config::private_write(&path, &serde_json::to_vec(&locator)?)
+}
+
+pub(crate) async fn probe_recorded_reply(
+    node: &Runtime,
+    client_id: &str,
+    agent_id: &str,
+    run_id: &str,
+) -> Result<Probe> {
+    let locator: ReplyLocator = match std::fs::read(reply_locator_path(
+        &node.data_dir.join("cursor"),
+        client_id,
+    )?) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(locator) => locator,
+            Err(_) => return Ok(Probe::Missing),
+        },
+        Err(_) => return Ok(Probe::Missing),
+    };
+    let expected_root = node
+        .data_dir
+        .join("cursor")
+        .join("instances")
+        .join(crate::crypto::digest(locator.owner.as_bytes()));
+    if locator.agent != agent_id
+        || locator.local_store_root != expected_root
+        || !locator.workspace.is_absolute()
+        || !locator.workspace.is_dir()
+    {
+        return Ok(Probe::Missing);
+    }
+    let configured_env = node.provider_env(Provider::Cursor);
+    let (Some(api_key), env) = crate::providers::cursor_launch(&configured_env) else {
+        return Ok(Probe::Missing);
+    };
+    if api_key.is_empty()
+        || provider_identity(
+            &api_key,
+            &env,
+            configured_env.contains_key("CURSOR_API_KEY"),
+        )? != locator.provider_identity
+    {
+        return Ok(Probe::Missing);
+    }
+    let Some(bridge) = node.cursor.get() else {
+        return Ok(Probe::Missing);
+    };
+    let turn = SdkTurn {
+        owner: locator.owner,
+        executable: locator.executable,
+        workspace: locator.workspace,
+        local_store_root: locator.local_store_root,
+        api_key,
+        env,
+        model: String::new(),
+        timeout_secs: node.cursor_executor.timeout_secs,
+        custom_tools: BTreeMap::new(),
+        callback_token: None,
+        process_started: None,
+        run_started: None,
+    };
+    Ok(match bridge.probe(&turn, agent_id, run_id).await {
+        Ok(native) => native_probe(native),
+        Err(_) => Probe::Missing,
+    })
+}
 
 /// Process groups of the running bridges, with the program each one runs.
 pub(super) const PIDFILE: &str = "cursor-sdk-bridge.pid";
@@ -471,7 +642,7 @@ impl Executor for CursorExecutor {
         network: &'a str,
         work: &'a WorkSpec,
         thread: Option<&'a str>,
-        args: &'a Value,
+        _args: &'a Value,
     ) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
             ensure!(
@@ -499,7 +670,7 @@ impl Executor for CursorExecutor {
             let turn = match self.turn(
                 &instance,
                 owner.workspace.clone(),
-                args["model"].as_str().unwrap_or_default().into(),
+                work.execution_model().unwrap_or_default().into(),
                 None,
                 None,
             ) {
@@ -563,31 +734,7 @@ impl Executor for CursorExecutor {
                     return Ok(Probe::Missing);
                 }
             };
-            Ok(match native.status {
-                NativeStatus::Running => Probe::Running {
-                    turn_id: native.run_id,
-                    epoch: 0,
-                },
-                NativeStatus::Completed => Probe::Terminal {
-                    turn_id: native.run_id,
-                    status: vibeface_bridge::turn::TurnStatus::Completed,
-                    text: native.output.unwrap_or_default(),
-                    error: None,
-                },
-                NativeStatus::Cancelled => Probe::Terminal {
-                    turn_id: native.run_id,
-                    status: vibeface_bridge::turn::TurnStatus::Interrupted,
-                    text: native.output.unwrap_or_default(),
-                    error: None,
-                },
-                NativeStatus::Failed { detail } => Probe::Terminal {
-                    turn_id: native.run_id,
-                    status: vibeface_bridge::turn::TurnStatus::Failed,
-                    text: native.output.unwrap_or_default(),
-                    error: Some(ExecFailure::upstream(detail, FailureKind::Unknown)),
-                },
-                NativeStatus::Unknown => Probe::Missing,
-            })
+            Ok(native_probe(native))
         })
     }
 
@@ -788,12 +935,207 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn bot_native_run_is_journaled_and_read_back_without_another_send() -> Result<()> {
+        let (node, dir, network, workspace) = cursor_node().await?;
+        let owner = CursorInstance::Bot {
+            network,
+            conversation: "bot-readback".into(),
+        };
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = calls.clone();
+        node.providers.lock().unwrap().env.apply(
+            Provider::Cursor,
+            BTreeMap::from([
+                (
+                    "FAKE_BRIDGE_GET_RUN_STATUS".into(),
+                    Some("RUN_LIFECYCLE_STATUS_UNSPECIFIED".into()),
+                ),
+                (
+                    "FAKE_BRIDGE_LOG".into(),
+                    Some(dir.join("bridge-starts.log").display().to_string()),
+                ),
+            ]),
+        )?;
+        let variables = node.provider_env(Provider::Cursor);
+        let config = crate::manager::ManagerConfig {
+            sdk: crate::manager::Sdk::Cursor {
+                bridge: node.cursor.get().cloned(),
+                sdk_bin: fake_bridge(),
+                owner: None,
+                local_store_root: None,
+            },
+            workspace: workspace.clone(),
+            model: "fixture-model".into(),
+            reasoning_effort: None,
+            timeout_secs: 10,
+            custom_tools: BTreeMap::new(),
+            tool_cli: None,
+            instructions: String::new(),
+            tool_env: BTreeMap::new(),
+            tool_token: None,
+            provider_env: variables,
+            process_started: None,
+            codex_turn: Some(crate::manager::CodexTurn {
+                client_id: "bot-attempt".into(),
+                record: Arc::new(move |agent, run| {
+                    recorded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((agent, run));
+                    Box::pin(async { Ok(()) })
+                }),
+                started: None,
+                fresh_prompt: None,
+            }),
+        }
+        .for_cursor_instance(owner.clone(), node.cursor_store_root(&owner));
+        let result = crate::manager::run_manager(
+            &config,
+            "read it back",
+            None,
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await?;
+        let agent = result.session_id.context("agent ID")?;
+        let journal = calls.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert_eq!(journal.len(), 2);
+        assert_eq!(journal[0], (agent.clone(), None));
+        let run = journal[1].1.as_deref().context("native run ID journaled")?;
+        assert_eq!(
+            probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
+            Probe::Terminal {
+                turn_id: run.into(),
+                status: vibeface_bridge::turn::TurnStatus::Completed,
+                text: "done: read it back".into(),
+                error: None,
+            }
+        );
+        assert_eq!(
+            probe_recorded_reply(&node, "bot-attempt", &agent, "not-the-run").await?,
+            Probe::Missing
+        );
+        let new_workspace = dir.join("new-workspace");
+        config::private_dir(&new_workspace)?;
+        node.settings.lock().unwrap().manager = Some(config::ManagerSettings {
+            provider: Provider::Cursor,
+            workspace: new_workspace,
+            model: "different-model".into(),
+            reasoning_effort: None,
+            backup: Default::default(),
+        });
+        let expected = Probe::Terminal {
+            turn_id: run.into(),
+            status: vibeface_bridge::turn::TurnStatus::Completed,
+            text: "done: read it back".into(),
+            error: None,
+        };
+        assert_eq!(
+            probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
+            expected
+        );
+        node.settings.lock().unwrap().manager = None;
+        node.providers
+            .lock()
+            .unwrap()
+            .bins
+            .insert(Provider::Cursor, dir.join("no-new-binary"));
+        assert_eq!(
+            probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
+            expected
+        );
+        let locator_path = reply_locator_path(&node.data_dir.join("cursor"), "bot-attempt")?;
+        let locator_bytes = std::fs::read(&locator_path)?;
+        let saved = std::str::from_utf8(&locator_bytes)?;
+        assert!(!saved.contains("fixture-api-key") && !saved.contains("CURSOR_API_KEY"));
+        let launches = std::fs::read_to_string(dir.join("bridge-starts.log"))?;
+        node.providers.lock().unwrap().env.apply(
+            Provider::Cursor,
+            BTreeMap::from([("CURSOR_API_KEY".into(), Some("rotated-key".into()))]),
+        )?;
+        assert_eq!(
+            probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
+            Probe::Missing
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("bridge-starts.log"))?,
+            launches,
+            "changed authentication never starts another native bridge"
+        );
+        node.providers.lock().unwrap().env.apply(
+            Provider::Cursor,
+            BTreeMap::from([("CURSOR_API_KEY".into(), Some("fixture-api-key".into()))]),
+        )?;
+        config::private_write(&locator_path, b"not json")?;
+        assert_eq!(
+            probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
+            Probe::Missing
+        );
+        config::private_write(&locator_path, &locator_bytes)?;
+        node.providers.lock().unwrap().env.apply(
+            Provider::Cursor,
+            BTreeMap::from([("CURSOR_API_KEY".into(), None)]),
+        )?;
+        assert_eq!(
+            probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
+            Probe::Missing
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("bridge-starts.log"))?,
+            launches
+        );
+        node.providers.lock().unwrap().env.apply(
+            Provider::Cursor,
+            BTreeMap::from([("CURSOR_API_KEY".into(), Some("fixture-api-key".into()))]),
+        )?;
+        let blocked = reply_locator_path(&node.data_dir.join("cursor"), "blocked-attempt")?;
+        config::private_dir(&blocked)?;
+        let mut blocked_config = config.clone();
+        blocked_config
+            .codex_turn
+            .as_mut()
+            .context("turn recorder")?
+            .client_id = "blocked-attempt".into();
+        let result = crate::manager::run_manager(
+            &blocked_config,
+            "must not send",
+            None,
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await;
+        let error = result.err().context("expected locator failure")?;
+        let error = error
+            .downcast_ref::<crate::manager::ManagerError>()
+            .context("structured failure")?;
+        assert_eq!(error.stage, vibeface_bridge::failure::ProviderStage::Record);
+        assert_eq!(error.start, StartEvidence::NotStarted);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sends.log"))?
+                .lines()
+                .count(),
+            1
+        );
+        node.shutdown().await;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     fn fake_bridge() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../bridge/tests/fixtures/fake-cursor-sdk-bridge")
     }
 
     async fn cursor_node() -> Result<(Arc<Runtime>, PathBuf, String, PathBuf)> {
+        let (node, dir, network, workspace, _) = cursor_node_with_admin().await?;
+        Ok((node, dir, network, workspace))
+    }
+
+    async fn cursor_node_with_admin()
+    -> Result<(Arc<Runtime>, PathBuf, String, PathBuf, LocalIdentity)> {
         let dir =
             std::env::temp_dir().join(format!("vibeface-cursor-work-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
@@ -833,7 +1175,7 @@ mod tests {
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state).await?;
-        Ok((node, dir, network, workspace))
+        Ok((node, dir, network, workspace, admin))
     }
 
     fn work(node: &Runtime, workspace: &Path, call_ref: &str, prompt: &str) -> Result<WorkSpec> {
@@ -846,6 +1188,11 @@ mod tests {
             dispatcher: device,
             call_ref: call_ref.into(),
             kind: WorkKind::Agent(Provider::Cursor),
+            model: None,
+            resolved: crate::model::ResolvedModel {
+                provider: Provider::Cursor,
+                model: Some("fixture-model".into()),
+            },
             cwd: workspace.display().to_string(),
             title: "cursor work".into(),
             prompt: prompt.into(),
@@ -873,88 +1220,305 @@ mod tests {
 
     #[tokio::test]
     async fn a_cursor_manager_reports_its_native_start_before_seen_context() -> Result<()> {
-        let (node, dir, network, workspace) = cursor_node().await?;
-        let instance = CursorInstance::Bot {
-            network,
-            conversation: "start-state".into(),
+        use crate::scheduling::{
+            ContextProjection, ContextStage, JobOutcome, SessionConfig, SessionKey, SessionScope,
+            Shown, TurnExecution, TurnRuntime,
         };
-        let mut config = node
-            .manager_config(crate::config::ManagerSettings {
+        async fn claim(
+            node: &Arc<Runtime>,
+            admin: &LocalIdentity,
+            network: &str,
+            id: &str,
+            configuration: &SessionConfig,
+        ) -> Result<(
+            crate::scheduling::SchedulerJob,
+            Arc<std::sync::Mutex<Shown>>,
+        )> {
+            let event = admin.attest(
+                network,
+                "start-state",
+                crate::model::EventBody::MessagePosted {
+                    message_id: id.into(),
+                    role: crate::model::Role::User,
+                    text: id.into(),
+                    attachments: vec![],
+                    report_results: Some(true),
+                    in_reply_to: None,
+                    status: None,
+                    answers: None,
+                    attestation: None,
+                    failure: None,
+                },
+            )?;
+            let mut store = node.store.lock().await;
+            store.accept_message(
+                &node.identity,
+                network,
+                "start-state",
+                id,
+                id,
+                vec![],
+                true,
+                event.attestation().cloned().context("signed message")?,
+                now_ms(),
+            )?;
+            let key = SessionKey {
+                conversation_id: "start-state".into(),
+                scope: SessionScope::Main,
+            };
+            let claimed = store
+                .claim_next_in_session(
+                    &node.identity,
+                    network,
+                    &key,
+                    crate::scheduler::boot_id(),
+                    configuration,
+                    &node.config.scheduling,
+                )?
+                .context("claimed Cursor turn")?;
+            let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+            let job = store.record_turn_runtime(
+                "start-state",
+                &claimed.job.trigger,
+                &attempt,
+                &TurnRuntime {
+                    provider: Provider::Cursor,
+                    model: Some("fixture-model".into()),
+                    reasoning_effort: None,
+                    generation: node.provider_generation(Provider::Cursor, &node.providers())?,
+                    session_generation: claimed.session_generation,
+                    delivery_id: attempt.clone(),
+                    stage: vibeface_bridge::failure::ProviderStage::Validate,
+                    execution: TurnExecution::NotStarted,
+                    attempted_at_ms: now_ms(),
+                    switched_from: None,
+                    switch_reason: None,
+                },
+            )?;
+            let context = ContextProjection {
+                attempt_id: attempt.clone(),
+                provider: Provider::Cursor,
+                stable_fingerprint: configuration.stable_fingerprint.clone(),
+                dynamic_fingerprint: format!("context-{id}"),
+                session_generation: claimed.session_generation,
+                coverage: Default::default(),
+                stable_bytes: 1,
+                dynamic_bytes: 1,
+                invalidation_reason: None,
+                stage: ContextStage::Compiled,
+                session_status: None,
+            };
+            store.record_compiled_context("start-state", &job.trigger, &attempt, &context)?;
+            store.mark_started("start-state", &job.trigger, &attempt)?;
+            Ok((
+                job,
+                Arc::new(std::sync::Mutex::new(Shown {
+                    session_generation: claimed.session_generation,
+                    dynamic: Some(format!("delivered-{id}")),
+                    context: Some(context),
+                    ..Shown::default()
+                })),
+            ))
+        }
+        async fn seen(node: &Runtime) -> Result<(crate::model::VersionVector, Shown)> {
+            let store = node.store.lock().await;
+            let (covers, shown) = store.connection.query_row(
+                "SELECT covers,shown FROM scheduler_sessions WHERE conversation_id='start-state' AND scope='main'", [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            Ok((
+                serde_json::from_str(&covers)?,
+                serde_json::from_str(&shown)?,
+            ))
+        }
+        let (node, dir, network, workspace, admin) = cursor_node_with_admin().await?;
+        let result = async {
+            let settings = crate::config::ManagerSettings {
                 provider: Provider::Cursor,
                 workspace,
                 model: "fixture-model".into(),
-            })?
-            .for_cursor_instance(instance.clone(), node.cursor_store_root(&instance));
-        let persisted = Arc::new(std::sync::Mutex::new(None::<String>));
-        let started = Arc::new(tokio::sync::Notify::new());
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        config.codex_turn = Some(crate::manager::CodexTurn {
-            client_id: "start-state".into(),
-            fresh_prompt: None,
-            started: Some({
+                reasoning_effort: None,
+                backup: Default::default(),
+            };
+            node.settings.lock().unwrap().manager = Some(settings.clone());
+            crate::runtime::triage::tests::bot(&node, &admin, "start-state", "Bot", &[]).await?;
+            let key = SessionKey {
+                conversation_id: "start-state".into(),
+                scope: SessionScope::Main,
+            };
+            let configuration =
+                crate::scheduler::session_configuration(&node, &network, &key).await?;
+            let instance = CursorInstance::Bot {
+                network: network.clone(),
+                conversation: "start-state".into(),
+            };
+            let config = node
+                .manager_config(settings, &node.providers())?
+                .for_cursor_instance(instance.clone(), node.cursor_store_root(&instance));
+            let (job, shown) = claim(&node, &admin, &network, "cancelled", &configuration).await?;
+            let attempt = job.state.attempt().unwrap().id.clone();
+            assert!(seen(&node).await?.0.is_empty());
+            assert!(seen(&node).await?.1.dynamic.is_none());
+            let persisted = Arc::new(std::sync::Mutex::new(None::<String>));
+            let started = Arc::new(tokio::sync::Notify::new());
+            let mut running_config = config.clone();
+            let mut observer =
+                crate::scheduler::turn_recorder(&node, &network, &job, "", shown, None);
+            let original_started = observer.started.take().context("started callback")?;
+            observer.started = Some({
                 let persisted = persisted.clone();
                 let started = started.clone();
-                Arc::new(move |_| {
+                Arc::new(move |run| {
                     assert!(persisted.lock().unwrap().is_some());
-                    started.notify_one();
-                    Box::pin(async { Ok(()) })
+                    let original_started = original_started.clone();
+                    let started = started.clone();
+                    Box::pin(async move {
+                        original_started(run).await?;
+                        started.notify_one();
+                        Ok(())
+                    })
                 })
-            }),
-            record: {
-                let seen = seen.clone();
-                Arc::new(move |session, turn| {
-                    seen.lock().unwrap().push((session, turn));
-                    Box::pin(async { Ok(()) })
-                })
-            },
-        });
-        let next = config.clone();
-        let saved = persisted.clone();
-        let (cancel, receiver) = tokio::sync::watch::channel(false);
-        let task = tokio::spawn(async move {
-            crate::manager::run_manager(
-                &config,
-                "hang",
+            });
+            running_config.codex_turn = Some(observer);
+            let saved = persisted.clone();
+            let persist_node = node.clone();
+            let persist_trigger = job.trigger.clone();
+            let persist_attempt = attempt.clone();
+            let (cancel, receiver) = tokio::sync::watch::channel(false);
+            let task = tokio::spawn(async move {
+                crate::manager::run_manager(
+                    &running_config,
+                    "hang",
+                    None,
+                    move |session| {
+                        *saved.lock().unwrap() = Some(session.clone());
+                        async move {
+                            persist_node.store.lock().await.save_scheduler_native_id(
+                                "start-state",
+                                &persist_trigger,
+                                &persist_attempt,
+                                &session,
+                                "controlled-token",
+                                false,
+                            )
+                        }
+                    },
+                    receiver,
+                    |_| async { Ok(()) },
+                )
+                .await
+            });
+            let observed = tokio::time::timeout(Duration::from_secs(5), started.notified()).await;
+            let pending = !task.is_finished();
+            let captured = async {
+                let store = node.store.lock().await;
+                let early = store
+                    .manager_turn_record(&attempt)?
+                    .context("early native locator")?;
+                let execution = store
+                    .scheduler_job("start-state", &job.trigger)?
+                    .context("job")?
+                    .runtime
+                    .context("runtime")?
+                    .execution;
+                drop(store);
+                let (covers, shown) = seen(&node).await?;
+                Ok::<_, anyhow::Error>((early, execution, covers, shown))
+            }
+            .await;
+            let signalled = cancel.send(true);
+            let interrupted = task.await?;
+            observed.context("native Cursor start callback")?;
+            signalled?;
+            let (early, execution, covers, early_shown) = captured?;
+            assert!(pending);
+            assert_eq!(
+                Some(early.thread.clone()),
+                persisted.lock().unwrap().clone()
+            );
+            assert!(
+                early.turn.is_some(),
+                "the early locator keeps the actual native run"
+            );
+            assert_eq!(execution, TurnExecution::Started);
+            assert!(covers.is_empty());
+            assert!(
+                early_shown.dynamic.is_none(),
+                "native start does not confirm delivered context"
+            );
+            assert_eq!(early_shown.context.unwrap().stage, ContextStage::Started);
+            assert!(
+                interrupted
+                    .err()
+                    .context("interrupted Cursor turn")?
+                    .downcast_ref::<crate::manager::ManagerError>()
+                    .unwrap()
+                    .cancelled()
+            );
+            assert!(seen(&node).await?.0.is_empty());
+            assert!(seen(&node).await?.1.dynamic.is_none());
+            node.store.lock().await.finish_job(
+                &node.identity,
+                &network,
+                "start-state",
+                &job.trigger,
+                &attempt,
+                JobOutcome::Cancelled("controlled stop".into()),
+                "",
+                now_ms(),
+            )?;
+
+            let (job, shown) = claim(&node, &admin, &network, "completed", &configuration).await?;
+            let attempt = job.state.attempt().unwrap().id.clone();
+            let mut completed_config = config;
+            completed_config.codex_turn = Some(crate::scheduler::turn_recorder(
+                &node,
+                &network,
+                &job,
+                "",
+                shown.clone(),
                 None,
-                move |session| {
-                    *saved.lock().unwrap() = Some(session);
-                    async { Ok(()) }
+            ));
+            let persist_node = node.clone();
+            let persist_trigger = job.trigger.clone();
+            let persist_attempt = attempt.clone();
+            let reply = crate::manager::run_manager(
+                &completed_config,
+                "hello",
+                None,
+                move |session| async move {
+                    persist_node.store.lock().await.save_scheduler_native_id(
+                        "start-state",
+                        &persist_trigger,
+                        &persist_attempt,
+                        &session,
+                        "controlled-token",
+                        false,
+                    )
                 },
-                receiver,
+                tokio::sync::watch::channel(false).1,
                 |_| async { Ok(()) },
             )
-            .await
-        });
-        let observed = tokio::time::timeout(Duration::from_secs(5), started.notified()).await;
-        let pending = !task.is_finished();
-        let seen_before_completion = seen.lock().unwrap().len();
-        cancel.send(true)?;
-        let interrupted = task.await?;
-        observed.context("native Cursor start callback")?;
-        assert!(pending);
-        assert_eq!(seen_before_completion, 0);
-        assert!(
-            interrupted
-                .err()
-                .context("expected interrupted Cursor turn")?
-                .downcast_ref::<crate::manager::ManagerError>()
-                .unwrap()
-                .cancelled()
-        );
-        let result = crate::manager::run_manager(
-            &next,
-            "finish",
-            None,
-            |_| async { Ok(()) },
-            tokio::sync::watch::channel(false).1,
-            |_| async { Ok(()) },
-        )
-        .await?;
-        assert_eq!(result.output, "done: finish");
-        assert_eq!(seen.lock().unwrap().len(), 1);
+            .await?;
+            assert_eq!(reply.output, "done: hello");
+            assert!(seen(&node).await?.0.is_empty());
+            assert!(seen(&node).await?.1.dynamic.is_none());
+            let delivered = shown.lock().unwrap().clone();
+            crate::scheduler::confirm_cursor_seen(&node, &job, &delivered, &reply).await?;
+            let (covers, completed_shown) = seen(&node).await?;
+            assert_eq!(covers, job.basis);
+            assert_eq!(
+                completed_shown.dynamic.as_deref(),
+                Some("delivered-completed")
+            );
+            assert_eq!(completed_shown.context.unwrap().attempt_id, attempt);
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
         node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
-        Ok(())
+        result
     }
 
     #[tokio::test]
@@ -975,7 +1539,7 @@ mod tests {
             ),
         ] {
             let spec = work(&node, &workspace, call_ref, "fixture prompt")?;
-            node.store.lock().await.accept_work(
+            node.store.lock().await.accept_work_fixture(
                 &node.identity,
                 &network,
                 spec.clone(),
@@ -993,6 +1557,7 @@ mod tests {
                     &network,
                     &spec.work_id,
                     Err(AgentRunError {
+                        stage: vibeface_bridge::failure::ProviderStage::TurnStart,
                         outcome,
                         start,
                         session_id: Some("fixture-agent".into()),
@@ -1032,10 +1597,12 @@ mod tests {
     async fn cursor_work_dispatches_once_and_returns_result() -> Result<()> {
         let (node, dir, network, workspace) = cursor_node().await?;
         let spec = work(&node, &workspace, "once", "build it")?;
-        node.store
-            .lock()
-            .await
-            .accept_work(&node.identity, &network, spec.clone(), now_ms())?;
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            &network,
+            spec.clone(),
+            now_ms(),
+        )?;
         assert!(
             !node
                 .start_work(
@@ -1056,11 +1623,12 @@ mod tests {
             "{finished:?}"
         );
         assert_eq!(finished.text, "done: build it");
-        let (_, created) =
-            node.store
-                .lock()
-                .await
-                .accept_work(&node.identity, &network, spec, now_ms())?;
+        let (_, created) = node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            &network,
+            spec,
+            now_ms(),
+        )?;
         assert!(
             !created,
             "retrying the same call only reads the existing work"
@@ -1080,10 +1648,12 @@ mod tests {
     async fn cursor_interrupt_waits_for_provider_cancelled_terminal() -> Result<()> {
         let (node, dir, network, workspace) = cursor_node().await?;
         let spec = work(&node, &workspace, "cancel", "hang around")?;
-        node.store
-            .lock()
-            .await
-            .accept_work(&node.identity, &network, spec.clone(), now_ms())?;
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            &network,
+            spec.clone(),
+            now_ms(),
+        )?;
         node.start_work(
             node.executor(Provider::Cursor)?,
             &network,

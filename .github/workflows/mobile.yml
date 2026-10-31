@@ -74,7 +74,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
@@ -89,15 +89,193 @@ jobs:
       - name: Build the simulator app
         working-directory: apps/mobile
         run: |
+          mkdir -p ../../.artifacts/native
           npx expo prebuild --platform ios
           xcodebuild -workspace ios/Vibeface.xcworkspace -scheme Vibeface -configuration Release \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' ARCHS=arm64 \
-            -derivedDataPath build CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= build
+            -derivedDataPath ../../.artifacts/native/ios-build CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= build
           # Ad-hoc signing writes the simulator entitlements into the binary; without them the Keychain refuses SecureStore.
-          otool -l build/Build/Products/Release-iphonesimulator/Vibeface.app/Vibeface | grep -q "sectname __entitlements"
-          cd build/Build/Products/Release-iphonesimulator && zip -qry "$GITHUB_WORKSPACE/vibeface-ios-simulator.zip" Vibeface.app
+          otool -l ../../.artifacts/native/ios-build/Build/Products/Release-iphonesimulator/Vibeface.app/Vibeface | grep -q "sectname __entitlements"
+          cd ../../.artifacts/native/ios-build/Build/Products/Release-iphonesimulator
+          zip -qry "$GITHUB_WORKSPACE/.artifacts/native/vibeface-ios-simulator.zip" Vibeface.app
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: vibeface-ios-simulator-${{ github.sha }}
-          path: vibeface-ios-simulator.zip
+          path: .artifacts/native/vibeface-ios-simulator.zip
           if-no-files-found: error
+      - name: Build the same-source host Node and browser cryptography
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.artifacts/native/target
+        run: |
+          umask 077
+          mkdir -p .artifacts/native/private
+          chmod 700 .artifacts/native .artifacts/native/private
+          printf '%s\n' host-source > .artifacts/native/private/stage.txt
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          test "$(uname -m)" = arm64
+          printf '%s\n' host-build > .artifacts/native/private/stage.txt
+          cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          bash scripts/build-web-crypto.sh
+          bash scripts/build-web.sh
+          CARGO_ENCODED_RUSTFLAGS="$(python3 scripts/release-rustflags.py)" cargo build --release -p vibeface --locked
+          .artifacts/native/target/release/vibeface --version
+      - name: Create the dedicated iOS Provider simulator
+        env:
+          VIBEFACE_E2E_SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          umask 077
+          python3 - <<'PY'
+          import json, os, pathlib, platform, re, subprocess
+          pathlib.Path(".artifacts/native/private/stage.txt").write_text("simulator-create\n")
+          assert platform.machine() == "arm64"
+          app = pathlib.Path(".artifacts/native/ios-build/Build/Products/Release-iphonesimulator/Vibeface.app").resolve()
+          assert "arm64" in subprocess.check_output(["lipo", "-archs", str(app / "Vibeface")], text=True).split()
+          runtimes = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "runtimes", "--json"]))["runtimes"]
+          available = [row for row in runtimes if row.get("isAvailable") and ".SimRuntime.iOS-" in row["identifier"]]
+          assert available, "A usable iOS runtime is required"
+          runtime = max(available, key=lambda row: tuple(map(int, row["version"].split("."))))["identifier"]
+          types = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devicetypes", "--json"]))["devicetypes"]
+          device_type = next(row["identifier"] for row in types if row["name"] == "iPhone 17" and row["productFamily"] == "iPhone")
+          name = "vibeface-provider-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+          simulator = subprocess.check_output(["xcrun", "simctl", "create", name, device_type, runtime], text=True).strip()
+          assert re.fullmatch(r"[a-fA-F0-9-]{36}", simulator)
+          pathlib.Path(".artifacts/native/simulator.txt").write_text(simulator)
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              for key, value in {"VIBEFACE_E2E_SIMULATOR": simulator, "VIBEFACE_E2E_IOS_RUNTIME": runtime,
+                                 "VIBEFACE_E2E_IOS_DEVICE_TYPE": device_type, "VIBEFACE_E2E_IOS_APP": str(app),
+                                 "VIBEFACE_E2E_BINARY": str(pathlib.Path(".artifacts/native/target/release/vibeface").resolve()),
+                                 "VIBEFACE_E2E_CRYPTO_MODULE": str(pathlib.Path("crates/node/web/generated/vibeface_secure.js").resolve())}.items():
+                  output.write(key + "=" + value + "\n")
+          subprocess.run(["xcrun", "simctl", "boot", simulator], check=True)
+          subprocess.run(["xcrun", "simctl", "bootstatus", simulator, "-b"], check=True)
+          PY
+      - name: Verify Provider settings and cancellation in the installed iOS app
+        env:
+          VIBEFACE_E2E_SOURCE_COMMIT: ${{ github.sha }}
+          E2E_TELEMETRY_DISABLED: '1'
+        run: |
+          umask 077
+          printf '%s\n' typecheck > .artifacts/native/private/stage.txt
+          pnpm test:e2e:check > .artifacts/native/private/typecheck.log 2>&1
+          printf '%s\n' selection > .artifacts/native/private/stage.txt
+          pnpm exec e2e list --config e2e.native.config.ts --grep '^provider ' --reporter json > .artifacts/native/private/selection.json 2> .artifacts/native/private/selection.log
+          python3 - <<'PY'
+          import json
+          pairs = json.load(open(".artifacts/native/private/selection.json"))["pairs"]
+          assert len(pairs) == 1 and pairs[0]["disposition"] == "run", "Exactly one runnable native Provider test is required"
+          PY
+          printf '%s\n' ui-run > .artifacts/native/private/stage.txt
+          set +e
+          pnpm exec e2e run --config e2e.native.config.ts --grep '^provider ' --trace off --video off --retries 0 > .artifacts/native/private/ui.log 2>&1
+          result=$?
+          set -e
+          echo "Native Provider e2e exit code: $result"
+          exit "$result"
+      - name: Remove only this task simulator and private acceptance state
+        if: always()
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          umask 077
+          python3 - <<'PY'
+          import json, os, pathlib, re, shutil, subprocess
+          root = pathlib.Path(".artifacts/native")
+          public = root / "public"
+          public.mkdir(parents=True, exist_ok=True, mode=0o700)
+          receipt_path = public / "provider.json"
+          receipt = json.loads(receipt_path.read_text()) if receipt_path.exists() else {"source_commit": os.environ["SOURCE_COMMIT"]}
+          simulator_file = root / "simulator.txt"
+          removed, fixture_stopped, selected_passed, private_removed = not simulator_file.exists(), False, False, False
+          stage_path = root / "private/stage.txt"
+          stage = stage_path.read_text().strip() if stage_path.exists() else "not_started"
+          stages = {"host-source", "host-build", "simulator-create", "typecheck", "selection", "ui-run"}
+          diagnostics = {"stage": stage if stage in stages else "not_started", "report": "missing", "failures": []}
+
+          def safe_error(error, source=None, api=None):
+              if not isinstance(error, dict):
+                  return None
+              code = error.get("code")
+              result = {"code": code if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) else "UNCLASSIFIED_ERROR"}
+              source = error.get("source", source)
+              if isinstance(source, dict) and source.get("file") in {"tests/native-transfers.e2e.ts", "e2e.native.config.ts"}:
+                  line = source.get("line")
+                  if type(line) is int and 1 <= line <= 100000:
+                      result.update(file=source["file"], line=line)
+              if api in {"app.open", "app.screenshot", "device.installApp", "device.clearKeychain", "device.openLink", "device.dismissKeyboard",
+                         "screen.scrollUntilVisible", "locator.click", "locator.tap", "locator.fill", "expect.toBeVisible", "expect.toBeHidden",
+                         "expect.toHaveAccessibleName", "expect.toEqual", "expect.toBe", "expect.poll"}:
+                  result["api"] = api
+              if error.get("phase") in {"config", "collection", "filter", "launch", "beforeAll", "beforeEach", "body", "afterEach", "afterAll", "cleanup", "report"}:
+                  result["phase"] = error["phase"]
+              return result
+
+          report_path = root / "e2e/report.json"
+          if report_path.exists():
+              try:
+                  run = json.loads(report_path.read_text())["run"]
+                  diagnostics["report"] = "present"
+                  summary = run["summary"]
+                  selected_passed = run["exitCode"] == 0 and not run["errors"] and summary["selected"] == summary["passed"] == 1 and all(
+                      summary[key] == 0 for key in ("failed", "skipped", "interrupted", "flaky"))
+                  failures = [safe_error(error) for error in run["errors"]]
+                  for result in run["results"]:
+                      for attempt in result["attempts"]:
+                          failures += [safe_error(error, result.get("source")) for error in [attempt.get("error"), *attempt.get("secondaryErrors", [])]]
+                          failures += [safe_error(step.get("error"), step.get("source"), step.get("api")) for step in attempt["steps"]]
+                  for failure in failures:
+                      if failure and failure not in diagnostics["failures"] and len(diagnostics["failures"]) < 16:
+                          diagnostics["failures"].append(failure)
+              except (OSError, ValueError, KeyError, TypeError):
+                  diagnostics["report"] = "unreadable"
+                  selected_passed = False
+          try:
+              if simulator_file.exists():
+                  simulator = simulator_file.read_text().strip()
+                  assert re.fullmatch(r"[a-fA-F0-9-]{36}", simulator)
+                  devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "--json"]))["devices"]
+                  matches = [row for rows in devices.values() for row in rows if row["udid"] == simulator]
+                  expected = "vibeface-provider-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+                  assert len(matches) == 1 and matches[0]["name"] == expected
+                  if matches[0]["state"] != "Shutdown":
+                      subprocess.run(["xcrun", "simctl", "shutdown", simulator], check=True, stdout=subprocess.DEVNULL)
+                  subprocess.run(["xcrun", "simctl", "delete", simulator], check=True, stdout=subprocess.DEVNULL)
+                  removed = True
+              cleanup = root / "network/cleanup.json"
+              fixture_stopped = cleanup.exists() and json.loads(cleanup.read_text()).get("fixture_stopped") is True
+          except Exception:
+              diagnostics["stage"] = "cleanup"
+          finally:
+              try:
+                  for name in ("network", "agent-device", "cache", "e2e", "private"):
+                      path = root / name
+                      assert not path.is_symlink()
+                      if path.exists():
+                          shutil.rmtree(path)
+                  private_removed = True
+              except Exception:
+                  diagnostics["stage"] = "cleanup"
+              finally:
+                  passed = receipt.get("status") == "ui_passed" and removed and fixture_stopped and selected_passed and private_removed
+                  if receipt.get("status") == "ui_passed" and not passed:
+                      diagnostics["stage"] = "cleanup"
+                  receipt.update(status="passed" if passed else "failed", simulator_removed=removed, fixture_stopped=fixture_stopped,
+                                 private_state_removed=private_removed, selected_test_passed=selected_passed,
+                                 diagnostics=diagnostics, run_id=os.environ["GITHUB_RUN_ID"], run_attempt=os.environ["GITHUB_RUN_ATTEMPT"])
+                  receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+          print(json.dumps(diagnostics, sort_keys=True))
+          raise SystemExit(0 if passed else 1)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && !cancelled() }}
+        with:
+          name: native-provider-ios-${{ github.sha }}
+          path: |
+            .artifacts/native/public/provider.json
+            .artifacts/native/public/provider-initial.png
+            .artifacts/native/public/provider-selectable.png
+            .artifacts/native/public/provider-controlled.png
+            .artifacts/native/public/provider-typed.png
+          if-no-files-found: error
+          retention-days: 7

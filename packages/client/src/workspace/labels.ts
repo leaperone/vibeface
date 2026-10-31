@@ -1,8 +1,8 @@
-import { asProvider, type MembershipView, type ProviderId } from "../lib/node.ts"
+import { type MembershipView, type ProviderId } from "../lib/node.ts"
 import type { LiveProgress } from "../lib/progress.ts"
 import { confirmReason } from "./model.ts"
 import { awaitsAnswer, workApproval } from "./questions.ts"
-import type { AgentLane, ContextProjection, ManagerJob, MemoryEntry, NodeInfo, OpenWork, OverviewBot, OverviewCoverage, OverviewJob, OverviewTask, PendingCheck, Question, QueueHoldReason, SessionHandoff, WorkRecord, WorkspaceActivity, WorkspaceActivityAttention, WorkspaceActivityFacts, WorkspaceActivityGroup, WorkspaceActivityJob, WorkspaceActivityView, WorkspaceOverview } from "./types.ts"
+import type { AgentLane, ContextProjection, ManagerJob, MemoryEntry, NodeInfo, OpenWorkCard, OverviewBot, OverviewCoverage, OverviewJob, OverviewTask, PendingCheck, Question, QueueHoldReason, ResolvedModel, SessionHandoff, WorkCard, WorkRecord, WorkspaceActivity, WorkspaceActivityAttention, WorkspaceActivityFacts, WorkspaceActivityGroup, WorkspaceActivityJob, WorkspaceActivityView, WorkspaceOverview } from "./types.ts"
 
 export const contextStages = {
   compiled: { label: '已编译', detail: '内容已准备，尚未确认 AI 开始执行。', tone: 'info' },
@@ -157,12 +157,8 @@ const progressStates: Record<string, string> = {
 }
 export const progressLabel = (status: string) => progressStates[status] ?? (/[\u4e00-\u9fff]/.test(status) ? status : "进行中")
 
-/**
- * Who runs a task, the same on every card: a provider names itself; an agent task runs as its device's bot turn, so
- * it names the provider that bot runs on there.
- */
-export const taskAgent = (work: Pick<WorkRecord, "kind" | "target_node">, nodes: readonly NodeInfo[]): ProviderId | null =>
-  work.kind === "task" ? asProvider(nodes.find((node) => node.device_id === work.target_node)?.capabilities?.manager) : work.kind ?? null
+export const taskAgent = (work: Pick<WorkCard, "kind"> & { resolved?: ResolvedModel }): ProviderId | null =>
+  work.kind === "task" ? work.resolved?.provider ?? null : work.kind ?? null
 /** A task's newest step: what it recorded, else the last line or status its device streams, as another device's bot records none. */
 export function taskProgress(work: Pick<WorkRecord, "work_id" | "target_node" | "summary">, live: readonly LiveProgress[]) {
   if (work.summary) return work.summary
@@ -177,14 +173,14 @@ export function taskProgress(work: Pick<WorkRecord, "work_id" | "target_node" | 
  * A work only the person can settle now reads as awaiting confirmation; a finished one as its outcome; a stop not yet
  * confirmed as that stop, which keeps being retried.
  */
-export const shownState = (work: WorkRecord, nodes: NodeInfo[] = []) =>
+export const shownState = (work: WorkCard, nodes: NodeInfo[] = []) =>
   confirmReason(work, nodes) ? "awaiting_confirmation" : work.outcome ?? work.stop ?? (work.state === "finished" ? "unknown" : work.state)
 export const taskActive = (state: string) => ["accepted", "running", "interrupting", "dispatch_waiting", "stop_waiting", "stop_timed_out"].includes(state)
 /**
  * A chat task's state: one that completed while a work it dispatched, or that work's own, still runs waits on them. No record
  * says so, so this reads only the works this device holds; a child not synced yet does not hold its parent.
  */
-export function chatTaskState(work: WorkRecord, works: readonly WorkRecord[], nodes: NodeInfo[] = []): string {
+export function chatTaskState(work: WorkCard, works: readonly WorkCard[], nodes: NodeInfo[] = []): string {
   const state = shownState(work, nodes)
   if (state !== "completed") return state
   const seen = new Set([work.work_id])
@@ -230,7 +226,7 @@ export const fixOnDeviceLabel = (device: string) => `去设置「${device}」`
 export type TaskGroup = "attention" | "working" | "waiting"
 export const taskGroups: readonly { group: TaskGroup; title: string }[] = [{ group: "attention", title: "需要留意" }, { group: "working", title: "进行中" }, { group: "waiting", title: "等待中" }]
 /** DAG results survive an older running read; unknown or conflicting results have no ordering proof. */
-export function cardState(work: WorkRecord, nodes: NodeInfo[], projected?: Pick<OverviewTask, "state" | "outcome">): string {
+export function cardState(work: WorkCard, nodes: NodeInfo[], projected?: Pick<OverviewTask, "state" | "outcome">): string {
   if (work.state === "unverified" || work.outcome === "unverified" || work.state === "dispatch_unverified") return shownState(work, nodes)
   if (projected && (projected.outcome === "unverified" || ["unknown", "unverified", "dispatch_unverified"].includes(projected.state))) return projected.outcome === "unverified" ? "unverified" : projected.state
   if ((work.state === "finished" && !work.outcome) || (projected?.state === "finished" && !projected.outcome)) return "unknown"
@@ -241,7 +237,7 @@ export function cardState(work: WorkRecord, nodes: NodeInfo[], projected?: Pick<
 }
 
 /** An entry task check only folds into its unverified work; a bounded Bot list does not prove deletion. */
-export function unrepresentedOverviewChecks(overview: WorkspaceOverview, works: readonly OpenWork[], nodes: NodeInfo[], knownBots: readonly OverviewBot[] = []) {
+export function unrepresentedOverviewChecks(overview: WorkspaceOverview, works: readonly OpenWorkCard[], nodes: NodeInfo[], knownBots: readonly OverviewBot[] = []) {
   const local = nodes.find((node) => node.local)?.device_id
   return overview.tasks.filter((check): check is Extract<OverviewTask, { kind: "check" }> => {
     if (check.kind !== "check" || check.target_node !== null) return false
@@ -260,7 +256,7 @@ export function unrepresentedOverviewChecks(overview: WorkspaceOverview, works: 
 }
 
 type WorkspaceActivityInput = {
-  works: readonly OpenWork[]
+  works: readonly OpenWorkCard[]
   questions: readonly Question[]
   checks: readonly PendingCheck[]
   overview?: WorkspaceOverview | null
@@ -273,9 +269,63 @@ type WorkspaceActivityInput = {
 }
 
 const activityKey = (conversationId: string, workId: string) => JSON.stringify([conversationId, workId])
+const questionKey = (conversationId: string, questionId: string) => JSON.stringify([conversationId, questionId])
 const emptyActivityFacts = (): WorkspaceActivityFacts => ({ questions: [], checks: [], overviewQuestions: [], overviewChecks: [], jobs: [] })
-const activityJobId = (conversationId: string | null, job: ManagerJob | OverviewJob) => `turn:${conversationId ?? ""}:${job.trigger}`
+const activityJobId = (conversationId: string | null, job: ManagerJob | OverviewJob) => `turn:${conversationId ?? ""}:${"source_node" in job ? job.source_node ?? "unknown" : "local"}:${"job_id" in job ? job.job_id : job.trigger}`
 const taskWorkId = (trigger: string) => trigger.startsWith("task:") ? trigger.slice(5) || null : null
+
+const jobSource = (entry: WorkspaceActivityJob, localNode: string | undefined) => {
+  if ("job_id" in entry.job) return entry.job.source_node
+  return entry.job.source_node ?? localNode ?? null
+}
+const sameObservedJob = (left: WorkspaceActivityJob, right: WorkspaceActivityJob, localNode: string | undefined) => {
+  if (!left.conversation_id || left.conversation_id !== right.conversation_id || !left.job.trigger || left.job.trigger !== right.job.trigger) return false
+  const leftSource = jobSource(left, localNode), rightSource = jobSource(right, localNode)
+  return leftSource !== null && leftSource === rightSource
+}
+const terminalJobStates = new Set(["completed", "failed", "cancelled", "interrupted", "rejected", "steered"])
+const activeJobStates = new Set(["claimed", "running", "steering", "cancelling", "publishing", "reconciling"])
+const jobStateRank: Record<string, number> = {
+  queued: 10, pending_delivery: 10, claimed: 20, running: 30, steering: 35, cancelling: 40, publishing: 50,
+  completed: 60, interrupted: 60, cancelled: 60, steered: 60, rejected: 65, failed: 65, reconciling: 80, unknown: 100, unverified: 100,
+}
+const jobFailure = (job: ManagerJob | OverviewJob) => "failure" in job ? job.failure : undefined
+
+function mergeJobObservations(entries: readonly WorkspaceActivityJob[]): WorkspaceActivityJob {
+  const first = entries[0]
+  if (!first) throw new Error("任务观察不能为空。")
+  const jobs = entries.map((entry) => entry.job)
+  const states = new Set(jobs.map((job) => job.state))
+  const terminalStates = new Set(jobs.map((job) => job.state).filter((state) => terminalJobStates.has(state)))
+  const outcomes = new Set(jobs.flatMap((job) => job.outcome ? [job.outcome] : []))
+  const runtimes = jobs.flatMap((job) => job.runtime ? [job.runtime] : [])
+  const runtimeIds = new Set(runtimes.map((runtime) => JSON.stringify([runtime.delivery_id, runtime.generation, runtime.session_generation, runtime.provider, runtime.model, runtime.reasoning_effort])))
+  const ownerEpochs = new Set(jobs.flatMap((job) => "owner_epoch" in job && job.owner_epoch !== null ? [job.owner_epoch] : []))
+  const hasUnknownState = jobs.some((job) => !(job.state in jobStateRank))
+  const pendingCheck = jobs.some((job) => job.pending_check === true)
+  const queueStates = new Set(["queued", "pending_delivery"])
+  const recoveryStates = new Set(["claimed", "steering"])
+  const recoveryRollback = jobs.some((job) => queueStates.has(job.state)) && jobs.some((job) => recoveryStates.has(job.state))
+  const attemptConflict = runtimeIds.size > 1 || ownerEpochs.size > 1
+  const uncertain = pendingCheck || hasUnknownState || states.has("unknown") || states.has("unverified") || terminalStates.size > 1 || outcomes.size > 1 || (terminalStates.size > 0 && jobs.some((job) => activeJobStates.has(job.state))) || recoveryRollback || attemptConflict || jobs.some((job) => job.state === "steered" && job.outcome === "unknown")
+  const state = uncertain ? "unknown" : [...states].sort((left, right) => jobStateRank[right]! - jobStateRank[left]!)[0] ?? "unknown"
+  const primary = entries.find((entry) => entry.job.state === state) ?? entries[0]
+  const failure = jobs.map(jobFailure).find(Boolean)
+  const runtime = primary.job.runtime ?? runtimes[0]
+  const retryable = state === "failed" && !pendingCheck && runtime?.execution === "not_started" && jobs.some((job) => job.retryable === true)
+  return {
+    conversation_id: primary.conversation_id,
+    job: {
+      ...primary.job,
+      state,
+      ...(runtime ? { runtime } : {}),
+      ...(failure ? { failure } : {}),
+      retryable,
+      ...(uncertain ? { outcome: "unknown" as const } : {}),
+      ...(pendingCheck ? { pending_check: true } : {}),
+    },
+  }
+}
 
 /** Build the shared Work/Turn/Attention activity domain from already loaded facts. */
 export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceActivityView {
@@ -292,16 +342,16 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
   }
   const projectionByKey = new Map<string, Extract<OverviewTask, { kind: "work" | "dispatch" }>>()
   for (const task of overview?.tasks ?? []) if ((task.kind === "work" || task.kind === "dispatch") && task.work_id) projectionByKey.set(activityKey(task.conversation_id, task.work_id), task)
-  const workByKey = new Map<string, OpenWork>()
+  const workByKey = new Map<string, OpenWorkCard>()
   for (const work of input.works) workByKey.set(activityKey(work.conversation_id, work.work_id), work)
-  const liveQuestionIds = new Set(input.questions.map((question) => question.question_id))
+  const liveQuestionIds = new Set(input.questions.map((question) => questionKey(question.conversation_id, question.question_id)))
   const attachedQuestions = new Set<string>()
   const attachedOverviewChecks = new Set<string>()
   const attachedJobs = new Set<string>()
   const activities: WorkspaceActivity[] = []
   const workActivities = new Map<string, WorkspaceActivity>()
   const keyForCheck = (check: PendingCheck) => check.kind === "work" ? activityKey(check.conversation_id, check.work_id) : null
-  const checkMatchesWork = (check: PendingCheck, work: OpenWork) => check.kind === "work"
+  const checkMatchesWork = (check: PendingCheck, work: OpenWorkCard) => check.kind === "work"
     ? check.conversation_id === work.conversation_id && check.work_id === work.work_id && check.target_node === work.target_node
     : check.kind === "device" && check.works.some((item) => item.conversation_id === work.conversation_id && item.work_id === work.work_id && item.target_node === work.target_node)
   for (const work of input.works) {
@@ -312,9 +362,9 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
     const effectiveState = taskStale(state, Boolean(input.connected && input.read)) ? "unknown" : state
     const facts = emptyActivityFacts()
     for (const question of input.questions) {
-      if (attachedQuestions.has(question.question_id)) continue
+      if (attachedQuestions.has(questionKey(question.conversation_id, question.question_id))) continue
       if (!awaitsAnswer(question, answered) || workApproval({ work, conversationId: work.conversation_id, questions: [question], answered })?.question_id !== question.question_id) continue
-      facts.questions.push(question); attachedQuestions.add(question.question_id)
+      facts.questions.push(question); attachedQuestions.add(questionKey(question.conversation_id, question.question_id))
     }
     for (const check of input.checks) {
       if (!checkMatchesWork(check, work)) continue
@@ -331,27 +381,34 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
     const activity: WorkspaceActivity = { id: `work:${work.conversation_id}:${work.work_id}`, kind: "work", conversation_id: work.conversation_id, work_id: work.work_id, group: taskGroup(effectiveState, facts.questions.length > 0 || facts.checks.length > 0), state: effectiveState, work, projection, facts }
     workActivities.set(key, activity); activities.push(activity)
   }
-  const jobs = [
+  const rawJobs: WorkspaceActivityJob[] = [
     ...(input.jobs ?? []),
     ...(overview?.jobs ?? []).map((job) => ({ conversation_id: job.conversation_id, job })),
   ]
-  for (const entry of jobs) {
+  const jobGroups: WorkspaceActivityJob[][] = []
+  for (const entry of rawJobs) {
+    const group = jobGroups.find((items) => sameObservedJob(items[0]!, entry, localNode))
+    if (group) group.push(entry)
+    else jobGroups.push([entry])
+  }
+  for (const observations of jobGroups) {
+    const entry = mergeJobObservations(observations)
     const workId = taskWorkId(entry.job.trigger)
     const key = workId && entry.conversation_id ? activityKey(entry.conversation_id, workId) : null
     const workActivity = key ? workActivities.get(key) : undefined
-    if (workActivity) { workActivity.facts.jobs.push(entry.job); attachedJobs.add(activityJobId(entry.conversation_id, entry.job)); continue }
+    if (workActivity) { workActivity.facts.jobs.push(...observations.map((item) => item.job)); attachedJobs.add(activityJobId(entry.conversation_id, entry.job)); continue }
     const id = activityJobId(entry.conversation_id, entry.job)
     if (attachedJobs.has(id)) continue
     const state = entry.job.state === "unknown" ? "unknown" : entry.job.state
     const history = schedulerStatus(state).group === "history"
     if (history && !["failed", "rejected"].includes(state) && !entry.job.pending_check) { attachedJobs.add(id); continue }
-    const group: WorkspaceActivityGroup = ["unknown", "unverified", "failed", "rejected"].includes(state) ? "attention" : taskActive(state) ? "working" : "waiting"
-    activities.push({ id, kind: "turn", conversation_id: entry.conversation_id, work_id: null, group, state, job: entry.job, facts: emptyActivityFacts() }); attachedJobs.add(id)
+    const activityGroup: WorkspaceActivityGroup = ["unknown", "unverified", "failed", "rejected"].includes(state) ? "attention" : taskActive(state) ? "working" : "waiting"
+    activities.push({ id, kind: "turn", conversation_id: entry.conversation_id, work_id: null, group: activityGroup, state, job: entry.job, facts: { ...emptyActivityFacts(), jobs: observations.map((item) => item.job) } }); attachedJobs.add(id)
   }
   const addAttention = (id: string, conversationId: string | null, attention: WorkspaceActivityAttention, state = "attention") => {
     activities.push({ id, kind: "attention", conversation_id: conversationId, work_id: null, group: "attention", state, attention, facts: emptyActivityFacts() })
   }
-  for (const question of input.questions) if (awaitsAnswer(question, answered) && !attachedQuestions.has(question.question_id)) addAttention(`attention:question:${question.question_id}`, question.conversation_id, question)
+  for (const question of input.questions) if (awaitsAnswer(question, answered) && !attachedQuestions.has(questionKey(question.conversation_id, question.question_id))) addAttention(`attention:question:${question.question_id}`, question.conversation_id, question)
   for (const check of input.checks) {
     const checkKey = keyForCheck(check)
     const attached = check.kind === "device"
@@ -359,7 +416,7 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
       : checkKey ? workByKey.get(checkKey) ? checkMatchesWork(check, workByKey.get(checkKey)!) : false : false
     if (!attached) addAttention(`attention:check:${check.check_id}`, check.kind === "work" ? check.conversation_id : null, check)
   }
-  for (const question of overview?.questions ?? []) if (!(question.question_id in answered) && !liveQuestionIds.has(question.question_id)) addAttention(`attention:overview-question:${question.question_id}`, question.conversation_id, question)
+  for (const question of overview?.questions ?? []) if (!(question.question_id in answered) && !liveQuestionIds.has(questionKey(question.conversation_id, question.question_id))) addAttention(`attention:overview-question:${question.question_id}`, question.conversation_id, question)
   for (const task of overview?.tasks ?? []) if (task.kind === "check" && !attachedOverviewChecks.has(task.check_id)) addAttention(`attention:overview-check:${task.item_id}`, task.conversation_id, enrichCheck(task))
   const groups: Record<WorkspaceActivityGroup, WorkspaceActivity[]> = { attention: [], working: [], waiting: [] }
   for (const activity of activities) groups[activity.group].push(activity)
@@ -387,7 +444,7 @@ export function parseSummarySteps(summary: string): SummaryStep[] | null {
 const schedulerStates: Record<string, { label: string; group: "open" | "history" }> = {
   queued: { label: "排队中", group: "open" }, claimed: { label: "已领取", group: "open" }, running: { label: "执行中", group: "open" },
   steering: { label: "补充中", group: "open" }, cancelling: { label: "停止中", group: "open" }, publishing: { label: "回复同步中", group: "open" },
-  pending_delivery: { label: "等待设备接收", group: "open" }, steered: { label: "已补充", group: "history" }, completed: { label: "已完成", group: "history" },
+  pending_delivery: { label: "等待设备接收", group: "open" }, reconciling: { label: "正在查询上次回复", group: "open" }, steered: { label: "已补充", group: "history" }, completed: { label: "已完成", group: "history" },
   failed: { label: "失败", group: "history" }, cancelled: { label: "已取消", group: "history" }, interrupted: { label: "已中断", group: "history" },
 }
 export const schedulerStatus = (state: string): { label: string; group: "open" | "history" | "unknown" } => schedulerStates[state] ?? { label: "状态未知", group: "unknown" }

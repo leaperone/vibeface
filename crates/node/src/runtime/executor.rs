@@ -32,10 +32,6 @@ pub(crate) enum SteerTrace {
 
 /// One provider's turns on this device.
 pub(crate) trait Executor: Send + Sync {
-    fn model_catalog(&self) -> BoxFuture<'_, Option<Vec<super::codex_server::ModelChoice>>> {
-        Box::pin(async { None })
-    }
-
     fn compact_or_handoff(&self, provider: Provider) -> Result<crate::providers::CompactionMode> {
         provider.descriptor().compact_or_handoff()
     }
@@ -78,13 +74,6 @@ pub(crate) trait Executor: Send + Sync {
 }
 
 impl Runtime {
-    pub(crate) async fn provider_models(
-        &self,
-        provider: Provider,
-    ) -> Option<Vec<super::codex_server::ModelChoice>> {
-        self.executor(provider).ok()?.model_catalog().await
-    }
-
     pub(crate) fn compact_or_handoff(
         &self,
         provider: Provider,

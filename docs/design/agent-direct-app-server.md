@@ -52,14 +52,14 @@
 | 协调 Agent（Shell 完全访问） | 经 `vibeface codex` 直接调用 App Server 的任意方法；本机派发时自己开线程、发回合 |
 | 运行时（Node 进程，`runtime/codex_server.rs`） | App Server 进程与 socket 的生命周期；工作登记与绑定；`thread/resume` 订阅并把进展写成事件；重启和超时对账；跨设备派发；同步、身份与网页；webhook 发件箱（第 4 节）；送决定（第 5 节） |
 
-Node 不再有执行层：删除 `executor` 命名、Node 发 `turn/start` 的路径、审批转发和逐方法包装。工作只分两类，记在 `WorkDispatched.kind`：`codex` 是本机协调 Agent 发出、Node 观察的 Codex 回合；`task` 是交给某台设备协调 Agent 的一轮任务。
+Node 保留 `runtime/executor.rs` 定义的多 Provider 执行器。`WorkKind::Agent(provider)` 序列化为 `codex`、`cursor`、`claude`、`pi` 或 `opencode`，`WorkKind::Task` 序列化为 `task`。Codex CLI 可以登记并直接发送回合，Node 观察与对账；其他执行器由 Node 启动相应 Provider。所有路径共用工作登记、状态机和恢复记录。
 
 ### 2.1a 用哪个 App Server
 
-App Server 由部署配置显式选择。执行默认关闭；启用时在 `providers.codex_app_server` 选择 `system` 并提供 socket，或选择 `spawn` 并在 Provider 环境设置 `CODEX_HOME`。配置步骤见[部署配置](../deployment.md#配置-sdk-与-app-server)。
+App Server 由部署配置显式选择。执行默认关闭；整个 `codex_app_server` 对象省略时默认 `spawn`，提供对象时 `mode` 必填。Node 使用自己的 `<data-dir>/providers/codex` 根。只有明确选择 `system` 并提供绝对 socket 才连接外部服务，`init --codex-socket` 同时选择该模式。配置步骤见[部署配置](../deployment.md#配置-sdk-与-app-server)。
 
-- `system`：Node 只连接明确配置的 socket，不搜索用户 home 或其他运行中的会话。它不启动或结束外部 App Server，只重连同一个配置入口。
-- `spawn`：沿用原来的托管方式，`codex_bin` 和 `provider-env.json` 里的 Codex 变量只在这个模式传给 App Server。
+- `system`：Node 只连接明确配置的 socket，不搜索用户 home 或其他运行中的会话。它不启动或结束外部 App Server，只重连同一个配置入口。该模式共享外部服务的会话，不属于默认私有目录隔离保证。
+- `spawn`：Node 注入 Node-owned `CODEX_HOME`，覆盖普通 Provider 环境里的同名值；用户凭证不会被复制。
 - Agent 的 `VIBEFACE_CODEX_SOCKET` 固定是 `/tmp/vibeface-<identity>/app-server.sock`，Node 把它软链到正在用的 socket，切换模式或 App Server 换位置时 Agent 的环境不用变。
 - 线程被另一个进程写着时（Codex 报 `already has an active writer`），写请求按“没有发出”报错，不自动重发；观察改为读取 turn，不再反复 `thread/resume`。
 - 网页的 `test_codex_app_server` 做一次独立握手，返回与状态相同的 `{state, socket, user_agent | reason | candidates}`。
@@ -98,7 +98,7 @@ sequenceDiagram
 - `continues` 指向原工作时，`track_work` 返回原 thread，CLI 跳过 `thread/start`。
 - CLI 在 `send_by_ms`（登记后 60 秒）之后不再发送。线程在发 `turn/start` 之前绑定，绑定失败就不发送。
 - `turn/start` 带 `clientUserMessageId=work_id`。回合里的 `userMessage.clientId` 证明这次发送，对账靠它，不靠“最后一个回合”。
-- 可选参数 `model`、`effort`、`images`（本机图片路径或 URL）原样进入 `turn/start`。
+- `model` 在接纳时解析并持久化为 `resolved`，后续 `turn/start` 使用冻结值。`effort` 和 `images`（本机图片路径或 URL）按 Provider 能力传递。
 - `target_node` 是另一台设备时，Node 把任务作为签名的 `WorkDispatched`（`kind=task`）交给那台设备的协调 Agent，由它在本机直连派发。目标设备必须启用协调 Agent。
 - Cursor SDK 没有 Shell CLI 路径，它的 `dispatch_work` 回调在 Node 进程里执行同一个 `agent_cli::dispatch`。
 
@@ -219,4 +219,4 @@ vibeface hooks test --data-dir <数据目录>
 vibeface hooks uninstall --data-dir <数据目录> [--home <目录>] [--dry-run]
 ```
 
-`install` 只修改 home 下各产品的 hook 与扩展文件（`.claude/settings.json`、pi 和 opencode 的扩展）以及 Codex 目录下的 `hooks.json`。不给 `--home` 时 home 是 `$HOME`，Codex 目录是 `CODEX_HOME`（须是已有目录），没设时 `$HOME/.codex`；给 `--home` 时 Codex 目录是 `<目录>/.codex`。先备份原文件，只追加本工具的条目，重复执行不会重复添加。`uninstall` 只删本工具的条目。`--dry-run` 展示将要修改的内容。`test` 仅向明确指定的 Node 发送测试事件。Codex 的 hook 功能仍须由部署者在配置中开启。
+`install` 默认修改 Node-owned 的 Claude/Codex hook 根，pi 和 opencode 的扩展仍写入本机用户目录。给 `--home` 时，这四种产品的 hook 和扩展都写入指定目录下；该参数只改变文件位置。先备份原文件，只追加本工具的条目，重复执行不会重复添加。`uninstall` 只删本工具的条目。`--dry-run` 展示将要修改的内容。`test` 仅向明确指定的 Node 发送测试事件。Codex 的 hook 功能仍须由部署者在配置中开启。

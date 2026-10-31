@@ -18,6 +18,7 @@ use std::sync::{
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use vibeface_bridge::failure::ProviderStage;
 use vibeface_bridge::{
     agent::{self, AgentResult},
     failure::{ExecFailure, FailureKind},
@@ -41,12 +42,54 @@ pub struct Processes {
     running: std::sync::Mutex<BTreeMap<u32, PathBuf>>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyLocator {
+    session: String,
+    projects: PathBuf,
+    message: String,
+}
+
 impl Processes {
     pub(crate) fn new(pidfile: PathBuf) -> Self {
         Self {
             pidfile,
             running: Default::default(),
         }
+    }
+
+    fn reply_locator_path(&self, client_id: &str) -> Result<PathBuf> {
+        vibeface_protocol::validate_id(client_id).map_err(anyhow::Error::msg)?;
+        Ok(self
+            .pidfile
+            .parent()
+            .context("Claude pidfile has no parent")?
+            .join("claude")
+            .join("replies")
+            .join(format!(
+                "{}.json",
+                crate::crypto::digest(client_id.as_bytes())
+            )))
+    }
+
+    fn record_reply(&self, session: &str, client_id: &str, projects: Option<&Path>) -> Result<()> {
+        uuid::Uuid::parse_str(session)?;
+        let projects = projects.context("Claude transcript root is unavailable")?;
+        ensure!(
+            projects.is_absolute(),
+            "Claude transcript root must be absolute"
+        );
+        let locator = ReplyLocator {
+            session: session.into(),
+            projects: projects.into(),
+            message: derived(MESSAGE_SEED, client_id),
+        };
+        let path = self.reply_locator_path(client_id)?;
+        config::private_dir(
+            path.parent()
+                .context("Claude reply locator has no parent")?,
+        )?;
+        config::private_write(&path, &serde_json::to_vec(&locator)?)
     }
 
     /// Ends the processes an earlier Node run left in `pidfile` before tracking this run's.
@@ -103,6 +146,7 @@ impl Processes {
 /// One line of the `stream-json` output, as far as a turn needs it.
 #[derive(Debug, PartialEq)]
 enum Frame {
+    Compacted,
     /// `system/init`: the turn runs in this session.
     Started {
         session: String,
@@ -197,6 +241,7 @@ fn frames(line: &str) -> Vec<Frame> {
     }
     let blocks = || frame["message"]["content"].as_array().into_iter().flatten();
     match frame["type"].as_str() {
+        Some("system") if frame["subtype"] == "compact_boundary" => vec![Frame::Compacted],
         Some("system") if frame["subtype"] == "init" => frame["session_id"]
             .as_str()
             .map(|session| Frame::Started {
@@ -270,6 +315,7 @@ impl Turn {
     /// Takes one frame in; returns what the chat shows of it, shaped as `native_progress`.
     fn apply(&mut self, frame: Frame) -> Option<Value> {
         match frame {
+            Frame::Compacted => Some(json!({"type":"context_compacted"})),
             Frame::Started { session } => {
                 self.session = Some(session);
                 Some(json!({"type":"status","status":"running"}))
@@ -300,8 +346,7 @@ fn projects_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     let home = env
         .get("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".claude")))?;
+        .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from))?;
     Some(home.join("projects"))
 }
 
@@ -408,6 +453,7 @@ fn seen(transcript: Option<&Path>, message: &str) -> Seen {
                     error: None,
                 });
             }
+            Some("user") if !text_of(body).is_empty() => break,
             _ => {}
         }
     }
@@ -635,8 +681,10 @@ where
     );
     let secrets = manager::secret_values(config);
     let start = std::sync::Mutex::new(manager::StartEvidence::NotStarted);
+    let stage = vibeface_bridge::failure::ProviderTrace::new("claude", ProviderStage::SessionStart);
     let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
         ManagerError {
+            stage: stage.current(),
             outcome,
             start: *start
                 .lock()
@@ -676,6 +724,7 @@ where
     };
     let session = resumed.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
     let native = Some(session.as_str());
+    stage.enter(ProviderStage::Record);
     if let Err(e) = persist_session(session.clone()).await {
         // A stop fences the attempt, so saving its session fails then.
         return Err(if *cancel.borrow() {
@@ -684,6 +733,24 @@ where
             let failure = own(&format!("persist the Claude Code session: {e}"));
             error(ManagerFailure::Failed, native, failure)
         });
+    }
+    if let Some(turn) = &config.codex_turn {
+        processes
+            .record_reply(&session, &turn.client_id, projects.as_deref())
+            .map_err(|e| {
+                error(
+                    ManagerFailure::Failed,
+                    native,
+                    own(&format!("persist the Claude reply locator: {e}")),
+                )
+            })?;
+        (turn.record)(session.clone(), None).await.map_err(|e| {
+            error(
+                ManagerFailure::Failed,
+                native,
+                own(&format!("record the Claude reply locator: {e}")),
+            )
+        })?;
     }
     let mut env = config.provider_env.clone();
     env.extend(config.tool_env.clone());
@@ -709,18 +776,21 @@ where
         session: &session,
         resume: resumed.is_some(),
         model: &config.model,
-        effort: None,
+        effort: config.reasoning_effort.as_deref(),
         instructions: &instructions,
         env: &env,
     };
+    stage.enter(ProviderStage::Launch);
     let mut process = launch
         .spawn()
         .map_err(|failure| error(ManagerFailure::Failed, native, failure))?;
     let sent = async {
+        stage.enter(ProviderStage::Record);
         processes.track(process.group, bin)?;
         if let Some(started) = &config.process_started {
             started(process.group).await?;
         }
+        stage.enter(ProviderStage::TurnStart);
         *start.lock().unwrap() = manager::StartEvidence::Unknown;
         send(&process.stdin, &user_frame(prompt, &message)).await
     }
@@ -737,6 +807,7 @@ where
         let line = tokio::select! {
             biased;
             _ = agent::wait_for_cancel(&mut cancel) => {
+                stage.enter(ProviderStage::Interrupt);
                 break if process.stop(&mut turn).await {
                     Err(error(ManagerFailure::Cancelled, native, own("Claude Code turn interrupted")))
                 } else {
@@ -784,6 +855,7 @@ where
                 ));
             }
             if !reported_start && !matches!(&frame, Frame::Ended(_)) {
+                stage.enter(ProviderStage::Run);
                 *start.lock().unwrap() = manager::StartEvidence::Started;
                 if let Some(started) = config
                     .codex_turn
@@ -805,6 +877,10 @@ where
                 break 'turn Err(error(ManagerFailure::Unknown, native, own(&e.to_string())));
             }
         }
+        if turn.session.is_some() {
+            stage.enter(ProviderStage::Run);
+            *start.lock().unwrap() = manager::StartEvidence::Started;
+        }
         if let Some(ending) = turn.ending.take() {
             break Ok(ending);
         }
@@ -824,8 +900,6 @@ where
             return Err(error(ManagerFailure::Failed, native, failure));
         }
     }
-    // Only now has the session seen the turn's prompt. Recording it earlier would leave a
-    // crashed reply checked against the Codex App Server.
     if let Some(turn) = &config.codex_turn
         && let Err(e) = (turn.record)(session.clone(), Some(message)).await
     {
@@ -893,6 +967,39 @@ impl Claude {
 
     fn starting(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
         self.starting.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) async fn probe_reply(
+        &self,
+        session: &str,
+        native_turn: Option<&str>,
+        client_id: &str,
+    ) -> Result<Probe> {
+        uuid::Uuid::parse_str(session)?;
+        vibeface_protocol::validate_id(client_id).map_err(anyhow::Error::msg)?;
+        let locator: ReplyLocator =
+            match std::fs::read(self.processes.reply_locator_path(client_id)?) {
+                Ok(bytes) => match serde_json::from_slice(&bytes) {
+                    Ok(locator) => locator,
+                    Err(_) => return Ok(Probe::Missing),
+                },
+                Err(_) => return Ok(Probe::Missing),
+            };
+        let message = derived(MESSAGE_SEED, client_id);
+        if locator.session != session
+            || locator.message != message
+            || !locator.projects.is_absolute()
+            || native_turn.is_some_and(|turn| turn != message)
+        {
+            return Ok(Probe::Missing);
+        }
+        let path = transcript(Some(&locator.projects), session);
+        Ok(
+            match path.as_deref().map(|path| seen(Some(path), &message)) {
+                Some(Seen::Ended(ending)) => ending.probe(message),
+                Some(Seen::Open | Seen::Unsent) | None => Probe::Missing,
+            },
+        )
     }
 
     fn projects(&self) -> Option<PathBuf> {
@@ -1068,7 +1175,7 @@ impl Executor for Claude {
                 cwd: &cwd,
                 session: &session,
                 resume: thread.is_some(),
-                model: args["model"].as_str().unwrap_or_default(),
+                model: work.execution_model().unwrap_or_default(),
                 // Claude Code's lowest effort is `low`.
                 effort: args["effort"].as_str().map(|effort| match effort {
                     "none" | "minimal" => "low",
@@ -1330,6 +1437,7 @@ mod tests {
             },
             workspace: place.dir.join("work"),
             model: "haiku".into(),
+            reasoning_effort: None,
             timeout_secs: 30,
             custom_tools: BTreeMap::new(),
             tool_cli: None,
@@ -1477,56 +1585,179 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_native_start_is_reported_before_completion_without_committing_seen_context()
-    -> Result<()> {
+    async fn bot_readback_requires_its_exact_message_and_explicit_ending() -> Result<()> {
         let place = Place::new()?;
+        let reader = Claude::open(&place.dir, &place.env());
+        let session = uuid::Uuid::new_v4().to_string();
+        let project = projects_dir(&place.env())
+            .context("projects")?
+            .join("fixture");
+        config::private_dir(&project)?;
+        let path = project.join(format!("{session}.jsonl"));
+        let message = derived(MESSAGE_SEED, "attempt-a");
+        let later = derived(MESSAGE_SEED, "attempt-b");
+        let user = |id: &str| json!({"type":"user","uuid":id,"message":{"role":"user","content":"question"}});
+        let assistant = |id: &str, text: &str, stop: Value| json!({"type":"assistant","message":{"id":id,"content":[{"type":"text","text":text}],"stop_reason":stop}});
+        let write = |records: Vec<Value>| -> Result<()> {
+            std::fs::write(
+                &path,
+                records
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )?;
+            Ok(())
+        };
+        assert_eq!(
+            reader.probe_reply(&session, None, "attempt-a").await?,
+            Probe::Missing
+        );
+        reader
+            .processes
+            .record_reply(&session, "attempt-a", project.parent())?;
+        write(vec![
+            user(&message),
+            assistant("reply-a", "unfinished", Value::Null),
+            user(&later),
+            assistant("reply-b", "later result", json!("end_turn")),
+        ])?;
+        assert_eq!(
+            reader.probe_reply(&session, None, "attempt-a").await?,
+            Probe::Missing
+        );
+        write(vec![
+            user(&message),
+            assistant("reply-a", "first result", json!("end_turn")),
+            user(&later),
+            assistant("reply-b", "later result", json!("end_turn")),
+        ])?;
+        assert_eq!(
+            reader.probe_reply(&session, None, "attempt-a").await?,
+            Probe::Terminal {
+                turn_id: message.clone(),
+                status: TurnStatus::Completed,
+                text: "first result".into(),
+                error: None,
+            }
+        );
+        assert_eq!(
+            reader
+                .probe_reply(&session, Some(&later), "attempt-a")
+                .await?,
+            Probe::Missing
+        );
+        let locator_path = reader.processes.reply_locator_path("attempt-a")?;
+        let locator = std::fs::read(&locator_path)?;
+        std::fs::remove_file(&locator_path)?;
+        assert_eq!(
+            reader.probe_reply(&session, None, "attempt-a").await?,
+            Probe::Missing
+        );
+        config::private_write(&locator_path, b"not json")?;
+        assert_eq!(
+            reader.probe_reply(&session, None, "attempt-a").await?,
+            Probe::Missing
+        );
+        config::private_write(&locator_path, &locator)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bot_readback_keeps_the_transcript_root_used_before_config_changed() -> Result<()> {
+        let place = Place::new()?;
+        let reader = Claude::open(&place.dir, &place.env());
+        let projects_a = reader.projects().context("initial transcript root")?;
+        let (record, _) = recorder();
+        let mut config = bot_config(&place, record);
+        config.provider_env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            place.dir.join("home-b").display().to_string(),
+        );
+        let (result, _, _) = bot_turn(
+            &place,
+            &config,
+            "completed under B",
+            None,
+            tokio::sync::watch::channel(false).1,
+        )
+        .await;
+        let result = result?;
+        let session = result.session_id.context("session")?;
+        assert!(transcript(Some(&projects_a), &session).is_none());
+        let projects_b = projects_dir(&config.provider_env).context("new transcript root")?;
+        assert!(transcript(Some(&projects_b), &session).is_some());
+        let expected = Probe::Terminal {
+            turn_id: derived(MESSAGE_SEED, "attempt-1"),
+            status: TurnStatus::Completed,
+            text: "done: completed under B".into(),
+            error: None,
+        };
+        assert_eq!(
+            reader.probe_reply(&session, None, "attempt-1").await?,
+            expected
+        );
+        let reopened = Claude::open(&place.dir, &place.env());
+        assert_eq!(reopened.projects(), Some(projects_a));
+        assert_eq!(
+            reopened.probe_reply(&session, None, "attempt-1").await?,
+            expected
+        );
+        let locator = reopened.processes.reply_locator_path("attempt-1")?;
+        let mode =
+            std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(locator)?.permissions());
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(place.user_frames(), 1, "readback does not send again");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_private_claude_locator_write_prevents_model_launch() -> Result<()> {
+        let place = Place::new()?;
+        std::fs::write(place.dir.join("claude"), "not a directory")?;
         let (record, calls) = recorder();
-        let mut config = gated_config(&place, "start-state");
-        let persisted = Arc::new(std::sync::Mutex::new(None::<String>));
-        let started = Arc::new(tokio::sync::Notify::new());
-        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observer = config.codex_turn.as_mut().unwrap();
-        observer.record = record;
-        observer.started = Some({
-            let persisted = persisted.clone();
-            let started = started.clone();
-            let count = count.clone();
-            Arc::new(move |turn| {
-                assert!(persisted.lock().unwrap().is_some());
-                assert_eq!(turn, derived(MESSAGE_SEED, "start-state"));
-                count.fetch_add(1, Ordering::SeqCst);
-                started.notify_one();
-                Box::pin(async { Ok(()) })
-            })
-        });
-        let saved = persisted.clone();
-        let task = tokio::spawn(async move {
-            manager::run_manager(
-                &config,
-                "hello",
-                None,
-                move |session| {
-                    *saved.lock().unwrap() = Some(session);
-                    async { Ok(()) }
-                },
-                tokio::sync::watch::channel(false).1,
-                |_| async { Ok(()) },
-            )
-            .await
-        });
-        let observed = tokio::time::timeout(Duration::from_secs(5), started.notified()).await;
-        let pending = !task.is_finished();
-        let seen_before_completion = calls.lock().unwrap().len();
-        let received = place.user_frames();
-        release(&place);
-        let result = task.await??;
-        observed.context("native Claude start callback")?;
-        assert!(pending);
-        assert_eq!(received, 1);
-        assert_eq!(seen_before_completion, 0);
-        assert_eq!(count.load(Ordering::SeqCst), 1);
-        assert_eq!(calls.lock().unwrap().len(), 1);
-        assert_eq!(result.output, "done: hello");
+        let config = bot_config(&place, record);
+        let (result, _, _) = bot_turn(
+            &place,
+            &config,
+            "must not run",
+            None,
+            tokio::sync::watch::channel(false).1,
+        )
+        .await;
+        let error = result.err().context("expected private locator failure")?;
+        let error = error
+            .downcast_ref::<ManagerError>()
+            .context("structured error")?;
+        assert_eq!(error.start, manager::StartEvidence::NotStarted);
+        assert_eq!(error.stage, ProviderStage::Record);
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(place.log().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_bot_without_a_durable_locator_never_starts_claude() -> Result<()> {
+        let place = Place::new()?;
+        let record: manager::TurnRecorder =
+            Arc::new(|_, _| Box::pin(async { anyhow::bail!("locator refused") }));
+        let config = bot_config(&place, record);
+        let (result, _, _) = bot_turn(
+            &place,
+            &config,
+            "hello",
+            None,
+            tokio::sync::watch::channel(false).1,
+        )
+        .await;
+        let error = result.err().context("expected locator failure")?;
+        let error = error
+            .downcast_ref::<ManagerError>()
+            .context("structured error")?;
+        assert_eq!(error.start, manager::StartEvidence::NotStarted);
+        assert_eq!(error.stage, ProviderStage::Record);
+        assert_eq!(place.user_frames(), 0);
+        assert!(place.log().is_empty());
         Ok(())
     }
 
@@ -1534,7 +1765,8 @@ mod tests {
     async fn a_bot_turn_streams_its_reply_and_keeps_the_session() -> Result<()> {
         let place = Place::new()?;
         let (record, calls) = recorder();
-        let config = bot_config(&place, record);
+        let mut config = bot_config(&place, record);
+        config.reasoning_effort = Some("high".into());
         let (_, never) = tokio::sync::watch::channel(false);
         let (result, saved, shown) = bot_turn(&place, &config, "hello", None, never.clone()).await;
         let result = result?;
@@ -1564,8 +1796,11 @@ mod tests {
         let message = derived(MESSAGE_SEED, "attempt-1");
         assert_eq!(
             *calls.lock().unwrap(),
-            [(session.clone(), Some(message.clone()))],
-            "the turn is recorded once it ended"
+            [
+                (session.clone(), None),
+                (session.clone(), Some(message.clone()))
+            ],
+            "the locator precedes send and the known turn advances coverage"
         );
         let log = place.log();
         let argv: Vec<&str> = log[0]["argv"]
@@ -1578,6 +1813,7 @@ mod tests {
             ["--session-id", session.as_str()],
             ["--permission-mode", "bypassPermissions"],
             ["--model", "haiku"],
+            ["--effort", "high"],
             ["--append-system-prompt", "Answer briefly."],
         ] {
             assert!(argv.windows(2).any(|pair| pair == expected), "{argv:?}");
@@ -1659,9 +1895,11 @@ mod tests {
             .log()
             .iter()
             .any(|entry| entry["stdin"] == "control_request" && entry["subtype"] == "interrupt"));
+        let journal = calls.lock().unwrap();
+        assert_eq!(journal.len(), 1);
         assert!(
-            calls.lock().unwrap().is_empty(),
-            "an interrupted turn is not recorded"
+            journal[0].1.is_none(),
+            "an interrupted turn keeps its locator without advancing coverage"
         );
         assert!(!place.dir.join(PIDFILE).exists());
         Ok(())
@@ -1915,6 +2153,11 @@ mod tests {
             dispatcher: local,
             call_ref: call_ref.into(),
             kind: WorkKind::Agent(Provider::Claude),
+            model: None,
+            resolved: crate::model::ResolvedModel {
+                provider: Provider::Claude,
+                model: None,
+            },
             cwd: place.dir.join("work").display().to_string(),
             title: "t".into(),
             prompt: prompt.into(),
@@ -1926,10 +2169,12 @@ mod tests {
 
     /// Registers the work and has Claude Code start it, as `track_work` does.
     async fn dispatch(node: &Arc<Runtime>, network: &str, spec: &WorkSpec) -> Result<bool> {
-        node.store
-            .lock()
-            .await
-            .accept_work(&node.identity, network, spec.clone(), now_ms())?;
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            network,
+            spec.clone(),
+            now_ms(),
+        )?;
         let claude = node.executor(Provider::Claude)?;
         node.start_work(claude, network, spec, None, &json!({}))
             .await
@@ -2033,10 +2278,12 @@ mod tests {
         let place = Place::new()?;
         let (node, _, network) = node(&place).await?;
         let spec = spec(&node, &place, "r1", "never sent")?;
-        node.store
-            .lock()
-            .await
-            .accept_work(&node.identity, &network, spec.clone(), now_ms())?;
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            &network,
+            spec.clone(),
+            now_ms(),
+        )?;
         let session = derived(SESSION_SEED, &spec.work_id);
         let journaled = node
             .signal_work(&network, &spec.work_id, Signal::ThreadCreated(session))
@@ -2082,7 +2329,7 @@ mod tests {
                 thread: Some(session.clone()),
                 ..spec(&node, &place, call_ref, "hang around")?
             };
-            node.store.lock().await.accept_work(
+            node.store.lock().await.accept_work_fixture(
                 &node.identity,
                 &network,
                 spec.clone(),
@@ -2170,10 +2417,12 @@ mod tests {
         let place = Place::new()?;
         let (node, _, network) = node(&place).await?;
         let spec = spec(&node, &place, "r1", "never run")?;
-        node.store
-            .lock()
-            .await
-            .accept_work(&node.identity, &network, spec.clone(), now_ms())?;
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            &network,
+            spec.clone(),
+            now_ms(),
+        )?;
         let error = node
             .start_work(&Unstartable, &network, &spec, None, &json!({}))
             .await
@@ -2202,6 +2451,8 @@ mod tests {
             provider: Provider::Claude,
             workspace: place.dir.join("work"),
             model: String::new(),
+            reasoning_effort: None,
+            backup: Default::default(),
         });
         let input = asks(
             "Bash",
@@ -2356,6 +2607,74 @@ mod tests {
             bail!("an API error fails the turn");
         };
         assert_eq!(failure.kind, FailureKind::AuthFailed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_native_start_is_reported_before_completion_without_committing_seen_context()
+    -> Result<()> {
+        let place = Place::new()?;
+        let (record, calls) = recorder();
+        let mut config = gated_config(&place, "start-state");
+        let persisted = Arc::new(std::sync::Mutex::new(None::<String>));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observer = config.codex_turn.as_mut().unwrap();
+        observer.record = record;
+        observer.started = Some({
+            let persisted = persisted.clone();
+            let started = started.clone();
+            let count = count.clone();
+            Arc::new(move |turn| {
+                assert!(persisted.lock().unwrap().is_some());
+                assert_eq!(turn, derived(MESSAGE_SEED, "start-state"));
+                count.fetch_add(1, Ordering::SeqCst);
+                started.notify_one();
+                Box::pin(async { Ok(()) })
+            })
+        });
+        let saved = persisted.clone();
+        let task = tokio::spawn(async move {
+            manager::run_manager(
+                &config,
+                "hello",
+                None,
+                move |session| {
+                    *saved.lock().unwrap() = Some(session);
+                    async { Ok(()) }
+                },
+                tokio::sync::watch::channel(false).1,
+                |_| async { Ok(()) },
+            )
+            .await
+        });
+        let observed = tokio::time::timeout(Duration::from_secs(5), started.notified()).await;
+        let pending = !task.is_finished();
+        let recorded_before_completion = calls.lock().unwrap().clone();
+        let seen_before_completion = recorded_before_completion
+            .iter()
+            .filter(|(_, turn)| turn.is_some())
+            .count();
+        let native_before_completion = persisted.lock().unwrap().clone();
+        let received = place.user_frames();
+        release(&place);
+        let result = task.await??;
+        observed.context("native Claude start callback")?;
+        assert!(pending);
+        assert_eq!(received, 1);
+        assert_eq!(seen_before_completion, 0);
+        let native = native_before_completion.context("native session persisted before start")?;
+        assert_eq!(recorded_before_completion, vec![(native.clone(), None)]);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                (native.clone(), None),
+                (native.clone(), Some(derived(MESSAGE_SEED, "start-state"))),
+            ]
+        );
+        assert_eq!(result.session_id.as_deref(), Some(native.as_str()));
+        assert_eq!(result.output, "done: hello");
         Ok(())
     }
 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ChangeEvent, type ComponentProps, type ReactNode } from "react"
-import { Asterisk, Braces, ChevronRight, CircleAlert, CircleCheck, CircleDashed, Download, ExternalLink, FolderOpen, FolderPlus, List, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
+import { Asterisk, Braces, ChevronRight, CircleAlert, CircleCheck, CircleDashed, Copy, Download, ExternalLink, FolderOpen, FolderPlus, List, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, FolderPath, InlineError, Segmented, Skeleton, toast, toneText, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -10,7 +10,7 @@ import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { availability, botOnChange, folderSuggestions, type Availability, modelTyped, parseAppServerLink, parseNodeSettings, parseProviderModels, type ModelChoice, providerGroups, providerNames, providerObservationLabels, providerObservationStates, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, modelTyped, parseAppServerLink, parseNodeSettings, parseProvider, probeIssueText, effortOptions, type ModelChoice, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
@@ -45,7 +45,6 @@ function issueText(provider: ProviderId, issue: ProviderIssue): string {
 }
 
 const modes: { value: AppServerMode; label: string; icon: LucideIcon }[] = [{ value: "system", label: deviceCopy.appServer.system, icon: Monitor }, { value: "spawn", label: deviceCopy.appServer.spawn, icon: Play }]
-const spawnServer = { mode: "spawn", socket: null } as const
 
 /** One line for an App Server state, from the device or a fresh test. */
 function LinkLine({ link, prefix = "" }: { link: AppServerLink; prefix?: string }) {
@@ -90,62 +89,62 @@ function PathField({ id, label, value, display, placeholder, working, busy, onSa
   </form>
 }
 
-const placeholders = { home: "例如 ~/.codex", socket: "例如 ~/.codex/app-server-control/app-server-control.sock" }
+const placeholders = { socket: "App Server socket 的绝对路径" }
 
-/**
- * Where Codex work runs: the App Server already running on this computer, at its socket, or one the device starts with the
- * Codex folder. The device fills both in from this computer when they are missing; the paths stay folded until one is missing or broken.
- * `children`: other paths the provider uses, folded with these.
- */
 function AppServerSettings({ server, home, sessions, display, working, blocked, busy, save, test, children }: {
   server: AppServer; home: string | null; sessions: string | null; display: Display; working: boolean; blocked: boolean; busy: string
   save(key: string, change: Omit<Change, "provider">): Promise<boolean>; test(): Promise<AppServerLink | null>; children?: ReactNode
 }) {
+  const [draft, setDraft] = useState({ mode: server.mode, socket: server.socket ?? "" })
   const [tested, setTested] = useState<AppServerLink | null>(null)
   const [testing, setTesting] = useState(false)
+  useEffect(() => setDraft({ mode: server.mode, socket: server.socket ?? "" }), [server.mode, server.socket])
   useEffect(() => setTested(null), [server.mode, server.socket])
+  const dirty = draft.mode !== server.mode || draft.socket.trim() !== (server.socket ?? "")
   const link = server.link
   const shown = tested ?? link
-  const setMode = (mode: AppServerMode) => void save("app_server", { app_server: { mode, socket: server.socket } })
   // Opens by itself when a path needs attention and stays open after it is fixed, so a saved field does not fold away under the cursor.
-  const needsPaths = blocked || (server.mode === "system" ? !server.socket : !home) || ["not_found", "handshake_failed", "launch_failed"].includes(link.state)
+  const needsPaths = blocked || (draft.mode === "spawn" && !home) || ["not_found", "handshake_failed", "launch_failed"].includes(link.state)
   const [pathsOpen, setPathsOpen] = useState(needsPaths)
   useEffect(() => { if (needsPaths) setPathsOpen(true) }, [needsPaths])
   const runTest = async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }
 
   return <div className="grid gap-3">
-    <div className="grid gap-2">
+    <form className="grid gap-2" onSubmit={(event) => {
+      event.preventDefault()
+      if (dirty) void save("app_server", { app_server: { mode: draft.mode, socket: draft.socket.trim() || null } })
+    }}>
       <p className="text-meta font-medium text-muted-foreground">连接方式</p>
       <div className="flex min-w-0 flex-wrap items-center gap-2">
-        <Segmented label="连接方式" labels fill value={server.mode} options={modes} disabled={working} onChange={setMode} />
-        <Button type="button" variant="ghost" disabled={working || testing || blocked || link.state === "off"} onClick={() => void runTest()}>
+        <Segmented label="连接方式" labels fill value={draft.mode} options={modes} disabled={working} onChange={(mode) => setDraft({ ...draft, mode })} />
+        {dirty ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy.endsWith(":app_server")} />保存</Button> : null}
+        <Button type="button" variant="ghost" disabled={working || testing || dirty || blocked || link.state === "off"} onClick={() => void runTest()}>
           <BusyIcon busy={testing} icon={PlugZap} />测试连接
         </Button>
       </div>
-      {blocked ? null : <LinkLine link={shown} prefix={tested ? "测试：" : ""} />}
-      {shown.state === "handshake_failed" || shown.state === "launch_failed" ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
-    </div>
+      {draft.mode === "system" ? <div className="grid gap-1">
+        <label htmlFor="codex-socket" className="text-meta font-medium text-muted-foreground">连接路径</label>
+        <Input id="codex-socket" name="socket" className="min-w-0 font-mono" placeholder={placeholders.socket} required pattern="/.*" maxLength={4096} spellCheck={false}
+          value={draft.socket} disabled={working} onChange={(event) => setDraft({ ...draft, socket: event.target.value })} />
+        <p className="text-meta text-muted-foreground">填写运行 Codex 的电脑上的绝对路径。</p>
+        <p className="text-meta text-muted-foreground">共享所选外部 App Server 的会话，不隔离该服务的数据。</p>
+      </div> : null}
+      {dirty ? <p role="status" className="text-meta text-muted-foreground">保存后可测试连接</p>
+        : blocked ? null : <LinkLine link={shown} prefix={tested ? "测试：" : ""} />}
+      {!dirty && (shown.state === "handshake_failed" || shown.state === "launch_failed") ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
+    </form>
     <Details label="路径" open={pathsOpen || needsPaths || undefined}>
-      {server.mode === "system"
-        ? <PathField id="codex-socket" label="连接路径" value={server.socket} display={display} placeholder={placeholders.socket} working={working} busy={busy.endsWith(":socket")}
-            onSave={(path) => save("socket", { app_server: { mode: "system", socket: path || null } })} />
-        : <PathField id="codex-home" label="Codex 目录" value={home} display={display} placeholder={placeholders.home} working={working} busy={busy.endsWith(":home")}
-            onSave={(path) => save("home", { env: { CODEX_HOME: path || null } })} />}
+      {draft.mode === "spawn" ? <p className="grid gap-1"><span className="font-medium">Node-owned Codex 目录</span><FolderPath path={home ?? ""} shown={home ? display[home] : "由 Node 创建"} /></p> : null}
       {sessions ? <p className="grid gap-1"><span className="font-medium">会话目录</span><span className="flex min-w-0 text-foreground"><FolderPath path={sessions} shown={display[sessions]} /></span></p> : null}
       {children}
     </Details>
   </div>
 }
 
-/**
- * When the device found no Codex on this computer: the folder or the running App Server's socket, typed in, turns on what was asked in one write.
- * `onboarding`: only the folder; the socket stays on the device page.
- */
 function ManualCodex({ onboarding, working, busy, save }: { onboarding: boolean; working: boolean; busy: string; save(key: string, change: Omit<Change, "provider">): Promise<boolean> }) {
   return <Details label="手动填写">
     <div className="grid gap-3">
-      <PathField id="manual-codex-home" label="Codex 目录" value={null} display={{}} placeholder={placeholders.home} working={working} busy={busy.endsWith(":home")}
-        onSave={(path) => save("home", { app_server: { mode: "spawn", socket: null }, env: { CODEX_HOME: path } })} />
+      <p className="text-meta text-muted-foreground">Codex 运行目录由 Node 自动隔离管理。</p>
       {onboarding ? null : <PathField id="manual-codex-socket" label="连接路径" value={null} display={{}} placeholder={placeholders.socket} working={working} busy={busy.endsWith(":socket")}
         onSave={(path) => save("socket", { app_server: { mode: "system", socket: path } })} />}
     </div>
@@ -163,7 +162,7 @@ function openProvider(provider: ProviderId) {
   target?.focus({ preventScroll: true })
 }
 
-type Change = { provider: ProviderId; bot?: boolean; execution?: boolean; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
+type Change = { provider: ProviderId; bot?: boolean; execution?: boolean; execution_model?: string; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
 type Failure = { at: ProviderId | "roots" | null; cause: unknown }
 
 /**
@@ -223,16 +222,20 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
       return null
     }
   }
-  // The bot's provider may list its models; until it answers, or when it cannot, the model stays a text field.
-  const [models, setModels] = useState<{ provider: ProviderId; list: ModelChoice[] } | null>(null)
-  const botProvider = response?.providers.find((item) => item.roles.includes("agent"))
-  useEffect(() => {
-    if (!ready?.isCurrent() || botProvider?.state !== "ready" && botProvider?.state !== "unverified") return
-    let live = true
-    const provider = botProvider.provider
-    ready.request("provider_models", { provider }).then(parseProviderModels).then((list) => { if (live) setModels(list ? { provider, list } : null) }, () => {})
-    return () => { live = false }
-  }, [ready, botProvider?.provider, botProvider?.state])
+  async function probe(provider: ProviderId) {
+    if (!ready?.isCurrent()) return
+    const connection = ready, owner = ++sequence.current
+    setBusy(`${provider}:probe`); setError(null)
+    try {
+      const status = parseProvider(await connection.request("provider_probe", { provider }))
+      if (status.provider !== provider) throw new Error("检查结果来自另一个 AI 服务，请重新读取。")
+      if (owner === sequence.current && connection.isCurrent()) {
+        setResponse((previous) => previous ? { ...previous, providers: previous.providers.map((item) => item.provider === provider ? status : item) } : previous)
+        if (workspace.isCurrent()) await workspace.refresh()
+      }
+    } catch (cause) { if (owner === sequence.current && connection.isCurrent()) setError({ at: provider, cause }) }
+    finally { if (owner === sequence.current) setBusy("") }
+  }
   const starting = response?.providers.some((item) => item.state === "starting")
   const botOn = response?.providers.some((item) => item.roles.includes("agent")) ?? false
   useEffect(() => { onBot?.(botOn) }, [botOn])
@@ -249,7 +252,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   if (!response) return error ? <InlineError error={error.cause} action={{ label: "重试", onClick: () => void load() }} /> : <div className="grid gap-2"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
   const { roots, manager } = response.settings
   const { shown, folded } = providerGroups(response.providers)
-  const card = (item: ProviderStatus) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy} models={models?.provider === item.provider ? models.list : null}
+  const card = (item: ProviderStatus) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy} models={item.probe.catalog.state === "available" ? item.probe.catalog.models : null} probe={() => probe(item.provider)}
     error={error?.at === item.provider ? error.cause : null} test={test} reconcile={reconcile}
     change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
     saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />
@@ -300,17 +303,19 @@ function RoleToggle({ role, name, pressed, busy, disabled, onClick }: { role: ke
   </Button>
 }
 
-function ProviderCard({ item, response, onboarding, busy, models, error, change, saveBot, test, reconcile }: {
+function ProviderCard({ item, response, onboarding, busy, models, error, change, saveBot, test, reconcile, probe }: {
   item: ProviderStatus; response: NodeSettingsResponse; onboarding: boolean; busy: string; models: ModelChoice[] | null; error: unknown
-  change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>; reconcile(): Promise<void>
+  change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>; reconcile(): Promise<void>; probe(): Promise<void>
 }) {
   const name = providerNames[item.provider], Icon = providerIcons[item.provider]
   const display = response.display_paths
   const bot = item.roles.includes("agent"), execution = item.roles.includes("execution")
   const botable = item.supports.includes("agent"), executable = item.supports.includes("execution")
   const manager = bot ? response.settings.manager : null
+  const readiness = summaryReadiness(item)
   const usable = availability(item)
   const state = states[usable]
+  const executionState = states[item.execution_readiness.state]
   const [editing, setEditing] = useState<string | null>(null)
   const [deleting, setDeleting] = useState<string | null>(null)
   const [value, setValue] = useState("")
@@ -403,10 +408,27 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
       {issue.code === "app_server_not_found" && server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
-          onClick={() => void change("app_server", { app_server: spawnServer })}>{deviceCopy.appServer.useSpawn}</button>
+          onClick={() => void change("app_server", { app_server: { mode: "spawn", socket: server.socket } })}>{deviceCopy.appServer.useSpawn}</button>
         : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={issue.code === "bin_missing" ? install[item.provider] : guide[item.provider]} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
         : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={() => openProvider(item.provider)}>去设置</button>}
     </p> : null}
+    <div className="grid gap-1 px-4 pb-3 sm:ps-12">
+      {'issue' in readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, readiness.issue)}</p> : null}
+      {item.setup && (bot || execution) && ["needs_setup", "unverified"].includes(readiness.state) ? <div className="grid gap-2 text-meta">
+        <p>在运行 AI 的电脑上执行以下命令，为独立目录登录或配置，再点“检查可用性”。不会复制已有登录信息。</p>
+        <FolderPath path={item.setup.directory} shown={display[item.setup.directory]} />
+        <div className="flex min-w-0 gap-2">
+          <Input readOnly aria-label={`${name} 私有目录登录命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />
+          <Button type="button" variant="outline" onClick={() => { if (item.setup) void navigator.clipboard.writeText(item.setup.command).then(() => toast("已复制登录命令", { tone: "success" }), () => toast("请选中命令后复制", { tone: "warning" })) }}><Copy aria-hidden="true" />复制命令</Button>
+        </div>
+      </div> : null}
+      <div className="flex flex-wrap items-center gap-2 text-meta text-muted-foreground">
+        <span>{item.probe.checked_at_ms === null ? "尚未主动检查" : `检查于 ${new Date(item.probe.checked_at_ms).toLocaleString()}`}</span>
+        <Button type="button" variant="ghost" size="sm" disabled={busy !== ""} onClick={() => void probe()}><BusyIcon busy={busy === `${item.provider}:probe`} icon={RotateCw} />检查可用性</Button>
+      </div>
+      {manager && item.probe.catalog.state === "available" && item.probe.catalog.coverage === "partial" ? <p className="text-meta text-muted-foreground">模型列表可能不完整，可手填其他模型。</p> : null}
+      {manager && item.probe.catalog.state === "unavailable" ? <p className="text-meta text-muted-foreground">模型列表暂不可用，可继续手填。已保存的模型保持不变。</p> : null}
+    </div>
     {onboarding ? null : <details id={`provider-${item.provider}`} className="details">
       <summary className="-mt-2 flex min-h-11 w-fit items-center gap-1 px-4 sm:ps-12 text-meta text-muted-foreground hover:text-foreground">
         <ChevronRight aria-hidden="true" className="size-4 transition-transform duration-200" />设置
@@ -416,8 +438,16 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
           <p>程序和密钥已配置，不代表登录或模型已经验证。未验证时可以尝试运行。</p>
           {item.observed ? <ul className="grid gap-1">{Object.entries(item.observed).map(([key, observation]) => <li key={key}>{providerObservationLabels[key]} · {providerObservationStates[observation.status]}</li>)}</ul> : <p>验证记录未提供。</p>}
         </Details>
-        {manager ? <BotDetails key={`${manager.provider}:${manager.model}`} fields={["model"]} manager={manager} models={models} display={display} working={working}
-          busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
+        {manager ? <Details label="运行 Bot">
+          <BotDetails key={`${manager.provider}:${JSON.stringify([manager.model, manager.reasoning_effort, manager.backup])}`} fields={["model"]} manager={manager} models={models} display={display} working={working}
+            busy={busy === `${item.provider}:bot_details`} save={saveBot} />
+        </Details> : null}
+        {execution ? <Details label="执行任务">
+          <p role="status" className={cn("text-meta", toneText[executionState.tone])}>执行模型：{executionState.label}</p>
+          {'issue' in item.execution_readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.execution_readiness.issue)}</p> : null}
+          <ExecutionDetails key={`${item.execution_model}:${item.provider}`} model={item.execution_model} models={models} working={working}
+            busy={busy === `${item.provider}:execution_model`} save={(model) => change("execution_model", { execution_model: model })} />
+        </Details> : null}
         {keys.length ? <ul className="grid gap-1" aria-label={terms.secret.label}>{keys.map((row) => envRow(row, true))}</ul> : null}
 
         {/* Connection, folders, program and variables are for whoever needs them; a problem in them opens the fold. */}
@@ -499,7 +529,10 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
   const [chosen, setTyping] = useState<boolean | null>(null)
   const typing = chosen ?? modelTyped(manager.model, models)
   const cursor = manager.provider === "cursor"
-  const dirty = fields.some((key) => draft[key] !== manager[key])
+  const selected = models?.find((model) => draft.model.trim() ? model.id === draft.model.trim() : model.default)
+  const reasoningEffort = selected?.effort.state === "provider_controlled" ? null : draft.reasoning_effort
+  const dirty = fields.some((key) => draft[key] !== manager[key]) || fields.includes("model") && (reasoningEffort !== manager.reasoning_effort || JSON.stringify(draft.backup) !== JSON.stringify(manager.backup))
+  const efforts = selected?.effort.state === "provider_controlled" ? [] : selected?.effort.state === "selectable" ? selected.effort.options : effortOptions(manager.provider)
   const field = (key: (typeof botFields)[number], label: string, extra: { placeholder?: string; required?: boolean; plain?: boolean } = {}) => {
     const props = { name: key, value: draft[key], disabled: working, placeholder: extra.placeholder, required: extra.required,
       onChange: (event: ChangeEvent<HTMLInputElement>) => setDraft({ ...draft, [key]: event.target.value }) }
@@ -507,8 +540,8 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
   }
   return <form className="grid gap-3" onSubmit={(event) => {
     event.preventDefault()
-    // Only this form's fields go over what is saved now, so the other form's edits survive.
-    void save({ ...manager, ...Object.fromEntries(fields.map((key) => [key, draft[key].trim()])) })
+    void save({ ...manager, ...Object.fromEntries(fields.map((key) => [key, draft[key].trim()])),
+      ...(fields.includes("model") ? { reasoning_effort: reasoningEffort, backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } } : {}) })
   }}>
     {fields.includes("model") ? models && !typing ? <label className="grid gap-1 text-meta">{copy.label}
       <NativeSelect className="w-full" name="model" value={draft.model} disabled={working}
@@ -522,7 +555,41 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
       {models ? <Button type="button" variant="ghost" size="icon" aria-label={copy.pick} title={copy.pick} disabled={working}
         onClick={() => { setTyping(false); setDraft({ ...draft, model: models.some((model) => model.id === draft.model) ? draft.model : "" }) }}><List aria-hidden="true" /></Button> : null}
     </div> : null}
+    {fields.includes("model") ? efforts.length ? <label className="grid gap-1 text-meta">推理强度
+      <NativeSelect value={reasoningEffort ?? ""} disabled={working} onChange={(event) => setDraft({ ...draft, reasoning_effort: event.target.value || null })}>
+        <NativeSelectOption value="">由 AI 服务决定</NativeSelectOption>
+        {reasoningEffort && !efforts.includes(reasoningEffort) ? <NativeSelectOption value={reasoningEffort}>{reasoningEffort}</NativeSelectOption> : null}
+        {efforts.map((effort) => <NativeSelectOption key={effort} value={effort}>{effort}</NativeSelectOption>)}
+      </NativeSelect>
+      <span className="text-muted-foreground">用于下一回合，模型是否支持以 AI 服务的检查结果为准。</span>
+    </label> : <p className="text-meta text-muted-foreground">推理强度由 AI 服务决定</p> : null}
+    {fields.includes("model") ? <Details label="备用策略"><BackupPolicyEditor policy={draft.backup} disabled={working} change={(backup) => setDraft({ ...draft, backup })} /></Details> : null}
     {fields.includes("workspace") ? field("workspace", folderLabels.botRun) : null}
+    {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
+  </form>
+}
+
+function ExecutionDetails({ model, models, working, busy, save }: { model: string; models: ModelChoice[] | null; working: boolean; busy: boolean; save(model: string): Promise<boolean> }) {
+  const [draft, setDraft] = useState(model)
+  const [chosen, setTyping] = useState<boolean | null>(null)
+  useEffect(() => { setDraft(model); setTyping(null) }, [model])
+  const typing = chosen ?? modelTyped(model, models)
+  const dirty = draft.trim() !== model
+  return <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void save(draft.trim()) }}>
+    {models && !typing ? <label className="grid gap-1 text-meta">{deviceCopy.executionModel.label}
+      <NativeSelect className="w-full" name="execution_model" value={draft} disabled={working}
+        onChange={(event) => { const value = event.target.value; if (value === other) { setTyping(true); setDraft("") } else setDraft(value) }}>
+        <NativeSelectOption value="">{deviceCopy.executionModel.default}</NativeSelectOption>
+        {models.map((choice) => <NativeSelectOption key={choice.id} value={choice.id}>{choice.name}</NativeSelectOption>)}
+        <NativeSelectOption value={other}>{deviceCopy.executionModel.other}</NativeSelectOption>
+      </NativeSelect>
+    </label> : <div className="flex min-w-0 items-end gap-2">
+      <label className="grid min-w-0 flex-1 gap-1 text-meta">{deviceCopy.executionModel.label}
+        <Input name="execution_model" value={draft} disabled={working} placeholder={deviceCopy.executionModel.default} onChange={(event) => setDraft(event.target.value)} />
+      </label>
+      {models ? <Button type="button" variant="ghost" size="icon" aria-label={deviceCopy.executionModel.pick} title={deviceCopy.executionModel.pick} disabled={working}
+        onClick={() => { setTyping(false); setDraft(models.some((choice) => choice.id === draft) ? draft : "") }}><List aria-hidden="true" /></Button> : null}
+    </div>}
     {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
   </form>
 }
@@ -553,4 +620,19 @@ function Folders({ later, roots, suggested, display, busy, save }: { later: bool
     </div>
     </div>
   </section>
+}
+
+function BackupPolicyEditor({ policy, disabled, change }: { policy: BackupPolicy; disabled: boolean; change(policy: BackupPolicy): void }) {
+  const update = (index: number, value: BackupPolicy['candidates'][number]) => change({ ...policy, candidates: policy.candidates.map((candidate, at) => at === index ? value : candidate) })
+  return <div className="grid gap-3">
+    <label className="flex min-h-11 items-center gap-2 text-meta"><input type="checkbox" disabled={disabled || !policy.candidates.length} checked={policy.automatic} onChange={(event) => change({ ...policy, automatic: event.target.checked })} />自动尝试备用模型</label>
+    <p className="text-meta text-muted-foreground">仅在原回合明确未执行时按顺序尝试一次。使用运行设备对应 AI 服务的登录账户，可能产生该账户的费用。</p>
+    {policy.candidates.map((candidate, index) => <div key={index} className="grid gap-2 rounded-lg border p-2">
+      <label className="grid gap-1 text-meta">备用 AI 服务 {index + 1}<NativeSelect disabled={disabled} value={candidate.provider} onChange={(event) => { const provider = providerIds.find((provider) => provider === event.target.value); if (provider) update(index, { provider, model: '', reasoning_effort: null }) }}>{providerIds.map((provider) => <NativeSelectOption key={provider} value={provider}>{providerNames[provider]}</NativeSelectOption>)}</NativeSelect></label>
+      <Input aria-label={`备用模型 ${index + 1}`} placeholder="模型名称" required value={candidate.model} disabled={disabled} onChange={(event) => update(index, { ...candidate, model: event.target.value })} />
+      {effortOptions(candidate.provider).length ? <label className="grid gap-1 text-meta">备用推理强度<NativeSelect disabled={disabled} value={candidate.reasoning_effort ?? ''} onChange={(event) => update(index, { ...candidate, reasoning_effort: event.target.value || null })}><NativeSelectOption value="">由 AI 服务决定</NativeSelectOption>{effortOptions(candidate.provider).map((effort) => <NativeSelectOption key={effort} value={effort}>{effort}</NativeSelectOption>)}</NativeSelect></label> : <p className="text-meta text-muted-foreground">推理强度由 AI 服务决定</p>}
+      <Button type="button" variant="ghost" disabled={disabled} onClick={() => { const candidates = policy.candidates.filter((_, at) => at !== index); change({ automatic: policy.automatic && candidates.length > 0, candidates }) }}>移除备用模型</Button>
+    </div>)}
+    <Button type="button" variant="outline" disabled={disabled || policy.candidates.length >= 5} onClick={() => change({ ...policy, candidates: [...policy.candidates, { provider: 'codex', model: '', reasoning_effort: null }] })}>添加备用模型</Button>
+  </div>
 }

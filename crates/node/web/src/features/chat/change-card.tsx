@@ -43,6 +43,7 @@ function ChangeRows({ change, conversationId, schedules, overwritten }: { change
       {change.name ? <Row icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} />{note('name')}</Row> : null}
       {change.instructions ? <Row icon={ScrollText} label="说明"><DiffLines lines={lineDiff(change.instructions.before, change.instructions.after)} />{note('instructions')}</Row> : null}
       {change.model ? <Row icon={Cpu} label='模型' tag={providerNames[change.model.provider]}><BeforeAfter before={change.model.before || '设备默认'} after={change.model.after || '设备默认'} />{note('model')}</Row> : null}
+      {change.reasoning_effort ? <Row icon={Cpu} label="推理强度" tag={providerNames[change.reasoning_effort.provider]}><BeforeAfter before={change.reasoning_effort.before || '设备默认'} after={change.reasoning_effort.after || '设备默认'} />{note('reasoning_effort')}</Row> : null}
       {change.skills ? <Row icon={BookOpen} label='Skill'><BeforeAfter before={skillCount(change.skills.before)} after={skillCount(change.skills.after)} />{note('skills')}</Row> : null}
       {change.avatar ? <Row icon={Smile} label='长相'><AvatarChange edit={change.avatar} conversationId={conversationId} />{note('avatar')}</Row> : null}
     </>

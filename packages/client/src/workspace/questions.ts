@@ -1,5 +1,5 @@
 import type { TranscriptMessage } from "../chat/types.ts"
-import type { BotRecord, NodeInfo, OpenWork, Question, WorkRecord } from "./types.ts"
+import type { BotRecord, NodeInfo, OpenWork, Question, WorkCard, WorkRecord } from "./types.ts"
 import { providerNames, type ProviderId } from "../lib/node.ts"
 
 /** Each question has one answer ID, so the web, Grok and every retry write the same message. */
@@ -43,7 +43,7 @@ export const awaitsAnswer = (question: Question, answered: Readonly<Record<strin
   questionOpen(question) && !(question.question_id in answered) && !folded?.has(question.question_id)
 
 /** Only an unfinished work on this conversation, device and session can wait on the request. */
-export function workApproval({ work, conversationId, questions, answered }: { work: WorkRecord; conversationId: string; questions: readonly Question[]; answered: Readonly<Record<string, string>> }): Question | undefined {
+export function workApproval({ work, conversationId, questions, answered }: { work: WorkCard; conversationId: string; questions: readonly Question[]; answered: Readonly<Record<string, string>> }): Question | undefined {
   if (work.outcome || work.state === "finished" || !work.thread_id) return undefined
   return questions.find((question) => question.conversation_id === conversationId && question.about.node === work.target_node
     && question.about.session_id === work.thread_id && question.about.request_id && awaitsAnswer(question, answered))
@@ -54,7 +54,7 @@ export function workApproval({ work, conversationId, questions, answered }: { wo
  * `task`: the running task that request holds, to link to. `local`: asked by `entry`, the device this screen goes through, which the card leaves unnamed.
  */
 export function questionMeta(question: Question, works: readonly OpenWork[], bots: readonly Pick<BotRecord, "bot_id" | "conversation_id">[], entry: string | undefined) {
-  const approval = Boolean(question.about.request_id)
+  const approval = question.attention?.kind === "approval" || Boolean(question.about.request_id)
   const work = approval ? works.find((item) => item.thread_id === question.about.session_id && !item.outcome) : undefined
   const bot = work && bots.find((item) => item.conversation_id === work.conversation_id)
   return { approval, task: work && bot ? { bot_id: bot.bot_id, work_id: work.work_id, title: work.title || "任务" } : null, local: question.about.node === entry }
@@ -113,3 +113,11 @@ export function sharedProject(cwd: string, node: string, nodes: readonly Pick<No
 }
 
 export const agentName = (agent: ProviderId) => providerNames[agent]
+
+export function attentionLabel(question: Pick<Question, 'attention'>): string {
+  switch (question.attention?.kind) {
+    case 'approval': return '需要你同意'
+    case 'browser_takeover': return '需要接管浏览器'
+    case 'question': case undefined: return '需要你回答'
+  }
+}

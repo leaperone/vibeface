@@ -35,14 +35,13 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 
 先安装所选 Provider，再配置程序路径、工作目录和认证环境。修改已有 `config.json` 时保留未列出的字段。
 
-用到 Codex 或 Cursor 而路径缺失时，Node 在 `init`、启动和网页打开开关时从本机找出并写进配置，之后照写下的用，不再每次猜：
+用到 Codex 或 Cursor 而程序路径缺失时，Node 在 `init`、启动和网页打开开关时从本机找出并写进配置，之后照写下的用，不再每次猜。Codex 的运行数据由 Node 隔离管理：
 
-- Codex 目录：Node 进程的 `CODEX_HOME`，没有时用 `$HOME/.codex`，目录必须存在。
-- App Server：`<Codex 目录>/app-server-control/app-server-control.sock` 存在时用它（`system`）；不存在时改为 `spawn`，并把 Codex 目录写进 `provider-env.json` 的 `CODEX_HOME`。
-- 会话目录：`<Codex 目录>/sessions`。
+- 默认 App Server 模式是 `spawn`，Node 使用 `<data-dir>/providers/codex` 作为 `CODEX_HOME`，并在 `<data-dir>/providers/codex/sessions` 保存自己的会话。
+- Node 不扫描 `$HOME/.codex` 或用户 control socket。只有明确选择 `system` 并填写绝对 socket 才连接外部 App Server。
 - 只写了名字的程序（`codex`、`cursor-sdk-bridge`）在 PATH 里找不到时，再找 `~/.local/bin`、`/opt/homebrew/bin`、`/usr/local/bin`，Codex 还找 `/Applications/Codex.app/Contents/Resources`。服务进程的 PATH 很短，这一步让它们也能找到。
 
-已写下的路径不被替换。找不到 Codex 目录时打开开关会报错，在网页里手动填写，或按下面写进配置。密钥不在查找范围内。
+已写下的程序路径不被替换。Node-owned Codex 运行目录由 Node 创建和维护，不从用户目录查找，也不在普通 Provider 环境变量中修改。密钥不在查找范围内。
 
 使用已经运行的 Codex App Server 时，也可以直接给出它的 socket：
 
@@ -63,17 +62,15 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 
 Node 只连接这个 socket，不搜索其他正在运行的会话，也不启动或停止其所属进程。
 
-由 Node 启动自己的 App Server 时，将模式改成 `spawn`，并在私有的 `provider-env.json` 中指定该实例使用的目录：
+由 Node 启动自己的 App Server 时只需保持 `spawn`。Node 会在启动边界注入 Node-owned `CODEX_HOME`，覆盖普通 Provider 环境里的同名值。Provider 的其他认证环境通过设备设置或服务配置填写。不要把密钥写入源码、URL、共享记录或命令历史。Cursor 的 bridge 路径和协调 Agent 工作目录也由本机配置指定。
 
-```json
-{
-	"codex": {
-		"CODEX_HOME": "<该 Codex 实例的数据目录绝对路径>"
-	}
-}
-```
+## 为 Node 私有目录登录
 
-Provider 的其他认证环境通过设备设置或服务配置填写。不要把密钥写入源码、URL、共享记录或命令历史。Cursor 的 bridge 路径和协调 Agent 工作目录也由本机配置指定。
+Codex spawn、Claude Code 和 OpenCode 的本机 CLI 已登录，不代表 Node 的私有目录已登录。打开设备 **AI** 设置，复制对应服务的登录命令，在运行该 Node 的电脑上执行，再点**检查可用性**。命令包含实际程序与私有目录的绝对路径，不包含凭证。
+
+Codex 命令设置 `<data-dir>/providers/codex` 的 `CODEX_HOME` 后执行 `codex login`。Claude Code 设置 `<data-dir>/providers/claude` 的 `CLAUDE_CONFIG_DIR` 后执行 `claude auth login`。OpenCode 命令固定 `<data-dir>/providers/opencode` 内的 XDG 与数据库路径，清除外部 config override，再执行 `opencode --standalone auth login`，防止登录到用户已有后台服务。按 Provider 保存的合法认证变量与 Node 继承的认证环境继续生效，Node 不自动读取或复制用户 auth 文件或密钥。
+
+pi 的认证目录不变，只有 session 目录固定为 `<data-dir>/providers/pi/sessions`。OpenCode 的数据、配置、状态和缓存分别位于私有根的 `data`、`config`、`state` 和 `cache`，项目配置不会覆盖此运行配置。Codex system 模式共享明确指定的外部服务会话，使用该服务自身的登录入口。
 
 ## 配置会话扫描和 hooks
 
@@ -89,7 +86,7 @@ Provider 的其他认证环境通过设备设置或服务配置填写。不要�
 }
 ```
 
-安装 hooks 默认改 `$HOME` 下的配置，Codex 的按 Codex 自己的规则找（`CODEX_HOME`，没设时 `~/.codex`）。改别的目录时用 `--home`，所有文件都落在该目录下，包括 Codex 的。写入的文件见 [回答本人自己开的会话](node.md#回答本人自己开的会话)：
+安装 hooks 默认改 Node-owned 的 Claude/Codex 根，pi 和 opencode 的扩展仍写入本机用户目录。`--home` 将这四种产品的 hook 和扩展改写到指定目录下，只改变文件位置。写入的文件见 [回答本人自己开的会话](node.md#回答本人自己开的会话)：
 
 ```sh
 vibeface hooks install [--home '<包含各 Agent 配置的目录>']
