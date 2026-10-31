@@ -225,3 +225,41 @@ a:focus-visible, button:focus-visible { outline: 2px solid currentColor; outline
 }
 @keyframes landing-arrive { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes orbit-arrive { from { opacity: 0; transform: rotate(calc(var(--orbit-angle) - 12deg)) scale(.94); } to { opacity: 1; transform: rotate(var(--orbit-angle)) scale(1); } }
+
+/* Shared brand shell for every route. */
+.site { --site-bg: #080b09; --site-ink: #f2f6f0; --site-muted: #a4aea4; --site-line: rgb(242 246 240 / .15); --site-accent: #4ade80; background: var(--site-bg); color: var(--site-ink); color-scheme: dark; min-height: 100svh; }
+.site-header { border-bottom: 1px solid var(--site-line); color: var(--site-ink); margin: 0 auto; max-width: 1280px; padding: 16px 40px; }
+.site-header nav { color: var(--site-muted); }
+.site-header nav a:hover, .site-header nav a.is-active { color: var(--site-ink); }
+.site-header nav a.is-active { text-decoration: underline; text-decoration-color: var(--site-accent); text-underline-offset: 7px; }
+.site .brand { color: var(--site-ink); }
+.site .theme-toggle { border-color: var(--site-line); color: var(--site-muted); }
+.site .theme-toggle:hover { border-color: var(--site-accent); color: var(--site-accent); }
+.site-skip { background: var(--site-bg); border: 1px solid var(--site-accent); border-radius: 8px; left: 20px; padding: 12px 16px; position: absolute; top: -80px; z-index: 10; }
+.site-skip:focus { top: 12px; }
+.site--page main { margin: 0 auto; max-width: 1280px; padding: 0 40px 96px; }
+.page-hero { border-bottom: 1px solid var(--site-line); max-width: 900px; padding: clamp(80px, 13vw, 160px) 0 100px; }
+.page-hero h1 { font-size: clamp(46px, 6vw, 76px); font-weight: 600; letter-spacing: -.055em; line-height: 1.08; margin: 20px 0 28px; text-wrap: balance; }
+.page-hero-copy { color: var(--site-muted); font-size: 18px; line-height: 1.85; max-width: 680px; }
+.page-hero-copy p { margin: 0; }
+.page-hero-copy p + p { margin-top: 20px; }
+.site .hero-kicker { color: var(--site-accent); }
+.site .button { border-color: var(--site-line); }
+.site .button-primary { background: var(--site-accent); border-color: var(--site-accent); color: #06110a; }
+.site .button-primary:hover { background: #86efac; border-color: #86efac; }
+.site .button-quiet:hover { background: rgb(242 246 240 / .06); border-color: var(--site-muted); }
+.site-footer { border-top: 1px solid var(--site-line); color: var(--site-muted); margin: 0 auto; max-width: 1200px; padding: 24px 0; }
+.site-footer .brand { color: var(--site-ink); }
+.site-footer .text-link:hover { color: var(--site-accent); }
+.site-docs { --fd-background: var(--site-bg); --fd-foreground: var(--site-ink); --fd-muted-foreground: var(--site-muted); --fd-border: var(--site-line); background: var(--site-bg); color: var(--site-ink); min-height: 100svh; }
+.site-docs .bg-fd-background, .site-docs [class*="bg-fd-background"] { background-color: var(--site-bg); }
+.site-docs .border-fd-border, .site-docs [class*="border-fd-border"] { border-color: var(--site-line); }
+.site-docs .text-fd-foreground, .site-docs [class*="text-fd-foreground"] { color: var(--site-ink); }
+.site-docs .text-fd-muted-foreground, .site-docs [class*="text-fd-muted-foreground"] { color: var(--site-muted); }
+.site-docs .docs-brand { gap: 10px; }
+.site-docs main { color: var(--site-ink); }
+.site-docs article { line-height: 1.85; }
+.site-docs article h1 { letter-spacing: -.045em; }
+.site-docs article code, .site-docs pre { border-color: var(--site-line); }
+@media (max-width: 960px) { .site-header { padding-inline: 24px; } .site--page main { padding-inline: 24px; } .site-footer { margin-inline: 24px; } }
+@media (max-width: 640px) { .site-header { gap: 16px; padding: 10px 20px; } .site-header nav { column-gap: 14px; font-size: 12px; } .site--page main { padding-inline: 20px; } .page-hero { padding-block: 64px 72px; } .page-hero h1 { font-size: clamp(38px, 10vw, 56px); } .page-hero-copy { font-size: 16px; } .site-footer { margin-inline: 20px; } }
