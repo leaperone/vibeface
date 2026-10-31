@@ -90,7 +90,10 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     seed('q-decision-four', [...three, '先发送摘要，正文保留可编辑版本']);
     await browser.goto(`${node.url}/tasks`);
     await expect(screen.getByRole('link', '待处理 1 项', { exact: true })).toBeVisible();
-    await expect(screen.getByRole('radio')).toHaveCount(0);
+    await expect(screen.getByRole('radiogroup', '任务状态').getByRole('radio')).toHaveCount(4);
+    await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toHaveCount(0);
+    await expect(screen.getByRole('button', '发送回答', { exact: true })).toHaveCount(0);
+    await expect(screen.getByLabel('你的回答')).toHaveCount(0);
     await browser.goto(`${node.url}/inbox`);
     await browser.setViewport({ width: 375, height: 812 });
     await expect(screen.getByRole('radio')).toHaveCount(5);
