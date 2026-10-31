@@ -14,10 +14,10 @@ import { ChatSkeleton, useCreateBot } from '@/features/workspace/workspace-shell
 import { ConfirmCard } from '@/features/workspace/task-activity'
 import { QuestionCard } from '@/features/workspace/question-card'
 import { chatTaskState, nodeName, progressLabel, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
-import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { BotChangeRecord, ManagerJob, SentBotMessage, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { botCopy, placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
-import { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject } from '@vibeface/client/workspace/questions.ts'
+import { awaitsAnswer, foldAnswers, questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { firstLine } from '@/lib/markdown'
 import { providerIcons } from '@/features/devices/ai-settings'
 import { providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
@@ -96,13 +96,12 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const placedChanges = placeChanges(data?.messages ?? [], changes)
   const changeRow = (records: BotChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={data?.bot_settings?.schedules ?? []} overwritten={data?.overwritten ?? []} /> })
 
-  // Questions, hand-offs and messages to other bots sit where they happened as rows, not bubbles; an answer shows inside its question.
+  // Questions and messages to other bots sit where they happened as rows, not bubbles; an answer shows inside its question.
   const questions = data?.questions ?? []
   const folded = foldAnswers(data?.messages ?? [], questions)
   const merged = new Map(jobs.filter((job) => job.state === 'steered').map((job) => [job.message_id, job.outcome]))
   const timeline = chatTimeline(data?.messages ?? [], [
     ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, waiting: awaitsAnswer(question, workspace.answered, folded.answers), node: <div id={`question-${question.question_id}`} className="scroll-mb-4"><QuestionCard question={question} answer={folded.answers.get(question.question_id)} /></div> })),
-    ...(data?.sessions ?? []).map((session) => ({ key: `session:${session.node}:${session.session_id}`, created_at_ms: session.created_at_ms, node: <SessionRow session={session} /> })),
     ...(data?.sent ?? []).map((sent) => ({ key: `sent:${sent.message_id}`, created_at_ms: sent.created_at_ms, node: <SentToBot sent={sent} to={workspace.bots.find((bot) => bot.conversation_id === sent.to) ?? { name: '另一个 Bot' }} /> })),
   ])
 
@@ -363,22 +362,6 @@ function TaskMeta({ device, here, label, agent, quiet = false, className = '' }:
     {here ? <span className="sr-only">{device}</span> : <><Laptop aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">{device}</span>{quiet ? null : dot}</>}
     <span className={quiet ? 'sr-only' : 'shrink-0'}>{label}</span>
   </span>
-}
-
-/** A session no bot started that this bot looks after. Bots hand sessions to each other themselves; the row only shows it. */
-function SessionRow({ session }: { session: SessionHandoff }) {
-  const { nodes } = useWorkspace()
-  const Icon = providerIcons[session.agent]
-  const project = sharedProject(session.cwd, session.node, nodes)
-  return <div className={`flex min-w-0 items-center gap-3 rounded-xl border border-dashed px-3 py-2 ${session.muted ? 'text-muted-foreground' : ''}`}>
-    <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground"><Icon aria-hidden="true" className="size-4" /></span>
-    <span className="grid min-w-0 flex-1">
-      <span className="truncate text-meta font-medium">{session.muted ? '不再关注' : '接手'} {agentName(session.agent)} 会话</span>
-      <span className="truncate text-meta text-muted-foreground" title={[project.path, session.summary].filter(Boolean).join('\n')}>
-        <span className="sr-only">项目 </span>{project.name}{session.summary ? ` · ${session.summary}` : ''}
-      </span>
-    </span>
-  </div>
 }
 
 /** Shaped like a message from another bot, its name above the text, so both directions read as one kind of thing. */

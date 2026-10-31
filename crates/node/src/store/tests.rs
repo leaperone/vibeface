@@ -4767,6 +4767,13 @@ fn a_session_owner_is_written_once_and_only_its_bot_hands_it_over() -> Result<()
             .claim_session(&net.a, &net.network, "c", &about, 3)?
             .is_some()
     );
+    let session_notifications = local
+        .pending_notifications(&net.network, &net.b.device_id()?)?
+        .into_iter()
+        .filter(|notification| notification.kind == "session_attributed")
+        .collect::<Vec<_>>();
+    assert_eq!(session_notifications.len(), 1);
+    assert_eq!(session_notifications[0].text, "tests fail");
     assert!(
         local
             .claim_session(&net.a, &net.network, "d", &about, 4)?
@@ -4853,6 +4860,13 @@ fn a_session_owner_is_written_once_and_only_its_bot_hands_it_over() -> Result<()
         "a rebuild reads the same"
     );
     assert!(other.session_muted(&net.network, &node, "s1")?);
+    assert!(
+        other
+            .pending_notifications(&net.network, &net.b.device_id()?)?
+            .into_iter()
+            .all(|notification| notification.kind != "session_attributed"),
+        "a projection rebuild does not backfill old session reminders"
+    );
 
     let seen = session_version(&local, &net, "s1")?;
     local.hand_over_session(&net.a, &net.network, "d", "s1", &seen, Some("c"), 10)?;

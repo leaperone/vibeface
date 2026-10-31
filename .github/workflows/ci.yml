@@ -834,7 +834,7 @@ jobs:
     needs: [plan]
     uses: ./.github/workflows/release-apps.yml
     with:
-      version: ${{ needs.plan.outputs.version }}
+      version: v${{ needs.plan.outputs.version }}
       prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
 
   publish:
@@ -870,9 +870,9 @@ jobs:
           [[ "$RELEASE_TAG" == "v$VERSION" ]]
           shopt -s nullglob
           archives=(packages/*.tar.gz)
-          checksums=(packages/*.tar.gz.sha256)
+          checksums=(packages/*.tar.gz.sha256 packages/*.zip.sha256 packages/*.dmg.sha256 packages/*.apk.sha256)
           files=(packages/*)
-          [[ "${#archives[@]}" == 3 && "${#checksums[@]}" == 5 && "${#files[@]}" == 13 ]]
+          [[ "${#archives[@]}" == 3 && "${#checksums[@]}" == 6 && "${#files[@]}" == 13 ]]
           for archive in "${archives[@]}"; do
             name="$(basename "$archive")"
             [[ "$name" == "vibeface-$VERSION-"*.tar.gz ]]

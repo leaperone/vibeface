@@ -23,6 +23,7 @@ import type {
   AnswerResult, ConversationPayload, NodeInfo, NotificationRecord, PendingAnswer, Question,
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, WriteState, WriteStatus, OpenWork, ScheduleAction, WorkspaceOverview,
 } from "./types.ts"
+import { isSessionNotification } from "./types.ts"
 
 const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
   aligning: "正在和你的其他设备同步，稍后就能发送。",
@@ -104,6 +105,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const messagesRef = useRef<PendingMessage[]>([])
   const botCreationRef = useRef<PendingBot | null>(null)
   const notificationsRef = useRef<NotificationRecord[]>([])
+  const ackNotificationRef = useRef<(notification: NotificationRecord) => Promise<void>>(async () => {})
   const inFlight = useRef(new Set<string>())
   const refreshingRef = useRef(false)
   const refreshingConnection = useRef<ReadyConnection | null>(null)
@@ -218,7 +220,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       return !job || (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state)
     }))
     if (joined && current() && readConnection.current === connection && viewRef.current === "chat" && platform.foreground()) {
-      const seen = notificationsRef.current.filter((item) => item.conversation_id === id)
+      const seen = notificationsRef.current.filter((item) => item.conversation_id === id && !isSessionNotification(item))
       for (const notification of seen) {
         try {
           await signedWrite("ack", notification.notification_id, "ack", { notification_id: notification.notification_id, attestation: await attest(notification.conversation_id, { type: "notification_acked", notification_id: notification.notification_id, client_id: clientId }) })
@@ -244,11 +246,17 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const seen = new Set(readStorage<string[]>(networkKey("seen", networkId), []))
     for (const item of items) {
       if (seen.has(item.notification_id)) continue
+      if (isSessionNotification(item) && platform.sessionNotifications === false) continue
       seen.add(item.notification_id)
       if (viewRef.current === "chat" && item.conversation_id === activeId.current && platform.foreground()) continue
       try {
-        notifier.show({ title: item.kind === "question" ? "Vibeface · 需要你回答" : "Vibeface · 进展", body: item.text, tag: item.notification_id }, () => {
-          if (current()) openConversation(item.conversation_id)
+        notifier.show({ title: item.kind === "question" ? "Vibeface · 需要你回答" : isSessionNotification(item) ? "Vibeface · 接手会话" : "Vibeface · 进展", body: item.text, tag: item.notification_id }, () => {
+          if (!current()) return
+          if (isSessionNotification(item)) {
+            void ackNotificationRef.current(item).then(() => { if (current()) openConversation(item.conversation_id) }, () => {})
+          } else {
+            openConversation(item.conversation_id)
+          }
         })
       } catch { /* The persisted inbox remains available when system alerts fail. */ }
     }
@@ -448,6 +456,19 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     mutations.add(key)
     try { return await work() } finally { mutations.delete(key) }
   }
+  const ackNotification = (notification: NotificationRecord) => withMutation(`ack:${notification.notification_id}`, async () => {
+    requireCurrent()
+    if (!notificationsRef.current.some((item) => item.notification_id === notification.notification_id)) return
+    await signedWrite("ack", notification.notification_id, "ack", {
+      notification_id: notification.notification_id,
+      client_id: clientId,
+      attestation: await attest(notification.conversation_id, { type: "notification_acked", notification_id: notification.notification_id, client_id: clientId }),
+    })
+    requireCurrent()
+    notificationsRef.current = notificationsRef.current.filter((item) => item.notification_id !== notification.notification_id)
+    setNotifications(notificationsRef.current)
+  })
+  ackNotificationRef.current = ackNotification
   const clearMessages = () => { if (current()) { setError(null); setNoticeText("") } }
   const run = async (action: () => Promise<void>, label?: string) => {
     clearMessages()
@@ -578,7 +599,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     logs: async (filter: LogFilter) => { requireCurrent(); return parseLogs(await connection.request("logs", filter)) },
     confirmWritable: async () => { requireCurrent(); setWriteState(parseWriteStatus(await connection.request("confirm_writable"))); scheduleRefresh() },
     syncText: !data ? "发一条消息开始对话。" : "已加载这台电脑上的记录。",
-    refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton,
+    refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton, ackNotification,
     selectBot,
     createBot: (input: { name: string; instructions: string; project?: BotProject }) => withMutation("create-bot", async () => {
       const name = inputText(input.name, "Bot 名称", 512), instructions = input.instructions.trim()

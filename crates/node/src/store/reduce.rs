@@ -107,6 +107,7 @@ pub(crate) fn apply(
     event: &Event,
     seen_at_ms: i64,
     rank: &str,
+    notify_session: bool,
 ) -> Result<()> {
     let scope = event.scope_id.as_str();
     match &event.body {
@@ -306,6 +307,17 @@ pub(crate) fn apply(
                 Some(attribution.to_string()),
                 event.created_at_ms,
             )?;
+            if notify_session {
+                notify(
+                    connection,
+                    network,
+                    hash,
+                    scope,
+                    "session_attributed",
+                    summary,
+                    rank,
+                )?;
+            }
         }
         // Follows the attribution it mutes in its author's log, so that row is already here.
         EventBody::SessionMuted { node, session_id } => {
