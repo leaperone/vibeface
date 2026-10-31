@@ -1,5 +1,6 @@
 //! Personal Node coordination, authenticated replication and local SDK tools.
 pub mod agent_cli;
+pub mod agent_context;
 pub mod api;
 pub mod client;
 pub mod config;

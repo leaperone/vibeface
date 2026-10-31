@@ -296,8 +296,6 @@ impl Runtime {
             | Tool::RemoveSkill
             | Tool::SaveSchedule
             | Tool::RemoveSchedule
-            | Tool::Remember
-            | Tool::Forget
             | Tool::Remind => {
                 let manager = access
                     .manager
@@ -336,6 +334,30 @@ impl Runtime {
                     );
                 }
                 Ok(json!(record))
+            }
+            Tool::Remember | Tool::Forget => {
+                let manager = access
+                    .manager
+                    .as_ref()
+                    .context("memory changes require an agent invocation")?;
+                let call_ref = field(&args, "call_ref")?.to_owned();
+                let mut request = args;
+                let fields = request
+                    .as_object_mut()
+                    .context("tool arguments must be an object")?;
+                fields.remove("call_ref");
+                fields.insert("tool".into(), json!(name));
+                let request: ChangeRequest =
+                    serde_json::from_value(request).context("invalid memory mutation")?;
+                self.store.lock().await.stage_memory(
+                    network,
+                    &scope,
+                    &manager.trigger,
+                    &manager.attempt_id,
+                    &call_ref,
+                    request,
+                    now_ms(),
+                )
             }
             Tool::TrackWork => self.track_work(&access, &scope, &args).await,
             Tool::BindWork => {

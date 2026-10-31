@@ -58,7 +58,7 @@ BotChange::Memory { memory_id, before: Option<String>, after: Option<String> }  
 - 每条最多 500 字符，一行到几行的事实或偏好；每个 bot 最多 50 条。提示词里 `bot.memory` 带全部笔记，超过 3000 字节的部分省略并给出条数，用 `recall` 取。
 - 疑似凭证的内容直接拒绝：私钥头、`sk-`、`ghp_`、`github_pat_`、`xox`、`AKIA`、`AIza` 等前缀、`Bearer` 令牌、`password=` 一类赋值，以及 32 个字符以上的连续高熵串。模型密钥从不进入记忆。bot 说明、skill 的描述和正文、schedule 提示按同一规则拒绝。
 - Node 签名自己的每条写入前，把已知的密钥换成 `[redacted]`，包括回复、bot 消息和工作结果。已知密钥指进程环境和设置页 Provider 变量里名字以 `_KEY`、`_TOKEN`、`_SECRET`、`_PASSWORD` 结尾或疑似凭证的值、入口令牌、Cursor 回调令牌，以及 `Bearer` 后的令牌。带本人设备签名的写入保持原样。
-- `remember` 和 `forget` 是设置类：只在本人消息的轮次提供，`cause` 指向那条签名消息，入库时核对，与改名、改说明相同。理由是记忆注入之后每一轮的提示词，作用等同于说明；工作结果、网页和工具输出里的文字不能写进去。`recall` 所有轮次都可用。
+- `remember` 和 `forget` 是设置类：只在本人消息的轮次提供，`cause` 指向那条签名消息，入库时核对，与改名、改说明相同。工具调用先写入当前本机回合的 staged overlay，回合以 `completed` 结束时才追加 `BotChanged`；失败、中断或未知结果会丢弃 overlay。并发期间笔记已变化时保留新值并记录本机冲突，不覆盖它。工作结果、网页和工具输出里的文字不能写进去。`recall` 所有轮次都可用。
 - 投影 `memories` 按 `memory_id` 后写者胜，删除保留墓碑。
 
 ## 4. bot 互发消息
@@ -128,7 +128,7 @@ BotMessaged {
 
 - `skills`：启用的 skill `{skill_id, name, description}`，按名称排，以及 `skills_omitted`；`read_bot` 列出全部；
 - `schedules`：`{schedule_id, name, prompt（前 500 字节）, first_run_at_ms, every_minutes, enabled, next_run_at_ms}`，只列活动的，下次运行最早的在前，以及 `schedules_omitted`；`read_bot` 列出全部；
-- `memory`：`{memory_id, text}`，保留最新的，以及 `memory_omitted`；`recall` 列出全部；
+- `memory`：`{memory_id, text}`，保留最新的，以及 `memory_omitted`；`memory_context` 另外给出 8192 字节 essential budget 和省略数；`recall` 列出全部；
 - `sessions`：它名下的外来会话 `{node, session_id, version, agent, cwd, summary, following}`，保留最新的，以及 `sessions_omitted`；`summary` 是会话第一次归给某个 bot 时最后说的一句，转交时沿用；`list_sessions {before?, limit?}` 从新到旧分页列出全部，带 `hand_over_session` 要的 `version`，还有更早的时返回 `next`，下一页把它作为 `before`；翻页途中转走或不再关注某个会话，不影响下一页；
 - `sent`：它发给其他 bot 的消息 `{message_id, to: {conversation_id, name}, text（前 500 字节）, created_at_ms}`，保留最新的，以及 `sent_omitted`，对方回信时能对上原来的问题；更早的不经工具读回；
 - `bots`：其他 bot 的 `{conversation_id, name}`，以及 `bots_omitted`；`list_bots` 列出全部。

@@ -2,6 +2,7 @@
 //! dispatch work, then write the reply. The turn ends after dispatch; a finished work comes back
 //! as its own `work:` trigger, so nothing waits on background work here.
 use crate::{
+    agent_context::{self, StableInput},
     crypto::digest,
     manager::{self, CursorInstance, ManagerConfig, ManagerError},
     model::{
@@ -72,14 +73,17 @@ pub(crate) fn session_key(
     settings: &crate::config::ManagerSettings,
     thread: Option<(&str, &str, &str)>,
     cursor_store_root: Option<PathBuf>,
+    stable_fingerprint: Option<&str>,
 ) -> Result<String> {
     let mut settings = settings.clone();
     if thread.is_some() {
         settings.model.clear();
     }
     let native = match cursor_store_root {
-        Some(root) => serde_json::to_vec(&(&settings, thread, ("jsonl", root)))?,
-        None => serde_json::to_vec(&(&settings, thread))?,
+        Some(root) => {
+            serde_json::to_vec(&(&settings, thread, ("jsonl", root), stable_fingerprint))?
+        }
+        None => serde_json::to_vec(&(&settings, thread, stable_fingerprint))?,
     };
     Ok(digest(&native))
 }
@@ -226,6 +230,39 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     }
     let provider = settings.provider;
     let thread = provider.prompt_mode() == crate::providers::PromptMode::Thread;
+    let (stable_bot, permission_version) = {
+        let store = node.store.lock().await;
+        (
+            bot_value(&store, &network, &conversation, crate::runtime::now_ms())?,
+            store.scheduler_permission_version(&conversation)?,
+        )
+    };
+    let stable_tools = provider.tools_for(TriggerKind::Human);
+    let stable_tool_values = stable_tools
+        .iter()
+        .map(|(name, spec)| {
+            (
+                name.clone(),
+                json!({
+                    "description": spec.description,
+                    "input_schema": spec.input_schema,
+                }),
+            )
+        })
+        .collect();
+    let stable = agent_context::compile_stable(StableInput {
+        provider,
+        bot: stable_bot["configured_bot"].clone(),
+        bot_revision: stable_bot["configured_bot"]["revision"]
+            .as_str()
+            .map(str::to_owned),
+        standing_rules: thread.then(thread_instructions).unwrap_or_default(),
+        workspace: vec![settings.workspace.clone()],
+        model: (!thread).then_some(settings.model.clone()),
+        permission_version,
+        tools: stable_tool_values,
+        skills: stable_bot["skills"].as_array().cloned().unwrap_or_default(),
+    })?;
     // Claiming before the tool listener exists would turn a startup race into a failed job.
     let tool_url = node
         .tool_url
@@ -241,11 +278,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     };
     let tool_cli = std::env::current_exe()?;
     // A thread lists the tools once, with the guidance that holds for all its turns.
-    let guide = manager::bot_instructions(
-        Some(&tool_cli),
-        &provider.tools_for(TriggerKind::Human),
-        &thread_instructions(),
-    );
+    let guide = manager::bot_instructions(Some(&tool_cli), &stable_tools, &stable.rendered);
     let instance = provider.instance_per_bot().then(|| CursorInstance::Bot {
         network: network.clone(),
         conversation: conversation.clone(),
@@ -256,6 +289,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         instance
             .as_ref()
             .map(|instance| node.cursor_store_root(instance)),
+        Some(&stable.fingerprint.digest),
     )?;
     let claimed = {
         let mut store = node.store.lock().await;
@@ -332,11 +366,88 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                 ),
                 _ => None,
             };
+            let handoff = claimed.invalidation.as_ref().map(|invalidation| {
+                agent_context::ContextHandoff {
+                    schema_version: agent_context::SCHEMA_VERSION,
+                    source_provider: provider,
+                    target_provider: provider,
+                    basis: job.basis.clone(),
+                    source_fingerprint: invalidation.old_config.clone().unwrap_or_default(),
+                    recent_context: "The new provider session rebuilds from the recorded DAG basis. Use context to read older events.".into(),
+                    open_work: works.iter().filter(|work| work.outcome.is_none()).map(|work| work.work_id.clone()).collect(),
+                    decisions: vec![],
+                    reason: invalidation.reason.clone(),
+                }
+            });
+            let handoff_text = handoff
+                .as_ref()
+                .map(|handoff| format!("<agent_context_handoff>{}</agent_context_handoff>", serde_json::to_string(handoff).expect("handoff serializes")))
+                .unwrap_or_default();
             let unseen = Shown::default();
-            let render = |history, thread| materialize(history, &job, &works, &dispatches, bot.clone(), schedule.as_ref(), &local_settings.roots, thread);
-            let turn = render(&history, thread.then_some(&claimed.shown))?;
-            let fresh = fresh_history.as_ref().map(|history| render(history, Some(&unseen))).transpose()?;
-            (turn, fresh)
+            let stable_budget = if thread { 0 } else { stable.rendered.len() + 2 };
+            let dynamic_limit = PROMPT_LIMIT
+                .saturating_sub(handoff_text.len() + 2)
+                .saturating_sub(stable_budget);
+            ensure!(dynamic_limit > 0, "compiled stable and handoff instructions exceed the provider input limit");
+            let render = |history: &TurnHistory, thread: Option<&Shown>| {
+                materialize_with_limit(
+                    history,
+                    &job,
+                    &works,
+                    &dispatches,
+                    bot.clone(),
+                    schedule.as_ref(),
+                    &local_settings.roots,
+                    thread,
+                    dynamic_limit,
+                )
+            };
+            let (prompt, shown) = render(&history, thread.then_some(&claimed.shown))?;
+            let prompt = if handoff_text.is_empty() {
+                prompt
+            } else {
+                format!("{}\n\n{}", handoff_text, prompt)
+            };
+            let dynamic = agent_context::DynamicContext::compile(
+                job.basis.clone(),
+                trigger.clone(),
+                prompt.clone(),
+            )?;
+            let prompt = if thread {
+                prompt
+            } else {
+                format!("{}\n\n{}", stable.rendered, prompt)
+            };
+            ensure!(
+                prompt.len() <= PROMPT_LIMIT,
+                "compiled prompt exceeds the provider input limit"
+            );
+            let mut shown = shown;
+            shown.dynamic = Some(dynamic.fingerprint);
+            let fresh = fresh_history
+                .as_ref()
+                .map(|history| render(history, Some(&unseen)))
+                .transpose()?
+                .map(|(fresh_prompt, mut fresh_shown)| -> Result<_> {
+                    let fresh_prompt = if handoff_text.is_empty() {
+                        fresh_prompt
+                    } else {
+                        format!("{}\n\n{}", handoff_text, fresh_prompt)
+                    };
+                    fresh_shown.dynamic = Some(agent_context::DynamicContext::compile(
+                        job.basis.clone(),
+                        trigger.clone(),
+                        fresh_prompt.clone(),
+                    )?.fingerprint);
+                    let fresh_prompt = if thread {
+                        fresh_prompt
+                    } else {
+                        format!("{}\n\n{}", stable.rendered, fresh_prompt)
+                    };
+                    Ok((fresh_prompt, fresh_shown))
+                })
+                .transpose()?;
+            ((prompt, shown), fresh)
         };
         let (fresh_prompt, fresh_shown) = fresh.unzip();
         let shown = Arc::new(Mutex::new(shown_now));
@@ -683,7 +794,7 @@ pub(crate) fn bot_value(
         .collect();
     let bot = bot.map(|bot| json!({"name":bot.name,"instructions":prefix(&bot.instructions,MAX_INSTRUCTIONS_BYTES),
         "project":bot.project,"models":(!bot.models.is_empty()).then_some(&bot.models),"uses_all_skills":bot.skills.is_none(),
-        "avatar":bot.shown_avatar()}));
+        "avatar":bot.shown_avatar(),"revision":bot.event_hash}));
     let mut schedules: Vec<_> = store
         .schedules(network, conversation)?
         .into_iter()
@@ -700,6 +811,12 @@ pub(crate) fn bot_value(
         .into_iter()
         .map(|note| json!({"memory_id":note.memory_id,"text":note.text}))
         .collect();
+    let memory_context = agent_context::essential_memory_block(memory.iter().filter_map(|row| {
+        Some((
+            row["memory_id"].as_str()?.to_owned(),
+            row["text"].as_str()?.to_owned(),
+        ))
+    }));
     let sessions: Vec<Value> = store
         .attributed_sessions(network, conversation)?
         .iter()
@@ -727,6 +844,7 @@ pub(crate) fn bot_value(
         "skills":skills,"skills_omitted":0,
         "schedules":schedules,"schedules_omitted":0,
         "memory":memory,"memory_omitted":0,
+        "memory_context":memory_context,
         "sessions":sessions,"sessions_omitted":0,
         "sent":sent,"sent_omitted":0,
         "bots":bots,"bots_omitted":0,
@@ -1116,6 +1234,10 @@ fn checkpoint_value(body: &EventBody, budget: usize) -> Value {
     clippy::too_many_arguments,
     reason = "a schedule turn adds its own trigger input"
 )]
+#[allow(
+    dead_code,
+    reason = "the default-budget wrapper is used by Store tests and callers outside the live turn"
+)]
 pub(crate) fn materialize(
     history: &TurnHistory,
     job: &SchedulerJob,
@@ -1125,6 +1247,34 @@ pub(crate) fn materialize(
     schedule: Option<&ScheduleEntry>,
     roots: &[std::path::PathBuf],
     thread: Option<&Shown>,
+) -> Result<(String, Shown)> {
+    materialize_with_limit(
+        history,
+        job,
+        works,
+        dispatches,
+        bot,
+        schedule,
+        roots,
+        thread,
+        PROMPT_LIMIT,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the prompt budget is provider-specific"
+)]
+pub(crate) fn materialize_with_limit(
+    history: &TurnHistory,
+    job: &SchedulerJob,
+    works: &[WorkProjection],
+    dispatches: &[Dispatch],
+    bot: Value,
+    schedule: Option<&ScheduleEntry>,
+    roots: &[std::path::PathBuf],
+    thread: Option<&Shown>,
+    prompt_limit: usize,
 ) -> Result<(String, Shown)> {
     let context = &history.recent;
     let pending = &history.pending_blobs;
@@ -1251,13 +1401,13 @@ pub(crate) fn materialize(
     let mut budgets = [WORK_BUDGET, CHECKPOINT_BUDGET, MESSAGE_BUDGET, INDEX_BUDGET];
     let (mut prompt, mut shown_works) = render(budgets);
     for index in 0..budgets.len() {
-        while prompt.len() > PROMPT_LIMIT && budgets[index] > 0 {
-            budgets[index] = budgets[index].saturating_sub(prompt.len() - PROMPT_LIMIT);
+        while prompt.len() > prompt_limit && budgets[index] > 0 {
+            budgets[index] = budgets[index].saturating_sub(prompt.len() - prompt_limit);
             (prompt, shown_works) = render(budgets);
         }
     }
     ensure!(
-        prompt.len() <= PROMPT_LIMIT,
+        prompt.len() <= prompt_limit,
         "scheduler context exceeds prompt limit even without works, checkpoint, messages and the bot's indexes"
     );
     let mut shown = thread.cloned().unwrap_or_default();
@@ -1356,6 +1506,7 @@ mod tests {
                 &settings(model, crate::providers::Provider::Codex),
                 Some(("http://127.0.0.1:1", "system", guide)),
                 None,
+                None,
             )
         };
         assert_eq!(codex("gpt-a", "guide")?, codex("gpt-b", "guide")?);
@@ -1363,6 +1514,7 @@ mod tests {
         let cursor = |model| {
             session_key(
                 &settings(model, crate::providers::Provider::Cursor),
+                None,
                 None,
                 None,
             )
@@ -1373,6 +1525,7 @@ mod tests {
                 &settings("a", crate::providers::Provider::Cursor),
                 None,
                 Some(PathBuf::from(root)),
+                None,
             )
         };
         assert_ne!(cursor("a")?, private_cursor("/node/cursor/bot-a")?);

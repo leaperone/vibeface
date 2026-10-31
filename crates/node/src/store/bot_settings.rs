@@ -7,14 +7,15 @@ use crate::{
     crypto::digest,
     model::*,
     providers::Provider,
-    scheduling::{AdmissionReceipt, TriggerKind, ahead, bot_message_trigger},
+    scheduling::{AdmissionReceipt, StagedMemory, TriggerKind, ahead, bot_message_trigger},
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
+use std::path::Path;
 
 pub const NOT_FROM_USER: &str = "bot settings change only when the user's own message asks for it";
 
-fn change_digest(conversation: &str, trigger: &str, call_ref: &str) -> String {
+pub(crate) fn change_digest(conversation: &str, trigger: &str, call_ref: &str) -> String {
     digest(&serde_json::to_vec(&("bot_change", conversation, trigger, call_ref)).expect("strings"))
 }
 
@@ -879,6 +880,62 @@ fn resolve(
 }
 
 impl Store {
+    /// Commit staged memory changes in the same transaction that closes the turn. A changed
+    /// committed value wins over a stale staged value; the turn remains successful and the
+    /// conflict is kept in the local log for diagnosis.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the completion transaction supplies the same turn identity and store handles"
+    )]
+    pub(crate) fn commit_staged_memory_from(
+        connection: &Connection,
+        blob_dir: &Path,
+        identity: &crate::crypto::LocalIdentity,
+        network: &str,
+        scope: &str,
+        trigger: &str,
+        staged: impl IntoIterator<Item = StagedMemory>,
+        at: i64,
+    ) -> Result<()> {
+        let cause = user_cause(connection, network, scope, trigger)?;
+        for staged in staged {
+            let current = memories_from(connection, network, scope)?
+                .into_iter()
+                .find(|entry| entry.memory_id == staged.memory_id)
+                .map(|entry| entry.text);
+            if current != staged.before {
+                tracing::warn!(
+                    event = "agent.memory_conflict",
+                    conversation_id = scope,
+                    memory_id = staged.memory_id,
+                    "staged memory was not committed because the note changed during the turn"
+                );
+                continue;
+            }
+            let change = BotChange::Memory {
+                memory_id: staged.memory_id.clone(),
+                before: staged.before,
+                after: staged.after,
+            };
+            change.validate()?;
+            log::append_from(
+                connection,
+                blob_dir,
+                identity,
+                network,
+                scope,
+                EventBody::BotChanged {
+                    change_id: change_id(scope, trigger, &staged.call_ref),
+                    cause: cause.clone(),
+                    change,
+                },
+                vec![],
+                at,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Writes the change a turn's tool call asked for. The same `call_ref` in the same turn
     /// returns the stored change and writes nothing; a different request under it is refused.
     /// Returns whether an event was written.

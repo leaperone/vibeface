@@ -350,6 +350,16 @@ pub struct ClaimedJob {
     pub covers: Option<VersionVector>,
     /// The bot and works the resumed native session was last shown; empty with no `covers`.
     pub shown: Shown,
+    /// Why a previously cached native session could not be reused for this claim.
+    pub invalidation: Option<SessionInvalidation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionInvalidation {
+    pub old_config: Option<String>,
+    pub new_config: String,
+    pub reason: String,
 }
 
 /// Digests of the bot and of each work a Codex thread was last shown, kept on this Node with
@@ -358,6 +368,21 @@ pub struct ClaimedJob {
 pub struct Shown {
     pub bot: Option<String>,
     pub works: BTreeMap<String, String>,
+    /// The last dynamic Context digest sent on this local native session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic: Option<String>,
+    /// Memory changes waiting for this attempt to complete.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub staged_memories: BTreeMap<String, StagedMemory>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagedMemory {
+    pub call_ref: String,
+    pub memory_id: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

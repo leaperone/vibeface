@@ -4,6 +4,7 @@ use super::{Store, authorize_node_from, conversation_from, log, message_from};
 use crate::{crypto::LocalIdentity, model::*, providers::Provider, scheduling::*};
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde_json::{Value, json};
 use std::path::Path;
 use vibeface_bridge::failure::ExecFailure;
 
@@ -554,6 +555,128 @@ fn admit_ended_from(
 }
 
 impl Store {
+    /// Stage a memory mutation for the active turn. The mutation is kept in the local scheduler
+    /// session and becomes a signed BotChanged event only when that turn completes.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "staging is keyed by the active turn and keeps the memory operation explicit"
+    )]
+    pub fn stage_memory(
+        &mut self,
+        network: &str,
+        conversation: &str,
+        trigger: &str,
+        attempt_id: &str,
+        call_ref: &str,
+        request: super::bot_settings::ChangeRequest,
+        at: i64,
+    ) -> Result<Value> {
+        vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut session = load_session(&tx, conversation)?;
+        let job = load_job(&tx, conversation, trigger)?.context("scheduler job missing")?;
+        ensure!(
+            job.state
+                .attempt()
+                .is_some_and(|attempt| attempt.id == attempt_id),
+            "scheduler attempt does not match"
+        );
+        ensure!(
+            session.active.as_deref() == Some(trigger),
+            "scheduler attempt is no longer active"
+        );
+        ensure!(
+            super::bot_settings::user_cause(&tx, network, conversation, trigger)?.is_some(),
+            super::bot_settings::NOT_FROM_USER
+        );
+        let change_id = super::bot_settings::change_id(conversation, trigger, call_ref);
+        if let Some(record) = super::bot_settings::change_from(&tx, network, &change_id)? {
+            return Ok(json!({"state":"committed","record":record}));
+        }
+        let staged = session.shown.staged_memories.clone();
+        let committed = super::bot_settings::memories_from(&tx, network, conversation)?;
+        let current =
+            |memory_id: &str| match staged.values().find(|entry| entry.memory_id == memory_id) {
+                Some(entry) => entry.after.clone(),
+                None => committed
+                    .iter()
+                    .find(|entry| entry.memory_id == memory_id)
+                    .map(|entry| entry.text.clone()),
+            };
+        let (memory_id, before, after) = match request {
+            super::bot_settings::ChangeRequest::Remember { memory_id, text } => {
+                validate_memory(&text)?;
+                let memory_id = memory_id.unwrap_or_else(|| {
+                    format!(
+                        "memory-{}",
+                        super::bot_settings::change_digest(conversation, trigger, call_ref)
+                    )
+                });
+                let before = current(&memory_id);
+                ensure!(
+                    !committed.iter().any(|entry| entry.text == text),
+                    "this note is already kept"
+                );
+                if before.is_none() {
+                    let staged_adds = staged
+                        .values()
+                        .filter(|entry| entry.before.is_none() && entry.after.is_some())
+                        .count();
+                    ensure!(
+                        committed.len() + staged_adds < MAX_MEMORIES,
+                        "this bot already keeps {MAX_MEMORIES} notes; forget one first"
+                    );
+                }
+                ensure!(
+                    before.as_deref() != Some(text.as_str()),
+                    "this note already has that text"
+                );
+                (memory_id, before, Some(text))
+            }
+            super::bot_settings::ChangeRequest::Forget { memory_id } => {
+                let before = current(&memory_id).context("note not found for this bot")?;
+                (memory_id, Some(before), None)
+            }
+            _ => bail!("only remember and forget use turn memory staging"),
+        };
+        if let Some(previous) = staged.get(call_ref) {
+            ensure!(
+                previous.memory_id == memory_id
+                    && previous.before == before
+                    && previous.after == after,
+                "call_ref {call_ref} already staged a different memory mutation"
+            );
+            return Ok(
+                json!({"state":"staged","memory_id":memory_id,"before":before,"after":after,"commit":"turn_completed"}),
+            );
+        }
+        ensure!(
+            !staged.values().any(|entry| entry.memory_id == memory_id),
+            "memory {memory_id} already has a staged mutation in this turn"
+        );
+        session.shown.staged_memories.insert(
+            call_ref.to_owned(),
+            StagedMemory {
+                call_ref: call_ref.into(),
+                memory_id: memory_id.clone(),
+                before: before.clone(),
+                after: after.clone(),
+            },
+        );
+        save_session(&tx, &session)?;
+        tx.commit()?;
+        let _ = at;
+        Ok(json!({
+            "state":"staged",
+            "memory_id":memory_id,
+            "before":before,
+            "after":after,
+            "commit":"turn_completed"
+        }))
+    }
+
     /// The user messages of a conversation this Node schedules that no device answered, in
     /// conversation order: no completed reply, not answered inside a reply they were steered
     /// into, and no turn here. A former owner left them; only the user starts them again.
@@ -1111,6 +1234,7 @@ fn end_job_from(
     } else {
         text.to_owned()
     };
+    let staged_memories = std::mem::take(&mut session.shown.staged_memories);
     let change = TaskJobChange::Ended {
         outcome: &outcome,
         text: &text,
@@ -1147,6 +1271,18 @@ fn end_job_from(
                 at,
             )?;
         }
+    }
+    if matches!(outcome, JobOutcome::Completed) {
+        super::Store::commit_staged_memory_from(
+            connection,
+            blob_dir,
+            identity,
+            network,
+            &job.conversation_id,
+            &job.trigger,
+            staged_memories.into_values(),
+            at,
+        )?;
     }
     job.state = match outcome {
         JobOutcome::Completed => JobState::Completed { attempt },
@@ -1330,6 +1466,15 @@ impl Store {
         load_job(&self.connection, conversation, trigger)
     }
 
+    pub(crate) fn scheduler_permission_version(&self, conversation: &str) -> Result<u64> {
+        Ok(
+            query_sessions(&self.connection, "conversation_id=?", [conversation])?
+                .pop()
+                .map(|session| session.permission_version)
+                .unwrap_or(1),
+        )
+    }
+
     pub fn scheduler_jobs(&self, conversation: &str) -> Result<Vec<SchedulerJob>> {
         query_jobs(&self.connection, "conversation_id=?", [conversation])
     }
@@ -1507,14 +1652,29 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         };
-        if session.sdk_config.as_deref() != Some(sdk_config) || session.owner_epoch != owner_epoch {
+        let invalidation = if session.sdk_config.as_deref() != Some(sdk_config)
+            || session.owner_epoch != owner_epoch
+        {
+            let reason = if session.owner_epoch != owner_epoch {
+                "conversation_owner_changed"
+            } else {
+                "stable_prompt_or_provider_changed"
+            };
+            let invalidation = Some(SessionInvalidation {
+                old_config: session.sdk_config.clone(),
+                new_config: sdk_config.into(),
+                reason: reason.into(),
+            });
             session.native_id = None;
             session.native_token = None;
             session.covers.clear();
             session.shown = Shown::default();
             session.sdk_config = Some(sdk_config.into());
             session.owner_epoch = owner_epoch;
-        }
+            invalidation
+        } else {
+            None
+        };
         job.basis = log::version_vector_from(&tx, network)?;
         let resumable = job.kind != TriggerKind::AgentTask
             && session.native_id.is_some()
@@ -1549,6 +1709,7 @@ impl Store {
             previous_token,
             covers,
             shown,
+            invalidation,
         }))
     }
 

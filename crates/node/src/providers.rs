@@ -96,13 +96,147 @@ pub enum Sessions {
 }
 
 /// What a bot turn's prompt carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PromptMode {
     /// The thread keeps its instructions, the tool catalog and what it was shown, so a turn
     /// carries only what is new and a thread lost on the App Server is replaced by a full one.
     Thread,
     /// Every turn carries everything.
     Turn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillInjection {
+    Folder,
+    Plugin,
+    PromptIndex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolMode {
+    StaticCatalog,
+    DynamicCatalog,
+    NativeCallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    ReadOnly,
+    Workspace,
+    FullAccess,
+    ProviderControlled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConcurrencyMode {
+    Serial,
+    Parallel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMode {
+    Native,
+    Request,
+    Handoff,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySupport {
+    Supported,
+    Unsupported,
+    Manual,
+}
+
+/// The provider facts used by the prompt compiler and scheduler. This is a description of a
+/// provider adapter, not a permission grant. Tool effects and workspace checks remain in the Node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDescriptor {
+    pub provider: Provider,
+    pub sessions: String,
+    pub prompt_mode: PromptMode,
+    pub tool_mode: ToolMode,
+    pub skill_injection: SkillInjection,
+    pub sandbox: SandboxMode,
+    pub steer: bool,
+    pub concurrency: ConcurrencyMode,
+    pub compaction: CompactionMode,
+    pub usage: CapabilitySupport,
+    pub approvals: CapabilitySupport,
+    pub model_catalog: CapabilitySupport,
+}
+
+impl ProviderDescriptor {
+    pub fn for_provider(provider: Provider) -> Self {
+        let (sessions, skill_injection, sandbox, concurrency, compaction, model_catalog) =
+            match provider {
+                Provider::Codex => (
+                    "app_server",
+                    SkillInjection::Folder,
+                    SandboxMode::FullAccess,
+                    ConcurrencyMode::Parallel,
+                    CompactionMode::Native,
+                    CapabilitySupport::Supported,
+                ),
+                Provider::Cursor => (
+                    "process",
+                    SkillInjection::Folder,
+                    SandboxMode::ProviderControlled,
+                    ConcurrencyMode::Serial,
+                    CompactionMode::Handoff,
+                    CapabilitySupport::Manual,
+                ),
+                Provider::Claude => (
+                    "process",
+                    SkillInjection::Plugin,
+                    SandboxMode::ProviderControlled,
+                    ConcurrencyMode::Serial,
+                    CompactionMode::Native,
+                    CapabilitySupport::Manual,
+                ),
+                Provider::Pi => (
+                    "process",
+                    SkillInjection::Folder,
+                    SandboxMode::ProviderControlled,
+                    ConcurrencyMode::Serial,
+                    CompactionMode::Request,
+                    CapabilitySupport::Manual,
+                ),
+                Provider::Opencode => (
+                    "store",
+                    SkillInjection::PromptIndex,
+                    SandboxMode::ProviderControlled,
+                    ConcurrencyMode::Serial,
+                    CompactionMode::Handoff,
+                    CapabilitySupport::Manual,
+                ),
+            };
+        Self {
+            provider,
+            sessions: sessions.into(),
+            prompt_mode: provider.prompt_mode(),
+            tool_mode: match provider {
+                Provider::Cursor => ToolMode::NativeCallback,
+                _ => ToolMode::StaticCatalog,
+            },
+            skill_injection,
+            sandbox,
+            steer: provider.supports_steer(),
+            concurrency,
+            compaction,
+            usage: CapabilitySupport::Supported,
+            approvals: CapabilitySupport::Supported,
+            model_catalog,
+        }
+    }
 }
 
 impl Provider {
@@ -799,6 +933,17 @@ mod tests {
         for retired in ["codex_sdk", "cursor_sdk"] {
             assert!(serde_json::from_value::<Provider>(json!(retired)).is_err());
             assert!(<Provider as clap::ValueEnum>::from_str(retired, false).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_descriptors_cover_every_provider() {
+        for provider in Provider::ALL {
+            let descriptor = ProviderDescriptor::for_provider(provider);
+            assert_eq!(descriptor.provider, provider);
+            assert_eq!(descriptor.prompt_mode, provider.prompt_mode());
+            assert_eq!(descriptor.steer, provider.supports_steer());
+            assert!(!descriptor.sessions.is_empty());
         }
     }
 

@@ -9,7 +9,7 @@ use crate::{
     work::{Signal, WorkSpec},
 };
 use serde_json::json;
-use vibeface_bridge::failure::ExecFailure;
+use vibeface_bridge::failure::{ExecFailure, FailureKind};
 
 struct Net {
     network: String,
@@ -561,8 +561,8 @@ fn a_reply_stopped_before_it_started_is_recorded_once() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
     conversation(&mut store, &net)?;
-    say(&mut store, &net, "m1", true)?;
-    let trigger = message_trigger("m1");
+    say(&mut store, &net, "m2", true)?;
+    let trigger = message_trigger("m2");
     let job = store.scheduler_job("c", &trigger)?.context("job")?;
     for _ in 0..2 {
         store.request_manager_cancel(&net.a, &net.network, "c", &trigger)?;
@@ -3503,6 +3503,76 @@ fn notes_refuse_secrets_and_sync() -> Result<()> {
 }
 
 #[test]
+fn staged_memory_commits_only_with_a_completed_turn() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    say(&mut store, &net, "m2", true)?;
+    let trigger = message_trigger("m2");
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    store.mark_started("c", &trigger, &attempt)?;
+    let staged = store.stage_memory(
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        "remember-1",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "prefers staged notes".into(),
+        },
+        4,
+    )?;
+    assert_eq!(staged["state"], "staged");
+    assert!(store.memories(&net.network, "c")?.is_empty());
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        JobOutcome::Completed,
+        "done",
+        5,
+    )?;
+    assert_eq!(store.memories(&net.network, "c")?.len(), 1);
+
+    say(&mut store, &net, "m3", true)?;
+    let trigger = message_trigger("m3");
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot-2", "cfg")?
+        .context("job")?;
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    store.mark_started("c", &trigger, &attempt)?;
+    store.stage_memory(
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        "remember-2",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "discard this note".into(),
+        },
+        6,
+    )?;
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        JobOutcome::Failed(ExecFailure::new(FailureKind::Rejected, "test")),
+        "",
+        7,
+    )?;
+    assert_eq!(store.memories(&net.network, "c")?.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn bot_settings_refuse_secrets() -> Result<()> {
     let net = net()?;
     let (mut origin, _) = bot_with_message(&net)?;
@@ -5691,6 +5761,8 @@ fn a_new_session_key_opens_a_new_thread_shown_everything() -> Result<()> {
     let shown = Shown {
         bot: Some("bot-digest".into()),
         works: [("w1".to_owned(), "work-digest".to_owned())].into(),
+        dynamic: None,
+        staged_memories: Default::default(),
     };
     let mut turn = |id: &str, key: &str| -> Result<crate::scheduling::ClaimedJob> {
         say(&mut store, &net, id, true)?;
