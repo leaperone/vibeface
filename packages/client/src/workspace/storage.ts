@@ -6,7 +6,7 @@ export function storageOf(storage: KeyValue) {
     try {
       return JSON.parse(storage.getItem(`vibeface.${key}`) ?? "null") ?? fallback
     } catch {
-      if (required) throw new Error("读不了本地需要确认的记录，已暂停发送。请不要清除这台设备上的应用数据。")
+      if (required) throw new Error("读不了本地需要确认的记录，已暂停发送。先别清除这台设备上的应用数据。")
       return fallback
     }
   }
@@ -14,7 +14,7 @@ export function storageOf(storage: KeyValue) {
     try {
       storage.setItem(`vibeface.${key}`, JSON.stringify(value))
     } catch {
-      if (required) throw new Error("保存不了这条记录。请允许保存本地数据后重试。")
+      if (required) throw new Error("保存不了这条记录。允许保存本地数据后重试。")
     }
   }
   return { readStorage, writeStorage }

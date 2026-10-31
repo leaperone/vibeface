@@ -11,13 +11,17 @@ export function answerBody(questionId: string, text: string) {
 }
 
 /**
- * What a settled question shows. `standing`: the answer the network holds. `mine`: what this browser answered.
- * When answers raced and another side's won, `elsewhere` says so instead of the person's text vanishing.
+ * What a settled question shows. `standing`: the answer the network holds. `mine`: what this device answered.
+ * `author` wrote the standing answer and `self` is this device, so a card mounted later still tells another device's answer from its own.
+ * `elsewhere`: another device answered. `beaten`: this device answered too and the other side's text won, which the card warns about
+ * instead of letting the person's text vanish.
  */
-export function settledAnswer(standing: string | undefined, mine: string | undefined) {
+export function settledAnswer(standing: string | undefined, mine: string | undefined, author?: string, self?: string) {
   const text = standing ?? mine
   if (text === undefined) return undefined
-  return { text, elsewhere: standing !== undefined && mine !== undefined && standing !== mine }
+  const beaten = standing !== undefined && mine !== undefined && standing !== mine
+  const other = standing !== undefined && author !== undefined && self !== undefined && author !== self
+  return { text, elsewhere: beaten || other, beaten }
 }
 
 /** A question's first line asks; the lines after it list what the answer applies to, each split at its first "：" into a label and a value. */

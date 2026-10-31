@@ -771,7 +771,7 @@ export function parseQuestions(value: unknown): Question[] {
 export function parseAnswer(value: unknown, questionId: string): AnswerResult {
   const data = record(value), message = record(data.message), status = data.status
   if (status !== "answered" && status !== "already_answered") throw new Error("回答结果无法识别。")
-  if (message.message_id !== answerId(questionId)) throw new Error("回答结果和这个问题对不上，请再查一次。")
+  if (message.message_id !== answerId(questionId)) throw new Error("回答结果和这个问题对不上。再查一次。")
   return { status, text: text(message.text) }
 }
 function outlet(value: unknown): Outlet {

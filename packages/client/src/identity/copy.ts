@@ -44,8 +44,8 @@ const nodeJoinReasons: [string, string][] = [
   ['already belongs to a personal network', '这台电脑已经在一个网络里了，不用再加入。'],
   ['another join is already running', '这台电脑正在用终端命令加入。等它结束后再试。'],
   ['another join is in progress', '这条链接上次用的是另一个名字。改回上次的名字再加入，会接着等批准。'],
-  ['invite link', '这不是有效的加入链接。请从管理设备的“添加设备”重新复制。'],
-  ['Vibeface ticket', '这不是有效的加入链接。请从管理设备的“添加设备”重新复制。'],
+  ['invite link', '这不是有效的加入链接。到管理设备的“添加设备”重新复制。'],
+  ['Vibeface ticket', '这不是有效的加入链接。到管理设备的“添加设备”重新复制。'],
 ]
 export const nodeJoinFailure = (reason: string) => nodeJoinReasons.find(([pattern]) => reason.includes(pattern))?.[1] ?? nodeJoinCopy.failed
 
@@ -84,7 +84,7 @@ export const addDeviceCopy = {
   installHow: '怎么装',
   orCommand: '或在那台电脑的终端运行',
   /** The browser could not write to the clipboard; the text below opens selected instead. */
-  copyFailed: '没能复制，请手动选中下面的内容',
+  copyFailed: '没能复制，手动选中下面的内容',
   compare: '新设备出现安全码后，回这里比对',
   /** After a computer joins: its AI is the next thing to set up. */
   setUpAi: '去配置它的 AI',
@@ -225,13 +225,13 @@ export const deviceCopy = {
   /** Ends on what removal cannot do: whatever already reached that device stays there. */
   removeNotice: (bot: boolean) => `${['移除后它无法再连接，要再用需重新加入', bot ? '上面的 Bot 会停止' : null, '对话记录会保留'].filter(Boolean).join('，')}。它已经拿到的内容删不掉。`,
   /**
-   * A provider's two uses on a device: one provider runs the bot, any number execute tasks. `note` is the line shown
-   * above the providers; `hint` says it again for one provider's control.
+   * A provider's two uses on a device: one provider runs the bot, any number execute tasks. `note` is the short phrase beside each use
+   * on the one line above the providers; `hint` says the whole of it for one provider's control.
    */
   roles: {
-    bot: { label: '运行 Bot', note: '只选一个，Bot 用它回复聊天', hint: (provider: string) => `Bot 用这台设备的 ${provider} 回复聊天` },
+    bot: { label: '运行 Bot', note: '选一个', hint: (provider: string) => `Bot 用这台设备的 ${provider} 回复聊天` },
     /** A task reaches a device as its bot's turn, so turning this on with no bot runs one too. */
-    execution: { label: '执行任务', note: '可开多个，派来的任务由这台设备的 Bot 交给它做', hint: (provider: string) => `派来的任务由这台设备的 Bot 交给 ${provider} 做` },
+    execution: { label: '执行任务', note: '可多个', hint: (provider: string) => `派来的任务由这台设备的 Bot 交给 ${provider} 做` },
   },
   /** How Codex work reaches an App Server: the one already running on that computer, or one Vibeface starts. */
   appServer: { system: '用已在运行的', spawn: '由 Vibeface 启动', useSpawn: '改由 Vibeface 启动' },

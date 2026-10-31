@@ -34,7 +34,7 @@ type ConnectOptions = {
   timeoutMs?: number
 }
 /** A computer that does not answer at its address: off, or on another network. */
-export const unreachableText = '连不上这台电脑。请确认它开着，并且和这里网络互通。'
+export const unreachableText = '连不上这台电脑。确认它开着，并且和这里网络互通。'
 
 export type Transport = ReturnType<typeof createTransport>
 /** What the Noise session runs over: binary frames each way; a text frame from the far side is a refusal. */
@@ -57,7 +57,7 @@ const frame = (bytes: Uint8Array) => bytes as Uint8Array<ArrayBuffer>
 const page = () => (globalThis as { location?: { origin: string; protocol: string } }).location
 
 export function validTarget(value: unknown): string {
-  if (typeof value !== 'string' || !devicePattern.test(value)) throw new Error('这个设备地址无效。请用加入链接或本机页面给的地址。')
+  if (typeof value !== 'string' || !devicePattern.test(value)) throw new Error('这个设备地址无效。改用加入链接或本机页面给的地址。')
   return value
 }
 
@@ -185,7 +185,7 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
 
   function initClient({ replaceLostKey = false } = {}): Promise<{ deviceId: string }> {
     initializing ??= keys.load({ replaceLostKey }).then(loaded => {
-      if (!devicePattern.test(loaded.deviceId)) throw new Error('这台设备保存的登录信息坏了。请重新加入。')
+      if (!devicePattern.test(loaded.deviceId)) throw new Error('这台设备保存的登录信息坏了。需要重新加入。')
       device = { deviceId: loaded.deviceId }
       return { deviceId: loaded.deviceId }
     }).catch(error => { initializing = null; throw error })
@@ -220,7 +220,7 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
   /** Trust comes from the ticket's device key; the addresses in a link or ticket are only hints. */
   async function parseJoinLink(value: string): Promise<JoinLink> {
     await initClient()
-    if (value.trim().length > 8192) throw new Error('加入链接过长。请重新复制管理设备上的链接。')
+    if (value.trim().length > 8192) throw new Error('加入链接过长。重新复制管理设备上的链接。')
     const found = joinTicket(value)
     if (!found) throw new Error('这不是 Vibeface 加入链接。')
     const ticket = JSON.parse(secure.ticketDecode(found.ticket))
@@ -302,7 +302,7 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
         if (closed) return Promise.reject(disconnected())
         const id = String(++nextId)
         return new Promise((resolve, reject) => {
-          const timer = setTimeout(() => { pending.delete(id); reject(new Error('设备还没确认结果。请先确认原操作的结果，不要重复提交。')) }, 60000)
+          const timer = setTimeout(() => { pending.delete(id); reject(new Error('设备还没确认结果。先确认原操作的结果，别重复提交。')) }, 60000)
           pending.set(id, { resolve, reject, timer })
           try { for (const record of open.sealMessage(encoder.encode(JSON.stringify({ id, method, params })))) wire.send(record) }
           catch (error) { wire.close(error as Error) }
