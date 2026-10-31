@@ -316,7 +316,8 @@ def self_test():
     nightly = make_plan(["crates/node/src/api.rs"], nightly=True)
     assert nightly["nightly"] and nightly["required_jobs"] == []
     assert nightly["rust_packages"] == [] and nightly["package_matrix"]["include"] == []
-    expect_failure(lambda: scope_plan(set(), "push", "branch", "nightly", nightly=True))
+    for event in ("push", "schedule", "workflow_dispatch", "merge_group"):
+        expect_failure(lambda event=event: scope_plan(set(), event, "branch", "nightly", nightly=True))
     docs = make_plan(["README.md", "docs/node.md"])
     assert docs["docs_only"] and docs["www"] and docs["required_jobs"] == ["quick-check", "www"]
     expected = {
