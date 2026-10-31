@@ -1279,6 +1279,7 @@ test("task filters keep the counts, device confirmations and empty state within 
     "@vibeface/client/workspace/labels.ts": taskLabels,
     "@vibeface/client/workspace/model.ts": workspaceModel,
     "@vibeface/client/workspace/questions.ts": workspaceQuestions,
+    "@/lib/utils": { cn: (...values: unknown[]) => values.filter(Boolean).join(" ") },
     "./inbox": { useInbox: () => inbox },
     "./workspace-shell": { useCreateBot: () => () => {} },
   })
@@ -1302,6 +1303,33 @@ test("task filters keep the counts, device confirmations and empty state within 
   } finally { app.close() }
 })
 
+test("a device confirmation stays visible when Bot filtering removes the first Work", () => {
+  const bots = [{ bot_id: "a", conversation_id: "chat-a", name: "Bot A" }, { bot_id: "b", conversation_id: "chat-b", name: "Bot B" }]
+  const openWork = (conversation_id: string) => ({ work_id: `work-${conversation_id}`, conversation_id, trigger: "message:one", target_node: "offline", cwd: "/project", title: conversation_id, prompt: "检查", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", thread_id: `thread-${conversation_id}` })
+  const works = [openWork("chat-a"), openWork("chat-b")]
+  const inbox = [{ key: "device", kind: "confirm", check: { kind: "device", check_id: "device", detail: "", target_node: "offline", reason: "offline", works: works.map((work) => ({ kind: "work", check_id: `work:${work.work_id}`, detail: "", work_id: work.work_id, conversation_id: work.conversation_id, target_node: work.target_node, title: work.title, reason: "offline" })) } }]
+  const workspace = { bots, selectedBot: bots[1], openWorks: works, nodes: [{ device_id: "offline", name: "离线设备", local: false, online: false, revoked: false }], questions: [], liveProgress: [], connectionOnline: true, synced: true, answered: {} }
+  const app = componentHarness("./tasks-overview.tsx", {
+    "@vibeface/client/workspace/context.tsx": { useWorkspace: () => workspace },
+    "@vibeface/client/identity/context.tsx": { useDevice: () => ({ directory: null }) },
+    "@vibeface/client/workspace/labels.ts": taskLabels,
+    "@vibeface/client/workspace/model.ts": workspaceModel,
+    "@vibeface/client/workspace/questions.ts": workspaceQuestions,
+    "@/lib/utils": { cn: (...values: unknown[]) => values.filter(Boolean).join(" ") },
+    "./inbox": { useInbox: () => inbox },
+    "./workspace-shell": { useCreateBot: () => () => {} },
+  })
+  try {
+    let elements = app.render("TasksOverview")
+    const selectBot = elements.find(({ type }) => typeof type === "function" && type.name === "TaskFilters")?.props.onBotFilter
+    assert.ok(typeof selectBot === "function")
+    selectBot("b")
+    elements = app.render("TasksOverview")
+    const checks = nestedElements(elements, ["TaskOverviewCard"]).filter(({ type }) => type === "ConfirmCard").map(({ props }) => props.check)
+    assert.deepEqual(JSON.parse(JSON.stringify(checks)).map((check: { works: { conversation_id: string }[] }) => check.works.map((work) => work.conversation_id)), [["chat-b"]])
+  } finally { app.close() }
+})
+
 test("mobile task attention counts unanswered questions and program checks and opens their inbox", () => {
   let inbox: unknown[] = [{ kind: "question", done: false }, { kind: "confirm", check: { kind: "process" } }, { kind: "question", done: true }]
   const app = componentHarness("../../../../../../apps/mobile/src/features/home/tasks.tsx", {
@@ -1322,6 +1350,28 @@ test("mobile task attention counts unanswered questions and program checks and o
     assert.equal(attention(), null)
     assert.equal(empty(), true)
     assert.equal(elements.find(({ type }) => typeof type === "function" && type.name === "MobileEmpty")?.props.read, false)
+  } finally { app.close() }
+})
+
+test("mobile task overview shows an unbound question summary and Bot entry", () => {
+  const shared = parityShared()
+  shared.openWorks = []
+  shared.overview = workspaceModel.parseWorkspaceOverview({ bots: [parityBot], questions: [{
+    question_id: "overview-question", conversation_id: "chat", bot: parityBot, text: "需要确认交付方式", severity: "attention", choices: [],
+    request_id: null, work_id: null, about: { node: "worker", agent: "codex", session_id: "session", cwd: "/project", summary: "" }, created_at_ms: 1,
+  }] })
+  const app = componentHarness("../../../../../../apps/mobile/src/features/home/tasks.tsx", {
+    "@/data/live": { useLive: () => shared, useInbox: () => [] },
+    "@/data/context": { useWorkspace: () => ({ bots: shared.bots }) },
+    "@vibeface/client/identity/context.tsx": { useDevice: () => ({ directory: null }) },
+    "@vibeface/client/workspace/labels.ts": taskLabels,
+    "@vibeface/client/workspace/model.ts": workspaceModel,
+    "@/lib/utils": { cn: (...values: unknown[]) => values.filter(Boolean).join(" ") },
+  })
+  try {
+    const elements = app.render("TasksScreen")
+    assert.equal(elements.some(({ type }) => typeof type === "function" && type.name === "MobileQuestionAttention"), true)
+    assert.equal(nestedElements(elements, ["MobileQuestionAttention"]).some(({ type, props }) => type === "Link" && props.href === "/b/bot"), true)
   } finally { app.close() }
 })
 

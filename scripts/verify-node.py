@@ -113,6 +113,7 @@ def maintenance(node, command):
 
 
 _port_base = [int(os.environ.get("VIBEFACE_PORT_BASE", "0"))]
+_assigned_ports = set()
 
 
 def available_port():
@@ -125,7 +126,10 @@ def available_port():
             try:
                 stream.bind(("127.0.0.1", port))
                 port = stream.getsockname()[1]
+                if port in _assigned_ports:
+                    continue
                 datagram.bind(("127.0.0.1", port))
+                _assigned_ports.add(port)
                 return port
             except OSError:
                 continue
@@ -539,6 +543,7 @@ class Node:
         self.directory = run / name
         self.port = port if port is not None else available_port()
         require(0 < self.port < 65536, "Node listener uses a valid port")
+        _assigned_ports.add(self.port)
         self.quic_port = available_port() if port is not None else self.port
         self.local_port = available_port()
         self.url = f"http://127.0.0.1:{self.port}"

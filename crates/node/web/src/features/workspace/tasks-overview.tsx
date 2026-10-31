@@ -76,8 +76,17 @@ export function TasksOverview() {
   const visibleCount = noticed + (visible("working") ? visibleGroups.working.length : 0) + (visible("waiting") ? visibleGroups.waiting.length : 0)
   const hasContent = visibleCount > 0
   const emptyLabel = !read ? workspace.connectionOnline ? "正在读取当前连接的任务" : "尚未读取任务，连接后再确认" : filter === "all" && botFilter === "all" ? "当前记录没有未完成的任务" : "没有符合筛选的任务"
+  const renderedDeviceChecks = new Set<string>()
   const card = (activity: WorkspaceActivity) => {
-    if (activity.kind === "work" && activity.work) return <div key={activity.id} className="grid gap-2"><TaskOverviewCard work={activity.work} projected={activity.projection} bot={activityBot(activity)} waiting={activity.facts.questions.length > 0} lookup={lookup} connected={workspace.connectionOnline && read} progress={taskProgress(activity.work, workspace.liveProgress)} />{activity.facts.questions.map((question) => <QuestionCard key={`question:${question.question_id}`} question={question} inbox from="tasks" />)}{activity.facts.checks.filter((check) => check.kind !== "device" || check.works[0]?.work_id === activity.work_id).map((check) => <ConfirmCard key={`check:${check.check_id}`} check={check} inbox from="tasks" />)}{activity.facts.overviewChecks.map((check) => <OverviewCheckCard key={`overview-check:${check.check_id}`} check={check} />)}</div>
+    if (activity.kind === "work" && activity.work) {
+      const checks = activity.facts.checks.filter((check) => {
+        if (check.kind !== "device") return true
+        if (!check.works.some((item) => item.work_id === activity.work_id) || renderedDeviceChecks.has(check.check_id)) return false
+        renderedDeviceChecks.add(check.check_id)
+        return true
+      }).map((check) => check.kind === "device" ? { ...check, works: check.works.filter((item) => matchesBot(item.conversation_id)) } : check)
+      return <div key={activity.id} className="grid gap-2"><TaskOverviewCard work={activity.work} projected={activity.projection} bot={activityBot(activity)} waiting={activity.facts.questions.length > 0} lookup={lookup} connected={workspace.connectionOnline && read} progress={taskProgress(activity.work, workspace.liveProgress)} />{activity.facts.questions.map((question) => <QuestionCard key={`question:${question.question_id}`} question={question} inbox from="tasks" />)}{checks.map((check) => <ConfirmCard key={`check:${check.check_id}`} check={check} inbox from="tasks" />)}{activity.facts.overviewChecks.map((check) => <OverviewCheckCard key={`overview-check:${check.check_id}`} check={check} />)}</div>
+    }
     if (activity.kind === "turn" && activity.job) return <TurnActivity key={activity.id} activity={activity} />
     if (activity.kind === "attention" && activity.attention) return <AttentionActivity key={activity.id} activity={activity} bot={activityBot(activity)} read={read} />
     return null
@@ -89,6 +98,7 @@ export function TasksOverview() {
     <WorkspaceMasthead attention={read ? visibleGroups.attention.length : null} working={read ? visibleGroups.working.length : null} waiting={read ? visibleGroups.waiting.length : null} online={workspace.connectionOnline} />
     <p className="text-meta text-muted-foreground">{[...overviewScope(overview.coverage), ...(!read ? ["当前连接尚未完成首读"] : !workspace.connectionOnline ? ["连接已断开，显示最近记录"] : [])].join(" · ")}</p>
     <TaskFilters filter={filter} botFilter={botFilter} bots={workspace.bots} onFilter={setFilter} onBotFilter={setBotFilter} />
+    {noticed ? <Link to="/inbox" className="flex min-h-12 items-center gap-2 rounded-lg border px-3 py-2 font-medium hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0" /><span>待处理 {noticed} 项</span><ChevronRight aria-hidden="true" className="ms-auto size-4 shrink-0 text-muted-foreground" /></Link> : null}
     {taskGroups.map(({ group, title }) => {
       if (!visible(group)) return null
       const count = visibleGroups[group].length
