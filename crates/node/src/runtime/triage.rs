@@ -5997,7 +5997,6 @@ pub(super) mod tests {
                 let network = node.network_id().await?;
                 let (human_trigger, _) = claim_reply(&node, &admin, "c", "human", crate::scheduler::boot_id()).await?;
                 let active = node.store.lock().await.scheduler_job("c", &human_trigger)?.context("active")?;
-                node.schedule_workers.lock().await.insert((network.clone(), "c".into()));
                 let before = node.store.lock().await.connection.query_row("SELECT json_array(active,permission_version,session_generation,sdk_config) FROM scheduler_sessions WHERE conversation_id='c'", [], |row| row.get::<_, String>(0))?;
                 let request = queued_task(&node, "c", "early-refusal", Provider::Pi, Some("fake/frozen")).await?;
                 {
