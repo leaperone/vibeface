@@ -535,6 +535,40 @@ const pendingResult = () => {
 }
 const settleComponent = () => new Promise(setImmediate)
 
+test("mobile provider probes discard settings that arrive after another call or connection", async () => {
+  for (const changed of ['call', 'connection', 'none']) {
+    const held = pendingResult()
+    let current = true, reads = 0, snapshot: unknown
+    const connection = { isCurrent: () => current, request: async (method: string) => {
+      if (method === 'node_settings') return ++reads === 1 ? 'initial settings' : held.promise
+      return method === 'configure_node' ? 'new settings' : 'probe result'
+    } }
+    const app = componentHarness('../../../../../../apps/mobile/src/features/devices/remote-settings.tsx', {
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: connection }) },
+    })
+    const useCall = app.module.useCall
+    assert.ok(typeof useCall === 'function')
+    app.module.Read = () => { snapshot = useCall((value: unknown) => value, 'node_settings'); return null }
+    const state = () => {
+      app.render('Read')
+      assert.ok(snapshot && typeof snapshot === 'object' && 'call' in snapshot && typeof snapshot.call === 'function' && 'value' in snapshot)
+      return { value: snapshot.value, call: snapshot.call }
+    }
+    try {
+      state(); await settleComponent()
+      assert.equal(state().value, 'initial settings')
+      const probe = state().call('probe', 'provider_probe')
+      await settleComponent()
+      assert.equal(reads, 2)
+      if (changed === 'call') await state().call('save', 'configure_node')
+      if (changed === 'connection') current = false
+      held.resolve('late settings')
+      assert.equal(await probe, changed === 'none' ? 'probe result' : null)
+      assert.equal(state().value, changed === 'none' ? 'late settings' : changed === 'call' ? 'new settings' : 'initial settings')
+    } finally { app.close() }
+  }
+})
+
 test("task filters keep the pending summary and empty state within the selected Bot", () => {
   const bots = [{ bot_id: "a", conversation_id: "chat-a", name: "Bot A" }, { bot_id: "b", conversation_id: "chat-b", name: "Bot B" }]
   const work = (conversation_id: string) => ({ kind: "work", work_id: conversation_id, check_id: conversation_id, conversation_id, target_node: "offline", title: conversation_id, detail: "", reason: "offline" })
