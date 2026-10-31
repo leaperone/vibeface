@@ -7188,7 +7188,6 @@ def e2e_fixture(options):
                     client.call("configure_provider", {"provider": "codex", "bot": False, "execution": False,
                         "bin": str(fixture_wrapper(run, "native-codex", "--fixture-codex")),
                         "app_server": SPAWN_APP_SERVER})
-                    # Startup probes an enabled manager, so only the native UI enables this provider.
                     nodes["receiver"].stop()
                     nodes["receiver"].start()
                     client.connect()
