@@ -3,6 +3,7 @@ import type { ReadyConnection } from "../lib/node.ts"
 import { messageOf } from "../lib/node.ts"
 import { parseLogs, reportLog, type LogFilter } from "../lib/web-log.ts"
 import { enqueue, settle, type OutboxItem, type OutboxStore } from "../lib/outbox.ts"
+import { requestKey } from "../lib/secure.ts"
 import type { Platform } from "../lib/platform.ts"
 import type { Tabs } from "../identity/context.tsx"
 import { mergeProgress, type LiveProgress } from "../lib/progress.ts"
@@ -18,9 +19,10 @@ import type { Avatar } from "../avatar/face.ts"
 import { avatarWrite } from "../avatar/pick.ts"
 import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions } from "./records.ts"
 import { answerBody, answerId } from "./questions.ts"
+import { memoryController, memoryResultLabel, memorySaved } from "./memory.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
 import type {
-  AnswerResult, ConversationPayload, NodeInfo, NotificationRecord, PendingAnswer, Question,
+  AnswerResult, ConversationPayload, MemoryBase, MemoryControlResult, NodeInfo, NotificationRecord, PendingAnswer, Question,
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, WriteState, WriteStatus, OpenWork, ScheduleAction, WorkspaceOverview,
 } from "./types.ts"
 import { isSessionNotification } from "./types.ts"
@@ -161,6 +163,16 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       throw caught
     }
   }
+  const memory = memoryController({
+    outbox, key: (conversationId, memoryId) => outboxKey("memory", JSON.stringify([conversationId, memoryId])),
+    rpc: (method, params) => { requireCurrent(); return connection.rpc(method, params) },
+    sign: async (scope, body) => {
+      const payload = platform.secure.attestationPayload(networkId, scope, JSON.stringify(body))
+      const signature = await platform.transport.signClient("attestation", payload)
+      requireCurrent()
+      return { attestation: { device_id: clientId, signature }, operation_id: await requestKey(payload, clientId) }
+    },
+  })
   const selectConversation = (id: string) => {
     requireCurrent()
     activeId.current = id
@@ -388,7 +400,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   /** After a (re)connection: confirm what the entry has, resubmit the rest byte for byte, stop at an unknown. */
   const settleOutbox = async () => {
     if (!tabs.leader() || !current()) return
-    const result = await settle(outbox, {
+    const result = await settle({ ...outbox, all: async () => (await outbox.all()).filter(item => item.method !== "control_memory") }, {
       recorded: async (item) => { requireCurrent(); return recorded(item) },
       submit: async (item) => { requireCurrent(); await connection.rpc(item.method, item.params) },
     })
@@ -397,6 +409,17 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const refusedFaces = result.rejected.filter((key) => key.startsWith(outboxKey("bot-avatar", "")))
     for (const key of refusedFaces) await outbox.delete(key)
     if (refusedFaces.length && current()) setNoticeText("之前没确认的那次长相修改被拒绝，没有生效。")
+    for (const item of (await outbox.all()).filter(item => item.method === "control_memory")) {
+      const key = `memory:${item.params.conversation_id}:${item.params.memory_id}`
+      if (inFlight.current.has(key)) continue
+      inFlight.current.add(key)
+      try {
+        const reconciled = await memory.reconcile(item)
+        if (current() && !memorySaved(reconciled)) setNoticeText(memoryResultLabel(reconciled))
+        scheduleRefresh()
+      } catch (caught) { showError(caught, "查明未确认的记忆操作"); break }
+      finally { inFlight.current.delete(key) }
+    }
     await outboxChanged()
     if (result.confirmed.length || result.resubmitted.length || result.rejected.length) scheduleRefresh()
   }
@@ -699,6 +722,17 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       requireCurrent()
       const written = parseBot(record(result).bot)
       setBots((previous) => previous.map((bot) => bot.conversation_id === id ? { ...bot, avatar: written.avatar, avatar_version: written.avatar_version } : bot))
+    }),
+    controlMemory: (conversationId: string, memoryId: string, base: MemoryBase, after: string | null) => withMutation(`memory:${conversationId}:${memoryId}`, async (): Promise<MemoryControlResult> => {
+      requireBotContext(conversationId)
+      let result: MemoryControlResult
+      try { result = await memory.controlMemory(conversationId, memoryId, base, after) }
+      catch (caught) { requireControlRefresh(caught); throw caught }
+      finally { await outboxChanged() }
+      requireCurrent()
+      setNoticeText(memoryResultLabel(result))
+      if (activeId.current === conversationId) await refreshRef.current()
+      return result
     }),
     deleteBot: (id: string) => withMutation(`bot-delete:${id}`, async () => {
       const attestation = await attest(id, { type: "bot_deleted" })

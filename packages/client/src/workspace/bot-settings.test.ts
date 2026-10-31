@@ -2,7 +2,10 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { botModelRows, formatIn, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger, sortSchedules } from "./bot-settings.ts"
 import { parseBots, parseConversation } from "./model.ts"
-import type { BotChangeRecord } from "./types.ts"
+import type { BotChangeRecord, MemoryMetadata } from "./types.ts"
+import type { OutboxItem, OutboxStore } from "../lib/outbox.ts"
+import { requestKey } from "../lib/secure.ts"
+import { DATA_EPOCH, memoryBase, memoryController, memoryResultLabel, memorySaved, parseMemoryControlResult, parseMemoryStateResult } from "./memory.ts"
 
 const at = (day: number, hour: number, minute = 0) => new Date(2026, 9, day, hour, minute).getTime()
 
@@ -12,6 +15,223 @@ test("unknown running providers still show effort-only Bot preferences without d
   assert.deepEqual(botModelRows(bot, null), [["codex", ""], ["claude", "sonnet"]])
   assert.deepEqual(botModelRows(bot, "pi"), [["pi", ""]])
   assert.deepEqual(botModelRows({ models: {} }, null), [])
+})
+
+const memoryMetadata: MemoryMetadata = { epoch: DATA_EPOCH, revision: 'a'.repeat(64), control_revision: 1, source_event_hash: 'c'.repeat(64), origin: 'user', user_controlled: true, essential: true }
+const memoryState = (revision = memoryMetadata.revision, text: string | null = '现有记忆') => ({ memory_id: 'memory', text, metadata: { ...memoryMetadata, revision } })
+const operationId = 'e'.repeat(64)
+function memoryClient(rpc: (method: string, params: Record<string, unknown>) => Promise<unknown>) {
+  const items = new Map<string, OutboxItem>(), signed: Record<string, unknown>[] = []
+  const outbox: OutboxStore = {
+    all: async () => structuredClone([...items.values()]),
+    put: async (item) => { items.set(item.key, structuredClone(item)) },
+    delete: async (key) => { items.delete(key) },
+  }
+  const client = memoryController({ outbox, rpc, key: (conversationId, memoryId) => JSON.stringify([conversationId, memoryId]), sign: async (_conversationId, body) => {
+    signed.push(body)
+    return { operation_id: operationId, attestation: { device_id: 'b'.repeat(64), signature: 'original-signature' } }
+  } })
+  return { ...client, outbox, signed }
+}
+
+test('Memory request key matches the Rust canonical payload vector', async () => {
+const payload = new TextEncoder().encode('{"body":{"after":"用中文","base":{"epoch":12,"version":null},"memory_id":"memory","type":"memory_controlled"},"network_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","scope_id":"chat"}')
+  assert.equal(await requestKey(payload, 'b'.repeat(64)), 'e7a5478f88f2f3860ab397cea199305703b0a2e43f47662f559b695e2a9d25f6')
+  assert.notEqual(await requestKey(payload, 'c'.repeat(64)), await requestKey(payload, 'b'.repeat(64)))
+})
+
+test('Memory create signs only the frozen body and accepts the matching current receipt', async () => {
+  const sent: unknown[] = []
+  const client = memoryClient(async (method, params) => {
+    sent.push({ method, params })
+    return { state: 'applied', operation_id: operationId, current: memoryState(operationId, '用中文') }
+  })
+  const base = memoryBase(null)
+  const result = await client.controlMemory('chat', 'memory', base, '用中文')
+  assert.deepEqual(client.signed, [{ type: 'memory_controlled', memory_id: 'memory', base: { epoch: DATA_EPOCH, version: null }, after: '用中文' }])
+  assert.deepEqual(sent, [{ method: 'control_memory', params: { conversation_id: 'chat', memory_id: 'memory', base, after: '用中文', operation_id: operationId, attestation: { device_id: 'b'.repeat(64), signature: 'original-signature' } } }])
+  assert.equal(memorySaved(result), true)
+  assert.equal(memoryResultLabel(result), '记忆已保存。')
+  assert.deepEqual(await client.outbox.all(), [])
+})
+
+test('fresh Memory rejection lets the user correct the same memory without retrying the refused draft', async () => {
+  for (const code of ['credential', 'quota']) {
+    const rejected = Object.assign(new Error(code), { responded: true })
+    const calls: { method: string; after: unknown }[] = []
+    const client = memoryClient(async (method, params) => {
+      calls.push({ method, after: params.after })
+      if (calls.length === 1) throw rejected
+      return { state: 'applied', operation_id: operationId, current: memoryState(operationId, '改正后的草稿') }
+    })
+    const base = memoryBase(memoryMetadata)
+    await assert.rejects(client.controlMemory('chat', 'memory', base, '原草稿'), (caught) => caught === rejected)
+    assert.deepEqual(await client.outbox.all(), [], 'a fresh explicit refusal cannot keep the editable draft blocked')
+    const corrected = await client.controlMemory('chat', 'memory', base, '改正后的草稿')
+    assert.equal(corrected.current?.text, '改正后的草稿')
+    assert.deepEqual(client.signed.map(body => body.after), ['原草稿', '改正后的草稿'])
+    assert.deepEqual(calls, [{ method: 'control_memory', after: '原草稿' }, { method: 'control_memory', after: '改正后的草稿' }])
+    assert.deepEqual(await client.outbox.all(), [])
+  }
+})
+
+test('unknown Memory retry rejection still needs a receipt before discarding the original operation', async () => {
+  const rejected = Object.assign(new Error('credential'), { responded: true })
+  const writes: Record<string, unknown>[] = []
+  let recorded = false
+  const client = memoryClient(async (method, params) => {
+    if (method === 'memory_state') return recorded ? { receipt: 'recorded', current: memoryState(operationId) } : { receipt: 'not_seen_here', current: memoryState() }
+    writes.push(structuredClone(params))
+    if (writes.length === 1) throw new Error('timeout')
+    throw rejected
+  })
+  const base = memoryBase(memoryMetadata)
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '原草稿'), /timeout/)
+  const original = await client.outbox.all()
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '原草稿'), (caught) => caught === rejected)
+  assert.deepEqual(await client.outbox.all(), original)
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '改正后的草稿'), (caught) => caught === rejected)
+  assert.deepEqual(await client.outbox.all(), original)
+  assert.deepEqual(writes, [original[0].params, original[0].params, original[0].params])
+  assert.equal(client.signed.length, 1)
+  recorded = true
+  assert.equal((await client.controlMemory('chat', 'memory', base, '原草稿')).state, 'already_recorded')
+  assert.deepEqual(await client.outbox.all(), [])
+})
+
+test('Memory deletion signs the observed base and retains the tombstone in its result', async () => {
+  const client = memoryClient(async () => ({ state: 'applied', operation_id: operationId, current: memoryState(operationId, null) }))
+  await assert.rejects(client.controlMemory('chat', 'memory', memoryBase(null), null), /需要当前版本/)
+  assert.equal(client.signed.length, 0)
+  const base = memoryBase(memoryMetadata)
+  const result = await client.controlMemory('chat', 'memory', base, null)
+  assert.deepEqual(client.signed, [{ type: 'memory_controlled', memory_id: 'memory', base, after: null }])
+  assert.equal(result.current?.text, null)
+  assert.equal(memoryResultLabel(result), '记忆已删除。')
+})
+
+test('a malformed Memory write receipt remains unknown until the original operation is read back', async () => {
+  const client = memoryClient(async (method) => method === 'control_memory'
+    ? { state: 'applied', operation_id: 'f'.repeat(64), current: memoryState(operationId) }
+    : { receipt: 'recorded', current: memoryState(operationId) })
+  const base = memoryBase(memoryMetadata)
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '原草稿'), /原操作不一致/)
+  assert.equal((await client.outbox.all()).length, 1)
+  assert.equal((await client.controlMemory('chat', 'memory', base, '原草稿')).state, 'already_recorded')
+  assert.equal(client.signed.length, 1)
+  assert.deepEqual(await client.outbox.all(), [])
+})
+
+test('an unknown Memory write stays byte-for-byte when reconciliation fails or another draft is submitted', async () => {
+  const calls: string[] = []
+  const client = memoryClient(async (method) => { calls.push(method); throw new Error('disconnected') })
+  const base = memoryBase(memoryMetadata)
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '原草稿'), /disconnected/)
+  const original = await client.outbox.all()
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '新草稿'), /disconnected/)
+  assert.deepEqual(await client.outbox.all(), original)
+  assert.equal(client.signed.length, 1)
+  assert.deepEqual(calls, ['control_memory', 'memory_state'])
+})
+
+test('an entrance not seeing the operation preserves its unknown outbox when the base changed, including a tombstone', async () => {
+  let query = false
+  const client = memoryClient(async (method, params) => {
+    if (method === 'control_memory') throw new Error('timeout')
+    assert.deepEqual(params, { conversation_id: 'chat', memory_id: 'memory', operation_id: operationId })
+    query = true
+    return { receipt: 'not_seen_here', current: memoryState('f'.repeat(64), null) }
+  })
+  const base = memoryBase(memoryMetadata)
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '原草稿'))
+  const original = await client.outbox.all()
+  const result = await client.controlMemory('chat', 'memory', base, '原草稿')
+  assert.equal(query, true)
+  assert.equal(result.state, 'conflict')
+  assert.equal(result.current?.text, null)
+  assert.equal(memorySaved(result), false)
+  assert.deepEqual(await client.outbox.all(), original)
+  await assert.rejects(client.controlMemory('chat', 'memory', memoryBase(result.current?.metadata ?? null), '新草稿'), /草稿已保留/)
+  assert.equal(client.signed.length, 1)
+  assert.deepEqual(await client.outbox.all(), original)
+})
+
+test('Memory retry sends its original attestation after reconciliation despite a different carrier representative', async () => {
+  const writes: Record<string, unknown>[] = []
+  const client = memoryClient(async (method, params) => {
+    if (method === 'memory_state') return { receipt: 'not_seen_here', current: { ...memoryState(), metadata: { ...memoryMetadata, source_event_hash: 'd'.repeat(64) } } }
+    writes.push(structuredClone(params))
+    if (writes.length === 1) throw new Error('timeout')
+    return { state: 'applied', operation_id: operationId, current: memoryState(operationId) }
+  })
+  const base = memoryBase(memoryMetadata)
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '原草稿'))
+  assert.equal((await client.controlMemory('chat', 'memory', base, '原草稿')).state, 'applied')
+  assert.deepEqual(writes[1], writes[0])
+  assert.equal(client.signed.length, 1)
+  assert.deepEqual(await client.outbox.all(), [])
+})
+
+test('a replayed Memory request that now conflicts cannot erase the original unknown operation', async () => {
+  let writes = 0
+  const client = memoryClient(async (method) => {
+    if (method === 'memory_state') return { receipt: 'not_seen_here', current: memoryState() }
+    if (++writes === 1) throw new Error('timeout')
+    return { state: 'conflict', operation_id: operationId, current: memoryState('f'.repeat(64)) }
+  })
+  const base = memoryBase(memoryMetadata)
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '原草稿'))
+  const original = await client.outbox.all()
+  assert.equal((await client.controlMemory('chat', 'memory', base, '原草稿')).state, 'conflict')
+  assert.equal(client.signed.length, 1)
+  assert.deepEqual(await client.outbox.all(), original)
+})
+
+test('a superseded Memory receipt clears only the known operation and never reports saved', async () => {
+  const calls: string[] = []
+  const client = memoryClient(async (method) => {
+    calls.push(method)
+    if (method === 'control_memory') throw new Error('timeout')
+    return { receipt: 'superseded', current: memoryState('f'.repeat(64)) }
+  })
+  const base = memoryBase(memoryMetadata)
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '原草稿'))
+  const result = await client.controlMemory('chat', 'memory', base, '原草稿')
+  assert.equal(result.state, 'superseded')
+  assert.equal(memorySaved(result), false)
+  assert.match(memoryResultLabel(result), /已被其他修改替代.*草稿已保留/)
+  assert.deepEqual(calls, ['control_memory', 'memory_state'])
+  assert.deepEqual(await client.outbox.all(), [])
+  assert.equal(client.signed.length, 1)
+})
+
+test('a recorded old Memory draft cannot be mistaken for saving the new draft', async () => {
+  const client = memoryClient(async (method) => {
+    if (method === 'control_memory') throw new Error('timeout')
+    return { receipt: 'recorded', current: memoryState(operationId, '原草稿') }
+  })
+  const base = memoryBase(memoryMetadata)
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '原草稿'))
+  await assert.rejects(client.controlMemory('chat', 'memory', base, '新草稿'), /草稿已保留/)
+  assert.equal(client.signed.length, 1)
+  assert.deepEqual(await client.outbox.all(), [])
+})
+
+test('Memory state, result and metadata fail closed on malformed or mismatched receipts', () => {
+  const result = { state: 'applied', operation_id: operationId, current: memoryState(operationId) }
+  assert.equal(parseMemoryControlResult(result, 'memory', operationId).state, 'applied')
+  assert.throws(() => parseMemoryControlResult({ ...result, operation_id: 'f'.repeat(64) }, 'memory', operationId))
+  assert.throws(() => parseMemoryControlResult({ ...result, current: memoryState() }, 'memory', operationId))
+  assert.throws(() => parseMemoryControlResult({ ...result, current: { ...result.current, memory_id: 'other' } }, 'memory', operationId))
+  for (const invalid of [{ control_revision: undefined }, { control_revision: -1 }, { control_revision: 0x1_0000_0000 }, { source_event_hash: null }, { origin: 'import' }, { epoch: DATA_EPOCH - 1 }]) {
+    assert.throws(() => parseMemoryControlResult({ ...result, current: { ...result.current, metadata: { ...result.current.metadata, ...invalid } } }, 'memory', operationId))
+  }
+  assert.throws(() => parseMemoryControlResult({ ...result, state: 'success' }, 'memory', operationId))
+  assert.throws(() => parseMemoryStateResult({ current: result.current }, 'memory', operationId))
+  assert.throws(() => parseMemoryStateResult({ current: result.current, receipt: null }, 'memory', operationId))
+  assert.throws(() => parseMemoryStateResult({ current: memoryState(), receipt: 'recorded' }, 'memory', operationId))
+  assert.throws(() => parseMemoryStateResult({ current: result.current, receipt: 'superseded' }, 'memory', operationId))
+  assert.deepEqual(parseMemoryStateResult({ current: memoryState('f'.repeat(64), null), receipt: null }, 'memory').current?.text, null)
 })
 
 test("schedule frequency reads as plain words in local time", () => {
@@ -83,7 +303,7 @@ test("changes sit after the reply to their message, else after the message, else
   assert.deepEqual(placed.after.get("u2"), [[third], [later]])
   assert.equal(placed.after.has("u1"), false)
   assert.deepEqual(placed.first, [[uncaused]])
-  assert.equal(scheduleName("r", { skills: [], schedules: [], memory: [] }, [first, second]), "y")
+  assert.equal(scheduleName("r", { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, [first, second]), "y")
   assert.equal(scheduleName("other", undefined), "定时任务")
 })
 
@@ -98,7 +318,7 @@ test("conversation snapshots parse bot changes strictly", () => {
         { schedule_id: "r", name: "看依赖", prompt: "p", first_run_at_ms: 1, every_minutes: 1440, enabled: false, next_run_at_ms: null },
         { schedule_id: "o", name: "提醒", prompt: "p", first_run_at_ms: 5, enabled: true, depth: 1, next_run_at_ms: 5 },
       ],
-      memory: [{ memory_id: "m", text: "用中文" }],
+        memory: [{ memory_id: "m", text: "用中文", metadata: { epoch: 12, revision: "a".repeat(64), control_revision: 0, source_event_hash: "b".repeat(64), origin: "agent", user_controlled: false, essential: true } }], memory_sync_conflicts: { items: [], has_more: false },
     },
     changes: [
       { change_id: "c1", conversation_id: "chat", cause: { conversation_id: "chat", message_id: "u1" }, event_hash: "h1", created_at_ms: 2, change: { kind: "profile", name: { before: "旧", after: "新" } } },
@@ -116,7 +336,7 @@ test("conversation snapshots parse bot changes strictly", () => {
   assert.equal(parsed.bot_settings.schedules[0]?.every_minutes, 1440)
   assert.equal("every_minutes" in parsed.bot_settings.schedules[1]!, false)
   assert.equal(scheduleFrequency(parsed.bot_settings.schedules[1]!), "一次")
-  assert.deepEqual(parsed.bot_settings.memory, [{ memory_id: "m", text: "用中文" }])
+  assert.deepEqual(parsed.bot_settings.memory, base.bot_settings.memory)
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[2], change: { kind: "memory", memory_id: "m", before: null, after: null } }] }, "chat"))
   assert.throws(() => parseConversation({ ...base, bot_settings: { ...base.bot_settings, schedules: [{ ...base.bot_settings.schedules[0], every_minutes: 0 }] } }, "chat"))
   assert.throws(() => parseConversation({ ...base, changes: undefined }, "chat"))
@@ -139,7 +359,7 @@ test("conversation snapshots parse bot changes strictly", () => {
 test("a change another device replaced reads as one line and asks for it back the usual way", () => {
   const base = {
     conversation: { conversation_id: "chat", title: "t", owner: null, owner_epoch: 0 }, messages: [], works: [], deliveries: [], checks: [], local_node: "n",
-    questions: [], sessions: [], sent: [], changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [] },
+    questions: [], sessions: [], sent: [], changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } },
   }
   assert.deepEqual(parseConversation(base, "chat").overwritten, [])
   const item = (value: Record<string, unknown>) => parseConversation({ ...base, overwritten: [{ change_id: "c1", by: "dev-b", ...value }] }, "chat").overwritten[0]!

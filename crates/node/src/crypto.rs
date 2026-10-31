@@ -142,7 +142,8 @@ impl LocalIdentity {
             | EventBody::PrimaryBotSet { attestation, .. }
             | EventBody::BotProjectSet { attestation, .. }
             | EventBody::BotAvatarSet { attestation, .. }
-            | EventBody::ScheduleControlled { attestation, .. } => *attestation = value,
+            | EventBody::ScheduleControlled { attestation, .. }
+            | EventBody::MemoryControlled { attestation, .. } => *attestation = value,
             _ => anyhow::bail!("this event carries no device signature"),
         }
         Ok(body)
@@ -320,6 +321,16 @@ pub fn attestation_payload(network_id: &str, scope_id: &str, body: &EventBody) -
     )?)
 }
 
+/// A logical signed operation keeps its identity across entry Node envelopes.
+pub fn request_key(network: &str, scope: &str, body: &EventBody, author: &str) -> Result<String> {
+    let signer = body
+        .attestation()
+        .map_or(author, |attestation| attestation.device_id.as_str());
+    let mut signed = attestation_payload(network, scope, body)?;
+    signed.extend_from_slice(signer.as_bytes());
+    Ok(digest(&signed))
+}
+
 /// The user's own writes must carry their device signature; nothing else may carry one.
 enum UserSignature {
     Required,
@@ -350,7 +361,8 @@ fn validate_attestation(event: &Event) -> Result<()> {
         | EventBody::PrimaryBotSet { .. }
         | EventBody::BotProjectSet { .. }
         | EventBody::BotAvatarSet { .. }
-        | EventBody::ScheduleControlled { .. } => UserSignature::Required,
+        | EventBody::ScheduleControlled { .. }
+        | EventBody::MemoryControlled { .. } => UserSignature::Required,
         EventBody::WorkFinished {
             outcome: WorkOutcome::Completed | WorkOutcome::Interrupted,
             ..
@@ -715,6 +727,25 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             change.validate()?;
         }
         EventBody::ScheduleControlled { schedule_id, .. } => id(schedule_id)?,
+        EventBody::MemoryControlled {
+            memory_id,
+            base,
+            after,
+            ..
+        } => {
+            id(memory_id)?;
+            ensure!(
+                event.scope_id != BOTS_SCOPE,
+                "a memory belongs to its bot's conversation"
+            );
+            base.validate()?;
+            base.next_control_revision()?;
+            ensure!(
+                after.is_some() || base.version.is_some(),
+                "a memory deletion needs a base"
+            );
+            after.as_deref().map(validate_memory).transpose()?;
+        }
         EventBody::MessageSteered { message_id, reply } => {
             id(message_id)?;
             id(reply)?;
@@ -810,6 +841,28 @@ mod tests {
             }
             .provider_fingerprint(payload)
             .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_request_key_matches_the_shared_client_vector() -> Result<()> {
+        let network = "a".repeat(64);
+        let body = EventBody::MemoryControlled {
+            memory_id: "memory".into(),
+            base: MemoryBase {
+                epoch: 12,
+                version: None,
+            },
+            after: Some("用中文".into()),
+            attestation: Some(Attestation {
+                device_id: "b".repeat(64),
+                signature: String::new(),
+            }),
+        };
+        assert_eq!(
+            request_key(&network, "chat", &body, "")?,
+            "e7a5478f88f2f3860ab397cea199305703b0a2e43f47662f559b695e2a9d25f6"
         );
         Ok(())
     }

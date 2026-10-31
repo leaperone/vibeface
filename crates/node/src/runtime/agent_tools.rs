@@ -59,7 +59,6 @@ impl Runtime {
         stage: &mut &'static str,
     ) -> Result<Value> {
         *stage = "authorization";
-        let name = tool.name();
         let _work = self.maintenance.enter()?;
         ensure!(!access.human, "tool endpoint requires a scoped Agent token");
         let scope = access
@@ -67,6 +66,7 @@ impl Runtime {
             .clone()
             .context("missing tool scope")?;
         self.require_scope(&access, &scope).await?;
+        let name = tool.name();
         if let Some(call_ref) = args["call_ref"].as_str()
             && vibeface_protocol::validate_id(call_ref).is_err()
         {
@@ -78,16 +78,19 @@ impl Runtime {
             tool.effect() == Effect::Read || access.manager.is_some(),
             "work changes require a live agent invocation"
         );
-        if let Some(manager) = &access.manager
-            && tool.effect() != Effect::Read
-        {
-            let kind = self
-                .store
-                .lock()
-                .await
-                .scheduler_job(&scope, &manager.trigger)?
-                .context("this turn is not running here")?
-                .kind;
+        let kind = if let Some(manager) = &access.manager {
+            Some(
+                self.store
+                    .lock()
+                    .await
+                    .scheduler_job(&scope, &manager.trigger)?
+                    .context("this turn is not running here")?
+                    .kind,
+            )
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
             ensure!(
                 tool.effect().offered(kind),
                 "{name} is not offered in a {kind:?} turn"
@@ -100,40 +103,9 @@ impl Runtime {
         *stage = "execution";
         let network = access.network_id.as_str();
         match tool {
-            Tool::ToolSearch | Tool::ToolDescribe => {
-                let kind = match &access.manager {
-                    Some(manager) => Some(
-                        self.store
-                            .lock()
-                            .await
-                            .scheduler_job(&scope, &manager.trigger)?
-                            .context("this turn is not running here")?
-                            .kind,
-                    ),
-                    None => None,
-                };
-                if tool == Tool::ToolDescribe {
-                    let target = Tool::parse(field(&args, "name")?)
-                        .filter(|tool| tool.available(kind))
-                        .context("unknown or unavailable target tool")?;
-                    return Ok(
-                        json!({"name":target.name(),"description":target.schema().expect("available schema").0,
-                        "input_schema":target.input_schema()}),
-                    );
-                }
-                let query = args["query"].as_str().unwrap_or("").to_lowercase();
-                let mut found: Vec<_> = Tool::ALL.into_iter().filter(|tool| tool.available(kind))
-                    .filter_map(|tool| {
-                        let description = tool.schema()?.0;
-                        format!("{} {description}", tool.name()).to_lowercase().contains(&query)
-                            .then(|| json!({"name":tool.name(),"description":description.split('.').next().unwrap_or(description)}))
-                    }).collect();
-                let limit = args["limit"].as_u64().unwrap_or(20) as usize;
-                let more = found.len() > limit;
-                found.truncate(limit);
-                Ok(json!({"tools":found,"more":more}))
-            }
-            Tool::ToolCall => unreachable!("discovery calls are resolved before admission"),
+            Tool::Search => Tool::search(args, kind),
+            Tool::Describe => Tool::describe(args, kind),
+            Tool::Call => unreachable!("discovery calls are resolved before admission"),
             Tool::HistorySearch | Tool::HistoryRead => {
                 self.agent_history(&access, &scope, tool, &args).await
             }
@@ -151,15 +123,56 @@ impl Runtime {
                 work_status(&works, &dispatches, &args)
             }
             Tool::CallLookup => {
-                self.call_lookup(&access, &scope, field(&args, "call_ref")?)
-                    .await
+                let manager = access
+                    .manager
+                    .as_ref()
+                    .context("call lookup requires an agent invocation")?;
+                let call_ref = field(&args, "call_ref")?;
+                let id = WorkSpec::id(&scope, &manager.trigger, call_ref);
+                let store = self.store.lock().await;
+                if let Some(work) = store
+                    .works(network, &scope)?
+                    .into_iter()
+                    .find(|work| work.work_id == id)
+                {
+                    return Ok(json!(work));
+                }
+                if let Some(dispatch) = store.dispatch(&id)? {
+                    return Ok(dispatch_row(&dispatch));
+                }
+                if let Some(change) =
+                    store.bot_change(network, &change_id(&scope, &manager.trigger, call_ref))?
+                {
+                    return Ok(json!(change));
+                }
+                if let Some(staged) = store.staged_memory_call(
+                    &scope,
+                    &manager.trigger,
+                    &manager.attempt_id,
+                    call_ref,
+                )? {
+                    return Ok(staged);
+                }
+                if let Some(message) = store
+                    .bot_message(network, &bot_message_id(&scope, &manager.trigger, call_ref))?
+                {
+                    return Ok(json!(message));
+                }
+                let (bot_id, _) = created_bot_id(&scope, &manager.trigger, call_ref);
+                let bot = store
+                    .bots(network)?
+                    .into_iter()
+                    .find(|bot| bot.bot_id == bot_id)
+                    .context(
+                        "nothing was dispatched, changed, sent or created with this call_ref",
+                    )?;
+                Ok(tool_bot(&bot))
             }
             Tool::Recall => {
                 let query = args["query"].as_str().map(str::to_lowercase);
-                let notes: Vec<_> = self
-                    .store
-                    .lock()
-                    .await
+                let manager = access.manager.as_ref();
+                let store = self.store.lock().await;
+                let mut notes: Vec<_> = store
                     .memories(network, &scope)?
                     .into_iter()
                     .filter(|note| {
@@ -168,7 +181,38 @@ impl Runtime {
                             .is_none_or(|query| note.text.to_lowercase().contains(query))
                     })
                     .collect();
-                Ok(json!({ "memory": notes }))
+                let mut staged = Vec::new();
+                if let Some(manager) = manager {
+                    for mutation in store.staged_memory_overlay(
+                        &scope,
+                        &manager.trigger,
+                        &manager.attempt_id,
+                    )? {
+                        notes.retain(|note| note.memory_id != mutation.memory_id);
+                        if let Some(text) = mutation.after {
+                            if query
+                                .as_ref()
+                                .is_none_or(|query| text.to_lowercase().contains(query))
+                            {
+                                notes.push(crate::model::MemoryEntry {
+                                    memory_id: mutation.memory_id.clone(),
+                                    text: text.clone(),
+                                });
+                                staged.push(json!({
+                                    "memory_id": mutation.memory_id,
+                                    "text": text,
+                                    "state": "staged"
+                                }));
+                            }
+                        } else {
+                            staged.push(json!({
+                                "memory_id": mutation.memory_id,
+                                "state": "staged_forget"
+                            }));
+                        }
+                    }
+                }
+                Ok(json!({ "memory": notes, "staged": staged }))
             }
             Tool::FetchUrl => crate::fetch::fetch_url(field(&args, "url")?).await,
             Tool::ListBots => {
@@ -324,8 +368,6 @@ impl Runtime {
             | Tool::RemoveSkill
             | Tool::SaveSchedule
             | Tool::RemoveSchedule
-            | Tool::Remember
-            | Tool::Forget
             | Tool::Remind => {
                 let manager = access
                     .manager
@@ -364,6 +406,30 @@ impl Runtime {
                     );
                 }
                 Ok(json!(record))
+            }
+            Tool::Remember | Tool::Forget => {
+                let manager = access
+                    .manager
+                    .as_ref()
+                    .context("memory changes require an agent invocation")?;
+                let call_ref = field(&args, "call_ref")?.to_owned();
+                let mut request = args;
+                let fields = request
+                    .as_object_mut()
+                    .context("tool arguments must be an object")?;
+                fields.remove("call_ref");
+                fields.insert("tool".into(), json!(name));
+                let request: ChangeRequest =
+                    serde_json::from_value(request).context("invalid memory mutation")?;
+                self.store.lock().await.stage_memory(
+                    network,
+                    &scope,
+                    &manager.trigger,
+                    &manager.attempt_id,
+                    &call_ref,
+                    request,
+                    now_ms(),
+                )
             }
             Tool::TrackWork => self.track_work(&access, &scope, &args).await,
             Tool::BindWork => {
@@ -560,8 +626,31 @@ impl Runtime {
             Value::Null => vec![],
             types => serde_json::from_value(types.clone()).context("types lists event types")?,
         };
+        let author = args
+            .get("author")
+            .map(|value| value.as_str().context("author must be a string"))
+            .transpose()?;
+        let keyword = args
+            .get("keyword")
+            .map(|value| value.as_str().context("keyword must be a string"))
+            .transpose()?;
         let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
-        let (events, more) = store.history_page(network, scope, &basis, at, &kinds, limit)?;
+        let (events, more) = if author.is_none() && keyword.is_none() {
+            store.history_page(network, scope, &basis, at, &kinds, limit)?
+        } else {
+            store.search_history_page(
+                network,
+                scope,
+                &basis,
+                at,
+                crate::store::HistoryFilter {
+                    kinds: &kinds,
+                    author,
+                    keyword,
+                },
+                limit,
+            )?
+        };
         drop(store);
         let after = at.is_some_and(|(_, _, after)| after);
         let mut rows = Vec::new();
@@ -578,10 +667,15 @@ impl Runtime {
             }
             rows.push(row);
         }
+        let more = more || cut;
+        let next = rows
+            .last()
+            .filter(|_| more)
+            .map(|row| json!({"author":row["author"],"seq":row["seq"]}));
         if !after {
             rows.reverse();
         }
-        Ok(json!({"events":rows,"more":more || cut}))
+        Ok(json!({"events":rows,"more":more,"next":next}))
     }
 
     async fn call_lookup(&self, access: &Access, scope: &str, call_ref: &str) -> Result<Value> {
@@ -1145,7 +1239,7 @@ mod tests {
                 .tool(
                     access.clone(),
                     "tool_call",
-                    json!({"name":"history_search","arguments":args}),
+                    json!({"tool":"history_search","arguments":args}),
                 )
                 .await?;
             assert!(result.to_string().len() <= PAGE_BYTES + 1_024);
@@ -1248,7 +1342,7 @@ mod tests {
             node.tool(
                 idle,
                 "tool_call",
-                json!({"name":"create_bot","arguments":{"call_ref":"one","name":"Docs"}})
+                json!({"tool":"create_bot","arguments":{"call_ref":"one","name":"Docs"}})
             )
             .await
             .is_err()
@@ -1257,7 +1351,7 @@ mod tests {
             .tool(
                 access.clone(),
                 "tool_call",
-                json!({"name":"create_bot","arguments":{"name":"Docs"},"call_ref":"one"}),
+                json!({"tool":"create_bot","arguments":{"name":"Docs"},"call_ref":"one"}),
             )
             .await?;
         let basis = node.store.lock().await.version_vector(&network)?;
@@ -1286,7 +1380,7 @@ mod tests {
             node.tool(
                 access,
                 "tool_call",
-                json!({"name":"create_bot","arguments":{"name":"Different"},"call_ref":"one"})
+                json!({"tool":"create_bot","arguments":{"name":"Different"},"call_ref":"one"})
             )
             .await
             .is_err()

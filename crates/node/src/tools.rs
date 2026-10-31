@@ -9,7 +9,11 @@ use crate::{
     scheduling::TriggerKind,
 };
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+/// Version of the Effect/offered rules, independent of per-attempt token fences.
+pub const PERMISSION_POLICY_VERSION: u64 = 1;
 
 /// Event types `context` filters by; see `EventBody::kind`.
 const EVENT_TYPES: [&str; 12] = [
@@ -29,11 +33,9 @@ const EVENT_TYPES: [&str; 12] = [
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
-    ToolSearch,
-    ToolDescribe,
-    ToolCall,
-    HistorySearch,
-    HistoryRead,
+    Search,
+    Describe,
+    Call,
     Nodes,
     Context,
     DispatchWork,
@@ -64,9 +66,12 @@ pub enum Tool {
     TrackWork,
     BindWork,
     WaitWork,
+    HistorySearch,
+    HistoryRead,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Effect {
     Read,
     /// Starts or stops work, or hands a session on; needs a live agent invocation.
@@ -89,20 +94,43 @@ impl Effect {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolSearch {
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "search_limit")]
+    limit: usize,
+}
+
+fn search_limit() -> usize {
+    20
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolDescribe {
+    tool: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolCall {
+    tool: String,
+    arguments: serde_json::Map<String, Value>,
+    #[serde(default)]
+    call_ref: Option<String>,
+}
+
 impl Tool {
-    pub const DISCOVERY: [Tool; 4] = [
-        Self::ToolSearch,
-        Self::ToolDescribe,
-        Self::ToolCall,
-        Self::CallLookup,
-    ];
+    pub const DISCOVERY: [Tool; 4] = [Self::Search, Self::Describe, Self::Call, Self::CallLookup];
 
     pub const ALL: [Tool; 35] = [
-        Tool::ToolSearch,
-        Tool::ToolDescribe,
-        Tool::ToolCall,
-        Tool::HistorySearch,
-        Tool::HistoryRead,
+        Tool::Search,
+        Tool::Describe,
+        Tool::Call,
         Tool::Nodes,
         Tool::Context,
         Tool::DispatchWork,
@@ -133,6 +161,8 @@ impl Tool {
         Tool::TrackWork,
         Tool::BindWork,
         Tool::WaitWork,
+        Tool::HistorySearch,
+        Tool::HistoryRead,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -141,9 +171,9 @@ impl Tool {
 
     pub fn name(self) -> &'static str {
         match self {
-            Tool::ToolSearch => "tool_search",
-            Tool::ToolDescribe => "tool_describe",
-            Tool::ToolCall => "tool_call",
+            Tool::Search => "tool_search",
+            Tool::Describe => "tool_describe",
+            Tool::Call => "tool_call",
             Tool::HistorySearch => "history_search",
             Tool::HistoryRead => "history_read",
             Tool::Nodes => "nodes",
@@ -181,9 +211,9 @@ impl Tool {
 
     pub fn effect(self) -> Effect {
         match self {
-            Tool::ToolSearch
-            | Tool::ToolDescribe
-            | Tool::ToolCall
+            Tool::Search
+            | Tool::Describe
+            | Tool::Call
             | Tool::HistorySearch
             | Tool::HistoryRead
             | Tool::Nodes
@@ -218,6 +248,105 @@ impl Tool {
         }
     }
 
+    pub fn initially_exposed(self) -> bool {
+        self.discovery() || matches!(self, Tool::Context | Tool::ReadSkill | Tool::CallLookup)
+    }
+
+    fn discovery(self) -> bool {
+        matches!(self, Tool::Search | Tool::Describe | Tool::Call)
+    }
+
+    fn catalog_visible(self, kind: Option<TriggerKind>) -> bool {
+        !self.discovery()
+            && self.schema().is_some()
+            && kind.map_or(self.effect() == Effect::Read, |kind| {
+                self.effect().offered(kind)
+            })
+    }
+
+    /// Resolve the target before the router checks its effect, invocation and lease.
+    pub fn resolve_call(name: &str, args: Value) -> Result<(Self, Value)> {
+        let tool = Self::parse(name).context("unknown or unavailable coordination tool")?;
+        ensure!(args.is_object(), "tool arguments must be an object");
+        if tool != Self::Call {
+            return Ok((tool, args));
+        }
+        validate_schema(
+            &args,
+            &tool.input_schema().expect("tool_call schema"),
+            "arguments",
+        )?;
+        let mut call: ToolCall =
+            serde_json::from_value(args).context("invalid tool_call arguments")?;
+        let target = Self::parse(&call.tool).context("unknown or unavailable coordination tool")?;
+        ensure!(
+            !target.discovery() && target.schema().is_some(),
+            "tool_call requires a public tool; discovery and internal tools cannot be nested"
+        );
+        if let Some(call_ref) = call.call_ref {
+            ensure!(
+                call.arguments
+                    .get("call_ref")
+                    .is_none_or(|argument| argument.as_str() == Some(call_ref.as_str())),
+                "tool_call call_ref must match arguments.call_ref"
+            );
+            call.arguments.insert("call_ref".into(), json!(call_ref));
+        }
+        ensure!(
+            !target.needs_call_ref()
+                || call.arguments.get("call_ref").is_some_and(Value::is_string),
+            "{} requires call_ref; preserve it and query call_lookup after any uncertain result",
+            target.name()
+        );
+        Ok((target, Value::Object(call.arguments)))
+    }
+
+    pub fn search(args: Value, kind: Option<TriggerKind>) -> Result<Value> {
+        let search: ToolSearch =
+            serde_json::from_value(args).context("invalid tool_search arguments")?;
+        ensure!(search.query.len() <= 256, "query exceeds 256 bytes");
+        ensure!((1..=30).contains(&search.limit), "limit must be 1-30");
+        let query = search.query.to_lowercase();
+        let catalog: Vec<Value> = Self::ALL
+            .into_iter()
+            .filter(|tool| tool.catalog_visible(kind))
+            .filter_map(|tool| {
+                let (description, _, _) = tool.schema()?;
+                let text = format!("{} {description}", tool.name()).to_lowercase();
+                query
+                    .split_whitespace()
+                    .all(|word| text.contains(word))
+                    .then(|| {
+                        json!({"name":tool.name(),"description":description,
+                        "effect":tool.effect(),"requires_call_ref":tool.needs_call_ref()})
+                    })
+            })
+            .collect();
+        let tools: Vec<_> = catalog
+            .iter()
+            .skip(search.offset)
+            .take(search.limit)
+            .collect();
+        let end = search.offset.saturating_add(tools.len());
+        let more = end < catalog.len();
+        Ok(json!({"tools":tools,"more":more,"next":more.then_some(end)}))
+    }
+
+    pub fn describe(args: Value, kind: Option<TriggerKind>) -> Result<Value> {
+        let describe: ToolDescribe =
+            serde_json::from_value(args).context("invalid tool_describe arguments")?;
+        let tool = Self::parse(&describe.tool)
+            .filter(|tool| tool.catalog_visible(kind))
+            .context("unknown or unavailable coordination tool")?;
+        let description = tool.schema().context("tool has no public schema")?.0;
+        let input_schema = tool.input_schema().context("tool has no public schema")?;
+        Ok(
+            json!({"name":tool.name(),"description":description,"effect":tool.effect(),
+            "requires_call_ref":tool.needs_call_ref(),
+            "input_schema":input_schema}),
+        )
+    }
+
     /// Description, properties and required fields the agent sees. `track_work`, `bind_work` and
     /// `wait_work` are the steps `vibeface tool dispatch_work` takes and are not offered on their own.
     pub fn schema(self) -> Option<(&'static str, Value, &'static [&'static str])> {
@@ -235,20 +364,22 @@ impl Tool {
         };
         let executors = || json!(Provider::executing(|_| true));
         Some(match self {
-            Tool::ToolSearch => (
-                "Find available coordination tools by name or purpose. Results contain short descriptions; use tool_describe for the input schema.",
-                json!({"query":{"type":"string","maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":50}}),
+            Tool::Search => (
+                "Search the tools this turn may use by name or description. An empty query lists them; next is the offset for another page. Describe a result before calling it.",
+                json!({"query":{"type":"string","maxLength":256},
+                    "offset":{"type":"integer","minimum":0},
+                    "limit":{"type":"integer","minimum":1,"maximum":30}}),
                 &[],
             ),
-            Tool::ToolDescribe => (
-                "Read one available coordination tool's full description and JSON input schema.",
-                json!({"name":string()}),
-                &["name"],
+            Tool::Describe => (
+                "Read one available tool's full input schema, effect and call_ref requirement.",
+                json!({"tool":string()}),
+                &["tool"],
             ),
-            Tool::ToolCall => (
-                "Call a discovered tool with its validated arguments and this turn's permissions. Keep the same call_ref for the same intent. An unknown result requires call_lookup; never change the reference to retry it.",
-                json!({"name":string(),"arguments":{"type":"object"},"call_ref":string()}),
-                &["name", "arguments"],
+            Tool::Call => (
+                "Call a tool from tool_describe through the Node's normal permission and retry checks. arguments must match its input schema. call_ref can be supplied here or in arguments; both must agree. Discovery and internal tools cannot be nested.",
+                json!({"tool":string(),"arguments":{"type":"object"},"call_ref":string()}),
+                &["tool", "arguments"],
             ),
             Tool::HistorySearch => (
                 "Search this conversation's shared DAG history at this turn's fixed basis, newest first. query matches event text, types filters event kinds. Each page scans at most 100 events and returns bounded excerpts with event_id, author and seq. An empty page can have more=true; continue with before=next. Results are local and partial, never the whole network or a private provider transcript.",
@@ -268,9 +399,10 @@ impl Tool {
                 &[],
             ),
             Tool::Context => (
-                "Read this conversation's events as of this turn, in shared order: the newest, or those before or after the event an author and seq name (a message in your prompt gives both). types keeps only those event types. more says further events lie that way. A long event is cut short; at with its author and seq reads that event alone, its body as body_json text from byte offset up to next_offset, the pages joined giving the whole body. With blob_hash, read an attachment instead: offset counts bytes, limit KiB; text comes back as text, other files as data_base64, and one not on this device yet as pending_download.",
+                "Read this conversation's events as of this turn, in shared order: the newest, or those before or after the event an author and seq name (a message in your prompt gives both). types filters event kinds, author filters the signing device, and keyword finds a literal substring in visible body text (ASCII case insensitive). more says further matching events lie that way; next is their before or after cursor. A long event is cut short; at with its author and seq reads that event alone, its body as body_json text from byte offset up to next_offset, the pages joined giving the whole body. With blob_hash, read an attachment instead: offset counts bytes, limit KiB; text comes back as text, other files as data_base64, and one not on this device yet as pending_download.",
                 json!({"at":position(),"before":position(),"after":position(),
                 "types":{"type":"array","items":{"type":"string","enum":EVENT_TYPES},"uniqueItems":true},
+                "author":string(),"keyword":{"type":"string","minLength":1,"maxLength":256},
                 "limit":{"type":"integer","minimum":1,"maximum":100},
                 "blob_hash":string(),"offset":{"type":"integer","minimum":0}}),
                 &[],
@@ -351,7 +483,7 @@ impl Tool {
                 &["call_ref", "memory_id"],
             ),
             Tool::Recall => (
-                "List this bot's notes, or those containing query. bot.memory already holds them unless some were omitted.",
+                "Read this bot's committed notes and the current turn's staged changes, optionally filtered by query. memory_context carries a bounded snapshot or delta; omitted notes remain available here.",
                 json!({"query":string()}),
                 &[],
             ),
@@ -453,28 +585,8 @@ impl Tool {
         Some(schema)
     }
 
-    pub fn invocation(name: &str, mut args: Value) -> Result<(Self, Value)> {
-        let mut tool = Self::parse(name).context("unknown or unavailable coordination tool")?;
-        if tool == Self::ToolCall {
-            validate_schema(
-                &args,
-                &tool.input_schema().expect("tool_call schema"),
-                "arguments",
-            )?;
-            tool = Self::parse(args["name"].as_str().context("name is required")?)
-                .filter(|tool| *tool != Self::ToolCall && tool.schema().is_some())
-                .context("unknown or unavailable target tool")?;
-            let call_ref = args["call_ref"].clone();
-            args = args["arguments"].take();
-            if !call_ref.is_null() {
-                ensure!(
-                    args["call_ref"].is_null() || args["call_ref"] == call_ref,
-                    "call_ref must match arguments.call_ref"
-                );
-                args["call_ref"] = call_ref;
-            }
-        }
-        ensure!(args.is_object(), "tool arguments must be an object");
+    pub fn invocation(name: &str, args: Value) -> Result<(Self, Value)> {
+        let (tool, args) = Self::resolve_call(name, args)?;
         if let Some(schema) = tool.input_schema() {
             validate_schema(&args, &schema, "arguments")?;
         }
@@ -677,7 +789,7 @@ mod tests {
         assert_eq!(
             Tool::invocation(
                 "tool_call",
-                json!({"name":"dispatch_work","arguments":args.clone()})
+                json!({"tool":"dispatch_work","arguments":args.clone()})
             )?,
             (Tool::DispatchWork, args)
         );
@@ -705,7 +817,7 @@ mod tests {
             assert!(
                 Tool::invocation(
                     "tool_call",
-                    json!({"name":"dispatch_work","arguments":args.clone()})
+                    json!({"tool":"dispatch_work","arguments":args.clone()})
                 )
                 .is_err(),
                 "{args}"
@@ -721,17 +833,19 @@ mod tests {
             Tool::invocation("create_bot", args.clone())?,
             Tool::invocation(
                 "tool_call",
-                json!({"name":"create_bot","arguments":{"name":"Docs"},"call_ref":"one-intent"})
+                json!({"tool":"create_bot","arguments":{"name":"Docs"},"call_ref":"one-intent"})
             )?
         );
         for args in [
-            json!({"name":"tool_call","arguments":{"name":"nodes","arguments":{}}}),
-            json!({"name":"track_work","arguments":{}}),
-            json!({"name":"create_bot","arguments":{"name":"Docs"}}),
-            json!({"name":"create_bot","call_ref":"a","arguments":{"name":"Docs","call_ref":"b"}}),
-            json!({"name":"history_search","arguments":{"limit":0}}),
-            json!({"name":"history_read","arguments":{"at":{"author":"a","seq":"1"}}}),
-            json!({"name":"history_search","arguments":{"conversation_id":"another-chat"}}),
+            json!({"name":"create_bot","arguments":{"name":"Docs"},"call_ref":"one-intent"}),
+            json!({"tool":"nodes","arguments":{},"call_ref":null}),
+            json!({"tool":"tool_call","arguments":{"tool":"nodes","arguments":{}}}),
+            json!({"tool":"track_work","arguments":{}}),
+            json!({"tool":"create_bot","arguments":{"name":"Docs"}}),
+            json!({"tool":"create_bot","call_ref":"a","arguments":{"name":"Docs","call_ref":"b"}}),
+            json!({"tool":"history_search","arguments":{"limit":0}}),
+            json!({"tool":"history_read","arguments":{"at":{"author":"a","seq":"1"}}}),
+            json!({"tool":"history_search","arguments":{"conversation_id":"another-chat"}}),
         ] {
             assert!(
                 Tool::invocation("tool_call", args.clone()).is_err(),
@@ -742,11 +856,11 @@ mod tests {
             ("create_bot", json!({"name":"Docs","call_ref":"bots/docs"})),
             (
                 "tool_call",
-                json!({"name":"create_bot","arguments":{"name":"Docs","call_ref":"bots/docs"}}),
+                json!({"tool":"create_bot","arguments":{"name":"Docs","call_ref":"bots/docs"}}),
             ),
             (
                 "tool_call",
-                json!({"name":"create_bot","arguments":{"name":"Docs"},"call_ref":"bots/docs"}),
+                json!({"tool":"create_bot","arguments":{"name":"Docs"},"call_ref":"bots/docs"}),
             ),
         ] {
             let error = Tool::invocation(name, args).expect_err("invalid call reference");
@@ -757,9 +871,9 @@ mod tests {
                 "{error:#}"
             );
         }
-        assert!(!Tool::ConfigureBot.available(Some(TriggerKind::AgentTask)));
-        assert!(Tool::HistoryRead.available(Some(TriggerKind::AgentTask)));
-        assert!(!Tool::CreateBot.available(None));
+        assert!(!Tool::ConfigureBot.catalog_visible(Some(TriggerKind::AgentTask)));
+        assert!(Tool::HistoryRead.catalog_visible(Some(TriggerKind::AgentTask)));
+        assert!(!Tool::CreateBot.catalog_visible(None));
         Ok(())
     }
 

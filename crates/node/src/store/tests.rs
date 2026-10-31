@@ -3,13 +3,13 @@ use crate::{
     crypto::LocalIdentity,
     providers::Provider,
     scheduling::{
-        JobOutcome, JobState, SchedulerJob, Shown, SteerOutcome, TriggerKind, TurnExecution,
-        TurnRuntime, bot_message_trigger, message_trigger, schedule_trigger, work_trigger,
+        JobOutcome, JobState, SchedulerJob, Shown, SteerOutcome, TriggerKind, bot_message_trigger,
+        message_trigger, schedule_trigger, work_trigger,
     },
-    work::{Signal, WorkSpec},
+    work::{RequestedWorkKind, Signal, WorkRequest, WorkSpec},
 };
 use serde_json::json;
-use vibeface_bridge::failure::{ExecFailure, ProviderStage};
+use vibeface_bridge::failure::{ExecFailure, FailureKind};
 
 impl Store {
     pub(crate) fn accept_work_fixture(
@@ -66,25 +66,71 @@ impl Store {
         network: &str,
         conversation: &str,
         boot: &str,
-        config: &str,
+        fingerprint: &str,
     ) -> Result<Option<crate::scheduling::ClaimedJob>> {
-        self.claim_next(identity, network, conversation, boot, |_, accepted| {
-            let accepted = accepted.cloned().unwrap_or(ResolvedModel {
-                provider: Provider::Codex,
-                model: None,
-            });
-            Ok(Some((
-                config.into(),
-                crate::scheduling::RuntimeSelection {
-                    provider: accepted.provider,
-                    model: accepted.model,
-                    reasoning_effort: None,
+        self.recover_scheduler_jobs(identity, network, boot)?;
+        let mut queued = self.scheduler_jobs(conversation)?;
+        queued.retain(|job| matches!(job.state, JobState::Queued));
+        queued.sort_by(|left, right| left.priority().cmp(&right.priority()));
+        for job in queued {
+            let resolved = if job.kind == TriggerKind::AgentTask {
+                self.works(network, conversation)?
+                    .into_iter()
+                    .find(|work| work.work_id == job.reply_to)
+                    .context("accepted task")?
+                    .resolved
+            } else {
+                ResolvedModel {
+                    provider: Provider::Codex,
+                    model: None,
+                }
+            };
+            if let Some(mut claimed) = self.claim_next_in_session(
+                identity,
+                network,
+                &job.session_key(),
+                boot,
+                &crate::scheduling::SessionConfig {
+                    stable_fingerprint: fingerprint.into(),
+                    runtime_fingerprint: fingerprint.into(),
+                    provider: resolved.provider,
                 },
-                "fixture-generation".into(),
-                (),
-            )))
-        })
-        .map(|claimed| claimed.map(|(claimed, ())| claimed))
+                &crate::config::SchedulingLimits::default(),
+            )? {
+                let attempt = claimed
+                    .job
+                    .state
+                    .attempt()
+                    .context("claimed attempt")?
+                    .id
+                    .clone();
+                let runtime = crate::scheduling::TurnRuntime {
+                    provider: resolved.provider,
+                    model: resolved.model,
+                    reasoning_effort: None,
+                    generation: "fixture-generation".into(),
+                    session_generation: claimed.session_generation,
+                    delivery_id: attempt.clone(),
+                    stage: vibeface_bridge::failure::ProviderStage::Validate,
+                    execution: crate::scheduling::TurnExecution::NotStarted,
+                    attempted_at_ms: 0,
+                    switched_from: None,
+                    switch_reason: None,
+                };
+                if claimed.job.runtime.as_ref().is_none_or(|saved| {
+                    saved.execution == crate::scheduling::TurnExecution::NotStarted
+                }) {
+                    claimed.job = self.record_turn_runtime(
+                        conversation,
+                        &claimed.job.trigger,
+                        &attempt,
+                        &runtime,
+                    )?;
+                }
+                return Ok(Some(claimed));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -140,6 +186,52 @@ fn signature(net: &Net, id: &str, text: &str) -> Result<Attestation> {
         .attestation()
         .cloned()
         .context("signed message")
+}
+
+fn signed_memory(
+    net: &Net,
+    store: &Store,
+    scope: &str,
+    memory_id: &str,
+    after: Option<&str>,
+) -> Result<EventBody> {
+    let base = store
+        .memory_state(&net.network, scope, memory_id, None)?
+        .current
+        .map_or_else(MemoryBase::absent, |state| state.metadata.base());
+    net.a.fixture_admin().attest(
+        &net.network,
+        scope,
+        EventBody::MemoryControlled {
+            memory_id: memory_id.into(),
+            base,
+            after: after.map(str::to_owned),
+            attestation: None,
+        },
+    )
+}
+
+fn memory_command(
+    network: &str,
+    scope: &str,
+    body: &EventBody,
+) -> Result<bot_settings::MemoryControlCommand> {
+    let EventBody::MemoryControlled {
+        memory_id,
+        base,
+        after,
+        attestation,
+    } = body
+    else {
+        bail!("not memory control")
+    };
+    Ok(bot_settings::MemoryControlCommand {
+        memory_id: memory_id.clone(),
+        base: base.clone(),
+        after: after.clone(),
+        attestation: attestation.clone().context("signed memory")?,
+        operation_id: crate::crypto::request_key(network, scope, body, "")?,
+    })
 }
 
 type Projection = (Vec<(String, String)>, Vec<String>, Option<Conversation>);
@@ -558,58 +650,6 @@ fn the_same_message_id_queues_one_job() -> Result<()> {
 }
 
 #[test]
-fn scheduler_configuration_failure_or_startup_wait_does_not_claim_the_job() -> Result<()> {
-    let net = net()?;
-    let mut store = store(&net)?;
-    conversation(&mut store, &net)?;
-    say(&mut store, &net, "m1", true)?;
-    assert!(
-        store
-            .claim_next::<()>(&net.a, &net.network, "c", "boot", |_, _| anyhow::bail!(
-                "invalid frozen provider"
-            ))
-            .is_err()
-    );
-    assert!(matches!(
-        store
-            .scheduler_job("c", "message:m1")?
-            .context("job")?
-            .state,
-        JobState::Queued
-    ));
-    assert!(
-        store
-            .claim_next::<()>(&net.a, &net.network, "c", "boot", |_, _| Ok(None))?
-            .is_none()
-    );
-    assert!(matches!(
-        store
-            .scheduler_job("c", "message:m1")?
-            .context("job")?
-            .state,
-        JobState::Queued
-    ));
-    let claimed = store
-        .claim_next::<()>(&net.a, &net.network, "c", "boot", |job, _| {
-            assert_eq!(job.trigger, "message:m1");
-            Ok(Some((
-                "frozen-provider-and-model".into(),
-                crate::scheduling::RuntimeSelection {
-                    provider: Provider::Codex,
-                    model: None,
-                    reasoning_effort: None,
-                },
-                "fixture-generation".into(),
-                (),
-            )))
-        })?
-        .context("claimed")?
-        .0;
-    assert!(matches!(claimed.job.state, JobState::Claimed { .. }));
-    Ok(())
-}
-
-#[test]
 fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
@@ -670,28 +710,18 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &claimed.job.trigger, &attempt)?;
     store.recover_scheduler_jobs(&net.a, &net.network, "boot-2")?;
-    assert!(
-        store
-            .message(&net.network, "c", &claimed.job.message_id)?
-            .is_none()
-    );
+    let reply = store
+        .message(&net.network, "c", &claimed.job.message_id)?
+        .context("reply")?;
+    assert_eq!(reply.status, Some(ReplyStatus::Interrupted));
     assert_eq!(store.pending_checks()?.len(), 1);
     assert!(matches!(
         store
             .scheduler_job("c", &message_trigger("m2"))?
             .context("job")?
             .state,
-        JobState::Reconciling { .. }
+        JobState::Interrupted { .. }
     ));
-    let check = store.pending_checks()?.pop().context("pending check")?;
-    store.confirm_manager_stopped(&net.a, &net.network, &check, 6)?;
-    assert_eq!(
-        store
-            .message(&net.network, "c", &claimed.job.message_id)?
-            .context("reply")?
-            .status,
-        Some(ReplyStatus::Interrupted)
-    );
     Ok(())
 }
 
@@ -950,17 +980,20 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         dispatcher: net.a.device_id()?,
         call_ref: "call-1".into(),
         kind: WorkKind::Agent(Provider::Codex),
-        model: None,
-        resolved: crate::model::ResolvedModel {
-            provider: Provider::Codex,
-            model: None,
-        },
         cwd: "/tmp".into(),
         title: "t".into(),
         prompt: "p".into(),
         continues: None,
         parent: None,
         thread: None,
+
+        model: None,
+
+        resolved: ResolvedModel {
+            provider: Provider::Codex,
+
+            model: None,
+        },
     };
     assert!(
         store
@@ -1050,21 +1083,22 @@ fn dispatches_the_dag_lacks_reach_the_bot_once() -> Result<()> {
     let (local, trigger) = (net.a.device_id()?, message_trigger("m1"));
     let dispatch = |call: &str| -> Result<Dispatch> {
         Ok(Dispatch {
-            spec: crate::work::WorkRequest {
+            spec: WorkRequest {
                 work_id: WorkSpec::id("c", &trigger, call),
                 conversation: "c".into(),
                 trigger: trigger.clone(),
                 target: net.b.device_id()?,
                 dispatcher: local.clone(),
                 call_ref: call.into(),
-                kind: crate::work::RequestedWorkKind::Task,
-                model: None,
+                kind: RequestedWorkKind::Task,
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),
                 continues: None,
                 parent: None,
                 thread: None,
+
+                model: None,
             },
             state: DispatchState::Pending,
         })
@@ -1179,17 +1213,20 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
             dispatcher: net.a.device_id()?,
             call_ref: call.into(),
             kind: WorkKind::Agent(Provider::Codex),
-            model: None,
-            resolved: crate::model::ResolvedModel {
-                provider: Provider::Codex,
-                model: None,
-            },
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".into(),
             continues: None,
             parent: None,
             thread: None,
+
+            model: None,
+
+            resolved: ResolvedModel {
+                provider: Provider::Codex,
+
+                model: None,
+            },
         })
     };
     let outcome = |store: &Store, id: &str| -> Result<Option<WorkOutcome>> {
@@ -1706,21 +1743,8 @@ fn a_move_fences_the_old_owners_running_turn() -> Result<()> {
         .context("job")?;
     let trigger = claimed.job.trigger.clone();
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
-    let permission = claimed
-        .job
-        .state
-        .attempt()
-        .context("attempt")?
-        .permission_version;
     store.mark_started("c", &trigger, &attempt)?;
-    assert!(store.manager_attempt_allowed(
-        &net.network,
-        &local,
-        "c",
-        &trigger,
-        &attempt,
-        permission
-    )?);
+    assert!(store.manager_attempt_allowed(&net.network, &local, "c", &trigger, &attempt)?);
     assert!(store.fence_moved_turns(&net.network, &local)?.is_empty());
 
     store.append_event(
@@ -1739,14 +1763,7 @@ fn a_move_fences_the_old_owners_running_turn() -> Result<()> {
         vec![],
         4,
     )?;
-    assert!(!store.manager_attempt_allowed(
-        &net.network,
-        &local,
-        "c",
-        &trigger,
-        &attempt,
-        permission
-    )?);
+    assert!(!store.manager_attempt_allowed(&net.network, &local, "c", &trigger, &attempt)?);
     assert_eq!(
         store.fence_moved_turns(&net.network, &local)?,
         vec![("c".to_owned(), trigger.clone(), attempt.clone())]
@@ -2020,9 +2037,10 @@ fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
                     }),
                     instructions: None,
                     model: None,
-                    reasoning_effort: None,
                     skills: None,
                     avatar: None,
+
+                    reasoning_effort: None,
                 },
             },
             blobs: vec![],
@@ -2201,9 +2219,10 @@ fn bot_changes_converge_and_retries_write_once() -> Result<()> {
             }),
             instructions: None,
             model: None,
-            reasoning_effort: None,
             skills: None,
-            avatar: None
+            avatar: None,
+
+            reasoning_effort: None,
         }
     );
     assert_eq!(
@@ -2974,9 +2993,10 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
                 }),
                 instructions: None,
                 model: None,
-                reasoning_effort: None,
                 skills: None,
                 avatar: None,
+
+                reasoning_effort: None,
             },
         },
         blobs: vec![],
@@ -3239,11 +3259,12 @@ fn a_bot_creates_and_configures_bots_for_the_users_message() -> Result<()> {
             name: Some("Backup".into()),
             instructions: None,
             model: None,
-            reasoning_effort: None,
             skills: None,
             all_skills: None,
             avatar: None,
             default_avatar: None,
+
+            reasoning_effort: None,
         },
         Provider::Codex,
         11,
@@ -3304,11 +3325,12 @@ fn configure(
         name: None,
         instructions: None,
         model: model.map(Into::into),
-        reasoning_effort: None,
         skills: skills.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
         all_skills,
         avatar: None,
         default_avatar: None,
+
+        reasoning_effort: None,
     }
 }
 
@@ -3479,59 +3501,6 @@ fn a_bot_runs_the_model_of_its_devices_provider_or_the_devices_default() -> Resu
         runs(&later, Provider::Cursor)?.as_deref(),
         Some("composer-1")
     );
-    Ok(())
-}
-
-#[test]
-fn bot_effort_overrides_sync_and_clear_per_provider() -> Result<()> {
-    let net = net()?;
-    let (mut origin, _) = bot_with_message(&net)?;
-    let change = |store: &mut Store, call_ref: &str, provider, value: &str| {
-        let mut request = configure("Helper", None, None, None);
-        let ChangeRequest::ConfigureBot {
-            reasoning_effort, ..
-        } = &mut request
-        else {
-            unreachable!()
-        };
-        *reasoning_effort = Some(value.into());
-        store.change_bot(
-            &net.a,
-            &net.network,
-            "c",
-            "message:m1",
-            call_ref,
-            request,
-            provider,
-            5,
-        )
-    };
-    let (saved, written) = change(&mut origin, "effort-1", Provider::Codex, "high")?;
-    assert!(written);
-    assert!(matches!(saved.change, BotChange::Profile {
-        reasoning_effort: Some(ReasoningEffortEdit { provider: Provider::Codex, before: None, after: Some(ref after) }), ..
-    } if after == "high"));
-    let (_, written) = change(&mut origin, "effort-1", Provider::Codex, "high")?;
-    assert!(!written, "same request reads the original change");
-    assert!(change(&mut origin, "unsupported", Provider::Cursor, "high").is_err());
-    assert!(change(&mut origin, "invalid", Provider::Claude, "xhigh").is_err());
-    change(&mut origin, "effort-2", Provider::Pi, "off")?;
-    let mut other = store(&net)?;
-    all_accepted(&mut other, &net, &origin)?;
-    let bot = other
-        .bot_for_conversation(&net.network, "c")?
-        .context("bot")?;
-    assert_eq!(bot.reasoning_effort(Provider::Codex), Some("high"));
-    assert_eq!(bot.reasoning_effort(Provider::Pi), Some("off"));
-    assert_eq!(bot.reasoning_effort(Provider::Claude), None);
-    change(&mut origin, "effort-3", Provider::Codex, "")?;
-    let mut rebuilt = store(&net)?;
-    all_accepted(&mut rebuilt, &net, &origin)?;
-    let bot = rebuilt
-        .bot_for_conversation(&net.network, "c")?
-        .context("bot")?;
-    assert_eq!(bot.reasoning_effort(Provider::Codex), None);
-    assert_eq!(bot.reasoning_effort(Provider::Pi), Some("off"));
     Ok(())
 }
 
@@ -3743,6 +3712,842 @@ fn notes_refuse_secrets_and_sync() -> Result<()> {
 }
 
 #[test]
+fn staged_memory_commits_only_with_a_completed_turn() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    say(&mut store, &net, "m2", true)?;
+    let trigger = message_trigger("m2");
+    let claimed = store
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    store.mark_started("c", &trigger, &attempt)?;
+    store.save_scheduler_native_id("c", &trigger, &attempt, "thread", "token", false)?;
+    let staged = store.stage_memory(
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        "remember-1",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "prefers staged notes".into(),
+        },
+        4,
+    )?;
+    assert_eq!(staged["state"], "staged");
+    assert_eq!(
+        store.staged_memory_call("c", &trigger, &attempt, "remember-1")?,
+        Some(staged)
+    );
+    assert!(
+        store
+            .staged_memory_call("c", &trigger, &attempt, "other")?
+            .is_none()
+    );
+    assert!(
+        store
+            .staged_memory_call("c", &trigger, "other-attempt", "remember-1")
+            .is_err()
+    );
+    assert!(store.memories(&net.network, "c")?.is_empty());
+    store.record_manager_turn(
+        &attempt,
+        "system",
+        "thread",
+        Some("turn"),
+        &Shown::default(),
+    )?;
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        JobOutcome::Completed,
+        "done",
+        5,
+    )?;
+    assert_eq!(store.memories(&net.network, "c")?.len(), 1);
+    assert!(
+        store
+            .staged_memory_call("c", &trigger, &attempt, "remember-1")?
+            .is_none()
+    );
+    assert!(
+        store
+            .bot_change(
+                &net.network,
+                &crate::store::bot_settings::change_id("c", &trigger, "remember-1")
+            )?
+            .is_some()
+    );
+    let record = store
+        .memory_records(&net.network, "c")?
+        .into_iter()
+        .next()
+        .context("memory record")?;
+    assert_eq!(record.epoch, crate::config::DATA_EPOCH);
+    assert!(!record.revision.is_empty());
+    assert_eq!(record.origin, MemoryOrigin::Agent);
+    assert!(!record.user_controlled);
+    assert!(record.essential);
+
+    say(&mut store, &net, "m3", true)?;
+    let trigger = message_trigger("m3");
+    let claimed = store
+        .claim_next_fixture(&net.a, &net.network, "c", "boot-2", "cfg")?
+        .context("job")?;
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    store.mark_started("c", &trigger, &attempt)?;
+    store.stage_memory(
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        "remember-2",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "discard this note".into(),
+        },
+        6,
+    )?;
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        JobOutcome::Failed(ExecFailure::new(FailureKind::Rejected, "test")),
+        "",
+        7,
+    )?;
+    assert_eq!(store.memories(&net.network, "c")?.len(), 1);
+    assert!(
+        store
+            .staged_memory_call("c", &trigger, &attempt, "remember-2")?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn staged_memory_revision_conflict_preserves_the_newer_user_value() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    say(&mut store, &net, "m2", true)?;
+    let trigger = message_trigger("m2");
+    let claimed = store
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    store.mark_started("c", &trigger, &attempt)?;
+    let staged = store.stage_memory(
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        "remember-conflict",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "agent candidate".into(),
+        },
+        4,
+    )?;
+    let memory_id = staged["memory_id"]
+        .as_str()
+        .context("memory id")?
+        .to_owned();
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        signed_memory(&net, &store, "c", &memory_id, Some("user value"))?,
+        vec![],
+        5,
+    )?;
+    assert_eq!(
+        store.stage_memory(
+            &net.network,
+            "c",
+            &trigger,
+            &attempt,
+            "remember-conflict",
+            ChangeRequest::Remember {
+                memory_id: None,
+                text: "agent candidate".into()
+            },
+            5,
+        )?,
+        staged,
+        "a retry returns its original snapshot after a concurrent user edit"
+    );
+    assert!(
+        store
+            .stage_memory(
+                &net.network,
+                "c",
+                &trigger,
+                &attempt,
+                "remember-conflict",
+                ChangeRequest::Remember {
+                    memory_id: None,
+                    text: "another candidate".into()
+                },
+                5,
+            )
+            .is_err()
+    );
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        JobOutcome::Completed,
+        "done",
+        6,
+    )?;
+    let conflicts = memory_test_shown(&store)?.memory_conflicts;
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].memory_id, memory_id);
+    assert_eq!(conflicts[0].reason, "user_controlled");
+    assert_eq!(conflicts[0].expected_revision, "");
+    assert!(!conflicts[0].actual_revision.is_empty());
+    let record = store
+        .memory_records(&net.network, "c")?
+        .into_iter()
+        .find(|record| record.entry.memory_id == memory_id)
+        .context("memory record")?;
+    assert_eq!(record.entry.text, "user value");
+    assert_eq!(record.origin, MemoryOrigin::User);
+    assert!(record.user_controlled);
+    Ok(())
+}
+
+fn memory_test_shown(store: &Store) -> Result<Shown> {
+    let shown: String = store.connection.query_row(
+        "SELECT shown FROM scheduler_sessions WHERE conversation_id='c'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(serde_json::from_str(&shown)?)
+}
+
+#[test]
+fn memory_review_schema_is_bounded_data_only_and_disabled_by_default() -> Result<()> {
+    use bot_settings::{MemoryReview, MemoryReviewPolicy};
+    assert_eq!(MemoryReviewPolicy::default(), MemoryReviewPolicy::Disabled);
+    let operation = json!({"operation":"add","text":"prefers concise replies"});
+    let twenty = json!({"operations":vec![operation.clone(); 20]});
+    assert_eq!(
+        serde_json::from_value::<MemoryReview>(twenty)?
+            .operations
+            .len(),
+        20
+    );
+    for refused in [
+        json!({"operations":vec![operation; 21]}),
+        json!({"operations":[],"tools":["shell"]}),
+        json!({"operations":[],"read_only":false}),
+        json!({"operations":[{"operation":"tool_call","name":"shell"}]}),
+        json!({"operations":[{"operation":"add","text":"safe note","tools":[]}]}),
+        json!({"operations":[{"operation":"add","text":"sk-proj-abcdefghijklmnopqrstuvwxyz123456"}]}),
+        json!({"operations":[{"operation":"update","memory_id":"m","epoch":1,"text":"safe"}]}),
+        json!({"operations":[{"operation":"forget","memory_id":"m","epoch":1,"expected_revision":"bad\nrevision"}]}),
+        json!({"operations":[{"operation":"forget","memory_id":"m","epoch":1,"expected_revision":"sk-proj-abcdefghijklmnopqrstuvwxyz123456"}]}),
+    ] {
+        assert!(
+            serde_json::from_value::<MemoryReview>(refused.clone()).is_err(),
+            "{refused}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn memory_review_stages_add_update_and_forget_until_turn_completion() -> Result<()> {
+    use bot_settings::{MemoryReview, MemoryReviewOperation, MemoryReviewPolicy};
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    for (call_ref, text) in [
+        ("keep", "old preference"),
+        ("remove", "obsolete preference"),
+    ] {
+        origin.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            call_ref,
+            ChangeRequest::Remember {
+                memory_id: None,
+                text: text.into(),
+            },
+            Provider::Codex,
+            4,
+        )?;
+    }
+    let records = origin.memory_records(&net.network, "c")?;
+    let kept = records
+        .iter()
+        .find(|record| record.entry.text == "old preference")
+        .context("kept")?;
+    let removed = records
+        .iter()
+        .find(|record| record.entry.text == "obsolete preference")
+        .context("removed")?;
+    let review = MemoryReview {
+        operations: vec![
+            MemoryReviewOperation::Add {
+                text: "new preference".into(),
+            },
+            MemoryReviewOperation::Update {
+                memory_id: kept.entry.memory_id.clone(),
+                epoch: kept.epoch,
+                expected_revision: kept.revision.clone(),
+                text: "updated preference".into(),
+            },
+            MemoryReviewOperation::Forget {
+                memory_id: removed.entry.memory_id.clone(),
+                epoch: removed.epoch,
+                expected_revision: removed.revision.clone(),
+            },
+        ],
+    };
+    say(&mut origin, &net, "m2", true)?;
+    let claimed = origin
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let trigger = &claimed.job.trigger;
+    let attempt = &claimed.job.state.attempt().context("attempt")?.id;
+    origin.mark_started("c", trigger, attempt)?;
+    let disabled = origin
+        .stage_memory_review(
+            &net.network,
+            "c",
+            trigger,
+            attempt,
+            "review",
+            MemoryReviewPolicy::default(),
+            &review,
+        )
+        .unwrap_err();
+    assert!(disabled.to_string().contains("disabled"));
+    assert!(
+        origin
+            .staged_memory_overlay("c", trigger, attempt)?
+            .is_empty()
+    );
+    let staged = origin.stage_memory_review(
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        "review",
+        MemoryReviewPolicy::ReadOnly,
+        &review,
+    )?;
+    assert_eq!(staged.len(), 3);
+    assert!(staged.iter().all(|result| result["state"] == "staged"));
+    assert_eq!(origin.memories(&net.network, "c")?.len(), 2);
+    assert_eq!(
+        origin.stage_memory_review(
+            &net.network,
+            "c",
+            trigger,
+            attempt,
+            "review",
+            MemoryReviewPolicy::ReadOnly,
+            &review,
+        )?,
+        staged
+    );
+    origin.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        JobOutcome::Completed,
+        "done",
+        6,
+    )?;
+    let committed = origin.memory_records(&net.network, "c")?;
+    assert_eq!(committed.len(), 2);
+    assert!(
+        committed
+            .iter()
+            .all(|record| record.origin == MemoryOrigin::Review)
+    );
+    assert!(
+        committed
+            .iter()
+            .any(|record| record.entry.text == "updated preference")
+    );
+    assert!(
+        committed
+            .iter()
+            .any(|record| record.entry.text == "new preference")
+    );
+    let events = origin.version_vector(&net.network)?;
+    assert!(
+        origin
+            .stage_memory_review(
+                &net.network,
+                "c",
+                trigger,
+                attempt,
+                "review",
+                MemoryReviewPolicy::ReadOnly,
+                &review,
+            )?
+            .iter()
+            .all(|result| result["state"] == "committed")
+    );
+    assert_eq!(origin.version_vector(&net.network)?, events);
+    assert!(memory_test_shown(&origin)?.memory_conflicts.is_empty());
+    let mut replica = store(&net)?;
+    all_accepted(&mut replica, &net, &origin)?;
+    assert_eq!(
+        replica.memories(&net.network, "c")?,
+        origin.memories(&net.network, "c")?
+    );
+    for record in replica.memory_records(&net.network, "c")? {
+        assert_eq!(record.origin, MemoryOrigin::Review);
+        assert!(
+            committed
+                .iter()
+                .any(|original| original.revision == record.revision)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn memory_review_preserves_user_controlled_notes_and_rolls_back_its_batch() -> Result<()> {
+    use bot_settings::{MemoryReview, MemoryReviewOperation, MemoryReviewPolicy};
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    origin.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        signed_memory(
+            &net,
+            &origin,
+            "c",
+            "manual-note",
+            Some("user-owned preference"),
+        )?,
+        vec![],
+        4,
+    )?;
+    let record = origin.memory_records(&net.network, "c")?.remove(0);
+    say(&mut origin, &net, "m2", true)?;
+    let claimed = origin
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let trigger = &claimed.job.trigger;
+    let attempt = &claimed.job.state.attempt().context("attempt")?.id;
+    origin.mark_started("c", trigger, attempt)?;
+    for operation in [
+        MemoryReviewOperation::Update {
+            memory_id: record.entry.memory_id.clone(),
+            epoch: record.epoch,
+            expected_revision: record.revision.clone(),
+            text: "replacement".into(),
+        },
+        MemoryReviewOperation::Forget {
+            memory_id: record.entry.memory_id.clone(),
+            epoch: record.epoch,
+            expected_revision: record.revision.clone(),
+        },
+    ] {
+        let review = MemoryReview {
+            operations: vec![
+                MemoryReviewOperation::Add {
+                    text: "discard the partial batch".into(),
+                },
+                operation,
+            ],
+        };
+        let error = origin
+            .stage_memory_review(
+                &net.network,
+                "c",
+                trigger,
+                attempt,
+                "review",
+                MemoryReviewPolicy::ReadOnly,
+                &review,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("user-controlled"));
+        assert!(
+            origin
+                .staged_memory_overlay("c", trigger, attempt)?
+                .is_empty()
+        );
+    }
+    origin.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        JobOutcome::Completed,
+        "done",
+        5,
+    )?;
+    assert_eq!(origin.memories(&net.network, "c")?, vec![record.entry]);
+    Ok(())
+}
+
+#[test]
+fn memory_review_epoch_conflict_is_visible_without_overwriting_the_note() -> Result<()> {
+    use bot_settings::{MemoryReview, MemoryReviewOperation, MemoryReviewPolicy};
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    origin.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "remember",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "current preference".into(),
+        },
+        Provider::Codex,
+        4,
+    )?;
+    let record = origin.memory_records(&net.network, "c")?.remove(0);
+    say(&mut origin, &net, "m2", true)?;
+    let claimed = origin
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let trigger = &claimed.job.trigger;
+    let attempt = &claimed.job.state.attempt().context("attempt")?.id;
+    origin.mark_started("c", trigger, attempt)?;
+    let review = MemoryReview {
+        operations: vec![MemoryReviewOperation::Update {
+            memory_id: record.entry.memory_id.clone(),
+            epoch: record.epoch + 1,
+            expected_revision: record.revision.clone(),
+            text: "stale review preference".into(),
+        }],
+    };
+    origin.stage_memory_review(
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        "review",
+        MemoryReviewPolicy::ReadOnly,
+        &review,
+    )?;
+    origin.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        JobOutcome::Completed,
+        "done",
+        5,
+    )?;
+    assert_eq!(origin.memories(&net.network, "c")?, vec![record.entry]);
+    let conflicts = memory_test_shown(&origin)?.memory_conflicts;
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].reason, "epoch_changed");
+    assert_eq!(conflicts[0].expected_epoch, record.epoch + 1);
+    assert_eq!(conflicts[0].actual_epoch, record.epoch);
+    assert_eq!(conflicts[0].actual_revision, record.revision);
+    Ok(())
+}
+
+#[test]
+fn staged_memory_detects_a_revision_change_even_when_the_text_returns_to_its_base() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    origin.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "remember",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "base preference".into(),
+        },
+        Provider::Codex,
+        4,
+    )?;
+    let record = origin.memory_records(&net.network, "c")?.remove(0);
+    say(&mut origin, &net, "m2", true)?;
+    let claimed = origin
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let trigger = &claimed.job.trigger;
+    let attempt = &claimed.job.state.attempt().context("attempt")?.id;
+    origin.mark_started("c", trigger, attempt)?;
+    let request = ChangeRequest::Remember {
+        memory_id: Some(record.entry.memory_id.clone()),
+        text: "candidate preference".into(),
+    };
+    let staged = origin.stage_memory(
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        "update",
+        request.clone(),
+        5,
+    )?;
+    for (index, before, after) in [
+        (0, "base preference", "temporary preference"),
+        (1, "temporary preference", "base preference"),
+    ] {
+        origin.append_event(
+            &net.a,
+            &net.network,
+            "c",
+            EventBody::BotChanged {
+                change_id: format!("concurrent-{index}"),
+                cause: Some(Cause {
+                    conversation_id: "c".into(),
+                    message_id: "m2".into(),
+                }),
+                change: BotChange::Memory {
+                    memory_id: record.entry.memory_id.clone(),
+                    before: Some(before.into()),
+                    after: Some(after.into()),
+                    base: origin
+                        .memory_state(&net.network, "c", &record.entry.memory_id, None)?
+                        .current
+                        .context("base")?
+                        .metadata
+                        .base(),
+                    origin: AutomaticMemoryOrigin::Agent,
+                    essential: true,
+                },
+            },
+            vec![],
+            6 + index,
+        )?;
+    }
+    assert_eq!(
+        origin.stage_memory(&net.network, "c", trigger, attempt, "update", request, 8)?,
+        staged
+    );
+    origin.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        JobOutcome::Completed,
+        "done",
+        9,
+    )?;
+    assert_eq!(origin.memories(&net.network, "c")?, vec![record.entry]);
+    let conflicts = memory_test_shown(&origin)?.memory_conflicts;
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].reason, "revision_changed");
+    assert_eq!(conflicts[0].expected_revision, record.revision);
+    assert_ne!(conflicts[0].actual_revision, record.revision);
+    Ok(())
+}
+
+#[test]
+fn staged_memory_is_discarded_for_failed_stopped_interrupted_and_unknown_turns() -> Result<()> {
+    for (outcome, pending) in [
+        (
+            JobOutcome::Failed(ExecFailure::new(FailureKind::Rejected, "failed")),
+            0,
+        ),
+        (JobOutcome::Cancelled("stopped".into()), 0),
+        (
+            JobOutcome::Interrupted {
+                failure: ExecFailure::new(FailureKind::Transport, "interrupted"),
+                process_unconfirmed: false,
+            },
+            0,
+        ),
+        (
+            JobOutcome::Interrupted {
+                failure: ExecFailure::new(FailureKind::Restarted, "unknown result"),
+                process_unconfirmed: true,
+            },
+            1,
+        ),
+    ] {
+        let net = net()?;
+        let (mut origin, _) = bot_with_message(&net)?;
+        say(&mut origin, &net, "m2", true)?;
+        let claimed = origin
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+            .context("job")?;
+        let trigger = &claimed.job.trigger;
+        let attempt = &claimed.job.state.attempt().context("attempt")?.id;
+        origin.mark_started("c", trigger, attempt)?;
+        origin.stage_memory(
+            &net.network,
+            "c",
+            trigger,
+            attempt,
+            "remember",
+            ChangeRequest::Remember {
+                memory_id: None,
+                text: "uncommitted preference".into(),
+            },
+            4,
+        )?;
+        origin.finish_job(
+            &net.a,
+            &net.network,
+            "c",
+            trigger,
+            attempt,
+            outcome,
+            "partial",
+            5,
+        )?;
+        assert!(origin.memories(&net.network, "c")?.is_empty());
+        assert!(
+            origin
+                .staged_memory_overlay("c", trigger, attempt)?
+                .is_empty()
+        );
+        assert_eq!(origin.pending_checks()?.len(), pending);
+    }
+    Ok(())
+}
+
+#[test]
+fn staged_memory_reopens_replays_and_discards_a_restarted_unknown_attempt() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    say(&mut origin, &net, "m2", true)?;
+    let claimed = origin
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let trigger = &claimed.job.trigger;
+    let attempt = &claimed.job.state.attempt().context("attempt")?.id;
+    origin.mark_started("c", trigger, attempt)?;
+    let request = ChangeRequest::Remember {
+        memory_id: None,
+        text: "persisted candidate".into(),
+    };
+    let staged = origin.stage_memory(
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        "remember",
+        request.clone(),
+        4,
+    )?;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.artifacts")
+        .join(format!("memory-restart-{}", uuid::Uuid::new_v4()));
+    crate::config::private_dir(&dir)?;
+    let path = dir.join("node.sqlite3");
+    origin
+        .connection
+        .execute("VACUUM INTO ?", [path.to_str().context("path")?])?;
+    drop(origin);
+    let mut reopened = Store::open(&path)?;
+    reopened.recover_scheduler_jobs(&net.a, &net.network, "boot")?;
+    assert_eq!(
+        reopened.stage_memory(
+            &net.network,
+            "c",
+            trigger,
+            attempt,
+            "remember",
+            request.clone(),
+            5
+        )?,
+        staged
+    );
+    reopened.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        JobOutcome::Completed,
+        "done",
+        6,
+    )?;
+    let initial = reopened.memory_records(&net.network, "c")?.remove(0);
+    reopened.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        signed_memory(
+            &net,
+            &reopened,
+            "c",
+            &initial.entry.memory_id,
+            Some("newer committed user preference"),
+        )?,
+        vec![],
+        7,
+    )?;
+    let version = reopened.version_vector(&net.network)?;
+    let replay =
+        reopened.stage_memory(&net.network, "c", trigger, attempt, "remember", request, 7)?;
+    assert_eq!(replay["state"], "committed");
+    assert_eq!(replay["record"]["change"]["after"], "persisted candidate");
+    assert_eq!(reopened.version_vector(&net.network)?, version);
+    let memory = reopened.memory_records(&net.network, "c")?.remove(0);
+    assert_eq!(memory.entry.text, "newer committed user preference");
+    say(&mut reopened, &net, "m3", true)?;
+    let next = reopened
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("next job")?;
+    let next_attempt = &next.job.state.attempt().context("next attempt")?.id;
+    reopened.mark_started("c", &next.job.trigger, next_attempt)?;
+    reopened.stage_memory(
+        &net.network,
+        "c",
+        &next.job.trigger,
+        next_attempt,
+        "discard",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "unknown candidate".into(),
+        },
+        8,
+    )?;
+    drop(reopened);
+    let mut restarted = Store::open(&path)?;
+    restarted.recover_scheduler_jobs(&net.a, &net.network, "new-boot")?;
+    assert_eq!(
+        restarted.memories(&net.network, "c")?,
+        vec![memory.entry.clone()]
+    );
+    assert!(memory_test_shown(&restarted)?.staged_memories.is_empty());
+    assert_eq!(restarted.pending_checks()?.len(), 1);
+    let replayed = restarted.memory_records(&net.network, "c")?.remove(0);
+    assert_eq!(replayed.revision, memory.revision);
+    assert_eq!(replayed.source_event_hash, memory.source_event_hash);
+    let mut replica = store(&net)?;
+    all_accepted(&mut replica, &net, &restarted)?;
+    assert_eq!(replica.memories(&net.network, "c")?, vec![memory.entry]);
+    assert_eq!(
+        replica.memory_records(&net.network, "c")?[0].revision,
+        memory.revision
+    );
+    drop(restarted);
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
 fn bot_settings_refuse_secrets() -> Result<()> {
     let net = net()?;
     let (mut origin, _) = bot_with_message(&net)?;
@@ -3786,8 +4591,6 @@ fn bot_settings_refuse_secrets() -> Result<()> {
     Ok(())
 }
 
-/// A key this Node knows never leaves it in a reply, a bot message or a work result, while what
-/// the user signed stays exactly as signed.
 #[test]
 fn shared_records_never_carry_a_known_credential() -> Result<()> {
     let key = "fake-shared-record-credential-0123456789";
@@ -3819,17 +4622,20 @@ fn shared_records_never_carry_a_known_credential() -> Result<()> {
         dispatcher: net.a.device_id()?,
         call_ref: "call-1".into(),
         kind: WorkKind::Agent(Provider::Codex),
-        model: None,
-        resolved: crate::model::ResolvedModel {
-            provider: Provider::Codex,
-            model: None,
-        },
         cwd: "/tmp".into(),
         title: "t".into(),
         prompt: "p".into(),
         continues: None,
         parent: None,
         thread: None,
+
+        model: None,
+
+        resolved: ResolvedModel {
+            provider: Provider::Codex,
+
+            model: None,
+        },
     };
     let id = spec.work_id.clone();
     origin.accept_work_fixture(&net.a, &net.network, spec, 6)?;
@@ -4471,10 +5277,6 @@ fn a_rebuild_never_touches_local_ledgers() -> Result<()> {
 fn question(net: &Net, id: &str, session: &str) -> Result<EventBody> {
     Ok(EventBody::QuestionAsked {
         question_id: id.into(),
-        attention: AttentionRequest {
-            kind: AttentionKind::Question,
-            device_id: Some(net.a.device_id()?),
-        },
         severity: Severity::Attention,
         text: "要继续吗？".into(),
         choices: vec![Choice {
@@ -4487,6 +5289,12 @@ fn question(net: &Net, id: &str, session: &str) -> Result<EventBody> {
             cwd: "/w".into(),
             summary: "tests fail".into(),
             request_id: None,
+        },
+
+        attention: AttentionRequest {
+            kind: AttentionKind::Question,
+
+            device_id: Some(net.a.device_id()?),
         },
     })
 }
@@ -4834,7 +5642,6 @@ fn the_pending_list_holds_exactly_the_unanswered_questions() -> Result<()> {
     Ok(())
 }
 
-/// The version of a session as its bot's chat lists it.
 fn session_version(store: &Store, net: &Net, session: &str) -> Result<String> {
     for scope in ["c", "d"] {
         if let Some(row) = store
@@ -5073,17 +5880,6 @@ fn a_failed_turn_shares_its_kind_and_keeps_the_raw_detail_local() -> Result<()> 
             "",
             3,
         )?;
-        let job = if matches!(job.state, JobState::Reconciling { .. }) {
-            assert!(
-                store
-                    .message(&net.network, "c", &claimed.job.message_id)?
-                    .is_none()
-            );
-            let check = store.pending_checks()?.pop().context("pending check")?;
-            store.confirm_manager_stopped(&net.a, &net.network, &check, 4)?
-        } else {
-            job
-        };
         let reply = store
             .message(&net.network, "c", &claimed.job.message_id)?
             .context("reply")?;
@@ -5277,17 +6073,20 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
             dispatcher: net.a.device_id()?,
             call_ref: format!("call-{i}"),
             kind: WorkKind::Agent(Provider::Codex),
-            model: None,
-            resolved: crate::model::ResolvedModel {
-                provider: Provider::Codex,
-                model: None,
-            },
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".repeat(600),
             continues: None,
             parent: None,
             thread: None,
+
+            model: None,
+
+            resolved: ResolvedModel {
+                provider: Provider::Codex,
+
+                model: None,
+            },
         };
         store.accept_work_fixture(&net.a, &net.network, spec, 200 + i)?;
     }
@@ -5301,10 +6100,13 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
         basis: context.basis.clone(),
         reply_to: "m49".into(),
         message_id: "reply".into(),
-        runtime: None,
-        pending_check: false,
-        tool_calls: false,
         state: JobState::Queued,
+
+        runtime: None,
+
+        pending_check: false,
+
+        tool_calls: false,
     };
     let history = store.turn_history(&net.network, "c", &job, None)?;
     let materialize = |bot: Value| {
@@ -5866,17 +6668,20 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
             dispatcher: net.a.device_id()?,
             call_ref: format!("call-{i}"),
             kind: WorkKind::Agent(Provider::Codex),
-            model: None,
-            resolved: crate::model::ResolvedModel {
-                provider: Provider::Codex,
-                model: None,
-            },
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".repeat(300),
             continues: None,
             parent: None,
             thread: None,
+
+            model: None,
+
+            resolved: ResolvedModel {
+                provider: Provider::Codex,
+
+                model: None,
+            },
         })
     };
     for i in 0..3 {
@@ -5892,10 +6697,13 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
             basis: store.version_vector(&net.network)?,
             reply_to: trigger.into(),
             message_id: "reply".into(),
-            runtime: None,
-            pending_check: false,
-            tool_calls: false,
             state: JobState::Queued,
+
+            runtime: None,
+
+            pending_check: false,
+
+            tool_calls: false,
         };
         let history = store.turn_history(
             &net.network,
@@ -5968,7 +6776,10 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
     )?;
     let ((changed, _), _) = render(&store, "m3", Some(&covers), Some(&shown))?;
     let data = prompt_data(&changed)?;
-    assert_eq!(data["bot"]["memory"][0]["text"], "prefers short replies");
+    assert_eq!(
+        data["memory_context"]["upserts"][0]["text"],
+        "prefers short replies"
+    );
     assert_eq!(data["works"], json!([]));
     Ok(())
 }
@@ -5981,6 +6792,11 @@ fn a_new_session_key_opens_a_new_thread_shown_everything() -> Result<()> {
     let shown = Shown {
         bot: Some("bot-digest".into()),
         works: [("w1".to_owned(), "work-digest".to_owned())].into(),
+        dynamic: None,
+        staged_memories: Default::default(),
+        session_generation: 0,
+        session_lineage: Vec::new(),
+        ..Shown::default()
     };
     let mut turn = |id: &str, key: &str| -> Result<crate::scheduling::ClaimedJob> {
         say(&mut store, &net, id, true)?;
@@ -6004,18 +6820,22 @@ fn a_new_session_key_opens_a_new_thread_shown_everything() -> Result<()> {
         )?;
         Ok(claimed)
     };
-    assert_eq!(turn("m1", "cfg")?.shown, Shown::default());
+    assert_eq!(
+        turn("m1", "cfg")?.shown,
+        Shown {
+            session_generation: 1,
+            ..Shown::default()
+        }
+    );
     let resumed = turn("m2", "cfg")?;
     assert_eq!(resumed.previous_native_id.as_deref(), Some("thread"));
-    assert_eq!(resumed.shown, shown);
-    assert_eq!(resumed.session_generation, 1);
-    assert_eq!(resumed.handoff_revision, 1);
+    assert_eq!(resumed.shown.session_generation, 1);
+    assert!(resumed.shown.session_lineage.is_empty());
     let fresh = turn("m3", "cfg-new-instructions")?;
     assert_eq!(fresh.previous_native_id, None);
-    assert_eq!(fresh.shown, Shown::default());
-    assert_eq!(fresh.session_generation, 2);
-    assert_eq!(fresh.handoff_revision, 2);
-    assert_eq!(fresh.handoff_source, fresh.job.basis);
+    assert_eq!(fresh.shown.session_generation, 2);
+    assert_eq!(fresh.shown.session_lineage.len(), 1);
+    assert_eq!(fresh.shown.session_lineage[0].generation, 1);
     Ok(())
 }
 
@@ -6028,10 +6848,13 @@ fn job_at(store: &Store, net: &Net, trigger: &str) -> Result<SchedulerJob> {
         basis: store.version_vector(&net.network)?,
         reply_to: trigger.into(),
         message_id: "reply".into(),
-        runtime: None,
-        pending_check: false,
-        tool_calls: false,
         state: JobState::Queued,
+
+        runtime: None,
+
+        pending_check: false,
+
+        tool_calls: false,
     })
 }
 
@@ -6046,6 +6869,135 @@ fn message_seq(store: &Store, net: &Net, message: &str) -> Result<u64> {
     .context("message")?
     .event
     .seq)
+}
+
+#[test]
+fn compiled_context_tracks_observed_turn_state_without_private_values() -> Result<()> {
+    use crate::scheduling::{ContextProjection, ContextStage, QueueHoldReason};
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    for (index, outcome, expected) in [
+        (1, JobOutcome::Completed, ContextStage::Completed),
+        (
+            2,
+            JobOutcome::Interrupted {
+                failure: ExecFailure::new(FailureKind::Lost, "unknown"),
+                process_unconfirmed: true,
+            },
+            ContextStage::Unknown,
+        ),
+    ] {
+        let message = format!("context-{index}");
+        say(&mut store, &net, &message, true)?;
+        let claimed = store
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+            .context("claim")?;
+        let trigger = claimed.job.trigger.clone();
+        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+        let projection = ContextProjection {
+            attempt_id: attempt.clone(),
+            provider: Provider::Codex,
+            stable_fingerprint: crate::crypto::digest(b"stable"),
+            dynamic_fingerprint: crate::crypto::digest(b"dynamic"),
+            session_generation: claimed.shown.session_generation,
+            coverage: Default::default(),
+            stable_bytes: 100,
+            dynamic_bytes: 200,
+            invalidation_reason: None,
+            stage: ContextStage::Compiled,
+            session_status: None,
+        };
+        store.record_compiled_context("c", &trigger, &attempt, &projection)?;
+        assert_eq!(
+            store
+                .scheduler_context_projection("c")?
+                .context("compiled")?
+                .stage,
+            ContextStage::Compiled
+        );
+        assert_eq!(
+            store.scheduler_queue_hold(
+                &net.network,
+                &net.a.device_id()?,
+                "c",
+                &JobState::Queued
+            )?,
+            Some(QueueHoldReason::ActiveTurn)
+        );
+        store.mark_started("c", &trigger, &attempt)?;
+        store.save_scheduler_native_id(
+            "c",
+            &trigger,
+            &attempt,
+            "private-native-thread",
+            "private-bearer",
+            false,
+        )?;
+        let before = memory_test_shown(&store)?;
+        let covers: String = store.connection.query_row(
+            "SELECT covers FROM scheduler_sessions WHERE conversation_id='c' AND scope='main'",
+            [],
+            |row| row.get(0),
+        )?;
+        store.record_context_started(&attempt)?;
+        let observed = memory_test_shown(&store)?;
+        assert_eq!(
+            observed.context.as_ref().context("started callback")?.stage,
+            ContextStage::Started
+        );
+        assert_eq!(observed.memory, before.memory);
+        assert_eq!(observed.works, before.works);
+        assert_eq!(
+            covers,
+            store.connection.query_row::<String, _, _>(
+                "SELECT covers FROM scheduler_sessions WHERE conversation_id='c' AND scope='main'",
+                [],
+                |row| row.get(0),
+            )?
+        );
+        store.record_manager_turn(
+            &attempt,
+            "system",
+            "private-native-thread",
+            Some("turn"),
+            &Shown::default(),
+        )?;
+        assert_eq!(
+            store
+                .scheduler_context_projection("c")?
+                .context("started")?
+                .stage,
+            ContextStage::Started
+        );
+        store.finish_job(
+            &net.a,
+            &net.network,
+            "c",
+            &trigger,
+            &attempt,
+            outcome,
+            "reply",
+            5,
+        )?;
+        store.record_context_started(&attempt)?;
+        store.record_manager_turn(
+            &attempt,
+            "system",
+            "private-native-thread",
+            Some("turn"),
+            &Shown::default(),
+        )?;
+        let context = store
+            .scheduler_context_projection("c")?
+            .context("terminal")?;
+        assert_eq!(context.stage, expected);
+        let encoded = serde_json::to_string(&context)?;
+        assert!(encoded.len() < 2_048);
+        assert!(!encoded.contains("private-native-thread"));
+        assert!(!encoded.contains("private-bearer"));
+    }
+    Ok(())
 }
 
 #[test]
@@ -6169,6 +7121,101 @@ fn history_pages_read_at_the_turn_basis_by_position_and_type() -> Result<()> {
             .any(|event| !matches!(event.event.body, EventBody::MessagePosted { .. })),
         "without types every event reads"
     );
+    Ok(())
+}
+
+#[test]
+fn history_search_filters_before_paging_and_keeps_the_recorded_basis() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    for (id, author, text) in [
+        ("s1", &net.a, "Needle 100%_ 中文"),
+        ("s2", &net.b, "needle from B"),
+        ("s3", &net.a, "unrelated text"),
+        ("s4", &net.a, "needle again"),
+    ] {
+        store.append_event(author, &net.network, "c", user(&net, id, text), vec![], 10)?;
+    }
+    let basis = store.version_vector(&net.network)?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "s5", "needle after basis"),
+        vec![],
+        11,
+    )?;
+    let a = net.a.device_id()?;
+    let b = net.b.device_id()?;
+    let kinds = ["message_posted".into()];
+    let filter = || super::HistoryFilter {
+        kinds: &kinds,
+        author: Some(&a),
+        keyword: Some("NEEDLE"),
+    };
+    let (newest, more) = store.search_history_page(&net.network, "c", &basis, None, filter(), 1)?;
+    assert_eq!(newest.len(), 1);
+    assert_eq!(newest[0].event.body.subject(), Some("s4"));
+    assert!(more);
+    let seq = newest[0].event.seq;
+    let (older, more) = store.search_history_page(
+        &net.network,
+        "c",
+        &basis,
+        Some((&a, seq, false)),
+        filter(),
+        1,
+    )?;
+    assert_eq!(older[0].event.body.subject(), Some("s1"));
+    assert!(
+        !more,
+        "nonmatching records cannot invent another matching page"
+    );
+    let (newer, more) = store.search_history_page(
+        &net.network,
+        "c",
+        &basis,
+        Some((&a, older[0].event.seq, true)),
+        filter(),
+        10,
+    )?;
+    assert_eq!(newer.len(), 1);
+    assert_eq!(newer[0].event.body.subject(), Some("s4"));
+    assert!(!more, "events beyond the turn basis are invisible");
+    for keyword in ["100%_", "中文"] {
+        let (found, more) = store.search_history_page(
+            &net.network,
+            "c",
+            &basis,
+            None,
+            super::HistoryFilter {
+                kinds: &kinds,
+                author: None,
+                keyword: Some(keyword),
+            },
+            1,
+        )?;
+        assert_eq!(found[0].event.body.subject(), Some("s1"));
+        assert!(!more);
+    }
+    let (found, more) = store.search_history_page(
+        &net.network,
+        "c",
+        &basis,
+        None,
+        super::HistoryFilter {
+            kinds: &kinds,
+            author: Some(&b),
+            keyword: Some("needle"),
+        },
+        1,
+    )?;
+    assert_eq!(found[0].event.body.subject(), Some("s2"));
+    assert!(!more);
+    let (missing, more) =
+        store.search_history_page(&net.network, "different-scope", &basis, None, filter(), 1)?;
+    assert!(missing.is_empty() && !more);
     Ok(())
 }
 
@@ -6424,17 +7471,20 @@ fn a_streamed_event_reads_only_the_runs_on_its_thread() -> Result<()> {
             dispatcher: net.a.device_id()?,
             call_ref: format!("call-{i}"),
             kind: WorkKind::Agent(Provider::Codex),
-            model: None,
-            resolved: crate::model::ResolvedModel {
-                provider: Provider::Codex,
-                model: None,
-            },
             cwd: format!("/tmp/{thread}"),
             title: "t".into(),
             prompt: "p".into(),
             continues: None,
             parent: None,
             thread: Some(thread.into()),
+
+            model: None,
+
+            resolved: ResolvedModel {
+                provider: Provider::Codex,
+
+                model: None,
+            },
         };
         store.accept_work_fixture(&net.a, &net.network, spec, 10 + i as i64)?;
     }
@@ -6529,17 +7579,20 @@ fn work_status_pages_newest_first_within_a_byte_cap() -> Result<()> {
             dispatcher: net.a.device_id()?,
             call_ref: format!("call-{i}"),
             kind: WorkKind::Agent(Provider::Codex),
-            model: None,
-            resolved: crate::model::ResolvedModel {
-                provider: Provider::Codex,
-                model: None,
-            },
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".repeat(2_000),
             continues: None,
             parent: None,
             thread: None,
+
+            model: None,
+
+            resolved: ResolvedModel {
+                provider: Provider::Codex,
+
+                model: None,
+            },
         };
         store.accept_work_fixture(&net.a, &net.network, spec, 10 + i)?;
     }
@@ -6818,11 +7871,12 @@ fn a_bots_face_from_the_chat_and_from_the_panel_converge_by_rank() -> Result<()>
             name: None,
             instructions: None,
             model: None,
-            reasoning_effort: None,
             skills: None,
             all_skills: None,
             avatar: Some(parts(None, Some(Eyes::Wide), Some(hue(285)?))),
             default_avatar: None,
+
+            reasoning_effort: None,
         },
         Provider::Codex,
         21,
@@ -6933,11 +7987,12 @@ fn read_bot_lists_every_skill_the_prompt_index_leaves_out() -> Result<()> {
             name: None,
             instructions: None,
             model: None,
-            reasoning_effort: None,
             skills: Some(chosen),
             all_skills: None,
             avatar: None,
             default_avatar: None,
+
+            reasoning_effort: None,
         },
         Provider::Codex,
         60,
@@ -7185,9 +8240,6 @@ fn the_prompt_never_carries_the_users_device_signature() -> Result<()> {
     Ok(())
 }
 
-/// Only what wants the user is read, however long the history: a failure stays until a later
-/// work ends, a completed bot reply follows it or the user closes it, and a refusal leaves the
-/// same way once the bot answered its report.
 #[test]
 fn open_works_list_only_what_still_wants_the_user() -> Result<()> {
     use crate::work::{Dispatch, DispatchState};
@@ -7215,17 +8267,20 @@ fn open_works_list_only_what_still_wants_the_user() -> Result<()> {
             dispatcher: local.clone(),
             call_ref: id.into(),
             kind: WorkKind::Task,
-            model: None,
-            resolved: crate::model::ResolvedModel {
-                provider: crate::providers::Provider::Codex,
-                model: None,
-            },
             cwd: "/w".into(),
             title: id.into(),
             prompt: "p".into(),
             continues: None,
             parent: None,
             thread: None,
+
+            model: None,
+
+            resolved: ResolvedModel {
+                provider: Provider::Codex,
+
+                model: None,
+            },
         };
         store.append_event(&net.a, &net.network, "c", dispatched, vec![], at)?;
         if let Some(outcome) = outcome {
@@ -7346,21 +8401,22 @@ fn open_works_list_only_what_still_wants_the_user() -> Result<()> {
     let trigger = message_trigger("m1");
     let refused = |call: &str| -> Result<Dispatch> {
         Ok(Dispatch {
-            spec: crate::work::WorkRequest {
+            spec: WorkRequest {
                 work_id: WorkSpec::id("c", &trigger, call),
                 conversation: "c".into(),
                 trigger: trigger.clone(),
                 target: net.b.device_id()?,
                 dispatcher: net.a.device_id()?,
                 call_ref: call.into(),
-                kind: crate::work::RequestedWorkKind::Task,
-                model: None,
+                kind: RequestedWorkKind::Task,
                 cwd: "/w".into(),
                 title: call.into(),
                 prompt: "p".into(),
                 continues: None,
                 parent: None,
                 thread: None,
+
+                model: None,
             },
             state: DispatchState::Pending,
         })
@@ -7470,1114 +8526,1937 @@ fn open_works_list_only_what_still_wants_the_user() -> Result<()> {
     Ok(())
 }
 
-fn submitted_runtime(claimed: &crate::scheduling::ClaimedJob) -> Result<TurnRuntime> {
-    Ok(TurnRuntime {
-        provider: Provider::Codex,
-        model: Some("submitted-model".into()),
-        reasoning_effort: Some("high".into()),
-        generation: "opaque-config-generation".into(),
-        session_generation: claimed.session_generation,
-        delivery_id: claimed.job.state.attempt().context("attempt")?.id.clone(),
-        stage: ProviderStage::Validate,
-        execution: TurnExecution::NotStarted,
-        attempted_at_ms: 10,
-        switched_from: None,
-        switch_reason: None,
-    })
-}
+fn isolated_task(store: &mut Store, net: &Net, work_id: &str) -> Result<WorkSpec> {
+    let spec = WorkSpec {
+        work_id: work_id.into(),
+        conversation: "c".into(),
+        trigger: message_trigger("m1"),
+        target: net.a.device_id()?,
+        dispatcher: net.a.device_id()?,
+        call_ref: work_id.into(),
+        kind: WorkKind::Task,
+        cwd: "/tmp".into(),
+        title: work_id.into(),
+        prompt: "read the task".into(),
+        continues: None,
+        parent: None,
+        thread: None,
 
-#[test]
-fn a_submitted_runtime_is_frozen_and_only_proven_unstarted_failure_is_retryable() -> Result<()> {
-    let net = net()?;
-    let mut store = store(&net)?;
-    conversation(&mut store, &net)?;
-    say(&mut store, &net, "m1", true)?;
-    let claimed = store
-        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
-        .context("job")?;
-    let runtime = submitted_runtime(&claimed)?;
-    let trigger = &claimed.job.trigger;
-    let attempt = &runtime.delivery_id;
-    store.record_turn_runtime("c", trigger, attempt, &runtime)?;
-    let running = store.mark_started("c", trigger, attempt)?;
-    assert_eq!(
-        running.runtime.context("runtime")?.execution,
-        TurnExecution::Unknown
-    );
-    assert!(
-        store
-            .record_turn_runtime("c", trigger, attempt, &runtime)
-            .is_err()
-    );
-    store.update_turn_runtime(
-        "c",
-        trigger,
-        attempt,
-        ProviderStage::TurnStart,
-        TurnExecution::NotStarted,
-    )?;
-    let failed = store.finish_job(
-        &net.a,
-        &net.network,
-        "c",
-        trigger,
-        attempt,
-        JobOutcome::Failed(ExecFailure::new(
-            FailureKind::Rejected,
-            "refused before send",
-        )),
-        "",
-        11,
-    )?;
-    assert!(failed.retryable());
-    assert_eq!(
-        failed.runtime.as_ref().context("runtime")?,
-        &TurnRuntime {
-            stage: ProviderStage::TurnStart,
-            ..runtime.clone()
-        }
-    );
-    say(&mut store, &net, "m2", true)?;
-    let next = store
-        .claim_next_fixture(
-            &net.a,
-            &net.network,
-            "c",
-            "boot",
-            "changed-model-and-effort",
-        )?
-        .context("job")?;
-    assert_eq!(next.session_generation, 2);
-    assert_eq!(
-        store
-            .scheduler_job("c", trigger)?
-            .context("old job")?
-            .runtime,
-        failed.runtime
-    );
-    let next_runtime = submitted_runtime(&next)?;
-    store.record_turn_runtime(
-        "c",
-        &next.job.trigger,
-        &next_runtime.delivery_id,
-        &next_runtime,
-    )?;
-    store.mark_started("c", &next.job.trigger, &next_runtime.delivery_id)?;
-    store.record_manager_tool_call("c", &next.job.trigger, &next_runtime.delivery_id)?;
-    assert!(
-        store
-            .update_turn_runtime(
-                "c",
-                &next.job.trigger,
-                &next_runtime.delivery_id,
-                ProviderStage::TurnStart,
-                TurnExecution::NotStarted
-            )
-            .is_err()
-    );
-    let failed = store.finish_job(
-        &net.a,
-        &net.network,
-        "c",
-        &next.job.trigger,
-        &next_runtime.delivery_id,
-        JobOutcome::Failed(ExecFailure::new(
-            FailureKind::Rejected,
-            "failed after tools",
-        )),
-        "",
-        12,
-    )?;
-    assert!(!failed.retryable());
-    let shared = serde_json::to_value(&failed)?;
-    assert!(shared.get("pending_check").is_none() && shared.get("tool_calls").is_none());
-    assert_eq!(shared["runtime"]["model"], "submitted-model");
-    assert!(shared["runtime"].get("native_id").is_none());
-    assert!(shared["runtime"].get("token").is_none());
-    Ok(())
-}
+        model: None,
 
-#[test]
-fn a_restarted_reply_waits_for_history_then_records_the_recovered_result_once() -> Result<()> {
-    let net = net()?;
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.artifacts")
-        .join(format!("store-{}", uuid::Uuid::new_v4()));
-    crate::config::private_dir(&dir)?;
-    let path = dir.join("node.sqlite3");
-    let result = (|| -> Result<()> {
-        let mut store = Store::open(&path)?;
-        store.install_trust_bundle(&net.network, &net.state)?;
-        conversation(&mut store, &net)?;
-        say(&mut store, &net, "m1", true)?;
-        let claimed = store
-            .claim_next_fixture(&net.a, &net.network, "c", "boot-1", "cfg")?
-            .context("job")?;
-        let runtime = submitted_runtime(&claimed)?;
-        store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
-        store.mark_started("c", &claimed.job.trigger, &runtime.delivery_id)?;
-        store.record_manager_turn(
-            &runtime.delivery_id,
-            "system",
-            "thread",
-            None,
-            &Shown::default(),
-        )?;
-        drop(store);
-        let mut store = Store::open(&path)?;
-        for _ in 0..2 {
-            store.recover_scheduler_jobs(&net.a, &net.network, "boot-2")?;
-            assert!(
-                store
-                    .claim_next_fixture(&net.a, &net.network, "c", "boot-2", "new-settings")?
-                    .is_none()
-            );
-            assert!(
-                store
-                    .message(&net.network, "c", &claimed.job.message_id)?
-                    .is_none()
-            );
-            let unknown = store
-                .scheduler_job("c", &claimed.job.trigger)?
-                .context("job")?;
-            assert!(matches!(unknown.state, JobState::Reconciling { .. }));
-            assert!(unknown.pending_check && !unknown.retryable());
-            assert_eq!(store.pending_checks()?.len(), 1);
-        }
-        let recovered = store.finish_job(
-            &net.a,
-            &net.network,
-            "c",
-            &claimed.job.trigger,
-            &runtime.delivery_id,
-            JobOutcome::Completed,
-            "recovered final answer",
-            20,
-        )?;
-        assert!(matches!(recovered.state, JobState::Completed { .. }));
-        assert_eq!(
-            recovered.runtime.context("runtime")?.execution,
-            TurnExecution::Started
-        );
-        assert!(store.pending_checks()?.is_empty());
-        store.finish_job(
-            &net.a,
-            &net.network,
-            "c",
-            &claimed.job.trigger,
-            &runtime.delivery_id,
-            JobOutcome::Completed,
-            "must not replace the answer",
-            21,
-        )?;
-        let messages = store.messages(&net.network, "c")?;
-        let replies: Vec<_> = messages
-            .iter()
-            .filter(|message| message.message_id == claimed.job.message_id)
-            .collect();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].text, "recovered final answer");
-        assert_eq!(replies[0].status, Some(ReplyStatus::Completed));
-        Ok(())
-    })();
-    let _ = std::fs::remove_dir_all(dir);
-    result
-}
+        resolved: ResolvedModel {
+            provider: Provider::Codex,
 
-#[test]
-fn an_unknown_process_reply_keeps_partial_text_until_the_user_confirms() -> Result<()> {
-    let net = net()?;
-    let mut store = store(&net)?;
-    conversation(&mut store, &net)?;
-    say(&mut store, &net, "m1", true)?;
-    let claimed = store
-        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
-        .context("job")?;
-    let runtime = submitted_runtime(&claimed)?;
-    store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
-    store.mark_started("c", &claimed.job.trigger, &runtime.delivery_id)?;
-    let unknown = store.finish_job(
-        &net.a,
-        &net.network,
-        "c",
-        &claimed.job.trigger,
-        &runtime.delivery_id,
-        JobOutcome::Interrupted {
-            failure: ExecFailure::new(FailureKind::Lost, "process exited without a final result"),
-            process_unconfirmed: true,
+            model: None,
         },
-        "partial output",
-        15,
-    )?;
-    assert!(matches!(unknown.state, JobState::Reconciling { .. }));
+    };
     assert!(
         store
-            .message(&net.network, "c", &claimed.job.message_id)?
-            .is_none()
+            .accept_work_fixture(&net.a, &net.network, spec.clone(), 4)?
+            .1
     );
-    store.update_turn_runtime(
-        "c",
-        &claimed.job.trigger,
-        &runtime.delivery_id,
-        ProviderStage::ReadBack,
-        TurnExecution::Unknown,
-    )?;
-    let check = store.pending_checks()?.pop().context("pending check")?;
-    let confirmed = store.confirm_manager_stopped(&net.a, &net.network, &check, 16)?;
-    assert!(matches!(confirmed.state, JobState::Interrupted { .. }));
-    assert!(!confirmed.retryable());
-    assert_eq!(
-        confirmed.runtime.context("runtime")?.execution,
-        TurnExecution::Unknown
-    );
-    assert_eq!(
-        store
-            .message(&net.network, "c", &claimed.job.message_id)?
-            .context("reply")?
-            .text,
-        "partial output"
-    );
-    assert!(store.pending_checks()?.is_empty());
-    Ok(())
+    Ok(spec)
+}
+
+fn isolated_claim(
+    store: &mut Store,
+    net: &Net,
+    scope: crate::scheduling::SessionScope,
+    provider: Provider,
+    limits: crate::config::SchedulingLimits,
+) -> Result<Option<crate::scheduling::ClaimedJob>> {
+    store.claim_next_in_session(
+        &net.a,
+        &net.network,
+        &crate::scheduling::SessionKey {
+            conversation_id: "c".into(),
+            scope,
+        },
+        "boot",
+        &crate::scheduling::SessionConfig {
+            stable_fingerprint: "stable".into(),
+            runtime_fingerprint: "runtime".into(),
+            provider,
+        },
+        &limits,
+    )
 }
 
 #[test]
-fn native_compaction_advances_lineage_and_keeps_the_resumable_session() -> Result<()> {
+fn parallel_sessions_keep_native_tokens_shown_and_memory_writers_separate() -> Result<()> {
+    use crate::scheduling::{SessionScope, task_trigger};
     let net = net()?;
-    let mut store = store(&net)?;
-    conversation(&mut store, &net)?;
-    say(&mut store, &net, "m1", true)?;
-    let claimed = store
-        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
-        .context("job")?;
-    let runtime = submitted_runtime(&claimed)?;
-    store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
-    store.mark_started("c", &claimed.job.trigger, &runtime.delivery_id)?;
-    store.save_scheduler_native_id(
-        "c",
-        &claimed.job.trigger,
-        &runtime.delivery_id,
-        "thread",
-        "token",
-        false,
-    )?;
-    let shown = Shown {
-        bot: Some("bot-digest".into()),
-        works: Default::default(),
-    };
-    store.record_manager_turn(
-        &runtime.delivery_id,
-        "system",
-        "thread",
-        Some("turn"),
-        &shown,
-    )?;
-    assert_eq!(
-        store.record_context_compaction("c", &claimed.job.trigger, &runtime.delivery_id)?,
-        2
+    let (mut store, _) = bot_with_message(&net)?;
+    let limits = crate::config::SchedulingLimits::default();
+    let task1 = isolated_task(&mut store, &net, "parallel-1")?;
+    isolated_task(&mut store, &net, "parallel-2")?;
+    say(&mut store, &net, "parallel-human", true)?;
+    assert!(
+        isolated_claim(
+            &mut store,
+            &net,
+            SessionScope::Task {
+                work_id: task1.work_id.clone()
+            },
+            Provider::Codex,
+            limits
+        )?
+        .is_none(),
+        "human admission wins even over an older task"
     );
-    let saved = store
-        .scheduler_job("c", &claimed.job.trigger)?
-        .context("job")?
-        .runtime
-        .context("runtime")?;
-    assert_eq!(saved.session_generation, 2);
-    assert_eq!(saved.stage, ProviderStage::Compact);
+    let main = isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Main,
+        Provider::Codex,
+        limits,
+    )?
+    .context("main")?;
+    let first = isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Task {
+            work_id: task1.work_id.clone(),
+        },
+        Provider::Codex,
+        limits,
+    )?
+    .context("first task")?;
+    let second = isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Task {
+            work_id: "parallel-2".into(),
+        },
+        Provider::Codex,
+        limits,
+    )?
+    .context("second task")?;
+    assert_eq!(store.scheduler_jobs("c")?.len(), 3);
+    assert!(!store.accept_work_fixture(&net.a, &net.network, task1, 5)?.1);
+    assert_eq!(
+        store.scheduler_jobs("c")?.len(),
+        3,
+        "retry keeps the same task job"
+    );
+    for (index, claimed) in [&main, &first, &second].into_iter().enumerate() {
+        let attempt = claimed.job.state.attempt().context("attempt")?;
+        let native = format!("native-{index}");
+        store.mark_started("c", &claimed.job.trigger, &attempt.id)?;
+        store.save_scheduler_native_id(
+            "c",
+            &claimed.job.trigger,
+            &attempt.id,
+            &native,
+            &format!("token-{index}"),
+            false,
+        )?;
+        let shown = Shown {
+            bot: Some(format!("bot-{index}")),
+            memory: Some([(format!("memory-{index}"), format!("digest-{index}"))].into()),
+            ..Shown::default()
+        };
+        store.record_manager_turn(&attempt.id, "fixture", &native, Some("turn"), &shown)?;
+    }
+    let main_attempt = main.job.state.attempt().context("main attempt")?;
+    store.stage_memory(
+        &net.network,
+        "c",
+        &main.job.trigger,
+        &main_attempt.id,
+        "parallel-memory",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "prefers isolated tasks".into(),
+        },
+        6,
+    )?;
+    assert_eq!(store.scheduler_memory_staged_count("c")?, 1);
+    let first_attempt = first.job.state.attempt().context("first attempt")?;
     store.finish_job(
         &net.a,
         &net.network,
         "c",
-        &claimed.job.trigger,
-        &runtime.delivery_id,
+        &first.job.trigger,
+        &first_attempt.id,
         JobOutcome::Completed,
-        "done",
-        20,
+        "task done",
+        7,
     )?;
-    say(&mut store, &net, "m2", true)?;
-    let next = store
-        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
-        .context("job")?;
-    assert_eq!(next.previous_native_id.as_deref(), Some("thread"));
-    assert_eq!(next.previous_token.as_deref(), Some("token"));
-    assert_eq!(next.covers.as_ref(), Some(&claimed.job.basis));
-    assert_eq!(next.shown, shown);
-    assert_eq!((next.session_generation, next.handoff_revision), (2, 2));
-    assert_eq!(next.handoff_source, claimed.job.basis);
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &first.job.trigger,
+        &first_attempt.id,
+        JobOutcome::Completed,
+        "task done",
+        8,
+    )?;
+    assert_eq!(
+        store
+            .staged_memory_overlay("c", &main.job.trigger, &main_attempt.id)?
+            .len(),
+        1,
+        "task completion leaves the main writer alone"
+    );
+    assert!(store.memories(&net.network, "c")?.is_empty());
+    for (index, claimed) in [&main, &first, &second].into_iter().enumerate() {
+        let (native, token, shown): (String, String, String) = store.connection.query_row(
+            "SELECT native_id,native_token,shown FROM scheduler_sessions WHERE conversation_id='c' AND scope=?",
+            [claimed.job.session_scope().storage_key()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+        assert_eq!(native, format!("native-{index}"));
+        assert_eq!(token, format!("token-{index}"));
+        let shown: Shown = serde_json::from_str(&shown)?;
+        assert_eq!(shown.bot, Some(format!("bot-{index}")));
+        assert_eq!(
+            shown.memory,
+            Some([(format!("memory-{index}"), format!("digest-{index}"))].into())
+        );
+    }
+    store.request_manager_cancel(&net.a, &net.network, "c", &main.job.trigger)?;
+    assert!(!store.manager_attempt_allowed(
+        &net.network,
+        &net.a.device_id()?,
+        "c",
+        &main.job.trigger,
+        &main_attempt.id
+    )?);
+    assert!(store.manager_attempt_allowed(
+        &net.network,
+        &net.a.device_id()?,
+        "c",
+        &second.job.trigger,
+        &second.job.state.attempt().context("second attempt")?.id
+    )?);
+    assert!(matches!(
+        store
+            .scheduler_job("c", &task_trigger("parallel-2"))?
+            .context("second")?
+            .state,
+        JobState::Running { .. }
+    ));
+    let finished = store.context(&net.network, "c", None)?.events.into_iter().filter(|event| {
+        matches!(&event.event.body, EventBody::WorkFinished { work_id, .. } if work_id == "parallel-1")
+    }).count();
+    assert_eq!(finished, 1);
     Ok(())
 }
 
 #[test]
-fn a_proven_unstarted_backup_gets_a_new_permission_and_keeps_delivery_identity() -> Result<()> {
+fn serial_provider_gates_only_its_actual_bot_instance() -> Result<()> {
+    use crate::scheduling::{QueueHoldReason, SessionConfig, SessionKey, SessionScope};
     let net = net()?;
-    let mut store = store(&net)?;
-    conversation(&mut store, &net)?;
-    say(&mut store, &net, "m1", true)?;
-    let claimed = store
-        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
-        .context("job")?;
-    let mut runtime = submitted_runtime(&claimed)?;
-    let original_permission = claimed
-        .job
-        .state
-        .attempt()
-        .context("attempt")?
-        .permission_version;
-    store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
-    store.mark_started("c", &claimed.job.trigger, &runtime.delivery_id)?;
-    store.update_turn_runtime(
-        "c",
-        &claimed.job.trigger,
-        &runtime.delivery_id,
-        ProviderStage::TurnStart,
-        TurnExecution::NotStarted,
-    )?;
-    store.fence_manager_permission(
-        "c",
-        &claimed.job.trigger,
-        &runtime.delivery_id,
-        original_permission,
-    )?;
-    assert!(!store.manager_attempt_allowed(
-        &net.network,
-        &net.a.device_id()?,
-        "c",
-        &claimed.job.trigger,
-        &runtime.delivery_id,
-        original_permission,
-    )?);
-    runtime.switched_from = Some(crate::scheduling::RuntimeSelection {
-        provider: runtime.provider,
-        model: runtime.model.clone(),
-        reasoning_effort: runtime.reasoning_effort.clone(),
-    });
-    runtime.switch_reason = Some(FailureKind::Quota);
-    runtime.provider = Provider::Pi;
-    runtime.model = Some("backup".into());
-    runtime.session_generation =
-        store.advance_scheduler_lineage("c", &claimed.job.trigger, &runtime.delivery_id)?;
-    let switched =
-        store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
-    assert_eq!(switched.message_id, claimed.job.message_id);
+    let (mut store, _) = bot_with_message(&net)?;
+    second_bot(&mut store, &net, "other")?;
+    let limits = crate::config::SchedulingLimits::default();
+    say(&mut store, &net, "serial-human", true)?;
+    isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Main,
+        Provider::Cursor,
+        limits,
+    )?
+    .context("main")?;
+    isolated_task(&mut store, &net, "serial-task")?;
+    let task = store
+        .scheduler_job("c", "task:serial-task")?
+        .context("task")?;
     assert_eq!(
-        switched.runtime.as_ref().context("runtime")?.delivery_id,
-        runtime.delivery_id
+        store.scheduler_job_hold(
+            &net.network,
+            &net.a.device_id()?,
+            &task,
+            Provider::Cursor,
+            &limits
+        )?,
+        Some(QueueHoldReason::ProviderSerial)
     );
-    let backup_permission = switched
-        .state
-        .attempt()
-        .context("attempt")?
-        .permission_version;
-    assert!(backup_permission > original_permission);
-    assert!(!store.manager_attempt_allowed(
-        &net.network,
-        &net.a.device_id()?,
-        "c",
-        &claimed.job.trigger,
-        &runtime.delivery_id,
-        original_permission,
-    )?);
-    assert!(store.manager_attempt_allowed(
-        &net.network,
-        &net.a.device_id()?,
-        "c",
-        &claimed.job.trigger,
-        &runtime.delivery_id,
-        backup_permission,
-    )?);
-    store.fence_manager_permission(
-        "c",
-        &claimed.job.trigger,
-        &runtime.delivery_id,
-        original_permission,
-    )?;
-    assert!(store.manager_attempt_allowed(
-        &net.network,
-        &net.a.device_id()?,
-        "c",
-        &claimed.job.trigger,
-        &runtime.delivery_id,
-        backup_permission,
-    )?);
-    store.record_manager_tool_call("c", &claimed.job.trigger, &runtime.delivery_id)?;
     assert!(
-        store
-            .record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)
-            .is_err()
+        isolated_claim(
+            &mut store,
+            &net,
+            task.session_scope(),
+            Provider::Cursor,
+            limits
+        )?
+        .is_none()
     );
+    super::scheduler::admit_from(
+        &store.connection,
+        &net.network,
+        "d",
+        "work:other",
+        TriggerKind::WorkResult,
+        "other",
+    )?;
+    let other = store
+        .claim_next_in_session(
+            &net.a,
+            &net.network,
+            &SessionKey {
+                conversation_id: "d".into(),
+                scope: SessionScope::Main,
+            },
+            "boot",
+            &SessionConfig {
+                stable_fingerprint: "stable".into(),
+                runtime_fingerprint: "runtime".into(),
+                provider: Provider::Cursor,
+            },
+            &limits,
+        )?
+        .context("other bot is not this Cursor instance")?;
+    assert_eq!(other.job.conversation_id, "d");
+    Ok(())
+}
+
+#[test]
+fn held_tasks_leave_room_for_humans_and_machine_slots_are_real() -> Result<()> {
+    use crate::scheduling::{QueueHoldReason, SessionScope};
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    let limits = crate::config::SchedulingLimits {
+        machine_slots: 2,
+        task_limit: 1,
+    };
+    isolated_task(&mut store, &net, "limited-1")?;
+    isolated_task(&mut store, &net, "limited-2")?;
+    isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Task {
+            work_id: "limited-1".into(),
+        },
+        Provider::Codex,
+        limits,
+    )?
+    .context("first")?;
+    let task = store
+        .scheduler_job("c", "task:limited-2")?
+        .context("second")?;
+    assert_eq!(
+        store.scheduler_job_hold(
+            &net.network,
+            &net.a.device_id()?,
+            &task,
+            Provider::Codex,
+            &limits
+        )?,
+        Some(QueueHoldReason::TaskLimit)
+    );
+    say(&mut store, &net, "priority-human", true)?;
+    isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Main,
+        Provider::Codex,
+        limits,
+    )?
+    .context("human bypasses held task")?;
+    let more_tasks = crate::config::SchedulingLimits {
+        machine_slots: 2,
+        task_limit: 2,
+    };
+    assert_eq!(
+        store.scheduler_job_hold(
+            &net.network,
+            &net.a.device_id()?,
+            &task,
+            Provider::Codex,
+            &more_tasks
+        )?,
+        Some(QueueHoldReason::MachineSlot)
+    );
+    assert!(
+        isolated_claim(
+            &mut store,
+            &net,
+            task.session_scope(),
+            Provider::Codex,
+            more_tasks
+        )?
+        .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn restart_recovers_each_scope_and_unknown_turns_are_never_replayed() -> Result<()> {
+    use crate::scheduling::{QueueHoldReason, SessionScope};
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    let limits = crate::config::SchedulingLimits {
+        machine_slots: 3,
+        task_limit: 2,
+    };
+    say(&mut store, &net, "restart-human", true)?;
+    isolated_task(&mut store, &net, "restart-task")?;
+    let main = isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Main,
+        Provider::Codex,
+        limits,
+    )?
+    .context("main")?;
+    let task = isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Task {
+            work_id: "restart-task".into(),
+        },
+        Provider::Codex,
+        limits,
+    )?
+    .context("task")?;
+    let main_attempt = main.job.state.attempt().context("main attempt")?;
+    store.mark_started("c", &main.job.trigger, &main_attempt.id)?;
+    store.recover_scheduler_jobs(&net.a, &net.network, "new-boot")?;
+    assert!(matches!(
+        store
+            .scheduler_job("c", &main.job.trigger)?
+            .context("main")?
+            .state,
+        JobState::Reconciling { .. }
+    ));
+    assert!(matches!(
+        store
+            .scheduler_job("c", &task.job.trigger)?
+            .context("task")?
+            .state,
+        JobState::Queued
+    ));
+    assert_eq!(store.pending_checks()?.len(), 1);
+    say(&mut store, &net, "after-restart-human", true)?;
+    let next = store
+        .scheduler_job("c", "message:after-restart-human")?
+        .context("next")?;
+    assert_eq!(
+        store.scheduler_job_hold(
+            &net.network,
+            &net.a.device_id()?,
+            &next,
+            Provider::Codex,
+            &limits
+        )?,
+        Some(QueueHoldReason::PendingCheck)
+    );
+    let config = crate::scheduling::SessionConfig {
+        stable_fingerprint: "stable".into(),
+        runtime_fingerprint: "runtime".into(),
+        provider: Provider::Codex,
+    };
+    let recovered = store
+        .claim_next_in_session(
+            &net.a,
+            &net.network,
+            &task.job.session_key(),
+            "new-boot",
+            &config,
+            &limits,
+        )?
+        .context("unstarted task can run in its own scope")?;
+    assert_ne!(
+        recovered.job.state.attempt().context("new attempt")?.id,
+        task.job.state.attempt().context("old attempt")?.id
+    );
+    assert_eq!(
+        store.pending_checks()?.len(),
+        1,
+        "claiming another scope does not clear unknown evidence"
+    );
+    store.resolve_pending_check(&main_attempt.id)?;
+    assert_eq!(
+        store.scheduler_job_hold(
+            &net.network,
+            &net.a.device_id()?,
+            &next,
+            Provider::Codex,
+            &limits
+        )?,
+        None
+    );
+    assert!(matches!(
+        store
+            .scheduler_job("c", &main.job.trigger)?
+            .context("old job")?
+            .state,
+        JobState::Reconciling { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_routine_is_ephemeral_and_keeps_the_main_session_untouched() -> Result<()> {
+    use crate::scheduling::{SessionConfig, SessionScope};
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    let (saved, _) = store.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "routine",
+        save_schedule(None, "Digest", 5),
+        Provider::Codex,
+        3,
+    )?;
+    let BotChange::Schedule { schedule_id, .. } = saved.change else {
+        panic!("schedule")
+    };
+    let due = store.admit_due_schedules(&net.a, &net.network, 1_001)?;
+    assert_eq!(due.len(), 1);
+    say(&mut store, &net, "routine-main", true)?;
+    let limits = crate::config::SchedulingLimits::default();
+    let main = isolated_claim(
+        &mut store,
+        &net,
+        SessionScope::Main,
+        Provider::Codex,
+        limits,
+    )?
+    .context("main")?;
+    let main_attempt = main.job.state.attempt().context("main attempt")?;
     store.save_scheduler_native_id(
         "c",
-        &claimed.job.trigger,
-        &runtime.delivery_id,
-        "pi-backup-session",
-        "backup-token",
+        &main.job.trigger,
+        &main_attempt.id,
+        "main-native",
+        "main-token",
+        true,
+    )?;
+    let trigger = schedule_trigger(&schedule_id, 1_000);
+    let routine_key = crate::scheduling::SessionKey {
+        conversation_id: "c".into(),
+        scope: SessionScope::Routine {
+            trigger: trigger.clone(),
+        },
+    };
+    let config = SessionConfig {
+        stable_fingerprint: "stable".into(),
+        runtime_fingerprint: "runtime".into(),
+        provider: Provider::Codex,
+    };
+    let routine = store
+        .claim_next_in_session(&net.a, &net.network, &routine_key, "boot", &config, &limits)?
+        .context("routine runs independently")?;
+    assert!(routine.previous_native_id.is_none());
+    assert!(routine.previous_token.is_none());
+    assert!(routine.covers.is_none());
+    assert!(routine.shown.memory.is_none());
+    let attempt = routine.job.state.attempt().context("routine attempt")?;
+    store.save_scheduler_native_id(
+        "c",
+        &trigger,
+        &attempt.id,
+        "routine-native",
+        "routine-token",
         true,
     )?;
     store.finish_job(
         &net.a,
         &net.network,
         "c",
-        &claimed.job.trigger,
-        &runtime.delivery_id,
+        &trigger,
+        &attempt.id,
         JobOutcome::Completed,
-        "backup result",
-        20,
+        "digest",
+        2_000,
     )?;
-    say(&mut store, &net, "m2", true)?;
-    let next = store
-        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
-        .context("next primary job")?;
-    assert!(next.previous_native_id.is_none());
-    assert!(next.previous_token.is_none());
-    assert!(next.covers.is_none());
-    assert_eq!(next.session_generation, runtime.session_generation + 1);
-    Ok(())
-}
-
-fn admission_request(
-    net: &Net,
-    scope: &str,
-    call_ref: &str,
-    kind: crate::work::RequestedWorkKind,
-) -> Result<crate::work::WorkRequest> {
-    Ok(crate::work::WorkRequest {
-        work_id: WorkSpec::id(scope, "message:m1", call_ref),
-        conversation: scope.into(),
-        trigger: "message:m1".into(),
-        target: net.a.device_id()?,
-        dispatcher: net.b.device_id()?,
-        call_ref: call_ref.into(),
-        kind,
-        model: None,
-        cwd: "/tmp".into(),
-        title: "task".into(),
-        prompt: "work".into(),
-        continues: None,
-        parent: None,
-        thread: None,
-    })
-}
-
-#[test]
-fn work_admission_returns_the_durable_selection_and_compares_the_original_request() -> Result<()> {
-    use crate::work::RequestedWorkKind;
-    let net = net()?;
-    let mut store = store(&net)?;
-    conversation(&mut store, &net)?;
-    let request = admission_request(&net, "c", "implicit", RequestedWorkKind::Agent(None))?;
-    let frozen = ResolvedModel {
-        provider: Provider::Codex,
-        model: None,
-    };
-    let first = store.accept_work(&net.a, &net.network, request.clone(), frozen.clone(), 3)?;
-    assert!(first.created);
-    let retried = store.accept_work(
-        &net.a,
-        &net.network,
-        request.clone(),
-        ResolvedModel {
-            provider: Provider::Claude,
-            model: Some("changed".into()),
-        },
-        4,
-    )?;
-    assert!(!retried.created);
-    assert_eq!(retried.spec, first.spec);
-    assert_eq!(retried.spec.resolved, frozen);
-    assert_eq!(retried.spec.execution_model(), None);
-    let mut changes = vec![];
-    let mut changed = request.clone();
-    changed.kind = RequestedWorkKind::Agent(Some(Provider::Claude));
-    changes.push(changed);
-    let mut changed = request.clone();
-    changed.prompt.push('!');
-    changes.push(changed);
-    let mut changed = request.clone();
-    changed.model = Some("request-model".into());
-    changes.push(changed);
-    let mut changed = request.clone();
-    changed.thread = Some("another-thread".into());
-    changes.push(changed);
-    for changed in changes {
-        assert!(store.accepted_work(&net.network, &changed).is_err());
-        assert!(
-            store
-                .accept_work(&net.a, &net.network, changed, frozen.clone(), 5)
-                .is_err()
-        );
-    }
-    assert_eq!(store.work_records()?.len(), 1);
+    let routine_cache: (Option<String>, Option<String>) = store.connection.query_row("SELECT native_id,native_token FROM scheduler_sessions WHERE conversation_id='c' AND scope=?", [routine_key.scope.storage_key()], |row| Ok((row.get(0)?,row.get(1)?)))?;
+    assert_eq!(routine_cache, (None, None));
+    let main_cache: (String,String) = store.connection.query_row("SELECT native_id,native_token FROM scheduler_sessions WHERE conversation_id='c' AND scope='main'", [], |row| Ok((row.get(0)?,row.get(1)?)))?;
+    assert_eq!(main_cache, ("main-native".into(), "main-token".into()));
     assert_eq!(
         store
-            .context(&net.network, "c", None)?
-            .events
-            .iter()
-            .filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. }))
-            .count(),
-        1
+            .message(&net.network, "c", &routine.job.message_id)?
+            .context("ordinary routine event")?
+            .text,
+        "digest"
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_shared_work_projection_cannot_create_another_local_admission() -> Result<()> {
-    use crate::work::RequestedWorkKind;
-    let net = net()?;
-    let mut origin = store(&net)?;
-    conversation(&mut origin, &net)?;
-    let mut request = admission_request(&net, "c", "synced", RequestedWorkKind::Agent(None))?;
-    request.thread = Some("t".into());
-    request.title = request.prompt.clone();
-    let frozen = ResolvedModel {
-        provider: Provider::Codex,
-        model: None,
-    };
-    assert!(origin.accepted_work(&net.network, &request)?.is_none());
-    assert!(
-        origin
-            .accept_work(&net.a, &net.network, request.clone(), frozen.clone(), 3)?
-            .created
-    );
-    let mut replica = store(&net)?;
-    let events = origin.events_from(&net.network, &net.a.device_id()?, 1, 500)?;
-    replica.ingest_events(&net.network, &events)?;
-    assert_eq!(replica.works(&net.network, "c")?.len(), 1);
-    assert!(replica.work_records()?.is_empty());
-    assert!(
-        replica
-            .accepted_work(&net.network, &request)
-            .unwrap_err()
-            .to_string()
-            .contains("without admission")
-    );
-    assert!(
-        replica
-            .accept_work(&net.a, &net.network, request.clone(), frozen.clone(), 4)
-            .is_err()
-    );
-    assert!(replica.work_records()?.is_empty());
-    assert_eq!(replica.works(&net.network, "c")?.len(), 1);
-    let projection = json!(replica.works(&net.network, "c")?[0]);
-    let mut args = json!(request);
-    args.as_object_mut().unwrap().remove("cwd");
-    args.as_object_mut().unwrap().remove("title");
-    let replica = std::cell::RefCell::new(replica);
-    let failure = crate::agent_cli::dispatch(
-        &args,
-        |_| std::future::ready(Ok(projection.clone())),
-        |args| {
-            std::future::ready((|| -> Result<serde_json::Value> {
-                let attempted = serde_json::from_value(args)?;
-                replica.borrow_mut().accept_work(
-                    &net.a,
-                    &net.network,
-                    attempted,
-                    frozen.clone(),
-                    4,
-                )?;
-                bail!("must not admit a projection without a local run")
-            })())
-        },
-        |_, _| async { bail!("must not bind or send") },
-        |_| async { bail!("must not ask readiness") },
-        None,
-    )
-    .await
-    .expect_err("a full projection is not a local admission");
-    assert!(
-        failure.to_string().contains("without admission"),
-        "{failure:#}"
-    );
-    let mut replica = replica.into_inner();
-    assert!(replica.work_records()?.is_empty());
-    let fresh = admission_request(&net, "c", "fresh", RequestedWorkKind::Task)?;
-    assert!(replica.accepted_work(&net.network, &fresh)?.is_none());
-    let accepted = replica.accept_work(&net.a, &net.network, fresh, frozen, 5)?;
-    assert!(accepted.created);
-    assert_eq!(replica.work_records()?.len(), 1);
-    assert_eq!(replica.works(&net.network, "c")?.len(), 2);
-    Ok(())
-}
-
-#[tokio::test]
-async fn dispatch_readback_revalidates_a_late_store_winner_and_a_lost_write_response() -> Result<()>
-{
-    use crate::work::{RequestedWorkKind, WorkRequest};
-    use std::{
-        cell::{Cell, RefCell},
-        future::ready,
-    };
-    for (before_ready, changed) in [(true, false), (true, true), (false, false)] {
-        let net = net()?;
-        let mut store = store(&net)?;
-        conversation(&mut store, &net)?;
-        let mut request = admission_request(&net, "c", "late", RequestedWorkKind::Agent(None))?;
-        if before_ready {
-            request.thread = Some("t".into());
-            request.title = request.prompt.clone();
-        }
-        let mut args = json!(request);
-        if before_ready {
-            args.as_object_mut().unwrap().remove("title");
-            args.as_object_mut().unwrap().remove("cwd");
-        }
-        if changed {
-            args["prompt"] = json!("changed");
-        }
-        let store = RefCell::new(store);
-        let lookups = Cell::new(0);
-        let tracks = Cell::new(0);
-        let ready_calls = Cell::new(0);
-        let frozen = ResolvedModel {
-            provider: Provider::Codex,
-            model: None,
-        };
-        let result = crate::agent_cli::dispatch(
-            &args,
-            |_| {
-                lookups.set(lookups.get() + 1);
-                ready((|| -> Result<serde_json::Value> {
-                    Ok(store.borrow().works(&net.network, "c")?.into_iter().find(|work| work.work_id == request.work_id).map(|work| json!(work)).unwrap_or_else(|| json!({"found":false})))
-                })())
-            },
-            |args| {
-                tracks.set(tracks.get() + 1);
-                ready((|| -> Result<serde_json::Value> {
-                    let attempted: WorkRequest = serde_json::from_value(args)?;
-                    let admitted = store.borrow_mut().accept_work(&net.a, &net.network, attempted, frozen.clone(), 4)?;
-                    if admitted.created { bail!("the durable write succeeded but its response was lost"); }
-                    Ok(json!({"work_id":admitted.spec.work_id,"resolved":admitted.spec.resolved,"may_send":false}))
-                })())
-            },
-            |_, _| async { bail!("readback must not bind or send") },
-            |_| {
-                ready_calls.set(ready_calls.get() + 1);
-                ready((|| -> Result<Option<String>> {
-                    assert!(store.borrow_mut().accept_work(&net.a, &net.network, request.clone(), frozen.clone(), 3)?.created);
-                    bail!("native readiness failed after a concurrent durable admission")
-                })())
-            },
-            None,
-        ).await;
-        if changed {
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("changed: title, prompt")
-            );
-        } else {
-            let result = result?;
-            assert_eq!(result["work_id"], request.work_id);
-            assert_eq!(result["resolved"], json!(frozen));
-            assert_eq!(result["may_send"], false);
-        }
-        assert_eq!(lookups.get(), if before_ready { 2 } else { 1 });
-        assert_eq!(ready_calls.get(), usize::from(before_ready));
-        assert_eq!(tracks.get(), if before_ready { 1 } else { 2 });
-        let store = store.borrow();
-        assert_eq!(store.work_records()?.len(), 1);
-        assert_eq!(
-            store
-                .context(&net.network, "c", None)?
-                .events
-                .iter()
-                .filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. }))
-                .count(),
-            1
-        );
-    }
     Ok(())
 }
 
 #[test]
-fn concurrent_implicit_admissions_return_the_same_transaction_winner() -> Result<()> {
-    use crate::work::RequestedWorkKind;
+fn stable_runtime_and_provider_changes_have_distinct_session_lineage() -> Result<()> {
+    use crate::scheduling::{SessionConfig, SessionKey, SessionScope};
     let net = net()?;
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.artifacts")
-        .join(format!("admission-{}", uuid::Uuid::new_v4()));
-    crate::config::private_dir(&dir)?;
-    let path = dir.join("store.sqlite3");
-    let mut first = Store::open(&path)?;
-    first.install_trust_bundle(&net.network, &net.state)?;
-    conversation(&mut first, &net)?;
-    let mut second = Store::open(&path)?;
-    let request = admission_request(&net, "c", "concurrent", RequestedWorkKind::Agent(None))?;
-    let barrier = std::sync::Barrier::new(2);
-    let (a, b) = std::thread::scope(|scope| {
-        let a = scope.spawn(|| {
-            barrier.wait();
-            first.accept_work(
-                &net.a,
-                &net.network,
-                request.clone(),
-                ResolvedModel {
-                    provider: Provider::Codex,
-                    model: Some("model-a".into()),
-                },
-                3,
-            )
-        });
-        let b = scope.spawn(|| {
-            barrier.wait();
-            second.accept_work(
-                &net.a,
-                &net.network,
-                request.clone(),
-                ResolvedModel {
-                    provider: Provider::Claude,
-                    model: Some("model-b".into()),
-                },
-                4,
-            )
-        });
-        (
-            a.join().expect("first admission"),
-            b.join().expect("second admission"),
-        )
-    });
-    let result = (|| -> Result<()> {
-        let (a, b) = (a?, b?);
-        assert_ne!(a.created, b.created);
-        assert_eq!(a.spec, b.spec);
-        assert_eq!(
-            first
-                .accepted_work(&net.network, &request)?
-                .context("accepted")?
-                .spec,
-            a.spec
-        );
-        assert_eq!(first.work_records()?.len(), 1);
-        assert_eq!(
-            first
-                .context(&net.network, "c", None)?
-                .events
-                .iter()
-                .filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. }))
-                .count(),
-            1
-        );
-        Ok(())
-    })();
-    drop((first, second));
-    std::fs::remove_dir_all(dir)?;
-    result
-}
-
-#[test]
-fn refusing_an_unstarted_task_is_atomic_idempotent_and_preserves_another_active_turn() -> Result<()>
-{
-    use crate::work::RequestedWorkKind;
-    let net = net()?;
-    let mut store = store(&net)?;
-    conversation(&mut store, &net)?;
-    say(&mut store, &net, "m1", true)?;
-    let active = store
-        .claim_next_fixture(&net.a, &net.network, "c", "boot", "human-config")?
-        .context("human claim")?;
-    let attempt = active.job.state.attempt().context("attempt")?;
-    store.mark_started("c", &active.job.trigger, &attempt.id)?;
-    let active_before = serde_json::to_value(
-        store
-            .scheduler_job("c", &active.job.trigger)?
-            .context("active job")?,
-    )?;
-    let session = |store: &Store| -> Result<String> {
-        Ok(store.connection.query_row("SELECT json_array(active,native_id,covers,owner_epoch,sdk_config,permission_version,native_token,shown,session_generation,handoff_revision,handoff_source) FROM scheduler_sessions WHERE conversation_id='c'", [], |row| row.get(0))?)
+    let (mut store, _) = bot_with_message(&net)?;
+    let limits = crate::config::SchedulingLimits::default();
+    let key = SessionKey {
+        conversation_id: "c".into(),
+        scope: SessionScope::Main,
     };
-    let next_sequence = |store: &Store| -> Result<u64> {
-        Ok(store.connection.query_row(
-            "SELECT next_sequence FROM scheduler_sessions WHERE conversation_id='c'",
-            [],
-            |row| row.get(0),
-        )?)
-    };
-    let before = session(&store)?;
-    let request = admission_request(&net, "c", "refused", RequestedWorkKind::Task)?;
-    let frozen = ResolvedModel {
+    let old = SessionConfig {
+        stable_fingerprint: "stable-one".into(),
+        runtime_fingerprint: "runtime-one".into(),
         provider: Provider::Codex,
-        model: Some("frozen-model".into()),
     };
-    store.accept_work(&net.a, &net.network, request.clone(), frozen.clone(), 4)?;
-    let next_sequence_before = next_sequence(&store)?;
-    store.create_conversation(
-        &net.a,
-        &net.network,
-        "foreign-target",
-        "other",
-        net.a
-            .owner_fixture(&net.network, "foreign-target", &net.a.device_id()?)?,
-        4,
+    say(&mut store, &net, "config-one", true)?;
+    let first = store
+        .claim_next_in_session(&net.a, &net.network, &key, "boot", &old, &limits)?
+        .context("first")?;
+    let attempt = first.job.state.attempt().context("attempt")?;
+    store.save_scheduler_native_id(
+        "c",
+        &first.job.trigger,
+        &attempt.id,
+        "old-native",
+        "old-token",
+        true,
     )?;
-    let mut foreign =
-        admission_request(&net, "foreign-target", "foreign", RequestedWorkKind::Task)?;
-    foreign.target = net.b.device_id()?;
-    let foreign_id = foreign.work_id.clone();
-    store.accept_work(&net.b, &net.network, foreign, frozen.clone(), 4)?;
-    let refusal = |_: &ResolvedModel| {
-        Ok(Some((
-            "refusal-generation".into(),
-            ExecFailure::new(FailureKind::NoBot, "disabled"),
-        )))
+    let new = SessionConfig {
+        stable_fingerprint: "stable-two".into(),
+        runtime_fingerprint: "runtime-two".into(),
+        provider: Provider::Cursor,
     };
-    let ended = store.refuse_queued_tasks(&net.a, &net.network, Some("c"), "boot", 5, refusal)?;
-    assert_eq!(ended.len(), 1);
-    let refused = &ended[0];
+    let status = store.scheduler_session_status(&key, Some(&new))?;
+    assert!(status.resumable && status.pending_generation);
     assert!(
-        matches!(&refused.state, JobState::Failed { failure, .. } if failure.kind == FailureKind::NoBot)
-    );
-    assert!(refused.retryable());
-    let runtime = refused.runtime.as_ref().context("refusal runtime")?;
-    assert_eq!(runtime.provider, frozen.provider);
-    assert_eq!(runtime.model, frozen.model);
-    assert_eq!(runtime.execution, TurnExecution::NotStarted);
-    assert_eq!(runtime.stage, ProviderStage::Validate);
-    assert_eq!(runtime.reasoning_effort, None);
-    assert!(!refused.pending_check && !refused.tool_calls);
-    assert_eq!(session(&store)?, before);
-    assert_eq!(
-        serde_json::to_value(
-            store
-                .scheduler_job("c", &active.job.trigger)?
-                .context("active job")?
+        store.manager_attempt_allowed(
+            &net.network,
+            &net.a.device_id()?,
+            "c",
+            &first.job.trigger,
+            &attempt.id
         )?,
-        active_before
+        "configuration observation does not fence an active old turn"
     );
-    let jobs = store.scheduler_jobs("c")?;
-    let result_trigger = work_trigger(&request.work_id);
-    assert_eq!(
-        jobs.iter()
-            .map(|job| (job.trigger.as_str(), job.kind, job.state.name()))
-            .collect::<Vec<_>>(),
-        vec![
-            (active.job.trigger.as_str(), TriggerKind::Human, "running"),
-            (refused.trigger.as_str(), TriggerKind::AgentTask, "failed"),
-            (result_trigger.as_str(), TriggerKind::WorkResult, "queued"),
-        ]
-    );
-    let report = jobs.last().context("work result")?;
-    assert_eq!(report.reply_to, "m1");
-    assert!(report.runtime.is_none() && !report.pending_check && !report.tool_calls);
-    assert_eq!(report.sequence, next_sequence_before);
-    let after_refusal = next_sequence(&store)?;
-    assert_eq!(after_refusal, next_sequence_before + 1);
-    assert!(jobs.iter().all(|job| job.sequence < after_refusal));
-    let jobs_before_retry = serde_json::to_value(&jobs)?;
-    assert!(
-        store
-            .refuse_queued_tasks(&net.a, &net.network, None, "boot", 6, refusal)?
-            .is_empty()
-    );
-    assert_eq!(
-        store
-            .scheduler_job("c", &refused.trigger)?
-            .context("refused")?
-            .runtime,
-        refused.runtime
-    );
-    assert_eq!(
-        serde_json::to_value(store.scheduler_jobs("c")?)?,
-        jobs_before_retry
-    );
-    assert_eq!(next_sequence(&store)?, after_refusal);
-    assert!(matches!(
-        store
-            .scheduler_job(
-                "foreign-target",
-                &crate::scheduling::task_trigger(&foreign_id)
-            )?
-            .context("foreign task")?
-            .state,
-        JobState::Queued
-    ));
-    assert_eq!(store.pending_checks()?.len(), 0);
-    let events = store.context(&net.network, "c", None)?.events;
-    assert_eq!(events.iter().filter(|event| matches!(&event.event.body, EventBody::WorkFinished { work_id, .. } if work_id == &request.work_id)).count(), 1);
-    assert_eq!(events.iter().filter(|event| matches!(&event.event.body, EventBody::WorkProgress { work_id, .. } if work_id == &request.work_id)).count(), 0);
-    let retried = store.accept_work(
+    store.finish_job(
         &net.a,
         &net.network,
-        request,
-        ResolvedModel {
-            provider: Provider::Claude,
-            model: None,
-        },
+        "c",
+        &first.job.trigger,
+        &attempt.id,
+        JobOutcome::Completed,
+        "done",
+        5,
+    )?;
+    assert!(
+        store
+            .scheduler_session_status(&key, Some(&new))?
+            .pending_generation
+    );
+    say(&mut store, &net, "config-two", true)?;
+    let second = store
+        .claim_next_in_session(&net.a, &net.network, &key, "boot", &new, &limits)?
+        .context("second")?;
+    let invalidation = second.invalidation.context("invalidation")?;
+    assert_eq!(invalidation.reason, "provider_changed");
+    assert_eq!(
+        invalidation.old_stable_fingerprint.as_deref(),
+        Some("stable-one")
+    );
+    assert_eq!(invalidation.new_stable_fingerprint, "stable-two");
+    assert_eq!(
+        invalidation.old_runtime_fingerprint.as_deref(),
+        Some("runtime-one")
+    );
+    assert_eq!(invalidation.new_runtime_fingerprint, "runtime-two");
+    assert_eq!(invalidation.source_provider, Some(Provider::Codex));
+    assert_eq!(invalidation.target_provider, Provider::Cursor);
+    assert_eq!(invalidation.source_basis, first.job.basis);
+    assert_ne!(invalidation.source_basis, second.job.basis);
+    assert_eq!(
+        second.shown.session_lineage[0].source_basis,
+        first.job.basis
+    );
+    assert_eq!(second.shown.session_generation, 2);
+    assert!(second.previous_native_id.is_none() && second.previous_token.is_none());
+    assert_eq!(
+        second.shown.session_lineage[0].stable_fingerprint,
+        "stable-one"
+    );
+    assert_eq!(
+        second.shown.session_lineage[0].runtime_fingerprint,
+        "runtime-one"
+    );
+    assert_eq!(second.shown.session_lineage[0].provider, Provider::Codex);
+    assert!(!store.manager_attempt_allowed(
+        &net.network,
+        &net.a.device_id()?,
+        "c",
+        &first.job.trigger,
+        &attempt.id
+    )?);
+    Ok(())
+}
+
+#[test]
+fn memory_control_preserves_tombstones_receipts_and_scope_isolation() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    second_bot(&mut origin, &net, "Other")?;
+    let create = signed_memory(&net, &origin, "c", "same-id", Some("first user value"))?;
+    let command = memory_command(&net.network, "c", &create)?;
+    let first = origin.control_memory(&net.a, &net.network, "c", command.clone(), 4)?;
+    assert_eq!(first.state, MemoryControlStatus::Applied);
+    let current = first.current.context("current")?;
+    assert_eq!(current.text.as_deref(), Some("first user value"));
+    assert_eq!(current.metadata.control_revision, 1);
+    assert_eq!(current.metadata.origin, MemoryOrigin::User);
+    assert!(current.metadata.user_controlled && current.metadata.essential);
+    assert_eq!(
+        origin
+            .control_memory(&net.a, &net.network, "c", command.clone(), 5)?
+            .state,
+        MemoryControlStatus::AlreadyRecorded
+    );
+    assert_eq!(
+        origin
+            .memory_state(&net.network, "c", "same-id", Some(&command.operation_id))?
+            .receipt,
+        Some(MemoryReceipt::Recorded)
+    );
+    let other = signed_memory(&net, &origin, "d", "same-id", Some("independent scope"))?;
+    origin.control_memory(
+        &net.a,
+        &net.network,
+        "d",
+        memory_command(&net.network, "d", &other)?,
+        6,
+    )?;
+    assert_eq!(
+        origin
+            .memory_state(&net.network, "d", "same-id", Some(&command.operation_id))?
+            .receipt,
+        Some(MemoryReceipt::NotSeenHere)
+    );
+    let delete = signed_memory(&net, &origin, "c", "same-id", None)?;
+    let deleted = origin.control_memory(
+        &net.a,
+        &net.network,
+        "c",
+        memory_command(&net.network, "c", &delete)?,
         7,
     )?;
-    assert!(!retried.created);
-    assert_eq!(retried.spec.resolved, frozen);
+    let tombstone = deleted.current.context("tombstone")?;
+    assert_eq!(tombstone.text, None);
+    assert_eq!(tombstone.metadata.control_revision, 2);
+    assert!(tombstone.metadata.user_controlled);
+    assert!(origin.memories(&net.network, "c")?.is_empty());
     assert_eq!(
-        serde_json::to_value(store.scheduler_jobs("c")?)?,
-        jobs_before_retry
+        origin.memories(&net.network, "d")?[0].text,
+        "independent scope"
     );
-    assert_eq!(next_sequence(&store)?, after_refusal);
-    say(&mut store, &net, "m2", true)?;
-    let next = store
-        .scheduler_job("c", &message_trigger("m2"))?
-        .context("next human job")?;
-    assert_eq!(next.sequence, after_refusal);
-    assert!(next.sequence > report.sequence);
-    assert_eq!(next_sequence(&store)?, next.sequence + 1);
-    assert_eq!(session(&store)?, before);
-    Ok(())
-}
-
-#[test]
-fn task_preparation_cannot_replace_the_accepted_selection_or_leave_a_partial_claim() -> Result<()> {
-    use crate::{scheduling::RuntimeSelection, work::RequestedWorkKind};
-    let net = net()?;
-    let mut store = store(&net)?;
-    conversation(&mut store, &net)?;
-    let request = admission_request(&net, "c", "prepared", RequestedWorkKind::Task)?;
-    let frozen = ResolvedModel {
-        provider: Provider::Codex,
-        model: None,
-    };
-    store.accept_work(&net.a, &net.network, request.clone(), frozen.clone(), 3)?;
+    assert_eq!(
+        origin
+            .control_memory(&net.a, &net.network, "c", command.clone(), 8)?
+            .state,
+        MemoryControlStatus::Superseded
+    );
+    assert_eq!(
+        origin
+            .memory_state(&net.network, "c", "same-id", Some(&command.operation_id))?
+            .receipt,
+        Some(MemoryReceipt::Superseded)
+    );
+    assert_eq!(
+        origin
+            .memory_state(&net.network, "c", "same-id", Some(&"0".repeat(64)))?
+            .receipt,
+        Some(MemoryReceipt::NotSeenHere)
+    );
+    assert_eq!(
+        origin
+            .memory_state(&net.network, "c", "same-id", None)?
+            .receipt,
+        None
+    );
     assert!(
-        store
-            .claim_next(&net.a, &net.network, "c", "boot", |_, accepted| {
-                assert_eq!(accepted, Some(&frozen));
-                Ok(Some((
-                    "wrong-key".into(),
-                    RuntimeSelection {
-                        provider: Provider::Codex,
-                        model: Some("mutable-default".into()),
-                        reasoning_effort: None,
-                    },
-                    "generation".into(),
-                    (),
-                )))
-            })
+        origin
+            .change_bot(
+                &net.a,
+                &net.network,
+                "c",
+                "message:m1",
+                "resurrect",
+                ChangeRequest::Remember {
+                    memory_id: Some("same-id".into()),
+                    text: "stale automatic resurrection".into(),
+                },
+                Provider::Codex,
+                9
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("user-controlled")
+    );
+    let restore = signed_memory(&net, &origin, "c", "same-id", Some("explicit restoration"))?;
+    let restored = origin.control_memory(
+        &net.a,
+        &net.network,
+        "c",
+        memory_command(&net.network, "c", &restore)?,
+        10,
+    )?;
+    assert_eq!(
+        restored
+            .current
+            .context("restored")?
+            .metadata
+            .control_revision,
+        3
+    );
+    let versions = origin.version_vector(&net.network)?;
+    let mut forged = command;
+    forged.operation_id = "0".repeat(64);
+    assert!(
+        origin
+            .control_memory(&net.a, &net.network, "c", forged, 11)
             .is_err()
     );
-    let trigger = crate::scheduling::task_trigger(&request.work_id);
-    let unclaimed = store
-        .scheduler_job("c", &trigger)?
-        .context("unclaimed task")?;
-    assert!(matches!(unclaimed.state, JobState::Queued));
-    assert_eq!(unclaimed.runtime, None);
-    let (claimed, ()) = store
-        .claim_next(&net.a, &net.network, "c", "boot", |_, accepted| {
-            let accepted = accepted.context("frozen selection")?;
-            Ok(Some((
-                "key-for-provider-default".into(),
-                RuntimeSelection {
-                    provider: accepted.provider,
-                    model: accepted.model.clone(),
-                    reasoning_effort: None,
-                },
-                "generation".into(),
-                (),
-            )))
-        })?
-        .context("claim")?;
-    let runtime = claimed.job.runtime.context("initial runtime")?;
-    assert_eq!(runtime.model, None);
-    assert_eq!(runtime.execution, TurnExecution::NotStarted);
-    assert_eq!(
-        runtime.delivery_id,
-        claimed.job.state.attempt().context("attempt")?.id
+    assert_eq!(origin.version_vector(&net.network)?, versions);
+    assert!(
+        origin
+            .memory_sync_conflicts(&net.network, "c")?
+            .items
+            .is_empty()
     );
-    assert_eq!(runtime.session_generation, claimed.session_generation);
     Ok(())
 }
 
 #[test]
-fn queued_task_refusal_does_not_downgrade_uncertain_started_tools_or_pending_checks() -> Result<()>
-{
-    use crate::work::RequestedWorkKind;
+fn memory_user_operations_keep_stable_identity_across_carriers_and_rebuild() -> Result<()> {
     let net = net()?;
-    let mut store = store(&net)?;
-    for evidence in ["unknown", "started", "tools", "pending"] {
-        let scope = format!("guard-{evidence}");
-        store.create_conversation(
-            &net.a,
-            &net.network,
-            &scope,
-            evidence,
-            net.a
-                .owner_fixture(&net.network, &scope, &net.a.device_id()?)?,
-            1,
+    let (mut a, _) = bot_with_message(&net)?;
+    let mut b = store(&net)?;
+    all_accepted(&mut b, &net, &a)?;
+    let first_body = signed_memory(&net, &a, "c", "memory", Some("first"))?;
+    let first_a = a.append_event(&net.a, &net.network, "c", first_body.clone(), vec![], 10)?;
+    let first_b = b.append_event(&net.b, &net.network, "c", first_body.clone(), vec![], 20)?;
+    let second_body = signed_memory(&net, &a, "c", "memory", Some("newer"))?;
+    let second_a = a.append_event(&net.a, &net.network, "c", second_body.clone(), vec![], 30)?;
+    b.ingest_events(
+        &net.network,
+        &a.events_from(&net.network, &net.a.device_id()?, 1, 500)?,
+    )?;
+    let second_b = b.append_event(&net.b, &net.network, "c", second_body.clone(), vec![], 40)?;
+    let replay = b.append_event(&net.b, &net.network, "c", first_body.clone(), vec![], 50)?;
+    let mut expected = None;
+    let mut expected_conflicts = None;
+    for reverse in [false, true] {
+        let mut replica = store(&net)?;
+        let mut events = a.events_from(&net.network, &net.a.device_id()?, 1, 500)?;
+        let split = events.len();
+        events.extend(b.events_from(&net.network, &net.b.device_id()?, 1, 500)?);
+        if reverse {
+            events.rotate_left(split);
+        }
+        for event in &events {
+            let statuses = replica
+                .ingest_events(&net.network, std::slice::from_ref(event))?
+                .statuses;
+            assert!(
+                statuses
+                    .iter()
+                    .all(|status| matches!(status, IngestStatus::Accepted | IngestStatus::Pending)),
+                "{statuses:?}"
+            );
+        }
+        let state = replica
+            .memory_state(&net.network, "c", "memory", None)?
+            .current
+            .context("current")?;
+        assert_eq!(state.text.as_deref(), Some("newer"));
+        assert_eq!(state.metadata.control_revision, 2);
+        assert_eq!(
+            state.metadata.source_event_hash,
+            second_a.hash.clone().min(second_b.hash.clone())
+        );
+        assert_eq!(
+            state.metadata.revision,
+            crate::crypto::request_key(&net.network, "c", &second_body, "")?
+        );
+        let changed_at: i64 = replica.connection.query_row("SELECT changed_at_ms FROM memories WHERE network_id=? AND conversation_id='c' AND memory_id='memory'", [&net.network], |row| row.get(0))?;
+        assert_eq!(
+            changed_at,
+            if second_a.hash < second_b.hash {
+                30
+            } else {
+                40
+            }
+        );
+        let conflicts = replica.memory_sync_conflicts(&net.network, "c")?;
+        assert!(
+            conflicts.items.is_empty(),
+            "duplicate old carriers are one logical ancestor"
+        );
+        if let Some(expected) = &expected {
+            assert_eq!(&state, expected);
+        }
+        if let Some(expected) = &expected_conflicts {
+            assert_eq!(&conflicts, expected);
+        }
+        expected = Some(state.clone());
+        expected_conflicts = Some(conflicts.clone());
+        replica.connection.execute(
+            "UPDATE events SET effective=0 WHERE network_id=?",
+            [&net.network],
         )?;
-        let request = admission_request(&net, &scope, evidence, RequestedWorkKind::Task)?;
-        store.accept_work(
+        assert!(log::recompute(
+            &replica.connection,
+            &membership_from(&replica.connection, &net.network)?
+        )?);
+        assert_eq!(
+            replica
+                .memory_state(&net.network, "c", "memory", None)?
+                .current,
+            Some(state)
+        );
+        assert_eq!(replica.memory_sync_conflicts(&net.network, "c")?, conflicts);
+    }
+    let context_entries = |store: &Store| -> Result<Vec<crate::agent_context::MemoryContextEntry>> {
+        Ok(store
+            .memory_records(&net.network, "c")?
+            .into_iter()
+            .map(|record| crate::agent_context::MemoryContextEntry {
+                memory_id: record.entry.memory_id,
+                text: record.entry.text,
+                epoch: record.epoch,
+                revision: record.revision,
+            })
+            .collect())
+    };
+    let delivered = crate::agent_context::compile_memory(&context_entries(&a)?, None)?;
+    a.ingest_events(
+        &net.network,
+        &b.events_from(&net.network, &net.b.device_id()?, 1, 500)?,
+    )?;
+    let duplicate_delivery =
+        crate::agent_context::compile_memory(&context_entries(&a)?, Some(&delivered.shown))?;
+    assert!(
+        matches!(duplicate_delivery.context, crate::agent_context::MemoryContext::Delta { upserts, deleted, omitted: 0, .. }
+        if upserts.is_empty() && deleted.is_empty())
+    );
+    assert_eq!(duplicate_delivery.shown, delivered.shown);
+    let mut old_source_base = a
+        .memory_state(&net.network, "c", "memory", None)?
+        .current
+        .context("base")?
+        .metadata
+        .base();
+    old_source_base
+        .version
+        .as_mut()
+        .context("version")?
+        .source_event_hash = second_a.hash.max(second_b.hash);
+    let delete = net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::MemoryControlled {
+            memory_id: "memory".into(),
+            base: old_source_base,
+            after: None,
+            attestation: None,
+        },
+    )?;
+    assert_eq!(
+        a.control_memory(
             &net.a,
             &net.network,
-            request.clone(),
-            ResolvedModel {
-                provider: Provider::Codex,
-                model: Some("frozen".into()),
+            "c",
+            memory_command(&net.network, "c", &delete)?,
+            60
+        )?
+        .state,
+        MemoryControlStatus::Applied
+    );
+    assert!(
+        a.memory_state(&net.network, "c", "memory", None)?
+            .current
+            .context("deleted")?
+            .text
+            .is_none()
+    );
+    assert_eq!(
+        a.control_memory(
+            &net.a,
+            &net.network,
+            "c",
+            memory_command(&net.network, "c", &first_body)?,
+            70
+        )?
+        .state,
+        MemoryControlStatus::Superseded
+    );
+    assert_ne!(first_a.hash, first_b.hash);
+    assert_ne!(replay.hash, first_a.hash);
+    Ok(())
+}
+
+#[test]
+fn memory_user_tombstones_survive_stale_automatic_branches_in_every_order() -> Result<()> {
+    let net = net()?;
+    let (mut a, _) = bot_with_message(&net)?;
+    a.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "seed",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "automatic base".into(),
+        },
+        Provider::Codex,
+        4,
+    )?;
+    let seed = a.memory_records(&net.network, "c")?.remove(0);
+    let mut b = store(&net)?;
+    all_accepted(&mut b, &net, &a)?;
+    b.change_bot(
+        &net.b,
+        &net.network,
+        "c",
+        "message:m1",
+        "stale",
+        ChangeRequest::Remember {
+            memory_id: Some(seed.entry.memory_id.clone()),
+            text: "stale automatic branch".into(),
+        },
+        Provider::Codex,
+        50,
+    )?;
+    let user_body = signed_memory(&net, &a, "c", &seed.entry.memory_id, Some("user value"))?;
+    a.append_event(&net.a, &net.network, "c", user_body, vec![], 6)?;
+    let delete_body = signed_memory(&net, &a, "c", &seed.entry.memory_id, None)?;
+    a.append_event(&net.a, &net.network, "c", delete_body, vec![], 7)?;
+    let mut expected = None;
+    for reverse in [false, true] {
+        let mut replica = store(&net)?;
+        let mut events = a.events_from(&net.network, &net.a.device_id()?, 1, 500)?;
+        let split = events.len();
+        events.extend(b.events_from(&net.network, &net.b.device_id()?, 1, 500)?);
+        if reverse {
+            events.rotate_left(split);
+        }
+        replica.ingest_events(&net.network, &events)?;
+        let state = replica
+            .memory_state(&net.network, "c", &seed.entry.memory_id, None)?
+            .current
+            .context("tombstone")?;
+        assert_eq!(state.text, None);
+        assert_eq!(state.metadata.control_revision, 2);
+        assert!(state.metadata.user_controlled);
+        let conflicts = replica.memory_sync_conflicts(&net.network, "c")?;
+        assert_eq!(conflicts.items.len(), 1);
+        assert_eq!(
+            conflicts.items[0].reason,
+            MemorySyncConflictReason::UserProtected
+        );
+        assert_eq!(conflicts.items[0].winning_revision, state.metadata.revision);
+        if let Some(expected) = &expected {
+            assert_eq!(&(state.clone(), conflicts.clone()), expected);
+        }
+        expected = Some((state, conflicts));
+    }
+    Ok(())
+}
+
+#[test]
+fn memory_base_authentication_rejects_forged_versions_and_waits_for_real_parents() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    origin.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "seed",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "base".into(),
+        },
+        Provider::Codex,
+        4,
+    )?;
+    let record = origin.memory_records(&net.network, "c")?.remove(0);
+    let base = record.metadata().base();
+    for (scope, memory_id, mut claimed, direct) in [
+        ("c", record.entry.memory_id.as_str(), base.clone(), false),
+        ("c", "another-memory", base.clone(), true),
+        ("d", record.entry.memory_id.as_str(), base.clone(), true),
+        ("c", record.entry.memory_id.as_str(), base.clone(), true),
+    ] {
+        if scope == "c" && memory_id == record.entry.memory_id && direct {
+            claimed
+                .version
+                .as_mut()
+                .context("version")?
+                .control_revision = 100;
+        }
+        let body = net.a.fixture_admin().attest(
+            &net.network,
+            scope,
+            EventBody::MemoryControlled {
+                memory_id: memory_id.into(),
+                base: claimed,
+                after: Some("forged".into()),
+                attestation: None,
             },
-            3,
         )?;
-        let claimed = store
-            .claim_next_fixture(&net.a, &net.network, &scope, "boot", "key")?
-            .context("claim")?;
-        let trigger = claimed.job.trigger;
+        let envelope = net.b.sign_event(Event {
+            version: WIRE_VERSION,
+            network_id: net.network.clone(),
+            author: net.b.device_id()?,
+            seq: 1,
+            prev: None,
+            deps: if direct {
+                vec![record.source_event_hash.clone()]
+            } else {
+                vec![]
+            },
+            scope_id: scope.into(),
+            created_at_ms: 5,
+            body,
+            blobs: vec![],
+        })?;
+        assert!(matches!(
+            origin
+                .ingest_events(&net.network, &[envelope])?
+                .statuses
+                .as_slice(),
+            [IngestStatus::Rejected(_)]
+        ));
+    }
+    let body = signed_memory(
+        &net,
+        &origin,
+        "c",
+        &record.entry.memory_id,
+        Some("real dependent user value"),
+    )?;
+    let dependent = net.b.sign_event(Event {
+        version: WIRE_VERSION,
+        network_id: net.network.clone(),
+        author: net.b.device_id()?,
+        seq: 1,
+        prev: None,
+        deps: vec![record.source_event_hash.clone()],
+        scope_id: "c".into(),
+        created_at_ms: 6,
+        body: body.clone(),
+        blobs: vec![],
+    })?;
+    let mut replica = store(&net)?;
+    assert_eq!(
+        replica.ingest_events(&net.network, &[dependent])?.statuses,
+        vec![IngestStatus::Pending]
+    );
+    all_accepted(&mut replica, &net, &origin)?;
+    let result = replica.memory_state(
+        &net.network,
+        "c",
+        &record.entry.memory_id,
+        Some(&crate::crypto::request_key(&net.network, "c", &body, "")?),
+    )?;
+    assert_eq!(result.receipt, Some(MemoryReceipt::Recorded));
+    assert_eq!(
+        result.current.context("dependent")?.text.as_deref(),
+        Some("real dependent user value")
+    );
+    let body = net.a.attest(
+        &net.network,
+        "c",
+        EventBody::MemoryControlled {
+            memory_id: "node-forgery".into(),
+            base: MemoryBase::absent(),
+            after: Some("node cannot impersonate user".into()),
+            attestation: None,
+        },
+    )?;
+    assert!(
+        origin
+            .append_event(&net.a, &net.network, "c", body, vec![], 7)
+            .is_err()
+    );
+    assert!(
+        origin
+            .append_event(
+                &net.a,
+                &net.network,
+                "c",
+                EventBody::MemoryControlled {
+                    memory_id: "unsigned".into(),
+                    base: MemoryBase::absent(),
+                    after: Some("unsigned value".into()),
+                    attestation: None,
+                },
+                vec![],
+                8
+            )
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<MemoryBase>(json!({"epoch":crate::config::DATA_EPOCH})).is_err()
+    );
+    let mut overflowing = base;
+    overflowing
+        .version
+        .as_mut()
+        .context("version")?
+        .control_revision = u32::MAX;
+    assert!(overflowing.next_control_revision().is_err());
+    for value in [
+        json!({"kind":"memory","memory_id":"m","before":null,"after":"value","base":{"epoch":crate::config::DATA_EPOCH,"version":null},"origin":"user","essential":true}),
+        json!({"kind":"memory","memory_id":"m","before":null,"after":"value","base":{"epoch":crate::config::DATA_EPOCH,"version":null},"origin":"agent","user_controlled":true,"essential":true}),
+    ] {
+        assert!(serde_json::from_value::<BotChange>(value).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn memory_sync_conflicts_follow_logical_bases_for_automatic_and_user_branches() -> Result<()> {
+    let net = net()?;
+    let (mut a, _) = bot_with_message(&net)?;
+    a.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "seed",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "seed".into(),
+        },
+        Provider::Codex,
+        4,
+    )?;
+    let seed = a.memory_records(&net.network, "c")?.remove(0);
+    a.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "linear",
+        ChangeRequest::Remember {
+            memory_id: Some(seed.entry.memory_id.clone()),
+            text: "linear update".into(),
+        },
+        Provider::Codex,
+        5,
+    )?;
+    assert!(a.memory_sync_conflicts(&net.network, "c")?.items.is_empty());
+    let mut b = store(&net)?;
+    all_accepted(&mut b, &net, &a)?;
+    for (store, author, call, text) in [
+        (&mut a, &net.a, "left", "left branch"),
+        (&mut b, &net.b, "right", "right branch"),
+    ] {
+        store.change_bot(
+            author,
+            &net.network,
+            "c",
+            "message:m1",
+            call,
+            ChangeRequest::Remember {
+                memory_id: Some(seed.entry.memory_id.clone()),
+                text: text.into(),
+            },
+            Provider::Codex,
+            6,
+        )?;
+    }
+    a.ingest_events(
+        &net.network,
+        &b.events_from(&net.network, &net.b.device_id()?, 1, 500)?,
+    )?;
+    let automatic = a.memory_sync_conflicts(&net.network, "c")?;
+    assert_eq!(automatic.items.len(), 1);
+    assert_eq!(
+        automatic.items[0].reason,
+        MemorySyncConflictReason::ConcurrentAutomatic
+    );
+    let takeover = signed_memory(
+        &net,
+        &a,
+        "c",
+        &seed.entry.memory_id,
+        a.memory_state(&net.network, "c", &seed.entry.memory_id, None)?
+            .current
+            .context("current")?
+            .text
+            .as_deref(),
+    )?;
+    a.append_event(&net.a, &net.network, "c", takeover, vec![], 7)?;
+    let protected = a.memory_sync_conflicts(&net.network, "c")?;
+    assert_eq!(protected.items.len(), 1);
+    assert_eq!(
+        protected.items[0].losing_revision,
+        automatic.items[0].losing_revision
+    );
+    assert_eq!(
+        protected.items[0].reason,
+        MemorySyncConflictReason::UserProtected
+    );
+    let versions = a.version_vector(&net.network)?;
+    let stale = signed_memory(
+        &net,
+        &b,
+        "c",
+        &seed.entry.memory_id,
+        Some("stale local edit"),
+    )?;
+    assert_eq!(
+        a.control_memory(
+            &net.a,
+            &net.network,
+            "c",
+            memory_command(&net.network, "c", &stale)?,
+            8
+        )?
+        .state,
+        MemoryControlStatus::Conflict
+    );
+    assert_eq!(a.version_vector(&net.network)?, versions);
+    Ok(())
+}
+
+#[test]
+fn memory_sync_conflicts_scan_all_history_before_bounding_private_metadata() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    for index in 0..55 {
+        let body = net.a.fixture_admin().attest(
+            &net.network,
+            "c",
+            EventBody::MemoryControlled {
+                memory_id: "memory".into(),
+                base: MemoryBase::absent(),
+                after: Some(format!("private candidate {index}")),
+                attestation: None,
+            },
+        )?;
+        origin.append_event(&net.a, &net.network, "c", body, vec![], 10 + index)?;
+    }
+    let page = origin.memory_sync_conflicts(&net.network, "c")?;
+    assert_eq!(page.items.len(), 50);
+    assert!(page.has_more);
+    assert!(
+        page.items
+            .windows(2)
+            .all(|pair| pair[0].losing_revision < pair[1].losing_revision)
+    );
+    assert!(
+        page.items
+            .iter()
+            .all(|item| item.reason == MemorySyncConflictReason::ConcurrentUser)
+    );
+    assert!(!serde_json::to_string(&page)?.contains("private candidate"));
+    let mut replica = store(&net)?;
+    let events = origin.events_from(&net.network, &net.a.device_id()?, 1, 500)?;
+    for chunk in events.chunks(3) {
+        replica.ingest_events(&net.network, chunk)?;
+    }
+    assert_eq!(replica.memory_sync_conflicts(&net.network, "c")?, page);
+    assert_eq!(
+        replica.memory_state(&net.network, "c", "memory", None)?,
+        origin.memory_state(&net.network, "c", "memory", None)?
+    );
+    Ok(())
+}
+
+#[test]
+fn memory_control_applies_live_limits_and_rejects_credentials_before_writing() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    for index in 0..MAX_MEMORIES {
+        let id = format!("memory-{index}");
+        let body = signed_memory(&net, &origin, "c", &id, Some("user note"))?;
+        origin.control_memory(
+            &net.a,
+            &net.network,
+            "c",
+            memory_command(&net.network, "c", &body)?,
+            10 + index as i64,
+        )?;
+    }
+    let extra = signed_memory(&net, &origin, "c", "extra", Some("another user note"))?;
+    let version = origin.version_vector(&net.network)?;
+    assert!(
+        origin
+            .control_memory(
+                &net.a,
+                &net.network,
+                "c",
+                memory_command(&net.network, "c", &extra)?,
+                70
+            )
+            .is_err()
+    );
+    assert_eq!(origin.version_vector(&net.network)?, version);
+    let delete = signed_memory(&net, &origin, "c", "memory-0", None)?;
+    origin.control_memory(
+        &net.a,
+        &net.network,
+        "c",
+        memory_command(&net.network, "c", &delete)?,
+        71,
+    )?;
+    assert_eq!(
+        origin
+            .control_memory(
+                &net.a,
+                &net.network,
+                "c",
+                memory_command(&net.network, "c", &extra)?,
+                72
+            )?
+            .state,
+        MemoryControlStatus::Applied
+    );
+    let restore = signed_memory(&net, &origin, "c", "memory-0", Some("restore"))?;
+    assert!(
+        origin
+            .control_memory(
+                &net.a,
+                &net.network,
+                "c",
+                memory_command(&net.network, "c", &restore)?,
+                73
+            )
+            .is_err()
+    );
+    assert_eq!(origin.memories(&net.network, "c")?.len(), MAX_MEMORIES);
+    assert_eq!(
+        origin
+            .memory_state(&net.network, "c", "memory-0", None)?
+            .current
+            .context("tombstone")?
+            .text,
+        None
+    );
+    for text in [
+        "x".repeat(MAX_MEMORY_CHARS + 1),
+        "password=fixture-value".into(),
+    ] {
+        let invalid = signed_memory(&net, &origin, "c", "memory-1", Some(&text))?;
+        let version = origin.version_vector(&net.network)?;
+        assert!(
+            origin
+                .control_memory(
+                    &net.a,
+                    &net.network,
+                    "c",
+                    memory_command(&net.network, "c", &invalid)?,
+                    74
+                )
+                .is_err()
+        );
+        assert_eq!(origin.version_vector(&net.network)?, version);
+    }
+    Ok(())
+}
+
+#[test]
+fn staged_memory_capacity_is_rechecked_at_completion() -> Result<()> {
+    for (live_count, staged_count, restore) in [(49, 1, false), (48, 2, false), (49, 1, true)] {
+        let net = net()?;
+        let (mut origin, _) = bot_with_message(&net)?;
+        let tombstone = if restore {
+            origin.change_bot(
+                &net.a,
+                &net.network,
+                "c",
+                "message:m1",
+                "deleted-seed",
+                ChangeRequest::Remember {
+                    memory_id: None,
+                    text: "old automatic note".into(),
+                },
+                Provider::Codex,
+                4,
+            )?;
+            let memory_id = origin.memories(&net.network, "c")?.remove(0).memory_id;
+            origin.change_bot(
+                &net.a,
+                &net.network,
+                "c",
+                "message:m1",
+                "delete-seed",
+                ChangeRequest::Forget {
+                    memory_id: memory_id.clone(),
+                },
+                Provider::Codex,
+                5,
+            )?;
+            origin
+                .memory_state(&net.network, "c", &memory_id, None)?
+                .current
+        } else {
+            None
+        };
+        for index in 0..live_count {
+            let body = signed_memory(
+                &net,
+                &origin,
+                "c",
+                &format!("user-{index}"),
+                Some("saved user note"),
+            )?;
+            origin.control_memory(
+                &net.a,
+                &net.network,
+                "c",
+                memory_command(&net.network, "c", &body)?,
+                10 + index,
+            )?;
+        }
+        say(&mut origin, &net, "m2", true)?;
+        let trigger = message_trigger("m2");
+        let claimed = origin
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+            .context("job")?;
         let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
-        store.mark_started(&scope, &trigger, &attempt)?;
-        match evidence {
-            "started" => {
+        origin.mark_started("c", &trigger, &attempt)?;
+        let mut staged_ids = Vec::new();
+        for index in 0..staged_count {
+            let staged = origin.stage_memory(
+                &net.network,
+                "c",
+                &trigger,
+                &attempt,
+                &format!("stage-{index}"),
+                ChangeRequest::Remember {
+                    memory_id: tombstone.as_ref().map(|state| state.memory_id.clone()),
+                    text: format!("staged candidate {index}"),
+                },
+                70,
+            )?;
+            staged_ids.push(
+                staged["memory_id"]
+                    .as_str()
+                    .context("staged memory ID")?
+                    .to_owned(),
+            );
+        }
+        let incoming = signed_memory(
+            &net,
+            &origin,
+            "c",
+            "incoming-user",
+            Some("new signed user memory"),
+        )?;
+        origin.control_memory(
+            &net.a,
+            &net.network,
+            "c",
+            memory_command(&net.network, "c", &incoming)?,
+            71,
+        )?;
+        origin.finish_job(
+            &net.a,
+            &net.network,
+            "c",
+            &trigger,
+            &attempt,
+            JobOutcome::Completed,
+            "completed reply",
+            72,
+        )?;
+        assert_eq!(origin.memories(&net.network, "c")?.len(), MAX_MEMORIES);
+        assert!(matches!(
+            origin
+                .scheduler_job("c", &trigger)?
+                .context("completed job")?
+                .state,
+            JobState::Completed { .. }
+        ));
+        let reply = origin
+            .messages(&net.network, "c")?
+            .into_iter()
+            .find(|message| message.in_reply_to.as_deref() == Some("m2"))
+            .context("reply")?;
+        assert_eq!(reply.text, "completed reply");
+        assert_eq!(reply.status, Some(ReplyStatus::Completed));
+        let conflicts = memory_test_shown(&origin)?.memory_conflicts;
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].reason, "capacity_exceeded");
+        assert_eq!(
+            conflicts[0].memory_id,
+            *staged_ids.last().context("rejected memory")?
+        );
+        for (index, memory_id) in staged_ids.iter().enumerate() {
+            let committed = index < (MAX_MEMORIES - live_count as usize - 1);
+            assert_eq!(
+                origin
+                    .bot_change(
+                        &net.network,
+                        &bot_settings::change_id("c", &trigger, &format!("stage-{index}"))
+                    )?
+                    .is_some(),
+                committed
+            );
+            if committed {
+                assert_eq!(
+                    origin
+                        .memory_state(&net.network, "c", memory_id, None)?
+                        .current
+                        .context("committed memory")?
+                        .text,
+                    Some(format!("staged candidate {index}"))
+                );
+            }
+        }
+        if let Some(tombstone) = tombstone {
+            assert_eq!(
+                origin
+                    .memory_state(&net.network, "c", &tombstone.memory_id, None)?
+                    .current
+                    .as_ref(),
+                Some(&tombstone)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn switchable_scheduler_session(
+    net: &Net,
+) -> Result<(
+    Store,
+    crate::scheduling::ClaimedJob,
+    crate::scheduling::SessionConfig,
+)> {
+    use crate::scheduling::{SessionConfig, SessionKey, SessionScope, TurnExecution, TurnRuntime};
+    use vibeface_bridge::failure::ProviderStage;
+    let mut store = store(net)?;
+    conversation(&mut store, net)?;
+    store.append_event(&net.a, &net.network, "c", bot(net, "Helper")?, vec![], 2)?;
+    say(&mut store, net, "m1", true)?;
+    let config = SessionConfig {
+        stable_fingerprint: "stable-before-backup".into(),
+        runtime_fingerprint: "runtime-before-backup".into(),
+        provider: Provider::Codex,
+    };
+    let key = SessionKey {
+        conversation_id: "c".into(),
+        scope: SessionScope::Main,
+    };
+    let limits = crate::config::SchedulingLimits::default();
+    let first = store
+        .claim_next_in_session(&net.a, &net.network, &key, "boot", &config, &limits)?
+        .context("first turn")?;
+    let attempt = first
+        .job
+        .state
+        .attempt()
+        .context("first attempt")?
+        .id
+        .clone();
+    store.mark_started("c", &first.job.trigger, &attempt)?;
+    store.save_scheduler_native_id(
+        "c",
+        &first.job.trigger,
+        &attempt,
+        "cached-thread",
+        "cached-token",
+        true,
+    )?;
+    let shown = Shown {
+        bot: Some("cached-bot".into()),
+        works: [("cached-work".into(), "work-revision".into())].into(),
+        memory: Some([("cached-memory".into(), "memory-revision".into())].into()),
+        dynamic: Some("cached-context".into()),
+        session_generation: first.session_generation,
+        ..Shown::default()
+    };
+    store.record_manager_turn(
+        &attempt,
+        "fixture",
+        "cached-thread",
+        Some("old-turn"),
+        &shown,
+    )?;
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &first.job.trigger,
+        &attempt,
+        JobOutcome::Completed,
+        "done",
+        4,
+    )?;
+    say(&mut store, net, "switch-next", true)?;
+    let mut claimed = store
+        .claim_next_in_session(&net.a, &net.network, &key, "boot", &config, &limits)?
+        .context("resumed turn")?;
+    assert_eq!(claimed.previous_native_id.as_deref(), Some("cached-thread"));
+    assert_eq!(claimed.shown.bot.as_deref(), Some("cached-bot"));
+    assert!(!claimed.covers.as_ref().context("cached covers")?.is_empty());
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    let runtime = TurnRuntime {
+        provider: Provider::Codex,
+        model: Some("selected-before-backup".into()),
+        reasoning_effort: Some("medium".into()),
+        generation: "before-backup".into(),
+        session_generation: claimed.session_generation,
+        delivery_id: attempt.clone(),
+        stage: ProviderStage::Authentication,
+        execution: TurnExecution::NotStarted,
+        attempted_at_ms: 5,
+        switched_from: None,
+        switch_reason: None,
+    };
+    claimed.job = store.record_turn_runtime("c", &claimed.job.trigger, &attempt, &runtime)?;
+    Ok((store, claimed, config))
+}
+
+fn scheduler_switch_rows(store: &Store) -> Result<Vec<String>> {
+    let mut rows = Vec::new();
+    for table in ["scheduler_jobs", "scheduler_sessions", "pending_checks"] {
+        let mut statement = store
+            .connection
+            .prepare(&format!("SELECT * FROM {table}"))?;
+        let count = statement.column_count();
+        for row in statement.query_map([], |row| {
+            (0..count)
+                .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })? {
+            rows.push(format!("{table}: {:?}", row?));
+        }
+    }
+    rows.sort();
+    Ok(rows)
+}
+
+#[test]
+fn backup_switch_fences_the_cached_session_without_readmitting_the_job() -> Result<()> {
+    use crate::scheduling::{RuntimeSelection, SessionConfig};
+    let net = net()?;
+    let (mut store, before, old) = switchable_scheduler_session(&net)?;
+    let attempt = before.job.state.attempt().context("attempt")?;
+    let jobs = store.scheduler_jobs("c")?.len();
+    let basis = store.version_vector(&net.network)?;
+    let config = SessionConfig {
+        stable_fingerprint: "stable-after-backup".into(),
+        runtime_fingerprint: "runtime-after-backup".into(),
+        provider: Provider::Cursor,
+    };
+    let switched =
+        store.switch_scheduler_session("c", &before.job.trigger, &attempt.id, &config)?;
+    assert_eq!(switched.job.trigger, before.job.trigger);
+    assert_eq!(switched.job.basis, before.job.basis);
+    assert_eq!(switched.job.message_id, before.job.message_id);
+    assert_eq!(
+        switched.job.state.attempt().context("switched attempt")?.id,
+        attempt.id
+    );
+    assert_eq!(
+        switched
+            .job
+            .state
+            .attempt()
+            .context("switched attempt")?
+            .permission_version,
+        attempt.permission_version + 1
+    );
+    assert_eq!(switched.session_generation, before.session_generation + 1);
+    assert_eq!(switched.handoff_revision, before.handoff_revision + 1);
+    assert_eq!(switched.handoff_source, before.job.basis);
+    assert!(
+        switched.previous_native_id.is_none()
+            && switched.previous_token.is_none()
+            && switched.covers.is_none()
+    );
+    assert_eq!(
+        switched.previous_runtime,
+        Some(RuntimeSelection {
+            provider: Provider::Codex,
+            model: Some("selected-before-backup".into()),
+            reasoning_effort: Some("medium".into()),
+        })
+    );
+    let invalidation = switched.invalidation.as_ref().context("invalidation")?;
+    assert_eq!(invalidation.reason, "provider_changed");
+    assert_eq!(invalidation.source_provider, Some(old.provider));
+    assert_eq!(invalidation.target_provider, config.provider);
+    assert_eq!(
+        invalidation.old_stable_fingerprint.as_deref(),
+        Some(old.stable_fingerprint.as_str())
+    );
+    assert_eq!(
+        invalidation.new_stable_fingerprint,
+        config.stable_fingerprint
+    );
+    assert_eq!(
+        invalidation.old_runtime_fingerprint.as_deref(),
+        Some(old.runtime_fingerprint.as_str())
+    );
+    assert_eq!(
+        invalidation.new_runtime_fingerprint,
+        config.runtime_fingerprint
+    );
+    assert_eq!(
+        invalidation.source_basis,
+        before.covers.clone().context("old covers")?
+    );
+    assert_eq!(invalidation.generation, switched.session_generation);
+    assert_eq!(
+        switched.shown.session_lineage.len(),
+        before.shown.session_lineage.len() + 1
+    );
+    let lineage = switched.shown.session_lineage.last().context("lineage")?;
+    assert_eq!(lineage.source_basis, invalidation.source_basis);
+    assert_eq!(lineage.generation, before.session_generation);
+    assert_eq!(lineage.stable_fingerprint, old.stable_fingerprint);
+    assert_eq!(lineage.runtime_fingerprint, old.runtime_fingerprint);
+    assert_eq!(lineage.provider, old.provider);
+    assert_eq!(lineage.handoff_revision, invalidation.handoff_revision);
+    assert_eq!(
+        switched.shown,
+        Shown {
+            session_generation: switched.session_generation,
+            session_lineage: switched.shown.session_lineage.clone(),
+            ..Shown::default()
+        }
+    );
+    assert_eq!(memory_test_shown(&store)?, switched.shown);
+    let persisted: (Option<String>, Option<String>, String, String, String, String, u64, u64) = store.connection.query_row(
+        "SELECT native_id,native_token,covers,stable_fingerprint,runtime_fingerprint,provider,permission_version,session_generation FROM scheduler_sessions WHERE conversation_id='c' AND scope='main'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+    )?;
+    assert_eq!(
+        (persisted.0, persisted.1, persisted.2.as_str()),
+        (None, None, "{}")
+    );
+    assert_eq!(
+        (persisted.3, persisted.4, persisted.5),
+        (
+            config.stable_fingerprint,
+            config.runtime_fingerprint,
+            enum_text(&config.provider)
+        )
+    );
+    assert_eq!(
+        (persisted.6, persisted.7),
+        (attempt.permission_version + 1, switched.session_generation)
+    );
+    assert_eq!(
+        store
+            .scheduler_job("c", &before.job.trigger)?
+            .context("saved job")?,
+        switched.job
+    );
+    assert_eq!(store.scheduler_jobs("c")?.len(), jobs);
+    assert_eq!(store.version_vector(&net.network)?, basis);
+    Ok(())
+}
+
+#[test]
+fn rejected_backup_switches_leave_jobs_sessions_and_checks_unchanged() -> Result<()> {
+    use crate::scheduling::{SessionConfig, SessionScope, TurnExecution};
+    use vibeface_bridge::failure::ProviderStage;
+    for (case, expected) in [
+        ("task", "only allowed for human turns"),
+        ("started", "started execution"),
+        ("unknown", "started execution"),
+        ("pending", "side effects"),
+        ("tools", "side effects"),
+        ("partial", "emitted reply text"),
+        ("attempt", "attempt does not match"),
+        ("inactive", "no longer active"),
+        ("missing-runtime", "turn runtime missing"),
+        ("unchanged", "configuration did not change"),
+    ] {
+        let net = net()?;
+        let (mut store, mut claimed, old) = switchable_scheduler_session(&net)?;
+        let mut config = SessionConfig {
+            stable_fingerprint: "stable-backup".into(),
+            runtime_fingerprint: "runtime-backup".into(),
+            provider: Provider::Cursor,
+        };
+        if case == "task" {
+            let task = isolated_task(&mut store, &net, "backup-task")?;
+            let mut runtime = claimed.job.runtime.clone().context("runtime")?;
+            claimed = isolated_claim(
+                &mut store,
+                &net,
+                SessionScope::Task {
+                    work_id: task.work_id,
+                },
+                task.resolved.provider,
+                crate::config::SchedulingLimits::default(),
+            )?
+            .context("task claim")?;
+            runtime.provider = task.resolved.provider;
+            runtime.model = task.resolved.model;
+            runtime.reasoning_effort = None;
+            runtime.session_generation = claimed.session_generation;
+            runtime.delivery_id = claimed
+                .job
+                .state
+                .attempt()
+                .context("task attempt")?
+                .id
+                .clone();
+            store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
+        }
+        let trigger = claimed.job.trigger.clone();
+        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+        match case {
+            "started" | "unknown" => {
                 store.update_turn_runtime(
-                    &scope,
+                    "c",
                     &trigger,
                     &attempt,
                     ProviderStage::Run,
-                    TurnExecution::Started,
+                    if case == "started" {
+                        TurnExecution::Started
+                    } else {
+                        TurnExecution::Unknown
+                    },
                 )?;
-            }
-            "tools" => {
-                store.record_manager_tool_call(&scope, &trigger, &attempt)?;
             }
             "pending" => {
-                store.finish_job(
-                    &net.a,
-                    &net.network,
-                    &scope,
-                    &trigger,
-                    &attempt,
-                    JobOutcome::Interrupted {
-                        failure: ExecFailure::new(FailureKind::Transport, "unknown send"),
-                        process_unconfirmed: true,
-                    },
-                    "",
-                    4,
-                )?;
+                assert_eq!(store.connection.execute("INSERT INTO pending_checks(attempt_id,conversation_id,trigger,detail,created_at_ms) VALUES(?,'c',?,'unknown provider result',6)", params![attempt, trigger])?, 1);
+            }
+            "tools" => {
+                store.record_manager_tool_call("c", &trigger, &attempt)?;
+            }
+            "partial" => {
+                assert_eq!(store.connection.execute("UPDATE scheduler_jobs SET partial_text='visible partial' WHERE conversation_id='c' AND trigger=?", [&trigger])?, 1);
+            }
+            "inactive" => {
+                assert_eq!(store.connection.execute("UPDATE scheduler_sessions SET active=NULL WHERE conversation_id='c' AND scope='main'", [])?, 1);
+            }
+            "missing-runtime" => {
+                assert_eq!(store.connection.execute("UPDATE scheduler_jobs SET runtime=NULL WHERE conversation_id='c' AND trigger=?", [&trigger])?, 1);
+            }
+            "unchanged" => {
+                config = old;
             }
             _ => {}
         }
-        store.connection.execute(
-            "UPDATE scheduler_jobs SET state='queued' WHERE conversation_id=? AND trigger=?",
-            params![scope, trigger],
-        )?;
-        let before =
-            serde_json::to_value(store.scheduler_job(&scope, &trigger)?.context("guarded")?)?;
-        let checks = serde_json::to_value(store.pending_checks()?)?;
-        assert!(
-            store
-                .refuse_queued_tasks(&net.a, &net.network, Some(&scope), "boot", 5, |_| Ok(Some(
-                    (
-                        "generation".into(),
-                        ExecFailure::new(FailureKind::NoBot, "disabled")
-                    )
-                )))?
-                .is_empty()
+        let before = scheduler_switch_rows(&store)?;
+        let job = store.scheduler_job("c", &trigger)?.context("saved job")?;
+        let basis = store.version_vector(&net.network)?;
+        let result = store.switch_scheduler_session(
+            "c",
+            &trigger,
+            if case == "attempt" {
+                "wrong-attempt"
+            } else {
+                &attempt
+            },
+            &config,
         );
+        let error = result.expect_err(case);
+        assert!(error.to_string().contains(expected), "{case}: {error}");
+        assert_eq!(scheduler_switch_rows(&store)?, before, "{case}");
         assert_eq!(
-            serde_json::to_value(store.scheduler_job(&scope, &trigger)?.context("guarded")?)?,
-            before
+            store.scheduler_job("c", &trigger)?.context("saved job")?,
+            job,
+            "{case}"
         );
-        assert_eq!(serde_json::to_value(store.pending_checks()?)?, checks);
-        assert_eq!(
-            store
-                .context(&net.network, &scope, None)?
-                .events
-                .iter()
-                .filter(|event| matches!(event.event.body, EventBody::WorkFinished { .. }))
-                .count(),
-            0
-        );
+        assert_eq!(store.version_vector(&net.network)?, basis, "{case}");
     }
     Ok(())
 }

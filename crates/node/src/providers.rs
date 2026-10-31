@@ -184,14 +184,14 @@ pub struct ProviderProbe {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
-pub enum ProviderReadiness {
+pub enum ProviderProbeReadiness {
     Starting,
     Ready,
     Unverified { issue: ProbeIssue },
     NeedsSetup { issue: ProbeIssue },
 }
 
-impl ProviderReadiness {
+impl ProviderProbeReadiness {
     pub fn state(&self) -> &'static str {
         match self {
             Self::Starting => "starting",
@@ -207,15 +207,15 @@ impl ProviderReadiness {
 }
 
 impl ProviderProbe {
-    pub fn readiness(&self, model: &str) -> ProviderReadiness {
-        use ProviderReadiness::{NeedsSetup, Unverified};
+    pub fn readiness(&self, model: &str) -> ProviderProbeReadiness {
+        use ProviderProbeReadiness::{NeedsSetup, Unverified};
         match &self.launch {
             LaunchCheck::Failed { issue } => {
                 return NeedsSetup {
                     issue: issue.clone(),
                 };
             }
-            LaunchCheck::Starting => return ProviderReadiness::Starting,
+            LaunchCheck::Starting => return ProviderProbeReadiness::Starting,
             _ => {}
         }
         if self.authentication == Authentication::SignInRequired {
@@ -263,7 +263,7 @@ impl ProviderProbe {
                 issue: ProbeIssue::new(ProbeStage::ModelList, ProbeCode::ModelUnverified),
             };
         }
-        ProviderReadiness::Ready
+        ProviderProbeReadiness::Ready
     }
 }
 
@@ -309,13 +309,333 @@ pub enum Sessions {
 }
 
 /// What a bot turn's prompt carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PromptMode {
     /// The thread keeps its instructions, the tool catalog and what it was shown, so a turn
     /// carries only what is new and a thread lost on the App Server is replaced by a full one.
     Thread,
     /// Every turn carries everything.
     Turn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillInjection {
+    Folder,
+    Plugin,
+    PromptIndex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolMode {
+    StaticCatalog,
+    DynamicCatalog,
+    NativeCallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    ReadOnly,
+    Workspace,
+    FullAccess,
+    ProviderControlled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConcurrencyMode {
+    Serial,
+    Parallel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMode {
+    Native,
+    Request,
+    Handoff,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySupport {
+    Supported,
+    Unsupported,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPersistence {
+    AppServer,
+    Process,
+    ProviderStore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StablePromptPlacement {
+    ThreadInstructions,
+    SessionInstructions,
+    TurnInstructions,
+    UserTurnPrefix,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicContextPlacement {
+    UserTurn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextStreamMode {
+    Snapshot,
+    DeltaAndSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelEvidence {
+    AppServerTurnEnd,
+    ProviderTerminal,
+    ProviderTerminalOrManagedProcessExit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationStatus {
+    Confirmed,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessEvidence {
+    BinaryDiscovery,
+    LaunchPrerequisites,
+    AppServerHandshake,
+    AppServerStarting,
+    AppServerUnavailable,
+    ManagedLaunchFailed,
+    ConfigurationInvalid,
+    AuthenticationNotObserved,
+    ModelCatalogNotObserved,
+    ReadinessNotObserved,
+    PrerequisitesRejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderObservation {
+    pub status: ObservationStatus,
+    pub evidence: ReadinessEvidence,
+}
+
+impl ProviderObservation {
+    pub fn new(status: ObservationStatus, evidence: ReadinessEvidence) -> Self {
+        Self { status, evidence }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderReadiness {
+    pub installed: ProviderObservation,
+    pub launchable: ProviderObservation,
+    pub authenticated: ProviderObservation,
+    pub model_known: ProviderObservation,
+    pub ready: ProviderObservation,
+}
+
+impl ProviderReadiness {
+    pub fn from_prerequisites(installed: bool, launchable: ProviderObservation) -> Self {
+        Self {
+            installed: ProviderObservation::new(
+                if installed {
+                    ObservationStatus::Confirmed
+                } else {
+                    ObservationStatus::Rejected
+                },
+                ReadinessEvidence::BinaryDiscovery,
+            ),
+            launchable,
+            authenticated: ProviderObservation::new(
+                ObservationStatus::Unknown,
+                ReadinessEvidence::AuthenticationNotObserved,
+            ),
+            model_known: ProviderObservation::new(
+                ObservationStatus::Unknown,
+                ReadinessEvidence::ModelCatalogNotObserved,
+            ),
+            ready: ProviderObservation::new(
+                if launchable.status == ObservationStatus::Rejected {
+                    ObservationStatus::Rejected
+                } else {
+                    ObservationStatus::Unknown
+                },
+                if launchable.status == ObservationStatus::Rejected {
+                    ReadinessEvidence::PrerequisitesRejected
+                } else {
+                    ReadinessEvidence::ReadinessNotObserved
+                },
+            ),
+        }
+    }
+}
+
+/// The provider facts used by the prompt compiler and scheduler. This is a description of a
+/// provider adapter, not a permission grant. Tool effects and workspace checks remain in the Node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDescriptor {
+    pub provider: Provider,
+    pub sessions: SessionPersistence,
+    pub prompt_mode: PromptMode,
+    pub stable_prompt: StablePromptPlacement,
+    pub dynamic_context: DynamicContextPlacement,
+    pub tool_mode: ToolMode,
+    pub skill_injection: SkillInjection,
+    pub workspace_required: bool,
+    pub sandbox: SandboxMode,
+    pub steer: bool,
+    pub concurrency: ConcurrencyMode,
+    pub compaction: CompactionMode,
+    pub usage: CapabilitySupport,
+    pub approvals: CapabilitySupport,
+    pub model_catalog: CapabilitySupport,
+    pub streaming: bool,
+    pub cancel: bool,
+    pub resume_local_session: bool,
+    pub text_stream_mode: TextStreamMode,
+    pub cancel_confirmation_evidence: CancelEvidence,
+}
+
+impl ProviderDescriptor {
+    pub fn for_provider(provider: Provider) -> Self {
+        let (
+            sessions,
+            prompt_mode,
+            stable_prompt,
+            skill_injection,
+            sandbox,
+            steer,
+            concurrency,
+            model_catalog,
+            text_stream_mode,
+            cancel_confirmation_evidence,
+        ) = match provider {
+            Provider::Codex => (
+                SessionPersistence::AppServer,
+                PromptMode::Thread,
+                StablePromptPlacement::ThreadInstructions,
+                SkillInjection::Folder,
+                SandboxMode::FullAccess,
+                true,
+                ConcurrencyMode::Parallel,
+                CapabilitySupport::Supported,
+                TextStreamMode::Snapshot,
+                CancelEvidence::AppServerTurnEnd,
+            ),
+            Provider::Cursor => (
+                SessionPersistence::Process,
+                PromptMode::Turn,
+                StablePromptPlacement::TurnInstructions,
+                SkillInjection::Folder,
+                SandboxMode::ProviderControlled,
+                false,
+                ConcurrencyMode::Serial,
+                CapabilitySupport::Unsupported,
+                TextStreamMode::DeltaAndSnapshot,
+                CancelEvidence::ProviderTerminal,
+            ),
+            Provider::Claude => (
+                SessionPersistence::Process,
+                PromptMode::Thread,
+                StablePromptPlacement::SessionInstructions,
+                SkillInjection::Plugin,
+                SandboxMode::ProviderControlled,
+                false,
+                ConcurrencyMode::Serial,
+                CapabilitySupport::Unsupported,
+                TextStreamMode::Snapshot,
+                CancelEvidence::ProviderTerminalOrManagedProcessExit,
+            ),
+            Provider::Pi => (
+                SessionPersistence::Process,
+                PromptMode::Thread,
+                StablePromptPlacement::SessionInstructions,
+                SkillInjection::Folder,
+                SandboxMode::ProviderControlled,
+                true,
+                ConcurrencyMode::Serial,
+                CapabilitySupport::Unsupported,
+                TextStreamMode::DeltaAndSnapshot,
+                CancelEvidence::ProviderTerminalOrManagedProcessExit,
+            ),
+            Provider::Opencode => (
+                SessionPersistence::ProviderStore,
+                PromptMode::Thread,
+                StablePromptPlacement::UserTurnPrefix,
+                SkillInjection::PromptIndex,
+                SandboxMode::ProviderControlled,
+                true,
+                ConcurrencyMode::Serial,
+                CapabilitySupport::Unsupported,
+                TextStreamMode::DeltaAndSnapshot,
+                CancelEvidence::ProviderTerminalOrManagedProcessExit,
+            ),
+        };
+        Self {
+            provider,
+            sessions,
+            prompt_mode,
+            stable_prompt,
+            dynamic_context: DynamicContextPlacement::UserTurn,
+            tool_mode: ToolMode::DynamicCatalog,
+            skill_injection,
+            workspace_required: true,
+            sandbox,
+            steer,
+            concurrency,
+            compaction: CompactionMode::Handoff,
+            usage: if provider == Provider::Cursor {
+                CapabilitySupport::Supported
+            } else {
+                CapabilitySupport::Unsupported
+            },
+            approvals: CapabilitySupport::Unsupported,
+            model_catalog,
+            streaming: true,
+            cancel: true,
+            resume_local_session: true,
+            text_stream_mode,
+            cancel_confirmation_evidence,
+        }
+    }
+
+    pub fn check_steer(&self) -> Result<()> {
+        ensure!(
+            self.steer,
+            "{} cannot steer a running turn",
+            self.provider.label()
+        );
+        Ok(())
+    }
+
+    pub fn compact_or_handoff(&self) -> Result<CompactionMode> {
+        ensure!(
+            self.compaction == CompactionMode::Handoff,
+            "{} has no Node compaction adapter",
+            self.provider.label()
+        );
+        Ok(CompactionMode::Handoff)
+    }
 }
 
 impl Provider {
@@ -487,10 +807,7 @@ impl Provider {
 
     /// Whether a queued user message can join the bot's running reply.
     pub fn supports_steer(self) -> bool {
-        match self {
-            Provider::Codex | Provider::Pi | Provider::Opencode => true,
-            Provider::Cursor | Provider::Claude => false,
-        }
+        self.descriptor().steer
     }
 
     /// `vibeface hooks install` sets this up; `None` when the Node does not watch the
@@ -518,12 +835,7 @@ impl Provider {
     }
 
     pub fn prompt_mode(self) -> PromptMode {
-        match self {
-            Provider::Codex | Provider::Claude | Provider::Pi | Provider::Opencode => {
-                PromptMode::Thread
-            }
-            Provider::Cursor => PromptMode::Turn,
-        }
+        self.descriptor().prompt_mode
     }
 
     pub fn native_compaction(self) -> bool {
@@ -539,13 +851,18 @@ impl Provider {
         }
     }
 
-    /// The tools a turn of `kind` is offered. A thread lists them once for all its turns, so it
-    /// gets every tool a user's own turn has.
+    /// The discovery entry points and essential reads. The router checks each discovered
+    /// target against the current turn, including when a thread keeps this initial catalog.
     pub fn tools_for(self, kind: TriggerKind) -> BTreeMap<String, CustomToolConfig> {
         crate::scheduler::tools(match self.prompt_mode() {
             PromptMode::Thread => TriggerKind::Human,
             PromptMode::Turn => kind,
         })
+        .into_iter()
+        .filter(|(name, _)| {
+            crate::tools::Tool::parse(name).is_some_and(crate::tools::Tool::initially_exposed)
+        })
+        .collect()
     }
 
     /// The model the bot runs with: Cursor needs one, and Codex, Claude Code and pi read "auto" as a
@@ -558,32 +875,12 @@ impl Provider {
         }
     }
 
+    pub fn descriptor(self) -> ProviderDescriptor {
+        ProviderDescriptor::for_provider(self)
+    }
+
     pub fn capabilities(self) -> Value {
-        let codex = self == Provider::Codex;
-        json!({
-            "verified": false,
-            "streaming": true,
-            "cancel": true,
-            "steer": self.supports_steer(),
-            "resume_local_session": true,
-            "context_compaction": if self.native_compaction() { "native" } else { "handoff" },
-            // Codex's and Claude Code's runners send whole text; the others stream it as well.
-            "text_stream_mode": match self {
-                Provider::Codex | Provider::Claude => "snapshot",
-                _ => "delta_and_snapshot",
-            },
-            "cancel_request": true,
-            "cancel_confirmation": true,
-            "cancel_confirmation_evidence": if codex {
-                "app_server_turn_end"
-            } else if self == Provider::Cursor {
-                "provider_terminal"
-            } else {
-                "provider_terminal_or_managed_process_exit"
-            },
-            "native_steer": self.supports_steer(),
-            "run_reconcile": false,
-        })
+        json!(self.descriptor())
     }
 }
 
@@ -981,7 +1278,7 @@ mod tests {
         probe.authentication = Authentication::SignInRequired;
         assert!(matches!(
             probe.readiness("model"),
-            ProviderReadiness::NeedsSetup {
+            ProviderProbeReadiness::NeedsSetup {
                 issue: ProbeIssue {
                     code: ProbeCode::SignInRequired,
                     ..
@@ -998,8 +1295,8 @@ mod tests {
             }],
             coverage: CatalogCoverage::Partial,
         };
-        assert_eq!(probe.readiness("model"), ProviderReadiness::Ready);
-        assert_eq!(probe.readiness(""), ProviderReadiness::Ready);
+        assert_eq!(probe.readiness("model"), ProviderProbeReadiness::Ready);
+        assert_eq!(probe.readiness(""), ProviderProbeReadiness::Ready);
         assert_eq!(probe.readiness("manual-model").state(), "unverified");
         if let ModelCatalog::Available { coverage, .. } = &mut probe.catalog {
             *coverage = CatalogCoverage::Complete;
@@ -1010,7 +1307,7 @@ mod tests {
         }
         assert!(matches!(
             probe.readiness("manual-model"),
-            ProviderReadiness::NeedsSetup {
+            ProviderProbeReadiness::NeedsSetup {
                 issue: ProbeIssue {
                     code: ProbeCode::ModelUnavailable,
                     ..
@@ -1278,6 +1575,88 @@ mod tests {
     }
 
     #[test]
+    fn provider_descriptors_cover_every_provider() {
+        for provider in Provider::ALL {
+            let descriptor = ProviderDescriptor::for_provider(provider);
+            assert_eq!(descriptor.provider, provider);
+            assert_eq!(descriptor.prompt_mode, provider.prompt_mode());
+            assert_eq!(descriptor.steer, provider.supports_steer());
+            assert!(descriptor.workspace_required);
+            assert_eq!(
+                descriptor.stable_prompt,
+                match provider {
+                    Provider::Codex => StablePromptPlacement::ThreadInstructions,
+                    Provider::Cursor => StablePromptPlacement::TurnInstructions,
+                    Provider::Claude | Provider::Pi => StablePromptPlacement::SessionInstructions,
+                    Provider::Opencode => StablePromptPlacement::UserTurnPrefix,
+                }
+            );
+            assert_eq!(
+                descriptor.dynamic_context,
+                DynamicContextPlacement::UserTurn
+            );
+            assert_eq!(
+                descriptor.compact_or_handoff().unwrap(),
+                CompactionMode::Handoff
+            );
+            let summary = provider.capabilities();
+            assert_eq!(summary, serde_json::to_value(&descriptor).unwrap());
+            assert!(summary.get("observed").is_none());
+            assert!(summary.get("env").is_none());
+        }
+    }
+
+    #[test]
+    fn readiness_requires_observed_authentication_and_model_evidence() {
+        let handshake = ProviderObservation::new(
+            ObservationStatus::Confirmed,
+            ReadinessEvidence::AppServerHandshake,
+        );
+        let observed = ProviderReadiness::from_prerequisites(false, handshake);
+        assert_eq!(observed.installed.status, ObservationStatus::Rejected);
+        assert_eq!(observed.launchable.status, ObservationStatus::Confirmed);
+        assert_eq!(observed.authenticated.status, ObservationStatus::Unknown);
+        assert_eq!(observed.model_known.status, ObservationStatus::Unknown);
+        assert_eq!(observed.ready.status, ObservationStatus::Unknown);
+        let prerequisites = ProviderObservation::new(
+            ObservationStatus::Unknown,
+            ReadinessEvidence::LaunchPrerequisites,
+        );
+        let present = ProviderReadiness::from_prerequisites(true, prerequisites);
+        assert_eq!(present.installed.status, ObservationStatus::Confirmed);
+        assert_eq!(present.launchable.status, ObservationStatus::Unknown);
+        assert_eq!(present.ready.status, ObservationStatus::Unknown);
+        let missing = ProviderReadiness::from_prerequisites(
+            false,
+            ProviderObservation::new(
+                ObservationStatus::Rejected,
+                ReadinessEvidence::PrerequisitesRejected,
+            ),
+        );
+        assert_eq!(missing.ready.status, ObservationStatus::Rejected);
+        assert_eq!(missing.authenticated.status, ObservationStatus::Unknown);
+    }
+
+    #[test]
+    fn undeclared_steer_and_native_compaction_are_rejected() {
+        for provider in Provider::ALL {
+            assert_eq!(
+                provider.descriptor().check_steer().is_ok(),
+                provider.supports_steer()
+            );
+            let mut descriptor = provider.descriptor();
+            for compaction in [
+                CompactionMode::Native,
+                CompactionMode::Request,
+                CompactionMode::Unsupported,
+            ] {
+                descriptor.compaction = compaction;
+                assert!(descriptor.compact_or_handoff().is_err());
+            }
+        }
+    }
+
+    #[test]
     fn variables_and_programs_are_kept_per_provider() -> Result<()> {
         let env: ProviderEnv = serde_json::from_value(json!({
             "claude":{"ANTHROPIC_API_KEY":"fixture-claude-value"},"opencode":{"OPENCODE_MODEL":"m"},
@@ -1300,6 +1679,133 @@ mod tests {
             PathBuf::from("cursor-sdk-bridge")
         );
         assert!(local.launches(Provider::Claude) && local.launches(Provider::Codex));
+        Ok(())
+    }
+
+    #[test]
+    fn every_provider_starts_with_dynamic_discovery_and_essential_reads() {
+        let expected = BTreeSet::from([
+            "tool_search",
+            "tool_describe",
+            "tool_call",
+            "context",
+            "read_skill",
+            "call_lookup",
+        ]);
+        for provider in Provider::ALL {
+            assert_eq!(
+                ProviderDescriptor::for_provider(provider).tool_mode,
+                ToolMode::DynamicCatalog
+            );
+            for kind in [
+                TriggerKind::Human,
+                TriggerKind::AgentTask,
+                TriggerKind::Schedule,
+            ] {
+                let tools = provider.tools_for(kind);
+                assert_eq!(
+                    tools.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discovered_tools_keep_the_turn_and_token_effect_boundary() -> Result<()> {
+        use crate::tools::{Effect, Tool};
+        let human = Tool::search(json!({"limit":30}), Some(TriggerKind::Human))?;
+        assert_eq!(human["tools"].as_array().map(Vec::len), Some(29));
+        assert_eq!(human["more"], false);
+        assert!(human["next"].is_null());
+        for kind in [
+            None,
+            Some(TriggerKind::AgentTask),
+            Some(TriggerKind::Schedule),
+        ] {
+            let found = Tool::search(json!({"limit":30}), kind)?;
+            for row in found["tools"].as_array().unwrap() {
+                let tool = Tool::parse(row["name"].as_str().unwrap()).unwrap();
+                assert!(!matches!(tool, Tool::Search | Tool::Describe | Tool::Call));
+                assert!(kind.map_or(tool.effect() == Effect::Read, |kind| {
+                    tool.effect().offered(kind)
+                }));
+            }
+            assert!(Tool::describe(json!({"tool":"update_profile"}), kind).is_err());
+        }
+        let first = Tool::search(json!({"limit":1}), Some(TriggerKind::Human))?;
+        assert_eq!(first["tools"][0]["name"], "nodes");
+        assert_eq!(first["more"], true);
+        let second = Tool::search(
+            json!({"limit":1,"offset":first["next"]}),
+            Some(TriggerKind::Human),
+        )?;
+        assert_eq!(second["tools"][0]["name"], "context");
+        let dispatch = Tool::search(json!({"query":"DISPATCH_WORK"}), Some(TriggerKind::Human))?;
+        assert_eq!(dispatch["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(dispatch["tools"][0]["name"], "dispatch_work");
+        let described = Tool::describe(json!({"tool":"dispatch_work"}), Some(TriggerKind::Human))?;
+        assert_eq!(described["effect"], "work");
+        assert_eq!(described["requires_call_ref"], true);
+        assert_eq!(
+            described["input_schema"],
+            crate::scheduler::tools(TriggerKind::Human)["dispatch_work"].input_schema
+        );
+        assert!(Tool::search(json!({"limit":0}), Some(TriggerKind::Human)).is_err());
+        assert!(Tool::describe(json!({"tool":"nodes","unknown":true}), None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn tool_calls_resolve_the_actual_effect_and_cannot_wrap_internal_or_discovery_tools()
+    -> Result<()> {
+        use crate::tools::{Effect, Tool};
+        let (target, args) = Tool::resolve_call(
+            "tool_call",
+            json!({
+                "tool":"update_profile","arguments":{"name":"new name"},"call_ref":"rename-once",
+            }),
+        )?;
+        assert_eq!(target, Tool::UpdateProfile);
+        assert_eq!(target.effect(), Effect::Settings);
+        assert!(!target.effect().offered(TriggerKind::Schedule));
+        assert_eq!(args, json!({"name":"new name","call_ref":"rename-once"}));
+        let (_, retry) = Tool::resolve_call(
+            "tool_call",
+            json!({
+                "tool":"update_profile","arguments":args,"call_ref":"rename-once",
+            }),
+        )?;
+        assert_eq!(retry["call_ref"], "rename-once");
+        assert!(
+            Tool::resolve_call(
+                "tool_call",
+                json!({
+                    "tool":"update_profile","arguments":retry,"call_ref":"another-intent",
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            Tool::resolve_call("tool_call", json!({"tool":"update_profile","arguments":{}}))
+                .is_err()
+        );
+        for tool in [
+            "track_work",
+            "bind_work",
+            "wait_work",
+            "tool_search",
+            "tool_describe",
+            "tool_call",
+        ] {
+            assert!(Tool::resolve_call("tool_call", json!({"tool":tool,"arguments":{}})).is_err());
+            assert!(Tool::describe(json!({"tool":tool}), Some(TriggerKind::Human)).is_err());
+        }
+        assert_eq!(
+            Tool::resolve_call("track_work", json!({}))?.0,
+            Tool::TrackWork
+        );
+        assert!(Tool::resolve_call("tool_call", json!({"tool":"nodes","arguments":[]})).is_err());
         Ok(())
     }
 }

@@ -1224,7 +1224,7 @@ impl Runtime {
 /// work that continues another one runs in a fork of that one's session, and one given a
 /// thread goes on in that session, which one of this device's works ran in.
 impl Executor for Pi {
-    fn start<'a>(
+    fn start_or_resume<'a>(
         &'a self,
         node: &'a Arc<Runtime>,
         network: &'a str,
@@ -1442,7 +1442,7 @@ impl Executor for Pi {
         })
     }
 
-    fn steer<'a>(
+    fn send_turn<'a>(
         &'a self,
         into: &'a SteerTarget,
         message_id: &'a str,
@@ -1571,6 +1571,7 @@ mod tests {
             let turns = turns.clone();
             CodexTurn {
                 client_id: "client".into(),
+                started: None,
                 record: Arc::new(move |session, turn| {
                     turns.lock().unwrap().push((session, turn));
                     Box::pin(async { anyhow::Ok(()) })
@@ -1604,6 +1605,7 @@ mod tests {
         config.provider_env = gated_env(dir, mode);
         config.codex_turn = Some(CodexTurn {
             client_id: client.into(),
+            started: None,
             record: Arc::new(|_, _| Box::pin(async { anyhow::Ok(()) })),
             fresh_prompt: None,
         });
@@ -1977,7 +1979,7 @@ mod tests {
                 turn_id,
             };
             assert_eq!(
-                pi.steer(&into, "m-1", "also this").await,
+                pi.send_turn(&into, "m-1", "also this").await,
                 SteerAck::Accepted
             );
             into
@@ -1993,7 +1995,7 @@ mod tests {
             Some(SteerTrace::NotArrived)
         );
         assert_eq!(
-            pi.steer(&into, "m-3", "late").await,
+            pi.send_turn(&into, "m-3", "late").await,
             SteerAck::Refused("the pi turn is not running".into())
         );
         std::fs::remove_dir_all(&dir)?;

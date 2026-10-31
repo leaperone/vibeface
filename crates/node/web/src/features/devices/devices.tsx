@@ -85,7 +85,7 @@ export function DevicesPage({ joins = true }: { joins?: boolean }) {
           <span className="flex min-w-0 flex-1 flex-col items-start gap-x-2 gap-y-0.5 sm:flex-row sm:items-center"><span className="line-clamp-2 min-w-0 font-medium [overflow-wrap:anywhere]">{row.name}</span>
             <span className="flex flex-wrap gap-1 empty:hidden">
               {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
-              {row.bot ? <Tag><terms.canRunBot.icon aria-hidden="true" className={cn("size-3.5", row.bot === "needs_setup" && "text-warning")} />{row.bot === "ready" ? "Bot" : row.bot === "starting" ? "Bot 启动中" : row.bot === "unverified" ? "Bot 尚未确认" : "Bot 需设置"}</Tag> : null}
+              {row.bot ? <Tag><terms.canRunBot.icon aria-hidden="true" className={cn("size-3.5", row.bot === "needs_setup" && "text-warning")} />{row.bot === "ready" ? "Bot" : row.bot === "unverified" ? "Bot 未验证，可尝试" : row.bot === "starting" ? "Bot 启动中" : "Bot 需设置"}</Tag> : null}
               {row.admin ? <Tag title={terms.admin.label}><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.tag}</Tag> : null}
             </span>
           </span>

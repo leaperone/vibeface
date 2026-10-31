@@ -4632,28 +4632,55 @@ pub(super) mod tests {
         let (node, admin, dir) = node().await?;
         let result = async {
             with_agent(&node);
-            let instructions = format!("只管前端仓库，发版前先问用户。{}截断之后", "很".repeat(3000));
+            let instructions = format!(
+                "只管前端仓库，发版前先问用户。{}截断之后",
+                "很".repeat(3000)
+            );
             instructed_bot(&node, &admin, "c", "前端", &instructions, &[]).await?;
             let network = node.network_id().await?;
-            node.store.lock().await.connection.execute(
-                "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms) VALUES(?,?,?,?,?,?)",
-                params![network, "memory-1", "c", "用户每周五才发版", "r", now_ms()],
-            )?;
-            node.store.lock().await.connection.execute(
-                "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms) VALUES(?,?,?,?,?,?)",
-                params![network, "memory-2", "c", "长".repeat(500), "r", now_ms() + 1],
-            )?;
+            for (index, text) in ["用户每周五才发版".to_owned(), "长".repeat(500)]
+                .into_iter()
+                .enumerate()
+            {
+                let body = admin.attest(
+                    &network,
+                    "c",
+                    EventBody::MemoryControlled {
+                        memory_id: format!("memory-{index}"),
+                        base: crate::model::MemoryBase::absent(),
+                        after: Some(text),
+                        attestation: None,
+                    },
+                )?;
+                node.store.lock().await.append_event(
+                    &node.identity,
+                    &network,
+                    "c",
+                    body,
+                    vec![],
+                    now_ms() + index as i64,
+                )?;
+            }
             let mut requests = coordination_app_server(&node).await?;
             node.ingest_agent_event(turn("s1", "t1", "/tmp")).await?;
             node.wake_agent().await?;
             let prompt = turn_starts(&mut requests).concat();
-            assert!(prompt.contains("只管前端仓库，发版前先问用户。"), "the bot's instructions");
+            assert!(
+                prompt.contains("只管前端仓库，发版前先问用户。"),
+                "the bot's instructions"
+            );
             assert!(
                 prompt.contains("用户每周五才发版"),
                 "older notes stay when the newest is too long"
             );
-            assert!(!prompt.contains("长长长"), "a note too long to fit is left out");
-            assert!(!prompt.contains("截断之后"), "only the start of long instructions");
+            assert!(
+                !prompt.contains("长长长"),
+                "a note too long to fit is left out"
+            );
+            assert!(
+                !prompt.contains("截断之后"),
+                "only the start of long instructions"
+            );
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -5876,7 +5903,7 @@ pub(super) mod tests {
             let before = requests.lock().unwrap().clone();
             assert_eq!(before.iter().filter(|request| request["method"] == "turn/start").count(), 4);
             for (args, work_id, expected) in &original {
-                for (tool, input) in [("dispatch_work", args.clone()), ("tool_call", json!({"name":"dispatch_work","arguments":args,"call_ref":args["call_ref"]}))] {
+                for (tool, input) in [("dispatch_work", args.clone()), ("tool_call", json!({"tool":"dispatch_work","arguments":args,"call_ref":args["call_ref"]}))] {
                     let retried = node.tool(access.clone(), tool, input).await?;
                     assert_eq!(&retried["work_id"], work_id);
                     assert_eq!(&retried["resolved"], expected);
@@ -6005,10 +6032,10 @@ pub(super) mod tests {
                     node.pending_provider_launches.store(true, Ordering::SeqCst);
                 }
                 if via_tick {
-                    assert!(node.schedule_workers.lock().await.insert((network.clone(), "c".into())));
+                    assert!(node.schedule_workers.lock().await.insert((network.clone(), crate::scheduling::SessionKey { conversation_id: "c".into(), scope: crate::scheduling::SessionScope::Main })));
                     node.schedule_tick().await?;
                 } else {
-                    crate::scheduler::run(node.clone(), Access { network_id: network.clone(), human: false, conversation_id: Some("c".into()), manager: None }, "c".into()).await?.context("refusal invocation")?;
+                    crate::scheduler::run(node.clone(), Access { network_id: network.clone(), human: false, conversation_id: Some("c".into()), manager: None }, "c".into(), crate::scheduling::SessionScope::Task { work_id: request.work_id.clone() }).await?.context("refusal invocation")?;
                 }
                 assert_refused_task(&node, &network, &request, if current.is_none() { FailureKind::NoBot } else { FailureKind::ExecutionDisabled }).await?;
                 let refused = node.store.lock().await.scheduler_job("c", &crate::scheduling::task_trigger(&request.work_id))?.context("refusal")?;
@@ -6030,7 +6057,7 @@ pub(super) mod tests {
                 }
                 assert!(node.accept_remote_dispatch(&network, &node.identity.device_id()?, &json!({"spec":request})).await.is_err());
                 if via_tick {
-                    assert!(node.schedule_workers.lock().await.remove(&(network.clone(), "c".into())));
+                    assert!(node.schedule_workers.lock().await.remove(&(network.clone(), crate::scheduling::SessionKey { conversation_id: "c".into(), scope: crate::scheduling::SessionScope::Main })));
                 }
                 Ok::<_, anyhow::Error>(())
             }.await;
@@ -6072,6 +6099,9 @@ pub(super) mod tests {
                     Some((claimed.clone(), resume.clone()));
                 let task_node = node.clone();
                 let task_network = network.clone();
+                let task_scope = crate::scheduling::SessionScope::Task {
+                    work_id: request.work_id.clone(),
+                };
                 let running = tokio::spawn(async move {
                     crate::scheduler::run(
                         task_node,
@@ -6082,6 +6112,7 @@ pub(super) mod tests {
                             manager: None,
                         },
                         "c".into(),
+                        task_scope,
                     )
                     .await
                 });
@@ -6171,6 +6202,9 @@ pub(super) mod tests {
             *node.claim_to_start_barrier.lock().unwrap() = Some((claimed.clone(), resume.clone()));
             let task_node = node.clone();
             let task_network = network.clone();
+            let task_scope = crate::scheduling::SessionScope::Task {
+                work_id: request.work_id.clone(),
+            };
             let running = tokio::spawn(async move {
                 crate::scheduler::run(
                     task_node,
@@ -6181,6 +6215,7 @@ pub(super) mod tests {
                         manager: None,
                     },
                     "c".into(),
+                    task_scope,
                 )
                 .await
             });
@@ -6310,6 +6345,12 @@ pub(super) mod tests {
                             manager: None,
                         },
                         "c".into(),
+                        match trigger.strip_prefix("task:") {
+                            Some(work_id) => crate::scheduling::SessionScope::Task {
+                                work_id: work_id.into(),
+                            },
+                            None => crate::scheduling::SessionScope::Main,
+                        },
                     ),
                 )
                 .await??

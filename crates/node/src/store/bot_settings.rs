@@ -1,20 +1,110 @@
-//! What the chat changes about bots: a profile's name and instructions, the skill library
-//! every bot shares, each bot's schedules and notes. Every change is one
-//! `BotChanged` the owner writes in a turn; all but a reminder the bot sets itself
-//! need a turn the user's own signed message started.
 use super::{Store, bots::bot_for_conversation_from, log, message_from};
 use crate::{
     crypto::digest,
     model::*,
     providers::Provider,
-    scheduling::{AdmissionReceipt, TriggerKind, ahead, bot_message_trigger},
+    scheduling::{
+        AdmissionReceipt, MemoryConflict, StagedMemory, TriggerKind, ahead, bot_message_trigger,
+    },
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
+use std::path::Path;
 
 pub const NOT_FROM_USER: &str = "bot settings change only when the user's own message asks for it";
 
-fn change_digest(conversation: &str, trigger: &str, call_ref: &str) -> String {
+/// A review receives data only. Its JSON proposes mutations without executing tools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MemoryReviewPolicy {
+    #[default]
+    Disabled,
+    ReadOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MemoryReviewOperation {
+    Add {
+        text: String,
+    },
+    Update {
+        memory_id: String,
+        epoch: u32,
+        expected_revision: String,
+        text: String,
+    },
+    Forget {
+        memory_id: String,
+        epoch: u32,
+        expected_revision: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "MemoryReviewInput")]
+pub struct MemoryReview {
+    pub operations: Vec<MemoryReviewOperation>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryReviewInput {
+    operations: Vec<MemoryReviewOperation>,
+}
+
+impl TryFrom<MemoryReviewInput> for MemoryReview {
+    type Error = anyhow::Error;
+
+    fn try_from(input: MemoryReviewInput) -> Result<Self> {
+        let review = Self {
+            operations: input.operations,
+        };
+        review.validate()?;
+        Ok(review)
+    }
+}
+
+impl MemoryReview {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.operations.len() <= 20,
+            "a memory review proposes at most 20 operations"
+        );
+        for operation in &self.operations {
+            match operation {
+                MemoryReviewOperation::Add { text }
+                | MemoryReviewOperation::Update { text, .. } => validate_memory(text)?,
+                MemoryReviewOperation::Forget { .. } => {}
+            }
+            if let MemoryReviewOperation::Update {
+                memory_id,
+                expected_revision,
+                ..
+            }
+            | MemoryReviewOperation::Forget {
+                memory_id,
+                expected_revision,
+                ..
+            } = operation
+            {
+                vibeface_protocol::validate_id(memory_id).map_err(anyhow::Error::msg)?;
+                ensure!(
+                    !expected_revision.is_empty()
+                        && expected_revision.len() <= 256
+                        && !expected_revision.chars().any(char::is_control),
+                    "memory review requires a bounded expected revision"
+                );
+                ensure!(
+                    !looks_secret(memory_id) && !looks_secret(expected_revision),
+                    "memory review must not contain secrets"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn change_digest(conversation: &str, trigger: &str, call_ref: &str) -> String {
     digest(&serde_json::to_vec(&("bot_change", conversation, trigger, call_ref)).expect("strings"))
 }
 
@@ -140,6 +230,17 @@ fn avatar_request(
 }
 
 impl ChangeRequest {
+    pub(super) fn matches_memory(&self, id: &str, after: Option<&str>) -> bool {
+        match self {
+            Self::Remember { memory_id, text } => {
+                memory_id.as_deref().is_none_or(|wanted| wanted == id)
+                    && after == Some(text.as_str())
+            }
+            Self::Forget { memory_id } => memory_id == id && after.is_none(),
+            _ => false,
+        }
+    }
+
     /// Every change but a reminder needs the user's own message to stand on.
     fn needs_user(&self) -> bool {
         !matches!(self, Self::Remind { .. })
@@ -300,21 +401,11 @@ impl ChangeRequest {
                 },
             ) => *note == saved.prompt && saved.every_minutes.is_none(),
             (
-                Self::Remember { memory_id, text },
+                Self::Remember { .. } | Self::Forget { .. },
                 BotChange::Memory {
-                    memory_id: id,
-                    after: Some(saved),
-                    ..
+                    memory_id, after, ..
                 },
-            ) => memory_id.as_ref().is_none_or(|wanted| wanted == id) && text == saved,
-            (
-                Self::Forget { memory_id },
-                BotChange::Memory {
-                    memory_id: id,
-                    after: None,
-                    ..
-                },
-            ) => memory_id == id,
+            ) => self.matches_memory(memory_id, after.as_deref()),
             _ => false,
         }
     }
@@ -437,22 +528,290 @@ pub(crate) fn schedule_from(
         .transpose()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MemoryRecord {
+    pub entry: MemoryEntry,
+    pub epoch: u32,
+    pub revision: String,
+    pub control_revision: u32,
+    pub origin: MemoryOrigin,
+    pub user_controlled: bool,
+    pub essential: bool,
+    pub source_event_hash: String,
+}
+
+impl MemoryRecord {
+    pub fn metadata(&self) -> MemoryMetadata {
+        MemoryMetadata {
+            epoch: self.epoch,
+            revision: self.revision.clone(),
+            control_revision: self.control_revision,
+            origin: self.origin,
+            user_controlled: self.user_controlled,
+            essential: self.essential,
+            source_event_hash: self.source_event_hash.clone(),
+        }
+    }
+}
+
+fn memory_state_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryState> {
+    let origin: String = row.get(4)?;
+    Ok(MemoryState {
+        memory_id: row.get(0)?,
+        text: row.get(1)?,
+        metadata: MemoryMetadata {
+            epoch: row.get(2)?,
+            revision: row.get(3)?,
+            origin: serde_json::from_str(&origin).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+            user_controlled: row.get(5)?,
+            essential: row.get(6)?,
+            source_event_hash: row.get(7)?,
+            control_revision: row.get(8)?,
+        },
+    })
+}
+
+const MEMORY_COLUMNS: &str = "memory_id,text,epoch,revision,origin,user_controlled,essential,source_event_hash,control_revision";
+
+pub(crate) fn memory_state_from(
+    connection: &Connection,
+    network: &str,
+    scope: &str,
+    memory_id: &str,
+) -> Result<Option<MemoryState>> {
+    Ok(connection.query_row(
+        &format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE network_id=? AND conversation_id=? AND memory_id=?"),
+        params![network, scope, memory_id], memory_state_row,
+    ).optional()?)
+}
+
+pub(crate) fn memory_records_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+) -> Result<Vec<MemoryRecord>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {MEMORY_COLUMNS} FROM memories WHERE network_id=? AND conversation_id=? AND text IS NOT NULL ORDER BY changed_at_ms,memory_id"
+    ))?;
+    let rows = statement.query_map(params![network, conversation], memory_state_row)?;
+    rows.map(|row| {
+        let state = row?;
+        let metadata = state.metadata;
+        Ok(MemoryRecord {
+            entry: MemoryEntry {
+                memory_id: state.memory_id,
+                text: state.text.context("live memory has no text")?,
+            },
+            epoch: metadata.epoch,
+            revision: metadata.revision,
+            control_revision: metadata.control_revision,
+            origin: metadata.origin,
+            user_controlled: metadata.user_controlled,
+            essential: metadata.essential,
+            source_event_hash: metadata.source_event_hash,
+        })
+    })
+    .collect()
+}
+
+pub(crate) struct MemoryOperation {
+    pub memory_id: String,
+    pub base: MemoryBase,
+    pub version: MemoryVersion,
+    pub after: Option<String>,
+    pub origin: MemoryOrigin,
+    pub user_controlled: bool,
+    pub essential: bool,
+}
+
+pub(crate) fn memory_operation(
+    network: &str,
+    hash: &str,
+    event: &Event,
+) -> Result<Option<MemoryOperation>> {
+    let (memory_id, base, after, origin, user_controlled, essential) = match &event.body {
+        EventBody::MemoryControlled {
+            memory_id,
+            base,
+            after,
+            ..
+        } => (memory_id, base, after, MemoryOrigin::User, true, true),
+        EventBody::BotChanged {
+            change:
+                BotChange::Memory {
+                    memory_id,
+                    base,
+                    after,
+                    origin,
+                    essential,
+                    ..
+                },
+            ..
+        } => (memory_id, base, after, (*origin).into(), false, *essential),
+        _ => return Ok(None),
+    };
+    Ok(Some(MemoryOperation {
+        memory_id: memory_id.clone(),
+        base: base.clone(),
+        after: after.clone(),
+        origin,
+        user_controlled,
+        essential,
+        version: MemoryVersion {
+            revision: if user_controlled {
+                crate::crypto::request_key(network, &event.scope_id, &event.body, &event.author)?
+            } else {
+                hash.into()
+            },
+            control_revision: if user_controlled {
+                base.next_control_revision()?
+            } else {
+                0
+            },
+            source_event_hash: hash.into(),
+        },
+    }))
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryControlCommand {
+    pub memory_id: String,
+    pub base: MemoryBase,
+    pub after: Option<String>,
+    pub attestation: Attestation,
+    pub operation_id: String,
+}
+
+fn memory_receipt_from(
+    connection: &Connection,
+    network: &str,
+    scope: &str,
+    memory_id: &str,
+    operation_id: &str,
+    current: Option<&MemoryState>,
+    body: Option<&EventBody>,
+) -> Result<MemoryReceipt> {
+    let mut statement = connection.prepare("SELECT hash,envelope FROM events WHERE network_id=? AND scope_id=? AND subject=? AND kind='memory_controlled' AND effective=1")?;
+    let rows = statement.query_map(params![network, scope, memory_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut found = false;
+    for row in rows {
+        let (hash, envelope) = row?;
+        let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+        let operation = memory_operation(network, &hash, &event)?.context("memory operation")?;
+        if operation.version.revision != operation_id {
+            continue;
+        }
+        if let Some(body) = body {
+            ensure!(
+                crate::crypto::attestation_payload(network, scope, &event.body)?
+                    == crate::crypto::attestation_payload(network, scope, body)?
+                    && event.body.attestation().map(|value| &value.device_id)
+                        == body.attestation().map(|value| &value.device_id),
+                "memory operation identity collision"
+            );
+        }
+        found = true;
+    }
+    Ok(if !found {
+        MemoryReceipt::NotSeenHere
+    } else if current.is_some_and(|state| {
+        state.metadata.user_controlled && state.metadata.revision == operation_id
+    }) {
+        MemoryReceipt::Recorded
+    } else {
+        MemoryReceipt::Superseded
+    })
+}
+
+fn memory_sync_conflicts_from(
+    connection: &Connection,
+    network: &str,
+    scope: &str,
+) -> Result<MemorySyncConflictPage> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut statement = connection.prepare("SELECT hash,envelope FROM events WHERE network_id=? AND scope_id=? AND effective=1 AND kind IN ('memory_controlled','bot_changed') ORDER BY hash")?;
+    let rows = statement.query_map(params![network, scope], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut operations = BTreeMap::<String, BTreeMap<String, MemoryOperation>>::new();
+    for row in rows {
+        let (hash, envelope) = row?;
+        let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+        if let Some(operation) = memory_operation(network, &hash, &event)? {
+            operations
+                .entry(operation.memory_id.clone())
+                .or_default()
+                .entry(operation.version.revision.clone())
+                .or_insert(operation);
+        }
+    }
+    let mut items = Vec::new();
+    for (memory_id, operations) in operations {
+        let Some(winner) = memory_state_from(connection, network, scope, &memory_id)? else {
+            continue;
+        };
+        let mut chain = BTreeSet::new();
+        let mut cursor = winner.metadata.base().version;
+        while let Some(version) = cursor {
+            if !chain.insert(version.revision.clone()) {
+                break;
+            }
+            cursor = if let Some(operation) = operations.get(&version.revision) {
+                operation.base.version.clone()
+            } else {
+                let source = log::event_from(connection, network, &version.source_event_hash)?
+                    .context("memory base is not stored here")?;
+                memory_operation(network, &version.source_event_hash, &source)?
+                    .context("memory base is not a memory operation")?
+                    .base
+                    .version
+            };
+        }
+        for (revision, losing) in &operations {
+            if chain.contains(revision) {
+                continue;
+            }
+            items.push(MemorySyncConflict {
+                memory_id: memory_id.clone(),
+                losing_revision: revision.clone(),
+                winning_revision: winner.metadata.revision.clone(),
+                losing_event_hash: losing.version.source_event_hash.clone(),
+                winning_event_hash: winner.metadata.source_event_hash.clone(),
+                reason: if winner.metadata.user_controlled && !losing.user_controlled {
+                    MemorySyncConflictReason::UserProtected
+                } else if losing.user_controlled {
+                    MemorySyncConflictReason::ConcurrentUser
+                } else {
+                    MemorySyncConflictReason::ConcurrentAutomatic
+                },
+            });
+        }
+    }
+    let has_more = items.len() > 50;
+    items.truncate(50);
+    Ok(MemorySyncConflictPage { items, has_more })
+}
+
 /// One bot's notes, oldest first.
 pub(crate) fn memories_from(
     connection: &Connection,
     network: &str,
     conversation: &str,
 ) -> Result<Vec<MemoryEntry>> {
-    let mut statement = connection.prepare(
-        "SELECT memory_id,text FROM memories WHERE network_id=? AND conversation_id=? AND text IS NOT NULL ORDER BY changed_at_ms,memory_id",
-    )?;
-    let rows = statement.query_map(params![network, conversation], |r| {
-        Ok(MemoryEntry {
-            memory_id: r.get(0)?,
-            text: r.get(1)?,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    Ok(memory_records_from(connection, network, conversation)?
+        .into_iter()
+        .map(|record| record.entry)
+        .collect())
 }
 
 const CHANGE_COLUMNS: &str = "change_id,cause,event_hash,created_at_ms,change,conversation_id";
@@ -871,37 +1230,46 @@ fn resolve(
             if let Some(same) = notes.iter().find(|note| note.text == text) {
                 bail!("this is already kept as {}", same.memory_id);
             }
-            let (memory_id, before) = match memory_id {
-                Some(id) => {
-                    let before = notes
-                        .into_iter()
-                        .find(|note| note.memory_id == id)
-                        .with_context(|| format!("note {id} not found for this bot"))?;
-                    (id, Some(before.text))
-                }
-                None => {
-                    ensure!(
-                        notes.len() < MAX_MEMORIES,
-                        "this bot already keeps {MAX_MEMORIES} notes; forget one first"
-                    );
-                    (format!("memory-{digest}"), None)
-                }
-            };
+            let memory_id = memory_id.unwrap_or_else(|| format!("memory-{digest}"));
+            let state = memory_state_from(connection, network, scope, &memory_id)?;
+            ensure!(
+                !state
+                    .as_ref()
+                    .is_some_and(|state| state.metadata.user_controlled),
+                "this note is user-controlled; change it directly"
+            );
+            if state.as_ref().is_none_or(|state| state.text.is_none()) {
+                ensure!(
+                    notes.len() < MAX_MEMORIES,
+                    "this bot already keeps {MAX_MEMORIES} notes; forget one first"
+                );
+            }
             BotChange::Memory {
                 memory_id,
-                before,
+                before: state.as_ref().and_then(|state| state.text.clone()),
                 after: Some(text),
+                base: state
+                    .as_ref()
+                    .map_or_else(MemoryBase::absent, |state| state.metadata.base()),
+                origin: AutomaticMemoryOrigin::Agent,
+                essential: state.as_ref().is_none_or(|state| state.metadata.essential),
             }
         }
         ChangeRequest::Forget { memory_id } => {
-            let before = memories_from(connection, network, scope)?
-                .into_iter()
-                .find(|note| note.memory_id == memory_id)
-                .with_context(|| format!("note {memory_id} not found for this bot"))?;
+            let state = memory_state_from(connection, network, scope, &memory_id)?
+                .context("note not found for this bot")?;
+            ensure!(
+                !state.metadata.user_controlled,
+                "this note is user-controlled; change it directly"
+            );
+            ensure!(state.text.is_some(), "note not found for this bot");
             BotChange::Memory {
                 memory_id,
-                before: Some(before.text),
+                base: state.metadata.base(),
+                before: state.text,
                 after: None,
+                origin: AutomaticMemoryOrigin::Agent,
+                essential: state.metadata.essential,
             }
         }
     };
@@ -910,6 +1278,107 @@ fn resolve(
 }
 
 impl Store {
+    /// Commit staged memory changes in the same transaction that closes the turn. A changed
+    /// committed revision wins over a stale staged value; the turn remains successful and the
+    /// conflicts are returned for the local scheduler projection.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the completion transaction supplies the same turn identity and store handles"
+    )]
+    pub(crate) fn commit_staged_memory_from(
+        connection: &Connection,
+        blob_dir: &Path,
+        identity: &crate::crypto::LocalIdentity,
+        network: &str,
+        scope: &str,
+        trigger: &str,
+        staged: impl IntoIterator<Item = StagedMemory>,
+        at: i64,
+    ) -> Result<Vec<MemoryConflict>> {
+        let cause = user_cause(connection, network, scope, trigger)?;
+        let mut conflicts = Vec::new();
+        for staged in staged {
+            let current = memory_state_from(connection, network, scope, &staged.memory_id)?;
+            let current_base = current
+                .as_ref()
+                .map_or_else(MemoryBase::absent, |state| state.metadata.base());
+            let current_text = current.as_ref().and_then(|state| state.text.clone());
+            let current_revision = current_base
+                .version
+                .as_ref()
+                .map(|version| version.revision.clone())
+                .unwrap_or_default();
+            let current_epoch = current_base.epoch;
+            let reason = if current
+                .as_ref()
+                .is_some_and(|state| state.metadata.user_controlled)
+            {
+                Some("user_controlled")
+            } else if current_epoch != staged.base.epoch {
+                Some("epoch_changed")
+            } else if !current_base.same_version(&staged.base) {
+                Some("revision_changed")
+            } else if current_text != staged.before {
+                Some("value_changed")
+            } else if current_text.is_none()
+                && staged.after.is_some()
+                && memory_records_from(connection, network, scope)?.len() >= MAX_MEMORIES
+            {
+                Some("capacity_exceeded")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                tracing::warn!(
+                    event = "agent.memory_conflict",
+                    conversation_id = scope,
+                    memory_id = staged.memory_id,
+                    reason,
+                    "staged memory was not committed"
+                );
+                conflicts.push(MemoryConflict {
+                    call_ref: staged.call_ref,
+                    memory_id: staged.memory_id,
+                    expected_epoch: staged.base.epoch,
+                    actual_epoch: current_epoch,
+                    expected_revision: staged
+                        .base
+                        .version
+                        .as_ref()
+                        .map(|version| version.revision.clone())
+                        .unwrap_or_default(),
+                    actual_revision: current_revision,
+                    reason: reason.into(),
+                });
+                continue;
+            }
+            let change = BotChange::Memory {
+                memory_id: staged.memory_id.clone(),
+                before: staged.before,
+                after: staged.after,
+                base: staged.base,
+                origin: staged.origin,
+                essential: staged.essential,
+            };
+            change.validate()?;
+            log::append_from(
+                connection,
+                blob_dir,
+                identity,
+                network,
+                scope,
+                EventBody::BotChanged {
+                    change_id: change_id(scope, trigger, &staged.call_ref),
+                    cause: cause.clone(),
+                    change,
+                },
+                vec![],
+                at,
+            )?;
+        }
+        Ok(conflicts)
+    }
+
     /// Writes the change a turn's tool call asked for. The same `call_ref` in the same turn
     /// returns the stored change and writes nothing; a different request under it is refused.
     /// Returns whether an event was written.
@@ -1004,6 +1473,156 @@ impl Store {
 
     pub fn memories(&self, network: &str, scope: &str) -> Result<Vec<MemoryEntry>> {
         memories_from(&self.connection, network, scope)
+    }
+
+    pub(crate) fn memory_records(&self, network: &str, scope: &str) -> Result<Vec<MemoryRecord>> {
+        memory_records_from(&self.connection, network, scope)
+    }
+
+    pub fn memory_state(
+        &self,
+        network: &str,
+        scope: &str,
+        memory_id: &str,
+        operation_id: Option<&str>,
+    ) -> Result<MemoryStateResult> {
+        vibeface_protocol::validate_id(memory_id).map_err(anyhow::Error::msg)?;
+        let current = memory_state_from(&self.connection, network, scope, memory_id)?;
+        let receipt = operation_id
+            .map(|operation_id| {
+                ensure!(
+                    hex::decode(operation_id).is_ok_and(|value| value.len() == 32),
+                    "invalid memory operation ID"
+                );
+                memory_receipt_from(
+                    &self.connection,
+                    network,
+                    scope,
+                    memory_id,
+                    operation_id,
+                    current.as_ref(),
+                    None,
+                )
+            })
+            .transpose()?;
+        Ok(MemoryStateResult { current, receipt })
+    }
+
+    pub fn memory_sync_conflicts(
+        &self,
+        network: &str,
+        scope: &str,
+    ) -> Result<MemorySyncConflictPage> {
+        memory_sync_conflicts_from(&self.connection, network, scope)
+    }
+
+    pub fn control_memory(
+        &mut self,
+        identity: &crate::crypto::LocalIdentity,
+        network: &str,
+        scope: &str,
+        command: MemoryControlCommand,
+        at: i64,
+    ) -> Result<MemoryControlResult> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let body = EventBody::MemoryControlled {
+            memory_id: command.memory_id.clone(),
+            base: command.base.clone(),
+            after: command.after,
+            attestation: Some(command.attestation),
+        };
+        let author = identity.device_id()?;
+        let event = Event {
+            version: WIRE_VERSION,
+            network_id: network.into(),
+            author: author.clone(),
+            seq: 1,
+            prev: None,
+            deps: vec![],
+            scope_id: scope.into(),
+            created_at_ms: at,
+            body,
+            blobs: vec![],
+        };
+        crate::crypto::validate_event_shape(&event)?;
+        let view = super::membership_from(&tx, network)?;
+        view.node(&author)?;
+        view.client(
+            &event
+                .body
+                .attestation()
+                .context("missing device signature")?
+                .device_id,
+        )?;
+        bot_for_conversation_from(&tx, network, scope)?.context("no such bot")?;
+        let operation_id = crate::crypto::request_key(network, scope, &event.body, &author)?;
+        ensure!(
+            operation_id == command.operation_id,
+            "memory operation ID does not match this write"
+        );
+        let current = memory_state_from(&tx, network, scope, &command.memory_id)?;
+        let receipt = memory_receipt_from(
+            &tx,
+            network,
+            scope,
+            &command.memory_id,
+            &operation_id,
+            current.as_ref(),
+            Some(&event.body),
+        )?;
+        let recorded = match receipt {
+            MemoryReceipt::Recorded => Some(MemoryControlStatus::AlreadyRecorded),
+            MemoryReceipt::Superseded => Some(MemoryControlStatus::Superseded),
+            MemoryReceipt::NotSeenHere => None,
+        };
+        if let Some(state) = recorded {
+            return Ok(MemoryControlResult {
+                state,
+                operation_id,
+                current,
+            });
+        }
+        log::validate_memory_base(&tx, network, scope, &event.body)?;
+        let current_base = current
+            .as_ref()
+            .map_or_else(MemoryBase::absent, |state| state.metadata.base());
+        if !current_base.same_version(&command.base) {
+            return Ok(MemoryControlResult {
+                state: MemoryControlStatus::Conflict,
+                operation_id,
+                current,
+            });
+        }
+        if current.as_ref().is_none_or(|state| state.text.is_none())
+            && matches!(
+                &event.body,
+                EventBody::MemoryControlled { after: Some(_), .. }
+            )
+        {
+            ensure!(
+                memory_records_from(&tx, network, scope)?.len() < MAX_MEMORIES,
+                "this bot already keeps {MAX_MEMORIES} notes; forget one first"
+            );
+        }
+        log::append_from(
+            &tx,
+            &self.blob_dir,
+            identity,
+            network,
+            scope,
+            event.body,
+            vec![],
+            at,
+        )?;
+        let current = memory_state_from(&tx, network, scope, &command.memory_id)?;
+        tx.commit()?;
+        Ok(MemoryControlResult {
+            state: MemoryControlStatus::Applied,
+            operation_id,
+            current,
+        })
     }
 
     pub fn find_bot(&self, network: &str, wanted: &str) -> Result<Bot> {

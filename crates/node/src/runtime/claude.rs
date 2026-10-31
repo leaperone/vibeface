@@ -801,6 +801,7 @@ where
         return Err(error(ManagerFailure::Failed, native, failure));
     }
     let mut turn = Turn::default();
+    let mut reported_start = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
     let outcome = 'turn: loop {
         let line = tokio::select! {
@@ -844,6 +845,32 @@ where
             break Err(error(ManagerFailure::Failed, native, failure));
         };
         for frame in frames(&line) {
+            if let Frame::Started { session: actual } = &frame
+                && actual != &session
+            {
+                break 'turn Err(error(
+                    ManagerFailure::Failed,
+                    native,
+                    own("Claude Code reported another session"),
+                ));
+            }
+            if !reported_start && !matches!(&frame, Frame::Ended(_)) {
+                stage.enter(ProviderStage::Run);
+                *start.lock().unwrap() = manager::StartEvidence::Started;
+                if let Some(started) = config
+                    .codex_turn
+                    .as_ref()
+                    .and_then(|turn| turn.started.as_ref())
+                    && let Err(callback_error) = started(message.clone()).await
+                {
+                    break 'turn Err(error(
+                        ManagerFailure::Unknown,
+                        native,
+                        own(&callback_error.to_string()),
+                    ));
+                }
+                reported_start = true;
+            }
             if let Some(update) = turn.apply(frame)
                 && let Err(e) = progress(manager::redact(update, &secrets)).await
             {
@@ -1098,7 +1125,7 @@ async fn follow(
 /// continues, with its prompt as a user message whose ID comes from the work ID too. The
 /// Node starts the process itself, so the dispatching Agent sends nothing.
 impl Executor for Claude {
-    fn start<'a>(
+    fn start_or_resume<'a>(
         &'a self,
         node: &'a Arc<Runtime>,
         network: &'a str,
@@ -1249,7 +1276,12 @@ impl Executor for Claude {
         })
     }
 
-    fn steer<'a>(&'a self, _: &'a SteerTarget, _: &'a str, _: &'a str) -> BoxFuture<'a, SteerAck> {
+    fn send_turn<'a>(
+        &'a self,
+        _: &'a SteerTarget,
+        _: &'a str,
+        _: &'a str,
+    ) -> BoxFuture<'a, SteerAck> {
         Box::pin(async {
             SteerAck::Refused(
                 "Claude Code takes no message into a running turn: a user message sent then waits for a turn of its own"
@@ -1416,6 +1448,7 @@ mod tests {
             process_started: None,
             codex_turn: Some(CodexTurn {
                 client_id: "attempt-1".into(),
+                started: None,
                 record,
                 fresh_prompt: Some("fresh full context".into()),
             }),
@@ -1440,6 +1473,7 @@ mod tests {
         config.timeout_secs = 30;
         config.codex_turn = Some(CodexTurn {
             client_id: client.into(),
+            started: None,
             record: Arc::new(|_, _| Box::pin(async { Ok(()) })),
             fresh_prompt: None,
         });
@@ -2341,7 +2375,7 @@ mod tests {
     struct Unstartable;
 
     impl Executor for Unstartable {
-        fn start<'a>(
+        fn start_or_resume<'a>(
             &'a self,
             _: &'a Arc<Runtime>,
             _: &'a str,
@@ -2360,7 +2394,7 @@ mod tests {
             unreachable!()
         }
 
-        fn steer<'a>(
+        fn send_turn<'a>(
             &'a self,
             _: &'a SteerTarget,
             _: &'a str,
@@ -2573,6 +2607,60 @@ mod tests {
             bail!("an API error fails the turn");
         };
         assert_eq!(failure.kind, FailureKind::AuthFailed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_native_start_is_reported_before_completion_without_committing_seen_context()
+    -> Result<()> {
+        let place = Place::new()?;
+        let (record, calls) = recorder();
+        let mut config = gated_config(&place, "start-state");
+        let persisted = Arc::new(std::sync::Mutex::new(None::<String>));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observer = config.codex_turn.as_mut().unwrap();
+        observer.record = record;
+        observer.started = Some({
+            let persisted = persisted.clone();
+            let started = started.clone();
+            let count = count.clone();
+            Arc::new(move |turn| {
+                assert!(persisted.lock().unwrap().is_some());
+                assert_eq!(turn, derived(MESSAGE_SEED, "start-state"));
+                count.fetch_add(1, Ordering::SeqCst);
+                started.notify_one();
+                Box::pin(async { Ok(()) })
+            })
+        });
+        let saved = persisted.clone();
+        let task = tokio::spawn(async move {
+            manager::run_manager(
+                &config,
+                "hello",
+                None,
+                move |session| {
+                    *saved.lock().unwrap() = Some(session);
+                    async { Ok(()) }
+                },
+                tokio::sync::watch::channel(false).1,
+                |_| async { Ok(()) },
+            )
+            .await
+        });
+        let observed = tokio::time::timeout(Duration::from_secs(5), started.notified()).await;
+        let pending = !task.is_finished();
+        let seen_before_completion = calls.lock().unwrap().len();
+        let received = place.user_frames();
+        release(&place);
+        let result = task.await??;
+        observed.context("native Claude start callback")?;
+        assert!(pending);
+        assert_eq!(received, 1);
+        assert_eq!(seen_before_completion, 0);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(result.output, "done: hello");
         Ok(())
     }
 }

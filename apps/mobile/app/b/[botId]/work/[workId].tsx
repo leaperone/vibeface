@@ -4,7 +4,7 @@ import { useCallback, useRef, useState, type ReactNode } from 'react'
 import { ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { outcomeUnknown, rawError, workFailure } from '@vibeface/client/lib/errors.ts'
-import { fixOnDevice, fixOnDeviceLabel, followUp, followUpCopy, interruptedCopy, nodeName, parseSummarySteps, progressLabel, promptSummary, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, type FollowUp, type SummaryStep } from '@vibeface/client/workspace/labels.ts'
+import { agentLaneLabels, contextStages, fixOnDevice, fixOnDeviceLabel, followUp, followUpCopy, interruptedCopy, nodeName, parseSummarySteps, progressLabel, promptSummary, queueHoldLabels, schedulerStatus, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, type FollowUp, type SummaryStep } from '@vibeface/client/workspace/labels.ts'
 import { messageOf, providerNames } from '@vibeface/client/lib/node.ts'
 import { projectName, workApproval } from '@vibeface/client/workspace/questions.ts'
 import { workChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
@@ -73,6 +73,7 @@ export default function TaskDetail() {
   const check = state === 'awaiting_confirmation' ? workChecks([{ ...work, conversation_id: bot.conversation_id }], shared.nodes).find((item): item is WorkCheck => item.kind === 'work') : undefined
   const asked = promptSummary(work.prompt, work.title)
   const plan = parseSummarySteps(work.summary)
+  const coordination = work.coordination_job
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: work.title || '任务' }} />
     <Button variant="ghost" className="self-start" accessibilityLabel={`打开所属 Bot ${bot.name}`} onPress={() => router.push(`/b/${bot.bot_id}`)}><Icon as={Bot} /><Text>{bot.name}</Text></Button>
@@ -91,6 +92,15 @@ export default function TaskDetail() {
         <Text selectable className="font-mono text-meta">{progress.text}</Text>
       </ScrollView> : null}
     </View>
+    {work.kind === 'task' ? <Details label="协调回合">
+      {coordination ? <>
+        <Text>{!shared.connectionOnline || !shared.synced || shared.nodes.find((node) => node.device_id === device)?.online === false ? '当前状态未知，显示最近记录' : schedulerStatus(coordination.state).label}{coordination.lane ? ` · ${agentLaneLabels[coordination.lane]}` : ''}</Text>
+        {coordination.hold_reason ? <Text>{queueHoldLabels[coordination.hold_reason]}</Text> : null}
+        {coordination.pending_check ? <Text>执行结果需要核对，不能据此重发。</Text> : null}
+        {coordination.context ? <Text>会话代次 {coordination.context.session_generation} · {contextStages[coordination.context.stage].label}</Text> : null}
+      </> : <Text>执行设备尚未提供这个任务的协调回合观察。</Text>}
+      <Text className="text-meta text-muted-foreground">这里显示 Bot 的准备和排队情况，任务结果仍以上面的共享记录为准。</Text>
+    </Details> : null}
     {asked.summary ? <Section title="交代的事"><Text selectable>{asked.summary}</Text></Section> : null}
     {result && !active ? <Section title={!failed && (work.result_text || state === 'completed') ? '结果' : '原因'}><Text selectable className={cn(failed && 'text-danger')}>{result}</Text></Section> : null}
     {check ? <ConfirmCard check={check} /> : null}

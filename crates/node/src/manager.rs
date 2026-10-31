@@ -28,6 +28,16 @@ pub enum CursorInstance {
         network: String,
         conversation: String,
     },
+    Task {
+        network: String,
+        conversation: String,
+        work_id: String,
+    },
+    Routine {
+        network: String,
+        conversation: String,
+        trigger: String,
+    },
     Work {
         network: String,
         conversation: String,
@@ -46,6 +56,26 @@ impl CursorInstance {
                 "bot:{}:{network}:{}:{conversation}",
                 network.len(),
                 conversation.len()
+            ),
+            Self::Task {
+                network,
+                conversation,
+                work_id,
+            } => format!(
+                "task:{}:{network}:{}:{conversation}:{}:{work_id}",
+                network.len(),
+                conversation.len(),
+                work_id.len()
+            ),
+            Self::Routine {
+                network,
+                conversation,
+                trigger,
+            } => format!(
+                "routine:{}:{network}:{}:{conversation}:{}:{trigger}",
+                network.len(),
+                conversation.len(),
+                trigger.len()
             ),
             Self::Work {
                 network,
@@ -75,7 +105,10 @@ pub enum Sdk {
     },
     /// Turns run on this Node's Codex App Server at `socket`; `vibeface tool` reads the turn
     /// from the Shell environment the thread was created with.
-    Codex { socket: PathBuf },
+    Codex {
+        socket: PathBuf,
+        launch: Option<Arc<std::sync::Mutex<crate::runtime::codex_server::CodexLease>>>,
+    },
     /// Each turn is one `claude -p` process; `processes` records its group.
     Claude {
         bin: PathBuf,
@@ -90,6 +123,8 @@ pub enum Sdk {
     /// environment the serve's plugin gives the session's shells.
     Opencode {
         server: Arc<crate::runtime::opencode::Opencode>,
+        bin: PathBuf,
+        launch: Option<Arc<crate::runtime::opencode::OpencodeLease>>,
     },
 }
 
@@ -118,6 +153,7 @@ pub type TurnRecorder = Arc<
 pub struct CodexTurn {
     pub client_id: String,
     pub record: TurnRecorder,
+    pub started: Option<agent::RunStarted>,
     /// The prompt for a new thread, sent instead when the resumed thread is gone: the turn's
     /// own prompt then leaves out what only the old thread had seen.
     pub fresh_prompt: Option<String>,
@@ -144,6 +180,41 @@ pub struct ManagerConfig {
 }
 
 impl ManagerConfig {
+    pub(crate) fn runtime_fingerprint(&self, local: &crate::providers::Local) -> Result<String> {
+        let launch = match &self.sdk {
+            Sdk::Cursor {
+                sdk_bin,
+                owner,
+                local_store_root,
+                ..
+            } => json!({"bin":sdk_bin,"owner":owner,"local_store_root":local_store_root}),
+            Sdk::Codex { socket, launch } => {
+                let lease = launch
+                    .as_ref()
+                    .map(|lease| lease.lock().expect("Codex lease"));
+                let target = lease.as_ref().map(|lease| lease.target());
+                match target {
+                    Some(crate::providers::CodexTarget::System(path)) => {
+                        json!({"mode":"system","socket":path,"agent_socket":socket})
+                    }
+                    Some(crate::providers::CodexTarget::Spawn(launch)) => {
+                        json!({"mode":"spawn","bin":launch.bin,"agent_socket":socket})
+                    }
+                    _ => json!({"mode":"direct","socket":socket}),
+                }
+            }
+            Sdk::Claude { bin, .. } | Sdk::Pi { bin, .. } => json!({"bin":bin}),
+            Sdk::Opencode { bin, .. } => json!({"bin":bin}),
+        };
+        let environment_digest = crate::crypto::digest(&serde_json::to_vec(&self.provider_env)?);
+        Ok(crate::crypto::digest(&serde_json::to_vec(&json!({
+            "provider":self.sdk.provider(), "launch":launch,
+            "workspace":self.workspace,"model":self.model,
+            "environment_digest":environment_digest,
+            "execution":local.switches.execution,
+        }))?))
+    }
+
     pub fn for_cursor_instance(
         mut self,
         instance: CursorInstance,
@@ -290,24 +361,40 @@ where
             })?;
             let native_agent = Arc::new(std::sync::Mutex::new(None::<String>));
             let record = config.codex_turn.as_ref().map(|turn| turn.record.clone());
-            let run_started = record.clone().map(|record| {
-                let native_agent = native_agent.clone();
-                let callback: agent::RunStarted = Arc::new(move |run| {
-                    let native_agent = native_agent
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
-                    let record = record.clone();
-                    Box::pin(async move {
-                        record(
-                            native_agent.context("Cursor run has no persisted agent ID")?,
-                            Some(run),
-                        )
-                        .await
-                    })
+            let started = config
+                .codex_turn
+                .as_ref()
+                .and_then(|turn| turn.started.clone());
+            let record_for_start = record.clone();
+            let started_for_start = started.clone();
+            let run_started =
+                (record_for_start.is_some() || started_for_start.is_some()).then(|| {
+                    let native_agent = native_agent.clone();
+                    let record = record_for_start;
+                    let started = started_for_start;
+                    let callback: agent::RunStarted = Arc::new(move |run| {
+                        let native_agent = native_agent
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        let record = record.clone();
+                        let started = started.clone();
+                        Box::pin(async move {
+                            if let Some(record) = record {
+                                record(
+                                    native_agent.context("Cursor run has no persisted agent ID")?,
+                                    Some(run.clone()),
+                                )
+                                .await?;
+                            }
+                            if let Some(started) = started {
+                                started(run).await?;
+                            }
+                            Ok(())
+                        })
+                    });
+                    callback
                 });
-                callback
-            });
             let turn = SdkTurn {
                 owner: owner.into(),
                 executable: sdk_bin.clone(),
@@ -322,7 +409,7 @@ where
                 process_started: config.process_started.clone(),
                 run_started,
             };
-            bridge
+            let result = bridge
                 .run(
                     &turn,
                     prompt,
@@ -332,6 +419,7 @@ where
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.clone());
                         let locator_turn = turn.clone();
+                        let record = record.clone();
                         async move {
                             persist_session(id.clone()).await?;
                             if let Some(native) = &config.codex_turn {
@@ -352,7 +440,7 @@ where
                     progress,
                 )
                 .await
-                .map_err(|error| {
+                .map_err(|error| -> anyhow::Error {
                     ManagerError {
                         stage: error.stage,
                         outcome: error.outcome,
@@ -361,10 +449,18 @@ where
                         failure: error.failure,
                     }
                     .into()
-                })
+                })?;
+            Ok(result)
         }
-        Sdk::Codex { socket } => {
-            run_codex(
+        Sdk::Codex { socket, launch } => {
+            if let (Some(lease), Some(turn)) = (launch, &config.codex_turn) {
+                lease
+                    .lock()
+                    .expect("Codex lease")
+                    .bind_turn(&turn.client_id)
+                    .map_err(ManagerError::not_started)?;
+            }
+            let result = run_codex(
                 config,
                 socket,
                 prompt,
@@ -373,7 +469,17 @@ where
                 cancel,
                 progress,
             )
-            .await
+            .await;
+            if result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<ManagerError>())
+                .is_some_and(ManagerError::uncertain)
+                && let Some(lease) = launch
+            {
+                lease.lock().expect("Codex lease").retain_until_read_back();
+            }
+            result
         }
         Sdk::Claude { bin, processes } => {
             crate::runtime::claude::run_bot(
@@ -400,7 +506,7 @@ where
             )
             .await
         }
-        Sdk::Opencode { server } => {
+        Sdk::Opencode { server, .. } => {
             server
                 .run_turn(
                     config,
@@ -415,9 +521,8 @@ where
     }
 }
 
-/// The instructions a bot's thread runs with: how to discover Node tools, then
-/// `instructions`. They stay out of each turn's prompt: Codex takes them as the thread's
-/// developer instructions, Claude Code, pi and opencode as a system prompt with every turn.
+/// Stable Bot instructions and the Node tool catalog. The adapter uses native instructions
+/// or a user-turn prefix.
 /// Node tools go through the CLI in the bot's shell, whose environment carries the turn's scope.
 pub fn bot_instructions(
     tool_cli: Option<&Path>,
@@ -428,6 +533,11 @@ pub fn bot_instructions(
         return instructions.into();
     };
     let executable = format!("'{}'", cli.to_string_lossy().replace('\'', r#"'"'"'"#));
+    let discovery = if tools.contains_key("tool_search") {
+        "Only discovery tools and essential reads are listed initially. Use tool_search with a query to find a tool, tool_describe with {\"tool\":\"TOOL_NAME\"} to read its full schema, then tool_call with {\"tool\":\"TOOL_NAME\",\"arguments\":{}}. The described target's permissions and call_ref requirement still apply. You can also call a discovered tool directly through this scoped CLI; dispatch_work uses the CLI's work execution flow. "
+    } else {
+        ""
+    };
     let catalog = tools
         .iter()
         .filter(|(name, _)| {
@@ -446,7 +556,7 @@ pub fn bot_instructions(
         .join("\n\n");
     let host = "Your shell has full access to this host: you can edit files and run git and gh. When this device runs Codex, `vibeface codex` calls its App Server. When a session asks something (an approval, a question, a login), `vibeface requests` lists the waiting requests and `vibeface respond REQUEST_ID 'RESULT_JSON'` answers one; raise a decision card with `vibeface triage raise --request-id` only when the user must decide, explaining the decision in plain words without the command itself. Add `--attention-kind browser-takeover` when the user must continue in a browser on the event's device; omit it to infer question or approval from the held request. The card kind grants no authority.";
     let text = format!(
-        "Node tools are available through your command-execution tool. Run:\n{executable} tool TOOL_NAME --json 'JSON_OBJECT'\nDiscover tools with tool_search {{\"query\":\"YOUR_GOAL\"}} and inspect the selected tool with tool_describe {{\"name\":\"TOOL_NAME\"}}. Execute it through tool_call {{\"name\":\"TOOL_NAME\",\"arguments\":{{}},\"call_ref\":\"UNIQUE_INTENT_REFERENCE\"}}. For write calls, choose the reference once before the first request and preserve it across CLI processes. Reuse it only with identical arguments. On a timeout, query call_lookup with {{\"call_ref\":\"THE_SAME_REFERENCE\"}}. An unknown outcome must be checked before a new intent is sent. Never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. {host}\n\nDiscovery tools:\n{catalog}"
+        "Node tools are available through your command-execution tool. Run:\n{executable} tool TOOL_NAME --json 'JSON_OBJECT'\n{discovery}For any tool whose schema requires call_ref, add --call-ref 'UNIQUE_INTENT_REFERENCE'. For tool_call the flag is passed to arguments.call_ref; when both are given they must agree. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {{\"call_ref\":\"THE_SAME_REFERENCE\"}}; never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. {host}\n\nAvailable tools:\n{catalog}"
     );
     if instructions.is_empty() {
         text
@@ -708,7 +818,13 @@ where
                 .map_err(|e| failed(native, own(format!("record the Codex turn: {e}"))))?;
             turn.client_id.clone()
         }
-        None => uuid::Uuid::new_v4().to_string(),
+        None => match &config.sdk {
+            Sdk::Codex {
+                launch: Some(lease),
+                ..
+            } => lease.lock().expect("Codex lease").client_id().to_owned(),
+            _ => uuid::Uuid::new_v4().to_string(),
+        },
     };
     let mut turn_params = json!({"threadId":thread,"clientUserMessageId":client_id,
         "input":[{"type":"text","text":prompt,"text_elements":[]}]});
@@ -980,9 +1096,37 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
+    #[test]
+    fn tool_guidance_discovers_targets_and_preserves_scoped_cli_references() {
+        let tools =
+            crate::providers::Provider::Codex.tools_for(crate::scheduling::TriggerKind::Human);
+        let guide = bot_instructions(
+            Some(Path::new("/opt/a'b/vibeface")),
+            &tools,
+            "standing rule",
+        );
+        assert!(guide.contains("'/opt/a'\"'\"'b/vibeface' tool TOOL_NAME"));
+        assert!(guide.contains("tool_search with a query"));
+        assert!(guide.contains("tool_describe with {\"tool\":\"TOOL_NAME\"}"));
+        assert!(guide.contains("flag is passed to arguments.call_ref"));
+        assert!(guide.contains("both are given they must agree"));
+        assert!(guide.contains("dispatch_work uses the CLI's work execution flow"));
+        assert!(guide.ends_with("standing rule"));
+        let catalog = guide.split_once("Available tools:\n").unwrap().1;
+        assert!(catalog.contains("tool_call\n"));
+        assert!(!catalog.contains("dispatch_work\n"));
+        assert_eq!(
+            bot_instructions(None, &tools, "standing rule"),
+            "standing rule"
+        );
+    }
+
     fn codex(workspace: PathBuf, socket: PathBuf) -> ManagerConfig {
         ManagerConfig {
-            sdk: Sdk::Codex { socket },
+            sdk: Sdk::Codex {
+                socket,
+                launch: None,
+            },
             workspace,
             model: String::new(),
             reasoning_effort: None,
@@ -996,6 +1140,74 @@ mod tests {
             process_started: None,
             codex_turn: None,
         }
+    }
+
+    #[test]
+    fn runtime_identity_uses_the_captured_sdk_and_private_environment() -> Result<()> {
+        let mut config = codex(
+            "/fixture/workspace".into(),
+            "/fixture/app-server.sock".into(),
+        );
+        config
+            .provider_env
+            .insert("FIXTURE_MODEL_KEY".into(), "private-fixture-value".into());
+        let mut local = crate::providers::Local {
+            switches: Default::default(),
+            bins: BTreeMap::new(),
+            env: Default::default(),
+        };
+        let original = config.runtime_fingerprint(&local)?;
+        assert_eq!(original.len(), 64);
+        assert!(!original.contains("private-fixture-value"));
+        local
+            .bins
+            .insert(crate::providers::Provider::Codex, "/another/codex".into());
+        assert_eq!(
+            config.runtime_fingerprint(&local)?,
+            original,
+            "the captured direct SDK still uses its original socket"
+        );
+        config
+            .provider_env
+            .insert("FIXTURE_MODEL_KEY".into(), "changed-fixture-value".into());
+        let changed = config.runtime_fingerprint(&local)?;
+        assert_ne!(original, changed);
+        config.model = "fixture-model".into();
+        assert_ne!(changed, config.runtime_fingerprint(&local)?);
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_task_and_routine_instances_do_not_share_the_bot_or_work_store() {
+        let network = "network".to_owned();
+        let conversation = "conversation".to_owned();
+        let instances = [
+            CursorInstance::Bot {
+                network: network.clone(),
+                conversation: conversation.clone(),
+            },
+            CursorInstance::Task {
+                network: network.clone(),
+                conversation: conversation.clone(),
+                work_id: "same".into(),
+            },
+            CursorInstance::Routine {
+                network: network.clone(),
+                conversation: conversation.clone(),
+                trigger: "same".into(),
+            },
+            CursorInstance::Work {
+                network,
+                conversation,
+                root_work: "same".into(),
+            },
+            CursorInstance::Coordination,
+        ];
+        let keys: std::collections::BTreeSet<_> = instances
+            .into_iter()
+            .map(|instance| instance.key())
+            .collect();
+        assert_eq!(keys.len(), 5);
     }
 
     #[derive(Clone, Copy, PartialEq)]
@@ -1414,6 +1626,7 @@ mod tests {
             tool_token: Some("turn-token-secret".into()),
             codex_turn: Some(CodexTurn {
                 client_id: "attempt-1".into(),
+                started: None,
                 record: Arc::new(move |thread, turn| {
                     record.lock().unwrap().push((thread, turn));
                     Box::pin(async { Ok(()) })
@@ -1546,6 +1759,7 @@ mod tests {
         let config = ManagerConfig {
             codex_turn: Some(CodexTurn {
                 client_id: "attempt-1".into(),
+                started: None,
                 record: Arc::new(|_, _| Box::pin(async { Ok(()) })),
                 fresh_prompt: Some("full context".into()),
             }),
@@ -1601,6 +1815,7 @@ mod tests {
         config.timeout_secs = 30;
         config.codex_turn = Some(CodexTurn {
             client_id: client.into(),
+            started: None,
             record: Arc::new(|_, _| Box::pin(async { Ok(()) })),
             fresh_prompt: None,
         });

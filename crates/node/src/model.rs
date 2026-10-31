@@ -436,6 +436,181 @@ pub struct Sender {
     pub name: String,
 }
 
+/// Where a memory came from. Agent writes are staged until the turn completes; user-controlled
+/// values cannot be replaced by an automatic review.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryOrigin {
+    #[default]
+    Agent,
+    User,
+    Review,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomaticMemoryOrigin {
+    Agent,
+    Review,
+}
+
+impl From<AutomaticMemoryOrigin> for MemoryOrigin {
+    fn from(origin: AutomaticMemoryOrigin) -> Self {
+        match origin {
+            AutomaticMemoryOrigin::Agent => Self::Agent,
+            AutomaticMemoryOrigin::Review => Self::Review,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryVersion {
+    pub revision: String,
+    pub control_revision: u32,
+    pub source_event_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryBase {
+    pub epoch: u32,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub version: Option<MemoryVersion>,
+}
+
+impl MemoryBase {
+    pub fn absent() -> Self {
+        Self {
+            epoch: crate::config::DATA_EPOCH,
+            version: None,
+        }
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.epoch == crate::config::DATA_EPOCH,
+            "unsupported memory epoch"
+        );
+        if let Some(version) = &self.version {
+            for hash in [&version.revision, &version.source_event_hash] {
+                anyhow::ensure!(
+                    hex::decode(hash).is_ok_and(|value| value.len() == 32),
+                    "invalid memory version"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn next_control_revision(&self) -> anyhow::Result<u32> {
+        self.version
+            .as_ref()
+            .map_or(0, |version| version.control_revision)
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("memory control revision overflow"))
+    }
+
+    pub fn same_version(&self, other: &Self) -> bool {
+        self.epoch == other.epoch
+            && match (&self.version, &other.version) {
+                (None, None) => true,
+                (Some(left), Some(right)) => {
+                    left.revision == right.revision
+                        && left.control_revision == right.control_revision
+                }
+                _ => false,
+            }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryMetadata {
+    pub epoch: u32,
+    pub revision: String,
+    pub control_revision: u32,
+    pub source_event_hash: String,
+    pub origin: MemoryOrigin,
+    pub user_controlled: bool,
+    pub essential: bool,
+}
+
+impl MemoryMetadata {
+    pub fn base(&self) -> MemoryBase {
+        MemoryBase {
+            epoch: self.epoch,
+            version: Some(MemoryVersion {
+                revision: self.revision.clone(),
+                control_revision: self.control_revision,
+                source_event_hash: self.source_event_hash.clone(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryState {
+    pub memory_id: String,
+    pub text: Option<String>,
+    pub metadata: MemoryMetadata,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryControlStatus {
+    Applied,
+    AlreadyRecorded,
+    Superseded,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MemoryControlResult {
+    pub state: MemoryControlStatus,
+    pub operation_id: String,
+    pub current: Option<MemoryState>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryReceipt {
+    Recorded,
+    Superseded,
+    NotSeenHere,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MemoryStateResult {
+    pub current: Option<MemoryState>,
+    pub receipt: Option<MemoryReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MemorySyncConflict {
+    pub memory_id: String,
+    pub losing_revision: String,
+    pub winning_revision: String,
+    pub losing_event_hash: String,
+    pub winning_event_hash: String,
+    pub reason: MemorySyncConflictReason,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySyncConflictReason {
+    UserProtected,
+    ConcurrentAutomatic,
+    ConcurrentUser,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct MemorySyncConflictPage {
+    pub items: Vec<MemorySyncConflict>,
+    pub has_more: bool,
+}
+
 /// What a chat turn changed about its bot. A `None` after removes the skill, schedule or
 /// note.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -469,6 +644,9 @@ pub enum BotChange {
         memory_id: String,
         before: Option<String>,
         after: Option<String>,
+        base: MemoryBase,
+        origin: AutomaticMemoryOrigin,
+        essential: bool,
     },
 }
 
@@ -721,8 +899,19 @@ impl BotChange {
                 memory_id,
                 before,
                 after,
+                base,
+                ..
             } => {
                 id(memory_id)?;
+                base.validate()?;
+                anyhow::ensure!(
+                    base.version.is_some() || before.is_none(),
+                    "a memory update needs a base"
+                );
+                anyhow::ensure!(
+                    after.is_some() || base.version.is_some(),
+                    "a memory deletion needs a base"
+                );
                 anyhow::ensure!(
                     (before.is_some() || after.is_some()) && before != after,
                     "the note is unchanged"
@@ -927,6 +1116,13 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
+    MemoryControlled {
+        memory_id: String,
+        base: MemoryBase,
+        after: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+    },
     /// Written only by the owner when it takes a schedule's due time, whether it runs or skips
     /// it as too late; no Node takes a time someone already claimed. Of concurrent claims the
     /// highest `owner_epoch` wins, ties pick the smaller author.
@@ -985,7 +1181,8 @@ impl EventBody {
             | Self::PrimaryBotSet { attestation, .. }
             | Self::BotProjectSet { attestation, .. }
             | Self::BotAvatarSet { attestation, .. }
-            | Self::ScheduleControlled { attestation, .. } => attestation.as_ref(),
+            | Self::ScheduleControlled { attestation, .. }
+            | Self::MemoryControlled { attestation, .. } => attestation.as_ref(),
             _ => None,
         }
     }
@@ -1010,6 +1207,7 @@ impl EventBody {
             Self::BotChanged { .. } => "bot_changed",
             Self::BotDeleted { .. } => "bot_deleted",
             Self::ScheduleControlled { .. } => "schedule_controlled",
+            Self::MemoryControlled { .. } => "memory_controlled",
             Self::ScheduleRunClaimed { .. } => "schedule_run_claimed",
             Self::MessageSteered { .. } => "message_steered",
             Self::BotMessaged { .. } => "bot_messaged",
@@ -1023,6 +1221,11 @@ impl EventBody {
                 Some(message_id)
             }
             Self::QuestionAsked { question_id, .. } => Some(question_id),
+            Self::MemoryControlled { memory_id, .. }
+            | Self::BotChanged {
+                change: BotChange::Memory { memory_id, .. },
+                ..
+            } => Some(memory_id),
             body => body.work_id(),
         }
     }

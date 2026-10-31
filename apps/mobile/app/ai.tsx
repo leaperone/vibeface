@@ -4,7 +4,7 @@ import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
-import { availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, effortOptions, probeIssueText, providerGroups, providerNames, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
+import { availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, effortOptions, probeIssueText, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { ErrorText } from '@/components/action'
 import { CopyableId, Details, EmptyState, Skeleton, providerIcons, toneText, type Tone } from '@/components/kit'
@@ -32,7 +32,7 @@ export default function AiScreen() {
 
 const states: Record<Availability, { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: '可用', tone: 'success', icon: CircleCheck },
-  unverified: { label: '尚未确认', tone: 'neutral', icon: CircleDashed },
+  unverified: { label: '未验证，可尝试', tone: 'neutral', icon: CircleDashed },
   needs_setup: { label: '需设置', tone: 'warning', icon: CircleAlert },
   starting: { label: '启动中', tone: 'neutral', icon: LoaderCircle },
   missing: { label: '未安装', tone: 'neutral', icon: CircleDashed },
@@ -150,6 +150,7 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
       {item.supports.includes('agent') ? <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', assistant ? { bot: false } : botOnChange(response, item))} /> : null}
       {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
       <View className="gap-4 border-t border-border p-4">
+        <Details label="能力验证"><Text className="text-meta text-muted-foreground">程序和密钥已配置，不代表登录或模型已经验证。未验证时可以尝试运行。</Text>{item.observed ? Object.entries(item.observed).map(([key, observation]) => <Text key={key} className="text-meta">{providerObservationLabels[key]} · {providerObservationStates[observation.status]}</Text>) : <Text className="text-meta text-muted-foreground">验证记录未提供。</Text>}</Details>
         {manager ? <Details label="运行 Bot" keepMounted>
           <AssistantDetails key={`${manager.provider}:${JSON.stringify([manager.model, manager.reasoning_effort, manager.backup])}`} fields={['model']} manager={manager} models={models} working={working} save={saveAssistant} />
         </Details> : null}

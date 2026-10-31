@@ -18,6 +18,7 @@ import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@/data/context'
 import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { useLive } from '@/data/live'
+import { MemorySummary } from '@/features/chat/memory-summary'
 
 export default function BotAbout() {
   const { botId } = useLocalSearchParams<{ botId: string }>()
@@ -105,8 +106,8 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
         </View>
       </View>)}
     </Section> : null}
-    {view?.memory.length ? <Section icon={NotebookPen} title="笔记" count={view.memory.length}>
-      {view.memory.map((note) => <Text key={note.memory_id} selectable numberOfLines={2} className="text-meta">{note.text}</Text>)}
+    {view ? <Section icon={NotebookPen} title="持久记忆" count={view.memory.length}>
+      <MemorySummary key={bot.conversation_id} settings={view} context={shared.data?.scheduler?.context} memory={shared} />
     </Section> : null}
     {view?.skills.length ? <Section icon={BookOpen} title={botCopy.skills(bot.skills, view.skills.length)}>
       {view.skills.map((skill) => <View key={skill.skill_id} className="gap-0.5">

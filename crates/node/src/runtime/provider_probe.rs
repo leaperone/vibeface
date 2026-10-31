@@ -3,7 +3,7 @@ use crate::config::ManagerSettings;
 use crate::providers::{
     self, AppServer, AppServerMode, Authentication, CatalogCoverage, EffortOptions, LaunchCheck,
     ModelCatalog, ModelChoice, ProbeCode, ProbeIssue, ProbeStage, Provider, ProviderProbe,
-    ProviderReadiness,
+    ProviderProbeReadiness,
 };
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
@@ -132,13 +132,13 @@ impl Runtime {
         &self,
         provider: Provider,
         model: &str,
-    ) -> ProviderReadiness {
+    ) -> ProviderProbeReadiness {
         self.provider_probe_snapshot(provider)
             .await
             .readiness(model)
     }
 
-    pub(crate) async fn manager_readiness(&self) -> Option<ProviderReadiness> {
+    pub(crate) async fn manager_readiness(&self) -> Option<ProviderProbeReadiness> {
         let manager = self.manager()?;
         Some(
             self.provider_readiness(manager.provider, &manager.model)

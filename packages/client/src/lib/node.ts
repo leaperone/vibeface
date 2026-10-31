@@ -54,6 +54,13 @@ export type AppServerLink = { state: 'off' } | { state: 'starting' } | { state: 
 export type AppServerMode = 'system' | 'spawn'
 /** `socket` is required when enabling a system App Server connection. */
 export type AppServer = { mode: AppServerMode; socket: string | null; link: AppServerLink }
+export type ProviderObservation = {
+  status: 'confirmed' | 'rejected' | 'unknown'
+  evidence: 'binary_discovery' | 'launch_prerequisites' | 'app_server_handshake' | 'app_server_starting' | 'app_server_unavailable' | 'managed_launch_failed' | 'configuration_invalid' | 'authentication_not_observed' | 'model_catalog_not_observed' | 'readiness_not_observed' | 'prerequisites_rejected'
+}
+export type ProviderObservations = Record<'installed' | 'launchable' | 'authenticated' | 'model_known' | 'ready', ProviderObservation>
+export const providerObservationLabels: Record<string, string> = { installed: '程序安装', launchable: '程序启动', authenticated: '登录状态', model_known: '模型可用性', ready: '完整可用性' }
+export const providerObservationStates: Record<ProviderObservation['status'], string> = { confirmed: '已确认', rejected: '未满足', unknown: '未验证' }
 /**
  * One local provider of the connected Node. `roles` is what it runs now: `agent` while the bot
  * runs on it, `execution` while it executes tasks; `off` means it runs nothing.
@@ -71,6 +78,7 @@ export type ProviderStatus = {
   state: 'ready' | 'unverified' | 'needs_setup' | 'starting' | 'off'; issues: ProviderIssue[]
   readiness: ProviderReadiness
   probe: { provider: ProviderId; config_id: string; checked_at_ms: number | null; launch: { state: 'unchecked' | 'starting' | 'launchable' } | { state: 'failed'; issue: ProbeIssue }; authentication: 'unverified' | 'authenticated' | 'not_required' | 'sign_in_required'; catalog: ModelCatalog; version: string | null }
+  observed: ProviderObservations
 }
 export type NodeSettingsResponse = {
   settings: NodeSettings
@@ -201,12 +209,23 @@ export function botOnChange(response: NodeSettingsResponse, provider: ProviderSt
   return first && provider.supports.includes('execution') ? { bot: true, execution: true } : { bot: true }
 }
 
+/**
+ * An unused program with prerequisites present can be tried; authentication and model availability remain unverified.
+ * A used provider keeps the state the device reports.
+ */
 export type Availability = Exclude<ProviderStatus['state'], 'off'> | 'missing'
 export function summaryReadiness(item: Pick<ProviderStatus, 'roles' | 'readiness' | 'execution_readiness'>): ProviderReadiness {
   return item.roles.includes('execution') && !item.roles.includes('agent') ? item.execution_readiness : item.readiness
 }
-export function availability(item: Pick<ProviderStatus, 'installed' | 'roles' | 'readiness' | 'execution_readiness'>): Availability {
-  return item.installed ? summaryReadiness(item).state : 'missing'
+export function availability(item: Pick<ProviderStatus, 'state' | 'installed' | 'env'> | Pick<ProviderStatus, 'installed' | 'roles' | 'readiness' | 'execution_readiness'>): Availability {
+  if ('roles' in item) return item.installed ? summaryReadiness(item).state : 'missing'
+  if ('state' in item) {
+    if (item.state !== 'off') return item.state
+    if (!item.installed) return 'missing'
+    if (item.env.some((row) => row.required && !row.set && !row.inherited)) return 'needs_setup'
+    return 'unverified'
+  }
+  return 'unverified'
 }
 
 /** Providers in use or on the device get a row; the others fold away until someone looks for one. */
@@ -237,6 +256,7 @@ export const providerIds: readonly ProviderId[] = ['codex', 'cursor', 'claude', 
 export const asProvider = (value: unknown): ProviderId | null => providerIds.includes(value as ProviderId) ? value as ProviderId : null
 const providerRoles: ProviderRole[] = ['agent', 'execution']
 const providerStates: ProviderStatus['state'][] = ['ready', 'unverified', 'needs_setup', 'starting', 'off']
+const observationEvidence: ProviderObservation['evidence'][] = ['binary_discovery', 'launch_prerequisites', 'app_server_handshake', 'app_server_starting', 'app_server_unavailable', 'managed_launch_failed', 'configuration_invalid', 'authentication_not_observed', 'model_catalog_not_observed', 'readiness_not_observed', 'prerequisites_rejected']
 function oneOf<T extends string>(value: unknown, options: readonly T[]): T {
   if (!options.includes(value as T)) throw new Error('AI 状态格式不对。')
   return value as T
@@ -323,29 +343,39 @@ export function parseAppServerLink(value: unknown): AppServerLink {
   }
 }
 function parseAppServer(value: unknown): AppServer | null {
-  if (value === null || value === undefined) return null
+  if (value === null) return null
   const v = record(value, 'App Server 设置')
   return { mode: oneOf(v.mode, ['system', 'spawn'] as const), socket: v.socket === null ? null : text(v.socket), link: parseAppServerLink(v.link) }
 }
 export function parseProvider(value: unknown): ProviderStatus {
   const v = record(value), probe = record(v.probe), launch = record(probe.launch)
   const provider = oneOf(v.provider, providerIds)
-  const setup = v.setup == null ? null : record(v.setup, 'AI 配置方式')
+  const setup = v.setup === null ? null : record(v.setup, 'AI 配置方式')
   if (oneOf(probe.provider, providerIds) !== provider) throw new Error('检查结果和 AI 服务不一致。')
   if (typeof v.execution_model !== 'string') throw new Error('执行任务模型格式不对。')
+  if (v.execution_readiness === undefined || v.execution_readiness === null) throw new Error('执行任务可用性格式不对。')
   const launchState = launch.state === 'failed' ? { state: 'failed' as const, issue: parseProbeIssue(launch.issue) } : { state: oneOf(launch.state, ['unchecked', 'starting', 'launchable'] as const) }
   if (probe.checked_at_ms !== null && (typeof probe.checked_at_ms !== 'number' || !Number.isSafeInteger(probe.checked_at_ms) || probe.checked_at_ms < 0)) throw new Error('检查时间无效。')
+  const observed = record(v.observed)
   return {
     provider,
     setup: setup === null ? null : { directory: text(setup.directory), command: text(setup.command) },
     roles: array(v.roles).map(role => oneOf(role, providerRoles)), supports: array(v.supports).map(role => oneOf(role, providerRoles)),
     installed: boolean(v.installed), bin: text(v.bin), app_server: parseAppServer(v.app_server),
-    home: typeof v.home === 'string' ? v.home : null, sessions: typeof v.sessions === 'string' ? v.sessions : null,
+    home: v.home === null ? null : text(v.home), sessions: v.sessions === null ? null : text(v.sessions),
     env: array(v.env).map(row => { const r = record(row); return { name: text(r.name), set: boolean(r.set), inherited: boolean(r.inherited), required: boolean(r.required) } }),
     state: oneOf(v.state, providerStates), issues: array(v.issues).map(parseIssue),
     readiness: parseProviderReadiness(v.readiness), execution_model: v.execution_model, execution_readiness: parseProviderReadiness(v.execution_readiness),
     probe: { provider: oneOf(probe.provider, providerIds), config_id: text(probe.config_id), checked_at_ms: probe.checked_at_ms, launch: launchState, authentication: oneOf(probe.authentication, ['unverified', 'authenticated', 'not_required', 'sign_in_required']), catalog: parseProviderModels(probe.catalog), version: probe.version === null ? null : text(probe.version) },
+    observed: {
+      installed: parseObservation(observed.installed), launchable: parseObservation(observed.launchable),
+      authenticated: parseObservation(observed.authenticated), model_known: parseObservation(observed.model_known), ready: parseObservation(observed.ready),
+    },
   }
+}
+function parseObservation(value: unknown): ProviderObservation {
+  const observation = record(value)
+  return { status: oneOf(observation.status, ['confirmed', 'rejected', 'unknown']), evidence: oneOf(observation.evidence, observationEvidence) }
 }
 function canonical(value: unknown): string {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value)

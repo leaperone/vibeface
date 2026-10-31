@@ -3,7 +3,10 @@ use super::codex_server::Link;
 use crate::config::{Config, ManagerSettings};
 use crate::discovery::{self, Paths, Target};
 use crate::manager::{ManagerConfig, Sdk};
-use crate::providers::{self, AppServer, AppServerMode, Provider, ProviderRoots, Role};
+use crate::providers::{
+    self, AppServer, AppServerMode, ObservationStatus, Provider, ProviderObservation,
+    ProviderReadiness, ProviderRoots, ReadinessEvidence, Role,
+};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -180,6 +183,25 @@ fn executable(path: &Path) -> bool {
 }
 
 impl Runtime {
+    pub(crate) async fn agent_configuration_snapshot(&self) -> (NodeSettings, providers::Local) {
+        let _configuration = self.config_save.lock().await;
+        (self.settings_snapshot(), self.providers())
+    }
+
+    pub(crate) fn provider_configuration_pending(
+        &self,
+        provider: Provider,
+        local: &providers::Local,
+    ) -> bool {
+        match provider {
+            Provider::Codex => self.codex.configuration_pending(&local.codex_target(true)),
+            Provider::Opencode => self
+                .opencode
+                .configuration_pending(&local.bin(provider), local.env.get(provider)),
+            Provider::Cursor | Provider::Claude | Provider::Pi => false,
+        }
+    }
+
     pub(crate) fn providers(&self) -> providers::Local {
         self.providers
             .lock()
@@ -237,6 +259,12 @@ impl Runtime {
             },
             Provider::Codex => Sdk::Codex {
                 socket: self.codex.socket(),
+                launch: Some(std::sync::Arc::new(std::sync::Mutex::new(
+                    self.codex.lease(
+                        format!("manager:{}", uuid::Uuid::new_v4()),
+                        &local.codex_target(true),
+                    )?,
+                ))),
             },
             Provider::Claude => Sdk::Claude {
                 bin: local.bin(Provider::Claude),
@@ -248,6 +276,11 @@ impl Runtime {
             },
             Provider::Opencode => Sdk::Opencode {
                 server: self.opencode.clone(),
+                bin: local.bin(Provider::Opencode),
+                launch: Some(std::sync::Arc::new(self.opencode.lease(
+                    &local.bin(Provider::Opencode),
+                    local.env.get(Provider::Opencode),
+                )?)),
             },
         };
         Ok(ManagerConfig {
@@ -270,6 +303,10 @@ impl Runtime {
     /// The variables this Node sets for `provider`, and only that provider.
     pub(crate) fn provider_env(&self, provider: Provider) -> BTreeMap<String, String> {
         self.providers().env.get(provider).clone()
+    }
+
+    pub(crate) async fn manager_backend_ready(&self, provider: Provider) -> bool {
+        !provider.on_app_server() || self.codex.ready().await
     }
 
     pub(crate) async fn provider_status(
@@ -299,6 +336,11 @@ impl Runtime {
             vec![]
         });
         let inherited = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+        let executable_missing = launches && !executable(&bin);
+        let environment_missing = launches
+            && required
+                .iter()
+                .any(|name| !configured.contains_key(name) && !inherited(name));
         let names: BTreeSet<&String> = configured.keys().chain(&required).collect();
         let env: Vec<Value> = names
             .into_iter()
@@ -314,7 +356,7 @@ impl Runtime {
             None
         };
         if !roles.is_empty() {
-            if launches && !executable(&bin) {
+            if executable_missing {
                 issues.push(json!({"code":"bin_missing","path":bin}));
             }
             for name in required.iter().filter(|_| launches) {
@@ -347,6 +389,42 @@ impl Runtime {
             .cloned()
             .unwrap_or_default();
         let execution_readiness = probe.readiness(&execution_model);
+        let launchable = if !issues.is_empty() || executable_missing || environment_missing {
+            ProviderObservation::new(
+                ObservationStatus::Rejected,
+                if issues.iter().any(|issue| issue["code"] == "config_invalid") {
+                    ReadinessEvidence::ConfigurationInvalid
+                } else {
+                    ReadinessEvidence::PrerequisitesRejected
+                },
+            )
+        } else {
+            match &link {
+                Some(Link::Connected { .. }) => ProviderObservation::new(
+                    ObservationStatus::Confirmed,
+                    ReadinessEvidence::AppServerHandshake,
+                ),
+                Some(Link::Starting) => ProviderObservation::new(
+                    ObservationStatus::Unknown,
+                    ReadinessEvidence::AppServerStarting,
+                ),
+                Some(Link::NotFound { .. } | Link::HandshakeFailed { .. }) => {
+                    ProviderObservation::new(
+                        ObservationStatus::Rejected,
+                        ReadinessEvidence::AppServerUnavailable,
+                    )
+                }
+                Some(Link::LaunchFailed { .. }) => ProviderObservation::new(
+                    ObservationStatus::Rejected,
+                    ReadinessEvidence::ManagedLaunchFailed,
+                ),
+                _ => ProviderObservation::new(
+                    ObservationStatus::Unknown,
+                    ReadinessEvidence::LaunchPrerequisites,
+                ),
+            }
+        };
+        let observed = ProviderReadiness::from_prerequisites(self.host.installed(&bin), launchable);
         let state = if roles.is_empty() {
             "off"
         } else {
@@ -356,7 +434,8 @@ impl Runtime {
         let setup = provider_setup(provider, local, &roots);
         json!({
             "provider":provider, "roles":roles, "supports":provider.supports(),
-            "installed":discovery::Host::current().installed(&bin), "bin":bin,
+            "installed":observed.installed.status == ObservationStatus::Confirmed, "bin":bin,
+            "descriptor":provider.descriptor(), "observed":observed,
             "app_server":codex.then(|| json!({"mode":app_server.mode,
                 "socket":app_server.socket,"link":link})),
             "home":codex.then(|| configured.get(discovery::CODEX_HOME)),
@@ -439,7 +518,7 @@ impl Runtime {
     }
 
     /// Chooses or stops the bot on a provider, turns its execution on or off, sets the
-    /// provider's program and variables, then restarts what runs on it. This is the only place
+    /// provider's program and variables. Active turns keep their launch until they end. This is the only place
     /// that decides what each provider is used for. The variables are written only to this
     /// Node's private file.
     pub(crate) async fn configure_provider(

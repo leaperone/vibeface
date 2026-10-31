@@ -636,7 +636,7 @@ impl CursorExecutor {
 }
 
 impl Executor for CursorExecutor {
-    fn start<'a>(
+    fn start_or_resume<'a>(
         &'a self,
         node: &'a Arc<Runtime>,
         network: &'a str,
@@ -762,7 +762,7 @@ impl Executor for CursorExecutor {
         })
     }
 
-    fn steer<'a>(
+    fn send_turn<'a>(
         &'a self,
         _: &'a crate::scheduling::SteerTarget,
         _: &'a str,
@@ -985,6 +985,7 @@ mod tests {
                         .push((agent, run));
                     Box::pin(async { Ok(()) })
                 }),
+                started: None,
                 fresh_prompt: None,
             }),
         }
@@ -1129,6 +1130,12 @@ mod tests {
     }
 
     async fn cursor_node() -> Result<(Arc<Runtime>, PathBuf, String, PathBuf)> {
+        let (node, dir, network, workspace, _) = cursor_node_with_admin().await?;
+        Ok((node, dir, network, workspace))
+    }
+
+    async fn cursor_node_with_admin()
+    -> Result<(Arc<Runtime>, PathBuf, String, PathBuf, LocalIdentity)> {
         let dir =
             std::env::temp_dir().join(format!("vibeface-cursor-work-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
@@ -1168,7 +1175,7 @@ mod tests {
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state).await?;
-        Ok((node, dir, network, workspace))
+        Ok((node, dir, network, workspace, admin))
     }
 
     fn work(node: &Runtime, workspace: &Path, call_ref: &str, prompt: &str) -> Result<WorkSpec> {
@@ -1209,6 +1216,309 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_cursor_manager_reports_its_native_start_before_seen_context() -> Result<()> {
+        use crate::scheduling::{
+            ContextProjection, ContextStage, JobOutcome, SessionConfig, SessionKey, SessionScope,
+            Shown, TurnExecution, TurnRuntime,
+        };
+        async fn claim(
+            node: &Arc<Runtime>,
+            admin: &LocalIdentity,
+            network: &str,
+            id: &str,
+            configuration: &SessionConfig,
+        ) -> Result<(
+            crate::scheduling::SchedulerJob,
+            Arc<std::sync::Mutex<Shown>>,
+        )> {
+            let event = admin.attest(
+                network,
+                "start-state",
+                crate::model::EventBody::MessagePosted {
+                    message_id: id.into(),
+                    role: crate::model::Role::User,
+                    text: id.into(),
+                    attachments: vec![],
+                    report_results: Some(true),
+                    in_reply_to: None,
+                    status: None,
+                    answers: None,
+                    attestation: None,
+                    failure: None,
+                },
+            )?;
+            let mut store = node.store.lock().await;
+            store.accept_message(
+                &node.identity,
+                network,
+                "start-state",
+                id,
+                id,
+                vec![],
+                true,
+                event.attestation().cloned().context("signed message")?,
+                now_ms(),
+            )?;
+            let key = SessionKey {
+                conversation_id: "start-state".into(),
+                scope: SessionScope::Main,
+            };
+            let claimed = store
+                .claim_next_in_session(
+                    &node.identity,
+                    network,
+                    &key,
+                    crate::scheduler::boot_id(),
+                    configuration,
+                    &node.config.scheduling,
+                )?
+                .context("claimed Cursor turn")?;
+            let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+            let job = store.record_turn_runtime(
+                "start-state",
+                &claimed.job.trigger,
+                &attempt,
+                &TurnRuntime {
+                    provider: Provider::Cursor,
+                    model: Some("fixture-model".into()),
+                    reasoning_effort: None,
+                    generation: node.provider_generation(Provider::Cursor, &node.providers())?,
+                    session_generation: claimed.session_generation,
+                    delivery_id: attempt.clone(),
+                    stage: vibeface_bridge::failure::ProviderStage::Validate,
+                    execution: TurnExecution::NotStarted,
+                    attempted_at_ms: now_ms(),
+                    switched_from: None,
+                    switch_reason: None,
+                },
+            )?;
+            let context = ContextProjection {
+                attempt_id: attempt.clone(),
+                provider: Provider::Cursor,
+                stable_fingerprint: configuration.stable_fingerprint.clone(),
+                dynamic_fingerprint: format!("context-{id}"),
+                session_generation: claimed.session_generation,
+                coverage: Default::default(),
+                stable_bytes: 1,
+                dynamic_bytes: 1,
+                invalidation_reason: None,
+                stage: ContextStage::Compiled,
+                session_status: None,
+            };
+            store.record_compiled_context("start-state", &job.trigger, &attempt, &context)?;
+            store.mark_started("start-state", &job.trigger, &attempt)?;
+            Ok((
+                job,
+                Arc::new(std::sync::Mutex::new(Shown {
+                    session_generation: claimed.session_generation,
+                    dynamic: Some(format!("delivered-{id}")),
+                    context: Some(context),
+                    ..Shown::default()
+                })),
+            ))
+        }
+        async fn seen(node: &Runtime) -> Result<(crate::model::VersionVector, Shown)> {
+            let store = node.store.lock().await;
+            let (covers, shown) = store.connection.query_row(
+                "SELECT covers,shown FROM scheduler_sessions WHERE conversation_id='start-state' AND scope='main'", [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            Ok((
+                serde_json::from_str(&covers)?,
+                serde_json::from_str(&shown)?,
+            ))
+        }
+        let (node, dir, network, workspace, admin) = cursor_node_with_admin().await?;
+        let result = async {
+            let settings = crate::config::ManagerSettings {
+                provider: Provider::Cursor,
+                workspace,
+                model: "fixture-model".into(),
+                reasoning_effort: None,
+                backup: Default::default(),
+            };
+            node.settings.lock().unwrap().manager = Some(settings.clone());
+            crate::runtime::triage::tests::bot(&node, &admin, "start-state", "Bot", &[]).await?;
+            let key = SessionKey {
+                conversation_id: "start-state".into(),
+                scope: SessionScope::Main,
+            };
+            let configuration =
+                crate::scheduler::session_configuration(&node, &network, &key).await?;
+            let instance = CursorInstance::Bot {
+                network: network.clone(),
+                conversation: "start-state".into(),
+            };
+            let config = node
+                .manager_config(settings, &node.providers())?
+                .for_cursor_instance(instance.clone(), node.cursor_store_root(&instance));
+            let (job, shown) = claim(&node, &admin, &network, "cancelled", &configuration).await?;
+            let attempt = job.state.attempt().unwrap().id.clone();
+            assert!(seen(&node).await?.0.is_empty());
+            assert!(seen(&node).await?.1.dynamic.is_none());
+            let persisted = Arc::new(std::sync::Mutex::new(None::<String>));
+            let started = Arc::new(tokio::sync::Notify::new());
+            let mut running_config = config.clone();
+            let mut observer =
+                crate::scheduler::turn_recorder(&node, &network, &job, "", shown, None);
+            let original_started = observer.started.take().context("started callback")?;
+            observer.started = Some({
+                let persisted = persisted.clone();
+                let started = started.clone();
+                Arc::new(move |run| {
+                    assert!(persisted.lock().unwrap().is_some());
+                    let original_started = original_started.clone();
+                    let started = started.clone();
+                    Box::pin(async move {
+                        original_started(run).await?;
+                        started.notify_one();
+                        Ok(())
+                    })
+                })
+            });
+            running_config.codex_turn = Some(observer);
+            let saved = persisted.clone();
+            let persist_node = node.clone();
+            let persist_trigger = job.trigger.clone();
+            let persist_attempt = attempt.clone();
+            let (cancel, receiver) = tokio::sync::watch::channel(false);
+            let task = tokio::spawn(async move {
+                crate::manager::run_manager(
+                    &running_config,
+                    "hang",
+                    None,
+                    move |session| {
+                        *saved.lock().unwrap() = Some(session.clone());
+                        async move {
+                            persist_node.store.lock().await.save_scheduler_native_id(
+                                "start-state",
+                                &persist_trigger,
+                                &persist_attempt,
+                                &session,
+                                "controlled-token",
+                                false,
+                            )
+                        }
+                    },
+                    receiver,
+                    |_| async { Ok(()) },
+                )
+                .await
+            });
+            let observed = tokio::time::timeout(Duration::from_secs(5), started.notified()).await;
+            let pending = !task.is_finished();
+            let captured = async {
+                let store = node.store.lock().await;
+                let early = store
+                    .manager_turn_record(&attempt)?
+                    .context("early native locator")?;
+                let execution = store
+                    .scheduler_job("start-state", &job.trigger)?
+                    .context("job")?
+                    .runtime
+                    .context("runtime")?
+                    .execution;
+                drop(store);
+                let (covers, shown) = seen(&node).await?;
+                Ok::<_, anyhow::Error>((early, execution, covers, shown))
+            }
+            .await;
+            let signalled = cancel.send(true);
+            let interrupted = task.await?;
+            observed.context("native Cursor start callback")?;
+            signalled?;
+            let (early, execution, covers, early_shown) = captured?;
+            assert!(pending);
+            assert_eq!(
+                Some(early.thread.clone()),
+                persisted.lock().unwrap().clone()
+            );
+            assert!(
+                early.turn.is_some(),
+                "the early locator keeps the actual native run"
+            );
+            assert_eq!(execution, TurnExecution::Started);
+            assert!(covers.is_empty());
+            assert!(
+                early_shown.dynamic.is_none(),
+                "native start does not confirm delivered context"
+            );
+            assert_eq!(early_shown.context.unwrap().stage, ContextStage::Started);
+            assert!(
+                interrupted
+                    .err()
+                    .context("interrupted Cursor turn")?
+                    .downcast_ref::<crate::manager::ManagerError>()
+                    .unwrap()
+                    .cancelled()
+            );
+            assert!(seen(&node).await?.0.is_empty());
+            assert!(seen(&node).await?.1.dynamic.is_none());
+            node.store.lock().await.finish_job(
+                &node.identity,
+                &network,
+                "start-state",
+                &job.trigger,
+                &attempt,
+                JobOutcome::Cancelled("controlled stop".into()),
+                "",
+                now_ms(),
+            )?;
+
+            let (job, shown) = claim(&node, &admin, &network, "completed", &configuration).await?;
+            let attempt = job.state.attempt().unwrap().id.clone();
+            let mut completed_config = config;
+            completed_config.codex_turn = Some(crate::scheduler::turn_recorder(
+                &node,
+                &network,
+                &job,
+                "",
+                shown.clone(),
+                None,
+            ));
+            let persist_node = node.clone();
+            let persist_trigger = job.trigger.clone();
+            let persist_attempt = attempt.clone();
+            let reply = crate::manager::run_manager(
+                &completed_config,
+                "hello",
+                None,
+                move |session| async move {
+                    persist_node.store.lock().await.save_scheduler_native_id(
+                        "start-state",
+                        &persist_trigger,
+                        &persist_attempt,
+                        &session,
+                        "controlled-token",
+                        false,
+                    )
+                },
+                tokio::sync::watch::channel(false).1,
+                |_| async { Ok(()) },
+            )
+            .await?;
+            assert_eq!(reply.output, "done: hello");
+            assert!(seen(&node).await?.0.is_empty());
+            assert!(seen(&node).await?.1.dynamic.is_none());
+            let delivered = shown.lock().unwrap().clone();
+            crate::scheduler::confirm_cursor_seen(&node, &job, &delivered, &reply).await?;
+            let (covers, completed_shown) = seen(&node).await?;
+            assert_eq!(covers, job.basis);
+            assert_eq!(
+                completed_shown.dynamic.as_deref(),
+                Some("delivered-completed")
+            );
+            assert_eq!(completed_shown.context.unwrap().attempt_id, attempt);
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
     }
 
     #[tokio::test]

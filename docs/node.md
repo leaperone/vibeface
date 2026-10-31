@@ -470,7 +470,7 @@ Node 用自身的业务 UDP 端口登记。发现服务只交换它从已认证�
 
 发送后先看状态。`pending_delivery` 表示入口已保存消息，正在投递给原调度设备；只有目标持久入队后才是 `queued`。排队不表示模型已开始，`running` 才表示已跨过 SDK 启动边界。目标离线、能力不满足或回执丢失时，保留原目标与消息身份核对，不自动改派另一台设备。
 
-管理 Agent 忙时，追加消息进入持久队列。尚未开始的本人消息优先于工作结果等后续轮次，同一调度 Node 上的同一会话一次只运行一个管理轮。管理轮派发工作后即结束，不等待工作；工作结束时它的结果作为新的一轮入队，Agent 汇报并可继续派发。关闭网页不会停止 Node 上的工作，但执行设备关机、休眠或断网会影响推进。
+管理 Agent 忙时，追加消息进入持久队列。尚未开始的本人消息优先于工作结果等后续轮次，同一 Bot 的主聊天一次只运行一个管理轮。独立 Agent task 各有本机 session 和 Memory staging writer，定时 routine 每次使用独立临时 session，不复用主聊天的 token、Context 或原生历史。管理轮派发工作后即结束，不等待工作；工作结束时它的结果作为新的一轮入队，Agent 汇报并可继续派发。关闭网页不会停止 Node 上的工作，但执行设备关机、休眠或断网会影响推进。
 
 需要停止时，区分以下动作：
 
@@ -511,7 +511,7 @@ Codex 结束一轮不等于交付目标已经达成，由本人核对产物后�
 
 A 已派发 B 后掉线时，从 C 打开原业务会话，等待 DAG 补齐，再核对 B 的实际执行状态。缺失历史、App Server 不可达和结果未知分别显示，不能通过创建同名新任务代替恢复。
 
-同一调度 Node 对同一会话串行领取管理轮，不提供旧执行层的项目目录锁或跨设备全局文件锁。多个 Agent 需要修改同一项目时，使用独立 worktree 或独立根目录隔离。
+本机 scheduler 按 Provider descriptor 检查实际 Bot/provider instance 的并发能力。Serial instance 的回合互斥，其他 Bot 可并行；Parallel instance 可同时运行主聊天和独立 task。`config.json` 的 `scheduling.machine_slots` 默认 4，限制本机所有 Bot 协调回合；`scheduling.task_limit` 默认 2，限制单个 Bot 的并行 Agent task。两者不限制独立编码工作的执行器。结果未知的回合继续占用 slot，先核对再释放。排队状态按真实 gate 显示当前回合、steer 核对、Provider 串行、task 上限、机器 slot 或待核对。本人消息优先，其余按 admission sequence、会话与 trigger 稳定排序；受阻 task 不挡住可运行的本人消息。Node 不提供项目目录锁或跨设备全局文件锁。多个 Agent 需要修改同一项目时，使用独立 worktree 或独立根目录隔离。
 
 浏览器在 IndexedDB 中保留尚未确认的消息和它的设备签名，入口把消息写进自己的签名日志并回执后删除。入口回执 `pending_delivery` 时，由入口负责继续投递给调度 Node，浏览器不再重发。回执丢失时，浏览器经同一或另一个访问地址原样重发同一请求，Node 按消息编号返回原来的结果。刷新后重试须使用原内容和汇报意图；改写正文会被拒绝，避免把新内容误当成旧操作重试。
 
@@ -612,4 +612,4 @@ vibeface service uninstall
 
 停掉 Node 后备份完整数据目录，保留 SQLite 数据库及未合并的 WAL。模型 key、本机私钥、原生会话正文和本地私有存储留在本机，不进入共享 DAG。任务的安全 thread/turn 标识可随工作记录共享，用于结果查询。完整目录备份含敏感信息，按本机凭证保管。不要复制运行中的 SQLite 文件来实现节点同步。
 
-存储使用 `rusqlite`，没有 ORM。设备授权、配对回执和业务记录共用单一 `node.sqlite3` 及同一个 Store 事务。Atlas HCL 为 `crates/node/schema.hcl`，唯一 initial SQL 和校验清单位于 `crates/node/migrations/`。数据格式为 epoch 9，数据库 `user_version` 为 9，直接初始化最终结构，不提供库迁移。不同 epoch 的程序和数据目录不能混用。程序不会自动清空旧目录。监控历史正文、附件和服务日志的磁盘占用。
+存储使用 `rusqlite`，没有 ORM。设备授权、配对回执和业务记录共用单一 `node.sqlite3` 及同一个 Store 事务。Atlas HCL 为 `crates/node/schema.hcl`，唯一 initial SQL 和校验清单位于 `crates/node/migrations/`。数据格式为 epoch 12，数据库 `user_version` 为 12，直接初始化最终结构，不提供库迁移。不同 epoch 的程序和数据目录不能混用。程序不会自动清空旧目录。监控历史正文、附件和服务日志的磁盘占用。

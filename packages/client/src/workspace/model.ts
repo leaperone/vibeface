@@ -7,7 +7,9 @@ import type {
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, DispatchState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
   BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, OpenWorkCard, WorkCard, SkillSet, SteerOutcome, Busy,
   WorkPhase, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation, OverviewConversation, OverviewSession,
+  AgentLane, QueueHoldReason, ContextProjection, ManagerJob, MemoryConflict,
 } from "./types.ts"
+import { parseMemoryEntry, parseMemorySyncConflicts } from "./memory.ts"
 import { answerId, questionOpen } from "./questions.ts"
 import { providerIds, type ProviderId } from "../lib/node.ts"
 import { failureKinds, type FailureKind } from "../lib/errors.ts"
@@ -110,14 +112,69 @@ export function parseTurnRuntime(value: unknown): TurnRuntime | null {
   if (data.execution !== 'not_started' && data.execution !== 'started' && data.execution !== 'unknown') throw new Error('回合执行状态无法识别。')
   return { provider: provider(data.provider), model: nullable(data.model), reasoning_effort: nullable(data.reasoning_effort), generation: text(data.generation), session_generation: number(data.session_generation), delivery_id: text(data.delivery_id), stage: providerStage(data.stage), execution: data.execution, attempted_at_ms: number(data.attempted_at_ms), switched_from: previous ? { provider: provider(previous.provider), model: nullable(previous.model), reasoning_effort: nullable(previous.reasoning_effort) } : null, switch_reason: failureKind(data.switch_reason) ?? null }
 }
+function agentLane(value: unknown): AgentLane | undefined {
+  switch (value) {
+    case null: case undefined: return undefined
+    case 'main': case 'task': case 'schedule_routine': case 'bot_message': return value
+    default: throw new Error('未知的任务通道。')
+  }
+}
+function queueHold(value: unknown): QueueHoldReason | undefined {
+  switch (value) {
+    case null: case undefined: return undefined
+    case 'active_turn': case 'steering_settlement': case 'provider_serial': case 'task_limit': case 'machine_slot': case 'pending_check': case 'backend_config_pending': return value
+    default: throw new Error('未知的排队原因。')
+  }
+}
+function contextProjection(value: unknown): ContextProjection | null {
+  if (value == null) return null
+  const data = record(value), coverage = record(data.coverage)
+  const stage = data.stage, provider = data.provider
+  if (stage !== 'compiled' && stage !== 'started' && stage !== 'completed' && stage !== 'failed' && stage !== 'cancelled' && stage !== 'interrupted' && stage !== 'unknown') throw new Error('未知的上下文状态。')
+  if (provider !== 'codex' && provider !== 'cursor' && provider !== 'claude' && provider !== 'pi' && provider !== 'opencode') throw new Error('未知的 AI 服务。')
+  const fingerprint = (value: unknown) => { const digest = text(value); if (!/^[a-f0-9]{64}$/.test(digest)) throw new Error('上下文指纹格式不对。'); return digest }
+  const session = data.session_status == null ? null : record(data.session_status)
+  return {
+    attempt_id: text(data.attempt_id), provider, stage,
+    stable_fingerprint: fingerprint(data.stable_fingerprint), dynamic_fingerprint: fingerprint(data.dynamic_fingerprint),
+    session_generation: number(data.session_generation), stable_bytes: number(data.stable_bytes), dynamic_bytes: number(data.dynamic_bytes),
+    invalidation_reason: data.invalidation_reason == null ? null : text(data.invalidation_reason),
+    ...(data.session_status === undefined ? {} : { session_status: session && { resumable: flag(session.resumable), pending_generation: flag(session.pending_generation) } }),
+    coverage: {
+      messages_omitted: number(coverage.messages_omitted), works_omitted: number(coverage.works_omitted), dispatches_omitted: number(coverage.dispatches_omitted),
+      questions_omitted: number(coverage.questions_omitted), attachments_omitted: number(coverage.attachments_omitted), memory_omitted: number(coverage.memory_omitted),
+      checkpoint_omitted: number(coverage.checkpoint_omitted), handoff_omitted: number(coverage.handoff_omitted), pending_checks_omitted: number(coverage.pending_checks_omitted),
+      bot_indexes_omitted: Object.fromEntries(Object.entries(record(coverage.bot_indexes_omitted)).map(([kind, count]) => [kind, number(count)])),
+      history_retrieval: text(coverage.history_retrieval),
+    },
+  }
+}
+function memoryConflicts(value: unknown): MemoryConflict[] | null {
+  if (value == null) return null
+  return list(value).map((value) => {
+    const data = record(value)
+    return { call_ref: text(data.call_ref), memory_id: text(data.memory_id), expected_epoch: number(data.expected_epoch), actual_epoch: number(data.actual_epoch), expected_revision: text(data.expected_revision), actual_revision: text(data.actual_revision), reason: text(data.reason) }
+  })
+}
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   if (value == null) return null
   const data = record(value), capabilities = data.capabilities == null ? null : record(data.capabilities), remote = data.remote == null ? null : record(data.remote)
   return {
     unanswered: list(data.unanswered).map(text),
-    jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), failure: job.failure == null ? undefined : { kind: failureKind(record(job.failure).kind) ?? "unknown", detail: text(record(job.failure).detail) }, runtime: parseTurnRuntime(job.runtime), retryable: job.retryable === true && recordOrNull(job.runtime)?.execution === "not_started" && job.pending_check !== true, pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined, source_node: optionalText(job.source_node) } }),
+    jobs: list(data.jobs).map(managerJob),
+    ...(data.context === undefined ? {} : { context: contextProjection(data.context) }),
     provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined,
     remote: remote ? { owner: text(remote.owner), reachable: flag(remote.reachable) } : undefined,
+  }
+}
+function managerJob(value: unknown): ManagerJob {
+  const job = record(value)
+  return { trigger: text(job.trigger), state: text(job.state), lane: agentLane(job.lane), hold_reason: queueHold(job.hold_reason),
+    message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id),
+    failure: job.failure == null ? undefined : { kind: failureKind(record(job.failure).kind) ?? 'unknown', detail: text(record(job.failure).detail) },
+    runtime: parseTurnRuntime(job.runtime), retryable: job.retryable === true && recordOrNull(job.runtime)?.execution === 'not_started' && job.pending_check !== true,
+    pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined, source_node: optionalText(job.source_node),
+    ...(job.context === undefined ? {} : { context: contextProjection(job.context) }),
   }
 }
 function workState(value: unknown): WorkState | DispatchState {
@@ -159,6 +216,7 @@ function optionalWorkFields(data: Record<string, unknown>): Partial<Omit<WorkRec
   if (kind !== undefined) fields.kind = kind
   if (typeof data.model === "string") fields.model = data.model
   if (data.phase != null) fields.phase = workPhase(data.phase)
+  if (data.coordination_job !== undefined) fields.coordination_job = data.coordination_job === null ? null : managerJob(data.coordination_job)
   return fields
 }
 function work(value: unknown): WorkRecord {
@@ -295,7 +353,7 @@ function safeOverviewOutcome(outcome: WorkOutcome | null, state: OverviewTaskSta
   return outcome === "completed" && (state === "unknown" || state === "unverified" || state === "dispatch_unverified" || state === "accepted_waiting_sync") ? "unverified" : outcome
 }
 
-function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "title" | "summary" | "cwd" | "state" | "outcome" | "target_node" | "dispatcher" | "call_ref" | "parent" | "continues" | "thread" | "thread_id" | "turn_id" | "phase" | "failure_reason" | "failure" | "kind" | "stop">, bot: OverviewBot | null, node: OverviewNode | null, source: OverviewTask["source"], itemId = work.work_id) {
+function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "title" | "summary" | "cwd" | "state" | "outcome" | "target_node" | "dispatcher" | "call_ref" | "parent" | "continues" | "thread" | "thread_id" | "turn_id" | "phase" | "failure_reason" | "failure" | "kind" | "stop" | "coordination_job">, bot: OverviewBot | null, node: OverviewNode | null, source: OverviewTask["source"], itemId = work.work_id) {
   const navigation = bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id, work_id: work.work_id } : null
   const rawState = overviewState(work.stop ?? work.state)
   const outcome = safeOverviewOutcome(work.outcome, rawState)
@@ -319,6 +377,7 @@ function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "
     thread_id: work.thread_id ?? null,
     turn_id: work.turn_id ?? null,
     phase: work.phase ?? null,
+    ...(work.coordination_job === undefined ? {} : { coordination_job: work.coordination_job }),
     reason: work.failure_reason,
     ...failure(work.failure),
     node,
@@ -435,6 +494,7 @@ function parseOverviewTask(value: unknown): OverviewTask {
     parent: nullableText(data.parent), continues: nullableText(data.continues), thread: nullableText(data.thread), thread_id: nullableText(data.thread_id), turn_id: nullableText(data.turn_id),
     phase: data.phase == null ? null : optionalPhase(data.phase) ?? null, reason: nullableText(data.reason ?? data.failure_reason), ...failure(data.failure), node, source: overviewSource(data.source),
     navigation: bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id, ...(workId ? { work_id: workId } : {}) } : null,
+    ...(data.coordination_job === undefined ? {} : { coordination_job: data.coordination_job === null ? null : managerJob(data.coordination_job) }),
   }
   if (itemKind === "dispatch") return { ...common, kind: "dispatch", delivery_state: overviewDispatchState(data.delivery_state ?? data.state) }
   if (itemKind === "check") return { ...common, kind: "check", check_id: text(data.check_id ?? common.item_id), work_ids: list(data.work_ids ?? (workId ? [workId] : [])).map(text), reason: data.reason === "offline" || data.reason === "disconnected" || data.reason === "unverified" ? data.reason : "unverified", state: "unknown", outcome: data.reason === "unverified" ? "unverified" : null }
@@ -459,6 +519,9 @@ function parseOverviewJob(value: unknown): OverviewJob {
     message_id: messageId, reply_message_id: nullableText(data.reply_message_id), source_node: nullableText(data.source_node), pending_check: data.pending_check === true,
     outcome: state === "unknown" ? "unknown" : data.outcome === "answered" || data.outcome === "unfinished" || data.outcome === "unknown" ? data.outcome : null,
     unknown_reason: unknownReason, kind: nullableText(data.kind), sequence: nullableNumber(data.sequence), owner_epoch: nullableNumber(data.owner_epoch),
+    ...(data.lane === undefined ? {} : { lane: agentLane(data.lane) }),
+    ...(data.hold_reason === undefined ? {} : { hold_reason: queueHold(data.hold_reason) }),
+    ...(data.context === undefined ? {} : { context: contextProjection(data.context) }),
   }
 }
 function parseOverviewConversation(value: unknown): OverviewConversation {
@@ -548,6 +611,7 @@ export function openWorksFromOverview(overview: WorkspaceOverview, openWorks: re
       state, summary: task.summary, outcome, failure_reason: task.reason, ...failure(task.failure), kind: task.work_kind ?? undefined,
       dispatcher: task.dispatcher ?? undefined, call_ref: task.call_ref ?? undefined, continues: task.continues ?? undefined, parent: task.parent ?? undefined,
       thread: task.thread ?? undefined, thread_id: task.thread_id ?? undefined, turn_id: task.turn_id ?? undefined, phase: task.phase ?? undefined,
+      ...(task.coordination_job === undefined ? {} : { coordination_job: task.coordination_job }),
       ...(task.state === "stop_waiting" || task.state === "stop_timed_out" ? { stop: task.state } : {}),
     })
     known.add(key)
@@ -566,6 +630,11 @@ export function parseRecords(value: unknown): ConversationRecords {
     questions: list(data.questions).map(question), notifications: parseNotifications(data),
     deliveries: list(data.deliveries), checks: list(data.checks).map(coordinationCheck),
     jobs: scheduler?.jobs ?? [], unanswered: scheduler?.unanswered ?? [],
+    ...(data.context === undefined ? {} : { context: contextProjection(data.context) }),
+    ...(data.memory === undefined ? {} : { memory: list(data.memory).map(parseMemoryEntry) }),
+    ...(data.memory_staged_count === undefined ? {} : { memory_staged_count: data.memory_staged_count === null ? null : number(data.memory_staged_count) }),
+    ...(data.memory_conflicts === undefined ? {} : { memory_conflicts: memoryConflicts(data.memory_conflicts) }),
+    ...(data.memory_sync_conflicts === undefined ? {} : { memory_sync_conflicts: parseMemorySyncConflicts(data.memory_sync_conflicts) }),
     sent: list(data.sent).map(sentBotMessage), open_works: list(data.open_works).map(openWork),
   }
 }
@@ -670,7 +739,10 @@ function botSettings(value: unknown): BotSettings {
       const view = record(item)
       return { ...schedule(view), schedule_id: text(view.schedule_id), next_run_at_ms: view.next_run_at_ms == null ? null : number(view.next_run_at_ms) }
     }),
-    memory: list(data.memory).map((item) => { const entry = record(item); return { memory_id: text(entry.memory_id), text: text(entry.text) } }),
+    memory: list(data.memory).map(parseMemoryEntry),
+    memory_sync_conflicts: parseMemorySyncConflicts(data.memory_sync_conflicts),
+    ...(data.memory_staged_count === undefined ? {} : { memory_staged_count: data.memory_staged_count === null ? null : number(data.memory_staged_count) }),
+    ...(data.memory_conflicts === undefined ? {} : { memory_conflicts: memoryConflicts(data.memory_conflicts) }),
   }
 }
 export function parseBinaryPage(value: unknown, hash: string, offset: number) {

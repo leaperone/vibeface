@@ -95,6 +95,12 @@ impl Runtime {
                 ),
             }
         }
+        if !quiet && record.state.finished() && on_app_server(&record) {
+            self.codex.release_work(work_id);
+        }
+        if !quiet && record.state.finished() && record.kind == WorkKind::Agent(Provider::Opencode) {
+            self.opencode.release_work(work_id);
+        }
         if !quiet && !live(&record) {
             self.drop_stop(work_id).await?;
         }
@@ -272,6 +278,9 @@ impl Runtime {
         Ok(())
     }
 
+    /// Records the dispatch. Its provider then starts it (see `Executor::start_or_resume`); an agent task
+    /// is queued for this device's bot. A retry of the same `work_id` returns the existing
+    /// record and `false`, so it never starts a second turn.
     pub(super) async fn accept_dispatch(
         self: &Arc<Self>,
         network: &str,

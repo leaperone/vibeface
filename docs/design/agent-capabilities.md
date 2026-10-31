@@ -43,23 +43,35 @@ ScheduleControlled { schedule_id, action: pause | resume | delete, attestation }
 
 ## 3. 记忆
 
-每个 bot 有自己的短笔记，存成 `BotChanged`，随 DAG 在本人的各台 Node 间同步：
+每个 bot 的记忆由自动 `BotChanged` 和本人签名的 `MemoryControlled` 共同投影，主键为 `(network_id, conversation_id, memory_id)`。有效记录和删除墓碑使用同一套版本。
 
-```text
-BotChange::Memory { memory_id, before: Option<String>, after: Option<String> }  // after 为空表示忘记
-```
+| 字段 | 作用 |
+|---|---|
+| epoch | 必须等于当前 DATA_EPOCH 11，不自动抬升旧事件格式 |
+| revision | 自动操作为完整事件 hash；本人操作为稳定 operation_id |
+| control_revision | 自动操作为 0；本人操作为签名 base 的计数加 1，新建为 1 |
+| origin | agent、user 或 review；自动事件只能声明 agent 或 review |
+| user_controlled | 本人接管后永久为 true，包含删除墓碑，自动修改不能覆盖 |
+| essential | 是否进入 essential memory block；本人操作固定为 true |
+| source_event_hash | 真实已验证来源；同一本人请求的多个封装取最小 hash，不改变逻辑版本 |
 
 | 工具 | 作用 |
 |---|---|
-| `remember {call_ref, text, memory_id?}` | 新记一条，或按 `memory_id` 改写 |
-| `forget {call_ref, memory_id}` | 删除一条 |
-| `recall {query?}` | 列出这个 bot 的笔记，`query` 按子串过滤 |
+| remember {call_ref, text, memory_id?} | 新记一条，或按 memory_id 改写未被本人保护的值 |
+| forget {call_ref, memory_id} | 删除一条未被本人保护的值 |
+| recall {query?} | 查询已提交记忆和当前轮的 staged overlay |
 
-- 每条最多 500 字符，一行到几行的事实或偏好；每个 bot 最多 50 条。提示词里 `bot.memory` 带全部笔记，超过 3000 字节的部分省略并给出条数，用 `recall` 取。
-- 疑似凭证的内容直接拒绝：私钥头、`sk-`、`ghp_`、`github_pat_`、`xox`、`AKIA`、`AIza` 等前缀、`Bearer` 令牌、`password=` 一类赋值，以及 32 个字符以上的连续高熵串。模型密钥从不进入记忆。bot 说明、skill 的描述和正文、schedule 提示按同一规则拒绝。
-- Node 签名自己的每条写入前，把已知的密钥换成 `[redacted]`，包括回复、bot 消息和工作结果。已知密钥指进程环境和设置页 Provider 变量里名字以 `_KEY`、`_TOKEN`、`_SECRET`、`_PASSWORD` 结尾或疑似凭证的值、入口令牌、Cursor 回调令牌，以及 `Bearer` 后的令牌。带本人设备签名的写入保持原样。
-- `remember` 和 `forget` 是设置类：只在本人消息的轮次提供，`cause` 指向那条签名消息，入库时核对，与改名、改说明相同。理由是记忆注入之后每一轮的提示词，作用等同于说明；工作结果、网页和工具输出里的文字不能写进去。`recall` 所有轮次都可用。
-- 投影 `memories` 按 `memory_id` 后写者胜，删除保留墓碑。
+每条记忆最多 500 字符，本机新增或恢复时每个 bot 以 50 条有效记忆为接纳上限。完成事务逐条重检容量，超限只记录该条提交冲突，正常回复仍完成。不同离线 Node 的合法新增同步后可能超过 50 条，系统不为容量删除已签名事实。疑似凭证的内容拒绝。essential memory 的 prompt budget 是 8192 字节，超出报告 omitted，不删除 Store 中的事实，也不推进省略记录的已发送版本。
+
+remember 和 forget 先写当前 attempt 的 staging，保存完整 `MemoryBase {epoch, version}`，version 为空或为 `{revision, control_revision, source_event_hash}`。只有 completed 回合才与回复和 job 终态在同一事务追加事件。failed、cancelled、interrupted 和 unknown 丢弃 staging。提交时比较含墓碑的当前 epoch、revision 和 control_revision；版本变化或用户保护只记录本轮冲突，不发布失败提案。
+
+本人在现有 Context 或 Bot 面板新增、编辑接管或删除记忆，通过同一个客户端签名入口 `control_memory` 操作。本人操作永久保护该 ID，没有解除保护开关。共享仲裁先比较保护位，再比较 control_revision，最后按本人 operation_id 或自动 event rank 决胜。因此旧本人签名经另一入口重新封装不能覆盖后续编辑，任意自动操作也不能复活本人删除的记忆。未保护的自动操作之间仍按 rank 决胜；并发本人编辑和删除按同一用户顺序决胜，删除没有额外优先级。
+
+非空 base 必须对应已存已验签的直接父事件。远端验证来源，不以当前赢家做 CAS，所以到达顺序不改变合法性。新建的空 base 表示签名者未见版本，不要求封装 Node 的全部祖先都没有这个 ID。
+
+共享 `memory_sync_conflicts` 从 effective 逻辑操作和 base 链推导。同一用户签名的重复封装先折叠，赢家正常 base 链不算冲突，其他分支作为历史冲突显示，最多 50 条并带 has_more。它与 owner 的本轮 `memory_conflicts` 分开，owner 不可达时仍可展示入口已知共享冲突。冲突元数据不包含候选正文。
+
+`memory_state` 可读回墓碑并按 operation_id 对账。未知结果先查原操作，已被后续操作替代时显示 superseded。not_seen_here 只表示本入口未见，客户端仅在原 base 未变时原样重发，不替用户换 base 重签，不丢弃同 ID 未知请求。recall 只合并 committed records 和当前 attempt staging，跨 Node 不传 staging、Provider transcript 或 token。
 
 ## 4. bot 互发消息
 
@@ -128,12 +140,12 @@ BotMessaged {
 
 - `skills`：启用的 skill `{skill_id, name, description}`，按名称排，以及 `skills_omitted`；`read_bot` 列出全部；
 - `schedules`：`{schedule_id, name, prompt（前 500 字节）, first_run_at_ms, every_minutes, enabled, next_run_at_ms}`，只列活动的，下次运行最早的在前，以及 `schedules_omitted`；`read_bot` 列出全部；
-- `memory`：`{memory_id, text}`，保留最新的，以及 `memory_omitted`；`recall` 列出全部；
+- Memory 不进入 `bot` 索引。顶层 `memory_context` 为有界 snapshot 或 delta，保留 memory_id、epoch、revision；按 Store 的稳定顺序选择可放入 8192 字节完整块的条目，超预算保留 omitted 数量，`recall` 仍可读取全部。续接回合只发送变化及删除项，没有变化时省略该块；
 - `sessions`：它名下的外来会话 `{node, session_id, version, agent, cwd, summary, following}`，保留最新的，以及 `sessions_omitted`；`summary` 是会话第一次归给某个 bot 时最后说的一句，转交时沿用；`list_sessions {before?, limit?}` 从新到旧分页列出全部，带 `hand_over_session` 要的 `version`，还有更早的时返回 `next`，下一页把它作为 `before`；翻页途中转走或不再关注某个会话，不影响下一页；
 - `sent`：它发给其他 bot 的消息 `{message_id, to: {conversation_id, name}, text（前 500 字节）, created_at_ms}`，保留最新的，以及 `sent_omitted`，对方回信时能对上原来的问题；更早的不经工具读回；
 - `bots`：其他 bot 的 `{conversation_id, name}`，以及 `bots_omitted`；`list_bots` 列出全部。
 
-每个索引最多 3000 字节。`memory`、`sessions` 和 `sent` 保留最新的，从旧到新展示；其余按上面的顺序保留前面的。整段提示词超过上限时，依次压缩工作、检查点和消息，仍超出再压缩这些索引，省略数照实计入 `_omitted`，不让回合失败。
+每个索引最多 3000 字节。`sessions` 和 `sent` 保留最新的，从旧到新展示；其余按上面的顺序保留前面的。整段提示词超过上限时，依次压缩工作、检查点和消息，仍超出再压缩这些索引，省略数照实计入 `_omitted`，不让回合失败。
 
 trigger 为 schedule 时带 `{schedule_id, name, prompt, every_minutes, reminder}`，`reminder` 表示深度大于 0、由 bot 自己定的提醒。bot 消息时带那条消息和发送者。
 

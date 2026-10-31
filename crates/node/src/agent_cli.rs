@@ -419,7 +419,7 @@ mod tests {
             ("dispatch_work", args.clone()),
             (
                 "tool_call",
-                json!({"name":"dispatch_work","arguments":args}),
+                json!({"tool":"dispatch_work","arguments":args}),
             ),
         ] {
             let (tool, args) = crate::tools::Tool::invocation(name, args)?;

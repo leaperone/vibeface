@@ -327,14 +327,7 @@ impl Store {
             !super::bots::bot_deleted_from(&tx, network, &spec.conversation)?,
             "the bot that dispatched this work was deleted"
         );
-        let busy = spec.kind == WorkKind::Task
-            && !query_runs(
-                &tx,
-                "kind='task' AND conversation_id=? AND state<>'finished'",
-                [&spec.conversation],
-            )?
-            .is_empty();
-        let (mut record, event) = accept(spec.clone(), at);
+        let (record, event) = accept(spec.clone(), at);
         let work_id = record.work_id.clone();
         save_run(&tx, &record)?;
         log::append_from(
@@ -347,23 +340,7 @@ impl Store {
             vec![],
             at,
         )?;
-        if busy {
-            record = apply_signal_from(
-                &tx,
-                &self.blob_dir,
-                identity,
-                network,
-                &work_id,
-                Signal::Concluded {
-                    outcome: WorkOutcome::Interrupted,
-                    text: String::new(),
-                    reason: Some("这台电脑在这个对话里还有没做完的任务".into()),
-                    failure: None,
-                },
-                at,
-            )?
-            .0;
-        } else if record.kind == WorkKind::Task {
+        if record.kind == WorkKind::Task {
             scheduler::admit_from(
                 &tx,
                 network,

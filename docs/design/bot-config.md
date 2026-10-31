@@ -15,12 +15,12 @@ Bot 配置、共用 skill 库和 schedule 使用 [Node 协议](../node-protocol.
 
 ## 2. 事件
 
-新增一种事件，由会话的调度 Node 作为作者写入：
+聊天修改由会话的调度 Node 作为作者写入：
 
 ```text
 BotChanged {
 	change_id: String,        // (会话, trigger, call_ref) 派生，重试得到同一个 ID
-	cause: String,            // 触发本轮的本人消息的 message_id
+	cause: Option<Cause>,     // 本人消息所在会话与 message_id；自动提醒可为空
 	change: BotChange,
 }
 
@@ -28,7 +28,11 @@ BotChange =
 	| Profile { name, instructions, model: Option<ModelEdit>, skills: Option<SkillsEdit>, avatar: Option<AvatarEdit> }   // 目标 bot；skills 为 null 表示全部
 	| Skill { skill_id, before: Option<Skill>, after: Option<Skill> }     // after 为空表示删除
 	| Schedule { schedule_id, before: Option<Schedule>, after: Option<Schedule> }
+	| Memory { memory_id, before: Option<String>, after: Option<String>, base: MemoryBase, origin: Agent|Review, essential }
 
+Cause { conversation_id, message_id }
+MemoryBase { epoch, version: Option<MemoryVersion> }
+MemoryVersion { revision, control_revision, source_event_hash }
 Edit { before: String, after: String }
 ModelEdit { provider, before: String, after: String }   // 写入设备的 Provider；after 为空跟随设备默认
 SkillsEdit { before: Option<Set<skill_id>>, after: Option<Set<skill_id>> }
@@ -95,3 +99,7 @@ BotAvatarSet {
 - 修改卡片放在该轮回复之后，没有回复时放在本人消息之后。每项一行：图标、项目名、改前 → 改后。长相画出改前和改后两张静止的小脸，读屏读出具体变化，如“长相：圆、圆点眼、蓝色 → 云朵、大眼、紫色”。说明按行比较，只列增删的行。例行任务行显示频率和下次运行时间，详细内容折叠。
 - 被覆盖的修改：仲裁仍是 rank 大者胜。名称、说明、各 provider 的模型、启用的 skill 和长相各自按 rank 排出所有写入，最后一条即当前值。从它往前看相邻两条，后一条的 `before` 不等于前一条的 `after`（`BotAvatarSet` 比的是 `version` 与前一条事件 hash 的前 16 位），前一条就是没被看到就被覆盖了；遇到第一对看到了的就停。被覆盖的修改如果和当前值出自同一台设备，或值已经等于当前值，就不提示。结果只取决于已生效的事件集合，各副本一致，重放、重建都不会多出一条，也不写任何东西。被覆盖的修改在自己的卡片那一项下多一行：图标、哪台设备把哪个 Bot 的哪项改成了什么，以及“改回我的”。长相经面板的签名写入改回，其他项在这个 Bot 的聊天里发一条消息请它改回。之后任何人再改这一项，这行就消失。
 - 聊天标题旁的“Bot”面板列出名称、模型（为空显示“跟随设备”）、说明、例行任务和这个 bot 启用的 skill。模型和 skill 只在聊天里改，面板只展示。长相是例外：面板顶部有轮廓、眼睛、颜色三行可选项和“恢复默认”，预览脸静止，只有顶部的大脸动。点选即生效：写入期间挑选器标为忙碌并显示“正在换”；写入成功后 Node 返回的 bot 立即并入列表，长相版本一变临时选择就清掉，之后只显示列表里的长相，刷新失败不算没换成；写入失败时退回原样并提示；切换到别的 bot 时不带上上一个 bot 的选择。每行是一组单选，Tab 进入当前项，方向键在行内移动，空格或回车选定。没有写权限时只读。面板底部有“删除 bot”，点开后就地确认。
+
+## 6. 本人维护记忆
+
+Context 与 Bot 面板的记忆操作使用 `MemoryControlled {memory_id, base, after, attestation}`，不经模型。新增、编辑与删除共用 Required 用户签名，after 为空即保留受保护墓碑。自动 BotChanged 不能声明用户来源或保护位。完整版本、跨入口幂等与共享冲突规则见 [Agent 能力的记忆说明](agent-capabilities.md#3-记忆)。长相的 outbox 替换规则不适用于记忆，未知记忆请求必须先对账并保留原签名。
