@@ -9,8 +9,8 @@ import { EmptyState, SettingsGroup, SettingsRow, toast } from "@/components/app/
 import { BotFace, botMood } from "@/components/app/bot-face"
 import { terms } from "@/lib/glossary"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
-import { asProvider, providerNames, type ProviderId } from "@vibeface/client/lib/node.ts"
-import { botCopy, folderLabels, formatIn, formatWhen, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
+import { asProvider, providerNames } from "@vibeface/client/lib/node.ts"
+import { botCopy, botModelRows, folderLabels, formatIn, formatWhen, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
 import { messageOf } from "@vibeface/client/lib/node.ts"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -76,9 +76,8 @@ export function BotPanelButton() {
     setConfirming(null)
     window.setTimeout(drop, GAP_MS)
   }
-  // The provider the bot runs on now, with its model; without one known, every model the bot chose.
   const running = asProvider(ownerNode?.capabilities?.manager)
-  const models = running ? [[running, bot.models[running] ?? ""]] as [ProviderId, string][] : Object.entries(bot.models) as [ProviderId, string][]
+  const models = botModelRows(bot, running)
   const empty = view && !bot.instructions.trim() && !rows.length && !view.memory.length && !view.skills.length
   const deviceName = owner ? nodeName(owner, { nodes: workspace.nodes, directory }) : ""
   const mood = botMood(bot, workspace)

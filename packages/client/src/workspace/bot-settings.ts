@@ -1,9 +1,14 @@
 import type { TranscriptMessage } from "../chat/types.ts"
 import { projectName } from "./questions.ts"
-import type { BotChange, BotChangeRecord, BotProject, BotSchedule, BotSettings, NodeInfo, Overwritten, ScheduleView, SkillSet } from "./types.ts"
+import type { BotChange, BotChangeRecord, BotProject, BotRecord, BotSchedule, BotSettings, NodeInfo, Overwritten, ScheduleView, SkillSet } from "./types.ts"
 import type { Avatar } from "../avatar/face.ts"
 import { avatarWords } from "../avatar/pick.ts"
-import { providerNames } from "../lib/node.ts"
+import { providerIds, providerNames, type ProviderId } from "../lib/node.ts"
+
+export function botModelRows(bot: Pick<BotRecord, "models" | "reasoning_efforts">, running: ProviderId | null): [ProviderId, string][] {
+  return (running ? [running] : providerIds.filter((provider) => bot.models[provider] !== undefined || bot.reasoning_efforts?.[provider] !== undefined))
+    .map((provider) => [provider, bot.models[provider] ?? ""])
+}
 
 /** A bot's project folder and the folder a device runs its bots in are different places, so they never share a name. */
 export const folderLabels = { project: "项目文件夹", botRun: "Bot 运行目录" } as const

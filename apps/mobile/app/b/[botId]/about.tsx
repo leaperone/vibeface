@@ -2,8 +2,8 @@ import { Stack, useLocalSearchParams } from 'expo-router'
 import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, Cpu, FolderOpen, Inbox, Laptop, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, WifiOff, type LucideIcon } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Alert, Pressable, ScrollView, View } from 'react-native'
-import { botCopy, folderLabels, formatIn, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
-import { asProvider, messageOf, providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
+import { botCopy, botModelRows, folderLabels, formatIn, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
+import { asProvider, messageOf, providerNames } from '@vibeface/client/lib/node.ts'
 import type { BotProject, BotRecord } from '@vibeface/client/workspace/types.ts'
 import { useAvatarPick } from '@vibeface/client/avatar/pick.ts'
 import { AvatarPicker } from '@/components/avatar-picker'
@@ -43,9 +43,8 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
   const projectNow = bot.project ? projectKey(bot.project) : ''
   const owner = shared.conversationId === bot.conversation_id ? shared.data?.conversation?.owner : undefined
   const ownerNode = shared.nodes.find((node) => node.device_id === owner)
-  // The provider the bot runs on now, with its model; without one known, every model the bot chose.
   const running = asProvider(ownerNode?.capabilities?.manager)
-  const models = running ? [[running, bot.models[running] ?? '']] as [ProviderId, string][] : Object.entries(bot.models) as [ProviderId, string][]
+  const models = botModelRows(bot, running)
   const place = bot.project ? projectPlace(bot.project, owner, (id) => nodeName(id, lookup)) : ''
   const options: { key: string; project: BotProject | null; label: string }[] = [{ key: '', project: null, label: '不选' },
     ...(bot.project && !choices.some((item) => item.key === projectNow) ? [{ key: projectNow, project: bot.project, label: place }] : []), ...choices]

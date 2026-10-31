@@ -79,7 +79,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const tasks: TaskRow[] = works.map((work, index) => {
     const state = chatTaskState(work, works, workspace.nodes)
     const joined = work.turn_id ? works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id) : undefined
-    return { id: work.work_id, state: state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state, device: work.target_node, summary: taskProgress(work, workspace.liveProgress), agent: taskAgent(work, workspace.nodes), trigger: work.trigger, work, joined: joined?.title }
+    return { id: work.work_id, state: state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state, device: work.target_node, summary: taskProgress(work, workspace.liveProgress), agent: taskAgent(work), trigger: work.trigger, work, joined: joined?.title }
   })
   const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'waiting' || task.state === 'awaiting_children')
   const placed = new Set<string>()

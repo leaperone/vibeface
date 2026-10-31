@@ -1,7 +1,7 @@
-import { asProvider, type MembershipView, type ProviderId } from "../lib/node.ts"
+import { type MembershipView, type ProviderId } from "../lib/node.ts"
 import type { LiveProgress } from "../lib/progress.ts"
 import { confirmReason } from "./model.ts"
-import type { NodeInfo, WorkCard, WorkRecord } from "./types.ts"
+import type { NodeInfo, ResolvedModel, WorkCard, WorkRecord } from "./types.ts"
 
 const stateNames: Record<string, string> = {
   accepted: "已接收",
@@ -124,12 +124,8 @@ const progressStates: Record<string, string> = {
 }
 export const progressLabel = (status: string) => progressStates[status] ?? (/[\u4e00-\u9fff]/.test(status) ? status : "进行中")
 
-/**
- * Who runs a task, the same on every card: a provider names itself; an agent task runs as its device's bot turn, so
- * it names the provider that bot runs on there.
- */
-export const taskAgent = (work: Pick<WorkRecord, "kind" | "target_node">, nodes: readonly NodeInfo[]): ProviderId | null =>
-  work.kind === "task" ? asProvider(nodes.find((node) => node.device_id === work.target_node)?.capabilities?.manager) : work.kind ?? null
+export const taskAgent = (work: Pick<WorkCard, "kind"> & { resolved?: ResolvedModel }): ProviderId | null =>
+  work.kind === "task" ? work.resolved?.provider ?? null : work.kind ?? null
 /** A task's newest step: what it recorded, else the last line or status its device streams, as another device's bot records none. */
 export function taskProgress(work: Pick<WorkRecord, "work_id" | "target_node" | "summary">, live: readonly LiveProgress[]) {
   if (work.summary) return work.summary
