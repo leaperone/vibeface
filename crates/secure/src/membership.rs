@@ -555,10 +555,17 @@ impl GovernanceEvent {
                 view.pending.as_ref().map(|p| &p.checkpoint) == Some(checkpoint),
                 NO_RECOVERY_WAITING
             ),
-            GovernanceAction::Approve { checkpoint, .. } => ensure!(
-                view.pending.as_ref().map(|p| &p.checkpoint) == Some(checkpoint),
-                NO_RECOVERY_WAITING
-            ),
+            GovernanceAction::Approve { checkpoint, at_ms } => {
+                let pending = view
+                    .pending
+                    .as_ref()
+                    .filter(|pending| pending.checkpoint == *checkpoint)
+                    .context(NO_RECOVERY_WAITING)?;
+                ensure!(
+                    *at_ms < pending.effective_at_ms,
+                    "this recovery is already due"
+                );
+            }
         }
         Ok(Self {
             version: IDENTITY_VERSION,
@@ -2545,6 +2552,17 @@ mod tests {
                 },
             ),
             "management permission required",
+        );
+        refused(
+            GovernanceEvent::unsigned(
+                &view,
+                &id(&a),
+                GovernanceAction::Approve {
+                    checkpoint: checkpoint.hash()?,
+                    at_ms: T + RECOVERY_DELAY_MS,
+                },
+            ),
+            "this recovery is already due",
         );
 
         let due = T + RECOVERY_DELAY_MS;
