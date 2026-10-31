@@ -1,0 +1,142 @@
+name: Release Apps
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing version tag (for example v0.0.1-nightly.20261031.1)
+        required: true
+        type: string
+      prerelease:
+        description: Mark the GitHub Release as a prerelease
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  VERSION: ${{ inputs.version || github.ref_name }}
+
+jobs:
+  build-macos:
+    name: Build macOS App
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {persist-credentials: false}
+      - name: Validate version tag
+        run: |
+          [[ "$VERSION" == v* ]]
+          [[ "$VERSION" != *"/"* ]]
+      - name: Build Vibeface.app
+        run: scripts/build-macos-app.sh .artifacts/macos
+      - name: Sign and notarize when credentials are configured
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        shell: bash
+        run: |
+          if [[ -z "$MACOS_CERTIFICATE_P12_BASE64" || -z "$MACOS_CERTIFICATE_PASSWORD" || -z "$MACOS_SIGNING_IDENTITY" ]]; then
+            echo 'macOS signing skipped: Developer ID secrets are not configured.'
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/vibeface-signing.keychain-db"
+          password="$(openssl rand -hex 24)"
+          security create-keychain -p "$password" "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/vibeface.p12"
+          security import "$RUNNER_TEMP/vibeface.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -f pkcs12 -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          codesign --deep --force --options runtime --sign "$MACOS_SIGNING_IDENTITY" .artifacts/macos/Vibeface.app
+          if [[ -n "$APPLE_API_KEY_P8_BASE64" && -n "$APPLE_API_KEY_ID" && -n "$APPLE_API_ISSUER_ID" ]]; then
+            printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+            xcrun notarytool submit .artifacts/macos/Vibeface.app --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait
+          else
+            echo 'Apple notarization skipped: App Store Connect API key secrets are not configured.'
+          fi
+      - name: Package macOS assets and checksums
+        run: |
+          cd .artifacts/macos
+          ditto -c -k --sequesterRsrc --keepParent Vibeface.app "vibeface-${VERSION#v}-macos-arm64.zip"
+          hdiutil create -volname Vibeface -srcfolder Vibeface.app -ov -format UDZO "vibeface-${VERSION#v}-macos-arm64.dmg"
+          shasum -a 256 vibeface-*.zip > "vibeface-${VERSION#v}-macos-arm64.zip.sha256"
+          shasum -a 256 vibeface-*.dmg > "vibeface-${VERSION#v}-macos-arm64.dmg.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-macos-${{ github.sha }}
+          path: .artifacts/macos/vibeface-*
+          if-no-files-found: error
+
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {persist-credentials: false}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with: {targets: aarch64-linux-android,x86_64-linux-android}
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with: {version: 11.9.0}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '24', cache: pnpm, cache-dependency-path: pnpm-lock.yaml}
+      - name: Prepare Android toolchain
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          cargo install cargo-ndk --locked
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6
+      - run: pnpm install --frozen-lockfile
+      - run: scripts/build-mobile-secure.sh android
+      - name: Build release APK
+        working-directory: apps/mobile
+        run: |
+          npx expo prebuild --platform android --no-install
+          cd android && ./gradlew assembleRelease --build-cache -PreactNativeArchitectures=arm64-v8a,x86_64
+      - name: Package APK and checksum
+        run: |
+          mkdir -p .artifacts/android
+          cp apps/mobile/android/app/build/outputs/apk/release/app-release.apk ".artifacts/android/vibeface-${VERSION#v}-android.apk"
+          shasum -a 256 ".artifacts/android/vibeface-${VERSION#v}-android.apk" > ".artifacts/android/vibeface-${VERSION#v}-android.apk.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-android-${{ github.sha }}
+          path: .artifacts/android/vibeface-*
+          if-no-files-found: error
+
+  github-release:
+    name: Upload App assets to GitHub Release
+    needs: [build-macos, build-android]
+    if: ${{ !cancelled() && needs.build-macos.result == 'success' && needs.build-android.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-macos-${{ github.sha }}
+          path: release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-android-${{ github.sha }}
+          path: release
+      - name: Create or update draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: Vibeface ${{ env.VERSION }}
+          draft: true
+          prerelease: ${{ inputs.prerelease || startsWith(env.VERSION, 'v0.0.1-nightly.') }}
+          generate_release_notes: true
+          files: release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
