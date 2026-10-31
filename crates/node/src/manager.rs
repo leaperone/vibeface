@@ -153,6 +153,7 @@ pub type TurnRecorder = Arc<
 pub struct CodexTurn {
     pub client_id: String,
     pub record: TurnRecorder,
+    pub started: Option<agent::RunStarted>,
     /// The prompt for a new thread, sent instead when the resumed thread is gone: the turn's
     /// own prompt then leaves out what only the old thread had seen.
     pub fresh_prompt: Option<String>,
@@ -343,6 +344,22 @@ where
                     "Cursor SDK manager has no private native store",
                 )
             })?;
+            let native_run = Arc::new(std::sync::Mutex::new(None));
+            let run_started = config.codex_turn.as_ref().map(|turn| {
+                let native_run = native_run.clone();
+                let started = turn.started.clone();
+                let callback: agent::RunStarted = Arc::new(move |run_id| {
+                    *native_run.lock().expect("Cursor run") = Some(run_id.clone());
+                    let started = started.clone();
+                    Box::pin(async move {
+                        if let Some(started) = started {
+                            started(run_id).await?;
+                        }
+                        Ok(())
+                    })
+                });
+                callback
+            });
             let turn = SdkTurn {
                 owner: owner.into(),
                 executable: sdk_bin.clone(),
@@ -355,9 +372,9 @@ where
                 custom_tools: config.custom_tools.clone(),
                 callback_token: config.tool_token.clone(),
                 process_started: config.process_started.clone(),
-                run_started: None,
+                run_started,
             };
-            bridge
+            let result = bridge
                 .run(
                     &turn,
                     prompt,
@@ -367,7 +384,7 @@ where
                     progress,
                 )
                 .await
-                .map_err(|error| {
+                .map_err(|error| -> anyhow::Error {
                     ManagerError {
                         outcome: error.outcome,
                         start: error.start,
@@ -375,7 +392,15 @@ where
                         failure: error.failure,
                     }
                     .into()
-                })
+                })?;
+            let run_id = native_run.lock().expect("Cursor run").take();
+            if let (Some(turn), Some(session), Some(run_id)) =
+                (&config.codex_turn, result.session_id.as_ref(), run_id)
+                && let Err(error) = (turn.record)(session.clone(), Some(run_id)).await
+            {
+                tracing::warn!(event = "cursor.turn_unrecorded", %error, "the next Cursor turn repeats what this one was shown");
+            }
+            Ok(result)
         }
         Sdk::Codex { socket, launch } => {
             if let (Some(lease), Some(turn)) = (launch, &config.codex_turn) {
@@ -1505,6 +1530,7 @@ mod tests {
             tool_token: Some("turn-token-secret".into()),
             codex_turn: Some(CodexTurn {
                 client_id: "attempt-1".into(),
+                started: None,
                 record: Arc::new(move |thread, turn| {
                     record.lock().unwrap().push((thread, turn));
                     Box::pin(async { Ok(()) })
@@ -1635,6 +1661,7 @@ mod tests {
         let config = ManagerConfig {
             codex_turn: Some(CodexTurn {
                 client_id: "attempt-1".into(),
+                started: None,
                 record: Arc::new(|_, _| Box::pin(async { Ok(()) })),
                 fresh_prompt: Some("full context".into()),
             }),
@@ -1686,6 +1713,7 @@ mod tests {
         config.timeout_secs = 30;
         config.codex_turn = Some(CodexTurn {
             client_id: client.into(),
+            started: None,
             record: Arc::new(|_, _| Box::pin(async { Ok(()) })),
             fresh_prompt: None,
         });

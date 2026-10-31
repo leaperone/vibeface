@@ -317,6 +317,13 @@ impl Opencode {
             .remove(&format!("work:{work_id}"));
     }
 
+    pub(crate) fn release_manager(&self, session: &str) {
+        self.unresolved_uses
+            .lock()
+            .expect("unresolved uses")
+            .remove(&format!("session:{session}"));
+    }
+
     /// Stops the serve; the Node calls this when it shuts down.
     pub(crate) async fn stop(&self) {
         if let Some(serve) = self.serve.lock().await.take() {
@@ -843,6 +850,27 @@ impl Opencode {
         Ok(Some(messages))
     }
 
+    pub(crate) async fn manager_running(&self, session: &str) -> Option<bool> {
+        let conn = {
+            let mut serve = self.serve.lock().await;
+            let Some(serve) = serve.as_mut() else {
+                return Some(false);
+            };
+            match serve.child.try_wait() {
+                Ok(None) => serve.conn.clone(),
+                Ok(Some(_)) => return Some(false),
+                Err(_) => return None,
+            }
+        };
+        if self.session(&conn, session).await.ok()?.is_none() {
+            return Some(false);
+        }
+        if self.busy(&conn, session).await.ok()? {
+            return Some(true);
+        }
+        Some(!self.inbox(&conn, session).await.ok()?.is_empty())
+    }
+
     /// Whether no run or queued input remains in a reply's session; a running turn is aborted. Runs
     /// end with their serve, and the Node stops the serve of an earlier run when it opens.
     pub(crate) async fn run_ended(&self, session: &str) -> bool {
@@ -870,10 +898,7 @@ impl Opencode {
         }
         .await;
         if ended {
-            self.unresolved_uses
-                .lock()
-                .expect("unresolved uses")
-                .remove(&format!("session:{session}"));
+            self.release_manager(session);
         }
         ended
     }
@@ -1951,6 +1976,7 @@ mod tests {
         peak_active: usize,
         interrupted: Vec<String>,
         environment_failure: bool,
+        unavailable: bool,
         ids: usize,
     }
 
@@ -2072,6 +2098,10 @@ mod tests {
         request: Request,
         next: axum::middleware::Next,
     ) -> Response {
+        let unavailable = api.fake.lock().unwrap().unavailable;
+        if unavailable {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         let password = std::fs::read_to_string(api.dir.join("password")).unwrap_or_default();
         let expected =
             base64::engine::general_purpose::STANDARD.encode(format!("opencode:{password}"));
@@ -2466,6 +2496,7 @@ mod tests {
             process_started: None,
             codex_turn: Some(CodexTurn {
                 client_id: client.into(),
+                started: None,
                 record: Arc::new(move |session, turn| {
                     turns.lock().unwrap().push((session, turn));
                     Box::pin(async { anyhow::Ok(()) })
@@ -3354,6 +3385,77 @@ mod tests {
         crate::work::transition(&mut work, Signal::ThreadCreated(session));
         let probe = server.probe(&work).await?;
         assert!(matches!(probe, Probe::Running { .. }), "{probe:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_manager_confirmation_releases_opencode_hold_but_refuses_live_or_queued_input()
+    -> Result<()> {
+        for observable in [true, false] {
+            let place = Place::new().await?;
+            let (node, admin, data) = super::super::triage::tests::node().await?;
+            let server = node.opencode.clone();
+            server.set_launch(fixture(), place.env());
+            let (conn, serving) = server.conn().await?;
+            let session = server
+                .create(&conn, place.dir.to_str().unwrap(), None)
+                .await
+                .expect("fixture session");
+            assert!(matches!(
+                server
+                    .send(&conn, &session, &json!({"id":"turn","text":"HOLD"}))
+                    .await,
+                Sent::Taken
+            ));
+            let (access, check) = super::super::manager_control::tests::pending_manager(
+                &node, &admin, SERVER, &session,
+            )
+            .await?;
+            let start = std::sync::Mutex::new(manager::StartEvidence::Started);
+            drop(TurnGuard {
+                owner: &server,
+                session: session.clone(),
+                events: tokio::spawn(async {}),
+                serving: Some(serving),
+                start: &start,
+                terminal: false,
+            });
+            let mut expected = server.launch.lock().expect("launch").current.clone();
+            expected
+                .env
+                .insert("VIBEFACE_FAKE_LAUNCH".into(), "manual-confirmation".into());
+            server.set_launch(expected.bin.clone(), expected.env.clone());
+            let input = json!({"conversation_id":"c","check_id":check.check_id});
+            assert!(node.resolve_check(&access, &input).await.is_err());
+            server
+                .send(&conn, &session, &json!({"id":"queued","text":"INBOX"}))
+                .await;
+            place
+                .fake
+                .lock()
+                .unwrap()
+                .sessions
+                .get_mut(&session)
+                .unwrap()
+                .busy = false;
+            assert!(node.resolve_check(&access, &input).await.is_err());
+            assert_eq!(node.store.lock().await.pending_checks()?.len(), 1);
+            assert_eq!(server.users.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(server.configuration_pending(&expected.bin, &expected.env));
+            {
+                let mut fake = place.fake.lock().unwrap();
+                fake.sessions.get_mut(&session).unwrap().inbox.clear();
+                fake.unavailable = !observable;
+            }
+            assert_eq!(node.resolve_check(&access, &input).await?["resolved"], true);
+            assert!(node.store.lock().await.pending_checks()?.is_empty());
+            assert_eq!(server.users.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(!server.configuration_pending(&expected.bin, &expected.env));
+            server.release_manager(&session);
+            node.shutdown().await;
+            drop(node);
+            std::fs::remove_dir_all(data)?;
+        }
         Ok(())
     }
 

@@ -26,11 +26,18 @@ fn last_answer(turn: &Value) -> String {
 }
 
 fn missing_thread(error: &CodexError) -> bool {
-    error.answered
-        && error
-            .message
-            .to_ascii_lowercase()
-            .starts_with("thread not found")
+    if !error.answered {
+        return false;
+    }
+    let missing = |message: &str| message.to_ascii_lowercase().starts_with("thread not found");
+    if let Some(body) = error.message.strip_prefix("Codex rejected request: ") {
+        let Ok(body) = serde_json::from_str::<Value>(body) else {
+            return false;
+        };
+        body["message"].as_str().is_some_and(missing)
+    } else {
+        missing(&error.message)
+    }
 }
 
 /// Whether a turn carries the user message the caller sent with this `clientUserMessageId`.
@@ -921,6 +928,10 @@ impl CodexServer {
         self.inner.release(&format!("work:{work_id}"));
     }
 
+    pub(crate) fn release_manager(&self, attempt_id: &str) {
+        self.inner.release(&format!("manager:{attempt_id}"));
+    }
+
     pub(crate) fn configuration_pending(&self, expected: &CodexTarget) -> bool {
         let target = self.inner.target.lock().expect("target lock");
         target.current != *expected
@@ -1074,6 +1085,18 @@ mod tests {
         assert!(!missing_thread(&error("authentication required", true)));
         assert!(!missing_thread(&error("server request rejected", true)));
         assert!(!missing_thread(&error("thread not found", false)));
+        let wrapped =
+            r#"Codex rejected request: {"code":-32602,"message":"thread not found: fixture"}"#;
+        assert!(missing_thread(&error(wrapped, true)));
+        assert!(!missing_thread(&error(wrapped, false)));
+        assert!(!missing_thread(&error(
+            r#"Codex rejected request: {"message":"authentication failed while reading thread not found"}"#,
+            true
+        )));
+        assert!(!missing_thread(&error(
+            "Codex rejected request: not-json",
+            true
+        )));
     }
 
     #[test]
@@ -1197,11 +1220,16 @@ mod tests {
         Ok((program, out))
     }
 
-    fn system_app_server(socket: &Path, user_agent: &'static str) -> tokio::task::JoinHandle<()> {
+    fn system_app_server(
+        socket: &Path,
+        user_agent: &'static str,
+        turn: Option<Arc<std::sync::Mutex<Value>>>,
+    ) -> tokio::task::JoinHandle<()> {
         let listener = tokio::net::UnixListener::bind(socket).expect("fixture socket");
         tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             while let Ok((stream, _)) = listener.accept().await {
+                let turn = turn.clone();
                 connections.spawn(async move {
                     let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
                         return;
@@ -1215,6 +1243,14 @@ mod tests {
                             let reply =
                                 json!({"id":request["id"],"result":{"userAgent":user_agent}});
                             let _ = server.send(reply.to_string().into()).await;
+                        } else if request["method"] == "thread/read" && let Some(turn) = &turn {
+                            let turn = turn.lock().unwrap().clone();
+                            let reply = if turn.is_null() {
+                                json!({"id":request["id"],"error":{"code":-32000,"message":"fixture unavailable"}})
+                            } else {
+                                json!({"id":request["id"],"result":{"thread":{"turns":[turn]}}})
+                            };
+                            let _ = server.send(reply.to_string().into()).await;
                         }
                     }
                 });
@@ -1224,6 +1260,64 @@ mod tests {
 
     fn stale_socket(path: &Path) -> Result<()> {
         drop(std::os::unix::net::UnixListener::bind(path)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_manager_confirmation_releases_codex_hold_but_refuses_a_live_turn() -> Result<()>
+    {
+        for completed in [true, false] {
+            let (node, admin, data) = super::super::triage::tests::node().await?;
+            let sockets = sockets()?;
+            let socket = sockets.join("manager.sock");
+            let turn = Arc::new(std::sync::Mutex::new(
+                json!({"id":"turn","status":"inProgress","items":[]}),
+            ));
+            let fixture = system_app_server(&socket, "codex/manual-check", Some(turn.clone()));
+            let target = CodexTarget::System(socket);
+            node.codex.retarget(target.clone());
+            node.codex.start();
+            link_becomes(&node.codex, |link| matches!(link, Link::Connected { .. })).await;
+            let (access, check) = super::super::manager_control::tests::pending_manager(
+                &node, &admin, "system", "thread",
+            )
+            .await?;
+            let mut lease = node
+                .codex
+                .lease(format!("manager:{}", check.attempt_id), &target)?;
+            lease.retain_until_read_back();
+            drop(lease);
+            node.codex.retarget(CodexTarget::Off);
+            let input = json!({"conversation_id":"c","check_id":check.check_id});
+            let mut agent = access.clone();
+            agent.human = false;
+            assert!(node.resolve_check(&agent, &input).await.is_err());
+            assert!(node.resolve_check(&access, &input).await.is_err());
+            assert_eq!(node.store.lock().await.pending_checks()?.len(), 1);
+            assert!(
+                node.codex
+                    .inner
+                    .target
+                    .lock()
+                    .unwrap()
+                    .leases
+                    .contains(&format!("manager:{}", check.attempt_id))
+            );
+            *turn.lock().unwrap() = if completed {
+                json!({"id":"turn","status":"completed","items":[]})
+            } else {
+                Value::Null
+            };
+            assert_eq!(node.resolve_check(&access, &input).await?["resolved"], true);
+            assert!(node.store.lock().await.pending_checks()?.is_empty());
+            assert!(node.codex.inner.target.lock().unwrap().leases.is_empty());
+            node.codex.release_manager(&check.attempt_id);
+            node.shutdown().await;
+            fixture.abort();
+            drop(node);
+            std::fs::remove_dir_all(data)?;
+            std::fs::remove_dir_all(sockets)?;
+        }
         Ok(())
     }
 
@@ -1342,7 +1436,7 @@ mod tests {
             dir.join("mute.sock"),
         );
         stale_socket(&stale)?;
-        let fixture = system_app_server(&live, "codex/fixture");
+        let fixture = system_app_server(&live, "codex/fixture", None);
         let found = discover(&[missing.clone(), stale.clone(), live.clone()]).await;
         assert_eq!(
             found,
@@ -1387,7 +1481,7 @@ mod tests {
             sockets.join("second.sock"),
         );
         stale_socket(&stale)?;
-        let fixture = system_app_server(&first, "codex/first");
+        let fixture = system_app_server(&first, "codex/first", None);
         std::os::unix::fs::symlink(&first, &control)?;
         let local = Local {
             switches: crate::providers::Providers {
@@ -1427,7 +1521,7 @@ mod tests {
         let _ = fixture.await;
         std::fs::remove_file(&first)?;
         link_becomes(&server, |link| !matches!(link, Link::Connected { .. })).await;
-        let restarted = system_app_server(&second, "codex/second");
+        let restarted = system_app_server(&second, "codex/second", None);
         std::fs::remove_file(&control)?;
         std::os::unix::fs::symlink(&second, &control)?;
         link_becomes(&server, |link| {

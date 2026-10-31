@@ -1428,6 +1428,7 @@ mod tests {
             let turns = turns.clone();
             CodexTurn {
                 client_id: "client".into(),
+                started: None,
                 record: Arc::new(move |session, turn| {
                     turns.lock().unwrap().push((session, turn));
                     Box::pin(async { anyhow::Ok(()) })
@@ -1460,6 +1461,7 @@ mod tests {
         config.provider_env = gated_env(dir, mode);
         config.codex_turn = Some(CodexTurn {
             client_id: client.into(),
+            started: None,
             record: Arc::new(|_, _| Box::pin(async { anyhow::Ok(()) })),
             fresh_prompt: None,
         });
