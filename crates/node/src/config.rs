@@ -8,11 +8,11 @@ use std::{
 };
 
 /// Bumped whenever stored data stops being readable by the previous build.
-pub const DATA_EPOCH: u32 = 10;
+pub const DATA_EPOCH: u32 = 11;
 /// SHA-256 over the migration files (`migrations/*.sql`, by name) that `DATA_EPOCH` stores.
 /// Any schema change fails a test until both constants change together.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
-    "8221837230cd137491e7b0f63d0c2a2fd2d981637b969d8130fa603565b55aec";
+    "67eaf7ba9a422bf6e801abb41f93362a5536663e931421e1c12c4717e2032856";
 /// Bumped whenever a release package stops being installable by the previous updater.
 pub const UPDATE_PROTOCOL: u32 = 1;
 pub fn data_epoch_marker() -> Vec<u8> {

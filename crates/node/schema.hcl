@@ -492,6 +492,10 @@ table "memories" {
     null = false
     type = text
   }
+  column "control_revision" {
+    null = false
+    type = integer
+  }
   column "origin" {
     null = false
     type = text
@@ -505,11 +509,11 @@ table "memories" {
     type = integer
   }
   column "source_event_hash" {
-    null = true
+    null = false
     type = text
   }
   primary_key {
-    columns = [column.network_id, column.memory_id]
+    columns = [column.network_id, column.conversation_id, column.memory_id]
   }
   index "memories_conversation" {
     columns = [column.network_id, column.conversation_id]
