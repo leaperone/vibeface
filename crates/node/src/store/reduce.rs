@@ -328,6 +328,7 @@ pub(crate) fn apply(
                     name,
                     instructions,
                     model,
+                    reasoning_effort,
                     skills,
                     avatar,
                 } => {
@@ -336,6 +337,12 @@ pub(crate) fn apply(
                         connection.execute(
                             "INSERT INTO bot_models(network_id,conversation_id,provider,model,rank) VALUES(?,?,?,?,?) ON CONFLICT(network_id,conversation_id,provider) DO UPDATE SET model=excluded.model,rank=excluded.rank WHERE excluded.rank>rank",
                             params![network, scope, serde_json::to_value(model.provider)?.as_str(), model.after, rank],
+                        )?;
+                    }
+                    if let Some(edit) = reasoning_effort {
+                        connection.execute(
+                            "INSERT INTO bot_profiles(network_id,conversation_id,field,value,rank) VALUES(?,?,?,?,?) ON CONFLICT(network_id,conversation_id,field) DO UPDATE SET value=excluded.value,rank=excluded.rank WHERE excluded.rank>rank",
+                            params![network, scope, format!("reasoning_effort:{}", edit.provider.name()), serde_json::to_string(&edit.after)?, rank],
                         )?;
                     }
                     let fields = [

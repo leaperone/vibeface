@@ -6,6 +6,24 @@ use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ProviderStage {
+    Validate,
+    Install,
+    Launch,
+    Authentication,
+    ModelList,
+    SessionStart,
+    TurnStart,
+    Run,
+    ReadBack,
+    Interrupt,
+    Compact,
+    Handoff,
+    Record,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FailureKind {
     /// The AI provider has no key, or it is malformed.
     MissingKey,
@@ -168,6 +186,23 @@ mod tests {
     use super::*;
     use FailureKind::*;
     use serde_json::json;
+
+    #[test]
+    fn lifecycle_stages_serialize_independently_of_failure_kinds() {
+        for (stage, name) in [
+            (ProviderStage::Authentication, "authentication"),
+            (ProviderStage::ModelList, "model_list"),
+            (ProviderStage::TurnStart, "turn_start"),
+            (ProviderStage::ReadBack, "read_back"),
+            (ProviderStage::Interrupt, "interrupt"),
+        ] {
+            assert_eq!(serde_json::to_value(stage).unwrap(), json!(name));
+            assert_eq!(
+                serde_json::from_value::<ProviderStage>(json!(name)).unwrap(),
+                stage
+            );
+        }
+    }
 
     #[test]
     fn upstream_wording_names_its_kind() {

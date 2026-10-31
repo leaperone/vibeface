@@ -1128,6 +1128,8 @@ fn init(options: Init) -> Result<()> {
                 .canonicalize()
                 .context("resolve manager workspace")?,
             model: manager.model(options.model.as_deref().unwrap_or_default()),
+            reasoning_effort: None,
+            backup: Default::default(),
         });
     }
     let mut env = vibeface::providers::ProviderEnv::default();
@@ -1656,7 +1658,6 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
         arguments.is_object(),
         "tool arguments must be a JSON object"
     );
-    let tool = vibeface::tools::Tool::parse(&name).context("unknown coordination tool")?;
     let argument_ref = arguments["call_ref"].as_str();
     ensure!(
         call_ref
@@ -1666,21 +1667,42 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
         "--call-ref must match arguments.call_ref"
     );
     let call_ref = call_ref.or_else(|| argument_ref.map(String::from));
-    ensure!(
-        !tool.needs_call_ref() || call_ref.is_some(),
-        "{name} requires --call-ref; keep it and query call_lookup after any uncertain result"
-    );
     if let Some(call_ref) = &call_ref {
         arguments["call_ref"] = json!(call_ref);
     }
-    let call_id = call_ref.unwrap_or_default();
+    let (tool, arguments) =
+        vibeface::tools::Tool::invocation(&name, arguments.clone()).map_err(|error| {
+            let failure =
+                vibeface::tools::ToolFailure::new(&name, &arguments, "validation", false, &error);
+            eprintln!("{}", failure.response);
+            anyhow::Error::new(failure)
+        })?;
+    let call_id = arguments["call_ref"].as_str().unwrap_or_default();
     let result = if tool == vibeface::tools::Tool::DispatchWork {
         let socket = std::env::var_os("VIBEFACE_CODEX_SOCKET")
             .context("VIBEFACE_CODEX_SOCKET is required")?;
-        dispatch_work(&arguments, &call_id, Path::new(&socket)).await?
+        dispatch_work(&arguments, call_id, Path::new(&socket)).await
     } else {
-        post_tool(&name, arguments, &call_id).await?
-    };
+        post_tool(tool.name(), arguments.clone(), call_id).await
+    }
+    .map_err(|error| {
+        if error
+            .downcast_ref::<vibeface::tools::ToolFailure>()
+            .is_some()
+        {
+            return error;
+        }
+        let failure = vibeface::tools::ToolFailure::new(
+            tool.name(),
+            &arguments,
+            "execution",
+            tool.effect() != vibeface::tools::Effect::Read,
+            &error,
+        );
+        eprintln!("{}", failure.response);
+        anyhow::Error::new(failure)
+    })?;
+    let result = tool.annotate(&arguments, result);
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
@@ -1725,10 +1747,20 @@ async fn post_tool(name: &str, arguments: Value, call_id: &str) -> Result<Value>
         .json(&json!({"toolName": name, "args": arguments, "agentId": "cli"}))
         .send()
         .await
-        .with_context(|| format!("reach local node tool API; preserve call_ref {call_id} and query call_lookup before retrying"))?;
+        .map_err(|error| {
+            let error = anyhow::Error::new(error).context(format!("reach local node tool API; preserve call_ref {call_id} and query call_lookup before retrying"));
+            let failure = vibeface::tools::ToolFailure::new(name, &arguments, "transport", true, &error);
+            eprintln!("{}", failure.response);
+            anyhow::Error::new(failure)
+        })?;
     let status = response.status();
     let body = bounded_body(response).await?;
     if !status.is_success() {
+        if let Ok(error) = serde_json::from_slice::<Value>(&body)
+            && error.get("call_record").is_some()
+        {
+            eprintln!("{}", serde_json::to_string(&error)?);
+        }
         let reason = serde_json::from_slice::<Value>(&body)
             .ok()
             .and_then(|error| error["error"].as_str().map(str::to_owned))

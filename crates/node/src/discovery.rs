@@ -689,6 +689,8 @@ mod tests {
             provider: Provider::Cursor,
             workspace: root.clone(),
             model: "auto".into(),
+            reasoning_effort: None,
+            backup: Default::default(),
         });
         let (mut local, mut triage) = (local(), TriageConfig::default());
         let found = missing(

@@ -4,6 +4,7 @@ import { useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { failureText, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
+import { botProviderNotice, canRetryJob, runtimeLabel } from '@vibeface/client/chat/protocol.ts'
 import { providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
 import { changeTitle, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { chatTaskState, interruptedCopy, nodeName, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
@@ -39,7 +40,7 @@ export function confirmText(check: Pick<WorkCheck, 'reason' | 'detail'>, device:
  * What the chat shows besides messages, as on the web: tasks after the message that started them, what a turn changed
  * after its reply, and everything waiting on the person (a device to take over, results to confirm) at the end.
  */
-export function useChatExtras(conversationId: string, botId: string) {
+export function useChatExtras(conversationId: string, botId: string, edit?: (text: string) => void) {
   const shared = useLive()
   const { directory } = useDevice()
   const data = shared && shared.conversationId === conversationId ? shared.data : null
@@ -64,7 +65,19 @@ export function useChatExtras(conversationId: string, botId: string) {
     add(cause && shown.has(cause) ? cause : undefined, { key: `task:${work.work_id}`, node: <TaskCard work={work} state={shownAs} stale={taskStale(shownAs, shared.connectionOnline)} away={shownAs === 'dispatch_waiting' && shared.nodes.some((node) => node.device_id === work.target_node && !node.online)} joined={joined} botId={botId} device={nodeName(work.target_node, lookup)} agent={taskAgent(work, shared.nodes)} progress={taskProgress(work, shared.liveProgress)} /> })
   })
   for (const job of jobs) {
-    if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '')) add(job.message_id, { key: `job:${job.trigger}`, node: <JobLine job={job} /> })
+    const at = job.reply_message_id && shown.has(job.reply_message_id) ? job.reply_message_id : job.message_id
+    if (job.runtime) add(at, { key: `runtime:${job.trigger}`, node: <Text className="text-meta text-muted-foreground">{runtimeLabel(job.runtime)}</Text> })
+    if (job.state === 'reconciling' || job.pending_check) cards.push(<ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => shared.refresh()}>再查一次</ActionButton>}><Text className="text-meta text-muted-foreground">设备正在查询上次回复，系统不会自动重发。</Text></ActionCard>)
+    const message = data.messages.find((message) => message.message_id === job.message_id && message.role === 'user')
+    if (job.state === 'queued' && message) add(job.message_id, { key: `queued:${job.trigger}`, node: <View className="flex-row flex-wrap gap-2">
+      <ActionButton variant="ghost" disabled={!shared.writable} action={() => shared.cancelManager(job.trigger)}>取消排队</ActionButton>
+      {!message.attachments?.length && edit ? <ActionButton variant="ghost" disabled={!shared.writable} action={async () => {
+        if (!await shared.cancelManager(job.trigger)) throw new Error('还没确认取消，请先再查一次。')
+        edit(message.text)
+      }}>取消并编辑重发</ActionButton> : null}
+      <ActionButton variant="ghost" action={() => shared.refresh()}>再查一次</ActionButton>
+    </View> })
+    if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id)) add(at, { key: `job:${job.trigger}`, node: <JobLine job={job} /> })
   }
   const changes = placeChanges(data.messages, data.changes)
   const schedules = data.bot_settings.schedules
@@ -72,6 +85,9 @@ export function useChatExtras(conversationId: string, botId: string) {
   for (const [at, turns] of changes.after) for (const records of turns) add(at, changeRow(records))
   const first = changes.first.map(changeRow)
 
+  if (shared.messagePending && !shared.messageBusy) cards.push(<PendingMessageCard key="undelivered" />)
+  const providerNotice = botProviderNotice(shared.nodes, data.conversation?.owner)
+  if (providerNotice) cards.push(<View key="provider" role="status"><Text className="text-meta text-muted-foreground">{providerNotice}</Text><ActionButton variant="ghost" action={() => shared.refresh()}>再查一次</ActionButton></View>)
   const owner = data.conversation?.owner
   const here = shared.nodes.find((node) => node.device_id === data.local_node)
   if (owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !shared.nodes.some((node) => node.device_id === owner && node.online && !node.revoked)) {
@@ -131,10 +147,13 @@ function TaskCard({ work, state, stale, away, joined, botId, device, agent, prog
 }
 
 function JobLine({ job }: { job: ManagerJob }) {
+  const shared = useLive()
   const reason = job.failure ? cause(job.failure.kind, job.failure.detail) : ''
+  const message = shared?.data?.messages.find((message) => message.message_id === job.message_id && message.role === 'user')
   return <View className="flex-row flex-wrap items-center gap-x-2 gap-y-1">
     <View className="flex-row items-center gap-1"><Icon as={CircleX} className="size-4 text-danger" /><Text className="text-meta text-danger">Bot 没能回复</Text></View>
     {reason ? <Text className="shrink text-meta text-muted-foreground">{reason}</Text> : null}
+    {shared ? canRetryJob(job) && message && !message.attachments?.length ? <ActionButton variant="ghost" disabled={!shared.writable} action={() => shared.sendMessage(message.text)}>再发一次</ActionButton> : <ActionButton variant="ghost" action={() => shared.refresh()}>再查一次</ActionButton> : null}
   </View>
 }
 
@@ -198,6 +217,7 @@ function ChangeRows({ change, conversationId, schedules, overwritten }: { change
         {note('instructions')}
       </ChangeRow> : null}
       {change.model ? <ChangeRow icon={Cpu} label="模型" tag={providerNames[change.model.provider]}><BeforeAfter before={change.model.before || '设备默认'} after={change.model.after || '设备默认'} />{note('model')}</ChangeRow> : null}
+      {change.reasoning_effort ? <ChangeRow icon={Cpu} label="推理强度" tag={providerNames[change.reasoning_effort.provider]}><BeforeAfter before={change.reasoning_effort.before || '设备默认'} after={change.reasoning_effort.after || '设备默认'} />{note('reasoning_effort')}</ChangeRow> : null}
       {change.skills ? <ChangeRow icon={BookOpen} label="Skill"><BeforeAfter before={skillCount(change.skills.before)} after={skillCount(change.skills.after)} />{note('skills')}</ChangeRow> : null}
       {change.avatar ? <ChangeRow icon={Smile} label="长相"><AvatarChange edit={change.avatar} conversationId={conversationId} />{note('avatar')}</ChangeRow> : null}
     </>
@@ -276,4 +296,18 @@ function BeforeAfter({ before, after }: { before: string; after: string }) {
     <Icon as={ArrowRight} accessibilityLabel="改为" className="size-4 text-muted-foreground" />
     <Text>{after}</Text>
   </View>
+}
+
+export function PendingMessageCard() {
+  const shared = useLive()
+  const pending = shared?.messagePending
+  if (!shared || !pending || shared.messageBusy) return null
+  return <ActionCard icon={CircleQuestionMark} title="消息可能没送达" actions={<>
+    <ActionButton variant="ghost" disabled={!shared.writable || pending.rejected === undefined} action={() => shared.releaseMessagePending()}>不发了</ActionButton>
+    <ActionButton variant="ghost" action={() => shared.refresh()}>再查一次</ActionButton>
+    <ActionButton disabled={!shared.writable || shared.incomplete} action={() => shared.sendMessage(pending.text)}>重新发送</ActionButton>
+  </>}>
+    <Text numberOfLines={3} className="text-meta text-muted-foreground">{pending.text}</Text>
+    <Text className="text-meta text-muted-foreground">{pending.rejected === undefined ? '结果未知，重新发送会沿用原消息编号。只有设备明确拒绝后才可放弃。' : pending.rejected}</Text>
+  </ActionCard>
 }

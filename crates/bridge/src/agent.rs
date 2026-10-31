@@ -1,4 +1,4 @@
-use crate::failure::{ExecFailure, FailureKind};
+use crate::failure::{ExecFailure, FailureKind, ProviderStage};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -97,7 +97,8 @@ pub enum AgentFailure {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StartEvidence {
     NotStarted,
     Started,
@@ -106,6 +107,7 @@ pub enum StartEvidence {
 
 #[derive(Debug)]
 pub struct AgentRunError {
+    pub stage: ProviderStage,
     pub outcome: AgentFailure,
     pub start: StartEvidence,
     pub session_id: Option<String>,
@@ -541,10 +543,14 @@ impl SdkBridge {
         P: FnMut(Value) -> PF,
         PF: Future<Output = Result<()>>,
     {
+        let stage = Arc::new(std::sync::Mutex::new(ProviderStage::Validate));
         let not_sent = |outcome, failure: ExecFailure| {
             let mut secrets = self.secrets(&turn.api_key, &turn.env, "");
             secrets.extend(turn.callback_token.as_deref());
             AgentRunError {
+                stage: *stage
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
                 outcome,
                 start: StartEvidence::NotStarted,
                 session_id: previous_session_id.map(str::to_owned),
@@ -587,6 +593,7 @@ impl SdkBridge {
             owner: owner_slot.clone(),
             _permit: permit,
         };
+        *stage.lock().unwrap() = ProviderStage::Launch;
         let admission = tokio::select! {
             admitted = self.admit(
                 &owner_slot,
@@ -608,6 +615,7 @@ impl SdkBridge {
             },
             None => None,
         };
+        *stage.lock().unwrap() = ProviderStage::Record;
         if let Some(record) = &turn.process_started
             && let Err(error) = record(live.group).await
         {
@@ -625,6 +633,20 @@ impl SdkBridge {
         let mut agent_id = previous_session_id.map(str::to_owned);
         let mut state = RunState::default();
         let mut send_started = false;
+        let record_stage = stage.clone();
+        let run_started = turn.run_started.clone();
+        let run_started: RunStarted = Arc::new(move |run| {
+            let stage = record_stage.clone();
+            let record = run_started.clone();
+            Box::pin(async move {
+                *stage.lock().unwrap() = ProviderStage::Record;
+                if let Some(record) = record {
+                    record(run).await?;
+                }
+                *stage.lock().unwrap() = ProviderStage::Run;
+                Ok(())
+            })
+        });
         let operation = async {
             let options = sdk_options(turn)?;
             if let Some(token) = &turn.callback_token {
@@ -636,6 +658,7 @@ impl SdkBridge {
                 )
                 .await?;
             }
+            *stage.lock().unwrap() = ProviderStage::SessionStart;
             let reply = if let Some(id) = previous_session_id {
                 rpc.unary(
                     AGENT_SERVICE,
@@ -656,9 +679,11 @@ impl SdkBridge {
                 ensure!(previous == id, "Cursor SDK resumed a different agent");
             }
             agent_id = Some(id.to_owned());
+            *stage.lock().unwrap() = ProviderStage::Record;
             persist_session(id.to_owned())
                 .await
                 .context("persist Cursor SDK session before sending management prompt")?;
+            *stage.lock().unwrap() = ProviderStage::TurnStart;
             send_started = true;
             let mut pending_text = BTreeMap::new();
             let mut emit_progress =
@@ -668,7 +693,7 @@ impl SdkBridge {
                 prompt,
                 &mut state,
                 &mut emit_progress,
-                turn.run_started.as_ref(),
+                Some(&run_started),
             )
             .await?;
             let mut result = state.finish(id)?;
@@ -688,6 +713,7 @@ impl SdkBridge {
                 Err(ExecFailure::new(FailureKind::Lost, "Cursor SDK bridge exited unexpectedly; completion is unknown"))
             }
             _ = wait_for_cancel(&mut cancel) => {
+                *stage.lock().unwrap() = ProviderStage::Interrupt;
                 cancellation_requested = true;
                 Err(ExecFailure::new(FailureKind::Unknown, "Cursor SDK management cancellation requested"))
             }
@@ -756,6 +782,9 @@ impl SdkBridge {
                 live.retire();
             }
             AgentRunError {
+                stage: *stage
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
                 outcome,
                 start: if !send_started {
                     StartEvidence::NotStarted

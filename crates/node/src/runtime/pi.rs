@@ -16,6 +16,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{oneshot, watch};
 use vibeface_bridge::agent::{self, AgentResult};
+use vibeface_bridge::failure::ProviderStage;
 use vibeface_bridge::failure::{ExecFailure, FailureKind};
 use vibeface_bridge::turn::TurnStatus;
 
@@ -75,6 +76,14 @@ struct Pointer {
     group: u32,
     /// The session's last entry before that prompt; `None` when it had none.
     after: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReplyPointer {
+    session: String,
+    file: PathBuf,
+    after: Option<String>,
+    prompt_hash: String,
 }
 
 /// One pi process's commands: each goes out with an ID and its response comes back by it.
@@ -258,6 +267,9 @@ impl Seen {
             format!("pi-{messages}.{}", index.as_u64().unwrap_or_default())
         };
         match event["type"].as_str().unwrap_or_default() {
+            "auto_compaction_end" if event["aborted"] != true && event["error"].is_null() => {
+                vec![json!({"type":"context_compacted"})]
+            }
             "message_start" if message["role"] == "assistant" => {
                 self.messages += 1;
                 vec![]
@@ -616,6 +628,92 @@ impl Pi {
         }
     }
 
+    fn reply_pointer_path(&self, client_id: &str) -> Result<PathBuf> {
+        vibeface_protocol::validate_id(client_id).map_err(anyhow::Error::msg)?;
+        Ok(self.dir.join("replies").join(format!(
+            "{}.json",
+            crate::crypto::digest(client_id.as_bytes())
+        )))
+    }
+
+    fn record_reply(&self, session: &str, client_id: &str, prompt: &str) -> Result<()> {
+        let pointer = self
+            .pointer(session)?
+            .context("pi session has no local pointer")?;
+        let reply = ReplyPointer {
+            session: session.into(),
+            file: pointer.file,
+            after: pointer.after,
+            prompt_hash: crate::crypto::digest(prompt.as_bytes()),
+        };
+        let path = self.reply_pointer_path(client_id)?;
+        config::private_dir(path.parent().context("pi reply locator has no parent")?)?;
+        config::private_write(&path, &serde_json::to_vec(&reply)?)
+    }
+
+    pub(crate) async fn probe_reply(
+        &self,
+        session: &str,
+        native_turn: Option<&str>,
+        client_id: &str,
+    ) -> Result<Probe> {
+        vibeface_protocol::validate_id(session).map_err(anyhow::Error::msg)?;
+        let pointer: ReplyPointer = match std::fs::read(self.reply_pointer_path(client_id)?) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Probe::Missing);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if pointer.session != session {
+            return Ok(Probe::Missing);
+        }
+        let entries = entries(&pointer.file)?;
+        let start = match &pointer.after {
+            Some(after) => match entries.iter().position(|entry| entry["id"] == *after) {
+                Some(at) => at + 1,
+                None => return Ok(Probe::Missing),
+            },
+            None => 0,
+        };
+        let Some(turn) = entries[start..]
+            .iter()
+            .position(|entry| is_message(entry, "user"))
+            .map(|at| start + at)
+        else {
+            return Ok(Probe::Missing);
+        };
+        let Some(turn_id) = entries[turn]["id"].as_str() else {
+            return Ok(Probe::Missing);
+        };
+        if native_turn.is_some_and(|native| native != turn_id)
+            || crate::crypto::digest(text(&entries[turn]["message"]).as_bytes())
+                != pointer.prompt_hash
+        {
+            return Ok(Probe::Missing);
+        }
+        if self.live_turn(session, turn_id).is_some() {
+            return Ok(Probe::Running {
+                turn_id: turn_id.into(),
+                epoch: 0,
+            });
+        }
+        let last = run(&entries, turn)
+            .iter()
+            .rev()
+            .find(|entry| is_message(entry, "assistant"))
+            .map(|entry| &entry["message"]);
+        let Some((status, error)) = last.and_then(ending) else {
+            return Ok(Probe::Missing);
+        };
+        Ok(Probe::Terminal {
+            turn_id: turn_id.into(),
+            status,
+            text: last.map(text).unwrap_or_default(),
+            error,
+        })
+    }
+
     /// Keeps where pi writes `session`, the directory it runs in and the session's last entry
     /// so far.
     fn keep(&self, session: &str, file: &Path, cwd: &Path, group: u32) -> Result<Option<String>> {
@@ -647,8 +745,16 @@ impl Pi {
         &self,
         launch: &Launch,
         session: &str,
-    ) -> Result<(Process, Option<String>), ExecFailure> {
-        let process = Process::spawn(launch, &self.processes)?;
+    ) -> Result<(Process, Option<String>), ManagerError> {
+        let before_start = |stage, failure| ManagerError {
+            stage,
+            outcome: ManagerFailure::Failed,
+            start: crate::manager::StartEvidence::NotStarted,
+            session_id: None,
+            failure,
+        };
+        let process = Process::spawn(launch, &self.processes)
+            .map_err(|failure| before_start(ProviderStage::Launch, failure))?;
         let opened = async {
             let state = match process.rpc.call(json!({"type":"get_state"}), ANSWER).await {
                 Reply::Done(state) => state,
@@ -670,7 +776,10 @@ impl Pi {
             Ok(after) => Ok((process, after)),
             Err(failure) => {
                 let tail = process.end().await;
-                Err(with_tail(failure, &tail))
+                Err(before_start(
+                    ProviderStage::SessionStart,
+                    with_tail(failure, &tail),
+                ))
             }
         }
     }
@@ -702,8 +811,12 @@ impl Pi {
         );
         let secrets = crate::manager::secret_values(config);
         let start = std::sync::Mutex::new(crate::manager::StartEvidence::NotStarted);
+        let stage = std::sync::Mutex::new(ProviderStage::SessionStart);
         let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
             ManagerError {
+                stage: *stage
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
                 outcome,
                 start: *start
                     .lock()
@@ -727,7 +840,7 @@ impl Pi {
         let resumed = match previous {
             Some(id) => self
                 .pointer(id)
-                .map_err(ManagerError::not_started)?
+                .map_err(|error| ManagerError::not_started_at(ProviderStage::Record, error))?
                 .filter(|pointer| pointer.file.is_file()),
             None => None,
         };
@@ -758,12 +871,17 @@ impl Pi {
         );
         if !guide.is_empty() {
             let path = self.dir.join(format!("{session}.md"));
-            config::private_dir(&self.dir).map_err(ManagerError::not_started)?;
-            config::private_write(&path, guide.as_bytes()).map_err(ManagerError::not_started)?;
+            config::private_dir(&self.dir)
+                .map_err(|error| ManagerError::not_started_at(ProviderStage::Record, error))?;
+            config::private_write(&path, guide.as_bytes())
+                .map_err(|error| ManagerError::not_started_at(ProviderStage::Record, error))?;
             args.extend(["--append-system-prompt".into(), path.display().to_string()]);
         }
         if !config.model.is_empty() {
             args.extend(["--model".into(), config.model.clone()]);
+        }
+        if let Some(effort) = &config.reasoning_effort {
+            args.extend(["--thinking".into(), effort.clone()]);
         }
         let mut env = config.provider_env.clone();
         env.extend(config.tool_env.clone());
@@ -779,11 +897,22 @@ impl Pi {
         if *cancel.borrow() {
             return Err(stopped(previous));
         }
-        let (mut process, after) = self
-            .open(&launch, &session)
-            .await
-            .map_err(|failure| error(ManagerFailure::Failed, previous, failure))?;
+        let (mut process, after) = self.open(&launch, &session).await.map_err(|failure| {
+            *stage.lock().unwrap() = failure.stage;
+            error(failure.outcome, previous, failure.failure)
+        })?;
         let native = Some(session.as_str());
+        *stage.lock().unwrap() = ProviderStage::Record;
+        if let Some(turn) = &config.codex_turn
+            && let Err(e) = self.record_reply(&session, &turn.client_id, prompt)
+        {
+            process.end().await;
+            return Err(error(
+                ManagerFailure::Failed,
+                native,
+                own(format!("record the pi reply locator: {e}")),
+            ));
+        }
         if let Some(started) = &config.process_started
             && let Err(e) = started(process.group).await
         {
@@ -824,6 +953,7 @@ impl Pi {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
         let within = PREFLIGHT.min(Duration::from_secs(config.timeout_secs));
         let prompt = json!({"type":"prompt","message":prompt});
+        *stage.lock().unwrap() = ProviderStage::TurnStart;
         *start.lock().unwrap() = crate::manager::StartEvidence::Unknown;
         let turn = match process
             .begin(after.as_deref(), prompt, within, &mut cancel)
@@ -858,6 +988,7 @@ impl Pi {
                 stopping: Default::default(),
             },
         );
+        *stage.lock().unwrap() = ProviderStage::Record;
         let recorded = match &config.codex_turn {
             Some(record) => (record.record)(session.clone(), Some(turn.clone())).await,
             None => Ok(()),
@@ -870,57 +1001,61 @@ impl Pi {
                 };
                 Err(error(kind, native, own(format!("record the pi turn: {e}"))))
             }
-            Ok(()) => loop {
-                let event = tokio::select! {
-                    biased;
-                    _ = agent::wait_for_cancel(&mut cancel) => {
-                        break match process.stop(&mut seen).await {
-                            true => Err(error(ManagerFailure::Cancelled, native, own("pi turn stopped".into()))),
-                            false => Err(error(ManagerFailure::Unknown, native, own("pi did not confirm the stop".into()))),
-                        };
-                    }
-                    _ = tokio::time::sleep_until(deadline) => {
-                        let kind = match process.stop(&mut seen).await {
-                            true => ManagerFailure::Failed,
-                            false => ManagerFailure::Unknown,
-                        };
-                        break Err(error(kind, native, ExecFailure::new(FailureKind::TimedOut, "pi management timed out")));
-                    }
-                    event = process.events.recv() => event,
-                };
-                let Some(event) = event else {
-                    break Err(error(
-                        ManagerFailure::Unknown,
-                        native,
-                        ExecFailure::new(FailureKind::Lost, "pi exited during the turn"),
-                    ));
-                };
-                let mut shown = Ok(());
-                for update in seen.apply(&event) {
-                    shown = progress(crate::manager::redact(update, &secrets)).await;
-                    if shown.is_err() {
-                        break;
-                    }
-                }
-                if let Err(e) = shown {
-                    break Err(error(ManagerFailure::Unknown, native, own(e.to_string())));
-                }
-                if event["type"] == "agent_settled" {
-                    break match seen.ending(false) {
-                        (TurnStatus::Completed, _) => Ok(seen.text()),
-                        (TurnStatus::Interrupted, _) => {
-                            let (outcome, failure) =
-                                crate::manager::interrupted(&cancel, Provider::Pi);
-                            Err(error(outcome, native, failure))
+            Ok(()) => {
+                *stage.lock().unwrap() = ProviderStage::Run;
+                loop {
+                    let event = tokio::select! {
+                        biased;
+                        _ = agent::wait_for_cancel(&mut cancel) => {
+                            *stage.lock().unwrap() = ProviderStage::Interrupt;
+                            break match process.stop(&mut seen).await {
+                                true => Err(error(ManagerFailure::Cancelled, native, own("pi turn stopped".into()))),
+                                false => Err(error(ManagerFailure::Unknown, native, own("pi did not confirm the stop".into()))),
+                            };
                         }
-                        (_, failure) => Err(error(
-                            ManagerFailure::Failed,
-                            native,
-                            failure.unwrap_or_else(|| own("pi turn failed".into())),
-                        )),
+                        _ = tokio::time::sleep_until(deadline) => {
+                            let kind = match process.stop(&mut seen).await {
+                                true => ManagerFailure::Failed,
+                                false => ManagerFailure::Unknown,
+                            };
+                            break Err(error(kind, native, ExecFailure::new(FailureKind::TimedOut, "pi management timed out")));
+                        }
+                        event = process.events.recv() => event,
                     };
+                    let Some(event) = event else {
+                        break Err(error(
+                            ManagerFailure::Unknown,
+                            native,
+                            ExecFailure::new(FailureKind::Lost, "pi exited during the turn"),
+                        ));
+                    };
+                    let mut shown = Ok(());
+                    for update in seen.apply(&event) {
+                        shown = progress(crate::manager::redact(update, &secrets)).await;
+                        if shown.is_err() {
+                            break;
+                        }
+                    }
+                    if let Err(e) = shown {
+                        break Err(error(ManagerFailure::Unknown, native, own(e.to_string())));
+                    }
+                    if event["type"] == "agent_settled" {
+                        break match seen.ending(false) {
+                            (TurnStatus::Completed, _) => Ok(seen.text()),
+                            (TurnStatus::Interrupted, _) => {
+                                let (outcome, failure) =
+                                    crate::manager::interrupted(&cancel, Provider::Pi);
+                                Err(error(outcome, native, failure))
+                            }
+                            (_, failure) => Err(error(
+                                ManagerFailure::Failed,
+                                native,
+                                failure.unwrap_or_else(|| own("pi turn failed".into())),
+                            )),
+                        };
+                    }
                 }
-            },
+            }
         };
         lock(&self.live).remove(&session);
         process.end().await;
@@ -944,7 +1079,7 @@ impl Pi {
         };
         let (mut process, after) = match self.open(&launch, &session).await {
             Ok(opened) => opened,
-            Err(failure) => return send(Report::Signal(Signal::StartRejected(failure))),
+            Err(error) => return send(Report::Signal(Signal::StartRejected(error.failure))),
         };
         // A work is stopped through `interrupt`, once its turn runs.
         let mut unstoppable = watch::channel(false).1;
@@ -1442,6 +1577,7 @@ mod tests {
             },
             workspace: dir.to_owned(),
             model: String::new(),
+            reasoning_effort: None,
             timeout_secs: 30,
             custom_tools: BTreeMap::new(),
             tool_cli: None,
@@ -1621,10 +1757,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bot_readback_uses_its_frozen_input_and_requires_an_ending() -> Result<()> {
+        let dir = scratch("bot-readback");
+        let pi = Pi::new(&dir);
+        let file = dir.join("session.jsonl");
+        std::fs::write(&file, "")?;
+        pi.keep("s-1", &file, &dir, 0)?;
+        pi.record_reply("s-1", "attempt-a", "first prompt")?;
+        let user = |id: &str, prompt: &str| json!({"type":"message","id":id,"message":{"role":"user","content":prompt}});
+        let assistant = |id: &str, text: &str, stop: Value| json!({"type":"message","id":id,"message":{"role":"assistant","content":[{"type":"text","text":text}],"stopReason":stop}});
+        let write = |records: Vec<Value>| -> Result<()> {
+            std::fs::write(
+                &file,
+                records
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )?;
+            Ok(())
+        };
+        assert_eq!(
+            pi.probe_reply("s-1", None, "attempt-a").await?,
+            Probe::Missing
+        );
+        write(vec![
+            user("user-a", "first prompt"),
+            assistant("reply-a", "unfinished", json!("toolUse")),
+            user("user-b", "later prompt"),
+            assistant("reply-b", "later result", json!("stop")),
+        ])?;
+        assert_eq!(
+            pi.probe_reply("s-1", None, "attempt-a").await?,
+            Probe::Missing
+        );
+        write(vec![
+            user("user-a", "first prompt"),
+            assistant("reply-a", "first result", json!("stop")),
+            user("user-b", "later prompt"),
+            assistant("reply-b", "later result", json!("stop")),
+        ])?;
+        pi.keep("s-1", &file, &dir, 0)?;
+        assert_eq!(
+            pi.probe_reply("s-1", None, "attempt-a").await?,
+            Probe::Terminal {
+                turn_id: "user-a".into(),
+                status: TurnStatus::Completed,
+                text: "first result".into(),
+                error: None,
+            }
+        );
+        assert_eq!(
+            pi.probe_reply("s-1", Some("user-b"), "attempt-a").await?,
+            Probe::Missing
+        );
+        assert_eq!(
+            pi.probe_reply("s-1", None, "attempt-b").await?,
+            Probe::Missing
+        );
+        assert_eq!(
+            pi.probe_reply("different-session", None, "attempt-a")
+                .await?,
+            Probe::Missing
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_bot_turn_streams_its_reply_and_the_next_turn_goes_on_in_its_session() -> Result<()> {
         let dir = scratch("bot");
         let pi = Arc::new(Pi::new(&dir));
-        let config = bot(&dir, &pi, "reply", None);
+        let mut config = bot(&dir, &pi, "reply", None);
+        config.reasoning_effort = Some("high".into());
         let shown = std::sync::Mutex::new(Vec::new());
         let progress = |update| {
             shown.lock().unwrap().push(update);
@@ -1664,6 +1869,9 @@ mod tests {
             .collect();
         let argv = |at: usize| serde_json::from_value::<Vec<String>>(starts[at]["argv"].clone());
         let (first, second) = (argv(0)?, argv(1)?);
+        for args in [&first, &second] {
+            assert!(args.windows(2).any(|pair| pair == ["--thinking", "high"]));
+        }
         assert_eq!(
             first[..5],
             [

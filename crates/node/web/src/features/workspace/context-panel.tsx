@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button"
 import { DetailRow, Details, SettingsGroup, SettingsRow, StatusPill, type Tone } from "@/components/app/kit"
 import { formatWhen, changeTitle } from "@vibeface/client/workspace/bot-settings.ts"
 import { nodeName, shownState, taskLabel } from "@vibeface/client/workspace/labels.ts"
+import { runtimeLabel } from "@vibeface/client/chat/protocol.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import type { BotChange, BotRecord, ConversationPayload, CoordinationCheck, NodeInfo, Question, SessionHandoff, WorkRecord } from "@vibeface/client/workspace/types.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
@@ -18,8 +19,6 @@ type ContextPanelProps = {
   nodes: readonly NodeInfo[]
   onBack: () => void
 }
-
-const continuityProviderLabels: Record<string, string> = { codex: "Codex", cursor: "Cursor", claude: "Claude Code", pi: "pi", opencode: "opencode" }
 
 /** A read-only view of the fields already present in one ConversationPayload. */
 export function ContextPanel({ bot, data, nodes, onBack }: ContextPanelProps) {
@@ -133,11 +132,12 @@ function AgentContinuity({ data, nodes }: { data: ConversationPayload; nodes: re
   const sessions = [...data.sessions].sort((left, right) => right.created_at_ms - left.created_at_ms || left.session_id.localeCompare(right.session_id))
   const scheduler = data.scheduler
   const remote = scheduler?.remote
-  const activeJob = scheduler?.jobs.some((job) => ["queued", "claimed", "running", "steering", "cancelling"].includes(job.state))
+  const activeJob = scheduler?.jobs.find((job) => ["queued", "claimed", "running", "steering", "cancelling", "reconciling"].includes(job.state))
+  const runtime = activeJob?.runtime ?? (scheduler?.jobs ?? []).flatMap((job) => job.runtime ? [job.runtime] : []).sort((left, right) => right.attempted_at_ms - left.attempted_at_ms)[0]
   const status: ContinuityStatus = remote?.reachable === false
     ? { tone: "warning", icon: Unplug, label: "远端状态未知", detail: "owner 不可达时，排队和回复结果不能视为已执行。" }
     : scheduler
-      ? { tone: "info", icon: activeJob ? Cpu : CircleCheck, label: activeJob ? "正在运行" : "状态已读取", detail: `${providerLabel(scheduler.provider)} · ${scheduler.model || "设备默认模型"}` }
+      ? { tone: "info", icon: activeJob ? Cpu : CircleCheck, label: activeJob?.state === "reconciling" ? "正在查询上次回复" : activeJob ? "正在运行" : "最近回合记录", detail: runtime ? runtimeLabel(runtime) : "当前快照尚未记录回合配置。" }
       : sessions.length
         ? { tone: "neutral", icon: History, label: "只有交接记录", detail: "当前没有运行状态。" }
         : { tone: "neutral", icon: CircleDashed, label: "尚未建立", detail: "Bot 身份和共享事实仍会保留。" }
@@ -224,11 +224,6 @@ function ContinuitySession({ session, nodes, localNode }: { session: SessionHand
       <p>这个 ID 只用于续接定位，不是共享聊天历史，也不是 Provider token。</p>
     </Details>
   </li>
-}
-
-function providerLabel(provider?: string) {
-  if (!provider) return "设备默认模型"
-  return continuityProviderLabels[provider] ?? provider
 }
 
 function ContextStat({ label, value }: { label: string; value: number }) {

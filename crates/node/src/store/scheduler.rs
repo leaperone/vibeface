@@ -5,9 +5,9 @@ use crate::{crypto::LocalIdentity, model::*, providers::Provider, scheduling::*}
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
-use vibeface_bridge::failure::ExecFailure;
+use vibeface_bridge::failure::{ExecFailure, ProviderStage};
 
-const JOB_COLUMNS: &str = "conversation_id,trigger,kind,sequence,basis,reply_to,message_id,state,attempt_id,attempt_boot,attempt_permission,detail,failure";
+const JOB_COLUMNS: &str = "conversation_id,trigger,kind,sequence,basis,reply_to,message_id,state,attempt_id,attempt_boot,attempt_permission,detail,failure,runtime,tool_calls";
 
 type JobRow = (
     String,
@@ -23,6 +23,9 @@ type JobRow = (
     Option<u64>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    bool,
+    bool,
 );
 
 fn job_from_row(row: JobRow) -> Result<SchedulerJob> {
@@ -40,6 +43,9 @@ fn job_from_row(row: JobRow) -> Result<SchedulerJob> {
         permission,
         detail,
         failure,
+        runtime,
+        tool_calls,
+        pending_check,
     ) = row;
     let attempt = match (id, boot, permission) {
         (Some(id), Some(boot), Some(permission_version)) => Some(ManagerAttempt {
@@ -72,6 +78,10 @@ fn job_from_row(row: JobRow) -> Result<SchedulerJob> {
         "cancelling" => JobState::Cancelling {
             attempt: attempt_or()?,
         },
+        "reconciling" => JobState::Reconciling {
+            attempt: attempt_or()?,
+            failure: failure()?,
+        },
         "completed" => JobState::Completed {
             attempt: attempt_or()?,
         },
@@ -102,6 +112,11 @@ fn job_from_row(row: JobRow) -> Result<SchedulerJob> {
         basis: serde_json::from_str(&basis)?,
         reply_to,
         message_id,
+        runtime: runtime
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
+        tool_calls,
+        pending_check,
         state,
     })
 }
@@ -112,7 +127,7 @@ fn query_jobs(
     params: impl rusqlite::Params,
 ) -> Result<Vec<SchedulerJob>> {
     let mut statement = connection.prepare(&format!(
-        "SELECT {JOB_COLUMNS} FROM scheduler_jobs WHERE {filter} ORDER BY sequence"
+        "SELECT {JOB_COLUMNS},EXISTS(SELECT 1 FROM pending_checks p WHERE p.attempt_id=scheduler_jobs.attempt_id) FROM scheduler_jobs WHERE {filter} ORDER BY sequence"
     ))?;
     let rows = statement
         .query_map(params, |r| {
@@ -130,6 +145,9 @@ fn query_jobs(
                 r.get(10)?,
                 r.get(11)?,
                 r.get(12)?,
+                r.get(13)?,
+                r.get(14)?,
+                r.get(15)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<JobRow>>>()?;
@@ -160,13 +178,15 @@ fn queued_jobs(connection: &Connection, conversation: &str) -> Result<Vec<Schedu
 fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
     let attempt = job.state.attempt();
     let failure = match &job.state {
-        JobState::Failed { failure, .. } | JobState::Interrupted { failure, .. } => Some(failure),
+        JobState::Failed { failure, .. }
+        | JobState::Interrupted { failure, .. }
+        | JobState::Reconciling { failure, .. } => Some(failure),
         _ => None,
     };
     let detail = match &job.state {
-        JobState::Failed { failure, .. } | JobState::Interrupted { failure, .. } => {
-            Some(failure.detail.clone())
-        }
+        JobState::Failed { failure, .. }
+        | JobState::Interrupted { failure, .. }
+        | JobState::Reconciling { failure, .. } => Some(failure.detail.clone()),
         JobState::Cancelled { evidence, .. } => Some(evidence.clone()),
         JobState::Steering { .. } | JobState::Steered { .. } => {
             Some(serde_json::to_string(&job.state)?)
@@ -175,7 +195,13 @@ fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
     };
     connection.execute(
         &format!(
-            "INSERT OR REPLACE INTO scheduler_jobs({JOB_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            "INSERT INTO scheduler_jobs({JOB_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(conversation_id,trigger) DO UPDATE SET
+             kind=excluded.kind,sequence=excluded.sequence,basis=excluded.basis,
+             reply_to=excluded.reply_to,message_id=excluded.message_id,state=excluded.state,
+             attempt_id=excluded.attempt_id,attempt_boot=excluded.attempt_boot,
+             attempt_permission=excluded.attempt_permission,detail=excluded.detail,
+             failure=excluded.failure,runtime=excluded.runtime,tool_calls=excluded.tool_calls"
         ),
         params![
             job.conversation_id,
@@ -191,12 +217,17 @@ fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
             attempt.map(|a| a.permission_version),
             detail,
             failure.map(|f| super::enum_text(&f.kind)),
+            job.runtime
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+            job.tool_calls,
         ],
     )?;
     Ok(())
 }
 
-const SESSION_COLUMNS: &str = "conversation_id,next_sequence,active,native_id,covers,owner_epoch,sdk_config,permission_version,native_token,shown";
+const SESSION_COLUMNS: &str = "conversation_id,next_sequence,active,native_id,covers,owner_epoch,sdk_config,permission_version,native_token,shown,session_generation,handoff_revision,handoff_source";
 
 fn query_sessions(
     connection: &Connection,
@@ -220,17 +251,22 @@ fn query_sessions(
                     sdk_config: r.get(6)?,
                     permission_version: r.get(7)?,
                     shown: Default::default(),
+                    session_generation: r.get(10)?,
+                    handoff_revision: r.get(11)?,
+                    handoff_source: VersionVector::new(),
                 },
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(9)?,
+                r.get::<_, String>(12)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter()
-        .map(|(session, covers, shown)| {
+        .map(|(session, covers, shown, handoff_source)| {
             Ok(SchedulerSession {
                 covers: serde_json::from_str(&covers)?,
                 shown: serde_json::from_str(&shown)?,
+                handoff_source: serde_json::from_str(&handoff_source)?,
                 ..session
             })
         })
@@ -248,7 +284,7 @@ fn load_session(connection: &Connection, conversation: &str) -> Result<Scheduler
 fn save_session(connection: &Connection, session: &SchedulerSession) -> Result<()> {
     connection.execute(
         &format!(
-            "INSERT OR REPLACE INTO scheduler_sessions({SESSION_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?)"
+            "INSERT OR REPLACE INTO scheduler_sessions({SESSION_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
         ),
         params![
             session.conversation_id,
@@ -261,6 +297,9 @@ fn save_session(connection: &Connection, session: &SchedulerSession) -> Result<(
             session.permission_version,
             session.native_token,
             serde_json::to_string(&session.shown)?,
+            session.session_generation,
+            session.handoff_revision,
+            serde_json::to_string(&session.handoff_source)?,
         ],
     )?;
     Ok(())
@@ -355,9 +394,25 @@ fn manager_turn(connection: &Connection, attempt_id: &str) -> Result<Option<(Str
         .optional()?)
 }
 
-fn fence(session: &mut SchedulerSession) -> Result<()> {
+fn advance_lineage(session: &mut SchedulerSession, source: &VersionVector) -> Result<()> {
+    session.session_generation = session
+        .session_generation
+        .checked_add(1)
+        .context("scheduler session generation overflow")?;
+    session.handoff_revision = session
+        .handoff_revision
+        .checked_add(1)
+        .context("scheduler handoff revision overflow")?;
+    session.handoff_source = source.clone();
     session.native_id = None;
     session.native_token = None;
+    session.covers.clear();
+    session.shown = Shown::default();
+    Ok(())
+}
+
+fn fence(session: &mut SchedulerSession) -> Result<()> {
+    advance_lineage(session, &session.covers.clone())?;
     session.permission_version = session
         .permission_version
         .checked_add(1)
@@ -536,6 +591,9 @@ fn admit_ended_from(
             trigger,
             conversation_from(connection, network, conversation)?.map_or(0, |c| c.owner_epoch),
         ),
+        runtime: None,
+        tool_calls: false,
+        pending_check: false,
         state: match ended {
             Some(evidence) => JobState::Cancelled {
                 attempt: None,
@@ -1105,6 +1163,34 @@ fn end_job_from(
         .context("scheduler attempt missing")?
         .clone();
     let attempt_id = attempt.id.clone();
+    if let JobOutcome::Interrupted {
+        failure,
+        process_unconfirmed: true,
+    } = &outcome
+    {
+        if !matches!(job.state, JobState::Reconciling { .. })
+            && attempt.permission_version == session.permission_version
+        {
+            fence(session)?;
+            session.handoff_source = job.basis.clone();
+        }
+        save_pending_check(connection, &job, &attempt, &failure.detail, at)?;
+        job.state = JobState::Reconciling {
+            attempt,
+            failure: failure.clone(),
+        };
+        job.pending_check = true;
+        if let Some(runtime) = &mut job.runtime {
+            runtime.stage = ProviderStage::ReadBack;
+        }
+        save_job(connection, &job)?;
+        connection.execute(
+            "UPDATE scheduler_jobs SET partial_text=? WHERE conversation_id=? AND trigger=?",
+            params![text, job.conversation_id, job.trigger],
+        )?;
+        save_session(connection, session)?;
+        return Ok(job);
+    }
     let (status, failure, fallback) = reply_status(&outcome);
     let text = if text.trim().is_empty() {
         fallback.to_owned()
@@ -1155,13 +1241,9 @@ fn end_job_from(
             attempt: Some(attempt),
             evidence,
         },
-        JobOutcome::Interrupted {
-            failure,
-            process_unconfirmed,
-        } => {
-            fence(session)?;
-            if process_unconfirmed {
-                save_pending_check(connection, &job, &attempt, &failure.detail, at)?;
+        JobOutcome::Interrupted { failure, .. } => {
+            if attempt.permission_version == session.permission_version {
+                fence(session)?;
             }
             JobState::Interrupted { attempt, failure }
         }
@@ -1169,12 +1251,17 @@ fn end_job_from(
     if session.active.as_deref() == Some(job.trigger.as_str()) {
         session.active = None;
     }
-    if !matches!(&job.state, JobState::Interrupted { .. })
-        || pending_checks_from(connection)?
-            .iter()
-            .all(|check| check.attempt_id != attempt_id)
+    connection.execute(
+        "DELETE FROM pending_checks WHERE attempt_id=?",
+        [&attempt_id],
+    )?;
+    job.pending_check = false;
+    forget_process(connection, &attempt_id)?;
+    if matches!(job.state, JobState::Completed { .. })
+        && let Some(runtime) = &mut job.runtime
     {
-        forget_process(connection, &attempt_id)?;
+        runtime.stage = ProviderStage::Record;
+        runtime.execution = TurnExecution::Started;
     }
     save_job(connection, &job)?;
     save_session(connection, session)?;
@@ -1203,6 +1290,8 @@ fn recover_session(
     match job.state {
         JobState::Claimed { .. } => {
             job.state = JobState::Queued;
+            job.runtime = None;
+            job.tool_calls = false;
             session.active = None;
             save_job(connection, &job)?;
         }
@@ -1225,6 +1314,7 @@ fn recover_session(
                 crate::runtime::now_ms(),
             )?;
         }
+        JobState::Reconciling { .. } => {}
         _ => session.active = None,
     }
     Ok(())
@@ -1507,15 +1597,12 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         };
+        job.basis = log::version_vector_from(&tx, network)?;
         if session.sdk_config.as_deref() != Some(sdk_config) || session.owner_epoch != owner_epoch {
-            session.native_id = None;
-            session.native_token = None;
-            session.covers.clear();
-            session.shown = Shown::default();
+            advance_lineage(&mut session, &job.basis)?;
             session.sdk_config = Some(sdk_config.into());
             session.owner_epoch = owner_epoch;
         }
-        job.basis = log::version_vector_from(&tx, network)?;
         let resumable = job.kind != TriggerKind::AgentTask
             && session.native_id.is_some()
             && session
@@ -1532,6 +1619,16 @@ impl Store {
             Some(_) => session.shown.clone(),
             None => Shown::default(),
         };
+        let previous_runtime = tx.query_row(
+            "SELECT runtime FROM scheduler_jobs WHERE conversation_id=? AND sequence<? AND runtime IS NOT NULL ORDER BY sequence DESC LIMIT 1",
+            params![conversation, job.sequence],
+            |row| row.get::<_, String>(0),
+        ).optional()?.map(|json| serde_json::from_str::<TurnRuntime>(&json)).transpose()?
+        .map(|runtime| RuntimeSelection {
+            provider: runtime.provider,
+            model: runtime.model,
+            reasoning_effort: runtime.reasoning_effort,
+        });
         job.state = JobState::Claimed {
             attempt: ManagerAttempt {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -1549,6 +1646,10 @@ impl Store {
             previous_token,
             covers,
             shown,
+            session_generation: session.session_generation,
+            handoff_revision: session.handoff_revision,
+            handoff_source: session.handoff_source,
+            previous_runtime,
         }))
     }
 
@@ -1577,6 +1678,166 @@ impl Store {
         Ok(job)
     }
 
+    pub fn record_turn_runtime(
+        &mut self,
+        conversation: &str,
+        trigger: &str,
+        attempt_id: &str,
+        runtime: &TurnRuntime,
+    ) -> Result<SchedulerJob> {
+        ensure!(
+            runtime.delivery_id == attempt_id,
+            "runtime delivery does not match attempt"
+        );
+        ensure!(
+            runtime.execution == TurnExecution::NotStarted,
+            "new runtime must not have started"
+        );
+        self.update_attempt(conversation, trigger, attempt_id, |job, session| {
+            ensure!(
+                matches!(
+                    job.state,
+                    JobState::Claimed { .. } | JobState::Running { .. }
+                ),
+                "scheduler attempt is no longer active"
+            );
+            ensure!(
+                !job.pending_check && !job.tool_calls,
+                "runtime has pending execution evidence"
+            );
+            ensure!(
+                job.runtime
+                    .as_ref()
+                    .is_none_or(|saved| saved.execution == TurnExecution::NotStarted),
+                "runtime may already have started"
+            );
+            ensure!(
+                runtime.session_generation == session.session_generation,
+                "runtime session generation does not match"
+            );
+            if runtime.switched_from.is_some() {
+                match &mut job.state {
+                    JobState::Claimed { attempt } | JobState::Running { attempt } => {
+                        attempt.permission_version = session.permission_version;
+                    }
+                    _ => unreachable!("active state checked above"),
+                }
+            }
+            job.runtime = Some(runtime.clone());
+            Ok(())
+        })
+    }
+
+    pub fn update_turn_runtime(
+        &mut self,
+        conversation: &str,
+        trigger: &str,
+        attempt_id: &str,
+        stage: ProviderStage,
+        execution: TurnExecution,
+    ) -> Result<SchedulerJob> {
+        self.update_attempt(conversation, trigger, attempt_id, |job, _| {
+            ensure!(!job.state.terminal(), "scheduler attempt already ended");
+            ensure!(
+                execution != TurnExecution::NotStarted || !job.tool_calls,
+                "a turn that called tools cannot be marked not started"
+            );
+            let runtime = job.runtime.as_mut().context("turn runtime missing")?;
+            ensure!(
+                runtime.execution != TurnExecution::Started
+                    || execution != TurnExecution::NotStarted,
+                "a started turn cannot be marked not started"
+            );
+            runtime.stage = stage;
+            runtime.execution = execution;
+            Ok(())
+        })
+    }
+
+    pub fn record_manager_tool_call(
+        &mut self,
+        conversation: &str,
+        trigger: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
+        self.update_attempt(conversation, trigger, attempt_id, |job, _| {
+            ensure!(
+                matches!(
+                    job.state,
+                    JobState::Running { .. } | JobState::Claimed { .. }
+                ),
+                "scheduler attempt is no longer active"
+            );
+            job.tool_calls = true;
+            if let Some(runtime) = &mut job.runtime {
+                runtime.execution = TurnExecution::Started;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    pub fn record_context_compaction(
+        &mut self,
+        conversation: &str,
+        trigger: &str,
+        attempt_id: &str,
+    ) -> Result<u64> {
+        let mut generation = 0;
+        self.update_attempt(conversation, trigger, attempt_id, |job, session| {
+            ensure!(
+                session.active.as_deref() == Some(trigger)
+                    && matches!(
+                        job.state,
+                        JobState::Claimed { .. } | JobState::Running { .. }
+                    ),
+                "scheduler attempt is no longer active"
+            );
+            session.session_generation = session
+                .session_generation
+                .checked_add(1)
+                .context("scheduler session generation overflow")?;
+            session.handoff_revision = session
+                .handoff_revision
+                .checked_add(1)
+                .context("scheduler handoff revision overflow")?;
+            session.handoff_source = job.basis.clone();
+            generation = session.session_generation;
+            if let Some(runtime) = &mut job.runtime {
+                runtime.session_generation = generation;
+                runtime.stage = ProviderStage::Compact;
+            }
+            Ok(())
+        })?;
+        Ok(generation)
+    }
+
+    pub fn advance_scheduler_lineage(
+        &mut self,
+        conversation: &str,
+        trigger: &str,
+        attempt_id: &str,
+    ) -> Result<u64> {
+        let mut generation = 0;
+        self.update_attempt(conversation, trigger, attempt_id, |job, session| {
+            ensure!(
+                session.active.as_deref() == Some(trigger)
+                    && matches!(
+                        job.state,
+                        JobState::Claimed { .. } | JobState::Running { .. }
+                    ),
+                "scheduler attempt is no longer active"
+            );
+            advance_lineage(session, &job.basis)?;
+            generation = session.session_generation;
+            if let Some(runtime) = &mut job.runtime {
+                runtime.session_generation = generation;
+            }
+            Ok(())
+        })?;
+        Ok(generation)
+    }
+
     pub fn mark_started(
         &mut self,
         conversation: &str,
@@ -1590,6 +1851,10 @@ impl Store {
             job.state = JobState::Running {
                 attempt: attempt.clone(),
             };
+            if let Some(runtime) = &mut job.runtime {
+                runtime.execution = TurnExecution::Unknown;
+                runtime.stage = ProviderStage::TurnStart;
+            }
             Ok(())
         })
     }
@@ -1613,9 +1878,15 @@ impl Store {
             );
             job.state.attempt().context("scheduler attempt missing")?;
             if job.kind != TriggerKind::AgentTask {
-                if session.native_id.as_deref() != Some(native_id) {
-                    session.covers.clear();
-                    session.shown = Shown::default();
+                if session
+                    .native_id
+                    .as_deref()
+                    .is_some_and(|previous| previous != native_id)
+                {
+                    advance_lineage(session, &job.basis)?;
+                    if let Some(runtime) = &mut job.runtime {
+                        runtime.session_generation = session.session_generation;
+                    }
                 }
                 session.native_id = Some(native_id.into());
                 session.native_token = Some(token.into());
@@ -1874,14 +2145,20 @@ impl Store {
             params![attempt_id, server, thread_id, turn_id],
         )?;
         if turn_id.is_some()
-            && let Some(job) = query_jobs(&tx, "attempt_id=?", [attempt_id])?.pop()
-            && job.kind != TriggerKind::AgentTask
+            && let Some(mut job) = query_jobs(&tx, "attempt_id=?", [attempt_id])?.pop()
         {
-            let mut session = load_session(&tx, &job.conversation_id)?;
-            if session.native_id.as_deref() == Some(thread_id) {
-                session.covers = job.basis;
-                session.shown = shown.clone();
-                save_session(&tx, &session)?;
+            if let Some(runtime) = &mut job.runtime {
+                runtime.execution = TurnExecution::Started;
+                runtime.stage = ProviderStage::Run;
+                save_job(&tx, &job)?;
+            }
+            if job.kind != TriggerKind::AgentTask {
+                let mut session = load_session(&tx, &job.conversation_id)?;
+                if session.native_id.as_deref() == Some(thread_id) {
+                    session.covers = job.basis;
+                    session.shown = shown.clone();
+                    save_session(&tx, &session)?;
+                }
             }
         }
         tx.commit()?;
@@ -2053,17 +2330,36 @@ impl Store {
         pending_checks_from(&self.connection)
     }
 
-    pub fn resolve_pending_check(&mut self, attempt_id: &str) -> Result<()> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "DELETE FROM pending_checks WHERE attempt_id=?",
-            [attempt_id],
+    pub fn confirm_manager_stopped(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        check: &PendingCheck,
+        at: i64,
+    ) -> Result<SchedulerJob> {
+        let job = load_job(&self.connection, &check.conversation_id, &check.trigger)?
+            .context("scheduler job missing")?;
+        let JobState::Reconciling { failure, .. } = &job.state else {
+            bail!("scheduler job is not awaiting reconciliation");
+        };
+        let partial: String = self.connection.query_row(
+            "SELECT partial_text FROM scheduler_jobs WHERE conversation_id=? AND trigger=?",
+            params![check.conversation_id, check.trigger],
+            |row| row.get(0),
         )?;
-        forget_process(&tx, attempt_id)?;
-        tx.commit()?;
-        Ok(())
+        self.finish_job(
+            identity,
+            network,
+            &check.conversation_id,
+            &check.trigger,
+            &check.attempt_id,
+            JobOutcome::Interrupted {
+                failure: failure.clone(),
+                process_unconfirmed: false,
+            },
+            &partial,
+            at,
+        )
     }
 
     pub fn scheduler_maintenance_idle(&self) -> Result<()> {

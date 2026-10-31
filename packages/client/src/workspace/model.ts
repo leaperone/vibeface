@@ -1,4 +1,6 @@
 import type { Attachment, TranscriptMessage } from "../chat/types.ts"
+import { parseProviderReadiness } from "../lib/node.ts"
+import { providerStages, type ProviderStage, type TurnRuntime } from "./types.ts"
 import type { ReplyStatus } from "../chat/types.ts"
 import type {
   AnswerResult, BotReadiness, CloseReason, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
@@ -51,12 +53,13 @@ export function parseNodes(value: unknown): NodeInfo[] {
       device_id: text(data.device_id),
       name: typeof data.name === "string" ? data.name : "",
       local: flag(data.local), online: flag(data.online), revoked: flag(data.revoked),
-      capabilities: capabilities ? { manager: capabilities.manager == null ? null : text(capabilities.manager), manager_state: capabilities.manager == null ? null : readiness(capabilities.manager_state), relay: capabilities.relay === true, roots: texts(capabilities.roots), codex_connected: capabilities.codex != null && record(capabilities.codex).connected === true } : undefined,
+      capabilities: capabilities ? { manager: capabilities.manager == null ? null : text(capabilities.manager), manager_state: capabilities.manager == null ? null : readiness(capabilities.manager_state), manager_readiness: capabilities.manager_readiness == null ? null : parseProviderReadiness(capabilities.manager_readiness), relay: capabilities.relay === true, roots: texts(capabilities.roots), codex_connected: capabilities.codex != null && record(capabilities.codex).connected === true } : undefined,
     }
   })
 }
 function readiness(value: unknown): BotReadiness {
-  return value === "ready" || value === "starting" ? value : "needs_setup"
+  if (value === "ready" || value === "starting" || value === "unverified" || value === "needs_setup") return value
+  throw new Error("Bot 可用性状态无法识别。")
 }
 export function botReadiness(node: NodeInfo | undefined): BotReadiness | null {
   if (!node || node.revoked || !node.online || !node.capabilities?.manager) return null
@@ -94,12 +97,25 @@ function failure(value: unknown): { failure?: FailureKind } {
 }
 function attachments(value: unknown) { return value == null ? undefined : list(value).map((item) => { const file = record(item); return { hash: text(file.hash), size: number(file.size), name: text(file.name) } }) }
 function optionalText(value: unknown): string | undefined { return value == null ? undefined : text(value) }
+function recordOrNull(value: unknown) { return value == null ? null : record(value) }
+function providerStage(value: unknown): ProviderStage {
+  const stage = providerStages.find((stage) => stage === value)
+  if (!stage) throw new Error('回合阶段无法识别。')
+  return stage
+}
+export function parseTurnRuntime(value: unknown): TurnRuntime | null {
+  if (value == null) return null
+  const data = record(value), previous = recordOrNull(data.switched_from)
+  const nullable = (value: unknown) => value == null ? null : text(value)
+  if (data.execution !== 'not_started' && data.execution !== 'started' && data.execution !== 'unknown') throw new Error('回合执行状态无法识别。')
+  return { provider: provider(data.provider), model: nullable(data.model), reasoning_effort: nullable(data.reasoning_effort), generation: text(data.generation), session_generation: number(data.session_generation), delivery_id: text(data.delivery_id), stage: providerStage(data.stage), execution: data.execution, attempted_at_ms: number(data.attempted_at_ms), switched_from: previous ? { provider: provider(previous.provider), model: nullable(previous.model), reasoning_effort: nullable(previous.reasoning_effort) } : null, switch_reason: failureKind(data.switch_reason) ?? null }
+}
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   if (value == null) return null
   const data = record(value), capabilities = data.capabilities == null ? null : record(data.capabilities), remote = data.remote == null ? null : record(data.remote)
   return {
     unanswered: list(data.unanswered).map(text),
-    jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), failure: job.failure == null ? undefined : { kind: failureKind(record(job.failure).kind) ?? "unknown", detail: text(record(job.failure).detail) }, pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined, source_node: optionalText(job.source_node) } }),
+    jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), failure: job.failure == null ? undefined : { kind: failureKind(record(job.failure).kind) ?? "unknown", detail: text(record(job.failure).detail) }, runtime: parseTurnRuntime(job.runtime), retryable: job.retryable === true && recordOrNull(job.runtime)?.execution === "not_started" && job.pending_check !== true, pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined, source_node: optionalText(job.source_node) } }),
     provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined,
     remote: remote ? { owner: text(remote.owner), reachable: flag(remote.reachable) } : undefined,
   }
@@ -368,7 +384,7 @@ export function overviewFromWorkspace({ openWorks, bots, questions, nodes }: Wor
     const related = question.about.request_id ? openWorks.find((work) => work.thread_id === question.about.session_id && !work.outcome) : undefined
     return {
       kind: "question", question_id: question.question_id, conversation_id: question.conversation_id, bot,
-      text: question.text, severity: question.severity, choices: question.choices.map((choice) => ({ label: choice.label })),
+      attention: question.attention, text: question.text, severity: question.severity, choices: question.choices.map((choice) => ({ label: choice.label })),
       request_id: question.about.request_id ?? null, work_id: related?.work_id ?? null, about: question.about, created_at_ms: question.created_at_ms,
       state: "unanswered", navigation: bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id } : null,
     }
@@ -425,7 +441,7 @@ function parseOverviewQuestion(value: unknown): OverviewQuestion {
   const about = data.about == null ? null : subject(data.about)
   return {
     kind: "question", question_id: text(data.question_id), conversation_id: text(data.conversation_id), bot,
-    text: text(data.text), severity: severity(data.severity), choices: list(data.choices ?? []).map((choice) => ({ label: text(record(choice).label) })),
+    attention: data.attention == null ? undefined : parseAttention(data.attention), text: text(data.text), severity: severity(data.severity), choices: list(data.choices ?? []).map((choice) => ({ label: text(record(choice).label) })),
     request_id: nullableText(data.request_id ?? about?.request_id), work_id: nullableText(data.work_id), about, created_at_ms: number(data.created_at_ms), state: "unanswered",
     navigation: bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id } : null,
   }
@@ -435,6 +451,7 @@ function parseOverviewJob(value: unknown): OverviewJob {
   const state = data.remote_reachable === false || unknownReason ? "unknown" : data.state == null ? "unknown" : text(data.state)
   return {
     job_id: nullableText(data.job_id) ?? `${conversationId ?? ""}:${trigger}:${messageId ?? ""}`, conversation_id: conversationId, trigger, state,
+    runtime: parseTurnRuntime(data.runtime), retryable: data.retryable === true && recordOrNull(data.runtime)?.execution === "not_started" && data.pending_check !== true && state === "failed",
     message_id: messageId, reply_message_id: nullableText(data.reply_message_id), source_node: nullableText(data.source_node), pending_check: data.pending_check === true,
     outcome: state === "unknown" ? "unknown" : data.outcome === "answered" || data.outcome === "unfinished" || data.outcome === "unknown" ? data.outcome : null,
     unknown_reason: unknownReason, kind: nullableText(data.kind), sequence: nullableNumber(data.sequence), owner_epoch: nullableNumber(data.owner_epoch),
@@ -600,10 +617,11 @@ function botChange(value: unknown): BotChange {
   const data = record(value)
   if (data.kind === "profile") {
     const name = edit(data.name), instructions = edit(data.instructions), model = modelEdit(data.model)
+    const effort = data.reasoning_effort == null ? undefined : (() => { const value = record(data.reasoning_effort); return { provider: provider(value.provider), before: value.before === null ? null : text(value.before), after: value.after === null ? null : text(value.after) } })()
     const skills = data.skills == null ? undefined : { before: skillSet(record(data.skills).before), after: skillSet(record(data.skills).after) }
     const face = data.avatar == null ? undefined : { before: avatar(record(data.avatar).before), after: avatar(record(data.avatar).after) }
-    if (!name && !instructions && !model && !skills && !face) throw new Error("Bot 修改记录是空的。")
-    return { kind: "profile", ...(name ? { name } : {}), ...(instructions ? { instructions } : {}), ...(model ? { model } : {}), ...(skills ? { skills } : {}), ...(face ? { avatar: face } : {}) }
+    if (!name && !instructions && !model && !effort && !skills && !face) throw new Error("Bot 修改记录是空的。")
+    return { kind: "profile", ...(name ? { name } : {}), ...(instructions ? { instructions } : {}), ...(model ? { model } : {}), ...(effort ? { reasoning_effort: effort } : {}), ...(skills ? { skills } : {}), ...(face ? { avatar: face } : {}) }
   }
   if (data.before == null && data.after == null) throw new Error("Bot 修改记录是空的。")
   switch (data.kind) {
@@ -625,6 +643,7 @@ function overwritten(value: unknown): Overwritten {
   switch (data.field) {
     case "name": case "instructions": return { ...base, field: data.field, value: text(data.value) }
     case "model": return { ...base, field: "model", provider: provider(data.provider), value: text(data.value) }
+    case "reasoning_effort": return { ...base, field: "reasoning_effort", provider: provider(data.provider), value: data.value === null ? null : text(data.value) }
     case "skills": return { ...base, field: "skills", value: skillSet(data.value) }
     case "avatar": return { ...base, field: "avatar", value: avatar(data.value) }
     default: throw new Error("被覆盖的设置无法识别。")
@@ -695,7 +714,7 @@ export function parseCreateBot(value: unknown): CreateBotRequest {
 }
 export function parseBot(value: unknown): BotRecord {
   const data = record(value), last = data.last_message == null ? null : record(data.last_message)
-  return { ...parseCreateBot(value), models: botModels(data.models), skills: skillSet(data.skills), avatar: avatar(data.avatar), avatar_version: data.avatar_version == null ? null : text(data.avatar_version), event_hash: text(data.event_hash), last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) }, busy: busy(data.busy) }
+  return { ...parseCreateBot(value), models: botModels(data.models), reasoning_efforts: botModels(data.reasoning_efforts ?? {}), skills: skillSet(data.skills), avatar: avatar(data.avatar), avatar_version: data.avatar_version == null ? null : text(data.avatar_version), event_hash: text(data.event_hash), last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) }, busy: busy(data.busy) }
 }
 const busy = (value: unknown): Busy => value === "thinking" || value === "replying" ? value : null
 export function parseBots(value: unknown): BotRecord[] {
@@ -742,13 +761,18 @@ function closeReason(value: unknown): CloseReason {
   if (value !== "request_lost") throw new Error("问题关闭的原因无法识别。")
   return value
 }
+function parseAttention(value: unknown): NonNullable<Question['attention']> {
+  const data = record(value)
+  if (data.kind !== 'question' && data.kind !== 'approval' && data.kind !== 'browser_takeover') throw new Error('请求类型无法识别。')
+  return { kind: data.kind, device_id: data.device_id === null ? null : text(data.device_id) }
+}
 function question(value: unknown): Question {
   const data = record(value)
   const bot = data.bot == null ? null : record(data.bot), answer = data.answer == null ? null : record(data.answer)
   return {
     question_id: text(data.question_id), conversation_id: text(data.conversation_id),
     bot: bot && { bot_id: text(bot.bot_id), name: text(bot.name) },
-    severity: severity(data.severity), text: text(data.text),
+    severity: severity(data.severity), attention: data.attention == null ? undefined : parseAttention(data.attention), text: text(data.text),
     choices: list(data.choices ?? []).map((item) => ({ label: text(record(item).label) })),
     about: subject(data.about), author: text(data.author), created_at_ms: number(data.created_at_ms),
     answer: answer && { message_id: text(answer.message_id), text: text(answer.text), author: text(answer.author), created_at_ms: number(answer.created_at_ms) },

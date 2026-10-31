@@ -1,6 +1,6 @@
 use super::{Access, Changed, Runtime, now_ms};
 use crate::model::{WorkKind, WorkOutcome, WorkProjection};
-use crate::scheduling::{JobState, PendingCheck, ReplyTurn, TaskJobChange, task_work_signal};
+use crate::scheduling::{JobOutcome, JobState, PendingCheck};
 use crate::work::{Probe, WorkState};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -9,6 +9,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::{OwnedRwLockReadGuard, RwLock, watch};
+use vibeface_bridge::{
+    failure::{ExecFailure, FailureKind},
+    turn::TurnStatus,
+};
 
 #[derive(Clone, Debug)]
 pub struct ManagerAccess {
@@ -19,7 +23,7 @@ pub struct ManagerAccess {
 /// How long a stop waits for the conversation's owner, which first drains the reply's tools.
 const OWNER_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-pub(super) struct ActiveManager {
+pub(crate) struct ActiveManager {
     access: Access,
     /// The provider the reply runs on, whatever the device switched to since.
     provider: crate::providers::Provider,
@@ -150,10 +154,15 @@ impl Runtime {
                 && active.access.conversation_id == access.conversation_id,
             "management invocation scope mismatch"
         );
-        Self::check_manager_permission(
-            &*self.store.lock().await,
-            &self.identity.device_id()?,
-            access,
+        let mut store = self.store.lock().await;
+        Self::check_manager_permission(&store, &self.identity.device_id()?, access)?;
+        store.record_manager_tool_call(
+            access
+                .conversation_id
+                .as_deref()
+                .context("missing manager scope")?,
+            &manager.trigger,
+            &manager.attempt_id,
         )?;
         Ok(Some(guard))
     }
@@ -253,76 +262,154 @@ impl Runtime {
         Ok(Some(json!({"job":job,"cancel_requested":cancel_requested})))
     }
 
-    /// A coordination turn left over from a crash is checked by its recorded process groups and
-    /// App Server turn. Once every group has exited and the turn has ended the check resolves
-    /// itself; an agent task waiting on it ends as interrupted. Only a group that is still alive
-    /// leaves a card for the user.
     pub(super) async fn reconcile_checks(self: &Arc<Self>, network: &str) -> Result<()> {
         let checks = self.store.lock().await.pending_checks()?;
         for check in checks {
-            if check.process_groups.iter().any(|group| group_alive(*group)) {
+            let Some((outcome, text)) = self.read_back_reply(network, &check).await else {
                 continue;
-            }
-            if let Some(turn) = &check.codex_turn
-                && !self.codex_turn_ended(turn, &check.attempt_id).await
+            };
+            self.fence_manager_attempt(&check.attempt_id).await?;
+            if self
+                .store
+                .lock()
+                .await
+                .scheduler_job(&check.conversation_id, &check.trigger)?
+                .is_some_and(|job| job.runtime.is_some())
             {
-                continue;
+                self.store.lock().await.update_turn_runtime(
+                    &check.conversation_id,
+                    &check.trigger,
+                    &check.attempt_id,
+                    vibeface_bridge::failure::ProviderStage::ReadBack,
+                    crate::scheduling::TurnExecution::Started,
+                )?;
             }
-            self.close_check(network, &check).await?;
-            if let Some((work_id, signal)) =
-                task_work_signal(&check.trigger, TaskJobChange::ProcessExited)
-                && self
-                    .store
-                    .lock()
-                    .await
-                    .work_record(work_id)?
-                    .is_some_and(|record| {
-                        matches!(record.state, WorkState::Unverified { handle: None, .. })
-                    })
-            {
-                self.signal_work(network, work_id, signal).await?;
-            }
+            self.store.lock().await.finish_job(
+                &self.identity,
+                network,
+                &check.conversation_id,
+                &check.trigger,
+                &check.attempt_id,
+                outcome,
+                &text,
+                now_ms(),
+            )?;
+            self.publish_changed(
+                network,
+                &check.conversation_id,
+                Changed::Job(&check.trigger),
+            );
+            self.wake_scheduler()?;
         }
         Ok(())
     }
 
-    /// Whether a reply's App Server turn has ended. One still running is interrupted, since its
-    /// reply was already recorded as interrupted; an unreachable App Server, or another one than
-    /// the turn ran on, leaves it unknown.
-    async fn codex_turn_ended(&self, turn: &ReplyTurn, attempt_id: &str) -> bool {
-        // A turn on no App Server ran in the recorded process groups, which have all exited.
-        if turn.server.is_empty() {
-            return true;
-        }
-        if turn.server == super::opencode::SERVER {
-            return self.opencode.run_ended(&turn.thread).await;
-        }
-        if turn.server != self.codex.server() {
-            return false;
-        }
-        let thread = turn.thread.as_str();
-        match self
-            .codex
-            .probe(thread, turn.turn.as_deref(), attempt_id)
+    async fn read_back_reply(
+        &self,
+        network: &str,
+        check: &PendingCheck,
+    ) -> Option<(JobOutcome, String)> {
+        let turn = check.codex_turn.as_ref()?;
+        let job = self
+            .store
+            .lock()
             .await
-        {
-            Ok(Probe::Running { turn_id, .. }) => {
-                if let Err(error) = self.codex.interrupt(thread, &turn_id).await {
-                    tracing::debug!(%error, "interrupting a reply turn left running is pending");
-                }
-                false
+            .scheduler_job(&check.conversation_id, &check.trigger)
+            .ok()??;
+        let runtime = job.runtime.as_ref()?;
+        let probe = match runtime.provider {
+            crate::providers::Provider::Codex if turn.server == self.codex.server() => self
+                .codex
+                .probe(&turn.thread, turn.turn.as_deref(), &check.attempt_id)
+                .await
+                .ok()?,
+            crate::providers::Provider::Opencode if turn.server == super::opencode::SERVER => self
+                .opencode
+                .probe_reply(
+                    &turn.thread,
+                    &turn
+                        .turn
+                        .clone()
+                        .unwrap_or_else(|| super::opencode::reply_message(&check.attempt_id)),
+                )
+                .await
+                .ok()?,
+            crate::providers::Provider::Claude => self
+                .claude
+                .probe_reply(&turn.thread, turn.turn.as_deref(), &check.attempt_id)
+                .await
+                .ok()?,
+            crate::providers::Provider::Pi => self
+                .pi
+                .probe_reply(&turn.thread, turn.turn.as_deref(), &check.attempt_id)
+                .await
+                .ok()?,
+            crate::providers::Provider::Cursor => {
+                let mut settings = self.manager()?;
+                settings.provider = runtime.provider;
+                settings.model = runtime.model.clone().unwrap_or_default();
+                settings.reasoning_effort = runtime.reasoning_effort.clone();
+                let instance = crate::manager::CursorInstance::Bot {
+                    network: network.into(),
+                    conversation: check.conversation_id.clone(),
+                };
+                let config = self
+                    .manager_config(settings, &self.providers())
+                    .ok()?
+                    .for_cursor_instance(instance.clone(), self.cursor_store_root(&instance));
+                super::cursor::probe_reply(&config, &turn.thread, turn.turn.as_deref()?)
+                    .await
+                    .ok()?
             }
-            Ok(Probe::Terminal { .. } | Probe::NotStarted | Probe::Missing) => true,
-            Err(_) => false,
-        }
+            _ => return None,
+        };
+        let Probe::Terminal {
+            status,
+            text,
+            error,
+            ..
+        } = probe
+        else {
+            return None;
+        };
+        let outcome = match status {
+            TurnStatus::Completed => JobOutcome::Completed,
+            TurnStatus::Failed => JobOutcome::Failed(ExecFailure::new(
+                error.map_or(FailureKind::Unknown, |failure| failure.kind),
+                "the provider recorded a failed turn",
+            )),
+            TurnStatus::Interrupted => JobOutcome::Interrupted {
+                failure: ExecFailure::new(
+                    error.map_or(FailureKind::Lost, |failure| failure.kind),
+                    "the provider confirmed this turn was interrupted",
+                ),
+                process_unconfirmed: false,
+            },
+            TurnStatus::InProgress | TurnStatus::Other(_) => return None,
+        };
+        let secrets: Vec<_> = crate::providers::Provider::ALL
+            .into_iter()
+            .flat_map(|provider| self.provider_env(provider).into_values())
+            .chain(self.agent_env().into_values())
+            .chain(
+                std::env::vars()
+                    .filter(|(name, _)| crate::logging::credential_name(name))
+                    .map(|(_, value)| value),
+            )
+            .filter(|value| value.len() >= 8)
+            .collect();
+        Some((outcome, crate::manager::redact_string(text, &secrets)))
     }
 
     async fn close_check(&self, network: &str, check: &PendingCheck) -> Result<()> {
         self.fence_manager_attempt(&check.attempt_id).await?;
-        self.store
-            .lock()
-            .await
-            .resolve_pending_check(&check.attempt_id)?;
+        self.store.lock().await.confirm_manager_stopped(
+            &self.identity,
+            network,
+            check,
+            now_ms(),
+        )?;
+        self.wake_scheduler()?;
         self.publish_changed(
             network,
             &check.conversation_id,
@@ -362,7 +449,16 @@ impl Runtime {
     /// reachable one; a work on the App Server also needs that device's App Server connected.
     async fn target_vouches(&self, network: &str, work: &WorkProjection) -> Result<bool> {
         let codex = if work.target_node == self.identity.device_id()? {
-            let run = self.store.lock().await.work_record(&work.work_id)?;
+            let store = self.store.lock().await;
+            if store
+                .pending_checks()?
+                .iter()
+                .any(|check| check.trigger == crate::scheduling::task_trigger(&work.work_id))
+            {
+                return Ok(false);
+            }
+            let run = store.work_record(&work.work_id)?;
+            drop(store);
             if run.is_none_or(|run| matches!(run.state, WorkState::Unverified { .. })) {
                 return Ok(false);
             }
@@ -424,9 +520,6 @@ impl Runtime {
             .pending_checks()?
             .into_iter()
             .find(|check| check.trigger == crate::scheduling::task_trigger(work_id));
-        if let Some(check) = manager {
-            self.close_check(network, &check).await?;
-        }
         let receipt = self.store.lock().await.settle_work(
             &self.identity,
             network,
@@ -438,6 +531,9 @@ impl Runtime {
             unvouched,
             now_ms(),
         )?;
+        if let Some(check) = manager {
+            self.close_check(network, &check).await?;
+        }
         self.publish_changed(network, scope, Changed::Work(work_id));
         if receipt.is_some() {
             self.wake_scheduler()?;
@@ -447,6 +543,7 @@ impl Runtime {
 }
 
 /// Signal 0 only asks whether the recorded group still exists; it never signals the processes.
+#[cfg(test)]
 pub(super) fn group_alive(group: u32) -> bool {
     let Ok(group) = libc::pid_t::try_from(group) else {
         return false;

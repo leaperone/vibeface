@@ -573,6 +573,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         }
         EventBody::QuestionAsked {
             question_id: question,
+            attention,
             text,
             choices,
             about,
@@ -585,6 +586,18 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             );
             subject(&about.node, &about.session_id, &about.cwd, &about.summary)?;
             about.request_id.as_deref().map(id).transpose()?;
+            ensure!(
+                attention
+                    .device_id
+                    .as_ref()
+                    .is_none_or(|device| device == &about.node),
+                "attention must target the request's device"
+            );
+            ensure!(
+                attention.kind != crate::model::AttentionKind::BrowserTakeover
+                    || attention.device_id.is_some(),
+                "browser takeover requires its running device"
+            );
             ensure!(choices.len() <= 8, "at most 8 choices");
             for (index, choice) in choices.iter().enumerate() {
                 ensure!(

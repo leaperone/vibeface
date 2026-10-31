@@ -3,7 +3,10 @@
 //! this Node never leaves an unmanaged one behind: the next start kills the recorded group.
 use super::executor::{Executor, SteerAck, SteerTrace};
 use super::*;
-use crate::providers::{CodexLaunch, CodexTarget};
+use crate::providers::{
+    Authentication, CatalogCoverage, CodexLaunch, CodexTarget, EffortOptions, ModelCatalog,
+    ModelChoice,
+};
 use crate::scheduling::{SteerOutcome, SteerTarget};
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
 use futures_util::future::BoxFuture;
@@ -338,6 +341,31 @@ pub(crate) enum Link {
     LaunchFailed {
         reason: String,
     },
+}
+
+impl Link {
+    pub(crate) fn sanitized(mut self) -> Self {
+        let text = match &mut self {
+            Self::LaunchFailed { reason } => {
+                *reason = "Codex App Server could not start; check the local Node log".into();
+                None
+            }
+            Self::HandshakeFailed { reason, .. } => {
+                *reason = "Codex App Server handshake failed; check the local Node log".into();
+                None
+            }
+            Self::Connected { user_agent, .. } => Some(user_agent),
+            _ => None,
+        };
+        if let Some(text) = text {
+            *text = crate::logging::scrub(text)
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(512)
+                .collect();
+        }
+        self
+    }
 }
 
 /// What the system App Server's control socket answered.
@@ -798,23 +826,56 @@ impl CodexServer {
         }
     }
 
-    /// The models the connected App Server offers; `None` while it is off or not connected, so
-    /// the page keeps its text field. Only reads, so a lost answer is simply asked again.
-    pub(crate) async fn models(&self) -> Option<Vec<ModelChoice>> {
+    pub(crate) async fn provider_observation(&self) -> (Authentication, ModelCatalog) {
+        let account = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.client
+                .request("account/read", json!({"refreshToken":false})),
+        )
+        .await;
+        let authentication = match account {
+            Ok(Ok(account)) => account_authentication(&account),
+            _ => Authentication::Unverified,
+        };
+        let catalog = tokio::time::timeout(Duration::from_secs(5), self.models())
+            .await
+            .unwrap_or_default();
+        (authentication, catalog)
+    }
+
+    async fn models(&self) -> ModelCatalog {
         if self.client.status().await["connection"]["state"] != "connected" {
-            return None;
+            return ModelCatalog::default();
         }
         let mut models = vec![];
         let mut params = json!({});
+        let mut coverage = CatalogCoverage::Partial;
+        let mut hidden = false;
         for _ in 0..MODEL_PAGES {
-            let page = self.client.request("model/list", params).await.ok()?;
+            let Ok(page) = self.client.request("model/list", params).await else {
+                return ModelCatalog::default();
+            };
+            let Some(data) = page["data"].as_array() else {
+                return ModelCatalog::default();
+            };
+            hidden |= data.iter().any(|model| model["hidden"] == true);
             models.extend(model_choices(&page));
-            match page["nextCursor"].as_str() {
-                Some(cursor) => params = json!({"cursor":cursor}),
-                None => break,
+            match page.get("nextCursor") {
+                Some(Value::String(cursor)) if !cursor.is_empty() => {
+                    params = json!({"cursor":cursor})
+                }
+                None | Some(Value::Null) | Some(Value::String(_)) => {
+                    if !hidden {
+                        coverage = CatalogCoverage::Complete;
+                    }
+                    break;
+                }
+                _ => return ModelCatalog::default(),
             }
         }
-        Some(models)
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.dedup_by(|a, b| a.id == b.id);
+        ModelCatalog::Available { models, coverage }
     }
 
     /// Stops the App Server the Node started; called on SIGTERM before the Node exits. The
@@ -833,12 +894,15 @@ impl CodexServer {
 
 const MODEL_PAGES: usize = 5;
 
-/// A model the bot can be set to: `id` is what `thread/start` takes.
-#[derive(Debug, serde::Serialize, PartialEq, Eq)]
-pub(crate) struct ModelChoice {
-    pub id: String,
-    pub name: String,
-    pub default: bool,
+fn account_authentication(account: &Value) -> Authentication {
+    match (
+        account["requiresOpenaiAuth"].as_bool(),
+        account.get("account"),
+    ) {
+        (Some(true), Some(Value::Null)) => Authentication::SignInRequired,
+        (Some(true), Some(value)) if value["type"] == "chatgpt" => Authentication::Authenticated,
+        _ => Authentication::Unverified,
+    }
 }
 
 /// One `model/list` page as choices, without the models the App Server hides.
@@ -849,18 +913,52 @@ fn model_choices(page: &Value) -> Vec<ModelChoice> {
         .flatten()
         .filter(|model| model["hidden"] != true)
         .filter_map(|model| {
-            let id = model["model"].as_str().or(model["id"].as_str())?;
+            let id = model["model"]
+                .as_str()
+                .or(model["id"].as_str())
+                .filter(|id| safe_model_text(id))?;
+            let options: Vec<String> = model["supportedReasoningEfforts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|effort| effort["reasoningEffort"].as_str())
+                .filter(|effort| {
+                    Provider::Codex
+                        .validate_reasoning_effort(Some(effort))
+                        .is_ok()
+                })
+                .map(String::from)
+                .collect();
+            let effort = if !options.is_empty() {
+                let default = model["defaultReasoningEffort"]
+                    .as_str()
+                    .filter(|default| options.iter().any(|option| option == default))
+                    .map(String::from);
+                EffortOptions::Selectable { options, default }
+            } else if model["reasoningEffortConfigurable"] == false {
+                EffortOptions::ProviderControlled
+            } else {
+                EffortOptions::Unknown
+            };
             Some(ModelChoice {
                 id: id.into(),
                 name: model["displayName"]
                     .as_str()
-                    .filter(|name| !name.is_empty())
+                    .filter(|name| safe_model_text(name))
                     .unwrap_or(id)
                     .into(),
                 default: model["isDefault"] == true,
+                effort,
             })
         })
         .collect()
+}
+
+fn safe_model_text(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 256
+        && !value.chars().any(char::is_control)
+        && !crate::model::looks_secret(value)
 }
 
 impl Runtime {
@@ -896,16 +994,67 @@ mod tests {
                 ModelChoice {
                     id: "gpt-a".into(),
                     name: "GPT A".into(),
-                    default: true
+                    default: true,
+                    effort: EffortOptions::Unknown,
                 },
                 ModelChoice {
                     id: "gpt-b".into(),
                     name: "gpt-b".into(),
-                    default: false
+                    default: false,
+                    effort: EffortOptions::Unknown,
                 },
             ]
         );
         assert!(model_choices(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn codex_observations_project_authentication_and_per_model_effort() {
+        assert_eq!(
+            account_authentication(&json!({"requiresOpenaiAuth":true,"account":null})),
+            Authentication::SignInRequired
+        );
+        assert_eq!(
+            account_authentication(
+                &json!({"requiresOpenaiAuth":true,"account":{"type":"chatgpt","email":"private@example.invalid"}})
+            ),
+            Authentication::Authenticated
+        );
+        assert_eq!(
+            account_authentication(
+                &json!({"requiresOpenaiAuth":false,"account":{"type":"apiKey"}})
+            ),
+            Authentication::Unverified
+        );
+        assert_eq!(
+            account_authentication(&json!({})),
+            Authentication::Unverified
+        );
+        let choices = model_choices(
+            &json!({"data":[{"model":"model","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"},{"reasoningEffort":"untrusted"}],"defaultReasoningEffort":"high"}]}),
+        );
+        assert_eq!(
+            choices[0].effort,
+            EffortOptions::Selectable {
+                options: vec!["low".into(), "high".into()],
+                default: Some("high".into())
+            }
+        );
+        assert!(model_choices(&json!({"data":[{"model":"bad\nmodel"}]})).is_empty());
+    }
+
+    #[test]
+    fn app_server_reasons_are_scrubbed_bounded_and_control_free() {
+        let link = Link::LaunchFailed {
+            reason: format!("Authorization: Bearer fixture-secret\n{}", "x".repeat(800)),
+        }
+        .sanitized();
+        let Link::LaunchFailed { reason } = link else {
+            panic!("wrong link state")
+        };
+        assert!(!reason.contains("fixture-secret"));
+        assert!(!reason.chars().any(char::is_control));
+        assert!(reason.chars().count() <= 512);
     }
 
     #[test]

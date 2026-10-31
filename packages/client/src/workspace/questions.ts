@@ -37,7 +37,7 @@ export const awaitsAnswer = (question: Question, answered: Readonly<Record<strin
  * `task`: the running task that request holds, to link to. `local`: asked by `entry`, the device this screen goes through, which the card leaves unnamed.
  */
 export function questionMeta(question: Question, works: readonly OpenWork[], bots: readonly Pick<BotRecord, "bot_id" | "conversation_id">[], entry: string | undefined) {
-  const approval = Boolean(question.about.request_id)
+  const approval = question.attention?.kind === "approval" || Boolean(question.about.request_id)
   const work = approval ? works.find((item) => item.thread_id === question.about.session_id && !item.outcome) : undefined
   const bot = work && bots.find((item) => item.conversation_id === work.conversation_id)
   return { approval, task: work && bot ? { bot_id: bot.bot_id, work_id: work.work_id, title: work.title || "任务" } : null, local: question.about.node === entry }
@@ -96,3 +96,11 @@ export function sharedProject(cwd: string, node: string, nodes: readonly Pick<No
 }
 
 export const agentName = (agent: ProviderId) => providerNames[agent]
+
+export function attentionLabel(question: Pick<Question, 'attention'>): string {
+  switch (question.attention?.kind) {
+    case 'approval': return '需要你同意'
+    case 'browser_takeover': return '需要接管浏览器'
+    case 'question': case undefined: return '需要你回答'
+  }
+}

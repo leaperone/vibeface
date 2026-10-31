@@ -1,6 +1,6 @@
 import { lanAddrs, validEndpoint, validTarget } from './transport.ts'
 import type { ChangedEvent } from './progress.ts'
-import { humanError } from './errors.ts'
+import { failureKinds, humanError, type FailureKind } from './errors.ts'
 
 /**
  * How this device reaches a Node: through a Gateway's web address, over the cookie-bound local page of the computer
@@ -40,7 +40,8 @@ export type JoinRequest = {
   admin_id: string | null; admin_name?: string; admin_nonce: string | null; joiner_nonce: string | null; reason: string | null; expires_at_ms: number; code?: string
 }
 export type LocalSetup = { kind: 'uninitialized'; entry: ConnectionEntry; capability: string } | { kind: 'initialized'; entry: ConnectionEntry; removed: boolean; local_launch?: { url: string; device_id: string; token: string } }
-export type ManagerSettings = { provider: ProviderId; workspace: string; model: string }
+export type BackupPolicy = { automatic: boolean; candidates: { provider: ProviderId; model: string; reasoning_effort: string | null }[] }
+export type ManagerSettings = { provider: ProviderId; workspace: string; model: string; reasoning_effort: string | null; backup: BackupPolicy }
 export type NodeSettings = { roots: string[]; manager: ManagerSettings | null }
 export type ProviderId = 'codex' | 'cursor' | 'claude' | 'pi' | 'opencode'
 export const providerNames: Record<ProviderId, string> = { codex: 'Codex', cursor: 'Cursor', claude: 'Claude Code', pi: 'pi', opencode: 'opencode' }
@@ -65,12 +66,14 @@ export type ProviderStatus = {
   /** Codex only: the Codex folder and the sessions folder the device uses. */
   home: string | null; sessions: string | null
   env: { name: string; set: boolean; inherited: boolean; required: boolean }[]
-  state: 'ready' | 'needs_setup' | 'starting' | 'off'; issues: ProviderIssue[]
+  state: 'ready' | 'unverified' | 'needs_setup' | 'starting' | 'off'; issues: ProviderIssue[]
+  readiness: ProviderReadiness
+  probe: { provider: ProviderId; config_id: string; checked_at_ms: number | null; launch: { state: 'unchecked' | 'starting' | 'launchable' } | { state: 'failed'; issue: ProbeIssue }; authentication: 'unverified' | 'authenticated' | 'not_required' | 'sign_in_required'; catalog: ModelCatalog; version: string | null }
 }
 export type NodeSettingsResponse = {
   settings: NodeSettings
   defaults: Pick<ManagerSettings, 'workspace'>
-  readiness: { manager: 'disabled' | 'authentication_unverified' | 'missing_prerequisites'; missing: ProviderId[] }
+  readiness: { manager: ProviderReadiness | null }
   providers: ProviderStatus[]
   /** How Settings shows each path under the home folder (`~/…`); edits still use the full path. */
   display_paths: Record<string, string>
@@ -196,15 +199,9 @@ export function botOnChange(response: NodeSettingsResponse, provider: ProviderSt
   return first && provider.supports.includes('execution') ? { bot: true, execution: true } : { bot: true }
 }
 
-/**
- * Whether a provider can be used, shown before any use is picked: an unused one reads ready once its program is here and
- * the keys it needs are set, `missing` without its program. A used one keeps the state the device reports.
- */
 export type Availability = Exclude<ProviderStatus['state'], 'off'> | 'missing'
-export function availability(item: Pick<ProviderStatus, 'state' | 'installed' | 'env'>): Availability {
-  if (item.state !== 'off') return item.state
-  if (!item.installed) return 'missing'
-  return item.env.some((row) => row.required && !row.set && !row.inherited) ? 'needs_setup' : 'ready'
+export function availability(item: Pick<ProviderStatus, 'installed' | 'readiness'>): Availability {
+  return item.installed ? item.readiness.state : 'missing'
 }
 
 /** Providers in use or on the device get a row; the others fold away until someone looks for one. */
@@ -219,13 +216,12 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
   if (settings.manager !== null) {
     const m = record(settings.manager)
     if (typeof m.model !== 'string') throw new Error('Bot 设置格式不对。')
-    manager = { provider: oneOf(m.provider, providerIds), workspace: text(m.workspace), model: m.model }
+    manager = { provider: oneOf(m.provider, providerIds), workspace: text(m.workspace), model: m.model, reasoning_effort: m.reasoning_effort === null ? null : text(m.reasoning_effort), backup: parseBackupPolicy(m.backup) }
   }
-  if (readiness.manager !== 'disabled' && readiness.manager !== 'authentication_unverified' && readiness.manager !== 'missing_prerequisites') throw new Error('程序检查结果格式不对。')
   return {
     settings: { roots: strings(settings.roots), manager },
     defaults: { workspace: text(defaults.workspace) },
-    readiness: { manager: readiness.manager, missing: array(readiness.missing).map(value => oneOf(value, providerIds)) },
+    readiness: { manager: readiness.manager === null ? null : parseProviderReadiness(readiness.manager) },
     providers: array(v.providers).map(parseProvider),
     display_paths: Object.fromEntries(Object.entries(record(v.display_paths)).map(([path, shown]) => [path, text(shown)])),
     suggested_roots: strings(v.suggested_roots),
@@ -235,7 +231,7 @@ export const providerIds: readonly ProviderId[] = ['codex', 'cursor', 'claude', 
 /** A provider named by a peer's capabilities, or null when it names none this client knows. */
 export const asProvider = (value: unknown): ProviderId | null => providerIds.includes(value as ProviderId) ? value as ProviderId : null
 const providerRoles: ProviderRole[] = ['agent', 'execution']
-const providerStates: ProviderStatus['state'][] = ['ready', 'needs_setup', 'starting', 'off']
+const providerStates: ProviderStatus['state'][] = ['ready', 'unverified', 'needs_setup', 'starting', 'off']
 function oneOf<T extends string>(value: unknown, options: readonly T[]): T {
   if (!options.includes(value as T)) throw new Error('AI 状态格式不对。')
   return value as T
@@ -252,17 +248,64 @@ function parseIssue(value: unknown): ProviderIssue {
     default: throw new Error('AI 状态格式不对。')
   }
 }
-/** A model a provider offers; `id` is what the bot's model setting stores. */
-export type ModelChoice = { id: string; name: string; default: boolean }
-/** `provider_models`: the provider's own list, or `null` when it lists none, so the field stays free text. */
-export function parseProviderModels(value: unknown): ModelChoice[] | null {
-  const v = record(value, '模型列表')
-  if (v.models === null || v.models === undefined) return null
-  const models = array(v.models).map((item) => { const model = record(item, '模型'); return { id: text(model.id), name: text(model.name), default: model.default === true } })
-  return models.length ? models : null
+export const probeCodes = ['not_installed', 'config_invalid', 'missing_credential', 'launch_unverified', 'launch_failed', 'sign_in_required', 'authentication_unverified', 'catalog_unavailable', 'model_unverified', 'model_unavailable'] as const
+export type ProbeCode = typeof probeCodes[number]
+export type ProbeIssue = { stage: 'install' | 'launch' | 'authentication' | 'model_list'; code: ProbeCode; kind?: FailureKind; safe_error?: string }
+export type ProviderReadiness = { state: 'ready' | 'starting' } | { state: 'unverified' | 'needs_setup'; issue: ProbeIssue }
+export type ModelEffort = { state: 'unknown' | 'provider_controlled' } | { state: 'selectable'; options: string[]; default: string | null }
+export type ModelChoice = { id: string; name: string; default: boolean; effort: ModelEffort }
+export type ModelCatalog = { state: 'unavailable'; reason: ProbeCode } | { state: 'available'; models: ModelChoice[]; coverage: 'partial' | 'complete' | 'account_available' }
+export function parseProbeIssue(value: unknown): ProbeIssue {
+  const v = record(value, '检查原因')
+  return { stage: oneOf(v.stage, ['install', 'launch', 'authentication', 'model_list']), code: oneOf(v.code, probeCodes), ...(v.kind == null ? {} : { kind: oneOf(v.kind, failureKinds) }), ...(v.safe_error == null ? {} : { safe_error: text(v.safe_error) }) }
 }
-/** Whether `model` is typed rather than picked: it is set and the list does not have it. */
+export function parseProviderReadiness(value: unknown): ProviderReadiness {
+  const v = record(value, 'AI 检查结果')
+  if (v.state === 'ready' || v.state === 'starting') return { state: v.state }
+  return { state: oneOf(v.state, ['unverified', 'needs_setup']), issue: parseProbeIssue(v.issue) }
+}
+export function parseProviderModels(value: unknown): ModelCatalog {
+  const v = record(value, '模型列表')
+  if (v.state === 'unavailable') return { state: v.state, reason: oneOf(v.reason, probeCodes) }
+  if (v.state !== 'available') throw new Error('模型列表状态无效。')
+  const models = array(v.models).map((item): ModelChoice => {
+    const model = record(item, '模型'), effort = record(model.effort)
+    return { id: text(model.id), name: text(model.name), default: boolean(model.default), effort: effort.state === 'selectable'
+      ? { state: effort.state, options: strings(effort.options), default: effort.default === null ? null : text(effort.default) }
+      : { state: oneOf(effort.state, ['unknown', 'provider_controlled']) } }
+  })
+  return { state: v.state, models, coverage: oneOf(v.coverage, ['partial', 'complete', 'account_available']) }
+}
 export const modelTyped = (model: string, models: ModelChoice[] | null) => Boolean(model) && !models?.some((choice) => choice.id === model)
+export function parseBackupPolicy(value: unknown): BackupPolicy {
+  const policy = record(value, '备用策略')
+  const candidates = array(policy.candidates).map((value) => {
+    const candidate = record(value)
+    return { provider: oneOf(candidate.provider, providerIds), model: text(candidate.model), reasoning_effort: candidate.reasoning_effort === null ? null : text(candidate.reasoning_effort) }
+  })
+  const automatic = boolean(policy.automatic)
+  if (candidates.length > 5 || new Set(candidates.map((item) => `${item.provider}:${item.model}`)).size !== candidates.length || automatic && !candidates.length) throw new Error('备用策略需要 1 至 5 个不同的模型。')
+  return { automatic, candidates }
+}
+export function effortOptions(provider: ProviderId): string[] {
+  switch (provider) {
+    case 'codex': return ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+    case 'claude': return ['low', 'medium', 'high', 'max']
+    case 'pi': return ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
+    case 'cursor': case 'opencode': return []
+  }
+}
+export function probeIssueText(provider: ProviderId, issue: ProbeIssue): string {
+  const name = providerNames[provider]
+  const messages: Record<ProbeCode, string> = {
+    not_installed: `找不到 ${name} 程序，请在运行设备安装或检查路径`, config_invalid: `${name} 配置无法读取，请检查运行设备上的配置`,
+    missing_credential: `${name} 缺少登录信息，请在运行设备设置`, launch_unverified: `${name} 尚未检查启动，请检查可用性`,
+    launch_failed: `${name} 没能启动，请在运行设备检查程序`, sign_in_required: `${name} 需要登录，请在运行设备完成登录`,
+    authentication_unverified: `${name} 登录尚未确认，可发送消息或先检查可用性`, catalog_unavailable: `${name} 模型列表暂不可用，可继续手填模型`,
+    model_unverified: `${name} 尚未确认这个模型，可发送消息或先检查可用性`, model_unavailable: `${name} 无法使用所选模型，请检查模型设置`,
+  }
+  return messages[issue.code]
+}
 export function parseAppServerLink(value: unknown): AppServerLink {
   const v = record(value, 'App Server 状态')
   switch (v.state) {
@@ -279,15 +322,21 @@ function parseAppServer(value: unknown): AppServer | null {
   const v = record(value, 'App Server 设置')
   return { mode: oneOf(v.mode, ['system', 'spawn'] as const), socket: v.socket === null ? null : text(v.socket), link: parseAppServerLink(v.link) }
 }
-function parseProvider(value: unknown): ProviderStatus {
-  const v = record(value)
+export function parseProvider(value: unknown): ProviderStatus {
+  const v = record(value), probe = record(v.probe), launch = record(probe.launch)
+  const provider = oneOf(v.provider, providerIds)
+  if (oneOf(probe.provider, providerIds) !== provider) throw new Error('检查结果和 AI 服务不一致。')
+  const launchState = launch.state === 'failed' ? { state: 'failed' as const, issue: parseProbeIssue(launch.issue) } : { state: oneOf(launch.state, ['unchecked', 'starting', 'launchable'] as const) }
+  if (probe.checked_at_ms !== null && (typeof probe.checked_at_ms !== 'number' || !Number.isSafeInteger(probe.checked_at_ms) || probe.checked_at_ms < 0)) throw new Error('检查时间无效。')
   return {
-    provider: oneOf(v.provider, providerIds),
+    provider,
     roles: array(v.roles).map(role => oneOf(role, providerRoles)), supports: array(v.supports).map(role => oneOf(role, providerRoles)),
     installed: boolean(v.installed), bin: text(v.bin), app_server: parseAppServer(v.app_server),
     home: typeof v.home === 'string' ? v.home : null, sessions: typeof v.sessions === 'string' ? v.sessions : null,
     env: array(v.env).map(row => { const r = record(row); return { name: text(r.name), set: boolean(r.set), inherited: boolean(r.inherited), required: boolean(r.required) } }),
     state: oneOf(v.state, providerStates), issues: array(v.issues).map(parseIssue),
+    readiness: parseProviderReadiness(v.readiness),
+    probe: { provider: oneOf(probe.provider, providerIds), config_id: text(probe.config_id), checked_at_ms: probe.checked_at_ms, launch: launchState, authentication: oneOf(probe.authentication, ['unverified', 'authenticated', 'not_required', 'sign_in_required']), catalog: parseProviderModels(probe.catalog), version: probe.version === null ? null : text(probe.version) },
   }
 }
 function canonical(value: unknown): string {

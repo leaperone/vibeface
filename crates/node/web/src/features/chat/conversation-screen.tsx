@@ -7,7 +7,7 @@ import { faceOf } from '@vibeface/client/avatar/face.ts'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
-import { failureText, outcomeUnknown, taskError, workFailure } from '@vibeface/client/lib/errors.ts'
+import { failureText, taskError, workFailure } from '@vibeface/client/lib/errors.ts'
 import { terms } from '@/lib/glossary'
 import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton, useCreateBot } from '@/features/workspace/workspace-shell'
@@ -25,7 +25,7 @@ import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import type { ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
-import { awaitsDevice, botReach, canSend, composerHint, starters } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, starters } from '@vibeface/client/chat/protocol.ts'
 import { chatTimeline, firstUnread } from '@vibeface/client/chat/timeline.ts'
 import './chat.css'
 
@@ -62,7 +62,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const checks = pendingChecks(data, workspace.nodes, conversationId)
   const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
-  const reach = botReach(workspace.nodes), agentReady = reach === 'ready'
+  const reach = botReach(workspace.nodes), agentReady = botCanSend(reach)
   const unready = workspace.nodes.find((node) => botReadiness(node) === 'needs_setup')
   const sendDisabled = !workspace.writable || !bot || !agentReady || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
   const botBusy = activeJobs.length > 0
@@ -109,7 +109,8 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   // When the newest reply failed, its message can go out again as is, unless it carried files.
   const newest = data?.messages.at(-1)
   // A reply whose outcome is unknown may have done its work, so it is checked, not sent again.
-  const newestUnknown = jobs.some((job) => job.reply_message_id === newest?.message_id && outcomeUnknown(job.failure?.kind, job.failure?.detail))
+  const newestJob = jobs.find((job) => job.reply_message_id === newest?.message_id)
+  const newestUnknown = !newestJob || !canRetryJob(newestJob)
   const failedAsk = newest?.status === 'failed' && !newestUnknown ? data?.messages.find((message) => message.role === 'user' && message.message_id === newest.in_reply_to && !message.attachments?.length) : undefined
   const retry = failedAsk && !sendDisabled ? async () => { setSendError(null); await workspace.sendMessage(failedAsk.text) } : undefined
   const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
@@ -131,17 +132,22 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
       entries.push({ key: message.message_id, message, schedule: scheduleName(schedule, data?.bot_settings, changes), detail })
       for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
     } else if (!folded.hidden.has(message.message_id)) entries.push({ ...pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message, message.message_id === newest?.message_id ? retry : undefined), detail })
+    const recordedJob = jobs.find((job) => job.reply_message_id === message.message_id || !job.reply_message_id && job.message_id === message.message_id)
+    if (recordedJob?.runtime) entries.push({ key: `runtime:${recordedJob.trigger}`, node: <p className="text-meta text-muted-foreground">{runtimeLabel(recordedJob.runtime)}</p> })
+    if (message.status === 'failed' && !recordedJob?.pending_check && (!recordedJob || !canRetryJob(recordedJob))) entries.push({ key: `query:${message.message_id}`, node: <ActionButton variant="ghost" action={() => workspace.refresh()}>再查一次</ActionButton> })
+    if (recordedJob?.state === 'reconciling' || recordedJob?.pending_check) entries.push({ key: `reconcile:${recordedJob.trigger}`, node: <ActionCard icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>}><p className="text-meta text-muted-foreground">设备正在查询上次回复，系统不会自动重发。</p></ActionCard> })
     entries.push(...announced.get(message.message_id) ?? [])
     for (const job of jobs) {
       if (job.message_id !== message.message_id) continue
+      if (job.state === 'queued' && message.role === 'user') entries.push({ key: `queued-actions:${job.trigger}`, node: <QueuedMessage job={job} text={message.text} attachments={Boolean(message.attachments?.length)} edit={(value) => setText(value)} /> })
       // Tasks follow the reply that started them once it is here, so the cause reads before its effect.
       const started = tasks.filter((task) => task.trigger === job.trigger).flatMap(taskRows)
       if (job.reply_message_id && replied.has(job.reply_message_id) && message.role === 'user') announced.set(job.reply_message_id, started)
       else entries.push(...started)
       if ((job.state !== 'failed' && job.state !== 'rejected') || replied.has(job.reply_message_id ?? '')) continue
       // Only a click sends it again, as a new message; once it is sent this message is no longer the newest.
-      const again = message.role === 'user' && message.message_id === newest?.message_id && !outcomeUnknown(job.failure?.kind, job.failure?.detail) && !message.attachments?.length && !sendDisabled ? async () => { setSendError(null); await workspace.sendMessage(message.text) } : undefined
-      entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} retry={again} /> })
+      const again = message.role === 'user' && message.message_id === newest?.message_id && canRetryJob(job) && !message.attachments?.length && !sendDisabled ? async () => { setSendError(null); await workspace.sendMessage(message.text) } : undefined
+      entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} retry={again} refresh={() => workspace.refresh()} /> })
     }
     for (const reply of workspace.interrupted) if (reply.after === message.message_id) entries.push(pendingRow(interruptedRow(reply)))
     for (const turn of placedChanges.after.get(message.message_id) ?? []) entries.push(changeRow(turn))
@@ -155,7 +161,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
 
   const owner = data?.conversation?.owner
   const here = workspace.nodes.find((node) => node.device_id === data?.local_node)
-  const ownerAway = Boolean(owner && here && botReadiness(here) === 'ready' && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
+  const ownerAway = Boolean(owner && here && (botReadiness(here) === 'ready' || botReadiness(here) === 'unverified') && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
   const lastUnanswered = data?.messages.filter((message) => unanswered.includes(message.message_id)).at(-1)
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
   // The owner holds the reply's state; when it does not answer, a waiting message shows that state as unknown.
@@ -176,7 +182,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   // Everything waiting on the person ends the conversation, so it scrolls with it instead of covering it.
   const cards = [
     messagePending && !messageBusy ? <ActionCard key="undelivered" icon={terms.undelivered.icon} title="消息可能没送达" actions={<>
-      <ActionButton variant="ghost" disabled={!workspace.writable} action={() => workspace.releaseMessagePending()}>不发了</ActionButton>
+      <ActionButton variant="ghost" disabled={!workspace.writable || messagePending.rejected === undefined} action={() => workspace.releaseMessagePending()}>不发了</ActionButton>
       <ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>
       <ActionButton variant="default" disabled={!workspace.writable || workspace.incomplete} action={async () => {
         if (await workspace.sendMessage(messagePending.text) && workspace.isCurrent()) clearSentDraft(messagePending.conversation_id, messagePending.text)
@@ -294,6 +300,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         }}
       >
         <InlineError error={sendError} className="basis-full" />
+        {botProviderNotice(workspace.nodes, data?.conversation?.owner) ? <p role="status" className="basis-full text-meta text-muted-foreground">{botProviderNotice(workspace.nodes, data?.conversation?.owner)}</p> : null}
         {needsSetup && !starting && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
     </section>
@@ -388,10 +395,23 @@ function SentToBot({ sent, to }: { sent: SentBotMessage; to: { name: string; bot
 }
 
 /** `retry`: sends the message again as a new one; only offered while it is the newest. */
-function JobLine({ job, retry }: { job: ManagerJob; retry?: () => Promise<void> }) {
+function JobLine({ job, retry, refresh }: { job: ManagerJob; retry?: () => Promise<void>; refresh: () => Promise<void> }) {
   return <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-meta">
     <span className="flex shrink-0 items-center gap-1 text-danger"><CircleX aria-hidden="true" className="size-4 shrink-0" />Bot 没能回复</span>
     {job.failure ? <span className="min-w-0 truncate text-muted-foreground" title={job.failure.detail}>{failureText(job.failure.kind) || failureReason(job.failure.detail)}</span> : null}
-    {retry ? <ActionButton variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11" action={retry}><RotateCcw aria-hidden="true" />再发一次</ActionButton> : null}
+    {retry ? <ActionButton variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11" action={retry}><RotateCcw aria-hidden="true" />再发一次</ActionButton> : <ActionButton variant="ghost" action={refresh}>再查一次</ActionButton>}
+  </div>
+}
+
+function QueuedMessage({ job, text, attachments, edit }: { job: ManagerJob; text: string; attachments: boolean; edit(text: string): void }) {
+  const workspace = useWorkspace()
+  return <div className="flex flex-wrap gap-2 text-meta">
+    <ActionButton variant="ghost" disabled={!workspace.writable} action={async () => { await workspace.cancelManager(job.trigger) }}>取消排队</ActionButton>
+    {!attachments ? <ActionButton variant="ghost" disabled={!workspace.writable} action={async () => {
+      if (!await workspace.cancelManager(job.trigger)) throw new Error('还没确认取消，请先再查一次。')
+      edit(text)
+      document.getElementById('message-text')?.focus()
+    }}>取消并编辑重发</ActionButton> : null}
+    <ActionButton variant="ghost" action={() => workspace.refresh()}>再查一次</ActionButton>
   </div>
 }

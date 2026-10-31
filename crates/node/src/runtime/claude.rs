@@ -18,6 +18,7 @@ use std::sync::{
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use vibeface_bridge::failure::ProviderStage;
 use vibeface_bridge::{
     agent::{self, AgentResult},
     failure::{ExecFailure, FailureKind},
@@ -103,6 +104,7 @@ impl Processes {
 /// One line of the `stream-json` output, as far as a turn needs it.
 #[derive(Debug, PartialEq)]
 enum Frame {
+    Compacted,
     /// `system/init`: the turn runs in this session.
     Started {
         session: String,
@@ -197,6 +199,7 @@ fn frames(line: &str) -> Vec<Frame> {
     }
     let blocks = || frame["message"]["content"].as_array().into_iter().flatten();
     match frame["type"].as_str() {
+        Some("system") if frame["subtype"] == "compact_boundary" => vec![Frame::Compacted],
         Some("system") if frame["subtype"] == "init" => frame["session_id"]
             .as_str()
             .map(|session| Frame::Started {
@@ -270,6 +273,7 @@ impl Turn {
     /// Takes one frame in; returns what the chat shows of it, shaped as `native_progress`.
     fn apply(&mut self, frame: Frame) -> Option<Value> {
         match frame {
+            Frame::Compacted => Some(json!({"type":"context_compacted"})),
             Frame::Started { session } => {
                 self.session = Some(session);
                 Some(json!({"type":"status","status":"running"}))
@@ -408,6 +412,7 @@ fn seen(transcript: Option<&Path>, message: &str) -> Seen {
                     error: None,
                 });
             }
+            Some("user") if !text_of(body).is_empty() => break,
             _ => {}
         }
     }
@@ -635,8 +640,12 @@ where
     );
     let secrets = manager::secret_values(config);
     let start = std::sync::Mutex::new(manager::StartEvidence::NotStarted);
+    let stage = std::sync::Mutex::new(ProviderStage::SessionStart);
     let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
         ManagerError {
+            stage: *stage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             outcome,
             start: *start
                 .lock()
@@ -676,6 +685,7 @@ where
     };
     let session = resumed.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
     let native = Some(session.as_str());
+    *stage.lock().unwrap() = ProviderStage::Record;
     if let Err(e) = persist_session(session.clone()).await {
         // A stop fences the attempt, so saving its session fails then.
         return Err(if *cancel.borrow() {
@@ -684,6 +694,15 @@ where
             let failure = own(&format!("persist the Claude Code session: {e}"));
             error(ManagerFailure::Failed, native, failure)
         });
+    }
+    if let Some(turn) = &config.codex_turn {
+        (turn.record)(session.clone(), None).await.map_err(|e| {
+            error(
+                ManagerFailure::Failed,
+                native,
+                own(&format!("record the Claude reply locator: {e}")),
+            )
+        })?;
     }
     let mut env = config.provider_env.clone();
     env.extend(config.tool_env.clone());
@@ -709,18 +728,21 @@ where
         session: &session,
         resume: resumed.is_some(),
         model: &config.model,
-        effort: None,
+        effort: config.reasoning_effort.as_deref(),
         instructions: &instructions,
         env: &env,
     };
+    *stage.lock().unwrap() = ProviderStage::Launch;
     let mut process = launch
         .spawn()
         .map_err(|failure| error(ManagerFailure::Failed, native, failure))?;
     let sent = async {
+        *stage.lock().unwrap() = ProviderStage::Record;
         processes.track(process.group, bin)?;
         if let Some(started) = &config.process_started {
             started(process.group).await?;
         }
+        *stage.lock().unwrap() = ProviderStage::TurnStart;
         *start.lock().unwrap() = manager::StartEvidence::Unknown;
         send(&process.stdin, &user_frame(prompt, &message)).await
     }
@@ -736,6 +758,7 @@ where
         let line = tokio::select! {
             biased;
             _ = agent::wait_for_cancel(&mut cancel) => {
+                *stage.lock().unwrap() = ProviderStage::Interrupt;
                 break if process.stop(&mut turn).await {
                     Err(error(ManagerFailure::Cancelled, native, own("Claude Code turn interrupted")))
                 } else {
@@ -780,6 +803,7 @@ where
             }
         }
         if turn.session.is_some() {
+            *stage.lock().unwrap() = ProviderStage::Run;
             *start.lock().unwrap() = manager::StartEvidence::Started;
         }
         if let Some(ending) = turn.ending.take() {
@@ -801,8 +825,7 @@ where
             return Err(error(ManagerFailure::Failed, native, failure));
         }
     }
-    // Only now has the session seen the turn's prompt. Recording it earlier would leave a
-    // crashed reply checked against the Codex App Server.
+    // Only a completed native turn advances the session's covered prompt.
     if let Some(turn) = &config.codex_turn
         && let Err(e) = (turn.record)(session.clone(), Some(message)).await
     {
@@ -870,6 +893,27 @@ impl Claude {
 
     fn starting(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
         self.starting.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) async fn probe_reply(
+        &self,
+        session: &str,
+        native_turn: Option<&str>,
+        client_id: &str,
+    ) -> Result<Probe> {
+        uuid::Uuid::parse_str(session)?;
+        vibeface_protocol::validate_id(client_id).map_err(anyhow::Error::msg)?;
+        let message = derived(MESSAGE_SEED, client_id);
+        if native_turn.is_some_and(|turn| turn != message) {
+            return Ok(Probe::Missing);
+        }
+        let path = transcript(self.projects().as_deref(), session);
+        Ok(
+            match path.as_deref().map(|path| seen(Some(path), &message)) {
+                Some(Seen::Ended(ending)) => ending.probe(message),
+                Some(Seen::Open | Seen::Unsent) | None => Probe::Missing,
+            },
+        )
     }
 
     fn projects(&self) -> Option<PathBuf> {
@@ -1302,6 +1346,7 @@ mod tests {
             },
             workspace: place.dir.join("work"),
             model: "haiku".into(),
+            reasoning_effort: None,
             timeout_secs: 30,
             custom_tools: BTreeMap::new(),
             tool_cli: None,
@@ -1447,10 +1492,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bot_readback_requires_its_exact_message_and_explicit_ending() -> Result<()> {
+        let place = Place::new()?;
+        let reader = Claude::open(&place.dir, &place.env());
+        let session = uuid::Uuid::new_v4().to_string();
+        let project = projects_dir(&place.env())
+            .context("projects")?
+            .join("fixture");
+        config::private_dir(&project)?;
+        let path = project.join(format!("{session}.jsonl"));
+        let message = derived(MESSAGE_SEED, "attempt-a");
+        let later = derived(MESSAGE_SEED, "attempt-b");
+        let user = |id: &str| json!({"type":"user","uuid":id,"message":{"role":"user","content":"question"}});
+        let assistant = |id: &str, text: &str, stop: Value| json!({"type":"assistant","message":{"id":id,"content":[{"type":"text","text":text}],"stop_reason":stop}});
+        let write = |records: Vec<Value>| -> Result<()> {
+            std::fs::write(
+                &path,
+                records
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )?;
+            Ok(())
+        };
+        assert_eq!(
+            reader.probe_reply(&session, None, "attempt-a").await?,
+            Probe::Missing
+        );
+        write(vec![
+            user(&message),
+            assistant("reply-a", "unfinished", Value::Null),
+            user(&later),
+            assistant("reply-b", "later result", json!("end_turn")),
+        ])?;
+        assert_eq!(
+            reader.probe_reply(&session, None, "attempt-a").await?,
+            Probe::Missing
+        );
+        write(vec![
+            user(&message),
+            assistant("reply-a", "first result", json!("end_turn")),
+            user(&later),
+            assistant("reply-b", "later result", json!("end_turn")),
+        ])?;
+        assert_eq!(
+            reader.probe_reply(&session, None, "attempt-a").await?,
+            Probe::Terminal {
+                turn_id: message.clone(),
+                status: TurnStatus::Completed,
+                text: "first result".into(),
+                error: None,
+            }
+        );
+        assert_eq!(
+            reader
+                .probe_reply(&session, Some(&later), "attempt-a")
+                .await?,
+            Probe::Missing
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_bot_without_a_durable_locator_never_starts_claude() -> Result<()> {
+        let place = Place::new()?;
+        let record: manager::TurnRecorder =
+            Arc::new(|_, _| Box::pin(async { anyhow::bail!("locator refused") }));
+        let config = bot_config(&place, record);
+        let (result, _, _) = bot_turn(
+            &place,
+            &config,
+            "hello",
+            None,
+            tokio::sync::watch::channel(false).1,
+        )
+        .await;
+        let error = result.unwrap_err();
+        let error = error
+            .downcast_ref::<ManagerError>()
+            .context("structured error")?;
+        assert_eq!(error.start, manager::StartEvidence::NotStarted);
+        assert_eq!(error.stage, ProviderStage::Record);
+        assert_eq!(place.user_frames(), 0);
+        assert!(place.log().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_bot_turn_streams_its_reply_and_keeps_the_session() -> Result<()> {
         let place = Place::new()?;
         let (record, calls) = recorder();
-        let config = bot_config(&place, record);
+        let mut config = bot_config(&place, record);
+        config.reasoning_effort = Some("high".into());
         let (_, never) = tokio::sync::watch::channel(false);
         let (result, saved, shown) = bot_turn(&place, &config, "hello", None, never.clone()).await;
         let result = result?;
@@ -1480,8 +1614,11 @@ mod tests {
         let message = derived(MESSAGE_SEED, "attempt-1");
         assert_eq!(
             *calls.lock().unwrap(),
-            [(session.clone(), Some(message.clone()))],
-            "the turn is recorded once it ended"
+            [
+                (session.clone(), None),
+                (session.clone(), Some(message.clone()))
+            ],
+            "the locator precedes send and the known turn advances coverage"
         );
         let log = place.log();
         let argv: Vec<&str> = log[0]["argv"]
@@ -1494,6 +1631,7 @@ mod tests {
             ["--session-id", session.as_str()],
             ["--permission-mode", "bypassPermissions"],
             ["--model", "haiku"],
+            ["--effort", "high"],
             ["--append-system-prompt", "Answer briefly."],
         ] {
             assert!(argv.windows(2).any(|pair| pair == expected), "{argv:?}");
@@ -1575,9 +1713,11 @@ mod tests {
             .log()
             .iter()
             .any(|entry| entry["stdin"] == "control_request" && entry["subtype"] == "interrupt"));
+        let journal = calls.lock().unwrap();
+        assert_eq!(journal.len(), 1);
         assert!(
-            calls.lock().unwrap().is_empty(),
-            "an interrupted turn is not recorded"
+            journal[0].1.is_none(),
+            "an interrupted turn keeps its locator without advancing coverage"
         );
         assert!(!place.dir.join(PIDFILE).exists());
         Ok(())
@@ -2118,6 +2258,8 @@ mod tests {
             provider: Provider::Claude,
             workspace: place.dir.join("work"),
             model: String::new(),
+            reasoning_effort: None,
+            backup: Default::default(),
         });
         let input = asks(
             "Bash",

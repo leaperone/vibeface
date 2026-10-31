@@ -30,6 +30,7 @@ mod observation;
 pub mod opencode;
 mod peers;
 pub mod pi;
+mod provider_probe;
 mod schedule_delivery;
 mod settings;
 mod triage;
@@ -188,6 +189,7 @@ fn workspace_question_summary(question: &Value) -> Value {
         "created_at_ms",
         "severity",
         "choices",
+        "attention",
     ] {
         if let Some(value) = question.get(key) {
             row[key] = value.clone();
@@ -251,6 +253,8 @@ fn workspace_job_summary(
         "message_id": job.message_id,
         "source_node": source_node,
         "owner_epoch": owner_epoch,
+        "runtime": job.runtime,
+        "retryable": job.retryable(),
         "unknown_reason": pending_checks.contains(&format!("{}\n{}", job.conversation_id, job.trigger))
             .then_some("pending_check"),
     })
@@ -321,6 +325,9 @@ pub struct Runtime {
     pub(crate) host: crate::discovery::Host,
     /// Provider paths a bot proposed, by the question that asks the user; kept until restart.
     pub(crate) provider_proposals: Mutex<HashMap<String, settings::Proposal>>,
+    provider_probes: std::sync::Mutex<BTreeMap<Provider, provider_probe::CachedProviderProbe>>,
+    provider_probe_locks: BTreeMap<Provider, Mutex<()>>,
+    pub(crate) pending_provider_launches: std::sync::atomic::AtomicBool,
     pub(crate) config_save: Mutex<()>,
     pub identity: LocalIdentity,
     pub store: Arc<Mutex<Store>>,
@@ -338,7 +345,7 @@ pub struct Runtime {
     outbox_wakeup: tokio::sync::Notify,
     pub events: broadcast::Sender<Update>,
     pub agent_tokens: Mutex<HashMap<String, Access>>,
-    manager_controls: Mutex<HashMap<String, Arc<manager_control::ActiveManager>>>,
+    pub(crate) manager_controls: Mutex<HashMap<String, Arc<manager_control::ActiveManager>>>,
     schedule_workers: Mutex<BTreeSet<(String, String)>>,
     schedule_wakeup: tokio::sync::Notify,
     observation: std::sync::Mutex<observation::ObservationState>,
@@ -492,6 +499,12 @@ impl Runtime {
             providers: providers.clone(),
             host,
             provider_proposals: Mutex::new(HashMap::new()),
+            provider_probes: std::sync::Mutex::new(BTreeMap::new()),
+            provider_probe_locks: Provider::ALL
+                .into_iter()
+                .map(|provider| (provider, Mutex::new(())))
+                .collect(),
+            pending_provider_launches: std::sync::atomic::AtomicBool::new(false),
             config_save: Mutex::new(()),
             config,
             identity,
@@ -1173,6 +1186,7 @@ impl Runtime {
         json!({"roots":settings.roots,"relay":self.config.network.relay_listen.is_some(),
             "manager":manager,
             "manager_state":self.manager_state().await,
+            "manager_readiness":self.manager_readiness().await,
             "manager_capabilities":manager.map(Provider::capabilities),
             "codex":codex})
     }

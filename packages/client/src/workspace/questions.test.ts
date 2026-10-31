@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { parseAnswer, parseConversation, parseOpenWorks, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
-import { answerBody, answerLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, settledAnswer, sharedProject } from "./questions.ts"
+import { answerBody, answerLabel, attentionLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, settledAnswer, sharedProject } from "./questions.ts"
 
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/path/to/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
@@ -130,4 +130,12 @@ test("a refused request reads as refused, never as agreed", () => {
   assert.equal(answerLabel("拒绝"), "已拒绝")
   assert.equal(answerLabel("拒绝，先别改"), "已拒绝 · 拒绝，先别改")
   assert.equal(answerLabel("允许"), "已回答 · 允许")
+})
+
+test('typed attention preserves the required device and distinguishes browser takeover from approval', () => {
+  const [takeover, approval] = parseQuestions({ questions: [row('takeover', 1, { attention: { kind: 'browser_takeover', device_id: 'worker' } }), row('approval', 2, { attention: { kind: 'approval', device_id: 'worker' } })] })
+  assert.equal(attentionLabel(takeover), '需要接管浏览器')
+  assert.equal(takeover.attention?.device_id, 'worker')
+  assert.equal(questionMeta(approval, [], [], 'worker').approval, true)
+  assert.throws(() => parseQuestions({ questions: [row('bad', 1, { attention: { kind: 'automatic_browser', device_id: 'worker' } })] }))
 })

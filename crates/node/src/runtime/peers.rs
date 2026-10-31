@@ -2983,6 +2983,8 @@ mod tests {
                 provider: crate::providers::Provider::Cursor,
                 workspace: dir_b.join("manager-workspace"),
                 model: String::new(),
+                reasoning_effort: None,
+                backup: Default::default(),
             });
             a.net()?.learn(&b.net()?.addr()).await;
             let peer = ib.device_id()?;
@@ -3174,6 +3176,8 @@ mod tests {
                 provider: crate::providers::Provider::Cursor,
                 workspace: dir_b.join("manager-workspace"),
                 model: String::new(),
+                reasoning_effort: None,
+                backup: Default::default(),
             });
             a.net()?.learn(&b.net()?.addr()).await;
             first_sync(&a, &peer).await?;

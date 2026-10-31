@@ -715,24 +715,24 @@ async fn tool(
     State(app): State<App>,
     headers: HeaderMap,
     Json(input): Json<ToolCallback>,
-) -> ApiResult<Json<Value>> {
-    let token = bearer(&headers).ok_or_else(ApiError::auth)?;
-    let access = app
-        .node
-        .tool_access(token, &input.agent_id)
-        .await
-        .ok_or_else(ApiError::auth)?;
+) -> Response {
+    let Some(token) = bearer(&headers) else {
+        return ApiError::auth().into_response();
+    };
+    let Some(access) = app.node.tool_access(token, &input.agent_id).await else {
+        return ApiError::auth().into_response();
+    };
     if !input.args.is_object() || input.agent_id.is_empty() || input.agent_id.len() > 256 {
-        return Err(ApiError::bad(
-            "args must be an object and agentId must be nonempty and bounded",
-        ));
+        return ApiError::bad("args must be an object and agentId must be nonempty and bounded")
+            .into_response();
     }
-    let result = app
-        .node
-        .tool(access, &input.tool_name, input.args)
-        .await
-        .map_err(ApiError::bad)?;
-    Ok(Json(json!({"result": result})))
+    match app.node.tool(access, &input.tool_name, input.args).await {
+        Ok(result) => Json(json!({"result": result})).into_response(),
+        Err(error) => match error.downcast_ref::<crate::tools::ToolFailure>() {
+            Some(error) => (StatusCode::BAD_REQUEST, Json(error.response.clone())).into_response(),
+            None => ApiError::bad(error).into_response(),
+        },
+    }
 }
 
 async fn hooks(

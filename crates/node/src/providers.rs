@@ -54,6 +54,219 @@ pub enum Role {
     Execution,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeStage {
+    Install,
+    Launch,
+    Authentication,
+    ModelList,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeCode {
+    NotInstalled,
+    ConfigInvalid,
+    MissingCredential,
+    LaunchUnverified,
+    LaunchFailed,
+    SignInRequired,
+    AuthenticationUnverified,
+    CatalogUnavailable,
+    ModelUnverified,
+    ModelUnavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProbeIssue {
+    pub stage: ProbeStage,
+    pub code: ProbeCode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::model::FailureKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_error: Option<String>,
+}
+
+impl ProbeIssue {
+    pub fn new(stage: ProbeStage, code: ProbeCode) -> Self {
+        use crate::model::FailureKind;
+        Self {
+            stage,
+            code,
+            kind: match code {
+                ProbeCode::NotInstalled => Some(FailureKind::MissingBinary),
+                ProbeCode::MissingCredential => Some(FailureKind::MissingKey),
+                ProbeCode::SignInRequired => Some(FailureKind::AuthFailed),
+                ProbeCode::ModelUnavailable => Some(FailureKind::NoModel),
+                _ => None,
+            },
+            safe_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum LaunchCheck {
+    Unchecked,
+    Starting,
+    Launchable,
+    Failed { issue: ProbeIssue },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Authentication {
+    Unverified,
+    Authenticated,
+    NotRequired,
+    SignInRequired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogCoverage {
+    Partial,
+    Complete,
+    AccountAvailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum EffortOptions {
+    ProviderControlled,
+    Unknown,
+    Selectable {
+        options: Vec<String>,
+        default: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ModelChoice {
+    pub id: String,
+    pub name: String,
+    pub default: bool,
+    pub effort: EffortOptions,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ModelCatalog {
+    Unavailable {
+        reason: ProbeCode,
+    },
+    Available {
+        models: Vec<ModelChoice>,
+        coverage: CatalogCoverage,
+    },
+}
+
+impl Default for ModelCatalog {
+    fn default() -> Self {
+        Self::Unavailable {
+            reason: ProbeCode::CatalogUnavailable,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProviderProbe {
+    pub provider: Provider,
+    pub config_id: String,
+    pub checked_at_ms: Option<i64>,
+    pub launch: LaunchCheck,
+    pub authentication: Authentication,
+    pub catalog: ModelCatalog,
+    pub version: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProviderReadiness {
+    Starting,
+    Ready,
+    Unverified { issue: ProbeIssue },
+    NeedsSetup { issue: ProbeIssue },
+}
+
+impl ProviderReadiness {
+    pub fn state(&self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Ready => "ready",
+            Self::Unverified { .. } => "unverified",
+            Self::NeedsSetup { .. } => "needs_setup",
+        }
+    }
+
+    pub fn can_attempt(&self) -> bool {
+        matches!(self, Self::Ready | Self::Unverified { .. })
+    }
+}
+
+impl ProviderProbe {
+    pub fn readiness(&self, model: &str) -> ProviderReadiness {
+        use ProviderReadiness::{NeedsSetup, Unverified};
+        match &self.launch {
+            LaunchCheck::Failed { issue } => {
+                return NeedsSetup {
+                    issue: issue.clone(),
+                };
+            }
+            LaunchCheck::Starting => return ProviderReadiness::Starting,
+            _ => {}
+        }
+        if self.authentication == Authentication::SignInRequired {
+            return NeedsSetup {
+                issue: ProbeIssue::new(ProbeStage::Authentication, ProbeCode::SignInRequired),
+            };
+        }
+        let model = self.provider.model(model);
+        if let ModelCatalog::Available {
+            models,
+            coverage: CatalogCoverage::AccountAvailable,
+        } = &self.catalog
+            && !model.is_empty()
+            && !models.iter().any(|choice| choice.id == model)
+        {
+            return NeedsSetup {
+                issue: ProbeIssue::new(ProbeStage::ModelList, ProbeCode::ModelUnavailable),
+            };
+        }
+        if self.launch == LaunchCheck::Unchecked {
+            return Unverified {
+                issue: ProbeIssue::new(ProbeStage::Launch, ProbeCode::LaunchUnverified),
+            };
+        }
+        if self.authentication == Authentication::Unverified {
+            return Unverified {
+                issue: ProbeIssue::new(
+                    ProbeStage::Authentication,
+                    ProbeCode::AuthenticationUnverified,
+                ),
+            };
+        }
+        let known_model = match &self.catalog {
+            ModelCatalog::Available { models, .. } => models.iter().any(|choice| {
+                if model.is_empty() {
+                    choice.default
+                } else {
+                    choice.id == model
+                }
+            }),
+            ModelCatalog::Unavailable { .. } => false,
+        };
+        if !known_model {
+            return Unverified {
+                issue: ProbeIssue::new(ProbeStage::ModelList, ProbeCode::ModelUnverified),
+            };
+        }
+        ProviderReadiness::Ready
+    }
+}
+
 /// How the Node hears from the provider's sessions it did not start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Watch {
@@ -172,6 +385,22 @@ impl Provider {
     /// A bot on the provider runs only on a model it is given; the others have a default.
     pub fn needs_model(self) -> bool {
         self == Provider::Cursor
+    }
+
+    pub fn validate_reasoning_effort(self, effort: Option<&str>) -> Result<()> {
+        let Some(effort) = effort else { return Ok(()) };
+        let options: &[&str] = match self {
+            Self::Codex => &["none", "minimal", "low", "medium", "high", "xhigh"],
+            Self::Claude => &["low", "medium", "high", "max"],
+            Self::Pi => &["off", "minimal", "low", "medium", "high", "xhigh"],
+            Self::Cursor | Self::Opencode => &[],
+        };
+        ensure!(
+            options.contains(&effort),
+            "{} does not support this reasoning effort",
+            self.label()
+        );
+        Ok(())
     }
 
     /// Each bot on the provider runs in a resident instance of its own, with a private store under
@@ -297,6 +526,10 @@ impl Provider {
         }
     }
 
+    pub fn native_compaction(self) -> bool {
+        matches!(self, Provider::Codex | Provider::Claude | Provider::Pi)
+    }
+
     /// Name prefixes of the variables the Node sets itself for this provider's processes.
     fn reserved_env(self) -> &'static [&'static str] {
         match self {
@@ -333,6 +566,7 @@ impl Provider {
             "cancel": true,
             "steer": self.supports_steer(),
             "resume_local_session": true,
+            "context_compaction": if self.native_compaction() { "native" } else { "handoff" },
             // Codex's and Claude Code's runners send whole text; the others stream it as well.
             "text_stream_mode": match self {
                 Provider::Codex | Provider::Claude => "snapshot",
@@ -627,6 +861,86 @@ impl Local {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_keeps_unknowns_attemptable_and_blocks_only_proven_failures() {
+        let mut probe = ProviderProbe {
+            provider: Provider::Codex,
+            config_id: "fixture-config".into(),
+            checked_at_ms: None,
+            launch: LaunchCheck::Unchecked,
+            authentication: Authentication::Unverified,
+            catalog: ModelCatalog::default(),
+            version: None,
+        };
+        assert_eq!(probe.readiness("manual-model").state(), "unverified");
+        assert!(probe.readiness("manual-model").can_attempt());
+        for code in [
+            ProbeCode::NotInstalled,
+            ProbeCode::MissingCredential,
+            ProbeCode::LaunchFailed,
+        ] {
+            probe.launch = LaunchCheck::Failed {
+                issue: ProbeIssue::new(ProbeStage::Launch, code),
+            };
+            assert_eq!(probe.readiness("manual-model").state(), "needs_setup");
+            assert!(!probe.readiness("manual-model").can_attempt());
+        }
+        probe.launch = LaunchCheck::Launchable;
+        probe.authentication = Authentication::SignInRequired;
+        assert!(matches!(
+            probe.readiness("model"),
+            ProviderReadiness::NeedsSetup {
+                issue: ProbeIssue {
+                    code: ProbeCode::SignInRequired,
+                    ..
+                }
+            }
+        ));
+        probe.authentication = Authentication::Authenticated;
+        probe.catalog = ModelCatalog::Available {
+            models: vec![ModelChoice {
+                id: "model".into(),
+                name: "Model".into(),
+                default: true,
+                effort: EffortOptions::Unknown,
+            }],
+            coverage: CatalogCoverage::Partial,
+        };
+        assert_eq!(probe.readiness("model"), ProviderReadiness::Ready);
+        assert_eq!(probe.readiness(""), ProviderReadiness::Ready);
+        assert_eq!(probe.readiness("manual-model").state(), "unverified");
+        if let ModelCatalog::Available { coverage, .. } = &mut probe.catalog {
+            *coverage = CatalogCoverage::Complete;
+        }
+        assert!(probe.readiness("manual-model").can_attempt());
+        if let ModelCatalog::Available { coverage, .. } = &mut probe.catalog {
+            *coverage = CatalogCoverage::AccountAvailable;
+        }
+        assert!(matches!(
+            probe.readiness("manual-model"),
+            ProviderReadiness::NeedsSetup {
+                issue: ProbeIssue {
+                    code: ProbeCode::ModelUnavailable,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn effort_validation_uses_native_values_without_guessing_model_support() {
+        for (provider, accepted, rejected) in [
+            (Provider::Codex, Some("xhigh"), "max"),
+            (Provider::Claude, Some("max"), "xhigh"),
+            (Provider::Pi, Some("off"), "none"),
+            (Provider::Cursor, None, "medium"),
+            (Provider::Opencode, None, "medium"),
+        ] {
+            assert!(provider.validate_reasoning_effort(accepted).is_ok());
+            assert!(provider.validate_reasoning_effort(Some(rejected)).is_err());
+        }
+    }
 
     #[test]
     fn threads_belong_to_the_app_server_that_keeps_them() {

@@ -1,4 +1,4 @@
-import type { ProviderId } from "../lib/node.ts"
+import type { ProviderId, ProviderReadiness } from "../lib/node.ts"
 import type { PendingMessage, TranscriptMessage } from "../chat/types.ts"
 import type { FailureKind } from "../lib/errors.ts"
 import type { Avatar } from "../avatar/face.ts"
@@ -9,10 +9,10 @@ export type NodeInfo = {
   local: boolean
   online: boolean
   revoked: boolean
-  capabilities?: { manager: string | null; manager_state: BotReadiness | null; relay: boolean; roots: string[]; codex_connected?: boolean }
+  capabilities?: { manager: string | null; manager_state: BotReadiness | null; manager_readiness?: ProviderReadiness | null; relay: boolean; roots: string[]; codex_connected?: boolean }
 }
-/** `ready` only when the bot's switch is on and its provider works; `starting` while it comes up; anything else needs the user. */
-export type BotReadiness = "ready" | "starting" | "needs_setup"
+/** An unverified provider can accept a message; confirmed setup failures block sending. */
+export type BotReadiness = "ready" | "unverified" | "starting" | "needs_setup"
 export type ConversationSummary = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }
 /** Where a work stands in the signed DAG. */
 export type WorkState = "accepted" | "running" | "interrupting" | "finished" | "unverified"
@@ -59,6 +59,13 @@ export type WorkRecord = {
   /** A stop sent while the device was unreachable: still retrying, or past its deadline. */
   stop?: StopState
 }
+export const providerStages = ['validate', 'install', 'launch', 'authentication', 'model_list', 'session_start', 'turn_start', 'run', 'read_back', 'interrupt', 'compact', 'handoff', 'record'] as const
+export type ProviderStage = typeof providerStages[number]
+export type TurnRuntime = {
+  provider: ProviderId; model: string | null; reasoning_effort: string | null; generation: string; session_generation: number; delivery_id: string
+  stage: ProviderStage; execution: 'not_started' | 'started' | 'unknown'; attempted_at_ms: number
+  switched_from: { provider: ProviderId; model: string | null; reasoning_effort: string | null } | null; switch_reason: FailureKind | null
+}
 export type ManagerJob = {
   trigger: string
   state: string
@@ -66,6 +73,8 @@ export type ManagerJob = {
   reply_message_id?: string
   /** A failed or interrupted reply's cause; `detail` is the original text, for 技术详情. */
   failure?: { kind: FailureKind; detail: string }
+  runtime?: TurnRuntime | null
+  retryable?: boolean
   pending_check?: boolean
   /** How the reply a steered message joined ended. */
   outcome?: SteerOutcome
@@ -141,7 +150,7 @@ type SkillsEdit = { before: SkillSet; after: SkillSet }
 export type AvatarEdit = { before: Avatar | null; after: Avatar | null }
 /** `before` null is a new item, `after` null a removed one (docs/design/bot-config.md section 2). */
 export type BotChange =
-  | { kind: "profile"; name?: FieldEdit; instructions?: FieldEdit; model?: ModelEdit; skills?: SkillsEdit; avatar?: AvatarEdit }
+  | { kind: "profile"; name?: FieldEdit; instructions?: FieldEdit; model?: ModelEdit; reasoning_effort?: { provider: ProviderId; before: string | null; after: string | null }; skills?: SkillsEdit; avatar?: AvatarEdit }
   | { kind: "skill"; skill_id: string; before: BotSkill | null; after: BotSkill | null }
   | { kind: "schedule"; schedule_id: string; before: BotSchedule | null; after: BotSchedule | null }
   | { kind: "memory"; memory_id: string; before: string | null; after: string | null }
@@ -153,6 +162,7 @@ export type BotChangeRecord = { change_id: string; conversation_id: string; caus
 export type Overwritten = { change_id: string; by: string } & (
   | { field: "name" | "instructions"; value: string }
   | { field: "model"; provider: ProviderId; value: string }
+  | { field: "reasoning_effort"; provider: ProviderId; value: string | null }
   | { field: "skills"; value: SkillSet }
   | { field: "avatar"; value: Avatar | null })
 type SkillSummary = { skill_id: string; name: string; description: string }
@@ -194,7 +204,7 @@ type LastMessage = { text: string; role: string; created_at_ms: number }
 /** What the bot does on the device serving this list: a message waiting or claimed, or a reply running. A bot another device schedules reads null once its message is delivered. */
 export type Busy = "thinking" | "replying" | null
 /** `avatar` null: the face its id gives. `avatar_version` names the face to change it, null before any change. */
-export type BotRecord = CreateBotRequest & { models: BotModels; skills: SkillSet; avatar: Avatar | null; avatar_version: string | null; event_hash: string; last_message: LastMessage | null; busy: Busy }
+export type BotRecord = CreateBotRequest & { models: BotModels; reasoning_efforts?: BotModels; skills: SkillSet; avatar: Avatar | null; avatar_version: string | null; event_hash: string; last_message: LastMessage | null; busy: Busy }
 
 export type OverviewBot = Pick<BotRecord, "bot_id" | "conversation_id" | "name">
 export type OverviewNode = Pick<NodeInfo, "device_id" | "name" | "online" | "revoked" | "local">
@@ -238,6 +248,7 @@ export type OverviewTask =
   | (OverviewTaskCommon & { kind: "dispatch"; delivery_state: OverviewDeliveryState })
 
 export type OverviewQuestion = {
+  attention?: Question["attention"]
   kind: "question"
   question_id: string
   conversation_id: string
@@ -258,6 +269,8 @@ export type OverviewJob = {
   conversation_id: string | null
   trigger: string
   state: string
+  runtime?: TurnRuntime | null
+  retryable?: boolean
   message_id: string | null
   reply_message_id: string | null
   source_node: string | null
@@ -333,6 +346,7 @@ export type Question = {
   conversation_id: string
   bot: { bot_id: string; name: string } | null
   severity: Severity
+  attention?: { kind: "question" | "approval" | "browser_takeover"; device_id: string | null }
   text: string
   choices: QuestionChoice[]
   about: QuestionSubject

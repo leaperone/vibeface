@@ -143,7 +143,7 @@ const failures: Record<FailureKind, string> = {
   no_bot: `那台设备还没设置 Bot。${settings}打开。`,
   writer_busy: '另一个进程正在写这个会话。等它结束后再试。',
   rejected: 'AI 服务拒绝了这次请求，没有执行。',
-  transport: '连不上 AI 服务，或连接中途断了。稍后再试。',
+  transport: '和 AI 服务的连接断了，结果未知。请先查询结果。',
   timed_out: 'AI 服务没有及时响应，结果未知。',
   restarted: '设备在中途重启了，这次没有重做。',
   lost: '执行的进程意外结束，不确定做完了没有。先看看有没有改动，再决定要不要重发。',
@@ -176,5 +176,5 @@ export function workFailure(work: { failure?: FailureKind; failure_reason: strin
  * unseen. Writes are not repeated on an unknown outcome, so the next step is checking the result, never a plain retry.
  */
 export function outcomeUnknown(kind: FailureKind | null | undefined, detail?: string | null): boolean {
-  return kind === 'timed_out' || kind === 'lost' || /outcome may be unknown|timed out/i.test(detail ?? '')
+  return kind === 'timed_out' || kind === 'lost' || kind === 'transport' || kind === 'restarted' || kind === 'unknown' || /outcome may be unknown|timed out/i.test(detail ?? '')
 }

@@ -8,11 +8,79 @@ use std::sync::{Mutex as StdMutex, PoisonError, Weak, atomic::Ordering};
 use tokio::sync::{Mutex, watch};
 use vibeface_bridge::{
     agent::{
-        AgentFailure, AgentRunError, NativeStatus, RunStarted, SdkBridge, SdkTurn, StartEvidence,
-        ToolCallbackConfig,
+        AgentFailure, AgentRunError, NativeRun, NativeStatus, RunStarted, SdkBridge, SdkTurn,
+        StartEvidence, ToolCallbackConfig,
     },
     failure::{ExecFailure, FailureKind},
 };
+
+fn native_probe(native: NativeRun) -> Probe {
+    match native.status {
+        NativeStatus::Running => Probe::Running {
+            turn_id: native.run_id,
+            epoch: 0,
+        },
+        NativeStatus::Completed => Probe::Terminal {
+            turn_id: native.run_id,
+            status: vibeface_bridge::turn::TurnStatus::Completed,
+            text: native.output.unwrap_or_default(),
+            error: None,
+        },
+        NativeStatus::Cancelled => Probe::Terminal {
+            turn_id: native.run_id,
+            status: vibeface_bridge::turn::TurnStatus::Interrupted,
+            text: native.output.unwrap_or_default(),
+            error: None,
+        },
+        NativeStatus::Failed { detail } => Probe::Terminal {
+            turn_id: native.run_id,
+            status: vibeface_bridge::turn::TurnStatus::Failed,
+            text: native.output.unwrap_or_default(),
+            error: Some(ExecFailure::upstream(detail, FailureKind::Unknown)),
+        },
+        NativeStatus::Unknown => Probe::Missing,
+    }
+}
+
+pub(crate) async fn probe_reply(
+    config: &crate::manager::ManagerConfig,
+    agent_id: &str,
+    run_id: &str,
+) -> Result<Probe> {
+    let crate::manager::Sdk::Cursor {
+        bridge: Some(bridge),
+        sdk_bin,
+        owner: Some(owner),
+        local_store_root: Some(root),
+    } = &config.sdk
+    else {
+        return Ok(Probe::Missing);
+    };
+    let (Some(api_key), env) = crate::providers::cursor_launch(&config.provider_env) else {
+        return Ok(Probe::Missing);
+    };
+    if !config.workspace.is_absolute() || !config.workspace.is_dir() {
+        return Ok(Probe::Missing);
+    }
+    let turn = SdkTurn {
+        owner: owner.clone(),
+        executable: sdk_bin.clone(),
+        workspace: config.workspace.clone(),
+        local_store_root: root.clone(),
+        api_key,
+        env,
+        model: config.model.clone(),
+        timeout_secs: config.timeout_secs,
+        custom_tools: BTreeMap::new(),
+        callback_token: None,
+        process_started: None,
+        run_started: None,
+    };
+    Ok(match bridge.probe(&turn, agent_id, run_id).await {
+        Ok(native) => native_probe(native),
+        Err(_) => Probe::Missing,
+    })
+}
 
 /// Process groups of the running bridges, with the program each one runs.
 pub(super) const PIDFILE: &str = "cursor-sdk-bridge.pid";
@@ -563,31 +631,7 @@ impl Executor for CursorExecutor {
                     return Ok(Probe::Missing);
                 }
             };
-            Ok(match native.status {
-                NativeStatus::Running => Probe::Running {
-                    turn_id: native.run_id,
-                    epoch: 0,
-                },
-                NativeStatus::Completed => Probe::Terminal {
-                    turn_id: native.run_id,
-                    status: vibeface_bridge::turn::TurnStatus::Completed,
-                    text: native.output.unwrap_or_default(),
-                    error: None,
-                },
-                NativeStatus::Cancelled => Probe::Terminal {
-                    turn_id: native.run_id,
-                    status: vibeface_bridge::turn::TurnStatus::Interrupted,
-                    text: native.output.unwrap_or_default(),
-                    error: None,
-                },
-                NativeStatus::Failed { detail } => Probe::Terminal {
-                    turn_id: native.run_id,
-                    status: vibeface_bridge::turn::TurnStatus::Failed,
-                    text: native.output.unwrap_or_default(),
-                    error: Some(ExecFailure::upstream(detail, FailureKind::Unknown)),
-                },
-                NativeStatus::Unknown => Probe::Missing,
-            })
+            Ok(native_probe(native))
         })
     }
 
@@ -788,6 +832,97 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn bot_native_run_is_journaled_and_read_back_without_another_send() -> Result<()> {
+        let (node, dir, network, workspace) = cursor_node().await?;
+        let owner = CursorInstance::Bot {
+            network,
+            conversation: "bot-readback".into(),
+        };
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let mut variables = node.provider_env(Provider::Cursor);
+        variables.insert(
+            "FAKE_BRIDGE_GET_RUN_STATUS".into(),
+            "RUN_LIFECYCLE_STATUS_UNSPECIFIED".into(),
+        );
+        let config = crate::manager::ManagerConfig {
+            sdk: crate::manager::Sdk::Cursor {
+                bridge: node.cursor.get().cloned(),
+                sdk_bin: fake_bridge(),
+                owner: None,
+                local_store_root: None,
+            },
+            workspace,
+            model: "fixture-model".into(),
+            reasoning_effort: None,
+            timeout_secs: 10,
+            custom_tools: BTreeMap::new(),
+            tool_cli: None,
+            instructions: String::new(),
+            tool_env: BTreeMap::new(),
+            tool_token: None,
+            provider_env: variables,
+            process_started: None,
+            codex_turn: Some(crate::manager::CodexTurn {
+                client_id: "bot-attempt".into(),
+                record: Arc::new(move |agent, run| {
+                    recorded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((agent, run));
+                    Box::pin(async { Ok(()) })
+                }),
+                fresh_prompt: None,
+            }),
+        }
+        .for_cursor_instance(owner.clone(), node.cursor_store_root(&owner));
+        let result = crate::manager::run_manager(
+            &config,
+            "read it back",
+            None,
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await?;
+        let agent = result.session_id.context("agent ID")?;
+        let journal = calls.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert_eq!(journal.len(), 2);
+        assert_eq!(journal[0], (agent.clone(), None));
+        let run = journal[1].1.as_deref().context("native run ID journaled")?;
+        assert_eq!(
+            probe_reply(&config, &agent, run).await?,
+            Probe::Terminal {
+                turn_id: run.into(),
+                status: vibeface_bridge::turn::TurnStatus::Completed,
+                text: "done: read it back".into(),
+                error: None,
+            }
+        );
+        assert_eq!(
+            probe_reply(&config, &agent, "not-the-run").await?,
+            Probe::Missing
+        );
+        let mut unavailable = config.clone();
+        unavailable
+            .provider_env
+            .insert("CURSOR_API_KEY".into(), String::new());
+        assert_eq!(
+            probe_reply(&unavailable, &agent, run).await?,
+            Probe::Missing
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sends.log"))?
+                .lines()
+                .count(),
+            1
+        );
+        node.shutdown().await;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     fn fake_bridge() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../bridge/tests/fixtures/fake-cursor-sdk-bridge")
@@ -907,6 +1042,7 @@ mod tests {
                     &network,
                     &spec.work_id,
                     Err(AgentRunError {
+                        stage: vibeface_bridge::failure::ProviderStage::TurnStart,
                         outcome,
                         start,
                         session_id: Some("fixture-agent".into()),

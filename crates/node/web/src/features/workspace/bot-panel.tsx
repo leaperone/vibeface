@@ -124,9 +124,10 @@ export function BotPanelButton() {
                 {choices.map((item) => <NativeSelectOption key={item.key} value={item.key}>{item.label}</NativeSelectOption>)}
               </NativeSelect> : <span className="max-w-48 truncate" title={bot.project?.cwd}>{projectLabel}</span>}
             </SettingsRow> : null}
-            {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={providerNames[provider]}>
+            {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={`${providerNames[provider]} 模型偏好`}>
               {model ? <span className="max-w-48 truncate font-mono" title={model}>{model}</span> : <span>设备默认</span>}
             </SettingsRow>) : <SettingsRow icon={Cpu} label="模型"><span>设备默认</span></SettingsRow>}
+            {models.map(([provider]) => <SettingsRow key={`effort:${provider}`} icon={Cpu} label={`${providerNames[provider]} 推理强度`}><span>{bot.reasoning_efforts?.[provider] ?? "设备默认"}</span></SettingsRow>)}
             <SettingsRow icon={terms.primaryBot.icon} label={terms.primaryBot.label} description={botCopy.primaryHint}>
               {workspace.primary === bot.conversation_id ? <span className="inline-flex items-center gap-1 text-foreground"><Check aria-hidden="true" className="size-4 text-brand" />是</span>
                 : <ActionButton disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}

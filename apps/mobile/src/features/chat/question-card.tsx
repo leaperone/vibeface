@@ -3,7 +3,7 @@ import { Link } from 'expo-router'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
-import { answerLabel, approvalTask, declined, questionMeta, sharedProject } from '@vibeface/client/workspace/questions.ts'
+import { answerLabel, attentionLabel, approvalTask, declined, questionMeta, sharedProject } from '@vibeface/client/workspace/questions.ts'
 import { ArrowUp, CircleCheck, CircleSlash, CircleX, FolderOpen, Hand, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, Laptop, PencilLine, TriangleAlert, type LucideIcon } from 'lucide-react-native'
 import { useState } from 'react'
 import { Pressable, TextInput, View } from 'react-native'
@@ -66,6 +66,8 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const project = question.about.cwd ? sharedProject(question.about.cwd, question.about.node, shared?.nodes ?? []) : null
   const { icon, tone } = looks[question.severity]
   return <ActionCard icon={approval ? Hand : icon} tone={tone} title={question.text}>
+    <Text className="text-meta text-muted-foreground">{attentionLabel(question)}{question.attention?.device_id ? ` · 处理设备 ${workspace.members.find((item) => item.device_id === question.attention?.device_id)?.name ?? '运行设备'}` : ''}</Text>
+    {question.attention?.kind === 'browser_takeover' ? <Text className="text-meta text-muted-foreground">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</Text> : null}
     {inTask ? null : <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
       {task ? <Link href={`/b/${task.bot_id}/work/${task.work_id}`} asChild>
         <Pressable accessibilityRole="link" accessibilityLabel={`任务 ${task.title}`} hitSlop={8} className="min-w-0 flex-row items-center gap-1 active:opacity-60">

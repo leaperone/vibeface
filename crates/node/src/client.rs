@@ -592,6 +592,7 @@ async fn dispatch(
             | "directory"
             | "node_settings"
             | "provider_models"
+            | "provider_probe"
             | "subscribe"
             | "join_check"
             | "join_status"
@@ -728,16 +729,21 @@ async fn dispatch(
         }
         "test_codex_app_server" => {
             node_operator(node, session).await?;
-            Ok(json!(node.codex.test().await))
+            Ok(json!(node.codex.test().await.sanitized()))
         }
-        "provider_models" => {
+        "provider_models" | "provider_probe" => {
             node_operator(node, session).await?;
-            let models = match params["provider"].as_str() {
-                Some("codex") => node.codex.models().await,
-                Some(_) => None,
-                None => bail!("provider is required"),
-            };
-            Ok(json!({"models":models}))
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Query {
+                provider: crate::providers::Provider,
+            }
+            let query: Query = serde_json::from_value(params).context("invalid provider query")?;
+            if method == "provider_probe" {
+                Ok(node.refresh_provider_status(query.provider).await)
+            } else {
+                Ok(json!(node.provider_catalog(query.provider).await))
+            }
         }
         "triage_settings" => {
             node_operator(node, session).await?;
@@ -2340,6 +2346,27 @@ mod tests {
         );
         let initial = dispatch(&node, &mut manager_session, "node_settings", json!({})).await?;
         assert_eq!(initial["settings"], json!({"roots":[],"manager":null}));
+        for invalid in [
+            json!({"provider":"unknown"}),
+            json!({"provider":"codex","prompt":"must not run"}),
+        ] {
+            assert!(
+                dispatch(&node, &mut manager_session, "provider_probe", invalid)
+                    .await
+                    .is_err()
+            );
+        }
+        let catalog = dispatch(
+            &node,
+            &mut manager_session,
+            "provider_models",
+            json!({"provider":"pi"}),
+        )
+        .await?;
+        assert_eq!(
+            catalog,
+            json!({"state":"unavailable","reason":"catalog_unavailable"})
+        );
         let before = std::fs::read(dir.join("config.json"))?;
         for invalid in [
             json!({"roots":["relative-project"],"manager":null}),
@@ -2371,6 +2398,8 @@ mod tests {
                 provider: crate::providers::Provider::Cursor,
                 workspace: workspace.clone(),
                 model: "auto".into(),
+                reasoning_effort: None,
+                backup: Default::default(),
             }),
         };
         let refused = dispatch(
@@ -2443,8 +2472,11 @@ mod tests {
         .await?;
         assert!(workspace.is_dir());
         assert_eq!(saved["settings"]["roots"], json!([project.canonicalize()?]));
-        assert_eq!(saved["readiness"]["manager"], "missing_prerequisites");
-        assert_eq!(saved["readiness"]["missing"], json!(["cursor"]));
+        assert_eq!(saved["readiness"]["manager"]["state"], "needs_setup");
+        assert_eq!(
+            saved["readiness"]["manager"]["issue"]["code"],
+            "not_installed"
+        );
         assert!(node.info().get("manager_available").is_none());
         let nodes = node
             .rpc(
@@ -2810,7 +2842,7 @@ mod tests {
         )
         .await?;
         assert_eq!(stopped["settings"]["manager"], Value::Null);
-        assert_eq!(stopped["readiness"]["manager"], "disabled");
+        assert_eq!(stopped["readiness"]["manager"], Value::Null);
         assert_eq!(stopped["providers"][1]["state"], "off");
         let executing = dispatch(
             &node,

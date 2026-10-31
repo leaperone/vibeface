@@ -502,6 +502,7 @@ impl Store {
             question,
             resumed_by: resumed.map(|(_, node)| node.to_owned()),
             pending_blobs: Default::default(),
+            handoff: None,
         })
     }
 

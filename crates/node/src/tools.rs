@@ -8,6 +8,7 @@ use crate::{
     providers::Provider,
     scheduling::TriggerKind,
 };
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
 /// Event types `context` filters by; see `EventBody::kind`.
@@ -28,6 +29,11 @@ const EVENT_TYPES: [&str; 12] = [
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
+    ToolSearch,
+    ToolDescribe,
+    ToolCall,
+    HistorySearch,
+    HistoryRead,
     Nodes,
     Context,
     DispatchWork,
@@ -84,7 +90,19 @@ impl Effect {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 30] = [
+    pub const DISCOVERY: [Tool; 4] = [
+        Self::ToolSearch,
+        Self::ToolDescribe,
+        Self::ToolCall,
+        Self::CallLookup,
+    ];
+
+    pub const ALL: [Tool; 35] = [
+        Tool::ToolSearch,
+        Tool::ToolDescribe,
+        Tool::ToolCall,
+        Tool::HistorySearch,
+        Tool::HistoryRead,
         Tool::Nodes,
         Tool::Context,
         Tool::DispatchWork,
@@ -123,6 +141,11 @@ impl Tool {
 
     pub fn name(self) -> &'static str {
         match self {
+            Tool::ToolSearch => "tool_search",
+            Tool::ToolDescribe => "tool_describe",
+            Tool::ToolCall => "tool_call",
+            Tool::HistorySearch => "history_search",
+            Tool::HistoryRead => "history_read",
             Tool::Nodes => "nodes",
             Tool::Context => "context",
             Tool::DispatchWork => "dispatch_work",
@@ -158,7 +181,12 @@ impl Tool {
 
     pub fn effect(self) -> Effect {
         match self {
-            Tool::Nodes
+            Tool::ToolSearch
+            | Tool::ToolDescribe
+            | Tool::ToolCall
+            | Tool::HistorySearch
+            | Tool::HistoryRead
+            | Tool::Nodes
             | Tool::Context
             | Tool::WorkStatus
             | Tool::CallLookup
@@ -202,11 +230,38 @@ impl Tool {
             "hue":{"type":"integer","description":format!("OKLCH degrees, one of {HUES:?}")}}})
         };
         let position = || {
-            json!({"type":"object","properties":{"author":string(),"seq":{"type":"integer","minimum":1}},
+            json!({"type":"object","properties":{"author":string(),"seq":{"type":"integer","minimum":1},"event_id":string()},
             "required":["author","seq"],"additionalProperties":false})
         };
         let executors = || json!(Provider::executing(|_| true));
         Some(match self {
+            Tool::ToolSearch => (
+                "Find available coordination tools by name or purpose. Results contain short descriptions; use tool_describe for the input schema.",
+                json!({"query":{"type":"string","maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":50}}),
+                &[],
+            ),
+            Tool::ToolDescribe => (
+                "Read one available coordination tool's full description and JSON input schema.",
+                json!({"name":string()}),
+                &["name"],
+            ),
+            Tool::ToolCall => (
+                "Call a discovered tool with its validated arguments and this turn's permissions. Keep the same call_ref for the same intent. An unknown result requires call_lookup; never change the reference to retry it.",
+                json!({"name":string(),"arguments":{"type":"object"},"call_ref":string()}),
+                &["name", "arguments"],
+            ),
+            Tool::HistorySearch => (
+                "Search this conversation's shared DAG history at this turn's fixed basis, newest first. query matches event text, types filters event kinds. Each page scans at most 100 events and returns bounded excerpts with event_id, author and seq. An empty page can have more=true; continue with before=next. Results are local and partial, never the whole network or a private provider transcript.",
+                json!({"query":{"type":"string","maxLength":256},"before":position(),
+                    "types":{"type":"array","items":{"type":"string","enum":EVENT_TYPES},"uniqueItems":true},
+                    "limit":{"type":"integer","minimum":1,"maximum":50}}),
+                &[],
+            ),
+            Tool::HistoryRead => (
+                "Read one event from this conversation's shared DAG at this turn's fixed basis using at={author,seq,event_id?}. body_json is a bounded page; continue with offset=next_offset until null. It does not read private provider transcripts or other conversations.",
+                json!({"at":position(),"offset":{"type":"integer","minimum":0}}),
+                &["at"],
+            ),
             Tool::Nodes => (
                 "List personal Nodes, device names and allowed roots.",
                 json!({}),
@@ -333,6 +388,7 @@ impl Tool {
                 "Change a bot's name, standing instructions, model, skills or face because the user's own message asked; bot is this or another bot's conversation_id, bot_id or name. instructions replaces the whole text, so keep what should stay. model is the model name the bot runs with on this device's provider (models lists one per provider); an empty string follows the device's default. skills lists the shared skill_ids it uses from now on; all_skills=true uses every shared skill again, new ones included. avatar changes the outline, eyes or hue it names and keeps the rest of the face the bot shows; default_avatar=true goes back to the face the bot's ID gives. Its provider and workspace change only in Settings; this device's provider paths go through propose_provider_config. Reuse call_ref only to retry the same change.",
                 json!({"call_ref":string(),"bot":string(),"name":string(),"instructions":{"type":"string"},
                 "model":{"type":"string","maxLength":MAX_MODEL_CHARS},
+                "reasoning_effort":{"type":"string","maxLength":32,"description":"Provider-native reasoning effort; empty follows this device's default"},
                 "skills":{"type":"array","items":string(),"maxItems":MAX_BOT_SKILLS,"uniqueItems":true},
                 "all_skills":{"type":"boolean","const":true},
                 "avatar":avatar(),"default_avatar":{"type":"boolean","const":true}}),
@@ -380,5 +436,287 @@ impl Tool {
     pub fn needs_call_ref(self) -> bool {
         self.schema()
             .is_some_and(|(_, _, required)| required.contains(&"call_ref"))
+    }
+
+    pub fn available(self, kind: Option<TriggerKind>) -> bool {
+        self.schema().is_some()
+            && (self.effect() == Effect::Read
+                || kind.is_some_and(|kind| self.effect().offered(kind)))
+    }
+
+    pub fn input_schema(self) -> Option<Value> {
+        let (_, properties, required) = self.schema()?;
+        Some(
+            json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}),
+        )
+    }
+
+    pub fn invocation(name: &str, mut args: Value) -> Result<(Self, Value)> {
+        let mut tool = Self::parse(name).context("unknown or unavailable coordination tool")?;
+        if tool == Self::ToolCall {
+            validate_schema(
+                &args,
+                &tool.input_schema().expect("tool_call schema"),
+                "arguments",
+            )?;
+            tool = Self::parse(args["name"].as_str().context("name is required")?)
+                .filter(|tool| *tool != Self::ToolCall && tool.schema().is_some())
+                .context("unknown or unavailable target tool")?;
+            let call_ref = args["call_ref"].clone();
+            args = args["arguments"].take();
+            if !call_ref.is_null() {
+                ensure!(
+                    args["call_ref"].is_null() || args["call_ref"] == call_ref,
+                    "call_ref must match arguments.call_ref"
+                );
+                args["call_ref"] = call_ref;
+            }
+        }
+        ensure!(args.is_object(), "tool arguments must be an object");
+        if let Some(schema) = tool.input_schema() {
+            validate_schema(&args, &schema, "arguments")?;
+        }
+        if let Some(call_ref) = args["call_ref"].as_str() {
+            vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
+        }
+        Ok((tool, args))
+    }
+
+    pub fn annotate(self, args: &Value, mut value: Value) -> Value {
+        let state = value["state"]
+            .as_str()
+            .or_else(|| value["state"]["state"].as_str());
+        let outcome = value["outcome"]
+            .as_str()
+            .or_else(|| value["state"]["outcome"].as_str());
+        let (execution, confirmation) = if value["found"] == false
+            || state.is_some_and(|state| state.contains("unverified"))
+            || outcome == Some("unverified")
+        {
+            ("unknown", "unknown")
+        } else if value.get("work_id").is_some() {
+            match (state, outcome) {
+                (Some("dispatch_rejected"), _) | (_, Some("rejected")) => {
+                    ("not_started", "confirmed")
+                }
+                (_, Some("completed" | "failed" | "interrupted")) => ("completed", "confirmed"),
+                (Some("running" | "interrupting"), _) => ("started", "confirmed"),
+                _ => ("unknown", "pending"),
+            }
+        } else if self.effect() == Effect::Read && self != Self::CallLookup {
+            ("read", "confirmed")
+        } else if value.get("event_hash").is_some()
+            || value.get("bot_id").is_some()
+            || value.get("message").is_some()
+            || value["deleted"] == true
+            || value["status"] == "applied"
+        {
+            ("applied", "confirmed")
+        } else if matches!(
+            value["status"].as_str(),
+            Some("asked" | "declined" | "unchanged")
+        ) {
+            ("not_started", "confirmed")
+        } else {
+            ("unknown", "unknown")
+        };
+        let approval = match value["status"].as_str() {
+            Some("asked") => "pending",
+            Some("applied") => "allowed",
+            Some("declined") => "denied",
+            _ if confirmation == "unknown" || value.get("work_id").is_some() => "unknown",
+            _ => "not_required",
+        };
+        let record = json!({"tool":self.name(),"call_ref":args.get("call_ref").or_else(|| value.get("call_ref")),
+            "stage":if self == Self::CallLookup { "lookup" } else { "result" },
+            "execution":execution,"confirmation":confirmation,"approval":approval,
+            "retry":if matches!(confirmation, "unknown" | "pending") { "lookup_same_ref" } else { "none" }});
+        if !value.is_object() {
+            value = json!({"value":value});
+        }
+        value["call_record"] = record;
+        value
+    }
+}
+
+#[derive(Debug)]
+pub struct ToolFailure {
+    pub response: Value,
+}
+
+impl ToolFailure {
+    pub fn new(
+        name: &str,
+        args: &Value,
+        stage: &str,
+        unknown: bool,
+        error: &anyhow::Error,
+    ) -> Self {
+        let message = crate::logging::scrub(&format!("{error:#}"));
+        Self {
+            response: json!({"error":message,"code":match stage {
+            "validation" => "invalid_tool_arguments",
+            "authorization" => "tool_not_authorized",
+            _ => "tool_execution_failed",
+        },"call_record":{"tool":name,"call_ref":args.get("call_ref").or_else(|| args["arguments"].get("call_ref")),"stage":stage,
+            "execution":if unknown { "unknown" } else { "not_started" },
+            "confirmation":if unknown { "unknown" } else { "confirmed" },
+            "approval":"unknown","retry":if unknown { "lookup_same_ref" } else { "none" }}}),
+        }
+    }
+}
+
+impl std::fmt::Display for ToolFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            self.response["error"]
+                .as_str()
+                .unwrap_or("tool call failed"),
+        )
+    }
+}
+
+impl std::error::Error for ToolFailure {}
+
+fn validate_schema(value: &Value, schema: &Value, path: &str) -> Result<()> {
+    let valid_type = match schema["type"].as_str() {
+        Some("object") => value.is_object(),
+        Some("array") => value.is_array(),
+        Some("string") => value.is_string(),
+        Some("integer") => value.is_i64() || value.is_u64(),
+        Some("boolean") => value.is_boolean(),
+        _ => true,
+    };
+    ensure!(valid_type, "{path} must be {}", schema["type"]);
+    if let Some(allowed) = schema["enum"].as_array() {
+        ensure!(allowed.contains(value), "{path} is not an allowed value");
+    }
+    if let Some(expected) = schema.get("const") {
+        ensure!(value == expected, "{path} must equal {expected}");
+    }
+    if let Some(fields) = value.as_object() {
+        if let Some(required) = schema["required"].as_array() {
+            for key in required.iter().filter_map(Value::as_str) {
+                ensure!(fields.contains_key(key), "{path}.{key} is required");
+            }
+        }
+        ensure!(
+            schema["minProperties"]
+                .as_u64()
+                .is_none_or(|min| fields.len() as u64 >= min),
+            "{path} has too few fields"
+        );
+        for (key, value) in fields {
+            if let Some(property) = schema["properties"].get(key) {
+                validate_schema(value, property, &format!("{path}.{key}"))?;
+            } else {
+                ensure!(
+                    schema["additionalProperties"] != false,
+                    "{path}.{key} is not allowed"
+                );
+            }
+        }
+    }
+    if let Some(text) = value.as_str() {
+        let size = text.chars().count() as u64;
+        ensure!(
+            schema["minLength"].as_u64().is_none_or(|min| size >= min)
+                && schema["maxLength"].as_u64().is_none_or(|max| size <= max),
+            "{path} has invalid length"
+        );
+    }
+    if let Some(number) = value.as_f64() {
+        ensure!(
+            schema["minimum"].as_f64().is_none_or(|min| number >= min)
+                && schema["maximum"].as_f64().is_none_or(|max| number <= max),
+            "{path} is out of range"
+        );
+    }
+    if let Some(items) = value.as_array() {
+        ensure!(
+            schema["minItems"]
+                .as_u64()
+                .is_none_or(|min| items.len() as u64 >= min)
+                && schema["maxItems"]
+                    .as_u64()
+                    .is_none_or(|max| items.len() as u64 <= max),
+            "{path} has invalid item count"
+        );
+        for (index, item) in items.iter().enumerate() {
+            if schema["uniqueItems"] == true {
+                ensure!(!items[..index].contains(item), "{path} has duplicate items");
+            }
+            validate_schema(item, &schema["items"], &format!("{path}[{index}]"))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_calls_validate_the_same_target_schema_once() -> Result<()> {
+        let args = json!({"call_ref":"one-intent","name":"Docs"});
+        assert_eq!(
+            Tool::invocation("create_bot", args.clone())?,
+            Tool::invocation(
+                "tool_call",
+                json!({"name":"create_bot","arguments":{"name":"Docs"},"call_ref":"one-intent"})
+            )?
+        );
+        for args in [
+            json!({"name":"tool_call","arguments":{"name":"nodes","arguments":{}}}),
+            json!({"name":"track_work","arguments":{}}),
+            json!({"name":"create_bot","arguments":{"name":"Docs"}}),
+            json!({"name":"create_bot","call_ref":"a","arguments":{"name":"Docs","call_ref":"b"}}),
+            json!({"name":"history_search","arguments":{"limit":0}}),
+            json!({"name":"history_read","arguments":{"at":{"author":"a","seq":"1"}}}),
+            json!({"name":"history_search","arguments":{"conversation_id":"another-chat"}}),
+        ] {
+            assert!(
+                Tool::invocation("tool_call", args.clone()).is_err(),
+                "{args}"
+            );
+        }
+        assert!(!Tool::ConfigureBot.available(Some(TriggerKind::AgentTask)));
+        assert!(Tool::HistoryRead.available(Some(TriggerKind::AgentTask)));
+        assert!(!Tool::CreateBot.available(None));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_outcomes_never_claim_a_safe_retry() {
+        let args = json!({"call_ref":"same-reference"});
+        for value in [
+            json!({"found":false}),
+            json!({"work_id":"w","state":"unverified"}),
+            json!({"work_id":"w","state":{"state":"unverified","probe":true}}),
+            json!({"work_id":"w","state":"dispatch_waiting"}),
+        ] {
+            let record = Tool::CallLookup.annotate(&args, value)["call_record"].clone();
+            assert_eq!(record["call_ref"], "same-reference");
+            assert_eq!(record["execution"], "unknown");
+            assert_ne!(record["confirmation"], "confirmed");
+            assert_eq!(record["retry"], "lookup_same_ref");
+        }
+        let rejected = Tool::DispatchWork.annotate(
+            &args,
+            json!({"work_id":"w","state":{"state":"finished","outcome":"rejected"}}),
+        );
+        assert_eq!(rejected["call_record"]["execution"], "not_started");
+        let approval = Tool::ProposeProviderConfig
+            .annotate(&json!({}), json!({"status":"asked","question_id":"q"}));
+        assert_eq!(approval["call_record"]["approval"], "pending");
+        let failure = ToolFailure::new(
+            "dispatch_work",
+            &args,
+            "transport",
+            true,
+            &anyhow::anyhow!("connection lost"),
+        );
+        assert_eq!(failure.response["call_record"]["execution"], "unknown");
+        assert_eq!(failure.response["call_record"]["retry"], "lookup_same_ref");
     }
 }

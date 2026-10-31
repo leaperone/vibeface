@@ -201,11 +201,31 @@ test('this computer\'s join failure reads as the terminal says it, and a spent l
   assert.equal(spentInvite.test(nodeJoinCopy.failed), false)
 })
 
-test('a provider\'s model list keeps its order and default, and no list keeps the text field', async () => {
-  const { parseProviderModels } = await import('@vibeface/client/lib/node.ts')
-  assert.deepEqual(parseProviderModels({ models: [{ id: 'gpt-a', name: 'GPT A', default: true }, { id: 'gpt-b', name: 'gpt-b', default: false }] }),
-    [{ id: 'gpt-a', name: 'GPT A', default: true }, { id: 'gpt-b', name: 'gpt-b', default: false }])
-  assert.equal(parseProviderModels({ models: null }), null)
-  assert.equal(parseProviderModels({ models: [] }), null)
-  assert.throws(() => parseProviderModels({ models: [{ name: 'no id' }] }))
+test('a provider catalog keeps model effort and distinguishes unavailable from an empty known list', async () => {
+  const { parseProviderModels, modelTyped, parseBackupPolicy } = await import('@vibeface/client/lib/node.ts')
+  const models = [{ id: 'gpt-a', name: 'GPT A', default: true, effort: { state: 'selectable', options: ['low', 'high'], default: 'high' } }]
+  assert.deepEqual(parseProviderModels({ state: 'available', models, coverage: 'account_available' }), { state: 'available', models, coverage: 'account_available' })
+  const unavailable = parseProviderModels({ state: 'unavailable', reason: 'catalog_unavailable' })
+  assert.deepEqual(unavailable, { state: 'unavailable', reason: 'catalog_unavailable' })
+  assert.equal(modelTyped('my-manual-model', null), true)
+  assert.deepEqual(parseProviderModels({ state: 'available', models: [], coverage: 'complete' }), { state: 'available', models: [], coverage: 'complete' })
+  assert.throws(() => parseProviderModels({ state: 'available', models: [{ name: 'no id' }], coverage: 'complete' }))
+  assert.throws(() => parseProviderModels({ state: 'unknown' }))
+  assert.deepEqual(parseBackupPolicy({ automatic: false, candidates: [] }), { automatic: false, candidates: [] })
+  assert.throws(() => parseBackupPolicy({ automatic: true, candidates: [] }))
+  const candidate = { provider: 'claude', model: 'opus', reasoning_effort: null }
+  assert.throws(() => parseBackupPolicy({ automatic: true, candidates: [candidate, candidate] }))
+})
+
+test('node settings keep a neutral unchecked provider and parse explicit probe evidence', async () => {
+  const { parseNodeSettings, availability, parseProvider } = await import('@vibeface/client/lib/node.ts')
+  const readiness = { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }
+  const provider = { provider: 'claude', roles: ['agent'], supports: ['agent', 'execution'], bin: 'claude', app_server: null, installed: true, home: null, sessions: null, env: [], state: 'unverified', issues: [], readiness, probe: { provider: 'claude', config_id: 'config', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null } }
+  const manager = { provider: 'claude', workspace: '/work', model: 'my-manual-model', reasoning_effort: null, backup: { automatic: false, candidates: [] } }
+  const parsed = parseNodeSettings({ settings: { roots: [], manager }, defaults: { workspace: '/work' }, readiness: { manager: readiness }, providers: [provider], display_paths: {}, suggested_roots: [] })
+  assert.equal(availability(parsed.providers[0]), 'unverified')
+  assert.deepEqual(parsed.settings.manager, manager)
+  assert.throws(() => parseProvider({ ...provider, probe: { ...provider.probe, launch: { state: 'success' } } }))
+  assert.throws(() => parseProvider({ ...provider, probe: { ...provider.probe, provider: 'pi' } }))
+  assert.throws(() => parseProvider({ ...provider, readiness: { state: 'maybe' } }))
 })

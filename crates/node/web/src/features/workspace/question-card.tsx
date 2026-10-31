@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
-import { answerLabel, approvalTask, declined, questionMeta, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
+import { answerLabel, attentionLabel, approvalTask, declined, questionMeta, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import type { Question, Severity } from "@vibeface/client/workspace/types.ts"
@@ -74,6 +74,8 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
     tone={tone}
     title={<>{label ? <span className="sr-only">{label}：</span> : null}<span className="[overflow-wrap:anywhere]">{ask}</span></>}
   >
+    <p className="text-meta text-muted-foreground">{attentionLabel(question)}{question.attention?.device_id ? ` · 处理设备 ${nodeName(question.attention.device_id, { nodes: workspace.nodes, directory })}` : ''}</p>
+    {question.attention?.kind === 'browser_takeover' ? <p className="text-meta text-muted-foreground">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</p> : null}
     <Lines lines={lines} />
     {inTask ? null : <p className="flex min-w-0 items-center gap-3 text-meta text-muted-foreground">
       {task ? <Link to="/b/$botId/work/$workId" params={{ botId: task.bot_id, workId: task.work_id }} search={from === "tasks" ? { from: "tasks" } : from === "inbox" || inbox ? { from: "inbox" } : {}} className="inline-flex min-w-12 items-center gap-1 rounded-md underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">

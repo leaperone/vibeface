@@ -144,7 +144,7 @@ verify_package() {
   json_fields "$package/BUILD-INFO.json" object > "$scratch/build-fields" || fail 'invalid BUILD-INFO.json'
   awk -F '\t' -v version="$version" -v target="$target" -v commit="$commit" '
     { info[$2]=$3 }
-    END { exit !(info["version"]==version && info["target"]==target && info["source_commit"]==commit && info["update_protocol"]=="1" && info["data_epoch"]=="8") }
+    END { exit !(info["version"]==version && info["target"]==target && info["source_commit"]==commit && info["update_protocol"]=="1" && info["data_epoch"]=="9") }
   ' "$scratch/build-fields" || fail 'BUILD-INFO does not match the release, platform, source commit, or data epoch'
   [[ -x "$package/vibeface" ]] || fail 'packaged CLI is not executable'
   [[ $("$package/vibeface" --version) == "vibeface $version" ]] || fail 'packaged CLI version does not match the release'
@@ -323,7 +323,7 @@ JSON
     mkdir -p "$fixture/source/$package/$(dirname "$entry")"
     printf 'test fixture\n' > "$fixture/source/$package/$entry"
   done
-  printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":8}\n' \
+  printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":9}\n' \
     "$version" "$target" > "$fixture/source/$package/BUILD-INFO.json"
   printf '#!/bin/sh\nprintf "vibeface %s\\n"\n' "$version" > "$fixture/source/$package/vibeface"
   chmod +x "$fixture/source/$package/vibeface"
@@ -353,7 +353,7 @@ JSON
     target="$platform"
     package="vibeface-$version-$target"
     if [[ $old_package != "$package" ]]; then mv "$fixture/source/$old_package" "$fixture/source/$package"; fi
-    printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":8}\n' \
+    printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":9}\n' \
       "$version" "$target" > "$fixture/source/$package/BUILD-INFO.json"
     case "$target" in
       aarch64-apple-darwin) printf 'Darwin\n' > "$fixture/os"; printf 'arm64\n' > "$fixture/arch" ;;
@@ -405,10 +405,10 @@ JSON
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
   local unsupported_epoch
-  for unsupported_epoch in 0 7 9; do
+  for unsupported_epoch in 0 8 10; do
     case_dir="$test_dir/data-epoch-$unsupported_epoch"
     mkdir "$case_dir"
-    sed "s/\"data_epoch\":8/\"data_epoch\":$unsupported_epoch/" "$fixture/supported-build" > "$fixture/unsupported-build"
+    sed "s/\"data_epoch\":9/\"data_epoch\":$unsupported_epoch/" "$fixture/supported-build" > "$fixture/unsupported-build"
     cp "$fixture/unsupported-build" "$fixture/source/$package/BUILD-INFO.json"
     repack_fixture
     expect_failure nightly 'BUILD-INFO does not match'
@@ -417,7 +417,7 @@ JSON
   repack_fixture
   case_dir="$test_dir/manifest"
   mkdir "$case_dir"
-  printf '{"version":"wrong","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":8}\n' "$target" > "$fixture/source/$package/BUILD-INFO.json"
+  printf '{"version":"wrong","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":9}\n' "$target" > "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
   expect_failure nightly 'BUILD-INFO does not match'
   case_dir="$test_dir/bin-conflict"

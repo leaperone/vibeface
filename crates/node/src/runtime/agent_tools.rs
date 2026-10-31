@@ -5,7 +5,7 @@ use crate::{
         bot_settings::{ChangeRequest, bot_message_id, change_id},
         bots::created_bot_id,
     },
-    tools::{Effect, Tool},
+    tools::{Effect, Tool, ToolFailure},
     work::WorkSpec,
 };
 
@@ -14,7 +14,24 @@ impl Runtime {
     pub async fn tool(self: &Arc<Self>, access: Access, name: &str, args: Value) -> Result<Value> {
         let conversation_id = access.conversation_id.clone();
         let asked_work = args["work_id"].as_str().map(str::to_owned);
-        let result = self.run_tool(access, name, args).await;
+        let mut stage = "validation";
+        let result = match Tool::invocation(name, args.clone()) {
+            Ok((tool, args)) => self
+                .run_tool(access, tool, args.clone(), &mut stage)
+                .await
+                .map(|value| tool.annotate(&args, value))
+                .map_err(|error| {
+                    ToolFailure::new(
+                        tool.name(),
+                        &args,
+                        stage,
+                        stage == "execution" && tool.effect() != Effect::Read,
+                        &error,
+                    )
+                    .into()
+                }),
+            Err(error) => Err(ToolFailure::new(name, &args, stage, false, &error).into()),
+        };
         let conversation_id = conversation_id.as_deref();
         match &result {
             Ok(value) => {
@@ -34,7 +51,15 @@ impl Runtime {
         result
     }
 
-    async fn run_tool(self: &Arc<Self>, access: Access, name: &str, args: Value) -> Result<Value> {
+    async fn run_tool(
+        self: &Arc<Self>,
+        access: Access,
+        tool: Tool,
+        args: Value,
+        stage: &mut &'static str,
+    ) -> Result<Value> {
+        *stage = "authorization";
+        let name = tool.name();
         let _work = self.maintenance.enter()?;
         ensure!(!access.human, "tool endpoint requires a scoped Agent token");
         let scope = access
@@ -42,7 +67,6 @@ impl Runtime {
             .clone()
             .context("missing tool scope")?;
         self.require_scope(&access, &scope).await?;
-        let tool = Tool::parse(name).context("unknown or unavailable coordination tool")?;
         if let Some(call_ref) = args["call_ref"].as_str()
             && vibeface_protocol::validate_id(call_ref).is_err()
         {
@@ -73,8 +97,46 @@ impl Runtime {
             tokio::time::timeout(Duration::from_secs(20), self.manager_tool_lease(&access))
                 .await
                 .context("agent tool admission timed out")??;
+        *stage = "execution";
         let network = access.network_id.as_str();
         match tool {
+            Tool::ToolSearch | Tool::ToolDescribe => {
+                let kind = match &access.manager {
+                    Some(manager) => Some(
+                        self.store
+                            .lock()
+                            .await
+                            .scheduler_job(&scope, &manager.trigger)?
+                            .context("this turn is not running here")?
+                            .kind,
+                    ),
+                    None => None,
+                };
+                if tool == Tool::ToolDescribe {
+                    let target = Tool::parse(field(&args, "name")?)
+                        .filter(|tool| tool.available(kind))
+                        .context("unknown or unavailable target tool")?;
+                    return Ok(
+                        json!({"name":target.name(),"description":target.schema().expect("available schema").0,
+                        "input_schema":target.input_schema()}),
+                    );
+                }
+                let query = args["query"].as_str().unwrap_or("").to_lowercase();
+                let mut found: Vec<_> = Tool::ALL.into_iter().filter(|tool| tool.available(kind))
+                    .filter_map(|tool| {
+                        let description = tool.schema()?.0;
+                        format!("{} {description}", tool.name()).to_lowercase().contains(&query)
+                            .then(|| json!({"name":tool.name(),"description":description.split('.').next().unwrap_or(description)}))
+                    }).collect();
+                let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+                let more = found.len() > limit;
+                found.truncate(limit);
+                Ok(json!({"tools":found,"more":more}))
+            }
+            Tool::ToolCall => unreachable!("discovery calls are resolved before admission"),
+            Tool::HistorySearch | Tool::HistoryRead => {
+                self.agent_history(&access, &scope, tool, &args).await
+            }
             Tool::Nodes => {
                 self.rpc_inner(access.clone(), json!({"method":"nodes"}))
                     .await
@@ -120,11 +182,12 @@ impl Runtime {
                 let bot = store
                     .bots(network)?
                     .into_iter()
-                    .find(|bot| bot.bot_id == bot_id)
-                    .context(
-                        "nothing was dispatched, changed, sent or created with this call_ref",
-                    )?;
-                Ok(tool_bot(&bot))
+                    .find(|bot| bot.bot_id == bot_id);
+                Ok(match bot {
+                    Some(bot) => tool_bot(&bot),
+                    None => json!({"found":false,"call_ref":call_ref,
+                        "reason":"no confirmed record for this call_ref; an absent record does not authorize a new reference or prove no effect"}),
+                })
             }
             Tool::Recall => {
                 let query = args["query"].as_str().map(str::to_lowercase);
@@ -163,7 +226,7 @@ impl Runtime {
                         json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,
                         "name":bot.name,"instructions":instructions,
                         "instructions_truncated":instructions.len() < bot.instructions.len(),
-                        "project":bot.project,"models":bot.models,"skills":bot.skills,"uses_all_skills":bot.skills.is_none(),"avatar":bot.shown_avatar(),
+                        "project":bot.project,"models":bot.models,"reasoning_efforts":bot.reasoning_efforts,"skills":bot.skills,"uses_all_skills":bot.skills.is_none(),"avatar":bot.shown_avatar(),
                         "schedules":schedules,"this_bot":bot.conversation_id == scope}),
                     );
                 }
@@ -405,6 +468,95 @@ impl Runtime {
                 .await
             }
         }
+    }
+
+    async fn agent_history(
+        &self,
+        access: &Access,
+        scope: &str,
+        tool: Tool,
+        args: &Value,
+    ) -> Result<Value> {
+        let store = self.store.lock().await;
+        let basis = match &access.manager {
+            Some(manager) => {
+                store
+                    .scheduler_job(scope, &manager.trigger)?
+                    .context("this turn is not running here")?
+                    .basis
+            }
+            None => store.version_vector(&access.network_id)?,
+        };
+        let at = if tool == Tool::HistoryRead {
+            &args["at"]
+        } else {
+            &args["before"]
+        };
+        let at = if at.is_null() {
+            None
+        } else {
+            let (author, seq) = position(at, &basis)?;
+            let event = store
+                .scope_event(&access.network_id, scope, author, seq)?
+                .context("no event with this author and seq in this conversation")?;
+            ensure!(
+                at["event_id"].is_null() || at["event_id"] == event.hash,
+                "event_id does not match this conversation's author and seq"
+            );
+            Some((author, seq, false))
+        };
+        if tool == Tool::HistoryRead {
+            let (author, seq, _) = at.context("at is required")?;
+            let mut result = event_page(
+                &store,
+                &access.network_id,
+                scope,
+                author,
+                seq,
+                args["offset"].as_u64().unwrap_or(0) as usize,
+            )?;
+            result["partial"] = json!(true);
+            result["coverage"] = json!("local_conversation_at_basis");
+            return Ok(result);
+        }
+        let kinds: Vec<String> = match &args["types"] {
+            Value::Null => vec![],
+            value => serde_json::from_value(value.clone())?,
+        };
+        let query = args["query"].as_str().unwrap_or("").to_lowercase();
+        let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+        let (events, mut more) =
+            store.history_page(&access.network_id, scope, &basis, at, &kinds, 100)?;
+        let mut rows = Vec::new();
+        let mut next = Value::Null;
+        let mut used = 0;
+        for (index, event) in events.iter().enumerate() {
+            let cursor =
+                json!({"author":event.event.author,"seq":event.event.seq,"event_id":event.hash});
+            let body = crate::scheduler::agent_event_body(&event.event.body);
+            if !body.to_string().to_lowercase().contains(&query) {
+                next = cursor;
+                continue;
+            }
+            let row = json!({"event_id":event.hash,"author":event.event.author,"seq":event.event.seq,
+                "created_at_ms":event.event.created_at_ms,"kind":event.event.body.kind(),
+                "body":crate::scheduler::bounded(&body, EVENT_BYTES)});
+            if !rows.is_empty() && used + row.to_string().len() > PAGE_BYTES {
+                more = true;
+                break;
+            }
+            used += row.to_string().len();
+            rows.push(row);
+            next = cursor;
+            if rows.len() == limit {
+                more |= index + 1 < events.len();
+                break;
+            }
+        }
+        Ok(
+            json!({"events":rows,"more":more,"next":if more { next } else { Value::Null },
+            "partial":true,"coverage":"local_conversation_at_basis"}),
+        )
     }
 
     /// Reads history as of the turn's basis, the same history its prompt was built from, so a
@@ -702,14 +854,15 @@ pub(crate) fn event_page(
 ) -> Result<Value> {
     let event = store
         .scope_event(network, scope, author, seq)?
-        .context("no event with this author and seq in this conversation")?
-        .event;
+        .context("no event with this author and seq in this conversation")?;
+    let hash = event.hash;
+    let event = event.event;
     let text = crate::scheduler::agent_event_body(&event.body).to_string();
     ensure!(
         offset <= text.len() && text.is_char_boundary(offset),
         "invalid body offset"
     );
-    let mut page = json!({"author":event.author,"seq":event.seq,"created_at_ms":event.created_at_ms,
+    let mut page = json!({"event_id":hash,"author":event.author,"seq":event.seq,"created_at_ms":event.created_at_ms,
         "blobs":event.blobs,"offset":offset,"size":text.len(),"next_offset":u64::MAX,"body_json":""});
     let mut room = PAGE_BYTES.saturating_sub(page.to_string().len());
     let mut end = offset;
@@ -804,7 +957,7 @@ pub(crate) fn read_bot(
     Ok(
         json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,"name":bot.name,
         "instructions":bot.instructions,"project":bot.project,
-        "models":bot.models,"skills":skills,"uses_all_skills":bot.skills.is_none(),
+        "models":bot.models,"reasoning_efforts":bot.reasoning_efforts,"skills":skills,"uses_all_skills":bot.skills.is_none(),
         "avatar":bot.shown_avatar(),"schedules":schedules,"memory":memory}),
     )
 }
@@ -884,4 +1037,252 @@ pub(crate) fn work_status(
     };
     let (page, more) = page(&rows, start, args);
     Ok(json!({"works":page,"more":more}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::triage::tests::{bot, node, start_reply};
+
+    async fn post(
+        node: &Runtime,
+        admin: &LocalIdentity,
+        network: &str,
+        scope: &str,
+        id: &str,
+        text: &str,
+    ) -> Result<HashedEvent> {
+        let body = admin.attest(
+            network,
+            scope,
+            EventBody::MessagePosted {
+                message_id: id.into(),
+                role: Role::User,
+                text: text.into(),
+                attachments: vec![],
+                report_results: Some(true),
+                in_reply_to: None,
+                status: None,
+                answers: None,
+                attestation: None,
+                failure: None,
+            },
+        )?;
+        let signed = node.store.lock().await.append_event(
+            &node.identity,
+            network,
+            scope,
+            body,
+            vec![],
+            now_ms(),
+        )?;
+        Ok(HashedEvent {
+            hash: signed.hash,
+            event: serde_json::from_str(&signed.canonical_body)?,
+        })
+    }
+
+    #[tokio::test]
+    async fn history_discovery_is_scoped_bounded_and_stable_at_the_turn_basis() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        bot(&node, &admin, "c", "Ops", &[]).await?;
+        bot(&node, &admin, "d", "Private", &[]).await?;
+        let network = node.store.lock().await.network()?.context("network")?;
+        for i in 0..5 {
+            post(
+                &node,
+                &admin,
+                &network,
+                "c",
+                &format!("older-{i}"),
+                &format!("needle-{i} {}", "x".repeat(9_000)),
+            )
+            .await?;
+        }
+        let elsewhere = post(&node, &admin, &network, "d", "secret", "needle-private").await?;
+        let (trigger, attempt) = start_reply(&node, &admin, "trigger").await?;
+        let access = Access {
+            network_id: network.clone(),
+            human: false,
+            conversation_id: Some("c".into()),
+            manager: Some(ManagerAccess {
+                attempt_id: attempt.clone(),
+                trigger: trigger.clone(),
+            }),
+        };
+        let idle = Access {
+            manager: None,
+            ..access.clone()
+        };
+        node.register_manager_attempt(
+            "tools-history".into(),
+            idle,
+            &attempt,
+            &trigger,
+            Provider::Codex,
+        )
+        .await?;
+        post(&node, &admin, &network, "c", "late", "needle-late").await?;
+        let mut before = Value::Null;
+        let mut ids = Vec::new();
+        loop {
+            let mut args = json!({"query":"needle","types":["message_posted"],"limit":50});
+            if !before.is_null() {
+                args["before"] = before;
+            }
+            let result = node
+                .tool(
+                    access.clone(),
+                    "tool_call",
+                    json!({"name":"history_search","arguments":args}),
+                )
+                .await?;
+            assert!(result.to_string().len() <= PAGE_BYTES + 1_024);
+            assert_eq!(result["partial"], true);
+            for event in result["events"].as_array().context("events")? {
+                ids.push(event["event_id"].as_str().context("event id")?.to_owned());
+                let read = node
+                    .tool(
+                        access.clone(),
+                        "history_read",
+                        json!({"at":{
+                    "author":event["author"],"seq":event["seq"],"event_id":event["event_id"]}}),
+                    )
+                    .await?;
+                assert_eq!(read["event_id"], event["event_id"]);
+                assert!(!read.to_string().contains("attestation"));
+                assert!(!read.to_string().contains("needle-private"));
+                assert!(!read.to_string().contains("needle-late"));
+            }
+            if result["more"] != true {
+                break;
+            }
+            before = result["next"].clone();
+            assert!(!before.is_null());
+        }
+        assert_eq!(ids.len(), 5);
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            5
+        );
+        assert!(
+            node.tool(
+                access.clone(),
+                "history_read",
+                json!({"at":{
+            "author":elsewhere.event.author,"seq":elsewhere.event.seq,"event_id":elsewhere.hash}})
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            node.tool(
+                access.clone(),
+                "history_search",
+                json!({"conversation_id":"d"})
+            )
+            .await
+            .is_err()
+        );
+        let searched = node
+            .tool(access.clone(), "tool_search", json!({"query":"history"}))
+            .await?;
+        assert!(
+            searched["tools"]
+                .as_array()
+                .context("tools")?
+                .iter()
+                .any(|tool| tool["name"] == "history_read")
+        );
+        node.fence_manager_attempt(&attempt).await?;
+        assert!(
+            node.tool(access, "history_search", json!({}))
+                .await
+                .is_err()
+        );
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovery_replays_the_existing_call_and_keeps_missing_outcomes_unknown() -> Result<()>
+    {
+        let (node, admin, dir) = node().await?;
+        bot(&node, &admin, "c", "Ops", &[]).await?;
+        let network = node.store.lock().await.network()?.context("network")?;
+        let (trigger, attempt) = start_reply(&node, &admin, "trigger").await?;
+        let idle = Access {
+            network_id: network.clone(),
+            human: false,
+            conversation_id: Some("c".into()),
+            manager: None,
+        };
+        node.register_manager_attempt(
+            "tools-replay".into(),
+            idle.clone(),
+            &attempt,
+            &trigger,
+            Provider::Codex,
+        )
+        .await?;
+        let access = Access {
+            manager: Some(ManagerAccess {
+                attempt_id: attempt,
+                trigger,
+            }),
+            ..idle.clone()
+        };
+        assert!(
+            node.tool(
+                idle,
+                "tool_call",
+                json!({"name":"create_bot","arguments":{"call_ref":"one","name":"Docs"}})
+            )
+            .await
+            .is_err()
+        );
+        let first = node
+            .tool(
+                access.clone(),
+                "tool_call",
+                json!({"name":"create_bot","arguments":{"name":"Docs"},"call_ref":"one"}),
+            )
+            .await?;
+        let basis = node.store.lock().await.version_vector(&network)?;
+        let replay = node
+            .tool(
+                access.clone(),
+                "create_bot",
+                json!({"name":"Docs","call_ref":"one"}),
+            )
+            .await?;
+        assert_eq!(first["bot_id"], replay["bot_id"]);
+        assert_eq!(first["event_hash"], replay["event_hash"]);
+        assert_eq!(basis, node.store.lock().await.version_vector(&network)?);
+        let lookup = node
+            .tool(access.clone(), "call_lookup", json!({"call_ref":"one"}))
+            .await?;
+        assert_eq!(lookup["bot_id"], first["bot_id"]);
+        assert_eq!(lookup["call_record"]["execution"], "applied");
+        let missing = node
+            .tool(access.clone(), "call_lookup", json!({"call_ref":"lost"}))
+            .await?;
+        assert_eq!(missing["found"], false);
+        assert_eq!(missing["call_record"]["execution"], "unknown");
+        assert_eq!(missing["call_record"]["retry"], "lookup_same_ref");
+        assert!(
+            node.tool(
+                access,
+                "tool_call",
+                json!({"name":"create_bot","arguments":{"name":"Different"},"call_ref":"one"})
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(basis, node.store.lock().await.version_vector(&network)?);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 }

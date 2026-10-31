@@ -6,7 +6,7 @@ import { enqueue, settle, type OutboxItem, type OutboxStore } from "../lib/outbo
 import type { Platform } from "../lib/platform.ts"
 import type { Tabs } from "../identity/context.tsx"
 import { mergeProgress, type LiveProgress } from "../lib/progress.ts"
-import { isQueuedReceipt, prepareSend } from "../chat/protocol.ts"
+import { botReach, isQueuedReceipt, prepareSend } from "../chat/protocol.ts"
 import { byRank, unreadReply } from "../chat/timeline.ts"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
@@ -551,6 +551,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   }
   const sendMessage = (input: string, files: AttachmentFile[] = []) => withMutation(`message:${activeId.current}`, async () => {
     if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("请先选一个 Bot。")
+    if (botReach(nodesRef.current) === "needs_setup") throw new Error("运行 Bot 的设备需设置，请先检查 AI 服务登录和模型。")
     const text = inputText(input, "消息内容", 65536)
     setMessageBusy(true)
     try { return await submitMessage(text, files) } finally { if (current()) setMessageBusy(false) }
@@ -630,13 +631,14 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         if (activeId.current === id) await refreshRef.current()
         const job = dataRef.current?.scheduler?.jobs.find((item) => item.trigger === trigger)
         setNoticeText(job && ["cancelling", "cancelled"].includes(job.state) ? stopped(job.state) : "停止未确认")
-        return
+        return job?.state === "cancelled"
       }
       const job = record(receipt.job)
       if (receipt.publication_pending === true) setNoticeText("本轮已有结果，正在补齐发布；未提交停止请求。")
       else if (receipt.cancel_requested === true) setNoticeText(stopped(job.state))
       else setNoticeText("现在停不了，请再查一次。")
       if (activeId.current === id) await refreshRef.current()
+      return job.state === "cancelled" && receipt.publication_pending !== true
     }),
     /** Replying or declining is keyed by message, so an unknown outcome is settled by reading the conversation again. */
     settleUnanswered: (messageIds: string[], choice: "reply" | "dismiss") => withMutation(`unanswered:${activeId.current}`, async () => {

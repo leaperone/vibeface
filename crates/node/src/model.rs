@@ -160,6 +160,21 @@ pub struct Subject {
     pub request_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionKind {
+    Question,
+    Approval,
+    BrowserTakeover,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionRequest {
+    pub kind: AttentionKind,
+    pub device_id: Option<DeviceId>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Choice {
@@ -344,6 +359,15 @@ pub struct ModelEdit {
     pub after: String,
 }
 
+/// A bot's effort override on one provider; `None` follows the device's setting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningEffortEdit {
+    pub provider: Provider,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
 /// A bot's model per provider. The provider is device-local, so a device runs the entry of its
 /// own provider or, without one, its default model.
 pub type BotModels = BTreeMap<Provider, String>;
@@ -415,6 +439,8 @@ pub enum BotChange {
         instructions: Option<Edit>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<ModelEdit>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<ReasoningEffortEdit>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skills: Option<SkillsEdit>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -612,6 +638,7 @@ impl BotChange {
                 name,
                 instructions,
                 model,
+                reasoning_effort,
                 skills,
                 avatar,
             } => {
@@ -619,6 +646,7 @@ impl BotChange {
                     name.is_some()
                         || instructions.is_some()
                         || model.is_some()
+                        || reasoning_effort.is_some()
                         || skills.is_some()
                         || avatar.is_some(),
                     "a profile change names a field"
@@ -629,6 +657,16 @@ impl BotChange {
                 if let Some(model) = model {
                     validate_model(&model.after)?;
                     anyhow::ensure!(model.before != model.after, "the model is unchanged");
+                }
+                if let Some(edit) = reasoning_effort {
+                    edit.provider
+                        .validate_reasoning_effort(edit.before.as_deref())?;
+                    edit.provider
+                        .validate_reasoning_effort(edit.after.as_deref())?;
+                    anyhow::ensure!(
+                        edit.before != edit.after,
+                        "the reasoning effort is unchanged"
+                    );
                 }
                 if let Some(skills) = skills {
                     validate_skill_set(&skills.after)?;
@@ -796,6 +834,7 @@ pub enum EventBody {
     /// message `a-<question_id>`.
     QuestionAsked {
         question_id: String,
+        attention: AttentionRequest,
         severity: Severity,
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1059,6 +1098,7 @@ pub struct Bot {
     pub instructions: String,
     pub project: Option<BotProject>,
     pub models: BotModels,
+    pub reasoning_efforts: BTreeMap<Provider, String>,
     pub skills: SkillSet,
     pub avatar: Option<Avatar>,
     /// The start of the hash of the event that last set the face, `None` before any change.
@@ -1070,6 +1110,10 @@ impl Bot {
     /// The model this bot runs on `provider`; `None` follows the device's default.
     pub fn model(&self, provider: Provider) -> Option<&str> {
         self.models.get(&provider).map(String::as_str)
+    }
+
+    pub fn reasoning_effort(&self, provider: Provider) -> Option<&str> {
+        self.reasoning_efforts.get(&provider).map(String::as_str)
     }
 
     pub fn shown_avatar(&self) -> ShownAvatar {

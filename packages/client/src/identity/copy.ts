@@ -212,9 +212,9 @@ export const deviceCopy = {
   /** 可用文件夹: what it is, and during setup that it can wait. */
   folders: (later: boolean) => later ? 'Bot 能读写的项目文件夹，可稍后添加' : 'Bot 能读写的项目文件夹',
   /** A computer's bot as `botReadiness` reports it; `null`: it has none set up. */
-  botStatus: { ready: '能运行 Bot', starting: 'Bot 启动中', needs_setup: 'Bot 需设置', none: '还没配置 Bot', unknown: '离线，状态未知' },
+  botStatus: { ready: '能运行 Bot', unverified: 'Bot 尚未确认可用', starting: 'Bot 启动中', needs_setup: 'Bot 需设置', none: '还没配置 Bot', unknown: '离线，状态未知' },
   /** An offline computer reports nothing, so no bot there is unknown rather than none. */
-  botState: (bot: 'ready' | 'starting' | 'needs_setup' | null | undefined, online: boolean | undefined) => bot ?? (online === false ? 'unknown' as const : 'none' as const),
+  botState: (bot: 'ready' | 'unverified' | 'starting' | 'needs_setup' | null | undefined, online: boolean | undefined) => bot ?? (online === false ? 'unknown' as const : 'none' as const),
   /** This computer has a provider installed but no use of any turned on, as a computer that just joined starts. */
   aiOff: '这台电脑的 AI 还没开',
   /** Ends on what removal cannot do: whatever already reached that device stays there. */
@@ -231,7 +231,7 @@ export const deviceCopy = {
   /** How Codex work reaches an App Server: the one already running on that computer, or one Vibeface starts. */
   appServer: { system: '用已在运行的', spawn: '由 Vibeface 启动', useSpawn: '改由 Vibeface 启动' },
   /** The bot's model: a choice from the list its provider gives, with 其他… and 从列表选 switching to and from typing it. */
-  botModel: { label: 'Bot 模型', default: '默认', other: '其他…', pick: '从列表选' },
+  botModel: { label: '设备默认模型', default: '由 AI 服务决定', other: '其他…', pick: '从列表选' },
 }
 
 /** Settings → 会话等你时: how a session that needs the person reaches them. `outlets`: where it shows by default. */

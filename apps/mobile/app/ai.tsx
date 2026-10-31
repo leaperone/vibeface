@@ -4,7 +4,7 @@ import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
-import { availability, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, parseProviderModels, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
+import { availability, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, effortOptions, probeIssueText, providerGroups, providerNames, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { ErrorText } from '@/components/action'
 import { Details, EmptyState, Skeleton, providerIcons, toneText, type Tone } from '@/components/kit'
@@ -32,6 +32,7 @@ export default function AiScreen() {
 
 const states: Record<Availability, { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: '可用', tone: 'success', icon: CircleCheck },
+  unverified: { label: '尚未确认', tone: 'neutral', icon: CircleDashed },
   needs_setup: { label: '需设置', tone: 'warning', icon: CircleAlert },
   starting: { label: '启动中', tone: 'neutral', icon: LoaderCircle },
   missing: { label: '未安装', tone: 'neutral', icon: CircleDashed },
@@ -67,16 +68,6 @@ function AiSettings() {
   const live = useLive()
   const botState = response?.providers.find((item) => item.roles.includes('agent'))?.state
   const folders = response?.settings.roots.join('\n')
-  // The bot's provider may list its models; until it answers, or when it cannot, the model stays a text field.
-  const [models, setModels] = useState<{ provider: ProviderId; list: ModelChoice[] } | null>(null)
-  const botProvider = response?.providers.find((item) => item.roles.includes('agent'))
-  useEffect(() => {
-    if (!ready?.isCurrent() || botProvider?.state !== 'ready') return
-    let live = true
-    const provider = botProvider.provider
-    ready.request('provider_models', { provider }).then(parseProviderModels).then((list) => { if (live) setModels(list ? { provider, list } : null) }, () => {})
-    return () => { live = false }
-  }, [ready, botProvider?.provider, botProvider?.state])
   useEffect(() => { if (folders !== undefined) live?.refresh().then(() => setError((shown) => shown?.at === 'refresh' ? null : shown), (cause) => { if (ready?.isCurrent()) setError({ at: 'refresh', text: messageOf(cause, '读取最新内容') }) }) }, [botState, folders])
   if (!response) return error ? <Retry error={error.text} onRetry={load} /> : <Skeleton className="h-28 rounded-xl" />
   const { roots, manager } = response.settings
@@ -87,7 +78,7 @@ function AiSettings() {
   }
   const { shown, folded } = providerGroups(response.providers)
   const row = (item: ProviderStatus, index: number) => <ProviderRow key={item.provider} item={item} first={index === 0} response={response} busy={busy} test={test}
-    models={models?.provider === item.provider ? models.list : null}
+    models={item.probe.catalog.state === 'available' ? item.probe.catalog.models : null} probe={async () => { await call(`${item.provider}:probe`, 'provider_probe', { provider: item.provider }, item.provider); if (live?.isCurrent()) await live.refresh() }}
     error={error?.at === item.provider ? error.text : ''}
     change={(key, change) => call(`${item.provider}:${key}`, 'configure_provider', { provider: item.provider, ...change }, item.provider).then(Boolean)}
     saveAssistant={(next) => call(`${item.provider}:assistant_details`, 'configure_node', { roots, manager: next }, item.provider).then(Boolean)} />
@@ -107,9 +98,9 @@ function AiSettings() {
 }
 
 /** One line per provider, as on the web: its uses that are on, and whether it can be used, greyed out without its program. Tapping it opens the switches and settings. */
-function ProviderRow({ item, first, response, busy, models, error, change, saveAssistant, test }: {
+function ProviderRow({ item, first, response, busy, models, error, change, saveAssistant, test, probe }: {
   item: ProviderStatus; first: boolean; response: NodeSettingsResponse; busy: string; models: ModelChoice[] | null; error: string
-  change(key: string, value: Change): Promise<boolean>; saveAssistant(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>
+  change(key: string, value: Change): Promise<boolean>; saveAssistant(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>; probe(): Promise<unknown>
 }) {
   const name = providerNames[item.provider]
   const assistant = item.roles.includes('agent'), execution = item.roles.includes('execution')
@@ -141,6 +132,13 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
         ? <Button variant="link" className="px-0" disabled={working} onPress={() => void change('app_server', { app_server: { mode: 'spawn', socket: item.app_server?.socket ?? null } })}><Text>{deviceCopy.appServer.useSpawn}</Text></Button>
         : open ? null : <Button variant="link" className="px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
     </View> : null}
+    <View className="gap-1 px-4 pb-3">
+      {'issue' in item.readiness ? <Text className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.readiness.issue)}</Text> : null}
+      <Text className="text-meta text-muted-foreground">{item.probe.checked_at_ms === null ? '尚未主动检查' : `检查于 ${new Date(item.probe.checked_at_ms).toLocaleString()}`}</Text>
+      <Button variant="ghost" className="self-start" disabled={busy !== ''} onPress={() => void probe()}><Icon as={busy === `${item.provider}:probe` ? LoaderCircle : PlugZap} /><Text>检查可用性</Text></Button>
+      {manager && item.probe.catalog.state === 'available' && item.probe.catalog.coverage === 'partial' ? <Text className="text-meta text-muted-foreground">模型列表可能不完整，可手填其他模型。</Text> : null}
+      {manager && item.probe.catalog.state === 'unavailable' ? <Text className="text-meta text-muted-foreground">模型列表暂不可用，可继续手填。已保存的模型保持不变。</Text> : null}
+    </View>
     {open ? <>
       {item.supports.includes('agent') ? <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', assistant ? { bot: false } : botOnChange(response, item))} /> : null}
       {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
@@ -232,7 +230,9 @@ function AssistantDetails({ manager, models, working, save }: { manager: Manager
   const [chosen, setTyping] = useState<boolean | null>(null)
   const typing = chosen ?? modelTyped(manager.model, models)
   const cursor = manager.provider === 'cursor'
-  const dirty = assistantFields.some((key) => draft[key] !== manager[key])
+  const dirty = assistantFields.some((key) => draft[key] !== manager[key]) || draft.reasoning_effort !== manager.reasoning_effort || JSON.stringify(draft.backup) !== JSON.stringify(manager.backup)
+  const selected = models?.find((model) => draft.model ? model.id === draft.model : model.default)
+  const efforts = selected?.effort.state === 'provider_controlled' ? [] : selected?.effort.state === 'selectable' ? selected.effort.options : effortOptions(manager.provider)
   const input = (key: (typeof assistantFields)[number], label: string, placeholder?: string) => <Input accessibilityLabel={label} className={key === 'model' ? 'min-w-0 flex-1' : 'font-mono'} autoCapitalize="none" autoCorrect={false} placeholder={placeholder}
     value={draft[key]} editable={!working} onChangeText={(text) => setDraft({ ...draft, [key]: text })} />
   return <View className="gap-3">
@@ -245,9 +245,16 @@ function AssistantDetails({ manager, models, working, save }: { manager: Manager
             onPress={() => { setTyping(false); setDraft({ ...draft, model: models.some((model) => model.id === draft.model) ? draft.model : '' }) }}><Icon as={List} /></Button> : null}
         </View>}
     </Field>
+    <Field label="推理强度">
+      {efforts.length ? <View className="flex-row flex-wrap gap-1">
+        {[null, ...efforts].map((effort) => <Button key={effort ?? 'default'} variant={draft.reasoning_effort === effort ? 'outline' : 'ghost'} disabled={working} onPress={() => setDraft({ ...draft, reasoning_effort: effort })}><Text>{effort ?? '由 AI 服务决定'}</Text></Button>)}
+        <Text className="text-meta text-muted-foreground">用于下一回合，模型是否支持以 AI 服务的检查结果为准。</Text>
+      </View> : <Text className="text-meta text-muted-foreground">由 AI 服务决定</Text>}
+    </Field>
+    <Details label="备用策略"><BackupPolicyEditor policy={draft.backup} disabled={working} change={(backup) => setDraft({ ...draft, backup })} /></Details>
     <Field label={folderLabels.botRun}>{input('workspace', folderLabels.botRun)}</Field>
-    {dirty ? <Button variant="outline" className="self-start" disabled={working || (cursor && !draft.model.trim())}
-      onPress={() => void save(Object.fromEntries(Object.entries(draft).map(([key, value]) => [key, typeof value === 'string' ? value.trim() : value])) as ManagerSettings)}><Text>保存</Text></Button> : null}
+    {dirty ? <Button variant="outline" className="self-start" disabled={working || (cursor && !draft.model.trim()) || draft.backup.candidates.some((candidate) => !candidate.model.trim())}
+      onPress={() => void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim(), backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } })}><Text>保存</Text></Button> : null}
   </View>
 }
 
@@ -328,5 +335,21 @@ function Section({ icon, title, children }: { icon: LucideIcon; title: string; c
       <Text role="heading" numberOfLines={1} className="shrink text-heading font-semibold">{title}</Text>
     </View>
     {children}
+  </View>
+}
+
+function BackupPolicyEditor({ policy, disabled, change }: { policy: BackupPolicy; disabled: boolean; change(policy: BackupPolicy): void }) {
+  const update = (index: number, value: BackupPolicy['candidates'][number]) => change({ ...policy, candidates: policy.candidates.map((candidate, at) => at === index ? value : candidate) })
+  return <View className="gap-3">
+    <View className="min-h-11 flex-row items-center gap-2"><Text className="min-w-0 flex-1 text-meta">自动尝试备用模型</Text><Switch accessibilityLabel="自动尝试备用模型" disabled={disabled || !policy.candidates.length} value={policy.automatic} onValueChange={(automatic) => change({ ...policy, automatic })} /></View>
+    <Text className="text-meta text-muted-foreground">仅在原回合明确未执行时按顺序尝试一次。使用运行设备对应 AI 服务的登录账户，可能产生该账户的费用。</Text>
+    {policy.candidates.map((candidate, index) => <View key={index} className="gap-2 rounded-lg border border-border p-2">
+      <Text className="text-meta">备用模型 {index + 1}</Text>
+      <View className="flex-row flex-wrap gap-1">{providerIds.map((provider) => <Button key={provider} variant={candidate.provider === provider ? 'outline' : 'ghost'} disabled={disabled} onPress={() => update(index, { provider, model: '', reasoning_effort: null })}><Text>{providerNames[provider]}</Text></Button>)}</View>
+      <Input accessibilityLabel={`备用模型 ${index + 1}`} placeholder="模型名称" autoCapitalize="none" autoCorrect={false} value={candidate.model} editable={!disabled} onChangeText={(model) => update(index, { ...candidate, model })} />
+      {effortOptions(candidate.provider).length ? <View className="flex-row flex-wrap gap-1">{[null, ...effortOptions(candidate.provider)].map((effort) => <Button key={effort ?? 'default'} variant={candidate.reasoning_effort === effort ? 'outline' : 'ghost'} disabled={disabled} onPress={() => update(index, { ...candidate, reasoning_effort: effort })}><Text>{effort ?? '由 AI 服务决定'}</Text></Button>)}</View> : <Text className="text-meta text-muted-foreground">推理强度由 AI 服务决定</Text>}
+      <Button variant="ghost" disabled={disabled} onPress={() => { const candidates = policy.candidates.filter((_, at) => at !== index); change({ automatic: policy.automatic && candidates.length > 0, candidates }) }}><Text>移除备用模型</Text></Button>
+    </View>)}
+    <Button variant="outline" disabled={disabled || policy.candidates.length >= 5} onPress={() => change({ ...policy, candidates: [...policy.candidates, { provider: 'codex', model: '', reasoning_effort: null }] })}><Text>添加备用模型</Text></Button>
   </View>
 }

@@ -82,11 +82,11 @@ test('the capsule names the computer from the directory once it lists it, not by
   assert.equal(entryLabel({ joined: false, directory: null, entryId: 'b', ownName: '我的 Mac', address: 'http://127.0.0.1:1' }), '我的 Mac')
 })
 
-test('a provider shows whether it can be used before any use is picked', () => {
-  const provider = (extra: Partial<ProviderStatus>) => ({ state: 'off', installed: true, env: [], ...extra }) as Pick<ProviderStatus, 'state' | 'installed' | 'env'>
-  assert.equal(availability(provider({})), 'ready')
+test('an installed provider remains unverified until the device confirms readiness', () => {
+  const provider = (extra: Partial<Pick<ProviderStatus, 'installed' | 'readiness'>> = {}): Pick<ProviderStatus, 'installed' | 'readiness'> => ({ installed: true, readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }, ...extra })
+  assert.equal(availability(provider()), 'unverified')
   assert.equal(availability(provider({ installed: false })), 'missing')
-  assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: false, required: true }] })), 'needs_setup')
-  assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: true, required: true }] })), 'ready')
-  assert.equal(availability(provider({ state: 'starting' })), 'starting')
+  assert.equal(availability(provider({ readiness: { state: 'needs_setup', issue: { stage: 'authentication', code: 'sign_in_required' } } })), 'needs_setup')
+  assert.equal(availability(provider({ readiness: { state: 'ready' } })), 'ready')
+  assert.equal(availability(provider({ readiness: { state: 'starting' } })), 'starting')
 })

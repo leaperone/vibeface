@@ -8,7 +8,7 @@ import Animated, { useAnimatedStyle } from 'react-native-reanimated'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
-import { awaitsDevice, botReach, starters } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, starters } from '@vibeface/client/chat/protocol.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
@@ -97,7 +97,7 @@ export default function ChatScreen() {
   const draft = (id && drafts[id]) || { text: '', files: [] }
   const setDraft = (next: Partial<typeof draft>) => { if (id) setDrafts((current) => ({ ...current, [id]: { ...draft, ...next } })) }
   useEffect(() => id ? workspace.actions.open(id) : undefined, [id])
-  const extras = useChatExtras(id ?? '', botId)
+  const extras = useChatExtras(id ?? '', botId, (text) => setDraft({ text }))
   const live = useLive()
   const device = useDevice()
   // As on the web: until a device can reply, the empty chat says so and points a manager at the AI settings instead of offering starters.
@@ -201,7 +201,7 @@ export default function ChatScreen() {
             <Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /><Text className="text-meta text-muted-foreground">主 Bot</Text>
           </View> : null}
         </View>
-        {reach === 'ready' ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
+        {botCanSend(reach) ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
           {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="outline" className="rounded-full" style={{ borderColor: tint.edge }} onPress={() => setDraft({ text: example })}><Text className="text-muted-foreground">{example}</Text></Button>)}
         </View> : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted-foreground" /><Text className="text-muted-foreground">Bot 正在启动</Text></View> : <>
           <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="text-muted-foreground" /><Text className="text-muted-foreground">Bot 还不能回复</Text></View>

@@ -65,9 +65,10 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
         {ownerNode && !ownerNode.online ? <Icon as={WifiOff} accessibilityLabel="离线" className="size-4 text-warning" /> : null}
         <Text numberOfLines={1} className="max-w-[50%] text-muted-foreground">{nodeName(owner, lookup)}</Text>
       </SettingsRow> : null}
-      {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={providerNames[provider]}>
+      {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={`${providerNames[provider]} 模型偏好`}>
         <Text numberOfLines={1} className={cn('max-w-[50%] text-muted-foreground', model && 'font-mono text-meta')}>{model || '设备默认'}</Text>
       </SettingsRow>) : <SettingsRow icon={Cpu} label="模型"><Text className="text-muted-foreground">设备默认</Text></SettingsRow>}
+      {models.map(([provider]) => <SettingsRow key={`effort:${provider}`} icon={Cpu} label={`${providerNames[provider]} 推理强度`}><Text className="text-meta text-muted-foreground">{bot.reasoning_efforts?.[provider] ?? '设备默认'}</Text></SettingsRow>)}
     </SettingsGroup> : null}
     {empty ? <View className="flex-row items-center gap-2"><Icon as={Inbox} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{botCopy.empty}</Text></View> : null}
     {bot.project || choices.length ? <Section icon={FolderOpen} title={folderLabels.project}>

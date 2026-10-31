@@ -8,11 +8,11 @@ use std::{
 };
 
 /// Bumped whenever stored data stops being readable by the previous build.
-pub const DATA_EPOCH: u32 = 8;
+pub const DATA_EPOCH: u32 = 9;
 /// SHA-256 over the migration files (`migrations/*.sql`, by name) that `DATA_EPOCH` stores.
 /// Any schema change fails a test until both constants change together.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
-    "840dd84cf861f2da087d86e516dc9771d415d4221847f866a382d2e34b439ba5";
+    "61c5d932c72a67a1f6e1fc2dfea795fe1b4c5ea168a543dcf91013375981f549";
 /// Bumped whenever a release package stops being installable by the previous updater.
 pub const UPDATE_PROTOCOL: u32 = 1;
 pub fn data_epoch_marker() -> Vec<u8> {
@@ -98,6 +98,9 @@ pub struct ManagerSettings {
     pub provider: crate::providers::Provider,
     pub workspace: PathBuf,
     pub model: String,
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub backup: crate::scheduler::BackupPolicy,
 }
 impl Config {
     pub fn local(listen: SocketAddr, roots: Vec<PathBuf>, allow_insecure_lan: bool) -> Self {
@@ -211,6 +214,9 @@ impl Config {
                 m.provider.name()
             );
             ensure!(m.workspace.is_dir(), "manager workspace does not exist");
+            m.provider
+                .validate_reasoning_effort(m.reasoning_effort.as_deref())?;
+            m.backup.validate()?;
         }
         Ok(())
     }

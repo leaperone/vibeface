@@ -68,7 +68,14 @@ fn validate_definition(
     Ok(())
 }
 
-type BotRow = (Bot, Option<String>, String, Option<String>, Option<String>);
+type BotRow = (
+    Bot,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
 
 fn bot_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BotRow> {
     Ok((
@@ -79,6 +86,7 @@ fn bot_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BotRow> {
             instructions: r.get(3)?,
             project: None,
             models: BotModels::new(),
+            reasoning_efforts: BTreeMap::new(),
             skills: None,
             avatar: None,
             avatar_version: r
@@ -91,6 +99,7 @@ fn bot_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BotRow> {
         r.get(6)?,
         r.get(7)?,
         r.get(8)?,
+        r.get(10)?,
     ))
 }
 
@@ -103,9 +112,9 @@ const MERGED_COLUMNS: &str = "b.bot_id,b.conversation_id,
     CASE WHEN i.rank>b.rank THEN i.value ELSE b.instructions END,
     CASE WHEN p.rank>b.rank THEN p.value ELSE b.project END,b.event_hash,
     (SELECT json_group_object(m.provider,m.model) FROM bot_models m WHERE m.network_id=b.network_id AND m.conversation_id=b.conversation_id AND m.model<>''),
-    s.value,a.value,a.rank";
-const CREATED_COLUMNS: &str =
-    "b.bot_id,b.conversation_id,b.name,b.instructions,b.project,b.event_hash,'{}',NULL,NULL,NULL";
+    s.value,a.value,a.rank,
+    (SELECT json_group_object(substr(e.field,18),json_extract(e.value,'$')) FROM bot_profiles e WHERE e.network_id=b.network_id AND e.conversation_id=b.conversation_id AND e.field GLOB 'reasoning_effort:*' AND e.value<>'null')";
+const CREATED_COLUMNS: &str = "b.bot_id,b.conversation_id,b.name,b.instructions,b.project,b.event_hash,'{}',NULL,NULL,NULL,'{}'";
 
 /// Bots not deleted.
 fn bots_where(
@@ -162,12 +171,13 @@ fn select_bots(
         .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
     let rows = statement.query_map(params![network, value], bot_row)?;
     rows.map(|row| {
-        let (mut bot, project, models, skills, avatar) = row?;
+        let (mut bot, project, models, skills, avatar, reasoning_efforts) = row?;
         bot.project = project
             .map(|p| serde_json::from_str::<Option<BotProject>>(&p))
             .transpose()?
             .flatten();
         bot.models = serde_json::from_str(&models)?;
+        bot.reasoning_efforts = serde_json::from_str(&reasoning_efforts)?;
         // A removed skill leaves every bot that listed it.
         bot.skills = skills
             .map(|s| serde_json::from_str::<SkillSet>(&s))

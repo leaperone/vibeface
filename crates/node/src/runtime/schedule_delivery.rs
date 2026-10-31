@@ -21,7 +21,11 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
     value["reply_message_id"] = json!(job.message_id);
     value["message_id"] = json!(job.trigger.strip_prefix("message:"));
     value["pending_check"] = json!(checks.iter().any(|check| check.trigger == job.trigger));
-    if let JobState::Failed { failure, .. } | JobState::Interrupted { failure, .. } = &job.state {
+    value["retryable"] = json!(job.retryable() && value["pending_check"] != true);
+    if let JobState::Failed { failure, .. }
+    | JobState::Interrupted { failure, .. }
+    | JobState::Reconciling { failure, .. } = &job.state
+    {
         value["failure"]["detail"] = json!(crate::logging::scrub(&failure.detail));
     }
     Ok(value)
@@ -38,6 +42,12 @@ impl Runtime {
     }
 
     pub(super) fn start_schedule_delivery(self: &Arc<Self>) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            if let Some(manager) = node.manager() {
+                node.probe_provider(manager.provider).await;
+            }
+        });
         let node = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(3));

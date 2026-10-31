@@ -6,7 +6,7 @@ use super::{Access, Changed, Runtime, now_ms};
 use crate::{
     config,
     manager::{self, CursorInstance, ManagerConfig},
-    model::{Choice, EventBody, Subject},
+    model::{AttentionKind, AttentionRequest, Choice, EventBody, Subject},
     net,
     providers::Provider,
     store::triage::{BudgetStatus, TriageAdmission},
@@ -57,7 +57,7 @@ pub(crate) struct TriageState {
     /// App Server threads nobody drives (`codex exec`, sub-agents); no bot is given them.
     background: std::sync::Mutex<HashSet<String>>,
     started_ms: i64,
-    turn: tokio::sync::Mutex<()>,
+    pub(super) turn: tokio::sync::Mutex<()>,
     active: std::sync::Mutex<Option<String>>,
     budget_warning: std::sync::Mutex<Option<BudgetStatus>>,
     mutations: tokio::sync::Mutex<()>,
@@ -998,24 +998,39 @@ impl Runtime {
         attempt: Option<&str>,
         prompt: impl FnOnce(&str) -> Result<String>,
     ) -> Result<()> {
+        let launch = self.manager_controls.lock().await;
+        if self
+            .pending_provider_launches
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(manager::ManagerError::not_started(anyhow::anyhow!(
+                "provider settings are pending"
+            )));
+        }
+        let providers = self.providers();
         let settings = self
             .manager()
             .context("no coordination Agent is configured")
             .map_err(manager::ManagerError::not_started)?;
-        self.manager_backend_ready(settings.provider).await;
+        crate::scheduler::ensure_readiness(
+            &self
+                .provider_readiness(settings.provider, &settings.model)
+                .await,
+        )?;
         let program = std::env::current_exe()
             .map_err(|error| manager::ManagerError::not_started(error.into()))?;
         let mut cli = format!("'{}'", program.to_string_lossy().replace('\'', r"'\''"));
         let mut config = ManagerConfig {
             tool_cli: Some(program),
             ..self
-                .manager_config(settings)
+                .manager_config(settings, &providers)
                 .map_err(manager::ManagerError::not_started)?
         }
         .for_cursor_instance(
             CursorInstance::Coordination,
             self.cursor_store_root(&CursorInstance::Coordination),
         );
+        drop(launch);
         if let Some(attempt) = attempt {
             config
                 .tool_env
@@ -1041,6 +1056,9 @@ impl Runtime {
     /// Hands waiting events, each with the bot that owns its session, to one turn of the
     /// coordination Agent. It answers through `vibeface triage` and `vibeface respond`.
     async fn wake_agent(&self) -> Result<()> {
+        if !self.apply_provider_launches().await? {
+            return Ok(());
+        }
         let Ok(_turn) = self.triage.turn.try_lock() else {
             return Ok(());
         };
@@ -1312,6 +1330,19 @@ impl Runtime {
                 }
                 let question = EventBody::QuestionAsked {
                     question_id: triage::question_id(&event.node, &event.event_id),
+                    attention: AttentionRequest {
+                        kind: match input["attention_kind"].as_str() {
+                            Some("browser_takeover") => AttentionKind::BrowserTakeover,
+                            Some("approval") => AttentionKind::Approval,
+                            Some("question") => AttentionKind::Question,
+                            Some(_) => bail!("unknown attention kind"),
+                            None if event.hold == Some(RequestKind::Permission) => {
+                                AttentionKind::Approval
+                            }
+                            None => AttentionKind::Question,
+                        },
+                        device_id: Some(event.node.clone()),
+                    },
                     severity,
                     text: crate::logging::scrub(super::field(&input, "question")?),
                     choices: labels
@@ -2036,6 +2067,8 @@ pub(super) mod tests {
             provider: crate::providers::Provider::Codex,
             workspace: "/tmp".into(),
             model: "fixture".into(),
+            reasoning_effort: None,
+            backup: Default::default(),
         });
     }
 
@@ -4957,6 +4990,7 @@ pub(super) mod tests {
             let answered = node.triage_command(response.clone()).await?;
             assert_eq!(answered["answered"], true);
             let failure = Err(manager::ManagerError {
+                stage: vibeface_bridge::failure::ProviderStage::Run,
                 outcome: manager::ManagerFailure::Failed,
                 start: manager::StartEvidence::Started,
                 session_id: Some("fixture-started-turn".into()),

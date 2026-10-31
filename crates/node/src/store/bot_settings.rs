@@ -43,6 +43,7 @@ pub enum ChangeRequest {
         name: Option<String>,
         instructions: Option<String>,
         model: Option<String>,
+        reasoning_effort: Option<String>,
         skills: Option<std::collections::BTreeSet<String>>,
         all_skills: Option<bool>,
         avatar: Option<AvatarParts>,
@@ -115,6 +116,7 @@ struct ProfileRequest {
     name: Option<String>,
     instructions: Option<String>,
     model: Option<(Provider, String)>,
+    reasoning_effort: Option<(Provider, Option<String>)>,
     skills: Option<SkillSet>,
     avatar: Option<Option<AvatarParts>>,
 }
@@ -155,6 +157,7 @@ impl ChangeRequest {
                 name: name.clone(),
                 instructions: instructions.clone(),
                 model: None,
+                reasoning_effort: None,
                 skills: None,
                 avatar: avatar_request(*avatar, *default_avatar)?,
             },
@@ -162,6 +165,7 @@ impl ChangeRequest {
                 name,
                 instructions,
                 model,
+                reasoning_effort,
                 skills,
                 all_skills,
                 avatar,
@@ -173,6 +177,12 @@ impl ChangeRequest {
                 model: model
                     .as_ref()
                     .map(|model| (provider, model.trim().to_owned())),
+                reasoning_effort: reasoning_effort.as_ref().map(|effort| {
+                    (
+                        provider,
+                        (!effort.trim().is_empty()).then(|| effort.trim().to_owned()),
+                    )
+                }),
                 skills: match (skills, all_skills) {
                     (Some(_), Some(true)) => bail!("give skills or all_skills, not both"),
                     (_, Some(true)) => Some(None),
@@ -194,6 +204,7 @@ impl ChangeRequest {
                 name,
                 instructions,
                 model,
+                reasoning_effort,
                 skills,
                 avatar,
             } = change
@@ -214,6 +225,10 @@ impl ChangeRequest {
                 && wanted.instructions == after(instructions)
                 && wanted.model
                     == model
+                        .as_ref()
+                        .map(|edit| (edit.provider, edit.after.clone()))
+                && wanted.reasoning_effort
+                    == reasoning_effort
                         .as_ref()
                         .map(|edit| (edit.provider, edit.after.clone()))
                 && wanted.skills == skills.as_ref().map(|edit| edit.after.clone());
@@ -456,6 +471,7 @@ fn change_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRow> {
                 name: None,
                 instructions: None,
                 model: None,
+                reasoning_effort: None,
                 skills: None,
                 avatar: None,
             },
@@ -602,6 +618,7 @@ fn resolve(
         name,
         instructions,
         model,
+        reasoning_effort,
         skills,
         avatar,
     }) = request.profile(provider)?
@@ -610,9 +627,10 @@ fn resolve(
             name.is_some()
                 || instructions.is_some()
                 || model.is_some()
+                || reasoning_effort.is_some()
                 || skills.is_some()
                 || avatar.is_some(),
-            "name, instructions, model, skills, all_skills, avatar or default_avatar is required"
+            "name, instructions, model, reasoning_effort, skills, all_skills, avatar or default_avatar is required"
         );
         let bot = bot_for_conversation_from(connection, network, scope)?
             .context("this conversation has no bot profile to change")?;
@@ -635,6 +653,13 @@ fn resolve(
             ensure!(
                 model != bot.model(*provider).unwrap_or_default(),
                 "the bot already uses this model; nothing to change"
+            );
+        }
+        if let Some((provider, effort)) = &reasoning_effort {
+            provider.validate_reasoning_effort(effort.as_deref())?;
+            ensure!(
+                effort.as_deref() != bot.reasoning_effort(*provider),
+                "the bot already uses this reasoning effort; nothing to change"
             );
         }
         if let Some(Some(wanted)) = &skills {
@@ -666,6 +691,11 @@ fn resolve(
             before: bot.model(provider).unwrap_or_default().to_owned(),
             after,
         });
+        let reasoning_effort = reasoning_effort.map(|(provider, after)| ReasoningEffortEdit {
+            provider,
+            before: bot.reasoning_effort(provider).map(str::to_owned),
+            after,
+        });
         let change = BotChange::Profile {
             name: name.map(|after| Edit {
                 before: bot.name,
@@ -676,6 +706,7 @@ fn resolve(
                 after,
             }),
             model,
+            reasoning_effort,
             skills: skills.map(|after| SkillsEdit {
                 before: bot.skills,
                 after,
@@ -1154,6 +1185,7 @@ pub enum Setting {
     Skills,
     Avatar,
     Model { provider: Provider },
+    ReasoningEffort { provider: Provider },
 }
 
 /// What a write built on: the value its writer saw, or, for the user's face pick, the version.
@@ -1248,6 +1280,7 @@ pub(crate) fn overwritten_from(
                         name,
                         instructions,
                         model,
+                        reasoning_effort,
                         skills,
                         avatar,
                     },
@@ -1263,6 +1296,15 @@ pub(crate) fn overwritten_from(
                         provider: edit.provider,
                     };
                     (setting, json(&edit.before), json(&edit.after))
+                }),
+                reasoning_effort.as_ref().map(|edit| {
+                    (
+                        Setting::ReasoningEffort {
+                            provider: edit.provider,
+                        },
+                        json(&edit.before),
+                        json(&edit.after),
+                    )
                 }),
                 skills
                     .as_ref()

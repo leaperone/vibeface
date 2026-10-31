@@ -29,7 +29,7 @@ export function changeTitle(changes: readonly BotChange[]): string {
 }
 
 const settingNames = { name: "名称", instructions: "说明", skills: "Skill", avatar: "长相" } as const
-const settingName = (item: Overwritten) => item.field === "model" ? `${providerNames[item.provider]} 模型` : settingNames[item.field]
+const settingName = (item: Overwritten) => item.field === "model" ? `${providerNames[item.provider]} 模型` : item.field === "reasoning_effort" ? `${providerNames[item.provider]} 推理强度` : settingNames[item.field]
 
 function settingWords(item: Overwritten): string {
   switch (item.field) {
@@ -39,6 +39,7 @@ function settingWords(item: Overwritten): string {
       return line ? `「${line.length > 24 ? `${line.slice(0, 24)}…` : line}」` : "空白"
     }
     case "model": return item.value ? `「${item.value}」` : "设备默认"
+    case "reasoning_effort": return item.value ? `「${item.value}」` : "设备默认"
     case "skills": return item.value === null ? "全部可用" : `${item.value.length} 个`
     case "avatar": return item.value ? avatarWords(item.value) : "默认长相"
   }
@@ -63,6 +64,7 @@ export function restoreRequest(item: Overwritten, change: BotChange): { avatar: 
     case "name": return change.name ? { text: `把名称改回「${change.name.after}」` } : null
     case "instructions": return change.instructions ? { text: `把说明改回下面这段：\n\n${change.instructions.after}` } : null
     case "model": return change.model ? { text: `把 ${providerNames[change.model.provider]} 模型改回${change.model.after ? `「${change.model.after}」` : "设备默认"}` } : null
+    case "reasoning_effort": return change.reasoning_effort ? { text: `把 ${providerNames[change.reasoning_effort.provider]} 推理强度改回${change.reasoning_effort.after ? `「${change.reasoning_effort.after}」` : "设备默认"}` } : null
     case "skills": return change.skills ? { text: change.skills.after === null ? "把 Skill 改回全部可用" : `把 Skill 改回这几个：${change.skills.after.join("、")}` } : null
     case "avatar": return change.avatar ? { avatar: change.avatar.after } : null
   }

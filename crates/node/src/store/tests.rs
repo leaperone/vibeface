@@ -3,13 +3,13 @@ use crate::{
     crypto::LocalIdentity,
     providers::Provider,
     scheduling::{
-        JobOutcome, JobState, SchedulerJob, Shown, SteerOutcome, TriggerKind, bot_message_trigger,
-        message_trigger, schedule_trigger, work_trigger,
+        JobOutcome, JobState, SchedulerJob, Shown, SteerOutcome, TriggerKind, TurnExecution,
+        TurnRuntime, bot_message_trigger, message_trigger, schedule_trigger, work_trigger,
     },
     work::{Signal, WorkSpec},
 };
 use serde_json::json;
-use vibeface_bridge::failure::ExecFailure;
+use vibeface_bridge::failure::{ExecFailure, ProviderStage};
 
 struct Net {
     network: String,
@@ -541,18 +541,28 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &claimed.job.trigger, &attempt)?;
     store.recover_scheduler_jobs(&net.a, &net.network, "boot-2")?;
-    let reply = store
-        .message(&net.network, "c", &claimed.job.message_id)?
-        .context("reply")?;
-    assert_eq!(reply.status, Some(ReplyStatus::Interrupted));
+    assert!(
+        store
+            .message(&net.network, "c", &claimed.job.message_id)?
+            .is_none()
+    );
     assert_eq!(store.pending_checks()?.len(), 1);
     assert!(matches!(
         store
             .scheduler_job("c", &message_trigger("m2"))?
             .context("job")?
             .state,
-        JobState::Interrupted { .. }
+        JobState::Reconciling { .. }
     ));
+    let check = store.pending_checks()?.pop().context("pending check")?;
+    store.confirm_manager_stopped(&net.a, &net.network, &check, 6)?;
+    assert_eq!(
+        store
+            .message(&net.network, "c", &claimed.job.message_id)?
+            .context("reply")?
+            .status,
+        Some(ReplyStatus::Interrupted)
+    );
     Ok(())
 }
 
@@ -1840,6 +1850,7 @@ fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
                     }),
                     instructions: None,
                     model: None,
+                    reasoning_effort: None,
                     skills: None,
                     avatar: None,
                 },
@@ -2020,6 +2031,7 @@ fn bot_changes_converge_and_retries_write_once() -> Result<()> {
             }),
             instructions: None,
             model: None,
+            reasoning_effort: None,
             skills: None,
             avatar: None
         }
@@ -2792,6 +2804,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
                 }),
                 instructions: None,
                 model: None,
+                reasoning_effort: None,
                 skills: None,
                 avatar: None,
             },
@@ -3056,6 +3069,7 @@ fn a_bot_creates_and_configures_bots_for_the_users_message() -> Result<()> {
             name: Some("Backup".into()),
             instructions: None,
             model: None,
+            reasoning_effort: None,
             skills: None,
             all_skills: None,
             avatar: None,
@@ -3120,6 +3134,7 @@ fn configure(
         name: None,
         instructions: None,
         model: model.map(Into::into),
+        reasoning_effort: None,
         skills: skills.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
         all_skills,
         avatar: None,
@@ -3258,6 +3273,8 @@ fn a_bot_runs_the_model_of_its_devices_provider_or_the_devices_default() -> Resu
             provider,
             workspace: "/w".into(),
             model: "auto".into(),
+            reasoning_effort: None,
+            backup: Default::default(),
         };
         let bot = store.bot_for_conversation(&net.network, "c")?;
         Ok(crate::scheduler::bot_model(&device, bot.as_ref()))
@@ -3292,6 +3309,59 @@ fn a_bot_runs_the_model_of_its_devices_provider_or_the_devices_default() -> Resu
         runs(&later, Provider::Cursor)?.as_deref(),
         Some("composer-1")
     );
+    Ok(())
+}
+
+#[test]
+fn bot_effort_overrides_sync_and_clear_per_provider() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    let change = |store: &mut Store, call_ref: &str, provider, value: &str| {
+        let mut request = configure("Helper", None, None, None);
+        let ChangeRequest::ConfigureBot {
+            reasoning_effort, ..
+        } = &mut request
+        else {
+            unreachable!()
+        };
+        *reasoning_effort = Some(value.into());
+        store.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            call_ref,
+            request,
+            provider,
+            5,
+        )
+    };
+    let (saved, written) = change(&mut origin, "effort-1", Provider::Codex, "high")?;
+    assert!(written);
+    assert!(matches!(saved.change, BotChange::Profile {
+        reasoning_effort: Some(ReasoningEffortEdit { provider: Provider::Codex, before: None, after: Some(ref after) }), ..
+    } if after == "high"));
+    let (_, written) = change(&mut origin, "effort-1", Provider::Codex, "high")?;
+    assert!(!written, "same request reads the original change");
+    assert!(change(&mut origin, "unsupported", Provider::Cursor, "high").is_err());
+    assert!(change(&mut origin, "invalid", Provider::Claude, "xhigh").is_err());
+    change(&mut origin, "effort-2", Provider::Pi, "off")?;
+    let mut other = store(&net)?;
+    all_accepted(&mut other, &net, &origin)?;
+    let bot = other
+        .bot_for_conversation(&net.network, "c")?
+        .context("bot")?;
+    assert_eq!(bot.reasoning_effort(Provider::Codex), Some("high"));
+    assert_eq!(bot.reasoning_effort(Provider::Pi), Some("off"));
+    assert_eq!(bot.reasoning_effort(Provider::Claude), None);
+    change(&mut origin, "effort-3", Provider::Codex, "")?;
+    let mut rebuilt = store(&net)?;
+    all_accepted(&mut rebuilt, &net, &origin)?;
+    let bot = rebuilt
+        .bot_for_conversation(&net.network, "c")?
+        .context("bot")?;
+    assert_eq!(bot.reasoning_effort(Provider::Codex), None);
+    assert_eq!(bot.reasoning_effort(Provider::Pi), Some("off"));
     Ok(())
 }
 
@@ -4226,6 +4296,10 @@ fn a_rebuild_never_touches_local_ledgers() -> Result<()> {
 fn question(net: &Net, id: &str, session: &str) -> Result<EventBody> {
     Ok(EventBody::QuestionAsked {
         question_id: id.into(),
+        attention: AttentionRequest {
+            kind: AttentionKind::Question,
+            device_id: Some(net.a.device_id()?),
+        },
         severity: Severity::Attention,
         text: "要继续吗？".into(),
         choices: vec![Choice {
@@ -4810,6 +4884,17 @@ fn a_failed_turn_shares_its_kind_and_keeps_the_raw_detail_local() -> Result<()> 
             "",
             3,
         )?;
+        let job = if matches!(job.state, JobState::Reconciling { .. }) {
+            assert!(
+                store
+                    .message(&net.network, "c", &claimed.job.message_id)?
+                    .is_none()
+            );
+            let check = store.pending_checks()?.pop().context("pending check")?;
+            store.confirm_manager_stopped(&net.a, &net.network, &check, 4)?
+        } else {
+            job
+        };
         let reply = store
             .message(&net.network, "c", &claimed.job.message_id)?
             .context("reply")?;
@@ -5022,6 +5107,9 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
         basis: context.basis.clone(),
         reply_to: "m49".into(),
         message_id: "reply".into(),
+        runtime: None,
+        pending_check: false,
+        tool_calls: false,
         state: JobState::Queued,
     };
     let history = store.turn_history(&net.network, "c", &job, None)?;
@@ -5605,6 +5693,9 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
             basis: store.version_vector(&net.network)?,
             reply_to: trigger.into(),
             message_id: "reply".into(),
+            runtime: None,
+            pending_check: false,
+            tool_calls: false,
             state: JobState::Queued,
         };
         let history = store.turn_history(
@@ -5718,9 +5809,14 @@ fn a_new_session_key_opens_a_new_thread_shown_everything() -> Result<()> {
     let resumed = turn("m2", "cfg")?;
     assert_eq!(resumed.previous_native_id.as_deref(), Some("thread"));
     assert_eq!(resumed.shown, shown);
+    assert_eq!(resumed.session_generation, 1);
+    assert_eq!(resumed.handoff_revision, 1);
     let fresh = turn("m3", "cfg-new-instructions")?;
     assert_eq!(fresh.previous_native_id, None);
     assert_eq!(fresh.shown, Shown::default());
+    assert_eq!(fresh.session_generation, 2);
+    assert_eq!(fresh.handoff_revision, 2);
+    assert_eq!(fresh.handoff_source, fresh.job.basis);
     Ok(())
 }
 
@@ -5733,6 +5829,9 @@ fn job_at(store: &Store, net: &Net, trigger: &str) -> Result<SchedulerJob> {
         basis: store.version_vector(&net.network)?,
         reply_to: trigger.into(),
         message_id: "reply".into(),
+        runtime: None,
+        pending_check: false,
+        tool_calls: false,
         state: JobState::Queued,
     })
 }
@@ -6510,6 +6609,7 @@ fn a_bots_face_from_the_chat_and_from_the_panel_converge_by_rank() -> Result<()>
             name: None,
             instructions: None,
             model: None,
+            reasoning_effort: None,
             skills: None,
             all_skills: None,
             avatar: Some(parts(None, Some(Eyes::Wide), Some(hue(285)?))),
@@ -6624,6 +6724,7 @@ fn read_bot_lists_every_skill_the_prompt_index_leaves_out() -> Result<()> {
             name: None,
             instructions: None,
             model: None,
+            reasoning_effort: None,
             skills: Some(chosen),
             all_skills: None,
             avatar: None,
@@ -7150,6 +7251,401 @@ fn open_works_list_only_what_still_wants_the_user() -> Result<()> {
         refusals(&store)?,
         ["late"],
         "a refusal arriving after the chat moved on waits for its report"
+    );
+    Ok(())
+}
+
+fn submitted_runtime(claimed: &crate::scheduling::ClaimedJob) -> Result<TurnRuntime> {
+    Ok(TurnRuntime {
+        provider: Provider::Codex,
+        model: Some("submitted-model".into()),
+        reasoning_effort: Some("high".into()),
+        generation: "opaque-config-generation".into(),
+        session_generation: claimed.session_generation,
+        delivery_id: claimed.job.state.attempt().context("attempt")?.id.clone(),
+        stage: ProviderStage::Validate,
+        execution: TurnExecution::NotStarted,
+        attempted_at_ms: 10,
+        switched_from: None,
+        switch_reason: None,
+    })
+}
+
+#[test]
+fn a_submitted_runtime_is_frozen_and_only_proven_unstarted_failure_is_retryable() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    say(&mut store, &net, "m1", true)?;
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let runtime = submitted_runtime(&claimed)?;
+    let trigger = &claimed.job.trigger;
+    let attempt = &runtime.delivery_id;
+    store.record_turn_runtime("c", trigger, attempt, &runtime)?;
+    let running = store.mark_started("c", trigger, attempt)?;
+    assert_eq!(
+        running.runtime.context("runtime")?.execution,
+        TurnExecution::Unknown
+    );
+    assert!(
+        store
+            .record_turn_runtime("c", trigger, attempt, &runtime)
+            .is_err()
+    );
+    store.update_turn_runtime(
+        "c",
+        trigger,
+        attempt,
+        ProviderStage::TurnStart,
+        TurnExecution::NotStarted,
+    )?;
+    let failed = store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        JobOutcome::Failed(ExecFailure::new(
+            FailureKind::Rejected,
+            "refused before send",
+        )),
+        "",
+        11,
+    )?;
+    assert!(failed.retryable());
+    assert_eq!(
+        failed.runtime.as_ref().context("runtime")?,
+        &TurnRuntime {
+            stage: ProviderStage::TurnStart,
+            ..runtime.clone()
+        }
+    );
+    say(&mut store, &net, "m2", true)?;
+    let next = store
+        .claim_next(
+            &net.a,
+            &net.network,
+            "c",
+            "boot",
+            "changed-model-and-effort",
+        )?
+        .context("job")?;
+    assert_eq!(next.session_generation, 2);
+    assert_eq!(
+        store
+            .scheduler_job("c", trigger)?
+            .context("old job")?
+            .runtime,
+        failed.runtime
+    );
+    let next_runtime = submitted_runtime(&next)?;
+    store.record_turn_runtime(
+        "c",
+        &next.job.trigger,
+        &next_runtime.delivery_id,
+        &next_runtime,
+    )?;
+    store.mark_started("c", &next.job.trigger, &next_runtime.delivery_id)?;
+    store.record_manager_tool_call("c", &next.job.trigger, &next_runtime.delivery_id)?;
+    assert!(
+        store
+            .update_turn_runtime(
+                "c",
+                &next.job.trigger,
+                &next_runtime.delivery_id,
+                ProviderStage::TurnStart,
+                TurnExecution::NotStarted
+            )
+            .is_err()
+    );
+    let failed = store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &next.job.trigger,
+        &next_runtime.delivery_id,
+        JobOutcome::Failed(ExecFailure::new(
+            FailureKind::Rejected,
+            "failed after tools",
+        )),
+        "",
+        12,
+    )?;
+    assert!(!failed.retryable());
+    let shared = serde_json::to_value(&failed)?;
+    assert!(shared.get("pending_check").is_none() && shared.get("tool_calls").is_none());
+    assert_eq!(shared["runtime"]["model"], "submitted-model");
+    assert!(shared["runtime"].get("native_id").is_none());
+    assert!(shared["runtime"].get("token").is_none());
+    Ok(())
+}
+
+#[test]
+fn a_restarted_reply_waits_for_history_then_records_the_recovered_result_once() -> Result<()> {
+    let net = net()?;
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.artifacts")
+        .join(format!("store-{}", uuid::Uuid::new_v4()));
+    crate::config::private_dir(&dir)?;
+    let path = dir.join("node.sqlite3");
+    let result = (|| -> Result<()> {
+        let mut store = Store::open(&path)?;
+        store.install_trust_bundle(&net.network, &net.state)?;
+        conversation(&mut store, &net)?;
+        say(&mut store, &net, "m1", true)?;
+        let claimed = store
+            .claim_next(&net.a, &net.network, "c", "boot-1", "cfg")?
+            .context("job")?;
+        let runtime = submitted_runtime(&claimed)?;
+        store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
+        store.mark_started("c", &claimed.job.trigger, &runtime.delivery_id)?;
+        store.record_manager_turn(
+            &runtime.delivery_id,
+            "system",
+            "thread",
+            None,
+            &Shown::default(),
+        )?;
+        drop(store);
+        let mut store = Store::open(&path)?;
+        for _ in 0..2 {
+            store.recover_scheduler_jobs(&net.a, &net.network, "boot-2")?;
+            assert!(
+                store
+                    .claim_next(&net.a, &net.network, "c", "boot-2", "new-settings")?
+                    .is_none()
+            );
+            assert!(
+                store
+                    .message(&net.network, "c", &claimed.job.message_id)?
+                    .is_none()
+            );
+            let unknown = store
+                .scheduler_job("c", &claimed.job.trigger)?
+                .context("job")?;
+            assert!(matches!(unknown.state, JobState::Reconciling { .. }));
+            assert!(unknown.pending_check && !unknown.retryable());
+            assert_eq!(store.pending_checks()?.len(), 1);
+        }
+        let recovered = store.finish_job(
+            &net.a,
+            &net.network,
+            "c",
+            &claimed.job.trigger,
+            &runtime.delivery_id,
+            JobOutcome::Completed,
+            "recovered final answer",
+            20,
+        )?;
+        assert!(matches!(recovered.state, JobState::Completed { .. }));
+        assert_eq!(
+            recovered.runtime.context("runtime")?.execution,
+            TurnExecution::Started
+        );
+        assert!(store.pending_checks()?.is_empty());
+        store.finish_job(
+            &net.a,
+            &net.network,
+            "c",
+            &claimed.job.trigger,
+            &runtime.delivery_id,
+            JobOutcome::Completed,
+            "must not replace the answer",
+            21,
+        )?;
+        let messages = store.messages(&net.network, "c")?;
+        let replies: Vec<_> = messages
+            .iter()
+            .filter(|message| message.message_id == claimed.job.message_id)
+            .collect();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].text, "recovered final answer");
+        assert_eq!(replies[0].status, Some(ReplyStatus::Completed));
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(dir);
+    result
+}
+
+#[test]
+fn an_unknown_process_reply_keeps_partial_text_until_the_user_confirms() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    say(&mut store, &net, "m1", true)?;
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let runtime = submitted_runtime(&claimed)?;
+    store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
+    store.mark_started("c", &claimed.job.trigger, &runtime.delivery_id)?;
+    let unknown = store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &claimed.job.trigger,
+        &runtime.delivery_id,
+        JobOutcome::Interrupted {
+            failure: ExecFailure::new(FailureKind::Lost, "process exited without a final result"),
+            process_unconfirmed: true,
+        },
+        "partial output",
+        15,
+    )?;
+    assert!(matches!(unknown.state, JobState::Reconciling { .. }));
+    assert!(
+        store
+            .message(&net.network, "c", &claimed.job.message_id)?
+            .is_none()
+    );
+    store.update_turn_runtime(
+        "c",
+        &claimed.job.trigger,
+        &runtime.delivery_id,
+        ProviderStage::ReadBack,
+        TurnExecution::Unknown,
+    )?;
+    let check = store.pending_checks()?.pop().context("pending check")?;
+    let confirmed = store.confirm_manager_stopped(&net.a, &net.network, &check, 16)?;
+    assert!(matches!(confirmed.state, JobState::Interrupted { .. }));
+    assert!(!confirmed.retryable());
+    assert_eq!(
+        confirmed.runtime.context("runtime")?.execution,
+        TurnExecution::Unknown
+    );
+    assert_eq!(
+        store
+            .message(&net.network, "c", &claimed.job.message_id)?
+            .context("reply")?
+            .text,
+        "partial output"
+    );
+    assert!(store.pending_checks()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn native_compaction_advances_lineage_and_keeps_the_resumable_session() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    say(&mut store, &net, "m1", true)?;
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let runtime = submitted_runtime(&claimed)?;
+    store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
+    store.mark_started("c", &claimed.job.trigger, &runtime.delivery_id)?;
+    store.save_scheduler_native_id(
+        "c",
+        &claimed.job.trigger,
+        &runtime.delivery_id,
+        "thread",
+        "token",
+        false,
+    )?;
+    let shown = Shown {
+        bot: Some("bot-digest".into()),
+        works: Default::default(),
+    };
+    store.record_manager_turn(
+        &runtime.delivery_id,
+        "system",
+        "thread",
+        Some("turn"),
+        &shown,
+    )?;
+    assert_eq!(
+        store.record_context_compaction("c", &claimed.job.trigger, &runtime.delivery_id)?,
+        2
+    );
+    let saved = store
+        .scheduler_job("c", &claimed.job.trigger)?
+        .context("job")?
+        .runtime
+        .context("runtime")?;
+    assert_eq!(saved.session_generation, 2);
+    assert_eq!(saved.stage, ProviderStage::Compact);
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &claimed.job.trigger,
+        &runtime.delivery_id,
+        JobOutcome::Completed,
+        "done",
+        20,
+    )?;
+    say(&mut store, &net, "m2", true)?;
+    let next = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    assert_eq!(next.previous_native_id.as_deref(), Some("thread"));
+    assert_eq!(next.previous_token.as_deref(), Some("token"));
+    assert_eq!(next.covers.as_ref(), Some(&claimed.job.basis));
+    assert_eq!(next.shown, shown);
+    assert_eq!((next.session_generation, next.handoff_revision), (2, 2));
+    assert_eq!(next.handoff_source, claimed.job.basis);
+    Ok(())
+}
+
+#[test]
+fn a_proven_unstarted_backup_gets_a_new_permission_and_keeps_delivery_identity() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    say(&mut store, &net, "m1", true)?;
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let mut runtime = submitted_runtime(&claimed)?;
+    store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
+    store.mark_started("c", &claimed.job.trigger, &runtime.delivery_id)?;
+    store.update_turn_runtime(
+        "c",
+        &claimed.job.trigger,
+        &runtime.delivery_id,
+        ProviderStage::TurnStart,
+        TurnExecution::NotStarted,
+    )?;
+    store.fence_manager_permission("c", &claimed.job.trigger, &runtime.delivery_id)?;
+    assert!(!store.manager_attempt_allowed(
+        &net.network,
+        &net.a.device_id()?,
+        "c",
+        &claimed.job.trigger,
+        &runtime.delivery_id
+    )?);
+    runtime.switched_from = Some(crate::scheduling::RuntimeSelection {
+        provider: runtime.provider,
+        model: runtime.model.clone(),
+        reasoning_effort: runtime.reasoning_effort.clone(),
+    });
+    runtime.switch_reason = Some(FailureKind::Quota);
+    runtime.model = Some("backup".into());
+    runtime.session_generation =
+        store.advance_scheduler_lineage("c", &claimed.job.trigger, &runtime.delivery_id)?;
+    let switched =
+        store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
+    assert_eq!(switched.message_id, claimed.job.message_id);
+    assert_eq!(
+        switched.runtime.as_ref().context("runtime")?.delivery_id,
+        runtime.delivery_id
+    );
+    assert!(store.manager_attempt_allowed(
+        &net.network,
+        &net.a.device_id()?,
+        "c",
+        &claimed.job.trigger,
+        &runtime.delivery_id
+    )?);
+    store.record_manager_tool_call("c", &claimed.job.trigger, &runtime.delivery_id)?;
+    assert!(
+        store
+            .record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)
+            .is_err()
     );
     Ok(())
 }

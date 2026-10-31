@@ -10,12 +10,13 @@ import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { availability, botOnChange, folderSuggestions, type Availability, modelTyped, parseAppServerLink, parseNodeSettings, parseProviderModels, type ModelChoice, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { availability, botOnChange, folderSuggestions, type Availability, modelTyped, parseAppServerLink, parseNodeSettings, parseProvider, probeIssueText, effortOptions, type ModelChoice, providerGroups, providerNames, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
 const states: Record<Availability, { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: "可用", tone: "success", icon: CircleCheck },
+  unverified: { label: "尚未确认", tone: "neutral", icon: CircleDashed },
   needs_setup: { label: "需设置", tone: "warning", icon: CircleAlert },
   starting: { label: "启动中", tone: "neutral", icon: LoaderCircle },
   missing: { label: "未安装", tone: "neutral", icon: CircleDashed },
@@ -222,16 +223,20 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
       return null
     }
   }
-  // The bot's provider may list its models; until it answers, or when it cannot, the model stays a text field.
-  const [models, setModels] = useState<{ provider: ProviderId; list: ModelChoice[] } | null>(null)
-  const botProvider = response?.providers.find((item) => item.roles.includes("agent"))
-  useEffect(() => {
-    if (!ready?.isCurrent() || botProvider?.state !== "ready") return
-    let live = true
-    const provider = botProvider.provider
-    ready.request("provider_models", { provider }).then(parseProviderModels).then((list) => { if (live) setModels(list ? { provider, list } : null) }, () => {})
-    return () => { live = false }
-  }, [ready, botProvider?.provider, botProvider?.state])
+  async function probe(provider: ProviderId) {
+    if (!ready?.isCurrent()) return
+    const connection = ready, owner = ++sequence.current
+    setBusy(`${provider}:probe`); setError(null)
+    try {
+      const status = parseProvider(await connection.request("provider_probe", { provider }))
+      if (status.provider !== provider) throw new Error("检查结果来自另一个 AI 服务，请重新读取。")
+      if (owner === sequence.current && connection.isCurrent()) {
+        setResponse((previous) => previous ? { ...previous, providers: previous.providers.map((item) => item.provider === provider ? status : item) } : previous)
+        if (workspace.isCurrent()) await workspace.refresh()
+      }
+    } catch (cause) { if (owner === sequence.current && connection.isCurrent()) setError({ at: provider, cause }) }
+    finally { if (owner === sequence.current) setBusy("") }
+  }
   const starting = response?.providers.some((item) => item.state === "starting")
   const botOn = response?.providers.some((item) => item.roles.includes("agent")) ?? false
   useEffect(() => { onBot?.(botOn) }, [botOn])
@@ -248,7 +253,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   if (!response) return error ? <InlineError error={error.cause} action={{ label: "重试", onClick: () => void load() }} /> : <div className="grid gap-2"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
   const { roots, manager } = response.settings
   const { shown, folded } = providerGroups(response.providers)
-  const card = (item: ProviderStatus) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy} models={models?.provider === item.provider ? models.list : null}
+  const card = (item: ProviderStatus) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy} models={item.probe.catalog.state === "available" ? item.probe.catalog.models : null} probe={() => probe(item.provider)}
     error={error?.at === item.provider ? error.cause : null} test={test} reconcile={reconcile}
     change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
     saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />
@@ -299,9 +304,9 @@ function RoleToggle({ role, name, pressed, busy, disabled, onClick }: { role: ke
   </Button>
 }
 
-function ProviderCard({ item, response, onboarding, busy, models, error, change, saveBot, test, reconcile }: {
+function ProviderCard({ item, response, onboarding, busy, models, error, change, saveBot, test, reconcile, probe }: {
   item: ProviderStatus; response: NodeSettingsResponse; onboarding: boolean; busy: string; models: ModelChoice[] | null; error: unknown
-  change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>; reconcile(): Promise<void>
+  change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>; reconcile(): Promise<void>; probe(): Promise<void>
 }) {
   const name = providerNames[item.provider], Icon = providerIcons[item.provider]
   const display = response.display_paths
@@ -406,6 +411,15 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
         : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={issue.code === "bin_missing" ? install[item.provider] : guide[item.provider]} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
         : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={() => openProvider(item.provider)}>去设置</button>}
     </p> : null}
+    <div className="grid gap-1 px-4 pb-3 sm:ps-12">
+      {'issue' in item.readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.readiness.issue)}</p> : null}
+      <div className="flex flex-wrap items-center gap-2 text-meta text-muted-foreground">
+        <span>{item.probe.checked_at_ms === null ? "尚未主动检查" : `检查于 ${new Date(item.probe.checked_at_ms).toLocaleString()}`}</span>
+        <Button type="button" variant="ghost" size="sm" disabled={busy !== ""} onClick={() => void probe()}><BusyIcon busy={busy === `${item.provider}:probe`} icon={RotateCw} />检查可用性</Button>
+      </div>
+      {manager && item.probe.catalog.state === "available" && item.probe.catalog.coverage === "partial" ? <p className="text-meta text-muted-foreground">模型列表可能不完整，可手填其他模型。</p> : null}
+      {manager && item.probe.catalog.state === "unavailable" ? <p className="text-meta text-muted-foreground">模型列表暂不可用，可继续手填。已保存的模型保持不变。</p> : null}
+    </div>
     {onboarding ? null : <details id={`provider-${item.provider}`} className="details">
       <summary className="-mt-2 flex min-h-11 w-fit items-center gap-1 px-4 sm:ps-12 text-meta text-muted-foreground hover:text-foreground">
         <ChevronRight aria-hidden="true" className="size-4 transition-transform duration-200" />设置
@@ -494,7 +508,9 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
   const [chosen, setTyping] = useState<boolean | null>(null)
   const typing = chosen ?? modelTyped(manager.model, models)
   const cursor = manager.provider === "cursor"
-  const dirty = fields.some((key) => draft[key] !== manager[key])
+  const dirty = fields.some((key) => draft[key] !== manager[key]) || draft.reasoning_effort !== manager.reasoning_effort || JSON.stringify(draft.backup) !== JSON.stringify(manager.backup)
+  const selected = models?.find((model) => draft.model ? model.id === draft.model : model.default)
+  const efforts = selected?.effort.state === "provider_controlled" ? [] : selected?.effort.state === "selectable" ? selected.effort.options : effortOptions(manager.provider)
   const field = (key: (typeof botFields)[number], label: string, extra: { placeholder?: string; required?: boolean; plain?: boolean } = {}) => {
     const props = { name: key, value: draft[key], disabled: working, placeholder: extra.placeholder, required: extra.required,
       onChange: (event: ChangeEvent<HTMLInputElement>) => setDraft({ ...draft, [key]: event.target.value }) }
@@ -502,7 +518,7 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
   }
   return <form className="grid gap-3" onSubmit={(event) => {
     event.preventDefault()
-    void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim() })
+    void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim(), backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } })
   }}>
     {fields.includes("model") ? models && !typing ? <label className="grid gap-1 text-meta">{copy.label}
       <NativeSelect className="w-full" name="model" value={draft.model} disabled={working}
@@ -516,6 +532,15 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
       {models ? <Button type="button" variant="ghost" size="icon" aria-label={copy.pick} title={copy.pick} disabled={working}
         onClick={() => { setTyping(false); setDraft({ ...draft, model: models.some((model) => model.id === draft.model) ? draft.model : "" }) }}><List aria-hidden="true" /></Button> : null}
     </div> : null}
+    {fields.includes("model") ? efforts.length ? <label className="grid gap-1 text-meta">推理强度
+      <NativeSelect value={draft.reasoning_effort ?? ""} disabled={working} onChange={(event) => setDraft({ ...draft, reasoning_effort: event.target.value || null })}>
+        <NativeSelectOption value="">由 AI 服务决定</NativeSelectOption>
+        {draft.reasoning_effort && !efforts.includes(draft.reasoning_effort) ? <NativeSelectOption value={draft.reasoning_effort}>{draft.reasoning_effort}</NativeSelectOption> : null}
+        {efforts.map((effort) => <NativeSelectOption key={effort} value={effort}>{effort}</NativeSelectOption>)}
+      </NativeSelect>
+      <span className="text-muted-foreground">用于下一回合，模型是否支持以 AI 服务的检查结果为准。</span>
+    </label> : <p className="text-meta text-muted-foreground">推理强度由 AI 服务决定</p> : null}
+    {fields.includes("model") ? <Details label="备用策略"><BackupPolicyEditor policy={draft.backup} disabled={working} change={(backup) => setDraft({ ...draft, backup })} /></Details> : null}
     {fields.includes("workspace") ? field("workspace", folderLabels.botRun) : null}
     {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
   </form>
@@ -547,4 +572,19 @@ function Folders({ later, roots, suggested, display, busy, save }: { later: bool
     </div>
     </div>
   </section>
+}
+
+function BackupPolicyEditor({ policy, disabled, change }: { policy: BackupPolicy; disabled: boolean; change(policy: BackupPolicy): void }) {
+  const update = (index: number, value: BackupPolicy['candidates'][number]) => change({ ...policy, candidates: policy.candidates.map((candidate, at) => at === index ? value : candidate) })
+  return <div className="grid gap-3">
+    <label className="flex min-h-11 items-center gap-2 text-meta"><input type="checkbox" disabled={disabled || !policy.candidates.length} checked={policy.automatic} onChange={(event) => change({ ...policy, automatic: event.target.checked })} />自动尝试备用模型</label>
+    <p className="text-meta text-muted-foreground">仅在原回合明确未执行时按顺序尝试一次。使用运行设备对应 AI 服务的登录账户，可能产生该账户的费用。</p>
+    {policy.candidates.map((candidate, index) => <div key={index} className="grid gap-2 rounded-lg border p-2">
+      <label className="grid gap-1 text-meta">备用 AI 服务 {index + 1}<NativeSelect disabled={disabled} value={candidate.provider} onChange={(event) => { const provider = providerIds.find((provider) => provider === event.target.value); if (provider) update(index, { provider, model: '', reasoning_effort: null }) }}>{providerIds.map((provider) => <NativeSelectOption key={provider} value={provider}>{providerNames[provider]}</NativeSelectOption>)}</NativeSelect></label>
+      <Input aria-label={`备用模型 ${index + 1}`} placeholder="模型名称" required value={candidate.model} disabled={disabled} onChange={(event) => update(index, { ...candidate, model: event.target.value })} />
+      {effortOptions(candidate.provider).length ? <label className="grid gap-1 text-meta">备用推理强度<NativeSelect disabled={disabled} value={candidate.reasoning_effort ?? ''} onChange={(event) => update(index, { ...candidate, reasoning_effort: event.target.value || null })}><NativeSelectOption value="">由 AI 服务决定</NativeSelectOption>{effortOptions(candidate.provider).map((effort) => <NativeSelectOption key={effort} value={effort}>{effort}</NativeSelectOption>)}</NativeSelect></label> : <p className="text-meta text-muted-foreground">推理强度由 AI 服务决定</p>}
+      <Button type="button" variant="ghost" disabled={disabled} onClick={() => { const candidates = policy.candidates.filter((_, at) => at !== index); change({ automatic: policy.automatic && candidates.length > 0, candidates }) }}>移除备用模型</Button>
+    </div>)}
+    <Button type="button" variant="outline" disabled={disabled || policy.candidates.length >= 5} onClick={() => change({ ...policy, candidates: [...policy.candidates, { provider: 'codex', model: '', reasoning_effort: null }] })}>添加备用模型</Button>
+  </div>
 }

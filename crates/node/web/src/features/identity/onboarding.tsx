@@ -21,7 +21,7 @@ export function Onboarding() {
   const [busy, setBusy] = useState(false)
   const [botOn, setBotOn] = useState(false)
   const [error, setError] = useState<unknown>(null)
-  const canReply = workspace.nodes.some((node) => botReadiness(node) === "ready" || botReadiness(node) === "starting")
+  const canReply = workspace.nodes.some((node) => botReadiness(node) === "ready" || botReadiness(node) === "unverified" || botReadiness(node) === "starting")
   // The first bot works in this computer's first folder; its panel changes it later.
   const project = projectChoices(workspace.nodes.filter((node) => node.local), () => "")[0]?.project
   // The folder reads as Settings shows it, `~/…`; the device only says that form in its settings.
