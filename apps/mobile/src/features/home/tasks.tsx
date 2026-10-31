@@ -35,6 +35,7 @@ export function TasksScreen() {
   const activityView = workspaceActivities({ works: visibleWorks, questions: openQuestions, checks: pendingChecks, overview, answered: shared?.answered ?? {}, nodes: lookup.nodes, knownBots: read ? shared?.bots ?? [] : [], connected: Boolean(shared?.connectionOnline), read, jobs: (shared?.data?.scheduler?.jobs ?? []).map((job) => ({ conversation_id: shared?.conversationId ?? null, job })) })
   const workActivities = activityView.activities.filter((activity): activity is Extract<WorkspaceActivity, { kind: 'work' }> => activity.kind === 'work')
   const turns = activityView.activities.filter((activity): activity is Extract<WorkspaceActivity, { kind: 'turn' }> => activity.kind === 'turn')
+  const questionActivities = activityView.groups.attention.filter((activity): activity is Extract<WorkspaceActivity, { kind: 'attention' }> => activity.kind === 'attention' && 'question_id' in activity.attention)
   const loading = !read && Boolean(shared?.connectionOnline) && !activityView.activities.length
   const bot = workspace.bots[0]
   const groups: Record<TaskGroup, Extract<WorkspaceActivity, { kind: 'work' }>[] > = {
@@ -52,6 +53,7 @@ export function TasksScreen() {
     <Text className="text-meta text-muted-foreground">{[...(overview ? overviewScope(overview.coverage) : ['尚未读取任务记录']), ...(!read ? ['当前连接尚未完成首读'] : !shared?.connectionOnline ? ['连接已断开，显示最近记录'] : [])].join(' · ')}</Text>
     <Link href="/inbox" asChild><Pressable accessibilityRole="link" accessibilityLabel={pending ? `${pending} 件事等你决定` : '查看待处理'} className={`min-h-11 flex-row items-center gap-3 rounded-xl border px-4 py-3 active:bg-muted ${pending ? 'border-warning/25 bg-warning-soft' : 'border-border bg-card'}`}><Icon as={pending ? CircleQuestionMark : Inbox} className={`size-5 ${pending ? 'text-warning' : 'text-muted-foreground'}`} /><Text className="min-w-0 flex-1">{pending ? `${pending} 件事等你决定` : '查看待处理'}</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Pressable></Link>
     {otherChecks.map((check) => <View key={`${check.conversation_id}:${check.item_id}`} className="gap-2 rounded-xl border border-border bg-card p-4"><Text className="font-medium">{check.work_id ? '任务状态待确认' : '程序状态待确认'} · {check.bot?.name ?? (read ? '未找到所属 Bot' : 'Bot 身份未加载')}</Text>{check.bot ? <Link href={`/b/${check.bot.bot_id}`} asChild><Pressable accessibilityRole="link" className="min-h-11 justify-center"><Text>打开 {check.bot.name}</Text></Pressable></Link> : null}</View>)}
+    {questionActivities.map((activity) => <MobileQuestionAttention key={activity.id} activity={activity} bots={shared?.bots ?? []} read={read} />)}
     {turns.map((activity) => <MobileTurn key={activity.id} activity={activity} />)}
     {loading ? <View accessibilityLabel="正在读取任务" className="gap-2">
       {[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-3">
@@ -63,6 +65,17 @@ export function TasksScreen() {
       {groups[group].map((activity) => <TaskRow key={activity.id} work={activity.work!} projected={activity.projection} waiting={activity.facts.questions.length > 0} bot={shared?.bots.find((item) => item.conversation_id === activity.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline && read)} progress={taskProgress(activity.work!, shared?.liveProgress ?? [])} />)}
     </View> : null) : activityView.groups.attention.length || otherChecks.length || turns.length ? null : <MobileEmpty bot={bot} read={read} />}
   </ScrollView>
+}
+
+function MobileQuestionAttention({ activity, bots, read }: { activity: Extract<WorkspaceActivity, { kind: 'attention' }>; bots: BotRecord[]; read: boolean }) {
+  const question = activity.attention
+  if (!('question_id' in question)) return null
+  const bot = 'bot' in question && question.bot ? question.bot : bots.find((item) => item.conversation_id === activity.conversation_id)
+  return <View className="gap-2 rounded-xl border border-warning/25 bg-warning-soft p-4">
+    <Text className="font-medium">问题待确认</Text>
+    <Text className="text-meta text-muted-foreground">{question.text}</Text>
+    {bot ? <Link href={`/b/${bot.bot_id}`} asChild><Pressable accessibilityRole="link" className="min-h-11 justify-center"><Text>打开 {bot.name}</Text></Pressable></Link> : <Text className="text-meta text-muted-foreground">{read ? '未找到所属 Bot' : 'Bot 身份未加载'}</Text>}
+  </View>
 }
 
 function MobileTurn({ activity }: { activity: Extract<WorkspaceActivity, { kind: 'turn' }> }) {

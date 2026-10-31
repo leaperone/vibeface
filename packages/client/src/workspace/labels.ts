@@ -242,7 +242,7 @@ type WorkspaceActivityInput = {
 
 const activityKey = (conversationId: string, workId: string) => JSON.stringify([conversationId, workId])
 const emptyActivityFacts = (): WorkspaceActivityFacts => ({ questions: [], checks: [], overviewQuestions: [], overviewChecks: [], jobs: [] })
-const activityJobId = (conversationId: string | null, job: ManagerJob | OverviewJob) => `turn:${conversationId ?? ""}:${"job_id" in job ? job.job_id : job.trigger}`
+const activityJobId = (conversationId: string | null, job: ManagerJob | OverviewJob) => `turn:${conversationId ?? ""}:${job.trigger}`
 const taskWorkId = (trigger: string) => trigger.startsWith("task:") ? trigger.slice(5) || null : null
 
 /** Build the shared Work/Turn/Attention activity domain from already loaded facts. */

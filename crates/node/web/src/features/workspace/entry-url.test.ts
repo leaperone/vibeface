@@ -1211,6 +1211,28 @@ test("mobile task attention counts unanswered questions and program checks and o
   } finally { app.close() }
 })
 
+test("mobile task overview shows an unbound question summary and Bot entry", () => {
+  const shared = parityShared()
+  shared.openWorks = []
+  shared.overview = workspaceModel.parseWorkspaceOverview({ bots: [parityBot], questions: [{
+    question_id: "overview-question", conversation_id: "chat", bot: parityBot, text: "需要确认交付方式", severity: "attention", choices: [],
+    request_id: null, work_id: null, about: { node: "worker", agent: "codex", session_id: "session", cwd: "/project", summary: "" }, created_at_ms: 1,
+  }] })
+  const app = componentHarness("../../../../../../apps/mobile/src/features/home/tasks.tsx", {
+    "@/data/live": { useLive: () => shared, useInbox: () => [] },
+    "@/data/context": { useWorkspace: () => ({ bots: shared.bots }) },
+    "@vibeface/client/identity/context.tsx": { useDevice: () => ({ directory: null }) },
+    "@vibeface/client/workspace/labels.ts": taskLabels,
+    "@vibeface/client/workspace/model.ts": workspaceModel,
+    "@/lib/utils": { cn: (...values: unknown[]) => values.filter(Boolean).join(" ") },
+  })
+  try {
+    const elements = app.render("TasksScreen")
+    assert.equal(elements.some(({ type }) => typeof type === "function" && type.name === "MobileQuestionAttention"), true)
+    assert.equal(nestedElements(elements, ["MobileQuestionAttention"]).some(({ type, props }) => type === "Link" && props.href === "/b/bot"), true)
+  } finally { app.close() }
+})
+
 test("question cards select locally, send exact answers only on confirmation, and keep unknown retries and winning answers", async () => {
   const sent: unknown[][] = [], notices: string[] = []
   let actionBusy: string | null = null, answerStatus = 'answered'

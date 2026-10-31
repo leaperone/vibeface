@@ -278,3 +278,13 @@ test("overview-only questions remain one attention item instead of attaching to 
   assert.deepEqual(view.activities.filter((activity) => activity.kind === "attention").map((activity) => activity.id), ["attention:overview-question:overview-q"])
   assert.equal(view.activities.filter((activity) => activity.kind === "work").some((activity) => activity.facts.overviewQuestions.length > 0), false)
 })
+
+test("workspace activities dedupe overview and live scheduler jobs by conversation and trigger", () => {
+  const overview = parseWorkspaceOverview({ jobs: [{ job_id: "job-queue", conversation_id: "chat-1", trigger: "message:queue", state: "queued" }] })
+  const view = workspaceActivities({
+    works: [], questions: [], checks: [], overview,
+    jobs: [{ conversation_id: "chat-1", job: { trigger: "message:queue", state: "running" } }],
+    nodes: [], read: true, connected: true,
+  })
+  assert.deepEqual(view.activities.filter((activity) => activity.kind === "turn").map((activity) => activity.id), ["turn:chat-1:message:queue"])
+})
