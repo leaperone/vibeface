@@ -101,6 +101,7 @@ export const mobilePlatform: Platform = {
     delete: async (key) => { store.remove(outboxPrefix + key) },
   },
   notifier,
+  sessionNotifications: false,
   onForeground(listener) {
     const subscription = AppState.addEventListener('change', (state) => { if (state === 'active') listener() })
     return () => subscription.remove()

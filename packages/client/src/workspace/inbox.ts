@@ -3,7 +3,7 @@ import type { ClientPrincipal, JoinRequest } from "../lib/node.ts"
 import { failedWork, nodeName } from "./labels.ts"
 import { botReadiness, workChecks } from "./model.ts"
 import { openQuestions } from "./questions.ts"
-import type { BotRecord, CoordinationCheck, NodeInfo, NotificationRecord, OpenWork, PendingCheck, Question, WriteStatus } from "./types.ts"
+import { isSessionNotification, type BotRecord, type CoordinationCheck, type NodeInfo, type NotificationRecord, type OpenWork, type PendingCheck, type Question, type WriteStatus } from "./types.ts"
 
 export type WriteCardKind = "read_only" | "forked" | "conflicts"
 
@@ -15,6 +15,7 @@ export type InboxItem = { key: string; title: string; meta?: string } & (
   | { kind: "confirm"; check: PendingCheck }
   | { kind: "join"; join: JoinRequest }
   | { kind: "attention"; bot: BotRecord }
+  | { kind: "session"; bot: BotRecord; notification: NotificationRecord }
   | { kind: "failed"; work: OpenWork; bot: BotRecord }
   | { kind: "setup"; device: string | undefined }
 )
@@ -63,9 +64,10 @@ export function inboxItems({ device, workspace }: InboxSource): InboxItem[] {
   if (workspace.messagePending && !workspace.messageBusy) items.push({ key: "undelivered", kind: "undelivered", title: "消息可能没送达", meta: workspace.selectedBot?.name })
   for (const join of openJoins(device)) items.push({ key: `join:${join.join_id}`, kind: "join", join, title: `${join.name || "新设备"} 想加入` })
   for (const note of workspace.notifications) {
-    if (note.kind !== "manager_attention") continue
     const bot = workspace.bots.find((item) => item.conversation_id === note.conversation_id)
-    if (bot) items.push({ key: `attention:${note.notification_id}`, kind: "attention", bot, title: note.text.trim() || "Bot 需要你看看", meta: bot.name })
+    if (!bot) continue
+    if (note.kind === "manager_attention") items.push({ key: `attention:${note.notification_id}`, kind: "attention", bot, title: note.text.trim() || "Bot 需要你看看", meta: bot.name })
+    else if (isSessionNotification(note)) items.push({ key: `session:${note.notification_id}`, kind: "session", bot, notification: note, title: "接手了一个外部会话", meta: bot.name })
   }
   const unready = workspace.nodes.find((node) => botReadiness(node) === "needs_setup")
   // Only an admin, or this computer's own page, may set one up; elsewhere the item would lead nowhere.

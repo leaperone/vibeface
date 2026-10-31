@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef } from 'react'
-import { createFileRoute, Link } from '@tanstack/react-router'
-import { ChevronRight, CircleX, Inbox, MessageCircle, Settings, X } from 'lucide-react'
+import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
+import { Bell, ChevronRight, CircleX, Inbox, MessageCircle, Settings, X } from 'lucide-react'
 import { ActionCard, claimFocus, EmptyState, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useInbox } from '@/features/workspace/inbox'
@@ -41,7 +41,7 @@ function InboxPage() {
     if (items[index]) held.current = { key: items[index].key, index }
   }}>
     {items.map((item) => <li key={item.key} tabIndex={-1} className="min-w-0 outline-none animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out">
-      {item.kind === 'recovery' ? <RecoveryPendingCard /> : item.kind === 'rotate' ? <RotateHintCard /> : item.kind === 'write' ? <WriteCard kind={item.write} /> : item.kind === 'join' ? <JoinCard request={item.join} /> : item.kind === 'question' ? <QuestionCard question={item.question} inbox from="inbox" /> : item.kind === 'confirm' ? <ConfirmCard check={item.check} inbox from="inbox" /> : item.kind === 'failed' ? <FailedCard item={item} /> : <div className="flex min-h-14 items-center rounded-xl border bg-card shadow-xs">
+      {item.kind === 'recovery' ? <RecoveryPendingCard /> : item.kind === 'rotate' ? <RotateHintCard /> : item.kind === 'write' ? <WriteCard kind={item.write} /> : item.kind === 'join' ? <JoinCard request={item.join} /> : item.kind === 'question' ? <QuestionCard question={item.question} inbox from="inbox" /> : item.kind === 'confirm' ? <ConfirmCard check={item.check} inbox from="inbox" /> : item.kind === 'failed' ? <FailedCard item={item} /> : item.kind === 'session' ? <SessionNotice item={item} /> : <div className="flex min-h-14 items-center rounded-xl border bg-card shadow-xs">
         <Link to={item.to} className="flex min-h-14 min-w-0 flex-1 items-center gap-3 interactive-row rounded-xl px-4 py-3">
           <item.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
           <span className="min-w-0 flex-1 truncate font-medium">{item.title}</span>
@@ -51,6 +51,24 @@ function InboxPage() {
       </div>}
     </li>)}
   </ul>
+}
+
+function SessionNotice({ item }: { item: Extract<InboxItem, { kind: 'session' }> }) {
+  const workspace = useWorkspace()
+  const navigate = useNavigate()
+  const open = () => void workspace.run(async () => {
+    if (workspace.writable) await workspace.ackNotification(item.notification)
+    await navigate({ to: '/b/$botId', params: { botId: item.bot.bot_id } })
+  }, '打开会话提醒')
+  return <button type="button" onClick={open} className="flex min-h-14 w-full min-w-0 items-center gap-3 interactive-row rounded-xl border bg-card px-4 py-3 text-left shadow-xs">
+    <Bell aria-hidden="true" className="size-5 shrink-0 text-warning" />
+    <span className="grid min-w-0 flex-1 gap-0.5">
+      <span className="truncate font-medium">{item.title}</span>
+      <span className="truncate text-meta text-muted-foreground" title={item.notification.text}>{item.notification.text || item.meta || 'Bot'}</span>
+    </span>
+    <span className="max-w-[28%] shrink-0 truncate text-meta text-muted-foreground">{item.meta}</span>
+    <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+  </button>
 }
 
 /** A task that did not finish: its device and why, and the device's settings when the fix is there. */
