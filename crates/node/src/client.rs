@@ -3412,7 +3412,7 @@ mod tests {
             &state,
             &root,
             &LocalIdentity::generate().device_id()?,
-            state.genesis.members.clone(),
+            state.genesis.members(),
             vec![],
             now - vibeface_secure::membership::RECOVERY_DELAY_MS + 60_000,
         )?;
