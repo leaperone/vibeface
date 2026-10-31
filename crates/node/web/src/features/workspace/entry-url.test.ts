@@ -5,22 +5,27 @@ import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
-import { entryAddress, entryJson, entryKey, parseEntry, parseInfo, providerIds, providerNames } from "@vibeface/client/lib/node.ts"
+import { entryAddress, entryJson, entryKey, messageOf, parseEntry, parseInfo, providerIds, providerNames } from "@vibeface/client/lib/node.ts"
 import * as nodeSettings from "@vibeface/client/lib/node.ts"
 import type { NodeSettingsResponse, ProviderReadiness, ProviderStatus, ReadyConnection } from "@vibeface/client/lib/node.ts"
 import type { WorkRecord } from "@vibeface/client/workspace/types.ts"
-import { cardState, nodeName, taskGroup, taskGroups } from "@vibeface/client/workspace/labels.ts"
+import { cardState, nodeName, taskGroup } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
-import { folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
-import { agentName, answerLabel, attentionLabel, approvalTask, awaitsAnswer, declined, foldAnswers, projectName, questionMeta, questionOpen, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
+import { botCopy, folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
+import { agentName, answerLabel, attentionLabel, approvalTask, awaitsAnswer, declined, foldAnswers, projectName, questionMeta, questionOpen, questionParts, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
 import * as errors from "@vibeface/client/lib/errors.ts"
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
-import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
+import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters } from "@vibeface/client/chat/protocol.ts"
 import { deviceCopy, setUpOnManager } from "@vibeface/client/identity/copy.ts"
-import { chatTimeline, firstUnread } from "@vibeface/client/chat/timeline.ts"
+import { chatTimeline, firstUnread, unreadCounts } from "@vibeface/client/chat/timeline.ts"
+import { accessOf } from "@vibeface/client/identity/access.ts"
+import { storageOf } from "@vibeface/client/workspace/storage.ts"
+import { unreachable } from "@vibeface/client/workspace/home.ts"
 import { primaryLane } from "@vibeface/client/identity/connection-lane.ts"
 import * as taskLabels from "@vibeface/client/workspace/labels.ts"
 import * as workspaceModel from "@vibeface/client/workspace/model.ts"
+import * as workspaceQuestions from "@vibeface/client/workspace/questions.ts"
+import { inboxItems } from "@vibeface/client/workspace/inbox.ts"
 
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
@@ -65,12 +70,12 @@ test("works, reply status and pending checks keep their exact shape", () => {
   assert.deepEqual(parsed.works[0].resolved, { provider: "codex", model: null })
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, resolved: undefined }] }), "accepted work requires its frozen selection")
   const offline = parseNodes({ nodes: [{ device_id: "worker", name: "工作电脑", local: false, online: false, revoked: false }] })
-  assert.equal(cardState(parsed.works[0], offline, "running"), "awaiting_confirmation", "the last overview state cannot make an offline task look active")
-  assert.equal(taskGroup(cardState(parsed.works[0], offline, "running"), false), "attention")
-  assert.equal(cardState(parsed.works[0], [{ ...offline[0], online: true }], "running"), "running")
-  assert.equal(cardState({ ...parsed.works[0], state: "unverified", outcome: "unverified" }, [], "unverified"), "awaiting_confirmation")
-  assert.equal(cardState({ ...parsed.works[0], outcome: "failed" }, offline, "finished"), "failed")
-  assert.equal(cardState({ ...parsed.works[0], state: "dispatch_waiting" }, offline, "dispatch_waiting"), "dispatch_waiting")
+  assert.equal(cardState(parsed.works[0], offline, { state: "running", outcome: null }), "awaiting_confirmation", "the last overview state cannot make an offline task look active")
+  assert.equal(taskGroup(cardState(parsed.works[0], offline, { state: "running", outcome: null }), false), "attention")
+  assert.equal(cardState(parsed.works[0], [{ ...offline[0], online: true }], { state: "running", outcome: null }), "running")
+  assert.equal(cardState({ ...parsed.works[0], state: "unverified", outcome: "unverified" }, [], { state: "unverified", outcome: "unverified" }), "awaiting_confirmation")
+  assert.equal(cardState({ ...parsed.works[0], outcome: "failed" }, offline, { state: "finished", outcome: "failed" }), "failed")
+  assert.equal(cardState({ ...parsed.works[0], state: "dispatch_waiting" }, offline, { state: "dispatch_waiting", outcome: null }), "dispatch_waiting")
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "waiting_approval" }] }), "approval states are gone")
   assert.equal(parseConversation({ ...context, works: [{ ...work, title: undefined }] }).works[0].title, "", "a dispatch row without a title still parses")
   assert.equal(parsed.messages[0].status, "stopped")
@@ -207,6 +212,7 @@ test("workspace preserves bot and message requests while routing native decision
   const work: WorkRecord = { work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", title: "工作", prompt: "工作", state: "running", resolved: { provider: "codex", model: null }, summary: "", outcome: null, result_text: "", failure_reason: null }
   let scheduler: Record<string, unknown> | null = null
   let transcript: Record<string, unknown>[] = []
+  let conversationMessages: Record<string, Record<string, unknown>[]> | null = null
   const posted = (message_id: unknown) => ({ message_id, role: "user", text: "work", event_hash: `event-${message_id}`, created_at_ms: 1 })
   const deferred = () => {
     let resolve: (value: unknown) => void = () => {}, reject: (cause: Error) => void = () => {}
@@ -225,17 +231,19 @@ test("workspace preserves bot and message requests while routing native decision
   let answerOutcome: "answered" | "already_answered" | "lost" = "lost"
   let createMode: "unknown" | "rejected" | "success" = "unknown"
   let knownBots: ReturnType<typeof parseBot>[] = [bot]
+  let knownNodes: ReturnType<typeof parseNodes> = []
   const connection: ReadyConnection = {
     generation: 1, entry: { kind: "gateway", device_id: "gateway", address: "https://node.example" },
     principal: { network_id: "network", device_id: "client", epoch: 1, can_manage: true, source: "membership" },
     info: { device_id: "gateway", name: "gateway", version: "test", initialized: true, network_id: "network" },
     isCurrent: () => activeConnection === connection, subscribe: () => () => {}, request: async (method: string) => { if (method === "write_state") return { state: "writable", conflicts: [] }; throw new Error("unexpected request") },
     async rpc(method, body = {}) {
-      if (method === "nodes") return { nodes: [] }
+      if (method === "nodes") return { nodes: knownNodes }
       if (method === "bots") { if (failBotCheck) throw new Error("lookup unavailable"); return { bots: knownBots } }
       if (method === "notifications") return { notifications: unreadNotifications }
       if (method === "questions") return { questions: questionRows }
       if (method === "open_works") return { works: [] }
+      if (method === "workspace_overview") return {}
       if (method === "answer") {
         answers.push(JSON.parse(JSON.stringify(body)))
         if (answerOutcome === "lost") throw new Error("connection lost")
@@ -243,7 +251,7 @@ test("workspace preserves bot and message requests while routing native decision
         return { status: answerOutcome, message: { message_id: `a-${body.question_id}`, role: "user", text: answerOutcome === "answered" ? body.text : "停下", answers: body.question_id } }
       }
       if (method === "ack") { acknowledgements.push(String(body.notification_id)); unreadNotifications = unreadNotifications.filter(item => item.notification_id !== body.notification_id); return {} }
-      if (method === "conversation") return conversationHold ? conversationHold.promise : { ...context, conversation: { ...context.conversation, conversation_id: body.conversation_id }, scheduler, messages: transcript, works: [work] }
+      if (method === "conversation") return conversationHold ? conversationHold.promise : { ...context, conversation: { ...context.conversation, conversation_id: body.conversation_id }, scheduler, messages: conversationMessages?.[String(body.conversation_id)] ?? transcript, works: [work] }
       if (method === "create_bot") {
         creations.push(JSON.parse(JSON.stringify(body)))
         assert.deepEqual(botBody(JSON.parse(stored.get("vibeface.pending-bot.client.network") ?? "null")), creations.at(-1))
@@ -480,6 +488,136 @@ test("workspace preserves bot and message requests while routing native decision
       await render().refresh()
       assert.deepEqual(acknowledgements.slice(ackBefore), ["after-reconnect"])
     })
+
+    await t.test('retained native chat focus restores its route through the real live bridge without acknowledging the previously selected Bot', async () => {
+      const botA = { ...bot, name: 'Bot A' }, botB = { ...bot, bot_id: 'bot-b', conversation_id: 'chat-b', name: 'Bot B' }
+      knownBots = [botA, botB]
+      knownNodes = [{ ...parityNode, device_id: 'gateway' }]
+      questionRows = []
+      conversationMessages = Object.fromEntries([botA, botB].map((item) => [item.conversation_id, [{ message_id: `${item.bot_id}-message`, event_hash: `${item.bot_id}-event`, role: 'user', text: `${item.name} 的消息`, created_at_ms: 1 }]]))
+      render().setView('other')
+      await render().selectBot(botA)
+      let shared = render()
+      const device = { get ready() { return activeConnection }, phase: 'ready', link: { kind: 'online' }, entries: [], directory: null, identity: { deviceId: 'client' }, join() {}, cancelJoin() {}, leave() {} }
+      const bridge = componentHarness('../../../../../../apps/mobile/src/data/live.tsx', {
+        '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/identity/access.ts': { accessOf },
+        '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/lib/node.ts': { entryAddress },
+        '@vibeface/client/chat/protocol.ts': { botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, unreadCounts },
+        '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/inbox.ts': { inboxItems }, '@vibeface/client/workspace/labels.ts': taskLabels,
+        '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers }, '@vibeface/client/workspace/storage.ts': { storageOf }, '@vibeface/client/workspace/types.ts': { isSessionNotification: () => false },
+        '@/platform': { mobilePlatform: { storage: browser.localStorage } }, './context': { WorkspaceProvider: 'NativeWorkspace' },
+      }, {}, 'Live')
+      type NativeWorkspace = import('../../../../../../apps/mobile/src/data/types.ts').Workspace
+      let native: NativeWorkspace
+      const mobile = () => {
+        shared = render()
+        const value = bridge.render('Live').find(({ type }) => type === 'NativeWorkspace')?.props.value
+        assert.ok(value && typeof value === 'object')
+        native = value as NativeWorkspace
+        return native
+      }
+      mobile()
+      const chat = componentHarness('../../../../../../apps/mobile/app/b/[botId].tsx', {
+        'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: botA.bot_id }) },
+        'expo-router/react-navigation': { useHeaderHeight: () => 0 },
+        'react-native': { Platform: { OS: 'android' }, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
+        'react-native-keyboard-controller': { useReanimatedKeyboardAnimation: () => ({ height: { value: 0 } }) },
+        'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read() },
+        'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }), useSafeAreaFrame: () => ({ width: 390 }) },
+        'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme: 'light' }) },
+        '@/data/context': { useWorkspace: () => native }, '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
+        '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/home.ts': { unreachable },
+        '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+        '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
+        '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
+      }, { requestAnimationFrame: (run: () => void) => run(), setInterval: () => 1, clearInterval() {} })
+      const stack = { Screen: 'Screen', Protected: 'Protected' }
+      const layout = componentHarness('../../../../../../apps/mobile/app/_layout.tsx', {
+        'expo-router': { Stack: stack }, 'expo-linking': { useLinkingURL: () => null }, '@/data/live': { LiveWorkspace: 'LiveWorkspace', useLive: () => shared },
+        '@/data/context': { useWorkspace: () => ({ session: { phase: 'ready' } }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
+        'uniwind': { useCSSVariable: () => ['white', 'black'] }, '@/lib/layout': { useWide: () => false }, 'react-native': { Platform: { OS: 'ios' }, View: 'View' },
+      })
+      try {
+        const tree = layout.render('default')
+        const screens = tree.find(({ type }) => typeof type === 'function' && type.name === 'Screens')
+        assert.ok(screens && typeof screens.type === 'function')
+        screens.type(screens.props)
+        const listener = tree.find(({ type }) => type === stack)?.props.screenListeners
+        assert.ok(typeof listener === 'function')
+        const focus = (name: string) => listener({ route: { name } }).focus()
+        chat.render('default')
+        await settleComponent()
+        mobile()
+        assert.equal(shared.conversationId, 'chat')
+        chat.blur()
+        focus('tasks')
+        unreadNotifications = [
+          { notification_id: 'native-a', kind: 'result', text: 'A 的通知', conversation_id: 'chat' },
+          { notification_id: 'native-b', kind: 'result', text: 'B 的通知', conversation_id: 'chat-b' },
+        ]
+        await render().selectBot(botB)
+        mobile()
+        focus('b/[botId]/work/[workId]')
+        await render().refresh()
+        focus('tasks')
+        const ackBefore = acknowledgements.length
+        focus('b/[botId]')
+        await render().refresh()
+        assert.deepEqual(acknowledgements.slice(ackBefore), [], 'a Stack focus before the retained chat callback cannot acknowledge Bot B')
+        mobile()
+        chat.focus()
+        await settleComponent()
+        mobile()
+        const elements = chat.render('default')
+        assert.equal(shared.conversationId, 'chat', 'the retained A route reselects A without changing its id or remounting')
+        assert.equal(shared.view, 'chat')
+        const rows = elements.find(({ type }) => type === 'FlatList')?.props.data as { message?: { text?: string } }[]
+        assert.equal(rows[0]?.message?.text, 'Bot A 的消息')
+        assert.equal(elements.find(({ type }) => type === 'Composer')?.props.blocked, null)
+        await render().refresh()
+        assert.deepEqual(acknowledgements.slice(ackBefore), ['native-a'])
+        assert.equal(render().notifications.some((item) => item.notification_id === 'native-b'), true)
+
+        chat.blur()
+        focus('tasks')
+        knownBots = [botB]
+        await render().refresh()
+        const waiting = mobile().actions.open('chat')
+        await settleComponent()
+        assert.equal(render().view, 'other', 'a route whose Bot has not arrived cannot make the old Bot a visible chat')
+        await render().refresh()
+        assert.deepEqual(acknowledgements.slice(ackBefore), ['native-a'])
+        knownBots = [botA, botB]
+        await render().refresh()
+        mobile()
+        await settleComponent()
+        mobile()
+        assert.equal(shared.conversationId, 'chat', 'a focused waiting route selects its Bot when the catalog arrives')
+        assert.equal(shared.view, 'chat')
+        waiting()
+        knownBots = [botB]
+        await render().refresh()
+        const cancelled = mobile().actions.open('chat')
+        cancelled()
+        knownBots = [botA, botB]
+        await render().refresh()
+        mobile()
+        await settleComponent()
+        assert.equal(render().conversationId, 'chat-b', 'a blurred waiting route cannot select its late Bot')
+        assert.equal(render().view, 'other')
+        conversationHold = deferred()
+        const reading = conversationHold
+        const backgrounded = mobile().actions.open('chat')
+        backgrounded()
+        focus('tasks')
+        reading.resolve({ ...context, scheduler: null, messages: conversationMessages.chat })
+        await settleComponent()
+        mobile()
+        assert.equal(shared.view, 'tasks', 'a completed read from a blurred chat cannot reactivate the chat view')
+        assert.deepEqual(acknowledgements.slice(ackBefore), ['native-a'])
+        conversationHold = null
+      } finally { chat.close(); layout.close(); bridge.close() }
+    })
   } finally {
     for (const effect of effects.values()) effect.cleanup?.()
   }
@@ -487,9 +625,10 @@ test("workspace preserves bot and message requests while routing native decision
 
 function componentHarness(path: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}, privateExport = '') {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
+  const focusEffects = new Map<number, { run: () => (() => void) | void; cleanup?: () => void }>()
   type Props = Record<string, unknown> & { name?: string; type?: string; role?: string; disabled?: boolean; value?: unknown; onChange?: (event: unknown) => void; onSubmit?: (event?: unknown) => void; onClick?: () => void; action?: () => Promise<unknown> }
   const elements: { type: unknown; props: Props }[] = [], afterRender: (() => void)[] = []
-  let cursor = 0
+  let cursor = 0, focused = true
   function effect(run: () => (() => void) | void, dependencies: unknown[]) {
     const index = cursor++, previous = effects.get(index)
     if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) afterRender.push(() => {
@@ -506,12 +645,30 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       return [values[index], (next: unknown) => { values[index] = typeof next === 'function' ? next(values[index]) : next }]
     },
     useRef(initial: unknown) { const index = cursor++; if (!(index in values)) values[index] = { current: initial }; return values[index] },
+    useCallback(callback: unknown, dependencies: unknown[]) {
+      const index = cursor++
+      const previous = values[index] as { callback: unknown; dependencies: unknown[] } | undefined
+      if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) values[index] = { callback, dependencies }
+      return (values[index] as { callback: unknown }).callback
+    },
+    useMemo(read: () => unknown, dependencies: unknown[]) {
+      const index = cursor++, previous = values[index] as { value: unknown; dependencies: unknown[] } | undefined
+      if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) values[index] = { value: read(), dependencies }
+      return (values[index] as { value: unknown }).value
+    },
     useEffect: effect, useLayoutEffect: effect,
   }
   const jsx = (type: unknown, props: Props) => { const element = { type, props }; elements.push(element); return element }
   const ui = new Proxy({}, { get: (_target, name) => String(name) })
   const module: { exports: Record<string, unknown> } = { exports: {} }
-  const require = (specifier: string) => specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : dependencies[specifier] ?? ui
+  const useFocusEffect = (run: () => (() => void) | void) => {
+    const index = cursor++, previous = focusEffects.get(index)
+    if (!previous || previous.run !== run) afterRender.push(() => {
+      previous?.cleanup?.()
+      focusEffects.set(index, { run, cleanup: focused ? run() ?? undefined : undefined })
+    })
+  }
+  const require = (specifier: string) => specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
   const filename = fileURLToPath(new URL(path, import.meta.url))
   const source = readFileSync(filename, 'utf8') + (privateExport ? `\nexport { ${privateExport} }\n` : '')
   const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
@@ -525,7 +682,9 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       afterRender.splice(0).forEach(run => run())
       return elements
     },
-    close() { for (const effect of effects.values()) effect.cleanup?.() },
+    focus() { if (!focused) { focused = true; for (const effect of focusEffects.values()) effect.cleanup = effect.run() ?? undefined } },
+    blur() { if (focused) { focused = false; for (const effect of focusEffects.values()) { effect.cleanup?.(); effect.cleanup = undefined } } },
+    close() { for (const effect of [...effects.values(), ...focusEffects.values()]) effect.cleanup?.() },
     module: module.exports,
   }
 }
@@ -636,7 +795,461 @@ test("mobile provider probes discard settings that arrive after another call or 
   }
 })
 
-test("task filters keep the pending summary and empty state within the selected Bot", () => {
+function nestedElements(elements: readonly { type: unknown; props: Record<string, unknown> }[], names: readonly string[]) {
+  const expanded = [...elements]
+  const pending = [...elements]
+  const enqueue = (value: unknown) => {
+    if (Array.isArray(value)) { value.forEach(enqueue); return }
+    if (!value || typeof value !== "object" || !("type" in value) || !("props" in value)) return
+    const element = value as { type: unknown; props: Record<string, unknown> }
+    if (!expanded.includes(element)) expanded.push(element)
+    pending.push(element)
+    if (element.props && "children" in element.props) enqueue(element.props.children)
+  }
+  while (pending.length) {
+    const element = pending.shift()!
+    if (typeof element.type !== "function" || !names.includes(element.type.name)) continue
+    enqueue(element.type(element.props))
+  }
+  return expanded
+}
+
+function componentText(node: unknown): string {
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(componentText).join('')
+  if (node && typeof node === 'object' && 'props' in node && node.props && typeof node.props === 'object' && 'children' in node.props) return componentText(node.props.children)
+  return ''
+}
+
+const parityBot = parseBot({ bot_id: 'bot', conversation_id: 'chat', name: '项目 Bot', instructions: '', models: {}, skills: null, avatar: null, avatar_version: null, event_hash: 'bot-event', last_message: null, busy: null })
+const parityNode = { device_id: 'worker', name: '工作设备', online: true, local: false, revoked: false, capabilities: { manager: 'codex', manager_state: 'ready' as const, relay: false, roots: [], codex_connected: true } }
+const parityWork = (extra: Record<string, unknown> = {}) => {
+  const work = parseConversation({ ...context, works: [{ resolved: { provider: 'codex', model: null }, work_id: 'work', trigger: 'message:one', target_node: 'worker', cwd: '/project', title: '核对项目', prompt: '完整请求', state: 'running', summary: '✓ 读记录\n→ 核对结果\n· 等待同步', outcome: null, result_text: '', failure_reason: null, kind: 'codex', thread_id: 'session', ...extra }] }).works[0]
+  assert.ok(work && work.resolved)
+  return work
+}
+const paritySnapshot = (value: unknown) => value === null ? null : parseConversation(value)
+const parityShared = () => ({
+  generation: 1, isCurrent: () => true, synced: true, connectionOnline: true, conversationId: 'chat', data: paritySnapshot(context),
+  bots: [parityBot], selectedBot: parityBot, nodes: [parityNode], openWorks: [{ ...parityWork(), conversation_id: 'chat' }],
+  overview: workspaceModel.parseWorkspaceOverview({}), questions: [] as ReturnType<typeof parseConversation>['questions'], answered: {} as Record<string, string>, liveProgress: [], writable: true,
+  writeState: { state: 'writable' as const, conflicts: [] }, notifications: [], messagePending: null, messageBusy: false,
+  setView(_view: string) {}, selectBot: async (_bot: typeof parityBot) => {}, interruptWork: async (_work: string) => {}, sendMessage: async () => true,
+})
+
+test('both task overviews preserve known records, show their coverage and only navigate cross-Bot program checks', () => {
+  for (const platform of ['web', 'native']) {
+    const shared = parityShared()
+    shared.openWorks = Array.from({ length: 257 }, (_, index) => ({ ...parityWork({ work_id: `work-${index}`, prompt: `完整请求 ${index}` }), conversation_id: 'chat' }))
+    shared.overview = workspaceModel.parseWorkspaceOverview({
+      bots: [parityBot, { bot_id: 'other', conversation_id: 'other-chat', name: '另一个 Bot' }],
+      tasks: shared.openWorks.slice(0, 256), truncated: true, consistency: 'partial', checks: [{ check_id: 'other-process', conversation_id: 'other-chat', trigger: 'message:remote' }],
+      coverage: { source: 'workspace_overview', truncated: true, omitted_tasks: 1, omitted_questions: 2, remote_owners: [{ owner: 'remote', reason: 'remote_scheduler_not_queried' }] },
+    })
+    const dependencies = {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: () => [] },
+      '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+      '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
+      '@vibeface/client/lib/errors.ts': errors, './inbox': { useInbox: () => [] }, './workspace-shell': { useCreateBot: () => () => {} },
+      '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') }, '@/components/kit': { providerIcons: { codex: 'CodexIcon' } },
+    }
+    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../../apps/mobile/src/features/home/tasks.tsx', dependencies)
+    const screen = platform === 'web' ? 'TasksOverview' : 'TasksScreen'
+    const cardName = platform === 'web' ? 'TaskOverviewCard' : 'TaskRow'
+    const mastheadName = platform === 'web' ? 'WorkspaceMasthead' : 'MobileMasthead'
+    try {
+      let elements = app.render(screen)
+      const cards = elements.filter(({ type }) => typeof type === 'function' && type.name === cardName)
+      assert.equal(cards.length, 257, `${platform} keeps the row outside the bounded overview`)
+      assert.equal((cards[256].props.work as WorkRecord).prompt, '完整请求 256')
+      assert.match(componentText(elements), /总览已截断/)
+      assert.match(componentText(elements), /本次总览未返回 1 项任务/)
+      assert.match(componentText(elements), /本次总览未返回 2 项问题/)
+      assert.doesNotMatch(componentText(elements), /另有.*未列出/)
+      assert.match(componentText(elements), /尚未读取其他设备的后台工作/)
+      assert.doesNotMatch(componentText(elements), /0 项.*未列出/)
+      assert.equal(elements.some(({ type }) => type === 'ConfirmCard'), false, 'another Bot program check cannot settle against the active conversation')
+      assert.equal(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard']).some(({ type, props }) => type === 'Link' && (platform === 'web' ? (props.params as { botId?: string })?.botId === 'other' : props.href === '/b/other')), true)
+      shared.nodes = [{ ...parityNode, online: false }]
+      elements = app.render(screen)
+      assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === mastheadName)?.props.attention, 258)
+      const offlineCard = elements.find(({ type }) => typeof type === 'function' && type.name === cardName)
+      assert.ok(offlineCard && typeof offlineCard.type === 'function')
+      assert.match(componentText(offlineCard.type(offlineCard.props)), /待确认/)
+      shared.nodes = [parityNode]
+      shared.connectionOnline = false
+      elements = app.render(screen)
+      const staleCard = elements.find(({ type }) => typeof type === 'function' && type.name === cardName)
+      assert.ok(staleCard && typeof staleCard.type === 'function')
+      assert.match(componentText(staleCard.type(staleCard.props)), /状态未知/)
+      shared.synced = false
+      shared.openWorks = []
+      shared.overview = workspaceModel.parseWorkspaceOverview({})
+      elements = app.render(screen)
+      assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === mastheadName)?.props.working, null)
+      assert.doesNotMatch(componentText(elements), /没有未完成的任务/)
+      shared.synced = true
+      shared.connectionOnline = true
+      elements = app.render(screen)
+      assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === mastheadName)?.props.working, 0)
+      const empty = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceEmpty' : 'MobileEmpty'))
+      assert.ok(empty && typeof empty.type === 'function')
+      assert.match(platform === 'web' ? String(empty.props.title) : componentText(empty.type(empty.props)), /当前记录没有未完成的任务/)
+      if (platform === 'native') {
+        assert.equal(elements.some(({ type, props }) => type === 'Link' && props.href === '/inbox'), true, 'the incoming mobile inbox entry remains available with no pending items')
+        assert.equal(elements.some(({ props }) => props.accessibilityLabel === '查看待处理'), true)
+      }
+    } finally { app.close() }
+  }
+})
+
+test('both task overviews recover bounded Bot identities only from the current complete catalog', () => {
+  for (const platform of ['web', 'native']) {
+    const bots = Array.from({ length: 257 }, (_, index) => ({ ...parityBot, bot_id: `bot-${index + 1}`, conversation_id: `chat-${index + 1}`, name: `项目 Bot ${index + 1}` }))
+    const shared = { ...parityShared(), conversationId: 'chat-1', bots, openWorks: [], overview: workspaceModel.parseWorkspaceOverview({ bots: bots.slice(0, 256), checks: [{ check_id: 'only-check', conversation_id: 'chat-257', trigger: 'message:one' }], truncated: true }) }
+    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../../apps/mobile/src/features/home/tasks.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: () => [] },
+      '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+      '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
+      './inbox': { useInbox: () => [] }, './workspace-shell': { useCreateBot: () => () => {} }, '@/components/kit': { providerIcons: {} },
+    })
+    const render = () => app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen')
+    const opens = (elements: ReturnType<typeof render>, botId = 'bot-257') => nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard']).some(({ type, props }) => type === 'Link' && (platform === 'web' ? (props.params as { botId?: string })?.botId === botId : props.href === `/b/${botId}`))
+    try {
+      let elements = render()
+      assert.match(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /项目 Bot 257/)
+      assert.equal(opens(elements), true, `${platform} keeps the only navigation for the Bot outside overview.bots`)
+      assert.doesNotMatch(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /已删除的 Bot/)
+      shared.bots = bots.slice(0, 256)
+      elements = render()
+      assert.match(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /未找到所属 Bot/)
+      assert.equal(opens(elements), false)
+      assert.match(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /程序状态待确认/, 'a missing identity does not remove the check')
+      shared.bots = [{ ...bots[256], conversation_id: 'different-chat' }]
+      assert.equal(opens(render()), false, 'a Bot from a different conversation cannot supply navigation')
+      shared.bots = bots
+      shared.synced = false
+      shared.generation++
+      elements = render()
+      assert.match(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /Bot 身份未加载/)
+      assert.doesNotMatch(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /项目 Bot 257|已删除的 Bot/)
+      assert.equal(opens(elements), false, 'a retained catalog before this connection first read cannot supply an old network identity')
+      shared.bots = [{ ...bots[256], bot_id: 'new-network-bot', name: '新网络 Bot' }]
+      shared.synced = true
+      elements = render()
+      assert.match(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /新网络 Bot/)
+      assert.equal(opens(elements, 'new-network-bot'), true)
+      assert.equal(opens(elements), false)
+    } finally { app.close() }
+  }
+})
+
+test('both task overviews retain failure outcomes and causes across unordered snapshots', () => {
+  for (const platform of ['web', 'native']) {
+    const shared = parityShared()
+    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../../apps/mobile/src/features/home/tasks.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: () => [] },
+      '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+      '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
+      '@vibeface/client/lib/errors.ts': errors, './inbox': { useInbox: () => [] }, './workspace-shell': { useCreateBot: () => () => {} },
+      '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') }, '@/components/kit': { providerIcons: { codex: 'CodexIcon' } },
+    })
+    try {
+      for (const observedFailure of [true, false]) {
+        const running = { ...parityWork({ summary: '', result_text: '完整输出', failure_reason: '旧快照记录的说明' }), conversation_id: 'chat' }
+        const failed = { ...running, state: 'finished' as const, outcome: 'failed' as const, failure_reason: '这次执行失败，已保留改动' }
+        shared.openWorks = [observedFailure ? running : failed]
+        shared.overview = workspaceModel.parseWorkspaceOverview({ bots: [parityBot], tasks: [{ ...(observedFailure ? failed : running), kind: 'work' }] })
+        const elements = app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen')
+        const card = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'TaskOverviewCard' : 'TaskRow'))
+        assert.ok(card && typeof card.type === 'function')
+        const text = componentText(card.type(card.props))
+        assert.match(text, /失败/, `${platform} uses the outcome rather than treating finished as success`)
+        assert.match(text, /这次执行失败，已保留改动/)
+        assert.doesNotMatch(text, /旧快照记录的说明/)
+        assert.doesNotMatch(text, /已完成/)
+        assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceMasthead' : 'MobileMasthead'))?.props.attention, 1)
+        assert.equal((card.props.work as WorkRecord).result_text, '完整输出')
+      }
+      for (const [known, observed] of [['completed', 'unverified'], ['unverified', 'completed'], ['completed', 'failed'], ['failed', 'completed']] as const) {
+        shared.openWorks = [{ ...parityWork({ state: known === 'unverified' ? 'unverified' : 'finished', outcome: known, summary: '' }), conversation_id: 'chat' }]
+        shared.overview = workspaceModel.parseWorkspaceOverview({ bots: [parityBot], tasks: [{ ...parityWork({ state: observed === 'unverified' ? 'unverified' : 'finished', outcome: observed }), conversation_id: 'chat', kind: 'work' }] })
+        const elements = app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen')
+        const card = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'TaskOverviewCard' : 'TaskRow'))
+        assert.ok(card && typeof card.type === 'function')
+        const text = componentText(card.type(card.props))
+        assert.match(text, /待确认|状态未知/)
+        assert.doesNotMatch(text, /已完成/)
+        assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceMasthead' : 'MobileMasthead'))?.props.attention, 1)
+      }
+    } finally { app.close() }
+  }
+})
+
+test('both task overviews reconcile raw confirmations and only fold task process checks on the same device', () => {
+  for (const platform of ['web', 'native']) {
+    const shared = parityShared()
+    shared.conversationId = 'other-chat'
+    const entry = { ...parityNode, device_id: 'entry', local: true }
+    const inbox = () => inboxItems({ device: { ready: null, joins: [], pendingRecovery: null, rotateHint: false }, workspace: shared })
+    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../../apps/mobile/src/features/home/tasks.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: inbox },
+      '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+      '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
+      '@vibeface/client/lib/errors.ts': errors, './inbox': { useInbox: inbox }, './workspace-shell': { useCreateBot: () => () => {} },
+      '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') }, '@/components/kit': { providerIcons: { codex: 'CodexIcon' } },
+    })
+    const render = () => app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen')
+    const count = (elements: ReturnType<typeof render>) => elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceMasthead' : 'MobileMasthead'))?.props.attention
+    try {
+      for (const unreachable of ['offline', 'disconnected']) {
+        shared.nodes = [entry, { ...parityNode, online: unreachable !== 'offline', capabilities: { ...parityNode.capabilities, codex_connected: unreachable !== 'disconnected' } }]
+        shared.openWorks = [{ ...parityWork({ summary: '' }), conversation_id: 'chat' }]
+        shared.overview = workspaceModel.parseWorkspaceOverview({ bots: [parityBot], tasks: [{ ...shared.openWorks[0], kind: 'work', state: 'finished', outcome: 'failed', failure_reason: '总览记录的失败原因' }] })
+        const elements = render()
+        assert.equal(elements.some(({ type }) => type === 'ConfirmCard'), false, `${platform} cannot offer settlement for an already failed work`)
+        const card = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'TaskOverviewCard' : 'TaskRow'))
+        assert.ok(card && typeof card.type === 'function')
+        assert.match(componentText(card.type(card.props)), /失败.*总览记录的失败原因/)
+        assert.equal(count(elements), 1)
+      }
+      const unknown = { ...parityWork({ kind: 'task', state: 'unverified', outcome: 'unverified', target_node: 'entry' }), conversation_id: 'chat' }
+      const checks = [{ check_id: 'process-work', conversation_id: 'chat', trigger: 'task:work' }]
+      for (const variant of ['same', 'outside-bound', 'missing', 'other-conversation', 'other-device', 'running']) {
+        const known = variant === 'other-conversation' ? { ...unknown, conversation_id: 'different-chat' } : variant === 'other-device' ? { ...unknown, target_node: 'worker' } : variant === 'running' ? { ...unknown, state: 'running' as const, outcome: null } : unknown
+        shared.nodes = [entry, parityNode]
+        shared.openWorks = variant === 'missing' ? [] : [known]
+        shared.overview = workspaceModel.parseWorkspaceOverview({ bots: [parityBot], tasks: variant === 'outside-bound' || variant === 'missing' ? [] : [{ ...known, kind: 'task' }], checks })
+        const elements = render()
+        assert.equal(count(elements), ['same', 'outside-bound', 'missing'].includes(variant) ? 1 : variant === 'running' ? 1 : 2, `${platform} ${variant} preserves exactly the represented checks`)
+        if (variant === 'same' || variant === 'outside-bound') {
+          if (platform === 'web') assert.equal(elements.filter(({ type }) => type === 'ConfirmCard').length, 1, 'the real unknown work keeps its confirmation action')
+          assert.doesNotMatch(componentText(elements), /程序状态待确认|任务状态待确认/)
+        }
+        if (variant === 'missing') {
+          assert.match(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /任务状态待确认/)
+          assert.equal(elements.some(({ type }) => type === 'ConfirmCard'), false, 'a bounded-out work keeps navigation rather than a settlement against the active Bot')
+          assert.equal(elements.some(({ type, props }) => type === 'Link' && (platform === 'web' ? (props.params as { botId?: string })?.botId === 'bot' : props.href === '/b/bot')), true)
+        }
+      }
+    } finally { app.close() }
+  }
+})
+
+test('both task details bind approval to current unfinished work and keep stops above approval', () => {
+  for (const platform of ['web', 'native']) {
+    const shared = parityShared()
+    const approval = { question_id: 'approval', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '继续吗', choices: [], author: 'worker', created_at_ms: 2, answer: null, closed: null, about: { node: 'worker', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' } }
+    shared.data = parseConversation({ ...context, works: [parityWork({ work_id: 'old', state: 'finished', outcome: 'completed' }), parityWork()], questions: [approval] })
+    let workId = 'old'
+    const app = componentHarness(platform === 'web' ? './task-detail.tsx' : '../../../../../../apps/mobile/app/b/[botId]/work/[workId].tsx', {
+      '@tanstack/react-router': { Link: 'Link', useNavigate: () => () => {} }, 'expo-router': { Stack: { Screen: 'Screen' }, useRouter: () => ({ push() {}, back() {} }), useLocalSearchParams: () => ({ botId: 'bot', workId }) },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': taskLabels,
+      '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/lib/node.ts': { providerNames, messageOf }, '@vibeface/client/lib/errors.ts': errors,
+      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: () => Promise.resolve() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) }),
+      '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+      './task-activity': { confirmText: () => '设备无法报告结果', BackOnline: 'BackOnline' },
+    }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
+    const render = () => app.render(platform === 'web' ? 'TaskDetail' : 'default', { botId: 'bot', workId })
+    try {
+      assert.equal(render().some(({ type }) => type === 'QuestionCard'), false, `${platform} old work cannot inherit the later approval`)
+      workId = 'work'
+      let elements = render()
+      assert.equal(elements.some(({ type }) => type === 'QuestionCard'), true)
+      assert.match(componentText(elements), /需要你同意/)
+      assert.equal(elements.some(({ props }) => props.label === '最近步骤摘要 · 3'), true)
+      shared.answered = { approval: '继续' }
+      assert.equal(render().some(({ type }) => type === 'QuestionCard'), false)
+      shared.answered = {}
+      shared.data = parseConversation({ ...context, works: [parityWork()], deliveries: [{ work_id: 'work', target_node: 'worker', state: 'stop_waiting' }], questions: [approval] })
+      elements = render()
+      assert.match(componentText(elements), /停止中/)
+      assert.doesNotMatch(componentText(elements), /需要你同意/)
+      shared.nodes = [{ ...parityNode, capabilities: { ...parityNode.capabilities, codex_connected: false } }]
+      assert.match(componentText(render()), /待确认/)
+    } finally { app.close() }
+  }
+})
+
+test('context shows scheduler observations without promising native resume or repeating external sessions', () => {
+  const shared = parityShared()
+  const data = parseConversation({ ...context, scheduler: { jobs: [{ trigger: 'message:queued', state: 'queued' }], unanswered: [] } })
+  const dependencies = { '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/chat/protocol.ts': { runtimeLabel }, '@vibeface/client/workspace/bot-settings.ts': { scheduleFrequency: () => '一次', formatWhen: () => '刚才' }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } }
+  const app = componentHarness('./context-panel.tsx', dependencies)
+  try {
+    const elements = app.render('ContextPanel', { bot: parityBot, data, nodes: shared.nodes, onBack() {} })
+    assert.equal(elements.filter(({ type }) => type === 'CollaborationPanel').length, 1)
+    const continuity = elements.find(({ type }) => typeof type === 'function' && type.name === 'AgentContinuity')
+    assert.ok(continuity && typeof continuity.type === 'function')
+    let tree = continuity.type(continuity.props)
+    assert.match(componentText(tree), /排队中/)
+    assert.doesNotMatch(componentText(tree), /正在运行|首次模型|续接记录|设备默认模型 · 设备默认模型/)
+    assert.equal(elements.filter(({ type }) => typeof type === 'function' && type.name === 'ContinuitySession').length, 0)
+    data.scheduler!.jobs = [{ trigger: 'message:stop', state: 'cancelling' }]
+    tree = continuity.type(continuity.props)
+    assert.match(componentText(tree), /停止中/)
+    data.scheduler!.jobs = [{ trigger: 'message:publish', state: 'publishing' }]
+    assert.match(componentText(continuity.type(continuity.props)), /回复同步中/)
+    data.scheduler = parseConversation({ ...context, scheduler: { provider: 'codex', model: 'current-model', unanswered: [], jobs: [{ trigger: 'message:reconcile', state: 'reconciling', runtime: { provider: 'claude', model: 'frozen-model', reasoning_effort: 'high', generation: 'generation', session_generation: 1, delivery_id: 'delivery', stage: 'read_back', execution: 'unknown', attempted_at_ms: 1, switched_from: null, switch_reason: null } }] } }).scheduler
+    tree = continuity.type(continuity.props)
+    assert.match(componentText(tree), /正在查询上次回复/)
+    assert.match(componentText(tree), /Claude Code.*frozen-model/)
+    assert.doesNotMatch(componentText(tree), /current-model/)
+    data.scheduler = null
+    assert.match(componentText(continuity.type(continuity.props)), /后台工作状态未提供/)
+    assert.equal(elements.some(({ type, props }) => typeof type === 'function' && type.name === 'ContinuityStat' && props.label === '后台工作' && props.value === null), true)
+  } finally { app.close() }
+
+  const collaboration = componentHarness('./collaboration-panel.tsx', { ...dependencies,
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/lib/node.ts': { providerNames }, '@/features/devices/ai-settings': { providerIcons: { codex: 'CodexIcon' } },
+  })
+  const records = parseConversation({ ...context,
+    scheduler: { jobs: [{ trigger: 'message:q', state: 'queued' }, { trigger: 'message:p', state: 'publishing' }, { trigger: 'message:u', state: 'future' }, { trigger: 'message:d', state: 'completed' }], unanswered: [] },
+    sessions: [{ node: 'worker', agent: 'codex', session_id: 'external', cwd: '/shared', summary: '外部摘要', muted: true, created_at_ms: 1 }],
+    sent: [{ message_id: 'sent', to: 'chat', text: '协作请求', created_at_ms: 2 }],
+  })
+  try {
+    const elements = collaboration.render('CollaborationPanel', { data: records, botId: 'bot' })
+    assert.equal(elements.find(({ type, props }) => typeof type === 'function' && type.name === 'Section' && props.title === '未结束的后台工作')?.props.count, 3)
+    assert.equal(elements.some(({ type, props }) => type === 'Details' && props.label === '后台工作历史 · 1'), true)
+    const publishing = elements.find(({ type, props }) => typeof type === 'function' && type.name === 'JobRow' && (props.job as { state: string }).state === 'publishing')
+    assert.ok(publishing && typeof publishing.type === 'function')
+    assert.match(componentText(publishing.type(publishing.props)), /回复同步中/)
+    const sessions = elements.filter(({ type }) => typeof type === 'function' && type.name === 'SessionRows')
+    assert.equal(sessions.length, 1)
+    assert.ok(typeof sessions[0].type === 'function')
+    shared.nodes = [{ ...parityNode, revoked: true }]
+    const sessionTree = sessions[0].type({ ...sessions[0].props, nodes: shared.nodes })
+    assert.match(componentText(sessionTree), /已静音/)
+    assert.match(componentText(sessionTree), /设备已撤权/)
+    const messages = elements.find(({ type }) => typeof type === 'function' && type.name === 'CollaborationMessages')
+    assert.ok(messages && typeof messages.type === 'function')
+    messages.type(messages.props)
+    const sent = elements.find(({ type }) => typeof type === 'function' && type.name === 'SentMessage')
+    assert.ok(sent && typeof sent.type === 'function')
+    const sentTree = sent.type(sent.props)
+    assert.match(componentText(sentTree), /对方是否收到或回复尚不清楚/)
+    assert.equal(elements.some(({ type, props }) => type === 'Link' && (props.params as { botId?: string })?.botId === 'bot'), true)
+  } finally { collaboration.close() }
+})
+
+test('native context and task detail keep selection errors and foreign payloads bound to their route and connection', async () => {
+  for (const route of ['context', 'work']) {
+    let generation = 1
+    let shared = parityShared()
+    const old = pendingResult(), next = pendingResult()
+    const views: string[] = []
+    shared.conversationId = 'other-chat'
+    shared.data = parseConversation({ ...context, conversation: { ...context.conversation, conversation_id: 'other-chat' }, works: [parityWork({ title: '别的 Bot 的秘密记录' })] })
+    shared.synced = false
+    shared.isCurrent = () => generation === 1
+    shared.selectBot = () => old.promise.then(() => {})
+    shared.setView = (view) => { views.push(view) }
+    const app = componentHarness(route === 'context' ? '../../../../../../apps/mobile/app/b/[botId]/context.tsx' : '../../../../../../apps/mobile/app/b/[botId]/work/[workId].tsx', {
+      'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot', workId: 'work' }), useRouter: () => ({ push() {}, back() {} }) },
+      '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+      '@vibeface/client/lib/node.ts': { messageOf, providerNames }, '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel,
+      '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/lib/errors.ts': errors, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+      '@/components/kit': { EmptyState: 'EmptyState', Details: 'Details', providerIcons: { codex: 'CodexIcon' }, toneText: {} },
+    })
+    const emptyTitle = (elements: ReturnType<typeof app.render>) => elements.find(({ type }) => type === 'EmptyState')?.props.title
+    try {
+      assert.match(String(emptyTitle(app.render('default'))), /正在读取/)
+      assert.deepEqual(views, ['other'], 'read-only routes never acknowledge chat notifications')
+      generation = 2
+      shared = { ...shared, generation, isCurrent: () => generation === 2, selectBot: () => next.promise.then(() => {}) }
+      app.render('default')
+      next.reject(new Error('当前读取失败'))
+      await settleComponent()
+      assert.match(String(emptyTitle(app.render('default'))), /当前读取失败/)
+      old.resolve(undefined)
+      await settleComponent()
+      assert.match(String(emptyTitle(app.render('default'))), /当前读取失败/, 'an old successful select cannot erase this connection error')
+      const retry = app.render('default').find(({ type, props }) => type === 'Button' && typeof props.onPress === 'function')
+      assert.ok(retry && typeof retry.props.onPress === 'function')
+      shared.selectBot = async () => {}
+      retry.props.onPress()
+      app.render('default')
+      await settleComponent()
+      shared.conversationId = 'chat'
+      let elements = app.render('default')
+      assert.equal(elements.some(({ type }) => typeof type === 'function' && type.name === 'ContextRecords'), false, 'matching selection alone cannot expose a foreign payload')
+      assert.doesNotMatch(componentText(elements), /秘密记录/)
+      shared.data = parseConversation({ ...context, works: [parityWork()] })
+      elements = app.render('default')
+      assert.match(componentText(elements), /当前连接尚未完成首读/)
+      shared.synced = true
+      shared.bots = []
+      assert.match(String(emptyTitle(app.render('default'))), /找不到这个 Bot/)
+      shared.bots = [parityBot]
+      shared.data = parseConversation(context)
+      elements = app.render('default')
+      if (route === 'work') assert.match(String(emptyTitle(elements)), /找不到这个任务/)
+      else assert.equal(elements.some(({ type }) => typeof type === 'function' && type.name === 'ContextRecords'), true)
+      shared.connectionOnline = false
+      elements = app.render('default')
+      assert.match(componentText(elements) + String(emptyTitle(elements)), /状态未知/)
+    } finally { app.close() }
+  }
+})
+
+test('native context renders shared memory, external attribution, scheduler states and honest sent records', () => {
+  const shared = parityShared()
+  shared.data = parseConversation({ ...context,
+    bot_settings: { skills: [], memory: [{ memory_id: 'm', text: '共享笔记' }], schedules: [] },
+    scheduler: { jobs: [{ trigger: 'message:p', state: 'publishing' }, { trigger: 'message:d', state: 'completed' }], unanswered: [] },
+    sessions: [{ node: 'worker', agent: 'codex', session_id: 'external', cwd: '/shared', summary: '外部摘要', muted: true, created_at_ms: 1 }],
+    sent: [{ message_id: 'sent', to: 'chat', text: '协作请求', created_at_ms: 2 }],
+  })
+  shared.nodes = [{ ...parityNode, online: false }]
+  const app = componentHarness('../../../../../../apps/mobile/app/b/[botId]/context.tsx', {
+    'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot' }) }, '@/data/live': { useLive: () => shared },
+    '@vibeface/client/lib/node.ts': { messageOf, providerNames }, '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
+    '@vibeface/client/workspace/bot-settings.ts': { formatWhen: () => '刚才', scheduleFrequency: () => '一次' },
+    '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, SettingsGroup: 'SettingsGroup', SettingsRow: 'SettingsRow', Details: 'Details' },
+  })
+  try {
+    const elements = app.render('default')
+    const records = elements.find(({ type }) => typeof type === 'function' && type.name === 'ContextRecords')
+    assert.ok(records && typeof records.type === 'function')
+    records.type(records.props)
+    assert.equal(elements.some(({ props }) => props.label === 'Bot 自身会话' && String(props.description).includes('未提供')), true)
+    assert.equal(elements.some(({ props }) => String(props.description).includes('已静音 · 设备不可达')), true)
+    assert.equal(elements.some(({ props }) => props.label === '后台工作历史 · 1'), true)
+    const job = elements.find(({ type, props }) => typeof type === 'function' && type.name === 'JobObservation' && (props.job as { state: string }).state === 'publishing')
+    assert.ok(job && typeof job.type === 'function')
+    assert.match(componentText(job.type(job.props)), /回复同步中/)
+    const message = elements.find(({ type }) => typeof type === 'function' && type.name === 'MessageRecord')
+    assert.ok(message && typeof message.type === 'function')
+    assert.match(componentText(message.type(message.props)), /对方是否收到或回复尚不清楚/)
+    assert.equal(elements.some(({ props }) => props.href === '/b/bot'), true)
+  } finally { app.close() }
+})
+
+test('native Stack focus restores non-chat views while the chat route owns its activation', () => {
+  const views: string[] = []
+  const stack = { Screen: 'Screen', Protected: 'Protected' }
+  const app = componentHarness('../../../../../../apps/mobile/app/_layout.tsx', {
+    'expo-router': { Stack: stack }, 'expo-linking': { useLinkingURL: () => null },
+    '@/data/live': { LiveWorkspace: 'LiveWorkspace', useLive: () => ({ setView: (view: string) => { views.push(view) } }) },
+    '@/data/context': { useWorkspace: () => ({ session: { phase: 'ready' } }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({}) },
+    'uniwind': { useCSSVariable: () => ['white', 'black'] }, '@/lib/layout': { useWide: () => false }, 'react-native': { Platform: { OS: 'ios' }, View: 'View' },
+  })
+  try {
+    const elements = app.render('default')
+    const screens = elements.find(({ type }) => typeof type === 'function' && type.name === 'Screens')
+    assert.ok(screens && typeof screens.type === 'function')
+    screens.type(screens.props)
+    const navigation = elements.find(({ type }) => type === stack)?.props.screenListeners
+    assert.ok(typeof navigation === 'function')
+    for (const name of ['b/[botId]/context', 'b/[botId]', 'b/[botId]/work/[workId]', 'tasks']) navigation({ route: { name } }).focus()
+    assert.deepEqual(views, ['other', 'other', 'tasks'])
+    assert.equal(elements.some(({ props }) => props.name === 'b/[botId]/context'), true)
+  } finally { app.close() }
+})
+
+test("task filters keep the counts, device confirmations and empty state within the selected Bot", () => {
   const bots = [{ bot_id: "a", conversation_id: "chat-a", name: "Bot A" }, { bot_id: "b", conversation_id: "chat-b", name: "Bot B" }]
   const work = (conversation_id: string) => ({ kind: "work", work_id: conversation_id, check_id: conversation_id, conversation_id, target_node: "offline", title: conversation_id, detail: "", reason: "offline" })
   let inbox = [
@@ -644,35 +1257,29 @@ test("task filters keep the pending summary and empty state within the selected 
     { key: "question-b", kind: "question", done: false, question: { conversation_id: "chat-b", bot: bots[1], about: {} } },
     { key: "process", kind: "confirm", check: { kind: "process", check_id: "process", detail: "still running" } },
   ]
-  const workspace = { bots, selectedBot: bots[1], openWorks: [], nodes: [], questions: [], liveProgress: [], connectionOnline: true }
+  const workspace = { bots, selectedBot: bots[1], openWorks: [], nodes: [], questions: [], liveProgress: [], connectionOnline: true, synced: true, answered: {} }
   const app = componentHarness("./tasks-overview.tsx", {
     "@vibeface/client/workspace/context.tsx": { useWorkspace: () => workspace },
     "@vibeface/client/identity/context.tsx": { useDevice: () => ({ directory: null }) },
     "@vibeface/client/workspace/labels.ts": taskLabels,
     "@vibeface/client/workspace/model.ts": workspaceModel,
+    "@vibeface/client/workspace/questions.ts": workspaceQuestions,
     "./inbox": { useInbox: () => inbox },
     "./workspace-shell": { useCreateBot: () => () => {} },
   })
   const named = (elements: ReturnType<typeof app.render>, name: string) => elements.find(({ type }) => typeof type === "function" && type.name === name)
   try {
     let elements = app.render("TasksOverview")
-    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 3)
+    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 2)
     const selectBot = named(elements, "TaskFilters")?.props.onBotFilter
     assert.ok(typeof selectBot === "function")
     selectBot("a")
     elements = app.render("TasksOverview")
     assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 1)
-    assert.equal(elements.filter(({ type, props }) => type === "Link" && props.to === "/inbox").length, 1)
-    assert.equal(elements.some(({ props }) => props.question || props.check), false)
-    assert.equal(elements.some(({ props }) => JSON.stringify(props.children) === JSON.stringify(["待处理 ", 1, " 项"])), true)
-    assert.equal(elements.find(({ props }) => props.role === "status")?.props.children, "0 项任务")
-    const selectState = named(elements, "TaskFilters")?.props.onFilter
-    assert.ok(typeof selectState === "function")
-    selectState("working")
-    elements = app.render("TasksOverview")
-    assert.equal(elements.some(({ type, props }) => type === "Link" && props.to === "/inbox"), false)
-    assert.equal(named(elements, "WorkspaceEmpty")?.props.title, "没有符合筛选的任务")
-    selectState("all")
+    const checks = nestedElements(elements, ["AttentionActivity"]).filter(({ type }) => type === "ConfirmCard").map(({ props }) => props.check)
+    assert.deepEqual(JSON.parse(JSON.stringify(checks)), [{ kind: "device", works: [work("chat-a")] }])
+    assert.equal(elements.some(({ type }) => type === "QuestionCard"), false)
+    assert.equal(elements.find(({ props }) => props.role === "status")?.props.children, "1 项任务")
     inbox = inbox.filter((item) => item.kind === "question")
     elements = app.render("TasksOverview")
     assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 0)
@@ -692,13 +1299,14 @@ test("mobile task attention counts unanswered questions and program checks and o
     let elements = app.render("TasksScreen")
     const attention = () => elements.find(({ type }) => typeof type === "function" && type.name === "MobileMasthead")?.props.attention
     const empty = () => elements.some(({ type }) => typeof type === "function" && type.name === "MobileEmpty")
-    assert.equal(attention(), 2)
+    assert.equal(attention(), null, "counts remain unknown without the live connection first read")
     assert.equal(elements.some(({ type, props }) => type === "Link" && props.href === "/inbox"), true)
     assert.equal(empty(), false)
     inbox = []
     elements = app.render("TasksScreen")
-    assert.equal(attention(), 0)
+    assert.equal(attention(), null)
     assert.equal(empty(), true)
+    assert.equal(elements.find(({ type }) => typeof type === "function" && type.name === "MobileEmpty")?.props.read, false)
   } finally { app.close() }
 })
 
@@ -714,9 +1322,6 @@ test("question cards select locally, send exact answers only on confirmation, an
   const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'web', source: 'membership', can_manage: false } } }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, answerLabel, attentionLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
   const longChoice = '只在本机验证完整配置并保留现有服务，检查通过后再决定是否发布'
   const question = { question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '\n是否允许继续？\n已完成本机检查。\n\n线上结果未知。', choices: [{ label: '允许' }, { label: longChoice }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
-  type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void } }
-  const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' && 'props' in node ? text((node as Element).props.children) : ''
-  const words = (elements: Element[]) => elements.map(({ props }) => text(props.children)).join('')
   const render = (props: object = {}) => app.render('QuestionCard', { question, ...props })
   const choose = (value: string) => {
     const option = render().find(({ type, props }) => type === 'input' && props.value === value)
@@ -724,7 +1329,7 @@ test("question cards select locally, send exact answers only on confirmation, an
     option.props.onChange({})
   }
   const send = async (props: object = {}) => {
-    const button = render(props).find(({ type, props }) => type === 'Button' && text(props.children).includes('发送回答'))
+    const button = render(props).find(({ type, props }) => type === 'Button' && componentText(props.children).includes('发送回答'))
     assert.ok(button?.props.onClick)
     button.props.onClick(); await settleComponent()
   }
@@ -736,7 +1341,7 @@ test("question cards select locally, send exact answers only on confirmation, an
   const plain = (value: unknown) => JSON.parse(JSON.stringify(value))
   try {
     let elements = render()
-    assert.match(words(elements), /web[^]*工作电脑/, 'the context identifies its project and device')
+    assert.match(componentText(elements), /web[^]*工作电脑/, 'the context identifies its project and device')
     assert.equal(elements.filter(({ type, props }) => type === 'input' && props.type === 'radio').length, 4, 'three real choices and one custom mode')
     assert.equal(elements.filter(({ type }) => type === 'input').every(({ props }) => props.checked === false), true, 'no answer is recommended or selected by default')
     assert.equal(elements.some(({ type }) => type === 'textarea' || type === 'form'), false)
@@ -744,7 +1349,7 @@ test("question cards select locally, send exact answers only on confirmation, an
     assert.ok(elements.some(({ props }) => props.text === '已完成本机检查。\n\n线上结果未知。'), 'the decision context keeps its paragraphs')
     await send()
     assert.equal(sent.length, 0)
-    assert.match(words(render()), /选一个回答，或自己写回答。/)
+    assert.match(componentText(render()), /选一个回答，或自己写回答。/)
     choose('允许')
     assert.equal(sent.length, 0, 'selecting approval never sends it')
     assert.equal(render().find(({ type, props }) => type === 'input' && props.value === '允许')?.props.checked, true)
@@ -759,7 +1364,7 @@ test("question cards select locally, send exact answers only on confirmation, an
       write(value)
       const input = render().find(({ type }) => type === 'textarea')
       assert.ok(input?.props.id)
-      assert.equal(render().some(({ type, props }) => type === 'label' && props.htmlFor === input.props.id && text(props.children) === '你的回答'), true)
+      assert.equal(render().some(({ type, props }) => type === 'label' && props.htmlFor === input.props.id && componentText(props.children) === '你的回答'), true)
       assert.equal(input.props.onKeyDown, undefined, 'Enter and IME stay native textarea input')
       await send()
       assert.deepEqual(plain(sent.at(-1)), [question, value], 'custom text is literal, including digits and newlines')
@@ -784,30 +1389,30 @@ test("question cards select locally, send exact answers only on confirmation, an
     workspace.pendingAnswers = [{ question_id: 'q1', text: '继续\n原文' }]
     elements = render()
     assert.equal(elements.some(({ type }) => type === 'input' || type === 'textarea'), false, 'a pending answer cannot be replaced')
-    assert.match(words(elements), /没确认送达/)
-    const retry = elements.find(({ type, props }) => type === 'Button' && text(props.children).includes('再试'))
+    assert.match(componentText(elements), /没确认送达/)
+    const retry = elements.find(({ type, props }) => type === 'Button' && componentText(props.children).includes('再试'))
     assert.ok(retry?.props.onClick)
     retry.props.onClick(); await settleComponent()
     assert.deepEqual(plain(sent.at(-1)), [question, '继续\n原文'], 'unknown results retry their original text')
     actionBusy = 'retry'
     elements = render()
-    assert.match(words(elements), /正在发送/)
-    assert.doesNotMatch(words(elements), /没确认送达/)
+    assert.match(componentText(elements), /正在发送/)
+    assert.doesNotMatch(componentText(elements), /没确认送达/)
     assert.equal(elements.find(({ type }) => type === 'Button')?.props.disabled, true)
     actionBusy = null
     workspace.answered = { q1: '允许' }
     elements = render({ question: { ...question, closed: 'request_lost', answer: { text: '停下' } }, answer: '过时答案' })
-    assert.match(words(elements), /已由另一端回答：停下/, 'the network winner takes precedence over a folded answer, closed state and pending retry')
+    assert.match(componentText(elements), /已由另一端回答：停下/, 'the network winner takes precedence over a folded answer, closed state and pending retry')
     assert.equal(elements.some(({ type }) => type === 'Button' || type === 'input'), false)
     workspace.pendingAnswers = []
     elements = render()
-    assert.match(words(elements), /已回答 · 允许/, 'a shared answer folds the card immediately')
-    assert.doesNotMatch(words(elements), /升级依赖/, 'an ordinary question names no held task')
+    assert.match(componentText(elements), /已回答 · 允许/, 'a shared answer folds the card immediately')
+    assert.doesNotMatch(componentText(elements), /升级依赖/, 'an ordinary question names no held task')
     elements = render({ question: { ...question, about: { ...question.about, request_id: 'r' } } })
-    assert.match(words(elements), /升级依赖[^]*工作电脑/)
+    assert.match(componentText(elements), /升级依赖[^]*工作电脑/)
     workspace.answered = {}
     elements = render({ question: { ...question, closed: 'request_lost' } })
-    assert.match(words(elements), /已失效/)
+    assert.match(componentText(elements), /已失效/)
     assert.equal(elements.some(({ type }) => type === 'Button' || type === 'input'), false)
     const four = { ...question, choices: [...question.choices, { label: '先核对发布目标' }] }
     assert.equal(render({ question: four }).filter(({ type, props }) => type === 'input' && props.type === 'radio').length, 5, 'four alternatives remain complete')
@@ -860,7 +1465,7 @@ test("mobile questions select before sending, preserve literal text and retry on
       assert.ok(typeof onPress === 'function', `missing mobile control ${label}`)
       onPress()
     }
-    const words = () => render().map(({ props }) => props.children).filter((child) => typeof child === 'string').join('')
+    const words = () => componentText(render())
     try {
       assert.equal(render().filter(({ props }) => props.accessibilityRole === 'radio').length, 5)
       press('发送回答')
@@ -905,7 +1510,6 @@ test("mobile questions select before sending, preserve literal text and retry on
 })
 
 test("remounted question cards identify the answer author and reserve warning styling for a lost race", () => {
-  const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' && 'props' in node ? text((node as { props: { children?: unknown } }).props.children) : ''
   for (const platform of ['web', 'mobile']) {
     for (const scenario of [{ author: 'phone', mine: undefined, elsewhere: true, warned: false }, { author: 'gateway', mine: undefined, elsewhere: true, warned: false }, { author: 'self', mine: undefined, elsewhere: false, warned: false }, { author: 'phone', mine: '停下', elsewhere: true, warned: true }, { author: 'phone', mine: '继续', elsewhere: true, warned: false }]) {
       const question = { question_id: 'remount', text: '继续吗？\n线上结果未知。', choices: [{ label: '允许' }], severity: 'attention', about: { node: 'worker', session_id: 's', cwd: '' }, answer: { text: '继续', author: scenario.author }, closed: 'request_lost' }
@@ -924,7 +1528,7 @@ test("remounted question cards identify the answer author and reserve warning st
         const elements = app.render('QuestionCard', { question, answer: '过时的折叠答案' })
         const settled = elements.find(({ props }) => props.ask === '继续吗？')
         assert.ok(settled, `${platform} returns the standing answer before closed or pending state`)
-        assert.equal(text(settled.props.children), scenario.elsewhere ? '已由另一端回答：继续' : '已回答 · 继续')
+        assert.equal(componentText(settled.props.children), scenario.elsewhere ? '已由另一端回答：继续' : '已回答 · 继续')
         const marker = settled.props.mark as { props: { className: string } } | undefined
         const className = platform === 'web' ? marker?.props.className : settled.props.className
         assert.equal(String(className).includes('text-warning'), scenario.warned, `${platform}: another author alone is not a failed race`)
@@ -934,37 +1538,12 @@ test("remounted question cards identify the answer author and reserve warning st
   }
 })
 
-test("task overview links to pending decisions and keeps every real task visible", () => {
-  const work = { resolved: { provider: 'codex', model: null }, trigger: 'message:one', target_node: 'offline', cwd: '/project', title: '检查项目', prompt: '', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null }
-  const works = parseConversation({ ...context, works: [{ ...work, work_id: 'held', thread_id: 'session' }, { ...work, work_id: 'running', target_node: 'online' }] }).works.map((item) => ({ ...item, conversation_id: 'chat' }))
-  const nodes = parseNodes({ nodes: [{ device_id: 'offline', name: '离线电脑', online: false, local: false, revoked: false }, { device_id: 'online', name: '在线电脑', online: true, local: false, revoked: false }] })
-  const overview = workspaceModel.overviewFromWorkspace({ openWorks: works, bots: [], questions: [], nodes })
-  const workspace = { nodes, openWorks: works, bots: [], questions: [], overview, selectedBot: null }
-  const app = componentHarness('./tasks-overview.tsx', {
-    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace },
-    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
-    '@vibeface/client/workspace/model.ts': workspaceModel,
-    '@vibeface/client/workspace/labels.ts': { cardState, taskGroup, taskGroups, taskProgress: () => '' },
-    './inbox': { useInbox: () => [{ kind: 'question', done: false, question: { about: { request_id: 'request', session_id: 'session' } } }, { kind: 'confirm', check: { kind: 'work', work_id: 'held' } }] },
-    './workspace-shell': { useCreateBot: () => () => {} },
-    '@tanstack/react-router': { Link: 'Link' },
-  })
-  try {
-    const elements = app.render('TasksOverview')
-    assert.equal(elements.filter(({ type, props }) => type === 'Link' && props.to === '/inbox').length, 1)
-    assert.deepEqual(elements.filter(({ props }) => props.work).map(({ props }) => (props.work as { work_id: string }).work_id), ['held', 'running'], 'a task waiting for confirmation remains visible before active tasks')
-    assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === 'WorkspaceMasthead')?.props.attention, 2, 'the same task and its confirmation are counted once')
-    assert.equal(elements.some(({ props }) => props.question || props.check), false, 'the overview renders no duplicate decision or confirmation card')
-    assert.equal(elements.some(({ props }) => typeof props.children === 'string' && props.children === '2 项任务'), true)
-  } finally { app.close() }
-})
-
 test("any entrance stops an unfinished task once, after a confirming second tap, even on another device", async () => {
   const stopped: string[] = []
   const data = { local_node: 'worker', works: [] as unknown[], questions: [] }
   const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data, interruptWork: async (work: string) => { stopped.push(work) } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
-  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', promptSummary, taskActive: () => true, taskLabel: () => '', taskStale: () => false, staleTaskLabel: '', progressLabel: () => '', shownState: (work: { state: string }) => work.state, taskAgent: () => null, followUp, followUpCopy }, '@vibeface/client/lib/errors.ts': errors, '@vibeface/client/workspace/questions.ts': { projectName, questionOpen } }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { ...taskLabels, nodeName: () => '设备', promptSummary, taskActive: () => true, taskLabel: () => '', taskStale: () => false, staleTaskLabel: '', progressLabel: () => '', shownState: (work: { state: string }) => work.state, taskAgent: () => null, followUp, followUpCopy }, '@vibeface/client/lib/errors.ts': errors, '@vibeface/client/workspace/questions.ts': workspaceQuestions }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
   const stop = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'destructive')
   const ask = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'outline' && [props.children].flat().some((child) => typeof child === 'string' && child.includes('停止')))
   try {
@@ -997,7 +1576,7 @@ test("below lg the task panel is a modal dialog that makes the rest of the page 
   const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data: { local_node: 'worker', questions: [], works: [{ work_id: 'work', target_node: 'worker', cwd: '/p', title: '整理日志', prompt: '', state: 'completed', summary: '', outcome: 'completed', result_text: '好了', failure_reason: null }] } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: () => Promise.resolve() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   let wide = false
-  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', promptSummary, taskActive: () => false, taskLabel: () => '', taskStale: () => false, staleTaskLabel: '', progressLabel: () => '', shownState: (work: { state: string }) => work.state, taskAgent: () => null, followUp, followUpCopy }, '@vibeface/client/lib/errors.ts': errors, '@vibeface/client/workspace/questions.ts': { projectName, questionOpen } }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: (query: string) => ({ matches: query === '(min-width: 1024px)' && wide }) } })
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { ...taskLabels, nodeName: () => '设备', promptSummary, taskActive: () => false, taskLabel: () => '', taskStale: () => false, staleTaskLabel: '', progressLabel: () => '', shownState: (work: { state: string }) => work.state, taskAgent: () => null, followUp, followUpCopy }, '@vibeface/client/lib/errors.ts': errors, '@vibeface/client/workspace/questions.ts': workspaceQuestions }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: (query: string) => ({ matches: query === '(min-width: 1024px)' && wide }) } })
   // A page shaped like the shell: the panel's layer beside the chat, a header above, a sidebar and the toast region outside.
   type Node = { name: string; attributes: Set<string>; parentElement: Node | null; children: Node[]; hasAttribute(name: string): boolean; setAttribute(name: string): void; removeAttribute(name: string): void }
   const node = (name: string, children: Node[] = [], attributes: string[] = []): Node => {
