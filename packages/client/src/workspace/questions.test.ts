@@ -50,6 +50,12 @@ test("an answer is signed as one message per question", () => {
   assert.deepEqual(answerBody("q1", "继续"), { type: "message_posted", message_id: "a-q1", role: "user", text: "继续", report_results: true, answers: "q1" })
 })
 
+test("a question uses its first non-empty line as the decision and preserves the remaining paragraphs", () => {
+  assert.deepEqual(questionParts("\n \r\n是否发布？\r\n已有检查通过。\r\n\r\n线上结果未知。\n"), { ask: "是否发布？", detail: "已有检查通过。\n\n线上结果未知。" })
+  assert.deepEqual(questionParts("允许吗？"), { ask: "允许吗？", detail: "" })
+  assert.deepEqual(questionParts("  \n"), { ask: "", detail: "" })
+})
+
 test("待处理 lists exactly the open questions, urgent first, then newest first", () => {
   const questions = parseQuestions({ questions: [row("old", 1), row("done", 3, { answer: { message_id: "a-done", text: "继续", author: "c", created_at_ms: 4 } }), row("new", 2), row("urgent", 0, { severity: "urgent" }),
     row("lost", 5, { about: { ...about, request_id: "r" }, closed: "request_lost" })] })
@@ -144,7 +150,7 @@ test('typed attention preserves the required device and distinguishes browser ta
   assert.throws(() => parseQuestions({ questions: [row('bad', 1, { attention: { kind: 'automatic_browser', device_id: 'worker' } })] }))
 })
 
-test('a question asks on its first line and lists what it applies to after it', () => {
-  assert.deepEqual(questionParts('要运行这个命令吗？\n\n命令：npm test\n在项目里'), { ask: '要运行这个命令吗？', lines: [{ label: '命令', value: 'npm test' }, { label: null, value: '在项目里' }] })
-  assert.deepEqual(questionParts('继续吗？'), { ask: '继续吗？', lines: [] })
+test('question details keep labels as readable text', () => {
+  assert.deepEqual(questionParts('要运行这个命令吗？\n\n命令：npm test\n在项目里'), { ask: '要运行这个命令吗？', detail: '命令：npm test\n在项目里' })
+  assert.deepEqual(questionParts('继续吗？'), { ask: '继续吗？', detail: '' })
 })
