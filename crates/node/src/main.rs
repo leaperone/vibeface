@@ -1511,13 +1511,8 @@ async fn join(options: Join) -> Result<()> {
     if node_running(&options.data.data_dir)? {
         return join_through_running_node(&options).await;
     }
-    let state =
-        vibeface::client::join_network(&options.data.data_dir, &options.link, &options.name)
-            .await?;
-    println!(
-        "已加入个人网络 {}。启动 Node 后即可连接。",
-        state.genesis.network_id
-    );
+    vibeface::client::join_network(&options.data.data_dir, &options.link, &options.name).await?;
+    println!("已加入。运行 vibeface 后就能连接。");
     Ok(())
 }
 
@@ -1628,11 +1623,11 @@ fn join_failure_text(reason: &str) -> String {
         ),
         (
             "invite link",
-            "这不是有效的加入链接。请从管理设备的“添加设备”重新复制。",
+            "这不是有效的加入链接。在管理设备上点“添加设备”重新复制。",
         ),
         (
             "Vibeface ticket",
-            "这不是有效的加入链接。请从管理设备的“添加设备”重新复制。",
+            "这不是有效的加入链接。在管理设备上点“添加设备”重新复制。",
         ),
     ];
     TABLE

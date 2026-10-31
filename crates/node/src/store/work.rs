@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use std::path::Path;
 
 /// Why a removed device's work or dispatch can only be settled by the user.
-const REMOVED: &str = "设备已移除，无法核对";
+const REMOVED: &str = "设备已移除，结果无法确认。";
 
 const RUN_COLUMNS: &str = "work_id,conversation_id,kind,state,thread_id,turn_id,codex_epoch,outcome,evidence,probe,result_text,send_by_ms,progress,progress_at_ms";
 
