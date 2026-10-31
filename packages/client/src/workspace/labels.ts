@@ -238,8 +238,47 @@ type WorkspaceActivityInput = {
 
 const activityKey = (conversationId: string, workId: string) => JSON.stringify([conversationId, workId])
 const emptyActivityFacts = (): WorkspaceActivityFacts => ({ questions: [], checks: [], overviewQuestions: [], overviewChecks: [], jobs: [] })
-const activityJobId = (conversationId: string | null, job: ManagerJob | OverviewJob) => `turn:${conversationId ?? ""}:${"job_id" in job ? job.job_id : job.trigger}`
+const activityJobId = (conversationId: string | null, job: ManagerJob | OverviewJob) => `turn:${conversationId ?? ""}:${"source_node" in job ? job.source_node ?? "unknown" : "local"}:${"job_id" in job ? job.job_id : job.trigger}`
 const taskWorkId = (trigger: string) => trigger.startsWith("task:") ? trigger.slice(5) || null : null
+
+const jobSource = (entry: WorkspaceActivityJob, localNode: string | undefined) => {
+  if ("job_id" in entry.job) return entry.job.source_node
+  return entry.job.source_node ?? localNode ?? null
+}
+const sameObservedJob = (left: WorkspaceActivityJob, right: WorkspaceActivityJob, localNode: string | undefined) => {
+  if (!left.conversation_id || left.conversation_id !== right.conversation_id || !left.job.trigger || left.job.trigger !== right.job.trigger) return false
+  const leftSource = jobSource(left, localNode), rightSource = jobSource(right, localNode)
+  return leftSource !== null && leftSource === rightSource
+}
+const terminalJobStates = new Set(["completed", "failed", "cancelled", "interrupted", "rejected"])
+const jobStateRank: Record<string, number> = { queued: 10, pending_delivery: 10, claimed: 20, running: 30, steering: 35, cancelling: 40, completed: 50, interrupted: 50, cancelled: 50, rejected: 55, failed: 55, unknown: 100, unverified: 100 }
+const jobFailure = (job: ManagerJob | OverviewJob) => "failure" in job ? job.failure : undefined
+
+function mergeJobObservations(entries: readonly WorkspaceActivityJob[]): WorkspaceActivityJob {
+  const first = entries[0]
+  if (!first) throw new Error("任务观察不能为空。")
+  const jobs = entries.map((entry) => entry.job)
+  const states = new Set(jobs.map((job) => job.state))
+  const terminalStates = new Set(jobs.map((job) => job.state).filter((state) => terminalJobStates.has(state)))
+  const outcomes = new Set(jobs.flatMap((job) => job.outcome ? [job.outcome] : []))
+  const uncertain = jobs.some((job) => job.pending_check === true) || states.has("unknown") || states.has("unverified") || terminalStates.size > 1 || outcomes.size > 1
+  const state = uncertain ? "unknown" : [...states].sort((left, right) => (jobStateRank[right] ?? 0) - (jobStateRank[left] ?? 0))[0] ?? "unknown"
+  const primary = entries.find((entry) => entry.job.state === state) ?? entries[0]
+  const runtimes = jobs.flatMap((job) => job.runtime ? [job.runtime] : []).sort((left, right) => left.attempted_at_ms - right.attempted_at_ms)
+  const failure = jobs.map(jobFailure).find(Boolean)
+  const retryable = jobs.some((job) => job.retryable === true)
+  return {
+    conversation_id: primary.conversation_id,
+    job: {
+      ...primary.job,
+      state,
+      runtime: runtimes.at(-1) ?? primary.job.runtime,
+      ...(failure ? { failure } : {}),
+      ...(retryable ? { retryable: true } : {}),
+      ...(uncertain ? { outcome: "unknown" as const, pending_check: true } : {}),
+    },
+  }
+}
 
 /** Build the shared Work/Turn/Attention activity domain from already loaded facts. */
 export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceActivityView {
@@ -299,22 +338,27 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
     const activity: WorkspaceActivity = { id: `work:${work.conversation_id}:${work.work_id}`, kind: "work", conversation_id: work.conversation_id, work_id: work.work_id, group: taskGroup(effectiveState, facts.questions.length > 0 || facts.checks.length > 0), state: effectiveState, work, projection, facts }
     workActivities.set(key, activity); activities.push(activity)
   }
-  const jobs = [
+  const rawJobs: WorkspaceActivityJob[] = [
     ...(overview?.jobs ?? []).map((job) => ({ conversation_id: job.conversation_id, job })),
-    ...(input.jobs ?? []).filter(({ conversation_id, job }) => !overview?.jobs.some((known) =>
-      conversation_id && job.trigger && known.conversation_id === conversation_id && known.trigger === job.trigger
-      && known.source_node !== null && known.source_node === (job.source_node ?? localNode))),
+    ...(input.jobs ?? []),
   ]
-  for (const entry of jobs) {
+  const jobGroups: WorkspaceActivityJob[][] = []
+  for (const entry of rawJobs) {
+    const group = jobGroups.find((items) => sameObservedJob(items[0]!, entry, localNode))
+    if (group) group.push(entry)
+    else jobGroups.push([entry])
+  }
+  for (const observations of jobGroups) {
+    const entry = mergeJobObservations(observations)
     const workId = taskWorkId(entry.job.trigger)
     const key = workId && entry.conversation_id ? activityKey(entry.conversation_id, workId) : null
     const workActivity = key ? workActivities.get(key) : undefined
-    if (workActivity) { workActivity.facts.jobs.push(entry.job); attachedJobs.add(activityJobId(entry.conversation_id, entry.job)); continue }
+    if (workActivity) { workActivity.facts.jobs.push(...observations.map((item) => item.job)); attachedJobs.add(activityJobId(entry.conversation_id, entry.job)); continue }
     const id = activityJobId(entry.conversation_id, entry.job)
     if (attachedJobs.has(id)) continue
     const state = entry.job.state === "unknown" ? "unknown" : entry.job.state
-    const group: WorkspaceActivityGroup = ["unknown", "unverified", "failed", "rejected"].includes(state) ? "attention" : taskActive(state) ? "working" : "waiting"
-    activities.push({ id, kind: "turn", conversation_id: entry.conversation_id, work_id: null, group, state, job: entry.job, facts: emptyActivityFacts() }); attachedJobs.add(id)
+    const activityGroup: WorkspaceActivityGroup = ["unknown", "unverified", "failed", "rejected"].includes(state) ? "attention" : taskActive(state) ? "working" : "waiting"
+    activities.push({ id, kind: "turn", conversation_id: entry.conversation_id, work_id: null, group: activityGroup, state, job: entry.job, facts: { ...emptyActivityFacts(), jobs: observations.map((item) => item.job) } }); attachedJobs.add(id)
   }
   const addAttention = (id: string, conversationId: string | null, attention: WorkspaceActivityAttention, state = "attention") => {
     activities.push({ id, kind: "attention", conversation_id: conversationId, work_id: null, group: "attention", state, attention, facts: emptyActivityFacts() })

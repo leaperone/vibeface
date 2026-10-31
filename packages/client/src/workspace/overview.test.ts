@@ -277,14 +277,26 @@ test("workspace activities show a standalone question once across full and overv
   assert.equal(workspaceActivities({ works: [], questions: [pending], checks: [], overview, answered: { [pending.question_id]: "继续" } }).activities.length, 0)
 })
 
-test("workspace activities count the same known scheduler job once without merging different sources", () => {
+test("workspace activities merge same-source job observations without hiding newer or uncertain state", () => {
+  const runtime = { provider: "codex" as const, model: "frozen", reasoning_effort: null, generation: "g", session_generation: 1, delivery_id: "d", stage: "run" as const, execution: "started" as const, attempted_at_ms: 2, switched_from: null, switch_reason: null }
   const overview = parseWorkspaceOverview({ jobs: [{ job_id: "job-1", conversation_id: "chat-1", trigger: "message:ordinary", state: "queued", source_node: "entry" }] })
-  const local = { conversation_id: "chat-1", job: { trigger: "message:ordinary", state: "queued" } }
-  const jobs = [local]
-  const input = { works: [], questions: [], checks: [], overview, jobs, nodes: [node("entry", true, true)] }
-  const activities = workspaceActivities(input).activities
-  assert.equal(activities.length, 1)
-  assert.equal(activities[0]?.kind === "turn" && activities[0].job, overview.jobs[0])
+  const local = { conversation_id: "chat-1", job: { trigger: "message:ordinary", state: "running", runtime, failure: { kind: "unknown" as const, detail: "保留本地说明" } } }
+  const input = { works: [], questions: [], checks: [], overview, jobs: [local], nodes: [node("entry", true, true)] }
+  const merged = workspaceActivities(input).activities
+  assert.equal(merged.length, 1)
+  assert.equal(merged[0]?.kind, "turn")
+  if (merged[0]?.kind === "turn") {
+    assert.equal(merged[0].state, "running")
+    assert.equal(merged[0].job.runtime?.model, "frozen")
+    assert.equal("failure" in merged[0].job ? merged[0].job.failure?.detail : undefined, "保留本地说明")
+    assert.equal(merged[0].facts.jobs.length, 2, "both observations remain available to the activity")
+  }
+  const completed = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "completed", outcome: "answered" as const } }] }).activities
+  assert.equal(completed[0]?.kind === "turn" && completed[0].state, "completed", "a newer terminal observation is not hidden by queued overview data")
+  const unknown = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "queued", pending_check: true } }] }).activities
+  assert.equal(unknown[0]?.kind === "turn" && unknown[0].state, "unknown", "a pending check stays uncertain")
+  const overviewRunning = parseWorkspaceOverview({ jobs: [{ job_id: "job-2", conversation_id: "chat-1", trigger: "message:ordinary", state: "running", source_node: "entry" }] })
+  assert.equal(workspaceActivities({ ...input, overview: overviewRunning, jobs: [{ ...local, job: { ...local.job, state: "queued" } }] }).activities[0]?.state, "running", "the overview observation can be newer without preferring the local source")
   assert.equal(workspaceActivities({ ...input, nodes: [] }).activities.length, 2, "an unknown local identity cannot prove a duplicate")
   assert.equal(workspaceActivities({ ...input, jobs: [{ ...local, conversation_id: "other-chat" }] }).activities.length, 2)
   assert.equal(workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, source_node: "other-node" } }] }).activities.length, 2)
