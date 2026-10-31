@@ -2677,7 +2677,50 @@ mod tests {
         assert!(!dir.join(crate::providers::ENV_FILE).exists());
 
         let mut owner = session(&admin)?;
+        let set_node = json!({"roots":[user_codex_home.canonicalize()?],"manager":null});
+        let before_config = std::fs::read(dir.join("config.json"))?;
+        let before_settings = serde_json::to_value(node.settings_snapshot())?;
+        let before_providers = node.providers();
+        for (method, params) in [
+            ("configure_provider", set_codex.clone()),
+            ("configure_node", set_node.clone()),
+        ] {
+            let active = node.manager_controls.lock().await;
+            let mut queued = Box::pin(dispatch(&node, &mut owner, method, params));
+            assert!(futures_util::poll!(queued.as_mut()).is_pending());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before_config);
+            assert!(!dir.join(crate::providers::ENV_FILE).exists());
+            drop(queued);
+            drop(active);
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before_config);
+            assert!(!dir.join(crate::providers::ENV_FILE).exists());
+            assert_eq!(
+                serde_json::to_value(node.settings_snapshot())?,
+                before_settings
+            );
+            let providers = node.providers();
+            assert_eq!(providers.switches, before_providers.switches);
+            assert_eq!(providers.bins, before_providers.bins);
+            assert!(providers.env == before_providers.env);
+            assert!(
+                !node
+                    .pending_provider_launches
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+        }
+        let configured = dispatch(&node, &mut owner, "configure_node", set_node.clone()).await?;
+        assert_eq!(configured["settings"], set_node);
+        assert_eq!(
+            node.settings_snapshot().roots,
+            vec![user_codex_home.canonicalize()?]
+        );
+        assert_eq!(Config::load(&dir)?.roots, node.settings_snapshot().roots);
         let saved = dispatch(&node, &mut owner, "configure_provider", set_codex).await?;
+        assert_eq!(
+            Config::load(&dir)?.bins.get(&Provider::Codex),
+            Some(&std::path::PathBuf::from("/fixture/codex"))
+        );
+        assert!(crate::providers::ProviderEnv::load(&dir)? == node.providers().env);
         let cursor = dispatch(
             &node,
             &mut owner,

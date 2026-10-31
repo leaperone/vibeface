@@ -515,6 +515,7 @@ impl Runtime {
             .is_some_and(|manager| manager.provider.on_app_server());
         next.validate(codex_agent)?;
         let manager_changed = manager != previous_manager;
+        let _active = self.manager_controls.lock().await;
         if manager_changed
             || next.switches != previous.switches
             || next.bins != previous.bins
@@ -533,7 +534,6 @@ impl Runtime {
         if !filled.is_empty() {
             tracing::info!(event = "providers.discovered", filled = ?filled.names(), "filled missing provider paths from this computer");
         }
-        let _active = self.manager_controls.lock().await;
         self.settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -687,12 +687,12 @@ impl Runtime {
                 .canonicalize()
                 .context("manager workspace does not exist")?;
         }
+        let _active = self.manager_controls.lock().await;
         let mut configuration = Config::load(directory)?;
         configuration.manager = settings.manager.clone();
         configuration.roots = settings.roots.clone();
         configuration.save(directory)?;
         let manager_changed = self.settings_snapshot().manager != settings.manager;
-        let _active = self.manager_controls.lock().await;
         *self
             .settings
             .lock()
