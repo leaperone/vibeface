@@ -1047,7 +1047,7 @@ def fixture_codex(arguments):
         prompt = params["input"][0]["text"]
         guide = bot_guide.get(thread["id"], "")
         cli = re.search(r"Run:\n'(.*?)' tool TOOL_NAME", guide)
-        catalog_start = guide.find("Discovery tools:\n")
+        catalog_start = guide.find("Available tools:\n")
         catalog = guide[catalog_start:] if cli and catalog_start >= 0 else ""
         advertised = re.findall(r"(?m)^(\w+)\n[^\n]*\nJSON schema: ([^\n]+)$", catalog)
         history = "\n".join(part.get("text", "") for past in thread["turns"] for item in past["items"]
@@ -1408,7 +1408,7 @@ def fixture_manager(run, initial, bot):
             "the provider initially receives exactly discovery and the required history/skill/read-back tools")
     require(set(initial["custom_tool_schemas"]) == initial_tools,
             "every initially exposed tool has exactly one advertised schema")
-    require(not context["trigger"].get("unavailable_tools"),
+    require(not (initial_tools & set(context["trigger"].get("unavailable_tools") or [])),
             "the initial entrypoints remain available in every trigger")
     expected_tools = READ_TOOLS | WORK_TOOLS
     if kind != "agent_task":

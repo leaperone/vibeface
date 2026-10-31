@@ -541,9 +541,7 @@ pub fn bot_instructions(
     let catalog = tools
         .iter()
         .filter(|(name, _)| {
-            crate::tools::Tool::DISCOVERY
-                .iter()
-                .any(|tool| tool.name() == name.as_str())
+            crate::tools::Tool::parse(name).is_some_and(crate::tools::Tool::initially_exposed)
         })
         .map(|(name, spec)| {
             format!(
@@ -1114,6 +1112,8 @@ mod tests {
         assert!(guide.ends_with("standing rule"));
         let catalog = guide.split_once("Available tools:\n").unwrap().1;
         assert!(catalog.contains("tool_call\n"));
+        assert!(catalog.contains("context\n"));
+        assert!(catalog.contains("read_skill\n"));
         assert!(!catalog.contains("dispatch_work\n"));
         assert_eq!(
             bot_instructions(None, &tools, "standing rule"),

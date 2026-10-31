@@ -125,8 +125,6 @@ struct ToolCall {
 }
 
 impl Tool {
-    pub const DISCOVERY: [Tool; 4] = [Self::Search, Self::Describe, Self::Call, Self::CallLookup];
-
     pub const ALL: [Tool; 35] = [
         Tool::Search,
         Tool::Describe,
