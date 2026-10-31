@@ -331,8 +331,17 @@ where
                         *native_agent
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.clone());
+                        let locator_turn = turn.clone();
                         async move {
                             persist_session(id.clone()).await?;
+                            if let Some(native) = &config.codex_turn {
+                                crate::runtime::record_cursor_reply(
+                                    &locator_turn,
+                                    &config.provider_env,
+                                    &native.client_id,
+                                    &id,
+                                )?;
+                            }
                             if let Some(record) = record {
                                 record(id, None).await?;
                             }
@@ -435,7 +444,7 @@ pub fn bot_instructions(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    let host = "Your shell has full access to this host: you can edit files and run git and gh. When this device runs Codex, `vibeface codex` calls its App Server. When a session asks something (an approval, a question, a login), `vibeface requests` lists the waiting requests and `vibeface respond REQUEST_ID 'RESULT_JSON'` answers one; raise a decision card with `vibeface triage raise --request-id` only when the user must decide, explaining the decision in plain words without the command itself.";
+    let host = "Your shell has full access to this host: you can edit files and run git and gh. When this device runs Codex, `vibeface codex` calls its App Server. When a session asks something (an approval, a question, a login), `vibeface requests` lists the waiting requests and `vibeface respond REQUEST_ID 'RESULT_JSON'` answers one; raise a decision card with `vibeface triage raise --request-id` only when the user must decide, explaining the decision in plain words without the command itself. Add `--attention-kind browser-takeover` when the user must continue in a browser on the event's device; omit it to infer question or approval from the held request. The card kind grants no authority.";
     let text = format!(
         "Node tools are available through your command-execution tool. Run:\n{executable} tool TOOL_NAME --json 'JSON_OBJECT'\nDiscover tools with tool_search {{\"query\":\"YOUR_GOAL\"}} and inspect the selected tool with tool_describe {{\"name\":\"TOOL_NAME\"}}. Execute it through tool_call {{\"name\":\"TOOL_NAME\",\"arguments\":{{}},\"call_ref\":\"UNIQUE_INTENT_REFERENCE\"}}. For write calls, choose the reference once before the first request and preserve it across CLI processes. Reuse it only with identical arguments. On a timeout, query call_lookup with {{\"call_ref\":\"THE_SAME_REFERENCE\"}}. An unknown outcome must be checked before a new intent is sent. Never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. {host}\n\nDiscovery tools:\n{catalog}"
     );

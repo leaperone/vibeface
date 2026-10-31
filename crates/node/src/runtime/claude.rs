@@ -42,12 +42,54 @@ pub struct Processes {
     running: std::sync::Mutex<BTreeMap<u32, PathBuf>>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyLocator {
+    session: String,
+    projects: PathBuf,
+    message: String,
+}
+
 impl Processes {
     pub(crate) fn new(pidfile: PathBuf) -> Self {
         Self {
             pidfile,
             running: Default::default(),
         }
+    }
+
+    fn reply_locator_path(&self, client_id: &str) -> Result<PathBuf> {
+        vibeface_protocol::validate_id(client_id).map_err(anyhow::Error::msg)?;
+        Ok(self
+            .pidfile
+            .parent()
+            .context("Claude pidfile has no parent")?
+            .join("claude")
+            .join("replies")
+            .join(format!(
+                "{}.json",
+                crate::crypto::digest(client_id.as_bytes())
+            )))
+    }
+
+    fn record_reply(&self, session: &str, client_id: &str, projects: Option<&Path>) -> Result<()> {
+        uuid::Uuid::parse_str(session)?;
+        let projects = projects.context("Claude transcript root is unavailable")?;
+        ensure!(
+            projects.is_absolute(),
+            "Claude transcript root must be absolute"
+        );
+        let locator = ReplyLocator {
+            session: session.into(),
+            projects: projects.into(),
+            message: derived(MESSAGE_SEED, client_id),
+        };
+        let path = self.reply_locator_path(client_id)?;
+        config::private_dir(
+            path.parent()
+                .context("Claude reply locator has no parent")?,
+        )?;
+        config::private_write(&path, &serde_json::to_vec(&locator)?)
     }
 
     /// Ends the processes an earlier Node run left in `pidfile` before tracking this run's.
@@ -694,6 +736,15 @@ where
         });
     }
     if let Some(turn) = &config.codex_turn {
+        processes
+            .record_reply(&session, &turn.client_id, projects.as_deref())
+            .map_err(|e| {
+                error(
+                    ManagerFailure::Failed,
+                    native,
+                    own(&format!("persist the Claude reply locator: {e}")),
+                )
+            })?;
         (turn.record)(session.clone(), None).await.map_err(|e| {
             error(
                 ManagerFailure::Failed,
@@ -901,11 +952,23 @@ impl Claude {
     ) -> Result<Probe> {
         uuid::Uuid::parse_str(session)?;
         vibeface_protocol::validate_id(client_id).map_err(anyhow::Error::msg)?;
+        let locator: ReplyLocator =
+            match std::fs::read(self.processes.reply_locator_path(client_id)?) {
+                Ok(bytes) => match serde_json::from_slice(&bytes) {
+                    Ok(locator) => locator,
+                    Err(_) => return Ok(Probe::Missing),
+                },
+                Err(_) => return Ok(Probe::Missing),
+            };
         let message = derived(MESSAGE_SEED, client_id);
-        if native_turn.is_some_and(|turn| turn != message) {
+        if locator.session != session
+            || locator.message != message
+            || !locator.projects.is_absolute()
+            || native_turn.is_some_and(|turn| turn != message)
+        {
             return Ok(Probe::Missing);
         }
-        let path = transcript(self.projects().as_deref(), session);
+        let path = transcript(Some(&locator.projects), session);
         Ok(
             match path.as_deref().map(|path| seen(Some(path), &message)) {
                 Some(Seen::Ended(ending)) => ending.probe(message),
@@ -1518,6 +1581,9 @@ mod tests {
             reader.probe_reply(&session, None, "attempt-a").await?,
             Probe::Missing
         );
+        reader
+            .processes
+            .record_reply(&session, "attempt-a", project.parent())?;
         write(vec![
             user(&message),
             assistant("reply-a", "unfinished", Value::Null),
@@ -1549,6 +1615,92 @@ mod tests {
                 .await?,
             Probe::Missing
         );
+        let locator_path = reader.processes.reply_locator_path("attempt-a")?;
+        let locator = std::fs::read(&locator_path)?;
+        std::fs::remove_file(&locator_path)?;
+        assert_eq!(
+            reader.probe_reply(&session, None, "attempt-a").await?,
+            Probe::Missing
+        );
+        config::private_write(&locator_path, b"not json")?;
+        assert_eq!(
+            reader.probe_reply(&session, None, "attempt-a").await?,
+            Probe::Missing
+        );
+        config::private_write(&locator_path, &locator)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bot_readback_keeps_the_transcript_root_used_before_config_changed() -> Result<()> {
+        let place = Place::new()?;
+        let reader = Claude::open(&place.dir, &place.env());
+        let projects_a = reader.projects().context("initial transcript root")?;
+        let (record, _) = recorder();
+        let mut config = bot_config(&place, record);
+        config.provider_env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            place.dir.join("home-b").display().to_string(),
+        );
+        let (result, _, _) = bot_turn(
+            &place,
+            &config,
+            "completed under B",
+            None,
+            tokio::sync::watch::channel(false).1,
+        )
+        .await;
+        let result = result?;
+        let session = result.session_id.context("session")?;
+        assert!(transcript(Some(&projects_a), &session).is_none());
+        let projects_b = projects_dir(&config.provider_env).context("new transcript root")?;
+        assert!(transcript(Some(&projects_b), &session).is_some());
+        let expected = Probe::Terminal {
+            turn_id: derived(MESSAGE_SEED, "attempt-1"),
+            status: TurnStatus::Completed,
+            text: "done: completed under B".into(),
+            error: None,
+        };
+        assert_eq!(
+            reader.probe_reply(&session, None, "attempt-1").await?,
+            expected
+        );
+        let reopened = Claude::open(&place.dir, &place.env());
+        assert_eq!(reopened.projects(), Some(projects_a));
+        assert_eq!(
+            reopened.probe_reply(&session, None, "attempt-1").await?,
+            expected
+        );
+        let locator = reopened.processes.reply_locator_path("attempt-1")?;
+        let mode =
+            std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(locator)?.permissions());
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(place.user_frames(), 1, "readback does not send again");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_private_claude_locator_write_prevents_model_launch() -> Result<()> {
+        let place = Place::new()?;
+        std::fs::write(place.dir.join("claude"), "not a directory")?;
+        let (record, calls) = recorder();
+        let config = bot_config(&place, record);
+        let (result, _, _) = bot_turn(
+            &place,
+            &config,
+            "must not run",
+            None,
+            tokio::sync::watch::channel(false).1,
+        )
+        .await;
+        let error = result.err().context("expected private locator failure")?;
+        let error = error
+            .downcast_ref::<ManagerError>()
+            .context("structured error")?;
+        assert_eq!(error.start, manager::StartEvidence::NotStarted);
+        assert_eq!(error.stage, ProviderStage::Record);
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(place.log().is_empty());
         Ok(())
     }
 

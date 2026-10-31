@@ -1101,18 +1101,11 @@ mod tests {
         }
         let elsewhere = post(&node, &admin, &network, "d", "secret", "needle-private").await?;
         let (trigger, attempt) = start_reply(&node, &admin, "trigger").await?;
-        let access = Access {
+        let idle = Access {
             network_id: network.clone(),
             human: false,
             conversation_id: Some("c".into()),
-            manager: Some(ManagerAccess {
-                attempt_id: attempt.clone(),
-                trigger: trigger.clone(),
-            }),
-        };
-        let idle = Access {
             manager: None,
-            ..access.clone()
         };
         node.register_manager_attempt(
             "tools-history".into(),
@@ -1122,6 +1115,13 @@ mod tests {
             Provider::Codex,
         )
         .await?;
+        let access = node
+            .agent_tokens
+            .lock()
+            .await
+            .get("tools-history")
+            .cloned()
+            .context("registered tool token")?;
         post(&node, &admin, &network, "c", "late", "needle-late").await?;
         let mut before = Value::Null;
         let mut ids = Vec::new();
@@ -1226,13 +1226,13 @@ mod tests {
             Provider::Codex,
         )
         .await?;
-        let access = Access {
-            manager: Some(ManagerAccess {
-                attempt_id: attempt,
-                trigger,
-            }),
-            ..idle.clone()
-        };
+        let access = node
+            .agent_tokens
+            .lock()
+            .await
+            .get("tools-replay")
+            .cloned()
+            .context("registered tool token")?;
         assert!(
             node.tool(
                 idle,
@@ -1281,6 +1281,142 @@ mod tests {
             .is_err()
         );
         assert_eq!(basis, node.store.lock().await.version_vector(&network)?);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cloned_access_cannot_reenter_after_backup_reregistration() -> Result<()> {
+        use crate::scheduling::{RuntimeSelection, TurnExecution, TurnRuntime};
+        use vibeface_bridge::failure::{FailureKind, ProviderStage};
+
+        let (node, admin, dir) = node().await?;
+        bot(&node, &admin, "c", "Ops", &[]).await?;
+        let network = node.store.lock().await.network()?.context("network")?;
+        let (trigger, attempt) = start_reply(&node, &admin, "trigger").await?;
+        let idle = Access {
+            network_id: network.clone(),
+            human: false,
+            conversation_id: Some("c".into()),
+            manager: None,
+        };
+        let mut runtime = TurnRuntime {
+            provider: Provider::Codex,
+            model: Some("primary".into()),
+            reasoning_effort: None,
+            generation: "primary-configuration".into(),
+            session_generation: node
+                .store
+                .lock()
+                .await
+                .advance_scheduler_lineage("c", &trigger, &attempt)?,
+            delivery_id: attempt.clone(),
+            stage: ProviderStage::Validate,
+            execution: TurnExecution::NotStarted,
+            attempted_at_ms: now_ms(),
+            switched_from: None,
+            switch_reason: None,
+        };
+        node.store
+            .lock()
+            .await
+            .record_turn_runtime("c", &trigger, &attempt, &runtime)?;
+        node.register_manager_attempt(
+            "old-token".into(),
+            idle.clone(),
+            &attempt,
+            &trigger,
+            Provider::Codex,
+        )
+        .await?;
+        let old = node
+            .agent_tokens
+            .lock()
+            .await
+            .get("old-token")
+            .cloned()
+            .context("old bearer access")?;
+        let original_permission = old
+            .manager
+            .as_ref()
+            .context("old manager")?
+            .permission_version;
+        node.seal_manager_tools(&attempt).await?;
+        node.finish_manager_attempt(&attempt).await;
+        assert!(!node.agent_tokens.lock().await.contains_key("old-token"));
+
+        runtime.switched_from = Some(RuntimeSelection {
+            provider: runtime.provider,
+            model: runtime.model.clone(),
+            reasoning_effort: runtime.reasoning_effort.clone(),
+        });
+        runtime.switch_reason = Some(FailureKind::Quota);
+        runtime.provider = Provider::Pi;
+        runtime.model = Some("backup".into());
+        runtime.session_generation = node
+            .store
+            .lock()
+            .await
+            .advance_scheduler_lineage("c", &trigger, &attempt)?;
+        node.store
+            .lock()
+            .await
+            .record_turn_runtime("c", &trigger, &attempt, &runtime)?;
+        node.register_manager_attempt("new-token".into(), idle, &attempt, &trigger, Provider::Pi)
+            .await?;
+        let current = node
+            .agent_tokens
+            .lock()
+            .await
+            .get("new-token")
+            .cloned()
+            .context("new bearer access")?;
+        assert!(
+            current
+                .manager
+                .as_ref()
+                .context("current manager")?
+                .permission_version
+                > original_permission
+        );
+        let local = node.identity.device_id()?;
+        {
+            let store = node.store.lock().await;
+            assert!(Runtime::check_manager_permission(&store, &local, &old).is_err());
+            Runtime::check_manager_permission(&store, &local, &current)?;
+        }
+        let before = node.store.lock().await.version_vector(&network)?;
+        assert!(
+            node.tool(
+                old,
+                "create_bot",
+                json!({"call_ref":"stale-access","name":"Stale bot"})
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(node.store.lock().await.version_vector(&network)?, before);
+        assert!(
+            !node
+                .store
+                .lock()
+                .await
+                .scheduler_job("c", &trigger)?
+                .context("job")?
+                .tool_calls
+        );
+        let created = node
+            .tool(
+                current,
+                "create_bot",
+                json!({"call_ref":"fresh-access","name":"Fresh bot"}),
+            )
+            .await?;
+        assert_eq!(created["name"], "Fresh bot");
+        assert!(created["bot_id"].as_str().is_some());
+        assert_ne!(node.store.lock().await.version_vector(&network)?, before);
+        node.finish_manager_attempt(&attempt).await;
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())

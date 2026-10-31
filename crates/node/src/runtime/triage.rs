@@ -3549,13 +3549,7 @@ pub(super) mod tests {
             };
             node.register_manager_attempt("token".into(), idle.clone(), &attempt, &trigger, crate::providers::Provider::Codex)
                 .await?;
-            let live = Access {
-                manager: Some(crate::runtime::ManagerAccess {
-                    attempt_id: attempt.clone(),
-                    trigger,
-                }),
-                ..idle.clone()
-            };
+            let live = node.agent_tokens.lock().await.get("token").cloned().context("registered tool token")?;
             let hand = |access: &Access, session: &str, how: Value| {
                 let (node, local, access, session) = (&node, &local, access.clone(), session.to_owned());
                 async move {
@@ -4050,13 +4044,13 @@ pub(super) mod tests {
                 crate::providers::Provider::Codex,
             )
             .await?;
-            let access = Access {
-                manager: Some(crate::runtime::ManagerAccess {
-                    attempt_id: attempt.clone(),
-                    trigger,
-                }),
-                ..access
-            };
+            let access = node
+                .agent_tokens
+                .lock()
+                .await
+                .get("token")
+                .cloned()
+                .context("registered tool token")?;
             let args = json!({"thread":"bot-thread","call_ref":"r1","title":"t","prompt":"p"});
             let refused = node.tool(access, "track_work", args).await;
             node.finish_manager_attempt(&attempt).await;
@@ -4097,13 +4091,7 @@ pub(super) mod tests {
             };
             node.register_manager_attempt("token".into(), access.clone(), &attempt, &trigger, crate::providers::Provider::Codex)
                 .await?;
-            let access = Access {
-                manager: Some(crate::runtime::ManagerAccess {
-                    attempt_id: attempt.clone(),
-                    trigger: trigger.clone(),
-                }),
-                ..access
-            };
+            let access = node.agent_tokens.lock().await.get("token").cloned().context("registered tool token")?;
             let send = |call_ref: &str, agent: Value| {
                 json!({"thread":"t-other","call_ref":call_ref,"title":"t","prompt":"p","agent":agent})
             };
@@ -4232,13 +4220,13 @@ pub(super) mod tests {
                 Provider::Codex,
             )
             .await?;
-            let access = Access {
-                manager: Some(crate::runtime::ManagerAccess {
-                    attempt_id: attempt.clone(),
-                    trigger: trigger.clone(),
-                }),
-                ..access
-            };
+            let access = node
+                .agent_tokens
+                .lock()
+                .await
+                .get("token")
+                .cloned()
+                .context("registered tool token")?;
             let asks = |call_ref: &str, agent: &str, extra: Value| {
                 let mut args = json!({"cwd":dir.display().to_string(),"call_ref":call_ref,
                     "title":"t","prompt":"p","agent":agent});
@@ -4331,13 +4319,7 @@ pub(super) mod tests {
                 Provider::Claude,
             )
             .await?;
-            let access = Access {
-                manager: Some(crate::runtime::ManagerAccess {
-                    attempt_id: attempt.clone(),
-                    trigger,
-                }),
-                ..access
-            };
+            let access = node.agent_tokens.lock().await.get("token").cloned().context("registered tool token")?;
             let local = node.identity.device_id()?;
             let original = crate::work::WorkSpec {
                 work_id: "w-codex".into(),
@@ -4422,13 +4404,13 @@ pub(super) mod tests {
                 crate::providers::Provider::Codex,
             )
             .await?;
-            let access = Access {
-                manager: Some(crate::runtime::ManagerAccess {
-                    attempt_id: attempt.clone(),
-                    trigger,
-                }),
-                ..access
-            };
+            let access = node
+                .agent_tokens
+                .lock()
+                .await
+                .get("token")
+                .cloned()
+                .context("registered tool token")?;
             let create = |call_ref: &str| json!({"call_ref":call_ref,"name":"2SOMEone/LEAPERone"});
             let refused = node
                 .tool(access.clone(), "create_bot", create("bots/2SOMEone"))

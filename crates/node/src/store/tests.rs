@@ -1556,8 +1556,21 @@ fn a_move_fences_the_old_owners_running_turn() -> Result<()> {
         .context("job")?;
     let trigger = claimed.job.trigger.clone();
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    let permission = claimed
+        .job
+        .state
+        .attempt()
+        .context("attempt")?
+        .permission_version;
     store.mark_started("c", &trigger, &attempt)?;
-    assert!(store.manager_attempt_allowed(&net.network, &local, "c", &trigger, &attempt)?);
+    assert!(store.manager_attempt_allowed(
+        &net.network,
+        &local,
+        "c",
+        &trigger,
+        &attempt,
+        permission
+    )?);
     assert!(store.fence_moved_turns(&net.network, &local)?.is_empty());
 
     store.append_event(
@@ -1576,7 +1589,14 @@ fn a_move_fences_the_old_owners_running_turn() -> Result<()> {
         vec![],
         4,
     )?;
-    assert!(!store.manager_attempt_allowed(&net.network, &local, "c", &trigger, &attempt)?);
+    assert!(!store.manager_attempt_allowed(
+        &net.network,
+        &local,
+        "c",
+        &trigger,
+        &attempt,
+        permission
+    )?);
     assert_eq!(
         store.fence_moved_turns(&net.network, &local)?,
         vec![("c".to_owned(), trigger.clone(), attempt.clone())]
@@ -7601,6 +7621,12 @@ fn a_proven_unstarted_backup_gets_a_new_permission_and_keeps_delivery_identity()
         .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
         .context("job")?;
     let mut runtime = submitted_runtime(&claimed)?;
+    let original_permission = claimed
+        .job
+        .state
+        .attempt()
+        .context("attempt")?
+        .permission_version;
     store.record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)?;
     store.mark_started("c", &claimed.job.trigger, &runtime.delivery_id)?;
     store.update_turn_runtime(
@@ -7610,13 +7636,19 @@ fn a_proven_unstarted_backup_gets_a_new_permission_and_keeps_delivery_identity()
         ProviderStage::TurnStart,
         TurnExecution::NotStarted,
     )?;
-    store.fence_manager_permission("c", &claimed.job.trigger, &runtime.delivery_id)?;
+    store.fence_manager_permission(
+        "c",
+        &claimed.job.trigger,
+        &runtime.delivery_id,
+        original_permission,
+    )?;
     assert!(!store.manager_attempt_allowed(
         &net.network,
         &net.a.device_id()?,
         "c",
         &claimed.job.trigger,
-        &runtime.delivery_id
+        &runtime.delivery_id,
+        original_permission,
     )?);
     runtime.switched_from = Some(crate::scheduling::RuntimeSelection {
         provider: runtime.provider,
@@ -7624,6 +7656,7 @@ fn a_proven_unstarted_backup_gets_a_new_permission_and_keeps_delivery_identity()
         reasoning_effort: runtime.reasoning_effort.clone(),
     });
     runtime.switch_reason = Some(FailureKind::Quota);
+    runtime.provider = Provider::Pi;
     runtime.model = Some("backup".into());
     runtime.session_generation =
         store.advance_scheduler_lineage("c", &claimed.job.trigger, &runtime.delivery_id)?;
@@ -7634,12 +7667,41 @@ fn a_proven_unstarted_backup_gets_a_new_permission_and_keeps_delivery_identity()
         switched.runtime.as_ref().context("runtime")?.delivery_id,
         runtime.delivery_id
     );
+    let backup_permission = switched
+        .state
+        .attempt()
+        .context("attempt")?
+        .permission_version;
+    assert!(backup_permission > original_permission);
+    assert!(!store.manager_attempt_allowed(
+        &net.network,
+        &net.a.device_id()?,
+        "c",
+        &claimed.job.trigger,
+        &runtime.delivery_id,
+        original_permission,
+    )?);
     assert!(store.manager_attempt_allowed(
         &net.network,
         &net.a.device_id()?,
         "c",
         &claimed.job.trigger,
-        &runtime.delivery_id
+        &runtime.delivery_id,
+        backup_permission,
+    )?);
+    store.fence_manager_permission(
+        "c",
+        &claimed.job.trigger,
+        &runtime.delivery_id,
+        original_permission,
+    )?;
+    assert!(store.manager_attempt_allowed(
+        &net.network,
+        &net.a.device_id()?,
+        "c",
+        &claimed.job.trigger,
+        &runtime.delivery_id,
+        backup_permission,
     )?);
     store.record_manager_tool_call("c", &claimed.job.trigger, &runtime.delivery_id)?;
     assert!(
@@ -7647,5 +7709,31 @@ fn a_proven_unstarted_backup_gets_a_new_permission_and_keeps_delivery_identity()
             .record_turn_runtime("c", &claimed.job.trigger, &runtime.delivery_id, &runtime)
             .is_err()
     );
+    store.save_scheduler_native_id(
+        "c",
+        &claimed.job.trigger,
+        &runtime.delivery_id,
+        "pi-backup-session",
+        "backup-token",
+        true,
+    )?;
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &claimed.job.trigger,
+        &runtime.delivery_id,
+        JobOutcome::Completed,
+        "backup result",
+        20,
+    )?;
+    say(&mut store, &net, "m2", true)?;
+    let next = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("next primary job")?;
+    assert!(next.previous_native_id.is_none());
+    assert!(next.previous_token.is_none());
+    assert!(next.covers.is_none());
+    assert_eq!(next.session_generation, runtime.session_generation + 1);
     Ok(())
 }

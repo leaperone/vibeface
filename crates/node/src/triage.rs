@@ -427,12 +427,12 @@ pub fn wake_prompt(
         "New events from the user's local coding agent sessions are waiting. Decide for each \
 whether the user must look at it now. Stay silent unless it matters; events you leave alone are \
 dropped after this turn.\n\
-- Needs the user: `{cli} triage raise --event-id ID --severity info|attention|urgent --question TEXT [--choice LABEL]...`. \
+- Needs the user: `{cli} triage raise --event-id ID --severity info|attention|urgent --question TEXT [--choice LABEL]... [--attention-kind question|approval|browser-takeover]`. \
 It asks in the chat of the event's bot. Write TEXT in the user's language and plain words: what is happening and what \
 they need to decide, in one or two sentences, never a shell command, code or raw output. Each --choice is one short action \
 the user can pick (2 to 4, at most 8, no numbers; the card numbers them), the likely answer first and never a destructive \
 one first; the user can always type an answer instead. While a question about the same session is unanswered, a raise returns it. \
-The answer comes back to that bot as a new turn, and it acts on it.\n\
+The answer comes back to that bot as a new turn, and it acts on it. Use `--attention-kind browser-takeover` when the user must continue in the browser on the event's device. Omit the flag to infer question or approval from the held request. The card kind grants no authority.\n\
 - Otherwise: `{cli} triage dismiss --event-id ID`.\n\
 - An event with a request_id is a request its session holds until it is answered: a Codex App Server \
 request, or one the session's hook, plugin or extension waits on. `{cli} requests` shows each in full. \

@@ -325,7 +325,8 @@ struct Triage {
     local: LocalNode,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, serde::Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 enum TriageAction {
     /// Pending events as JSON.
     Events {
@@ -343,6 +344,9 @@ enum TriageAction {
         /// Hold this request until the question is answered.
         #[arg(long)]
         request_id: Option<String>,
+        /// Card kind, inferred from the held request when omitted.
+        #[arg(long, value_enum)]
+        attention_kind: Option<vibeface::model::AttentionKind>,
         /// An answer the user can pick; repeat for more.
         #[arg(long = "choice", value_name = "LABEL")]
         choices: Vec<String>,
@@ -2181,20 +2185,7 @@ fn extensions(
 }
 
 async fn triage(options: Triage) -> Result<()> {
-    let body = match options.action {
-        TriageAction::Events { since } => json!({"action":"events","since":since}),
-        TriageAction::Raise {
-            event_id,
-            severity,
-            question,
-            request_id,
-            choices,
-        } => {
-            json!({"action":"raise","event_id":event_id,"severity":severity,"question":question,
-                "request_id":request_id,"choices":choices})
-        }
-        TriageAction::Dismiss { event_id } => json!({"action":"dismiss","event_id":event_id}),
-    };
+    let body = serde_json::to_value(options.action)?;
     post_triage(&options.local, body).await
 }
 
@@ -2202,6 +2193,75 @@ async fn triage(options: Triage) -> Result<()> {
 mod tests {
     use super::*;
     use clap::{CommandFactory, FromArgMatches};
+
+    #[test]
+    fn triage_attention_kind_parses_and_serializes_for_the_existing_request_boundary() {
+        let base = [
+            "vibeface",
+            "triage",
+            "raise",
+            "--event-id",
+            "event",
+            "--severity",
+            "attention",
+            "--question",
+            "Continue in this browser",
+            "--request-id",
+            "request",
+            "--choice",
+            "Continue",
+        ];
+        for (flag, expected) in [
+            (None, Value::Null),
+            (Some("question"), json!("question")),
+            (Some("approval"), json!("approval")),
+            (Some("browser-takeover"), json!("browser_takeover")),
+        ] {
+            let mut args = base.to_vec();
+            if let Some(flag) = flag {
+                args.extend(["--attention-kind", flag]);
+            }
+            let Some(Action::Triage(options)) = Cli::try_parse_from(args).unwrap().command else {
+                panic!("expected triage");
+            };
+            let body = serde_json::to_value(options.action).unwrap();
+            assert_eq!(
+                body,
+                json!({"action":"raise","event_id":"event","severity":"attention",
+                "question":"Continue in this browser","request_id":"request","choices":["Continue"],
+                "attention_kind":expected})
+            );
+            assert!(
+                body.get("device_id").is_none(),
+                "the event, not CLI input, chooses the device"
+            );
+        }
+        for unknown in ["browser_takeover", "unknown"] {
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain(["--attention-kind", unknown])).is_err()
+            );
+        }
+        for (action, expected) in [
+            (
+                TriageAction::Events { since: Some(12) },
+                json!({"action":"events","since":12}),
+            ),
+            (
+                TriageAction::Events { since: None },
+                json!({"action":"events","since":null}),
+            ),
+            (
+                TriageAction::Dismiss {
+                    event_id: "event".into(),
+                },
+                json!({"action":"dismiss","event_id":"event"}),
+            ),
+        ] {
+            let body = serde_json::to_value(action).unwrap();
+            assert_eq!(body, expected);
+            assert!(body.get("attention_kind").is_none());
+        }
+    }
 
     #[test]
     fn receiving_key_commands_require_an_explicit_stable_intent() {

@@ -230,6 +230,94 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
+    async fn direct_and_discovered_thread_calls_derive_the_same_title_and_directory() -> Result<()>
+    {
+        let dir =
+            std::env::temp_dir().join(format!("vf-cli-thread-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir)?;
+        let socket = dir.join("app.sock");
+        let listener = tokio::net::UnixListener::bind(&socket)?;
+        let methods = Arc::new(Mutex::new(vec![]));
+        let seen = methods.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
+                    continue;
+                };
+                while let Some(Ok(message)) = server.next().await {
+                    let Ok(request) = serde_json::from_slice::<Value>(&message.into_data()) else {
+                        continue;
+                    };
+                    seen.lock().unwrap().push(request["method"].clone());
+                    let result = match request["method"].as_str() {
+                        Some("initialize") => json!({"userAgent":"codex/fixture"}),
+                        Some("thread/read") => {
+                            json!({"thread":{"id":"t","cwd":"/work/tree","source":"cli"}})
+                        }
+                        _ => json!({}),
+                    };
+                    if request.get("id").is_some() {
+                        let _ = server
+                            .send(
+                                json!({"id":request["id"],"result":result})
+                                    .to_string()
+                                    .into(),
+                            )
+                            .await;
+                    }
+                }
+            }
+        });
+        let observed = Arc::new(Mutex::new(vec![]));
+        let args = json!({"thread":"t","prompt":"follow up","call_ref":"r"});
+        for (name, args) in [
+            ("dispatch_work", args.clone()),
+            (
+                "tool_call",
+                json!({"name":"dispatch_work","arguments":args}),
+            ),
+        ] {
+            let (tool, args) = crate::tools::Tool::invocation(name, args)?;
+            assert_eq!(tool, crate::tools::Tool::DispatchWork);
+            let observed = observed.clone();
+            dispatch(
+                &args,
+                move |args| {
+                    observed.lock().unwrap().push(args);
+                    async { Ok(json!({"may_send":false,"work_id":"existing"})) }
+                },
+                |_, _| async { bail!("an existing call must not bind or send again") },
+                |_| async { Ok(Some("codex".to_owned())) },
+                &socket,
+            )
+            .await?;
+        }
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0], observed[1]);
+        assert_eq!(observed[0]["cwd"], "/work/tree");
+        assert_eq!(observed[0]["title"], "follow up");
+        assert_eq!(observed[0]["call_ref"], "r");
+        assert_eq!(
+            methods
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|method| *method == "thread/read")
+                .count(),
+            2
+        );
+        assert!(!methods.lock().unwrap().iter().any(|method| {
+            method
+                .as_str()
+                .is_some_and(|method| method.starts_with("turn/"))
+        }));
+        server.abort();
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_codex_sub_agent_thread_is_refused_before_anything_is_registered() -> Result<()> {
         let dir =
             std::path::PathBuf::from(format!("/tmp/vf-cli-{}", uuid::Uuid::new_v4().simple()));

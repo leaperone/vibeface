@@ -288,7 +288,7 @@ impl Tool {
                     "description":format!("Taken by agent {:?}", Provider::executing(|can| can.effort))},
                 "images":{"type":"array","items":string(),"maxItems":8,
                     "description":format!("Local image paths, taken by agent {:?}", Provider::executing(|can| can.images))}}),
-                &["title", "prompt", "cwd", "call_ref"],
+                &["prompt", "call_ref"],
             ),
             Tool::WorkStatus => (
                 "Read one work_id's state and result, or this conversation's works newest first. before continues after the last work_id of the previous page; more says older ones remain.",
@@ -446,9 +446,11 @@ impl Tool {
 
     pub fn input_schema(self) -> Option<Value> {
         let (_, properties, required) = self.schema()?;
-        Some(
-            json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}),
-        )
+        let mut schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
+        if self == Self::DispatchWork {
+            schema["anyOf"] = json!([{"required":["thread"]},{"required":["title","cwd"]}]);
+        }
+        Some(schema)
     }
 
     pub fn invocation(name: &str, mut args: Value) -> Result<(Self, Value)> {
@@ -579,6 +581,14 @@ impl std::fmt::Display for ToolFailure {
 impl std::error::Error for ToolFailure {}
 
 fn validate_schema(value: &Value, schema: &Value, path: &str) -> Result<()> {
+    if let Some(branches) = schema["anyOf"].as_array() {
+        ensure!(
+            branches
+                .iter()
+                .any(|branch| validate_schema(value, branch, path).is_ok()),
+            "{path} requires either thread or both title and cwd"
+        );
+    }
     let valid_type = match schema["type"].as_str() {
         Some("object") => value.is_object(),
         Some("array") => value.is_array(),
@@ -655,6 +665,53 @@ fn validate_schema(value: &Value, schema: &Value, path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_thread_dispatch_keeps_its_existing_derived_title_and_directory() -> Result<()> {
+        let args = json!({"thread":"t","prompt":"follow up","call_ref":"r"});
+        assert_eq!(
+            Tool::invocation("dispatch_work", args.clone())?,
+            (Tool::DispatchWork, args.clone())
+        );
+        assert_eq!(
+            Tool::invocation(
+                "tool_call",
+                json!({"name":"dispatch_work","arguments":args.clone()})
+            )?,
+            (Tool::DispatchWork, args)
+        );
+        assert!(
+            Tool::invocation(
+                "dispatch_work",
+                json!({"prompt":"new work","call_ref":"r","title":"New","cwd":"/w"})
+            )
+            .is_ok()
+        );
+        for args in [
+            json!({"prompt":"new work","call_ref":"r"}),
+            json!({"prompt":"new work","call_ref":"r","title":"New"}),
+            json!({"prompt":"new work","call_ref":"r","cwd":"/w"}),
+            json!({"thread":"","prompt":"follow up","call_ref":"r"}),
+            json!({"thread":"t","prompt":7,"call_ref":"r"}),
+            json!({"thread":"t","prompt":"follow up"}),
+            json!({"thread":"t","prompt":"follow up","call_ref":"r","cwd":7}),
+            json!({"thread":"t","prompt":"follow up","call_ref":"r","extra":true}),
+        ] {
+            assert!(
+                Tool::invocation("dispatch_work", args.clone()).is_err(),
+                "{args}"
+            );
+            assert!(
+                Tool::invocation(
+                    "tool_call",
+                    json!({"name":"dispatch_work","arguments":args.clone()})
+                )
+                .is_err(),
+                "{args}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn discovery_calls_validate_the_same_target_schema_once() -> Result<()> {

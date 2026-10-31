@@ -70,9 +70,6 @@ impl ProviderChange {
                 if chosen.provider != provider {
                     chosen.reasoning_effort = None;
                 }
-                if chosen.provider != provider {
-                    chosen.reasoning_effort = None;
-                }
                 chosen.provider = provider;
                 chosen.model = provider.model(&chosen.model);
                 *target.manager = Some(chosen);

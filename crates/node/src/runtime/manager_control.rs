@@ -14,10 +14,11 @@ use vibeface_bridge::{
     turn::TurnStatus,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManagerAccess {
     pub attempt_id: String,
     pub trigger: String,
+    pub permission_version: u64,
 }
 
 /// How long a stop waits for the conversation's owner, which first drains the reply's tools.
@@ -61,7 +62,13 @@ impl Runtime {
         access.manager = Some(ManagerAccess {
             attempt_id: attempt_id.into(),
             trigger: trigger.into(),
+            permission_version: attempt.permission_version,
         });
+        Self::check_manager_permission(
+            &*self.store.lock().await,
+            &self.identity.device_id()?,
+            &access,
+        )?;
         let (cancel, receiver) = watch::channel(false);
         let active = Arc::new(ActiveManager {
             access: access.clone(),
@@ -110,6 +117,7 @@ impl Runtime {
                     .context("manager scope missing")?,
                 &manager.trigger,
                 &manager.attempt_id,
+                manager.permission_version,
             )?;
             let _drained = active.admission.clone().write_owned().await;
         }
@@ -151,7 +159,8 @@ impl Runtime {
         );
         ensure!(
             active.access.network_id == access.network_id
-                && active.access.conversation_id == access.conversation_id,
+                && active.access.conversation_id == access.conversation_id
+                && active.access.manager.as_ref() == Some(manager),
             "management invocation scope mismatch"
         );
         let mut store = self.store.lock().await;
@@ -186,6 +195,7 @@ impl Runtime {
                 scope,
                 &manager.trigger,
                 &manager.attempt_id,
+                manager.permission_version,
             )?,
             "management invocation permission is no longer valid"
         );
@@ -265,7 +275,7 @@ impl Runtime {
     pub(super) async fn reconcile_checks(self: &Arc<Self>, network: &str) -> Result<()> {
         let checks = self.store.lock().await.pending_checks()?;
         for check in checks {
-            let Some((outcome, text)) = self.read_back_reply(network, &check).await else {
+            let Some((outcome, text)) = self.read_back_reply(&check).await else {
                 continue;
             };
             self.fence_manager_attempt(&check.attempt_id).await?;
@@ -304,11 +314,7 @@ impl Runtime {
         Ok(())
     }
 
-    async fn read_back_reply(
-        &self,
-        network: &str,
-        check: &PendingCheck,
-    ) -> Option<(JobOutcome, String)> {
+    async fn read_back_reply(&self, check: &PendingCheck) -> Option<(JobOutcome, String)> {
         let turn = check.codex_turn.as_ref()?;
         let job = self
             .store
@@ -344,23 +350,14 @@ impl Runtime {
                 .probe_reply(&turn.thread, turn.turn.as_deref(), &check.attempt_id)
                 .await
                 .ok()?,
-            crate::providers::Provider::Cursor => {
-                let mut settings = self.manager()?;
-                settings.provider = runtime.provider;
-                settings.model = runtime.model.clone().unwrap_or_default();
-                settings.reasoning_effort = runtime.reasoning_effort.clone();
-                let instance = crate::manager::CursorInstance::Bot {
-                    network: network.into(),
-                    conversation: check.conversation_id.clone(),
-                };
-                let config = self
-                    .manager_config(settings, &self.providers())
-                    .ok()?
-                    .for_cursor_instance(instance.clone(), self.cursor_store_root(&instance));
-                super::cursor::probe_reply(&config, &turn.thread, turn.turn.as_deref()?)
-                    .await
-                    .ok()?
-            }
+            crate::providers::Provider::Cursor => super::cursor::probe_recorded_reply(
+                self,
+                &check.attempt_id,
+                &turn.thread,
+                turn.turn.as_deref()?,
+            )
+            .await
+            .ok()?,
             _ => return None,
         };
         let Probe::Terminal {

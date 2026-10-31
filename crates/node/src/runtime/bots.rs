@@ -599,13 +599,13 @@ mod tests {
             crate::providers::Provider::Codex,
         )
         .await?;
-        let live = Access {
-            manager: Some(crate::runtime::ManagerAccess {
-                attempt_id: attempt,
-                trigger,
-            }),
-            ..idle
-        };
+        let live = node
+            .agent_tokens
+            .lock()
+            .await
+            .get("token")
+            .cloned()
+            .context("registered tool token")?;
         let created = node
             .tool(
                 live.clone(),

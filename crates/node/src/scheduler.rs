@@ -54,6 +54,10 @@ impl BackupPolicy {
             self.candidates.len() <= 5,
             "at most five backup models are allowed"
         );
+        ensure!(
+            !self.automatic || !self.candidates.is_empty(),
+            "automatic backup requires at least one model"
+        );
         let mut seen = BTreeSet::new();
         for candidate in &self.candidates {
             crate::model::validate_model(&candidate.model)?;
@@ -65,11 +69,7 @@ impl BackupPolicy {
                 .provider
                 .validate_reasoning_effort(candidate.reasoning_effort.as_deref())?;
             ensure!(
-                seen.insert((
-                    candidate.provider,
-                    &candidate.model,
-                    &candidate.reasoning_effort
-                )),
+                seen.insert((candidate.provider, &candidate.model)),
                 "duplicate backup model"
             );
         }
@@ -1935,8 +1935,14 @@ mod tests {
         failure.failure.kind = FailureKind::Quota;
         failure.outcome = manager::ManagerFailure::Unknown;
         assert!(policy.candidate(&settings, &failure, false).is_none());
-        policy.candidates.push(policy.candidates[0].clone());
+        let mut duplicate = policy.candidates[0].clone();
+        duplicate.reasoning_effort = Some("low".into());
+        policy.candidates.push(duplicate);
         assert!(policy.validate().is_err());
+        policy.candidates.clear();
+        assert!(policy.validate().is_err());
+        policy.automatic = false;
+        assert!(policy.validate().is_ok());
         Ok(())
     }
 

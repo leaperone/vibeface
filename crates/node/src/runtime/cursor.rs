@@ -42,35 +42,138 @@ fn native_probe(native: NativeRun) -> Probe {
     }
 }
 
-pub(crate) async fn probe_reply(
-    config: &crate::manager::ManagerConfig,
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyLocator {
+    agent: String,
+    owner: String,
+    workspace: PathBuf,
+    executable: PathBuf,
+    local_store_root: PathBuf,
+    provider_identity: String,
+}
+
+fn provider_identity(
+    api_key: &str,
+    env: &BTreeMap<String, String>,
+    configured_key: bool,
+) -> Result<String> {
+    Ok(crate::crypto::digest(&serde_json::to_vec(&(
+        api_key,
+        env,
+        configured_key,
+    ))?))
+}
+
+fn reply_locator_path(cursor_dir: &Path, client_id: &str) -> Result<PathBuf> {
+    vibeface_protocol::validate_id(client_id).map_err(anyhow::Error::msg)?;
+    Ok(cursor_dir.join("replies").join(format!(
+        "{}.json",
+        crate::crypto::digest(client_id.as_bytes())
+    )))
+}
+
+pub(crate) fn record_reply(
+    turn: &SdkTurn,
+    configured_env: &BTreeMap<String, String>,
+    client_id: &str,
+    agent: &str,
+) -> Result<()> {
+    vibeface_protocol::validate_id(agent).map_err(anyhow::Error::msg)?;
+    let instances = turn
+        .local_store_root
+        .parent()
+        .context("Cursor native store has no parent")?;
+    ensure!(
+        instances
+            .file_name()
+            .is_some_and(|name| name == "instances"),
+        "Cursor native store has no stable instance root"
+    );
+    let cursor_dir = instances
+        .parent()
+        .context("Cursor instance root has no parent")?;
+    ensure!(
+        cursor_dir.file_name().is_some_and(|name| name == "cursor"),
+        "Cursor instance root is outside its private data directory"
+    );
+    ensure!(
+        turn.local_store_root == instances.join(crate::crypto::digest(turn.owner.as_bytes())),
+        "Cursor native store does not match its owner"
+    );
+    let locator = ReplyLocator {
+        agent: agent.into(),
+        owner: turn.owner.clone(),
+        workspace: turn.workspace.clone(),
+        executable: turn.executable.clone(),
+        local_store_root: turn.local_store_root.clone(),
+        provider_identity: provider_identity(
+            &turn.api_key,
+            &turn.env,
+            configured_env.contains_key("CURSOR_API_KEY"),
+        )?,
+    };
+    let path = reply_locator_path(cursor_dir, client_id)?;
+    config::private_dir(
+        path.parent()
+            .context("Cursor reply locator has no parent")?,
+    )?;
+    config::private_write(&path, &serde_json::to_vec(&locator)?)
+}
+
+pub(crate) async fn probe_recorded_reply(
+    node: &Runtime,
+    client_id: &str,
     agent_id: &str,
     run_id: &str,
 ) -> Result<Probe> {
-    let crate::manager::Sdk::Cursor {
-        bridge: Some(bridge),
-        sdk_bin,
-        owner: Some(owner),
-        local_store_root: Some(root),
-    } = &config.sdk
-    else {
-        return Ok(Probe::Missing);
+    let locator: ReplyLocator = match std::fs::read(reply_locator_path(
+        &node.data_dir.join("cursor"),
+        client_id,
+    )?) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(locator) => locator,
+            Err(_) => return Ok(Probe::Missing),
+        },
+        Err(_) => return Ok(Probe::Missing),
     };
-    let (Some(api_key), env) = crate::providers::cursor_launch(&config.provider_env) else {
-        return Ok(Probe::Missing);
-    };
-    if !config.workspace.is_absolute() || !config.workspace.is_dir() {
+    let expected_root = node
+        .data_dir
+        .join("cursor")
+        .join("instances")
+        .join(crate::crypto::digest(locator.owner.as_bytes()));
+    if locator.agent != agent_id
+        || locator.local_store_root != expected_root
+        || !locator.workspace.is_absolute()
+        || !locator.workspace.is_dir()
+    {
         return Ok(Probe::Missing);
     }
+    let configured_env = node.provider_env(Provider::Cursor);
+    let (Some(api_key), env) = crate::providers::cursor_launch(&configured_env) else {
+        return Ok(Probe::Missing);
+    };
+    if api_key.is_empty()
+        || provider_identity(
+            &api_key,
+            &env,
+            configured_env.contains_key("CURSOR_API_KEY"),
+        )? != locator.provider_identity
+    {
+        return Ok(Probe::Missing);
+    }
+    let Some(bridge) = node.cursor.get() else {
+        return Ok(Probe::Missing);
+    };
     let turn = SdkTurn {
-        owner: owner.clone(),
-        executable: sdk_bin.clone(),
-        workspace: config.workspace.clone(),
-        local_store_root: root.clone(),
+        owner: locator.owner,
+        executable: locator.executable,
+        workspace: locator.workspace,
+        local_store_root: locator.local_store_root,
         api_key,
         env,
-        model: config.model.clone(),
-        timeout_secs: config.timeout_secs,
+        model: String::new(),
+        timeout_secs: node.cursor_executor.timeout_secs,
         custom_tools: BTreeMap::new(),
         callback_token: None,
         process_started: None,
@@ -841,11 +944,20 @@ mod tests {
         };
         let calls = Arc::new(StdMutex::new(Vec::new()));
         let recorded = calls.clone();
-        let mut variables = node.provider_env(Provider::Cursor);
-        variables.insert(
-            "FAKE_BRIDGE_GET_RUN_STATUS".into(),
-            "RUN_LIFECYCLE_STATUS_UNSPECIFIED".into(),
-        );
+        node.providers.lock().unwrap().env.apply(
+            Provider::Cursor,
+            BTreeMap::from([
+                (
+                    "FAKE_BRIDGE_GET_RUN_STATUS".into(),
+                    Some("RUN_LIFECYCLE_STATUS_UNSPECIFIED".into()),
+                ),
+                (
+                    "FAKE_BRIDGE_LOG".into(),
+                    Some(dir.join("bridge-starts.log").display().to_string()),
+                ),
+            ]),
+        )?;
+        let variables = node.provider_env(Provider::Cursor);
         let config = crate::manager::ManagerConfig {
             sdk: crate::manager::Sdk::Cursor {
                 bridge: node.cursor.get().cloned(),
@@ -853,7 +965,7 @@ mod tests {
                 owner: None,
                 local_store_root: None,
             },
-            workspace,
+            workspace: workspace.clone(),
             model: "fixture-model".into(),
             reasoning_effort: None,
             timeout_secs: 10,
@@ -892,7 +1004,7 @@ mod tests {
         assert_eq!(journal[0], (agent.clone(), None));
         let run = journal[1].1.as_deref().context("native run ID journaled")?;
         assert_eq!(
-            probe_reply(&config, &agent, run).await?,
+            probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
             Probe::Terminal {
                 turn_id: run.into(),
                 status: vibeface_bridge::turn::TurnStatus::Completed,
@@ -901,17 +1013,105 @@ mod tests {
             }
         );
         assert_eq!(
-            probe_reply(&config, &agent, "not-the-run").await?,
+            probe_recorded_reply(&node, "bot-attempt", &agent, "not-the-run").await?,
             Probe::Missing
         );
-        let mut unavailable = config.clone();
-        unavailable
-            .provider_env
-            .insert("CURSOR_API_KEY".into(), String::new());
+        let new_workspace = dir.join("new-workspace");
+        config::private_dir(&new_workspace)?;
+        node.settings.lock().unwrap().manager = Some(config::ManagerSettings {
+            provider: Provider::Cursor,
+            workspace: new_workspace,
+            model: "different-model".into(),
+            reasoning_effort: None,
+            backup: Default::default(),
+        });
+        let expected = Probe::Terminal {
+            turn_id: run.into(),
+            status: vibeface_bridge::turn::TurnStatus::Completed,
+            text: "done: read it back".into(),
+            error: None,
+        };
         assert_eq!(
-            probe_reply(&unavailable, &agent, run).await?,
+            probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
+            expected
+        );
+        node.settings.lock().unwrap().manager = None;
+        node.providers
+            .lock()
+            .unwrap()
+            .bins
+            .insert(Provider::Cursor, dir.join("no-new-binary"));
+        assert_eq!(
+            probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
+            expected
+        );
+        let locator_path = reply_locator_path(&node.data_dir.join("cursor"), "bot-attempt")?;
+        let locator_bytes = std::fs::read(&locator_path)?;
+        let saved = std::str::from_utf8(&locator_bytes)?;
+        assert!(!saved.contains("fixture-api-key") && !saved.contains("CURSOR_API_KEY"));
+        let launches = std::fs::read_to_string(dir.join("bridge-starts.log"))?;
+        node.providers.lock().unwrap().env.apply(
+            Provider::Cursor,
+            BTreeMap::from([("CURSOR_API_KEY".into(), Some("rotated-key".into()))]),
+        )?;
+        assert_eq!(
+            probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
             Probe::Missing
         );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("bridge-starts.log"))?,
+            launches,
+            "changed authentication never starts another native bridge"
+        );
+        node.providers.lock().unwrap().env.apply(
+            Provider::Cursor,
+            BTreeMap::from([("CURSOR_API_KEY".into(), Some("fixture-api-key".into()))]),
+        )?;
+        config::private_write(&locator_path, b"not json")?;
+        assert_eq!(
+            probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
+            Probe::Missing
+        );
+        config::private_write(&locator_path, &locator_bytes)?;
+        node.providers.lock().unwrap().env.apply(
+            Provider::Cursor,
+            BTreeMap::from([("CURSOR_API_KEY".into(), Some(String::new()))]),
+        )?;
+        assert_eq!(
+            probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
+            Probe::Missing
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("bridge-starts.log"))?,
+            launches
+        );
+        node.providers.lock().unwrap().env.apply(
+            Provider::Cursor,
+            BTreeMap::from([("CURSOR_API_KEY".into(), Some("fixture-api-key".into()))]),
+        )?;
+        let blocked = reply_locator_path(&node.data_dir.join("cursor"), "blocked-attempt")?;
+        config::private_dir(&blocked)?;
+        let mut blocked_config = config.clone();
+        blocked_config
+            .codex_turn
+            .as_mut()
+            .context("turn recorder")?
+            .client_id = "blocked-attempt".into();
+        let result = crate::manager::run_manager(
+            &blocked_config,
+            "must not send",
+            None,
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await;
+        let error = result.err().context("expected locator failure")?;
+        let error = error
+            .downcast_ref::<crate::manager::ManagerError>()
+            .context("structured failure")?;
+        assert_eq!(error.stage, vibeface_bridge::failure::ProviderStage::Record);
+        assert_eq!(error.start, StartEvidence::NotStarted);
         assert_eq!(
             std::fs::read_to_string(dir.join("sends.log"))?
                 .lines()

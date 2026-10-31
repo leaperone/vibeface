@@ -35,6 +35,7 @@ mod schedule_delivery;
 mod settings;
 mod triage;
 mod work;
+pub(crate) use cursor::record_reply as record_cursor_reply;
 pub use manager_control::ManagerAccess;
 pub(crate) use observation::{ObservationGuard, native_progress};
 pub use settings::NodeSettings;

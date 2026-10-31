@@ -1716,6 +1716,7 @@ impl Store {
                 "runtime session generation does not match"
             );
             if runtime.switched_from.is_some() {
+                session.sdk_config = None;
                 match &mut job.state {
                     JobState::Claimed { attempt } | JobState::Running { attempt } => {
                         attempt.permission_version = session.permission_version;
@@ -2038,10 +2039,13 @@ impl Store {
         conversation: &str,
         trigger: &str,
         attempt_id: &str,
+        permission_version: u64,
     ) -> Result<()> {
         self.update_attempt(conversation, trigger, attempt_id, |job, session| {
             let attempt = job.state.attempt().context("manager attempt missing")?;
-            if attempt.permission_version == session.permission_version {
+            if attempt.permission_version == permission_version
+                && permission_version == session.permission_version
+            {
                 session.permission_version = session
                     .permission_version
                     .checked_add(1)
@@ -2059,6 +2063,7 @@ impl Store {
         conversation: &str,
         trigger: &str,
         attempt_id: &str,
+        permission_version: u64,
     ) -> Result<bool> {
         let session = load_session(&self.connection, conversation)?;
         let Some(job) = self.scheduler_job(conversation, trigger)? else {
@@ -2069,7 +2074,8 @@ impl Store {
         };
         Ok(session.active.as_deref() == Some(trigger)
             && attempt.id == attempt_id
-            && attempt.permission_version == session.permission_version
+            && attempt.permission_version == permission_version
+            && permission_version == session.permission_version
             && matches!(
                 job.state,
                 JobState::Claimed { .. } | JobState::Running { .. }
