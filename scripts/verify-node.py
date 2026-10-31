@@ -1261,6 +1261,8 @@ def fixture_manager(run, initial, bot):
               "work_id": body.get("work_id"), "outcome": body.get("outcome"),
               "resumed_session": context["conversation"]["resumed_session"],
               "checkpoint": context["conversation"]["checkpoint"] is not None,
+              "handoff": context.get("handoff") is not None,
+              "memory_context": context.get("memory_context"),
               "messages": [row["text"][:200] for row in context["conversation"]["messages"]],
               "trigger_text": str(((context["trigger"].get("event") or {}).get("body") or {}).get("text", ""))[:200],
               "works": [row["work_id"] for row in context["works"]] if isinstance(context["works"], list) else None,
@@ -1733,6 +1735,14 @@ def scheduler_records(node, network):
 
 def scheduler_record(node, network, trigger):
     return next((row for row in scheduler_records(node, network) if row["trigger"] == trigger), None)
+
+
+def scheduler_sessions(node, conversation):
+    with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute("SELECT scope,native_id,native_token,active,stable_fingerprint,shown "
+                                  "FROM scheduler_sessions WHERE conversation_id=?", (conversation,)).fetchall()
+    return {row["scope"]: {**dict(row), "shown": json.loads(row["shown"])} for row in rows}
 
 
 def require_quiet(description, predicate):
@@ -2947,6 +2957,59 @@ def phase1_acceptance(options):
         passed("a crash interrupts the running attempt, reconciles its processes and never replays it",
                attempt_id=old_attempt)
 
+        name = "phase1-memory"
+        a.client.rpc("create_bot", bot_id=name, conversation_id=name, name=name, instructions="",
+                     project={"target_node": a.device_id, "cwd": str(workspace)})
+        notes = [f"note-{index} " + "记" * 480 for index in range(6)]
+        for index, text in enumerate(notes):
+            actions = [{"name": "remember", "arguments": {"call_ref": "note", "text": text}}]
+            if index == 5:
+                previous = scheduler_sessions(a, name)["main"]
+                actions.append({"name": "update_profile", "arguments": {
+                    "call_ref": "profile", "instructions": "memory-generation-sentinel"}})
+            seeded, _ = send(name, f"memory-seed-{index}", tools=actions)
+            wait_for("the real turn commits its staged note", lambda: completed(seeded))
+        current = scheduler_sessions(a, name)["main"]
+        require(current["native_id"] == previous["native_id"]
+                and current["native_token"] == previous["native_token"]
+                and current["shown"]["session_generation"] == previous["shown"]["session_generation"],
+                "a profile change made inside a turn preserves its captured session until completion")
+        snapshot, _ = send(name, "memory-snapshot")
+        wait_for("the next turn starts from the new profile", lambda: completed(snapshot))
+        renewed = scheduler_sessions(a, name)["main"]
+        block = calls(name, label="memory-snapshot")[0]["memory_context"]
+        saved = {row["memory_id"]: row["text"] for row in conversation(name)["bot_settings"]["memory"]}
+        delivered = {row["memory_id"]: row["text"] for row in block["entries"]}
+        require(len(saved) == 6 and set(saved.values()) == set(notes)
+                and block["mode"] == "snapshot" and block["budget_bytes"] == 8192
+                and 0 < len(delivered) < 6 and block["omitted"] == 6 - len(delivered)
+                and delivered.items() <= saved.items()
+                and len(json.dumps(block, ensure_ascii=False, separators=(",", ":")).encode()) <= 8192,
+                "the actual Provider receives a bounded snapshot without losing stored notes")
+        require(not calls(name, label="memory-snapshot")[0]["resumed"]
+                and renewed["native_id"] != current["native_id"]
+                and renewed["native_token"] != current["native_token"]
+                and renewed["stable_fingerprint"] != current["stable_fingerprint"]
+                and renewed["shown"]["session_generation"] == current["shown"]["session_generation"] + 1
+                and set(renewed["shown"]["memory"]) == set(delivered),
+                "the next generation fences the old native token and records only delivered Memory")
+        delta, _ = send(name, "memory-delta")
+        wait_for("the resumed turn receives the omitted notes", lambda: completed(delta))
+        changed = calls(name, label="memory-delta")[0]
+        require(changed["resumed"] and changed["native_session_id"] == renewed["native_id"]
+                and changed["memory_context"]["mode"] == "delta"
+                and {row["memory_id"]: row["text"] for row in changed["memory_context"]["upserts"]}
+                == {key: value for key, value in saved.items() if key not in delivered}
+                and changed["memory_context"]["deleted"] == [] and changed["memory_context"]["omitted"] == 0,
+                "a budget omission is sent as the next real delta and is never treated as a deletion")
+        unchanged, _ = send(name, "memory-unchanged")
+        wait_for("the unchanged Memory turn finishes", lambda: completed(unchanged))
+        require(calls(name, label="memory-unchanged")[0]["memory_context"] is None
+                and set(scheduler_sessions(a, name)["main"]["shown"]["memory"]) == set(saved),
+                "unchanged delivered Memory is absent from the next Provider payload")
+        passed("profile changes take effect next turn; Memory snapshot, omission and delta reach the Provider",
+               generation=renewed["shown"]["session_generation"], snapshot_notes=len(delivered), delta_notes=6 - len(delivered))
+
         name = new_conversation("phase1-budget")
         day = time.strftime("%Y-%m-%d", time.gmtime())
         with sqlite3.connect(a.directory / "node.sqlite3") as connection:
@@ -3452,7 +3515,10 @@ def phase4_acceptance(options):
         seen_at_b = wait_for("entrance B shows the work A finished", lambda: work_in(at_b, first, "finished"), timeout=60)
         require(seen_at_b["outcome"] == "completed", "B shows A's result")
         turn(a, "work:" + first)
-        r2 = send(at_b, "p4-m2", {"label": "p4-m2", "dispatch": {"label": "p4-continued", "cwd": str(first_dir),
+        old_session = scheduler_sessions(a, conversation)["main"]
+        r2 = send(at_b, "p4-m2", {"label": "p4-m2", "tools": [{"name": "update_profile", "arguments": {
+            "call_ref": "remote-profile", "instructions": "cross-node-generation-sentinel"}}],
+            "dispatch": {"label": "p4-continued", "cwd": str(first_dir),
                                                                  "continues": first, "native": {"gate": str(first_dir / "release")}}})
         require(r2["state"] == "pending_delivery", "entrance B keeps the message for owner A")
         continued = dispatched(a, "p4-continued")
@@ -3487,6 +3553,15 @@ def phase4_acceptance(options):
                                                                      "target_node": b.device_id, "native": task_directive}})
         task = dispatched(a, "p4-task")
         turn(a, r3["trigger"])
+        new_session = scheduler_sessions(a, conversation)["main"]
+        after_profile = records(a)[next(index for index, row in enumerate(records(a)) if row["trigger"] == r2["trigger"]) + 1]
+        require(not after_profile["resumed"] and after_profile["handoff"]
+                and after_profile["native_session_id"] != t2["native_session_id"]
+                and new_session["shown"]["session_generation"] == old_session["shown"]["session_generation"] + 1
+                and new_session["native_token"] != old_session["native_token"],
+                "a profile changed through entrance B fences owner A's native token on the following turn")
+        passed("cross-node-profile-generation", generation=new_session["shown"]["session_generation"],
+               next_trigger=after_profile["trigger"], handoff=after_profile["handoff"])
         child = dispatched(b, "p4-task-child")
         (task_dir / "release").touch()
         question = wait_for("A shows the question B's Agent asked about its App Server request", lambda: next(
@@ -3601,12 +3676,38 @@ def phase4_acceptance(options):
             event["body"]["type"] == "context_checkpoint" for event in scope_events(a, network, conversation)), timeout=90)
         wait_for("the checkpoint reaches B", lambda: any(
             event["body"]["type"] == "context_checkpoint" for event in scope_events(b, network, conversation)), timeout=60)
+        parallel_gate = workspace / "p4-parallel-release"
+        parallel = send(a.client, "p4-parallel", {"label": "p4-parallel", "tools": [
+            {"name": "dispatch_work", "arguments": {"call_ref": f"parallel-{index}", "title": f"parallel-{index}",
+                "prompt": json.dumps({"label": f"p4-parallel-{index}", "gate": str(parallel_gate)}),
+                "cwd": str(workspace), "target_node": b.device_id}} for index in range(2)]})
+        turn(a, parallel["trigger"])
+        parallel_tasks = wait_for("two independent tasks are running on B", lambda: (lambda rows: rows if len(rows) == 2 else None)(
+            [row for row in records(b) if row["label"] in ("p4-parallel-0", "p4-parallel-1")]), timeout=60)
         a_calls, b_calls = len(records(a)), len(records(b))
         at_b.rpc("set_owner", conversation_id=conversation, scheduler_node=b.device_id, epoch=2)
         wait_for("every entrance moves the conversation to B", lambda: all(
             client.rpc("conversation", conversation_id=conversation)["conversation"]["owner"] == b.device_id
             for client in (a.client, at_p)), timeout=60)
-        r7 = send(a.client, "p4-m7", {"label": "p4-m7"})
+        main_gate = workspace / "p4-main-release"
+        r7 = send(a.client, "p4-m7", {"label": "p4-m7", "gate": str(main_gate)})
+        running_main = wait_for("B runs Main while both delegated task turns are held", lambda: next(
+            (row for row in records(b) if row["trigger"] == r7["trigger"]), None), timeout=60)
+        scoped = scheduler_sessions(b, conversation)
+        active = [scoped[key] for key in ["main"] + [row["trigger"] for row in parallel_tasks]]
+        native_ids = {row["native_session_id"] for row in [running_main, *parallel_tasks]}
+        native_state = wait_for("the fixture App Server has three active native threads", lambda: (lambda threads: threads if all(
+            threads.get(native, {}).get("status", {}).get("type") == "active" for native in native_ids) else None)(
+                json.loads((roots["B"] / "fixture-codex-state.json").read_text())["threads"]))
+        require(len(native_ids) == 3 and all(row["active"] and row["native_token"] for row in active)
+                and {row["native_id"] for row in active} == native_ids
+                and len({row["native_token"] for row in active}) == 3
+                and all(native_state[native]["status"]["type"] == "active"
+                        and native_state[native]["turns"][-1]["status"] == "inProgress" for native in native_ids)
+                and all(not row["resumed"] for row in parallel_tasks)
+                and {row["kind"] for row in parallel_tasks} == {"agent_task"},
+                "Main and two Task scopes own three simultaneous native sessions and distinct native tokens")
+        main_gate.touch()
         t7 = turn(b, r7["trigger"])
         require(not t7["resumed"] and t7["checkpoint"] and "p4-m7" in t7["trigger_text"],
                 "the new owner starts fresh from the checkpoint and the newer messages")
@@ -3615,6 +3716,13 @@ def phase4_acceptance(options):
                       and [row["trigger"] for row in records(b)[b_calls:]] == [r7["trigger"]])
         passed("owner-switch-without-replay", owner="B", epoch=2, checkpoint=t7["checkpoint"],
                messages_in_prompt=len(t7["messages"]), host_effects=side_effect.read_text())
+        parallel_gate.touch()
+        for row in parallel_tasks:
+            turn(b, row["trigger"])
+            finished = wait_for("the parallel task reports its own result", lambda: work_in(at_b, row["work_id"], "finished"), timeout=60)
+            require(finished["outcome"] == "completed" and row["label"] + ":complete" in finished["result_text"],
+                    "each isolated task returns its own terminal result")
+        passed("main-and-two-tasks-overlap", sessions=len(native_ids), tasks=[row["work_id"] for row in parallel_tasks])
 
         payload = run / "attachment.bin"
         with open(payload, "wb") as out:
@@ -3663,6 +3771,9 @@ def phase4_acceptance(options):
         payload.unlink()
         passed("attachment-64mib-restart-resume", size=size, upload_restart_at=restarted_at, download_kept=kept,
                message=receipt["message_id"], binary_pages_at_b=pages)
+        require(all(sum(row["label"] == task["label"] for row in records(b)) == 1 for task in parallel_tasks)
+                and sum(row["trigger"] == "task:" + lost for row in records(c)) == 1,
+                "sync and B's restart do not replay completed tasks or the revoked Node's unknown task")
 
         require(file_sha256(binary) == report["binary_sha256"], "one immutable binary completes acceptance")
         report["status"] = "passed"
