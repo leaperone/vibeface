@@ -466,7 +466,11 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         let mut config = ManagerConfig {
             custom_tools: provider.tools_for(job.kind),
             tool_cli: Some(tool_cli),
-            instructions: if thread { thread_instructions() } else { String::new() },
+            instructions: if thread {
+                stable.rendered.clone()
+            } else {
+                String::new()
+            },
             tool_token: Some(token.clone()),
             process_started: Some(process_recorder(&node, &attempt.id)),
             codex_turn: Some(turn_recorder(&node, &attempt.id, &server, shown.clone(), fresh_prompt)),
