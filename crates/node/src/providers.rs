@@ -223,10 +223,7 @@ impl ProviderDescriptor {
             provider,
             sessions: sessions.into(),
             prompt_mode: provider.prompt_mode(),
-            tool_mode: match provider {
-                Provider::Cursor => ToolMode::NativeCallback,
-                _ => ToolMode::StaticCatalog,
-            },
+            tool_mode: ToolMode::DynamicCatalog,
             skill_injection,
             sandbox,
             steer: provider.supports_steer(),
@@ -440,13 +437,18 @@ impl Provider {
         }
     }
 
-    /// The tools a turn of `kind` is offered. A thread lists them once for all its turns, so it
-    /// gets every tool a user's own turn has.
+    /// The discovery entry points and essential reads. The router checks each discovered
+    /// target against the current turn, including when a thread keeps this initial catalog.
     pub fn tools_for(self, kind: TriggerKind) -> BTreeMap<String, CustomToolConfig> {
         crate::scheduler::tools(match self.prompt_mode() {
             PromptMode::Thread => TriggerKind::Human,
             PromptMode::Turn => kind,
         })
+        .into_iter()
+        .filter(|(name, _)| {
+            crate::tools::Tool::parse(name).is_some_and(crate::tools::Tool::initially_exposed)
+        })
+        .collect()
     }
 
     /// The model the bot runs with: Cursor needs one, and Codex, Claude Code and pi read "auto" as a
@@ -761,6 +763,133 @@ impl Local {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_provider_starts_with_dynamic_discovery_and_essential_reads() {
+        let expected = BTreeSet::from([
+            "tool_search",
+            "tool_describe",
+            "tool_call",
+            "context",
+            "read_skill",
+            "call_lookup",
+        ]);
+        for provider in Provider::ALL {
+            assert_eq!(
+                ProviderDescriptor::for_provider(provider).tool_mode,
+                ToolMode::DynamicCatalog
+            );
+            for kind in [
+                TriggerKind::Human,
+                TriggerKind::AgentTask,
+                TriggerKind::Schedule,
+            ] {
+                let tools = provider.tools_for(kind);
+                assert_eq!(
+                    tools.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discovered_tools_keep_the_turn_and_token_effect_boundary() -> Result<()> {
+        use crate::tools::{Effect, Tool};
+        let human = Tool::search(json!({"limit":30}), Some(TriggerKind::Human))?;
+        assert_eq!(human["tools"].as_array().map(Vec::len), Some(27));
+        assert_eq!(human["more"], false);
+        assert!(human["next"].is_null());
+        for kind in [
+            None,
+            Some(TriggerKind::AgentTask),
+            Some(TriggerKind::Schedule),
+        ] {
+            let found = Tool::search(json!({"limit":30}), kind)?;
+            for row in found["tools"].as_array().unwrap() {
+                let tool = Tool::parse(row["name"].as_str().unwrap()).unwrap();
+                assert!(!matches!(tool, Tool::Search | Tool::Describe | Tool::Call));
+                assert!(kind.map_or(tool.effect() == Effect::Read, |kind| {
+                    tool.effect().offered(kind)
+                }));
+            }
+            assert!(Tool::describe(json!({"tool":"update_profile"}), kind).is_err());
+        }
+        let first = Tool::search(json!({"limit":1}), Some(TriggerKind::Human))?;
+        assert_eq!(first["tools"][0]["name"], "nodes");
+        assert_eq!(first["more"], true);
+        let second = Tool::search(
+            json!({"limit":1,"offset":first["next"]}),
+            Some(TriggerKind::Human),
+        )?;
+        assert_eq!(second["tools"][0]["name"], "context");
+        let dispatch = Tool::search(json!({"query":"DISPATCH_WORK"}), Some(TriggerKind::Human))?;
+        assert_eq!(dispatch["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(dispatch["tools"][0]["name"], "dispatch_work");
+        let described = Tool::describe(json!({"tool":"dispatch_work"}), Some(TriggerKind::Human))?;
+        assert_eq!(described["effect"], "work");
+        assert_eq!(described["requires_call_ref"], true);
+        assert_eq!(
+            described["input_schema"],
+            crate::scheduler::tools(TriggerKind::Human)["dispatch_work"].input_schema
+        );
+        assert!(Tool::search(json!({"limit":0}), Some(TriggerKind::Human)).is_err());
+        assert!(Tool::describe(json!({"tool":"nodes","unknown":true}), None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn tool_calls_resolve_the_actual_effect_and_cannot_wrap_internal_or_discovery_tools()
+    -> Result<()> {
+        use crate::tools::{Effect, Tool};
+        let (target, args) = Tool::resolve_call(
+            "tool_call",
+            json!({
+                "tool":"update_profile","arguments":{"name":"new name"},"call_ref":"rename-once",
+            }),
+        )?;
+        assert_eq!(target, Tool::UpdateProfile);
+        assert_eq!(target.effect(), Effect::Settings);
+        assert!(!target.effect().offered(TriggerKind::Schedule));
+        assert_eq!(args, json!({"name":"new name","call_ref":"rename-once"}));
+        let (_, retry) = Tool::resolve_call(
+            "tool_call",
+            json!({
+                "tool":"update_profile","arguments":args,"call_ref":"rename-once",
+            }),
+        )?;
+        assert_eq!(retry["call_ref"], "rename-once");
+        assert!(
+            Tool::resolve_call(
+                "tool_call",
+                json!({
+                    "tool":"update_profile","arguments":retry,"call_ref":"another-intent",
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            Tool::resolve_call("tool_call", json!({"tool":"update_profile","arguments":{}}))
+                .is_err()
+        );
+        for tool in [
+            "track_work",
+            "bind_work",
+            "wait_work",
+            "tool_search",
+            "tool_describe",
+            "tool_call",
+        ] {
+            assert!(Tool::resolve_call("tool_call", json!({"tool":tool,"arguments":{}})).is_err());
+            assert!(Tool::describe(json!({"tool":tool}), Some(TriggerKind::Human)).is_err());
+        }
+        assert_eq!(
+            Tool::resolve_call("track_work", json!({}))?.0,
+            Tool::TrackWork
+        );
+        assert!(Tool::resolve_call("tool_call", json!({"tool":"nodes","arguments":[]})).is_err());
+        Ok(())
+    }
 
     #[test]
     fn threads_belong_to_the_app_server_that_keeps_them() {

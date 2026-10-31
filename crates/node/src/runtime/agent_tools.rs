@@ -13,8 +13,17 @@ impl Runtime {
     /// The one entry for coordination tools: the Cursor SDK callback and `vibeface tool` both land here.
     pub async fn tool(self: &Arc<Self>, access: Access, name: &str, args: Value) -> Result<Value> {
         let conversation_id = access.conversation_id.clone();
-        let asked_work = args["work_id"].as_str().map(str::to_owned);
-        let result = self.run_tool(access, name, args).await;
+        let resolved = Tool::resolve_call(name, args);
+        let name = resolved.as_ref().map_or(name, |(tool, _)| tool.name());
+        let asked_work = resolved
+            .as_ref()
+            .ok()
+            .and_then(|(_, args)| args["work_id"].as_str())
+            .map(str::to_owned);
+        let result = match resolved {
+            Ok((tool, args)) => self.run_tool(access, tool, args).await,
+            Err(error) => Err(error),
+        };
         let conversation_id = conversation_id.as_deref();
         match &result {
             Ok(value) => {
@@ -34,7 +43,7 @@ impl Runtime {
         result
     }
 
-    async fn run_tool(self: &Arc<Self>, access: Access, name: &str, args: Value) -> Result<Value> {
+    async fn run_tool(self: &Arc<Self>, access: Access, tool: Tool, args: Value) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         ensure!(!access.human, "tool endpoint requires a scoped Agent token");
         let scope = access
@@ -42,7 +51,7 @@ impl Runtime {
             .clone()
             .context("missing tool scope")?;
         self.require_scope(&access, &scope).await?;
-        let tool = Tool::parse(name).context("unknown or unavailable coordination tool")?;
+        let name = tool.name();
         if let Some(call_ref) = args["call_ref"].as_str()
             && vibeface_protocol::validate_id(call_ref).is_err()
         {
@@ -54,16 +63,19 @@ impl Runtime {
             tool.effect() == Effect::Read || access.manager.is_some(),
             "work changes require a live agent invocation"
         );
-        if let Some(manager) = &access.manager
-            && tool.effect() != Effect::Read
-        {
-            let kind = self
-                .store
-                .lock()
-                .await
-                .scheduler_job(&scope, &manager.trigger)?
-                .context("this turn is not running here")?
-                .kind;
+        let kind = if let Some(manager) = &access.manager {
+            Some(
+                self.store
+                    .lock()
+                    .await
+                    .scheduler_job(&scope, &manager.trigger)?
+                    .context("this turn is not running here")?
+                    .kind,
+            )
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
             ensure!(
                 tool.effect().offered(kind),
                 "{name} is not offered in a {kind:?} turn"
@@ -75,6 +87,9 @@ impl Runtime {
                 .context("agent tool admission timed out")??;
         let network = access.network_id.as_str();
         match tool {
+            Tool::Search => Tool::search(args, kind),
+            Tool::Describe => Tool::describe(args, kind),
+            Tool::Call => bail!("nested tool_call is unavailable"),
             Tool::Nodes => {
                 self.rpc_inner(access.clone(), json!({"method":"nodes"}))
                     .await
@@ -494,8 +509,31 @@ impl Runtime {
             Value::Null => vec![],
             types => serde_json::from_value(types.clone()).context("types lists event types")?,
         };
+        let author = args
+            .get("author")
+            .map(|value| value.as_str().context("author must be a string"))
+            .transpose()?;
+        let keyword = args
+            .get("keyword")
+            .map(|value| value.as_str().context("keyword must be a string"))
+            .transpose()?;
         let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
-        let (events, more) = store.history_page(network, scope, &basis, at, &kinds, limit)?;
+        let (events, more) = if author.is_none() && keyword.is_none() {
+            store.history_page(network, scope, &basis, at, &kinds, limit)?
+        } else {
+            store.search_history_page(
+                network,
+                scope,
+                &basis,
+                at,
+                crate::store::HistoryFilter {
+                    kinds: &kinds,
+                    author,
+                    keyword,
+                },
+                limit,
+            )?
+        };
         drop(store);
         let after = at.is_some_and(|(_, _, after)| after);
         let mut rows = Vec::new();
@@ -512,10 +550,15 @@ impl Runtime {
             }
             rows.push(row);
         }
+        let more = more || cut;
+        let next = rows
+            .last()
+            .filter(|_| more)
+            .map(|row| json!({"author":row["author"],"seq":row["seq"]}));
         if !after {
             rows.reverse();
         }
-        Ok(json!({"events":rows,"more":more || cut}))
+        Ok(json!({"events":rows,"more":more,"next":next}))
     }
 
     /// Registers a dispatch before anything is sent, then has its provider start it. Only the

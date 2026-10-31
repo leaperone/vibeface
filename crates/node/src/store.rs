@@ -71,6 +71,12 @@ pub struct Store {
     process_lock: Option<Arc<std::fs::File>>,
 }
 
+pub(crate) struct HistoryFilter<'a> {
+    pub kinds: &'a [String],
+    pub author: Option<&'a str>,
+    pub keyword: Option<&'a str>,
+}
+
 /// Merges `state` into the stored history. Returns whether the projections were rebuilt.
 ///
 /// A recovery takes effect with time alone, and a late veto can put the earlier directory back, so
@@ -542,13 +548,47 @@ impl Store {
         kinds: &[String],
         limit: usize,
     ) -> Result<(Vec<HashedEvent>, bool)> {
+        self.search_history_page(
+            network_id,
+            scope_id,
+            basis,
+            at,
+            HistoryFilter {
+                kinds,
+                author: None,
+                keyword: None,
+            },
+            limit,
+        )
+    }
+
+    /// Filtering and basis checks precede LIMIT, so only matching envelopes are materialized
+    /// and the extra row proves whether another page exists.
+    pub(crate) fn search_history_page(
+        &self,
+        network_id: &str,
+        scope_id: &str,
+        basis: &VersionVector,
+        at: Option<(&str, u64, bool)>,
+        filter: HistoryFilter<'_>,
+        limit: usize,
+    ) -> Result<(Vec<HashedEvent>, bool)> {
         use rusqlite::types::Value as Sql;
+        ensure!((1..=100).contains(&limit), "history limit must be 1-100");
+        ensure!(
+            filter
+                .keyword
+                .is_none_or(|keyword| !keyword.is_empty() && keyword.len() <= 256),
+            "keyword must contain 1-256 bytes"
+        );
         let mut sql = String::from(
-            "SELECT author,seq,hash,envelope FROM events WHERE network_id=? AND scope_id=? AND effective=1",
+            "SELECT author,seq,hash,envelope FROM events WHERE network_id=? AND scope_id=? AND effective=1
+             AND seq<=COALESCE((SELECT value FROM json_each(?) WHERE key=events.author),0)",
         );
         let mut values = vec![
             Sql::from(network_id.to_owned()),
             Sql::from(scope_id.to_owned()),
+            Sql::from(serde_json::to_string(basis)?),
         ];
         let after = at.is_some_and(|(_, _, after)| after);
         if let Some((author, seq, _)) = at {
@@ -568,26 +608,42 @@ impl Store {
             });
             values.extend([Sql::from(lamport), Sql::from(created), Sql::from(hash)]);
         }
-        if !kinds.is_empty() {
+        if !filter.kinds.is_empty() {
             sql.push_str(&format!(
                 " AND kind IN ({})",
-                vec!["?"; kinds.len()].join(",")
+                vec!["?"; filter.kinds.len()].join(",")
             ));
-            values.extend(kinds.iter().cloned().map(Sql::from));
+            values.extend(filter.kinds.iter().cloned().map(Sql::from));
+        }
+        if let Some(author) = filter.author {
+            sql.push_str(" AND author=?");
+            values.push(Sql::from(author.to_owned()));
+        }
+        if let Some(keyword) = filter.keyword {
+            // Match the same visible strings as agent_event_body, excluding attestations.
+            let body = "json_extract(json_extract(events.envelope,'$.canonical_body'),'$.body')";
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM json_tree(CASE events.kind
+                    WHEN 'bot_created' THEN json_object('type','bot_configuration',
+                        'name',json_extract({body},'$.name'),
+                        'instructions',json_extract({body},'$.instructions'),
+                        'project',json_extract({body},'$.project'))
+                    ELSE json_remove({body},'$.attestation') END) AS visible
+                    WHERE visible.type='text' AND instr(lower(visible.atom),lower(?))>0)"
+            ));
+            values.push(Sql::from(keyword.to_owned()));
         }
         sql.push_str(if after {
             " ORDER BY lamport,created_at_ms,hash"
         } else {
             " ORDER BY lamport DESC,created_at_ms DESC,hash DESC"
         });
+        sql.push_str(" LIMIT ?");
+        values.push(Sql::from((limit + 1) as i64));
         let mut statement = self.connection.prepare(&sql)?;
         let mut rows = statement.query(rusqlite::params_from_iter(values))?;
         let mut events = Vec::new();
         while let Some(row) = rows.next()? {
-            let (author, seq): (String, u64) = (row.get(0)?, row.get(1)?);
-            if seq > basis.get(&author).copied().unwrap_or(0) {
-                continue;
-            }
             if events.len() == limit {
                 return Ok((events, true));
             }

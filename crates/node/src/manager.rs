@@ -371,16 +371,11 @@ pub fn bot_instructions(
         return instructions.into();
     };
     let executable = format!("'{}'", cli.to_string_lossy().replace('\'', r#"'"'"'"#));
-    let with_call_ref = tools
-        .iter()
-        .filter(|(_, spec)| {
-            spec.input_schema["required"]
-                .as_array()
-                .is_some_and(|required| required.iter().any(|name| name == "call_ref"))
-        })
-        .map(|(name, _)| name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let discovery = if tools.contains_key("tool_search") {
+        "Only discovery tools and essential reads are listed initially. Use tool_search with a query to find a tool, tool_describe with {\"tool\":\"TOOL_NAME\"} to read its full schema, then tool_call with {\"tool\":\"TOOL_NAME\",\"arguments\":{}}. The described target's permissions and call_ref requirement still apply. You can also call a discovered tool directly through this scoped CLI; dispatch_work uses the CLI's work execution flow. "
+    } else {
+        ""
+    };
     let catalog = tools
         .iter()
         .map(|(name, spec)| {
@@ -394,7 +389,7 @@ pub fn bot_instructions(
         .join("\n\n");
     let host = "Your shell has full access to this host: you can edit files and run git and gh. When this device runs Codex, `vibeface codex` calls its App Server. When a session asks something (an approval, a question, a login), `vibeface requests` lists the waiting requests and `vibeface respond REQUEST_ID 'RESULT_JSON'` answers one; raise a decision card with `vibeface triage raise --request-id` only when the user must decide, explaining the decision in plain words without the command itself.";
     let text = format!(
-        "Node tools are available through your command-execution tool. Run:\n{executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor {with_call_ref}, add --call-ref 'UNIQUE_INTENT_REFERENCE'. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {{\"call_ref\":\"THE_SAME_REFERENCE\"}}; never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. {host}\n\nAvailable tools:\n{catalog}"
+        "Node tools are available through your command-execution tool. Run:\n{executable} tool TOOL_NAME --json 'JSON_OBJECT'\n{discovery}For any tool whose schema requires call_ref, add --call-ref 'UNIQUE_INTENT_REFERENCE'. For tool_call the flag is passed to arguments.call_ref; when both are given they must agree. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {{\"call_ref\":\"THE_SAME_REFERENCE\"}}; never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. {host}\n\nAvailable tools:\n{catalog}"
     );
     if instructions.is_empty() {
         text
@@ -913,6 +908,31 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn tool_guidance_discovers_targets_and_preserves_scoped_cli_references() {
+        let tools =
+            crate::providers::Provider::Codex.tools_for(crate::scheduling::TriggerKind::Human);
+        let guide = bot_instructions(
+            Some(Path::new("/opt/a'b/vibeface")),
+            &tools,
+            "standing rule",
+        );
+        assert!(guide.contains("'/opt/a'\"'\"'b/vibeface' tool TOOL_NAME"));
+        assert!(guide.contains("tool_search with a query"));
+        assert!(guide.contains("tool_describe with {\"tool\":\"TOOL_NAME\"}"));
+        assert!(guide.contains("flag is passed to arguments.call_ref"));
+        assert!(guide.contains("both are given they must agree"));
+        assert!(guide.contains("dispatch_work uses the CLI's work execution flow"));
+        assert!(guide.ends_with("standing rule"));
+        let catalog = guide.split_once("Available tools:\n").unwrap().1;
+        assert!(catalog.contains("tool_call\n"));
+        assert!(!catalog.contains("dispatch_work\n"));
+        assert_eq!(
+            bot_instructions(None, &tools, "standing rule"),
+            "standing rule"
+        );
+    }
 
     fn codex(workspace: PathBuf, socket: PathBuf) -> ManagerConfig {
         ManagerConfig {
