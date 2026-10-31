@@ -20,6 +20,12 @@ export function settledAnswer(standing: string | undefined, mine: string | undef
   return { text, elsewhere: standing !== undefined && mine !== undefined && standing !== mine }
 }
 
+/** The first non-empty line asks for the decision; the rest keeps its paragraphs. */
+export function questionParts(text: string) {
+  const [ask = "", ...lines] = text.trim().split(/\r?\n/)
+  return { ask: ask.trim(), detail: lines.join("\n").trim() }
+}
+
 /** An answer that turns the request down, so it reads as refused, not agreed. */
 export const declined = (answer: string) => /^(拒绝|不允许|不同意|不行|不要|否|取消)|^(deny|decline|no)\b/i.test(answer.trim())
 /** How a settled answer reads: a bare refusal says only that; a refusal with words keeps them. */

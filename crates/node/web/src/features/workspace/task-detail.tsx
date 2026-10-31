@@ -134,7 +134,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       </section> : null}
       {sharing.length && stop ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">会一起停止</h3>
         <ul className="grid gap-1">{sharing.map((item) => <li key={item.work_id} className="flex min-w-0 items-center gap-2"><Link2 aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="truncate">{item.title || "任务"}</span></li>)}</ul></section> : null}
-      {asking ? <QuestionCard question={asking} inTask /> : null}
+      {asking ? <QuestionCard key={asking.question_id} question={asking} inTask /> : null}
       {stop ? <div className="grid gap-2">
         {confirming || action.busy === "stop" ? <div className="flex flex-wrap items-center gap-2">
           <Button type="button" variant="ghost" disabled={action.busy !== null} onClick={() => setConfirming(false)}>取消</Button>

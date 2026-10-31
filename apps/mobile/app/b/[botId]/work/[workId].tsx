@@ -70,7 +70,7 @@ export default function TaskDetail() {
     {state === 'awaiting_confirmation' ? <Text className="text-muted-foreground">
       {confirmText({ reason: confirmReason(work, shared.nodes) ?? 'unverified', detail: work.failure_reason ?? '' }, nodeName(device, lookup))}请在对话或待处理里确认它做完了没有。
     </Text> : null}
-    {asking ? <QuestionCard question={asking} inTask /> : null}
+    {asking ? <QuestionCard key={asking.question_id} question={asking} inTask /> : null}
     {canStop && sharing.length ? <Section title="会一起停止">
       {sharing.map((item) => <View key={item.work_id} className="flex-row items-center gap-2">
         <Icon as={Link2} className="size-4 text-muted-foreground" /><Text numberOfLines={1} className="shrink">{item.title || '任务'}</Text>

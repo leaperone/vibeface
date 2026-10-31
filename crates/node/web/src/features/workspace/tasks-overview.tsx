@@ -16,8 +16,6 @@ import { projectName } from "@vibeface/client/workspace/questions.ts"
 import { workFailure } from "@vibeface/client/lib/errors.ts"
 import type { NodeInfo, OpenWork, OverviewTask } from "@vibeface/client/workspace/types.ts"
 import { useInbox } from "./inbox"
-import { ConfirmCard } from "./task-activity"
-import { QuestionCard } from "./question-card"
 import { useCreateBot } from "./workspace-shell"
 
 type ProjectedWork = Extract<OverviewTask, { kind: "work" | "dispatch" }>
@@ -36,30 +34,23 @@ export function TasksOverview() {
   const overview = workspace.overview ?? localOverview
   const overviewWorks = workspace.overview ? openWorksFromOverview(workspace.overview) : workspace.openWorks
   const attention = inbox.filter((item): item is Extract<InboxItem, { kind: "question" | "confirm" }> => item.kind === "confirm" || item.kind === "question" && !item.done)
-  const attentionWorkIds = new Set<string>()
-  for (const item of attention) {
-    if (item.kind !== "confirm") continue
-    if (item.check.kind === "work") attentionWorkIds.add(item.check.work_id)
-    if (item.check.kind === "device") for (const work of item.check.works) attentionWorkIds.add(work.work_id)
-  }
   const openQuestions = attention.filter((item): item is Extract<InboxItem, { kind: "question" }> => item.kind === "question").map((item) => item.question)
   const waitingSessions = new Set(openQuestions.filter((question) => question.about.request_id).map((question) => question.about.session_id))
   const projected = new Map(overview.tasks.filter((task): task is ProjectedWork => task.kind === "work" || task.kind === "dispatch").filter((task) => task.work_id).map((task) => [task.work_id!, task]))
-  const tasks = overviewWorks.filter((work) => projected.has(work.work_id) && !attentionWorkIds.has(work.work_id))
+  const tasks = overviewWorks.filter((work) => projected.has(work.work_id))
   const groups: Record<TaskGroup, OpenWork[]> = { attention: [], working: [], waiting: [] }
   for (const work of tasks) groups[taskGroup(cardState(work, workspace.nodes, projected.get(work.work_id)?.state), waitingSessions.has(work.thread_id ?? ""))].push(work)
-  const noticed = attention.length + groups.attention.length
-  const hasContent = noticed > 0 || groups.working.length > 0 || groups.waiting.length > 0
+  const hasContent = attention.length > 0 || tasks.length > 0
   const card = (work: OpenWork) => <TaskOverviewCard key={work.work_id} work={work} projected={projected.get(work.work_id)} lookup={lookup} connected={workspace.connectionOnline} progress={taskProgress(work, workspace.liveProgress)} />
   const bot = workspace.selectedBot ?? workspace.bots[0]
 
   if (workspace.incomplete && !workspace.nodes.length) return <div className="mx-auto grid w-full max-w-(--page-width) gap-3" aria-busy="true"><Skeleton className="h-20" /><Skeleton className="h-20" /><Skeleton className="h-20" /></div>
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
-    <p className="sr-only" role="status" aria-live="polite">{hasContent ? `${attention.length + tasks.length} 项任务` : "没有未完成的任务"}</p>
+    <p className="sr-only" role="status" aria-live="polite">{tasks.length ? `${tasks.length} 项任务` : "没有未完成的任务"}</p>
+    {attention.length ? <Link to="/inbox" className="flex min-h-12 items-center gap-2 rounded-lg border px-3 py-2 font-medium hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0" /><span>待处理 {attention.length} 项</span><ChevronRight aria-hidden="true" className="ms-auto size-4 shrink-0 text-muted-foreground" /></Link> : null}
     {taskGroups.map(({ group, title }) => {
-      const count = group === "attention" ? noticed : groups[group].length
+      const count = groups[group].length
       return count ? <OverviewSection key={group} title={title} count={count}>
-        {group === "attention" ? attention.map((item) => <div key={item.key}>{item.kind === "question" ? <QuestionCard question={item.question} inbox from="tasks" /> : <ConfirmCard check={item.check} inbox from="tasks" />}</div>) : null}
         {groups[group].map(card)}
       </OverviewSection> : null
     })}

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { parseAnswer, parseConversation, parseOpenWorks, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
-import { answerBody, answerLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, settledAnswer, sharedProject } from "./questions.ts"
+import { answerBody, answerLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, questionParts, settledAnswer, sharedProject } from "./questions.ts"
 
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/path/to/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
@@ -48,6 +48,12 @@ test("an answer result is the question's own message, or it is not trusted", () 
 
 test("an answer is signed as one message per question", () => {
   assert.deepEqual(answerBody("q1", "继续"), { type: "message_posted", message_id: "a-q1", role: "user", text: "继续", report_results: true, answers: "q1" })
+})
+
+test("a question uses its first non-empty line as the decision and preserves the remaining paragraphs", () => {
+  assert.deepEqual(questionParts("\n \r\n是否发布？\r\n已有检查通过。\r\n\r\n线上结果未知。\n"), { ask: "是否发布？", detail: "已有检查通过。\n\n线上结果未知。" })
+  assert.deepEqual(questionParts("允许吗？"), { ask: "允许吗？", detail: "" })
+  assert.deepEqual(questionParts("  \n"), { ask: "", detail: "" })
 })
 
 test("待处理 lists exactly the open questions, urgent first, then newest first", () => {
