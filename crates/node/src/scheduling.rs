@@ -426,6 +426,8 @@ pub struct SessionLineage {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shown {
     pub bot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<BTreeMap<String, String>>,
     pub works: BTreeMap<String, String>,
     /// The last dynamic Context digest sent on this local native session.
     #[serde(default, skip_serializing_if = "Option::is_none")]

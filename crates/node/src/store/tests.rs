@@ -6525,7 +6525,10 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
     )?;
     let ((changed, _), _) = render(&store, "m3", Some(&covers), Some(&shown))?;
     let data = prompt_data(&changed)?;
-    assert_eq!(data["bot"]["memory"][0]["text"], "prefers short replies");
+    assert_eq!(
+        data["memory_context"]["upserts"][0]["text"],
+        "prefers short replies"
+    );
     assert_eq!(data["works"], json!([]));
     Ok(())
 }

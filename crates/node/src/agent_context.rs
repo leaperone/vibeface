@@ -46,6 +46,7 @@ pub struct StableInstructions {
     pub skills: Vec<SkillIndexEntry>,
     pub fingerprint: PromptFingerprint,
     pub rendered: String,
+    pub redacted_values: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -121,6 +122,133 @@ pub struct DynamicContext {
     pub memory: Value,
     #[serde(default)]
     pub session_generation: u64,
+    #[serde(default)]
+    pub redacted_values: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryContextEntry {
+    pub memory_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub epoch: u32,
+    #[serde(default)]
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum MemoryContext {
+    Snapshot {
+        entries: Vec<MemoryContextEntry>,
+        omitted: usize,
+        budget_bytes: usize,
+    },
+    Delta {
+        upserts: Vec<MemoryContextEntry>,
+        deleted: Vec<String>,
+        omitted: usize,
+        budget_bytes: usize,
+    },
+}
+
+impl MemoryContext {
+    pub fn omitted(&self) -> usize {
+        match self {
+            Self::Snapshot { omitted, .. } | Self::Delta { omitted, .. } => *omitted,
+        }
+    }
+
+    fn pending(&mut self, count: usize) {
+        match self {
+            Self::Snapshot { omitted, .. } | Self::Delta { omitted, .. } => *omitted = count,
+        }
+    }
+}
+
+pub struct MemoryDelivery {
+    pub context: MemoryContext,
+    pub shown: BTreeMap<String, String>,
+}
+
+/// Only delivered rows advance the cache; a budget omission is never a deletion.
+pub fn compile_memory(
+    entries: &[MemoryContextEntry],
+    previous: Option<&BTreeMap<String, String>>,
+) -> Result<MemoryDelivery> {
+    let mut current = BTreeMap::new();
+    let mut redacted = 0;
+    for entry in entries {
+        if looks_secret(&entry.text) || looks_secret(&entry.memory_id) {
+            redacted += 1;
+        } else {
+            current.insert(entry.memory_id.clone(), digest(&serde_json::to_vec(entry)?));
+        }
+    }
+    let upserts: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            !looks_secret(&entry.text)
+                && !looks_secret(&entry.memory_id)
+                && current.get(&entry.memory_id).is_some_and(|fingerprint| {
+                    previous.is_none_or(|seen| seen.get(&entry.memory_id) != Some(fingerprint))
+                })
+        })
+        .collect();
+    let deleted: Vec<_> = previous
+        .into_iter()
+        .flat_map(|seen| seen.keys())
+        .filter(|id| !current.contains_key(*id))
+        .cloned()
+        .collect();
+    let mut pending = upserts.len() + deleted.len() + redacted;
+    let mut context = match previous {
+        Some(_) => MemoryContext::Delta {
+            upserts: vec![],
+            deleted: vec![],
+            omitted: pending,
+            budget_bytes: ESSENTIAL_MEMORY_BUDGET,
+        },
+        None => MemoryContext::Snapshot {
+            entries: vec![],
+            omitted: pending,
+            budget_bytes: ESSENTIAL_MEMORY_BUDGET,
+        },
+    };
+    let mut shown = previous.cloned().unwrap_or_default();
+    for id in deleted {
+        let mut candidate = context.clone();
+        if let MemoryContext::Delta { deleted, .. } = &mut candidate {
+            deleted.push(id.clone());
+        }
+        candidate.pending(pending - 1);
+        if serde_json::to_vec(&candidate)?.len() <= ESSENTIAL_MEMORY_BUDGET {
+            context = candidate;
+            pending -= 1;
+            shown.remove(&id);
+        }
+    }
+    for entry in upserts {
+        let mut candidate = context.clone();
+        match &mut candidate {
+            MemoryContext::Snapshot { entries, .. } => entries.push(entry.clone()),
+            MemoryContext::Delta { upserts, .. } => upserts.push(entry.clone()),
+        }
+        candidate.pending(pending - 1);
+        if serde_json::to_vec(&candidate)?.len() <= ESSENTIAL_MEMORY_BUDGET {
+            context = candidate;
+            pending -= 1;
+            shown.insert(entry.memory_id.clone(), current[&entry.memory_id].clone());
+        }
+    }
+    Ok(MemoryDelivery { context, shown })
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedactionReport {
+    pub stable_values: usize,
+    pub dynamic_values: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,6 +290,7 @@ pub struct CompiledTurn {
     pub dynamic: DynamicContext,
     pub prompt_mode: crate::providers::PromptMode,
     pub session_generation: u64,
+    pub redaction_report: RedactionReport,
 }
 
 impl DynamicContext {
@@ -173,7 +302,7 @@ impl DynamicContext {
             .iter()
             .chain(&self.dispatches.entries)
             .collect();
-        let data = json!({
+        let mut data = json!({
             "network_id": self.network_id, "conversation_id": self.conversation_id,
             "basis": self.basis, "bot": self.bot,
             "conversation": {
@@ -188,7 +317,18 @@ impl DynamicContext {
             "pending_checks": self.pending_checks.entries, "attachments": self.attachments.entries,
             "memory_context": self.memory, "coverage": self.coverage,
         });
-        self.rendered = format!("{}\n\n{data}", self.instructions);
+        if self.memory["mode"] == "delta"
+            && self.memory["upserts"] == json!([])
+            && self.memory["deleted"] == json!([])
+            && self.memory["omitted"] == 0
+        {
+            data.as_object_mut()
+                .expect("context object")
+                .remove("memory_context");
+        }
+        let mut instructions = json!(self.instructions);
+        self.redacted_values = redact_content(&mut data) + redact_content(&mut instructions);
+        self.rendered = format!("{}\n\n{data}", instructions.as_str().expect("instructions"));
         self.refresh_fingerprint()
     }
 
@@ -196,12 +336,32 @@ impl DynamicContext {
         let mut content = self.clone();
         content.rendered.clear();
         content.fingerprint.clear();
-        self.fingerprint = digest(&serde_json::to_vec(&content)?);
+        let mut value = serde_json::to_value(&content)?;
+        redact_content(&mut value);
+        self.fingerprint = digest(&serde_json::to_vec(&value)?);
         Ok(())
     }
 }
 
 impl CompiledTurn {
+    pub fn new(
+        stable: StableInstructions,
+        dynamic: DynamicContext,
+        prompt_mode: crate::providers::PromptMode,
+    ) -> Self {
+        let redaction_report = RedactionReport {
+            stable_values: stable.redacted_values,
+            dynamic_values: dynamic.redacted_values,
+        };
+        let session_generation = dynamic.session_generation;
+        Self {
+            stable,
+            dynamic,
+            prompt_mode,
+            session_generation,
+            redaction_report,
+        }
+    }
     pub fn prompt(&self) -> String {
         match self.prompt_mode {
             crate::providers::PromptMode::Thread => self.dynamic.rendered.clone(),
@@ -248,13 +408,15 @@ pub fn compile_stable(mut input: StableInput) -> Result<StableInstructions> {
             )
         });
     }
-    redact_content(&mut input.bot);
+    let mut redacted_values = redact_content(&mut input.bot);
     for skill in &mut input.skills {
         if looks_secret(&skill.name) {
             skill.name = "[redacted]".into();
+            redacted_values += 1;
         }
         if looks_secret(&skill.description) {
             skill.description = "[redacted]".into();
+            redacted_values += 1;
         }
     }
     let provider = ProviderDescriptor::for_provider(input.provider);
@@ -324,6 +486,7 @@ pub fn compile_stable(mut input: StableInput) -> Result<StableInstructions> {
         skills: input.skills,
         fingerprint,
         rendered,
+        redacted_values,
     })
 }
 
@@ -331,12 +494,15 @@ fn tag_safe(value: &str) -> String {
     value.replace('<', "\\u003c")
 }
 
-fn redact_content(value: &mut Value) {
+fn redact_content(value: &mut Value) -> usize {
     match value {
-        Value::String(text) if looks_secret(text) => *text = "[redacted]".into(),
-        Value::Array(rows) => rows.iter_mut().for_each(redact_content),
-        Value::Object(fields) => fields.values_mut().for_each(redact_content),
-        _ => {}
+        Value::String(text) if looks_secret(text) => {
+            *text = "[redacted]".into();
+            1
+        }
+        Value::Array(rows) => rows.iter_mut().map(redact_content).sum(),
+        Value::Object(fields) => fields.values_mut().map(redact_content).sum(),
+        _ => 0,
     }
 }
 
@@ -432,9 +598,94 @@ mod tests {
             },
             memory: Value::Null,
             session_generation: 0,
+            redacted_values: 0,
         };
         dynamic.render()?;
         Ok(dynamic)
+    }
+
+    #[test]
+    fn memory_delta_tracks_changes_without_repeating_or_deleting_omitted_rows() -> Result<()> {
+        let note = |id: &str, text: &str| MemoryContextEntry {
+            memory_id: id.into(),
+            text: text.into(),
+            epoch: 10,
+            revision: digest(text.as_bytes()),
+        };
+        let original = [note("a", "first"), note("b", "second")];
+        let initial = compile_memory(&original, None)?;
+        assert!(
+            matches!(&initial.context, MemoryContext::Snapshot { entries, omitted: 0, .. } if entries.len() == 2)
+        );
+        let unchanged = compile_memory(&original, Some(&initial.shown))?;
+        assert!(
+            matches!(&unchanged.context, MemoryContext::Delta { upserts, deleted, omitted: 0, .. } if upserts.is_empty() && deleted.is_empty())
+        );
+        let changed = [note("a", "updated"), note("c", "third")];
+        let next = compile_memory(&changed, Some(&initial.shown))?;
+        assert!(
+            matches!(&next.context, MemoryContext::Delta { upserts, deleted, omitted: 0, .. } if upserts.len() == 2 && deleted == &["b"])
+        );
+        assert_eq!(next.shown, compile_memory(&changed, None)?.shown);
+        let oversized = [
+            note("a", &"中".repeat(ESSENTIAL_MEMORY_BUDGET)),
+            note("b", "second"),
+        ];
+        let held = compile_memory(&oversized, Some(&initial.shown))?;
+        assert_eq!(held.context.omitted(), 1);
+        assert_eq!(
+            held.shown, initial.shown,
+            "an omitted update keeps the last delivered revision"
+        );
+        assert!(serde_json::to_vec(&held.context)?.len() <= ESSENTIAL_MEMORY_BUDGET);
+        let retried = compile_memory(&original, Some(&held.shown))?;
+        assert_eq!(retried.context.omitted(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn memory_delta_removes_a_previously_shown_note_when_its_new_value_is_secret() -> Result<()> {
+        let mut note = MemoryContextEntry {
+            memory_id: "a".into(),
+            text: "public preference".into(),
+            epoch: 10,
+            revision: "1".into(),
+        };
+        let first = compile_memory(&[note.clone()], None)?;
+        note.text = "sk-proj-abcdefghijklmnopqrstuvwxyz123456".into();
+        note.revision = "2".into();
+        let second = compile_memory(&[note], Some(&first.shown))?;
+        let encoded = serde_json::to_string(&second.context)?;
+        assert!(!encoded.contains("sk-proj"));
+        assert!(
+            matches!(&second.context, MemoryContext::Delta { upserts, deleted, omitted: 1, .. } if upserts.is_empty() && deleted == &["a"])
+        );
+        assert!(second.shown.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_secrets_are_redacted_before_rendering_and_fingerprinting() -> Result<()> {
+        let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456";
+        let mut context = dynamic()?;
+        context.messages.entries[0]["text"] = json!(secret);
+        context.trigger.event = Some(json!({"body":{"text":secret}}));
+        context.render()?;
+        assert!(!context.rendered.contains(secret));
+        assert_eq!(context.redacted_values, 2);
+        let compiled = CompiledTurn::new(
+            compile_stable(input())?,
+            context.clone(),
+            crate::providers::PromptMode::Turn,
+        );
+        assert_eq!(compiled.redaction_report.dynamic_values, 2);
+        context.messages.entries[0]["text"] = json!("sk-proj-anotherdifferentsecret0000000");
+        context.render()?;
+        assert_eq!(
+            compiled.dynamic.fingerprint, context.fingerprint,
+            "only redacted context reaches the fingerprint"
+        );
+        Ok(())
     }
 
     #[test]
@@ -542,12 +793,7 @@ mod tests {
     fn compiled_turn_renders_the_provider_prompt_mode() -> Result<()> {
         let stable = compile_stable(input())?;
         let dynamic = dynamic()?;
-        let mut compiled = CompiledTurn {
-            stable,
-            dynamic,
-            prompt_mode: crate::providers::PromptMode::Thread,
-            session_generation: 0,
-        };
+        let mut compiled = CompiledTurn::new(stable, dynamic, crate::providers::PromptMode::Thread);
         assert_eq!(compiled.prompt(), compiled.dynamic.rendered);
         compiled.prompt_mode = crate::providers::PromptMode::Turn;
         assert!(compiled.prompt().starts_with(&compiled.stable.rendered));
