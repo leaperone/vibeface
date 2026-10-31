@@ -247,3 +247,46 @@ test("workspace activities attach approval facts, keep task checks with work, an
   assert.equal(mismatched.activities.filter((activity) => activity.kind === "attention").length, 2, "different conversations and devices do not dedupe")
   assert.equal(workspaceActivities({ works: [{ ...running, state: "unverified", outcome: "unverified" }], questions: [], checks: [], nodes: [node("worker")], read: true, connected: true }).groups.attention.length, 1)
 })
+
+test("workspace activities dedupe live and overview questions, keep approvals on one work, and hide scheduler history", () => {
+  const running = work()
+  const sibling = work({ work_id: "work-2" })
+  const approval = question()
+  const overview = overviewFromWorkspace({ openWorks: [running, sibling], bots: [bot("chat-1")], questions: [approval], nodes: [node("worker")] })
+  const view = workspaceActivities({
+    works: [running, sibling], questions: [approval], checks: [], overview,
+    jobs: [
+      { conversation_id: "chat-1", job: { trigger: "message:done", state: "completed" } },
+      { conversation_id: "chat-1", job: { trigger: "message:queue", state: "queued" } },
+    ], nodes: [node("worker")], read: true, connected: true, answered: {},
+  })
+  const workActivities = view.activities.filter((activity) => activity.kind === "work")
+  assert.equal(workActivities.find((activity) => activity.work_id === running.work_id)?.facts.questions.length, 1)
+  assert.equal(workActivities.find((activity) => activity.work_id === sibling.work_id)?.facts.questions.length, 0)
+  assert.equal(view.activities.filter((activity) => activity.kind === "attention").length, 0)
+  assert.deepEqual(view.activities.filter((activity): activity is Extract<typeof view.activities[number], { kind: "turn" }> => activity.kind === "turn").map((activity) => activity.job.state), ["queued"])
+})
+
+test("overview-only questions remain one attention item instead of attaching to every sibling work", () => {
+  const running = work()
+  const sibling = work({ work_id: "work-2" })
+  const overview = parseWorkspaceOverview({ questions: [{
+    question_id: "overview-q", conversation_id: "chat-1", text: "继续吗？", severity: "attention", choices: [],
+    about: { node: "worker", agent: "codex", session_id: "provider-thread", cwd: "/project", summary: "", request_id: "request" }, work_id: running.work_id, created_at_ms: 2,
+  }] })
+  const view = workspaceActivities({ works: [running, sibling], questions: [], checks: [], overview, nodes: [node("worker")], read: true, connected: true, answered: {} })
+  assert.deepEqual(view.activities.filter((activity) => activity.kind === "attention").map((activity) => activity.id), ["attention:overview-question:overview-q"])
+  assert.equal(view.activities.filter((activity) => activity.kind === "work").some((activity) => activity.facts.overviewQuestions.length > 0), false)
+})
+
+test("workspace activities dedupe overview and live scheduler jobs by conversation and trigger", () => {
+  const overview = parseWorkspaceOverview({ jobs: [{ job_id: "job-queue", conversation_id: "chat-1", trigger: "message:queue", state: "queued" }] })
+  const view = workspaceActivities({
+    works: [], questions: [], checks: [], overview,
+    jobs: [{ conversation_id: "chat-1", job: { trigger: "message:queue", state: "running" } }],
+    nodes: [], read: true, connected: true,
+  })
+  const turns = view.activities.filter((activity): activity is Extract<typeof view.activities[number], { kind: "turn" }> => activity.kind === "turn")
+  assert.deepEqual(turns.map((activity) => activity.id), ["turn:chat-1:message:queue"])
+  assert.equal(turns[0]?.job.state, "running", "the live conversation snapshot wins over an older overview job")
+})
