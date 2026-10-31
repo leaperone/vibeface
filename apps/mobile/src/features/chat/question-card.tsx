@@ -38,6 +38,8 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const [text, setText] = useState('')
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState('')
+  const [failed, setFailed] = useState<string | null>(null)
+  const [beaten, setBeaten] = useState(false)
   const standing = answer ?? question.answer?.text
   const settled = settledAnswer(standing, shared?.answered[question.question_id])
   const { ask, lines } = questionParts(question.text)
@@ -45,8 +47,9 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   // Read back later, an answered approval says which task on which device it settled.
   const heldTask = inTask ? null : approvalTask(question, [...shared?.openWorks ?? [], ...shared?.data?.works ?? []])
   const about = heldTask ? `${heldTask} · ${member?.name ?? '另一台设备'}` : undefined
-  if (settled) return <Settled icon={settled.elsewhere ? CircleAlert : declined(settled.text) ? CircleX : CircleCheck} className={settled.elsewhere ? 'text-warning' : declined(settled.text) ? 'text-danger' : 'text-success'} ask={ask} about={about}>
-    {settled.elsewhere ? `已由另一端回答：${settled.text}` : declined(settled.text) ? answerLabel(settled.text) : settled.text}
+  const elsewhere = settled && (settled.elsewhere || beaten)
+  if (settled) return <Settled icon={elsewhere ? CircleAlert : declined(settled.text) ? CircleX : CircleCheck} className={elsewhere ? 'text-warning' : declined(settled.text) ? 'text-danger' : 'text-success'} ask={ask} about={about}>
+    {elsewhere ? `已由另一端回答：${settled.text}` : declined(settled.text) ? answerLabel(settled.text) : settled.text}
   </Settled>
   if (question.closed) return <Settled icon={CircleSlash} ask={ask} about={about}>已失效</Settled>
   const pending = shared?.pendingAnswers.find((item) => item.question_id === question.question_id)
@@ -54,12 +57,18 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const send = async (key: string, value: string) => {
     setBusy(key)
     setError('')
+    setFailed(null)
     try {
-      await workspace.actions.answer(question, value)
+      const result = await workspace.actions.answer(question, value)
+      if (result.status === 'already_answered' && result.text !== value.trim()) {
+        setBeaten(true)
+        return
+      }
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success)
       // Stays busy until the answer arrives and folds or removes the card, so it never flashes back to open.
     } catch (caught) {
       setError(humanError(caught instanceof Error ? caught.message : '', undefined, '这次回答'))
+      setFailed(key)
       setBusy(null)
     }
   }
@@ -90,7 +99,7 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
       <Icon as={CircleAlert} className="size-4 text-warning" />
       <Text numberOfLines={1} className="min-w-0 shrink text-meta">{pending.text}</Text>
       <Text className="text-meta text-muted-foreground">· 没确认送达 ·</Text>
-      <Button variant="ghost" disabled={busy !== null} onPress={() => void send('retry', pending.text)}><Icon as={busy === 'retry' ? LoaderCircle : RotateCw} /><Text>再试</Text></Button>
+      <Button variant="ghost" disabled={busy !== null || !shared?.writable} onPress={() => void send('retry', pending.text)}><Icon as={busy === 'retry' ? LoaderCircle : RotateCw} /><Text>再试</Text></Button>
     </View> : <View accessibilityRole="radiogroup" accessibilityLabel="选一个回答" className="gap-2">
       {question.choices.map((choice, index) => {
         const key = `choice:${choice.label}`
@@ -112,7 +121,7 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
         </Button>
       </View>
     </View>}
-    <ErrorText error={pending ? '' : error} />
+    <ErrorText error={pending && failed !== 'retry' ? '' : error} />
   </ActionCard>
 }
 
