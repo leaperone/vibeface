@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "imageId": "477368533aa28c0413389a75cc7b109d9191a778124585f1db82783e0d6a562b",
+  "schemaHash": "05ce7650d4c5955a83d5fecf51eb031db976fdf749f94062e9f65cf92ae6a74d",
+  "elfSha256": "a6127e7762bd39558d29756a978284ddec9fa66423c151a1efee66ede9045cab",
+  "proofs": [
+    {
+      "receipt": "relation-1.receipt",
+      "public": "relation-1.json"
+    },
+    {
+      "receipt": "relation-2.receipt",
+      "public": "relation-2.json"
+    },
+    {
+      "receipt": "relation-3.receipt",
+      "public": "relation-3.json"
+    },
+    {
+      "receipt": "relation-4.receipt",
+      "public": "relation-4.json"
+    }
+  ]
+}
