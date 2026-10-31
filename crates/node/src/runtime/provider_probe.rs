@@ -1,8 +1,9 @@
 use super::{Runtime, codex_server::Link};
 use crate::config::ManagerSettings;
 use crate::providers::{
-    self, AppServer, Authentication, CatalogCoverage, EffortOptions, LaunchCheck, ModelCatalog,
-    ModelChoice, ProbeCode, ProbeIssue, ProbeStage, Provider, ProviderProbe, ProviderReadiness,
+    self, AppServer, AppServerMode, Authentication, CatalogCoverage, EffortOptions, LaunchCheck,
+    ModelCatalog, ModelChoice, ProbeCode, ProbeIssue, ProbeStage, Provider, ProviderProbe,
+    ProviderReadiness,
 };
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
@@ -19,6 +20,17 @@ struct ProbeInput {
     server: Option<AppServer>,
     epoch: u64,
     manager: Option<ManagerSettings>,
+}
+
+#[derive(serde::Serialize)]
+enum LaunchIdentity<'a> {
+    Process {
+        bin: PathBuf,
+        env: &'a BTreeMap<String, String>,
+    },
+    System {
+        socket: Option<&'a std::path::Path>,
+    },
 }
 
 pub(super) struct CachedProviderProbe {
@@ -66,8 +78,24 @@ impl Runtime {
         entry.probe.clone()
     }
 
-    pub(crate) fn provider_config_id(&self, provider: Provider) -> String {
-        self.cached_probe(provider, &self.providers()).config_id
+    pub(crate) fn provider_generation(
+        &self,
+        provider: Provider,
+        local: &providers::Local,
+    ) -> anyhow::Result<String> {
+        let server = &local.switches.codex_app_server;
+        let launch = if provider.on_app_server() && server.mode == AppServerMode::System {
+            LaunchIdentity::System {
+                socket: server.socket.as_deref(),
+            }
+        } else {
+            LaunchIdentity::Process {
+                bin: local.bin(provider),
+                env: local.env.get(provider),
+            }
+        };
+        self.identity
+            .provider_fingerprint(&serde_json::to_vec(&(provider, launch))?)
     }
 
     pub(crate) async fn provider_probe_snapshot(&self, provider: Provider) -> ProviderProbe {
@@ -414,6 +442,150 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn runtime_generation_follows_effective_launch_and_not_probe_epochs() -> anyhow::Result<()>
+    {
+        let (node, _, dir) = super::super::triage::tests::node().await?;
+        let provider = Provider::Codex;
+        let mut local = node.providers();
+        local.switches.codex_app_server = AppServer {
+            mode: AppServerMode::Spawn,
+            socket: Some("/unused/socket-a".into()),
+        };
+        local.bins.insert(provider, "/fixture/codex".into());
+        local.env.apply(
+            provider,
+            BTreeMap::from([
+                ("CODEX_HOME".into(), Some("/fixture/home".into())),
+                ("CPA_API_KEY".into(), Some("fixture-secret-a".into())),
+            ]),
+        )?;
+        let generation = node.provider_generation(provider, &local)?;
+        let first = node.cached_probe(provider, &local);
+        node.provider_probes.lock().unwrap().clear();
+        let restarted = node.cached_probe(provider, &local);
+        assert_ne!(first.config_id, restarted.config_id);
+        assert_eq!(node.provider_generation(provider, &local)?, generation);
+        node.provider_probes
+            .lock()
+            .unwrap()
+            .get_mut(&provider)
+            .unwrap()
+            .input
+            .epoch = u64::MAX;
+        let reconnected = node.cached_probe(provider, &local);
+        assert_ne!(restarted.config_id, reconnected.config_id);
+        assert_eq!(node.provider_generation(provider, &local)?, generation);
+
+        let mut changed = local.clone();
+        changed
+            .bins
+            .insert(provider, "/fixture/another-codex".into());
+        assert_ne!(node.provider_generation(provider, &changed)?, generation);
+        for (name, value) in [
+            ("CODEX_HOME", "/fixture/other-home"),
+            ("CPA_API_KEY", "fixture-secret-b"),
+        ] {
+            let mut changed = local.clone();
+            changed.env.apply(
+                provider,
+                BTreeMap::from([(name.into(), Some(value.into()))]),
+            )?;
+            assert_ne!(node.provider_generation(provider, &changed)?, generation);
+        }
+        local.switches.codex_app_server.socket = Some("/unused/socket-b".into());
+        local.env.apply(
+            Provider::Claude,
+            BTreeMap::from([("ANTHROPIC_API_KEY".into(), Some("unrelated-secret".into()))]),
+        )?;
+        assert_eq!(node.provider_generation(provider, &local)?, generation);
+        local.switches.codex_app_server.mode = AppServerMode::System;
+        let system = node.provider_generation(provider, &local)?;
+        assert_ne!(system, generation);
+        local.bins.insert(provider, "/another/unused-bin".into());
+        local.env.apply(
+            provider,
+            BTreeMap::from([("CPA_API_KEY".into(), Some("unused-secret".into()))]),
+        )?;
+        assert_eq!(node.provider_generation(provider, &local)?, system);
+        local.switches.codex_app_server.socket = Some("/fixture/other-system".into());
+        assert_ne!(node.provider_generation(provider, &local)?, system);
+
+        use std::os::unix::ffi::OsStringExt;
+        local.switches.codex_app_server.mode = AppServerMode::Spawn;
+        local
+            .bins
+            .insert(provider, std::ffi::OsString::from_vec(vec![0xff]).into());
+        assert!(node.provider_generation(provider, &local).is_err());
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_probe_from_the_first_configuration_cannot_overwrite_its_replacement()
+    -> anyhow::Result<()> {
+        let (node, _, dir) = super::super::triage::tests::node().await?;
+        let (fixture_dir, input) = fixture(
+            r#"
+[ "$*" = "auth status --json" ] || exit 9
+touch "$PROBE_READY"
+while [ ! -f "$PROBE_RELEASE" ]; do sleep 0.01; done
+printf '%s\n' '{"loggedIn":false}'
+exit 1
+"#,
+        )?;
+        let ready = fixture_dir.join("ready");
+        let release = fixture_dir.join("release");
+        let provider = Provider::Claude;
+        let mut original = node.providers();
+        original.bins.insert(provider, input.bin);
+        original.switches.execution.insert(provider);
+        original.env.apply(
+            provider,
+            BTreeMap::from([
+                ("PROBE_READY".into(), Some(ready.display().to_string())),
+                ("PROBE_RELEASE".into(), Some(release.display().to_string())),
+                ("ANTHROPIC_API_KEY".into(), Some("fixture-secret-a".into())),
+            ]),
+        )?;
+        *node.providers.lock().unwrap() = original.clone();
+        let generation = node.provider_generation(provider, &original)?;
+        let first = node.provider_probe_snapshot(provider).await;
+        let running = node.clone();
+        let pending = tokio::spawn(async move { running.probe_provider(provider).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        let mut changed = original.clone();
+        changed.env.apply(
+            provider,
+            BTreeMap::from([("ANTHROPIC_API_KEY".into(), Some("fixture-secret-b".into()))]),
+        )?;
+        *node.providers.lock().unwrap() = changed.clone();
+        let between = node.provider_probe_snapshot(provider).await;
+        assert_ne!(node.provider_generation(provider, &changed)?, generation);
+        *node.providers.lock().unwrap() = original.clone();
+        let current = node.provider_probe_snapshot(provider).await;
+        assert_ne!(first.config_id, between.config_id);
+        assert_ne!(first.config_id, current.config_id);
+        assert_eq!(node.provider_generation(provider, &original)?, generation);
+        std::fs::write(&release, b"ready")?;
+        let returned = pending.await?;
+        assert_eq!(returned.config_id, current.config_id);
+        assert_eq!(returned.authentication, Authentication::Unverified);
+        assert_eq!(returned.checked_at_ms, None);
+        let saved = node.provider_probe_snapshot(provider).await;
+        assert_eq!(saved, returned);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        std::fs::remove_dir_all(fixture_dir)?;
+        Ok(())
+    }
 
     fn fixture(script: &str) -> anyhow::Result<(PathBuf, ProbeInput)> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -401,6 +401,8 @@ class Client:
                     "instructions": arguments.get("instructions", "")}
             if arguments.get("project") is not None:
                 body["project"] = arguments["project"]
+        elif method == "delete_bot":
+            body = {"type": "bot_deleted"}
         elif method == "answer":
             scope = arguments.pop("scope_id")
             body = {"type": "message_posted", "message_id": "a-" + arguments["question_id"], "role": "user",
@@ -931,12 +933,15 @@ def fixture_codex(arguments):
         prompt = params["input"][0]["text"]
         guide = bot_guide.get(thread["id"], "")
         cli = re.search(r"Run:\n'(.*?)' tool TOOL_NAME", guide)
-        catalog = guide[guide.find("Available tools:\n"):] if cli else ""
+        catalog_start = guide.find("Discovery tools:\n")
+        catalog = guide[catalog_start:] if cli and catalog_start >= 0 else ""
+        advertised = re.findall(r"(?m)^(\w+)\n[^\n]*\nJSON schema: ([^\n]+)$", catalog)
         history = "\n".join(part.get("text", "") for past in thread["turns"] for item in past["items"]
                             if item["type"] == "userMessage" for part in item["content"])
         initial = {"prompt": prompt, "history": history, "tool_env": bot_env.get(thread["id"], {}), "cwd": thread["cwd"],
                    "session_id": thread["id"] if resumed else None, "tool_cli": cli and cli.group(1),
-                   "custom_tools": re.findall(r"(?m)^(\w+)\n[^\n]*\nJSON schema: ", catalog)}
+                   "custom_tools": [name for name, _ in advertised],
+                   "custom_tool_schemas": {name: json.loads(schema) for name, schema in advertised}}
         bot = BotTurn(stream, thread, turn)
         try:
             fixture_manager(run, initial, bot)
@@ -1175,7 +1180,8 @@ def fixture_codex(arguments):
         threading.Thread(target=connection, args=(stream,), daemon=True).start()
 
 
-READ_TOOLS = {"nodes", "context", "work_status", "call_lookup", "read_skill", "recall", "fetch_url", "list_bots", "read_bot", "list_sessions"}
+DISCOVERY_TOOLS = {"tool_search", "tool_describe", "tool_call", "call_lookup"}
+READ_TOOLS = {"nodes", "context", "history_search", "history_read", "work_status", "call_lookup", "read_skill", "recall", "fetch_url", "list_bots", "read_bot", "list_sessions"}
 WORK_TOOLS = {"dispatch_work", "interrupt_work", "hand_over_session", "propose_provider_config", "apply_provider_config"}
 WAKE_TOOLS = {"remind", "message_bot"}
 SETTINGS_TOOLS = {"update_profile", "save_skill", "remove_skill", "save_schedule", "remove_schedule", "remember", "forget",
@@ -1271,18 +1277,16 @@ def fixture_manager(run, initial, bot):
               "bot_prompt_markers": [marker for marker in
                   ("bot-alpha-instructions-sentinel", "bot-beta-instructions-sentinel") if marker in initial["history"]],
               "node_url": initial["tool_env"]["VIBEFACE_NODE_URL"]}
-    fixture_record(run, "manager-invocations.jsonl", record)
     # A held report keeps a failed task's result from being answered, so it waits on the person.
     if autonomous and (run / "fixture-hold-report").exists():
+        fixture_record(run, "manager-invocations.jsonl", record)
         bot.end("failed")
         return
-    schemas = set(initial["custom_tools"]) - set(context["trigger"].get("unavailable_tools", []))
-    expected_tools = READ_TOOLS | WORK_TOOLS
-    if kind != "agent_task":
-        expected_tools |= WAKE_TOOLS
-    if kind == "human":
-        expected_tools |= SETTINGS_TOOLS
-    require(schemas == expected_tools, "the turn receives the authoritative scoped tool catalog")
+    require(set(initial["custom_tools"]) == DISCOVERY_TOOLS
+            and len(initial["custom_tools"]) == len(DISCOVERY_TOOLS),
+            "the turn advertises exactly the three discovery tools and call_lookup")
+    require(not context["trigger"].get("unavailable_tools"),
+            "the discovery entrypoints remain available in every trigger")
 
     def tool(name, arguments, expected=True, rejection="unknown", discard=False):
         environment = initial["tool_env"]
@@ -1319,6 +1323,35 @@ def fixture_manager(run, initial, bot):
                        "elapsed_ms": round((time.monotonic() - started) * 1000)})
         require(accepted == expected, "scoped tool " + name + " has its expected authority")
         return None if discard else value
+
+    discovered = tool("tool_search", {"limit": 50})
+    cli_discovered = json.loads(fixture_cli(initial, "tool", "tool_search", "--json", '{"limit":50}').stdout)
+    require(cli_discovered == discovered, "the real CLI and direct API discover the same scoped tools")
+    require(discovered["more"] is False, "the bounded discovery page contains the complete scoped catalog")
+    names = [row["name"] for row in discovered["tools"]]
+    expected_tools = READ_TOOLS | WORK_TOOLS | DISCOVERY_TOOLS
+    if kind != "agent_task":
+        expected_tools |= WAKE_TOOLS
+    if kind == "human":
+        expected_tools |= SETTINGS_TOOLS
+    require(set(names) == expected_tools and len(names) == len(expected_tools),
+            "discovery returns the authoritative read, work, wake and settings groups for this trigger")
+    for name in sorted(expected_tools):
+        described = tool("tool_describe", {"name": name})
+        require(described["name"] == name and described["description"]
+                and described["input_schema"]["type"] == "object"
+                and described["input_schema"]["additionalProperties"] is False,
+                "every discovered target exposes its actual bounded input schema")
+        if name in DISCOVERY_TOOLS:
+            require(described["input_schema"] == initial["custom_tool_schemas"][name],
+                    "advertised discovery schemas match the Node's authoritative descriptions")
+    for name in sorted((SETTINGS_TOOLS | WAKE_TOOLS) - expected_tools):
+        tool("tool_describe", {"name": name}, expected=False, rejection="unknown or unavailable target tool")
+    fixture_record(run, "manager-catalogs.jsonl", {"conversation_id": context["conversation_id"],
+                   "trigger": trigger, "kind": kind, "advertised": sorted(initial["custom_tools"]),
+                   "available": sorted(names), "unavailable": sorted((SETTINGS_TOOLS | WAKE_TOOLS) - expected_tools),
+                   "cli_matches_api": True})
+    fixture_record(run, "manager-invocations.jsonl", record)
 
     def dispatch_cli(arguments, expected=True, rejection=""):
         """`vibeface tool dispatch_work` from the Agent's Shell: the CLI registers, then talks to the socket itself."""
@@ -2447,7 +2480,7 @@ def bot_settings_checks(run, a, network, passed):
         {"name": "update_profile", "arguments": {**profile, "name": "Other"}, "accepted": False,
          "rejection": "different change"},
         {"name": "update_profile", "arguments": {"call_ref": "model", "model": "other"}, "accepted": False,
-         "rejection": "only in Settings"},
+         "rejection": "arguments.model is not allowed"},
         {"name": "save_skill", "arguments": {"call_ref": "skill", "name": "Digest", "description": "Summarize commits",
                                              "body": "List yesterday's commits by author."}},
         {"name": "save_schedule", "arguments": schedule},
@@ -2455,7 +2488,12 @@ def bot_settings_checks(run, a, network, passed):
     ]}))
     first, retry = results(receipt["trigger"], "update_profile")[:2]
     lookup = results(receipt["trigger"], "call_lookup")[0]["result"]
-    require(first["result"] == retry["result"] == lookup and first["result"]["cause"]["message_id"] == "bot-settings",
+    first_change = {key: value for key, value in first["result"].items() if key != "call_record"}
+    looked_up_change = {key: value for key, value in lookup.items() if key != "call_record"}
+    require(first["result"] == retry["result"] and first_change == looked_up_change
+            and first["result"]["cause"]["message_id"] == "bot-settings"
+            and first["result"]["call_record"]["call_ref"] == lookup["call_record"]["call_ref"] == "profile"
+            and lookup["call_record"]["execution"] == "applied" and lookup["call_record"]["confirmation"] == "confirmed",
             "a retried or looked-up call_ref returns the one recorded change")
     view = snapshot()
     changes = view["changes"]
@@ -2577,7 +2615,8 @@ def provider_runtime_checks(run, workspace, node, network, passed):
     settings["manager"]["model"] = "fixture-quota-before-start"
     settings["manager"]["backup"] = {"automatic": False, "candidates": [
         {"provider": "codex", "model": "fixture-model", "reasoning_effort": "medium"}]}
-    tools_before = len(fixture_records(run, "manager-tools.jsonl"))
+    tools_before = [row for row in fixture_records(run, "manager-tools.jsonl")
+                    if row["accepted"] and row["name"] in WORK_TOOLS | WAKE_TOOLS | SETTINGS_TOOLS]
     try:
         node.client.call("configure_node", settings)
         disabled = node.client.rpc("message", conversation_id=scope, message_id="runtime-default-off",
@@ -2605,7 +2644,8 @@ def provider_runtime_checks(run, workspace, node, network, passed):
                 and runtime["switched_from"]["model"] == "fixture-quota-before-start"
                 and runtime["switch_reason"] == "quota" and not completed["retryable"],
                 "the durable runtime binds the one allowed fallback and submitted effort to the same delivery")
-        require(len(fixture_records(run, "manager-tools.jsonl")) == tools_before,
+        require([row for row in fixture_records(run, "manager-tools.jsonl")
+                 if row["accepted"] and row["name"] in WORK_TOOLS | WAKE_TOOLS | SETTINGS_TOOLS] == tools_before,
                 "neither the refused turn nor the backup repeats a tool effect")
         node.client.call("configure_node", original)
         frozen = next(job for job in node.client.rpc("conversation", conversation_id=scope)["scheduler"]["jobs"]
@@ -3496,7 +3536,8 @@ def phase4_acceptance(options):
         require(question["conversation_id"] == conversation, "B's question lands in the chat that owns the child's thread")
         task_turn = next(row for row in records(b) if row["trigger"] == "task:" + task)
         require(task_turn["kind"] == "agent_task", "B's own Agent runs the task")
-        refused = [row for row in records(b, "manager-tool-errors.jsonl") if row["trigger"] == "task:" + task]
+        refused = [row for row in records(b, "manager-tool-errors.jsonl")
+                   if row["trigger"] == "task:" + task and row["name"] == "answer_approval"]
         require(len(refused) == 1, "B's Agent has no tool to answer for the user")
         answered = a.client.rpc("answer", question_id=question_id, text="允许", scope_id=conversation)
         require(answered["status"] == "answered" and a.client.rpc("answer", question_id=question_id, text="允许",

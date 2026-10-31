@@ -1,6 +1,7 @@
 //! Node-side triage of local agent sessions: one event shape for hooks, App Server and session
 //! scans, the coordination Agent's prompts, outlet choice, webhook signing and delivery, and hook
 //! installation. The coordination Agent judges; nothing here decides what matters.
+use crate::crypto::hmac_sha256;
 use crate::providers::{Provider, Watch};
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -542,26 +543,6 @@ impl TriageConfig {
     }
 }
 
-/// HMAC-SHA256 (RFC 2104) over `sha2`, to avoid a dependency for twenty lines.
-pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut block = [0u8; 64];
-    if key.len() > 64 {
-        block[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        block[..key.len()].copy_from_slice(key);
-    }
-    let pad = |byte: u8| block.map(|b| b ^ byte);
-    let inner = Sha256::new()
-        .chain_update(pad(0x36))
-        .chain_update(message)
-        .finalize();
-    Sha256::new()
-        .chain_update(pad(0x5c))
-        .chain_update(inner)
-        .finalize()
-        .into()
-}
-
 /// `X-Vibeface-Signature` for a body sent at `timestamp` (Unix seconds).
 pub fn signature(secret: &[u8], timestamp: i64, body: &str) -> String {
     format!(
@@ -749,20 +730,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hmac_matches_rfc_4231() {
-        let key = [0x0b; 20];
-        assert_eq!(
-            hex::encode(hmac_sha256(&key, b"Hi There")),
-            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
-        );
-        let long = [0xaa; 131];
-        assert_eq!(
-            hex::encode(hmac_sha256(
-                &long,
-                b"Test Using Larger Than Block-Size Key - Hash Key First"
-            )),
-            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
-        );
+    fn webhook_signature_binds_the_timestamp() {
         assert!(signature(b"k", 1, "{}").starts_with("v1="));
         assert_ne!(signature(b"k", 1, "{}"), signature(b"k", 2, "{}"));
     }

@@ -3915,7 +3915,7 @@ pub(super) mod tests {
                 provider: Provider::Codex,
                 model: Some("fixture".into()),
                 reasoning_effort: None,
-                generation: node.provider_config_id(Provider::Codex),
+                generation: node.provider_generation(Provider::Codex, &node.providers())?,
                 session_generation: claimed.session_generation,
                 delivery_id: attempt.clone(),
                 stage: vibeface_bridge::failure::ProviderStage::Validate,

@@ -4,8 +4,10 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 const EVENT_DOMAIN: &[u8] = b"vibeface:event:v1:";
+const PROVIDER_CONFIG_DOMAIN: &[u8] = b"vibeface:provider-runtime-key:v1";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +52,12 @@ impl LocalIdentity {
             vibeface_secure::Identity::from_secret_hex(&self.secret_key_hex)?
                 .sign(domain, payload)?,
         )
+    }
+
+    pub(crate) fn provider_fingerprint(&self, payload: &[u8]) -> Result<String> {
+        let seed = Zeroizing::new(self.key()?.to_bytes());
+        let key = Zeroizing::new(hmac_sha256(&seed[..], PROVIDER_CONFIG_DOMAIN));
+        Ok(hex::encode(hmac_sha256(&key[..], payload)))
     }
     pub fn sign_event(&self, mut event: Event) -> Result<SignedEvent> {
         ensure!(
@@ -219,6 +227,25 @@ pub fn random_hex(bytes: usize) -> String {
 
 pub fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let pad = |byte: u8| block.map(|b| b ^ byte);
+    let inner = Sha256::new()
+        .chain_update(pad(0x36))
+        .chain_update(message)
+        .finalize();
+    Sha256::new()
+        .chain_update(pad(0x5c))
+        .chain_update(inner)
+        .finalize()
+        .into()
 }
 fn decode32(value: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(value).context("invalid hexadecimal key/hash")?;
@@ -716,6 +743,52 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
 mod tests {
 
     use super::*;
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        assert_eq!(
+            hex::encode(hmac_sha256(&[0x0b; 20], b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            hex::encode(hmac_sha256(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn provider_fingerprints_are_stable_and_private_to_the_device() -> Result<()> {
+        let identity = LocalIdentity {
+            secret_key_hex: hex::encode([7; 32]),
+        };
+        let payload = b"provider-config-fixture";
+        let tag = identity.provider_fingerprint(payload)?;
+        assert_eq!(
+            tag,
+            "19cdf6bf40dd7beddd0fcb28b93d1ce8450c62da516aa4d1147c971fcc47d714"
+        );
+        let restored: LocalIdentity = serde_json::from_slice(&serde_json::to_vec(&identity)?)?;
+        assert_eq!(restored.provider_fingerprint(payload)?, tag);
+        assert_ne!(identity.provider_fingerprint(b"changed-config")?, tag);
+        assert_ne!(
+            LocalIdentity {
+                secret_key_hex: hex::encode([8; 32]),
+            }
+            .provider_fingerprint(payload)?,
+            tag
+        );
+        assert!(
+            LocalIdentity {
+                secret_key_hex: "invalid".into(),
+            }
+            .provider_fingerprint(payload)
+            .is_err()
+        );
+        Ok(())
+    }
+
     #[test]
     fn signatures_pin_identity_and_original_bytes() -> Result<()> {
         let owner = LocalIdentity::generate();

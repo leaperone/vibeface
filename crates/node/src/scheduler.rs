@@ -356,7 +356,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         settings.reasoning_effort = Some(effort.to_owned());
     }
     let provider = settings.provider;
-    let generation = node.provider_config_id(provider);
+    let generation = node.provider_generation(provider, &local_providers)?;
     let readiness = node.provider_readiness(provider, &settings.model).await;
     if matches!(readiness, crate::providers::ProviderReadiness::Starting) {
         return Ok(None);
@@ -687,6 +687,8 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                 let Some(backup) = backup else {
                     return Err(error);
                 };
+                let backup_generation =
+                    node.provider_generation(backup.provider, &local_providers)?;
                 node.seal_manager_tools(&attempt.id).await?;
                 node.finish_manager_attempt(&attempt.id).await;
                 registered = false;
@@ -705,7 +707,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                     provider: backup.provider,
                     model: (!backup.model.is_empty()).then(|| backup.model.clone()),
                     reasoning_effort: backup.reasoning_effort.clone(),
-                    generation: uuid::Uuid::new_v4().to_string(),
+                    generation: backup_generation,
                     session_generation: generation,
                     stage: ProviderStage::Validate,
                     execution: TurnExecution::NotStarted,
