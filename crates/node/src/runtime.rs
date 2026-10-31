@@ -216,6 +216,7 @@ fn workspace_question_summary(question: &Value) -> Value {
 fn workspace_session_summary(session: &Value) -> Value {
     let mut row = json!({});
     for key in [
+        "conversation_id",
         "node",
         "session_id",
         "agent",
