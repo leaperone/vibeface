@@ -17,6 +17,7 @@ export const Route = createFileRoute('/')({
 function HomePage() {
   return (
     <SiteLayout>
+      <div className="landing">
         <section className="landing-hero" aria-labelledby="hero-title">
           <div className="hero-copy-block">
             <p className="hero-kicker">自己的设备，自己的 Agent <span aria-hidden="true">/</span> Nightly</p>
@@ -26,12 +27,18 @@ function HomePage() {
               <Link className="button button-primary" to="/docs/$" params={{ _splat: 'install' }}>开始安装 <ArrowRight size={16} aria-hidden="true" /></Link>
               <Link className="button button-quiet" to="/docs/$" params={{ _splat: 'overview' }}>先了解 Vibeface <ArrowRight size={16} aria-hidden="true" /></Link>
             </div>
+            <ul className="hero-proof" aria-label="Vibeface 的核心边界">
+              <li><span>01</span><strong>本机执行</strong><small>复用已登录 Agent</small></li>
+              <li><span>02</span><strong>签名历史</strong><small>带因果依赖的 DAG</small></li>
+              <li><span>03</span><strong>权限可见</strong><small>先知道谁能读到内容</small></li>
+            </ul>
           </div>
 
           <figure className="hero-figure" aria-label="Bot 协调、本机 Agent 执行与共享历史的关系示意">
             <div className="hero-visual">
               <div className="visual-grid" aria-hidden="true" />
               <div className="visual-glow" aria-hidden="true" />
+              <div className="visual-readout" aria-hidden="true"><span>PERSONAL NETWORK / 01</span><strong>READY TO HAND OFF</strong></div>
               <div className="orbit orbit-one" aria-hidden="true" />
               <div className="orbit orbit-two" aria-hidden="true" />
               <div className="orbit orbit-three" aria-hidden="true" />
@@ -45,21 +52,28 @@ function HomePage() {
         </section>
 
         <section className="landing-section landing-story" aria-labelledby="story-title">
+          <p className="section-eyebrow">01 / 工作流</p>
           <h2 id="story-title">一条需求，留在同一段聊天。</h2>
           <p className="story-prompt"><span>示例需求</span>检查这个项目的失败测试，并说明需要怎样修改。</p>
-          <ol className="work-story" role="list">
-            <li><h3>把需求交给 Bot</h3><p>交代目标、项目和希望使用的设备。Bot 结合这段聊天的历史组织工作。</p></li>
-            <li><h3>选定电脑执行</h3><p>工作交给已授权、已准备好项目的电脑，由那里的 Agent 读取文件、运行工具。</p></li>
-            <li><h3>回原聊天看结果</h3><p>阶段和持久结果回到原聊天。结果不确定时先核对原任务，不直接重发。</p></li>
-          </ol>
+          <div className="story-frame">
+            <div className="story-frame-meta"><span>WORK LOOP / 01</span><span>PRIVATE NETWORK</span></div>
+            <ol className="work-story" role="list">
+              <li><h3>把需求交给 Bot</h3><p>交代目标、项目和希望使用的设备。Bot 结合这段聊天的历史组织工作。</p></li>
+              <li><h3>选定电脑执行</h3><p>工作交给已授权、已准备好项目的电脑，由那里的 Agent 读取文件、运行工具。</p></li>
+              <li><h3>回原聊天看结果</h3><p>阶段和持久结果回到原聊天。结果不确定时先核对原任务，不直接重发。</p></li>
+            </ol>
+            <div className="story-frame-result"><span>RETURNED TO CHAT</span><strong>阶段与持久结果回到原聊天</strong><small>完整逐字流式进度不作为共享历史保存。</small></div>
+          </div>
         </section>
 
         <section className="landing-system" id="system" aria-labelledby="system-title">
           <div className="system-intro">
+            <p className="section-eyebrow">02 / 结构</p>
             <h2 id="system-title">保留上下文，<br />原有工具继续用。</h2>
             <p>增加长期 Bot 协调和个人设备间的共享历史，执行仍交给本机的 Agent。</p>
             <a className="text-link" href="/docs/bot-and-execution">看看分工怎么安排 <ArrowRight size={16} aria-hidden="true" /></a>
           </div>
+          <p className="system-manifesto">协调可以迁移，<em>执行留在你选择的电脑。</em></p>
           <div className="system-details">
             <article><h3>Bot 与执行分开</h3><p>协调与执行可以分别选择产品。复用自己电脑上的 Codex 或 Claude Code，各自准备程序、登录和项目。</p></article>
             <article><h3>共享 Bot 历史</h3><div><p>带签名和因果依赖的 DAG 同步 Bot 聊天、设置、任务阶段和结果。项目、依赖、登录与原生 SDK 状态不会自动迁移，完整逐字进度不作为共享历史保存。</p><a className="text-link" href="/docs/history-sync">了解同步范围 <ArrowRight size={16} aria-hidden="true" /></a></div></article>
@@ -68,6 +82,7 @@ function HomePage() {
         </section>
 
         <section className="landing-section landing-comparison" aria-labelledby="comparison-title">
+          <p className="section-eyebrow">03 / 选择</p>
           <h2 id="comparison-title">已经有 Agent，还需要这一层吗？</h2>
           <p className="section-copy">原生工具也有远程与自动化入口。按你需要的工作方式选择。</p>
           <dl className="choice-list">
@@ -79,6 +94,7 @@ function HomePage() {
         </section>
 
         <section className="landing-section landing-trust" aria-labelledby="trust-title">
+          <p className="section-eyebrow">04 / 边界</p>
           <h2 id="trust-title">先知道谁能读到内容。</h2>
           <div className="trust-content">
             <dl className="trust-facts">
@@ -95,6 +111,7 @@ function HomePage() {
         </section>
 
         <section className="landing-section landing-start" aria-labelledby="start-title">
+          <p className="section-eyebrow">05 / 开始</p>
           <h2 id="start-title">从一台电脑开始。</h2>
           <p className="section-copy">准备一台支持的 Mac 或 Linux、已安装并登录的 Agent，以及自己的模型服务和项目目录。</p>
           <ol className="start-steps" role="list">
@@ -104,6 +121,7 @@ function HomePage() {
           </ol>
           <p className="nightly-note">当前为 Nightly。正式版前不保留协议、数据格式和 API 的向后兼容。<a href="https://github.com/leaperone/vibeface/releases">查看 Nightly Releases <ArrowUpRight size={14} aria-hidden="true" /></a></p>
         </section>
+      </div>
     </SiteLayout>
   )
 }
