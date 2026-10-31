@@ -267,7 +267,7 @@ queued → claimed → running ─→ completed | failed
 reconciling ─ 查询原回合或本人确认后 → 终态
 ```
 
-Node 每隔几秒用 signal 0 检查待核对记下的进程组，Codex 回合则按记下的线程和回合 ID 复查 App Server，仍在运行就中断。都已结束时自动结清，相应的 agent 任务记为中断；仍有进程组存活时，`conversation.checks` 才列出这条，等本人一键确认。结果未知的工作由 `works[].state == "unverified"` 表示，卡片 ID 为 `work:<work_id>`。同一工作只显示一条：`kind=task` 的工作结果未知时，目标上那一轮管理进程的待核对不再单独显示，结清工作项时一并结清。模型不能结清待核对。
+Node 按记下的 Provider、会话和回合标识读取原结果。只有 Provider 返回明确终态时才自动结清并保存对应结果；读不到或仍在进行时继续待核对，不能仅凭进程退出就认定已停止。`conversation.checks` 列出本会话尚未结清的管理轮，不按进程组是否存活过滤，也可由本人确认结清。结果未知的工作由 `works[].state == "unverified"` 表示，卡片 ID 为 `work:<work_id>`。同一工作只显示一条：`kind=task` 的工作结果未知时，目标上那一轮管理进程的待核对不再单独显示，结清工作项时一并结清。模型不能结清待核对。
 
 Cursor 已发送的回合遇到 bridge 崩溃、断流或超时后记为 `reconciling` 并登记待核对，只退休该 Bot 的进程组。下轮等待旧进程组结束后才能启动新进程，其他 Bot 的回合继续。Node 不重发未知结果的提示，也不因本地进程结束把它改成成功或 Provider 已确认取消。
 
