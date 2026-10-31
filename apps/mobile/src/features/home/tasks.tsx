@@ -5,7 +5,7 @@ import { Pressable, ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
-import { cardState, needsLook, nodeName, staleTaskLabel, taskActive, taskAgent, taskGroup, taskGroups, taskLabel, taskStale, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
+import { cardState, needsLook, nodeName, staleTaskLabel, taskActive, taskAgent, taskGroup, taskGroups, taskLabel, taskProgress, taskStale, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
 import { awaitsAnswer } from '@vibeface/client/workspace/questions.ts'
 import { openWorksFromOverview, overviewFromWorkspace } from '@vibeface/client/workspace/model.ts'
 import type { BotRecord, NodeInfo, OpenWork, OverviewTask } from '@vibeface/client/workspace/types.ts'
@@ -45,7 +45,7 @@ export function TasksScreen() {
       </View>)}
     </View> : visibleWorks.length ? taskGroups.map(({ group, title }) => groups[group].length ? <View key={group} className="gap-2">
       <Text role="heading" className="px-1 text-heading font-semibold">{title} <Text className="text-muted-foreground">{groups[group].length}</Text></Text>
-      {groups[group].map((work) => <TaskRow key={work.work_id} work={work} projected={projected.get(work.work_id)} bot={workspace.bots.find((item) => item.conversation_id === work.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline)} />)}
+      {groups[group].map((work) => <TaskRow key={work.work_id} work={work} projected={projected.get(work.work_id)} bot={workspace.bots.find((item) => item.conversation_id === work.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline)} progress={taskProgress(work, shared?.liveProgress ?? [])} />)}
     </View> : null) : <MobileEmpty bot={bot} />}
   </ScrollView>
 }
@@ -57,7 +57,7 @@ function MobileEmpty({ bot }: { bot?: Pick<BotRecord, 'bot_id' | 'name'> }) {
 type Lookup = { nodes: NodeInfo[]; directory: ReturnType<typeof useDevice>['directory'] }
 type TaskBot = Pick<BotRecord, 'bot_id' | 'conversation_id' | 'name' | 'avatar'>
 
-function TaskRow({ work, projected, bot, lookup, connected }: { work: OpenWork; projected?: Extract<OverviewTask, { kind: 'work' | 'dispatch' }>; bot?: TaskBot; lookup: Lookup; connected: boolean }) {
+function TaskRow({ work, projected, bot, lookup, connected, progress }: { work: OpenWork; projected?: Extract<OverviewTask, { kind: 'work' | 'dispatch' }>; bot?: TaskBot; lookup: Lookup; connected: boolean; progress: string }) {
   const rawState = cardState(work, lookup.nodes, projected?.state)
   const failed = needsLook(rawState) && rawState !== 'dispatch_unverified'
   const stale = taskStale(rawState, connected)
@@ -69,7 +69,7 @@ function TaskRow({ work, projected, bot, lookup, connected }: { work: OpenWork; 
   const device = nodeName(work.target_node, lookup)
   const title = work.title || '任务'
   const href = bot ? `/b/${bot.bot_id}/work/${work.work_id}` as const : undefined
-  const line = failed || rawState === 'dispatch_unverified' ? workFailure(work) : work.summary
+  const line = failed || rawState === 'dispatch_unverified' ? workFailure(work) : progress
   return <View className={cn('min-h-16 flex-row items-center gap-3 rounded-xl border bg-card px-4 py-2.5 shadow-xs dark:border-line-strong', active ? 'border-brand/25' : 'border-border')}>
     {bot ? <BotFace bot={bot} mood="idle" size={28} still /> : <View className="size-8 items-center justify-center rounded-lg bg-muted"><Icon as={Bot} className="text-muted-foreground" /></View>}
     <View className="min-w-0 flex-1 gap-0.5">

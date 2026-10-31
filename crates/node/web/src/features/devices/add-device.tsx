@@ -123,7 +123,7 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
         <SheetHeader className="pr-14"><SheetTitle tabIndex={-1} className="outline-none">添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
         <div className="grid gap-6 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
           {/* A device already asking is the next thing to act on, so it comes before a new link. */}
-          <JoinRequests issuing={result !== null} manage={asManager} onAllowed={(name, manage) => { setAdded({ name, manage }); setResult(null); setError(""); setCopyFailed(false) }} />
+          <JoinRequests issuing={result !== null} manage={asManager} onAllowed={(name, manage) => { setAdded({ name, manage }); setAsManager(false); setResult(null); setError(""); setCopyFailed(false) }} />
           {added && !requests ? <div className="grid gap-3">
             <p role="status" className="flex min-w-0 items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" /><span className="truncate" title={added.name}>{added.manage ? deviceCopy.addedManager(added.name) : `已添加「${added.name}」`}</span></p>
             <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Plus} />再添加一台</Button>

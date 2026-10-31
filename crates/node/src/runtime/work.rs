@@ -45,9 +45,13 @@ impl Runtime {
         let quiet = matches!(signal, Signal::Text(_) | Signal::Progress { .. });
         let (before, (record, receipt)) = {
             let mut store = self.store.lock().await;
-            let before = store
-                .work_record(work_id)?
-                .map(|record| record.state.name());
+            let before = if quiet {
+                None
+            } else {
+                store
+                    .work_record(work_id)?
+                    .map(|record| record.state.name())
+            };
             let applied =
                 store.apply_work_signal(&self.identity, network, work_id, signal, now_ms())?;
             (before, applied)
