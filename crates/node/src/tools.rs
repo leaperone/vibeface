@@ -12,6 +12,9 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Version of the Effect/offered rules, independent of per-attempt token fences.
+pub const PERMISSION_POLICY_VERSION: u64 = 1;
+
 /// Event types `context` filters by; see `EventBody::kind`.
 const EVENT_TYPES: [&str; 12] = [
     "message_posted",

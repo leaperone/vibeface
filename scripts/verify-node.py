@@ -1274,19 +1274,28 @@ def fixture_manager(run, initial, bot):
     if autonomous and (run / "fixture-hold-report").exists():
         bot.end("failed")
         return
-    schemas = set(initial["custom_tools"]) - set(context["trigger"].get("unavailable_tools", []))
+    initial_tools = {"tool_search", "tool_describe", "tool_call", "context", "read_skill", "call_lookup"}
+    require(set(initial["custom_tools"]) == initial_tools,
+            "the provider initially receives discovery and the required history/skill/read-back tools")
     expected_tools = READ_TOOLS | WORK_TOOLS
     if kind != "agent_task":
         expected_tools |= WAKE_TOOLS
     if kind == "human":
         expected_tools |= SETTINGS_TOOLS
-    require(schemas == expected_tools, "the turn receives the authoritative scoped tool catalog")
+    described = set()
 
     def tool(name, arguments, expected=True, rejection="unknown", discard=False):
+        if expected and name not in initial_tools and name not in described:
+            schema = tool("tool_describe", {"tool": name})
+            require(schema["name"] == name and schema["input_schema"]["type"] == "object"
+                    and schema["input_schema"]["additionalProperties"] is False,
+                    "tool discovery returns the original domain schema")
+            described.add(name)
+        target, payload = (name, arguments) if name in initial_tools else ("tool_call", {"tool": name, "arguments": arguments})
         environment = initial["tool_env"]
         request = urllib.request.Request(
             environment["VIBEFACE_NODE_URL"] + "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
-            json.dumps({"toolName": name, "args": arguments, "agentId": "fixture"}).encode(),
+            json.dumps({"toolName": target, "args": payload, "agentId": "fixture"}).encode(),
             {"Content-Type": "application/json", "Authorization": "Bearer " + environment["VIBEFACE_TOOL_TOKEN"]})
         started = time.monotonic()
         try:
@@ -1317,6 +1326,19 @@ def fixture_manager(run, initial, bot):
                        "elapsed_ms": round((time.monotonic() - started) * 1000)})
         require(accepted == expected, "scoped tool " + name + " has its expected authority")
         return None if discard else value
+
+    catalog, offset = set(), 0
+    while True:
+        page = tool("tool_search", {"offset": offset, "limit": 30})
+        names = [row["name"] for row in page["tools"]]
+        require(not (catalog & set(names)), "tool discovery pages do not repeat entries")
+        catalog.update(names)
+        if not page["more"]:
+            break
+        require(isinstance(page["next"], int) and page["next"] > offset,
+                "tool discovery has a forward-only bounded cursor")
+        offset = page["next"]
+    require(catalog == expected_tools, "dynamic discovery exposes exactly this turn's authorized domain tools")
 
     def dispatch_cli(arguments, expected=True, rejection=""):
         """`vibeface tool dispatch_work` from the Agent's Shell: the CLI registers, then talks to the socket itself."""

@@ -232,13 +232,12 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     }
     let provider = settings.provider;
     let thread = provider.prompt_mode() == crate::providers::PromptMode::Thread;
-    let (stable_bot, stable_skills, permission_version) = {
+    let (stable_bot, stable_skills) = {
         let store = node.store.lock().await;
         let bot = store.bot_for_conversation(&network, &conversation)?;
         (
             configured_bot_value(bot.as_ref()),
             skill_index(&store, &network, bot.as_ref())?,
-            store.scheduler_permission_version(&conversation)?,
         )
     };
     let stable_tools = provider.tools_for(TriggerKind::Human);
@@ -262,7 +261,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         workspace: vec![settings.workspace.clone()],
         roots: local_settings.roots.clone(),
         model: Some(settings.model.clone()),
-        permission_version,
+        permission_version: crate::tools::PERMISSION_POLICY_VERSION,
         tools: stable_tool_values,
         skills: stable_skills,
     })?;

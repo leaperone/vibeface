@@ -1653,15 +1653,6 @@ impl Store {
         load_job(&self.connection, conversation, trigger)
     }
 
-    pub(crate) fn scheduler_permission_version(&self, conversation: &str) -> Result<u64> {
-        Ok(
-            query_sessions(&self.connection, "conversation_id=?", [conversation])?
-                .pop()
-                .map(|session| session.permission_version)
-                .unwrap_or(1),
-        )
-    }
-
     pub(crate) fn scheduler_queue_hold(
         &self,
         network: &str,

@@ -6842,6 +6842,101 @@ fn history_pages_read_at_the_turn_basis_by_position_and_type() -> Result<()> {
 }
 
 #[test]
+fn history_search_filters_before_paging_and_keeps_the_recorded_basis() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    for (id, author, text) in [
+        ("s1", &net.a, "Needle 100%_ 中文"),
+        ("s2", &net.b, "needle from B"),
+        ("s3", &net.a, "unrelated text"),
+        ("s4", &net.a, "needle again"),
+    ] {
+        store.append_event(author, &net.network, "c", user(&net, id, text), vec![], 10)?;
+    }
+    let basis = store.version_vector(&net.network)?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "s5", "needle after basis"),
+        vec![],
+        11,
+    )?;
+    let a = net.a.device_id()?;
+    let b = net.b.device_id()?;
+    let kinds = ["message_posted".into()];
+    let filter = || super::HistoryFilter {
+        kinds: &kinds,
+        author: Some(&a),
+        keyword: Some("NEEDLE"),
+    };
+    let (newest, more) = store.search_history_page(&net.network, "c", &basis, None, filter(), 1)?;
+    assert_eq!(newest.len(), 1);
+    assert_eq!(newest[0].event.body.subject(), Some("s4"));
+    assert!(more);
+    let seq = newest[0].event.seq;
+    let (older, more) = store.search_history_page(
+        &net.network,
+        "c",
+        &basis,
+        Some((&a, seq, false)),
+        filter(),
+        1,
+    )?;
+    assert_eq!(older[0].event.body.subject(), Some("s1"));
+    assert!(
+        !more,
+        "nonmatching records cannot invent another matching page"
+    );
+    let (newer, more) = store.search_history_page(
+        &net.network,
+        "c",
+        &basis,
+        Some((&a, older[0].event.seq, true)),
+        filter(),
+        10,
+    )?;
+    assert_eq!(newer.len(), 1);
+    assert_eq!(newer[0].event.body.subject(), Some("s4"));
+    assert!(!more, "events beyond the turn basis are invisible");
+    for keyword in ["100%_", "中文"] {
+        let (found, more) = store.search_history_page(
+            &net.network,
+            "c",
+            &basis,
+            None,
+            super::HistoryFilter {
+                kinds: &kinds,
+                author: None,
+                keyword: Some(keyword),
+            },
+            1,
+        )?;
+        assert_eq!(found[0].event.body.subject(), Some("s1"));
+        assert!(!more);
+    }
+    let (found, more) = store.search_history_page(
+        &net.network,
+        "c",
+        &basis,
+        None,
+        super::HistoryFilter {
+            kinds: &kinds,
+            author: Some(&b),
+            keyword: Some("needle"),
+        },
+        1,
+    )?;
+    assert_eq!(found[0].event.body.subject(), Some("s2"));
+    assert!(!more);
+    let (missing, more) =
+        store.search_history_page(&net.network, "different-scope", &basis, None, filter(), 1)?;
+    assert!(missing.is_empty() && !more);
+    Ok(())
+}
+
+#[test]
 fn a_turn_reads_only_past_the_checkpoint_yet_finds_an_older_trigger() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
