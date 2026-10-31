@@ -93,13 +93,15 @@ export default function ChatScreen() {
   const bot = workspace.bots.find((item) => item.bot_id === botId)
   const id = bot?.conversation_id
   const chat = id ? workspace.conversations[id] : undefined
+  const live = useLive()
+  const latestWorkspace = useRef(workspace)
+  latestWorkspace.current = workspace
   const [drafts, setDrafts] = useState<Record<string, { text: string; files: Attachment[] }>>({})
   const [launching, setLaunching] = useState(false)
   const draft = (id && drafts[id]) || { text: '', files: [] }
   const setDraft = (next: Partial<typeof draft>) => { if (id) setDrafts((current) => ({ ...current, [id]: { ...draft, ...next } })) }
-  useEffect(() => id ? workspace.actions.open(id) : undefined, [id])
+  useFocusEffect(useCallback(() => id ? latestWorkspace.current.actions.open(id) : undefined, [id, live?.generation]))
   const extras = useChatExtras(id ?? '', botId, (text) => setDraft({ text }))
-  const live = useLive()
   const device = useDevice()
   // As on the web: until a device can reply, the empty chat says so and points a manager at the AI settings instead of offering starters.
   const reach = live ? botReach(live.nodes) : 'ready'

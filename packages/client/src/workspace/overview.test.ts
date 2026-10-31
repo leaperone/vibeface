@@ -1,7 +1,8 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { openWorksFromOverview, overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
-import type { BotRecord, NodeInfo, OpenWork, Question } from "./types.ts"
+import { cardState, overviewScope, taskGroup, taskLabel, unrepresentedOverviewChecks, workspaceActivities } from "./labels.ts"
+import type { BotRecord, NodeInfo, OpenWork, PendingCheck, Question } from "./types.ts"
 
 const bot = (conversation_id: string, bot_id = `bot-${conversation_id}`, name = conversation_id): BotRecord => ({
   bot_id, conversation_id, name, instructions: "", models: {}, skills: null, avatar: null, avatar_version: null,
@@ -109,7 +110,6 @@ test("a failed open work stays on the task page", () => {
   assert.deepEqual(overview.tasks.map((task) => [task.work_id, task.outcome]), [["work-1", "failed"]])
 })
 
-
 test("accepted records require a frozen selection while dispatch and overview cards stay summaries", () => {
   const accepted = work()
   assert.deepEqual(accepted.resolved, { provider: "codex", model: null })
@@ -121,9 +121,146 @@ test("accepted records require a frozen selection while dispatch and overview ca
   assert.equal(dispatch?.state, "dispatch_waiting")
   assert.equal(dispatch?.resolved, undefined)
   const overview = overviewFromWorkspace({ openWorks: [accepted], bots: [bot("chat-1")], questions: [], nodes: [node("worker")] })
-  const [card] = openWorksFromOverview(overview)
+  const [card] = openWorksFromOverview(overview, [])
   assert.equal(card?.work_id, accepted.work_id)
   assert.equal(card?.state, "running")
   assert.equal(card && "resolved" in card, false)
   assert.equal(card && "prompt" in card, false)
+})
+
+test("a bounded overview adds observations without deleting known work or replacing its full fields", () => {
+  const known = Array.from({ length: 257 }, (_, index) => work({ work_id: `w-${index}`, prompt: `完整请求 ${index}`, result_text: "已有输出", trigger: "message:known" }))
+  const overview = parseWorkspaceOverview({
+    tasks: known.slice(0, 256).map((item) => ({ ...item, kind: "work", prompt: undefined, result_text: undefined, summary: "另一次读取" })),
+    deliveries: [{ work_id: "delivery-only", conversation_id: "chat-1", state: "accepted_waiting_sync", target_node: "worker" },
+      { work_id: "w-0", conversation_id: "other-chat", state: "stop_waiting", target_node: "other" }],
+    truncated: true, consistency: "partial", coverage: { source: "workspace_overview", complete: false, truncated: true, remote_owners: [{ owner: "remote", reason: "remote_scheduler_not_queried" }] },
+  })
+  const merged = openWorksFromOverview(overview, known)
+  assert.equal(merged.length, 259)
+  assert.equal(merged[0], known[0], "the bounded read cannot establish that its fields are newer")
+  assert.deepEqual(merged.slice(0, 257), known, "all prompt, result and causal fields remain intact")
+  assert.equal(merged[257]?.state, "dispatch_waiting")
+  assert.equal(merged[258]?.stop, "stop_waiting")
+  assert.equal(cardState(merged[257], [], overview.tasks[256]), "accepted_waiting_sync")
+  assert.equal(cardState(merged[258], [], overview.tasks[257]), "stop_waiting")
+  const notes = overviewScope(overview.coverage).join(" · ")
+  assert.match(notes, /部分记录/)
+  assert.match(notes, /截断/)
+  assert.match(notes, /尚未读取其他设备的后台工作/)
+  assert.doesNotMatch(notes, /0 项|另有/, "unknown omission counts are not fabricated")
+  assert.match(overviewScope({ ...overview.coverage, omitted_tasks: 3 }).join(" · "), /本次总览未返回 3 项任务/)
+})
+
+test("task confirmation outranks a running projection while delivery, stop and real outcomes remain distinct", () => {
+  const running = work()
+  const offline = [node("worker", false)]
+  assert.equal(cardState(running, offline, { state: "running", outcome: null }), "awaiting_confirmation")
+  assert.equal(taskGroup(cardState(running, offline, { state: "running", outcome: null }), false), "attention")
+  const disconnected = [{ ...node("worker"), capabilities: { ...node("worker").capabilities!, codex_connected: false } }]
+  assert.equal(cardState(running, disconnected, { state: "running", outcome: null }), "awaiting_confirmation")
+  assert.equal(cardState(work({ state: "unverified", outcome: "unverified" }), [], { state: "running", outcome: null }), "awaiting_confirmation")
+  assert.equal(cardState(work({ outcome: "unverified" }), [], { state: "running", outcome: null }), "unverified")
+  for (const state of ["unknown", "unverified", "awaiting_confirmation"]) assert.equal(taskGroup(state, false), "attention")
+  for (const state of ["dispatch_waiting", "accepted_waiting_sync", "stop_waiting", "stop_timed_out", "dispatch_unverified"] as const) assert.equal(cardState(running, [], { state, outcome: null }), state)
+  for (const outcome of ["completed", "interrupted", "failed", "rejected"] as const) {
+    const ended = work({ state: "finished", outcome })
+    assert.equal(cardState(ended, offline, { state: "running", outcome: null }), outcome)
+  }
+  const ended = parseWorkspaceOverview({ tasks: [{ ...running, kind: "work", state: "finished", outcome: "completed", remote_reachable: false }] })
+  assert.equal(ended.tasks[0]?.outcome, "completed", "offline now does not invalidate an already recorded result")
+  const stopped = parseWorkspaceOverview({
+    bots: [bot("chat-1")], tasks: [{ ...running, kind: "work", state: "finished", outcome: "completed" }, { ...running, work_id: "unknown", kind: "work", state: "unverified", outcome: "unverified" }],
+    deliveries: [{ work_id: running.work_id, conversation_id: running.conversation_id, state: "stop_waiting" }, { work_id: "unknown", conversation_id: running.conversation_id, state: "stop_waiting" }],
+    checks: [{ check_id: "process", conversation_id: "chat-1" }],
+  })
+  assert.equal(stopped.tasks[0]?.outcome, "completed", "a pending stop does not erase a terminal result")
+  assert.equal(stopped.tasks[1]?.outcome, "unverified", "a stop does not replace an unknown result with an active state")
+  assert.deepEqual(stopped.tasks[2]?.navigation, { bot_id: "bot-chat-1", conversation_id: "chat-1" })
+})
+
+test("unordered work snapshots retain terminal outcomes and leave ambiguous results unknown", () => {
+  const observed = (extra: Partial<OpenWork>) => parseWorkspaceOverview({ tasks: [{ ...work(extra), kind: "work" }] }).tasks[0]
+  const online = [node("worker")]
+  const running = work()
+  const failed = observed({ state: "finished", outcome: "failed", failure_reason: "总览记录的失败原因" })
+  const state = cardState(running, online, failed)
+  assert.equal(state, "failed", "a failed observation cannot become a generic finished success")
+  assert.equal(taskLabel(state), "失败")
+  assert.equal(taskGroup(state, false), "attention")
+  assert.equal(cardState(work({ state: "finished", outcome: "failed" }), online, observed({})), "failed")
+  assert.equal(cardState(running, online, observed({ state: "finished", outcome: "completed" })), "completed")
+  assert.equal(cardState(work({ state: "finished", outcome: "completed" }), online, observed({})), "completed")
+  assert.equal(cardState(work({ state: "unverified", outcome: "unverified" }), online, failed), "awaiting_confirmation")
+  assert.equal(cardState(work({ state: "finished", outcome: "completed" }), online, observed({ state: "unverified", outcome: "unverified" })), "unverified")
+  for (const [known, projected] of [["completed", "failed"], ["failed", "completed"]] as const) {
+    assert.equal(cardState(work({ state: "finished", outcome: known }), online, observed({ state: "finished", outcome: projected })), "unknown", "neither snapshot exposes the finish rank that settles conflicting results")
+  }
+  assert.equal(cardState(running, online, observed({ state: "finished", outcome: null })), "unknown")
+  assert.equal(cardState(work({ state: "dispatch_unverified" }), online, observed({ state: "finished", outcome: "completed" })), "dispatch_unverified")
+  assert.equal(cardState(work({ state: "finished", outcome: "rejected" }), online, observed({})), "rejected", "retrying an existing DAG work ID returns its original result")
+  const merged = openWorksFromOverview(parseWorkspaceOverview({ tasks: [{ ...work(), kind: "work", state: "finished", outcome: "failed" }] }), [running])
+  assert.equal(merged[0], running, "display reconciliation never rewrites complete request, output or causal fields")
+})
+
+test("overview task checks only fold into a visible unverified work on this conversation and device", () => {
+  const known = work({ kind: "task", state: "unverified", outcome: "unverified", target_node: "entry" })
+  const nodes = [node("entry", true, true), node("worker")]
+  const overview = parseWorkspaceOverview({ checks: [{ check_id: "process-work", conversation_id: known.conversation_id, trigger: `task:${known.work_id}` }, { check_id: "process-chat", conversation_id: known.conversation_id, trigger: "message:one" }] })
+  assert.equal(overview.tasks[0]?.work_id, known.work_id)
+  assert.deepEqual(overview.tasks[0]?.kind === "check" && overview.tasks[0].work_ids, [known.work_id])
+  const ids = (works: OpenWork[], available = nodes) => unrepresentedOverviewChecks(overview, works, available).map((check) => check.check_id)
+  assert.deepEqual(ids([known]), ["process-chat"])
+  assert.deepEqual(ids([]), ["process-work", "process-chat"], "a bounded-out work cannot hide the only available check")
+  assert.deepEqual(ids([{ ...known, conversation_id: "other-chat" }]), ["process-work", "process-chat"])
+  assert.deepEqual(ids([{ ...known, target_node: "worker" }]), ["process-work", "process-chat"])
+  assert.deepEqual(ids([known], []), ["process-work", "process-chat"], "the check device must be known, not guessed")
+  assert.deepEqual(ids([work({ ...known, state: "running", outcome: null })]), ["process-work", "process-chat"], "an active task does not replace a separate process check")
+  const bounded = parseWorkspaceOverview({ tasks: [{ ...known, kind: "task" }], checks: [{ check_id: "process-work", conversation_id: known.conversation_id, trigger: `task:${known.work_id}` }] })
+  assert.deepEqual(unrepresentedOverviewChecks(bounded, openWorksFromOverview(bounded, []), nodes), [], "an overview-only unverified work also represents its local task check")
+})
+
+test("bounded check identities use the complete known Bot catalog without changing the received snapshot", () => {
+  const bots = Array.from({ length: 257 }, (_, index) => bot(`chat-${index + 1}`))
+  const overview = parseWorkspaceOverview({ bots: bots.slice(0, 256), checks: [{ check_id: "only-check", conversation_id: "chat-257", trigger: "message:one" }], truncated: true })
+  const checks = unrepresentedOverviewChecks(overview, [], [], bots)
+  assert.deepEqual(checks[0]?.bot, bots[256])
+  assert.deepEqual(checks[0]?.navigation, { bot_id: "bot-chat-257", conversation_id: "chat-257" })
+  assert.equal(overview.tasks[0]?.bot, null, "the bounded snapshot remains the actual received observation")
+  assert.equal(unrepresentedOverviewChecks(overview, [], [], bots.slice(0, 256))[0]?.bot, null)
+  assert.equal(unrepresentedOverviewChecks(overview, [], [], [bot("other-chat", "bot-chat-257")])[0]?.navigation, null, "identity is matched by conversation, never by a coincident Bot id")
+})
+
+test("workspace activities attach approval facts, keep task checks with work, and leave other turns separate", () => {
+  const running = work({ thread_id: "provider-thread" })
+  const approval = question({ about: { node: "worker", agent: "codex", session_id: "provider-thread", cwd: "/project", summary: "", request_id: "request-1" } })
+  const workCheck: PendingCheck = { kind: "work", check_id: "work:work-1", detail: "", work_id: running.work_id, target_node: running.target_node, conversation_id: running.conversation_id, title: running.title, reason: "offline" }
+  const overview = parseWorkspaceOverview({
+    tasks: [
+      { ...running, kind: "work" },
+    ],
+    checks: [{ check_id: "process-work", conversation_id: running.conversation_id, trigger: `task:${running.work_id}` }],
+    questions: [{ question_id: approval.question_id, conversation_id: approval.conversation_id, text: approval.text, severity: approval.severity, choices: approval.choices, created_at_ms: approval.created_at_ms, answer: null, closed: null, about: approval.about }],
+    jobs: [{ job_id: "job-1", conversation_id: running.conversation_id, trigger: "message:ordinary", state: "queued", message_id: "message-1" }],
+    truncated: true,
+  })
+  const view = workspaceActivities({ works: [running], questions: [approval], checks: [workCheck], overview, nodes: [node("worker")], read: true, connected: true, answered: {} })
+  assert.equal(view.activities.length, 2, "approval, pending check and task process check share one work activity; ordinary job is a turn")
+  const workActivity = view.activities.find((activity) => activity.kind === "work")
+  assert.ok(workActivity)
+  assert.equal(workActivity?.facts.questions.length, 1)
+  assert.equal(workActivity?.facts.checks.length, 1)
+  assert.equal(workActivity?.facts.overviewChecks.length, 1)
+  assert.equal(workActivity?.group, "waiting")
+  assert.equal(view.activities.filter((activity) => activity.kind === "turn").length, 1)
+  const answered = workspaceActivities({ works: [running], questions: [approval], checks: [workCheck], overview, nodes: [node("worker")], read: true, connected: true, answered: { [approval.question_id]: "继续" } })
+  assert.equal(answered.activities.length, 2, "answering removes only the attention fact and never drops the work")
+  assert.ok(["working", "waiting"].includes(answered.activities.find((activity) => activity.kind === "work")?.group ?? ""), "the work remains running or waiting on its own unresolved device check")
+  const parentChild = workspaceActivities({ works: [running, { ...running, work_id: "child", parent: running.work_id }], questions: [], checks: [], nodes: [node("worker")], read: true, connected: true })
+  assert.equal(parentChild.activities.filter((activity) => activity.kind === "work").length, 2, "parent and child remain separate activities")
+  const processOnly = workspaceActivities({ works: [running], questions: [], checks: [{ kind: "process", check_id: "process", detail: "still alive" }], nodes: [node("worker")], read: true, connected: true })
+  assert.equal(processOnly.activities.filter((activity) => activity.kind === "attention").length, 1)
+  const mismatched = workspaceActivities({ works: [running], questions: [], checks: [{ ...workCheck, conversation_id: "other-chat" }, { ...workCheck, target_node: "other" }], nodes: [node("worker"), node("other")], read: true, connected: true })
+  assert.equal(mismatched.activities.filter((activity) => activity.kind === "attention").length, 2, "different conversations and devices do not dedupe")
+  assert.equal(workspaceActivities({ works: [{ ...running, state: "unverified", outcome: "unverified" }], questions: [], checks: [], nodes: [node("worker")], read: true, connected: true }).groups.attention.length, 1)
 })
