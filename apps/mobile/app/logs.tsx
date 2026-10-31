@@ -66,8 +66,8 @@ export default function Logs() {
       </Button>
     </View>
     {error ? <ErrorText error={error} /> : null}
-    {records === null && !error ? <View className="gap-2"><Skeleton className="h-16 rounded-xl" /><Skeleton className="h-16 rounded-xl" /><Skeleton className="h-16 rounded-xl" /></View>
-      : records?.length ? records.map((record, index) => {
+    {records === null ? error ? null : <View className="gap-2"><Skeleton className="h-16 rounded-xl" /><Skeleton className="h-16 rounded-xl" /><Skeleton className="h-16 rounded-xl" /></View>
+      : records.length ? records.map((record, index) => {
         const bot = record.conversation_id ? shared.bots.find((item) => item.conversation_id === record.conversation_id)?.name : undefined
         const work = record.work_id ? works.find((item) => item.work_id === record.work_id)?.title : undefined
         const target = textField(record.fields, ['target', 'target_node', 'device_id'])
