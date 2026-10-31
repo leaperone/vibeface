@@ -6,6 +6,7 @@ on:
 permissions: {contents: read}
 jobs:
   build:
+    if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'nightly')
     runs-on: macos-14
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262

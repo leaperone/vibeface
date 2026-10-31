@@ -20,7 +20,9 @@ permissions:
 
 jobs:
   android:
-    if: inputs.android_only || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'mobile')
+    if: >-
+      (inputs.android_only || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'mobile')) &&
+      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'nightly'))
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -69,7 +71,10 @@ jobs:
           if-no-files-found: error
 
   ios:
-    if: ${{ !inputs.android_only && (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'mobile')) }}
+    if: >-
+      !inputs.android_only &&
+      (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'mobile')) &&
+      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'nightly'))
     runs-on: macos-26
     timeout-minutes: 60
     steps:
