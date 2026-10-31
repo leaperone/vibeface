@@ -1,14 +1,14 @@
 import { Link, type Href } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { Bot, ChevronRight, CircleAlert, CircleX, Copy, LoaderCircle, Settings, X, Inbox as InboxIcon, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
-import { useRef, type ReactNode } from 'react'
+import { Bot, ChevronRight, CircleAlert, CircleX, Copy, LoaderCircle, MessageCircle, Settings, X, Inbox as InboxIcon, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
+import { useRef } from 'react'
 import { Pressable, View } from 'react-native'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import Animated, { LayoutAnimationConfig } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { ErrorText, useAction } from '@/components/action'
-import { EmptyState } from '@/components/kit'
+import { ActionCard, EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -28,8 +28,8 @@ import { RecoveryPendingCard, RotateHintCard } from '@/features/recovery/recover
 // An answered card leaves at once and what was below glides up into its space, so nothing passes over anything.
 const Group = withUniwind(Animated.View)
 
-type Row = Extract<InboxItem, { kind: 'write' | 'undelivered' | 'attention' | 'setup' | 'failed' }>
-const rowIcons: Record<Row['kind'], LucideIcon> = { write: Copy, undelivered: CircleAlert, attention: MessageSquareWarning, setup: Sparkles, failed: CircleX }
+type Row = Extract<InboxItem, { kind: 'write' | 'undelivered' | 'attention' | 'setup' }>
+const rowIcons: Record<Row['kind'], LucideIcon> = { write: Copy, undelivered: CircleAlert, attention: MessageSquareWarning, setup: Sparkles }
 
 /**
  * The items the web lists: a recovery to stop first, cards to act on here, rows leading to where the rest is settled, join
@@ -63,7 +63,8 @@ export default function Inbox() {
       : item.kind === 'rotate' ? <RotateHintCard key={item.key} />
       : item.kind === 'confirm' ? <ConfirmCard key={item.key} check={item.check} />
       : item.kind === 'undelivered' ? <PendingMessageCard key={item.key} />
-      : item.kind === 'write' || item.kind === 'attention' || item.kind === 'setup' || item.kind === 'failed' ? <ItemRow key={item.key} item={item} href={rowHref(item, shared?.selectedBot?.bot_id, device.ready?.entry.device_id)} replace={wide} />
+      : item.kind === 'failed' ? <FailedCard key={item.key} item={item} replace={wide} />
+      : item.kind === 'write' || item.kind === 'attention' || item.kind === 'setup' ? <ItemRow key={item.key} item={item} href={rowHref(item, shared?.selectedBot?.bot_id, device.ready?.entry.device_id)} replace={wide} />
       : null)}
     {items.some((item) => item.kind === 'join') ? <JoinRequests /> : null}
     {open.length ? open.map((questions) => <Group key={questions[0].bot?.bot_id ?? ''} layout={move} className="gap-2">
@@ -74,7 +75,7 @@ export default function Inbox() {
       </Link> : null}
       {questions.map((question) => <Animated.View key={question.question_id} layout={move}><QuestionCard question={question} /></Animated.View>)}
     </Group>) : items.length ? null : <View style={{ minHeight: below, paddingTop: 24, justifyContent: 'center' }}>
-      <EmptyState icon={InboxIcon} title="没有要你决定的事" />
+      <EmptyState icon={InboxIcon} title="没有待处理" action={<Link href="/" dismissTo asChild><Button variant="outline"><Icon as={MessageCircle} /><Text>回到消息</Text></Button></Link>} />
     </View>}
   </KeyboardAwareScrollView></LayoutAnimationConfig>
 }
@@ -82,7 +83,6 @@ export default function Inbox() {
 /** Where a row leads on the phone; the phone cannot settle a copied or read-only computer, so that row only says it. */
 function rowHref(item: Row, chat: string | undefined, entry: string | undefined): Href | null {
   if (item.kind === 'attention') return `/b/${item.bot.bot_id}`
-  if (item.kind === 'failed') return `/b/${item.bot.bot_id}/work/${item.work.work_id}`
   if (item.kind === 'undelivered') return chat ? `/b/${chat}` : null
   if (item.kind === 'setup') return !item.device || item.device === entry ? '/ai' : `/device/${item.device}`
   return null
@@ -91,33 +91,33 @@ function rowHref(item: Row, chat: string | undefined, entry: string | undefined)
 function ItemRow({ item, href, replace }: { item: Row; href: Href | null; replace: boolean }) {
   const card = 'min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-3 shadow-xs dark:border-line-strong'
   const body = <>
-    <Icon as={item.kind === 'write' && item.write === 'read_only' ? Lock : rowIcons[item.kind]} className={item.kind === 'failed' ? 'size-5 text-danger' : 'size-5 text-warning'} />
+    <Icon as={item.kind === 'write' && item.write === 'read_only' ? Lock : rowIcons[item.kind]} className="size-5 text-warning" />
     <Text numberOfLines={2} className="min-w-0 flex-1 font-medium">{item.title}</Text>
     {item.meta ? <Text numberOfLines={1} className="max-w-[40%] text-meta text-muted-foreground">{item.meta}</Text> : null}
     {href ? <Icon as={ChevronRight} className="text-muted-foreground" /> : null}
   </>
-  const row = href ? <Link href={href} replace={replace} asChild><Pressable accessibilityRole="link" className={`${card} active:bg-muted`}>{body}</Pressable></Link> : <View className={card}>{body}</View>
-  return item.kind === 'failed' ? <Dismiss item={item}>{row}</Dismiss> : row
+  return href ? <Link href={href} replace={replace} asChild><Pressable accessibilityRole="link" className={`${card} active:bg-muted`}>{body}</Pressable></Link> : <View className={card}>{body}</View>
 }
 
-/** A failure the person has seen to leaves the list by hand; the bot's later reply also clears it. */
-function Dismiss({ item, children }: { item: Extract<Row, { kind: 'failed' }>; children: ReactNode }) {
+/**
+ * A task that did not finish, laid out as on the web: its device, why, 关掉 on the title row and the device's settings when the fix is there.
+ * The person dismisses it by hand; the bot's later reply also clears it.
+ */
+function FailedCard({ item, replace }: { item: Extract<InboxItem, { kind: 'failed' }>; replace: boolean }) {
   const shared = useLive()
   const device = useDevice()
   const { busy, error, run } = useAction()
   const reason = workFailure(item.work)
   const target = item.work.target_node
-  return <View className="gap-1">
-    <View className="flex-row items-center gap-1">
-      <View className="min-w-0 flex-1">{children}</View>
-      <Button variant="ghost" size="icon" accessibilityLabel="关掉" disabled={!shared?.writable || busy !== null} onPress={() => void run('dismiss', () => shared!.dismissWork(item.work.conversation_id, item.work.work_id))}>
-        <Icon as={busy ? LoaderCircle : X} className="text-muted-foreground" />
-      </Button>
-    </View>
-    {reason ? <Text numberOfLines={3} className="px-4 text-meta text-muted-foreground">{reason}</Text> : null}
-    {fixOnDevice(item.work) ? <Link href={target === device.ready?.entry.device_id ? '/ai' : `/device/${target}`} asChild>
-      <Button variant="ghost" className="self-start"><Icon as={Settings} /><Text>{fixOnDeviceLabel(item.meta ?? '')}</Text></Button>
-    </Link> : null}
+  return <ActionCard icon={CircleX} tone="danger" meta={item.meta}
+    title={<Link href={`/b/${item.bot.bot_id}/work/${item.work.work_id}`} replace={replace} className="underline">{item.title}</Link>}
+    trailing={<Button variant="ghost" size="icon" accessibilityLabel="关掉" disabled={!shared?.writable || busy !== null} onPress={() => void run('dismiss', () => shared!.dismissWork(item.work.conversation_id, item.work.work_id))}>
+      <Icon as={busy ? LoaderCircle : X} className="text-muted-foreground" />
+    </Button>}
+    actions={fixOnDevice(item.work) ? <Link href={target === device.ready?.entry.device_id ? '/ai' : `/device/${target}`} asChild>
+      <Button variant="outline"><Icon as={Settings} /><Text>{fixOnDeviceLabel(item.meta ?? '')}</Text></Button>
+    </Link> : undefined}>
+    {reason ? <Text numberOfLines={3} className="text-muted-foreground">{reason}</Text> : null}
     <ErrorText error={error} />
-  </View>
+  </ActionCard>
 }

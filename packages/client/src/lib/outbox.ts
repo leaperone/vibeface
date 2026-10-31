@@ -22,7 +22,7 @@ const same = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.st
 export async function enqueue(store: OutboxStore, item: OutboxItem): Promise<OutboxItem> {
   const existing = (await store.all()).find(entry => entry.key === item.key)
   if (existing) {
-    if (existing.method !== item.method || !same(existing.params, item.params)) throw new Error('这项操作还有一份未确认的不同内容。请先确认原操作。')
+    if (existing.method !== item.method || !same(existing.params, item.params)) throw new Error('这项操作还有一份未确认的不同内容。先确认原操作。')
     return existing
   }
   await store.put(item)

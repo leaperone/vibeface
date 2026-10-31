@@ -6,6 +6,8 @@ APP_DIR="$ROOT/apps/macos"
 SRC="$APP_DIR/Sources/VibefaceMac"
 OUT_ROOT="${1:-$ROOT/.artifacts/macos}"
 BUILD_CFG="${BUILD_CFG:-release}"
+APP_VERSION="${APP_VERSION:-0.0.1}"
+APP_BUILD_VERSION="${APP_BUILD_VERSION:-1}"
 PRODUCT="Vibeface.app"
 ICON_SRC="$SRC/Resources/AppIcon.png"
 STAGING="$(mktemp -d)"
@@ -58,9 +60,9 @@ cat >"$OUT_ROOT/$PRODUCT/Contents/Info.plist" <<'PLIST'
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.0.1</string>
+	<string>__APP_VERSION__</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>__APP_BUILD_VERSION__</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>
@@ -68,5 +70,10 @@ cat >"$OUT_ROOT/$PRODUCT/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+
+sed -i '' \
+  -e "s/__APP_VERSION__/${APP_VERSION}/" \
+  -e "s/__APP_BUILD_VERSION__/${APP_BUILD_VERSION}/" \
+  "$OUT_ROOT/$PRODUCT/Contents/Info.plist"
 
 echo "Built $OUT_ROOT/$PRODUCT"

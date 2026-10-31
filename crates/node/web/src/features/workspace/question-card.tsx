@@ -36,15 +36,15 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
   const answering = useRef(false)
   const id = question.question_id
   const standing = answer ?? question.answer?.text
-  const settled = settledAnswer(standing, workspace.answered[id])
+  const settled = settledAnswer(standing, workspace.answered[id], question.answer?.author, ready?.principal.device_id)
   const { ask, lines } = questionParts(question.text)
   const node = nodeName(question.about.node, { nodes: workspace.nodes, directory })
   // Read back later, an answered approval says which task on which device it settled.
   const heldTask = inTask ? null : approvalTask(question, [...workspace.openWorks, ...(workspace.data?.works ?? [])])
   const about = heldTask ? <span className="flex min-w-0 items-center gap-1"><ListChecks aria-hidden="true" className="size-3.5 shrink-0" /><span className="sr-only">任务 </span><span className="min-w-0 truncate">{heldTask}</span>
     <span aria-hidden="true">·</span><Laptop aria-hidden="true" className="size-3.5 shrink-0" /><span className="sr-only">设备 </span><span className="min-w-0 truncate">{node}</span></span> : null
-  if (settled) return <Settled ask={ask} lines={lines} about={about} focus={answering.current} role={standing === undefined || settled.elsewhere ? "status" : undefined}
-    mark={settled.elsewhere ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : declined(settled.text) ? <CircleX aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}>
+  if (settled) return <Settled ask={ask} lines={lines} about={about} focus={answering.current} role={standing === undefined || settled.beaten ? "status" : undefined}
+    mark={settled.beaten ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : declined(settled.text) ? <CircleX aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}>
     <span className="text-foreground">{settled.elsewhere ? `已由另一端回答：${settled.text}` : answerLabel(settled.text)}</span>
   </Settled>
 

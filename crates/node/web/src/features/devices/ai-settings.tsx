@@ -259,9 +259,9 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
     saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />
   return <div className="grid gap-6">
     <div className="grid gap-2">
-    <ul className="grid gap-1 px-1 text-meta text-muted-foreground" aria-label="两种用法">
-      {(["bot", "execution"] as const).map((role) => { const { label, note, icon: RoleIcon } = roles[role]; return <li key={role} className="flex min-w-0 items-start gap-1.5">
-        <RoleIcon aria-hidden="true" className="mt-0.5 size-4 shrink-0" /><span className="min-w-0"><span className="font-medium text-foreground">{label}</span> · {note}</span>
+    <ul className="flex flex-wrap gap-x-4 gap-y-1 px-1 text-meta text-muted-foreground" aria-label="两种用法">
+      {(["bot", "execution"] as const).map((role) => { const { label, note, icon: RoleIcon } = roles[role]; return <li key={role} className="flex items-center gap-1.5 whitespace-nowrap">
+        <RoleIcon aria-hidden="true" className="size-4 shrink-0" /><span className="font-medium text-foreground">{label}</span><span aria-hidden="true">·</span>{note}
       </li> })}
     </ul>
     <ul className={cn("divide-y overflow-hidden rounded-xl border", !onboarding && "bg-card shadow-xs")}>
@@ -425,7 +425,7 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
         <ChevronRight aria-hidden="true" className="size-4 transition-transform duration-200" />设置
       </summary>
       <div className="grid gap-4 px-4 sm:ps-12 pt-1 pb-4">
-        {manager ? <BotDetails key={JSON.stringify(manager)} fields={["model"]} manager={manager} models={models} display={display} working={working}
+        {manager ? <BotDetails key={`${manager.provider}:${JSON.stringify([manager.model, manager.reasoning_effort, manager.backup])}`} fields={["model"]} manager={manager} models={models} display={display} working={working}
           busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
         {keys.length ? <ul className="grid gap-1" aria-label={terms.secret.label}>{keys.map((row) => envRow(row, true))}</ul> : null}
 
@@ -434,7 +434,7 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
         <div className="grid gap-4 pt-1 text-foreground">
         {serverSettings}
 
-        {manager ? <BotDetails key={JSON.stringify(manager)} fields={["workspace"]} manager={manager} display={display} working={working}
+        {manager ? <BotDetails key={`${manager.provider}:${manager.workspace}`} fields={["workspace"]} manager={manager} display={display} working={working}
           busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
 
         <div className="grid gap-2">
@@ -500,7 +500,7 @@ const botFields = ["model", "workspace"] as const
 /** The model option that opens the text field; no provider names a model this way. */
 const other = "\u0000other"
 
-/** The bot's model and folder, inside the settings of the provider it runs on. */
+/** The bot's model or folder, as `fields` picks, inside the settings of the provider it runs on. Keyed by its own saved fields, so saving the other one keeps its draft. */
 function BotDetails({ fields, manager, models = null, display, working, busy, save }: { fields: (typeof botFields)[number][]; manager: ManagerSettings; models?: ModelChoice[] | null; display: Display; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
   const [draft, setDraft] = useState(manager)
   const copy = deviceCopy.botModel
@@ -508,7 +508,7 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
   const [chosen, setTyping] = useState<boolean | null>(null)
   const typing = chosen ?? modelTyped(manager.model, models)
   const cursor = manager.provider === "cursor"
-  const dirty = fields.some((key) => draft[key] !== manager[key]) || draft.reasoning_effort !== manager.reasoning_effort || JSON.stringify(draft.backup) !== JSON.stringify(manager.backup)
+  const dirty = fields.some((key) => draft[key] !== manager[key]) || fields.includes("model") && (draft.reasoning_effort !== manager.reasoning_effort || JSON.stringify(draft.backup) !== JSON.stringify(manager.backup))
   const selected = models?.find((model) => draft.model ? model.id === draft.model : model.default)
   const efforts = selected?.effort.state === "provider_controlled" ? [] : selected?.effort.state === "selectable" ? selected.effort.options : effortOptions(manager.provider)
   const field = (key: (typeof botFields)[number], label: string, extra: { placeholder?: string; required?: boolean; plain?: boolean } = {}) => {
@@ -518,7 +518,8 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
   }
   return <form className="grid gap-3" onSubmit={(event) => {
     event.preventDefault()
-    void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim(), backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } })
+    void save({ ...manager, ...Object.fromEntries(fields.map((key) => [key, draft[key].trim()])),
+      ...(fields.includes("model") ? { reasoning_effort: draft.reasoning_effort, backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } } : {}) })
   }}>
     {fields.includes("model") ? models && !typing ? <label className="grid gap-1 text-meta">{copy.label}
       <NativeSelect className="w-full" name="model" value={draft.model} disabled={working}

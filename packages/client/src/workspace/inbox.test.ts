@@ -36,6 +36,22 @@ test('待处理 counts the same items wherever it shows: open questions, joins t
   assert.deepEqual(inboxItems(starting).find((item) => item.kind === 'setup'), { key: 'setup', kind: 'setup', device: 'pc', title: '运行 Bot 的设备需设置' }, 'one device starting does not hide another that needs setup')
 })
 
+test('a different pending recovery gets a fresh confirmation card', () => {
+  const current = source(true)
+  const recovery = { checkpoint: 'first', effective_at_ms: 1, members: [] }
+  current.device.pendingRecovery = recovery
+  const first = inboxItems(current).find((item) => item.kind === 'recovery')
+  assert.ok(first)
+  current.device.pendingRecovery = { ...recovery, effective_at_ms: 2 }
+  assert.equal(inboxItems(current).find((item) => item.kind === 'recovery')?.key, first.key)
+  current.device.pendingRecovery = { ...recovery, checkpoint: 'replacement' }
+  const replacement = inboxItems(current).find((item) => item.kind === 'recovery')
+  assert.ok(replacement)
+  assert.notEqual(replacement.key, first.key)
+  current.device.pendingRecovery = null
+  assert.equal(inboxItems(current).some((item) => item.kind === 'recovery'), false)
+})
+
 test('a failed task waits in 待处理 under its bot until something follows it up, naming its device', () => {
   const failed = source(false)
   const work = { work_id: 'w1', conversation_id: 'c', trigger: '', target_node: 'mac', cwd: '/w', title: '跑测试', prompt: '', state: 'finished', summary: '', outcome: 'failed', result_text: '', failure_reason: 'timed out' } as const
@@ -99,4 +115,9 @@ test('a task page shows a summary of what it was asked and folds the rest', () =
   const long = promptSummary('很'.repeat(100), '长任务')
   assert.equal(long.summary.length, 80)
   assert.equal(long.folded, true)
+  assert.deepEqual(promptSummary('[紧急] 修好登录页', '修登录'), { summary: '[紧急] 修好登录页', folded: false }, 'plain words that open with a bracket still show')
+  assert.deepEqual(promptSummary('[1, 2]', '列表'), { summary: '', folded: true }, 'a JSON array is machine text')
+  assert.deepEqual(promptSummary('{"step":1}\n{"step":2}', '两步'), { summary: '', folded: true }, 'JSON lines are machine text too')
+  const emoji = promptSummary('👨‍👩‍👧'.repeat(100), '一家人')
+  assert.equal(emoji.summary, `${'👨‍👩‍👧'.repeat(79)}…`, 'the cut keeps whole emoji')
 })

@@ -1705,6 +1705,37 @@ def verify_recovery(node, other, network):
     return checkpoint
 
 
+def verify_recovery_approval(node, other, network):
+    material = other.command("recover_material", backup=node.backup, password=node.backup_password)
+    other.connect(node.device_id)
+    proof = other.command("recovery_read_proof", network_id=network)
+    read = other.call("recovery_state", {**proof, "checkpoints": material["checkpoints"], "events": material["events"]})
+    before = node.client.call("directory")
+    keep = [*before["view"]["members"],
+            {"device_id": other.own_id(), "kind": "client", "name": "Confirmed recovery", "manage": True}]
+    checkpoint = other.command("recovery_checkpoint", state=read["state"], network_id=network,
+                               members=keep, heads=read["heads"])
+    other.call("recover", {"genesis": material["genesis"],
+                           "checkpoints": [*read["state"]["checkpoints"], checkpoint],
+                           "events": read["state"]["events"]})
+    waiting = node.client.call("directory")
+    pending = waiting["view"]["pending"]
+    event = node.client.command("governance", state=waiting["state"], network_id=network,
+                                action={"type": "approve", "checkpoint": pending["checkpoint"], "at_ms": waiting["now_ms"]})
+    other.call("approve_recovery", {"event": event}, status=400)
+    approved = node.client.call("approve_recovery", {"event": event})
+    require(approved["view"]["epoch"] == checkpoint["epoch"] and approved["view"]["pending"] is None
+            and approved["now_ms"] < pending["effective_at_ms"], "manager confirmation activates recovery before its deadline")
+    require(node.client.call("approve_recovery", {"event": event})["view"] == approved["view"],
+            "repeating the signed confirmation changes nothing")
+    other.authenticate(network)
+    require(other.principal["can_manage"] and other.principal["epoch"] == checkpoint["epoch"],
+            "the waiting recovery client immediately becomes a manager")
+    node.client.connect()
+    node.client.authenticate(network)
+    return checkpoint
+
+
 def scheduler_records(node, network):
     with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
         connection.row_factory = sqlite3.Row
@@ -4435,6 +4466,8 @@ def auto_route_acceptance(options):
         nodes.append(blank)
         fresh_checkpoint = recover_fresh_node(blank, target.backup, target.backup_password)
         passed("fresh-node-recovery", network=network, epoch=fresh_checkpoint["epoch"])
+        approved = verify_recovery_approval(target, recovered, network)
+        passed("root-recovery-manager-confirmation", epoch=approved["epoch"])
         report["status"] = "passed"
     except BaseException as error:
         report["status"] = "failed"

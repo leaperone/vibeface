@@ -5,13 +5,14 @@ import { BrainCircuit, ChevronLeft, CircleCheck, CircleDashed, CircleHelp, Circl
 import { Link } from "@tanstack/react-router"
 import { Button } from "@/components/ui/button"
 import { DetailRow, Details, SettingsGroup, SettingsRow, StatusPill, type Tone } from "@/components/app/kit"
-import { formatWhen, changeTitle } from "@vibeface/client/workspace/bot-settings.ts"
+import { formatWhen, changeTitle, scheduleFrequency } from "@vibeface/client/workspace/bot-settings.ts"
 import { nodeName, shownState, taskLabel } from "@vibeface/client/workspace/labels.ts"
 import { runtimeLabel } from "@vibeface/client/chat/protocol.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import type { BotChange, BotRecord, ConversationPayload, CoordinationCheck, NodeInfo, Question, SessionHandoff, WorkRecord } from "@vibeface/client/workspace/types.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import { CollaborationPanel } from "./collaboration-panel"
+import { cn } from "@/lib/utils"
 
 type ContextPanelProps = {
   bot: Pick<BotRecord, "bot_id" | "name">
@@ -168,6 +169,16 @@ function AgentContinuity({ data, nodes }: { data: ConversationPayload; nodes: re
         <ContinuityStat label="交接记录" value={sessions.length} />
         <ContinuityStat label="队列观察" value={scheduler?.jobs.length ?? 0} />
       </div>
+      {data.bot_settings.memory.length ? <Details label={`查看持久记忆 · ${data.bot_settings.memory.length}`}>
+        <ul className="grid gap-2">{data.bot_settings.memory.map((entry) => <li key={entry.memory_id} className="rounded-lg border bg-card px-3 py-2 whitespace-pre-wrap [overflow-wrap:anywhere]">{entry.text}</li>)}</ul>
+      </Details> : <p className="text-meta text-muted-foreground">暂无持久记忆</p>}
+      {data.bot_settings.schedules.length ? <Details label={`查看定时任务 · ${data.bot_settings.schedules.length}`}>
+        <ul className="grid gap-2">{data.bot_settings.schedules.map((schedule) => <li key={schedule.schedule_id} className={cn("grid gap-1 rounded-lg border bg-card px-3 py-2", !schedule.enabled && "text-muted-foreground")}>
+          <div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate font-medium" title={schedule.name}>{schedule.name}</span><StatusPill tone={schedule.enabled ? "info" : "neutral"}>{schedule.enabled ? "启用" : "已暂停"}</StatusPill></div>
+          <p className="line-clamp-2 whitespace-pre-wrap text-meta text-muted-foreground">{schedule.prompt}</p>
+          <p className="text-meta text-muted-foreground">{scheduleFrequency(schedule)}{schedule.next_run_at_ms === null ? " · 尚未安排下一次运行" : ` · 下次 ${formatWhen(schedule.next_run_at_ms)}`}</p>
+        </li>)}</ul>
+      </Details> : <p className="text-meta text-muted-foreground">暂无待执行定时任务</p>}
       <div className="flex min-w-0 flex-wrap items-center gap-2 rounded-lg bg-muted/45 px-3 py-2 text-meta">
         <span className="font-medium">{ownerLabel}</span>
         {remote?.reachable === false ? <StatusPill tone="warning" icon={Unplug}>状态未知</StatusPill> : owner ? <StatusPill tone="info">归属已知</StatusPill> : <StatusPill tone="neutral">等待归属</StatusPill>}

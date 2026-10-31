@@ -154,15 +154,15 @@ test('backend English and gateway refusal codes reach the page as plain Chinese'
   assert.match(humanError('set an explicit absolute CODEX_HOME before starting a managed App Server'), /Codex 目录/)
   assert.match(humanError("this computer's Codex folder has no sessions folder yet"), /先用 Codex 跑一次对话/)
   assert.match(humanError('no Codex folder found on this computer', 'codex_missing'), /没找到这台电脑上的 Codex 目录/)
-  assert.equal(humanError('something nobody mapped'), '这次操作没有成功，请再试一次。')
-  assert.equal(humanError('something nobody mapped', undefined, '读取最新内容'), '读取最新内容没有成功，请再试一次。')
+  assert.equal(humanError('something nobody mapped'), '这次操作没有成功。再试一次。')
+  assert.equal(humanError('something nobody mapped', undefined, '读取最新内容'), '读取最新内容没有成功。再试一次。')
   assert.equal(rawError(new Error('conversation not found')), 'conversation not found')
   assert.equal(rawError(new Error('已断开')), '')
 })
 
 test('a failed task leads with its cause, and one whose outcome is unknown is checked, not run again', () => {
   assert.equal(workFailure({ failure: 'timed_out', failure_reason: 'Codex management timed out' }), failureText('timed_out'))
-  assert.equal(workFailure({ failure_reason: 'Codex management timed out' }), '设备没有及时回复，结果未知。请先确认结果，不要重复提交。')
+  assert.equal(workFailure({ failure_reason: 'Codex management timed out' }), '设备没有及时回复，结果未知。先确认结果，别重复提交。')
   assert.equal(workFailure({ failure_reason: null }), '')
   assert.ok(outcomeUnknown('timed_out'))
   assert.ok(outcomeUnknown('lost'))

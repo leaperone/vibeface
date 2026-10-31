@@ -18,6 +18,8 @@ import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, run
 import { setUpOnManager } from "@vibeface/client/identity/copy.ts"
 import { chatTimeline, firstUnread } from "@vibeface/client/chat/timeline.ts"
 import { primaryLane } from "@vibeface/client/identity/connection-lane.ts"
+import * as taskLabels from "@vibeface/client/workspace/labels.ts"
+import * as workspaceModel from "@vibeface/client/workspace/model.ts"
 
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
@@ -514,6 +516,65 @@ const pendingResult = () => {
   return { promise, resolve, reject }
 }
 const settleComponent = () => new Promise(setImmediate)
+
+test("task filters keep the counts, device confirmations and empty state within the selected Bot", () => {
+  const bots = [{ bot_id: "a", conversation_id: "chat-a", name: "Bot A" }, { bot_id: "b", conversation_id: "chat-b", name: "Bot B" }]
+  const work = (conversation_id: string) => ({ kind: "work", work_id: conversation_id, check_id: conversation_id, conversation_id, target_node: "offline", title: conversation_id, detail: "", reason: "offline" })
+  let inbox = [
+    { key: "device", kind: "confirm", check: { kind: "device", works: [work("chat-a"), work("chat-b")] } },
+    { key: "question-b", kind: "question", done: false, question: { conversation_id: "chat-b", bot: bots[1], about: {} } },
+    { key: "process", kind: "confirm", check: { kind: "process", check_id: "process", detail: "still running" } },
+  ]
+  const workspace = { bots, selectedBot: bots[1], openWorks: [], nodes: [], questions: [], liveProgress: [], connectionOnline: true }
+  const app = componentHarness("./tasks-overview.tsx", {
+    "@vibeface/client/workspace/context.tsx": { useWorkspace: () => workspace },
+    "@vibeface/client/identity/context.tsx": { useDevice: () => ({ directory: null }) },
+    "@vibeface/client/workspace/labels.ts": taskLabels,
+    "@vibeface/client/workspace/model.ts": workspaceModel,
+    "./inbox": { useInbox: () => inbox },
+    "./workspace-shell": { useCreateBot: () => () => {} },
+  })
+  const named = (elements: ReturnType<typeof app.render>, name: string) => elements.find(({ type }) => typeof type === "function" && type.name === name)
+  try {
+    let elements = app.render("TasksOverview")
+    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 3)
+    const selectBot = named(elements, "TaskFilters")?.props.onBotFilter
+    assert.ok(typeof selectBot === "function")
+    selectBot("a")
+    elements = app.render("TasksOverview")
+    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 1)
+    const checks = elements.filter(({ type }) => type === "ConfirmCard").map(({ props }) => props.check)
+    assert.deepEqual(JSON.parse(JSON.stringify(checks)), [{ kind: "device", works: [work("chat-a")] }])
+    assert.equal(elements.some(({ type }) => type === "QuestionCard"), false)
+    assert.equal(elements.find(({ props }) => props.role === "status")?.props.children, "1 项任务")
+    inbox = inbox.filter((item) => item.kind === "question")
+    elements = app.render("TasksOverview")
+    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 0)
+    assert.equal(named(elements, "WorkspaceEmpty")?.props.title, "没有符合筛选的任务")
+  } finally { app.close() }
+})
+
+test("mobile task attention counts unanswered questions and program checks and opens their inbox", () => {
+  let inbox: unknown[] = [{ kind: "question", done: false }, { kind: "confirm", check: { kind: "process" } }, { kind: "question", done: true }]
+  const app = componentHarness("../../../../../../apps/mobile/src/features/home/tasks.tsx", {
+    "@/data/live": { useLive: () => null, useInbox: () => inbox },
+    "@/data/context": { useWorkspace: () => ({ bots: [] }) },
+    "@vibeface/client/identity/context.tsx": { useDevice: () => ({ directory: null }) },
+    "@vibeface/client/workspace/labels.ts": taskLabels,
+  })
+  try {
+    let elements = app.render("TasksScreen")
+    const attention = () => elements.find(({ type }) => typeof type === "function" && type.name === "MobileMasthead")?.props.attention
+    const empty = () => elements.some(({ type }) => typeof type === "function" && type.name === "MobileEmpty")
+    assert.equal(attention(), 2)
+    assert.equal(elements.some(({ type, props }) => type === "Link" && props.href === "/inbox"), true)
+    assert.equal(empty(), false)
+    inbox = []
+    elements = app.render("TasksScreen")
+    assert.equal(attention(), 0)
+    assert.equal(empty(), true)
+  } finally { app.close() }
+})
 
 test("question cards answer with a choice or typed text, retry an unconfirmed answer as sent and fold once answered", async () => {
   const sent: unknown[][] = []

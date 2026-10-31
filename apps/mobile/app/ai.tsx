@@ -84,10 +84,10 @@ function AiSettings() {
     saveAssistant={(next) => call(`${item.provider}:assistant_details`, 'configure_node', { roots, manager: next }, item.provider).then(Boolean)} />
   const list = (items: ProviderStatus[]) => <View className="overflow-hidden rounded-xl border border-border bg-card shadow-xs dark:border-line-strong">{items.map(row)}</View>
   return <View className="gap-6">
-    <View className="gap-1 px-1">
-      {(['bot', 'execution'] as const).map((role) => <View key={role} className="flex-row items-start gap-1.5">
-        <Icon as={roles[role].icon} className="mt-0.5 size-4 text-muted-foreground" />
-        <Text className="min-w-0 flex-1 text-meta text-muted-foreground"><Text className="text-meta font-medium">{roles[role].label}</Text> · {roles[role].note}</Text>
+    <View className="flex-row flex-wrap gap-x-4 gap-y-1 px-1">
+      {(['bot', 'execution'] as const).map((role) => <View key={role} accessible accessibilityLabel={`${roles[role].label}，${roles[role].note}`} className="flex-row items-center gap-1.5">
+        <Icon as={roles[role].icon} className="size-4 text-muted-foreground" />
+        <Text className="text-meta text-muted-foreground"><Text className="text-meta font-medium">{roles[role].label}</Text> · {roles[role].note}</Text>
       </View>)}
     </View>
     {shown.length ? list(shown) : null}
@@ -143,14 +143,14 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
       {item.supports.includes('agent') ? <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', assistant ? { bot: false } : botOnChange(response, item))} /> : null}
       {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
       <View className="gap-4 border-t border-border p-4">
-        {manager ? <AssistantDetails key={JSON.stringify(manager)} fields={['model']} manager={manager} models={models} working={working} save={saveAssistant} /> : null}
+        {manager ? <AssistantDetails key={`${manager.provider}:${JSON.stringify([manager.model, manager.reasoning_effort, manager.backup])}`} fields={['model']} manager={manager} models={models} working={working} save={saveAssistant} /> : null}
         {item.env.some((row) => row.required) ? <Variables item={item} required working={working} change={change} /> : null}
         {/* As on the web: connection, program and other variables are for whoever needs them; a problem in them opens the fold. */}
         <Details label="高级" open={Boolean(issue && issue.code !== 'env_missing')}>
           <View className="gap-4 pt-1">
             {/* Keyed by the roles, so switching one drops a test result that no longer matches what runs. */}
             {item.app_server ? <AppServerSettings key={item.roles.join()} server={item.app_server} working={working} save={change} test={test} /> : null}
-            {manager ? <AssistantDetails key={JSON.stringify(manager)} fields={['workspace']} manager={manager} models={models} working={working} save={saveAssistant} /> : null}
+            {manager ? <AssistantDetails key={`${manager.provider}:${manager.workspace}`} fields={['workspace']} manager={manager} models={models} working={working} save={saveAssistant} /> : null}
             <Field label="程序">
               <SaveRow value={bin} saved={item.bin} placeholder={item.bin.split(/[\\/]/).pop() ?? ''} mono working={working} onChange={setBin} onSave={() => void change('bin', { bin: bin.trim() })} />
             </Field>
@@ -229,7 +229,10 @@ function AppServerSettings({ server, working, save, test }: { server: AppServer;
 
 const assistantFields = ['model', 'workspace'] as const
 
-/** The bot's model or folder, as `fields` picks, inside the settings of the provider it runs on. */
+/**
+ * The bot's model or folder, as `fields` picks, inside the settings of the provider it runs on. Keyed by its own saved fields and saving
+ * only those over what is saved now, so saving one keeps the other's draft.
+ */
 function AssistantDetails({ fields, manager, models, working, save }: { fields: readonly (typeof assistantFields)[number][]; manager: ManagerSettings; models: ModelChoice[] | null; working: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
   const [draft, setDraft] = useState(manager)
   const copy = deviceCopy.botModel
@@ -261,8 +264,9 @@ function AssistantDetails({ fields, manager, models, working, save }: { fields: 
     <Details label="备用策略"><BackupPolicyEditor policy={draft.backup} disabled={working} change={(backup) => setDraft({ ...draft, backup })} /></Details>
     </> : null}
     {fields.includes('workspace') ? <Field label={folderLabels.botRun}>{input('workspace', folderLabels.botRun)}</Field> : null}
-    {dirty ? <Button variant="outline" className="self-start" disabled={working || (cursor && !draft.model.trim()) || draft.backup.candidates.some((candidate) => !candidate.model.trim())}
-      onPress={() => void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim(), backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } })}><Text>保存</Text></Button> : null}
+    {dirty ? <Button variant="outline" className="self-start" disabled={working || (cursor && !(fields.includes('model') ? draft.model : manager.model).trim()) || fields.includes('model') && draft.backup.candidates.some((candidate) => !candidate.model.trim())}
+      onPress={() => void save({ ...manager, ...Object.fromEntries(fields.map((key) => [key, draft[key].trim()])),
+        ...(fields.includes('model') ? { reasoning_effort: draft.reasoning_effort, backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } } : {}) })}><Text>保存</Text></Button> : null}
   </View>
 }
 

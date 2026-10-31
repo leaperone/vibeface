@@ -1,5 +1,5 @@
 import { recoveryCopy } from "../identity/copy.ts"
-import type { ClientPrincipal, JoinRequest } from "../lib/node.ts"
+import type { ClientPrincipal, JoinRequest, PendingRecovery } from "../lib/node.ts"
 import { failedWork, nodeName } from "./labels.ts"
 import { botReadiness, workChecks } from "./model.ts"
 import { openQuestions } from "./questions.ts"
@@ -23,7 +23,7 @@ export type InboxItem = { key: string; title: string; meta?: string } & (
 export type InboxSource = {
   device: {
     ready: { principal: ClientPrincipal; entry: { device_id: string } } | null
-    joins: readonly JoinRequest[]; pendingRecovery: unknown; rotateHint: boolean
+    joins: readonly JoinRequest[]; pendingRecovery: PendingRecovery | null; rotateHint: boolean
   }
   workspace: {
     writeState: WriteStatus; questions: readonly Question[]; answered: Readonly<Record<string, string>>
@@ -45,7 +45,7 @@ export const openJoins = (device: InboxSource["device"]) =>
 export function inboxItems({ device, workspace }: InboxSource): InboxItem[] {
   const items: InboxItem[] = []
   const write = workspace.writeState
-  if (device.pendingRecovery) items.push({ key: "recovery", kind: "recovery", title: recoveryCopy.pending })
+  if (device.pendingRecovery) items.push({ key: `recovery:${device.pendingRecovery.checkpoint}`, kind: "recovery", title: recoveryCopy.pending })
   if (device.rotateHint) items.push({ key: "rotate", kind: "rotate", title: "换个恢复密码" })
   if (write.state === "read_only") items.push({ key: "write:read_only", kind: "write", write: "read_only", title: "这台电脑暂时只读" })
   if (write.state === "forked") items.push({ key: "write:forked", kind: "write", write: "forked", title: "这台电脑的数据被复制过" })
