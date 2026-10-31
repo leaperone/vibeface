@@ -2087,10 +2087,6 @@ impl Store {
 
     /// Claim and every resource gate share one transaction. A held background candidate never
     /// blocks a runnable human message, and ties remain stable across concurrent consumers.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the local session and captured execution policy"
-    )]
     pub fn claim_next_in_session(
         &mut self,
         identity: &LocalIdentity,
