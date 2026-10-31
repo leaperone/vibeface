@@ -5879,7 +5879,10 @@ pub(super) mod tests {
                     node.settings.lock().unwrap().manager = current.map(|provider| crate::config::ManagerSettings { provider, workspace: dir.clone(), model: "changed".into(), reasoning_effort: None, backup: crate::scheduler::BackupPolicy { automatic: true, candidates: vec![crate::scheduler::BackupModel { provider: Provider::Pi, model: "fake/backup".into(), reasoning_effort: None }] } });
                     node.pending_provider_launches.store(true, Ordering::SeqCst);
                 }
-                if via_tick { node.schedule_tick().await?; } else {
+                if via_tick {
+                    assert!(node.schedule_workers.lock().await.insert((network.clone(), "c".into())));
+                    node.schedule_tick().await?;
+                } else {
                     crate::scheduler::run(node.clone(), Access { network_id: network.clone(), human: false, conversation_id: Some("c".into()), manager: None }, "c".into()).await?.context("refusal invocation")?;
                 }
                 assert_refused_task(&node, &network, &request, if current.is_none() { FailureKind::NoBot } else { FailureKind::ExecutionDisabled }).await?;
@@ -5901,6 +5904,9 @@ pub(super) mod tests {
                     assert!(node.accept_remote_dispatch(&network, &request.dispatcher, &input).await.is_err());
                 }
                 assert!(node.accept_remote_dispatch(&network, &node.identity.device_id()?, &json!({"spec":request})).await.is_err());
+                if via_tick {
+                    assert!(node.schedule_workers.lock().await.remove(&(network.clone(), "c".into())));
+                }
                 Ok::<_, anyhow::Error>(())
             }.await;
             cleanup(node, dir).await?;

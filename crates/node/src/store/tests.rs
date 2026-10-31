@@ -8114,6 +8114,13 @@ fn refusing_an_unstarted_task_is_atomic_idempotent_and_preserves_another_active_
     let session = |store: &Store| -> Result<String> {
         Ok(store.connection.query_row("SELECT json_array(active,native_id,covers,owner_epoch,sdk_config,permission_version,native_token,shown,session_generation,handoff_revision,handoff_source) FROM scheduler_sessions WHERE conversation_id='c'", [], |row| row.get(0))?)
     };
+    let next_sequence = |store: &Store| -> Result<u64> {
+        Ok(store.connection.query_row(
+            "SELECT next_sequence FROM scheduler_sessions WHERE conversation_id='c'",
+            [],
+            |row| row.get(0),
+        )?)
+    };
     let before = session(&store)?;
     let request = admission_request(&net, "c", "refused", RequestedWorkKind::Task)?;
     let frozen = ResolvedModel {
@@ -8121,6 +8128,7 @@ fn refusing_an_unstarted_task_is_atomic_idempotent_and_preserves_another_active_
         model: Some("frozen-model".into()),
     };
     store.accept_work(&net.a, &net.network, request.clone(), frozen.clone(), 4)?;
+    let next_sequence_before = next_sequence(&store)?;
     store.create_conversation(
         &net.a,
         &net.network,
@@ -8164,6 +8172,26 @@ fn refusing_an_unstarted_task_is_atomic_idempotent_and_preserves_another_active_
         )?,
         active_before
     );
+    let jobs = store.scheduler_jobs("c")?;
+    let result_trigger = work_trigger(&request.work_id);
+    assert_eq!(
+        jobs.iter()
+            .map(|job| (job.trigger.as_str(), job.kind, job.state.name()))
+            .collect::<Vec<_>>(),
+        vec![
+            (active.job.trigger.as_str(), TriggerKind::Human, "running"),
+            (refused.trigger.as_str(), TriggerKind::AgentTask, "failed"),
+            (result_trigger.as_str(), TriggerKind::WorkResult, "queued"),
+        ]
+    );
+    let report = jobs.last().context("work result")?;
+    assert_eq!(report.reply_to, "m1");
+    assert!(report.runtime.is_none() && !report.pending_check && !report.tool_calls);
+    assert_eq!(report.sequence, next_sequence_before);
+    let after_refusal = next_sequence(&store)?;
+    assert_eq!(after_refusal, next_sequence_before + 1);
+    assert!(jobs.iter().all(|job| job.sequence < after_refusal));
+    let jobs_before_retry = serde_json::to_value(&jobs)?;
     assert!(
         store
             .refuse_queued_tasks(&net.a, &net.network, None, "boot", 6, refusal)?
@@ -8176,7 +8204,11 @@ fn refusing_an_unstarted_task_is_atomic_idempotent_and_preserves_another_active_
             .runtime,
         refused.runtime
     );
-    assert_eq!(store.scheduler_jobs("c")?.len(), 2);
+    assert_eq!(
+        serde_json::to_value(store.scheduler_jobs("c")?)?,
+        jobs_before_retry
+    );
+    assert_eq!(next_sequence(&store)?, after_refusal);
     assert!(matches!(
         store
             .scheduler_job(
@@ -8203,7 +8235,19 @@ fn refusing_an_unstarted_task_is_atomic_idempotent_and_preserves_another_active_
     )?;
     assert!(!retried.created);
     assert_eq!(retried.spec.resolved, frozen);
-    assert_eq!(store.scheduler_jobs("c")?.len(), 2);
+    assert_eq!(
+        serde_json::to_value(store.scheduler_jobs("c")?)?,
+        jobs_before_retry
+    );
+    assert_eq!(next_sequence(&store)?, after_refusal);
+    say(&mut store, &net, "m2", true)?;
+    let next = store
+        .scheduler_job("c", &message_trigger("m2"))?
+        .context("next human job")?;
+    assert_eq!(next.sequence, after_refusal);
+    assert!(next.sequence > report.sequence);
+    assert_eq!(next_sequence(&store)?, next.sequence + 1);
+    assert_eq!(session(&store)?, before);
     Ok(())
 }
 

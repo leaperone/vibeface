@@ -284,7 +284,8 @@ fn load_session(connection: &Connection, conversation: &str) -> Result<Scheduler
 fn save_session(connection: &Connection, session: &SchedulerSession) -> Result<()> {
     connection.execute(
         &format!(
-            "INSERT OR REPLACE INTO scheduler_sessions({SESSION_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            "INSERT OR REPLACE INTO scheduler_sessions({SESSION_COLUMNS})
+             VALUES(?1,MAX(?2,COALESCE((SELECT next_sequence FROM scheduler_sessions WHERE conversation_id=?1),?2)),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"
         ),
         params![
             session.conversation_id,
