@@ -144,7 +144,7 @@ jobs:
         run: |
           mkdir -p .artifacts/android
           cp apps/mobile/android/app/build/outputs/apk/release/app-release.apk ".artifacts/android/vibeface-${VERSION#v}-android.apk"
-          shasum -a 256 ".artifacts/android/vibeface-${VERSION#v}-android.apk" > ".artifacts/android/vibeface-${VERSION#v}-android.apk.sha256"
+          (cd .artifacts/android && shasum -a 256 "vibeface-${VERSION#v}-android.apk" > "vibeface-${VERSION#v}-android.apk.sha256")
           python3 - <<'PY'
           import hashlib, json, os
           name = f"vibeface-{os.environ['VERSION'].removeprefix('v')}-android.apk"
