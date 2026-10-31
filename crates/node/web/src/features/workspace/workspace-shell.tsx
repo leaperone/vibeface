@@ -27,7 +27,7 @@ import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
 import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
 import { backTo } from "@vibeface/client/workspace/home.ts"
-import { addressName, hostOf, isLoopback } from "@vibeface/client/workspace/labels.ts"
+import { addressName, entryLabel, hostOf, isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { entryAddress, entryKey } from "@vibeface/client/lib/node.ts"
 import { unreachableText } from "@vibeface/client/lib/transport.ts"
 import { LocalSession } from "./local-session"
@@ -84,7 +84,10 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   // A chat link to a bot this network does not have; the conversation open before must not stand in for it.
   const missingBot = routeBot !== undefined && workspace.bots.length > 0 && !workspace.bots.some((bot) => bot.bot_id === decodeURIComponent(routeBot))
   const botTitle = chatRoute && !missingBot && workspace.selectedBot
-  const title = chatRoute ? "对话" : titles[pathname] ?? (pathname.startsWith("/devices") ? terms.myDevices.label : "")
+  // On a phone the back button stands in for the sidebar, so a device's page is titled by the device.
+  const deviceId = /^\/devices\/([^/]+)$/.exec(pathname)?.[1]
+  const deviceName = isMobile && deviceId ? device.directory?.members.find((member) => member.device_id === decodeURIComponent(deviceId))?.name : undefined
+  const title = chatRoute ? "对话" : deviceName || (titles[pathname] ?? (pathname.startsWith("/devices") ? terms.myDevices.label : ""))
   const navigate = useNavigate()
   const joins = useOpenJoins()
   const [actionsSlot, setActionsSlot] = useState<HTMLElement | null>(null)
@@ -142,12 +145,13 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
                   const mood = botMood(bot, workspace)
                   return <SidebarMenuItem key={bot.bot_id}>
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
-                      <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name}>
+                      <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name} className="group/bot">
                         <BotFace bot={bot} mood={mood} size={28} className="size-7!" />
                         <span className="min-w-0 flex-1 truncate">{bot.name}</span>
-                        <MoodTag mood={mood} />
-                        {workspace.primary === bot.conversation_id ? <PrimaryMark /> : null}
-                        {marked ? <Dot label="有新进展" /> : null}
+                        {/* The star waits for a pointer on the row; a touch screen has none, so it stays there. */}
+                        {workspace.primary === bot.conversation_id ? <span className="flex transition-opacity duration-150 [@media(hover:hover)]:opacity-0 group-hover/bot:opacity-100 group-focus-visible/bot:opacity-100"><PrimaryMark /></span> : null}
+                        {/* One status: a decision waiting outranks news, which outranks what the bot is doing. */}
+                        {mood !== "waiting" && marked ? <Dot label="有新进展" /> : <MoodTag mood={mood} />}
                       </Link>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
@@ -238,13 +242,11 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
   const device = useDevice()
   const { link, entrances } = device
   const address = device.ready ? entryAddress(device.ready.entry) : ""
-  const entryId = device.ready?.entry.device_id
-  const entryName = device.directory?.members.find((member) => member.device_id === entryId)?.name || workspace.info?.name
-  const name = entryName || addressName(address)
+  const name = entryLabel({ joined: workspace.joined, directory: device.directory, entryId: device.ready?.entry.device_id, ownName: workspace.info?.name, address })
   // Devices of another network this browser opened before; the current network fails over by itself.
   const others = device.entries.filter((item) => item.kind !== "local" && !device.directory?.members.some((member) => member.device_id === item.device_id))
-  const state: { label: string; icon: LucideIcon; tone: string; encrypted?: boolean } = link.kind === "connecting"
-    ? { label: entrances.length > 1 ? "切换中" : "连接中", icon: ArrowRightLeft, tone: "text-info" }
+  const state: { label: string; icon: LucideIcon; tone: string; encrypted?: boolean } = link.kind === "connecting" || name === null
+    ? { label: entrances.length > 1 && name !== null ? "切换中" : "连接中", icon: ArrowRightLeft, tone: "text-info" }
     : !workspace.connectionOnline || link.kind === "offline"
       ? { label: "离线", icon: WifiOff, tone: "text-muted-foreground" }
       : workspace.writeState.state === "forked"
@@ -256,10 +258,10 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
         : { label: "在线", icon: Wifi, tone: "text-success", encrypted: true }
   return <Popover.Root>
     <Popover.Trigger asChild>
-      <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent active:bg-sidebar-accent max-md:h-11" aria-label={`${name} · ${state.encrypted ? `${terms.encrypted.label} · ` : ""}${state.label}`}>
+      <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent active:bg-sidebar-accent max-md:h-11" aria-label={name === null ? state.label : `${name} · ${state.encrypted ? `${terms.encrypted.label} · ` : ""}${state.label}`}>
         <state.icon aria-hidden="true" className={cn("size-4 shrink-0", state.tone)} />
-        <span className="min-w-0 flex-1 truncate">{name}</span>
-        <span className={cn("shrink-0", state.tone)}>{state.label}</span>
+        <span className={cn("min-w-0 flex-1 truncate", name === null && state.tone)}>{name ?? state.label}</span>
+        {name === null ? null : <span className={cn("shrink-0", state.tone)}>{state.label}</span>}
       </button>
     </Popover.Trigger>
     <Popover.Portal>

@@ -33,11 +33,11 @@ export function useDeviceRows(): DeviceRow[] {
   const rank = (row: DeviceRow) => row.browser ? 0 : row.entry ? 1 : row.kind === "node" ? 2 : deviceForm(row.kind, row.name) === "browser" ? 4 : 3
   return ids.map((id): DeviceRow => {
     const member = members.find((item) => item.device_id === id), node = nodes.find((item) => item.device_id === id)
-    const kind = member?.kind ?? "node", entry = id === ready?.entry.device_id
+    const kind = member?.kind ?? "node", entry = id === ready?.entry.device_id, browser = id === identity?.deviceId
     return {
       id, member, node, kind, name: member?.name || node?.name || (kind === "node" ? "电脑" : "浏览器"),
-      entry, browser: id === identity?.deviceId,
-      online: deviceOnline(kind, node, entry, connectionOnline), bot: botReadiness(node), admin: member?.manage ?? false,
+      entry, browser,
+      online: deviceOnline(kind, node, entry, connectionOnline, browser), bot: botReadiness(node), admin: member?.manage ?? false,
     }
   }).sort((a, b) => rank(a) - rank(b))
 }
@@ -188,6 +188,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
         <div className="flex flex-wrap items-center gap-2">
           {row.online !== undefined ? <Online online={row.online} /> : null}
           {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
+          {row.browser && entryName ? <Tag title={`连在「${entryName}」上`}><terms.thisComputer.icon aria-hidden="true" className="size-3.5" />{entryName}</Tag> : null}
           {row.admin ? <Tag title={terms.admin.label}><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.tag}</Tag> : null}
         </div>
         {row.online === false ? <p className="text-meta text-muted-foreground">{entryName && !row.entry ? `确认它开着，并且能连到「${entryName}」` : deviceCopy.offline}</p> : null}
@@ -226,14 +227,8 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       {action.errorKey === "local" ? <InlineError error={action.error} /> : null}
     </Section> : null}
 
-    <SettingsGroup>
-      <SettingsDisclosure icon={Info} label="详细信息">
-        <div className="grid gap-3 text-meta text-muted-foreground">
-          {address ? <DetailRow label={terms.address.label} value={address} mono /> : null}
-          <DetailRow label="设备编号" value={row.id} mono />
-        </div>
-      </SettingsDisclosure>
-      {canManage && row.member?.kind === "client" && !row.browser ? <SettingsRow icon={terms.admin.icon} label={unmanaging ? deviceCopy.unmanageAsk(row.name) : terms.admin.label} tone={unmanaging ? "danger" : undefined} stacked={unmanaging}
+    {canManage && row.member?.kind === "client" && !row.browser ? <SettingsGroup>
+      <SettingsRow icon={terms.admin.icon} label={unmanaging ? deviceCopy.unmanageAsk(row.name) : terms.admin.label} tone={unmanaging ? "danger" : undefined} stacked={unmanaging}
         description={unmanaging ? deviceCopy.unmanageNote(rows.filter((item) => item.admin && item.id !== row.id).length) : deviceCopy.manageHint}>
         {unmanaging ? <>
           <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setUnmanaging(false)}>取消</Button>
@@ -243,8 +238,17 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
         </> : <input type="checkbox" role="switch" className="switch" aria-label={terms.admin.label} checked={row.admin}
           disabled={action.busy !== null || row.admin && !rows.some((item) => item.admin && item.id !== row.id)}
           onChange={(event) => { if (!event.target.checked) setUnmanaging(true); else void action.run("manage", () => device.setManage(row.id, true), "已设为管理设备") }} />}
-      </SettingsRow> : null}
+      </SettingsRow>
       {action.errorKey === "manage" ? <div className="px-4 py-3"><InlineError error={action.error} /></div> : null}
+    </SettingsGroup> : null}
+
+    <SettingsGroup>
+      <SettingsDisclosure icon={Info} label="详细信息">
+        <div className="grid gap-3 text-meta text-muted-foreground">
+          {address ? <DetailRow label={terms.address.label} value={address} mono /> : null}
+          <DetailRow label="设备编号" value={row.id} mono />
+        </div>
+      </SettingsDisclosure>
       {canManage && row.member && !row.entry && !row.browser ? <SettingsRow icon={RemoveIcon} tone="danger" label={terms.remove.label} description={removing ? deviceCopy.removeNotice(Boolean(row.bot)) : undefined} stacked onClick={removing ? undefined : () => setRemoving(true)}>
         {removing ? <>
           <Button type="button" size="sm" variant="ghost" onClick={() => setRemoving(false)}>取消</Button>

@@ -11,7 +11,7 @@ import type { WorkRecord } from "@vibeface/client/workspace/types.ts"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
 import { folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
-import { agentName, answerLabel, awaitsAnswer, declined, foldAnswers, projectName, questionMeta, questionOpen, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
+import { agentName, answerLabel, approvalTask, awaitsAnswer, declined, foldAnswers, projectName, questionMeta, questionOpen, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
 import * as errors from "@vibeface/client/lib/errors.ts"
 import { followUp, followUpCopy } from "@vibeface/client/workspace/labels.ts"
 import { awaitsDevice, botReach, canSend, composerHint, starters } from "@vibeface/client/chat/protocol.ts"
@@ -517,12 +517,12 @@ const settleComponent = () => new Promise(setImmediate)
 test("question cards answer with a choice or typed text, retry an unconfirmed answer as sent and fold once answered", async () => {
   const sent: unknown[][] = []
   const workspace = { generation: 1, writable: true, nodes: [], answered: {} as Record<string, string>, pendingAnswers: [] as { question_id: string; text: string }[], announce() {},
-    bots: [{ bot_id: 'bot', conversation_id: 'chat', name: '项目 Bot' }],
+    bots: [{ bot_id: 'bot', conversation_id: 'chat', name: '项目 Bot' }], openWorks: [], data: { works: [{ work_id: 'w', thread_id: 's', title: '升级依赖', outcome: 'completed' }] },
     answer: async (...args: unknown[]) => { sent.push(args); return { status: 'answered', text: args[1] } } }
   const toasts: { text: string; action?: { label: string; onClick(): void } }[] = [], visited: unknown[] = []
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const router = { Link: 'Link', useNavigate: () => (target: unknown) => { visited.push(target) } }
-  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, answerLabel, declined, questionMeta, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
+  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, answerLabel, approvalTask, declined, questionMeta, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
   const question = { question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '要不要继续', choices: [{ label: '继续' }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null }
   type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void; onSubmit?: (event: unknown) => void } }
   const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' && 'props' in node ? text((node as Element).props.children) : ''
@@ -558,6 +558,9 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
     assert.match(words(elements), /已回答 · 停下/, 'an answer that just landed folds the card at once')
     assert.equal(elements.some(({ props }) => props.role === 'status'), true, 'and is announced')
     assert.equal(toasts.length, 0, 'answering in the chat itself needs no toast')
+    assert.doesNotMatch(words(elements), /升级依赖/, 'a question that held no task names none')
+    elements = app.render('QuestionCard', { question: { ...question, about: { ...question.about, request_id: 'r' } } })
+    assert.match(words(elements), /升级依赖[^]*工作电脑/, 'an answered approval names the task it held and its device, even once that task finished')
     workspace.answered = {}
     labelled(app.render('QuestionCard', { question: { ...question, question_id: 'q2' }, inbox: true }), '继续')?.props.onClick?.()
     await settleComponent()

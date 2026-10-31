@@ -860,7 +860,7 @@ jobs:
           [[ "${#archives[@]}" == 3 && "${#checksums[@]}" == 3 && "${#files[@]}" == 6 ]]
           for archive in "${archives[@]}"; do
             name="$(basename "$archive")"
-            [[ "$name" == "vibeface-$VERSION-"* ]]
+            [[ "$name" == "vibeface-$VERSION-"*.tar.gz ]]
             (cd packages && sha256sum -c "$name.sha256")
           done
       - name: Upload complete draft and publish
@@ -887,3 +887,4 @@ jobs:
             cmp "$asset" "$RUNNER_TEMP/release-download/$(basename "$asset")"
           done
           gh release edit "$RELEASE_TAG" --draft=false "${release_flags[@]}"
+

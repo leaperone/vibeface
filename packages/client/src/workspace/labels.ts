@@ -67,6 +67,16 @@ export function addressName(address: string) {
   try { return new URL(address).hostname } catch { return address }
 }
 
+/**
+ * The connected computer's name for the connection capsule. A member reads it from the directory; until the directory
+ * lists that computer it is `null`, since the computer's own name may predate its join. Before joining, its own name.
+ */
+export function entryLabel(input: { joined: boolean; directory: Pick<MembershipView, "members"> | null | undefined; entryId: string | undefined; ownName: string | undefined; address: string }): string | null {
+  const member = input.directory?.members.find((item) => item.device_id === input.entryId)?.name
+  if (member) return member
+  return input.joined ? null : input.ownName || addressName(input.address)
+}
+
 /** Joins and members carry only node or client, so a client named like a tablet or a phone counts as one, everywhere it shows. */
 export type DeviceForm = "computer" | "tablet" | "phone" | "browser"
 export const deviceForm = (kind: "node" | "client", name: string): DeviceForm =>
@@ -75,18 +85,19 @@ export const formName: Record<DeviceForm, string> = { computer: "电脑", tablet
 
 /**
  * A computer's reachability as the Node reports it; `entry` marks the computer this device connects through, online
- * before that read. A browser or phone has none: only the Node it happens to be connected to would know. While this
- * device is offline the last report is stale: the computer it lost reads offline, the others unknown.
+ * before that read. Another browser or phone has none: only the Node it happens to be connected to would know; `self`,
+ * the device in hand, is online while its connection is. While this device is offline the last report is stale: the
+ * computer it lost reads offline, the others unknown.
  */
-export const deviceOnline = (kind: "node" | "client", node: Pick<NodeInfo, "online"> | undefined, entry: boolean, connected: boolean) =>
-  kind !== "node" ? undefined : !connected ? (entry ? false : undefined) : node?.online ?? entry
+export const deviceOnline = (kind: "node" | "client", node: Pick<NodeInfo, "online"> | undefined, entry: boolean, connected: boolean, self = false) =>
+  kind !== "node" ? (self ? connected : undefined) : !connected ? (entry ? false : undefined) : node?.online ?? entry
 export const hostOf = (address: string) => { try { return new URL(address).host } catch { return "" } }
 
 const taskStates: Record<string, string> = {
   pending_delivery: "等待中", queued: "等待中", claimed: "准备中", accepted: "准备中", running: "运行中", waiting: "需要你同意",
   cancelling: "停止中", interrupting: "停止中", completed: "已完成", failed: "失败", cancelled: "已停止", interrupted: "已中断",
   pending_check: "待确认", unknown: "待确认", starting: "准备中", finished: "已完成", unverified: "待确认", awaiting_confirmation: "待确认",
-  dispatch_waiting: "等设备接收", dispatch_rejected: "未接收", dispatch_unverified: "结果未知", accepted_waiting_sync: "等待同步", stop_waiting: "停止中", stop_timed_out: "还在尝试停止",
+  dispatch_waiting: "等设备接收", dispatch_rejected: "未接收", awaiting_children: "等子任务", dispatch_unverified: "结果未知", accepted_waiting_sync: "等待同步", stop_waiting: "停止中", stop_timed_out: "还在尝试停止",
 }
 export const taskLabel = (state: string) => taskStates[state] ?? stateNames[state] ?? state
 /** A task still running when this device went offline may have moved on since; it reads unknown, not running. */
@@ -136,12 +147,28 @@ export function taskProgress(work: Pick<WorkRecord, "work_id" | "target_node" | 
 export const shownState = (work: WorkRecord, nodes: NodeInfo[] = []) =>
   confirmReason(work, nodes) ? "awaiting_confirmation" : work.outcome ?? work.stop ?? work.state
 export const taskActive = (state: string) => ["accepted", "running", "interrupting", "dispatch_waiting", "stop_waiting", "stop_timed_out"].includes(state)
+/**
+ * A chat task's state: one that completed while a work it dispatched, or that work's own, still runs waits on them. No record
+ * says so, so this reads only the works this device holds; a child not synced yet does not hold its parent.
+ */
+export function chatTaskState(work: WorkRecord, works: readonly WorkRecord[], nodes: NodeInfo[] = []): string {
+  const state = shownState(work, nodes)
+  if (state !== "completed") return state
+  const seen = new Set([work.work_id])
+  const open = (id: string): boolean => works.some((child) => {
+    if (child.parent !== id || seen.has(child.work_id)) return false
+    seen.add(child.work_id)
+    const shown = shownState(child, nodes)
+    return taskActive(shown) || shown === "awaiting_confirmation" || open(child.work_id)
+  })
+  return open(work.work_id) ? "awaiting_children" : state
+}
 
 /** A failed work, or a dispatch its device refused: the person sees it until something follows it up. */
 export const failedWork = (work: Pick<WorkRecord, "outcome" | "state">) => work.outcome === "failed" || work.outcome === "rejected" || work.state === "dispatch_rejected"
 /** A failure fixed in its device's settings: no bot there to take it, or the AI service there not set up. */
-export const fixOnDevice = (work: Pick<WorkRecord, "failure" | "failure_reason">) =>
-  ["missing_key", "auth_failed", "missing_binary", "execution_disabled", "no_model"].includes(work.failure ?? "") || /has no bot to take the task/i.test(work.failure_reason ?? "")
+export const fixOnDevice = (work: Pick<WorkRecord, "failure">) =>
+  ["missing_key", "auth_failed", "missing_binary", "execution_disabled", "no_model", "no_bot"].includes(work.failure ?? "")
 export const fixOnDeviceLabel = (device: string) => `去设置「${device}」`
 
 /** Where a task card sits on the tasks page, in both apps. */
