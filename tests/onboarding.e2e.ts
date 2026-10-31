@@ -30,6 +30,66 @@ test('creates a persistent Bot without a model and shows triage budget state', a
   await expect(bot).toBeVisible();
   await app.screenshot('onboarding-complete');
 
+  // Public projection fixtures check rendering; Provider lifecycle is covered by process tests.
+  const contextDb = new DatabaseSync(join(node.directory, 'node.sqlite3'));
+  const viewport = await browser.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
+  try {
+    const identity = contextDb.prepare('SELECT network_id, conversation_id FROM bots WHERE name=?').get('E2E Bot');
+    assert(typeof identity?.network_id === 'string' && typeof identity.conversation_id === 'string');
+    const shown = { bot: null, works: {}, session_generation: 4, context: {
+      attempt_id: 'p7-public-projection-fixture', provider: 'codex', stage: 'compiled', session_generation: 4,
+      stable_fingerprint: 'a'.repeat(64), dynamic_fingerprint: 'b'.repeat(64), stable_bytes: 100, dynamic_bytes: 200, invalidation_reason: null,
+      coverage: { messages_omitted: 1, works_omitted: 0, dispatches_omitted: 0, questions_omitted: 0, attachments_omitted: 0, memory_omitted: 3,
+        checkpoint_omitted: 1, handoff_omitted: 2, pending_checks_omitted: 3, bot_indexes_omitted: { skills: 4 }, history_retrieval: 'context' },
+    }, memory_conflicts: [{ call_ref: 'p7-public-memory-fixture', memory_id: 'p7-ui-memory', expected_epoch: 10, actual_epoch: 10,
+      expected_revision: 'b'.repeat(64), actual_revision: 'c'.repeat(64), reason: 'revision_changed' }] };
+    const saveContext = contextDb.prepare("INSERT INTO scheduler_sessions(conversation_id,scope,next_sequence,covers,owner_epoch,permission_version,shown) VALUES(?,'main',1,'{}',0,1,?) ON CONFLICT(conversation_id,scope) DO UPDATE SET shown=excluded.shown");
+    assert.equal(saveContext.run(identity.conversation_id, JSON.stringify(shown)).changes, 1);
+    contextDb.prepare('INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms,epoch,revision,origin,user_controlled,essential,source_event_hash) VALUES(?,?,?,?,?,?,10,?,?,1,1,?)')
+      .run(identity.network_id, 'p7-ui-memory', identity.conversation_id, '浏览器公开夹具记忆，回复使用中文。', 'p7-ui-fixture', Date.now(), 'c'.repeat(64), JSON.stringify('user'), 'd'.repeat(64));
+    const showContext = async () => {
+      await browser.reload();
+      await expect(bot).toBeVisible();
+      await screen.getByRole('heading', 'E2E Bot', { level: 1 }).getByRole('button', 'E2E Bot', { exact: true }).click();
+      const dialog = screen.getByRole('dialog');
+      await dialog.getByRole('button', /^上下文和会话/).click();
+      await expect(dialog.getByRole('heading', '上下文和会话')).toBeVisible();
+      return dialog;
+    };
+    await browser.setViewport({ width: 375, height: 812 });
+    let dialog = await showContext();
+    await expect(dialog.getByText('已编译', { exact: true })).toBeVisible();
+    await expect(dialog.getByText('内容已准备，尚未确认 AI 开始执行。')).toBeVisible();
+    await expect(dialog.getByText('当前续接状态未知。')).toBeVisible();
+    await expect(dialog.getByText('可尝试续接', { exact: true })).toHaveCount(0);
+    await expect(dialog.getByText('下轮重建', { exact: true })).toHaveCount(0);
+    await dialog.getByRole('button', '本轮上下文详情').click();
+    await expect(dialog.getByText('会话代次 4 · 已编译 · Codex')).toBeVisible();
+    await expect(dialog.getByText('历史检查点 · 1')).toBeVisible();
+    await expect(dialog.getByText('交接摘要 · 2')).toBeVisible();
+    await expect(dialog.getByText('待核对事项 · 3')).toBeVisible();
+    await expect(dialog.getByText('记忆 · 3')).toBeVisible();
+    await expect(dialog.getByText('Skill · 4')).toBeVisible();
+    await app.screenshot('context-fixture-compiled-coverage-narrow');
+    await dialog.getByRole('button', '查看已保存记忆 · 1').click();
+    await expect(dialog.getByText('浏览器公开夹具记忆，回复使用中文。')).toBeVisible();
+    await expect(dialog.getByText('你记录 · 由你维护，受保护 · 优先带入上下文')).toBeVisible();
+    await dialog.getByRole('button', '记忆版本').click();
+    await expect(dialog.getByText(`数据版本 10 · ${'c'.repeat(64)}`)).toBeVisible();
+    await dialog.getByRole('button', '查看记忆冲突 · 1').click();
+    await expect(dialog.getByText('记忆已被更新，未覆盖新值')).toBeVisible();
+    await app.screenshot('context-fixture-memory-narrow');
+    shown.context.stage = 'unknown';
+    assert.equal(saveContext.run(identity.conversation_id, JSON.stringify(shown)).changes, 1);
+    dialog = await showContext();
+    await expect(dialog.getByText('结果未知', { exact: true })).toBeVisible();
+    await expect(dialog.getByText('需核对执行结果，不能据此重发操作。')).toBeVisible();
+    await expect(dialog.getByText('已发送', { exact: true })).toHaveCount(0);
+  } finally {
+    contextDb.close();
+    await browser.setViewport(viewport);
+  }
+
   await browser.goto(`${node.url}/settings`);
   await screen.getByRole('button', /^转发到外部聊天/).click();
   const triage = screen.getByRole('status', '分诊状态');
