@@ -4,7 +4,7 @@
 use crate::{
     agent_context::{
         self, CompiledTurn, ContextCoverage, ContextSection, DynamicContext, DynamicTrigger,
-        MemoryContextEntry, SkillIndexEntry, StableInput,
+        MemoryContextEntry, SkillIndexEntry, StableInput, StableInstructions,
     },
     crypto::digest,
     manager::{self, CursorInstance, ManagerConfig, ManagerError},
@@ -13,7 +13,10 @@ use crate::{
         MAX_SCHEDULE_PROMPT_BYTES, OpenWork, Role, ScheduleEntry, VersionVector, WorkProjection,
     },
     runtime::{Access, Changed, Runtime},
-    scheduling::{JobOutcome, JobState, SchedulerJob, Shown, TriggerKind},
+    scheduling::{
+        JobOutcome, JobState, SchedulerJob, SessionConfig, SessionKey, SessionScope, Shown,
+        TriggerKind,
+    },
     store::Store,
     tools::Tool,
     work::Dispatch,
@@ -67,27 +70,6 @@ pub(crate) fn thread_instructions() -> String {
         "{BOT_AUTHORITY}\n{}\n\n{HISTORY_RULES}\n{THREAD_RULES}",
         CONSTRAINTS.join("\n")
     )
-}
-
-/// A different key opens a new native session. Native thread settings leave the per-turn model
-/// out; the compiled fingerprint still fences model and identity changes.
-pub(crate) fn session_key(
-    settings: &crate::config::ManagerSettings,
-    thread: Option<(&str, &str, &str)>,
-    cursor_store_root: Option<PathBuf>,
-    stable_fingerprint: Option<&str>,
-) -> Result<String> {
-    let mut settings = settings.clone();
-    if thread.is_some() {
-        settings.model.clear();
-    }
-    let native = match cursor_store_root {
-        Some(root) => {
-            serde_json::to_vec(&(&settings, thread, ("jsonl", root), stable_fingerprint))?
-        }
-        None => serde_json::to_vec(&(&settings, thread, stable_fingerprint))?,
-    };
-    Ok(digest(&native))
 }
 
 /// The model the bot set for this device's provider; `None` runs the device's default.
@@ -189,57 +171,39 @@ pub(crate) fn prefix(text: &str, max_bytes: usize) -> &str {
     &text[..end]
 }
 
-/// Invocation only consumes durable admissions; imported history never creates runnable jobs.
-pub async fn run(
-    node: Arc<Runtime>,
-    access: Access,
-    conversation: String,
-) -> Result<Option<Value>> {
-    use tracing::Instrument as _;
-    let span = tracing::info_span!("agent_turn", conversation_id = %conversation, work_id = tracing::field::Empty);
-    turn(node, access, conversation).instrument(span).await
+struct PreparedTurn {
+    local_settings: crate::runtime::NodeSettings,
+    provider_local: crate::providers::Local,
+    bot_model: Option<String>,
+    stable: StableInstructions,
+    config: ManagerConfig,
+    server: String,
+    session_config: SessionConfig,
 }
 
-async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Result<Option<Value>> {
-    let _work = node.maintenance.enter()?;
-    // A turn whose reply could not be recorded must not start; queued jobs wait.
-    if !node.writable() {
-        return Ok(None);
-    }
-    ensure!(
-        access
-            .conversation_id
-            .as_ref()
-            .is_none_or(|id| id == &conversation),
-        "conversation access denied"
-    );
-    let local_settings = node.settings_snapshot();
+async fn prepare_turn(
+    node: &Runtime,
+    network: &str,
+    conversation: &str,
+    scope: &SessionScope,
+) -> Result<PreparedTurn> {
+    let (local_settings, provider_local) = node.agent_configuration_snapshot().await;
     let Some(mut settings) = local_settings.manager.clone() else {
         bail!("this Node has no configured management SDK")
     };
-    let network = access.network_id.clone();
-    // An unknown model is the provider's error to report.
-    let bot_model = bot_model(
-        &settings,
-        node.store
-            .lock()
-            .await
-            .bot_for_conversation(&network, &conversation)?
-            .as_ref(),
-    );
+    let provider = settings.provider;
+    let (stable_bot, stable_skills, bot_model) = {
+        let store = node.store.lock().await;
+        let bot = store.bot_for_conversation(network, conversation)?;
+        (
+            configured_bot_value(bot.as_ref()),
+            skill_index(&store, network, bot.as_ref())?,
+            bot_model(&settings, bot.as_ref()),
+        )
+    };
     if let Some(model) = &bot_model {
         settings.model = model.clone();
     }
-    let provider = settings.provider;
-    let thread = provider.prompt_mode() == crate::providers::PromptMode::Thread;
-    let (stable_bot, stable_skills) = {
-        let store = node.store.lock().await;
-        let bot = store.bot_for_conversation(&network, &conversation)?;
-        (
-            configured_bot_value(bot.as_ref()),
-            skill_index(&store, &network, bot.as_ref())?,
-        )
-    };
     let stable_tools = provider.tools_for(TriggerKind::Human);
     let stable_tool_values = tools(TriggerKind::Human)
         .into_iter()
@@ -280,28 +244,130 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     };
     let tool_cli = std::env::current_exe()?;
     // A thread lists the tools once, with the guidance that holds for all its turns.
-    let guide = manager::bot_instructions(Some(&tool_cli), &stable_tools, &stable.rendered);
-    let instance = provider.instance_per_bot().then(|| CursorInstance::Bot {
-        network: network.clone(),
-        conversation: conversation.clone(),
+    let instance = provider.instance_per_bot().then(|| match scope {
+        SessionScope::Main => CursorInstance::Bot {
+            network: network.into(),
+            conversation: conversation.into(),
+        },
+        SessionScope::Task { work_id } => CursorInstance::Task {
+            network: network.into(),
+            conversation: conversation.into(),
+            work_id: work_id.clone(),
+        },
+        SessionScope::Routine { trigger } => CursorInstance::Routine {
+            network: network.into(),
+            conversation: conversation.into(),
+            trigger: trigger.clone(),
+        },
     });
-    let sdk_config = session_key(
-        &settings,
-        thread.then_some((tool_url.as_str(), server.as_str(), guide.as_str())),
-        instance
+    let mut config = ManagerConfig {
+        custom_tools: stable_tools,
+        tool_cli: Some(tool_cli),
+        instructions: match provider.descriptor().stable_prompt {
+            crate::providers::StablePromptPlacement::TurnInstructions => String::new(),
+            crate::providers::StablePromptPlacement::ThreadInstructions
+            | crate::providers::StablePromptPlacement::SessionInstructions
+            | crate::providers::StablePromptPlacement::UserTurnPrefix => stable.rendered.clone(),
+        },
+        ..node.manager_config_from(settings, &provider_local)?
+    };
+    if let Some(instance) = &instance {
+        config = config.for_cursor_instance(instance.clone(), node.cursor_store_root(instance));
+    }
+    let runtime_fingerprint = digest(&serde_json::to_vec(&(
+        config.runtime_fingerprint(&provider_local)?,
+        tool_url,
+        &server,
+        &config.tool_cli,
+    ))?);
+    let session_config = SessionConfig {
+        stable_fingerprint: stable.fingerprint.digest.clone(),
+        runtime_fingerprint,
+        provider,
+    };
+    Ok(PreparedTurn {
+        local_settings,
+        provider_local,
+        bot_model,
+        stable,
+        config,
+        server,
+        session_config,
+    })
+}
+
+pub(crate) async fn session_configuration(
+    node: &Runtime,
+    network: &str,
+    key: &SessionKey,
+) -> Result<SessionConfig> {
+    Ok(
+        prepare_turn(node, network, &key.conversation_id, &key.scope)
+            .await?
+            .session_config,
+    )
+}
+
+/// Invocation only consumes durable admissions; imported history never creates runnable jobs.
+pub async fn run(
+    node: Arc<Runtime>,
+    access: Access,
+    conversation: String,
+    scope: SessionScope,
+) -> Result<Option<Value>> {
+    use tracing::Instrument as _;
+    let span = tracing::info_span!("agent_turn", conversation_id = %conversation, work_id = tracing::field::Empty);
+    turn(node, access, conversation, scope)
+        .instrument(span)
+        .await
+}
+
+async fn turn(
+    node: Arc<Runtime>,
+    access: Access,
+    conversation: String,
+    scope: SessionScope,
+) -> Result<Option<Value>> {
+    let _work = node.maintenance.enter()?;
+    // A turn whose reply could not be recorded must not start; queued jobs wait.
+    if !node.writable() {
+        return Ok(None);
+    }
+    ensure!(
+        access
+            .conversation_id
             .as_ref()
-            .map(|instance| node.cursor_store_root(instance)),
-        Some(&stable.fingerprint.digest),
-    )?;
+            .is_none_or(|id| id == &conversation),
+        "conversation access denied"
+    );
+    let network = access.network_id.clone();
+    let PreparedTurn {
+        local_settings,
+        provider_local,
+        bot_model,
+        stable,
+        mut config,
+        server,
+        session_config,
+    } = prepare_turn(&node, &network, &conversation, &scope).await?;
+    let provider = session_config.provider;
+    let thread = provider.prompt_mode() == crate::providers::PromptMode::Thread;
+    if node.provider_configuration_pending(provider, &provider_local) {
+        return Ok(None);
+    }
     let claimed = {
         let mut store = node.store.lock().await;
         store.authorize_node(&network, &node.identity.device_id()?)?;
-        match store.claim_next(
+        match store.claim_next_in_session(
             &node.identity,
             &network,
-            &conversation,
+            &SessionKey {
+                conversation_id: conversation.clone(),
+                scope,
+            },
             boot_id(),
-            &sdk_config,
+            &session_config,
+            &node.config.scheduling,
         )? {
             Some(claimed) => claimed,
             None => return Ok(None),
@@ -323,7 +389,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     tracing::info!(event = "agent.turn.started", trigger, attempt = attempt.id, kind = ?job.kind, provider = ?provider, "agent turn started");
     // A resumed Codex thread keeps the Shell environment it was created with, so its token
     // carries over; it acts only while an attempt has it registered.
-    let token = if instance.is_some() {
+    let token = if provider.instance_per_bot() {
         uuid::Uuid::new_v4().to_string()
     } else {
         claimed
@@ -359,7 +425,10 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             let store = node.store.lock().await;
             let works = store.works(&network, &conversation)?;
             let dispatches = store.undelivered_dispatches(&network, &conversation)?;
-            let bot = bot_value(&store, &network, &conversation, crate::runtime::now_ms())?;
+            let mut bot = bot_value(&store, &network, &conversation, crate::runtime::now_ms())?;
+            bot["configured_bot"] = stable.bot.clone();
+            bot["skills"] = json!(stable.skills);
+            fit_bot(&mut bot, INDEX_BUDGET);
             let memories: Vec<_> = store.memory_records(&network, &conversation)?
                 .into_iter().filter(|record| record.essential)
                 .map(|record| MemoryContextEntry { memory_id: record.entry.memory_id,
@@ -373,13 +442,14 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                 ),
                 _ => None,
             };
-            let handoff = claimed.invalidation.as_ref().map(|invalidation| {
+            let uses_handoff = node.compact_or_handoff(provider)? == crate::providers::CompactionMode::Handoff;
+            let handoff = claimed.invalidation.as_ref().filter(|value| uses_handoff && value.source_provider.is_some()).map(|invalidation| {
                 agent_context::ContextHandoff {
                     schema_version: agent_context::SCHEMA_VERSION,
-                    source_provider: provider,
-                    target_provider: provider,
-                    basis: job.basis.clone(),
-                    source_fingerprint: invalidation.old_config.clone().unwrap_or_default(),
+                    source_provider: invalidation.source_provider.expect("existing session provider"),
+                    target_provider: invalidation.target_provider,
+                    basis: invalidation.source_basis.clone(),
+                    source_fingerprint: invalidation.old_stable_fingerprint.clone().unwrap_or_default(),
                     generation: invalidation.generation,
                     handoff_revision: invalidation.handoff_revision.clone(),
                     recent_context: "The new provider session rebuilds from the recorded DAG basis. Use context to read older events.".into(),
@@ -395,7 +465,13 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                     "created_at_ms":check.created_at_ms}))
                 .collect();
             let unseen = Shown { session_generation: claimed.shown.session_generation, ..Shown::default() };
-            let stable_budget = if thread { 0 } else { stable.rendered.len() + 2 };
+            let adapter_prefix = match stable.provider.stable_prompt {
+                crate::providers::StablePromptPlacement::UserTurnPrefix => manager::bot_instructions(
+                    config.tool_cli.as_deref(), &config.custom_tools, &stable.rendered,
+                ).len() + 2,
+                _ => 0,
+            };
+            let stable_budget = if thread { adapter_prefix } else { stable.rendered.len() + 2 };
             let dynamic_limit = PROMPT_LIMIT.saturating_sub(stable_budget);
             ensure!(dynamic_limit > 0, "compiled stable instructions exceed the provider input limit");
             let render = |history: &TurnHistory, seen: Option<&Shown>| -> Result<_> {
@@ -415,10 +491,11 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                     stable_bytes: stable.rendered.len(), dynamic_bytes: dynamic.rendered.len(),
                     invalidation_reason: claimed.invalidation.as_ref().map(|value| value.reason.clone()),
                     stage: crate::scheduling::ContextStage::Compiled,
+                    session_status: None,
                 });
                 let compiled = CompiledTurn::new(stable.clone(), dynamic, provider.prompt_mode());
                 let prompt = compiled.prompt();
-                ensure!(prompt.len() <= PROMPT_LIMIT, "compiled prompt exceeds the provider input limit");
+                ensure!(prompt.len() + adapter_prefix <= PROMPT_LIMIT, "compiled prompt exceeds the provider input limit");
                 Ok((prompt, shown))
             };
             let (prompt, shown) = render(&history, thread.then_some(&claimed.shown))?;
@@ -435,22 +512,10 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
         // The backend may still be starting with the Node.
         node.manager_backend_ready(provider).await;
-        let mut config = ManagerConfig {
-            custom_tools: provider.tools_for(job.kind),
-            tool_cli: Some(tool_cli),
-            instructions: if thread {
-                stable.rendered.clone()
-            } else {
-                String::new()
-            },
-            tool_token: Some(token.clone()),
-            process_started: Some(process_recorder(&node, &attempt.id)),
-            codex_turn: Some(turn_recorder(&node, &attempt.id, &server, shown.clone(), fresh_prompt)),
-            ..node.manager_config(settings)?
-        };
-        if let Some(instance) = &instance {
-            config = config.for_cursor_instance(instance.clone(), node.cursor_store_root(instance));
-        }
+        config.custom_tools = provider.tools_for(job.kind);
+        config.tool_token = Some(token.clone());
+        config.process_started = Some(process_recorder(&node, &attempt.id));
+        config.codex_turn = Some(turn_recorder(&node, &attempt.id, &server, shown.clone(), fresh_prompt));
         config.tool_env.extend([
             ("VIBEFACE_NODE_URL".into(), local_url),
             ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
@@ -1935,52 +2000,6 @@ mod tests {
         partial.apply(&json!({"type":"tool","item_id":"t","status":"running"}));
         partial.apply(&json!({"type":"text_delta","item_id":"b","text":"world"}));
         assert_eq!(partial.text(), "hello\n\nworld");
-    }
-
-    #[test]
-    fn the_session_key_follows_what_the_native_session_holds() -> Result<()> {
-        let settings = |model: &str, provider| crate::config::ManagerSettings {
-            provider,
-            workspace: "/w".into(),
-            model: model.into(),
-        };
-        let codex = |model, guide| {
-            session_key(
-                &settings(model, crate::providers::Provider::Codex),
-                Some(("http://127.0.0.1:1", "system", guide)),
-                None,
-                None,
-            )
-        };
-        assert_eq!(codex("gpt-a", "guide")?, codex("gpt-b", "guide")?);
-        assert_ne!(codex("gpt-a", "guide")?, codex("gpt-a", "new guide")?);
-        let cursor = |model| {
-            session_key(
-                &settings(model, crate::providers::Provider::Cursor),
-                None,
-                None,
-                None,
-            )
-        };
-        assert_ne!(cursor("a")?, cursor("b")?);
-        let private_cursor = |root| {
-            session_key(
-                &settings("a", crate::providers::Provider::Cursor),
-                None,
-                Some(PathBuf::from(root)),
-                None,
-            )
-        };
-        assert_ne!(cursor("a")?, private_cursor("/node/cursor/bot-a")?);
-        assert_ne!(
-            private_cursor("/node/cursor/bot-a")?,
-            private_cursor("/node/cursor/bot-b")?
-        );
-        assert_eq!(
-            private_cursor("/node/cursor/bot-a")?,
-            private_cursor("/node/cursor/bot-a")?
-        );
-        Ok(())
     }
 
     #[test]

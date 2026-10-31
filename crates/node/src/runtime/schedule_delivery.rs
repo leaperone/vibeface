@@ -35,6 +35,25 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
 }
 
 impl Runtime {
+    pub(super) async fn scheduler_context_observation(
+        &self,
+        network: &str,
+        key: &SessionKey,
+    ) -> Result<Option<crate::scheduling::ContextProjection>> {
+        let desired = crate::scheduler::session_configuration(self, network, key)
+            .await
+            .ok();
+        let store = self.store.lock().await;
+        let mut context = store.scheduler_scoped_context_projection(key)?;
+        if let Some(context) = &mut context {
+            context.session_status = desired
+                .as_ref()
+                .map(|config| store.scheduler_session_status(key, Some(config)))
+                .transpose()?;
+        }
+        Ok(context)
+    }
+
     pub(super) fn scheduler_job_projection(
         &self,
         store: &Store,
@@ -481,6 +500,15 @@ impl Runtime {
             manager: None,
         };
         self.require_scope(&access, scope).await?;
+        let context = self
+            .scheduler_context_observation(
+                network,
+                &SessionKey {
+                    conversation_id: scope.into(),
+                    scope: crate::scheduling::SessionScope::Main,
+                },
+            )
+            .await?;
         let store = self.store.lock().await;
         let checks = store.pending_checks()?;
         let all = chat_jobs(store.scheduler_jobs(scope)?);
@@ -492,7 +520,7 @@ impl Runtime {
         }
         Ok(
             json!({"jobs":jobs,"manager":self.scheduler_manager_metadata(),
-            "context":store.scheduler_context_projection(scope)?,
+            "context":context,
             "memory_staged_count":store.scheduler_memory_staged_count(scope)?,
             "memory_conflicts":store.scheduler_memory_conflicts(scope)?}),
         )
@@ -556,7 +584,8 @@ impl Runtime {
             jobs.push(job);
         }
         Ok(Some((
-            json!({"owner":owner,"reachable":true,"context":reply["context"]}),
+            json!({"owner":owner,"reachable":true,"context":reply["context"],
+                "memory_staged_count":reply["memory_staged_count"],"memory_conflicts":reply["memory_conflicts"]}),
             reply["manager"].clone(),
         )))
     }

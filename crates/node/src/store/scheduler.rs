@@ -1846,26 +1846,36 @@ impl Store {
         config: Option<&SessionConfig>,
     ) -> Result<SessionStatusProjection> {
         let session = load_scoped_session(&self.connection, key)?;
+        let changed = config.is_some_and(|config| {
+            session.stable_fingerprint.as_deref() != Some(config.stable_fingerprint.as_str())
+                || session.runtime_fingerprint.as_deref()
+                    != Some(config.runtime_fingerprint.as_str())
+                || session.provider != Some(config.provider)
+        });
         Ok(SessionStatusProjection {
             resumable: !matches!(key.scope, SessionScope::Routine { .. })
                 && session.native_id.is_some(),
-            pending_generation: session.active.is_some()
-                && config.is_some_and(|config| {
-                    session.stable_fingerprint.as_deref()
-                        != Some(config.stable_fingerprint.as_str())
-                        || session.runtime_fingerprint.as_deref()
-                            != Some(config.runtime_fingerprint.as_str())
-                        || session.provider != Some(config.provider)
-                }),
+            pending_generation: changed,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn scheduler_context_projection(
         &self,
         conversation: &str,
     ) -> Result<Option<ContextProjection>> {
         let session = load_session(&self.connection, conversation)?;
         Ok(context_projection_from(&session))
+    }
+
+    pub(crate) fn scheduler_scoped_context_projection(
+        &self,
+        key: &SessionKey,
+    ) -> Result<Option<ContextProjection>> {
+        Ok(context_projection_from(&load_scoped_session(
+            &self.connection,
+            key,
+        )?))
     }
 
     pub(crate) fn scheduler_memory_conflicts(
@@ -2176,6 +2186,7 @@ impl Store {
                 &job.basis,
             ))?);
             let invalidation = SessionInvalidation {
+                source_basis: session.covers.clone(),
                 old_stable_fingerprint: session.stable_fingerprint.clone(),
                 new_stable_fingerprint: config.stable_fingerprint.clone(),
                 old_runtime_fingerprint: session.runtime_fingerprint.clone(),
@@ -2195,6 +2206,7 @@ impl Store {
                 session.provider,
             ) {
                 lineage.push(SessionLineage {
+                    source_basis: invalidation.source_basis.clone(),
                     generation: session.shown.session_generation,
                     stable_fingerprint,
                     runtime_fingerprint,

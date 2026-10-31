@@ -152,7 +152,7 @@ impl Runtime {
         let store = self.store.lock().await;
         let works = store.works(network, scope)?;
         let task_jobs = task_observations(self, &store, network, scope, &checks)?;
-        let work_values = works
+        let mut work_values = works
             .iter()
             .map(|work| work_view(work, &task_jobs))
             .collect::<Result<Vec<_>>>()?;
@@ -205,9 +205,19 @@ impl Runtime {
         let memory = memory_view(&store, network, scope)?;
         let memory_staged_count = store.scheduler_memory_staged_count(scope)?;
         let memory_conflicts = store.scheduler_memory_conflicts(scope)?;
-        let local_context = store.scheduler_context_projection(scope)?;
         let unanswered = store.unanswered_messages(network, &local, scope)?;
         drop(store);
+        self.refresh_task_contexts(network, &mut work_values)
+            .await?;
+        let local_context = self
+            .scheduler_context_observation(
+                network,
+                &crate::scheduling::SessionKey {
+                    conversation_id: scope.into(),
+                    scope: crate::scheduling::SessionScope::Main,
+                },
+            )
+            .await?;
         let (remote, metadata) = match owner {
             Some((remote, metadata)) if metadata.is_object() => (remote, metadata),
             Some((remote, _)) => (remote, Value::Null),
@@ -258,6 +268,15 @@ impl Runtime {
     ) -> Result<Option<Value>> {
         let scope = field(change, "conversation_id")?;
         let (jobs, checks) = self.scheduler_snapshot_jobs(network, scope).await?;
+        let context = self
+            .scheduler_context_observation(
+                network,
+                &crate::scheduling::SessionKey {
+                    conversation_id: scope.into(),
+                    scope: crate::scheduling::SessionScope::Main,
+                },
+            )
+            .await?;
         let store = self.store.lock().await;
         let mut message_id = None;
         let mut work_id = change["work_id"].as_str().map(str::to_owned);
@@ -305,7 +324,7 @@ impl Runtime {
             .into_iter()
             .filter(|notification| notification.conversation_id == scope)
             .collect();
-        Ok(Some(json!({
+        let mut value = json!({
             "type":"records",
             "conversation_id":scope,
             "messages":messages.into_iter().collect::<Vec<_>>(),
@@ -319,12 +338,42 @@ impl Runtime {
             "deliveries":deliveries(&store, network, scope)?,
             "checks":without_work_checks(checks, &works),
             "jobs":jobs,
-            "context":store.scheduler_context_projection(scope)?,
+            "context":context,
             "memory":memory_view(&store, network, scope)?,
             "memory_staged_count":store.scheduler_memory_staged_count(scope)?,
             "memory_conflicts":store.scheduler_memory_conflicts(scope)?,
             "unanswered":store.unanswered_messages(network, &self.identity.device_id()?, scope)?,
-        })))
+        });
+        drop(store);
+        if let Some(works) = value["works"].as_array_mut() {
+            self.refresh_task_contexts(network, works).await?;
+        }
+        Ok(Some(value))
+    }
+}
+
+impl Runtime {
+    async fn refresh_task_contexts(&self, network: &str, works: &mut [Value]) -> Result<()> {
+        for work in works {
+            let Some(expected) = work["coordination_job"]["context"]["attempt_id"]
+                .as_str()
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let key = crate::scheduling::SessionKey {
+                conversation_id: field(work, "conversation_id")?.into(),
+                scope: crate::scheduling::SessionScope::Task {
+                    work_id: field(work, "work_id")?.into(),
+                },
+            };
+            work["coordination_job"]["context"] = json!(
+                self.scheduler_context_observation(network, &key)
+                    .await?
+                    .filter(|context| context.attempt_id == expected)
+            );
+        }
+        Ok(())
     }
 }
 

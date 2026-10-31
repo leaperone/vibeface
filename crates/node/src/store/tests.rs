@@ -8816,6 +8816,11 @@ fn stable_runtime_and_provider_changes_have_distinct_session_lineage() -> Result
         "done",
         5,
     )?;
+    assert!(
+        store
+            .scheduler_session_status(&key, Some(&new))?
+            .pending_generation
+    );
     say(&mut store, &net, "config-two", true)?;
     let second = store
         .claim_next_in_session(&net.a, &net.network, &key, "boot", &new, &limits)?
@@ -8834,6 +8839,12 @@ fn stable_runtime_and_provider_changes_have_distinct_session_lineage() -> Result
     assert_eq!(invalidation.new_runtime_fingerprint, "runtime-two");
     assert_eq!(invalidation.source_provider, Some(Provider::Codex));
     assert_eq!(invalidation.target_provider, Provider::Cursor);
+    assert_eq!(invalidation.source_basis, first.job.basis);
+    assert_ne!(invalidation.source_basis, second.job.basis);
+    assert_eq!(
+        second.shown.session_lineage[0].source_basis,
+        first.job.basis
+    );
     assert_eq!(second.shown.session_generation, 2);
     assert!(second.previous_native_id.is_none() && second.previous_token.is_none());
     assert_eq!(

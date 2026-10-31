@@ -490,6 +490,7 @@ pub struct ClaimedJob {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionInvalidation {
+    pub source_basis: VersionVector,
     pub old_stable_fingerprint: Option<String>,
     pub new_stable_fingerprint: String,
     pub old_runtime_fingerprint: Option<String>,
@@ -504,6 +505,7 @@ pub struct SessionInvalidation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionLineage {
+    pub source_basis: VersionVector,
     pub generation: u64,
     pub stable_fingerprint: String,
     pub runtime_fingerprint: String,
@@ -517,8 +519,6 @@ pub struct SessionLineage {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shown {
     pub bot: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<BTreeMap<String, String>>,
     pub works: BTreeMap<String, String>,
     /// Digests of the bounded memory rows actually delivered to this native session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
