@@ -72,6 +72,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const agent = work ? taskAgent(work, workspace.nodes) : null
   const AgentIcon = agent ? providerIcons[agent] : null
   const progress = workspace.liveProgress.find((item) => item.kind === "native" && item.work_id === workId && item.target_node === device)
+  const plan = parseSummarySteps(work?.summary ?? "")
   // Any entry forwards the stop; an unreachable device gets it when it is back.
   const canStop = work && state !== "awaiting_confirmation" && !work.outcome && !work.stop && ["accepted", "running"].includes(work.state)
   const navigate = useNavigate()
@@ -119,7 +120,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
         {work.cwd ? <span className="flex min-w-0 items-center gap-1.5" title={work.cwd}><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project} </span><span className="truncate">{projectName(work.cwd)}</span></span> : null}
       </p> : null}
       {progress?.status && taskActive(state) && progress.status !== "awaiting_input" && progressLabel(progress.status) !== "进行中" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
-      {!progress?.text && work.summary && taskActive(state) ? <Summary text={work.summary} /> : null}
+      {plan ? <Details label={`执行步骤 · ${plan.length}`} open={taskActive(state)}><SummarySteps steps={plan} /></Details> : !progress?.text && work.summary && taskActive(state) ? <Summary text={work.summary} /> : null}
       {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}
       {work.prompt ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">交代的事</h3><p className="line-clamp-6 whitespace-pre-wrap break-words" title={work.prompt}>{work.prompt}</p></section> : null}
       {result && !taskActive(state) && !check ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">{failed || !work.result_text ? "原因" : "结果"}</h3>{!failed && work.result_text ? <Markdown text={result} /> : <p className={`whitespace-pre-wrap break-words ${failed ? "text-danger" : ""}`}>{result}</p>}</section> : null}
@@ -171,12 +172,24 @@ const steps: Record<string, { icon: typeof Circle; className: string; label: str
   "·": { icon: Circle, className: "text-muted-foreground", label: "待做" },
 }
 
+type SummaryStep = { marker: keyof typeof steps; text: string }
+
+function parseSummarySteps(text: string): SummaryStep[] | null {
+  if (!text) return null
+  const lines = text.split("\n")
+  if (!lines.length || !lines.every((line) => steps[line.slice(0, 1)] && line[1] === " ")) return null
+  return lines.map((line) => ({ marker: line.slice(0, 1) as keyof typeof steps, text: line.slice(2) }))
+}
+
+function SummarySteps({ steps: items }: { steps: SummaryStep[] }) {
+  return <ol className="grid gap-1.5">{items.map((item, index) => {
+    const step = steps[item.marker]
+    return <li key={`${item.marker}:${index}`} className={cn("flex min-w-0 items-start gap-2", item.marker === "·" && "text-muted-foreground")}><step.icon aria-hidden="true" className={cn("mt-0.5 size-4 shrink-0", step.className)} /><span className="sr-only">{step.label} </span><span className="break-words">{item.text}</span></li>
+  })}</ol>
+}
+
 /** A task's summary; a plan shows each step with an icon for where it stands. */
 function Summary({ text }: { text: string }) {
-  const lines = text.split("\n")
-  if (!lines.every((line) => steps[line.slice(0, 1)] && line[1] === " ")) return <p className="whitespace-pre-wrap break-words">{text}</p>
-  return <ol className="grid gap-1.5">{lines.map((line, index) => {
-    const step = steps[line.slice(0, 1)]
-    return <li key={index} className={cn("flex min-w-0 items-start gap-2", line.startsWith("·") && "text-muted-foreground")}><step.icon aria-hidden="true" className={cn("mt-0.5 size-4 shrink-0", step.className)} /><span className="sr-only">{step.label} </span><span className="break-words">{line.slice(2)}</span></li>
-  })}</ol>
+  const parsed = parseSummarySteps(text)
+  return parsed ? <SummarySteps steps={parsed} /> : <p className="whitespace-pre-wrap break-words">{text}</p>
 }
