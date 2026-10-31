@@ -38,7 +38,7 @@ export function TasksOverview() {
   const lookup = { nodes: workspace.nodes, directory }
   const localOverview = overviewFromWorkspace({ openWorks: workspace.openWorks, bots: workspace.bots, questions: workspace.questions, nodes: workspace.nodes })
   const overview = workspace.overview ?? localOverview
-  const overviewWorks = workspace.overview ? openWorksFromOverview(workspace.overview) : workspace.openWorks
+  const overviewWorks = workspace.overview ? openWorksFromOverview(workspace.overview, workspace.openWorks) : workspace.openWorks
   const attention = inbox.filter((item): item is Extract<InboxItem, { kind: "question" | "confirm" }> => item.kind === "confirm" || item.kind === "question" && !item.done)
   const attentionWorkIds = new Set<string>()
   for (const item of attention) {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
+import { openWorksFromOverview, overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
+import { cardState, overviewScope, taskGroup } from "./labels.ts"
 import type { BotRecord, NodeInfo, OpenWork, Question } from "./types.ts"
 
 const bot = (conversation_id: string, bot_id = `bot-${conversation_id}`, name = conversation_id): BotRecord => ({
@@ -107,4 +108,47 @@ test("an overview row the Node names only by its conversation shows that convers
 test("a failed open work stays on the task page", () => {
   const overview = overviewFromWorkspace({ openWorks: [work({ state: "finished", outcome: "failed", failure_reason: "boom" })], bots: [bot("chat-1")], questions: [], nodes: [node("worker")] })
   assert.deepEqual(overview.tasks.map((task) => [task.work_id, task.outcome]), [["work-1", "failed"]])
+})
+
+test("a bounded overview adds observations without deleting known work or replacing its full fields", () => {
+  const known = Array.from({ length: 257 }, (_, index) => work({ work_id: `w-${index}`, prompt: `完整请求 ${index}`, result_text: "已有输出", trigger: "message:known" }))
+  const overview = parseWorkspaceOverview({
+    tasks: known.slice(0, 256).map((item) => ({ ...item, kind: "work", prompt: undefined, result_text: undefined, summary: "另一次读取" })),
+    deliveries: [{ work_id: "delivery-only", conversation_id: "chat-1", state: "accepted_waiting_sync", target_node: "worker" },
+      { work_id: "w-0", conversation_id: "other-chat", state: "stop_waiting", target_node: "other" }],
+    truncated: true, consistency: "partial", coverage: { source: "workspace_overview", complete: false, truncated: true, remote_owners: [{ owner: "remote", reason: "remote_scheduler_not_queried" }] },
+  })
+  const merged = openWorksFromOverview(overview, known)
+  assert.equal(merged.length, 259)
+  assert.equal(merged[0], known[0], "the bounded read cannot establish that its fields are newer")
+  assert.deepEqual(merged.slice(0, 257), known, "all prompt, result and causal fields remain intact")
+  assert.equal(merged[257]?.state, "dispatch_waiting")
+  assert.equal(merged[258]?.stop, "stop_waiting")
+  assert.equal(cardState(merged[257], [], overview.tasks[256]?.state), "accepted_waiting_sync")
+  assert.equal(cardState(merged[258], [], overview.tasks[257]?.state), "stop_waiting")
+  const notes = overviewScope(overview.coverage).join(" · ")
+  assert.match(notes, /部分记录/)
+  assert.match(notes, /截断/)
+  assert.match(notes, /远端调度尚未查询/)
+  assert.doesNotMatch(notes, /0 项|另有/, "unknown omission counts are not fabricated")
+  assert.match(overviewScope({ ...overview.coverage, omitted_tasks: 3 }).join(" · "), /3 项任务未列出/)
+})
+
+test("task confirmation outranks a running projection while delivery, stop and real outcomes remain distinct", () => {
+  const running = work()
+  const offline = [node("worker", false)]
+  assert.equal(cardState(running, offline, "running"), "awaiting_confirmation")
+  assert.equal(taskGroup(cardState(running, offline, "running"), false), "attention")
+  const disconnected = [{ ...node("worker"), capabilities: { ...node("worker").capabilities!, codex_connected: false } }]
+  assert.equal(cardState(running, disconnected, "running"), "awaiting_confirmation")
+  assert.equal(cardState(work({ state: "unverified", outcome: "unverified" }), [], "running"), "awaiting_confirmation")
+  assert.equal(cardState(work({ outcome: "unverified" }), [], "running"), "unverified")
+  for (const state of ["unknown", "unverified", "awaiting_confirmation"]) assert.equal(taskGroup(state, false), "attention")
+  for (const state of ["dispatch_waiting", "accepted_waiting_sync", "stop_waiting", "stop_timed_out", "dispatch_unverified"]) assert.equal(cardState(running, [], state), state)
+  for (const outcome of ["completed", "interrupted", "failed", "rejected"] as const) {
+    const ended = work({ state: "finished", outcome })
+    assert.equal(cardState(ended, offline, "running"), outcome)
+  }
+  const ended = parseWorkspaceOverview({ tasks: [{ ...running, kind: "work", state: "finished", outcome: "completed", remote_reachable: false }] })
+  assert.equal(ended.tasks[0]?.outcome, "completed", "offline now does not invalidate an already recorded result")
 })

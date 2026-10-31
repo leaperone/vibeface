@@ -31,7 +31,7 @@ export function TasksScreen() {
   const overview = shared?.overview ?? localOverview
   type ProjectedWork = Extract<OverviewTask, { kind: 'work' | 'dispatch' }>
   const projected = new Map(overview?.tasks.filter((task): task is ProjectedWork => (task.kind === 'work' || task.kind === 'dispatch') && Boolean(task.work_id)).map((task) => [task.work_id!, task]))
-  const overviewWorks = shared?.overview ? openWorksFromOverview(shared.overview) : works
+  const overviewWorks = shared?.overview ? openWorksFromOverview(shared.overview, works) : works
   const visibleWorks = overview ? overviewWorks.filter((work) => projected.has(work.work_id)) : overviewWorks
   const bot = workspace.bots[0]
   const held = new Set((shared?.questions ?? []).filter((question) => awaitsAnswer(question, shared?.answered ?? {}) && question.about.request_id).map((question) => question.about.session_id))

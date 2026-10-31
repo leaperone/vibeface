@@ -41,6 +41,13 @@ export const questionOpen = (question: Question) => question.answer === null && 
 export const awaitsAnswer = (question: Question, answered: Readonly<Record<string, string>>, folded?: ReadonlyMap<string, string>) =>
   questionOpen(question) && !(question.question_id in answered) && !folded?.has(question.question_id)
 
+/** Only an unfinished work on this conversation, device and session can wait on the request. */
+export function workApproval({ work, conversationId, questions, answered }: { work: WorkRecord; conversationId: string; questions: readonly Question[]; answered: Readonly<Record<string, string>> }): Question | undefined {
+  if (work.outcome || work.state === "finished" || !work.thread_id) return undefined
+  return questions.find((question) => question.conversation_id === conversationId && question.about.node === work.target_node
+    && question.about.session_id === work.thread_id && question.about.request_id && awaitsAnswer(question, answered))
+}
+
 /**
  * What a question card shows under its text, the same on every screen. `approval`: a held App Server request, read as 需要你同意.
  * `task`: the running task that request holds, to link to. `local`: asked by `entry`, the device this screen goes through, which the card leaves unnamed.

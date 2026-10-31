@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { parseAnswer, parseConversation, parseOpenWorks, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
-import { answerBody, answerLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, questionParts, settledAnswer, sharedProject } from "./questions.ts"
+import { answerBody, answerLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, questionParts, settledAnswer, sharedProject, workApproval } from "./questions.ts"
 
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/path/to/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
@@ -135,4 +135,20 @@ test("a refused request reads as refused, never as agreed", () => {
 test('a question asks on its first line and lists what it applies to after it', () => {
   assert.deepEqual(questionParts('要运行这个命令吗？\n\n命令：npm test\n在项目里'), { ask: '要运行这个命令吗？', lines: [{ label: '命令', value: 'npm test' }, { label: null, value: '在项目里' }] })
   assert.deepEqual(questionParts('继续吗？'), { ask: '继续吗？', lines: [] })
+})
+
+test("work approval belongs to an unfinished work in the same Bot, target device and session", () => {
+  const [work] = parseOpenWorks({ works: [{ work_id: "new", conversation_id: "chat", trigger: "m", target_node: "worker", cwd: "/w", title: "新任务", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, thread_id: "s" }] })
+  const [approval] = parseQuestions({ questions: [row("approval", 2, { about: { ...about, request_id: "request" } })] })
+  const input = { work, conversationId: "chat", questions: [approval], answered: {} }
+  assert.equal(workApproval(input), approval)
+  assert.equal(workApproval({ ...input, work: { ...work, work_id: "old", state: "finished", outcome: "completed" } }), undefined)
+  assert.equal(workApproval({ ...input, work: { ...work, state: "finished" } }), undefined)
+  assert.equal(workApproval({ ...input, answered: { approval: "继续" } }), undefined)
+  assert.equal(workApproval({ ...input, conversationId: "other-bot" }), undefined)
+  assert.equal(workApproval({ ...input, work: { ...work, target_node: "other-device" } }), undefined)
+  assert.equal(workApproval({ ...input, work: { ...work, thread_id: "other-session" } }), undefined)
+  assert.equal(workApproval({ ...input, questions: [{ ...approval, about: { ...about, agent: "codex" } }] }), undefined)
+  assert.equal(workApproval({ ...input, questions: [{ ...approval, closed: "request_lost" }] }), undefined)
+  assert.equal(workApproval({ ...input, questions: [{ ...approval, answer: { message_id: "a", text: "继续", author: "me", created_at_ms: 3 } }] }), undefined)
 })

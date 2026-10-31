@@ -270,15 +270,14 @@ function overviewNodeFromValue(value: unknown): OverviewNode | null {
   }
 }
 
-function safeOverviewOutcome(outcome: WorkOutcome | null, state: OverviewTaskState, node: OverviewNode | null): WorkOutcome | null {
-  const unreachable = node !== null && (!node.online || node.revoked)
-  return outcome === "completed" && (state === "unknown" || state === "unverified" || state === "dispatch_unverified" || state === "accepted_waiting_sync" || unreachable) ? "unverified" : outcome
+function safeOverviewOutcome(outcome: WorkOutcome | null, state: OverviewTaskState): WorkOutcome | null {
+  return outcome === "completed" && (state === "unknown" || state === "unverified" || state === "dispatch_unverified" || state === "accepted_waiting_sync") ? "unverified" : outcome
 }
 
 function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "title" | "summary" | "cwd" | "state" | "outcome" | "target_node" | "dispatcher" | "call_ref" | "parent" | "continues" | "thread" | "thread_id" | "turn_id" | "phase" | "failure_reason" | "failure" | "kind" | "stop">, bot: OverviewBot | null, node: OverviewNode | null, source: OverviewTask["source"], itemId = work.work_id) {
   const navigation = bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id, work_id: work.work_id } : null
   const rawState = overviewState(work.stop ?? work.state)
-  const outcome = safeOverviewOutcome(work.outcome, rawState, node)
+  const outcome = safeOverviewOutcome(work.outcome, rawState)
   return {
     item_id: itemId,
     work_id: work.work_id,
@@ -309,7 +308,7 @@ function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "
 
 function openOverviewWork(work: OpenWork, bots: ReadonlyMap<string, OverviewBot>, nodes: ReadonlyMap<string, OverviewNode>): OverviewTask | null {
   const bot = bots.get(work.conversation_id) ?? null, node = nodes.get(work.target_node) ?? null
-  const unsafeCompleted = work.outcome === "completed" && (work.state === "unverified" || (node !== null && (!node.online || node.revoked)))
+  const unsafeCompleted = work.outcome === "completed" && work.state === "unverified"
   // A failure stays listed until a later work of its conversation ends, as the Node lists it.
   const failed = work.outcome === "failed" || work.outcome === "rejected"
   if (work.outcome && work.outcome !== "unverified" && !unsafeCompleted && !failed) return null
@@ -405,7 +404,7 @@ function parseOverviewTask(value: unknown): OverviewTask {
   const bot = data.bot == null ? null : parseOverviewBot(data.bot)
   const state = overviewState(data.state)
   const node = overviewNodeFromValue(data.node) ?? (data.remote_reachable === false ? { device_id: nullableText(data.target_node) ?? "", name: "", online: false, revoked: false, local: false } : null)
-  const outcome = safeOverviewOutcome(overviewOutcome(data.outcome), state, node)
+  const outcome = safeOverviewOutcome(overviewOutcome(data.outcome), state)
   const common = {
     item_id: nullableText(data.item_id) ?? nullableText(data.check_id) ?? workId ?? `${conversationId}:${text(data.trigger ?? "")}`,
     work_id: workId, conversation_id: conversationId, bot, title: data.title == null ? "" : text(data.title), summary: data.summary == null ? "" : text(data.summary), cwd: data.cwd == null ? "" : text(data.cwd),
@@ -477,7 +476,7 @@ function parseOverviewCoverage(value: unknown, consistency: OverviewConsistency,
   }
 }
 
-/** Parse a future bounded `workspace_overview` response without claiming unknown state is complete. */
+/** Parse the bounded `workspace_overview` response without claiming unknown state is complete. */
 export function parseWorkspaceOverview(value: unknown): WorkspaceOverview {
   const data = record(value), consistency = overviewConsistency(data.consistency), generatedAt = nullableNumber(data.generated_at_ms), networkEpoch = nullableNumber(data.network_epoch), truncated = data.truncated === true
   const heads = data.heads == null ? {} : Object.fromEntries(Object.entries(record(data.heads)).map(([key, head]) => [key, number(head)]))
@@ -486,14 +485,14 @@ export function parseWorkspaceOverview(value: unknown): WorkspaceOverview {
   const named = (row: Record<string, unknown>) => row.bot != null ? row : { ...row, bot: bots.find((bot) => bot.conversation_id === row.conversation_id) ?? null }
   const tasks = list(data.tasks ?? []).map((task) => parseOverviewTask(named(record(task))))
   const deliveries = list(data.deliveries ?? []).map((delivery) => parseOverviewTask(named({ ...record(delivery), item_kind: "dispatch" })))
-  const stops = new Map(deliveries.filter((delivery) => delivery.work_id && (delivery.state === "stop_waiting" || delivery.state === "stop_timed_out")).map((delivery) => [delivery.work_id, delivery]))
+  const stops = new Map(deliveries.filter((delivery) => delivery.work_id && (delivery.state === "stop_waiting" || delivery.state === "stop_timed_out")).map((delivery) => [JSON.stringify([delivery.conversation_id, delivery.work_id]), delivery]))
   const mergedTasks = tasks.map((task) => {
-    const stop = task.work_id ? stops.get(task.work_id) : undefined
+    const stop = task.work_id ? stops.get(JSON.stringify([task.conversation_id, task.work_id])) : undefined
     return stop && task.kind !== "check" ? { ...task, state: stop.state, outcome: stop.outcome, reason: stop.reason ?? task.reason, cwd: task.cwd || stop.cwd } : task
   })
   const extraDeliveries = deliveries.filter((delivery) => {
     if (!delivery.work_id) return true
-    const existing = tasks.some((task) => task.work_id === delivery.work_id && (delivery.state === "stop_waiting" || delivery.state === "stop_timed_out" || task.kind === "dispatch"))
+    const existing = tasks.some((task) => task.conversation_id === delivery.conversation_id && task.work_id === delivery.work_id && (delivery.state === "stop_waiting" || delivery.state === "stop_timed_out" || task.kind === "dispatch"))
     return !existing
   })
   return {
@@ -506,23 +505,29 @@ export function parseWorkspaceOverview(value: unknown): WorkspaceOverview {
   }
 }
 
-/** Adapt bounded overview work rows for existing task cards and inbox checks. */
-export function openWorksFromOverview(overview: WorkspaceOverview): OpenWork[] {
-  return overview.tasks.flatMap((task): OpenWork[] => {
-    if ((task.kind !== "work" && task.kind !== "dispatch") || !task.work_id) return []
+/** Keep complete known work records and add observations only present in the bounded overview. Neither read orders the other. */
+export function openWorksFromOverview(overview: WorkspaceOverview, openWorks: readonly OpenWork[]): OpenWork[] {
+  const works = [...openWorks]
+  const known = new Set(works.map((work) => JSON.stringify([work.conversation_id, work.work_id])))
+  for (const task of overview.tasks) {
+    if ((task.kind !== "work" && task.kind !== "dispatch") || !task.work_id) continue
+    const key = JSON.stringify([task.conversation_id, task.work_id])
+    if (known.has(key)) continue
     const state: WorkRecord["state"] = task.state === "accepted_waiting_sync" ? "dispatch_waiting"
       : task.state === "unknown" ? "unverified"
         : task.state === "stop_waiting" || task.state === "stop_timed_out" ? "accepted"
           : task.state
     const outcome = task.outcome === "completed" && state === "unverified" ? "unverified" : task.outcome
-    return [{
+    works.push({
       work_id: task.work_id, conversation_id: task.conversation_id, trigger: "", target_node: task.target_node ?? "", cwd: task.cwd, title: task.title, prompt: "",
       state, summary: task.summary, outcome, result_text: "", failure_reason: task.reason, ...failure(task.failure), kind: task.work_kind ?? undefined,
       dispatcher: task.dispatcher ?? undefined, call_ref: task.call_ref ?? undefined, continues: task.continues ?? undefined, parent: task.parent ?? undefined,
       thread: task.thread ?? undefined, thread_id: task.thread_id ?? undefined, turn_id: task.turn_id ?? undefined, phase: task.phase ?? undefined,
       ...(task.state === "stop_waiting" || task.state === "stop_timed_out" ? { stop: task.state } : {}),
-    }]
-  })
+    })
+    known.add(key)
+  }
+  return works
 }
 
 /** A pushed change: the records it touched, or null when it carries none. */

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { availability, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
-import { chatTaskState, deviceForm, deviceOnline, entryLabel, fixOnDevice, formName, promptSummary, taskLabel } from './labels.ts'
+import { cardState, chatTaskState, deviceForm, deviceOnline, entryLabel, externalSessionLabels, externalSessionStatus, fixOnDevice, formName, parseSummarySteps, promptSummary, schedulerStatus, staleTaskLabel, taskGroup, taskLabel, taskStale } from './labels.ts'
 import type { NodeInfo, Question, WorkRecord } from './types.ts'
 
 const question = (id: string, closed = false): Question => ({
@@ -99,4 +99,33 @@ test('a task page shows a summary of what it was asked and folds the rest', () =
   const long = promptSummary('很'.repeat(100), '长任务')
   assert.equal(long.summary.length, 80)
   assert.equal(long.folded, true)
+})
+
+test('only fully marked latest summaries become semantic steps', () => {
+  assert.deepEqual(parseSummarySteps('✓ 读记录\n→ 核对结果\n· 等待同步'), [
+    { state: 'done', text: '读记录' }, { state: 'current', text: '核对结果' }, { state: 'pending', text: '等待同步' },
+  ])
+  assert.deepEqual(parseSummarySteps('✓ 完成\r\n·  后续'), [{ state: 'done', text: '完成' }, { state: 'pending', text: '后续' }])
+  for (const text of ['', '普通摘要', '✓', '✓ ', '✓   ', '✓没有空格', '✓ 一步\n普通说明', '✓ 一步\n', '→\t一步']) assert.equal(parseSummarySteps(text), null, text)
+})
+
+test('scheduler observations distinguish waiting, stopping, publishing, history and unknown states', () => {
+  assert.deepEqual(schedulerStatus('queued'), { label: '排队中', group: 'open' })
+  assert.deepEqual(schedulerStatus('cancelling'), { label: '停止中', group: 'open' })
+  assert.deepEqual(schedulerStatus('publishing'), { label: '回复同步中', group: 'open' })
+  assert.equal(schedulerStatus('completed').group, 'history')
+  assert.deepEqual(schedulerStatus('future-state'), { label: '状态未知', group: 'unknown' })
+})
+
+test('losing the entry makes active tasks stale without claiming every target is offline', () => {
+  const work: WorkRecord = { work_id: 'w', trigger: '', target_node: 'mac', cwd: '', title: '', prompt: '', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null }
+  const state = cardState(work, [unready], 'running')
+  assert.equal(state, 'running', 'the last target report is still online')
+  assert.equal(taskStale(state, false), true)
+  assert.equal(staleTaskLabel, '状态未知')
+  assert.equal(taskGroup(taskStale(state, false) ? 'unknown' : state, false), 'attention')
+  assert.equal(taskStale('completed', false), false)
+  assert.equal(externalSessionLabels[externalSessionStatus({ node: 'mac' }, [{ ...unready, revoked: true }])], '设备已撤权')
+  assert.equal(externalSessionStatus({ node: 'mac' }, [{ ...unready, online: false }]), 'offline')
+  assert.equal(externalSessionStatus({ node: 'other' }, [unready]), 'unknown')
 })

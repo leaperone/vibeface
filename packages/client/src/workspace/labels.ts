@@ -1,7 +1,7 @@
 import { asProvider, type MembershipView, type ProviderId } from "../lib/node.ts"
 import type { LiveProgress } from "../lib/progress.ts"
 import { confirmReason } from "./model.ts"
-import type { NodeInfo, WorkRecord } from "./types.ts"
+import type { NodeInfo, OverviewCoverage, SessionHandoff, WorkRecord } from "./types.ts"
 
 const stateNames: Record<string, string> = {
   accepted: "已接收",
@@ -145,7 +145,7 @@ export function taskProgress(work: Pick<WorkRecord, "work_id" | "target_node" | 
  * confirmed as that stop, which keeps being retried.
  */
 export const shownState = (work: WorkRecord, nodes: NodeInfo[] = []) =>
-  confirmReason(work, nodes) ? "awaiting_confirmation" : work.outcome ?? work.stop ?? work.state
+  confirmReason(work, nodes) ? "awaiting_confirmation" : work.outcome ?? work.stop ?? (work.state === "finished" ? "unknown" : work.state)
 export const taskActive = (state: string) => ["accepted", "running", "interrupting", "dispatch_waiting", "stop_waiting", "stop_timed_out"].includes(state)
 /**
  * A chat task's state: one that completed while a work it dispatched, or that work's own, still runs waits on them. No record
@@ -187,8 +187,48 @@ export type TaskGroup = "attention" | "working" | "waiting"
 export const taskGroups: readonly { group: TaskGroup; title: string }[] = [{ group: "attention", title: "需要留意" }, { group: "working", title: "进行中" }, { group: "waiting", title: "等待中" }]
 /** The state a task card shows: the overview names a failed work only as finished, so its outcome says how. */
 export const cardState = (work: WorkRecord, nodes: NodeInfo[], projected?: string) =>
-  work.outcome === "failed" || work.outcome === "rejected" ? work.outcome : projected ?? shownState(work, nodes)
+  confirmReason(work, nodes) ? "awaiting_confirmation" : work.outcome ?? work.stop ?? (work.state === "finished" ? "unknown" : projected ?? work.state)
 export const needsLook = (state: string) => ["failed", "rejected", "dispatch_rejected", "dispatch_unverified"].includes(state)
 /** A task that failed, was never taken or awaits the person's confirmation needs them; one out of their hands or held on them waits; the rest work. */
 export const taskGroup = (state: string, heldOnPerson: boolean): TaskGroup =>
-  needsLook(state) || state === "awaiting_confirmation" ? "attention" : state === "unverified" || heldOnPerson || !taskActive(state) ? "waiting" : "working"
+  needsLook(state) || ["awaiting_confirmation", "unverified", "unknown"].includes(state) ? "attention" : heldOnPerson || !taskActive(state) ? "waiting" : "working"
+
+export type SummaryStep = { state: "done" | "current" | "pending"; text: string }
+
+/** Only a summary made entirely of marked lines is a step list. It is the latest summary, not execution history. */
+export function parseSummarySteps(summary: string): SummaryStep[] | null {
+  if (!summary) return null
+  const steps: SummaryStep[] = []
+  for (const line of summary.split(/\r?\n/)) {
+    const match = /^([✓→·]) +(.+)$/.exec(line)
+    if (!match || !match[2].trim()) return null
+    steps.push({ state: match[1] === "✓" ? "done" : match[1] === "→" ? "current" : "pending", text: match[2] })
+  }
+  return steps
+}
+
+const schedulerStates: Record<string, { label: string; group: "open" | "history" }> = {
+  queued: { label: "排队中", group: "open" }, claimed: { label: "已领取", group: "open" }, running: { label: "执行中", group: "open" },
+  steering: { label: "补充中", group: "open" }, cancelling: { label: "停止中", group: "open" }, publishing: { label: "回复同步中", group: "open" },
+  pending_delivery: { label: "等待设备接收", group: "open" }, steered: { label: "已补充", group: "history" }, completed: { label: "已完成", group: "history" },
+  failed: { label: "失败", group: "history" }, cancelled: { label: "已取消", group: "history" }, interrupted: { label: "已中断", group: "history" },
+}
+export const schedulerStatus = (state: string): { label: string; group: "open" | "history" | "unknown" } => schedulerStates[state] ?? { label: "状态未知", group: "unknown" }
+
+/** Muting is independent of the device's reachability and never proves that a provider session is alive. */
+export function externalSessionStatus(session: Pick<SessionHandoff, "node">, nodes: readonly NodeInfo[]): "revoked" | "unknown" | "offline" | "reachable" {
+  const node = nodes.find((item) => item.device_id === session.node)
+  return node?.revoked ? "revoked" : !node ? "unknown" : !node.online ? "offline" : "reachable"
+}
+export const externalSessionLabels = { revoked: "设备已撤权", unknown: "设备可达性未知", offline: "设备不可达", reachable: "设备可达" }
+
+export function overviewScope(coverage: OverviewCoverage): string[] {
+  const notes = [coverage.source === "workspace_overview" ? "当前已同步到接入设备的记录" : "当前已加载的本地记录"]
+  if (!coverage.complete || coverage.consistency === "partial") notes.push("部分记录，不代表全部任务")
+  if (coverage.truncated) notes.push("总览已截断，保留其他已知任务")
+  const omitted = [["任务", coverage.omitted_tasks], ["问题", coverage.omitted_questions], ["检查", coverage.omitted_checks], ["派发", coverage.omitted_dispatches], ["投递", coverage.omitted_deliveries], ["调度记录", coverage.omitted_jobs]] as const
+  for (const [label, count] of omitted) if (count !== null && count > 0) notes.push(`另有 ${count} 项${label}未列出`)
+  if (coverage.remote_owners.some((owner) => owner.reason === "remote_scheduler_not_queried" || owner.status === "remote_scheduler_not_queried")) notes.push("远端调度尚未查询")
+  if (coverage.unreachable_nodes.length) notes.push("部分设备不可达，状态可能滞后")
+  return notes
+}
