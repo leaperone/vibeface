@@ -232,7 +232,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 
 工作接纳先读取已有 `work_id` 并校验完整请求，只有新工作读取可变设置。停用或切换 Bot 后，相同请求仍返回原状态且不重新发送。任务调度在 claim 和会话身份计算之前选择冻结的 Provider 与模型。`resolved.model=null` 固定 Provider 默认语义，不再读取 Node 后来修改的默认值，也不保证 Provider 内部实际型号不变。
 
-Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, origin, user_controlled, essential}`。`base` 为 `{epoch, version}`，version 为 null 或 `{revision, control_revision, source_event_hash}`，删除必须有 version。epoch 必须为当前 11。用户 operation_id 使用 `SHA256(attestation 签名输入 ‖ 签名设备)`，入口重算后核对，签名字节和 Node 外层事件不参与。本人操作计数为 base 计数加一，空 base 为 1。自动计数固定 0，revision 为完整事件 hash；用户 revision 为 operation_id。CAS 比较 epoch/revision/control_revision，source 另验真实等价来源。相同操作的多个封装以最小 hash 作为来源代表，不改变逻辑版本。
+Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, origin, user_controlled, essential}`。`base` 为 `{epoch, version}`，version 为 null 或 `{revision, control_revision, source_event_hash}`，删除必须有 version。epoch 必须为当前 12。用户 operation_id 使用 `SHA256(attestation 签名输入 ‖ 签名设备)`，入口重算后核对，签名字节和 Node 外层事件不参与。本人操作计数为 base 计数加一，空 base 为 1。自动计数固定 0，revision 为完整事件 hash；用户 revision 为 operation_id。CAS 比较 epoch/revision/control_revision，source 另验真实等价来源。相同操作的多个封装以最小 hash 作为来源代表，不改变逻辑版本。
 
 `memory_sync_conflicts` 为 `{items, has_more}`，最多 50 项。每项为 `{memory_id, losing_revision, winning_revision, losing_event_hash, winning_event_hash, reason}`，reason 为 user_protected、concurrent_automatic 或 concurrent_user。该页从入口 effective 历史的逻辑 base 链计算，同一本人操作先去重，赢家正常祖先排除，不包含候选正文。它与 owner 的本轮 `memory_conflicts` 独立，owner 不可达不影响入口共享冲突。
 
