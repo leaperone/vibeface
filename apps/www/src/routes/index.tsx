@@ -40,12 +40,18 @@ function HomePage() {
               <Link className="button button-primary" to="/docs/$" params={{ _splat: 'install' }}>开始安装 <ArrowRight size={16} aria-hidden="true" /></Link>
               <Link className="button button-quiet" to="/docs/$" params={{ _splat: 'overview' }}>先了解 Vibeface <ArrowRight size={16} aria-hidden="true" /></Link>
             </div>
+            <ul className="hero-proof" aria-label="Vibeface 的核心边界">
+              <li><span>01</span><strong>本机执行</strong><small>复用已登录 Agent</small></li>
+              <li><span>02</span><strong>签名历史</strong><small>带因果依赖的 DAG</small></li>
+              <li><span>03</span><strong>权限可见</strong><small>先知道谁能读到内容</small></li>
+            </ul>
           </div>
 
           <figure className="hero-figure" aria-label="Bot 协调、本机 Agent 执行与共享历史的关系示意">
             <div className="hero-visual">
               <div className="visual-grid" aria-hidden="true" />
               <div className="visual-glow" aria-hidden="true" />
+              <div className="visual-readout" aria-hidden="true"><span>PERSONAL NETWORK / 01</span><strong>READY TO HAND OFF</strong></div>
               <div className="orbit orbit-one" aria-hidden="true" />
               <div className="orbit orbit-two" aria-hidden="true" />
               <div className="orbit orbit-three" aria-hidden="true" />
@@ -59,6 +65,7 @@ function HomePage() {
         </section>
 
         <section className="landing-section landing-story" aria-labelledby="story-title">
+          <p className="section-eyebrow">01 / 工作流</p>
           <h2 id="story-title">一条需求，留在同一段聊天。</h2>
           <p className="story-prompt"><span>示例需求</span>检查这个项目的失败测试，并说明需要怎样修改。</p>
           <ol className="work-story" role="list">
@@ -70,6 +77,7 @@ function HomePage() {
 
         <section className="landing-system" id="system" aria-labelledby="system-title">
           <div className="system-intro">
+            <p className="section-eyebrow">02 / 结构</p>
             <h2 id="system-title">保留上下文，<br />原有工具继续用。</h2>
             <p>增加长期 Bot 协调和个人设备间的共享历史，执行仍交给本机的 Agent。</p>
             <a className="text-link" href="/docs/bot-and-execution">看看分工怎么安排 <ArrowRight size={16} aria-hidden="true" /></a>
@@ -82,6 +90,7 @@ function HomePage() {
         </section>
 
         <section className="landing-section landing-comparison" aria-labelledby="comparison-title">
+          <p className="section-eyebrow">03 / 选择</p>
           <h2 id="comparison-title">已经有 Agent，还需要这一层吗？</h2>
           <p className="section-copy">原生工具也有远程与自动化入口。按你需要的工作方式选择。</p>
           <dl className="choice-list">
@@ -93,6 +102,7 @@ function HomePage() {
         </section>
 
         <section className="landing-section landing-trust" aria-labelledby="trust-title">
+          <p className="section-eyebrow">04 / 边界</p>
           <h2 id="trust-title">先知道谁能读到内容。</h2>
           <div className="trust-content">
             <dl className="trust-facts">
@@ -109,6 +119,7 @@ function HomePage() {
         </section>
 
         <section className="landing-section landing-start" aria-labelledby="start-title">
+          <p className="section-eyebrow">05 / 开始</p>
           <h2 id="start-title">从一台电脑开始。</h2>
           <p className="section-copy">准备一台支持的 Mac 或 Linux、已安装并登录的 Agent，以及自己的模型服务和项目目录。</p>
           <ol className="start-steps" role="list">
