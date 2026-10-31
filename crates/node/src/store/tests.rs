@@ -9698,3 +9698,166 @@ fn memory_control_applies_live_limits_and_rejects_credentials_before_writing() -
     }
     Ok(())
 }
+
+#[test]
+fn staged_memory_capacity_is_rechecked_at_completion() -> Result<()> {
+    for (live_count, staged_count, restore) in [(49, 1, false), (48, 2, false), (49, 1, true)] {
+        let net = net()?;
+        let (mut origin, _) = bot_with_message(&net)?;
+        let tombstone = if restore {
+            origin.change_bot(
+                &net.a,
+                &net.network,
+                "c",
+                "message:m1",
+                "deleted-seed",
+                ChangeRequest::Remember {
+                    memory_id: None,
+                    text: "old automatic note".into(),
+                },
+                Provider::Codex,
+                4,
+            )?;
+            let memory_id = origin.memories(&net.network, "c")?.remove(0).memory_id;
+            origin.change_bot(
+                &net.a,
+                &net.network,
+                "c",
+                "message:m1",
+                "delete-seed",
+                ChangeRequest::Forget {
+                    memory_id: memory_id.clone(),
+                },
+                Provider::Codex,
+                5,
+            )?;
+            origin
+                .memory_state(&net.network, "c", &memory_id, None)?
+                .current
+        } else {
+            None
+        };
+        for index in 0..live_count {
+            let body = signed_memory(
+                &net,
+                &origin,
+                "c",
+                &format!("user-{index}"),
+                Some("saved user note"),
+            )?;
+            origin.control_memory(
+                &net.a,
+                &net.network,
+                "c",
+                memory_command(&net.network, "c", &body)?,
+                10 + index,
+            )?;
+        }
+        say(&mut origin, &net, "m2", true)?;
+        let trigger = message_trigger("m2");
+        let claimed = origin
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .context("job")?;
+        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+        origin.mark_started("c", &trigger, &attempt)?;
+        let mut staged_ids = Vec::new();
+        for index in 0..staged_count {
+            let staged = origin.stage_memory(
+                &net.network,
+                "c",
+                &trigger,
+                &attempt,
+                &format!("stage-{index}"),
+                ChangeRequest::Remember {
+                    memory_id: tombstone.as_ref().map(|state| state.memory_id.clone()),
+                    text: format!("staged candidate {index}"),
+                },
+                70,
+            )?;
+            staged_ids.push(
+                staged["memory_id"]
+                    .as_str()
+                    .context("staged memory ID")?
+                    .to_owned(),
+            );
+        }
+        let incoming = signed_memory(
+            &net,
+            &origin,
+            "c",
+            "incoming-user",
+            Some("new signed user memory"),
+        )?;
+        origin.control_memory(
+            &net.a,
+            &net.network,
+            "c",
+            memory_command(&net.network, "c", &incoming)?,
+            71,
+        )?;
+        origin.finish_job(
+            &net.a,
+            &net.network,
+            "c",
+            &trigger,
+            &attempt,
+            JobOutcome::Completed,
+            "completed reply",
+            72,
+        )?;
+        assert_eq!(origin.memories(&net.network, "c")?.len(), MAX_MEMORIES);
+        assert!(matches!(
+            origin
+                .scheduler_job("c", &trigger)?
+                .context("completed job")?
+                .state,
+            JobState::Completed { .. }
+        ));
+        let reply = origin
+            .messages(&net.network, "c")?
+            .into_iter()
+            .find(|message| message.in_reply_to.as_deref() == Some("m2"))
+            .context("reply")?;
+        assert_eq!(reply.text, "completed reply");
+        assert_eq!(reply.status, Some(ReplyStatus::Completed));
+        let conflicts = memory_test_shown(&origin)?.memory_conflicts;
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].reason, "capacity_exceeded");
+        assert_eq!(
+            conflicts[0].memory_id,
+            *staged_ids.last().context("rejected memory")?
+        );
+        for (index, memory_id) in staged_ids.iter().enumerate() {
+            let committed = index < (MAX_MEMORIES - live_count as usize - 1);
+            assert_eq!(
+                origin
+                    .bot_change(
+                        &net.network,
+                        &bot_settings::change_id("c", &trigger, &format!("stage-{index}"))
+                    )?
+                    .is_some(),
+                committed
+            );
+            if committed {
+                assert_eq!(
+                    origin
+                        .memory_state(&net.network, "c", memory_id, None)?
+                        .current
+                        .context("committed memory")?
+                        .text,
+                    Some(format!("staged candidate {index}"))
+                );
+            }
+        }
+        if let Some(tombstone) = tombstone {
+            assert_eq!(
+                origin
+                    .memory_state(&net.network, "c", &tombstone.memory_id, None)?
+                    .current
+                    .as_ref(),
+                Some(&tombstone)
+            );
+        }
+    }
+    Ok(())
+}

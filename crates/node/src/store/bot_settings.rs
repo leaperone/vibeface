@@ -1289,6 +1289,11 @@ impl Store {
                 Some("revision_changed")
             } else if current_text != staged.before {
                 Some("value_changed")
+            } else if current_text.is_none()
+                && staged.after.is_some()
+                && memory_records_from(connection, network, scope)?.len() >= MAX_MEMORIES
+            {
+                Some("capacity_exceeded")
             } else {
                 None
             };
@@ -1297,7 +1302,8 @@ impl Store {
                     event = "agent.memory_conflict",
                     conversation_id = scope,
                     memory_id = staged.memory_id,
-                    "staged memory was not committed because the note changed during the turn"
+                    reason,
+                    "staged memory was not committed"
                 );
                 conflicts.push(MemoryConflict {
                     call_ref: staged.call_ref,
