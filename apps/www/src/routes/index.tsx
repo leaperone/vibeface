@@ -75,7 +75,7 @@ function HomePage() {
               <li><h3>选定电脑执行</h3><p>工作交给已授权、已准备好项目的电脑，由那里的 Agent 读取文件、运行工具。</p></li>
               <li><h3>回原聊天看结果</h3><p>阶段和持久结果回到原聊天。结果不确定时先核对原任务，不直接重发。</p></li>
             </ol>
-            <div className="story-frame-result"><span>RETURNED TO CHAT</span><strong>阶段与持久结果回到原聊天</strong><small>完整逐字进度仍留在执行设备。</small></div>
+            <div className="story-frame-result"><span>RETURNED TO CHAT</span><strong>阶段与持久结果回到原聊天</strong><small>完整逐字流式进度不作为共享历史保存。</small></div>
           </div>
         </section>
 
