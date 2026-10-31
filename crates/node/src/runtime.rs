@@ -4,7 +4,7 @@ use crate::{
     identity::{AuthorizationView, GovernanceAction, IdentityKind, NetworkState},
     maintenance::Gate,
     model::*,
-    providers::Provider,
+    providers::{Provider, ProviderRoots},
     store::{Store, WriteState},
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -30,10 +30,12 @@ mod observation;
 pub mod opencode;
 mod peers;
 pub mod pi;
+mod provider_probe;
 mod schedule_delivery;
 mod settings;
 mod triage;
 mod work;
+pub(crate) use cursor::record_reply as record_cursor_reply;
 pub use manager_control::ManagerAccess;
 pub(crate) use observation::{ObservationGuard, native_progress};
 pub use settings::NodeSettings;
@@ -158,6 +160,8 @@ fn workspace_work_summary(work: &WorkProjection, source: &str) -> Value {
         "target_node": work.target_node,
         "dispatcher": work.dispatcher,
         "call_ref": work.call_ref,
+        "model": work.model,
+        "resolved": work.resolved,
         "parent": work.parent,
         "continues": work.continues,
         "thread": work.thread,
@@ -188,6 +192,7 @@ fn workspace_question_summary(question: &Value) -> Value {
         "created_at_ms",
         "severity",
         "choices",
+        "attention",
     ] {
         if let Some(value) = question.get(key) {
             row[key] = value.clone();
@@ -256,6 +261,8 @@ fn workspace_job_summary(
         "message_id": job.message_id,
         "source_node": source_node,
         "owner_epoch": owner_epoch,
+        "runtime": job.runtime,
+        "retryable": job.retryable(),
         "unknown_reason": pending_checks.contains(&format!("{}\n{}", job.conversation_id, job.trigger))
             .then_some("pending_check"),
     })
@@ -300,6 +307,11 @@ mod workspace_overview_tests {
             title: "title".into(),
             prompt: "provider secret".into(),
             call_ref: "call-ref".into(),
+            model: None,
+            resolved: ResolvedModel {
+                provider: Provider::Codex,
+                model: None,
+            },
             continues: None,
             parent: None,
             thread: None,
@@ -348,6 +360,9 @@ pub struct Runtime {
     pub(crate) host: crate::discovery::Host,
     /// Provider paths a bot proposed, by the question that asks the user; kept until restart.
     pub(crate) provider_proposals: Mutex<HashMap<String, settings::Proposal>>,
+    provider_probes: std::sync::Mutex<BTreeMap<Provider, provider_probe::CachedProviderProbe>>,
+    provider_probe_locks: BTreeMap<Provider, Mutex<()>>,
+    pub(crate) pending_provider_launches: std::sync::atomic::AtomicBool,
     pub(crate) config_save: Mutex<()>,
     pub identity: LocalIdentity,
     pub store: Arc<Mutex<Store>>,
@@ -365,7 +380,10 @@ pub struct Runtime {
     outbox_wakeup: tokio::sync::Notify,
     pub events: broadcast::Sender<Update>,
     pub agent_tokens: Mutex<HashMap<String, Access>>,
-    manager_controls: Mutex<HashMap<String, Arc<manager_control::ActiveManager>>>,
+    pub(crate) manager_controls: Mutex<HashMap<String, Arc<manager_control::ActiveManager>>>,
+    #[cfg(test)]
+    pub(crate) claim_to_start_barrier:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     schedule_workers: Mutex<BTreeSet<(String, crate::scheduling::SessionKey)>>,
     schedule_wakeup: tokio::sync::Notify,
     observation: std::sync::Mutex<observation::ObservationState>,
@@ -439,6 +457,10 @@ fn id(v: &Value, key: &str) -> Result<String> {
     Ok(s.into())
 }
 impl Runtime {
+    pub(crate) fn enforce_provider_roots(&self, local: &mut crate::providers::Local) -> Result<()> {
+        ProviderRoots::new(&self.data_dir).apply(local)
+    }
+
     pub async fn open(dir: &Path) -> Result<Self> {
         let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
         ensure!(
@@ -449,7 +471,18 @@ impl Runtime {
         let process_lock = Arc::new(config::lock_data_dir(dir)?);
         let host = crate::discovery::Host::current();
         crate::discovery::complete_saved(dir, &host)?;
-        let config = Config::load(dir)?;
+        let mut config = Config::load(dir)?;
+        let provider_roots = ProviderRoots::new(dir);
+        for directory in [
+            provider_roots.codex_home.as_path(),
+            provider_roots.codex_sessions.as_path(),
+            provider_roots.claude_config.as_path(),
+            provider_roots.claude_projects.as_path(),
+            provider_roots.pi_sessions.as_path(),
+            provider_roots.opencode.as_path(),
+        ] {
+            config::private_dir(directory)?;
+        }
         let entry_token = ((config.public_entry
             && config.network.relay_mode == crate::net::RelayServiceMode::Forward)
             || config.network.entry.is_some())
@@ -468,11 +501,16 @@ impl Runtime {
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
         vibeface_bridge::agent::SdkBridge::kill_orphan(&dir.join(cursor::PIDFILE));
-        let providers = Arc::new(std::sync::Mutex::new(crate::providers::Local {
+        let mut local = crate::providers::Local {
             switches: config.providers.clone(),
             bins: config.bins.clone(),
             env: crate::providers::ProviderEnv::load(dir)?,
-        }));
+        };
+        provider_roots.apply(&mut local)?;
+        if !config.triage.scan_codex_sessions {
+            config.triage.codex_sessions = Some(provider_roots.codex_sessions.clone());
+        }
+        let providers = Arc::new(std::sync::Mutex::new(local));
         let codex_agent = config
             .manager
             .as_ref()
@@ -519,6 +557,12 @@ impl Runtime {
             providers: providers.clone(),
             host,
             provider_proposals: Mutex::new(HashMap::new()),
+            provider_probes: std::sync::Mutex::new(BTreeMap::new()),
+            provider_probe_locks: Provider::ALL
+                .into_iter()
+                .map(|provider| (provider, Mutex::new(())))
+                .collect(),
+            pending_provider_launches: std::sync::atomic::AtomicBool::new(false),
             config_save: Mutex::new(()),
             config,
             identity,
@@ -535,6 +579,8 @@ impl Runtime {
             events,
             agent_tokens: Mutex::new(HashMap::new()),
             manager_controls: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            claim_to_start_barrier: std::sync::Mutex::new(None),
             schedule_workers: Mutex::new(BTreeSet::new()),
             schedule_wakeup: tokio::sync::Notify::new(),
             observation: std::sync::Mutex::new(Default::default()),
@@ -1215,6 +1261,7 @@ impl Runtime {
         json!({"roots":settings.roots,"relay":self.config.network.relay_listen.is_some(),
             "manager":manager,
             "manager_state":self.manager_state().await,
+            "manager_readiness":self.manager_readiness().await,
             "manager_capabilities":manager.map(Provider::capabilities),
             "codex":codex})
     }

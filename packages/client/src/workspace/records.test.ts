@@ -3,12 +3,13 @@ import test from "node:test"
 import { parseChanged } from "../lib/progress.ts"
 import { botReadiness, confirmReason, parseConversation, parseNodes, parseQuestions, parseRecords, workChecks } from "./model.ts"
 import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions } from "./records.ts"
+import { taskAgent } from "./labels.ts"
 import type { NodeInfo } from "./types.ts"
 
 const rank = (lamport: number) => `${String(lamport).padStart(20, "0")}:${"0".repeat(20)}:h${lamport}`
 const message = (message_id: string, lamport: number) => ({ message_id, role: "user", text: message_id, event_hash: `e-${message_id}`, created_at_ms: lamport, rank: rank(lamport) })
 const work = (work_id: string, extra: Record<string, unknown> = {}) => ({
-  work_id, trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", ...extra,
+  work_id, trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", resolved: { provider: "codex", model: null }, ...extra,
 })
 const question = (question_id: string, conversation_id: string, answer: unknown = null) => ({
   question_id, conversation_id, bot: null, severity: "info", text: "?", choices: [],
@@ -29,6 +30,13 @@ const records = (extra: Record<string, unknown> = {}) => {
   assert.equal(event.type, "records")
   return parseRecords(event.type === "records" ? event.value : null)
 }
+
+test("task labels use the accepted provider and leave summaries unknown", () => {
+  const accepted = records({ works: [work("frozen", { kind: "task", resolved: { provider: "claude", model: null } })] }).works[0]
+  assert.equal(taskAgent(accepted), "claude")
+  assert.equal(taskAgent({ kind: "task" }), null)
+  assert.equal(taskAgent({ kind: "pi" }), "pi")
+})
 
 test("a pushed message lands in rank order and the push replaces deliveries, checks, jobs and questions", () => {
   const next = mergeConversation(shown, records({
@@ -68,7 +76,7 @@ test("context state and queue reasons survive records without replacing a remote
     native_token: 'must-not-enter-client-state', rendered: 'private context',
   }
   const conflict = { call_ref: 'remember', memory_id: 'memory', expected_epoch: 9, actual_epoch: 9, expected_revision: '', actual_revision: 'new', reason: 'revision_changed' }
-  const memory = { memory_id: 'memory', text: '已保存的事实', metadata: { epoch: 11, revision: 'c'.repeat(64), control_revision: 1, origin: 'user', user_controlled: true, essential: false, source_event_hash: 'd'.repeat(64), native_token: 'private-memory-token' } }
+  const memory = { memory_id: 'memory', text: '已保存的事实', metadata: { epoch: 12, revision: 'c'.repeat(64), control_revision: 1, origin: 'user', user_controlled: true, essential: false, source_event_hash: 'd'.repeat(64), native_token: 'private-memory-token' } }
   const sync = { items: [{ memory_id: 'memory', losing_revision: 'a'.repeat(64), winning_revision: 'c'.repeat(64), losing_event_hash: 'b'.repeat(64), winning_event_hash: 'd'.repeat(64), reason: 'user_protected', text: 'private-conflict-text', signature: 'private-conflict-signature' }], has_more: true }
   const update = records({ context, memory: [memory], memory_staged_count: 2, memory_conflicts: [conflict], memory_sync_conflicts: sync, jobs: [{ trigger: 'a', state: 'queued', lane: 'main', hold_reason: 'active_turn', pending_check: false, context }] })
   const next = mergeConversation(shown, update)
@@ -84,7 +92,7 @@ test("context state and queue reasons survive records without replacing a remote
   assert.equal(next.bot_settings.memory_staged_count, 2)
   assert.equal(next.bot_settings.memory_sync_conflicts.items[0].reason, 'user_protected')
   assert.equal(next.bot_settings.memory_sync_conflicts.has_more, true)
-  assert.deepEqual(next.bot_settings.memory[0].metadata, { epoch: 11, revision: 'c'.repeat(64), control_revision: 1, origin: 'user', user_controlled: true, essential: false, source_event_hash: 'd'.repeat(64) })
+  assert.deepEqual(next.bot_settings.memory[0].metadata, { epoch: 12, revision: 'c'.repeat(64), control_revision: 1, origin: 'user', user_controlled: true, essential: false, source_event_hash: 'd'.repeat(64) })
   assert(!JSON.stringify(next).includes('must-not-enter-client-state'))
   assert(!JSON.stringify(next).includes('private context'))
   assert(!JSON.stringify(next).includes('private-native-id'))

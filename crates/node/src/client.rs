@@ -592,6 +592,7 @@ async fn dispatch(
             | "directory"
             | "node_settings"
             | "provider_models"
+            | "provider_probe"
             | "subscribe"
             | "join_check"
             | "join_status"
@@ -728,15 +729,21 @@ async fn dispatch(
         }
         "test_codex_app_server" => {
             node_operator(node, session).await?;
-            Ok(json!(node.codex.test().await))
+            Ok(json!(node.codex.test().await.sanitized()))
         }
-        "provider_models" => {
+        "provider_models" | "provider_probe" => {
             node_operator(node, session).await?;
-            let provider =
-                serde_json::from_value::<crate::providers::Provider>(params["provider"].clone())
-                    .context("provider is required")?;
-            let models = node.provider_models(provider).await;
-            Ok(json!({"models":models}))
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Query {
+                provider: crate::providers::Provider,
+            }
+            let query: Query = serde_json::from_value(params).context("invalid provider query")?;
+            if method == "provider_probe" {
+                Ok(node.refresh_provider_status(query.provider).await)
+            } else {
+                Ok(json!(node.provider_catalog(query.provider).await))
+            }
         }
         "triage_settings" => {
             node_operator(node, session).await?;
@@ -2386,6 +2393,27 @@ mod tests {
         );
         let initial = dispatch(&node, &mut manager_session, "node_settings", json!({})).await?;
         assert_eq!(initial["settings"], json!({"roots":[],"manager":null}));
+        for invalid in [
+            json!({"provider":"unknown"}),
+            json!({"provider":"codex","prompt":"must not run"}),
+        ] {
+            assert!(
+                dispatch(&node, &mut manager_session, "provider_probe", invalid)
+                    .await
+                    .is_err()
+            );
+        }
+        let catalog = dispatch(
+            &node,
+            &mut manager_session,
+            "provider_models",
+            json!({"provider":"pi"}),
+        )
+        .await?;
+        assert_eq!(
+            catalog,
+            json!({"state":"unavailable","reason":"catalog_unavailable"})
+        );
         let before = std::fs::read(dir.join("config.json"))?;
         for invalid in [
             json!({"roots":["relative-project"],"manager":null}),
@@ -2417,6 +2445,8 @@ mod tests {
                 provider: crate::providers::Provider::Cursor,
                 workspace: workspace.clone(),
                 model: "auto".into(),
+                reasoning_effort: None,
+                backup: Default::default(),
             }),
         };
         let refused = dispatch(
@@ -2489,8 +2519,11 @@ mod tests {
         .await?;
         assert!(workspace.is_dir());
         assert_eq!(saved["settings"]["roots"], json!([project.canonicalize()?]));
-        assert_eq!(saved["readiness"]["manager"], "missing_prerequisites");
-        assert_eq!(saved["readiness"]["missing"], json!(["cursor"]));
+        assert_eq!(saved["readiness"]["manager"]["state"], "needs_setup");
+        assert_eq!(
+            saved["readiness"]["manager"]["issue"]["code"],
+            "not_installed"
+        );
         assert!(node.info().get("manager_available").is_none());
         let nodes = node
             .rpc(
@@ -2625,14 +2658,15 @@ mod tests {
         };
         let codex_key = "fixture-codex-secret-0123456789";
         let cursor_key = "fixture-cursor-secret-0123456789";
-        let codex_home = dir.join("codex-home");
-        config::private_dir(&codex_home)?;
+        let user_codex_home = dir.join("user-codex-home");
+        config::private_dir(&user_codex_home)?;
+        let node_codex_home = dir.join("providers/codex");
         std::fs::write(
-            codex_home.join("config.toml"),
+            node_codex_home.join("config.toml"),
             "model_provider='fixture'\n[model_providers.fixture]\nenv_key='FIXTURE_PROVIDER_KEY'\n",
         )?;
         let set_codex = json!({"provider":"codex","bot":true,"bin":"/fixture/codex",
-            "env":{"FIXTURE_CODEX_KEY":codex_key,"CODEX_HOME":codex_home}});
+            "env":{"FIXTURE_CODEX_KEY":codex_key,"CODEX_HOME":user_codex_home}});
         let mut member = session(&client)?;
         assert!(
             dispatch(&node, &mut member, "configure_provider", set_codex.clone())
@@ -2643,7 +2677,50 @@ mod tests {
         assert!(!dir.join(crate::providers::ENV_FILE).exists());
 
         let mut owner = session(&admin)?;
+        let set_node = json!({"roots":[user_codex_home.canonicalize()?],"manager":null});
+        let before_config = std::fs::read(dir.join("config.json"))?;
+        let before_settings = serde_json::to_value(node.settings_snapshot())?;
+        let before_providers = node.providers();
+        for (method, params) in [
+            ("configure_provider", set_codex.clone()),
+            ("configure_node", set_node.clone()),
+        ] {
+            let active = node.manager_controls.lock().await;
+            let mut queued = Box::pin(dispatch(&node, &mut owner, method, params));
+            assert!(futures_util::poll!(queued.as_mut()).is_pending());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before_config);
+            assert!(!dir.join(crate::providers::ENV_FILE).exists());
+            drop(queued);
+            drop(active);
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before_config);
+            assert!(!dir.join(crate::providers::ENV_FILE).exists());
+            assert_eq!(
+                serde_json::to_value(node.settings_snapshot())?,
+                before_settings
+            );
+            let providers = node.providers();
+            assert_eq!(providers.switches, before_providers.switches);
+            assert_eq!(providers.bins, before_providers.bins);
+            assert!(providers.env == before_providers.env);
+            assert!(
+                !node
+                    .pending_provider_launches
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+        }
+        let configured = dispatch(&node, &mut owner, "configure_node", set_node.clone()).await?;
+        assert_eq!(configured["settings"], set_node);
+        assert_eq!(
+            node.settings_snapshot().roots,
+            vec![user_codex_home.canonicalize()?]
+        );
+        assert_eq!(Config::load(&dir)?.roots, node.settings_snapshot().roots);
         let saved = dispatch(&node, &mut owner, "configure_provider", set_codex).await?;
+        assert_eq!(
+            Config::load(&dir)?.bins.get(&Provider::Codex),
+            Some(&std::path::PathBuf::from("/fixture/codex"))
+        );
+        assert!(crate::providers::ProviderEnv::load(&dir)? == node.providers().env);
         let cursor = dispatch(
             &node,
             &mut owner,
@@ -2664,6 +2741,7 @@ mod tests {
         assert_eq!(codex["provider"], "codex");
         assert_eq!(codex["roles"], json!(["agent", "execution"]));
         assert_eq!(codex["bin"], "/fixture/codex");
+        assert_eq!(codex["home"], node_codex_home.to_string_lossy().as_ref());
         assert!(codex["env"].as_array().unwrap().contains(
             &json!({"name":"FIXTURE_CODEX_KEY","set":true,"inherited":false,"required":false})
         ));
@@ -2672,8 +2750,12 @@ mod tests {
         ));
         assert_eq!(
             (codex["state"].clone(), codex["issues"].clone()),
-            (json!("starting"), json!([])),
-            "the system App Server runs with its own program and variables"
+            (
+                json!("needs_setup"),
+                json!([{"code":"bin_missing","path":"/fixture/codex"},
+                    {"code":"env_missing","name":"FIXTURE_PROVIDER_KEY"}])
+            ),
+            "spawn uses the Node-owned program and provider root"
         );
         assert_eq!(read["providers"][1]["env"][0]["set"], true);
         assert_eq!(
@@ -2684,7 +2766,7 @@ mod tests {
             (json!("off"), json!([])),
             "Cursor runs nothing until a role is enabled"
         );
-        assert_eq!(codex["app_server"]["mode"], "system");
+        assert_eq!(codex["app_server"]["mode"], "spawn");
         assert_eq!(read["providers"][1]["app_server"], Value::Null);
         let spawn = json!({"provider":"codex","app_server":{"mode":"spawn","socket":null}});
         let moved = dispatch(&node, &mut owner, "configure_provider", spawn).await?;
@@ -2856,7 +2938,7 @@ mod tests {
         )
         .await?;
         assert_eq!(stopped["settings"]["manager"], Value::Null);
-        assert_eq!(stopped["readiness"]["manager"], "disabled");
+        assert_eq!(stopped["readiness"]["manager"], Value::Null);
         assert_eq!(stopped["providers"][1]["state"], "off");
         let executing = dispatch(
             &node,

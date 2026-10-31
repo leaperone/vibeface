@@ -7,7 +7,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use vibeface_bridge::failure::ExecFailure;
+use vibeface_bridge::failure::{ExecFailure, FailureKind, ProviderStage};
 
 pub const MAX_PENDING_JOBS: usize = 256;
 
@@ -150,8 +150,6 @@ pub(crate) enum TaskJobChange<'a> {
         outcome: &'a JobOutcome,
         text: &'a str,
     },
-    /// Every process of a turn that ended unconfirmed has exited.
-    ProcessExited,
 }
 
 /// The one place an agent task's job state reaches its work: the work and the signal a change
@@ -193,7 +191,6 @@ pub(crate) fn task_work_signal<'a>(
                 failure,
             }
         }
-        TaskJobChange::ProcessExited => Signal::ProcessExited,
     };
     Some((work_id, signal))
 }
@@ -319,6 +316,10 @@ pub enum JobState {
     Cancelling {
         attempt: ManagerAttempt,
     },
+    Reconciling {
+        attempt: ManagerAttempt,
+        failure: ExecFailure,
+    },
     Completed {
         attempt: ManagerAttempt,
     },
@@ -346,6 +347,7 @@ impl JobState {
             Self::Claimed { .. } => "claimed",
             Self::Running { .. } => "running",
             Self::Cancelling { .. } => "cancelling",
+            Self::Reconciling { .. } => "reconciling",
             Self::Completed { .. } => "completed",
             Self::Failed { .. } => "failed",
             Self::Cancelled { .. } => "cancelled",
@@ -359,6 +361,7 @@ impl JobState {
             Self::Claimed { attempt }
             | Self::Running { attempt }
             | Self::Cancelling { attempt }
+            | Self::Reconciling { attempt, .. }
             | Self::Completed { attempt }
             | Self::Failed { attempt, .. }
             | Self::Interrupted { attempt, .. } => Some(attempt),
@@ -377,6 +380,37 @@ impl JobState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSelection {
+    pub provider: Provider,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnExecution {
+    NotStarted,
+    Started,
+    Unknown,
+}
+
+/// Safe submitted configuration and execution evidence. Native identifiers and credentials stay local.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnRuntime {
+    pub provider: Provider,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub generation: String,
+    pub session_generation: u64,
+    pub delivery_id: String,
+    pub stage: ProviderStage,
+    pub execution: TurnExecution,
+    pub attempted_at_ms: i64,
+    pub switched_from: Option<RuntimeSelection>,
+    pub switch_reason: Option<FailureKind>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchedulerJob {
     pub conversation_id: String,
     /// `message:<message_id>`, `work:<work_id>`, `task:<work_id>`,
@@ -392,11 +426,27 @@ pub struct SchedulerJob {
     pub reply_to: String,
     /// The bot reply's message ID, fixed at admission so retries reuse it.
     pub message_id: String,
+    pub runtime: Option<TurnRuntime>,
+    #[serde(skip)]
+    pub pending_check: bool,
+    #[serde(skip)]
+    pub tool_calls: bool,
     #[serde(flatten)]
     pub state: JobState,
 }
 
 impl SchedulerJob {
+    pub fn retryable(&self) -> bool {
+        matches!(&self.state, JobState::Failed { failure, .. }
+            if !matches!(failure.kind, FailureKind::Restarted | FailureKind::Lost | FailureKind::Unknown))
+            && self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.execution == TurnExecution::NotStarted)
+            && !self.pending_check
+            && !self.tool_calls
+    }
+
     pub fn session_scope(&self) -> SessionScope {
         match self.kind {
             TriggerKind::AgentTask => SessionScope::Task {
@@ -483,6 +533,10 @@ pub struct ClaimedJob {
     pub covers: Option<VersionVector>,
     /// The bot and works the resumed native session was last shown; empty with no `covers`.
     pub shown: Shown,
+    pub session_generation: u64,
+    pub handoff_revision: u64,
+    pub handoff_source: VersionVector,
+    pub previous_runtime: Option<RuntimeSelection>,
     /// Why a previously cached native session could not be reused for this claim.
     pub invalidation: Option<SessionInvalidation>,
 }
@@ -633,7 +687,11 @@ pub(crate) struct SchedulerSession {
     pub stable_fingerprint: Option<String>,
     pub runtime_fingerprint: Option<String>,
     pub provider: Option<Provider>,
+    pub sdk_config: Option<String>,
     pub permission_version: u64,
+    pub session_generation: u64,
+    pub handoff_revision: u64,
+    pub handoff_source: VersionVector,
 }
 
 impl SchedulerSession {
@@ -651,14 +709,17 @@ impl SchedulerSession {
             stable_fingerprint: None,
             runtime_fingerprint: None,
             provider: None,
+            sdk_config: None,
             permission_version: 1,
+            session_generation: 0,
+            handoff_revision: 0,
+            handoff_source: VersionVector::new(),
         }
     }
 }
 
-/// A coordination turn whose end this Node has not seen. The runtime resolves it once every
-/// recorded process group is gone and its App Server turn has ended; only a group that stays
-/// alive needs the user.
+/// A coordination turn whose result is unknown. Provider history can settle its outcome;
+/// process exit alone cannot, so unavailable history leaves the check for the user.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingCheck {
     pub check_id: String,

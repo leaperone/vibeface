@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { availability, parseNodeSettings, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
+import { availability, parseNodeSettings, summaryReadiness, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
 import { cardState, chatTaskState, deviceForm, deviceOnline, entryLabel, externalSessionLabels, externalSessionStatus, fixOnDevice, formName, parseSummarySteps, promptSummary, schedulerStatus, staleTaskLabel, taskGroup, taskLabel, taskStale } from './labels.ts'
-import type { BotRecord, NodeInfo, Question, WorkRecord } from './types.ts'
+import type { BotRecord, NodeInfo, Question, WorkCard, WorkRecord } from './types.ts'
 
 const question = (id: string, closed = false): Question => ({
   question_id: id, conversation_id: 'c', bot: { bot_id: 'b', name: '助手' }, severity: 'normal', text: id, choices: [], about: { kind: 'general' },
@@ -59,7 +59,7 @@ test('a different pending recovery gets a fresh confirmation card', () => {
 test('a failed task waits in 待处理 under its bot until something follows it up, naming its device', () => {
   const failed = source(false)
   const work = { work_id: 'w1', conversation_id: 'c', trigger: '', target_node: 'mac', cwd: '/w', title: '跑测试', prompt: '', state: 'finished', summary: '', outcome: 'failed', result_text: '', failure_reason: 'timed out' } as const
-  failed.workspace.openWorks = [work, { ...work, work_id: 'w2', outcome: null, state: 'running' }, { ...work, work_id: 'w3', title: '', outcome: null, state: 'dispatch_rejected' }]
+  failed.workspace.openWorks = [{ ...work, resolved: { provider: 'codex', model: null } }, { ...work, work_id: 'w2', outcome: null, state: 'running', resolved: { provider: 'codex', model: null } }, { ...work, work_id: 'w3', title: '', outcome: null, state: 'dispatch_rejected' }]
   failed.workspace.bots = [botRecord]
   assert.deepEqual(inboxItems(failed).filter((item) => item.kind === 'failed').map((item) => [item.key, item.title, item.meta]), [['failed:w1', '跑测试', 'Mac'], ['failed:w3', '任务没有完成', 'Mac']], 'a refused dispatch waits like a failure')
 })
@@ -88,7 +88,7 @@ test('a phone asking to join reads as a phone, and only a computer has an online
 })
 
 test('a task done itself waits on a child still running, down the chain, and only then', () => {
-  const work = (work_id: string, extra: Partial<WorkRecord> = {}): WorkRecord => ({ work_id, trigger: '', target_node: 'mac', cwd: '/w', title: work_id, prompt: '', state: 'finished', summary: '', outcome: 'completed', result_text: '', failure_reason: null, ...extra })
+  const work = (work_id: string, extra: Partial<WorkCard> = {}): WorkCard => ({ work_id, target_node: 'mac', cwd: '/w', title: work_id, state: 'finished', summary: '', outcome: 'completed', failure_reason: null, ...extra })
   const parent = work('p')
   assert.equal(chatTaskState(parent, [parent]), 'completed')
   assert.equal(chatTaskState(parent, [parent, work('c', { parent: 'p', state: 'running', outcome: null })]), 'awaiting_children')
@@ -111,6 +111,29 @@ test('the capsule names the computer from the directory once it lists it, not by
   assert.equal(entryLabel({ joined: false, directory: null, entryId: 'b', ownName: '我的 Mac', address: 'http://127.0.0.1:1' }), '我的 Mac')
 })
 
+test('an installed provider remains unverified until the device confirms readiness', () => {
+  type Status = Pick<ProviderStatus, 'installed' | 'roles' | 'readiness' | 'execution_readiness'>
+  const unverified: ProviderStatus['readiness'] = { state: 'unverified', issue: { stage: 'model_list', code: 'model_unverified' } }
+  const provider = (extra: Partial<Status> = {}): Status => ({ installed: true, roles: ['agent'], readiness: unverified, execution_readiness: unverified, ...extra })
+  assert.equal(availability(provider()), 'unverified')
+  assert.equal(availability(provider({ installed: false })), 'missing')
+  assert.equal(availability(provider({ readiness: { state: 'needs_setup', issue: { stage: 'authentication', code: 'sign_in_required' } } })), 'needs_setup')
+  assert.equal(availability(provider({ readiness: { state: 'ready' } })), 'ready')
+  assert.equal(availability(provider({ readiness: { state: 'starting' } })), 'starting')
+  const roles: ProviderStatus['roles'][] = [['execution'], ['agent', 'execution'], ['execution', 'agent'], ['agent'], []]
+  for (const role of roles) {
+    const executionOnly = role.length === 1 && role[0] === 'execution'
+    const status = provider({ roles: role, readiness: { state: 'ready' } })
+    assert.equal(summaryReadiness(status), executionOnly ? status.execution_readiness : status.readiness)
+    assert.equal(availability(status), executionOnly ? 'unverified' : 'ready')
+    assert.equal(availability(provider({ roles: role, execution_readiness: { state: 'ready' } })), executionOnly ? 'ready' : 'unverified')
+    assert.equal(availability(provider({ roles: role, installed: false, readiness: { state: 'ready' }, execution_readiness: { state: 'ready' } })), 'missing')
+  }
+  const botNeedsSetup = provider({ roles: ['agent', 'execution'], readiness: { state: 'needs_setup', issue: { stage: 'model_list', code: 'model_unavailable' } }, execution_readiness: { state: 'ready' } })
+  assert.equal(summaryReadiness(botNeedsSetup), botNeedsSetup.readiness)
+  assert.equal(availability(botNeedsSetup), 'needs_setup')
+})
+
 test('a provider shows whether it can be used before any use is picked', () => {
   const provider = (extra: Partial<ProviderStatus>) => ({ state: 'off', installed: true, env: [], ...extra }) as Pick<ProviderStatus, 'state' | 'installed' | 'env'>
   assert.equal(availability(provider({})), 'unverified')
@@ -125,8 +148,9 @@ test('provider observations preserve unknown prerequisites and discard private f
     installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'confirmed', evidence: 'app_server_handshake' },
     authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' },
   }
-  const provider = { provider: 'codex', roles: ['agent'], supports: ['agent', 'execution'], installed: true, bin: 'codex', app_server: null, env: [], state: 'unverified', issues: [], observed }
-  const response = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: 'authentication_unverified', missing: [] }, display_paths: {}, suggested_roots: [], providers: [provider] }
+  const readiness = { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }
+  const provider = { provider: 'codex', roles: ['agent'], supports: ['agent', 'execution'], installed: true, bin: 'codex', app_server: null, setup: null, home: null, sessions: null, env: [], state: 'unverified', issues: [], readiness, execution_model: '', execution_readiness: readiness, probe: { provider: 'codex', config_id: 'config', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null }, observed }
+  const response = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: readiness, missing: [] }, display_paths: {}, suggested_roots: [], providers: [provider] }
   const parsed = parseNodeSettings({ ...response, providers: [{ ...provider, observed: { ...observed, authenticated: { ...observed.authenticated, native_token: 'private-token' } } }] })
   assert.equal(parsed.providers[0].state, 'unverified')
   assert.deepEqual(parsed.providers[0].observed, observed)
@@ -162,12 +186,13 @@ test('scheduler observations distinguish waiting, stopping, publishing, history 
   assert.deepEqual(schedulerStatus('queued'), { label: '排队中', group: 'open' })
   assert.deepEqual(schedulerStatus('cancelling'), { label: '停止中', group: 'open' })
   assert.deepEqual(schedulerStatus('publishing'), { label: '回复同步中', group: 'open' })
+  assert.deepEqual(schedulerStatus('reconciling'), { label: '正在查询上次回复', group: 'open' })
   assert.equal(schedulerStatus('completed').group, 'history')
   assert.deepEqual(schedulerStatus('future-state'), { label: '状态未知', group: 'unknown' })
 })
 
 test('losing the entry makes active tasks stale without claiming every target is offline', () => {
-  const work: WorkRecord = { work_id: 'w', trigger: '', target_node: 'mac', cwd: '', title: '', prompt: '', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null }
+  const work: WorkRecord = { work_id: 'w', trigger: '', target_node: 'mac', cwd: '', title: '', prompt: '', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null, resolved: { provider: 'codex', model: null } }
   const state = cardState(work, [unready], { state: 'running', outcome: null })
   assert.equal(state, 'running', 'the last target report is still online')
   assert.equal(taskStale(state, false), true)

@@ -40,7 +40,7 @@ test('creates a persistent Bot without a model and shows triage budget state', a
       stable_fingerprint: 'a'.repeat(64), dynamic_fingerprint: 'b'.repeat(64), stable_bytes: 100, dynamic_bytes: 200, invalidation_reason: null,
       coverage: { messages_omitted: 1, works_omitted: 0, dispatches_omitted: 0, questions_omitted: 0, attachments_omitted: 0, memory_omitted: 3,
         checkpoint_omitted: 1, handoff_omitted: 2, pending_checks_omitted: 3, bot_indexes_omitted: { skills: 4 }, history_retrieval: 'context' },
-    }, memory_conflicts: [{ call_ref: 'p7-public-memory-fixture', memory_id: 'p7-ui-memory', expected_epoch: 11, actual_epoch: 11,
+    }, memory_conflicts: [{ call_ref: 'p7-public-memory-fixture', memory_id: 'p7-ui-memory', expected_epoch: 12, actual_epoch: 12,
       expected_revision: 'b'.repeat(64), actual_revision: 'c'.repeat(64), reason: 'revision_changed' }] };
     const saveContext = contextDb.prepare("INSERT INTO scheduler_sessions(conversation_id,scope,next_sequence,covers,owner_epoch,permission_version,shown) VALUES(?,'main',1,'{}',0,1,?) ON CONFLICT(conversation_id,scope) DO UPDATE SET shown=excluded.shown");
     assert.equal(saveContext.run(identity.conversation_id, JSON.stringify(shown)).changes, 1);
@@ -77,7 +77,7 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     const memoryRow = () => contextDb.prepare('SELECT memory_id,text,epoch,revision,control_revision,origin,user_controlled,essential,source_event_hash FROM memories WHERE network_id=? AND conversation_id=?').get(identity.network_id, identity.conversation_id);
     const created = memoryRow();
     assert(created && typeof created.memory_id === 'string' && typeof created.revision === 'string' && typeof created.source_event_hash === 'string');
-    assert.equal(created.epoch, 11);
+    assert.equal(created.epoch, 12);
     assert.equal(created.control_revision, 1);
     assert.equal(created.origin, JSON.stringify('user'));
     assert.equal(created.user_controlled, 1);
@@ -91,7 +91,7 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     assert.equal(typeof userEvent.body.attestation.signature, 'string');
     await expect(dialog.getByText('你记录 · 由你维护，受保护 · 优先带入上下文')).toBeVisible();
     await dialog.getByText('记忆版本', { exact: true }).click();
-    await expect(dialog.getByText(`数据版本 11 · 维护版本 1 · ${created.revision}`)).toBeVisible();
+    await expect(dialog.getByText(`数据版本 12 · 维护版本 1 · ${created.revision}`)).toBeVisible();
     await dialog.getByText('查看记忆冲突 · 1', { exact: true }).click();
     await expect(dialog.getByText('记忆已被更新，未覆盖新值')).toBeVisible();
     await app.screenshot('context-signed-memory-narrow');
@@ -186,9 +186,12 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     await browser.goto(`${node.url}/tasks`);
     await expect(screen.getByRole('main').getByRole('link', '待处理 2', { exact: true })).toBeVisible();
     await expect(screen.getByRole('radiogroup', '任务状态').getByRole('radio')).toHaveCount(4);
-    await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toBeVisible();
-    await expect(screen.getByRole('button', '发送回答', { exact: true })).toBeVisible();
+    await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toHaveCount(1);
+    await expect(screen.getByRole('button', '发送回答', { exact: true })).toHaveCount(1);
+    await expect(screen.getByText('问题待确认', { exact: true })).toHaveCount(0);
+    await expect(screen.getByText('2 项任务', { exact: true })).toBeVisible();
     await expect(screen.getByLabel('你的回答')).toHaveCount(0);
+    await app.screenshot('task-overview-single-question-and-turn');
     await browser.goto(`${node.url}/inbox`);
     await browser.setViewport({ width: 375, height: 812 });
     await expect(screen.getByRole('radio')).toHaveCount(5);

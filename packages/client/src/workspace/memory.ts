@@ -2,7 +2,7 @@ import { array, boolean, record, text } from '../lib/node.ts'
 import { enqueue, type OutboxItem, type OutboxStore } from '../lib/outbox.ts'
 import type { MemoryBase, MemoryControlResult, MemoryEntry, MemoryMetadata, MemoryState, MemoryStateResult, MemorySyncConflicts } from './types.ts'
 
-export const DATA_EPOCH = 11
+export const DATA_EPOCH = 12
 export type MemoryControls = {
   conversationId: string; writable: boolean
   controlMemory(conversationId: string, memoryId: string, base: MemoryBase, after: string | null): Promise<MemoryControlResult>

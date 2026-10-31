@@ -23,7 +23,9 @@ export function useCall<T>(parse: (value: unknown) => T, loadMethod: string) {
     try {
       const result = await connection.request(method, params)
       if (owner !== sequence.current || !connection.isCurrent()) return null
-      setValue(parse(method === loadMethod || method.startsWith('configure') ? result : await connection.request(loadMethod)))
+      const latest = method === loadMethod || method.startsWith('configure') ? result : await connection.request(loadMethod)
+      if (owner !== sequence.current || !connection.isCurrent()) return null
+      setValue(parse(latest))
       return result
     } catch (cause) {
       if (owner === sequence.current) setError({ at, text: messageOf(cause) })

@@ -12,6 +12,7 @@ use futures_util::future::BoxFuture;
 use reqwest::Method;
 use std::os::unix::process::CommandExt as _;
 use tokio::io::AsyncBufReadExt as _;
+use vibeface_bridge::failure::ProviderStage;
 use vibeface_bridge::{
     agent::{self, AgentResult},
     failure::{ExecFailure, FailureKind},
@@ -20,6 +21,10 @@ use vibeface_bridge::{
 
 /// The server reply turns record for opencode: its store keeps the sessions across serves.
 pub(crate) const SERVER: &str = "opencode";
+pub(crate) fn reply_message(attempt_id: &str) -> String {
+    hashed("msg_", &format!("vibeface-turn:{attempt_id}"), 24)
+}
+
 /// The user's opencode hook plugin.
 pub(crate) const PLUGIN: &str = include_str!("../../extensions/opencode.ts");
 const PIDFILE: &str = "serve.pid";
@@ -38,6 +43,7 @@ const MAX_OUTPUT: usize = 65_536;
 /// The Node's opencode serve and the bot turns running on it.
 pub struct Opencode {
     dir: PathBuf,
+    roots: ProviderRoots,
     launch: Arc<std::sync::Mutex<LaunchState>>,
     serve: Mutex<Option<Serve>>,
     http: reqwest::Client,
@@ -237,6 +243,7 @@ impl Opencode {
         kill_orphan(&dir.join(PIDFILE));
         Ok(Self {
             dir,
+            roots: ProviderRoots::new(data_dir),
             launch: Arc::new(std::sync::Mutex::new(LaunchState {
                 current: Launch { bin, env },
                 pending: None,
@@ -382,6 +389,18 @@ impl Opencode {
 
     async fn spawn(&self, launch: Launch) -> Result<Serve> {
         config::private_dir(&self.dir)?;
+        for (name, value) in self.roots.env(Provider::Opencode) {
+            if value == "true" {
+                continue;
+            }
+            let path = Path::new(&value);
+            config::private_dir(if name == "OPENCODE_DB" {
+                path.parent()
+                    .context("OpenCode database directory missing")?
+            } else {
+                path
+            })?;
+        }
         let dir = self.dir.canonicalize()?;
         let password = crate::crypto::random_hex(32);
         crate::logging::add_secret(&password);
@@ -395,6 +414,10 @@ impl Opencode {
         let mut command = std::process::Command::new(&launch.bin);
         command
             .envs(&launch.env)
+            .envs(self.roots.env(Provider::Opencode))
+            .env_remove("OPENCODE_CONFIG")
+            .env_remove("OPENCODE_CLI_CONFIG_CONTENT")
+            .env_remove("OPENCODE_TEST_HOME")
             .env("OPENCODE_SERVER_USERNAME", "opencode")
             .env("OPENCODE_SERVER_PASSWORD", &password)
             .env("OPENCODE_CONFIG_CONTENT", settings.to_string())
@@ -681,6 +704,15 @@ impl Opencode {
             .collect();
         variables.insert("OPENCODE_SERVER_PASSWORD".into(), String::new());
         variables.extend(tool_env.clone());
+        variables.extend(self.roots.env(Provider::Opencode));
+        for name in [
+            "OPENCODE_CONFIG",
+            "OPENCODE_CLI_CONFIG_CONTENT",
+            "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_TEST_HOME",
+        ] {
+            variables.insert(name.into(), String::new());
+        }
         let (status, body) = self
             .call(
                 conn,
@@ -850,6 +882,87 @@ impl Opencode {
         Ok(Some(messages))
     }
 
+    pub(crate) async fn probe_reply(&self, session: &str, message_id: &str) -> Result<Probe> {
+        self.probe_native(session, message_id, false).await
+    }
+
+    async fn probe_native(
+        &self,
+        session: &str,
+        message_id: &str,
+        infer_work_end: bool,
+    ) -> Result<Probe> {
+        vibeface_protocol::validate_id(session).map_err(anyhow::Error::msg)?;
+        vibeface_protocol::validate_id(message_id).map_err(anyhow::Error::msg)?;
+        let id = message_id.to_owned();
+        let conn = (self.running().await)
+            .context("no opencode serve runs; the next one reads this work back")?;
+        let Some(found) = self.session(&conn, session).await? else {
+            return Ok(Probe::Missing);
+        };
+        let epoch = conn.started_ms as u64;
+        let Some(messages) = self.tail(&conn, session, &id).await? else {
+            if self.inbox_contains(&conn, session, &id).await? {
+                return Ok(Probe::Running { turn_id: id, epoch });
+            }
+            return Ok(Probe::NotStarted);
+        };
+        found["location"]["directory"]
+            .as_str()
+            .context("opencode sent a session without its directory")?;
+        let later = messages.iter().skip(1).any(|m| m["type"] == "user");
+        let busy = self.busy(&conn, session).await?;
+        if !later && busy {
+            return Ok(Probe::Running { turn_id: id, epoch });
+        }
+        let chain = chain(&messages, &id);
+        let done = |status, error| Probe::Terminal {
+            turn_id: id.clone(),
+            status,
+            text: chain.text.clone(),
+            error,
+        };
+        let finished = |reply: &Value| {
+            !reply["time"]["completed"].is_null()
+                && if infer_work_end {
+                    later || !matches!(reply["finish"].as_str(), Some("tool-calls" | "unknown"))
+                } else {
+                    matches!(
+                        reply["finish"].as_str(),
+                        Some("stop" | "length" | "content-filter")
+                    )
+                }
+        };
+        Ok(match &chain.reply {
+            Some(reply) if reply["error"]["type"] == "aborted" => {
+                done(TurnStatus::Interrupted, None)
+            }
+            Some(reply) if !reply["error"].is_null() => {
+                done(TurnStatus::Failed, Some(failure_of(&reply["error"])))
+            }
+            Some(reply) if finished(reply) => done(TurnStatus::Completed, None),
+            _ if !infer_work_end => Probe::Missing,
+            _ if chain.created_ms < conn.started_ms => {
+                let failure = ExecFailure::new(
+                    FailureKind::Restarted,
+                    "the opencode serve running this work stopped",
+                );
+                done(TurnStatus::Interrupted, Some(failure))
+            }
+            _ if busy || now_ms() - chain.created_ms < QUIET_MS => Probe::Running {
+                turn_id: id.clone(),
+                epoch,
+            },
+            _ => {
+                let failure = ExecFailure::new(
+                    FailureKind::Unknown,
+                    "opencode ended this run without an answer; check that the model exists and its provider is signed in",
+                );
+                done(TurnStatus::Failed, Some(failure))
+            }
+        })
+    }
+
     pub(crate) async fn manager_running(&self, session: &str) -> Option<bool> {
         let conn = {
             let mut serve = self.serve.lock().await;
@@ -873,6 +986,7 @@ impl Opencode {
 
     /// Whether no run or queued input remains in a reply's session; a running turn is aborted. Runs
     /// end with their serve, and the Node stops the serve of an earlier run when it opens.
+    #[cfg(test)]
     pub(crate) async fn run_ended(&self, session: &str) -> bool {
         let ended = async {
             let Some(conn) = self.running().await else {
@@ -903,9 +1017,6 @@ impl Opencode {
         ended
     }
 
-    /// One bot turn in its session on the serve. The session is created and saved before
-    /// anything is sent; the message ID comes from the attempt, so a send whose fate is unknown
-    /// is read back by it and never sent twice.
     pub(crate) async fn run_turn<F, P, PF>(
         &self,
         config: &ManagerConfig,
@@ -926,8 +1037,11 @@ impl Opencode {
             .context("manager workspace must be an existing absolute directory")?;
         let secrets = manager::secret_values(config);
         let start = std::sync::Mutex::new(manager::StartEvidence::NotStarted);
+        let stage =
+            vibeface_bridge::failure::ProviderTrace::new("opencode", ProviderStage::Validate);
         let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
             ManagerError {
+                stage: stage.current(),
                 outcome,
                 start: *start
                     .lock()
@@ -958,6 +1072,7 @@ impl Opencode {
             return Err(stopped(previous));
         }
         let model = parse_model(&config.model).map_err(|failure| failed(previous, failure))?;
+        stage.enter(ProviderStage::Launch);
         let expected = match &config.sdk {
             Sdk::Opencode { bin, .. } => Launch {
                 bin: bin.clone(),
@@ -972,6 +1087,7 @@ impl Opencode {
         };
         let (conn, serving) = (self.conn_for(Some(expected)).await)
             .map_err(|e| failed(previous, launch_failure(&e)))?;
+        stage.enter(ProviderStage::SessionStart);
         let resumed = match previous {
             Some(id) => self.session(&conn, id).await.map_err(|e| {
                 failed(
@@ -1024,6 +1140,7 @@ impl Opencode {
             }
         };
         let native = Some(session.as_str());
+        stage.enter(ProviderStage::Record);
         if let Err(e) = persist_session(session.clone()).await {
             // A stop fences the attempt, so saving its session fails then.
             return Err(if *cancel.borrow() {
@@ -1037,7 +1154,7 @@ impl Opencode {
                 (turn.record)(session.clone(), None)
                     .await
                     .map_err(|e| failed(native, own(&format!("record the opencode turn: {e}"))))?;
-                hashed("msg_", &format!("vibeface-turn:{}", turn.client_id), 24)
+                reply_message(&turn.client_id)
             }
             None => format!("msg_{}", crate::crypto::random_hex(12)),
         };
@@ -1045,6 +1162,7 @@ impl Opencode {
         if let Some(token) = &config.tool_token {
             env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
         }
+        stage.enter(ProviderStage::SessionStart);
         self.environment(&conn, &session, &env)
             .await
             .map_err(|e| failed(native, own(&format!("set the tool environment: {e}"))))?;
@@ -1094,6 +1212,7 @@ impl Opencode {
         if *cancel.borrow() {
             return Err(stopped(native));
         }
+        stage.enter(ProviderStage::TurnStart);
         *start.lock().unwrap() = manager::StartEvidence::Unknown;
         match self.send(&conn, &session, &first).await {
             Sent::Taken => {}
@@ -1108,6 +1227,7 @@ impl Opencode {
         }
         *start.lock().unwrap() = manager::StartEvidence::Started;
         self.touch(&session);
+        stage.enter(ProviderStage::Record);
         if let Some(turn) = &config.codex_turn
             && let Err(e) = (turn.record)(session.clone(), Some(message.clone())).await
         {
@@ -1123,6 +1243,7 @@ impl Opencode {
                 own(&format!("record the opencode turn: {e}")),
             ));
         }
+        stage.enter(ProviderStage::Run);
         let mut seen = Seen::default();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
         let mut ticks = tokio::time::interval(TICK);
@@ -1131,6 +1252,7 @@ impl Opencode {
             let check = tokio::select! {
                 biased;
                 _ = agent::wait_for_cancel(&mut cancel) => {
+                    stage.enter(ProviderStage::Interrupt);
                     let last = self.close(&session);
                     break if self.stop_run(&conn, &session, &last).await {
                         guard.terminal = true;
@@ -1618,7 +1740,7 @@ impl Executor for Opencode {
                 }
             }
             // ponytail: opencode takes no effort per message; a model variant would carry it.
-            let model = match parse_model(args["model"].as_str().unwrap_or_default()) {
+            let model = match parse_model(work.execution_model().unwrap_or_default()) {
                 Ok(model) => model,
                 Err(failure) => return reject(failure),
             };
@@ -1791,66 +1913,7 @@ impl Executor for Opencode {
                 });
             }
             let session = work.state.thread().context("the work has no session")?;
-            let conn = (self.running().await)
-                .context("no opencode serve runs; the next one reads this work back")?;
-            let Some(found) = self.session(&conn, session).await? else {
-                return Ok(Probe::Missing);
-            };
-            let epoch = conn.started_ms as u64;
-            let Some(messages) = self.tail(&conn, session, &id).await? else {
-                if self.inbox_contains(&conn, session, &id).await? {
-                    return Ok(Probe::Running { turn_id: id, epoch });
-                }
-                return Ok(Probe::NotStarted);
-            };
-            found["location"]["directory"]
-                .as_str()
-                .context("opencode sent a session without its directory")?;
-            let later = messages.iter().skip(1).any(|m| m["type"] == "user");
-            let busy = self.busy(&conn, session).await?;
-            if !later && busy {
-                return Ok(Probe::Running { turn_id: id, epoch });
-            }
-            let chain = chain(&messages, &id);
-            let done = |status, error| Probe::Terminal {
-                turn_id: id.clone(),
-                status,
-                text: chain.text.clone(),
-                error,
-            };
-            // A run cut between steps leaves its last step finished for tools.
-            let finished = |reply: &Value| {
-                !reply["time"]["completed"].is_null()
-                    && (later
-                        || !matches!(reply["finish"].as_str(), Some("tool-calls" | "unknown")))
-            };
-            Ok(match &chain.reply {
-                Some(reply) if reply["error"]["type"] == "aborted" => {
-                    done(TurnStatus::Interrupted, None)
-                }
-                Some(reply) if !reply["error"].is_null() => {
-                    done(TurnStatus::Failed, Some(failure_of(&reply["error"])))
-                }
-                Some(reply) if finished(reply) => done(TurnStatus::Completed, None),
-                _ if chain.created_ms < conn.started_ms => {
-                    let failure = ExecFailure::new(
-                        FailureKind::Restarted,
-                        "the opencode serve running this work stopped",
-                    );
-                    done(TurnStatus::Interrupted, Some(failure))
-                }
-                _ if busy || now_ms() - chain.created_ms < QUIET_MS => Probe::Running {
-                    turn_id: id.clone(),
-                    epoch,
-                },
-                _ => {
-                    let failure = ExecFailure::new(
-                        FailureKind::Unknown,
-                        "opencode ended this run without an answer; check that the model exists and its provider is signed in",
-                    );
-                    done(TurnStatus::Failed, Some(failure))
-                }
-            })
+            self.probe_native(session, &id, true).await
         })
     }
 
@@ -2486,6 +2549,7 @@ mod tests {
             },
             workspace: place.dir.join("work"),
             model: "fake/m".into(),
+            reasoning_effort: None,
             timeout_secs: 30,
             custom_tools: BTreeMap::new(),
             tool_cli: None,
@@ -2555,6 +2619,11 @@ mod tests {
             dispatcher: target.into(),
             call_ref: "w-1".into(),
             kind: WorkKind::Agent(Provider::Opencode),
+            model: Some("fake/m".into()),
+            resolved: crate::model::ResolvedModel {
+                provider: Provider::Opencode,
+                model: Some("fake/m".into()),
+            },
             cwd: place.dir.join("work").display().to_string(),
             title: "t".into(),
             prompt: prompt.into(),
@@ -2596,7 +2665,7 @@ mod tests {
     /// Registers the work `w-1` and has the Node start it on opencode.
     async fn dispatch(node: &Arc<Runtime>, network: &str, spec: &WorkSpec) -> Result<()> {
         let at = now_ms();
-        (node.store.lock().await).accept_work(&node.identity, network, spec.clone(), at)?;
+        (node.store.lock().await).accept_work_fixture(&node.identity, network, spec.clone(), at)?;
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();
         let sends = (node.start_work(opencode.as_ref(), network, spec, None, &args)).await?;
@@ -2619,6 +2688,100 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn two_nodes_keep_opencode_database_and_shell_paths_private() -> Result<()> {
+        let place = Place::new().await?;
+        let user = place.dir.join("user");
+        std::fs::create_dir(&user)?;
+        let mut servers = Vec::new();
+        for name in ["node-a", "node-b"] {
+            let data = place.dir.join(name);
+            let mut env = place.env();
+            for key in [
+                "OPENCODE_DB",
+                "OPENCODE_CONFIG_DIR",
+                "XDG_DATA_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+                "OPENCODE_CONFIG",
+                "OPENCODE_TEST_HOME",
+            ] {
+                env.insert(key.into(), user.join(key).display().to_string());
+            }
+            let server = Arc::new(Opencode::open(&data, fixture(), env)?);
+            let (conn, _used) = server.conn().await?;
+            let session = server
+                .create(&conn, place.dir.to_str().context("directory")?, None)
+                .await?;
+            server
+                .environment(
+                    &conn,
+                    &session,
+                    &BTreeMap::from([(
+                        "OPENCODE_DB".into(),
+                        user.join("tool.db").display().to_string(),
+                    )]),
+                )
+                .await?;
+            let expected = ProviderRoots::new(&data).env(Provider::Opencode);
+            let recorded: Vec<Value> = place
+                .recorded("roots.jsonl")
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<std::result::Result<_, _>>()?;
+            let last = recorded.last().context("recorded launch")?;
+            for (key, value) in &expected {
+                if last.get(key).is_some() {
+                    assert_eq!(last[key], json!(value));
+                }
+            }
+            assert_eq!(last["OPENCODE_CONFIG"], Value::Null);
+            assert_eq!(last["OPENCODE_TEST_HOME"], Value::Null);
+            assert_eq!(last["fake_auth_present"], true);
+            assert!(Path::new(&expected["OPENCODE_DB"]).is_file());
+            let fake = place.fake.lock().unwrap();
+            let environment = &fake.sessions[&session].environment;
+            assert_eq!(environment["OPENCODE_DB"], expected["OPENCODE_DB"]);
+            assert_eq!(environment["OPENCODE_CONFIG"], "");
+            drop(fake);
+            servers.push(server);
+        }
+        assert_eq!(std::fs::read_dir(&user)?.count(), 0);
+        for server in servers {
+            server.stop().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsupported_bot_effort_is_rejected_without_starting_opencode() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let turns = Turns::default();
+        let mut config = bot(&place, &server, "effort", &turns);
+        config.reasoning_effort = Some("high".into());
+        let error = run_manager(
+            &config,
+            "hello",
+            None,
+            |_| async { panic!("must not persist") },
+            watch::channel(false).1,
+            |_| async { panic!("must not send") },
+        )
+        .await
+        .err()
+        .expect("expected failure");
+        let error = error
+            .downcast_ref::<ManagerError>()
+            .context("structured failure")?;
+        assert_eq!(error.stage, ProviderStage::Validate);
+        assert_eq!(error.start, manager::StartEvidence::NotStarted);
+        assert!(server.running().await.is_none());
+        assert!(place.prompts().is_empty());
+        Ok(())
     }
 
     #[tokio::test]
@@ -3021,7 +3184,10 @@ mod tests {
             .get_mut(&session)
             .unwrap()
             .busy = false;
-        assert!(!server.run_ended(&session).await);
+        assert!(matches!(
+            server.probe_reply(&session, &id).await?,
+            Probe::Running { .. }
+        ));
         let recorded = Turns::default();
         let config = bot(&place, &server, "next", &recorded);
         let (blocked, _, _) = turn(
@@ -3045,7 +3211,7 @@ mod tests {
         assert_eq!(place.prompts().len(), 1);
         assert!(server.stop_run(&conn, &session, &id).await);
         assert!(!server.received(&conn, &session, &id).await?);
-        assert!(server.run_ended(&session).await);
+        assert_eq!(server.probe_reply(&session, &id).await?, Probe::NotStarted);
         let (result, _, _) = turn(
             &place,
             &config,
@@ -3093,8 +3259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_input_does_not_prevent_reconciliation_from_stopping_a_running_session()
-    -> Result<()> {
+    async fn reading_a_running_reply_preserves_it_and_its_pending_inputs() -> Result<()> {
         let place = Place::new().await?;
         let server = place.opencode()?;
         let (conn, _serving) = server.conn().await?;
@@ -3108,14 +3273,17 @@ mod tests {
         server
             .send(&conn, &session, &json!({"id":"msg_pending","text":"INBOX"}))
             .await;
-        assert!(!server.run_ended(&session).await);
-        assert!(!place.fake.lock().unwrap().sessions[&session].busy);
+        assert!(matches!(
+            server.probe_reply(&session, "msg_active").await?,
+            Probe::Running { .. }
+        ));
+        assert!(place.fake.lock().unwrap().sessions[&session].busy);
         assert!(
             server
                 .inbox_contains(&conn, &session, "msg_pending")
                 .await?
         );
-        assert_eq!(place.fake.lock().unwrap().aborts, 1);
+        assert_eq!(place.fake.lock().unwrap().aborts, 0);
         Ok(())
     }
 
@@ -3224,13 +3392,17 @@ mod tests {
             .context("the work's session")?
             .to_owned();
         let second = WorkSpec {
+            resolved: crate::model::ResolvedModel {
+                provider: Provider::Opencode,
+                model: Some("fake/other".into()),
+            },
             work_id: "w-2".into(),
             call_ref: "w-2".into(),
             prompt: "again".into(),
             thread: Some(session.clone()),
             ..first
         };
-        (node.store.lock().await).accept_work(
+        (node.store.lock().await).accept_work_fixture(
             &node.identity,
             &network,
             second.clone(),
@@ -3285,7 +3457,7 @@ mod tests {
         };
         for work in [&unsure, &second] {
             let mut store = node.store.lock().await;
-            store.accept_work(&node.identity, &network, work.clone(), now_ms())?;
+            store.accept_work_fixture(&node.identity, &network, work.clone(), now_ms())?;
         }
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();
@@ -3324,7 +3496,7 @@ mod tests {
         };
         for work in [&first, &second] {
             let mut store = node.store.lock().await;
-            store.accept_work(&node.identity, &network, work.clone(), now_ms())?;
+            store.accept_work_fixture(&node.identity, &network, work.clone(), now_ms())?;
         }
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();
@@ -3554,5 +3726,32 @@ mod tests {
             parse_model("flash").map_err(|failure| failure.kind),
             Err(FailureKind::NoModel)
         );
+    }
+
+    #[tokio::test]
+    async fn pending_input_does_not_prevent_reconciliation_from_stopping_a_running_session()
+    -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let (conn, _serving) = server.conn().await?;
+        let session = server
+            .create(&conn, &place.dir.join("work").to_string_lossy(), None)
+            .await
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        server
+            .send(&conn, &session, &json!({"id":"msg_active","text":"HOLD"}))
+            .await;
+        server
+            .send(&conn, &session, &json!({"id":"msg_pending","text":"INBOX"}))
+            .await;
+        assert!(!server.run_ended(&session).await);
+        assert!(!place.fake.lock().unwrap().sessions[&session].busy);
+        assert!(
+            server
+                .inbox_contains(&conn, &session, "msg_pending")
+                .await?
+        );
+        assert_eq!(place.fake.lock().unwrap().aborts, 1);
+        Ok(())
     }
 }

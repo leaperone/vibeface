@@ -24,7 +24,7 @@ Provider session IDs, transcripts, tokens, environment values and credentials ne
 
 ## Memory
 
-Memory rows use the scoped key `(network_id, conversation_id, memory_id)`. Their metadata contains epoch, revision, control_revision, origin, user_controlled, essential and source_event_hash. The epoch must match data epoch 11. Automatic revisions are full event hashes. User revisions are stable operation IDs derived from the canonical attestation payload and signer. A duplicate Node wrapper can change the representative source hash without changing the logical revision.
+Memory rows use the scoped key `(network_id, conversation_id, memory_id)`. Their metadata contains epoch, revision, control_revision, origin, user_controlled, essential and source_event_hash. The epoch must match data epoch 12. Automatic revisions are full event hashes. User revisions are stable operation IDs derived from the canonical attestation payload and signer. A duplicate Node wrapper can change the representative source hash without changing the logical revision.
 
 remember and forget write an attempt-scoped staged overlay with the complete MemoryBase. A completed turn commits the mutations with its reply and terminal state in one Store transaction. Failed, cancelled, interrupted and unknown turns discard them. Local commit compares epoch, revision and control_revision, including tombstones, and rechecks the local live-row limit before each addition or restoration. A changed base, protected record or exhausted capacity produces a local conflict and leaves the committed state intact. Source hashes prove the referenced version, but a different valid wrapper for that version does not cause a conflict.
 
@@ -56,6 +56,6 @@ The essential Memory budget covers the entire serialized block. A data-only Memo
 
 ## Data format
 
-The Store uses data_epoch 11 for Memory metadata and the scoped scheduler-session schema. It opens only the matching database epoch and does not migrate an older data directory. The migration hash is recorded in crates/node/src/config.rs. Protocol clients must treat another epoch as an incompatible data format.
+The Store uses data_epoch 12 for Memory metadata and the scoped scheduler-session schema. It opens only the matching database epoch and does not migrate an older data directory. The migration hash is recorded in crates/node/src/config.rs. Protocol clients must treat another epoch as an incompatible data format.
 
 This contract does not add a shared device pool, shared Provider account, remote screen control, phone projection or a second history store.

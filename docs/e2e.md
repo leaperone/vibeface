@@ -159,10 +159,40 @@ VIBEFACE_E2E_BINARY=/absolute/task/.artifacts/native/vibeface \
 VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/.artifacts/native/web/vibeface_secure.js \
 AGENT_DEVICE_HOME="$PWD/.artifacts/native/agent-device" \
 AGENT_DEVICE_STATE_DIR="$PWD/.artifacts/native/agent-device" \
-pnpm exec e2e run --config e2e.native.config.ts
+pnpm exec e2e run --config e2e.native.config.ts --grep '^receives a charity file'
 ```
 
 原生测试通过真实邀请码加入接收网络，检查手机与管理员的安全码相同，再授予管理权限。测试从私有任务文件读取一次性邀请码，像扫码一样以 `vibeface://join?link=` 打开应用。发送方经真实 Node 发出公益订单，原生界面接受并保存文件。测试只读该专用应用的 `Documents/transfers/`，以独立 SHA-256 核对实际保存的字节。没有安装新构建、执行原生界面或读取实际文件时，不能把入口准备完成或 Web 通过作为原生验收成功。
+
+## 验证原生 Provider 设置和队列取消
+
+手动运行 `.github/workflows/mobile.yml` 时，现有 iOS job 在当前 checkout 构建 Simulator App、宿主 Node、Web 和 WASM，然后运行一个 Provider 原生用例。Android job 仍只构建 APK。iOS job 核对实际 arm64 宿主与 App，选择可用 iOS runtime，创建专属 iPhone 17 simulator 并等待它启动。缺少 runtime、启动失败或 driver 不可用都会使验收失败，构建成功不能代替 UI 结果。
+
+宿主构建前还要求 HEAD 等于本次提交，且 `git status --porcelain --untracked-files=normal` 为空。DerivedData 和 Simulator zip 位于已忽略的 `.artifacts/native/`，不会干扰这个检查。Expo prebuild 改变源码时必须先解决，不能继续把脏源码产物记为当前提交。
+
+本地运行使用上节的四个明确产物与 simulator 环境变量，并补充当前源码身份。仅选择 Provider 用例，不运行公益文件用例。
+
+```sh
+umask 077
+mkdir -p .artifacts/native/private
+VIBEFACE_E2E_SOURCE_COMMIT="$(git rev-parse HEAD)" \
+pnpm exec e2e run --config e2e.native.config.ts --grep '^provider ' \
+  --trace off --video off --retries 0 > .artifacts/native/private/ui.log 2>&1
+```
+
+该用例重新安装当前 App，逐项核对已安装 bundle 与构建 bundle 的文件摘要，包括实际可执行文件、打包 JavaScript 和原生库。它用 e2e Secret 从任务私有文件读取邀请，填写原生“加入链接”表单，再核对双方安全码并授予管理权限。邀请不会作为普通深链接参数传入 UI driver。iOS 的 TextInput 可把 placeholder 或值附在可访问名称后面，因此输入定位使用 textbox 角色和以字段名称开头、带分隔边界的正则，仍要求唯一匹配。已填写值、保存回读和私有命令剪贴板均作精确核对。
+
+原生设备页的“Bot 与任务”进入真实 AI 设置页。fixture 只配置受控程序与连接模式，并关闭 Bot 和执行角色，真实返回 `manager=null`。用例先确认未启用的 Codex 尚未主动检查，再开启执行用途；依照 Node 的首次设置默认，这也开启 Bot，用例随后由原生界面关闭 Bot。启用和已有 manager 的 Node 启动都会主动检查，不能把这些结果称为未检查。用例在 execution-only 状态实际检查未登录提示，精确核对从界面复制的私有目录登录命令，由受限 fake CLI 完成一次合成登录，再主动检查并选择、手填和清空执行模型。之后开启 Bot，验证双角色草稿、独立保存、默认模型和 high。它还确认 Provider 控制强度时清除旧覆盖，包括带空白的手填已知模型，以及目录不可用时保留旧模型和强度。所有启用与保存均经已授权手机的正常接口执行。
+
+队列场景通过真实 Node API 准备一条运行中消息和一条排队消息。原生 UI 取消排队后，再通过原生“停止”结束运行中的消息并释放槽位。独立读取确认运行中的消息调用过一次，被取消的消息始终没有调用，离开再进入聊天后计数保持不变。受控 fixture 不调用真实模型，也不代替手机保存、取消或停止。
+
+native config 默认关闭 trace 和整段 video。原始日志、自动失败截图、e2e report、邀请、恢复文件、Node 数据与 driver 状态都属于私有材料，不能递归上传 `.artifacts/native/`。CI 只上传固定的 `provider.json`、`provider-initial.png`、`provider-selectable.png`、`provider-controlled.png` 和 `provider-typed.png`。
+
+`provider-initial.png` 是唯一的配对前诊断图。它只在本次 CI 新建的专属 simulator 上，重新安装、清除钥匙串并启动 App 后主动拍摄，且早于首次 `secrets.get` 和邀请输入。用例核对 simulator 文件、实际 UUID、Booted 状态以及包含当前 run ID 和 attempt 的专属名称。此时 App 尚未接收邀请、登录命令或凭证，也没有旧应用数据；初始图只用于查看路由、系统弹窗和空表单。其他三张图仍只在配对后的设置页保存。诊断图不代表配对或表单验收通过。最终收据只有在一个目标测试真实通过、fixture 退出、专属 simulator 删除和私有状态清理后才标为 `passed`。
+
+失败收据与 stdout 只保留固定阶段、报告是否可读，以及从实际 e2e report 提取的受限错误码、已知 API 名和两个验收文件的行号。错误 message、stack、locator label、值和原始报告不会导出。报告尚未生成时仍保留失败阶段，完整私有日志随后按原清理规则删除。
+
+本地用例产生的 `ui_passed` 仅表示 UI 步骤已完成；本地操作者仍须关闭并删除本人创建的专属 simulator，并核对 fixture 清理结果。这个入口覆盖 iOS Simulator 与受控 Provider，不代表 Android UI、iPhone 真机、真实登录或真实模型已经验收。
 
 ## 让编码代理使用 e2e
 

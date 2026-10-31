@@ -6,7 +6,7 @@ use super::{Access, Changed, Runtime, now_ms};
 use crate::{
     config,
     manager::{self, CursorInstance, ManagerConfig},
-    model::{Choice, EventBody, Subject},
+    model::{AttentionKind, AttentionRequest, Choice, EventBody, Subject},
     net,
     providers::Provider,
     store::triage::{BudgetStatus, TriageAdmission},
@@ -57,7 +57,7 @@ pub(crate) struct TriageState {
     /// App Server threads nobody drives (`codex exec`, sub-agents); no bot is given them.
     background: std::sync::Mutex<HashSet<String>>,
     started_ms: i64,
-    turn: tokio::sync::Mutex<()>,
+    pub(super) turn: tokio::sync::Mutex<()>,
     active: std::sync::Mutex<Option<String>>,
     budget_warning: std::sync::Mutex<Option<BudgetStatus>>,
     mutations: tokio::sync::Mutex<()>,
@@ -998,24 +998,39 @@ impl Runtime {
         attempt: Option<&str>,
         prompt: impl FnOnce(&str) -> Result<String>,
     ) -> Result<()> {
+        let launch = self.manager_controls.lock().await;
+        if self
+            .pending_provider_launches
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(manager::ManagerError::not_started(anyhow::anyhow!(
+                "provider settings are pending"
+            )));
+        }
+        let providers = self.providers();
         let settings = self
             .manager()
             .context("no coordination Agent is configured")
             .map_err(manager::ManagerError::not_started)?;
-        self.manager_backend_ready(settings.provider).await;
+        crate::scheduler::ensure_readiness(
+            &self
+                .provider_readiness(settings.provider, &settings.model)
+                .await,
+        )?;
         let program = std::env::current_exe()
             .map_err(|error| manager::ManagerError::not_started(error.into()))?;
         let mut cli = format!("'{}'", program.to_string_lossy().replace('\'', r"'\''"));
         let mut config = ManagerConfig {
             tool_cli: Some(program),
             ..self
-                .manager_config(settings)
+                .manager_config(settings, &providers)
                 .map_err(manager::ManagerError::not_started)?
         }
         .for_cursor_instance(
             CursorInstance::Coordination,
             self.cursor_store_root(&CursorInstance::Coordination),
         );
+        drop(launch);
         if let Some(attempt) = attempt {
             config
                 .tool_env
@@ -1041,6 +1056,9 @@ impl Runtime {
     /// Hands waiting events, each with the bot that owns its session, to one turn of the
     /// coordination Agent. It answers through `vibeface triage` and `vibeface respond`.
     async fn wake_agent(&self) -> Result<()> {
+        if !self.apply_provider_launches().await? {
+            return Ok(());
+        }
         let Ok(_turn) = self.triage.turn.try_lock() else {
             return Ok(());
         };
@@ -1312,6 +1330,19 @@ impl Runtime {
                 }
                 let question = EventBody::QuestionAsked {
                     question_id: triage::question_id(&event.node, &event.event_id),
+                    attention: AttentionRequest {
+                        kind: match input["attention_kind"].as_str() {
+                            Some("browser_takeover") => AttentionKind::BrowserTakeover,
+                            Some("approval") => AttentionKind::Approval,
+                            Some("question") => AttentionKind::Question,
+                            Some(_) => bail!("unknown attention kind"),
+                            None if event.hold == Some(RequestKind::Permission) => {
+                                AttentionKind::Approval
+                            }
+                            None => AttentionKind::Question,
+                        },
+                        device_id: Some(event.node.clone()),
+                    },
                     severity,
                     text: crate::logging::scrub(super::field(&input, "question")?),
                     choices: labels
@@ -1987,7 +2018,10 @@ pub(super) mod tests {
         config::Config,
         crypto::LocalIdentity,
         identity::{Genesis, Member, NetworkState},
+        model::{ResolvedModel, Role},
     };
+    use std::{collections::BTreeMap, sync::atomic::Ordering};
+    use vibeface_bridge::failure::FailureKind;
 
     async fn bare_node() -> Result<(Arc<Runtime>, PathBuf)> {
         node_at(LocalIdentity::generate(), Default::default()).await
@@ -2007,6 +2041,7 @@ pub(super) mod tests {
             "/tmp/vf-{}.sock",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         );
+        configuration.providers.codex_app_server.mode = crate::providers::AppServerMode::System;
         configuration.providers.codex_app_server.socket = Some(socket.into());
         configuration.providers.execution = [crate::providers::Provider::Codex].into();
         configuration.network = network;
@@ -2036,6 +2071,8 @@ pub(super) mod tests {
             provider: crate::providers::Provider::Codex,
             workspace: "/tmp".into(),
             model: "fixture".into(),
+            reasoning_effort: None,
+            backup: Default::default(),
         });
     }
 
@@ -2238,6 +2275,11 @@ pub(super) mod tests {
                 dispatcher: local,
                 call_ref: "r".into(),
                 kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
+                model: None,
+                resolved: crate::model::ResolvedModel {
+                    provider: crate::providers::Provider::Codex,
+                    model: None,
+                },
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -2245,10 +2287,12 @@ pub(super) mod tests {
                 parent: None,
                 thread: Some("t-9".into()),
             };
-            node.store
-                .lock()
-                .await
-                .accept_work(&node.identity, &network, spec, now_ms())?;
+            node.store.lock().await.accept_work_fixture(
+                &node.identity,
+                &network,
+                spec,
+                now_ms(),
+            )?;
             let stopped = node.interrupt_work(&network, "w-stop").await?;
             assert_eq!(stopped["waiting_for_start"], true);
             let waiting = node.store.lock().await.stop_requests()?;
@@ -2306,6 +2350,11 @@ pub(super) mod tests {
             dispatcher: local,
             call_ref: work_id.into(),
             kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
+            model: None,
+            resolved: crate::model::ResolvedModel {
+                provider: crate::providers::Provider::Codex,
+                model: None,
+            },
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".into(),
@@ -2316,7 +2365,7 @@ pub(super) mod tests {
         node.store
             .lock()
             .await
-            .accept_work(&node.identity, &network, spec, now_ms())?;
+            .accept_work_fixture(&node.identity, &network, spec, now_ms())?;
         let epoch = node.codex.epoch();
         let turn = crate::work::Signal::TurnStarted {
             turn_id: "u-1".into(),
@@ -2400,6 +2449,11 @@ pub(super) mod tests {
                 dispatcher: local,
                 call_ref: "late".into(),
                 kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
+                model: None,
+                resolved: crate::model::ResolvedModel {
+                    provider: crate::providers::Provider::Codex,
+                    model: None,
+                },
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -2408,7 +2462,7 @@ pub(super) mod tests {
                 thread: None,
             };
             let window = crate::work::SEND_WINDOW_MS + crate::work::RECONCILE_GRACE_MS;
-            node.store.lock().await.accept_work(
+            node.store.lock().await.accept_work_fixture(
                 &node.identity,
                 &network,
                 spec,
@@ -3516,13 +3570,7 @@ pub(super) mod tests {
             };
             node.register_manager_attempt("token".into(), idle.clone(), &attempt, &trigger, crate::providers::Provider::Codex)
                 .await?;
-            let live = Access {
-                manager: Some(crate::runtime::ManagerAccess {
-                    attempt_id: attempt.clone(),
-                    trigger,
-                }),
-                ..idle.clone()
-            };
+            let live = node.agent_tokens.lock().await.get("token").cloned().context("registered tool token")?;
             let hand = |access: &Access, session: &str, how: Value| {
                 let (node, local, access, session) = (&node, &local, access.clone(), session.to_owned());
                 async move {
@@ -3686,6 +3734,8 @@ pub(super) mod tests {
                 dispatcher: local,
                 call_ref: "r".into(),
                 kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
+                model: None,
+                resolved: crate::model::ResolvedModel { provider: crate::providers::Provider::Codex, model: None },
                 cwd: "/w".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -3696,7 +3746,7 @@ pub(super) mod tests {
             node.store
                 .lock()
                 .await
-                .accept_work(&node.identity, &network, spec, now_ms())?;
+                .accept_work_fixture(&node.identity, &network, spec, now_ms())?;
             let queued = node.ingest_agent_event(turn("wt", "t1", "/w")).await?;
             assert_eq!(queued["status"], "accepted");
             assert_eq!(attributions(&node, "d").await?, 0, "a work's thread is its bot's at once");
@@ -3735,6 +3785,11 @@ pub(super) mod tests {
                 dispatcher: local.clone(),
                 call_ref: "r".into(),
                 kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
+                model: None,
+                resolved: crate::model::ResolvedModel {
+                    provider: crate::providers::Provider::Codex,
+                    model: None,
+                },
                 cwd: "/w".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -3743,7 +3798,7 @@ pub(super) mod tests {
                 thread: Some(format!("t-{work_id}")),
             };
             for (work_id, conversation) in [("w-d", "d"), ("w-c", "c")] {
-                node.store.lock().await.accept_work(
+                node.store.lock().await.accept_work_fixture(
                     &node.identity,
                     &network,
                     spec(work_id, conversation),
@@ -3752,7 +3807,7 @@ pub(super) mod tests {
             }
             let hash = delete_bot(&node, &admin, "d").await?;
             node.bot_deleted(&network, "d", &hash);
-            let late = node.store.lock().await.accept_work(
+            let late = node.store.lock().await.accept_work_fixture(
                 &node.identity,
                 &network,
                 spec("w-late", "d"),
@@ -3831,6 +3886,21 @@ pub(super) mod tests {
         scope: &str,
         id: &str,
     ) -> Result<(String, String)> {
+        let (trigger, attempt) = claim_reply(node, admin, scope, id, "boot").await?;
+        node.store
+            .lock()
+            .await
+            .mark_started(scope, &trigger, &attempt)?;
+        Ok((trigger, attempt))
+    }
+
+    pub(in crate::runtime) async fn claim_reply(
+        node: &Runtime,
+        admin: &LocalIdentity,
+        scope: &str,
+        id: &str,
+        boot: &str,
+    ) -> Result<(String, String)> {
         let network = node.network_id().await?;
         let posted = admin.attest(
             &network,
@@ -3862,11 +3932,28 @@ pub(super) mod tests {
             now_ms(),
         )?;
         let claimed = store
-            .claim_next(&node.identity, &network, scope, "boot", "cfg")?
+            .claim_next_fixture(&node.identity, &network, scope, boot, "cfg")?
             .context("job")?;
         let trigger = claimed.job.trigger.clone();
         let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
-        store.mark_started(scope, &trigger, &attempt)?;
+        store.record_turn_runtime(
+            scope,
+            &trigger,
+            &attempt,
+            &crate::scheduling::TurnRuntime {
+                provider: Provider::Codex,
+                model: Some("fixture".into()),
+                reasoning_effort: None,
+                generation: node.provider_generation(Provider::Codex, &node.providers())?,
+                session_generation: claimed.session_generation,
+                delivery_id: attempt.clone(),
+                stage: vibeface_bridge::failure::ProviderStage::Validate,
+                execution: crate::scheduling::TurnExecution::NotStarted,
+                attempted_at_ms: now_ms(),
+                switched_from: None,
+                switch_reason: None,
+            },
+        )?;
         Ok((trigger, attempt))
     }
 
@@ -3876,15 +3963,22 @@ pub(super) mod tests {
         let result = async {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
-            bot(&node, &admin, "c2", "后端", &[]).await?;
-            let _requests = answering_app_server(&node)?;
-            while node.codex.status().await["connection"]["state"] != "connected" {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            bot(&node, &admin, "d", "后端", &[]).await?;
+            let mut requests =
+                scripted_app_server(&node, |request| match request["method"].as_str() {
+                    Some("thread/read") => json!({"result":{"thread":{"turns":[
+                    {"id":"turn","status":"completed","items":[]}]}}}),
+                    _ => json!({"result":{}}),
+                })?;
+            tokio::time::timeout(Duration::from_secs(5), connected(&node)).await?;
             let network = node.network_id().await?;
             assert_eq!(node.codex.server(), "system");
-            for (id, server, scope) in [("m1", "own:", "c"), ("m2", "system", "c2")] {
-                let (trigger, attempt) = start_reply_in(&node, &admin, scope, id).await?;
+            let mut foreign_attempt = String::new();
+            for (scope, server) in [("c", "own:"), ("d", "system")] {
+                let (trigger, attempt) = start_reply_in(&node, &admin, scope, "m1").await?;
+                if server == "own:" {
+                    foreign_attempt = attempt.clone();
+                }
                 let mut store = node.store.lock().await;
                 store.record_manager_turn(
                     &attempt,
@@ -3912,6 +4006,7 @@ pub(super) mod tests {
                 )?;
             }
             node.reconcile_checks(&network).await?;
+            node.reconcile_checks(&network).await?;
             let left = node.store.lock().await.pending_checks()?;
             let servers: Vec<_> = left
                 .iter()
@@ -3921,7 +4016,39 @@ pub(super) mod tests {
             assert_eq!(
                 servers,
                 ["own:"],
-                "only the turn on this App Server was found gone"
+                "only this App Server's confirmed terminal turn is settled"
+            );
+            assert_eq!(
+                left[0].attempt_id, foreign_attempt,
+                "the original foreign attempt stays pending"
+            );
+            let store = node.store.lock().await;
+            let foreign = store
+                .scheduler_job("c", "message:m1")?
+                .context("foreign job")?;
+            assert!(matches!(
+                foreign.state,
+                crate::scheduling::JobState::Reconciling { .. }
+            ));
+            assert!(store.message(&network, "c", &foreign.message_id)?.is_none());
+            assert!(matches!(
+                store
+                    .scheduler_job("d", "message:m1")?
+                    .context("local job")?
+                    .state,
+                crate::scheduling::JobState::Completed { .. }
+            ));
+            let sent: Vec<_> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
+            assert_eq!(
+                sent.iter()
+                    .filter(|request| request["method"] == "thread/read")
+                    .count(),
+                1
+            );
+            assert!(
+                sent.iter().all(|request| request["method"] != "turn/start"
+                    && request["method"] != "turn/steer"),
+                "reconciliation never resends either prompt"
             );
             Ok::<_, anyhow::Error>(())
         }
@@ -3938,14 +4065,15 @@ pub(super) mod tests {
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;
             let trigger = crate::scheduling::message_trigger("m1");
-            let spec = WorkSpec {
+            let spec = crate::work::WorkRequest {
                 work_id: WorkSpec::id("c", &trigger, "r"),
                 conversation: "c".into(),
                 trigger,
                 target: LocalIdentity::generate().device_id()?,
                 dispatcher: node.identity.device_id()?,
                 call_ref: "r".into(),
-                kind: crate::model::WorkKind::Task,
+                kind: crate::work::RequestedWorkKind::Task,
+                model: None,
                 cwd: "/w".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -4027,13 +4155,13 @@ pub(super) mod tests {
                 crate::providers::Provider::Codex,
             )
             .await?;
-            let access = Access {
-                manager: Some(crate::runtime::ManagerAccess {
-                    attempt_id: attempt.clone(),
-                    trigger,
-                }),
-                ..access
-            };
+            let access = node
+                .agent_tokens
+                .lock()
+                .await
+                .get("token")
+                .cloned()
+                .context("registered tool token")?;
             let args = json!({"thread":"bot-thread","call_ref":"r1","title":"t","prompt":"p"});
             let refused = node.tool(access, "track_work", args).await;
             node.finish_manager_attempt(&attempt).await;
@@ -4074,13 +4202,7 @@ pub(super) mod tests {
             };
             node.register_manager_attempt("token".into(), access.clone(), &attempt, &trigger, crate::providers::Provider::Codex)
                 .await?;
-            let access = Access {
-                manager: Some(crate::runtime::ManagerAccess {
-                    attempt_id: attempt.clone(),
-                    trigger: trigger.clone(),
-                }),
-                ..access
-            };
+            let access = node.agent_tokens.lock().await.get("token").cloned().context("registered tool token")?;
             let send = |call_ref: &str, agent: Value| {
                 json!({"thread":"t-other","call_ref":call_ref,"title":"t","prompt":"p","agent":agent})
             };
@@ -4117,6 +4239,8 @@ pub(super) mod tests {
                 dispatcher: local,
                 call_ref: "w-earlier".into(),
                 kind: crate::model::WorkKind::Agent(Provider::Claude),
+                model: None,
+                resolved: crate::model::ResolvedModel { provider: Provider::Claude, model: None },
                 cwd: String::new(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -4124,7 +4248,7 @@ pub(super) mod tests {
                 parent: None,
                 thread: Some("t-claude".into()),
             };
-            (node.store.lock().await).accept_work(&node.identity, &network, earlier, now_ms())?;
+            (node.store.lock().await).accept_work_fixture(&node.identity, &network, earlier, now_ms())?;
             let own = json!({"thread":"t-claude","call_ref":"r5","title":"t","prompt":"p",
                 "agent":"claude"});
             let crossed = json!({"thread":"t-claude","call_ref":"r7","title":"t","prompt":"p",
@@ -4209,13 +4333,13 @@ pub(super) mod tests {
                 Provider::Codex,
             )
             .await?;
-            let access = Access {
-                manager: Some(crate::runtime::ManagerAccess {
-                    attempt_id: attempt.clone(),
-                    trigger: trigger.clone(),
-                }),
-                ..access
-            };
+            let access = node
+                .agent_tokens
+                .lock()
+                .await
+                .get("token")
+                .cloned()
+                .context("registered tool token")?;
             let asks = |call_ref: &str, agent: &str, extra: Value| {
                 let mut args = json!({"cwd":dir.display().to_string(),"call_ref":call_ref,
                     "title":"t","prompt":"p","agent":agent});
@@ -4308,13 +4432,7 @@ pub(super) mod tests {
                 Provider::Claude,
             )
             .await?;
-            let access = Access {
-                manager: Some(crate::runtime::ManagerAccess {
-                    attempt_id: attempt.clone(),
-                    trigger,
-                }),
-                ..access
-            };
+            let access = node.agent_tokens.lock().await.get("token").cloned().context("registered tool token")?;
             let local = node.identity.device_id()?;
             let original = crate::work::WorkSpec {
                 work_id: "w-codex".into(),
@@ -4324,6 +4442,8 @@ pub(super) mod tests {
                 dispatcher: local,
                 call_ref: "w-codex".into(),
                 kind: WorkKind::Agent(Provider::Codex),
+                model: None,
+                resolved: crate::model::ResolvedModel { provider: Provider::Codex, model: None },
                 cwd: String::new(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -4331,7 +4451,7 @@ pub(super) mod tests {
                 parent: None,
                 thread: Some("t-done".into()),
             };
-            (node.store.lock().await).accept_work(&node.identity, &network, original, now_ms())?;
+            (node.store.lock().await).accept_work_fixture(&node.identity, &network, original, now_ms())?;
             let cwd = dir.display().to_string();
             let call = |args: Value| node.tool(access.clone(), "track_work", args);
             let answered = call(json!({"thread":"t-codex","call_ref":"a1","title":"t","prompt":"yes"})).await;
@@ -4399,13 +4519,13 @@ pub(super) mod tests {
                 crate::providers::Provider::Codex,
             )
             .await?;
-            let access = Access {
-                manager: Some(crate::runtime::ManagerAccess {
-                    attempt_id: attempt.clone(),
-                    trigger,
-                }),
-                ..access
-            };
+            let access = node
+                .agent_tokens
+                .lock()
+                .await
+                .get("token")
+                .cloned()
+                .context("registered tool token")?;
             let create = |call_ref: &str| json!({"call_ref":call_ref,"name":"2SOMEone/LEAPERone"});
             let refused = node
                 .tool(access.clone(), "create_bot", create("bots/2SOMEone"))
@@ -4416,7 +4536,9 @@ pub(super) mod tests {
             node.finish_manager_attempt(&attempt).await;
             let refused = refused.expect_err("a call_ref with a slash");
             assert!(
-                refused.to_string().starts_with("call_ref must contain"),
+                refused
+                    .to_string()
+                    .starts_with("arguments.call_ref is invalid: id must contain"),
                 "{refused:#}"
             );
             assert_eq!(created?["name"], "2SOMEone/LEAPERone");
@@ -4435,13 +4557,13 @@ pub(super) mod tests {
         Unknown,
     }
 
-    fn coordination_app_server(
+    async fn coordination_app_server(
         node: &Runtime,
     ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
-        coordination_server(node, CoordinationReply::Complete)
+        coordination_server(node, CoordinationReply::Complete).await
     }
 
-    fn coordination_server(
+    async fn coordination_server(
         node: &Runtime,
         response: CoordinationReply,
     ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
@@ -4494,6 +4616,7 @@ pub(super) mod tests {
                 });
             }
         });
+        tokio::time::timeout(Duration::from_secs(5), connected(node)).await?;
         Ok(received)
     }
 
@@ -4538,7 +4661,7 @@ pub(super) mod tests {
                     now_ms() + index as i64,
                 )?;
             }
-            let mut requests = coordination_app_server(&node)?;
+            let mut requests = coordination_app_server(&node).await?;
             node.ingest_agent_event(turn("s1", "t1", "/tmp")).await?;
             node.wake_agent().await?;
             let prompt = turn_starts(&mut requests).concat();
@@ -4578,7 +4701,7 @@ pub(super) mod tests {
                 .lock()
                 .await
                 .reserve_budget(&triage, limit - 1, limit)?;
-            let mut requests = coordination_app_server(&node)?;
+            let mut requests = coordination_app_server(&node).await?;
 
             node.ingest_agent_event(turn("s1", "t1", "/tmp")).await?;
             node.wake_agent().await?;
@@ -4840,6 +4963,7 @@ pub(super) mod tests {
         let result = async {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
+            let mut calls = coordination_app_server(&node).await?;
             node.settings
                 .lock()
                 .unwrap()
@@ -4853,6 +4977,7 @@ pub(super) mod tests {
                 .wake_agent()
                 .await
                 .expect_err("invalid manager workspace");
+            assert!(error.to_string().contains("manager workspace"), "{error:#}");
             assert_eq!(
                 error
                     .downcast_ref::<manager::ManagerError>()
@@ -4864,6 +4989,7 @@ pub(super) mod tests {
             assert_eq!(status["budget"]["used"], 0);
             assert_eq!(status["pending_events"], 1);
             assert_eq!(status["unknown_events"], 0);
+            assert!(turn_starts(&mut calls).is_empty());
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -4897,13 +5023,7 @@ pub(super) mod tests {
             let result = async {
                 with_agent(&node);
                 bot(&node, &admin, "c", "前端", &[]).await?;
-                let mut calls = coordination_server(&node, reply)?;
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    while node.codex.status().await["connection"]["state"] != "connected" {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                })
-                .await?;
+                let mut calls = coordination_server(&node, reply).await?;
                 node.ingest_agent_event(turn("s", "t", "/tmp")).await?;
                 let error = node
                     .wake_agent()
@@ -4994,6 +5114,7 @@ pub(super) mod tests {
             let answered = node.triage_command(response.clone()).await?;
             assert_eq!(answered["answered"], true);
             let failure = Err(manager::ManagerError {
+                stage: vibeface_bridge::failure::ProviderStage::Run,
                 outcome: manager::ManagerFailure::Failed,
                 start: manager::StartEvidence::Started,
                 session_id: Some("fixture-started-turn".into()),
@@ -5037,7 +5158,7 @@ pub(super) mod tests {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;
-            let mut calls = coordination_app_server(&node)?;
+            let mut calls = coordination_app_server(&node).await?;
             let answered_request = node.ingest_agent_event(asks_permission("respond-before-crash")).await?;
             let TriageAdmission::Claimed(answered_attempt) = node.store.lock().await.admit_triage(&network, &node.boot, 1, 100, now_ms())? else { bail!("response claim"); };
             *lock(&node.triage.active) = Some(answered_attempt.id().into());
@@ -5095,7 +5216,7 @@ pub(super) mod tests {
         let result = async {
             let (old_action, dismissed, answered_request) = before?;
             with_agent(&reopened);
-            let mut calls = coordination_app_server(&reopened)?;
+            let mut calls = coordination_app_server(&reopened).await?;
             let status = reopened.triage_status().await?;
             assert_eq!(status["budget"]["used"], 4, "no crash restores refund authority");
             assert_eq!(status["unknown_events"], 4, "reserve, accepted, response and action-before-finish crashes remain observable");
@@ -5148,7 +5269,7 @@ pub(super) mod tests {
             assert!(lock(&reopened.triage.answered).is_empty());
             assert!(reopened.triage_command(json!({"action":"respond","request_id":request,"result":{"behavior":"allow"}})).await.is_err());
             assert_eq!(reopened.wait_request(&request).await, undecided());
-            let mut calls = coordination_app_server(&reopened)?;
+            let mut calls = coordination_app_server(&reopened).await?;
             reopened.wake_agent().await?;
             reopened.wake_agent().await?;
             assert_eq!(turn_starts(&mut calls).len(), 1, "retained events have one review without a phantom reply");
@@ -5254,7 +5375,7 @@ pub(super) mod tests {
         let result = async {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
-            coordination_app_server(&node)?;
+            coordination_app_server(&node).await?;
             node.coordination_turn(None, |_| Ok("triage".into()))
                 .await?;
             *node.triage.config.lock().unwrap() = TriageConfig {
@@ -5500,7 +5621,10 @@ pub(super) mod tests {
                 "declined"
             );
             assert_eq!(saved()?, None, "a declined proposal writes nothing");
-            assert_eq!(node.triage.config().codex_sessions, None);
+            assert_eq!(
+                node.triage.config().codex_sessions,
+                Some(dir.join("providers/codex/sessions"))
+            );
 
             let asked = node
                 .propose_provider_config(
@@ -5580,5 +5704,741 @@ pub(super) mod tests {
         .await;
         cleanup(node, dir).await?;
         result
+    }
+
+    fn controlled_pi(node: &Runtime, dir: &Path, mode: &str) -> Result<()> {
+        let mut providers = node.providers.lock().unwrap();
+        providers.switches.execution = [Provider::Pi].into();
+        providers.bins.insert(
+            Provider::Pi,
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-pi"),
+        );
+        providers.env.apply(
+            Provider::Pi,
+            BTreeMap::from([
+                (
+                    "PI_CODING_AGENT_SESSION_DIR".into(),
+                    Some(dir.join("pi-sessions").display().to_string()),
+                ),
+                (
+                    "FAKE_PI_LOG".into(),
+                    Some(dir.join("pi.log").display().to_string()),
+                ),
+                ("FAKE_PI_MODE".into(), Some(mode.into())),
+            ]),
+        )?;
+        Ok(())
+    }
+
+    fn pi_fixture_log(dir: &Path) -> Result<Vec<Value>> {
+        let text = std::fs::read_to_string(dir.join("pi.log")).unwrap_or_default();
+        text.lines()
+            .map(|line| Ok(serde_json::from_str(line)?))
+            .collect()
+    }
+
+    async fn queued_task(
+        node: &Runtime,
+        scope: &str,
+        call: &str,
+        provider: Provider,
+        model: Option<&str>,
+    ) -> Result<crate::work::WorkRequest> {
+        let request = crate::work::WorkRequest {
+            work_id: crate::work::WorkSpec::id(scope, "message:origin", call),
+            conversation: scope.into(),
+            trigger: "message:origin".into(),
+            target: node.identity.device_id()?,
+            dispatcher: LocalIdentity::generate().device_id()?,
+            call_ref: call.into(),
+            kind: crate::work::RequestedWorkKind::Task,
+            model: None,
+            cwd: "/tmp".into(),
+            title: "task".into(),
+            prompt: "controlled task".into(),
+            continues: None,
+            parent: None,
+            thread: None,
+        };
+        let network = node.network_id().await?;
+        node.store.lock().await.accept_work(
+            &node.identity,
+            &network,
+            request.clone(),
+            ResolvedModel {
+                provider,
+                model: model.map(str::to_owned),
+            },
+            now_ms(),
+        )?;
+        Ok(request)
+    }
+
+    async fn assert_refused_task(
+        node: &Runtime,
+        network: &str,
+        request: &crate::work::WorkRequest,
+        kind: FailureKind,
+    ) -> Result<()> {
+        use crate::scheduling::{JobState, TurnExecution};
+        let store = node.store.lock().await;
+        let job = store
+            .scheduler_job(
+                &request.conversation,
+                &crate::scheduling::task_trigger(&request.work_id),
+            )?
+            .context("task job")?;
+        assert!(
+            matches!(&job.state, JobState::Failed { failure, .. } if failure.kind == kind),
+            "{job:?}"
+        );
+        let runtime = job.runtime.as_ref().context("runtime")?;
+        assert_eq!(runtime.provider, Provider::Pi);
+        assert_eq!(runtime.model.as_deref(), Some("fake/frozen"));
+        assert_eq!(runtime.execution, TurnExecution::NotStarted);
+        assert_eq!(
+            runtime.stage,
+            vibeface_bridge::failure::ProviderStage::Validate
+        );
+        assert_eq!(runtime.switched_from, None);
+        assert!(job.retryable() && !job.pending_check && !job.tool_calls);
+        assert_eq!(store.work_records()?.len(), 1);
+        assert_eq!(
+            store
+                .scheduler_jobs(&request.conversation)?
+                .iter()
+                .filter(|job| job.kind == crate::scheduling::TriggerKind::AgentTask)
+                .count(),
+            1
+        );
+        let events = store.context(network, &request.conversation, None)?.events;
+        assert_eq!(events.iter().filter(|event| matches!(&event.event.body, EventBody::WorkDispatched { work_id, .. } if work_id == &request.work_id)).count(), 1);
+        assert_eq!(events.iter().filter(|event| matches!(&event.event.body, EventBody::WorkFinished { work_id, .. } if work_id == &request.work_id)).count(), 1);
+        assert_eq!(events.iter().filter(|event| matches!(&event.event.body, EventBody::WorkProgress { work_id, .. } if work_id == &request.work_id)).count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_dispatch_retries_read_the_durable_work_before_execution_and_native_state()
+    -> Result<()> {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let (node, admin, dir) = node().await?;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let turns = Arc::new(std::sync::Mutex::new(BTreeMap::<String, Value>::new()));
+        let listener = tokio::net::UnixListener::bind(named_socket(&node))?;
+        let seen = requests.clone();
+        let server = tokio::spawn(async move {
+            let mut sessions = tokio::task::JoinSet::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                let seen = seen.clone();
+                let turns = turns.clone();
+                sessions.spawn(async move {
+                    let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else { return; };
+                    let mut direct = false;
+                    while let Some(Ok(message)) = server.next().await {
+                        let Ok(request) = serde_json::from_slice::<Value>(&message.into_data()) else { continue; };
+                        if request["method"] == "initialize" { direct = request["params"]["clientInfo"]["title"] == "Vibeface Agent CLI"; }
+                        if direct || request["method"].as_str().is_some_and(|method| method.starts_with("turn/")) { seen.lock().unwrap().push(request.clone()); }
+                        let thread = request["params"]["threadId"].as_str().unwrap_or_default();
+                        let result = {
+                        let mut turns = turns.lock().unwrap();
+                        match request["method"].as_str() {
+                            Some("initialize") => json!({"userAgent":"codex/fixture"}),
+                            Some("thread/read") if thread == "missing" => json!({"thread":null}),
+                            Some("thread/read") if thread == "sub" => json!({"thread":{"id":"sub","source":{"subAgent":{}},"parentThreadId":"lead"}}),
+                            Some("turn/start") => {
+                                let turn = json!({"id":format!("turn-{thread}"),"status":"inProgress","items":[{"type":"userMessage","clientId":request["params"]["clientUserMessageId"]}]});
+                                turns.insert(thread.into(), turn.clone());
+                                json!({"turn":turn})
+                            }
+                            Some("thread/read" | "thread/resume") => json!({"thread":{"id":thread,"cwd":"/work/original","source":"cli","status":{"type":"idle"},"turns":turns.get(thread).cloned().into_iter().collect::<Vec<_>>()}}),
+                            _ => json!({}),
+                        }
+                        };
+                        if request.get("id").is_some() {
+                            let _ = server.send(json!({"id":request["id"],"result":result}).to_string().into()).await;
+                        }
+                    }
+                });
+            }
+        });
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "Bot", &[]).await?;
+            let network = node.network_id().await?;
+            let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
+            node.register_manager_attempt("thread-retry-token".into(), Access { network_id: network.clone(), human: false, conversation_id: Some("c".into()), manager: None }, &attempt, &trigger, Provider::Codex).await?;
+            let access = node.agent_tokens.lock().await.get("thread-retry-token").cloned().context("access")?;
+            let mut original = Vec::new();
+            for (call, explicit, model) in [("explicit", true, Some("frozen")), ("implicit", false, Some("frozen")), ("explicit-default", true, None), ("implicit-default", false, None)] {
+                {
+                    let mut providers = node.providers.lock().unwrap();
+                    match model { Some(model) => { providers.switches.execution_models.insert(Provider::Codex, model.into()); }, None => { providers.switches.execution_models.remove(&Provider::Codex); } }
+                }
+                let mut args = json!({"thread":format!("t-{call}"),"prompt":"\n follow up \nmore","call_ref":call});
+                if explicit { args["agent"] = json!("codex"); }
+                let first = node.tool(access.clone(), "dispatch_work", args.clone()).await?;
+                let expected = json!({"provider":"codex","model":model});
+                let work = node.store.lock().await.works(&network, "c")?.into_iter().find(|work| first["work_id"].as_str() == Some(work.work_id.as_str())).context("accepted work")?;
+                assert_eq!(work.cwd, "/work/original");
+                assert_eq!(work.title, "follow up");
+                assert_eq!(json!(work.resolved), expected);
+                original.push((args, first["work_id"].clone(), expected));
+            }
+            for (thread, reason) in [("missing", "was not returned"), ("sub", "parent thread lead")] {
+                let failure = node.tool(access.clone(), "dispatch_work", json!({"thread":thread,"prompt":"p","call_ref":thread})).await.expect_err("invalid native thread must not create work");
+                assert!(failure.to_string().contains(reason), "{failure:#}");
+                assert_eq!(node.store.lock().await.work_records()?.len(), 4);
+            }
+            node.signal_work(&network, original[0].1.as_str().context("work id")?, crate::work::Signal::TurnCompleted { turn_id: "turn-t-explicit".into(), status: vibeface_bridge::turn::TurnStatus::Completed, text: "done".into(), error: None }).await?;
+            node.signal_work(&network, original[1].1.as_str().context("work id")?, crate::work::Signal::Disconnected).await?;
+            assert!(matches!(node.store.lock().await.work_record(original[0].1.as_str().context("work id")?)?.context("finished")?.state, crate::work::WorkState::Finished { .. }));
+            assert!(matches!(node.store.lock().await.work_record(original[1].1.as_str().context("work id")?)?.context("unknown")?.state, crate::work::WorkState::Unverified { .. }));
+            {
+                let _controls = node.manager_controls.lock().await;
+                node.providers.lock().unwrap().switches.execution.clear();
+                node.providers.lock().unwrap().switches.execution_models.insert(Provider::Codex, "changed-default".into());
+                node.settings.lock().unwrap().manager = None;
+            }
+            let before = requests.lock().unwrap().clone();
+            assert_eq!(before.iter().filter(|request| request["method"] == "turn/start").count(), 4);
+            for (args, work_id, expected) in &original {
+                for (tool, input) in [("dispatch_work", args.clone()), ("tool_call", json!({"tool":"dispatch_work","arguments":args,"call_ref":args["call_ref"]}))] {
+                    let retried = node.tool(access.clone(), tool, input).await?;
+                    assert_eq!(&retried["work_id"], work_id);
+                    assert_eq!(&retried["resolved"], expected);
+                    assert_eq!(retried["may_send"], false);
+                }
+                for (field, value) in [("title", json!("changed title")), ("prompt", json!("changed prompt")), ("thread", json!("changed-thread")), ("model", json!("changed model")), ("agent", json!("claude"))] {
+                    let mut changed = args.clone(); changed[field] = value;
+                    let failure = node.tool(access.clone(), "dispatch_work", changed).await.expect_err("Store must reject changed payloads");
+                    assert!(failure.to_string().contains("different request"), "{field}: {failure:#}");
+                }
+                let mut changed_cwd = args.clone(); changed_cwd["cwd"] = json!("/still-ignored");
+                assert_eq!(node.tool(access.clone(), "dispatch_work", changed_cwd).await?["work_id"], *work_id);
+            }
+            assert_eq!(*requests.lock().unwrap(), before);
+            let failure = node.tool(access.clone(), "dispatch_work", json!({"thread":"fresh","prompt":"p","call_ref":"no-ready"})).await.expect_err("ready None must not create work");
+            assert!(failure.to_string().contains("no execution agent"), "{failure:#}");
+            assert_eq!(*requests.lock().unwrap(), before);
+            server.abort();
+            let _ = std::fs::remove_file(named_socket(&node));
+            node.providers.lock().unwrap().switches.execution.insert(Provider::Codex);
+            for (args, work_id, expected) in &original {
+                let retried = tokio::time::timeout(Duration::from_secs(2), node.tool(access.clone(), "dispatch_work", args.clone())).await??;
+                assert_eq!(&retried["work_id"], work_id);
+                assert_eq!(&retried["resolved"], expected);
+                assert_eq!(retried["may_send"], false);
+            }
+            let store = node.store.lock().await;
+            assert_eq!(store.work_records()?.len(), 4);
+            assert_eq!(store.context(&network, "c", None)?.events.iter().filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. })).count(), 4);
+            drop(store);
+            node.finish_manager_attempt(&attempt).await;
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        server.abort();
+        node.shutdown().await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn admitted_local_retries_keep_the_frozen_selection_after_models_and_permissions_change()
+    -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            controlled_pi(&node, &dir, "reply")?;
+            node.providers.lock().unwrap().switches.execution_models.insert(Provider::Pi, "fake/frozen".into());
+            node.settings.lock().unwrap().roots = vec![dir.clone()];
+            bot(&node, &admin, "c", "Bot", &[]).await?;
+            let network = node.network_id().await?;
+            let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
+            node.register_manager_attempt("retry-token".into(), Access { network_id: network.clone(), human: false, conversation_id: Some("c".into()), manager: None }, &attempt, &trigger, Provider::Codex).await?;
+            let access = node.agent_tokens.lock().await.get("retry-token").cloned().context("access")?;
+            let args = |call: &str, explicit: bool| {
+                let mut args = json!({"cwd":dir.display().to_string(),"call_ref":call,"title":"task","prompt":"controlled work"});
+                if explicit { args["agent"] = json!("pi"); }
+                args
+            };
+            let mut original = Vec::new();
+            for (call, explicit) in [("explicit", true), ("implicit", false), ("provider-default", false)] {
+                if call == "provider-default" { node.providers.lock().unwrap().switches.execution_models.remove(&Provider::Pi); }
+                let args = args(call, explicit);
+                let first = node.tool(access.clone(), "track_work", args.clone()).await?;
+                assert_eq!(first["may_send"], false);
+                assert_eq!(first["resolved"], json!({"provider":"pi","model":if call == "provider-default" { Value::Null } else { json!("fake/frozen") }}));
+                original.push((args, first));
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if node.store.lock().await.work_records()?.iter().all(|run| run.state.finished()) { break Ok::<_, anyhow::Error>(()); }
+                    tokio::task::yield_now().await;
+                }
+            }).await??;
+            {
+                let _controls = node.manager_controls.lock().await;
+                let mut providers = node.providers.lock().unwrap();
+                providers.switches.execution.clear();
+                providers.switches.execution_models.insert(Provider::Pi, "fake/new-default".into());
+                node.settings.lock().unwrap().manager = None;
+            }
+            for (args, first) in &original {
+                let retried = node.tool(access.clone(), "track_work", args.clone()).await?;
+                assert_eq!(retried["resolved"], first["resolved"]);
+                assert_eq!(retried["may_send"], false);
+                assert_eq!(retried["work_id"], first["work_id"]);
+                for (key, value) in [("agent", json!("codex")), ("model", json!("changed")), ("prompt", json!("changed"))] {
+                    let mut changed = args.clone(); changed[key] = value;
+                    assert!(node.tool(access.clone(), "track_work", changed).await.is_err());
+                }
+            }
+            assert_eq!(pi_fixture_log(&dir)?.iter().filter(|entry| entry.get("prompt").is_some()).count(), 3);
+            let store = node.store.lock().await;
+            assert_eq!(store.work_records()?.len(), 3);
+            assert_eq!(store.context(&network, "c", None)?.events.iter().filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. })).count(), 3);
+            drop(store);
+            node.finish_manager_attempt(&attempt).await;
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        node.shutdown().await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn queued_tasks_are_refused_before_manager_launch_and_active_session_gates() -> Result<()>
+    {
+        for (via_tick, current) in [
+            (false, None),
+            (false, Some(Provider::Claude)),
+            (true, None),
+            (true, Some(Provider::Claude)),
+        ] {
+            let (node, admin, dir) = node().await?;
+            let result = async {
+                with_agent(&node);
+                controlled_pi(&node, &dir, "reply")?;
+                bot(&node, &admin, "c", "Bot", &[]).await?;
+                let network = node.network_id().await?;
+                let (human_trigger, _) = claim_reply(&node, &admin, "c", "human", crate::scheduler::boot_id()).await?;
+                let active = node.store.lock().await.scheduler_job("c", &human_trigger)?.context("active")?;
+                let before = node.store.lock().await.connection.query_row("SELECT json_array(active,permission_version,session_generation,sdk_config) FROM scheduler_sessions WHERE conversation_id='c'", [], |row| row.get::<_, String>(0))?;
+                let request = queued_task(&node, "c", "early-refusal", Provider::Pi, Some("fake/frozen")).await?;
+                {
+                    let _controls = node.manager_controls.lock().await;
+                    node.settings.lock().unwrap().manager = current.map(|provider| crate::config::ManagerSettings { provider, workspace: dir.clone(), model: "changed".into(), reasoning_effort: None, backup: crate::scheduler::BackupPolicy { automatic: true, candidates: vec![crate::scheduler::BackupModel { provider: Provider::Pi, model: "fake/backup".into(), reasoning_effort: None }] } });
+                    node.pending_provider_launches.store(true, Ordering::SeqCst);
+                }
+                if via_tick {
+                    assert!(node.schedule_workers.lock().await.insert((network.clone(), crate::scheduling::SessionKey { conversation_id: "c".into(), scope: crate::scheduling::SessionScope::Main })));
+                    node.schedule_tick().await?;
+                } else {
+                    crate::scheduler::run(node.clone(), Access { network_id: network.clone(), human: false, conversation_id: Some("c".into()), manager: None }, "c".into(), crate::scheduling::SessionScope::Task { work_id: request.work_id.clone() }).await?.context("refusal invocation")?;
+                }
+                assert_refused_task(&node, &network, &request, if current.is_none() { FailureKind::NoBot } else { FailureKind::ExecutionDisabled }).await?;
+                let refused = node.store.lock().await.scheduler_job("c", &crate::scheduling::task_trigger(&request.work_id))?.context("refusal")?;
+                node.finish_incompatible_tasks(&network, None).await?;
+                assert_eq!(node.store.lock().await.scheduler_job("c", &refused.trigger)?.context("refusal")?.runtime, refused.runtime);
+                assert_eq!(serde_json::to_value(node.store.lock().await.scheduler_job("c", &human_trigger)?.context("active")?)?, serde_json::to_value(active)?);
+                let after = node.store.lock().await.connection.query_row("SELECT json_array(active,permission_version,session_generation,sdk_config) FROM scheduler_sessions WHERE conversation_id='c'", [], |row| row.get::<_, String>(0))?;
+                assert_eq!(before, after);
+                assert!(pi_fixture_log(&dir)?.is_empty());
+                assert!(node.agent_tokens.lock().await.is_empty());
+                let retried = node.accept_dispatch(&network, request.clone(), &Value::Null).await?;
+                assert!(!retried.created);
+                assert_eq!(retried.spec.resolved.model.as_deref(), Some("fake/frozen"));
+                let peer_retry = node.accept_remote_dispatch(&network, &request.dispatcher, &json!({"spec":request})).await?;
+                assert_eq!(peer_retry["work_id"], request.work_id);
+                for resolved in [Value::Null, json!({"provider":"pi","model":"forged"})] {
+                    let mut input = json!({"spec":request}); input["spec"]["resolved"] = resolved;
+                    assert!(node.accept_remote_dispatch(&network, &request.dispatcher, &input).await.is_err());
+                }
+                assert!(node.accept_remote_dispatch(&network, &node.identity.device_id()?, &json!({"spec":request})).await.is_err());
+                if via_tick {
+                    assert!(node.schedule_workers.lock().await.remove(&(network.clone(), crate::scheduling::SessionKey { conversation_id: "c".into(), scope: crate::scheduling::SessionScope::Main })));
+                }
+                Ok::<_, anyhow::Error>(())
+            }.await;
+            cleanup(node, dir).await?;
+            result?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_task_disabled_between_claim_and_start_finishes_without_a_token_or_sdk_call()
+    -> Result<()> {
+        for current in [None, Some(Provider::Claude)] {
+            let (node, admin, dir) = node().await?;
+            let result = async {
+                with_agent(&node);
+                controlled_pi(&node, &dir, "reply")?;
+                let mut manager = node.manager().context("manager")?;
+                manager.provider = Provider::Pi;
+                manager.model = "fake/current".into();
+                manager.workspace = dir.clone();
+                manager.backup = crate::scheduler::BackupPolicy {
+                    automatic: true,
+                    candidates: vec![crate::scheduler::BackupModel {
+                        provider: Provider::Pi,
+                        model: "fake/backup".into(),
+                        reasoning_effort: None,
+                    }],
+                };
+                node.settings.lock().unwrap().manager = Some(manager.clone());
+                node.tool_url.set("http://127.0.0.1:1".into()).unwrap();
+                bot(&node, &admin, "c", "Bot", &[]).await?;
+                let network = node.network_id().await?;
+                let request =
+                    queued_task(&node, "c", "barrier", Provider::Pi, Some("fake/frozen")).await?;
+                let claimed = Arc::new(tokio::sync::Notify::new());
+                let resume = Arc::new(tokio::sync::Notify::new());
+                *node.claim_to_start_barrier.lock().unwrap() =
+                    Some((claimed.clone(), resume.clone()));
+                let task_node = node.clone();
+                let task_network = network.clone();
+                let task_scope = crate::scheduling::SessionScope::Task {
+                    work_id: request.work_id.clone(),
+                };
+                let running = tokio::spawn(async move {
+                    crate::scheduler::run(
+                        task_node,
+                        Access {
+                            network_id: task_network,
+                            human: false,
+                            conversation_id: Some("c".into()),
+                            manager: None,
+                        },
+                        "c".into(),
+                        task_scope,
+                    )
+                    .await
+                });
+                tokio::time::timeout(Duration::from_secs(5), claimed.notified()).await?;
+                let initial = node
+                    .store
+                    .lock()
+                    .await
+                    .scheduler_job("c", &crate::scheduling::task_trigger(&request.work_id))?
+                    .context("claimed")?;
+                assert_eq!(
+                    initial
+                        .runtime
+                        .as_ref()
+                        .context("initial runtime")?
+                        .model
+                        .as_deref(),
+                    Some("fake/frozen")
+                );
+                {
+                    let _controls = node.manager_controls.lock().await;
+                    node.settings.lock().unwrap().manager =
+                        current.map(|provider| crate::config::ManagerSettings {
+                            provider,
+                            ..manager
+                        });
+                }
+                resume.notify_one();
+                tokio::time::timeout(Duration::from_secs(10), running)
+                    .await???
+                    .context("finished refusal")?;
+                assert_refused_task(
+                    &node,
+                    &network,
+                    &request,
+                    if current.is_none() {
+                        FailureKind::NoBot
+                    } else {
+                        FailureKind::ExecutionDisabled
+                    },
+                )
+                .await?;
+                assert!(node.agent_tokens.lock().await.is_empty());
+                assert!(node.manager_controls.lock().await.is_empty());
+                assert!(node.store.lock().await.pending_checks()?.is_empty());
+                assert!(pi_fixture_log(&dir)?.is_empty());
+                let active: Option<String> = node.store.lock().await.connection.query_row(
+                    "SELECT active FROM scheduler_sessions WHERE conversation_id='c'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(active, None);
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            node.shutdown().await;
+            cleanup(node, dir).await?;
+            result?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_registration_that_cannot_mark_started_leaves_no_token_and_preserves_unknown_evidence()
+    -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            controlled_pi(&node, &dir, "reply")?;
+            let mut manager = node.manager().context("manager")?;
+            manager.provider = Provider::Pi;
+            manager.workspace = dir.clone();
+            node.settings.lock().unwrap().manager = Some(manager);
+            node.tool_url.set("http://127.0.0.1:1".into()).unwrap();
+            bot(&node, &admin, "c", "Bot", &[]).await?;
+            let network = node.network_id().await?;
+            let request = queued_task(
+                &node,
+                "c",
+                "mark-failure",
+                Provider::Pi,
+                Some("fake/frozen"),
+            )
+            .await?;
+            let claimed = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            *node.claim_to_start_barrier.lock().unwrap() = Some((claimed.clone(), resume.clone()));
+            let task_node = node.clone();
+            let task_network = network.clone();
+            let task_scope = crate::scheduling::SessionScope::Task {
+                work_id: request.work_id.clone(),
+            };
+            let running = tokio::spawn(async move {
+                crate::scheduler::run(
+                    task_node,
+                    Access {
+                        network_id: task_network,
+                        human: false,
+                        conversation_id: Some("c".into()),
+                        manager: None,
+                    },
+                    "c".into(),
+                    task_scope,
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), claimed.notified()).await?;
+            let trigger = crate::scheduling::task_trigger(&request.work_id);
+            let job = node
+                .store
+                .lock()
+                .await
+                .scheduler_job("c", &trigger)?
+                .context("claim")?;
+            let attempt = job.state.attempt().context("attempt")?.id.clone();
+            let before_registration = {
+                let mut store = node.store.lock().await;
+                store.mark_started("c", &trigger, &attempt)?;
+                store.update_turn_runtime(
+                    "c",
+                    &trigger,
+                    &attempt,
+                    vibeface_bridge::failure::ProviderStage::TurnStart,
+                    crate::scheduling::TurnExecution::Unknown,
+                )?
+            };
+            resume.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), running)
+                .await???
+                .context("reconciled refusal")?;
+            assert!(matches!(
+                before_registration.state,
+                crate::scheduling::JobState::Running { .. }
+            ));
+            assert_eq!(
+                before_registration
+                    .runtime
+                    .as_ref()
+                    .context("unknown runtime before registration")?
+                    .execution,
+                crate::scheduling::TurnExecution::Unknown
+            );
+            let job = node
+                .store
+                .lock()
+                .await
+                .scheduler_job("c", &trigger)?
+                .context("job")?;
+            assert!(matches!(
+                job.state,
+                crate::scheduling::JobState::Reconciling { .. }
+            ));
+            assert_eq!(
+                job.runtime.as_ref().context("runtime")?.execution,
+                crate::scheduling::TurnExecution::Unknown
+            );
+            assert!(job.pending_check);
+            assert!(node.agent_tokens.lock().await.is_empty());
+            assert!(node.manager_controls.lock().await.is_empty());
+            assert!(pi_fixture_log(&dir)?.is_empty());
+            assert_eq!(node.store.lock().await.pending_checks()?.len(), 1);
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        node.shutdown().await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn task_turns_use_frozen_models_and_never_automatic_backup_but_human_turns_can()
+    -> Result<()> {
+        for (kind, accepted, mode) in [
+            ("task", Some("fake/frozen"), "reply"),
+            ("task-default", None, "reply"),
+            ("task-failure", Some("fake/frozen"), "refuse"),
+            ("human", None, "reply"),
+        ] {
+            let (node, admin, dir) = node().await?;
+            let result = async {
+                with_agent(&node);
+                controlled_pi(&node, &dir, mode)?;
+                let mut manager = node.manager().context("manager")?;
+                manager.provider = if kind == "human" {
+                    Provider::Claude
+                } else {
+                    Provider::Pi
+                };
+                manager.model = "fake/changed-current".into();
+                manager.workspace = dir.clone();
+                manager.backup = crate::scheduler::BackupPolicy {
+                    automatic: true,
+                    candidates: vec![crate::scheduler::BackupModel {
+                        provider: Provider::Pi,
+                        model: "fake/backup".into(),
+                        reasoning_effort: None,
+                    }],
+                };
+                node.settings.lock().unwrap().manager = Some(manager);
+                node.providers
+                    .lock()
+                    .unwrap()
+                    .bins
+                    .insert(Provider::Claude, dir.join("missing-claude"));
+                node.tool_url.set("http://127.0.0.1:1".into()).unwrap();
+                bot(&node, &admin, "c", "Bot", &[]).await?;
+                let network = node.network_id().await?;
+                let trigger = if kind == "human" {
+                    let posted = admin.attest(
+                        &network,
+                        "c",
+                        EventBody::MessagePosted {
+                            message_id: "human".into(),
+                            role: Role::User,
+                            text: "controlled request".into(),
+                            attachments: vec![],
+                            report_results: Some(true),
+                            in_reply_to: None,
+                            status: None,
+                            failure: None,
+                            answers: None,
+                            attestation: None,
+                        },
+                    )?;
+                    node.store.lock().await.accept_message(
+                        &node.identity,
+                        &network,
+                        "c",
+                        "human",
+                        "controlled request",
+                        vec![],
+                        true,
+                        posted.attestation().cloned().context("signature")?,
+                        now_ms(),
+                    )?;
+                    "message:human".into()
+                } else {
+                    let request = queued_task(&node, "c", kind, Provider::Pi, accepted).await?;
+                    crate::scheduling::task_trigger(&request.work_id)
+                };
+                tokio::time::timeout(
+                    Duration::from_secs(15),
+                    crate::scheduler::run(
+                        node.clone(),
+                        Access {
+                            network_id: network.clone(),
+                            human: false,
+                            conversation_id: Some("c".into()),
+                            manager: None,
+                        },
+                        "c".into(),
+                        match trigger.strip_prefix("task:") {
+                            Some(work_id) => crate::scheduling::SessionScope::Task {
+                                work_id: work_id.into(),
+                            },
+                            None => crate::scheduling::SessionScope::Main,
+                        },
+                    ),
+                )
+                .await??
+                .context("turn")?;
+                let job = node
+                    .store
+                    .lock()
+                    .await
+                    .scheduler_job("c", &trigger)?
+                    .context("job")?;
+                let runtime = job.runtime.as_ref().context("runtime")?;
+                assert_eq!(runtime.provider, Provider::Pi);
+                assert_eq!(
+                    runtime.model.as_deref(),
+                    if kind == "human" {
+                        Some("fake/backup")
+                    } else {
+                        accepted
+                    }
+                );
+                let log = pi_fixture_log(&dir)?;
+                assert_eq!(
+                    log.iter()
+                        .filter(|entry| entry.get("prompt").is_some())
+                        .count(),
+                    1
+                );
+                let launches: Vec<_> = log
+                    .iter()
+                    .filter_map(|entry| entry["argv"].as_array())
+                    .collect();
+                assert_eq!(launches.len(), 1);
+                let argv = launches[0];
+                let model = argv
+                    .iter()
+                    .position(|arg| arg == "--model")
+                    .map(|index| argv[index + 1].as_str().unwrap());
+                assert_eq!(
+                    model,
+                    if kind == "human" {
+                        Some("fake/backup")
+                    } else {
+                        accepted
+                    }
+                );
+                if kind == "task-failure" {
+                    assert!(matches!(
+                        job.state,
+                        crate::scheduling::JobState::Failed { .. }
+                    ));
+                    assert_eq!(
+                        runtime.execution,
+                        crate::scheduling::TurnExecution::NotStarted
+                    );
+                    assert_eq!(runtime.switched_from, None);
+                } else {
+                    assert!(
+                        matches!(job.state, crate::scheduling::JobState::Completed { .. }),
+                        "{job:?}"
+                    );
+                    assert_eq!(runtime.switched_from.is_some(), kind == "human");
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            node.shutdown().await;
+            cleanup(node, dir).await?;
+            result?;
+        }
+        Ok(())
     }
 }

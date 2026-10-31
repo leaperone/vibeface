@@ -1,7 +1,9 @@
 import { botReadiness, inputText } from '../workspace/model.ts'
 import { newId } from '../workspace/storage.ts'
 import type { MessageRequest, PendingMessage, TranscriptMessage } from './types.ts'
-import type { NodeInfo } from '../workspace/types.ts'
+import { failureText } from '../lib/errors.ts'
+import { asProvider, providerNames, probeIssueText } from '../lib/node.ts'
+import type { ManagerJob, ProviderStage, TurnRuntime, NodeInfo } from '../workspace/types.ts'
 
 /** An empty chat's first messages: project questions for a bot with a folder, otherwise what any bot can do from chat. */
 export const starters = { project: ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？'], general: ['你能帮我做什么？', '每天早上 9 点提醒我', '记住：回复用中文'] }
@@ -29,6 +31,33 @@ export function botReach(nodes: NodeInfo[]): BotReach {
   if (nodes.some((node) => botReadiness(node) === 'needs_setup')) return 'needs_setup'
   return nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager) ? 'offline' : 'none'
 }
+export const botCanSend = (reach: BotReach) => reach === 'ready' || reach === 'unverified'
+
+export const canRetryJob = (job: ManagerJob) => job.retryable === true && job.runtime?.execution === 'not_started' && !job.pending_check && job.state === 'failed'
+export function runtimeLabel(runtime: TurnRuntime): string {
+  const model = runtime.model ? `提交模型 ${runtime.model}` : 'AI 服务默认模型，实际模型未确认'
+  const effort = runtime.reasoning_effort ? `提交推理强度 ${runtime.reasoning_effort}` : '推理强度由 AI 服务决定'
+  const switched = runtime.switched_from ? `，由 ${providerNames[runtime.switched_from.provider]} 的 ${runtime.switched_from.model ?? '默认模型'} 切换` : ''
+  const stages: Record<ProviderStage, string> = { validate: '检查设置', install: '检查程序', launch: '启动程序', authentication: '检查登录', model_list: '检查模型', session_start: '开始会话', turn_start: '提交回合', run: '执行回合', read_back: '查询结果', interrupt: '中断回合', compact: '整理上下文', handoff: '交接上下文', record: '记录结果' }
+  const reason = runtime.switch_reason ? `，原因 ${failureText(runtime.switch_reason) || 'AI 服务未能启动'}` : ''
+  return `${providerNames[runtime.provider]} · ${model} · ${effort} · ${stages[runtime.stage]}${switched}${reason}`
+}
+export function botProviderNotice(nodes: NodeInfo[], owner?: string | null): string {
+  const node = nodes.find((item) => !item.revoked && item.device_id === owner && item.capabilities?.manager)
+    ?? nodes.find((item) => !item.revoked && item.online && item.capabilities?.manager)
+    ?? nodes.find((item) => !item.revoked && item.capabilities?.manager)
+  if (!node?.capabilities?.manager) return ''
+  const provider = asProvider(node.capabilities.manager)
+  const prefix = `${provider ? providerNames[provider] : node.capabilities.manager} · ${node.name || '运行设备'}`
+  if (!node.online) return `${prefix} 离线，先恢复设备连接，再查询回复结果。`
+  const readiness = node.capabilities.manager_readiness
+  if (readiness && 'issue' in readiness && provider) return `${prefix} · ${probeIssueText(provider, readiness.issue)}。检查状态${readiness.state === 'unverified' ? '尚未确认' : '需设置'}。`
+  if (node.capabilities.manager_state === 'unverified') return `${prefix} 尚未确认可用，可发送消息或在设备设置检查。`
+  if (node.capabilities.manager_state === 'needs_setup') return `${prefix} 需设置，请在运行设备检查登录和模型。`
+  if (node.capabilities.manager_state === 'starting') return `${prefix} 正在启动，请稍后查询。`
+  return ''
+}
+
 /** The device a person goes to while the bot cannot reply: the one to set up, else the one that is offline. */
 export function reachDevice(nodes: NodeInfo[], reach: BotReach): string | undefined {
   if (reach === 'needs_setup') return nodes.find((node) => botReadiness(node) === 'needs_setup')?.device_id

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { parseAnswer, parseConversation, parseOpenWorks, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
-import { answerBody, answerLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, questionParts, settledAnswer, sharedProject, workApproval } from "./questions.ts"
+import { answerBody, answerLabel, attentionLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, questionParts, settledAnswer, sharedProject, workApproval } from "./questions.ts"
 
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/path/to/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
@@ -123,8 +123,8 @@ test("only an open question waits on the person: a closed one is no count and no
 
 test("an approval card names the task its request holds and leaves the device this screen goes through unnamed", () => {
   const works = parseOpenWorks({ works: [
-    { work_id: "w-done", conversation_id: "chat", thread_id: "s", trigger: "t", target_node: "worker", cwd: "/w", title: "旧的", prompt: "p", state: "finished", summary: "", outcome: "completed", result_text: "", failure_reason: null, kind: "codex" },
-    { work_id: "w1", conversation_id: "chat", thread_id: "s", trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex" },
+    { work_id: "w-done", conversation_id: "chat", thread_id: "s", trigger: "t", target_node: "worker", cwd: "/w", title: "旧的", prompt: "p", state: "finished", summary: "", outcome: "completed", result_text: "", failure_reason: null, kind: "codex", resolved: { provider: "codex", model: null } },
+    { work_id: "w1", conversation_id: "chat", thread_id: "s", trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", resolved: { provider: "codex", model: null } },
   ] })
   const bots = [{ bot_id: "bot", conversation_id: "chat" }]
   const [approval, question] = parseQuestions({ questions: [row("s1", 1, { about: { ...about, request_id: "r" } }), row("q1", 2)] })
@@ -142,13 +142,21 @@ test("a refused request reads as refused, never as agreed", () => {
   assert.equal(answerLabel("允许"), "已回答 · 允许")
 })
 
+test('typed attention preserves the required device and distinguishes browser takeover from approval', () => {
+  const [takeover, approval] = parseQuestions({ questions: [row('takeover', 1, { attention: { kind: 'browser_takeover', device_id: 'worker' } }), row('approval', 2, { attention: { kind: 'approval', device_id: 'worker' } })] })
+  assert.equal(attentionLabel(takeover), '需要接管浏览器')
+  assert.equal(takeover.attention?.device_id, 'worker')
+  assert.equal(questionMeta(approval, [], [], 'worker').approval, true)
+  assert.throws(() => parseQuestions({ questions: [row('bad', 1, { attention: { kind: 'automatic_browser', device_id: 'worker' } })] }))
+})
+
 test('question details keep labels as readable text', () => {
   assert.deepEqual(questionParts('要运行这个命令吗？\n\n命令：npm test\n在项目里'), { ask: '要运行这个命令吗？', detail: '命令：npm test\n在项目里' })
   assert.deepEqual(questionParts('继续吗？'), { ask: '继续吗？', detail: '' })
 })
 
 test("work approval belongs to an unfinished work in the same Bot, target device and session", () => {
-  const [work] = parseOpenWorks({ works: [{ work_id: "new", conversation_id: "chat", trigger: "m", target_node: "worker", cwd: "/w", title: "新任务", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, thread_id: "s" }] })
+  const [work] = parseOpenWorks({ works: [{ work_id: "new", conversation_id: "chat", trigger: "m", target_node: "worker", cwd: "/w", title: "新任务", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, thread_id: "s", resolved: { provider: "codex", model: null } }] })
   const [approval] = parseQuestions({ questions: [row("approval", 2, { about: { ...about, request_id: "request" } })] })
   const input = { work, conversationId: "chat", questions: [approval], answered: {} }
   assert.equal(workApproval(input), approval)

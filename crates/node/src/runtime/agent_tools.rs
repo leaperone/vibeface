@@ -5,24 +5,32 @@ use crate::{
         bot_settings::{ChangeRequest, bot_message_id, change_id},
         bots::created_bot_id,
     },
-    tools::{Effect, Tool},
-    work::WorkSpec,
+    tools::{Effect, Tool, ToolFailure},
+    work::{RequestedWorkKind, WorkRequest, WorkSpec},
 };
 
 impl Runtime {
     /// The one entry for coordination tools: the Cursor SDK callback and `vibeface tool` both land here.
     pub async fn tool(self: &Arc<Self>, access: Access, name: &str, args: Value) -> Result<Value> {
         let conversation_id = access.conversation_id.clone();
-        let resolved = Tool::resolve_call(name, args);
-        let name = resolved.as_ref().map_or(name, |(tool, _)| tool.name());
-        let asked_work = resolved
-            .as_ref()
-            .ok()
-            .and_then(|(_, args)| args["work_id"].as_str())
-            .map(str::to_owned);
-        let result = match resolved {
-            Ok((tool, args)) => self.run_tool(access, tool, args).await,
-            Err(error) => Err(error),
+        let asked_work = args["work_id"].as_str().map(str::to_owned);
+        let mut stage = "validation";
+        let result = match Tool::invocation(name, args.clone()) {
+            Ok((tool, args)) => self
+                .run_tool(access, tool, args.clone(), &mut stage)
+                .await
+                .map(|value| tool.annotate(&args, value))
+                .map_err(|error| {
+                    ToolFailure::new(
+                        tool.name(),
+                        &args,
+                        stage,
+                        stage == "execution" && tool.effect() != Effect::Read,
+                        &error,
+                    )
+                    .into()
+                }),
+            Err(error) => Err(ToolFailure::new(name, &args, stage, false, &error).into()),
         };
         let conversation_id = conversation_id.as_deref();
         match &result {
@@ -43,7 +51,14 @@ impl Runtime {
         result
     }
 
-    async fn run_tool(self: &Arc<Self>, access: Access, tool: Tool, args: Value) -> Result<Value> {
+    async fn run_tool(
+        self: &Arc<Self>,
+        access: Access,
+        tool: Tool,
+        args: Value,
+        stage: &mut &'static str,
+    ) -> Result<Value> {
+        *stage = "authorization";
         let _work = self.maintenance.enter()?;
         ensure!(!access.human, "tool endpoint requires a scoped Agent token");
         let scope = access
@@ -85,11 +100,15 @@ impl Runtime {
             tokio::time::timeout(Duration::from_secs(20), self.manager_tool_lease(&access))
                 .await
                 .context("agent tool admission timed out")??;
+        *stage = "execution";
         let network = access.network_id.as_str();
         match tool {
             Tool::Search => Tool::search(args, kind),
             Tool::Describe => Tool::describe(args, kind),
-            Tool::Call => bail!("nested tool_call is unavailable"),
+            Tool::Call => unreachable!("discovery calls are resolved before admission"),
+            Tool::HistorySearch | Tool::HistoryRead => {
+                self.agent_history(&access, &scope, tool, &args).await
+            }
             Tool::Nodes => {
                 self.rpc_inner(access.clone(), json!({"method":"nodes"}))
                     .await
@@ -104,50 +123,8 @@ impl Runtime {
                 work_status(&works, &dispatches, &args)
             }
             Tool::CallLookup => {
-                let manager = access
-                    .manager
-                    .as_ref()
-                    .context("call lookup requires an agent invocation")?;
-                let call_ref = field(&args, "call_ref")?;
-                let id = WorkSpec::id(&scope, &manager.trigger, call_ref);
-                let store = self.store.lock().await;
-                if let Some(work) = store
-                    .works(network, &scope)?
-                    .into_iter()
-                    .find(|work| work.work_id == id)
-                {
-                    return Ok(json!(work));
-                }
-                if let Some(dispatch) = store.dispatch(&id)? {
-                    return Ok(dispatch_row(&dispatch));
-                }
-                if let Some(change) =
-                    store.bot_change(network, &change_id(&scope, &manager.trigger, call_ref))?
-                {
-                    return Ok(json!(change));
-                }
-                if let Some(staged) = store.staged_memory_call(
-                    &scope,
-                    &manager.trigger,
-                    &manager.attempt_id,
-                    call_ref,
-                )? {
-                    return Ok(staged);
-                }
-                if let Some(message) = store
-                    .bot_message(network, &bot_message_id(&scope, &manager.trigger, call_ref))?
-                {
-                    return Ok(json!(message));
-                }
-                let (bot_id, _) = created_bot_id(&scope, &manager.trigger, call_ref);
-                let bot = store
-                    .bots(network)?
-                    .into_iter()
-                    .find(|bot| bot.bot_id == bot_id)
-                    .context(
-                        "nothing was dispatched, changed, sent or created with this call_ref",
-                    )?;
-                Ok(tool_bot(&bot))
+                self.call_lookup(&access, &scope, field(&args, "call_ref")?)
+                    .await
             }
             Tool::Recall => {
                 let query = args["query"].as_str().map(str::to_lowercase);
@@ -216,7 +193,7 @@ impl Runtime {
                         json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,
                         "name":bot.name,"instructions":instructions,
                         "instructions_truncated":instructions.len() < bot.instructions.len(),
-                        "project":bot.project,"models":bot.models,"skills":bot.skills,"uses_all_skills":bot.skills.is_none(),"avatar":bot.shown_avatar(),
+                        "project":bot.project,"models":bot.models,"reasoning_efforts":bot.reasoning_efforts,"skills":bot.skills,"uses_all_skills":bot.skills.is_none(),"avatar":bot.shown_avatar(),
                         "schedules":schedules,"this_bot":bot.conversation_id == scope}),
                     );
                 }
@@ -429,6 +406,7 @@ impl Runtime {
                 let (access, scope) = (&access, scope.as_str());
                 crate::agent_cli::dispatch(
                     &args,
+                    |call_ref| async move { self.call_lookup(access, scope, &call_ref).await },
                     |args| async move { self.track_work(access, scope, &args).await },
                     |work_id, report| async move {
                         self.bind_work(network, scope, &work_id, report).await
@@ -437,7 +415,7 @@ impl Runtime {
                         Ok((self.ready_for(network, &args).await)
                             .map(|agent| agent.name().to_owned()))
                     },
-                    &socket,
+                    Some(&socket),
                 )
                 .await
             }
@@ -480,6 +458,95 @@ impl Runtime {
                 .await
             }
         }
+    }
+
+    async fn agent_history(
+        &self,
+        access: &Access,
+        scope: &str,
+        tool: Tool,
+        args: &Value,
+    ) -> Result<Value> {
+        let store = self.store.lock().await;
+        let basis = match &access.manager {
+            Some(manager) => {
+                store
+                    .scheduler_job(scope, &manager.trigger)?
+                    .context("this turn is not running here")?
+                    .basis
+            }
+            None => store.version_vector(&access.network_id)?,
+        };
+        let at = if tool == Tool::HistoryRead {
+            &args["at"]
+        } else {
+            &args["before"]
+        };
+        let at = if at.is_null() {
+            None
+        } else {
+            let (author, seq) = position(at, &basis)?;
+            let event = store
+                .scope_event(&access.network_id, scope, author, seq)?
+                .context("no event with this author and seq in this conversation")?;
+            ensure!(
+                at["event_id"].is_null() || at["event_id"] == event.hash,
+                "event_id does not match this conversation's author and seq"
+            );
+            Some((author, seq, false))
+        };
+        if tool == Tool::HistoryRead {
+            let (author, seq, _) = at.context("at is required")?;
+            let mut result = event_page(
+                &store,
+                &access.network_id,
+                scope,
+                author,
+                seq,
+                args["offset"].as_u64().unwrap_or(0) as usize,
+            )?;
+            result["partial"] = json!(true);
+            result["coverage"] = json!("local_conversation_at_basis");
+            return Ok(result);
+        }
+        let kinds: Vec<String> = match &args["types"] {
+            Value::Null => vec![],
+            value => serde_json::from_value(value.clone())?,
+        };
+        let query = args["query"].as_str().unwrap_or("").to_lowercase();
+        let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+        let (events, mut more) =
+            store.history_page(&access.network_id, scope, &basis, at, &kinds, 100)?;
+        let mut rows = Vec::new();
+        let mut next = Value::Null;
+        let mut used = 0;
+        for (index, event) in events.iter().enumerate() {
+            let cursor =
+                json!({"author":event.event.author,"seq":event.event.seq,"event_id":event.hash});
+            let body = crate::scheduler::agent_event_body(&event.event.body);
+            if !body.to_string().to_lowercase().contains(&query) {
+                next = cursor;
+                continue;
+            }
+            let row = json!({"event_id":event.hash,"author":event.event.author,"seq":event.event.seq,
+                "created_at_ms":event.event.created_at_ms,"kind":event.event.body.kind(),
+                "body":crate::scheduler::bounded(&body, EVENT_BYTES)});
+            if !rows.is_empty() && used + row.to_string().len() > PAGE_BYTES {
+                more = true;
+                break;
+            }
+            used += row.to_string().len();
+            rows.push(row);
+            next = cursor;
+            if rows.len() == limit {
+                more |= index + 1 < events.len();
+                break;
+            }
+        }
+        Ok(
+            json!({"events":rows,"more":more,"next":if more { next } else { Value::Null },
+            "partial":true,"coverage":"local_conversation_at_basis"}),
+        )
     }
 
     /// Reads history as of the turn's basis, the same history its prompt was built from, so a
@@ -569,6 +636,51 @@ impl Runtime {
         Ok(json!({"events":rows,"more":more,"next":next}))
     }
 
+    async fn call_lookup(&self, access: &Access, scope: &str, call_ref: &str) -> Result<Value> {
+        let network = access.network_id.as_str();
+        let manager = access
+            .manager
+            .as_ref()
+            .context("call lookup requires an agent invocation")?;
+        let id = WorkSpec::id(scope, &manager.trigger, call_ref);
+        let store = self.store.lock().await;
+        if let Some(work) = store
+            .works(network, scope)?
+            .into_iter()
+            .find(|work| work.work_id == id)
+        {
+            return Ok(json!(work));
+        }
+        if let Some(dispatch) = store.dispatch(&id)? {
+            return Ok(dispatch_row(&dispatch));
+        }
+        if let Some(change) =
+            store.bot_change(network, &change_id(scope, &manager.trigger, call_ref))?
+        {
+            return Ok(json!(change));
+        }
+        if let Some(staged) =
+            store.staged_memory_call(scope, &manager.trigger, &manager.attempt_id, call_ref)?
+        {
+            return Ok(staged);
+        }
+        if let Some(message) =
+            store.bot_message(network, &bot_message_id(scope, &manager.trigger, call_ref))?
+        {
+            return Ok(json!(message));
+        }
+        let (bot_id, _) = created_bot_id(scope, &manager.trigger, call_ref);
+        let bot = store
+            .bots(network)?
+            .into_iter()
+            .find(|bot| bot.bot_id == bot_id);
+        Ok(match bot {
+            Some(bot) => tool_bot(&bot),
+            None => json!({"found":false,"call_ref":call_ref,
+                "reason":"no confirmed record for this call_ref; an absent record does not authorize a new reference or prove no effect"}),
+        })
+    }
+
     /// Registers a dispatch before anything is sent, then has its provider start it. Only the
     /// call that created the work gets `may_send`, and only when the dispatching Agent sends it
     /// itself; another device's bot gets the task instead.
@@ -602,49 +714,28 @@ impl Runtime {
                 args["continues"].is_null(),
                 "thread and continues are exclusive"
             );
-            ensure!(
-                self.store
-                    .lock()
-                    .await
-                    .native_thread_conversation(thread)?
-                    .is_none(),
-                "this thread is a bot's own reply thread; message that bot with message_bot instead"
-            );
         }
         let agent: Option<Provider> =
             serde_json::from_value(args["agent"].clone()).context("agent names a provider")?;
         let work_id = WorkSpec::id(scope, &manager.trigger, call_ref);
-        // A retry keeps the provider the first call settled on, whatever the switches say now.
-        let retried = match agent {
-            None => (self.store.lock().await.work_record(&work_id)?).map(|run| run.kind),
-            Some(_) => None,
+        let kind = if target == local {
+            RequestedWorkKind::Agent(agent)
+        } else {
+            ensure!(
+                agent.is_none(),
+                "agent picks a provider of this device; another device's bot picks its own"
+            );
+            RequestedWorkKind::Task
         };
-        let kind = match (agent, retried) {
-            (None, Some(kind)) if target == local => kind,
-            _ if target == local => WorkKind::Agent(self.executing(network, args).await?),
-            (None, _) => WorkKind::Task,
-            (Some(_), _) => {
-                bail!("agent picks a provider of this device; another device's bot picks its own")
-            }
-        };
-        if let WorkKind::Agent(provider) = kind {
-            provider.check_work(args)?;
+        let requested_model = optional("model")
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty());
+        if target != local && requested_model.is_some() {
+            bail!(
+                "a remote task uses the target Bot's model; omit model or dispatch locally with an execution provider"
+            );
         }
-        if let (Some(thread), WorkKind::Agent(provider)) = (&thread, kind) {
-            match self.ran_on(network, thread).await? {
-                Some(ran) if ran != provider => bail!(
-                    "this device's {} works ran in this session; set agent to {} or leave agent out",
-                    ran.label(),
-                    ran.name()
-                ),
-                None if !provider.work().any_thread => bail!(
-                    "{} takes work only in sessions this device's works ran in; leave agent out for a Codex thread, and dispatch without thread for a session the user opened",
-                    provider.label()
-                ),
-                _ => {}
-            }
-        }
-        let spec = WorkSpec {
+        let request = WorkRequest {
             work_id,
             conversation: scope.into(),
             trigger: manager.trigger.clone(),
@@ -652,6 +743,7 @@ impl Runtime {
             dispatcher: local.clone(),
             call_ref: call_ref.into(),
             kind,
+            model: requested_model,
             // A thread's directory is only informational and may be unknown.
             cwd: match &thread {
                 Some(_) => optional("cwd").unwrap_or_default(),
@@ -664,10 +756,11 @@ impl Runtime {
             thread: thread.clone(),
         };
         if target != local {
-            let dispatch = self.send_dispatch(network, spec, false).await?;
+            let dispatch = self.send_dispatch(network, request, false).await?;
             return Ok(dispatch_row(&dispatch));
         }
-        let (record, created) = self.accept_dispatch(network, spec.clone()).await?;
+        let admitted = self.accept_dispatch(network, request, args).await?;
+        let (spec, record, created) = (admitted.spec, admitted.record, admitted.created);
         let thread = match &spec.continues {
             None => thread,
             Some(original) => self
@@ -696,7 +789,8 @@ impl Runtime {
         };
         Ok(
             json!({"work_id":record.work_id,"call_ref":call_ref,"state":record.state,
-            "may_send":may_send,"send_by_ms":record.send_by_ms,"cwd":spec.cwd,"thread_id":thread}),
+            "may_send":may_send,"send_by_ms":record.send_by_ms,"cwd":spec.cwd,"thread_id":thread,
+            "model":spec.model,"resolved":spec.resolved}),
         )
     }
 
@@ -715,21 +809,40 @@ impl Runtime {
     /// one the work it continues ran on; else the bot's own provider when it executes work
     /// here, else the first one that does.
     async fn executing(&self, network: &str, args: &Value) -> Result<Provider> {
-        use vibeface_bridge::failure::{ExecFailure, FailureKind};
         let agent: Option<Provider> =
             serde_json::from_value(args["agent"].clone()).context("agent names a provider")?;
-        let earlier = match (agent, args["thread"].as_str(), args["continues"].as_str()) {
+        let store = self.store.lock().await;
+        self.executing_from(
+            &store,
+            network,
+            agent,
+            args["thread"].as_str(),
+            args["continues"].as_str(),
+        )
+    }
+
+    pub(super) fn executing_from(
+        &self,
+        store: &Store,
+        network: &str,
+        agent: Option<Provider>,
+        thread: Option<&str>,
+        continues: Option<&str>,
+    ) -> Result<Provider> {
+        use vibeface_bridge::failure::{ExecFailure, FailureKind};
+        let earlier = match (agent, thread, continues) {
             (Some(_), _, _) => None,
-            (None, Some(thread), _) => (self.ran_on(network, thread).await?).or_else(|| {
+            (None, Some(thread), _) => self.ran_on_from(store, network, thread)?.or_else(|| {
                 Provider::ALL
                     .into_iter()
                     .find(|provider| provider.work().any_thread)
             }),
-            (None, None, Some(original)) => (self.store.lock().await.work_record(original)?)
-                .and_then(|run| match run.kind {
+            (None, None, Some(original)) => {
+                store.work_record(original)?.and_then(|run| match run.kind {
                     WorkKind::Agent(provider) => Some(provider),
                     WorkKind::Task => None,
-                }),
+                })
+            }
             (None, None, None) => None,
         };
         let execution = self.providers().switches.execution;
@@ -753,8 +866,12 @@ impl Runtime {
     }
 
     /// The provider this device's works in a session of this network ran on.
-    async fn ran_on(&self, network: &str, thread: &str) -> Result<Option<Provider>> {
-        let store = self.store.lock().await;
+    pub(super) fn ran_on_from(
+        &self,
+        store: &Store,
+        network: &str,
+        thread: &str,
+    ) -> Result<Option<Provider>> {
         let runs = store.work_records_on_thread(thread)?;
         Ok(runs.iter().find_map(|run| match run.kind {
             WorkKind::Agent(provider)
@@ -805,14 +922,15 @@ pub(crate) fn event_page(
 ) -> Result<Value> {
     let event = store
         .scope_event(network, scope, author, seq)?
-        .context("no event with this author and seq in this conversation")?
-        .event;
+        .context("no event with this author and seq in this conversation")?;
+    let hash = event.hash;
+    let event = event.event;
     let text = crate::scheduler::agent_event_body(&event.body).to_string();
     ensure!(
         offset <= text.len() && text.is_char_boundary(offset),
         "invalid body offset"
     );
-    let mut page = json!({"author":event.author,"seq":event.seq,"created_at_ms":event.created_at_ms,
+    let mut page = json!({"event_id":hash,"author":event.author,"seq":event.seq,"created_at_ms":event.created_at_ms,
         "blobs":event.blobs,"offset":offset,"size":text.len(),"next_offset":u64::MAX,"body_json":""});
     let mut room = PAGE_BYTES.saturating_sub(page.to_string().len());
     let mut end = offset;
@@ -907,7 +1025,7 @@ pub(crate) fn read_bot(
     Ok(
         json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,"name":bot.name,
         "instructions":bot.instructions,"project":bot.project,
-        "models":bot.models,"skills":skills,"uses_all_skills":bot.skills.is_none(),
+        "models":bot.models,"reasoning_efforts":bot.reasoning_efforts,"skills":skills,"uses_all_skills":bot.skills.is_none(),
         "avatar":bot.shown_avatar(),"schedules":schedules,"memory":memory}),
     )
 }
@@ -987,4 +1105,523 @@ pub(crate) fn work_status(
     };
     let (page, more) = page(&rows, start, args);
     Ok(json!({"works":page,"more":more}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::triage::tests::{bot, claim_reply, node, start_reply};
+
+    async fn post(
+        node: &Runtime,
+        admin: &LocalIdentity,
+        network: &str,
+        scope: &str,
+        id: &str,
+        text: &str,
+    ) -> Result<HashedEvent> {
+        let body = admin.attest(
+            network,
+            scope,
+            EventBody::MessagePosted {
+                message_id: id.into(),
+                role: Role::User,
+                text: text.into(),
+                attachments: vec![],
+                report_results: Some(true),
+                in_reply_to: None,
+                status: None,
+                answers: None,
+                attestation: None,
+                failure: None,
+            },
+        )?;
+        let signed = node.store.lock().await.append_event(
+            &node.identity,
+            network,
+            scope,
+            body,
+            vec![],
+            now_ms(),
+        )?;
+        Ok(HashedEvent {
+            hash: signed.hash,
+            event: serde_json::from_str(&signed.canonical_body)?,
+        })
+    }
+
+    #[tokio::test]
+    async fn history_discovery_is_scoped_bounded_and_stable_at_the_turn_basis() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        bot(&node, &admin, "c", "Ops", &[]).await?;
+        bot(&node, &admin, "d", "Private", &[]).await?;
+        let network = node.store.lock().await.network()?.context("network")?;
+        for i in 0..5 {
+            post(
+                &node,
+                &admin,
+                &network,
+                "c",
+                &format!("older-{i}"),
+                &format!("needle-{i} {}", "x".repeat(9_000)),
+            )
+            .await?;
+        }
+        let elsewhere = post(&node, &admin, &network, "d", "secret", "needle-private").await?;
+        let (trigger, attempt) = start_reply(&node, &admin, "trigger").await?;
+        let idle = Access {
+            network_id: network.clone(),
+            human: false,
+            conversation_id: Some("c".into()),
+            manager: None,
+        };
+        node.register_manager_attempt(
+            "tools-history".into(),
+            idle,
+            &attempt,
+            &trigger,
+            Provider::Codex,
+        )
+        .await?;
+        let access = node
+            .agent_tokens
+            .lock()
+            .await
+            .get("tools-history")
+            .cloned()
+            .context("registered tool token")?;
+        post(&node, &admin, &network, "c", "late", "needle-late").await?;
+        let mut before = Value::Null;
+        let mut ids = Vec::new();
+        loop {
+            let mut args = json!({"query":"needle","types":["message_posted"],"limit":50});
+            if !before.is_null() {
+                args["before"] = before;
+            }
+            let result = node
+                .tool(
+                    access.clone(),
+                    "tool_call",
+                    json!({"tool":"history_search","arguments":args}),
+                )
+                .await?;
+            assert!(result.to_string().len() <= PAGE_BYTES + 1_024);
+            assert_eq!(result["partial"], true);
+            for event in result["events"].as_array().context("events")? {
+                ids.push(event["event_id"].as_str().context("event id")?.to_owned());
+                let read = node
+                    .tool(
+                        access.clone(),
+                        "history_read",
+                        json!({"at":{
+                    "author":event["author"],"seq":event["seq"],"event_id":event["event_id"]}}),
+                    )
+                    .await?;
+                assert_eq!(read["event_id"], event["event_id"]);
+                assert!(!read.to_string().contains("attestation"));
+                assert!(!read.to_string().contains("needle-private"));
+                assert!(!read.to_string().contains("needle-late"));
+            }
+            if result["more"] != true {
+                break;
+            }
+            before = result["next"].clone();
+            assert!(!before.is_null());
+        }
+        assert_eq!(ids.len(), 5);
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            5
+        );
+        assert!(
+            node.tool(
+                access.clone(),
+                "history_read",
+                json!({"at":{
+            "author":elsewhere.event.author,"seq":elsewhere.event.seq,"event_id":elsewhere.hash}})
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            node.tool(
+                access.clone(),
+                "history_search",
+                json!({"conversation_id":"d"})
+            )
+            .await
+            .is_err()
+        );
+        let searched = node
+            .tool(access.clone(), "tool_search", json!({"query":"history"}))
+            .await?;
+        assert!(
+            searched["tools"]
+                .as_array()
+                .context("tools")?
+                .iter()
+                .any(|tool| tool["name"] == "history_read")
+        );
+        node.fence_manager_attempt(&attempt).await?;
+        assert!(
+            node.tool(access, "history_search", json!({}))
+                .await
+                .is_err()
+        );
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovery_replays_the_existing_call_and_keeps_missing_outcomes_unknown() -> Result<()>
+    {
+        let (node, admin, dir) = node().await?;
+        bot(&node, &admin, "c", "Ops", &[]).await?;
+        let network = node.store.lock().await.network()?.context("network")?;
+        let (trigger, attempt) = start_reply(&node, &admin, "trigger").await?;
+        let idle = Access {
+            network_id: network.clone(),
+            human: false,
+            conversation_id: Some("c".into()),
+            manager: None,
+        };
+        node.register_manager_attempt(
+            "tools-replay".into(),
+            idle.clone(),
+            &attempt,
+            &trigger,
+            Provider::Codex,
+        )
+        .await?;
+        let access = node
+            .agent_tokens
+            .lock()
+            .await
+            .get("tools-replay")
+            .cloned()
+            .context("registered tool token")?;
+        assert!(
+            node.tool(
+                idle,
+                "tool_call",
+                json!({"tool":"create_bot","arguments":{"call_ref":"one","name":"Docs"}})
+            )
+            .await
+            .is_err()
+        );
+        let first = node
+            .tool(
+                access.clone(),
+                "tool_call",
+                json!({"tool":"create_bot","arguments":{"name":"Docs"},"call_ref":"one"}),
+            )
+            .await?;
+        let basis = node.store.lock().await.version_vector(&network)?;
+        let replay = node
+            .tool(
+                access.clone(),
+                "create_bot",
+                json!({"name":"Docs","call_ref":"one"}),
+            )
+            .await?;
+        assert_eq!(first["bot_id"], replay["bot_id"]);
+        assert_eq!(first["event_hash"], replay["event_hash"]);
+        assert_eq!(basis, node.store.lock().await.version_vector(&network)?);
+        let lookup = node
+            .tool(access.clone(), "call_lookup", json!({"call_ref":"one"}))
+            .await?;
+        assert_eq!(lookup["bot_id"], first["bot_id"]);
+        assert_eq!(lookup["call_record"]["execution"], "applied");
+        let missing = node
+            .tool(access.clone(), "call_lookup", json!({"call_ref":"lost"}))
+            .await?;
+        assert_eq!(missing["found"], false);
+        assert_eq!(missing["call_record"]["execution"], "unknown");
+        assert_eq!(missing["call_record"]["retry"], "lookup_same_ref");
+        assert!(
+            node.tool(
+                access,
+                "tool_call",
+                json!({"tool":"create_bot","arguments":{"name":"Different"},"call_ref":"one"})
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(basis, node.store.lock().await.version_vector(&network)?);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cloned_access_cannot_reenter_after_backup_reregistration() -> Result<()> {
+        use crate::scheduling::{RuntimeSelection, SessionConfig, TurnExecution, TurnRuntime};
+        use vibeface_bridge::failure::{FailureKind, ProviderStage};
+
+        let (node, admin, dir) = node().await?;
+        bot(&node, &admin, "c", "Ops", &[]).await?;
+        let network = node.store.lock().await.network()?.context("network")?;
+        let (trigger, attempt) = claim_reply(&node, &admin, "c", "trigger", "boot").await?;
+        let claimed = node
+            .store
+            .lock()
+            .await
+            .scheduler_job("c", &trigger)?
+            .context("claimed job")?;
+        assert!(matches!(
+            claimed.state,
+            crate::scheduling::JobState::Claimed { .. }
+        ));
+        assert_eq!(
+            claimed
+                .runtime
+                .as_ref()
+                .context("claimed runtime")?
+                .execution,
+            TurnExecution::NotStarted
+        );
+        let idle = Access {
+            network_id: network.clone(),
+            human: false,
+            conversation_id: Some("c".into()),
+            manager: None,
+        };
+        let mut runtime = TurnRuntime {
+            provider: Provider::Codex,
+            model: Some("primary".into()),
+            reasoning_effort: None,
+            generation: "primary-configuration".into(),
+            session_generation: claimed
+                .runtime
+                .as_ref()
+                .context("claimed runtime")?
+                .session_generation,
+            delivery_id: attempt.clone(),
+            stage: ProviderStage::Validate,
+            execution: TurnExecution::NotStarted,
+            attempted_at_ms: now_ms(),
+            switched_from: None,
+            switch_reason: None,
+        };
+        node.store
+            .lock()
+            .await
+            .record_turn_runtime("c", &trigger, &attempt, &runtime)?;
+        node.register_manager_attempt(
+            "old-token".into(),
+            idle.clone(),
+            &attempt,
+            &trigger,
+            Provider::Codex,
+        )
+        .await?;
+        let old = node
+            .agent_tokens
+            .lock()
+            .await
+            .get("old-token")
+            .cloned()
+            .context("old bearer access")?;
+        let original_permission = old
+            .manager
+            .as_ref()
+            .context("old manager")?
+            .permission_version;
+        node.seal_manager_tools(&attempt).await?;
+        node.finish_manager_attempt(&attempt).await;
+        assert!(!node.agent_tokens.lock().await.contains_key("old-token"));
+
+        runtime.switched_from = Some(RuntimeSelection {
+            provider: runtime.provider,
+            model: runtime.model.clone(),
+            reasoning_effort: runtime.reasoning_effort.clone(),
+        });
+        runtime.switch_reason = Some(FailureKind::Quota);
+        runtime.provider = Provider::Pi;
+        runtime.model = Some("backup".into());
+        runtime.generation = "backup-configuration".into();
+        runtime.session_generation = node
+            .store
+            .lock()
+            .await
+            .switch_scheduler_session(
+                "c",
+                &trigger,
+                &attempt,
+                &SessionConfig {
+                    stable_fingerprint: "backup-stable".into(),
+                    runtime_fingerprint: "backup-runtime".into(),
+                    provider: Provider::Pi,
+                },
+            )?
+            .session_generation;
+        node.store
+            .lock()
+            .await
+            .record_turn_runtime("c", &trigger, &attempt, &runtime)?;
+        node.register_manager_attempt("new-token".into(), idle, &attempt, &trigger, Provider::Pi)
+            .await?;
+        let current = node
+            .agent_tokens
+            .lock()
+            .await
+            .get("new-token")
+            .cloned()
+            .context("new bearer access")?;
+        assert!(
+            current
+                .manager
+                .as_ref()
+                .context("current manager")?
+                .permission_version
+                > original_permission
+        );
+        let local = node.identity.device_id()?;
+        {
+            let store = node.store.lock().await;
+            assert!(Runtime::check_manager_permission(&store, &local, &old).is_err());
+            Runtime::check_manager_permission(&store, &local, &current)?;
+        }
+        let before = node.store.lock().await.version_vector(&network)?;
+        assert!(
+            node.tool(
+                old,
+                "create_bot",
+                json!({"call_ref":"stale-access","name":"Stale bot"})
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(node.store.lock().await.version_vector(&network)?, before);
+        assert!(
+            !node
+                .store
+                .lock()
+                .await
+                .scheduler_job("c", &trigger)?
+                .context("job")?
+                .tool_calls
+        );
+        let created = node
+            .tool(
+                current,
+                "create_bot",
+                json!({"call_ref":"fresh-access","name":"Fresh bot"}),
+            )
+            .await?;
+        assert_eq!(created["name"], "Fresh bot");
+        assert!(created["bot_id"].as_str().is_some());
+        assert_ne!(node.store.lock().await.version_vector(&network)?, before);
+        node.finish_manager_attempt(&attempt).await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn epoch8_directory_is_rejected_before_loading_any_provider_or_history() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("vibeface-old-epoch-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        std::fs::write(dir.join("data-epoch.json"), br#"{"data_epoch":8}"#)?;
+        let error = Runtime::open(&dir)
+            .await
+            .err()
+            .context("old epoch must fail")?;
+        assert!(error.to_string().contains(&format!(
+            "requires an initialized data epoch {} directory",
+            crate::config::DATA_EPOCH
+        )));
+        assert_eq!(std::fs::read_dir(&dir)?.count(), 1);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_execution_keeps_its_first_model_after_defaults_change() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        bot(&node, &admin, "c", "Bot", &[]).await?;
+        let network = node.store.lock().await.network()?.context("network")?;
+        post(&node, &admin, &network, "c", "m1", "go").await?;
+        node.settings.lock().unwrap().roots = vec![dir.clone()];
+        node.providers
+            .lock()
+            .unwrap()
+            .switches
+            .execution_models
+            .insert(Provider::Codex, "first".into());
+        let spec = WorkRequest {
+            work_id: WorkSpec::id("c", "message:m1", "frozen"),
+            conversation: "c".into(),
+            trigger: "message:m1".into(),
+            target: node.identity.device_id()?,
+            dispatcher: node.identity.device_id()?,
+            call_ref: "frozen".into(),
+            kind: RequestedWorkKind::Agent(Some(Provider::Codex)),
+            model: None,
+            cwd: dir.display().to_string(),
+            title: "work".into(),
+            prompt: "go".into(),
+            continues: None,
+            parent: None,
+            thread: None,
+        };
+        assert!(
+            node.accept_dispatch(&network, spec.clone(), &Value::Null)
+                .await?
+                .created
+        );
+        node.providers
+            .lock()
+            .unwrap()
+            .switches
+            .execution_models
+            .insert(Provider::Codex, "changed".into());
+        let (left, right) = tokio::join!(
+            node.accept_dispatch(&network, spec.clone(), &Value::Null),
+            node.accept_dispatch(&network, spec.clone(), &Value::Null)
+        );
+        assert!(!left?.created && !right?.created);
+        let works = node.store.lock().await.works(&network, "c")?;
+        assert_eq!(works.len(), 1);
+        assert_eq!(works[0].resolved.model.as_deref(), Some("first"));
+        let explicit = WorkRequest {
+            work_id: WorkSpec::id("c", "message:m1", "explicit"),
+            call_ref: "explicit".into(),
+            model: Some("  chosen  ".into()),
+            ..spec.clone()
+        };
+        assert!(
+            node.accept_dispatch(&network, explicit.clone(), &Value::Null)
+                .await?
+                .created
+        );
+        assert!(
+            !node
+                .accept_dispatch(
+                    &network,
+                    WorkRequest {
+                        model: Some("chosen".into()),
+                        ..explicit.clone()
+                    },
+                    &Value::Null,
+                )
+                .await?
+                .created
+        );
+        assert!(
+            node.accept_dispatch(
+                &network,
+                WorkRequest {
+                    model: Some("other".into()),
+                    ..explicit
+                },
+                &Value::Null,
+            )
+            .await
+            .is_err()
+        );
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 }

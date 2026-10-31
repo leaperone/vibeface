@@ -1048,6 +1048,25 @@ table "scheduler_sessions" {
     null = false
     type = text
   }
+  column "sdk_config" {
+    null = true
+    type = text
+  }
+  column "session_generation" {
+    null = false
+    type = integer
+    default = 0
+  }
+  column "handoff_revision" {
+    null = false
+    type = integer
+    default = 0
+  }
+  column "handoff_source" {
+    null = false
+    type = text
+    default = "{}"
+  }
   primary_key {
     columns = [column.conversation_id, column.scope]
   }
@@ -1105,6 +1124,19 @@ table "scheduler_jobs" {
   column "failure" {
     null = true
     type = text
+  }
+  column "runtime" {
+    null = true
+    type = text
+  }
+  column "tool_calls" {
+    null = false
+    type = integer
+  }
+  column "partial_text" {
+    null = false
+    type = text
+    default = ""
   }
   primary_key {
     columns = [column.conversation_id, column.trigger]

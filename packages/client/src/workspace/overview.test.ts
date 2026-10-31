@@ -1,8 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { openWorksFromOverview, overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
-import { cardState, overviewScope, taskGroup, taskLabel, unrepresentedOverviewChecks } from "./labels.ts"
-import { workspaceActivities } from "./labels.ts"
+import { cardState, overviewScope, taskGroup, taskLabel, unrepresentedOverviewChecks, workspaceActivities } from "./labels.ts"
 import type { BotRecord, NodeInfo, OpenWork, PendingCheck, Question } from "./types.ts"
 
 const bot = (conversation_id: string, bot_id = `bot-${conversation_id}`, name = conversation_id): BotRecord => ({
@@ -13,12 +12,12 @@ const node = (device_id: string, online = true, local = false): NodeInfo => ({
   device_id, name: device_id, local, online, revoked: false,
   capabilities: { manager: "manager", manager_state: "ready", relay: false, roots: [], codex_connected: true },
 })
-const work = (extra: Partial<OpenWork> = {}): OpenWork => ({
+const work = (extra: Record<string, unknown> = {}): OpenWork => parseOpenWorks({ works: [{
   work_id: "work-1", conversation_id: "chat-1", trigger: "message:m1", dispatcher: "gateway", call_ref: "dispatch-1",
   target_node: "worker", cwd: "/project", title: "检查部署", prompt: "检查", state: "running", phase: "running",
   summary: "执行中", outcome: null, result_text: "", failure_reason: null, kind: "codex", thread: "provider-thread",
-  thread_id: "provider-thread", turn_id: "turn-1", parent: "parent-work", continues: "continued-work", ...extra,
-})
+  thread_id: "provider-thread", turn_id: "turn-1", parent: "parent-work", continues: "continued-work", resolved: { provider: "codex", model: null }, ...extra,
+}] })[0]!
 const question = (extra: Partial<Question> = {}): Question => ({
   question_id: "question-1", conversation_id: "chat-1", bot: { bot_id: "bot-chat-1", name: "Bot" }, severity: "attention",
   text: "要继续吗？", choices: [{ label: "继续" }], about: { node: "worker", agent: "codex", session_id: "provider-thread", cwd: "/project", summary: "", request_id: "request-1" },
@@ -111,6 +110,24 @@ test("a failed open work stays on the task page", () => {
   assert.deepEqual(overview.tasks.map((task) => [task.work_id, task.outcome]), [["work-1", "failed"]])
 })
 
+test("accepted records require a frozen selection while dispatch and overview cards stay summaries", () => {
+  const accepted = work()
+  assert.deepEqual(accepted.resolved, { provider: "codex", model: null })
+  const { resolved: _selection, ...missing } = accepted
+  assert.throws(() => parseOpenWorks({ works: [missing] }))
+  assert.throws(() => parseOpenWorks({ works: [{ ...missing, resolved: null }] }))
+  assert.throws(() => parseOpenWorks({ works: [{ ...missing, resolved: { provider: "codex" } }] }))
+  const [dispatch] = parseOpenWorks({ works: [{ ...missing, state: "dispatch_waiting" }] })
+  assert.equal(dispatch?.state, "dispatch_waiting")
+  assert.equal(dispatch?.resolved, undefined)
+  const overview = overviewFromWorkspace({ openWorks: [accepted], bots: [bot("chat-1")], questions: [], nodes: [node("worker")] })
+  const [card] = openWorksFromOverview(overview, [])
+  assert.equal(card?.work_id, accepted.work_id)
+  assert.equal(card?.state, "running")
+  assert.equal(card && "resolved" in card, false)
+  assert.equal(card && "prompt" in card, false)
+})
+
 test("a bounded overview adds observations without deleting known work or replacing its full fields", () => {
   const known = Array.from({ length: 257 }, (_, index) => work({ work_id: `w-${index}`, prompt: `完整请求 ${index}`, result_text: "已有输出", trigger: "message:known" }))
   const overview = parseWorkspaceOverview({
@@ -198,7 +215,7 @@ test("overview task checks only fold into a visible unverified work on this conv
   assert.deepEqual(ids([{ ...known, conversation_id: "other-chat" }]), ["process-work", "process-chat"])
   assert.deepEqual(ids([{ ...known, target_node: "worker" }]), ["process-work", "process-chat"])
   assert.deepEqual(ids([known], []), ["process-work", "process-chat"], "the check device must be known, not guessed")
-  assert.deepEqual(ids([{ ...known, state: "running", outcome: null }]), ["process-work", "process-chat"], "an active task does not replace a separate process check")
+  assert.deepEqual(ids([work({ ...known, state: "running", outcome: null })]), ["process-work", "process-chat"], "an active task does not replace a separate process check")
   const bounded = parseWorkspaceOverview({ tasks: [{ ...known, kind: "task" }], checks: [{ check_id: "process-work", conversation_id: known.conversation_id, trigger: `task:${known.work_id}` }] })
   assert.deepEqual(unrepresentedOverviewChecks(bounded, openWorksFromOverview(bounded, []), nodes), [], "an overview-only unverified work also represents its local task check")
 })
@@ -248,6 +265,79 @@ test("workspace activities attach approval facts, keep task checks with work, an
   assert.equal(workspaceActivities({ works: [{ ...running, state: "unverified", outcome: "unverified" }], questions: [], checks: [], nodes: [node("worker")], read: true, connected: true }).groups.attention.length, 1)
 })
 
+test("workspace activities show a standalone question once across full and overview records", () => {
+  const pending = question()
+  const overview = overviewFromWorkspace({ openWorks: [], bots: [], questions: [pending], nodes: [] })
+  const activities = workspaceActivities({ works: [], questions: [pending], checks: [], overview }).activities
+  assert.equal(activities.length, 1)
+  assert.equal(activities[0]?.kind === "attention" && activities[0].attention, pending, "keep the complete actionable question")
+  assert.equal(workspaceActivities({ works: [], questions: [], checks: [], overview }).activities.length, 1, "an overview-only question stays visible")
+  const other = { ...overview, questions: overview.questions.map((entry) => ({ ...entry, conversation_id: "other-chat" })) }
+  assert.equal(workspaceActivities({ works: [], questions: [pending], checks: [], overview: other }).activities.length, 2, "a different conversation is a separate question")
+  assert.equal(workspaceActivities({ works: [], questions: [pending], checks: [], overview, answered: { [pending.question_id]: "继续" } }).activities.length, 0)
+})
+
+test("workspace activities merge same-source job observations without hiding newer or uncertain state", () => {
+  const runtime = { provider: "codex" as const, model: "frozen", reasoning_effort: null, generation: "g", session_generation: 1, delivery_id: "d", stage: "run" as const, execution: "started" as const, attempted_at_ms: 2, switched_from: null, switch_reason: null }
+  const overview = parseWorkspaceOverview({ jobs: [{ job_id: "job-1", conversation_id: "chat-1", trigger: "message:ordinary", state: "queued", source_node: "entry" }] })
+  const local = { conversation_id: "chat-1", job: { trigger: "message:ordinary", state: "running", runtime, failure: { kind: "unknown" as const, detail: "保留本地说明" } } }
+  const input = { works: [], questions: [], checks: [], overview, jobs: [local], nodes: [node("entry", true, true)] }
+  const merged = workspaceActivities(input).activities
+  assert.equal(merged.length, 1)
+  assert.equal(merged[0]?.kind, "turn")
+  if (merged[0]?.kind === "turn") {
+    assert.equal(merged[0].state, "running")
+    assert.equal(merged[0].job.runtime?.model, "frozen")
+    assert.equal("failure" in merged[0].job ? merged[0].job.failure?.detail : undefined, "保留本地说明")
+    assert.equal(merged[0].facts.jobs.length, 2, "both observations remain available to the activity")
+  }
+  const completed = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "completed", outcome: "answered" as const } }] }).activities
+  assert.equal(completed.length, 0, "confirmed completed history is hidden after observations are merged")
+  const failed = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "failed", outcome: "unknown" as const } }] }).activities
+  assert.equal(failed[0]?.kind === "turn" && failed[0].state, "failed", "a newer terminal observation is not hidden by queued overview data")
+  const unknown = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "queued", pending_check: true } }] }).activities
+  assert.equal(unknown[0]?.kind === "turn" && unknown[0].state, "unknown", "a pending check stays uncertain")
+  for (const state of ["reconciling", "publishing"]) {
+    const observed = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state } }] }).activities
+    assert.equal(observed[0]?.kind === "turn" && observed[0].state, state, `${state} is not treated as an old queued observation`)
+  }
+  const steeredOverview = parseWorkspaceOverview({ jobs: [{ job_id: "job-3", conversation_id: "chat-1", trigger: "message:ordinary", state: "steered", source_node: "entry" }] })
+  assert.equal(workspaceActivities({ ...input, overview: steeredOverview, jobs: [{ ...local, job: { ...local.job, state: "steered", outcome: "answered" as const } }] }).activities.length, 0, "steered history remains hidden after reconciliation")
+  assert.equal(workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "steered", outcome: "answered" as const } }] }).activities.length, 0, "steered history remains hidden without an overview duplicate")
+  const overviewRunning = parseWorkspaceOverview({ jobs: [{ job_id: "job-2", conversation_id: "chat-1", trigger: "message:ordinary", state: "running", source_node: "entry" }] })
+  const failedConflict = workspaceActivities({ ...input, overview: overviewRunning, jobs: [{ ...local, job: { ...local.job, state: "failed", retryable: true } }] }).activities
+  assert.equal(failedConflict[0]?.kind === "turn" && failedConflict[0].state, "unknown", "an active and terminal observation has no ordering proof")
+  if (failedConflict[0]?.kind === "turn") assert.equal(failedConflict[0].job.retryable, false, "an uncertain merge cannot become retryable")
+  for (const [overviewState, localState] of [["claimed", "queued"], ["queued", "claimed"], ["steering", "queued"]] as const) {
+    const rollback = parseWorkspaceOverview({ jobs: [{ job_id: `job-${overviewState}`, conversation_id: "chat-1", trigger: "message:ordinary", state: overviewState, source_node: "entry" }] })
+    assert.equal(workspaceActivities({ ...input, overview: rollback, jobs: [{ ...local, job: { ...local.job, state: localState } }] }).activities[0]?.state, "unknown", `${overviewState} and ${localState} recovery reads have no ordering proof`)
+  }
+  const otherAttempt = parseWorkspaceOverview({ jobs: [{ job_id: "job-attempt", conversation_id: "chat-1", trigger: "message:ordinary", state: "running", source_node: "entry", runtime: { ...runtime, delivery_id: "different-attempt" } }] })
+  const attemptConflict = workspaceActivities({ ...input, overview: otherAttempt }).activities
+  assert.equal(attemptConflict[0]?.kind === "turn" && attemptConflict[0].state, "unknown", "different attempt identities remain uncertain")
+  if (attemptConflict[0]?.kind === "turn") assert.equal(attemptConflict[0].facts.jobs.length, 2)
+  for (const changed of [{ session_generation: 2 }, { generation: "next-config" }, { provider: "claude" as const }, { model: "backup-model" }, { reasoning_effort: "high" }]) {
+    const previous = parseWorkspaceOverview({ jobs: [{ job_id: "same-delivery", conversation_id: "chat-1", trigger: "message:ordinary", state: "running", source_node: "entry", runtime }] })
+    const conflict = workspaceActivities({ ...input, overview: previous, jobs: [{ ...local, job: { ...local.job, runtime: { ...runtime, ...changed } } }] }).activities
+    assert.equal(conflict[0]?.state, "unknown", "a shared delivery id does not prove that runtime lineage or frozen selection agree")
+    if (conflict[0]?.kind === "turn") {
+      assert.equal(conflict[0].facts.jobs.length, 2)
+      assert.equal(conflict[0].job.retryable, false)
+    }
+  }
+  const epochs = parseWorkspaceOverview({ jobs: [1, 2].map((owner_epoch) => ({ job_id: "same-job", conversation_id: "chat-1", trigger: "message:ordinary", state: "running", source_node: "entry", owner_epoch })) })
+  assert.equal(workspaceActivities({ ...input, overview: epochs, jobs: [] }).activities[0]?.state, "unknown", "different observed ownership epochs have no ordering proof")
+  const remoteUnknown = parseWorkspaceOverview({ jobs: [{ job_id: "remote-unknown", conversation_id: "chat-1", trigger: "message:ordinary", state: "unknown", source_node: "remote" }] })
+  const localCompleted = { ...local, job: { ...local.job, state: "completed", outcome: "answered" as const } }
+  assert.deepEqual(workspaceActivities({ ...input, overview: remoteUnknown, jobs: [localCompleted] }).activities.map((entry) => entry.state), ["unknown"], "local completed history cannot hide another source's unknown observation")
+  const arbitrary = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "future_state" } }] }).activities
+  assert.equal(arbitrary[0]?.kind === "turn" && arbitrary[0].state, "unknown", "an unrecognized scheduler state stays conservative")
+  assert.equal(workspaceActivities({ ...input, overview: overviewRunning, jobs: [{ ...local, job: { ...local.job, state: "queued" } }] }).activities[0]?.state, "running", "the overview observation can be newer without preferring the local source")
+  assert.equal(workspaceActivities({ ...input, nodes: [] }).activities.length, 2, "an unknown local identity cannot prove a duplicate")
+  assert.equal(workspaceActivities({ ...input, jobs: [{ ...local, conversation_id: "other-chat" }] }).activities.length, 2)
+  assert.equal(workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, source_node: "other-node" } }] }).activities.length, 2)
+})
+
 test("workspace activities dedupe live and overview questions, keep approvals on one work, and hide scheduler history", () => {
   const running = work()
   const sibling = work({ work_id: "work-2" })
@@ -279,14 +369,14 @@ test("overview-only questions remain one attention item instead of attaching to 
   assert.equal(view.activities.filter((activity) => activity.kind === "work").some((activity) => activity.facts.overviewQuestions.length > 0), false)
 })
 
-test("workspace activities dedupe overview and live scheduler jobs by conversation and trigger", () => {
-  const overview = parseWorkspaceOverview({ jobs: [{ job_id: "job-queue", conversation_id: "chat-1", trigger: "message:queue", state: "queued" }] })
+test("workspace activities dedupe overview and live scheduler jobs by trusted source", () => {
+  const overview = parseWorkspaceOverview({ jobs: [{ job_id: "job-queue", conversation_id: "chat-1", trigger: "message:queue", state: "queued", source_node: "entry" }] })
   const view = workspaceActivities({
     works: [], questions: [], checks: [], overview,
     jobs: [{ conversation_id: "chat-1", job: { trigger: "message:queue", state: "running" } }],
-    nodes: [], read: true, connected: true,
+    nodes: [node("entry", true, true)], read: true, connected: true,
   })
   const turns = view.activities.filter((activity): activity is Extract<typeof view.activities[number], { kind: "turn" }> => activity.kind === "turn")
-  assert.deepEqual(turns.map((activity) => activity.id), ["turn:chat-1:message:queue"])
+  assert.deepEqual(turns.map((activity) => activity.id), ["turn:chat-1:local:message:queue"])
   assert.equal(turns[0]?.job.state, "running", "the live conversation snapshot wins over an older overview job")
 })

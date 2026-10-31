@@ -1,6 +1,7 @@
 //! Node-side triage of local agent sessions: one event shape for hooks, App Server and session
 //! scans, the coordination Agent's prompts, outlet choice, webhook signing and delivery, and hook
 //! installation. The coordination Agent judges; nothing here decides what matters.
+use crate::crypto::hmac_sha256;
 use crate::providers::{Provider, Watch};
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -427,7 +428,7 @@ pub fn wake_prompt(
         "New events from the user's local coding agent sessions are waiting. Decide for each \
 whether the user must look at it now. Stay silent unless it matters; events you leave alone are \
 dropped after this turn.\n\
-- Needs the user: `{cli} triage raise --event-id ID --severity info|attention|urgent --question TEXT [--choice LABEL]...`. \
+- Needs the user: `{cli} triage raise --event-id ID --severity info|attention|urgent --question TEXT [--choice LABEL]... [--attention-kind question|approval|browser-takeover]`. \
 It asks in the chat of the event's bot. Write TEXT in the user's language and plain words. The first non-empty line asks \
 for the concrete decision. Then explain the known situation, the consequences of the alternatives and why the user must \
 decide. Keep TEXT within 1024 UTF-8 bytes. Say when something is unknown; never invent facts or use a shell command, \
@@ -436,7 +437,7 @@ consequence within 120 characters. Never put a destructive action first. Use zer
 eight is only the protocol limit, not a target. Do not pad the list with later, other or keep researching, and do not imply \
 a recommendation by putting the likely answer first. The user can always write an answer. While a question about the \
 same session is unanswered, a raise returns it. \
-The answer comes back to that bot as a new turn, and it acts on it.\n\
+The answer comes back to that bot as a new turn, and it acts on it. Use `--attention-kind browser-takeover` when the user must continue in the browser on the event's device. Omit the flag to infer question or approval from the held request. The card kind grants no authority.\n\
 - Otherwise: `{cli} triage dismiss --event-id ID`.\n\
 - An event with a request_id is a request its session holds until it is answered: a Codex App Server \
 request, or one the session's hook, plugin or extension waits on. `{cli} requests` shows each in full. \
@@ -546,26 +547,6 @@ impl TriageConfig {
     }
 }
 
-/// HMAC-SHA256 (RFC 2104) over `sha2`, to avoid a dependency for twenty lines.
-pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut block = [0u8; 64];
-    if key.len() > 64 {
-        block[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        block[..key.len()].copy_from_slice(key);
-    }
-    let pad = |byte: u8| block.map(|b| b ^ byte);
-    let inner = Sha256::new()
-        .chain_update(pad(0x36))
-        .chain_update(message)
-        .finalize();
-    Sha256::new()
-        .chain_update(pad(0x5c))
-        .chain_update(inner)
-        .finalize()
-        .into()
-}
-
 /// `X-Vibeface-Signature` for a body sent at `timestamp` (Unix seconds).
 pub fn signature(secret: &[u8], timestamp: i64, body: &str) -> String {
     format!(
@@ -634,6 +615,15 @@ pub struct HookFile {
 
 /// The hook files under `home`, Codex's under `codex_home`.
 pub fn hook_files(home: &Path, codex_home: &Path) -> Vec<HookFile> {
+    hook_files_with_claude_root(home, &home.join(".claude"), codex_home)
+}
+
+/// Hook files when the caller already resolved the provider-owned Claude config root.
+pub fn hook_files_with_claude_root(
+    home: &Path,
+    claude_home: &Path,
+    codex_home: &Path,
+) -> Vec<HookFile> {
     Provider::ALL
         .into_iter()
         .filter_map(|agent| match agent.watch()? {
@@ -641,6 +631,7 @@ pub fn hook_files(home: &Path, codex_home: &Path) -> Vec<HookFile> {
                 agent,
                 path: match agent {
                     Provider::Codex => codex_home.join(file),
+                    Provider::Claude => claude_home.join("settings.json"),
                     _ => home.join(file),
                 },
                 events,
@@ -753,20 +744,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hmac_matches_rfc_4231() {
-        let key = [0x0b; 20];
-        assert_eq!(
-            hex::encode(hmac_sha256(&key, b"Hi There")),
-            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
-        );
-        let long = [0xaa; 131];
-        assert_eq!(
-            hex::encode(hmac_sha256(
-                &long,
-                b"Test Using Larger Than Block-Size Key - Hash Key First"
-            )),
-            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
-        );
+    fn webhook_signature_binds_the_timestamp() {
         assert!(signature(b"k", 1, "{}").starts_with("v1="));
         assert_ne!(signature(b"k", 1, "{}"), signature(b"k", 2, "{}"));
     }

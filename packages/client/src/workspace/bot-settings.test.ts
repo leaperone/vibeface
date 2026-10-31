@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { formatIn, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger, sortSchedules } from "./bot-settings.ts"
+import { botModelRows, formatIn, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger, sortSchedules } from "./bot-settings.ts"
 import { parseBots, parseConversation } from "./model.ts"
 import type { BotChangeRecord, MemoryMetadata } from "./types.ts"
 import type { OutboxItem, OutboxStore } from "../lib/outbox.ts"
@@ -8,6 +8,14 @@ import { requestKey } from "../lib/secure.ts"
 import { DATA_EPOCH, memoryBase, memoryController, memoryResultLabel, memorySaved, parseMemoryControlResult, parseMemoryStateResult } from "./memory.ts"
 
 const at = (day: number, hour: number, minute = 0) => new Date(2026, 9, day, hour, minute).getTime()
+
+test("unknown running providers still show effort-only Bot preferences without duplicates", () => {
+  assert.deepEqual(botModelRows({ models: {}, reasoning_efforts: { codex: "high" } }, null), [["codex", ""]])
+  const bot = { models: { claude: "sonnet" }, reasoning_efforts: { codex: "high", claude: "low" } }
+  assert.deepEqual(botModelRows(bot, null), [["codex", ""], ["claude", "sonnet"]])
+  assert.deepEqual(botModelRows(bot, "pi"), [["pi", ""]])
+  assert.deepEqual(botModelRows({ models: {} }, null), [])
+})
 
 const memoryMetadata: MemoryMetadata = { epoch: DATA_EPOCH, revision: 'a'.repeat(64), control_revision: 1, source_event_hash: 'c'.repeat(64), origin: 'user', user_controlled: true, essential: true }
 const memoryState = (revision = memoryMetadata.revision, text: string | null = '现有记忆') => ({ memory_id: 'memory', text, metadata: { ...memoryMetadata, revision } })
@@ -27,8 +35,8 @@ function memoryClient(rpc: (method: string, params: Record<string, unknown>) => 
 }
 
 test('Memory request key matches the Rust canonical payload vector', async () => {
-  const payload = new TextEncoder().encode('{"body":{"after":"用中文","base":{"epoch":11,"version":null},"memory_id":"memory","type":"memory_controlled"},"network_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","scope_id":"chat"}')
-  assert.equal(await requestKey(payload, 'b'.repeat(64)), '71e91d1340a1a11d26fa2c3fcba63cac764deec8d617be3518dcb71e6d040e49')
+const payload = new TextEncoder().encode('{"body":{"after":"用中文","base":{"epoch":12,"version":null},"memory_id":"memory","type":"memory_controlled"},"network_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","scope_id":"chat"}')
+  assert.equal(await requestKey(payload, 'b'.repeat(64)), 'e7a5478f88f2f3860ab397cea199305703b0a2e43f47662f559b695e2a9d25f6')
   assert.notEqual(await requestKey(payload, 'c'.repeat(64)), await requestKey(payload, 'b'.repeat(64)))
 })
 
@@ -310,7 +318,7 @@ test("conversation snapshots parse bot changes strictly", () => {
         { schedule_id: "r", name: "看依赖", prompt: "p", first_run_at_ms: 1, every_minutes: 1440, enabled: false, next_run_at_ms: null },
         { schedule_id: "o", name: "提醒", prompt: "p", first_run_at_ms: 5, enabled: true, depth: 1, next_run_at_ms: 5 },
       ],
-      memory: [{ memory_id: "m", text: "用中文", metadata: { epoch: 11, revision: "a".repeat(64), control_revision: 0, source_event_hash: "b".repeat(64), origin: "agent", user_controlled: false, essential: true } }], memory_sync_conflicts: { items: [], has_more: false },
+        memory: [{ memory_id: "m", text: "用中文", metadata: { epoch: 12, revision: "a".repeat(64), control_revision: 0, source_event_hash: "b".repeat(64), origin: "agent", user_controlled: false, essential: true } }], memory_sync_conflicts: { items: [], has_more: false },
     },
     changes: [
       { change_id: "c1", conversation_id: "chat", cause: { conversation_id: "chat", message_id: "u1" }, event_hash: "h1", created_at_ms: 2, change: { kind: "profile", name: { before: "旧", after: "新" } } },

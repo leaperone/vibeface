@@ -6,8 +6,8 @@ use crate::{
     model::*,
     scheduling::{AdmissionReceipt, TriggerKind, task_trigger},
     work::{
-        Dispatch, DispatchState, Handle, Signal, StopRequest, WorkRecord, WorkSpec, WorkState,
-        accept, transition,
+        Dispatch, DispatchState, Handle, RequestedWorkKind, Signal, StopRequest, WorkAdmission,
+        WorkRecord, WorkRequest, WorkSpec, WorkState, accept, transition,
     },
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -199,57 +199,135 @@ pub(super) fn apply_signal_from(
     Ok((record, receipt))
 }
 
+fn matching_admission_from(
+    connection: &Connection,
+    network: &str,
+    request: &WorkRequest,
+) -> Result<Option<WorkAdmission>> {
+    let Some(record) = load_run(connection, &request.work_id)? else {
+        ensure!(
+            reduce::work_from(connection, network, &request.work_id)?.is_none(),
+            "work exists in shared history without admission on this Node; cannot register it again"
+        );
+        return Ok(None);
+    };
+    let work = reduce::work_from(connection, network, &request.work_id)?
+        .context("work ID reused with a different request")?;
+    let same_kind = match (request.kind, work.kind) {
+        (RequestedWorkKind::Agent(None), WorkKind::Agent(_)) => true,
+        (RequestedWorkKind::Agent(Some(requested)), WorkKind::Agent(accepted)) => {
+            requested == accepted
+        }
+        (RequestedWorkKind::Task, WorkKind::Task) => true,
+        _ => false,
+    };
+    let fields = [
+        ("conversation", work.conversation_id == request.conversation),
+        ("trigger", work.trigger == request.trigger),
+        ("target_node", work.target_node == request.target),
+        ("dispatcher", work.dispatcher == request.dispatcher),
+        ("call_ref", work.call_ref == request.call_ref),
+        ("agent", same_kind),
+        ("model", work.model == request.model),
+        ("cwd", work.cwd == request.cwd),
+        ("title", work.title == request.title),
+        ("prompt", work.prompt == request.prompt),
+        ("continues", work.continues == request.continues),
+        ("parent", work.parent == request.parent),
+        ("thread", work.thread == request.thread),
+    ];
+    let differ: Vec<&str> = fields
+        .iter()
+        .filter(|(_, same)| !same)
+        .map(|(field, _)| *field)
+        .collect();
+    ensure!(
+        differ.is_empty(),
+        "work ID reused with a different request; changed: {}. Retry with the same values or use a new call_ref",
+        differ.join(", ")
+    );
+    Ok(Some(WorkAdmission {
+        spec: WorkSpec {
+            work_id: work.work_id,
+            conversation: work.conversation_id,
+            trigger: work.trigger,
+            target: work.target_node,
+            dispatcher: work.dispatcher,
+            call_ref: work.call_ref,
+            kind: work.kind,
+            model: work.model,
+            resolved: work.resolved,
+            cwd: work.cwd,
+            title: work.title,
+            prompt: work.prompt,
+            continues: work.continues,
+            parent: work.parent,
+            thread: work.thread,
+        },
+        record,
+        created: false,
+    }))
+}
+
 impl Store {
-    /// Retrying the same `work_id` returns the existing record and never starts a second turn.
-    /// The returned flag says whether this call created it. An agent task is queued for this
-    /// Node's coordination Agent in the same transaction.
+    pub fn accepted_work(
+        &self,
+        network: &str,
+        request: &WorkRequest,
+    ) -> Result<Option<WorkAdmission>> {
+        matching_admission_from(&self.connection, network, request)
+    }
+
     pub fn accept_work(
         &mut self,
         identity: &LocalIdentity,
         network: &str,
-        spec: WorkSpec,
+        request: WorkRequest,
+        proposed: ResolvedModel,
         at: i64,
-    ) -> Result<(WorkRecord, bool)> {
+    ) -> Result<WorkAdmission> {
         ensure!(
-            spec.target == identity.device_id()?,
+            request.target == identity.device_id()?,
             "work targets another Node"
         );
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(existing) = load_run(&tx, &spec.work_id)? {
-            let work = reduce::work_from(&tx, network, &spec.work_id)?
-                .context("work ID reused with a different request")?;
-            let fields = [
-                ("conversation", work.conversation_id == spec.conversation),
-                ("trigger", work.trigger == spec.trigger),
-                ("target_node", work.target_node == spec.target),
-                ("dispatcher", work.dispatcher == spec.dispatcher),
-                ("call_ref", work.call_ref == spec.call_ref),
-                ("agent", work.kind == spec.kind),
-                ("cwd", work.cwd == spec.cwd),
-                ("title", work.title == spec.title),
-                ("prompt", work.prompt == spec.prompt),
-                ("continues", work.continues == spec.continues),
-                ("parent", work.parent == spec.parent),
-                ("thread", work.thread == spec.thread),
-            ];
-            let differ: Vec<&str> = (fields.iter())
-                .filter(|(_, same)| !same)
-                .map(|(field, _)| *field)
-                .collect();
-            ensure!(
-                differ.is_empty(),
-                "work ID reused with a different request; changed: {}. Retry with the same values or use a new call_ref",
-                differ.join(", ")
-            );
-            return Ok((existing, false));
+        if let Some(existing) = matching_admission_from(&tx, network, &request)? {
+            return Ok(existing);
         }
+        let kind = match request.kind {
+            RequestedWorkKind::Agent(provider) => {
+                ensure!(
+                    provider.is_none_or(|provider| provider == proposed.provider),
+                    "resolved work provider does not match its agent"
+                );
+                WorkKind::Agent(proposed.provider)
+            }
+            RequestedWorkKind::Task => WorkKind::Task,
+        };
+        let spec = WorkSpec {
+            work_id: request.work_id,
+            conversation: request.conversation,
+            trigger: request.trigger,
+            target: request.target,
+            dispatcher: request.dispatcher,
+            call_ref: request.call_ref,
+            kind,
+            model: request.model,
+            resolved: proposed,
+            cwd: request.cwd,
+            title: request.title,
+            prompt: request.prompt,
+            continues: request.continues,
+            parent: request.parent,
+            thread: request.thread,
+        };
         ensure!(
             !super::bots::bot_deleted_from(&tx, network, &spec.conversation)?,
             "the bot that dispatched this work was deleted"
         );
-        let (record, event) = accept(spec, at);
+        let (record, event) = accept(spec.clone(), at);
         let work_id = record.work_id.clone();
         save_run(&tx, &record)?;
         log::append_from(
@@ -273,7 +351,11 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok((record, true))
+        Ok(WorkAdmission {
+            spec,
+            record,
+            created: true,
+        })
     }
 
     pub fn apply_work_signal(

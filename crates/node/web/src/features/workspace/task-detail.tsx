@@ -69,7 +69,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const check = work && state === "awaiting_confirmation" ? workChecks([{ ...work, conversation_id: workspace.data?.conversation?.conversation_id ?? "" }], workspace.nodes).find((item): item is WorkCheck => item.kind === "work") : undefined
   const settle = (choice: "completed" | "interrupted") => async () => { if (!check) return; await workspace.resolveCheck(check, choice, ""); toast(choice === "completed" ? "已记为做完" : "已记为没做完", { tone: "success" }) }
   const device = work?.target_node ?? ""
-  const agent = work ? taskAgent(work, workspace.nodes) : null
+  const agent = work ? taskAgent(work) : null
   const AgentIcon = agent ? providerIcons[agent] : null
   const progress = workspace.liveProgress.find((item) => item.kind === "native" && item.work_id === workId && item.target_node === device)
   const plan = parseSummarySteps(work?.summary ?? "")

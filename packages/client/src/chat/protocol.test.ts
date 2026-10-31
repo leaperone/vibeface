@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { awaitsDevice, botReach, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, reachDevice, replyStatusLabel, roleLabel } from './protocol.ts'
-import { parseNodes } from '../workspace/model.ts'
+import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, roleLabel, reachDevice } from './protocol.ts'
+import type { ManagerJob, TurnRuntime } from '../workspace/types.ts'
+import { parseNodes, parseTurnRuntime } from '../workspace/model.ts'
 
 const ready = { hasConversation: true, loaded: true, bot: 'ready' as const }
 test('send waits for a loaded conversation', () => {
@@ -20,6 +21,10 @@ test('chat rereads readiness only while a device that could reply is not ready y
   assert.equal(botReach([]), 'none')
   assert.equal(botReach([node(true, null)]), 'none')
   assert.equal(botReach([node(true, 'needs_setup')]), 'needs_setup')
+  assert.equal(botReach([node(true, 'unverified')]), 'unverified')
+  assert.equal(botCanSend('unverified'), true)
+  assert.equal(botCanSend('needs_setup'), false)
+  assert.equal(composerHint({ ...ready, bot: 'unverified' }), '')
   assert.equal(botReach([node(true, 'needs_setup'), node(true, 'unverified')]), 'unverified')
   assert.equal(composerHint({ ...ready, bot: 'unverified' }), '', 'an unverified provider can be tried')
   assert.equal(awaitsDevice('unverified'), false, 'unknown authentication is not a pending launch')
@@ -92,4 +97,23 @@ test('stopped and interrupted replies are labelled; completed replies are not', 
   assert.equal(replyStatusLabel(undefined), '')
   assert.equal(replyStatusLabel('stopped'), '已中断')
   assert.equal(replyStatusLabel('interrupted'), '已中断')
+})
+
+test('retry requires explicit not-started evidence and an affirmative job receipt', () => {
+  const runtime: TurnRuntime = { provider: 'claude', model: null, reasoning_effort: null, generation: 'g', session_generation: 1, delivery_id: 'd', stage: 'turn_start', execution: 'not_started', attempted_at_ms: 1, switched_from: null, switch_reason: null }
+  const job: ManagerJob = { trigger: 'm', state: 'failed', retryable: true, runtime }
+  assert.equal(canRetryJob(job), true)
+  for (const changed of [{ ...job, runtime: null }, { ...job, pending_check: true }, { ...job, retryable: false }, { ...job, state: 'reconciling' }, { ...job, runtime: { ...runtime, execution: 'unknown' as const } }, { ...job, runtime: { ...runtime, execution: 'started' as const } }]) assert.equal(canRetryJob(changed), false)
+  assert.deepEqual(parseTurnRuntime(runtime), runtime)
+  assert.throws(() => parseTurnRuntime({ ...runtime, execution: 'maybe' }))
+  assert.match(runtimeLabel(runtime), /默认模型，实际模型未确认/)
+  assert.doesNotMatch(runtimeLabel(runtime), /medium/)
+  assert.match(runtimeLabel({ ...runtime, provider: 'pi', switched_from: { provider: 'claude', model: 'opus', reasoning_effort: 'high' }, switch_reason: 'quota' }), /由 Claude Code 的 opus 切换/)
+})
+
+test('the shared readiness reason names the provider and device without blocking unverified sends', () => {
+  const [node] = parseNodes({ nodes: [{ device_id: 'mac', name: '我的 Mac', online: true, local: false, revoked: false, capabilities: { manager: 'claude', manager_state: 'unverified', manager_readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }, roots: [], relay: false } }] })
+  assert.equal(botCanSend(botReach([node])), true)
+  assert.match(botProviderNotice([node]), /Claude Code · 我的 Mac/)
+  assert.match(botProviderNotice([node]), /登录尚未确认/)
 })

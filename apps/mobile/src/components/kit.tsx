@@ -148,13 +148,13 @@ export function CopyableId({ value, label }: { value: string; label: string }) {
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
 
 /** Technical detail folded away by default, as the web's <Details>. */
-export function Details({ children, label = '详细信息', open: initial = false }: { children: ReactNode; label?: string; open?: boolean }) {
+export function Details({ children, label = '详细信息', open: initial = false, keepMounted = false }: { children: ReactNode; label?: string; open?: boolean; keepMounted?: boolean }) {
   const [open, setOpen] = useState(initial)
   return <View>
     <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} className="min-h-11 flex-row items-center gap-1 self-start" onPress={() => setOpen(!open)}>
       <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{label}</Text>
     </Pressable>
-    {open ? <View className="gap-2">{children}</View> : null}
+    {open || keepMounted ? <View className={cn('gap-2', !open && 'hidden')}>{children}</View> : null}
   </View>
 }
 

@@ -11,6 +11,7 @@ import { newId } from "@vibeface/client/workspace/storage.ts"
 import { memoryBase, memoryResultLabel, memorySaved, memorySyncConflictLabel, type MemoryControls } from "@vibeface/client/workspace/memory.ts"
 import { formatWhen, changeTitle, scheduleFrequency } from "@vibeface/client/workspace/bot-settings.ts"
 import { contextCoverageLabels, contextIndexLabels, contextInvalidation, contextStages, memoryConflictLabel, memoryOrigins, nativeSessionObservation, nodeName, schedulerStatus, shownState, taskLabel } from "@vibeface/client/workspace/labels.ts"
+import { runtimeLabel } from "@vibeface/client/chat/protocol.ts"
 import type { BotChange, BotRecord, BotSettings, ContextProjection, ConversationPayload, CoordinationCheck, MemoryBase, MemoryControlResult, NodeInfo, Question, WorkRecord } from "@vibeface/client/workspace/types.ts"
 import { CollaborationPanel } from "./collaboration-panel"
 import { cn } from "@/lib/utils"
@@ -142,10 +143,12 @@ function AgentContinuity({ data, nodes, connected, memory }: { data: Conversatio
   const native = unavailable ? null : context?.session_status
   const nativeStatus = nativeSessionObservation(native)
   const openJobs = scheduler?.jobs.filter((job) => schedulerStatus(job.state).group !== "history") ?? []
+  const activeJob = openJobs[0]
+  const runtime = activeJob?.runtime ?? (scheduler?.jobs ?? []).flatMap((job) => job.runtime ? [job.runtime] : []).sort((left, right) => right.attempted_at_ms - left.attempted_at_ms)[0]
   const status: ContinuityStatus = unavailable
     ? { tone: "warning", icon: Unplug, label: "当前状态未知", detail: "连接中断或负责设备不可达，显示最近读取的记录。" }
     : scheduler
-      ? { tone: "info", icon: openJobs.length ? Cpu : CircleCheck, label: openJobs.length === 1 ? schedulerStatus(openJobs[0].state).label : openJobs.length ? `${openJobs.length} 项后台工作未结束` : "状态已读取", detail: [scheduler.provider ? providerLabel(scheduler.provider) : null, scheduler.model || "设备默认模型"].filter(Boolean).join(" · ") }
+      ? { tone: "info", icon: openJobs.length ? Cpu : CircleCheck, label: openJobs.length === 1 ? schedulerStatus(openJobs[0].state).label : openJobs.length ? `${openJobs.length} 项后台工作未结束` : "状态已读取", detail: runtime ? runtimeLabel(runtime) : "当前快照尚未记录回合配置。" }
       : { tone: "neutral", icon: CircleDashed, label: "后台工作状态未提供", detail: "Bot 身份和共享事实仍会保留。" }
   const owner = data.conversation?.owner
   const ownerName = nodeName(owner ?? undefined, { nodes })
@@ -270,6 +273,10 @@ export function MemorySummary({ settings, context, memory }: { settings: BotSett
   </div>
 }
 
+function providerLabel(provider: string) {
+  return continuityProviderLabels[provider] ?? provider
+}
+
 function ContinuityLayer({ step, label, detail, tone, status }: { step: string; label: string; detail: string; tone: Tone; status: string }) {
   return <li className="grid min-w-0 gap-1 rounded-xl border border-border/70 bg-background/55 p-3">
     <div className="flex min-w-0 items-center gap-2"><span aria-hidden="true" className="grid size-5 shrink-0 place-items-center rounded-full bg-muted text-meta font-semibold tabular-nums">{step}</span><span className="min-w-0 truncate font-medium">{label}</span><StatusPill tone={tone}>{status}</StatusPill></div>
@@ -279,10 +286,6 @@ function ContinuityLayer({ step, label, detail, tone, status }: { step: string; 
 
 function ContinuityStat({ label, value }: { label: string; value: number | null }) {
   return <div className="grid gap-0.5 rounded-xl border border-border/70 bg-background/55 px-3 py-2"><span className="text-meta text-muted-foreground">{label}</span><span className="text-lg font-semibold tabular-nums">{value ?? "未提供"}</span></div>
-}
-
-function providerLabel(provider: string) {
-  return continuityProviderLabels[provider] ?? provider
 }
 
 function ContextStat({ label, value }: { label: string; value: number }) {

@@ -144,6 +144,7 @@ class Bridge(BaseHTTPRequestHandler):
             runs[run]["result"] = answer
             with open(agent_file(agent), "a") as history_file:
                 history_file.write(json.dumps({"run_id": run, "status": "RUN_LIFECYCLE_STATUS_FINISHED", "result": answer}) + "\n")
+            runs[run]["status"] = "RUN_LIFECYCLE_STATUS_FINISHED"
             stream = (frame(0, finished(agent, run, answer))
                       + frame(0, {"done": {"agentId": agent, "runId": run}}) + frame(2, {}))
             return self.answer(200, stream, "application/connect+json")

@@ -9,8 +9,8 @@ import { EmptyState, SettingsGroup, SettingsRow, toast } from "@/components/app/
 import { BotFace, botMood } from "@/components/app/bot-face"
 import { terms } from "@/lib/glossary"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
-import { asProvider, providerNames, type ProviderId } from "@vibeface/client/lib/node.ts"
-import { botCopy, folderLabels, formatIn, formatWhen, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
+import { asProvider, providerNames } from "@vibeface/client/lib/node.ts"
+import { botCopy, botModelRows, folderLabels, formatIn, formatWhen, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
 import { messageOf } from "@vibeface/client/lib/node.ts"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -76,9 +76,8 @@ export function BotPanelButton() {
     setConfirming(null)
     window.setTimeout(drop, GAP_MS)
   }
-  // The provider the bot runs on now, with its model; without one known, every model the bot chose.
   const running = asProvider(ownerNode?.capabilities?.manager)
-  const models = running ? [[running, bot.models[running] ?? ""]] as [ProviderId, string][] : Object.entries(bot.models) as [ProviderId, string][]
+  const models = botModelRows(bot, running)
   const empty = view && !bot.instructions.trim() && !rows.length && !view.memory.length && !view.skills.length
   const deviceName = owner ? nodeName(owner, { nodes: workspace.nodes, directory }) : ""
   const mood = botMood(bot, workspace)
@@ -124,9 +123,10 @@ export function BotPanelButton() {
                 {choices.map((item) => <NativeSelectOption key={item.key} value={item.key}>{item.label}</NativeSelectOption>)}
               </NativeSelect> : <span className="max-w-48 truncate" title={bot.project?.cwd}>{projectLabel}</span>}
             </SettingsRow> : null}
-            {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={providerNames[provider]}>
+            {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={`${providerNames[provider]} 模型偏好`}>
               {model ? <span className="max-w-48 truncate font-mono" title={model}>{model}</span> : <span>设备默认</span>}
             </SettingsRow>) : <SettingsRow icon={Cpu} label="模型"><span>设备默认</span></SettingsRow>}
+            {models.map(([provider]) => <SettingsRow key={`effort:${provider}`} icon={Cpu} label={`${providerNames[provider]} 推理强度`}><span>{bot.reasoning_efforts?.[provider] ?? "设备默认"}</span></SettingsRow>)}
             <SettingsRow icon={terms.primaryBot.icon} label={terms.primaryBot.label} description={botCopy.primaryHint}>
               {workspace.primary === bot.conversation_id ? <span className="inline-flex items-center gap-1 text-foreground"><Check aria-hidden="true" className="size-4 text-brand" />是</span>
                 : <ActionButton disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}

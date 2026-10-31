@@ -4,8 +4,10 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 const EVENT_DOMAIN: &[u8] = b"vibeface:event:v1:";
+const PROVIDER_CONFIG_DOMAIN: &[u8] = b"vibeface:provider-runtime-key:v1";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +52,12 @@ impl LocalIdentity {
             vibeface_secure::Identity::from_secret_hex(&self.secret_key_hex)?
                 .sign(domain, payload)?,
         )
+    }
+
+    pub(crate) fn provider_fingerprint(&self, payload: &[u8]) -> Result<String> {
+        let seed = Zeroizing::new(self.key()?.to_bytes());
+        let key = Zeroizing::new(hmac_sha256(&seed[..], PROVIDER_CONFIG_DOMAIN));
+        Ok(hex::encode(hmac_sha256(&key[..], payload)))
     }
     pub fn sign_event(&self, mut event: Event) -> Result<SignedEvent> {
         ensure!(
@@ -220,6 +228,25 @@ pub fn random_hex(bytes: usize) -> String {
 
 pub fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let pad = |byte: u8| block.map(|b| b ^ byte);
+    let inner = Sha256::new()
+        .chain_update(pad(0x36))
+        .chain_update(message)
+        .finalize();
+    Sha256::new()
+        .chain_update(pad(0x5c))
+        .chain_update(inner)
+        .finalize()
+        .into()
 }
 fn decode32(value: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(value).context("invalid hexadecimal key/hash")?;
@@ -530,6 +557,9 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             trigger,
             dispatcher,
             call_ref,
+            kind,
+            model,
+            resolved,
             continues,
             parent,
             thread,
@@ -546,6 +576,27 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             }
             id(call_ref)?;
             decode32(dispatcher)?;
+            if let Some(model) = model {
+                crate::model::validate_model(model)?;
+            }
+            let role = if *kind == WorkKind::Task {
+                crate::providers::Role::Agent
+            } else {
+                crate::providers::Role::Execution
+            };
+            if let WorkKind::Agent(provider) = kind {
+                ensure!(
+                    resolved.provider == *provider,
+                    "resolved work provider does not match its agent"
+                );
+            }
+            ensure!(
+                resolved.provider.supports().contains(&role),
+                "resolved work provider cannot run this kind"
+            );
+            if let Some(model) = &resolved.model {
+                crate::model::validate_model(model)?;
+            }
             for work in continues.iter().chain(parent.iter()).chain(thread.iter()) {
                 id(work)?;
             }
@@ -585,6 +636,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         }
         EventBody::QuestionAsked {
             question_id: question,
+            attention,
             text,
             choices,
             about,
@@ -597,6 +649,18 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             );
             subject(&about.node, &about.session_id, &about.cwd, &about.summary)?;
             about.request_id.as_deref().map(id).transpose()?;
+            ensure!(
+                attention
+                    .device_id
+                    .as_ref()
+                    .is_none_or(|device| device == &about.node),
+                "attention must target the request's device"
+            );
+            ensure!(
+                attention.kind != crate::model::AttentionKind::BrowserTakeover
+                    || attention.device_id.is_some(),
+                "browser takeover requires its running device"
+            );
             ensure!(choices.len() <= 8, "at most 8 choices");
             for (index, choice) in choices.iter().enumerate() {
                 ensure!(
@@ -734,13 +798,60 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
 mod tests {
 
     use super::*;
+    use crate::providers::Provider;
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        assert_eq!(
+            hex::encode(hmac_sha256(&[0x0b; 20], b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            hex::encode(hmac_sha256(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn provider_fingerprints_are_stable_and_private_to_the_device() -> Result<()> {
+        let identity = LocalIdentity {
+            secret_key_hex: hex::encode([7; 32]),
+        };
+        let payload = b"provider-config-fixture";
+        let tag = identity.provider_fingerprint(payload)?;
+        assert_eq!(
+            tag,
+            "19cdf6bf40dd7beddd0fcb28b93d1ce8450c62da516aa4d1147c971fcc47d714"
+        );
+        let restored: LocalIdentity = serde_json::from_slice(&serde_json::to_vec(&identity)?)?;
+        assert_eq!(restored.provider_fingerprint(payload)?, tag);
+        assert_ne!(identity.provider_fingerprint(b"changed-config")?, tag);
+        assert_ne!(
+            LocalIdentity {
+                secret_key_hex: hex::encode([8; 32]),
+            }
+            .provider_fingerprint(payload)?,
+            tag
+        );
+        assert!(
+            LocalIdentity {
+                secret_key_hex: "invalid".into(),
+            }
+            .provider_fingerprint(payload)
+            .is_err()
+        );
+        Ok(())
+    }
+
     #[test]
     fn memory_request_key_matches_the_shared_client_vector() -> Result<()> {
         let network = "a".repeat(64);
         let body = EventBody::MemoryControlled {
             memory_id: "memory".into(),
             base: MemoryBase {
-                epoch: 11,
+                epoch: 12,
                 version: None,
             },
             after: Some("用中文".into()),
@@ -751,7 +862,7 @@ mod tests {
         };
         assert_eq!(
             request_key(&network, "chat", &body, "")?,
-            "71e91d1340a1a11d26fa2c3fcba63cac764deec8d617be3518dcb71e6d040e49"
+            "e7a5478f88f2f3860ab397cea199305703b0a2e43f47662f559b695e2a9d25f6"
         );
         Ok(())
     }
@@ -965,6 +1076,52 @@ mod tests {
         );
         event.prev = Some(digest(b"c"));
         assert!(identity.sign_event(event).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_agent_work_provider_matches_the_selected_executor() -> Result<()> {
+        let identity = LocalIdentity::generate();
+        let network = identity.fixture_network_id()?;
+        let event = |provider| Event {
+            version: WIRE_VERSION,
+            network_id: network.clone(),
+            scope_id: "conversation".into(),
+            author: identity.device_id().unwrap(),
+            seq: 1,
+            prev: None,
+            deps: vec![],
+            created_at_ms: 0,
+            body: EventBody::WorkDispatched {
+                work_id: "work-1".into(),
+                trigger: "message:m-1".into(),
+                dispatcher: identity.device_id().unwrap(),
+                call_ref: "call-1".into(),
+                kind: WorkKind::Agent(Provider::Codex),
+                model: None,
+                resolved: ResolvedModel {
+                    provider,
+                    model: None,
+                },
+                cwd: "/tmp".into(),
+                title: "run".into(),
+                prompt: "run".into(),
+                continues: None,
+                parent: None,
+                thread: None,
+            },
+            blobs: vec![],
+        };
+        identity
+            .sign_event(event(Provider::Codex))
+            .expect("matching frozen provider should be valid");
+        assert!(identity.sign_event(event(Provider::Claude)).is_err());
+        let mut missing = serde_json::to_value(event(Provider::Codex))?;
+        missing["body"]
+            .as_object_mut()
+            .context("body")?
+            .remove("resolved");
+        assert!(serde_json::from_value::<Event>(missing).is_err());
         Ok(())
     }
 }

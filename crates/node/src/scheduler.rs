@@ -15,7 +15,7 @@ use crate::{
     runtime::{Access, Changed, Runtime},
     scheduling::{
         JobOutcome, JobState, SchedulerJob, SessionConfig, SessionKey, SessionScope, Shown,
-        TriggerKind,
+        TriggerKind, TurnExecution, TurnRuntime,
     },
     store::Store,
     tools::Tool,
@@ -23,6 +23,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use futures_util::FutureExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -31,8 +32,138 @@ use std::{
 };
 use vibeface_bridge::{
     agent::CustomToolConfig,
-    failure::{ExecFailure, FailureKind},
+    failure::{ExecFailure, FailureKind, ProviderStage},
 };
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupPolicy {
+    #[serde(default)]
+    pub automatic: bool,
+    #[serde(default)]
+    pub candidates: Vec<BackupModel>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupModel {
+    pub provider: crate::providers::Provider,
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+}
+
+impl BackupPolicy {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.candidates.len() <= 5,
+            "at most five backup models are allowed"
+        );
+        ensure!(
+            !self.automatic || !self.candidates.is_empty(),
+            "automatic backup requires at least one model"
+        );
+        let mut seen = BTreeSet::new();
+        for candidate in &self.candidates {
+            crate::model::validate_model(&candidate.model)?;
+            ensure!(
+                !candidate.provider.needs_model() || !candidate.model.trim().is_empty(),
+                "backup provider requires a model"
+            );
+            candidate
+                .provider
+                .validate_reasoning_effort(candidate.reasoning_effort.as_deref())?;
+            ensure!(
+                seen.insert((candidate.provider, &candidate.model)),
+                "duplicate backup model"
+            );
+        }
+        Ok(())
+    }
+
+    fn candidate_for_job(
+        &self,
+        current: &crate::config::ManagerSettings,
+        job: &SchedulerJob,
+        error: &ManagerError,
+        partial_output: bool,
+    ) -> Option<&BackupModel> {
+        if job.kind == TriggerKind::AgentTask
+            || job
+                .runtime
+                .as_ref()
+                .is_none_or(|runtime| runtime.execution != TurnExecution::NotStarted)
+            || !matches!(
+                job.state,
+                JobState::Claimed { .. } | JobState::Running { .. }
+            )
+        {
+            return None;
+        }
+        self.candidate(
+            current,
+            error,
+            job.tool_calls || job.pending_check || partial_output,
+        )
+    }
+
+    fn candidate(
+        &self,
+        current: &crate::config::ManagerSettings,
+        error: &ManagerError,
+        tool_calls: bool,
+    ) -> Option<&BackupModel> {
+        if !self.automatic
+            || error.start != manager::StartEvidence::NotStarted
+            || error.uncertain()
+            || error.cancelled()
+            || tool_calls
+            || !matches!(
+                error.failure.kind,
+                FailureKind::MissingKey
+                    | FailureKind::AuthFailed
+                    | FailureKind::Quota
+                    | FailureKind::MissingBinary
+                    | FailureKind::NoModel
+                    | FailureKind::ExecutionDisabled
+                    | FailureKind::Transport
+                    | FailureKind::TimedOut
+            )
+        {
+            return None;
+        }
+        self.candidates.iter().find(|candidate| {
+            candidate.provider != current.provider
+                || candidate.model != current.model
+                || candidate.reasoning_effort != current.reasoning_effort
+        })
+    }
+}
+
+pub(crate) fn ensure_readiness(readiness: &crate::providers::ProviderProbeReadiness) -> Result<()> {
+    use crate::providers::{ProbeStage, ProviderProbeReadiness};
+    match readiness {
+        ProviderProbeReadiness::Ready | ProviderProbeReadiness::Unverified { .. } => Ok(()),
+        ProviderProbeReadiness::NeedsSetup { issue } => Err(ManagerError {
+            stage: match issue.stage {
+                ProbeStage::Install => ProviderStage::Install,
+                ProbeStage::Launch => ProviderStage::Launch,
+                ProbeStage::Authentication => ProviderStage::Authentication,
+                ProbeStage::ModelList => ProviderStage::ModelList,
+            },
+            start: manager::StartEvidence::NotStarted,
+            outcome: manager::ManagerFailure::Failed,
+            session_id: None,
+            failure: ExecFailure::new(
+                issue.kind.unwrap_or(FailureKind::Rejected),
+                format!("provider setup required: {:?}", issue.code),
+            ),
+        }
+        .into()),
+        ProviderProbeReadiness::Starting => Err(ManagerError::not_started(anyhow::anyhow!(
+            "provider is starting"
+        ))),
+    }
+}
 
 /// The whole turn prompt; Codex accepts 65536 bytes per message and Cursor more. A thread takes
 /// the tool catalog and `thread_instructions` apart from the prompt, so they stay out of this.
@@ -171,7 +302,42 @@ pub(crate) fn prefix(text: &str, max_bytes: usize) -> &str {
     &text[..end]
 }
 
+pub(crate) fn task_start_failure(
+    current: Option<crate::providers::Provider>,
+    accepted: crate::providers::Provider,
+) -> Option<ExecFailure> {
+    match current {
+        None => Some(ExecFailure::new(
+            FailureKind::NoBot,
+            "this device's Bot is turned off",
+        )),
+        Some(provider) if provider != accepted => Some(ExecFailure::new(
+            FailureKind::ExecutionDisabled,
+            "the accepted task provider is no longer this device's Bot",
+        )),
+        Some(_) => None,
+    }
+}
+
+fn turn_settings(
+    mut settings: crate::config::ManagerSettings,
+    bot: Option<&Bot>,
+    resolved: Option<&crate::model::ResolvedModel>,
+) -> crate::config::ManagerSettings {
+    if let Some(resolved) = resolved {
+        settings.provider = resolved.provider;
+        settings.model = resolved.model.clone().unwrap_or_default();
+    } else if let Some(model) = bot_model(&settings, bot) {
+        settings.model = model;
+    }
+    if let Some(effort) = bot.and_then(|bot| bot.reasoning_effort(settings.provider)) {
+        settings.reasoning_effort = Some(effort.to_owned());
+    }
+    settings
+}
+
 struct PreparedTurn {
+    settings: crate::config::ManagerSettings,
     local_settings: crate::runtime::NodeSettings,
     provider_local: crate::providers::Local,
     bot_model: Option<String>,
@@ -188,22 +354,70 @@ async fn prepare_turn(
     scope: &SessionScope,
 ) -> Result<PreparedTurn> {
     let (local_settings, provider_local) = node.agent_configuration_snapshot().await;
-    let Some(mut settings) = local_settings.manager.clone() else {
+    prepare_turn_from(
+        node,
+        network,
+        conversation,
+        scope,
+        local_settings,
+        provider_local,
+        None,
+    )
+    .await
+}
+
+async fn prepare_turn_from(
+    node: &Runtime,
+    network: &str,
+    conversation: &str,
+    scope: &SessionScope,
+    local_settings: crate::runtime::NodeSettings,
+    provider_local: crate::providers::Local,
+    selected: Option<crate::config::ManagerSettings>,
+) -> Result<PreparedTurn> {
+    let explicit = selected.is_some();
+    let Some(mut settings) = selected.or_else(|| local_settings.manager.clone()) else {
         bail!("this Node has no configured management SDK")
     };
-    let provider = settings.provider;
+    let resolved = if let SessionScope::Task { work_id } = scope {
+        let store = node.store.lock().await;
+        Some(
+            store
+                .work(network, work_id)?
+                .context("accepted task work missing")?
+                .resolved,
+        )
+    } else {
+        None
+    };
+    if let Some(resolved) = &resolved
+        && let Some(failure) = task_start_failure(Some(settings.provider), resolved.provider)
+    {
+        return Err(ManagerError {
+            stage: ProviderStage::Validate,
+            outcome: manager::ManagerFailure::Failed,
+            start: manager::StartEvidence::NotStarted,
+            session_id: None,
+            failure,
+        }
+        .into());
+    }
     let (stable_bot, stable_skills, bot_model) = {
         let store = node.store.lock().await;
         let bot = store.bot_for_conversation(network, conversation)?;
+        let bot_model = (!explicit && resolved.is_none())
+            .then(|| bot_model(&settings, bot.as_ref()))
+            .flatten();
+        if !explicit {
+            settings = turn_settings(settings, bot.as_ref(), resolved.as_ref());
+        }
         (
             configured_bot_value(bot.as_ref()),
             skill_index(&store, network, bot.as_ref())?,
-            bot_model(&settings, bot.as_ref()),
+            bot_model,
         )
     };
-    if let Some(model) = &bot_model {
-        settings.model = model.clone();
-    }
+    let provider = settings.provider;
     let stable_tools = provider.tools_for(TriggerKind::Human);
     let stable_tool_values = tools(TriggerKind::Human)
         .into_iter()
@@ -269,23 +483,14 @@ async fn prepare_turn(
             | crate::providers::StablePromptPlacement::SessionInstructions
             | crate::providers::StablePromptPlacement::UserTurnPrefix => stable.rendered.clone(),
         },
-        ..node.manager_config_from(settings, &provider_local)?
+        ..node.manager_config(settings.clone(), &provider_local)?
     };
     if let Some(instance) = &instance {
         config = config.for_cursor_instance(instance.clone(), node.cursor_store_root(instance));
     }
-    let runtime_fingerprint = digest(&serde_json::to_vec(&(
-        config.runtime_fingerprint(&provider_local)?,
-        tool_url,
-        &server,
-        &config.tool_cli,
-    ))?);
-    let session_config = SessionConfig {
-        stable_fingerprint: stable.fingerprint.digest.clone(),
-        runtime_fingerprint,
-        provider,
-    };
+    let session_config = session_identity(&config, &provider_local, &stable, tool_url, &server)?;
     Ok(PreparedTurn {
+        settings,
         local_settings,
         provider_local,
         bot_model,
@@ -293,6 +498,27 @@ async fn prepare_turn(
         config,
         server,
         session_config,
+    })
+}
+
+fn session_identity(
+    config: &ManagerConfig,
+    local: &crate::providers::Local,
+    stable: &StableInstructions,
+    tool_url: &str,
+    server: &str,
+) -> Result<SessionConfig> {
+    let runtime_fingerprint = digest(&serde_json::to_vec(&(
+        config.runtime_fingerprint(local)?,
+        tool_url,
+        server,
+        &config.tool_cli,
+        &config.reasoning_effort,
+    ))?);
+    Ok(SessionConfig {
+        stable_fingerprint: stable.fingerprint.digest.clone(),
+        runtime_fingerprint,
+        provider: config.sdk.provider(),
     })
 }
 
@@ -340,21 +566,29 @@ async fn turn(
         "conversation access denied"
     );
     let network = access.network_id.clone();
+    if let Some(job) = node
+        .finish_incompatible_tasks(&network, Some(&conversation))
+        .await?
+        .into_iter()
+        .next()
+    {
+        return Ok(Some(invocation_value(&job, &network)));
+    }
     let PreparedTurn {
+        mut settings,
         local_settings,
         provider_local,
-        bot_model,
-        stable,
+        mut bot_model,
+        mut stable,
         mut config,
-        server,
-        session_config,
+        mut server,
+        mut session_config,
     } = prepare_turn(&node, &network, &conversation, &scope).await?;
     let provider = session_config.provider;
-    let thread = provider.prompt_mode() == crate::providers::PromptMode::Thread;
     if node.provider_configuration_pending(provider, &provider_local) {
         return Ok(None);
     }
-    let claimed = {
+    let mut claimed = {
         let mut store = node.store.lock().await;
         store.authorize_node(&network, &node.identity.device_id()?)?;
         match store.claim_next_in_session(
@@ -362,7 +596,7 @@ async fn turn(
             &network,
             &SessionKey {
                 conversation_id: conversation.clone(),
-                scope,
+                scope: scope.clone(),
             },
             boot_id(),
             &session_config,
@@ -372,7 +606,7 @@ async fn turn(
             None => return Ok(None),
         }
     };
-    let mut job = claimed.job;
+    let mut job = claimed.job.clone();
     let trigger = job.trigger.clone();
     let attempt = job
         .state
@@ -386,9 +620,27 @@ async fn turn(
         tracing::Span::current().record("work_id", work_id);
     }
     tracing::info!(event = "agent.turn.started", trigger, attempt = attempt.id, kind = ?job.kind, provider = ?provider, "agent turn started");
+    job = node.store.lock().await.record_turn_runtime(
+        &conversation,
+        &trigger,
+        &attempt.id,
+        &TurnRuntime {
+            provider,
+            model: (!config.model.is_empty()).then(|| config.model.clone()),
+            reasoning_effort: config.reasoning_effort.clone(),
+            generation: node.provider_generation(provider, &provider_local)?,
+            session_generation: claimed.session_generation,
+            delivery_id: attempt.id.clone(),
+            stage: ProviderStage::Validate,
+            execution: TurnExecution::NotStarted,
+            attempted_at_ms: crate::runtime::now_ms(),
+            switched_from: None,
+            switch_reason: None,
+        },
+    )?;
     // A resumed Codex thread keeps the Shell environment it was created with, so its token
     // carries over; it acts only while an attempt has it registered.
-    let token = if provider.instance_per_bot() {
+    let mut token = if provider.instance_per_bot() {
         uuid::Uuid::new_v4().to_string()
     } else {
         claimed
@@ -397,202 +649,310 @@ async fn turn(
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
     };
     let partial = Arc::new(Mutex::new(PartialText::default()));
+    let progress_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut started = false;
     let mut tools_fenced = false;
     let mut registered = false;
     let mut sdk_live = false;
     let outcome: Result<Value> = std::panic::AssertUnwindSafe(async {
-        let local = node.identity.device_id()?;
-        // A resumed thread the backend no longer has is replaced by a new one, which needs it all.
-        let wants_fresh = thread && claimed.previous_native_id.is_some();
-        let (mut history, mut fresh_history) = {
-            let store = node.store.lock().await;
-            let resumed = claimed.covers.as_ref().map(|covers| (covers, local.as_str()));
-            (
-                store.turn_history(&network, &conversation, &job, resumed)?,
-                wants_fresh.then(|| store.turn_history(&network, &conversation, &job, None)).transpose()?,
-            )
-        };
-        let pending = node
-            .fetch_turn_attachments(&network, history.shown_events().chain(fresh_history.iter().flat_map(|history| history.shown_events())))
-            .await;
-        history.pending_blobs = pending.clone();
-        if let Some(fresh) = &mut fresh_history {
-            fresh.pending_blobs = pending;
+        #[cfg(test)]
+        if job.kind == TriggerKind::AgentTask {
+            let barrier = node.claim_to_start_barrier.lock().expect("claim barrier").take();
+            if let Some((claimed, resume)) = barrier {
+                claimed.notify_one();
+                resume.notified().await;
+            }
         }
-        let ((prompt, shown_now), fresh) = {
-            let store = node.store.lock().await;
-            let works = store.works(&network, &conversation)?;
-            let dispatches = store.undelivered_dispatches(&network, &conversation)?;
-            let mut bot = bot_value(&store, &network, &conversation, crate::runtime::now_ms())?;
-            bot["configured_bot"] = stable.bot.clone();
-            bot["skills"] = json!(stable.skills);
-            fit_bot(&mut bot, INDEX_BUDGET);
-            let memories: Vec<_> = store.memory_records(&network, &conversation)?
-                .into_iter().filter(|record| record.essential)
-                .map(|record| MemoryContextEntry { memory_id: record.entry.memory_id,
-                    text: record.entry.text, epoch: record.epoch, revision: record.revision })
-                .collect();
-            let schedule = match job.kind {
-                TriggerKind::Schedule => Some(
-                    store
-                        .schedule(&network, crate::scheduling::parse_schedule_trigger(&trigger).context("invalid schedule trigger")?.0)?
-                        .context("the schedule was deleted")?,
-                ),
-                _ => None,
-            };
-            let uses_handoff = node.compact_or_handoff(provider)? == crate::providers::CompactionMode::Handoff;
-            let handoff = claimed.invalidation.as_ref().filter(|value| uses_handoff && value.source_provider.is_some()).map(|invalidation| {
-                agent_context::ContextHandoff {
-                    schema_version: agent_context::SCHEMA_VERSION,
-                    source_provider: invalidation.source_provider.expect("existing session provider"),
-                    target_provider: invalidation.target_provider,
-                    basis: invalidation.source_basis.clone(),
-                    source_fingerprint: invalidation.old_stable_fingerprint.clone().unwrap_or_default(),
-                    generation: invalidation.generation,
-                    handoff_revision: invalidation.handoff_revision.clone(),
-                    recent_context: "The new provider session rebuilds from the recorded DAG basis. Use context to read older events.".into(),
-                    open_work: works.iter().filter(|work| work.outcome.is_none()).map(|work| work.work_id.clone()).collect(),
-                    decisions: vec![],
-                    reason: invalidation.reason.clone(),
-                }
-            });
-            let pending_checks: Vec<_> = store.pending_checks()?.into_iter()
-                .filter(|check| check.conversation_id == conversation)
-                .map(|check| json!({"check_id":check.check_id,"trigger":check.trigger,
-                    "detail":if crate::model::looks_secret(&check.detail) { "[redacted]" } else { prefix(&check.detail, 1_000) },
-                    "created_at_ms":check.created_at_ms}))
-                .collect();
-            let unseen = Shown { session_generation: claimed.shown.session_generation, ..Shown::default() };
-            let adapter_prefix = match stable.provider.stable_prompt {
-                crate::providers::StablePromptPlacement::UserTurnPrefix => manager::bot_instructions(
-                    config.tool_cli.as_deref(), &config.custom_tools, &stable.rendered,
-                ).len() + 2,
-                _ => 0,
-            };
-            let stable_budget = if thread { adapter_prefix } else { stable.rendered.len() + 2 };
-            let dynamic_limit = PROMPT_LIMIT.saturating_sub(stable_budget);
-            ensure!(dynamic_limit > 0, "compiled stable instructions exceed the provider input limit");
-            let render = |history: &TurnHistory, seen: Option<&Shown>| -> Result<_> {
-                let (dynamic, mut shown) = compile_dynamic_with_limit(
-                    history, &job, &works, &dispatches, bot.clone(), schedule.as_ref(),
-                    &local_settings.roots, seen, dynamic_limit,
-                    DynamicExtras { handoff: handoff.as_ref(), pending_checks: &pending_checks,
-                        session_generation: claimed.shown.session_generation, rules_in_stable: true,
-                        memories: Some(&memories) },
-                )?;
-                shown.dynamic = Some(dynamic.fingerprint.clone());
-                shown.context = Some(crate::scheduling::ContextProjection {
-                    attempt_id: attempt.id.clone(), provider,
-                    stable_fingerprint: stable.fingerprint.digest.clone(),
-                    dynamic_fingerprint: dynamic.fingerprint.clone(),
-                    session_generation: shown.session_generation, coverage: dynamic.coverage.clone(),
-                    stable_bytes: stable.rendered.len(), dynamic_bytes: dynamic.rendered.len(),
-                    invalidation_reason: claimed.invalidation.as_ref().map(|value| value.reason.clone()),
-                    stage: crate::scheduling::ContextStage::Compiled,
-                    session_status: None,
-                });
-                let compiled = CompiledTurn::new(stable.clone(), dynamic, provider.prompt_mode());
-                let prompt = compiled.prompt();
-                ensure!(prompt.len() + adapter_prefix <= PROMPT_LIMIT, "compiled prompt exceeds the provider input limit");
-                Ok((prompt, shown))
-            };
-            let (prompt, shown) = render(&history, thread.then_some(&claimed.shown))?;
-            let fresh = fresh_history.as_ref()
-                .map(|history| render(history, Some(&unseen))).transpose()?;
-            ((prompt, shown), fresh)
-        };
-        node.store.lock().await.record_compiled_context(
-            &conversation, &trigger, &attempt.id,
-            shown_now.context.as_ref().context("compiled context projection missing")?,
-        )?;
-        let (fresh_prompt, fresh_shown) = fresh.unzip();
-        let shown = Arc::new(Mutex::new(shown_now));
-        let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
-        // The backend may still be starting with the Node.
-        node.manager_backend_ready(provider).await;
-        config.custom_tools = provider.tools_for(job.kind);
-        config.tool_token = Some(token.clone());
-        config.process_started = Some(process_recorder(&node, &attempt.id));
-        config.codex_turn = Some(turn_recorder(&node, &network, &job, &server, shown.clone(), fresh_prompt));
-        config.tool_env.extend([
-            ("VIBEFACE_NODE_URL".into(), local_url),
-            ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
-            ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
-        ]);
-        if matches!(
-            job.kind,
-            TriggerKind::WorkResult | TriggerKind::AgentTask | TriggerKind::Schedule | TriggerKind::BotMessage
-        ) {
-            node.store.lock().await.reserve_budget(
-                &network,
-                1,
-                node.config.daily_decision_limit,
-            )?;
-        }
-        let cancel = node
-            .register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger, provider)
-            .await?;
-        registered = true;
-        let (persist_node, persist_conversation, persist_trigger, persist_attempt, persist_token) =
-            (node.clone(), conversation.clone(), trigger.clone(), attempt.id.clone(), token.clone());
-        let resumed_thread = claimed.previous_native_id.clone();
-        let (progress_node, progress_network, progress_job, progress_attempt, progress_source) =
-            (node.clone(), network.clone(), job.clone(), attempt.id.clone(), node.identity.device_id()?);
-        let progress_text = partial.clone();
-        let progress_sequence = std::sync::atomic::AtomicU64::new(0);
-        node.store.lock().await.mark_started(&conversation, &trigger, &attempt.id)?;
-        node.publish_changed(&network, &conversation, Changed::Job(&trigger));
-        started = true;
-        sdk_live = true;
-        let result = manager::run_manager(
-            &config,
-            &prompt,
-            claimed.previous_native_id.as_deref(),
-            move |id| async move {
-                if resumed_thread.is_some_and(|resumed| resumed != id)
-                    && let Some(fresh) = fresh_shown
-                {
-                    *shown.lock().expect("shown") = fresh;
-                }
-                persist_node.store.lock().await.save_scheduler_native_id(
-                    &persist_conversation,
-                    &persist_trigger,
-                    &persist_attempt,
-                    &id,
-                    &persist_token,
-                    // A turn sends the prompt right after this; a thread has seen it only once
-                    // its turn starts, which the turn recorder marks.
-                    !thread,
+        loop {
+            let provider = session_config.provider;
+            let thread = provider.prompt_mode() == crate::providers::PromptMode::Thread;
+            let local = node.identity.device_id()?;
+            // A resumed thread the backend no longer has is replaced by a new one, which needs it all.
+            let wants_fresh = thread && claimed.previous_native_id.is_some();
+            let (mut history, mut fresh_history) = {
+                let store = node.store.lock().await;
+                let resumed = claimed.covers.as_ref().map(|covers| (covers, local.as_str()));
+                (
+                    store.turn_history(&network, &conversation, &job, resumed)?,
+                    wants_fresh.then(|| store.turn_history(&network, &conversation, &job, None)).transpose()?,
                 )
-            },
-            cancel,
-            move |progress| {
-                progress_text.lock().expect("partial text").apply(&progress);
-                let sequence = progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                progress_node.publish_progress(
-                    &progress_network,
-                    progress_event(&progress_job, &progress_attempt, &progress_source, sequence, progress),
-                );
-                async { Ok(()) }
-            },
-        )
-        .await?;
-        sdk_live = false;
-        node.seal_manager_tools(&attempt.id).await?;
-        tools_fenced = true;
-        let output = prefix(&result.output, REPLY_LIMIT).to_owned();
-        job = node.store.lock().await.finish_job(
-            &node.identity,
-            &network,
-            &conversation,
-            &trigger,
-            &attempt.id,
-            JobOutcome::Completed,
-            &output,
-            crate::runtime::now_ms(),
-        )?;
-        Ok(invocation_value(&job, &network))
+            };
+            let pending = node
+                .fetch_turn_attachments(&network, history.shown_events().chain(fresh_history.iter().flat_map(|history| history.shown_events())))
+                .await;
+            history.pending_blobs = pending.clone();
+            if let Some(fresh) = &mut fresh_history {
+                fresh.pending_blobs = pending;
+            }
+            let ((prompt, shown_now), fresh) = {
+                let store = node.store.lock().await;
+                let works = store.works(&network, &conversation)?;
+                let dispatches = store.undelivered_dispatches(&network, &conversation)?;
+                let mut bot = bot_value(&store, &network, &conversation, crate::runtime::now_ms())?;
+                bot["configured_bot"] = stable.bot.clone();
+                bot["skills"] = json!(stable.skills);
+                fit_bot(&mut bot, INDEX_BUDGET);
+                let memories: Vec<_> = store.memory_records(&network, &conversation)?
+                    .into_iter().filter(|record| record.essential)
+                    .map(|record| MemoryContextEntry { memory_id: record.entry.memory_id,
+                        text: record.entry.text, epoch: record.epoch, revision: record.revision })
+                    .collect();
+                let schedule = match job.kind {
+                    TriggerKind::Schedule => Some(
+                        store
+                            .schedule(&network, crate::scheduling::parse_schedule_trigger(&trigger).context("invalid schedule trigger")?.0)?
+                            .context("the schedule was deleted")?,
+                    ),
+                    _ => None,
+                };
+                let uses_handoff = node.compact_or_handoff(provider)? == crate::providers::CompactionMode::Handoff;
+                let handoff = claimed.invalidation.as_ref().filter(|value| uses_handoff && value.source_provider.is_some()).map(|invalidation| {
+                    agent_context::ContextHandoff {
+                        schema_version: agent_context::SCHEMA_VERSION,
+                        source_provider: invalidation.source_provider.expect("existing session provider"),
+                        target_provider: invalidation.target_provider,
+                        basis: invalidation.source_basis.clone(),
+                        source_fingerprint: invalidation.old_stable_fingerprint.clone().unwrap_or_default(),
+                        generation: invalidation.generation,
+                        handoff_revision: invalidation.handoff_revision.clone(),
+                        recent_context: "The new provider session rebuilds from the recorded DAG basis. Use context to read older events.".into(),
+                        open_work: works.iter().filter(|work| work.outcome.is_none()).map(|work| work.work_id.clone()).collect(),
+                        decisions: vec![],
+                        reason: invalidation.reason.clone(),
+                    }
+                });
+                let pending_checks: Vec<_> = store.pending_checks()?.into_iter()
+                    .filter(|check| check.conversation_id == conversation)
+                    .map(|check| json!({"check_id":check.check_id,"trigger":check.trigger,
+                        "detail":if crate::model::looks_secret(&check.detail) { "[redacted]" } else { prefix(&check.detail, 1_000) },
+                        "created_at_ms":check.created_at_ms}))
+                    .collect();
+                let unseen = Shown { session_generation: claimed.shown.session_generation, ..Shown::default() };
+                let adapter_prefix = match stable.provider.stable_prompt {
+                    crate::providers::StablePromptPlacement::UserTurnPrefix => manager::bot_instructions(
+                        config.tool_cli.as_deref(), &config.custom_tools, &stable.rendered,
+                    ).len() + 2,
+                    _ => 0,
+                };
+                let stable_budget = if thread { adapter_prefix } else { stable.rendered.len() + 2 };
+                let dynamic_limit = PROMPT_LIMIT.saturating_sub(stable_budget);
+                ensure!(dynamic_limit > 0, "compiled stable instructions exceed the provider input limit");
+                let render = |history: &TurnHistory, seen: Option<&Shown>| -> Result<_> {
+                    let (dynamic, mut shown) = compile_dynamic_with_limit(
+                        history, &job, &works, &dispatches, bot.clone(), schedule.as_ref(),
+                        &local_settings.roots, seen, dynamic_limit,
+                        DynamicExtras { handoff: handoff.as_ref(), pending_checks: &pending_checks,
+                            session_generation: claimed.shown.session_generation, rules_in_stable: true,
+                            memories: Some(&memories) },
+                    )?;
+                    shown.dynamic = Some(dynamic.fingerprint.clone());
+                    shown.context = Some(crate::scheduling::ContextProjection {
+                        attempt_id: attempt.id.clone(), provider,
+                        stable_fingerprint: stable.fingerprint.digest.clone(),
+                        dynamic_fingerprint: dynamic.fingerprint.clone(),
+                        session_generation: shown.session_generation, coverage: dynamic.coverage.clone(),
+                        stable_bytes: stable.rendered.len(), dynamic_bytes: dynamic.rendered.len(),
+                        invalidation_reason: claimed.invalidation.as_ref().map(|value| value.reason.clone()),
+                        stage: crate::scheduling::ContextStage::Compiled,
+                        session_status: None,
+                    });
+                    let compiled = CompiledTurn::new(stable.clone(), dynamic, provider.prompt_mode());
+                    let prompt = compiled.prompt();
+                    ensure!(prompt.len() + adapter_prefix <= PROMPT_LIMIT, "compiled prompt exceeds the provider input limit");
+                    Ok((prompt, shown))
+                };
+                let (prompt, shown) = render(&history, thread.then_some(&claimed.shown))?;
+                let fresh = fresh_history.as_ref()
+                    .map(|history| render(history, Some(&unseen))).transpose()?;
+                ((prompt, shown), fresh)
+            };
+            node.store.lock().await.record_compiled_context(
+                &conversation, &trigger, &attempt.id,
+                shown_now.context.as_ref().context("compiled context projection missing")?,
+            )?;
+            let (fresh_prompt, fresh_shown) = fresh.unzip();
+            let shown = Arc::new(Mutex::new(shown_now));
+            let confirmed_shown = shown.clone();
+            let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
+            // The backend may still be starting with the Node.
+            node.manager_backend_ready(provider).await;
+            config.custom_tools = provider.tools_for(job.kind);
+            config.tool_token = Some(token.clone());
+            config.process_started = Some(process_recorder(&node, &attempt.id));
+            config.codex_turn = Some(turn_recorder(&node, &network, &job, &server, shown.clone(), fresh_prompt));
+            config.tool_env.extend([
+                ("VIBEFACE_NODE_URL".into(), local_url),
+                ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
+                ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
+            ]);
+            if !started && matches!(
+                job.kind,
+                TriggerKind::WorkResult | TriggerKind::AgentTask | TriggerKind::Schedule | TriggerKind::BotMessage
+            ) {
+                node.store.lock().await.reserve_budget(
+                    &network,
+                    1,
+                    node.config.daily_decision_limit,
+                )?;
+            }
+            let cancel = node
+                .register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger, provider)
+                .await?;
+            registered = true;
+            tools_fenced = false;
+            let (persist_node, persist_conversation, persist_trigger, persist_attempt, persist_token) =
+                (node.clone(), conversation.clone(), trigger.clone(), attempt.id.clone(), token.clone());
+            let resumed_thread = claimed.previous_native_id.clone();
+            let (progress_node, progress_network, progress_job, progress_attempt, progress_source) =
+                (node.clone(), network.clone(), job.clone(), attempt.id.clone(), node.identity.device_id()?);
+            let progress_text = partial.clone();
+            let progress_sequence = progress_sequence.clone();
+            if !started && job.kind != TriggerKind::AgentTask {
+                node.store.lock().await.mark_started(&conversation, &trigger, &attempt.id)?;
+            }
+            node.publish_changed(&network, &conversation, Changed::Job(&trigger));
+            started = true;
+            sdk_live = true;
+            let readiness = node.provider_readiness(provider, &config.model).await;
+            let first = match ensure_readiness(&readiness) {
+              Err(error) => Err(error),
+              Ok(()) => {
+                node.store.lock().await.update_turn_runtime(
+                    &conversation, &trigger, &attempt.id, ProviderStage::TurnStart, TurnExecution::Unknown,
+                )?;
+                manager::run_manager(
+                &config,
+                &prompt,
+                claimed.previous_native_id.as_deref(),
+                move |id| async move {
+                    if resumed_thread.is_some_and(|resumed| resumed != id)
+                        && let Some(fresh) = fresh_shown
+                    {
+                        *shown.lock().expect("shown") = fresh;
+                    }
+                    persist_node.store.lock().await.save_scheduler_native_id(
+                        &persist_conversation,
+                        &persist_trigger,
+                        &persist_attempt,
+                        &id,
+                        &persist_token,
+                        // Cursor confirms delivered context only after a successful turn.
+                        !thread && provider != crate::providers::Provider::Cursor,
+                    )
+                },
+                cancel,
+                move |progress| {
+                    progress_text.lock().expect("partial text").apply(&progress);
+                    let sequence = progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let compacted = progress["type"] == "context_compacted";
+                    let node = progress_node.clone();
+                    let network = progress_network.clone();
+                    let job = progress_job.clone();
+                    let attempt = progress_attempt.clone();
+                    let source = progress_source.clone();
+                    async move {
+                        if compacted {
+                            node.store.lock().await.record_context_compaction(
+                                &job.conversation_id,
+                                &job.trigger,
+                                &attempt,
+                            )?;
+                        }
+                        node.publish_progress(
+                            &network,
+                            progress_event(&job, &attempt, &source, sequence, progress),
+                        );
+                        Ok(())
+                    }
+                },
+            ).await
+              }
+            };
+            let result = match first {
+                Ok(result) => result,
+                Err(error) => {
+                    let known = record_failure(&node, &job, &error, TurnExecution::Unknown).await?;
+                    let backup = error.downcast_ref::<ManagerError>()
+                        .filter(|_| job.kind != TriggerKind::AgentTask && !matches!(scope, SessionScope::Task { .. }))
+                        .and_then(|error| settings.backup.candidate_for_job(
+                            &settings, &known, error,
+                            !partial.lock().expect("partial text").text().is_empty(),
+                        ))
+                        .filter(|backup| backup.provider == provider || provider_local.switches.execution.contains(&backup.provider))
+                        .cloned();
+                    let Some(backup) = backup else { return Err(error) };
+                    let previous = known.runtime.as_ref().context("turn runtime missing")?.clone();
+                    let reason = error.downcast_ref::<ManagerError>().context("backup requires structured failure")?.failure.kind;
+                    node.seal_manager_tools(&attempt.id).await?;
+                    tools_fenced = true;
+                    node.finish_manager_attempt(&attempt.id).await;
+                    registered = false;
+                    sdk_live = false;
+                    drop(config);
+                    let mut selected = settings.clone();
+                    selected.provider = backup.provider;
+                    selected.model = backup.model;
+                    selected.reasoning_effort = backup.reasoning_effort;
+                    selected.backup.automatic = false;
+                    let next = prepare_turn_from(
+                        &node, &network, &conversation, &scope,
+                        local_settings.clone(), provider_local.clone(), Some(selected),
+                    ).await.map_err(ManagerError::not_started)?;
+                    if node.provider_configuration_pending(next.session_config.provider, &provider_local) {
+                        return Err(ManagerError::not_started(anyhow::anyhow!("backup provider is starting")));
+                    }
+                    claimed = node.store.lock().await.switch_scheduler_session(
+                        &conversation, &trigger, &attempt.id, &next.session_config,
+                    )?;
+                    let runtime = TurnRuntime {
+                        provider: next.session_config.provider,
+                        model: (!next.config.model.is_empty()).then(|| next.config.model.clone()),
+                        reasoning_effort: next.config.reasoning_effort.clone(),
+                        generation: node.provider_generation(next.session_config.provider, &provider_local)?,
+                        session_generation: claimed.session_generation,
+                        stage: ProviderStage::Validate,
+                        execution: TurnExecution::NotStarted,
+                        attempted_at_ms: crate::runtime::now_ms(),
+                        switched_from: Some(crate::scheduling::RuntimeSelection {
+                            provider: previous.provider, model: previous.model, reasoning_effort: previous.reasoning_effort,
+                        }),
+                        switch_reason: Some(reason),
+                        ..previous
+                    };
+                    job = node.store.lock().await.record_turn_runtime(&conversation, &trigger, &attempt.id, &runtime)?;
+                    settings = next.settings;
+                    bot_model = next.bot_model;
+                    stable = next.stable;
+                    config = next.config;
+                    server = next.server;
+                    session_config = next.session_config;
+                    token = uuid::Uuid::new_v4().to_string();
+                    continue;
+                }
+            };
+            sdk_live = false;
+            node.store.lock().await.update_turn_runtime(
+                &conversation, &trigger, &attempt.id, ProviderStage::Record, TurnExecution::Started,
+            )?;
+            node.seal_manager_tools(&attempt.id).await?;
+            tools_fenced = true;
+            if provider == crate::providers::Provider::Cursor {
+                let shown = confirmed_shown.lock().expect("shown").clone();
+                confirm_cursor_seen(&node, &job, &shown, &result).await?;
+            }
+            let output = prefix(&result.output, REPLY_LIMIT).to_owned();
+            job = node.store.lock().await.finish_job(
+                &node.identity,
+                &network,
+                &conversation,
+                &trigger,
+                &attempt.id,
+                JobOutcome::Completed,
+                &output,
+                crate::runtime::now_ms(),
+            )?;
+            return Ok(invocation_value(&job, &network));
+        }
     })
     .catch_unwind()
     .await
@@ -601,6 +961,17 @@ async fn turn(
         let Err(error) = outcome else {
             return outcome;
         };
+        job = record_failure(
+            &node,
+            &job,
+            &error,
+            if sdk_live {
+                TurnExecution::Unknown
+            } else {
+                TurnExecution::NotStarted
+            },
+        )
+        .await?;
         let cancellation = error
             .downcast_ref::<ManagerError>()
             .is_some_and(|e| e.cancelled());
@@ -609,10 +980,15 @@ async fn turn(
             || ExecFailure::new(FailureKind::Unknown, error.to_string()),
             |e| e.failure.clone(),
         );
-        let uncertain = sdk_live
-            && error
-                .downcast_ref::<ManagerError>()
-                .is_none_or(|e| e.uncertain());
+        let uncertain = job.pending_check
+            || job.runtime.as_ref().is_some_and(|runtime| {
+                runtime.execution == TurnExecution::Unknown
+                    || !started && runtime.execution == TurnExecution::Started
+            })
+            || sdk_live
+                && error
+                    .downcast_ref::<ManagerError>()
+                    .is_none_or(|e| e.uncertain());
         if !registered {
             tools_fenced = true;
         }
@@ -633,7 +1009,11 @@ async fn turn(
         };
         let stopped = matches!(current.state, JobState::Cancelling { .. });
         // Stopping a reply ends only this turn; dispatched work keeps its own tracking.
-        let terminal = if (cancellation || (stopped && !started)) && tools_fenced {
+        let no_execution = current
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.execution == TurnExecution::NotStarted);
+        let terminal = if (cancellation || (stopped && no_execution)) && tools_fenced {
             JobOutcome::Cancelled(
                 if moved {
                     "会话已移到另一台设备"
@@ -690,6 +1070,48 @@ async fn turn(
     final_result.map(Some)
 }
 
+async fn record_failure(
+    node: &Runtime,
+    job: &SchedulerJob,
+    error: &anyhow::Error,
+    otherwise: TurnExecution,
+) -> Result<SchedulerJob> {
+    let attempt = job.state.attempt().context("manager attempt missing")?;
+    let mut store = node.store.lock().await;
+    let current = store
+        .scheduler_job(&job.conversation_id, &job.trigger)?
+        .context("scheduler job missing")?;
+    let (stage, mut execution) = match error.downcast_ref::<ManagerError>() {
+        Some(error) => (
+            error.stage,
+            match error.start {
+                manager::StartEvidence::NotStarted => TurnExecution::NotStarted,
+                manager::StartEvidence::Started => TurnExecution::Started,
+                manager::StartEvidence::Unknown => TurnExecution::Unknown,
+            },
+        ),
+        None => (ProviderStage::Record, otherwise),
+    };
+    if execution == TurnExecution::NotStarted
+        && (current.tool_calls
+            || current.pending_check
+            || current.runtime.as_ref().is_some_and(|runtime| {
+                runtime.execution == TurnExecution::Started
+                    || otherwise == TurnExecution::NotStarted
+                        && runtime.execution == TurnExecution::Unknown
+            }))
+    {
+        execution = TurnExecution::Unknown;
+    }
+    store.update_turn_runtime(
+        &job.conversation_id,
+        &job.trigger,
+        &attempt.id,
+        stage,
+        execution,
+    )
+}
+
 /// What a turn streams. A reply streams into its chat; an agent task's turn is its work's progress,
 /// shown on that work's card and details, so no device takes it for the chat's reply.
 fn progress_event(
@@ -726,7 +1148,35 @@ fn process_recorder(node: &Arc<Runtime>, attempt: &str) -> vibeface_bridge::agen
     })
 }
 
-fn turn_recorder(
+pub(crate) async fn confirm_cursor_seen(
+    node: &Runtime,
+    job: &SchedulerJob,
+    shown: &Shown,
+    result: &vibeface_bridge::agent::AgentResult,
+) -> Result<()> {
+    let attempt = job.state.attempt().context("Cursor attempt missing")?;
+    let mut store = node.store.lock().await;
+    let locator = store
+        .manager_turn_record(&attempt.id)?
+        .context("completed Cursor locator missing")?;
+    ensure!(
+        result.session_id.as_deref() == Some(locator.thread.as_str()),
+        "completed Cursor agent does not match its locator"
+    );
+    let turn = locator
+        .turn
+        .as_deref()
+        .context("completed Cursor run missing")?;
+    store.record_manager_turn(
+        &attempt.id,
+        &locator.server,
+        &locator.thread,
+        Some(turn),
+        shown,
+    )
+}
+
+pub(crate) fn turn_recorder(
     node: &Arc<Runtime>,
     network: &str,
     job: &SchedulerJob,
@@ -747,6 +1197,10 @@ fn turn_recorder(
     let started_conversation = job.conversation_id.clone();
     let started_trigger = job.trigger.clone();
     let server = server.to_owned();
+    let cursor = job
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.provider == crate::providers::Provider::Cursor);
     manager::CodexTurn {
         client_id: attempt.clone(),
         fresh_prompt,
@@ -759,7 +1213,17 @@ fn turn_recorder(
                 started_trigger.clone(),
             );
             Box::pin(async move {
-                node.store.lock().await.record_context_started(&attempt)?;
+                {
+                    let mut store = node.store.lock().await;
+                    store.update_turn_runtime(
+                        &conversation,
+                        &trigger,
+                        &attempt,
+                        ProviderStage::Run,
+                        TurnExecution::Started,
+                    )?;
+                    store.record_context_started(&attempt)?;
+                }
                 node.publish_changed(&network, &conversation, Changed::Job(&trigger));
                 Ok(())
             })
@@ -770,13 +1234,12 @@ fn turn_recorder(
             let server = server.clone();
             let shown = shown.lock().expect("shown").clone();
             Box::pin(async move {
-                node.store.lock().await.record_manager_turn(
-                    &attempt,
-                    &server,
-                    &thread,
-                    turn.as_deref(),
-                    &shown,
-                )
+                let mut store = node.store.lock().await;
+                if cursor {
+                    store.record_manager_locator(&attempt, &server, &thread, turn.as_deref())
+                } else {
+                    store.record_manager_turn(&attempt, &server, &thread, turn.as_deref(), &shown)
+                }
             })
         }),
     }
@@ -1739,12 +2202,13 @@ pub fn tools(kind: TriggerKind) -> BTreeMap<String, CustomToolConfig> {
         .into_iter()
         .filter(|tool| tool.effect().offered(kind))
         .filter_map(|tool| {
-            let (description, properties, required) = tool.schema()?;
+            let (description, _, _) = tool.schema()?;
+            let input_schema = tool.input_schema()?;
             Some((
                 tool.name().into(),
                 CustomToolConfig {
                     description: Some(description.into()),
-                    input_schema: json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}),
+                    input_schema,
                     output_schema: None,
                 },
             ))
@@ -1802,6 +2266,9 @@ mod tests {
             basis: basis.clone(),
             reply_to: "m30".into(),
             message_id: "reply".into(),
+            runtime: None,
+            pending_check: false,
+            tool_calls: false,
             state: JobState::Queued,
         };
         (
@@ -1831,6 +2298,7 @@ mod tests {
                 serde_json::from_value(json!({
                     "work_id":format!("w{index}"),"conversation_id":"c","target_node":"a",
                     "trigger":"message:m30","dispatcher":"a","kind":"codex","cwd":"/work",
+                    "model":null,"resolved":{"provider":"codex","model":null},
                     "title":"work","prompt":"p".repeat(500),"call_ref":format!("call-{index}"),
                     "summary":"s".repeat(400),"result_text":"r".repeat(1_000),"state":"unverified",
                 }))
@@ -1985,6 +2453,9 @@ mod tests {
             basis: Default::default(),
             reply_to: reply_to.into(),
             message_id: "reply".into(),
+            runtime: None,
+            pending_check: false,
+            tool_calls: false,
             state: JobState::Queued,
         };
         let text = json!({"type":"text_delta","text":"收到"});
@@ -2158,5 +2629,291 @@ mod tests {
             model_noted(ExecFailure::new(FailureKind::NoModel, "x"), None).detail,
             "x"
         );
+    }
+    fn selection_identity(
+        settings: &crate::config::ManagerSettings,
+        guide: &str,
+        cursor_root: Option<&str>,
+    ) -> Result<SessionConfig> {
+        use crate::providers::Provider;
+        let stable = agent_context::compile_stable(StableInput {
+            provider: settings.provider,
+            bot: Value::Null,
+            bot_revision: None,
+            standing_rules: guide.into(),
+            workspace: vec![settings.workspace.clone()],
+            roots: vec![settings.workspace.clone()],
+            model: Some(settings.model.clone()),
+            permission_version: crate::tools::PERMISSION_POLICY_VERSION,
+            tools: BTreeMap::new(),
+            skills: vec![],
+        })?;
+        let sdk = match settings.provider {
+            Provider::Codex => manager::Sdk::Codex {
+                socket: "/fixture/codex.sock".into(),
+                launch: None,
+            },
+            Provider::Cursor => manager::Sdk::Cursor {
+                bridge: None,
+                sdk_bin: "/fixture/cursor".into(),
+                owner: Some("fixture-bot".into()),
+                local_store_root: cursor_root.map(PathBuf::from),
+            },
+            _ => bail!("identity fixture uses Codex and Cursor"),
+        };
+        let config = ManagerConfig {
+            sdk,
+            workspace: settings.workspace.clone(),
+            model: settings.model.clone(),
+            reasoning_effort: settings.reasoning_effort.clone(),
+            timeout_secs: 10,
+            custom_tools: BTreeMap::new(),
+            tool_cli: Some("/fixture/vibeface".into()),
+            instructions: stable.rendered.clone(),
+            tool_env: BTreeMap::new(),
+            tool_token: None,
+            provider_env: BTreeMap::new(),
+            process_started: None,
+            codex_turn: None,
+        };
+        session_identity(
+            &config,
+            &crate::providers::Local {
+                switches: Default::default(),
+                bins: BTreeMap::new(),
+                env: Default::default(),
+            },
+            &stable,
+            "http://127.0.0.1:1",
+            "fixture",
+        )
+    }
+
+    #[test]
+    fn backup_requires_explicit_policy_and_proven_no_execution() -> Result<()> {
+        use crate::providers::Provider;
+        let settings = crate::config::ManagerSettings {
+            provider: Provider::Codex,
+            workspace: "/w".into(),
+            model: "primary".into(),
+            reasoning_effort: None,
+            backup: BackupPolicy {
+                automatic: false,
+                candidates: vec![BackupModel {
+                    provider: Provider::Claude,
+                    model: "backup".into(),
+                    reasoning_effort: Some("high".into()),
+                }],
+            },
+        };
+        settings.backup.validate()?;
+        let mut policy = settings.backup.clone();
+        let mut failure = ManagerError {
+            stage: ProviderStage::TurnStart,
+            outcome: manager::ManagerFailure::Failed,
+            start: manager::StartEvidence::NotStarted,
+            session_id: None,
+            failure: ExecFailure::new(FailureKind::Quota, "fixture"),
+        };
+        assert!(policy.candidate(&settings, &failure, false).is_none());
+        policy.automatic = true;
+        for kind in [
+            FailureKind::Quota,
+            FailureKind::AuthFailed,
+            FailureKind::Transport,
+            FailureKind::TimedOut,
+            FailureKind::MissingBinary,
+        ] {
+            failure.failure.kind = kind;
+            assert_eq!(
+                policy
+                    .candidate(&settings, &failure, false)
+                    .map(|model| model.model.as_str()),
+                Some("backup")
+            );
+            assert!(policy.candidate(&settings, &failure, true).is_none());
+            for start in [
+                manager::StartEvidence::Started,
+                manager::StartEvidence::Unknown,
+            ] {
+                failure.start = start;
+                assert!(policy.candidate(&settings, &failure, false).is_none());
+            }
+            failure.start = manager::StartEvidence::NotStarted;
+        }
+        for kind in [
+            FailureKind::Lost,
+            FailureKind::Restarted,
+            FailureKind::Unknown,
+            FailureKind::Rejected,
+        ] {
+            failure.failure.kind = kind;
+            assert!(policy.candidate(&settings, &failure, false).is_none());
+        }
+        failure.failure.kind = FailureKind::Quota;
+        failure.outcome = manager::ManagerFailure::Unknown;
+        assert!(policy.candidate(&settings, &failure, false).is_none());
+        let mut duplicate = policy.candidates[0].clone();
+        duplicate.reasoning_effort = Some("low".into());
+        policy.candidates.push(duplicate);
+        assert!(policy.validate().is_err());
+        policy.candidates.clear();
+        assert!(policy.validate().is_err());
+        policy.automatic = false;
+        assert!(policy.validate().is_ok());
+        let mut policy = settings.backup.clone();
+        policy.automatic = true;
+        failure.outcome = manager::ManagerFailure::Failed;
+        failure.start = manager::StartEvidence::NotStarted;
+        failure.failure.kind = FailureKind::Quota;
+        let (_, mut job) = context_fixture();
+        let attempt = crate::scheduling::ManagerAttempt {
+            id: "attempt".into(),
+            boot: "boot".into(),
+            permission_version: 1,
+        };
+        job.state = JobState::Running {
+            attempt: attempt.clone(),
+        };
+        job.runtime = Some(TurnRuntime {
+            provider: Provider::Codex,
+            model: Some("primary".into()),
+            reasoning_effort: None,
+            generation: "captured".into(),
+            session_generation: 1,
+            delivery_id: attempt.id.clone(),
+            stage: ProviderStage::TurnStart,
+            execution: TurnExecution::NotStarted,
+            attempted_at_ms: 0,
+            switched_from: None,
+            switch_reason: None,
+        });
+        assert!(
+            policy
+                .candidate_for_job(&settings, &job, &failure, false)
+                .is_some()
+        );
+        assert!(
+            policy
+                .candidate_for_job(&settings, &job, &failure, true)
+                .is_none()
+        );
+        job.pending_check = true;
+        assert!(
+            policy
+                .candidate_for_job(&settings, &job, &failure, false)
+                .is_none()
+        );
+        job.pending_check = false;
+        job.tool_calls = true;
+        assert!(
+            policy
+                .candidate_for_job(&settings, &job, &failure, false)
+                .is_none()
+        );
+        job.tool_calls = false;
+        for execution in [TurnExecution::Started, TurnExecution::Unknown] {
+            job.runtime.as_mut().unwrap().execution = execution;
+            assert!(
+                policy
+                    .candidate_for_job(&settings, &job, &failure, false)
+                    .is_none()
+            );
+        }
+        job.runtime.as_mut().unwrap().execution = TurnExecution::NotStarted;
+        job.state = JobState::Cancelling { attempt };
+        assert!(
+            policy
+                .candidate_for_job(&settings, &job, &failure, false)
+                .is_none()
+        );
+        job.state = JobState::Running {
+            attempt: job.state.attempt().unwrap().clone(),
+        };
+        job.kind = TriggerKind::AgentTask;
+        assert!(
+            policy
+                .candidate_for_job(&settings, &job, &failure, false)
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_selection_uses_frozen_provider_and_model_before_the_session_identity() -> Result<()> {
+        let settings = crate::config::ManagerSettings {
+            provider: crate::providers::Provider::Codex,
+            workspace: "/tmp".into(),
+            model: "new-default".into(),
+            reasoning_effort: Some("high".into()),
+            backup: Default::default(),
+        };
+        let frozen = crate::model::ResolvedModel {
+            provider: crate::providers::Provider::Codex,
+            model: Some("accepted".into()),
+        };
+        let selected = turn_settings(settings.clone(), None, Some(&frozen));
+        assert_eq!(selected.provider, frozen.provider);
+        assert_eq!(selected.model, "accepted");
+        assert_eq!(selected.reasoning_effort, Some("high".into()));
+        assert_ne!(
+            selection_identity(&selected, "guide", None)?.stable_fingerprint,
+            selection_identity(&settings, "guide", None)?.stable_fingerprint
+        );
+        let default = turn_settings(
+            settings.clone(),
+            None,
+            Some(&crate::model::ResolvedModel {
+                model: None,
+                ..frozen
+            }),
+        );
+        assert_eq!(default.model, "");
+        assert_ne!(
+            selection_identity(&default, "guide", None)?.stable_fingerprint,
+            selection_identity(&selected, "guide", None)?.stable_fingerprint
+        );
+        assert_eq!(turn_settings(settings, None, None).model, "new-default");
+        Ok(())
+    }
+
+    #[test]
+    fn the_session_key_follows_what_the_native_session_holds() -> Result<()> {
+        use crate::providers::Provider;
+        let settings = |provider, model: &str| crate::config::ManagerSettings {
+            provider,
+            workspace: "/w".into(),
+            model: model.into(),
+            reasoning_effort: None,
+            backup: Default::default(),
+        };
+        let codex_a = selection_identity(&settings(Provider::Codex, "a"), "guide", None)?;
+        let codex_b = selection_identity(&settings(Provider::Codex, "b"), "guide", None)?;
+        assert_ne!(codex_a.stable_fingerprint, codex_b.stable_fingerprint);
+        assert_ne!(codex_a.runtime_fingerprint, codex_b.runtime_fingerprint);
+        assert_ne!(
+            codex_a.stable_fingerprint,
+            selection_identity(&settings(Provider::Codex, "a"), "new guide", None)?
+                .stable_fingerprint
+        );
+        let cursor = settings(Provider::Cursor, "a");
+        let private_a = selection_identity(&cursor, "guide", Some("/node/cursor/a"))?;
+        let private_b = selection_identity(&cursor, "guide", Some("/node/cursor/b"))?;
+        assert_ne!(private_a.runtime_fingerprint, private_b.runtime_fingerprint);
+        assert_eq!(
+            private_a.runtime_fingerprint,
+            selection_identity(&cursor, "guide", Some("/node/cursor/a"))?.runtime_fingerprint
+        );
+        assert_ne!(
+            private_a.runtime_fingerprint,
+            selection_identity(&cursor, "guide", None)?.runtime_fingerprint
+        );
+        let mut effort = cursor.clone();
+        effort.reasoning_effort = Some("high".into());
+        assert_ne!(
+            private_a.runtime_fingerprint,
+            selection_identity(&effort, "guide", Some("/node/cursor/a"))?.runtime_fingerprint
+        );
+        Ok(())
     }
 }
