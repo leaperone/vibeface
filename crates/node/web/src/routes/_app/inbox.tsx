@@ -79,7 +79,7 @@ function FailedCard({ item }: { item: Extract<InboxItem, { kind: 'failed' }> }) 
   const device = nodeName(work.target_node, { nodes: workspace.nodes, directory })
   const reason = workFailure(work)
   return <ActionCard icon={CircleX} tone="danger" meta={device}
-    title={<Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work.work_id }} search={{ from: 'inbox' }} className="rounded-sm underline-offset-4 hover:underline">{item.title}</Link>}
+    title={<Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work.work_id }} search={{ from: 'inbox' }} className="-my-2 flex min-h-11 items-center rounded-sm underline-offset-4 hover:underline">{item.title}</Link>}
     trailing={<ActionButton variant="ghost" label="关掉" disabled={!workspace.writable} action={() => workspace.dismissWork(work.conversation_id, work.work_id)}><X aria-hidden="true" /></ActionButton>}
     actions={fixOnDevice(work) ? <Button asChild variant="outline"><Link to="/devices/$deviceId" params={{ deviceId: work.target_node }}><Settings aria-hidden="true" />{fixOnDeviceLabel(device)}</Link></Button> : undefined}>
     {reason ? <p className="line-clamp-3 text-muted-foreground">{reason}</p> : null}

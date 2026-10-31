@@ -98,7 +98,7 @@ test("works, reply status and pending checks keep their exact shape", () => {
   const delivered = parseConversation({ ...context, works: [work], deliveries: [
     { work_id: "new", target_node: "other", state: "dispatch_rejected", kind: "codex", title: "新任务", cwd: "/p", reason: "project unavailable" },
     { work_id: "work", target_node: "worker", state: "stop_timed_out" },
-    { work_id: "lost", target_node: "gone", state: "dispatch_unverified", kind: "task", title: "旧任务", cwd: "/p", reason: "设备已移除，无法核对" },
+    { work_id: "lost", target_node: "gone", state: "dispatch_unverified", kind: "task", title: "旧任务", cwd: "/p", reason: "设备已移除，结果无法确认。" },
   ] })
   assert.equal(delivered.works[0].stop, "stop_timed_out")
   assert.equal(delivered.works[2].state, "dispatch_unverified")

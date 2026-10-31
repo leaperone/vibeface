@@ -74,7 +74,7 @@ export default function Inbox() {
       </Link> : null}
       {questions.map((question) => <Animated.View key={question.question_id} layout={move}><QuestionCard question={question} /></Animated.View>)}
     </Group>) : items.length ? null : <View style={{ minHeight: below, paddingTop: 24, justifyContent: 'center' }}>
-      <EmptyState icon={InboxIcon} title="没有待处理" action={<Link href="/" dismissTo asChild><Button variant="outline"><Icon as={MessageCircle} /><Text>回到消息</Text></Button></Link>} />
+      <EmptyState icon={InboxIcon} title="没有待处理" action={<Link href="/" dismissTo asChild><Button variant="outline" className="self-center"><Icon as={MessageCircle} /><Text>回到消息</Text></Button></Link>} />
     </View>}
   </KeyboardAwareScrollView></LayoutAnimationConfig>
 }
