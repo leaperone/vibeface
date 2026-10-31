@@ -562,8 +562,6 @@ impl Store {
         )
     }
 
-    /// Filtering and basis checks precede LIMIT, so only matching envelopes are materialized
-    /// and the extra row proves whether another page exists.
     pub(crate) fn search_history_page(
         &self,
         network_id: &str,
@@ -620,7 +618,6 @@ impl Store {
             values.push(Sql::from(author.to_owned()));
         }
         if let Some(keyword) = filter.keyword {
-            // Match the same visible strings as agent_event_body, excluding attestations.
             let body = "json_extract(json_extract(events.envelope,'$.canonical_body'),'$.body')";
             sql.push_str(&format!(
                 " AND EXISTS (SELECT 1 FROM json_tree(CASE events.kind

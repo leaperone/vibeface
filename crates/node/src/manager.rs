@@ -179,7 +179,6 @@ pub struct ManagerConfig {
 }
 
 impl ManagerConfig {
-    /// Only the digest leaves this device; configured environment values stay private.
     pub(crate) fn runtime_fingerprint(&self, local: &crate::providers::Local) -> Result<String> {
         let launch = match &self.sdk {
             Sdk::Cursor {

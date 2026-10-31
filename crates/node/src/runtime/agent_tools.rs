@@ -126,6 +126,14 @@ impl Runtime {
                 {
                     return Ok(json!(change));
                 }
+                if let Some(staged) = store.staged_memory_call(
+                    &scope,
+                    &manager.trigger,
+                    &manager.attempt_id,
+                    call_ref,
+                )? {
+                    return Ok(staged);
+                }
                 if let Some(message) = store
                     .bot_message(network, &bot_message_id(&scope, &manager.trigger, call_ref))?
                 {

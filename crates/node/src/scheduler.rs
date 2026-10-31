@@ -515,7 +515,7 @@ async fn turn(
         config.custom_tools = provider.tools_for(job.kind);
         config.tool_token = Some(token.clone());
         config.process_started = Some(process_recorder(&node, &attempt.id));
-        config.codex_turn = Some(turn_recorder(&node, &attempt.id, &server, shown.clone(), fresh_prompt));
+        config.codex_turn = Some(turn_recorder(&node, &network, &job, &server, shown.clone(), fresh_prompt));
         config.tool_env.extend([
             ("VIBEFACE_NODE_URL".into(), local_url),
             ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
@@ -729,17 +729,42 @@ fn process_recorder(node: &Arc<Runtime>, attempt: &str) -> vibeface_bridge::agen
 
 fn turn_recorder(
     node: &Arc<Runtime>,
-    attempt: &str,
+    network: &str,
+    job: &SchedulerJob,
     server: &str,
     shown: Arc<Mutex<Shown>>,
     fresh_prompt: Option<String>,
 ) -> manager::CodexTurn {
     let node = node.clone();
-    let attempt = attempt.to_owned();
+    let attempt = job
+        .state
+        .attempt()
+        .expect("claimed scheduler job")
+        .id
+        .clone();
+    let started_node = node.clone();
+    let started_attempt = attempt.clone();
+    let started_network = network.to_owned();
+    let started_conversation = job.conversation_id.clone();
+    let started_trigger = job.trigger.clone();
     let server = server.to_owned();
     manager::CodexTurn {
         client_id: attempt.clone(),
         fresh_prompt,
+        started: Some(Arc::new(move |_| {
+            let (node, attempt, network, conversation, trigger) = (
+                started_node.clone(),
+                started_attempt.clone(),
+                started_network.clone(),
+                started_conversation.clone(),
+                started_trigger.clone(),
+            );
+            Box::pin(async move {
+                node.store.lock().await.record_context_started(&attempt)?;
+                node.publish_changed(&network, &conversation, Changed::Job(&trigger));
+                Ok(())
+            })
+        })),
         record: Arc::new(move |thread, turn| {
             let node = node.clone();
             let attempt = attempt.clone();
@@ -846,7 +871,6 @@ fn skill_index(store: &Store, network: &str, bot: Option<&Bot>) -> Result<Vec<Sk
         .collect())
 }
 
-/// The bot's current profile and bounded indexes; the stable compiler reads its full skill index.
 pub(crate) fn bot_value(
     store: &Store,
     network: &str,
@@ -1309,10 +1333,7 @@ fn checkpoint_value(body: &EventBody, budget: usize) -> Value {
     clippy::too_many_arguments,
     reason = "a schedule turn adds its own trigger input"
 )]
-#[allow(
-    dead_code,
-    reason = "the default-budget wrapper is used by Store tests and callers outside the live turn"
-)]
+#[cfg(test)]
 pub(crate) fn materialize(
     history: &TurnHistory,
     job: &SchedulerJob,
@@ -1340,6 +1361,7 @@ pub(crate) fn materialize(
     clippy::too_many_arguments,
     reason = "the prompt budget is provider-specific"
 )]
+#[cfg(test)]
 pub(crate) fn materialize_with_limit(
     history: &TurnHistory,
     job: &SchedulerJob,

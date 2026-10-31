@@ -3822,10 +3822,19 @@ pub(super) mod tests {
         admin: &LocalIdentity,
         id: &str,
     ) -> Result<(String, String)> {
+        start_reply_in(node, admin, "c", id).await
+    }
+
+    async fn start_reply_in(
+        node: &Runtime,
+        admin: &LocalIdentity,
+        scope: &str,
+        id: &str,
+    ) -> Result<(String, String)> {
         let network = node.network_id().await?;
         let posted = admin.attest(
             &network,
-            "c",
+            scope,
             EventBody::MessagePosted {
                 message_id: id.into(),
                 role: crate::model::Role::User,
@@ -3844,7 +3853,7 @@ pub(super) mod tests {
         store.accept_message(
             &node.identity,
             &network,
-            "c",
+            scope,
             id,
             id,
             vec![],
@@ -3853,11 +3862,11 @@ pub(super) mod tests {
             now_ms(),
         )?;
         let claimed = store
-            .claim_next(&node.identity, &network, "c", "boot", "cfg")?
+            .claim_next(&node.identity, &network, scope, "boot", "cfg")?
             .context("job")?;
         let trigger = claimed.job.trigger.clone();
         let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
-        store.mark_started("c", &trigger, &attempt)?;
+        store.mark_started(scope, &trigger, &attempt)?;
         Ok((trigger, attempt))
     }
 
@@ -3867,14 +3876,15 @@ pub(super) mod tests {
         let result = async {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
+            bot(&node, &admin, "c2", "后端", &[]).await?;
             let _requests = answering_app_server(&node)?;
             while node.codex.status().await["connection"]["state"] != "connected" {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             let network = node.network_id().await?;
             assert_eq!(node.codex.server(), "system");
-            for (id, server) in [("m1", "own:"), ("m2", "system")] {
-                let (trigger, attempt) = start_reply(&node, &admin, id).await?;
+            for (id, server, scope) in [("m1", "own:", "c"), ("m2", "system", "c2")] {
+                let (trigger, attempt) = start_reply_in(&node, &admin, scope, id).await?;
                 let mut store = node.store.lock().await;
                 store.record_manager_turn(
                     &attempt,
@@ -3893,7 +3903,7 @@ pub(super) mod tests {
                 store.finish_job(
                     &node.identity,
                     &network,
-                    "c",
+                    scope,
                     &trigger,
                     &attempt,
                     interrupted,

@@ -30,7 +30,6 @@ test('creates a persistent Bot without a model and shows triage budget state', a
   await expect(bot).toBeVisible();
   await app.screenshot('onboarding-complete');
 
-  // Public projection fixtures check rendering; Provider lifecycle is covered by process tests.
   const contextDb = new DatabaseSync(join(node.directory, 'node.sqlite3'));
   const viewport = await browser.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
   try {
@@ -63,27 +62,27 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     await expect(dialog.getByText('当前续接状态未知。')).toBeVisible();
     await expect(dialog.getByText('可尝试续接', { exact: true })).toHaveCount(0);
     await expect(dialog.getByText('下轮重建', { exact: true })).toHaveCount(0);
-    await dialog.getByRole('button', '本轮上下文详情').click();
+    await dialog.getByText('本轮上下文详情', { exact: true }).click();
     await expect(dialog.getByText('会话代次 4 · 已编译 · Codex')).toBeVisible();
     await expect(dialog.getByText('历史检查点 · 1')).toBeVisible();
     await expect(dialog.getByText('交接摘要 · 2')).toBeVisible();
-    await expect(dialog.getByText('待核对事项 · 3')).toBeVisible();
+    await expect(dialog.getByText('结果待确认 · 3')).toBeVisible();
     await expect(dialog.getByText('记忆 · 3')).toBeVisible();
     await expect(dialog.getByText('Skill · 4')).toBeVisible();
     await app.screenshot('context-fixture-compiled-coverage-narrow');
-    await dialog.getByRole('button', '查看已保存记忆 · 1').click();
+    await dialog.getByText('查看已保存记忆 · 1', { exact: true }).click();
     await expect(dialog.getByText('浏览器公开夹具记忆，回复使用中文。')).toBeVisible();
     await expect(dialog.getByText('你记录 · 由你维护，受保护 · 优先带入上下文')).toBeVisible();
-    await dialog.getByRole('button', '记忆版本').click();
+    await dialog.getByText('记忆版本', { exact: true }).click();
     await expect(dialog.getByText(`数据版本 10 · ${'c'.repeat(64)}`)).toBeVisible();
-    await dialog.getByRole('button', '查看记忆冲突 · 1').click();
+    await dialog.getByText('查看记忆冲突 · 1', { exact: true }).click();
     await expect(dialog.getByText('记忆已被更新，未覆盖新值')).toBeVisible();
     await app.screenshot('context-fixture-memory-narrow');
     shown.context.stage = 'unknown';
     assert.equal(saveContext.run(identity.conversation_id, JSON.stringify(shown)).changes, 1);
     dialog = await showContext();
     await expect(dialog.getByText('结果未知', { exact: true })).toBeVisible();
-    await expect(dialog.getByText('需核对执行结果，不能据此重发操作。')).toBeVisible();
+    await expect(dialog.getByText('先查明执行结果，请勿直接重试。')).toBeVisible();
     await expect(dialog.getByText('已发送', { exact: true })).toHaveCount(0);
   } finally {
     contextDb.close();
@@ -149,10 +148,10 @@ test('creates a persistent Bot without a model and shows triage budget state', a
 
     seed('q-decision-four', [...three, '先发送摘要，正文保留可编辑版本']);
     await browser.goto(`${node.url}/tasks`);
-    await expect(screen.getByRole('link', '待处理 1 项', { exact: true })).toBeVisible();
+    await expect(screen.getByRole('main').getByRole('link', '待处理 2', { exact: true })).toBeVisible();
     await expect(screen.getByRole('radiogroup', '任务状态').getByRole('radio')).toHaveCount(4);
-    await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toHaveCount(0);
-    await expect(screen.getByRole('button', '发送回答', { exact: true })).toHaveCount(0);
+    await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toBeVisible();
+    await expect(screen.getByRole('button', '发送回答', { exact: true })).toBeVisible();
     await expect(screen.getByLabel('你的回答')).toHaveCount(0);
     await browser.goto(`${node.url}/inbox`);
     await browser.setViewport({ width: 375, height: 812 });

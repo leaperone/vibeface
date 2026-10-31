@@ -829,6 +829,20 @@ fn stage_memory_from(
 }
 
 impl Store {
+    pub(crate) fn staged_memory_call(
+        &self,
+        conversation: &str,
+        trigger: &str,
+        attempt_id: &str,
+        call_ref: &str,
+    ) -> Result<Option<Value>> {
+        Ok(self
+            .staged_memory_overlay(conversation, trigger, attempt_id)?
+            .iter()
+            .find(|mutation| mutation.call_ref == call_ref)
+            .map(staged_memory_result))
+    }
+
     pub(crate) fn staged_memory_overlay(
         &self,
         conversation: &str,
@@ -1927,6 +1941,31 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn record_context_started(&mut self, attempt_id: &str) -> Result<()> {
+        let Some(job) = query_jobs(&self.connection, "attempt_id=?", [attempt_id])?.pop() else {
+            return Ok(());
+        };
+        if job.state.terminal() {
+            return Ok(());
+        }
+        self.update_attempt(
+            &job.conversation_id,
+            &job.trigger,
+            attempt_id,
+            |job, session| {
+                if session.active.as_deref() == Some(job.trigger.as_str())
+                    && let Some(context) = session.shown.context.as_mut()
+                    && context.attempt_id == attempt_id
+                    && context.stage == ContextStage::Compiled
+                {
+                    context.stage = ContextStage::Started;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
     pub fn scheduler_jobs(&self, conversation: &str) -> Result<Vec<SchedulerJob>> {
         query_jobs(&self.connection, "conversation_id=?", [conversation])
     }
@@ -2016,7 +2055,6 @@ impl Store {
         Ok(())
     }
 
-    /// Fixture convenience; production claims always carry the captured provider configuration.
     #[cfg(test)]
     pub fn claim_next(
         &mut self,

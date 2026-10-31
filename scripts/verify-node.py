@@ -1420,7 +1420,7 @@ def fixture_manager(run, initial, bot):
         tool("update_profile", {"call_ref": "rename", "name": rename.group(2).strip()})
     for action in directive.get("tools", []):
         tool(action["name"], action["arguments"], expected=action.get("accepted", True),
-             rejection=action.get("rejection", "unknown"))
+             rejection=action.get("rejection", "unknown"), discard=action.get("discard", False))
     sequence = 0
     gate = directive.get("gate")
     # Screens show these replies, so only an explicit test label is echoed back.
@@ -2962,13 +2962,19 @@ def phase1_acceptance(options):
                      project={"target_node": a.device_id, "cwd": str(workspace)})
         notes = [f"note-{index} " + "记" * 480 for index in range(6)]
         for index, text in enumerate(notes):
-            actions = [{"name": "remember", "arguments": {"call_ref": "note", "text": text}}]
+            actions = [{"name": "remember", "arguments": {"call_ref": "note", "text": text}, "discard": True},
+                       {"name": "call_lookup", "arguments": {"call_ref": "note"}}]
             if index == 5:
                 previous = scheduler_sessions(a, name)["main"]
                 actions.append({"name": "update_profile", "arguments": {
                     "call_ref": "profile", "instructions": "memory-generation-sentinel"}})
             seeded, _ = send(name, f"memory-seed-{index}", tools=actions)
             wait_for("the real turn commits its staged note", lambda: completed(seeded))
+        lookups = [row for row in fixture_records(run, "manager-tools.jsonl")
+                   if row["conversation_id"] == name and row["name"] == "call_lookup"]
+        require(len(lookups) == 6 and all(row["result"]["state"] == "staged"
+                and row["result"]["after"] in notes for row in lookups),
+                "lost remember responses are read back as staged through the real call_lookup tool")
         current = scheduler_sessions(a, name)["main"]
         require(current["native_id"] == previous["native_id"]
                 and current["native_token"] == previous["native_token"]

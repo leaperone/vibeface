@@ -1,4 +1,3 @@
-//! Local scheduling: the owner Node drains its durable admissions one isolated session at a time.
 //! A message for another owner waits in the outbox until `peers` delivers it.
 use super::*;
 use crate::scheduling::{

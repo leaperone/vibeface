@@ -3527,6 +3527,20 @@ fn staged_memory_commits_only_with_a_completed_turn() -> Result<()> {
         4,
     )?;
     assert_eq!(staged["state"], "staged");
+    assert_eq!(
+        store.staged_memory_call("c", &trigger, &attempt, "remember-1")?,
+        Some(staged)
+    );
+    assert!(
+        store
+            .staged_memory_call("c", &trigger, &attempt, "other")?
+            .is_none()
+    );
+    assert!(
+        store
+            .staged_memory_call("c", &trigger, "other-attempt", "remember-1")
+            .is_err()
+    );
     assert!(store.memories(&net.network, "c")?.is_empty());
     store.record_manager_turn(
         &attempt,
@@ -3546,6 +3560,19 @@ fn staged_memory_commits_only_with_a_completed_turn() -> Result<()> {
         5,
     )?;
     assert_eq!(store.memories(&net.network, "c")?.len(), 1);
+    assert!(
+        store
+            .staged_memory_call("c", &trigger, &attempt, "remember-1")?
+            .is_none()
+    );
+    assert!(
+        store
+            .bot_change(
+                &net.network,
+                &crate::store::bot_settings::change_id("c", &trigger, "remember-1")
+            )?
+            .is_some()
+    );
     let record = store
         .memory_records(&net.network, "c")?
         .into_iter()
@@ -3587,6 +3614,11 @@ fn staged_memory_commits_only_with_a_completed_turn() -> Result<()> {
         7,
     )?;
     assert_eq!(store.memories(&net.network, "c")?.len(), 1);
+    assert!(
+        store
+            .staged_memory_call("c", &trigger, &attempt, "remember-2")?
+            .is_none()
+    );
     Ok(())
 }
 
@@ -6677,6 +6709,28 @@ fn compiled_context_tracks_observed_turn_state_without_private_values() -> Resul
             "private-bearer",
             false,
         )?;
+        let before = memory_test_shown(&store)?;
+        let covers: String = store.connection.query_row(
+            "SELECT covers FROM scheduler_sessions WHERE conversation_id='c' AND scope='main'",
+            [],
+            |row| row.get(0),
+        )?;
+        store.record_context_started(&attempt)?;
+        let observed = memory_test_shown(&store)?;
+        assert_eq!(
+            observed.context.as_ref().context("started callback")?.stage,
+            ContextStage::Started
+        );
+        assert_eq!(observed.memory, before.memory);
+        assert_eq!(observed.works, before.works);
+        assert_eq!(
+            covers,
+            store.connection.query_row::<String, _, _>(
+                "SELECT covers FROM scheduler_sessions WHERE conversation_id='c' AND scope='main'",
+                [],
+                |row| row.get(0),
+            )?
+        );
         store.record_manager_turn(
             &attempt,
             "system",
@@ -6701,7 +6755,7 @@ fn compiled_context_tracks_observed_turn_state_without_private_values() -> Resul
             "reply",
             5,
         )?;
-        // A late Provider callback cannot change a terminal observation back to started.
+        store.record_context_started(&attempt)?;
         store.record_manager_turn(
             &attempt,
             "system",

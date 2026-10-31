@@ -456,7 +456,7 @@ impl Tool {
                 &["call_ref", "memory_id"],
             ),
             Tool::Recall => (
-                "List this bot's notes, or those containing query. bot.memory already holds them unless some were omitted.",
+                "Read this bot's committed notes and the current turn's staged changes, optionally filtered by query. memory_context carries a bounded snapshot or delta; omitted notes remain available here.",
                 json!({"query":string()}),
                 &[],
             ),

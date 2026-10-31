@@ -5,7 +5,7 @@
 //! and gives each boundary a stable digest.
 use crate::{
     crypto::digest,
-    model::{MemoryOrigin, VersionVector, looks_secret},
+    model::{VersionVector, looks_secret},
     providers::{Provider, ProviderDescriptor},
     scheduling::TriggerKind,
 };
@@ -273,18 +273,6 @@ pub struct ContextCoverage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct MemoryRevision {
-    pub memory_id: String,
-    pub epoch: u32,
-    pub revision: String,
-    pub origin: MemoryOrigin,
-    pub user_controlled: bool,
-    pub essential: bool,
-    pub source_event_hash: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct CompiledTurn {
     pub stable: StableInstructions,
     pub dynamic: DynamicContext,
@@ -295,7 +283,6 @@ pub struct CompiledTurn {
 
 impl DynamicContext {
     pub fn render(&mut self) -> Result<()> {
-        // Keep the established works view while retaining separate budgeted compiler sections.
         let works: Vec<_> = self
             .works
             .entries

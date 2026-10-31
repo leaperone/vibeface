@@ -32,12 +32,10 @@ pub(crate) enum SteerTrace {
 
 /// One provider's turns on this device.
 pub(crate) trait Executor: Send + Sync {
-    /// Reads a catalog only where this Node implements the provider's catalog protocol.
     fn model_catalog(&self) -> BoxFuture<'_, Option<Vec<super::codex_server::ModelChoice>>> {
         Box::pin(async { None })
     }
 
-    /// Native compaction is not exposed by these adapters; the scheduler owns bounded handoff.
     fn compact_or_handoff(&self, provider: Provider) -> Result<crate::providers::CompactionMode> {
         provider.descriptor().compact_or_handoff()
     }

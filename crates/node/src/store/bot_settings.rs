@@ -528,7 +528,6 @@ pub(crate) struct MemoryRecord {
     pub source_event_hash: Option<String>,
 }
 
-/// One bot's notes with local revision metadata, oldest first.
 pub(crate) fn memory_records_from(
     connection: &Connection,
     network: &str,

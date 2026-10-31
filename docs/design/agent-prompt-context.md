@@ -18,13 +18,13 @@ Handoff is a bounded recovery record. It carries the source Provider and stable 
 
 ## Session generation
 
-A local SchedulerSession stores its generation and a bounded lineage in the serialized shown state. Each main chat, task and routine owns a separate durable session and Memory writer. Stable and runtime fingerprints are stored separately. The runtime digest uses the same captured binary, workspace, environment and backend lease as execution. When the stable configuration, runtime configuration or owner epoch changes, claim_next_in_session clears the native ID, native token, covers and shown data, increments the generation and records the source Provider, old stable and runtime fingerprints, source covers and handoff revision. The active turn keeps its old generation. The next turn starts with the new one. A captured backend lease pins the selected configuration before claiming; a concurrent settings save cannot move that turn to a different backend.
+A local SchedulerSession stores its generation and a bounded lineage in the serialized shown state. Each main chat, task and routine owns a separate durable scheduler record and Memory writer. A routine discards its Provider session after completion. Stable and runtime fingerprints are stored separately. The runtime digest uses the same captured binary, workspace, environment and backend lease as execution. When the stable configuration, runtime configuration or owner epoch changes, claim_next_in_session clears the native ID, native token, covers and shown data, increments the generation and records the source Provider, old stable and runtime fingerprints, source covers and handoff revision. The active turn keeps its old generation. The next turn starts with the new one. A captured backend lease pins the selected configuration before claiming; a concurrent settings save cannot move that turn to a different backend.
 
 Provider session IDs, transcripts, tokens, environment values and credentials never enter shared events. Only bounded, redacted handoff information can cross a Node boundary.
 
 ## Memory
 
-Memory rows carry epoch, revision, origin, user_controlled, essential and source event hash. Revision is the event rank projected by the reducer. Old event payloads default to the current epoch and Agent origin when replayed.
+Memory rows carry epoch, revision, origin, user_controlled, essential and source event hash. Revision is the event rank projected by the reducer. The reducer projects the greater of an event Memory epoch and the current data epoch, preserving a higher event epoch as the conflict baseline. This does not permit opening an older database directory.
 
 remember and forget write an attempt-scoped staged overlay. Each mutation records the base epoch and base revision. A completed turn commits the mutation with the reply and job terminal state in one Store transaction. Failed, interrupted and unknown turns discard it. A changed revision, epoch or user-controlled value leaves the newer record intact and records a local conflict.
 

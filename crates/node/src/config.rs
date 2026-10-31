@@ -12,7 +12,7 @@ pub const DATA_EPOCH: u32 = 10;
 /// SHA-256 over the migration files (`migrations/*.sql`, by name) that `DATA_EPOCH` stores.
 /// Any schema change fails a test until both constants change together.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
-    "e3cf0f0c67ff231fee413a5f9ca576abae1eb6837d82ea21d02c16f9850c3e32";
+    "8221837230cd137491e7b0f63d0c2a2fd2d981637b969d8130fa603565b55aec";
 /// Bumped whenever a release package stops being installable by the previous updater.
 pub const UPDATE_PROTOCOL: u32 = 1;
 pub fn data_epoch_marker() -> Vec<u8> {
