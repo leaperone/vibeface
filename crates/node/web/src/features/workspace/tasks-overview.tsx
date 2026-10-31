@@ -59,6 +59,10 @@ export function TasksOverview() {
     return matchesBot(check.kind === "work" ? check.conversation_id : workspace.selectedBot?.conversation_id ?? "") ? [item] : []
   })
   const visible = (group: TaskGroup) => filter === "all" || filter === group
+  const pendingWorkIds = new Set(visibleAttention.flatMap((item) => item.kind === "confirm"
+    ? item.check.kind === "work" ? [item.check.work_id] : item.check.kind === "device" ? item.check.works.map((work) => work.work_id) : []
+    : []))
+  const attentionCount = visibleAttention.length + groups.attention.filter((work) => !pendingWorkIds.has(work.work_id)).length
   const pendingCount = visible("attention") ? visibleAttention.length : 0
   const visibleCount = (visible("attention") ? groups.attention.length : 0) + (visible("working") ? groups.working.length : 0) + (visible("waiting") ? groups.waiting.length : 0)
   const hasContent = visibleCount > 0 || pendingCount > 0
@@ -69,7 +73,7 @@ export function TasksOverview() {
   if (workspace.incomplete && !workspace.nodes.length) return <div className="mx-auto grid w-full max-w-(--page-width) gap-3" aria-busy="true"><Skeleton className="h-20" /><Skeleton className="h-20" /><Skeleton className="h-20" /></div>
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     <p className="sr-only" role="status" aria-live="polite">{hasContent ? `${visibleCount} 项任务` : emptyLabel}</p>
-    <WorkspaceMasthead attention={visibleAttention.length + groups.attention.length} working={groups.working.length} waiting={groups.waiting.length} online={workspace.connectionOnline} />
+    <WorkspaceMasthead attention={attentionCount} working={groups.working.length} waiting={groups.waiting.length} online={workspace.connectionOnline} />
     <TaskFilters filter={filter} botFilter={botFilter} bots={workspace.bots} onFilter={setFilter} onBotFilter={setBotFilter} />
     {pendingCount ? <Link to="/inbox" className="flex min-h-12 items-center gap-2 rounded-lg border px-3 py-2 font-medium hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0" /><span>待处理 {pendingCount} 项</span><ChevronRight aria-hidden="true" className="ms-auto size-4 shrink-0 text-muted-foreground" /></Link> : null}
     {taskGroups.map(({ group, title }) => {

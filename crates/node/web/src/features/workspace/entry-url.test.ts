@@ -61,6 +61,13 @@ test("works, reply status and pending checks keep their exact shape", () => {
   const sent = { message_id: "one", event_hash: "sent", role: "user", text: "看附件", created_at_ms: 0, attachments: [{ hash: "file", size: 20, name: "报告.pdf" }] }
   const parsed = parseConversation({ ...context, works: [work], scheduler, messages: [message, sent] })
   assert.equal(parsed.works[0].state, "running")
+  const offline = parseNodes({ nodes: [{ device_id: "worker", name: "工作电脑", local: false, online: false, revoked: false }] })
+  assert.equal(cardState(parsed.works[0], offline, "running"), "awaiting_confirmation", "the last overview state cannot make an offline task look active")
+  assert.equal(taskGroup(cardState(parsed.works[0], offline, "running"), false), "attention")
+  assert.equal(cardState(parsed.works[0], [{ ...offline[0], online: true }], "running"), "running")
+  assert.equal(cardState({ ...parsed.works[0], state: "unverified", outcome: "unverified" }, [], "unverified"), "awaiting_confirmation")
+  assert.equal(cardState({ ...parsed.works[0], outcome: "failed" }, offline, "finished"), "failed")
+  assert.equal(cardState({ ...parsed.works[0], state: "dispatch_waiting" }, offline, "dispatch_waiting"), "dispatch_waiting")
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "waiting_approval" }] }), "approval states are gone")
   assert.equal(parseConversation({ ...context, works: [{ ...work, title: undefined }] }).works[0].title, "", "a dispatch row without a title still parses")
   assert.equal(parsed.messages[0].status, "stopped")
@@ -786,13 +793,15 @@ test("mobile questions select before sending, preserve literal text and retry on
 })
 
 test("task overview links to pending decisions and keeps every real task visible", () => {
-  const works = [{ work_id: 'held', thread_id: 'session', state: 'unverified', outcome: 'unverified' }, { work_id: 'running', state: 'running', outcome: null }]
-  const overview = { tasks: works.map((work) => ({ kind: 'work', ...work })) }
-  const workspace = { nodes: [], openWorks: works, bots: [], questions: [], overview, selectedBot: null }
+  const work = { trigger: 'message:one', target_node: 'offline', cwd: '/project', title: '检查项目', prompt: '', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null }
+  const works = parseConversation({ ...context, works: [{ ...work, work_id: 'held', thread_id: 'session' }, { ...work, work_id: 'running', target_node: 'online' }] }).works.map((item) => ({ ...item, conversation_id: 'chat' }))
+  const nodes = parseNodes({ nodes: [{ device_id: 'offline', name: '离线电脑', online: false, local: false, revoked: false }, { device_id: 'online', name: '在线电脑', online: true, local: false, revoked: false }] })
+  const overview = workspaceModel.overviewFromWorkspace({ openWorks: works, bots: [], questions: [], nodes })
+  const workspace = { nodes, openWorks: works, bots: [], questions: [], overview, selectedBot: null }
   const app = componentHarness('./tasks-overview.tsx', {
     '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace },
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
-    '@vibeface/client/workspace/model.ts': { overviewFromWorkspace: () => overview, openWorksFromOverview: () => works },
+    '@vibeface/client/workspace/model.ts': workspaceModel,
     '@vibeface/client/workspace/labels.ts': { cardState, taskGroup, taskGroups, taskProgress: () => '' },
     './inbox': { useInbox: () => [{ kind: 'question', done: false, question: { about: { request_id: 'request', session_id: 'session' } } }, { kind: 'confirm', check: { kind: 'work', work_id: 'held' } }] },
     './workspace-shell': { useCreateBot: () => () => {} },
@@ -801,7 +810,8 @@ test("task overview links to pending decisions and keeps every real task visible
   try {
     const elements = app.render('TasksOverview')
     assert.equal(elements.filter(({ type, props }) => type === 'Link' && props.to === '/inbox').length, 1)
-    assert.deepEqual(elements.filter(({ props }) => props.work).map(({ props }) => (props.work as { work_id: string }).work_id), ['running', 'held'], 'a task waiting for confirmation remains visible')
+    assert.deepEqual(elements.filter(({ props }) => props.work).map(({ props }) => (props.work as { work_id: string }).work_id), ['held', 'running'], 'a task waiting for confirmation remains visible before active tasks')
+    assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === 'WorkspaceMasthead')?.props.attention, 2, 'the same task and its confirmation are counted once')
     assert.equal(elements.some(({ props }) => props.question || props.check), false, 'the overview renders no duplicate decision or confirmation card')
     assert.equal(elements.some(({ props }) => typeof props.children === 'string' && props.children === '2 项任务'), true)
   } finally { app.close() }
