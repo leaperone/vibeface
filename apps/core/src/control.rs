@@ -598,6 +598,13 @@ mod tests {
         std::env::temp_dir().join(format!("vibeface-{label}-{}", uuid::Uuid::new_v4()))
     }
 
+    fn free_addr() -> SocketAddr {
+        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
     #[test]
     fn initialization_preserves_nonempty_data_directories() {
         let dir = temp_dir("existing");
@@ -641,10 +648,17 @@ mod tests {
             Some(PathBuf::from("/tmp/vibeface-fixture-codex.sock")),
         ] {
             let dir = temp_dir("mode");
+            let listen = free_addr();
+            let local_listen = loop {
+                let candidate = free_addr();
+                if candidate != listen {
+                    break candidate;
+                }
+            };
             let options = InitOptions {
                 data_dir: dir.clone(),
-                listen: "127.0.0.1:0".parse().unwrap(),
-                local_listen: "127.0.0.1:0".parse().unwrap(),
+                listen,
+                local_listen,
                 public_url: None,
                 no_web: true,
                 allowed_origins: vec![],
