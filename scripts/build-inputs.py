@@ -19,6 +19,17 @@ INPUTS = {
     "web": ("apps/app/", "packages/client/", "packages/theme/", "package.json",
             "pnpm-lock.yaml", "pnpm-workspace.yaml", "scripts/build-web.sh"),
 }
+CACHE_POLICIES = (
+    ("/", "no-store"),
+    ("/_shell.html", "no-store"),
+    ("/index.html", "no-store"),
+    ("/vibeface_secure.js", "no-store"),
+    ("/vibeface_secure_bg.wasm", "no-store"),
+    ("/sw.js", "no-cache"),
+    ("/manifest.webmanifest", "no-cache"),
+    ("/icon.svg", "no-cache"),
+    ("/assets/*", "public, max-age=31536000, immutable"),
+)
 
 
 def digest(data):
@@ -44,7 +55,17 @@ def content_security_policy(shell):
 
 
 def static_headers(policy):
-    return "/*\n  Content-Security-Policy: " + policy + "\n  X-Content-Type-Options: nosniff\n  X-Frame-Options: DENY\n  Referrer-Policy: no-referrer\n"
+    # Netlify concatenates repeated Cache-Control fields, so the security wildcard has no cache rule.
+    lines = [
+        "/*",
+        "  Content-Security-Policy: " + policy,
+        "  X-Content-Type-Options: nosniff",
+        "  X-Frame-Options: DENY",
+        "  Referrer-Policy: no-referrer",
+    ]
+    for path, cache in CACHE_POLICIES:
+        lines.extend((path, "  Cache-Control: " + cache))
+    return "\n".join(lines) + "\n"
 
 
 def files(directory):
@@ -177,6 +198,12 @@ def self_test():
             )
             finish(repo, component)
             check(repo, component)
+        headers = (repo / OUTPUTS["web"] / "_headers").read_text()
+        if headers.count("Cache-Control:") != len(CACHE_POLICIES):
+            raise AssertionError("static headers have duplicate or missing cache rules")
+        for path, cache in CACHE_POLICIES:
+            if f"{path}\n  Cache-Control: {cache}\n" not in headers:
+                raise AssertionError(f"static headers are missing the cache rule for {path}")
         public = repo / "apps/app/public"
         public.mkdir(parents=True)
         (public / ".env").write_text("PRIVATE_DATA=must-not-ship")

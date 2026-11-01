@@ -862,15 +862,10 @@ async fn frontend(State(app): State<App>, method: Method, uri: axum::http::Uri) 
         return StatusCode::NOT_FOUND.into_response();
     };
     if path == "/" {
-        return static_response(assets.shell_file(), "no-cache");
+        return static_response(assets.shell_file(), "no-store");
     }
     if let Some(file) = assets.read(path) {
-        let cache = if path.starts_with("/assets/") {
-            "public, max-age=31536000, immutable"
-        } else {
-            "no-cache"
-        };
-        return static_response(file, cache);
+        return static_response(file, static_cache_control(path));
     }
     if path == "/assets"
         || path.starts_with("/assets/")
@@ -880,7 +875,20 @@ async fn frontend(State(app): State<App>, method: Method, uri: axum::http::Uri) 
     {
         return StatusCode::NOT_FOUND.into_response();
     }
-    static_response(assets.shell_file(), "no-cache")
+    static_response(assets.shell_file(), "no-store")
+}
+
+fn static_cache_control(path: &str) -> &'static str {
+    if path.starts_with("/assets/") {
+        "public, max-age=31536000, immutable"
+    } else if matches!(
+        path,
+        "/_shell.html" | "/index.html" | "/vibeface_secure.js" | "/vibeface_secure_bg.wasm"
+    ) {
+        "no-store"
+    } else {
+        "no-cache"
+    }
 }
 
 fn static_response(file: static_assets::StaticFile, cache: &'static str) -> Response {
@@ -894,6 +902,30 @@ fn static_response(file: static_assets::StaticFile, cache: &'static str) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_cache_policy_keeps_shell_crypto_and_assets_distinct() {
+        for path in [
+            "/",
+            "/_shell.html",
+            "/index.html",
+            "/vibeface_secure.js",
+            "/vibeface_secure_bg.wasm",
+        ] {
+            assert_eq!(
+                static_cache_control(path),
+                "no-store",
+                "{path} must not be cached"
+            );
+        }
+        for path in ["/sw.js", "/manifest.webmanifest", "/icon.svg"] {
+            assert_eq!(static_cache_control(path), "no-cache");
+        }
+        assert_eq!(
+            static_cache_control("/assets/chunk-123.js"),
+            "public, max-age=31536000, immutable"
+        );
+    }
 
     #[test]
     fn origin_and_host_allow_fixed_local_aliases_only() {

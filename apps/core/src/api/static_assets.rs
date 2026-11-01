@@ -227,7 +227,7 @@ fn content_type(path: &Path) -> &'static str {
 
 fn static_headers(policy: &str) -> String {
     format!(
-        "/*\n  Content-Security-Policy: {policy}\n  X-Content-Type-Options: nosniff\n  X-Frame-Options: DENY\n  Referrer-Policy: no-referrer\n"
+        "/*\n  Content-Security-Policy: {policy}\n  X-Content-Type-Options: nosniff\n  X-Frame-Options: DENY\n  Referrer-Policy: no-referrer\n/\n  Cache-Control: no-store\n/_shell.html\n  Cache-Control: no-store\n/index.html\n  Cache-Control: no-store\n/vibeface_secure.js\n  Cache-Control: no-store\n/vibeface_secure_bg.wasm\n  Cache-Control: no-store\n/sw.js\n  Cache-Control: no-cache\n/manifest.webmanifest\n  Cache-Control: no-cache\n/icon.svg\n  Cache-Control: no-cache\n/assets/*\n  Cache-Control: public, max-age=31536000, immutable\n"
     )
 }
 
