@@ -7,6 +7,14 @@ description: 在自己的 Mac 或 Linux 设备上安装 Vibeface Nightly，并�
 
 第一次使用可以先按[快速上手](quick-start.md)完成安装、建网和第一次对话。本文提供安装方式、后台服务和更新命令的详细说明。
 
+## 先核对安装包版本
+
+本文对应拆分后的 CLI、Core 与 App。完整包需要同时含 `vibeface`、`vibeface-core` 和 `web/`，当前 main 的安装器会检查这个结构。
+
+Nightly `0.0.1-nightly.20261031.18` 是拆分前的发行包，不包含 `vibeface-core`，不能用当前 main 的安装器安装。已有该版本时，使用包内或同 tag 的文档；不要只把一个新程序覆盖进去。需要运行当前源码、但尚无匹配完整包时，按[从源码准备当前版本](quick-start.md#从源码准备当前版本)操作。下面的完整包安装和更新步骤以匹配的发行包已经发布为前提。
+
+## 选择安装目录
+
 本文的命令默认使用数据目录 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定其他绝对路径，见[部署配置](deployment.md)。首次安装前设置安装目录和命令目录，例如：
 
 ```sh

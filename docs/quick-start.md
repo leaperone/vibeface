@@ -1,6 +1,6 @@
 ---
 title: 快速上手
-description: 从安装 Nightly 到创建个人网络，让第一台电脑上的 Bot 回答一条消息。
+description: 准备匹配当前源码的程序，创建个人网络，让第一台电脑上的 Bot 回答一条消息。
 ---
 
 # 快速上手
@@ -17,7 +17,9 @@ Vibeface 不提供模型账号，也不安装 Agent。默认 Codex、Claude Code
 
 ## 1. 安装 Nightly
 
-首次安装可在终端执行以下命令。已经安装时，不重复运行安装器，按[更新说明](install.md#选择更新渠道)管理现有安装。
+本指南对应拆分后的 CLI、Core 与 App。先检查 [Releases](https://github.com/leaperone/vibeface/releases) 中的完整包是否同时包含 `vibeface`、`vibeface-core` 和 `web/`。Nightly `0.0.1-nightly.20261031.18` 仍是拆分前的包，缺少 `vibeface-core`，不能交给当前 main 的安装器安装。旧包请使用包内或同版本文档。
+
+有匹配的完整包时，首次安装可执行以下命令。已经安装时，不重复运行安装器，按[更新说明](install.md#选择更新渠道)管理现有安装。
 
 ```sh
 export VIBEFACE_INSTALL_ROOT="$HOME/.local/share/vibeface"
@@ -31,6 +33,26 @@ vibeface --version
 ```
 
 安装器校验下载包，安装 CLI、Core 和网页资源。看到版本号后，说明 CLI 可以启动。把命令目录加入自己的 shell 配置，才能在新终端继续使用 `vibeface`。平台选择、校验和其他安装方式见[安装与管理节点](install.md)。
+
+### 从源码准备当前版本
+
+匹配的安装包尚未发布时，需要先从源码构建。准备 Git、Python 3、Rust 1.91+、Node.js 22.12+ 和 pnpm 11.9.0，再执行：
+
+```sh
+git clone https://github.com/leaperone/vibeface.git
+cd vibeface
+pnpm install --frozen-lockfile
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.129 --locked
+bash scripts/build-web-crypto.sh
+bash scripts/build-web.sh
+cargo build -p vibeface -p vibeface-core --locked
+export PATH="$PWD/target/debug:$PATH"
+export VIBEFACE_APP_DIR="$PWD/apps/app/dist/client"
+vibeface --version
+```
+
+后续步骤使用这个终端。这里启动的是本地源码构建，不是受管安装；先保持前台运行，不执行安装包专用的服务或自动更新步骤。源码构建工具的安装方式和平台条件以各工具文档为准。
 
 ## 2. 启动并打开本机页面
 

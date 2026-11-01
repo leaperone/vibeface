@@ -88,6 +88,8 @@ vibeface --version
 
 npm 包内含完整平台程序和服务脚本，不在 postinstall 阶段下载、初始化或启动服务。在此之前，可从 [Releases](https://github.com/leaperone/vibeface/releases) 下载 GitHub 完整包，步骤见 [安装说明](docs/install.md)。
 
+当前源码的完整包需含 `vibeface`、`vibeface-core` 和 `web/`。Nightly `0.0.1-nightly.20261031.18` 仍是拆分前的包，不适用于当前 main 安装器；需要当前版本但尚无匹配发行包时，按[源码运行步骤](docs/quick-start.md#从源码准备当前版本)操作。
+
 ### 首次启动
 
 ```sh
