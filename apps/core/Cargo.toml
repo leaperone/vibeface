@@ -45,7 +45,3 @@ vibeface-control.workspace = true
 vibeface-secure = { path = "../../crates/secure" }
 vibeface-delivery = { path = "../../crates/delivery" }
 zeroize = { version = "1", features = ["derive"] }
-
-[build-dependencies]
-base64 = "0.22"
-sha2.workspace = true
