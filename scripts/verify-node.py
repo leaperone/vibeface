@@ -7919,16 +7919,19 @@ if __name__ == "__main__":
         parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "proofs/delivery/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()
         try:
-            program = shutil.which(str(arguments.binary)) if len(arguments.binary.parts) == 1 else str(arguments.binary)
-            require(program is not None, "the Vibeface CLI binary exists on PATH or at its explicit path")
-            arguments.binary = Path(program).resolve(strict=True)
-            arguments.core_binary = (arguments.core_binary or arguments.binary.with_name("vibeface-core")).resolve(strict=True)
-            require(arguments.binary.is_file() and arguments.binary.stat().st_mode & 0o111,
-                    "the Vibeface CLI binary is executable")
-            require(arguments.core_binary.is_file() and arguments.core_binary.stat().st_mode & 0o111,
-                    "the sibling Vibeface Core binary is executable")
-            require(arguments.core_binary.parent == arguments.binary.parent,
-                    "CLI and Core binaries come from one release directory")
+            needs_process = not (arguments.delivery_ui_selfcheck or arguments.native_provider_selfcheck)
+            if needs_process:
+                program = shutil.which(str(arguments.binary)) if len(arguments.binary.parts) == 1 else str(arguments.binary)
+                require(program is not None, "the Vibeface CLI binary exists on PATH or at its explicit path")
+                arguments.binary = Path(program).resolve(strict=True)
+                arguments.core_binary = (arguments.core_binary or arguments.binary.with_name("vibeface-core")).resolve(strict=True)
+                require(arguments.binary.is_file() and arguments.binary.stat().st_mode & 0o111,
+                        "the Vibeface CLI binary is executable")
+                require(arguments.core_binary.name == "vibeface-core", "the Core binary has the canonical name")
+                require(arguments.core_binary.is_file() and arguments.core_binary.stat().st_mode & 0o111,
+                        "the sibling Vibeface Core binary is executable")
+                require(arguments.core_binary.parent == arguments.binary.parent,
+                        "CLI and Core binaries come from one release directory")
             if arguments.app_dir is not None:
                 arguments.app_dir = arguments.app_dir.resolve(strict=True)
                 require(arguments.app_dir.is_dir(), "the explicit App output directory exists")
