@@ -47,7 +47,7 @@ cd vibeface-<version>-<target>
 
 ## CI 验证范围
 
-`crypto-web` 在固定版本的 wasm-bindgen 工具链生成一份浏览器密码学资源，运行 native Rust 与 WASM 的实际 Noise 互通和篡改、重放、身份错配负例。`web` 下载这份资源及其真实 TypeScript 声明，以锁定的 pnpm 依赖生成 TanStack Start 静态 SPA。被选中的检查和打包任务下载同一份密码学资源和 SPA，再由 Rust 构建脚本内嵌。缺少资源时构建失败，不用空模块替代。
+`crypto-web` 在固定版本的 wasm-bindgen 工具链生成一份浏览器密码学资源，运行 native Rust 与 WASM 的实际 Noise 互通和篡改、重放、身份错配负例。`web` 下载这份资源及其真实 TypeScript 声明，以锁定的 pnpm 依赖生成 TanStack Start 静态 SPA。被选中的检查和打包任务下载同一份密码学资源和 SPA。Core 不再编译时内嵌网页或 WASM，而是从 `VIBEFACE_APP_DIR` 或发行包同级 `web/` 读取完整静态目录。缺少资源时构建失败，不用空模块替代。
 
 质量检查按计划选择受影响的 crate，包含 Rust fmt、快慢测试、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法、Web TypeScript 检查和静态构建，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。README 和项目指引不触发构建，`docs/` 触发门户构建；Node Web-only PR 只构建 Linux x64 包并验收网页资源，不运行 Node 库业务测试。所有 PR 和 `main` 仅保留相关快速测试、Clippy 和 Linux x64 制品。慢测试、最低 Rust 版本和三平台制品移至定时、手动与 tag 扩展检查。`ci-gate` 要求本次计划中的任务全部成功。
 
@@ -61,7 +61,7 @@ bash scripts/build-web.sh
 bash scripts/package-node.sh
 ```
 
-`build-web.sh` 校验生成资源、按 lockfile 安装依赖、生成路由、检查类型，再构建 `apps/app/dist/client`。Rust 只内嵌这个目录，不运行 Start 的 SSR 输出。页面和密码学资源使用 `no-store`，成功命中的 `/assets/` 内容使用 immutable 缓存。CSP 根据最终 HTML 生成脚本 hash，并允许 WASM、WebSocket 和 Radix 所需的动态样式。
+`build-web.sh` 校验生成资源、按 lockfile 安装依赖、生成路由、检查类型，再构建 `apps/app/dist/client`。Core 从这个目录读取静态资源，不运行 Start 的 SSR 输出，也不把网页编译进 Core。页面和密码学资源使用 `no-store`，成功命中的 `/assets/` 内容使用 immutable 缓存。CSP 根据最终 HTML 生成脚本 hash，并允许 WASM、WebSocket 和 Radix 所需的动态样式。
 
 验收失败时只上传各模式的报告、进程日志和 `node.log`，不上传测试目录或数据库。正常制品保留 14 天，诊断保留 7 天。CI 不验证真实模型调用、实体手机、物理局域网、公网反向代理或用户后台服务安装。
 
@@ -113,7 +113,7 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。正在执行的操作、管理 Agent 调用或 `unknown` 结果会推迟升级。更新器不会为升级强行结束任务。更新只更换程序，不覆盖身份、历史、配置和凭证，也不更新 Codex、Cursor 或其他 Provider 程序。
 
-`BUILD-INFO.json` 声明 `update_protocol=1` 和 `data_epoch=12`，两者取自 `apps/core/src/config.rs` 的 `UPDATE_PROTOCOL` 和 `DATA_EPOCH`。包协议 1 要求同名 `vibeface` 程序和制品。设备授权和业务记录使用单一 `node.sqlite3`，数据库 `user_version=12`，Atlas HCL 为 `apps/core/schema.hcl`。不同 epoch 的数据目录和节点不能混用。更新器只安装与本机存储 epoch 一致的包，不隐式转换或清空数据目录。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
+`BUILD-INFO.json` 声明 `update_protocol=1` 和 `data_epoch=12`，两者取自 `apps/core/src/config.rs` 的 `UPDATE_PROTOCOL` 和 `DATA_EPOCH`。包协议 1 要求同目录的 `vibeface`、`vibeface-core` 和完整 `web/` 制品使用相同版本与源码提交。设备授权和业务记录使用单一 `node.sqlite3`，数据库 `user_version=12`，Atlas HCL 为 `apps/core/schema.hcl`。不同 epoch 的数据目录和节点不能混用。更新器只安装与本机存储 epoch 一致的包，不隐式转换或清空数据目录。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
 
 ## 首次安装
 
@@ -131,7 +131,7 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 校验并解压新包到受管安装根目录下的独立目录，通过 `current` 符号链接选择程序。例如，先将解压后的包移动到 `$VIBEFACE_INSTALL_ROOT/releases/<version>`，再创建指向它的 `$VIBEFACE_INSTALL_ROOT/current`。保留整个包，不单独复制 Rust binary；更新器需要同包的脚本和 `BUILD-INFO.json`。
 
-原子切换 `current` 后，建立 `$VIBEFACE_BIN_DIR/vibeface` 到 `current/vibeface` 的链接。旧 CLI 链接只有在确认属于该受管安装时才可移除，不覆盖用户自有文件。使用全新或已确认属于 epoch 12 的数据目录前台启动，核对设备身份与状态，随后按 [后台运行说明](node.md#作为后台应用运行) 配置指向这一固定路径的用户服务。Linux 服务名是 `vibeface.service`，先卸载旧服务定义，避免双进程。停止前台进程后再启动用户服务。
+原子切换 `current` 后，建立 `$VIBEFACE_BIN_DIR/vibeface` 到 `current/vibeface` 的链接。Core 通过同一 `current` 目录发现 `vibeface-core` 和 `web/`，不能只替换 CLI。旧 CLI 链接只有在确认属于该受管安装时才可移除，不覆盖用户自有文件。使用全新或已确认属于 epoch 12 的数据目录前台启动，核对设备身份和状态，随后按 [后台运行说明](node.md#作为后台应用运行) 配置指向这一固定路径的用户服务。Linux 服务名是 `vibeface.service`，先卸载旧服务定义，避免双进程。停止前台进程后再启动用户服务。
 
 已有私有凭证启动脚本时，保留内容和私有权限，仅将末端启动路径改为 `current/vibeface`。不要用 `service install` 覆盖凭证脚本。核对新服务的 PID、版本、设备身份、历史及本机健康状态，再恢复原更新渠道和自动更新策略。
 

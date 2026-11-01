@@ -15,7 +15,7 @@ export default {
       command: {
         executable: 'node',
         args: ['scripts/e2e-node.mjs', '{port}'],
-        env: { VIBEFACE_E2E_BINARY: process.env.VIBEFACE_E2E_BINARY ?? 'vibeface', VIBEFACE_E2E_CRYPTO_MODULE: process.env.VIBEFACE_E2E_CRYPTO_MODULE ?? '', VIBEFACE_E2E_PROFILE_FILE: process.env.VIBEFACE_E2E_PROFILE_FILE ?? '' },
+        env: { VIBEFACE_E2E_BINARY: process.env.VIBEFACE_E2E_BINARY ?? 'vibeface', VIBEFACE_E2E_CRYPTO_MODULE: process.env.VIBEFACE_E2E_CRYPTO_MODULE ?? '', VIBEFACE_E2E_APP_DIR: process.env.VIBEFACE_E2E_APP_DIR ?? '', VIBEFACE_E2E_PROFILE_FILE: process.env.VIBEFACE_E2E_PROFILE_FILE ?? '' },
         shutdownTimeout: 30000,
         log: '.artifacts/e2e/node.log',
       },

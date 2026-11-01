@@ -39,6 +39,7 @@ async function startFixture(kind) {
   const args = ['scripts/verify-node.py', '--e2e-fixture', '--binary', binary,
     '--artifacts', root, '--fixture-port', String(port), '--fixture-kind', kind];
   if (process.env.VIBEFACE_E2E_CRYPTO_MODULE) args.push('--crypto-module', process.env.VIBEFACE_E2E_CRYPTO_MODULE);
+  if (process.env.VIBEFACE_E2E_APP_DIR) args.push('--app-dir', process.env.VIBEFACE_E2E_APP_DIR);
   if (process.env.VIBEFACE_E2E_PROFILE_FILE) args.push('--fixture-profile', process.env.VIBEFACE_E2E_PROFILE_FILE);
   const child = spawn('python3', args, { stdio: ['pipe', 'pipe', 'inherit'] });
   fixture = child;

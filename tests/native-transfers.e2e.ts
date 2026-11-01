@@ -36,6 +36,7 @@ const test = base.extend<{ network: NativeNetwork }>({
     await new Promise<void>((done, fail) => listener.close(error => error ? fail(error) : done()));
     const args = [resolve(root, 'scripts/verify-node.py'), '--e2e-fixture', '--fixture-kind', 'delivery',
       '--fixture-port', String(address.port), '--binary', binary, '--crypto-module', crypto, '--artifacts', artifacts];
+    if (process.env.VIBEFACE_E2E_APP_DIR) args.push('--app-dir', process.env.VIBEFACE_E2E_APP_DIR);
     if (process.env.VIBEFACE_E2E_PROFILE_FILE) args.push('--fixture-profile', process.env.VIBEFACE_E2E_PROFILE_FILE);
     const child = spawn('python3', args, { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] });
     let pending: { resolve(value: Record<string, unknown>): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> } | null = null;

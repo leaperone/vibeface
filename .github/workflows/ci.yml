@@ -448,9 +448,14 @@ jobs:
           assert info["target"] == os.environ["PACKAGE_TARGET"]
           binary = pathlib.Path(sys.argv[1]).parent / "vibeface"
           web = binary.parent / "web"
+          assert (web / "_shell.html").stat().st_size > 0
+          assert (web / "_headers").stat().st_size > 0
+          assert (web / ".vibeface-build.json").stat().st_size > 0
           assert (web / "vibeface_secure.js").stat().st_size > 0
           assert (web / "vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm")
+          assert (binary.parent / "vibeface-core").stat().st_size > 0
           assert subprocess.check_output([str(binary), "--version"], text=True).strip() == f'vibeface {info["version"]}'
+          assert subprocess.check_output([str(binary.parent / "vibeface-core"), "--version"], text=True).strip() == f'vibeface-core {info["version"]}'
           PY
           "$package/vibeface" --help
           printf 'package=%s\n' "$package" >> "$GITHUB_OUTPUT"
@@ -460,37 +465,39 @@ jobs:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: |
           set -o pipefail
-          codesign --verify --strict "$PACKAGE/vibeface"
-          details="$(codesign -dvvv "$PACKAGE/vibeface" 2>&1)"
-          printf '%s\n' "$details"
-          grep -qx 'Identifier=cn.leaperone.vibeface' <<< "$details"
-          grep -qx "TeamIdentifier=$VIBEFACE_CODESIGN_TEAM" <<< "$details"
-          grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime' <<< "$details"
-          binary_sha="$(shasum -a 256 "$PACKAGE/vibeface" | cut -d ' ' -f 1)"
-          delays=(15 30 60 120 120 120 120 120 120)
-          for attempt in $(seq 0 "${#delays[@]}"); do
-            assessment="$RUNNER_TEMP/gatekeeper-assessment-$attempt.txt"
-            if spctl -a -vvv --ignore-cache --no-cache -t open --context context:primary-signature "$PACKAGE/vibeface" >"$assessment" 2>&1; then
-              assessment_status=0
-            else
-              assessment_status=$?
-            fi
-            cat "$assessment"
-            printf 'Gatekeeper assessment %s exited %s\n' "$attempt" "$assessment_status"
-            test "$(shasum -a 256 "$PACKAGE/vibeface" | cut -d ' ' -f 1)" = "$binary_sha"
-            if test "$assessment_status" -eq 0; then
-              grep -qx 'source=Notarized Developer ID' "$assessment"
-              break
-            fi
-            if test "$assessment_status" -ne 3 || ! grep -qx 'source=Unnotarized Developer ID' "$assessment" || test "$attempt" -eq "${#delays[@]}"; then
-              exit "$assessment_status"
-            fi
-            sleep "${delays[$attempt]}"
+          for binary in "$PACKAGE/vibeface" "$PACKAGE/vibeface-core"; do
+            codesign --verify --strict "$binary"
+            details="$(codesign -dvvv "$binary" 2>&1)"
+            printf '%s\n' "$details"
+            grep -qx 'Identifier=cn.leaperone.vibeface' <<< "$details"
+            grep -qx "TeamIdentifier=$VIBEFACE_CODESIGN_TEAM" <<< "$details"
+            grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime' <<< "$details"
+            binary_sha="$(shasum -a 256 "$binary" | cut -d ' ' -f 1)"
+            delays=(15 30 60 120 120 120 120 120 120)
+            for attempt in $(seq 0 "${#delays[@]}"); do
+              assessment="$RUNNER_TEMP/gatekeeper-assessment-$(basename "$binary")-$attempt.txt"
+              if spctl -a -vvv --ignore-cache --no-cache -t open --context context:primary-signature "$binary" >"$assessment" 2>&1; then
+                assessment_status=0
+              else
+                assessment_status=$?
+              fi
+              cat "$assessment"
+              printf 'Gatekeeper assessment %s exited %s\n' "$attempt" "$assessment_status"
+              test "$(shasum -a 256 "$binary" | cut -d ' ' -f 1)" = "$binary_sha"
+              if test "$assessment_status" -eq 0; then
+                grep -qx 'source=Notarized Developer ID' "$assessment"
+                break
+              fi
+              if test "$assessment_status" -ne 3 || ! grep -qx 'source=Unnotarized Developer ID' "$assessment" || test "$attempt" -eq "${#delays[@]}"; then
+                exit "$assessment_status"
+              fi
+              sleep "${delays[$attempt]}"
+            done
           done
       - name: Verify packaged Web assets and process
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
       - name: Verify packaged free discovery and charity delivery over real Node processes
         if: needs.plan.outputs.delivery == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
@@ -500,7 +507,7 @@ jobs:
         run: |
           cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml -- --check
           cargo build --manifest-path tests/fixtures/delivery-probe/Cargo.toml --locked
-          python3 scripts/verify-node.py --delivery-charity --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts "$PWD/.artifacts/ci-delivery" --delivery-probe "$CARGO_TARGET_DIR/debug/vibeface-delivery-probe" --delivery-source-root "$PWD" --delivery-profile "$PWD/proofs/delivery/profile.json"
+          python3 scripts/verify-node.py --delivery-charity --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts "$PWD/.artifacts/ci-delivery" --delivery-probe "$CARGO_TARGET_DIR/debug/vibeface-delivery-probe" --delivery-source-root "$PWD" --delivery-profile "$PWD/proofs/delivery/profile.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ !cancelled() && needs.plan.outputs.delivery == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' }}
         with:
@@ -541,37 +548,37 @@ jobs:
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-node --phase1
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-node --phase1
       - name: Verify multi-Node sync, entrances and delivery over iroh
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-multi-node
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-multi-node
       - name: Verify bot tools and startup event recovery
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'aarch64-apple-darwin'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-chat-agent --chat-agent
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-chat-agent --chat-agent
       - name: Verify cross-device coordination, owner moves and attachments
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-phase4 --phase4
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-phase4 --phase4
       - name: Verify the public entry and its relay token
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-public-entry --public-entry
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-public-entry --public-entry
       - name: Verify discovery-only assistance and headless Nodes
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-discovery --discovery
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-discovery --discovery
       - name: Verify write protection, status and diagnostics
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'aarch64-apple-darwin'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-phase5 --phase5
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-phase5 --phase5
       - name: Upload verified package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -811,7 +818,7 @@ jobs:
           PACKAGE_TARGET: ${{ matrix.target }}
         run: |
           prefix="$PWD/.artifacts/npm-installed"
-          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --crypto-module "$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --web-only
+          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --core-binary "$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/vibeface-core" --crypto-module "$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --web-only
 
   ci-gate:
     name: ci-gate

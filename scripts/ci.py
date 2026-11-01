@@ -14,11 +14,11 @@ import tempfile
 
 PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi", "vibeface-delivery")
 DEPENDENTS = {
-    "protocol": ("bridge", "node"),
-    "bridge": ("node",),
+    "protocol": ("bridge", "control"),
+    "bridge": ("control",),
     "secure": ("node", "secure-ffi"),
     "node": (),
-    "control": (),
+    "control": ("node", "cli"),
     "cli": (),
     "secure-ffi": (),
     "delivery": ("node",),
@@ -307,10 +307,10 @@ def self_test():
     assert docs["docs_only"] and docs["www"] and docs["required_jobs"] == ["quick-check", "www"]
     expected = {
         "node": ["vibeface-core"],
-        "bridge": ["vibeface-bridge", "vibeface-core"],
-        "protocol": ["vibeface-protocol", "vibeface-bridge", "vibeface-core"],
+        "bridge": ["vibeface-bridge", "vibeface-core", "vibeface-control", "vibeface"],
+        "protocol": ["vibeface-protocol", "vibeface-bridge", "vibeface-core", "vibeface-control", "vibeface"],
         "secure": ["vibeface-secure", "vibeface-core", "vibeface-secure-ffi"],
-        "control": ["vibeface-control"],
+        "control": ["vibeface-core", "vibeface-control", "vibeface"],
         "cli": ["vibeface"],
         "delivery": ["vibeface-core", "vibeface-delivery"],
     }
@@ -319,6 +319,8 @@ def self_test():
         plan = make_plan([source])
         assert plan["rust_packages"] == packages and plan["test_tiers"] == ["fast"]
         assert plan["package_mode"] == "web" and plan["package_matrix"]["include"] == list(PLATFORMS[:1])
+    assert make_plan(["crates/control/src/lib.rs"])["node"]
+    assert make_plan(["crates/control/src/lib.rs"])["rust_packages"] == expected["control"]
     for path in ("crates/delivery/Cargo.toml", "crates/delivery/abi/Statement.sol", "proofs/delivery/guest/src/main.rs", "proofs/delivery/fixtures/manifest.json", "contracts/delivery/DeliveryEscrow.sol", "contracts/delivery/package-lock.json", "tests/fixtures/delivery-probe/Cargo.toml", "tests/fixtures/delivery-probe/Cargo.lock", "tests/fixtures/delivery-probe/src/main.rs", "apps/core/src/net/pkarr.rs", "apps/core/src/delivery/wallet.rs", "apps/core/src/client.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"):
         selected = make_plan([path])
         assert selected["scopes"] == ["delivery"] and selected["delivery"]
@@ -330,7 +332,6 @@ def self_test():
         assert make_plan([path])["rust_packages"] == list(PACKAGES)
     assert make_plan(["apps/app/src/a.tsx", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
     assert make_plan(["apps/cli/src/main.rs"])["rust_packages"] == ["vibeface"]
-    assert make_plan(["crates/control/src/lib.rs"])["rust_packages"] == ["vibeface-control"]
     assert make_plan(["apps/core/schema.hcl"])["node"]
     assert make_plan(["install.sh"])["node"]
     for path in ("packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts"):
@@ -509,15 +510,18 @@ def gatekeeper_test(root, scratch):
             import json, os, sys
             from pathlib import Path
             tool = Path(sys.argv[0]).name
-            binary = Path(os.environ["PACKAGE"]) / "vibeface"
             if tool == "codesign":
+                binary = Path(sys.argv[-1])
+                assert binary.parent == Path(os.environ["PACKAGE"])
                 if sys.argv[1:] == ["--verify", "--strict", str(binary)]:
                     sys.exit(0)
                 assert sys.argv[1:] == ["-dvvv", str(binary)]
                 print("Identifier=cn.leaperone.vibeface\\nTeamIdentifier=FIXTURETEAM\\nCodeDirectory flags=0x10000(runtime)")
             elif tool == "spctl":
+                binary = Path(sys.argv[-1])
+                assert binary.parent == Path(os.environ["PACKAGE"])
                 assert sys.argv[1:] == ["-a", "-vvv", "--ignore-cache", "--no-cache", "-t", "open", "--context", "context:primary-signature", str(binary)]
-                state = Path(os.environ["RUNNER_TEMP"]) / "calls"
+                state = Path(os.environ["RUNNER_TEMP"]) / ("calls-" + binary.name)
                 index = int(state.read_text()) if state.exists() else 0
                 state.write_text(str(index + 1))
                 status, source = json.loads(os.environ["FIXTURE_ASSESSMENTS"])[index]
@@ -537,14 +541,17 @@ def gatekeeper_test(root, scratch):
             case = fixture / name
             case.mkdir()
             (case / "vibeface").write_text("original")
+            (case / "vibeface-core").write_text("original")
             environment = dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ['PATH']}", PACKAGE=str(case), RUNNER_TEMP=str(case), VIBEFACE_CODESIGN_TEAM="FIXTURETEAM", FIXTURE_ASSESSMENTS=json.dumps(assessments), FIXTURE_MUTATE=json.dumps(mutate))
             result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail"], input=script, env=environment, text=True, capture_output=True)
             assert result.returncode == expected, (name, result.returncode, result.stdout, result.stderr)
-            assert int((case / "calls").read_text()) == len(assessments), name
+            completed_binaries = 2 if expected == 0 else 1
+            for binary in (("vibeface", "vibeface-core") if completed_binaries == 2 else ("vibeface",)):
+                assert int((case / ("calls-" + binary)).read_text()) == len(assessments), name
             sleeps = [int(line) for line in (case / "sleeps").read_text().split()] if (case / "sleeps").exists() else []
-            assert len(sleeps) == len(assessments) - 1 and sleeps == sorted(sleeps), (name, sleeps)
+            assert len(sleeps) == completed_binaries * (len(assessments) - 1) and sleeps == sorted(sleeps), (name, sleeps)
             if name == "pending-exhausted":
-                assert 600 <= sum(sleeps) <= 900, ("waits long enough for Apple's ticket propagation", sleeps)
+                assert 600 * completed_binaries <= sum(sleeps) <= 900 * completed_binaries, ("waits long enough for Apple's ticket propagation", sleeps)
     print("Gatekeeper workflow control-flow self-tests passed; native assessment remains required")
 
 

@@ -8,8 +8,8 @@ build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text())
 
 [[domain_check]]
 name = "Rust workspace"
-trigger_paths = ["crates/delivery/**", "apps/core/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
-command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && cargo fmt --all -- --check && python3 scripts/ci.py test --tier fast --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface vibeface-delivery && cargo clippy --workspace --all-targets --locked -- -D warnings"
+trigger_paths = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
+command = "cargo fmt --all -- --check && python3 scripts/ci.py test --tier fast --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface-core vibeface-control vibeface vibeface-delivery && cargo clippy --workspace --all-targets --locked -- -D warnings"
 
 [[domain_check]]
 name = "Delivery proof and settlement"
@@ -24,7 +24,7 @@ command = "cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml --
 [[domain_check]]
 name = "Web build and packaged resources"
 trigger_paths = ["apps/app/**", "packages/client/**", "apps/mobile/**", "scripts/build-web.sh", "scripts/build-web-crypto.sh"]
-command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && cargo build -p vibeface --locked && python3 scripts/verify-node.py --binary target/debug/vibeface --artifacts .artifacts/preflight-web --web-only"
+command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && cargo build -p vibeface -p vibeface-core --locked && python3 scripts/verify-node.py --binary target/debug/vibeface --core-binary target/debug/vibeface-core --app-dir apps/app/dist/client --crypto-module apps/app/dist/client/vibeface_secure.js --artifacts .artifacts/preflight-web --web-only"
 
 [[domain_check]]
 name = "Static www portal"
