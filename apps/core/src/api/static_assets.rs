@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use axum::http::HeaderValue;
+use axum::{body::Bytes, http::HeaderValue};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -12,8 +12,7 @@ pub(crate) const DEFAULT_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; sc
 
 #[derive(Clone)]
 pub(crate) struct StaticAssets {
-    root: PathBuf,
-    pub(crate) shell: Vec<u8>,
+    files: BTreeMap<String, StaticFile>,
     pub(crate) content_security_policy: HeaderValue,
 }
 
@@ -25,10 +24,10 @@ struct Receipt {
     outputs: BTreeMap<String, String>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StaticFile {
     pub(crate) content_type: &'static str,
-    pub(crate) body: Vec<u8>,
+    pub(crate) body: Bytes,
 }
 
 impl StaticAssets {
@@ -60,6 +59,7 @@ impl StaticAssets {
             !receipt.content_security_policy.is_empty(),
             "static App receipt has no CSP"
         );
+        let files = validate_outputs(&root, &receipt.outputs)?;
         for name in [
             "_shell.html",
             "vibeface_secure.js",
@@ -70,16 +70,11 @@ impl StaticAssets {
                 receipt.outputs.contains_key(name),
                 "static App receipt is missing {name}"
             );
-            let path = root.join(name);
-            let metadata = fs::symlink_metadata(&path)
-                .with_context(|| format!("static App file is missing: {}", path.display()))?;
             ensure!(
-                metadata.is_file(),
-                "static App entry is not a regular file: {}",
-                path.display()
+                files.contains_key(name),
+                "static App file is missing: {name}"
             );
         }
-        validate_outputs(&root, &receipt.outputs)?;
         let content_security_policy = HeaderValue::from_str(&receipt.content_security_policy)
             .context("static App receipt has an invalid CSP")?;
         let headers = fs::read_to_string(root.join("_headers"))?;
@@ -87,36 +82,38 @@ impl StaticAssets {
             headers == static_headers(&receipt.content_security_policy),
             "static App headers do not match the receipt CSP"
         );
-        let shell = fs::read(root.join("_shell.html"))?;
-        ensure!(!shell.is_empty(), "static App shell is empty");
+        ensure!(
+            !files["_shell.html"].body.is_empty(),
+            "static App shell is empty"
+        );
         Ok(Self {
-            root,
-            shell,
+            files,
             content_security_policy,
         })
     }
 
-    pub(crate) async fn read(&self, path: &str) -> Option<StaticFile> {
+    pub(crate) fn read(&self, path: &str) -> Option<StaticFile> {
         let relative = relative_path(path)?;
         if is_metadata(relative) {
             return None;
         }
-        let full = self.root.join(relative);
-        let metadata = tokio::fs::symlink_metadata(&full).await.ok()?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return None;
-        }
-        Some(StaticFile {
-            content_type: content_type(&full),
-            body: tokio::fs::read(full).await.ok()?,
-        })
+        self.files.get(relative).cloned()
+    }
+
+    pub(crate) fn is_unsafe_path(path: &str) -> bool {
+        path.split('/')
+            .any(|part| part == "." || part == ".." || part.contains('\\'))
+            || {
+                let encoded = path.to_ascii_lowercase();
+                encoded.contains("%2e") || encoded.contains("%5c")
+            }
     }
 
     pub(crate) fn shell_file(&self) -> StaticFile {
-        StaticFile {
-            content_type: "text/html; charset=utf-8",
-            body: self.shell.clone(),
-        }
+        self.files
+            .get("_shell.html")
+            .expect("validated App shell")
+            .clone()
     }
 }
 
@@ -145,8 +142,12 @@ fn reject_symlinks(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_outputs(root: &Path, outputs: &BTreeMap<String, String>) -> Result<()> {
+fn validate_outputs(
+    root: &Path,
+    outputs: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, StaticFile>> {
     let mut actual = BTreeMap::new();
+    let mut files = BTreeMap::new();
     let mut pending = vec![root.to_owned()];
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(&directory)? {
@@ -164,23 +165,30 @@ fn validate_outputs(root: &Path, outputs: &BTreeMap<String, String>) -> Result<(
                 .expect("asset path must stay below root")
                 .to_string_lossy()
                 .replace('\\', "/");
-            let digest = hex::encode(Sha256::digest(fs::read(&path)?));
-            actual.insert(name, digest);
+            let body = Bytes::from(fs::read(&path)?);
+            let digest = hex::encode(Sha256::digest(&body));
+            actual.insert(name.clone(), digest);
+            files.insert(
+                name,
+                StaticFile {
+                    content_type: content_type(&path),
+                    body,
+                },
+            );
         }
     }
     ensure!(
         actual == *outputs,
         "static App output hashes do not match the receipt"
     );
-    Ok(())
+    Ok(files)
 }
 
 fn relative_path(path: &str) -> Option<&str> {
     let relative = path.strip_prefix('/')?;
     if relative.is_empty()
-        || relative
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == ".." || part.contains('\\'))
+        || relative.split('/').any(|part| part.is_empty())
+        || StaticAssets::is_unsafe_path(path)
     {
         return None;
     }
@@ -220,8 +228,63 @@ fn static_headers(policy: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_type, is_metadata, relative_path};
-    use std::path::Path;
+    use super::{
+        DEFAULT_CONTENT_SECURITY_POLICY, StaticAssets, content_type, is_metadata, relative_path,
+        static_headers,
+    };
+    use sha2::{Digest, Sha256};
+    use std::{collections::BTreeMap, fs, path::Path};
+
+    fn fixture() -> std::path::PathBuf {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("static-assets-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let mut outputs = BTreeMap::new();
+        let files = [
+            ("_shell.html", b"<main>shell</main>".as_slice()),
+            (
+                "vibeface_secure.js",
+                b"export default function init() {}".as_slice(),
+            ),
+            ("vibeface_secure_bg.wasm", b"\0asmfixture".as_slice()),
+            ("known.js", b"known".as_slice()),
+        ];
+        for (name, body) in files {
+            fs::write(root.join(name), body).unwrap();
+            outputs.insert(name.to_string(), hex::encode(Sha256::digest(body)));
+        }
+        let headers = static_headers(DEFAULT_CONTENT_SECURITY_POLICY);
+        fs::write(root.join("_headers"), headers.as_bytes()).unwrap();
+        outputs.insert(
+            "_headers".into(),
+            hex::encode(Sha256::digest(headers.as_bytes())),
+        );
+        fs::write(
+            root.join(".vibeface-build.json"),
+            serde_json::json!({
+                "version": 1,
+                "component": "web",
+                "content_security_policy": DEFAULT_CONTENT_SECURITY_POLICY,
+                "outputs": outputs,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn loaded_assets_are_immutable_and_do_not_expose_later_files() {
+        let root = fixture();
+        let assets = StaticAssets::load(&root).unwrap();
+        assert_eq!(assets.read("/known.js").unwrap().body.as_ref(), b"known");
+        fs::write(root.join("known.js"), b"mutated").unwrap();
+        fs::write(root.join("private.txt"), b"secret").unwrap();
+        assert_eq!(assets.read("/known.js").unwrap().body.as_ref(), b"known");
+        assert!(assets.read("/private.txt").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn static_paths_keep_metadata_and_traversal_outside_the_asset_namespace() {
@@ -229,6 +292,7 @@ mod tests {
         for path in ["/", "/../secret", "/assets/../secret", "/assets\\secret"] {
             assert!(relative_path(path).is_none());
         }
+        assert!(StaticAssets::is_unsafe_path("/%2e%2e/secret"));
         for path in [
             ".vibeface-build.json",
             "_headers",

@@ -855,7 +855,8 @@ async fn frontend(State(app): State<App>, method: Method, uri: axum::http::Uri) 
     if method != Method::GET && method != Method::HEAD {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    if path == "/_headers"
+    if static_assets::StaticAssets::is_unsafe_path(path)
+        || path == "/_headers"
         || path == "/_redirects"
         || path.split('/').any(|segment| segment.starts_with('.'))
     {
@@ -867,7 +868,7 @@ async fn frontend(State(app): State<App>, method: Method, uri: axum::http::Uri) 
     if path == "/" {
         return static_response(assets.shell_file(), "no-cache");
     }
-    if let Some(file) = assets.read(path).await {
+    if let Some(file) = assets.read(path) {
         let cache = if path.starts_with("/assets/") {
             "public, max-age=31536000, immutable"
         } else {
@@ -900,7 +901,6 @@ async fn crypto_javascript(State(app): State<App>) -> Response {
     };
     assets
         .read("/vibeface_secure.js")
-        .await
         .map(|file| static_response(file, "no-cache"))
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
@@ -911,7 +911,6 @@ async fn crypto_wasm(State(app): State<App>) -> Response {
     };
     assets
         .read("/vibeface_secure_bg.wasm")
-        .await
         .map(|file| static_response(file, "no-cache"))
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
