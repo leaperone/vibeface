@@ -478,6 +478,20 @@ fn manifest(package: &Path) -> Result<Manifest> {
             "package is missing required file {file}"
         );
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for binary in ["vibeface", "vibeface-core"] {
+            ensure!(
+                fs::symlink_metadata(package.join(binary))?
+                    .permissions()
+                    .mode()
+                    & 0o111
+                    != 0,
+                "package binary is not executable: {binary}"
+            );
+        }
+    }
     let web = fs::symlink_metadata(package.join("web"))?;
     ensure!(
         web.is_dir()
