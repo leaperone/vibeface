@@ -152,7 +152,7 @@ function ScheduleRow({ id, before, after, current }: { id: string; before: BotSc
   const { data } = useWorkspace()
   const schedule = after ?? before!
   const once = schedule.every_minutes === undefined
-  const fired = once ? firedAt(data?.messages ?? [], id) : null
+  const fired = once ? firedAt(data?.messages ?? [], id, schedule.first_run_at_ms) : null
   const icon = once ? AlarmClock : Repeat
   const tag = !before ? '新定时任务' : !after ? '已删除' : before.enabled !== after.enabled ? (after.enabled ? '已恢复' : '已暂停') : '已更新'
   if (!after) return <Row icon={icon} label={schedule.name} tag={tag} removed />

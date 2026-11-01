@@ -3149,6 +3149,13 @@ fn a_bot_message_wakes_the_other_bot_once() -> Result<()> {
         (receipt.conversation_id.as_str(), receipt.trigger.as_str()),
         ("d", trigger.as_str())
     );
+    let unread = origin.pending_notifications(&net.network, "web")?;
+    assert!(
+        unread.iter().any(|note| note.kind == "bot_message"
+            && note.conversation_id == "d"
+            && note.notification_id == message.event_hash),
+        "the receiving chat counts the message as unread"
+    );
     let (again, _, written) = send(&mut origin, "s1", "Ops", "Check the backups", 11)?;
     assert!(!written && again.message_id == message.message_id);
     let changed = send(&mut origin, "s1", "d", "Other", 11).unwrap_err();

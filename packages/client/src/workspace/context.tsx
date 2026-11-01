@@ -117,6 +117,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const refreshingRef = useRef(false)
   const refreshingConnection = useRef<ReadyConnection | null>(null)
   const refreshAgain = useRef(false)
+  const refreshPromiseRef = useRef<Promise<void> | null>(null)
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const refreshRef = useRef<() => Promise<void>>(async () => {})
   const current = () => alive.current && connection.isCurrent()
@@ -301,7 +302,17 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   }
   const refresh = async () => {
     requireCurrent()
-    if (refreshingRef.current && refreshingConnection.current === connection) { refreshAgain.current = true; return }
+    if (refreshingRef.current && refreshingConnection.current === connection) {
+      refreshAgain.current = true
+      const pending = refreshPromiseRef.current
+      if (pending) await pending
+      return
+    }
+    let resolveRefresh: () => void = () => {}, rejectRefresh: (caught: unknown) => void = () => {}
+    const refreshPromise = new Promise<void>((resolve, reject) => { resolveRefresh = resolve; rejectRefresh = reject })
+    // The operation is also awaited by explicit retries; mark its rejection handled for callers that only schedule refresh.
+    refreshPromise.catch(() => {})
+    refreshPromiseRef.current = refreshPromise
     refreshingRef.current = true
     refreshingConnection.current = connection
     setRefreshing(true)
@@ -326,9 +337,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       readConnection.current = connection
       void notify(nextNotifications.filter((item) => !ignoredNotificationsRef.current.has(item.notification_id)))
       void refreshNotificationButton()
+      resolveRefresh()
     } catch (caught) {
       // What the page shows stays; writes wait for the next full read.
       if (current()) readConnection.current = null
+      rejectRefresh(caught)
       throw caught
     } finally {
       if (refreshingConnection.current === connection) refreshingRef.current = false
@@ -336,6 +349,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         setRefreshing(false)
         if (refreshAgain.current) { refreshAgain.current = false; scheduleRefresh() }
       }
+      if (refreshPromiseRef.current === refreshPromise) refreshPromiseRef.current = null
     }
   }
   refreshRef.current = refresh

@@ -155,9 +155,10 @@ export function sortSchedules<T extends Pick<ScheduleView, "enabled" | "next_run
   return schedules.filter((schedule) => schedule.every_minutes !== undefined || schedule.first_run_at_ms > now).sort((a, b) => key(a) - key(b))
 }
 
-/** When a one-time schedule ran, as the time of its reply in the chat; null until it ran. */
-export function firedAt(messages: readonly { in_reply_to?: string; created_at_ms: number }[], scheduleId: string): number | null {
-  return messages.find((message) => scheduleTrigger(message.in_reply_to) === scheduleId)?.created_at_ms ?? null
+/** When this exact one-time schedule slot ran, as the time of its reply in the chat; null until it ran. */
+export function firedAt(messages: readonly { in_reply_to?: string; created_at_ms: number }[], scheduleId: string, firstRunAtMs: number): number | null {
+  const trigger = `schedule:${scheduleId}:${firstRunAtMs}`
+  return messages.find((message) => message.in_reply_to === trigger)?.created_at_ms ?? null
 }
 
 export type DiffLine = { kind: "removed" | "added"; text: string }

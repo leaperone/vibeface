@@ -242,7 +242,7 @@ function ChangeRows({ change, conversationId, schedules, overwritten }: { change
   if (!next) return <ChangeRow icon={icon} label={before!.name} tag={tag} removed />
   const current = schedules.find((schedule) => schedule.schedule_id === change.schedule_id)
   const at = once ? next.first_run_at_ms : current?.enabled ? current.next_run_at_ms : null
-  const fired = once ? firedAt(messages, change.schedule_id) : null
+  const fired = once ? firedAt(messages, change.schedule_id, (next ?? before!).first_run_at_ms) : null
   const when = fired !== null ? `已提醒 ${formatWhen(fired)}` : at !== null ? `${once ? '' : '下次 '}${formatWhen(at)}` : ''
   return <ChangeRow icon={icon} label={next.name} tag={tag}>
     <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{[scheduleFrequency(next), next.enabled ? when : '已暂停'].filter(Boolean).join(' · ')}</Text>

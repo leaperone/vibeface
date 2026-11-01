@@ -404,7 +404,8 @@ test("a one-time reminder leaves the list once due and reads as fired from its r
   const once = { schedule_id: "s1", first_run_at_ms: 1_000, enabled: true, next_run_at_ms: 1_000 }, daily = { schedule_id: "s2", first_run_at_ms: 1_000, every_minutes: 1440, enabled: true, next_run_at_ms: 87_400_000 }
   assert.deepEqual(sortSchedules([once, daily], 2_000), [daily])
   assert.deepEqual(sortSchedules([once], 500), [once])
-  const messages = [{ in_reply_to: "message:m1", created_at_ms: 1 }, { in_reply_to: "schedule:s1:1000", created_at_ms: 1_200 }]
-  assert.equal(firedAt(messages, "s1"), 1_200)
-  assert.equal(firedAt(messages, "s2"), null)
+  const messages = [{ in_reply_to: "message:m1", created_at_ms: 1 }, { in_reply_to: "schedule:s1:1000", created_at_ms: 1_200 }, { in_reply_to: "schedule:s1:2000", created_at_ms: 2_200 }]
+  assert.equal(firedAt(messages, "s1", 1_000), 1_200)
+  assert.equal(firedAt(messages, "s1", 2_000), 2_200)
+  assert.equal(firedAt(messages, "s2", 1_000), null)
 })
