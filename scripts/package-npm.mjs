@@ -10,8 +10,9 @@ import { gunzipSync, gzipSync } from 'node:zlib';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const targets = ['aarch64-apple-darwin', 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-gnu'];
-const required = ['vibeface', 'BUILD-INFO.json', 'README.md', 'RUNTIME-REQUIREMENTS.md',
+const required = ['vibeface', 'vibeface-core', 'BUILD-INFO.json', 'README.md', 'RUNTIME-REQUIREMENTS.md',
   'scripts/install-node-service.sh', 'docs/node.md', 'docs/releasing.md',
+  'web/_shell.html', 'web/index.html', 'web/_redirects', 'web/_headers', 'web/.vibeface-build.json',
   'web/vibeface_secure.js', 'web/vibeface_secure_bg.wasm'];
 const run = (program, args, options = {}) => execFileSync(program, args, {
   encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, ...options,
@@ -77,7 +78,10 @@ function nativePackage(directory, version, target, sourceCommit) {
   assert.deepEqual([info.version, info.target, info.source_commit, info.update_protocol],
     [version, target, sourceCommit, 1], 'native package identity mismatch');
   assert(Number.isSafeInteger(info.data_epoch) && info.data_epoch > 0 && info.data_epoch <= 0xffffffff, 'invalid data epoch');
-  assert(fs.statSync(path.join(directory, 'vibeface')).mode & 0o111, 'native binary must be executable');
+  for (const binary of ['vibeface', 'vibeface-core']) {
+    const executable = path.join(directory, binary);
+    assert(fs.statSync(executable).mode & 0o111, `${binary} must be executable`);
+  }
   assert(fs.readFileSync(path.join(directory, 'web/vibeface_secure_bg.wasm')).subarray(0, 4).equals(Buffer.from([0, 97, 115, 109])), 'invalid WebAssembly module');
   return info.data_epoch;
 }
@@ -174,11 +178,15 @@ async function selfTest() {
       }
       fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ version, target, source_commit: commit, update_protocol: 1, data_epoch: 1 }));
       fs.writeFileSync(path.join(directory, 'web/vibeface_secure_bg.wasm'), Buffer.from([0, 97, 115, 109]));
-      fs.writeFileSync(path.join(directory, 'vibeface'), '#!/usr/bin/env node\nif (process.argv[2] === "exit") process.exit(23);\nif (process.argv[2] === "wait") { process.on("SIGTERM", () => process.exit(42)); console.log("ready"); setInterval(() => {}, 1000); }\nelse console.log(JSON.stringify(process.argv.slice(2)));\n');
-      fs.chmodSync(path.join(directory, 'vibeface'), 0o755);
+      fs.writeFileSync(path.join(directory, 'vibeface'), '#!/usr/bin/env node\nif (process.env.VIBEFACE_PACK_ASSERT_NO_EXEC) process.exit(99);\nif (process.argv[2] === "--version") console.log(`vibeface ${process.env.VIBEFACE_FIXTURE_VERSION}`);\nelse if (process.argv[2] === "exit") process.exit(23);\nelse if (process.argv[2] === "wait") { process.on("SIGTERM", () => process.exit(42)); console.log("ready"); setInterval(() => {}, 1000); }\nelse console.log(JSON.stringify(process.argv.slice(2)));\n');
+      fs.writeFileSync(path.join(directory, 'vibeface-core'), '#!/usr/bin/env node\nif (process.env.VIBEFACE_PACK_ASSERT_NO_EXEC) process.exit(99);\nif (process.argv[2] === "--version") console.log(`vibeface-core ${process.env.VIBEFACE_FIXTURE_VERSION}`);\nelse console.log(JSON.stringify(process.argv.slice(2)));\n');
+      for (const binary of ['vibeface', 'vibeface-core']) fs.chmodSync(path.join(directory, binary), 0o755);
       repack(target);
     }
+    process.env.VIBEFACE_FIXTURE_VERSION = version;
+    process.env.VIBEFACE_PACK_ASSERT_NO_EXEC = '1';
     const artifact = pack(input, path.join(scratch, 'output'), version, commit);
+    delete process.env.VIBEFACE_PACK_ASSERT_NO_EXEC;
     assert.equal(path.basename(artifact), `leaperone-vibeface-${version}.tgz`);
     const artifactBytes = fs.readFileSync(artifact);
     const privateHeader = gunzipSync(artifactBytes);
@@ -192,6 +200,8 @@ async function selfTest() {
     assert.equal(JSON.parse(fs.readFileSync(path.join(prefix, 'lib/node_modules/@leaperone/vibeface/package.json'), 'utf8')).name, '@leaperone/vibeface');
     const binary = path.join(prefix, 'bin/vibeface');
     assert.equal(run(binary, ['one two', '--flag']), '["one two","--flag"]\n');
+    const core = path.join(prefix, 'lib/node_modules/@leaperone/vibeface/vendor', targets[0], 'vibeface-core');
+    assert.equal(run(core, ['--version']), `vibeface-core ${version}\n`);
     assert.equal(spawnSync(binary, ['exit']).status, 23);
     const waiting = spawn(binary, ['wait'], { stdio: ['ignore', 'pipe', 'inherit'] });
     try {

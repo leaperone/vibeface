@@ -119,8 +119,9 @@ jobs:
           cargo install wasm-bindgen-cli --version 0.2.129 --locked
           bash scripts/build-web-crypto.sh
           bash scripts/build-web.sh
-          CARGO_ENCODED_RUSTFLAGS="$(python3 scripts/release-rustflags.py)" cargo build --release -p vibeface --locked
+          CARGO_ENCODED_RUSTFLAGS="$(python3 scripts/release-rustflags.py)" cargo build --release -p vibeface -p vibeface-core --locked
           .artifacts/native/target/release/vibeface --version
+          .artifacts/native/target/release/vibeface-core --version
       - name: Create the dedicated iOS Provider simulator
         env:
           VIBEFACE_E2E_SOURCE_COMMIT: ${{ github.sha }}
@@ -146,7 +147,8 @@ jobs:
               for key, value in {"VIBEFACE_E2E_SIMULATOR": simulator, "VIBEFACE_E2E_IOS_RUNTIME": runtime,
                                  "VIBEFACE_E2E_IOS_DEVICE_TYPE": device_type, "VIBEFACE_E2E_IOS_APP": str(app),
                                  "VIBEFACE_E2E_BINARY": str(pathlib.Path(".artifacts/native/target/release/vibeface").resolve()),
-                                 "VIBEFACE_E2E_CRYPTO_MODULE": str(pathlib.Path("crates/node/web/generated/vibeface_secure.js").resolve())}.items():
+                                 "VIBEFACE_E2E_APP_DIR": str(pathlib.Path("apps/app/dist/client").resolve()),
+                                 "VIBEFACE_E2E_CRYPTO_MODULE": str(pathlib.Path("apps/app/dist/client/vibeface_secure.js").resolve())}.items():
                   output.write(key + "=" + value + "\n")
           subprocess.run(["xcrun", "simctl", "boot", simulator], check=True)
           subprocess.run(["xcrun", "simctl", "bootstatus", simulator, "-b"], check=True)

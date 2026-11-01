@@ -22,7 +22,7 @@
 - 🌐 **个人设备网络**。所有 Node 设备运行同一个 `vibeface` Node，经 iroh QUIC 直连或经 relay 互通。A 设备上的 bot 可以把任务派给 B 设备执行。
 - 🔁 **换设备接着干**。Bot 聊天、设置、任务阶段、摘要和结果写进签名 DAG 并在授权 Node 间同步，完整逐字进度不进入共享历史。A 离线时，在已同步的 C 打开原聊天，由本人切换负责人后接着协调。历史回放不启动旧工作，工程、登录和原生 SDK 状态不会自动迁移。
 - 🔐 **端到端加密入口**。浏览器和手机 App 用本机设备密钥与 Node 建立 Noise 通道。公网入口只转发密文，不加入个人网络。
-- 📦 **单个二进制**。网页是 React + TanStack Start 静态 SPA，内嵌在 Rust 程序里，生产环境不需要 Node.js Web 服务。
+- 📦 **完整本机包**。包内同时提供 `vibeface` CLI、`vibeface-core` 和 `web/` 静态 SPA，生产环境不需要 Node.js Web 服务。
 - 📱 **原生移动端**。Expo iOS/Android 客户端复用同一套 client 协议、恢复包和加入链接，设备密钥保存在系统安全存储。
 
 > [!WARNING]
@@ -50,7 +50,7 @@ flowchart LR
 | **Node**（Rust） | 认证、路由、签名日志同步、写入保护、SQLite 存储、任务调度、去重和通知。 |
 | **协调 Agent** | Codex、Claude Code、pi、opencode 或 Cursor SDK 驱动。Cursor 用 SDK 原生自定义工具，其余经本机 `vibeface tool` 命令回调 Node，不需要 MCP。 |
 | **执行** | 宿主命令和文件操作直接用 Agent 自己的工具。任务在本机 Codex App Server、Claude Code、pi、opencode 或 Cursor 的会话里运行。 |
-| **网页** | 内嵌静态 SPA。浏览器设备密钥签名，经 Noise 通道访问指定 Node。 |
+| **网页** | Core 从同包 `web/` 或显式 App 目录提供静态 SPA。浏览器设备密钥签名，经 Noise 通道访问指定 Node。 |
 | **手机 App**（Expo） | 复用共享 client 与原生安全模块，设备密钥保存在系统安全存储。 |
 
 几条设计约束值得先知道：
@@ -172,6 +172,7 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 rustup target add wasm32-unknown-unknown
 bash scripts/build-web-crypto.sh
 bash scripts/build-web.sh
+cargo build --release -p vibeface -p vibeface-core --locked
 bash scripts/package-node.sh
 ./target/release/vibeface init \
 	--root /absolute/path/to/projects
@@ -182,6 +183,8 @@ bash scripts/package-node.sh
 
 `bash scripts/package-node.sh` 生成当前平台的压缩包和 SHA256 文件，输出到 `.artifacts/packages/`。
 
+完整包根目录同时包含 `vibeface`、`vibeface-core`、`BUILD-INFO.json` 和 `web/`。Core 从同目录的 `web/` 读取静态 App；源码运行时可用 `VIBEFACE_APP_DIR` 指向 `apps/app/dist/client`。更新器原子切换整个发行目录，不单独替换其中一个程序。
+
 移动端先用 `bash scripts/build-mobile-secure.sh ios` 或 `bash scripts/build-mobile-secure.sh android` 构建原生安全模块，再按 `apps/mobile` 的 Expo 脚本构建对应平台。
 
 ## 📁 目录结构
@@ -189,10 +192,12 @@ bash scripts/package-node.sh
 ```text
 .
 ├── apps/
+│   ├── app/         # 独立 Web App，产出可由 Core 读取的 dist/client
+│   ├── cli/         # vibeface 命令行与本机控制客户端
+│   ├── core/        # vibeface-core 后台、存储、同步、调度与执行
 │   └── mobile/      # Expo iOS/Android 客户端，复用 packages/client
 ├── crates/
-│   ├── node/        # vibeface 主程序：CLI、Node 运行时、存储、同步、调度
-│   │   └── web/     # React + TanStack Start 网页，构建后内嵌进二进制
+│   ├── control/     # CLI/Core 使用的无数据库控制 DTO 与客户端
 │   ├── bridge/      # Codex App Server 与 Agent 客户端
 │   ├── protocol/    # 共享 RPC 与消息类型
 │   ├── secure/      # 设备签名、成员关系、Noise 通道与恢复逻辑（含 wasm 构建）
@@ -224,12 +229,12 @@ bash scripts/package-node.sh
 | [文件交付实验参考](docs/paid-delivery.md) | VDP-1 的角色、费用、钱包、证明与结算边界。 |
 | [排障](docs/troubleshooting.md) | `status`、`node.log`、诊断包，只读与分叉处理。 |
 | [构建与发布](docs/releasing.md) | 三个平台包、SHA256、Stable 与 Nightly 渠道、tag 规则。 |
-| [CI](docs/ci.md) | PR 核心检查与本地专项检查。 |
+| [CI](docs/ci.md) | 主分支、扩展 CI 与本地专项检查。 |
 
 ## 🤝 参与贡献
 
 - **报告问题**：在 [Issues](https://github.com/leaperone/vibeface/issues) 附上 `vibeface --version`、平台和 `vibeface status` 输出。诊断方法见 [排障](docs/troubleshooting.md)。请勿粘贴密钥或恢复包。
-- **提交 PR**：从 `main` 拉独立分支，使用 Conventional Commits。PR 由 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 执行核心检查。改动同步、恢复、调度或工具执行时，按 [docs/ci.md](docs/ci.md) 补跑本地专项并在 PR 中记录结果。
+- **提交 PR**：从 `main` 拉独立分支，使用 Conventional Commits。开发分支 PR 不自动运行 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml)，提交前运行相关本地检查，必要时手动触发扩展 CI。改动同步、恢复、调度或工具执行时，按 [docs/ci.md](docs/ci.md) 补跑本地专项并在 PR 中记录结果。
 
 提交前可在仓库根目录运行：
 

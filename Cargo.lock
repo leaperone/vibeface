@@ -6360,6 +6360,67 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vibeface"
 version = "0.0.1-nightly.20261031.19"
 dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "flate2",
+ "futures-util",
+ "hex",
+ "libc",
+ "reqwest 0.12.28",
+ "semver 1.0.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "uuid",
+ "vibeface-bridge",
+ "vibeface-control",
+ "vibeface-protocol",
+ "zeroize",
+]
+
+[[package]]
+name = "vibeface-bridge"
+version = "0.0.1-nightly.20261031.19"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "tracing",
+ "vibeface-protocol",
+]
+
+[[package]]
+name = "vibeface-control"
+version = "0.0.1-nightly.20261031.19"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "libc",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "uuid",
+ "vibeface-bridge",
+ "vibeface-protocol",
+ "zeroize",
+]
+
+[[package]]
+name = "vibeface-core"
+version = "0.0.1-nightly.20261031.19"
+dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-primitives",
@@ -6395,25 +6456,11 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vibeface-bridge",
+ "vibeface-control",
  "vibeface-delivery",
  "vibeface-protocol",
  "vibeface-secure",
  "zeroize",
-]
-
-[[package]]
-name = "vibeface-bridge"
-version = "0.0.1-nightly.20261031.19"
-dependencies = [
- "anyhow",
- "futures-util",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite 0.28.0",
- "tracing",
- "vibeface-protocol",
 ]
 
 [[package]]

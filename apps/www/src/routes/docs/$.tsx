@@ -6,33 +6,12 @@ import { Suspense, use } from 'react'
 import { Link } from '@tanstack/react-router'
 import { docs, source } from '@/lib/source'
 import { useMDXComponents } from '@/components/mdx'
-import { PUBLIC_DOC_BY_SLUG } from '@/lib/public-docs'
-
-type DocsLoaderData = {
-  path: string
-  url: string
-  title: string
-  description: string
-  pageTree: Awaited<ReturnType<typeof source.serializePageTree>>
-}
 
 export const Route = createFileRoute('/docs/$')({
   component: DocsRoute,
-  head: ({ params }) => {
-    const doc = PUBLIC_DOC_BY_SLUG.get(params._splat?.split('/').filter(Boolean)[0] ?? '')
-    return doc
-      ? {
-          meta: [
-            { title: `${doc.title} · Vibeface 文档` },
-            { name: 'description', content: doc.description },
-          ],
-          links: [{ rel: 'canonical', href: `https://www.vibeface.dev/docs/${doc.slug}` }],
-        }
-      : {}
-  },
   loader: async ({ params }) => {
     const path = params._splat?.split('/').filter(Boolean) ?? []
-    const page = source.getPage(path)
+    const page = source.getPage(path.length ? path : ['overview'])
     if (!page) throw notFound()
     await docs.getPage(page.path)?.preload()
     return {
@@ -43,6 +22,15 @@ export const Route = createFileRoute('/docs/$')({
       pageTree: await source.serializePageTree(source.getPageTree()),
     }
   },
+  head: ({ loaderData }) => loaderData
+    ? {
+        meta: [
+          { title: `${loaderData.title} · Vibeface 文档` },
+          { name: 'description', content: loaderData.description },
+        ],
+        links: [{ rel: 'canonical', href: `https://www.vibeface.dev${loaderData.url}` }],
+      }
+    : {},
 })
 
 function Content({ path }: { path: string }) {
@@ -68,7 +56,7 @@ const docsNavLinks = [
 ]
 
 function DocsRoute() {
-  const data = Route.useLoaderData() as DocsLoaderData
+  const data = Route.useLoaderData()
   const pageTree = useFumadocsLoader({ pageTree: data.pageTree }).pageTree
   return (
     <div className="site-docs">

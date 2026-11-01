@@ -4,7 +4,7 @@ set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 python3 "$repo/scripts/build-inputs.py" check crypto
 python3 "$repo/scripts/build-inputs.py" prepare web
-cd "$repo/crates/node/web"
+cd "$repo/apps/app"
 for asset in vibeface_secure.js vibeface_secure_bg.wasm vibeface_secure.d.ts; do
   [[ -s "generated/$asset" ]] || { echo 'Run scripts/build-web-crypto.sh before building the web client.' >&2; exit 1; }
 done
@@ -22,4 +22,15 @@ pnpm --filter @vibeface/secure-native run typecheck
 pnpm --filter vibeface-mobile run typecheck
 pnpm run build
 [[ -s dist/client/_shell.html ]] || { echo 'SPA shell was not written to dist/client/_shell.html' >&2; exit 1; }
+cp generated/vibeface_secure.js generated/vibeface_secure_bg.wasm dist/client/
+[[ -s dist/client/vibeface_secure.js && -s dist/client/vibeface_secure_bg.wasm ]] || {
+  echo 'Browser crypto files were not copied into the static App output.' >&2
+  exit 1
+}
+cp dist/client/_shell.html dist/client/index.html
+cat > dist/client/_redirects <<'EOF'
+/api/* /__vibeface_missing_api__ 404
+/sdk.v1.* /__vibeface_missing_api__ 404
+/* /_shell.html 200
+EOF
 python3 "$repo/scripts/build-inputs.py" finish web

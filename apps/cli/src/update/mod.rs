@@ -1,0 +1,1504 @@
+pub mod release;
+
+use anyhow::{Context, Result, bail, ensure};
+use clap::{Args, Subcommand};
+use release::Channel;
+use serde::{Deserialize, Serialize};
+use std::{
+    fs::{self, File, OpenOptions},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use tokio::process::Command;
+use vibeface_control::{self, ControlRequest, maintenance};
+
+#[derive(Args)]
+pub struct Update {
+    #[command(subcommand)]
+    action: Action,
+}
+
+#[derive(Subcommand)]
+enum Action {
+    /// Select a release channel and install or remove the automatic update timer.
+    Configure {
+        #[arg(long, value_enum)]
+        channel: Channel,
+        #[arg(long, action = clap::ArgAction::Set)]
+        automatic: bool,
+        #[arg(long)]
+        install_root: PathBuf,
+        #[command(flatten)]
+        data: Data,
+    },
+    /// Show the local policy and any interrupted activation.
+    Status(Data),
+    /// Check the selected channel without stopping the node.
+    Check(Data),
+    /// Install a newer compatible release when this node is idle.
+    Apply {
+        /// Used by the user-service timer; disabled policies do nothing.
+        #[arg(long)]
+        automatic: bool,
+        #[command(flatten)]
+        data: Data,
+    },
+}
+
+#[derive(Args)]
+struct Data {
+    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = absolute_path, default_value_os_t = default_data_dir())]
+    data_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Policy {
+    channel: Channel,
+    automatic: bool,
+    install_root: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct Manifest {
+    version: semver::Version,
+    update_protocol: u32,
+    data_epoch: u32,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Phase {
+    Prepared,
+    Confirmed,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Journal {
+    phase: Phase,
+    previous: PathBuf,
+    candidate: PathBuf,
+
+    device_id: String,
+    backup: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectResult {
+    status: String,
+    device_id: String,
+    data_dir: PathBuf,
+    maintenance_socket: PathBuf,
+    listen: SocketAddr,
+    version: Option<String>,
+    core_version: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MaintenanceHealth {
+    device_id: String,
+    version: String,
+}
+
+fn absolute_path(value: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err("path must be absolute".into())
+    }
+}
+
+fn default_data_dir() -> PathBuf {
+    std::env::var_os("HOME").map_or_else(
+        || PathBuf::from(".vibeface"),
+        |home| PathBuf::from(home).join(".vibeface"),
+    )
+}
+
+fn core_binary() -> Result<PathBuf> {
+    vibeface_control::sibling_core(&std::env::current_exe()?)
+}
+
+async fn inspect(data: &Path, core: &Path) -> Result<InspectResult> {
+    let value = vibeface_control::request(
+        core,
+        &ControlRequest::Inspect {
+            data_dir: data.to_owned(),
+        },
+    )
+    .await?;
+    let result: InspectResult =
+        serde_json::from_value(value).context("invalid core inspect response")?;
+    ensure!(
+        result.data_dir == data,
+        "core inspected a different data directory"
+    );
+    ensure!(
+        !result.device_id.is_empty(),
+        "core inspect returned no device identity"
+    );
+    Ok(result)
+}
+
+fn private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = path.parent().context("private file has no parent")?;
+    private_dir(parent)?;
+    let temporary = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .context("private file has no name")?
+            .to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn lock_data_dir(data: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(data.join("node.lock"))?;
+    file.try_lock()
+        .context("stop the Node using this data directory before updating")?;
+    Ok(file)
+}
+
+fn policy(data: &Path) -> Result<Policy> {
+    let path = data.join("update.json");
+    Ok(serde_json::from_slice(&fs::read(path).context(
+        "configure updates with an explicit --install-root before using the updater",
+    )?)?)
+}
+
+/// Resolve the same managed installation used by this node's update policy.
+pub fn managed_install_root(data: &Path) -> Result<PathBuf> {
+    let root = policy(data)?.install_root;
+    ensure!(root.is_absolute(), "install-root must be absolute");
+    let root = fs::canonicalize(root)
+        .context("managed installation is required; install a published Vibeface package first")?;
+    installed(&root)?;
+    Ok(root)
+}
+
+pub fn npm_install_root(executable: &Path) -> Result<Option<PathBuf>> {
+    let executable = fs::canonicalize(executable)?;
+    let Some(package) = executable.parent() else {
+        return Ok(None);
+    };
+    let Some(vendor) = package
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "vendor"))
+    else {
+        return Ok(None);
+    };
+    let root = vendor.parent().context("npm package root is missing")?;
+    #[derive(Deserialize)]
+    struct NpmPackage {
+        name: String,
+        version: semver::Version,
+    }
+    let npm: NpmPackage = serde_json::from_slice(&fs::read(root.join("package.json"))?)
+        .context("invalid npm package metadata")?;
+    ensure!(
+        npm.name == "@leaperone/vibeface"
+            && npm.version == manifest(package)?.version
+            && root.join("bin/vibeface.mjs").is_file()
+            && executable
+                .file_name()
+                .is_some_and(|name| name == "vibeface"),
+        "npm package does not match the native Vibeface program"
+    );
+    Ok(Some(root.to_path_buf()))
+}
+
+pub async fn run(options: Update) -> Result<()> {
+    let data = match &options.action {
+        Action::Configure { data, .. }
+        | Action::Status(data)
+        | Action::Check(data)
+        | Action::Apply { data, .. } => &data.data_dir,
+    };
+    ensure!(data.is_absolute(), "--data-dir must be absolute");
+    let data = fs::canonicalize(data).context("initialized data directory is required")?;
+    let _lock = update_lock(&data)?;
+    if let Some(root) = npm_install_root(&std::env::current_exe()?)? {
+        match options.action {
+            Action::Status(_) => {
+                println!(
+                    "{}",
+                    serde_json::json!({"distribution":"npm", "install_root":root,
+                    "current_version":env!("CARGO_PKG_VERSION"), "automatic":false,
+                    "recovery_required":data.join("update-pending.json").exists()})
+                );
+                return Ok(());
+            }
+            Action::Apply {
+                automatic: true, ..
+            } => return Ok(()),
+            _ => bail!(
+                "npm owns this installation; wait for idle, stop any node service, then run npm install -g @leaperone/vibeface@nightly and restart the service"
+            ),
+        }
+    }
+    match options.action {
+        Action::Status(_) => {
+            let policy = policy(&data)?;
+            let current = installed(&policy.install_root)
+                .and_then(|path| manifest(&path).map(|m| m.version))
+                .ok();
+            println!(
+                "{}",
+                serde_json::json!({"policy":policy,"current_version":current,
+                    "recovery_required":data.join("update-pending.json").exists()})
+            );
+            Ok(())
+        }
+        Action::Configure {
+            channel,
+            automatic,
+            install_root,
+            ..
+        } => {
+            ensure!(
+                !data.join("update-pending.json").exists(),
+                "interrupted update: run update apply with the existing policy first"
+            );
+            ensure!(
+                install_root.is_absolute(),
+                "--install-root must be absolute"
+            );
+            let install_root = fs::canonicalize(install_root)?;
+            let package = installed(&install_root)?;
+            manifest(&package)?;
+            let new = Policy {
+                channel,
+                automatic,
+                install_root,
+            };
+            // Keep the old policy if the platform cannot install the requested timer.
+            configure_timer(&new, &data).await?;
+            persist(&data.join("update.json"), &new)?;
+            println!("{}", serde_json::to_string(&new)?);
+            Ok(())
+        }
+        Action::Check(_) => {
+            let policy = policy(&data)?;
+            let current = manifest(&installed(&policy.install_root)?)?.version;
+            let latest = release::check(policy.channel).await?;
+            let newer = latest.as_ref().filter(|r| r.version > current);
+            println!(
+                "{}",
+                serde_json::json!({"channel":policy.channel,"current_version":current,
+                    "available_version":newer.map(|r|&r.version),
+                    "tag":newer.map(|r|&r.tag)})
+            );
+            Ok(())
+        }
+        Action::Apply { automatic, .. } => {
+            let policy = policy(&data)?;
+            recover(&policy, &data).await?;
+            if automatic && !policy.automatic {
+                println!("Automatic updates are disabled.");
+                return Ok(());
+            }
+            let previous = installed(&policy.install_root)?;
+            let current = manifest(&previous)?.version;
+            let Some(latest) = release::check(policy.channel)
+                .await?
+                .filter(|r| r.version > current)
+            else {
+                println!("No newer release is available in the selected channel.");
+                return Ok(());
+            };
+            let candidate = fs::canonicalize(release::stage(&latest, &policy.install_root).await?)?;
+            ensure!(
+                manifest(&candidate)?.version == latest.version,
+                "staged version changed"
+            );
+            let inspected = inspect(&data, &core_binary()?).await?;
+            prepare_firewall(&inspected, &policy.install_root, &candidate).await?;
+            let service = Service::load(&data).await?;
+            let lease = match maintenance::acquire(&inspected.maintenance_socket).await {
+                Ok(lease) => lease,
+                Err(error) if error.downcast_ref::<maintenance::Busy>().is_some() => {
+                    println!("Update deferred; the node could not become idle: {error:#}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error.context("request node maintenance")),
+            };
+            let health: MaintenanceHealth = serde_json::from_value(lease.health.clone())
+                .context("maintenance response has invalid health")?;
+            ensure!(
+                health.version == current.to_string(),
+                "running node does not match current package"
+            );
+            ensure!(
+                health.device_id == inspected.device_id,
+                "running node identity changed"
+            );
+            let root = fs::canonicalize(&policy.install_root)?;
+            ensure!(
+                !root.starts_with(&data),
+                "install-root must not be inside the node data directory"
+            );
+            let backups = root.join("backups");
+            if !backups.exists() {
+                fs::create_dir(&backups)?;
+            }
+            ensure!(
+                fs::symlink_metadata(&backups)?.is_dir(),
+                "backup directory must not be a symlink"
+            );
+            private_dir(&backups)?;
+            let mut journal = Journal {
+                phase: Phase::Prepared,
+                previous,
+                candidate,
+                device_id: health.device_id.clone(),
+                backup: backups.join(uuid::Uuid::new_v4().to_string()),
+            };
+            persist(&data.join("update-pending.json"), &journal)?;
+            // The open lease closes admission until the service has actually stopped.
+            let applied = activate(&policy, &data, &service, &mut journal).await;
+            drop(lease);
+            if let Err(error) = applied {
+                match recover(&policy, &data).await {
+                    Ok(()) if installed(&policy.install_root)? == journal.candidate => {
+                        maintenance_commit(&data)
+                            .await
+                            .context("confirmed update must reopen admission")?;
+                        healthy(&data, &journal.candidate, &journal.device_id).await?;
+                    }
+                    Ok(()) => {
+                        bail!("update failed; previous program restored, data was kept: {error:#}")
+                    }
+                    Err(rollback) => bail!(
+                        "update failed: {error:#}; recovery also failed: {rollback:#}; keep update-pending.json and run update apply again"
+                    ),
+                }
+            }
+            println!(
+                "Updated to {}. Backup: {}",
+                latest.version,
+                journal.backup.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn maintenance_commit(data: &Path) -> Result<()> {
+    let inspected = inspect(data, &core_binary()?).await?;
+    let response = maintenance::request(
+        &inspected.maintenance_socket,
+        vibeface_control::maintenance::MaintenanceCommand::Commit,
+    )
+    .await?;
+    ensure!(
+        matches!(
+            response.status,
+            vibeface_control::maintenance::MaintenanceStatus::Committed
+        ),
+        "node activation was not committed"
+    );
+    Ok(())
+}
+
+pub fn update_lock(data: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(data.join("update.lock"))?;
+    file.try_lock()
+        .context("another updater is already running")?;
+    Ok(file)
+}
+
+fn manifest(package: &Path) -> Result<Manifest> {
+    let metadata = fs::symlink_metadata(package.join("BUILD-INFO.json"))?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= 64 * 1024,
+        "invalid package manifest"
+    );
+    let manifest: Manifest = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
+        .context("invalid package manifest")?;
+    ensure!(
+        manifest.update_protocol == vibeface_control::UPDATE_PROTOCOL
+            && manifest.data_epoch == vibeface_control::DATA_EPOCH,
+        "package does not support the current updater and data compatibility epoch; manual upgrade required"
+    );
+    for file in [
+        "vibeface",
+        "vibeface-core",
+        "scripts/install-node-service.sh",
+    ] {
+        ensure!(
+            fs::symlink_metadata(package.join(file))?
+                .file_type()
+                .is_file(),
+            "package is missing required file {file}"
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for binary in ["vibeface", "vibeface-core"] {
+            ensure!(
+                fs::symlink_metadata(package.join(binary))?
+                    .permissions()
+                    .mode()
+                    & 0o111
+                    != 0,
+                "package binary is not executable: {binary}"
+            );
+        }
+    }
+    let web = fs::symlink_metadata(package.join("web"))?;
+    ensure!(
+        web.is_dir()
+            && !web.file_type().is_symlink()
+            && fs::read_dir(package.join("web"))?.next().is_some(),
+        "package web directory is missing or empty"
+    );
+    Ok(manifest)
+}
+
+fn installed(root: &Path) -> Result<PathBuf> {
+    ensure!(root.is_absolute(), "install-root must be absolute");
+    let root = fs::canonicalize(root)?;
+    let current = root.join("current");
+    ensure!(
+        fs::symlink_metadata(&current)?.is_symlink(),
+        "managed installation requires a current symlink"
+    );
+    let package = fs::canonicalize(current)?;
+    ensure!(
+        package.starts_with(&root) && package != root,
+        "current points outside the installation"
+    );
+    manifest(&package)?;
+    Ok(package)
+}
+
+async fn configure_timer(policy: &Policy, data: &Path) -> Result<()> {
+    let mut command = Command::new(
+        policy
+            .install_root
+            .join("current/scripts/install-node-service.sh"),
+    );
+    if policy.automatic {
+        command
+            .arg("install-updater")
+            .arg("--binary")
+            .arg(policy.install_root.join("current/vibeface"));
+    } else {
+        command.arg("uninstall-updater");
+    }
+    command.arg("--data-dir").arg(data);
+    checked(&mut command, "configure automatic update service").await
+}
+
+fn persist(path: &Path, value: &impl Serialize) -> Result<()> {
+    private_write(path, &serde_json::to_vec_pretty(value)?)?;
+    File::open(path.parent().context("missing parent directory")?)?.sync_all()?;
+    Ok(())
+}
+
+fn switch(root: &Path, package: &Path) -> Result<()> {
+    let root = fs::canonicalize(root)?;
+    let package = fs::canonicalize(package)?;
+    ensure!(
+        package.starts_with(&root) && package != root,
+        "package is outside installation"
+    );
+    manifest(&package)?;
+    let temporary = root.join(format!(".current-{}", uuid::Uuid::new_v4()));
+    std::os::unix::fs::symlink(&package, &temporary)?;
+    if let Err(error) = fs::rename(&temporary, root.join("current")) {
+        let _ = fs::remove_file(temporary);
+        return Err(error.into());
+    }
+    File::open(root)?.sync_all()?;
+    Ok(())
+}
+
+async fn activate(
+    policy: &Policy,
+    data: &Path,
+    service: &impl ServiceControl,
+    journal: &mut Journal,
+) -> Result<()> {
+    service.stop().await?;
+    let lock = wait_for_node_lock(data).await?;
+    backup(data, &journal.backup)?;
+    switch(&policy.install_root, &journal.candidate)?;
+    drop(lock);
+    service.start().await?;
+    service
+        .healthy(data, &journal.candidate, &journal.device_id)
+        .await?;
+    // Confirm durably before opening admission; recovery must never undo a committed update.
+    journal.phase = Phase::Confirmed;
+    persist(&data.join("update-pending.json"), journal)?;
+    service.commit(data).await?;
+    Ok(())
+}
+
+async fn recover(policy: &Policy, data: &Path) -> Result<()> {
+    if !data.join("update-pending.json").exists() {
+        return Ok(());
+    }
+    let service = Service::load(data).await?;
+    recover_with_service(policy, data, &service).await
+}
+
+async fn recover_with_service(
+    policy: &Policy,
+    data: &Path,
+    service: &impl ServiceControl,
+) -> Result<()> {
+    let pending = data.join("update-pending.json");
+    if !pending.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(&pending)?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= 64 * 1024,
+        "invalid pending update journal"
+    );
+    let mut journal: Journal = serde_json::from_slice(&fs::read(&pending)?)?;
+    let root = fs::canonicalize(&policy.install_root)?;
+    ensure!(
+        journal.backup.parent() == Some(root.join("backups").as_path())
+            && journal
+                .backup
+                .file_name()
+                .is_some_and(|name| !name.is_empty()),
+        "journal backup path is outside installation"
+    );
+    for package in [&journal.previous, &journal.candidate] {
+        ensure!(
+            package.is_absolute()
+                && fs::canonicalize(package)? == *package
+                && package.starts_with(&root)
+                && package != &root,
+            "journal package path is outside installation"
+        );
+        manifest(package)?;
+    }
+    ensure!(
+        journal.device_id == service.device_id(data).await?,
+        "update journal belongs to another node"
+    );
+    let confirmed = journal.phase == Phase::Confirmed;
+    let wanted = if confirmed {
+        journal.candidate.clone()
+    } else {
+        journal.previous.clone()
+    };
+    if confirmed
+        && installed(&root)? == wanted
+        && service
+            .healthy(data, &wanted, &journal.device_id)
+            .await
+            .is_ok()
+    {
+        service.commit(data).await?;
+        return Ok(());
+    }
+    service.stop().await?;
+    let lock = wait_for_node_lock(data).await?;
+    switch(&root, &wanted)?;
+    drop(lock);
+    service.start().await?;
+    service.healthy(data, &wanted, &journal.device_id).await?;
+    journal.candidate = wanted;
+    journal.phase = Phase::Confirmed;
+    persist(&pending, &journal)?;
+    service.commit(data).await?;
+    println!(
+        "Recovered {} program; business data was kept.",
+        if confirmed { "confirmed" } else { "previous" }
+    );
+    Ok(())
+}
+
+async fn wait_for_node_lock(data: &Path) -> Result<File> {
+    for _ in 0..150 {
+        if let Ok(lock) = lock_data_dir(data) {
+            return Ok(lock);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("node did not release its data lock after stopping")
+}
+
+async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
+    let version = manifest(package)?.version.to_string();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(1))
+        .build()?;
+    let mut last = String::new();
+    for _ in 0..150 {
+        match inspect(data, &package.join("vibeface-core")).await {
+            Ok(inspected) => {
+                let running_version = inspected
+                    .core_version
+                    .as_deref()
+                    .or(inspected.version.as_deref());
+                if inspected.status != "running" {
+                    last = inspected
+                        .error
+                        .unwrap_or_else(|| "node is not running".into());
+                } else if inspected.device_id != device_id
+                    || running_version != Some(version.as_str())
+                {
+                    bail!("started node has an unexpected version or identity");
+                } else {
+                    let health = maintenance::request(
+                        &inspected.maintenance_socket,
+                        vibeface_control::maintenance::MaintenanceCommand::Probe,
+                    )
+                    .await
+                    .and_then(|response| {
+                        ensure!(
+                            matches!(
+                                response.status,
+                                vibeface_control::maintenance::MaintenanceStatus::Healthy
+                            ),
+                            "node did not report healthy"
+                        );
+                        let health: MaintenanceHealth = serde_json::from_value(
+                            response
+                                .health
+                                .context("maintenance response has no health")?,
+                        )
+                        .context("maintenance response has invalid health")?;
+                        Ok(health)
+                    });
+                    match health {
+                        Ok(health)
+                            if health.device_id == device_id && health.version == version =>
+                        {
+                            let mut listen = inspected.listen;
+                            if listen.ip().is_unspecified() {
+                                listen.set_ip(if listen.is_ipv6() {
+                                    Ipv6Addr::LOCALHOST.into()
+                                } else {
+                                    Ipv4Addr::LOCALHOST.into()
+                                });
+                            }
+                            let url = format!("http://{listen}/api/info");
+                            let host = format!(
+                                "{}:{}",
+                                if listen.is_ipv6() {
+                                    "[::1]"
+                                } else {
+                                    "127.0.0.1"
+                                },
+                                listen.port()
+                            );
+                            match client
+                                .get(&url)
+                                .header(reqwest::header::HOST, &host)
+                                .send()
+                                .await
+                            {
+                                Ok(response) if response.status().is_success() => {
+                                    if let Ok(info) = response.json::<serde_json::Value>().await {
+                                        ensure!(
+                                            info.get("device_id")
+                                                .and_then(serde_json::Value::as_str)
+                                                == Some(device_id)
+                                                && info["version"] == version,
+                                            "HTTP listener belongs to a different node or version"
+                                        );
+                                        return Ok(());
+                                    }
+                                    last = "invalid local HTTP health response".into();
+                                }
+                                Ok(response) => {
+                                    last = format!(
+                                        "local HTTP listener returned {}",
+                                        response.status()
+                                    )
+                                }
+                                Err(error) => last = error.to_string(),
+                            }
+                        }
+                        Ok(_) => bail!("started node has an unexpected version or identity"),
+                        Err(error) => last = error.to_string(),
+                    }
+                }
+            }
+            Err(error) => last = error.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    bail!("node failed its private health check: {last}")
+}
+
+fn backup(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    fs::create_dir(destination)?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o700))?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        let target = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_socket() {
+            continue;
+        }
+        if metadata.is_symlink() {
+            std::os::unix::fs::symlink(fs::read_link(path)?, target)?;
+        } else if metadata.is_dir() {
+            backup(&path, &target)?;
+        } else {
+            ensure!(
+                metadata.is_file(),
+                "unsupported data file: {}",
+                path.display()
+            );
+            fs::copy(&path, &target)?;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+            File::open(target)?.sync_all()?;
+        }
+    }
+    File::open(destination)?.sync_all()?;
+    Ok(())
+}
+
+async fn prepare_firewall(inspected: &InspectResult, root: &Path, candidate: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        if inspected.listen.ip().is_loopback() {
+            return Ok(());
+        }
+        let tool = "/usr/libexec/ApplicationFirewall/socketfilterfw";
+        let state = Command::new(tool).arg("--getglobalstate").output().await?;
+        ensure!(
+            state.status.success(),
+            "could not inspect application firewall before LAN update"
+        );
+        let state = String::from_utf8(state.stdout)?;
+        if state.contains("State = 0") {
+            return Ok(());
+        }
+        ensure!(
+            state.contains("State = 1"),
+            "unknown application firewall state; update deferred"
+        );
+        for binary in [
+            candidate.join("vibeface"),
+            candidate.join("vibeface-core"),
+            root.join("current/vibeface"),
+            root.join("current/vibeface-core"),
+        ] {
+            checked(
+                Command::new(tool).arg("--add").arg(&binary),
+                "retain this node's application firewall permission",
+            )
+            .await?;
+            let permission = Command::new(tool)
+                .arg("--getappblocked")
+                .arg(&binary)
+                .output()
+                .await?;
+            ensure!(
+                permission.status.success()
+                    && String::from_utf8(permission.stdout)?.contains("is permitted."),
+                "application firewall did not permit the new node binary; old service was kept"
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (inspected, root, candidate);
+    Ok(())
+}
+
+struct Service {
+    #[cfg(target_os = "macos")]
+    domain: String,
+    #[cfg(target_os = "macos")]
+    plist: PathBuf,
+}
+
+trait ServiceControl {
+    async fn stop(&self) -> Result<()>;
+    async fn start(&self) -> Result<()>;
+    async fn device_id(&self, data: &Path) -> Result<String> {
+        Ok(inspect(data, &core_binary()?).await?.device_id)
+    }
+    async fn healthy(&self, data: &Path, package: &Path, device_id: &str) -> Result<()> {
+        healthy(data, package, device_id).await
+    }
+    async fn commit(&self, data: &Path) -> Result<()> {
+        maintenance_commit(data).await
+    }
+}
+
+impl Service {
+    async fn load(data: &Path) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            let home = std::env::var_os("HOME").context("HOME is required for the user service")?;
+            let plist =
+                PathBuf::from(home).join("Library/LaunchAgents/com.leaperone.vibeface.node.plist");
+            let output = Command::new("/usr/bin/plutil")
+                .args(["-extract", "ProgramArguments", "json", "-o", "-"])
+                .arg(&plist)
+                .output()
+                .await?;
+            ensure!(
+                output.status.success(),
+                "installed node LaunchAgent is required"
+            );
+            let args: Vec<String> = serde_json::from_slice(&output.stdout)?;
+            ensure!(
+                service_data_matches(&args, data),
+                "installed node service uses a different data directory"
+            );
+            let uid = Command::new("/usr/bin/id").arg("-u").output().await?;
+            ensure!(
+                uid.status.success(),
+                "could not identify user service domain"
+            );
+            let uid = String::from_utf8(uid.stdout)?.trim().to_owned();
+            ensure!(
+                !uid.is_empty() && uid.bytes().all(|c| c.is_ascii_digit()),
+                "invalid user id"
+            );
+            Ok(Self {
+                domain: format!("gui/{uid}"),
+                plist,
+            })
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let output = Command::new("systemctl")
+                .args(["--user", "cat", "vibeface.service"])
+                .output()
+                .await?;
+            ensure!(
+                output.status.success(),
+                "installed systemd user node service is required"
+            );
+            let unit = String::from_utf8(output.stdout)?;
+            let escaped = data
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('%', "%%")
+                .replace('$', "$$");
+            let mut starts = Vec::new();
+            for line in unit
+                .lines()
+                .filter_map(|line| line.strip_prefix("ExecStart="))
+            {
+                if line.is_empty() {
+                    starts.clear();
+                } else {
+                    starts.push(line);
+                }
+            }
+            ensure!(
+                starts.len() == 1 && starts[0].ends_with(&format!("--data-dir \"{escaped}\"")),
+                "installed node service uses a different data directory or an unsupported ExecStart"
+            );
+            Ok(Self {})
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        bail!("automatic updates require macOS launchd or Linux systemd user services")
+    }
+}
+
+impl ServiceControl for Service {
+    async fn stop(&self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let label = format!("{}/com.leaperone.vibeface.node", self.domain);
+            let loaded = Command::new("/bin/launchctl")
+                .args(["print", &label])
+                .output()
+                .await?;
+            if loaded.status.success() {
+                checked(
+                    Command::new("/bin/launchctl").args(["bootout", &label]),
+                    "stop node service",
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        {
+            checked(
+                Command::new("systemctl").args(["--user", "stop", "vibeface.service"]),
+                "stop node service",
+            )
+            .await
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            bail!("unsupported service platform")
+        }
+    }
+
+    async fn start(&self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let label = format!("{}/com.leaperone.vibeface.node", self.domain);
+            let loaded = Command::new("/bin/launchctl")
+                .args(["print", &label])
+                .output()
+                .await?;
+            if loaded.status.success() {
+                checked(
+                    Command::new("/bin/launchctl").args(["kickstart", &label]),
+                    "start node service",
+                )
+                .await
+            } else {
+                checked(
+                    Command::new("/bin/launchctl")
+                        .args(["bootstrap", &self.domain])
+                        .arg(&self.plist),
+                    "start node service",
+                )
+                .await
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            checked(
+                Command::new("systemctl").args(["--user", "start", "vibeface.service"]),
+                "start node service",
+            )
+            .await
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            bail!("unsupported service platform")
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn service_data_matches(args: &[String], data: &Path) -> bool {
+    args.get(1).is_some_and(|s| s == "serve")
+        && args.iter().filter(|s| *s == "--data-dir").count() == 1
+        && args.windows(2).any(|pair| {
+            pair[0] == "--data-dir" && fs::canonicalize(&pair[1]).is_ok_and(|actual| actual == data)
+        })
+}
+
+async fn checked(command: &mut Command, action: &str) -> Result<()> {
+    let mut child = command
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| action.to_owned())?;
+    let status = tokio::time::timeout(Duration::from_secs(120), child.wait())
+        .await
+        .with_context(|| format!("timed out attempting to {action}"))??;
+    ensure!(status.success(), "could not {action}: {status}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn device_id_journal_uses_only_the_current_field() -> Result<()> {
+        let wire = r#"{"phase":"prepared","previous":"old","candidate":"new","device_id":"device","backup":"backup"}"#;
+        let journal: Journal = serde_json::from_str(wire)?;
+        assert_eq!(journal.device_id, "device");
+        assert_eq!(serde_json::to_string(&journal)?, wire);
+        assert!(serde_json::from_str::<Journal>(&wire.replace("device_id", "node_id")).is_err());
+        Ok(())
+    }
+
+    fn sandbox() -> PathBuf {
+        let directory =
+            PathBuf::from("/tmp").join(format!("vibeface-updater-{}", uuid::Uuid::new_v4()));
+        private_dir(&directory).unwrap();
+        fs::canonicalize(directory).unwrap()
+    }
+
+    #[tokio::test]
+    async fn update_health_inspects_the_candidate_core() -> Result<()> {
+        let root = sandbox();
+        let candidate = package(&root, "9.0.0");
+        let data = root.join("data");
+        let marker = root.join("candidate-inspected");
+        let response = serde_json::json!({"ok":true,"result":{
+            "status":"running","device_id":"unexpected","data_dir":data,
+            "maintenance_socket":root.join("socket"),"listen":"127.0.0.1:4790",
+            "version":"9.0.0","core_version":"9.0.0"
+        }});
+        let core = candidate.join("vibeface-core");
+        fs::write(
+            &core,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\ntouch '{}'\nprintf '%s\\n' '{}'\n",
+                marker.display(),
+                response
+            ),
+        )?;
+        fs::set_permissions(&core, fs::Permissions::from_mode(0o700))?;
+        let error = healthy(&data, &candidate, "expected").await.unwrap_err();
+        assert!(marker.exists(), "health must execute the candidate Core");
+        assert!(error.to_string().contains("unexpected version or identity"));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    fn package(root: &Path, version: &str) -> PathBuf {
+        let directory = root.join("releases").join(version);
+        fs::create_dir_all(directory.join("scripts")).unwrap();
+        fs::write(directory.join("vibeface"), b"binary").unwrap();
+        fs::write(directory.join("vibeface-core"), b"core").unwrap();
+        fs::create_dir(directory.join("web")).unwrap();
+        fs::write(directory.join("web/index.html"), b"web").unwrap();
+        fs::write(directory.join("scripts/install-node-service.sh"), b"script").unwrap();
+        fs::set_permissions(
+            directory.join("vibeface"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::set_permissions(
+            directory.join("vibeface-core"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("BUILD-INFO.json"),
+            format!(
+                r#"{{"version":"{version}","update_protocol":{},"data_epoch":{}}}"#,
+                vibeface_control::UPDATE_PROTOCOL,
+                vibeface_control::DATA_EPOCH
+            ),
+        )
+        .unwrap();
+        directory
+    }
+
+    #[tokio::test]
+    async fn first_update_configuration_creates_an_explicit_policy() -> Result<()> {
+        let root = sandbox();
+        let data = root.join("data");
+        private_dir(&data)?;
+        fs::write(data.join("identity.json"), b"opaque identity fixture")?;
+        let package = package(&root, "1.0.0");
+        std::os::unix::fs::symlink(&package, root.join("current"))?;
+        let installer = package.join("scripts/install-node-service.sh");
+        fs::write(
+            &installer,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n",
+        )?;
+        fs::set_permissions(&installer, fs::Permissions::from_mode(0o700))?;
+
+        assert!(
+            run(Update {
+                action: Action::Status(Data {
+                    data_dir: data.clone()
+                }),
+            })
+            .await
+            .is_err()
+        );
+        run(Update {
+            action: Action::Configure {
+                channel: Channel::Nightly,
+                automatic: false,
+                install_root: root.clone(),
+                data: Data {
+                    data_dir: data.clone(),
+                },
+            },
+        })
+        .await?;
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(data.join("update.json"))?)?;
+        assert_eq!(
+            saved,
+            serde_json::json!({"channel":"nightly","automatic":false,"install_root":root})
+        );
+        assert_eq!(
+            fs::read_to_string(installer.with_extension("sh.args"))?,
+            format!("uninstall-updater\n--data-dir\n{}\n", data.display())
+        );
+        run(Update {
+            action: Action::Status(Data { data_dir: data }),
+        })
+        .await?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn npm_installation_requires_matching_package_metadata() {
+        let root = sandbox();
+        let original = package(&root, "1.2.3-nightly.20261019.1");
+        assert_eq!(npm_install_root(&original.join("vibeface")).unwrap(), None);
+        fs::create_dir_all(root.join("vendor")).unwrap();
+        let native = root.join("vendor/aarch64-apple-darwin");
+        fs::rename(original, &native).unwrap();
+        fs::create_dir(root.join("bin")).unwrap();
+        fs::write(root.join("bin/vibeface.mjs"), b"launcher").unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"@leaperone/vibeface","version":"1.2.3-nightly.20261019.1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            npm_install_root(&native.join("vibeface")).unwrap(),
+            Some(root.clone())
+        );
+        for metadata in [
+            r#"{"name":"another-package","version":"1.2.3-nightly.20261019.1"}"#,
+            r#"{"name":"vibeface","version":"1.2.3-nightly.20261019.1"}"#,
+            r#"{"name":"@leaperone/vibeface","version":"2.0.0"}"#,
+            r#"{"name":"@leaperone/vibeface"}"#,
+        ] {
+            fs::write(root.join("package.json"), metadata).unwrap();
+            assert!(npm_install_root(&native.join("vibeface")).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_switch_is_confined_and_preserves_previous_package() {
+        let root = sandbox();
+        let old = package(&root, "1.0.0");
+        let new = package(&root, "1.1.0");
+        std::os::unix::fs::symlink(&old, root.join("current")).unwrap();
+        assert_eq!(installed(&root).unwrap(), old);
+        let data = root.join("data");
+        fs::create_dir(&data).unwrap();
+        persist(
+            &data.join("update.json"),
+            &Policy {
+                install_root: root.clone(),
+                channel: Channel::Stable,
+                automatic: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(managed_install_root(&data).unwrap(), root);
+        switch(&root, &new).unwrap();
+        assert_eq!(installed(&root).unwrap(), new);
+        assert!(old.join("vibeface").is_file());
+        let outside = sandbox();
+        let escaped = package(&outside, "2.0.0");
+        assert!(switch(&root, &escaped).is_err());
+        assert_eq!(installed(&root).unwrap(), new);
+        fs::write(
+            old.join("BUILD-INFO.json"),
+            format!(
+                r#"{{"version":"1.0.0","update_protocol":{},"data_epoch":{}}}"#,
+                vibeface_control::UPDATE_PROTOCOL,
+                vibeface_control::DATA_EPOCH + 1
+            ),
+        )
+        .unwrap();
+        assert!(manifest(&old).is_err());
+        fs::write(
+            old.join("BUILD-INFO.json"),
+            format!(
+                r#"{{"version":"1.0.0","update_protocol":{},"data_epoch":{}}}"#,
+                vibeface_control::UPDATE_PROTOCOL + 1,
+                vibeface_control::DATA_EPOCH
+            ),
+        )
+        .unwrap();
+        assert!(manifest(&old).is_err());
+        fs::write(old.join("BUILD-INFO.json"), r#"{"version":"1.0.0"}"#).unwrap();
+        assert!(manifest(&old).is_err());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn private_backup_keeps_wal_and_links_without_following_them() {
+        use std::os::unix::net::UnixListener;
+        let root = sandbox();
+        let data = root.join("data");
+        private_dir(&data).unwrap();
+        fs::write(data.join("node.sqlite3"), b"db").unwrap();
+        fs::write(data.join("node.sqlite3-wal"), b"wal").unwrap();
+        std::os::unix::fs::symlink("missing-private-target", data.join("link")).unwrap();
+        let _socket = UnixListener::bind(data.join("maintenance.sock")).unwrap();
+        let destination = root.join("backup");
+        backup(&data, &destination).unwrap();
+        assert_eq!(
+            fs::read(destination.join("node.sqlite3-wal")).unwrap(),
+            b"wal"
+        );
+        assert_eq!(
+            fs::read_link(destination.join("link")).unwrap(),
+            Path::new("missing-private-target")
+        );
+        assert!(!destination.join("maintenance.sock").exists());
+        assert_eq!(
+            fs::metadata(destination.join("node.sqlite3"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(data.join("node.sqlite3")).unwrap(), b"db");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn service_paths_match_only_the_managed_data_dir() {
+        let root = sandbox();
+        let data = root.join("data");
+        fs::create_dir(&data).unwrap();
+        let args = vec![
+            "/private/wrapper".into(),
+            "serve".into(),
+            "--data-dir".into(),
+            data.to_string_lossy().into(),
+        ];
+        assert!(service_data_matches(&args, &data));
+        assert!(!service_data_matches(&args, &root));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    struct FakeService {
+        candidate: PathBuf,
+        failure: &'static str,
+        starts: std::sync::atomic::AtomicUsize,
+        stops: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ServiceControl for FakeService {
+        async fn stop(&self) -> Result<()> {
+            self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn start(&self) -> Result<()> {
+            let attempt = self
+                .starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ensure!(
+                self.failure != "start" || attempt != 0,
+                "simulated service start failure"
+            );
+            Ok(())
+        }
+        async fn healthy(&self, data: &Path, package: &Path, _: &str) -> Result<()> {
+            ensure!(
+                data.join("update-pending.json").exists(),
+                "admission must remain closed until the program is healthy"
+            );
+            ensure!(
+                self.failure != "health" || package != self.candidate,
+                "simulated unhealthy candidate"
+            );
+            Ok(())
+        }
+        async fn device_id(&self, _: &Path) -> Result<String> {
+            Ok("device".into())
+        }
+        async fn commit(&self, data: &Path) -> Result<()> {
+            let pending = data.join("update-pending.json");
+            let journal: Journal = serde_json::from_slice(&fs::read(&pending)?)?;
+            ensure!(
+                journal.phase == Phase::Confirmed,
+                "only a confirmed activation can open admission"
+            );
+            fs::remove_file(pending)?;
+            File::open(data)?.sync_all()?;
+            Ok(())
+        }
+    }
+
+    fn activation_fixture() -> (Policy, PathBuf, Journal) {
+        let root = sandbox();
+        let data = root.join("data");
+        private_dir(&data).unwrap();
+        private_dir(&root.join("backups")).unwrap();
+        fs::write(data.join("identity.json"), b"opaque identity fixture").unwrap();
+        fs::write(data.join("config.json"), b"opaque config fixture").unwrap();
+        fs::write(data.join("node.sqlite3"), b"tasks-and-deduplication").unwrap();
+        fs::write(data.join("node.sqlite3-wal"), b"uncheckpointed-events").unwrap();
+        let previous = package(&root, "1.0.0");
+        let candidate = package(&root, "1.1.0");
+        std::os::unix::fs::symlink(&previous, root.join("current")).unwrap();
+        let journal = Journal {
+            phase: Phase::Prepared,
+            previous,
+            candidate,
+            device_id: "device".into(),
+            backup: root.join("backups/fixture"),
+        };
+        persist(&data.join("update-pending.json"), &journal).unwrap();
+        (
+            Policy {
+                install_root: root,
+                channel: Channel::Stable,
+                automatic: false,
+            },
+            data,
+            journal,
+        )
+    }
+
+    #[tokio::test]
+    async fn activation_failures_restore_program_without_restoring_business_data() {
+        for failure in ["backup", "start", "health"] {
+            let (policy, data, mut journal) = activation_fixture();
+            let filenames = [
+                "identity.json",
+                "config.json",
+                "node.sqlite3",
+                "node.sqlite3-wal",
+            ];
+            let before: Vec<_> = filenames
+                .iter()
+                .map(|name| fs::read(data.join(name)).unwrap())
+                .collect();
+            if failure == "backup" {
+                fs::create_dir(&journal.backup).unwrap();
+            }
+            let service = FakeService {
+                candidate: journal.candidate.clone(),
+                failure,
+                starts: std::sync::atomic::AtomicUsize::new(0),
+                stops: std::sync::atomic::AtomicUsize::new(0),
+            };
+            assert!(
+                activate(&policy, &data, &service, &mut journal)
+                    .await
+                    .is_err()
+            );
+            if failure == "backup" {
+                assert_eq!(installed(&policy.install_root).unwrap(), journal.previous);
+            }
+            recover_with_service(&policy, &data, &service)
+                .await
+                .unwrap();
+            assert_eq!(installed(&policy.install_root).unwrap(), journal.previous);
+            assert!(!data.join("update-pending.json").exists());
+            for (name, bytes) in filenames.iter().zip(before) {
+                assert_eq!(fs::read(data.join(name)).unwrap(), bytes);
+            }
+            fs::remove_dir_all(policy.install_root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_prepared_activation_rolls_back_but_confirmed_never_does() {
+        let (policy, data, mut journal) = activation_fixture();
+        let service = FakeService {
+            candidate: journal.candidate.clone(),
+            failure: "none",
+            starts: std::sync::atomic::AtomicUsize::new(0),
+            stops: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let lock = update_lock(&data).unwrap();
+        assert!(update_lock(&data).is_err());
+        switch(&policy.install_root, &journal.candidate).unwrap();
+        recover_with_service(&policy, &data, &service)
+            .await
+            .unwrap();
+        assert_eq!(installed(&policy.install_root).unwrap(), journal.previous);
+        journal.phase = Phase::Confirmed;
+        persist(&data.join("update-pending.json"), &journal).unwrap();
+        recover_with_service(&policy, &data, &service)
+            .await
+            .unwrap();
+        assert_eq!(installed(&policy.install_root).unwrap(), journal.candidate);
+        assert!(!data.join("update-pending.json").exists());
+        assert_eq!(
+            fs::read(data.join("node.sqlite3")).unwrap(),
+            b"tasks-and-deduplication"
+        );
+        drop(lock);
+        assert!(update_lock(&data).is_ok());
+        fs::remove_dir_all(policy.install_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_update_backs_up_data_and_confirmed_recovery_does_not_restart() {
+        let (policy, data, mut journal) = activation_fixture();
+        let service = FakeService {
+            candidate: journal.candidate.clone(),
+            failure: "none",
+            starts: std::sync::atomic::AtomicUsize::new(0),
+            stops: std::sync::atomic::AtomicUsize::new(0),
+        };
+        activate(&policy, &data, &service, &mut journal)
+            .await
+            .unwrap();
+        assert_eq!(installed(&policy.install_root).unwrap(), journal.candidate);
+        assert!(!data.join("update-pending.json").exists());
+        assert_eq!(
+            fs::read(journal.backup.join("node.sqlite3-wal")).unwrap(),
+            b"uncheckpointed-events"
+        );
+        assert_eq!(
+            fs::read(journal.backup.join("identity.json")).unwrap(),
+            fs::read(data.join("identity.json")).unwrap()
+        );
+        fs::write(data.join("node.sqlite3"), b"new-user-writes-must-survive").unwrap();
+        persist(&data.join("update-pending.json"), &journal).unwrap();
+        recover_with_service(&policy, &data, &service)
+            .await
+            .unwrap();
+        assert_eq!(service.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(service.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read(data.join("node.sqlite3")).unwrap(),
+            b"new-user-writes-must-survive"
+        );
+        fs::remove_dir_all(policy.install_root).unwrap();
+    }
+}

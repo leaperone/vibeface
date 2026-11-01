@@ -4,7 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 (( $# == 0 )) || { echo 'This script writes the project browser cryptography output; no arguments are accepted.' >&2; exit 2; }
-out="$root/crates/node/web/generated"
+out="$root/apps/app/generated"
 bindgen="${WASM_BINDGEN:-wasm-bindgen}"
 version=0.2.129
 if ! command -v "$bindgen" >/dev/null 2>&1; then

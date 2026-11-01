@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 mod pkarr {
     include!(concat!(
         env!("VIBEFACE_PROBE_SOURCE_ROOT"),
-        "/crates/node/src/net/pkarr.rs"
+        "/apps/core/src/net/pkarr.rs"
     ));
 }
 
@@ -298,7 +298,7 @@ async fn discovery_checks(key: &SecretKey) -> Result<Value> {
     server.abort();
     Ok(
         json!({"fresh":true,"expiredRejected":true,"futureRejected":true,"badSignatureRejected":true,"oversizeRejected":true,
-        "productSourceSha256":hex::encode(Sha256::digest(include_bytes!(concat!(env!("VIBEFACE_PROBE_SOURCE_ROOT"), "/crates/node/src/net/pkarr.rs"))))}),
+        "productSourceSha256":hex::encode(Sha256::digest(include_bytes!(concat!(env!("VIBEFACE_PROBE_SOURCE_ROOT"), "/apps/core/src/net/pkarr.rs"))))}),
     )
 }
 #[tokio::main]

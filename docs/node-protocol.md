@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=12`，数据库 `user_version=12`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，epoch 12 使用本文定义的最终事件结构。同一个人网络中的所有 Node 必须使用该最终格式的构建，不能混跑其他 epoch 或旧的 epoch 12 开发快照。`data-epoch.json` 只检查本机目录，不参与 peer 握手。旧 Node 会因 `deny_unknown_fields` 拒绝新增的 `model`、`resolved` 等字段；协议版本 1 不代表这些不同结构可以互通。程序不迁移或清空旧数据。
+协议版本为 `1`，数据格式 `data_epoch=12`，数据库 `user_version=12`。共享结构以 `apps/core/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，epoch 12 使用本文定义的最终事件结构。同一个人网络中的所有 Node 必须使用该最终格式的构建，不能混跑其他 epoch 或旧的 epoch 12 开发快照。`data-epoch.json` 只检查本机目录，不参与 peer 握手。旧 Node 会因 `deny_unknown_fields` 拒绝新增的 `model`、`resolved` 等字段；协议版本 1 不代表这些不同结构可以互通。程序不迁移或清空旧数据。
 
 ## 身份与数据范围
 
@@ -115,9 +115,9 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 
 | 路径 | 方法 | 用途 |
 | --- | --- | --- |
-| `/`、`/assets/*` | GET | 内置网页客户端；`/assets/` 下为带哈希的不可变资源 |
+| `/`、`/assets/*` | GET | App 静态网页客户端；`/assets/` 下为带哈希的不可变资源 |
 | `/sw.js`、`/manifest.webmanifest`、`/icon.svg` | GET | 离线应用外壳和 PWA 清单，`no-cache` |
-| `/generated/vibeface_secure.js`、`/generated/vibeface_secure_bg.wasm` | GET | 同一 Rust 密码学实现的浏览器构建 |
+| `/vibeface_secure.js`、`/vibeface_secure_bg.wasm` | GET | 同一 Rust 密码学实现的浏览器构建 |
 | `/api/info` | GET | `device_id`、`version` 和 `public_entry` |
 | `/api/local/setup` | POST | 本机网页读取一次性初始化邀请或已有网络的当前入口；公共入口回 404 |
 | `/api/client` | GET，WebSocket upgrade | 浏览器网关 |

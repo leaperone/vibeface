@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'apps/www/**'
+      - 'docs/**'
       - 'packages/**'
       - 'pnpm-lock.yaml'
       - 'package.json'

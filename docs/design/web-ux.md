@@ -103,4 +103,4 @@
 
 **旧词。** 下列词已被替换，`Details` 里也不能用：自己启动 → 由 Vibeface 启动，只在网页 → 只在待处理，没有这个 Bot → 找不到这个 Bot，skill → Skill，机器人 → Bot 或外部聊天，管理员 → 管理设备，邀请 → 加入链接。
 
-`crates/node/web/src/lib/copy.test.ts` 是这两份清单的准绳，检查网页、`packages/client` 和手机 App 文案中的禁用词与旧词，由 `pnpm run test` 执行。
+`apps/app/src/lib/copy.test.ts` 是这两份清单的准绳，检查网页、`packages/client` 和手机 App 文案中的禁用词与旧词，由 `pnpm run test` 执行。

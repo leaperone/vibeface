@@ -12,7 +12,7 @@ export default defineConfig({
     tailwindcss(),
     tanstackStart({
       prerender: { enabled: true },
-      pages: [{ path: '/api/search', prerender: { outputPath: '/search-index.json', autoSubfolderIndex: false } }],
+      pages: [{ path: '/docs' }, { path: '/api/search', prerender: { outputPath: '/search-index.json', autoSubfolderIndex: false } }],
     }),
     viteReact(),
   ],

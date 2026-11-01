@@ -11,7 +11,9 @@ pnpm test:e2e
 默认从 PATH 运行 `vibeface`。测试源码改动时，使用对应提交构建的完整程序：
 
 ```sh
-VIBEFACE_E2E_BINARY=/absolute/path/to/vibeface pnpm test:e2e
+VIBEFACE_E2E_BINARY=/absolute/path/to/vibeface \
+VIBEFACE_E2E_APP_DIR=/absolute/path/to/apps/app/dist/client \
+pnpm test:e2e
 ```
 
 程序的构建步骤见[源码构建](releasing.md#ci-验证范围)。首次运行会把 Chromium 下载到 `.artifacts/e2e/browsers/`。Linux CI 先执行以下命令：
@@ -48,6 +50,7 @@ cargo build --manifest-path tests/fixtures/delivery-probe/Cargo.toml --locked
 
 python3 scripts/verify-node.py --delivery-charity \
   --binary /absolute/path/to/vibeface \
+  --core-binary /absolute/path/to/vibeface-core \
   --artifacts .artifacts/delivery \
   --delivery-probe .artifacts/delivery-probe/target/debug/vibeface-delivery-probe
 ```
@@ -89,6 +92,7 @@ node contracts/delivery/install.mjs
 ```sh
 python3 scripts/verify-node.py --delivery \
   --binary /absolute/path/to/vibeface \
+  --core-binary /absolute/path/to/vibeface-core \
   --artifacts .artifacts/delivery \
   --delivery-probe .artifacts/delivery-probe/target/debug/vibeface-delivery-probe \
   --delivery-config .artifacts/delivery/acceptance.json

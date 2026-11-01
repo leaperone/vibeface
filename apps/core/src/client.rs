@@ -1,0 +1,3956 @@
+//! Browser and CLI sessions over `/api/client`.
+//!
+//! Both ends prove their device key inside the Noise handshake. Membership is read again for
+//! every request, so a device that joins mid-session gains access and a revoked one loses it.
+
+use crate::{
+    crypto::LocalIdentity,
+    identity::{
+        AuthorizationView, GovernanceAction, GovernanceEvent, IdentityKind, LAST_MANAGER, Member,
+        NO_RECOVERY_WAITING, NetworkState, RECOVERY_SKEW_MS, RootCheckpoint,
+        local::{Join, JoinRequest, JoinStatus},
+    },
+    net::{self, Net, NetworkConfig},
+    runtime::{Access, Runtime},
+};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use axum::extract::ws::{Message, WebSocket};
+use futures_util::{SinkExt, StreamExt};
+use iroh::{
+    EndpointAddr, TransportAddr,
+    endpoint::{Connection, ReadExactError, RecvStream, SendStream},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    net::SocketAddr,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message as NativeMessage;
+use vibeface_secure::{
+    Channel,
+    join::{InviteRecord, Ticket, invite_id, join_commit, short_code},
+};
+
+pub const PROLOGUE: &[u8] = b"vibeface:client:v1";
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const HEARTBEAT: Duration = Duration::from_secs(20);
+const MAX_FORWARDED_FRAME: usize = 1024 * 1024;
+/// Anyone can open `/api/client`, so a Gateway relays a bounded number of sessions at once.
+static FORWARDS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(256);
+/// Sessions from devices that are not members yet (joining, recovering) share a few slots and
+/// close after `GUEST_LIFETIME`, longer than an invite lives.
+static GUESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
+const GUEST_LIFETIME: Duration = Duration::from_secs(15 * 60);
+
+type NativeSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A client channel: the browser's WebSocket, the CLI's, or a stream another Gateway forwards
+/// over `vibeface/client/1`. Forwarded frames are `tag ‖ u32 length ‖ bytes`.
+pub enum ClientSocket {
+    Server(Box<WebSocket>),
+    Client(Box<NativeSocket>),
+    Forwarded(Box<Forwarded>),
+}
+
+pub struct Forwarded {
+    send: SendStream,
+    frames: mpsc::Receiver<Result<Message>>,
+    reader: tokio::task::JoinHandle<()>,
+}
+impl Drop for Forwarded {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+impl ClientSocket {
+    pub fn server(socket: WebSocket) -> Self {
+        Self::Server(Box::new(socket))
+    }
+
+    fn forwarded(send: SendStream, mut recv: RecvStream) -> Self {
+        let (frames, receiver) = mpsc::channel(16);
+        let reader = tokio::spawn(async move {
+            loop {
+                let frame = match read_forwarded(&mut recv).await {
+                    Ok(Some(frame)) => Ok(frame),
+                    Ok(None) => return,
+                    Err(error) => Err(error),
+                };
+                let failed = frame.is_err();
+                if frames.send(frame).await.is_err() || failed {
+                    return;
+                }
+            }
+        });
+        Self::Forwarded(Box::new(Forwarded {
+            send,
+            frames: receiver,
+            reader,
+        }))
+    }
+
+    /// Cancel-safe, so callers may race it in `select!`.
+    pub async fn next(&mut self) -> Option<Result<Message>> {
+        match self {
+            Self::Server(socket) => socket.next().await.map(|frame| frame.map_err(Into::into)),
+            Self::Client(socket) => loop {
+                let frame = match socket.next().await? {
+                    Ok(frame) => frame,
+                    Err(error) => return Some(Err(error.into())),
+                };
+                return Some(Ok(match frame {
+                    NativeMessage::Text(text) => Message::Text(text.as_str().to_owned().into()),
+                    NativeMessage::Binary(bytes) => Message::Binary(bytes),
+                    NativeMessage::Ping(bytes) => Message::Ping(bytes),
+                    NativeMessage::Pong(bytes) => Message::Pong(bytes),
+                    NativeMessage::Close(_) => Message::Close(None),
+                    NativeMessage::Frame(_) => continue,
+                }));
+            },
+            Self::Forwarded(forwarded) => forwarded.frames.recv().await,
+        }
+    }
+
+    pub async fn send(&mut self, message: Message) -> Result<()> {
+        match self {
+            Self::Server(socket) => socket.send(message).await.map_err(Into::into),
+            Self::Client(socket) => socket
+                .send(match message {
+                    Message::Text(text) => NativeMessage::Text(text.as_str().to_owned().into()),
+                    Message::Binary(bytes) => NativeMessage::Binary(bytes),
+                    Message::Ping(bytes) => NativeMessage::Ping(bytes),
+                    Message::Pong(bytes) => NativeMessage::Pong(bytes),
+                    Message::Close(_) => NativeMessage::Close(None),
+                })
+                .await
+                .map_err(Into::into),
+            Self::Forwarded(forwarded) => {
+                let (tag, bytes) = match message {
+                    Message::Binary(bytes) => (0, bytes.to_vec()),
+                    Message::Text(text) => (1, text.as_str().as_bytes().to_vec()),
+                    Message::Ping(bytes) => (2, bytes.to_vec()),
+                    Message::Pong(bytes) => (3, bytes.to_vec()),
+                    Message::Close(_) => {
+                        forwarded.send.finish().ok();
+                        return Ok(());
+                    }
+                };
+                ensure!(bytes.len() <= MAX_FORWARDED_FRAME, "client frame too large");
+                let mut frame = vec![tag];
+                frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                frame.extend_from_slice(&bytes);
+                forwarded
+                    .send
+                    .write_all(&frame)
+                    .await
+                    .map_err(|error| anyhow!("forwarded client stream failed: {error}"))
+            }
+        }
+    }
+}
+
+async fn read_forwarded(recv: &mut RecvStream) -> Result<Option<Message>> {
+    let mut header = [0u8; 5];
+    match recv.read_exact(&mut header).await {
+        Ok(()) => {}
+        Err(ReadExactError::FinishedEarly(0)) => return Ok(None),
+        Err(error) => bail!("forwarded client stream failed: {error}"),
+    }
+    let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    ensure!(length <= MAX_FORWARDED_FRAME, "client frame too large");
+    let mut bytes = vec![0; length];
+    recv.read_exact(&mut bytes)
+        .await
+        .map_err(|error| anyhow!("forwarded client stream failed: {error}"))?;
+    Ok(Some(match header[0] {
+        0 => Message::Binary(bytes.into()),
+        1 => Message::Text(String::from_utf8(bytes)?.into()),
+        2 => Message::Ping(bytes.into()),
+        3 => Message::Pong(bytes.into()),
+        _ => bail!("unknown forwarded client frame"),
+    }))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Request {
+    id: String,
+    method: String,
+    #[serde(default)]
+    params: Value,
+}
+#[derive(Serialize)]
+struct Response {
+    id: String,
+    result: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
+}
+
+/// First text frame on `/api/client`.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum Connect {
+    Connect { target: String },
+}
+
+struct Session {
+    device_id: String,
+    /// Present only on `/api/local/ws`; it lets a non-member browser use this Node.
+    cookie: Option<String>,
+    /// Set by `subscribe` to the management permission the device had then.
+    subscribed: Option<bool>,
+    observation: Option<crate::runtime::ObservationGuard>,
+}
+
+#[derive(Serialize)]
+struct Principal {
+    source: &'static str,
+    network_id: String,
+    device_id: String,
+    epoch: u64,
+    can_manage: bool,
+}
+
+pub struct Client {
+    socket: ClientSocket,
+    channel: Channel,
+}
+impl Client {
+    /// Connects through the Gateway at `origin` and pins `target`'s device key.
+    pub async fn connect(origin: &str, identity: &LocalIdentity, target: &str) -> Result<Self> {
+        let (socket, _) = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            tokio_tungstenite::connect_async(client_url(origin)?),
+        )
+        .await
+        .context("Gateway connection timed out")??;
+        let mut socket = ClientSocket::Client(Box::new(socket));
+        let connect = serde_json::to_string(&Connect::Connect {
+            target: target.to_owned(),
+        })?;
+        socket.send(Message::Text(connect.into())).await?;
+        Self::from_socket(socket, identity, target).await
+    }
+    async fn from_socket(
+        mut socket: ClientSocket,
+        identity: &LocalIdentity,
+        target: &str,
+    ) -> Result<Self> {
+        let channel = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            let mut handshake = identity.handshake(true, Some(target.to_owned()), PROLOGUE)?;
+            send_frame(&mut socket, handshake.write(&[])?).await?;
+            let second = next_binary(&mut socket).await?;
+            ensure!(
+                handshake.read(&second)?.is_empty(),
+                "unexpected client handshake payload"
+            );
+            send_frame(&mut socket, handshake.write(&[])?).await?;
+            Ok(handshake.finish()?)
+        })
+        .await
+        .context("client handshake timed out")??;
+        Ok(Self { socket, channel })
+    }
+    pub async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let request = Request {
+            id: id.clone(),
+            method: method.to_owned(),
+            params,
+        };
+        send_value(&mut self.socket, &mut self.channel, &request).await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let value: Value = serde_json::from_slice(
+                    &receive_value(&mut self.socket, &mut self.channel).await?,
+                )?;
+                if value["id"].as_str() != Some(&id) {
+                    continue;
+                }
+                if let Some(error) = value["error"].as_str() {
+                    bail!("{error}");
+                }
+                return Ok(value["result"].clone());
+            }
+        })
+        .await
+        .context("client response timed out; outcome may be unknown")?
+    }
+}
+
+/// `/api/client`: read the connect frame, then end Noise here when the target is this Node,
+/// or relay the ciphertext to the target member Node over `vibeface/client/1`.
+pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Result<()> {
+    let frame = tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.next())
+        .await
+        .context("connect frame timed out")?
+        .context("client disconnected")??;
+    let Message::Text(text) = frame else {
+        bail!("the first client frame must be a connect request")
+    };
+    let Connect::Connect { target } =
+        serde_json::from_str(&text).context("invalid connect frame")?;
+    if target == node.identity.device_id()? && !node.config.public_entry {
+        return serve_session(node, socket, None).await;
+    }
+    let Ok(_slot) = FORWARDS.try_acquire() else {
+        let refusal = json!({"type":"error","code":"gateway_busy","error":"this Gateway relays too many sessions"});
+        let _ = socket.send(Message::Text(refusal.to_string().into())).await;
+        bail!("gateway forwarding budget exhausted");
+    };
+    let forwarded = match open_forward(&node, &target).await {
+        Ok(forwarded) => forwarded,
+        Err((code, error)) => {
+            let refusal = json!({"type":"error","code":code,"error":format!("{error:#}")});
+            let _ = socket.send(Message::Text(refusal.to_string().into())).await;
+            return Err(error.context("client target refused"));
+        }
+    };
+    relay_frames(socket, forwarded).await
+}
+
+/// A public entry holds no address book: the target must be on this entry's relay, which only
+/// token holders reach.
+pub(crate) async fn reach_through_entry(node: &Runtime, target: &str) -> Result<()> {
+    let relay = node
+        .config
+        .network
+        .own_relay()?
+        .context("a public entry runs a relay")?;
+    let addr = EndpointAddr::from_parts(net::endpoint_id(target)?, [TransportAddr::Relay(relay)]);
+    node.net()?.learn(&addr).await;
+    Ok(())
+}
+
+async fn open_forward(
+    node: &Runtime,
+    target: &str,
+) -> std::result::Result<ClientSocket, (&'static str, anyhow::Error)> {
+    if node.config.public_entry {
+        reach_through_entry(node, target)
+            .await
+            .map_err(|error| ("target_unreachable", error))?;
+    } else {
+        let member = async {
+            let network = node.membership_state().await?.genesis.network_id;
+            node.store.lock().await.authorize_node(&network, target)
+        };
+        member.await.map_err(|error| ("target_not_member", error))?;
+    }
+    let opened = async {
+        let connection = node.net()?.connect(target, net::CLIENT).await?;
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|error| anyhow!("target connection closed: {error}"))?;
+        Ok::<_, anyhow::Error>(ClientSocket::forwarded(send, recv))
+    };
+    opened.await.map_err(|error| ("target_unreachable", error))
+}
+
+/// Copies frames both ways without reading them; the Noise session ends at the target.
+async fn relay_frames(mut client: ClientSocket, mut target: ClientSocket) -> Result<()> {
+    loop {
+        tokio::select! {
+            frame = client.next() => match frame {
+                Some(Ok(Message::Close(_))) | None => return Ok(()),
+                Some(frame) => target.send(frame?).await?,
+            },
+            frame = target.next() => match frame {
+                None => return Ok(()),
+                Some(frame) => client.send(frame?).await?,
+            },
+        }
+    }
+}
+
+/// The target side of `vibeface/client/1`: each stream is one forwarded client session.
+pub async fn serve_forwarded(node: Arc<Runtime>, connection: Connection) -> Result<()> {
+    while let Ok((send, recv)) = connection.accept_bi().await {
+        let node = node.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_session(node, ClientSocket::forwarded(send, recv), None).await
+            {
+                tracing::debug!(%error, "forwarded client session closed");
+            }
+        });
+    }
+    Ok(())
+}
+
+/// `vibeface/join/1`: any device may call `join`, `join_status` and `join_withdraw`, nothing else.
+/// QUIC proves the caller's key, so the session's device is the connection's remote ID.
+pub async fn serve_join(node: Arc<Runtime>, connection: Connection, remote: String) -> Result<()> {
+    net::serve_streams(connection, move |request: Value| {
+        let (node, remote) = (node.clone(), remote.clone());
+        async move {
+            let method = text(&request, "method")?;
+            ensure!(
+                matches!(
+                    method,
+                    "join_check" | "join" | "join_status" | "join_withdraw"
+                ) && request["params"].is_object(),
+                "a join connection only joins"
+            );
+            let mut session = Session {
+                device_id: remote,
+                cookie: None,
+                subscribed: None,
+                observation: None,
+            };
+            let result = dispatch(&node, &mut session, method, request["params"].clone()).await?;
+            Ok(json!({"result":result}))
+        }
+    })
+    .await;
+    Ok(())
+}
+
+pub async fn serve_local(node: Arc<Runtime>, socket: ClientSocket, cookie: String) -> Result<()> {
+    serve_session(node, socket, Some(cookie)).await
+}
+
+async fn serve_session(
+    node: Arc<Runtime>,
+    mut socket: ClientSocket,
+    cookie: Option<String>,
+) -> Result<()> {
+    let mut local_changes = node.local_access.subscribe();
+    let (mut channel, device_id) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let mut handshake = node.identity.handshake(false, None, PROLOGUE)?;
+        ensure!(
+            handshake.read(&next_binary(&mut socket).await?)?.is_empty(),
+            "unexpected first client payload"
+        );
+        send_frame(&mut socket, handshake.write(&[])?).await?;
+        ensure!(
+            handshake.read(&next_binary(&mut socket).await?)?.is_empty(),
+            "unexpected final client payload"
+        );
+        let device_id = handshake.remote_id().context("client identity missing")?;
+        Ok::<_, anyhow::Error>((handshake.finish()?, device_id))
+    })
+    .await
+    .context("client handshake timed out")??;
+    if let Some(cookie) = &cookie {
+        let view = node.membership_state().await?.project()?;
+        if view.client(&device_id).is_err() {
+            let local =
+                node.local_access
+                    .session(cookie, &node.identity.device_id()?, &view.network_id)?;
+            ensure!(
+                local.device_id == device_id,
+                "local browser cookie is bound to another device"
+            );
+        }
+    }
+    let mut session = Session {
+        device_id,
+        cookie,
+        subscribed: None,
+        observation: None,
+    };
+    let opened = Instant::now();
+    let mut guest = if session.cookie.is_none() && principal(&node, &session).await.is_err() {
+        Some(
+            GUESTS
+                .try_acquire()
+                .map_err(|_| anyhow!("too many devices are joining this Node; try again later"))?,
+        )
+    } else {
+        None
+    };
+    let mut membership = node.membership.subscribe();
+    let mut events = node.events.subscribe();
+    let mut heartbeat = tokio::time::interval(HEARTBEAT);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut received = Instant::now();
+    let mut partial_started: Option<Instant> = None;
+    loop {
+        tokio::select! {
+            frame = socket.next() => {
+                received = Instant::now();
+                match frame.context("client disconnected")?? {
+                    Message::Binary(bytes) => {
+                        if let Some(plaintext) = channel.open_record(&bytes)? {
+                            partial_started = None;
+                            let request: Request = serde_json::from_slice(&plaintext).context("invalid client request")?;
+                            validate_request(&request)?;
+                            let local = is_local_only(&node, &session).await?;
+                            let result = if local && request.method != "local_access" {
+                                tokio::select! {
+                                    result = dispatch(&node, &mut session, &request.method, request.params) => result,
+                                    _ = local_changes.changed() => bail!("local browser access was revoked"),
+                                }
+                            } else {
+                                dispatch(&node, &mut session, &request.method, request.params).await
+                            };
+                            let response = match result {
+                                Ok(result) => Response { id: request.id, result, error: None, code: None },
+                                Err(error) => Response { id: request.id, result: Value::Null, error: Some(crate::logging::scrub(&error.to_string())), code: error.downcast_ref::<crate::discovery::CodexMissing>().map(|_| crate::discovery::CodexMissing::CODE) },
+                            };
+                            send_value(&mut socket, &mut channel, &response).await?;
+                        } else { partial_started.get_or_insert_with(Instant::now); }
+                    }
+                    Message::Ping(_) | Message::Pong(_) => {},
+                    _ => bail!("client channel accepts only encrypted binary frames"),
+                }
+            }
+            event = events.recv(), if session.subscribed.is_some() => {
+                let principal = principal(&node, &session).await?;
+                match event {
+                    Ok(event) if event.network_id == principal.network_id => {
+                        // A burst, such as a sync catching up, is cheaper as one full read than as records per event.
+                        let payload = if events.len() > PUSH_BURST {
+                            while events.try_recv().is_ok() {}
+                            json!({"type":"changed"})
+                        } else {
+                            pushed(&node, &principal.network_id, &session.device_id, event.payload).await
+                        };
+                        send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":payload})).await?
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => send_value(&mut socket, &mut channel, &json!({"type":"changed"})).await?,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                    _ => {},
+                }
+            }
+            _ = heartbeat.tick() => {
+                ensure!(received.elapsed() < IDLE_TIMEOUT, "client channel idle");
+                ensure!(partial_started.is_none_or(|at| at.elapsed() < IDLE_TIMEOUT), "client fragmented message timed out");
+                if session.subscribed.is_some() || session.observation.is_some() { principal(&node, &session).await?; }
+                if guest.is_some() {
+                    if principal(&node, &session).await.is_ok() { guest = None; }
+                    else { ensure!(opened.elapsed() < GUEST_LIFETIME, "a device that is not a member may stay connected for 15 minutes"); }
+                }
+                if let Some(observation) = &session.observation { observation.refresh(); }
+                tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.send(Message::Ping(Vec::new().into()))).await.context("client heartbeat send timed out")??;
+            }
+            changed = membership.changed() => {
+                changed.context("membership state closed")?;
+                // A removed device loses its subscription at once, not at the next heartbeat; one
+                // whose management permission changed reconnects to pick up the new principal.
+                if session.subscribed.is_some() || session.observation.is_some() {
+                    let now = principal(&node, &session).await?.can_manage;
+                    ensure!(session.subscribed.is_none_or(|was| was == now), "this device's management permission changed");
+                }
+            }
+            changed = local_changes.changed(), if session.cookie.is_some() => {
+                changed.context("local access state closed")?;
+                if is_local_only(&node, &session).await? {
+                    bail!("local browser access was revoked");
+                }
+            }
+        }
+    }
+}
+
+/// Methods a device that is not (or no longer) a member may call.
+const GUEST_METHODS: [&str; 12] = [
+    "info",
+    "authenticate",
+    "join_check",
+    "join",
+    "join_status",
+    "join_withdraw",
+    "recovery_state",
+    "recover",
+    "node_join_check",
+    "node_join",
+    "node_join_cancel",
+    "rejoin",
+];
+
+/// A recovery file signed too long ago for this Node to start its wait now.
+const RECOVERY_TOO_OLD: &str = "this recovery was signed too long ago; start it again";
+/// A veto so close to the recovery's time that some Node may have put it in effect already.
+const RECOVERY_DUE: &str = "this recovery is about to take effect and can no longer be stopped";
+
+/// Domain of the recovery root's short-lived permission to read the membership state.
+const RECOVERY_READ_DOMAIN: &str = "identity-recovery-read";
+
+async fn dispatch(
+    node: &Arc<Runtime>,
+    session: &mut Session,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    let _work = if matches!(
+        method,
+        "info"
+            | "authenticate"
+            | "directory"
+            | "node_settings"
+            | "provider_models"
+            | "provider_probe"
+            | "subscribe"
+            | "join_check"
+            | "join_status"
+            | "recovery_state"
+            | "entrances"
+    ) {
+        None
+    } else {
+        Some(node.maintenance.enter()?)
+    };
+    if !GUEST_METHODS.contains(&method) {
+        principal(node, session).await?;
+    }
+    match method {
+        "info" => {
+            let device_id = node.identity.device_id()?;
+            let initialized = node.has_membership().await?;
+            let mut info = json!({"initialized":initialized,"network_id":null,"device_id":device_id,
+                "name":crate::config::UNNAMED_NODE,"public_entry":node.config.public_entry,
+                "version":env!("CARGO_PKG_VERSION")});
+            if initialized && principal(node, session).await.is_ok() {
+                let state = node.membership_state().await?;
+                if let Some(member) = state
+                    .project()?
+                    .members
+                    .iter()
+                    .find(|m| m.device_id == device_id)
+                {
+                    info["name"] = json!(member.name);
+                }
+                info["network_id"] = json!(state.genesis.network_id);
+                info["connection_entry"] = connection_entry(node).await?;
+            }
+            Ok(info)
+        }
+        "authenticate" => {
+            let authenticated = authentication(node, session).await?;
+            if let Some(network) = params
+                .get("network_id")
+                .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+                && authenticated.get("network_id").is_some()
+                && authenticated["network_id"] != *network
+            {
+                bail!("client requested another personal network");
+            }
+            Ok(authenticated)
+        }
+        "directory" => {
+            let state = node.membership_state().await?;
+            let now = crate::runtime::now_ms();
+            let view = state.project_at(now as u64)?;
+            let since = node.recovery_since_ms(&view.recovery_key).await?;
+            Ok(json!({"view":view,"state":state,"recovery_since_ms":since,"now_ms":now}))
+        }
+        "write_state" => {
+            let principal = principal(node, session).await?;
+            node.write_status(&principal.network_id).await
+        }
+        "diagnostics" => {
+            node_operator(node, session).await?;
+            let principal = principal(node, session).await?;
+            let range = (params["since_ms"].as_i64(), params["until_ms"].as_i64());
+            node.diagnostics(&principal.network_id, range).await
+        }
+        "log" => {
+            let accepted = crate::logging::submit(
+                &node.log_intake,
+                &session.device_id,
+                crate::logging::Source::Web,
+                &params["records"],
+                crate::runtime::now_ms(),
+            )?;
+            Ok(json!({"accepted":accepted}))
+        }
+        "logs" => {
+            node_operator(node, session).await?;
+            let filter: crate::logging::Filter =
+                serde_json::from_value(params).context("invalid log filter")?;
+            let dir = node.data_dir.clone();
+            let records =
+                tokio::task::spawn_blocking(move || crate::logging::read(&dir, &filter)).await??;
+            Ok(json!({"records":records}))
+        }
+        "confirm_writable" => {
+            node_operator(node, session).await?;
+            let principal = principal(node, session).await?;
+            node.confirm_writable(&principal.network_id, &session.device_id)
+                .await?;
+            node.write_status(&principal.network_id).await
+        }
+        "node_settings" => {
+            node_operator(node, session).await?;
+            node.node_settings().await
+        }
+        "delivery" => {
+            let principal = principal(node, session).await?;
+            let read_only = matches!(
+                params["op"].as_str(),
+                Some("status" | "list" | "get" | "find_intent" | "read")
+            );
+            ensure!(
+                read_only || (principal.source == "membership" && principal.can_manage),
+                "delivery writes and spending require a managing member of your personal network"
+            );
+            if !read_only && params["op"] != "configure" {
+                ensure!(
+                    node.write_status(&principal.network_id).await?["state"] == "writable",
+                    "delivery writes wait until this Node is writable"
+                );
+            }
+            node.delivery
+                .client_request(node, &principal.network_id, &principal.device_id, params)
+                .await
+        }
+        "configure_node" => {
+            node_operator(node, session).await?;
+            let settings = serde_json::from_value(params).context("invalid Node settings")?;
+            let cookie = match is_local_only(node, session).await? {
+                true => session.cookie.as_deref(),
+                false => None,
+            };
+            node.configure_node(settings, &session.device_id, cookie)
+                .await
+        }
+        "configure_provider" => {
+            node_operator(node, session).await?;
+            let change = serde_json::from_value(params).context("invalid provider settings")?;
+            let cookie = match is_local_only(node, session).await? {
+                true => session.cookie.as_deref(),
+                false => None,
+            };
+            node.configure_provider(change, &session.device_id, cookie)
+                .await
+        }
+        "test_codex_app_server" => {
+            node_operator(node, session).await?;
+            Ok(json!(node.codex.test().await.sanitized()))
+        }
+        "provider_models" | "provider_probe" => {
+            node_operator(node, session).await?;
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Query {
+                provider: crate::providers::Provider,
+            }
+            let query: Query = serde_json::from_value(params).context("invalid provider query")?;
+            if method == "provider_probe" {
+                Ok(node.refresh_provider_status(query.provider).await)
+            } else {
+                Ok(json!(node.provider_catalog(query.provider).await))
+            }
+        }
+        "triage_settings" => {
+            node_operator(node, session).await?;
+            node.triage_settings().await
+        }
+        "configure_triage" => {
+            node_operator(node, session).await?;
+            node.configure_triage(params).await
+        }
+        "test_webhook" => {
+            node_operator(node, session).await?;
+            node.test_webhook().await
+        }
+        "create_decision_token" => {
+            node_operator(node, session).await?;
+            node.create_decision_token(params["label"].as_str().unwrap_or_default())
+                .await
+        }
+        "revoke_decision_token" => {
+            node_operator(node, session).await?;
+            node.revoke_decision_token(text(&params, "token_id")?).await
+        }
+        "subscribe" => {
+            // The browser sends the vector it has already shown; a lagging entry asks its peers now.
+            let principal = principal(node, session).await?;
+            session.subscribed = Some(principal.can_manage);
+            let vector: std::collections::BTreeMap<String, u64> = node
+                .store
+                .lock()
+                .await
+                .heads(&principal.network_id)?
+                .into_iter()
+                .map(|(author, (seq, _))| (author, seq))
+                .collect();
+            let behind = params["vector"].as_object().is_some_and(|seen| {
+                seen.iter().any(|(author, seq)| {
+                    seq.as_u64()
+                        .is_some_and(|seq| vector.get(author).is_none_or(|have| *have < seq))
+                })
+            });
+            if behind {
+                node.wake_sync_all();
+            }
+            Ok(json!({"subscribed":true,"vector":vector,"behind":behind}))
+        }
+        "rpc" => {
+            let principal = principal(node, session).await?;
+            let mut params = params;
+            bind_client_identity(&mut params, &principal.device_id)?;
+            let watched_scope = (params["method"] == "conversation")
+                .then(|| params["conversation_id"].as_str().map(String::from))
+                .flatten();
+            let access = Access {
+                network_id: principal.network_id,
+                human: true,
+                conversation_id: None,
+                manager: None,
+            };
+            let mut result = node.rpc(access.clone(), params).await?;
+            if let Some(scope) = watched_scope {
+                // The old lease goes only after the new one holds, so a stream keeps its cursor.
+                let _previous = session.observation.take();
+                let targets = result["observation_targets"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str().map(String::from))
+                    .collect();
+                match node.observe_conversation(&access, &scope, targets).await {
+                    Ok(observation) => session.observation = Some(observation),
+                    Err(error) => result["observation_error"] = json!(error.to_string()),
+                }
+            }
+            Ok(result)
+        }
+        "local_access" => {
+            let _save = node.config_save.lock().await;
+            let principal = principal(node, session).await?;
+            if let Some(enabled) = params.get("enabled") {
+                let enabled = enabled.as_bool().context("enabled must be a boolean")?;
+                ensure!(
+                    principal.can_manage || (principal.source == "local_session" && !enabled),
+                    "only a management client can enable local browser access"
+                );
+                node.local_access.set_enabled(enabled)?;
+            }
+            Ok(json!({"enabled":node.local_access.enabled()}))
+        }
+        "invite" => {
+            manager_view(node, session).await?;
+            let record: InviteRecord = from_field(&params, "record")?;
+            let join_id = node
+                .store
+                .lock()
+                .await
+                .register_invite(&record, &session.device_id)?;
+            // Only this Node's own relay knows the invite, so only it admits the joiner's token.
+            let own_relay = node.config.network.own_relay().ok().flatten();
+            let entry = node.net().ok().map(|net| {
+                let addr = net.addr();
+                json!({"relay_url":own_relay.or_else(|| addr.relay_urls().next().cloned()),
+                    "direct_addrs":invite_addrs(addr.ip_addrs().copied())})
+            });
+            Ok(
+                json!({"join_id":join_id,"entry_id":node.identity.device_id()?,"entry":entry,"gateway_url":node.gateway_url()}),
+            )
+        }
+        "entrances" => {
+            let principal = principal(node, session).await?;
+            Ok(json!({"entrances":node.entrances(&principal.network_id).await?}))
+        }
+        "join_check" => {
+            let state = node
+                .store
+                .lock()
+                .await
+                .invite_state(text(&params, "secret")?, &session.device_id)?;
+            Ok(json!({"invite":state}))
+        }
+        "join" => {
+            let join: Join = serde_json::from_value(params).context("invalid join request")?;
+            ensure!(
+                join.public_key == session.device_id,
+                "join key differs from this channel's device"
+            );
+            let request = node.store.lock().await.join(&join, &session.device_id)?;
+            node.join_changed(&request.network_id);
+            Ok(serde_json::to_value(request)?)
+        }
+        "join_status" => {
+            let Some(join_id) = params.get("join_id") else {
+                manager_view(node, session).await?;
+                let mut pending = serde_json::to_value(
+                    node.store.lock().await.pending_joins(&session.device_id)?,
+                )?;
+                // A join waits on the Node whose invite it used; managers see it from any entry.
+                if let Some(local) = pending.as_array_mut() {
+                    for remote in node.remote_joins(&session.device_id).await {
+                        if !local
+                            .iter()
+                            .any(|known| known["join_id"] == remote["join_id"])
+                        {
+                            local.push(remote);
+                        }
+                    }
+                }
+                return Ok(json!({"requests":pending}));
+            };
+            let join_id = join_id.as_str().context("join_id must be a string")?;
+            let reveal = params.get("reveal").and_then(Value::as_str);
+            let request =
+                node.store
+                    .lock()
+                    .await
+                    .join_status(join_id, &session.device_id, reveal)?;
+            if reveal.is_some() {
+                node.join_changed(&request.network_id);
+            }
+            let mut result = serde_json::to_value(&request)?;
+            if let Some(admin) = &request.admin_id {
+                let view = node.membership_state().await?.project()?;
+                if let Ok(member) = view.member(admin) {
+                    result["admin_name"] = json!(member.name);
+                }
+            }
+            if request.status == JoinStatus::Joined {
+                let state = node.membership_state().await?;
+                state.project()?.member(&session.device_id)?;
+                result["addresses"] = json!(node.store.lock().await.address_book()?);
+                result["state"] = serde_json::to_value(state)?;
+            }
+            Ok(result)
+        }
+        "join_withdraw" => {
+            let request = node
+                .store
+                .lock()
+                .await
+                .withdraw_join(text(&params, "join_id")?, &session.device_id)?;
+            node.join_changed(&request.network_id);
+            Ok(serde_json::to_value(request)?)
+        }
+        "approve" => {
+            manager_view(node, session).await?;
+            let join_id = text(&params, "join_id")?;
+            if node.store.lock().await.holds_join(join_id)? {
+                approve_join(node, &session.device_id, &params).await
+            } else {
+                node.forward_join_approval(&session.device_id, &params)
+                    .await
+            }
+        }
+        // A manager revokes any device; any client may revoke itself, which the history checks.
+        "revoke" => {
+            let view = node.membership_state().await?.project()?;
+            view.client(&session.device_id)?;
+            let event: GovernanceEvent = from_field(&params, "event")?;
+            ensure!(
+                event.issuer == session.device_id
+                    && event.epoch == view.epoch
+                    && matches!(event.action, GovernanceAction::Revoke(_)),
+                "invalid revoke signer or action"
+            );
+            let mut state = node.membership_state().await?;
+            state.append(event)?;
+            ensure!(
+                state.project()?.members.iter().any(|m| m.manage),
+                LAST_MANAGER
+            );
+            node.install_membership(state.clone()).await?;
+            authentication(node, session).await
+        }
+        "grant" => {
+            let view = manager_view(node, session).await?;
+            let event: GovernanceEvent = from_field(&params, "event")?;
+            let GovernanceAction::Grant { member } = &event.action else {
+                bail!("invalid grant signer or action")
+            };
+            ensure!(
+                event.issuer == session.device_id && event.epoch == view.epoch,
+                "invalid grant signer or action"
+            );
+            // New devices join through `approve`; this only renames a current device or changes
+            // a client's permission.
+            ensure!(
+                view.member(&member.device_id)
+                    .is_ok_and(|current| current.kind == member.kind),
+                "device is not a member of this personal network"
+            );
+            let mut state = node.membership_state().await?;
+            state.append(event)?;
+            ensure!(
+                state.project()?.members.iter().any(|m| m.manage),
+                LAST_MANAGER
+            );
+            node.install_membership(state).await?;
+            authentication(node, session).await
+        }
+        "veto" => {
+            let view = manager_view(node, session).await?;
+            let event: GovernanceEvent = from_field(&params, "event")?;
+            let GovernanceAction::Veto { checkpoint, at_ms } = &event.action else {
+                bail!("invalid veto signer or action")
+            };
+            ensure!(
+                event.issuer == session.device_id && event.epoch == view.epoch,
+                "invalid veto signer or action"
+            );
+            let mut state = node.membership_state().await?;
+            // A retry after the veto landed finds nothing waiting, and changes nothing.
+            if !state.events.contains(&event) {
+                let now = crate::runtime::now_ms() as u64;
+                ensure!(
+                    at_ms.abs_diff(now) <= RECOVERY_SKEW_MS,
+                    "this device's clock is too far from this Node's clock"
+                );
+                let pending = view
+                    .pending
+                    .as_ref()
+                    .filter(|pending| pending.checkpoint == *checkpoint)
+                    .context(NO_RECOVERY_WAITING)?;
+                // A Node whose clock runs a little ahead may have put it in effect already; the
+                // veto would roll it back, but this leaves it time to arrive before that happens.
+                ensure!(
+                    now + RECOVERY_SKEW_MS < pending.effective_at_ms,
+                    RECOVERY_DUE
+                );
+                let checkpoint = checkpoint.clone();
+                state.append(event)?;
+                ensure!(
+                    state.project_at(now)?.stopped.contains(&checkpoint),
+                    NO_RECOVERY_WAITING
+                );
+                node.install_membership(state).await?;
+            }
+            authentication(node, session).await
+        }
+        "approve_recovery" => {
+            let view = manager_view(node, session).await?;
+            let event: GovernanceEvent = from_field(&params, "event")?;
+            let GovernanceAction::Approve { checkpoint, at_ms } = &event.action else {
+                bail!("invalid recovery approval signer or action")
+            };
+            ensure!(
+                event.issuer == session.device_id,
+                "invalid recovery approval signer or action"
+            );
+            let mut state = node.membership_state().await?;
+            // A retry after the approval landed finds the event and changes nothing.
+            if !state.events.contains(&event) {
+                ensure!(
+                    event.epoch == view.epoch,
+                    "invalid recovery approval signer or action"
+                );
+                let now = crate::runtime::now_ms() as u64;
+                ensure!(
+                    *at_ms <= now && now - *at_ms <= RECOVERY_SKEW_MS,
+                    "this device's clock is too far from this Node's clock"
+                );
+                let pending = view
+                    .pending
+                    .as_ref()
+                    .filter(|pending| pending.checkpoint == *checkpoint)
+                    .context(NO_RECOVERY_WAITING)?;
+                ensure!(
+                    *at_ms < pending.effective_at_ms,
+                    "this recovery is already due"
+                );
+                let checkpoint = checkpoint.clone();
+                let epoch = event.epoch;
+                state.append(event)?;
+                let approved = state.project_at(now)?;
+                ensure!(
+                    approved.epoch > epoch && !approved.stopped.contains(&checkpoint),
+                    "this recovery approval did not take effect"
+                );
+                node.install_membership(state).await?;
+            }
+            // The approved directory can remove its signer before the reply is sent.
+            let state = node.membership_state().await?;
+            let now = crate::runtime::now_ms() as u64;
+            let view = state.project_at(now)?;
+            Ok(json!({"state":state,"view":view,"now_ms":now}))
+        }
+        "recovery_state" => {
+            // The recovery root may not be a member any more, so it proves itself
+            // with a two-minute signature bound to this channel's device. The checkpoints its
+            // file carries count too, so a Node that missed the last recovery still knows the key.
+            let current = node.membership_state().await?;
+            let state = current.merge(&carried(&params, &current)?)?;
+            let expires = params["expires_at_ms"]
+                .as_i64()
+                .context("expires_at_ms must be an integer")?;
+            let now = crate::runtime::now_ms();
+            ensure!(
+                expires > now && expires <= now + 120_000,
+                "recovery proof expired"
+            );
+            let payload = format!(
+                r#"{{"device_id":"{}","expires_at_ms":{expires},"network_id":"{}"}}"#,
+                session.device_id, state.genesis.network_id
+            );
+            let signature = text(&params, "signature")?;
+            let key = state
+                .recovery_keys()
+                .find(|key| {
+                    vibeface_secure::verify(
+                        key,
+                        RECOVERY_READ_DOMAIN,
+                        payload.as_bytes(),
+                        signature,
+                    )
+                    .is_ok()
+                })
+                .context("recovery key does not own this personal network")?;
+            state.check_root(key, now as u64, false)?;
+            let heads = node.store.lock().await.heads(&state.genesis.network_id)?;
+            Ok(json!({"state":state,"heads":heads,"now_ms":now}))
+        }
+        "recover" => {
+            recover(node, session, &params).await?;
+            authentication(node, session).await
+        }
+        "node_join_check" => check_link_for_local_page(node, &params).await,
+        "node_join" => Ok(serde_json::to_value(
+            join_from_local_page(node, &params).await?,
+        )?),
+        "node_join_cancel" => Ok(serde_json::to_value(cancel_node_join(node, &params)?)?),
+        "rejoin" => {
+            removed_and_local(node, session).await?;
+            node.request_rejoin();
+            Ok(json!({"restarting":true}))
+        }
+        _ => bail!("unknown client method"),
+    }
+}
+
+/// The history a recovery file carries, on top of `state`'s genesis. Anyone may send it, so of
+/// its events only the vetoes of its own checkpoints count: they let a recovery key sign again.
+/// Any other event, and with it any way to sign into an older epoch, is dropped.
+fn carried(params: &Value, state: &NetworkState) -> Result<NetworkState> {
+    let checkpoints: Vec<RootCheckpoint> = optional(params, "checkpoints")?;
+    let hashes = checkpoints
+        .iter()
+        .map(RootCheckpoint::hash)
+        .collect::<Result<Vec<_>>>()?;
+    let events: Vec<GovernanceEvent> = optional(params, "events")?;
+    Ok(NetworkState {
+        genesis: state.genesis.clone(),
+        checkpoints,
+        events: events
+            .into_iter()
+            .filter(|event| {
+                matches!(&event.action, GovernanceAction::Veto { checkpoint, .. } if hashes.contains(checkpoint))
+            })
+            .collect(),
+    })
+}
+
+fn optional<T: serde::de::DeserializeOwned + Default>(params: &Value, key: &str) -> Result<T> {
+    Ok(params
+        .get(key)
+        .map(|_| from_field(params, key))
+        .transpose()?
+        .unwrap_or_default())
+}
+
+/// Creates the network on an empty Node, or installs the recovery file's next checkpoint.
+///
+/// The recovery key's signatures authorize this; a fresh Node also needs its one-time
+/// capability. A retry of an installed recovery changes nothing.
+async fn recover(node: &Runtime, session: &Session, params: &Value) -> Result<()> {
+    let empty = NetworkState::new(from_field(params, "genesis")?)?;
+    let now = crate::runtime::now_ms() as u64;
+    let node_id = node.identity.device_id()?;
+    if !node.has_membership().await? {
+        // An empty Node starts a network of its own, which its one-time capability authorizes,
+        // so the file's whole history comes along.
+        let mut incoming = NetworkState {
+            checkpoints: optional(params, "checkpoints")?,
+            events: optional(params, "events")?,
+            ..empty
+        };
+        let next = incoming.checkpoints.pop();
+        incoming.project()?;
+        if let Some(next) = next {
+            fresh(&next, now)?;
+            incoming.recover_at(next, now)?;
+        }
+        stays(&incoming.project_at(now)?, &node_id)?;
+        node.store.lock().await.bootstrap_network(
+            incoming.clone(),
+            text(params, "capability")?,
+            &session.device_id,
+        )?;
+        node.install_membership(incoming).await?;
+        return Ok(());
+    }
+    let mut incoming = carried(params, &empty)?;
+    let Some(next) = incoming.checkpoints.pop() else {
+        return Ok(());
+    };
+    let current = node.membership_state().await?;
+    ensure!(
+        incoming.genesis == current.genesis,
+        "personal network already initialized"
+    );
+    // Only a checkpoint new here installs anything; a retry changes nothing.
+    if current.checkpoints.contains(&next) {
+        return Ok(());
+    }
+    // The vetoes rest on this Node's own history, so they are checked merged into it.
+    let mut state = current.merge(&incoming)?;
+    // Older checkpoints this Node never saw pass unchecked only as history that was stopped: one
+    // that would take effect here is checked like the new one, or a recovery dated back would
+    // skip the wait.
+    let stopped = state.project_at(now)?.stopped;
+    for checkpoint in &incoming.checkpoints {
+        if !current.checkpoints.contains(checkpoint) && !stopped.contains(&checkpoint.hash()?) {
+            fresh(checkpoint, now)?;
+        }
+    }
+    fresh(&next, now)?;
+    state.recover_at(next, now)?;
+    stays(&state.project_at(now)?, &node_id)?;
+    node.install_membership(state).await?;
+    Ok(())
+}
+
+/// A new directory takes effect `RECOVERY_DELAY_MS` after its signed time, so that time must be
+/// now by this Node's clock. A rotation takes effect at once whatever its time.
+fn fresh(checkpoint: &RootCheckpoint, now: u64) -> Result<()> {
+    if checkpoint.directory.is_none() {
+        return Ok(());
+    }
+    ensure!(
+        checkpoint.issued_at_ms + RECOVERY_SKEW_MS >= now,
+        RECOVERY_TOO_OLD
+    );
+    ensure!(
+        checkpoint.issued_at_ms <= now + RECOVERY_SKEW_MS,
+        "this device's clock is too far from this Node's clock"
+    );
+    Ok(())
+}
+
+/// This Node must be in the directory a recovery leads to, waiting or not.
+fn stays(view: &AuthorizationView, node_id: &str) -> Result<()> {
+    let members = view.pending.as_ref().map_or(&view.members, |p| &p.members);
+    ensure!(
+        members
+            .iter()
+            .any(|m| m.device_id == node_id && m.kind == IdentityKind::Node),
+        "this recovery removes this Node; send it to a Node that stays"
+    );
+    Ok(())
+}
+
+/// One approval step for a join this Node holds; `admin` is the authenticated manager, here or
+/// at the entry that forwarded it.
+pub(crate) async fn approve_join(
+    node: &Arc<Runtime>,
+    admin: &str,
+    params: &Value,
+) -> Result<Value> {
+    let join_id = text(params, "join_id")?;
+    let request = if params["reject"] == true {
+        node.store.lock().await.reject_join(join_id, admin)?
+    } else if let Some(nonce) = params.get("admin_nonce") {
+        let nonce = nonce.as_str().context("admin_nonce must be a string")?;
+        node.store
+            .lock()
+            .await
+            .approve_nonce(join_id, admin, nonce)?
+    } else {
+        let event: GovernanceEvent = from_field(params, "event")?;
+        let (request, state) = node
+            .store
+            .lock()
+            .await
+            .approve_grant(join_id, admin, event)?;
+        node.install_membership(state.clone()).await?;
+        request
+    };
+    node.join_changed(&request.network_id);
+    Ok(serde_json::to_value(request)?)
+}
+
+/// Queued changes past which a session asks its client to re-read instead.
+const PUSH_BURST: usize = 32;
+
+/// A conversation change goes out as the records it touched; one this session cannot build
+/// asks the client to re-read that conversation.
+async fn pushed(node: &Runtime, network: &str, client: &str, payload: Value) -> Value {
+    if payload["type"] != "changed" || !payload["conversation_id"].is_string() {
+        return payload;
+    }
+    match node.changed_records(network, client, &payload).await {
+        Ok(Some(records)) => records,
+        Ok(None) => json!({"type":"changed","conversation_id":payload["conversation_id"]}),
+        Err(error) => {
+            tracing::debug!(%error, "change pushed as a reload");
+            json!({"type":"changed","conversation_id":payload["conversation_id"]})
+        }
+    }
+}
+
+/// Reads membership; a member wins over a local cookie.
+async fn principal(node: &Runtime, session: &Session) -> Result<Principal> {
+    let view = node.membership_state().await?.project()?;
+    let node_id = node.identity.device_id()?;
+    ensure!(
+        view.revocation(&node_id).is_none(),
+        "this Node has been removed from the personal network"
+    );
+    if let Ok(member) = view.client(&session.device_id) {
+        return Ok(Principal {
+            source: "membership",
+            network_id: view.network_id,
+            device_id: member.device_id,
+            epoch: view.epoch,
+            can_manage: member.manage,
+        });
+    }
+    let cookie = session
+        .cookie
+        .as_deref()
+        .context("this device is not a member of the personal network")?;
+    view.node(&node_id)?;
+    let local = node
+        .local_access
+        .session(cookie, &node_id, &view.network_id)?;
+    ensure!(
+        local.device_id == session.device_id,
+        "local browser session belongs to another device"
+    );
+    Ok(Principal {
+        source: "local_session",
+        network_id: local.network_id,
+        device_id: local.device_id,
+        epoch: view.epoch,
+        can_manage: false,
+    })
+}
+
+/// Starting over is for the owner at this computer, once the signed removal is installed here.
+async fn removed_and_local(node: &Runtime, session: &Session) -> Result<()> {
+    let view = node.membership_state().await?.project()?;
+    let node_id = node.identity.device_id()?;
+    ensure!(
+        view.revocation(&node_id).is_some(),
+        "this Node has not been removed from the personal network"
+    );
+    let cookie = session
+        .cookie
+        .as_deref()
+        .context("only this computer's local page can rejoin")?;
+    let local = node
+        .local_access
+        .session(cookie, &node_id, &view.network_id)?;
+    ensure!(
+        local.device_id == session.device_id,
+        "local browser session belongs to another device"
+    );
+    Ok(())
+}
+
+async fn is_local_only(node: &Runtime, session: &Session) -> Result<bool> {
+    Ok(session.cookie.is_some()
+        && (!node.has_membership().await?
+            || node
+                .membership_state()
+                .await?
+                .project()?
+                .client(&session.device_id)
+                .is_err()))
+}
+
+async fn node_operator(node: &Runtime, session: &Session) -> Result<()> {
+    let principal = principal(node, session).await?;
+    ensure!(
+        principal.can_manage || principal.source == "local_session",
+        "management permission or local browser access required"
+    );
+    Ok(())
+}
+
+async fn manager_view(node: &Runtime, session: &Session) -> Result<AuthorizationView> {
+    let view = node.membership_state().await?.project()?;
+    view.manager(&session.device_id)?;
+    Ok(view)
+}
+
+/// Members get the directory; anyone else learns only whether this device was revoked, or
+/// where the recovery that names it as a manager stands.
+async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
+    if !node.has_membership().await? {
+        return Ok(json!({"principal":null,"initialized":false,"revoked":false}));
+    }
+    let state = node.membership_state().await?;
+    // The browser checks the view against the state at this same time.
+    let now = crate::runtime::now_ms();
+    let view = state.project_at(now as u64)?;
+    match principal(node, session).await {
+        Ok(principal) => Ok(
+            json!({"principal":principal,"network_id":view.network_id,"state":state,"view":view,"recovery_since_ms":node.recovery_since_ms(&view.recovery_key).await?,"local_auto_access":node.local_access.enabled(),"now_ms":now}),
+        ),
+        // This Node's own browsers get the signed history that removed it, to check themselves.
+        Err(_)
+            if view.revocation(&node.identity.device_id()?).is_some()
+                && (session.cookie.is_some() || view.client(&session.device_id).is_ok()) =>
+        {
+            Ok(
+                json!({"principal":null,"initialized":true,"network_id":view.network_id,"node_revoked":true,"state":state,"now_ms":now}),
+            )
+        }
+        Err(_) => Ok(
+            json!({"principal":null,"initialized":true,"revoked":view.cutoff(&session.device_id).is_some(),"recovery":recovery_status(&state, &view, &session.device_id)?,"now_ms":now}),
+        ),
+    }
+}
+
+fn recovery_status(state: &NetworkState, view: &AuthorizationView, device: &str) -> Result<Value> {
+    let manages = |members: &[Member]| members.iter().any(|m| m.device_id == device && m.manage);
+    if let Some(pending) = view.pending.as_ref().filter(|p| manages(&p.members)) {
+        return Ok(json!({"status":"waiting","effective_at_ms":pending.effective_at_ms}));
+    }
+    for checkpoint in &state.checkpoints {
+        if checkpoint
+            .directory
+            .as_ref()
+            .is_some_and(|d| manages(&d.members))
+            && view.stopped.contains(&checkpoint.hash()?)
+        {
+            return Ok(json!({"status":"stopped"}));
+        }
+    }
+    Ok(Value::Null)
+}
+
+async fn connection_entry(node: &Runtime) -> Result<Value> {
+    let url = reqwest::Url::parse(&node.config.public_url)?;
+    Ok(json!({"address":url.origin().ascii_serialization(),"device_id":node.identity.device_id()?}))
+}
+
+fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
+    if let Some(signer) = input.pointer("/attestation/device_id") {
+        ensure!(
+            signer.as_str() == Some(subject),
+            "the write is signed by another device"
+        );
+    }
+    if let Some(client) = input.get("client_id") {
+        ensure!(
+            client.as_str() == Some(subject),
+            "client_id differs from authenticated client"
+        );
+    }
+    if matches!(
+        input["method"].as_str(),
+        Some("message" | "presence" | "notifications" | "ack")
+    ) {
+        input
+            .as_object_mut()
+            .context("RPC input must be an object")?
+            .insert("client_id".to_owned(), Value::String(subject.to_owned()));
+    }
+    Ok(())
+}
+
+/// `http(s)://host` → `ws(s)://host/api/client`.
+fn client_url(origin: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(origin)?;
+    let scheme = match url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        _ => bail!("Gateway URL must be HTTP or HTTPS"),
+    };
+    ensure!(
+        url.host_str().is_some() && url.username().is_empty() && url.password().is_none(),
+        "Gateway URL must not contain credentials"
+    );
+    url.set_scheme(scheme)
+        .map_err(|_| anyhow::anyhow!("invalid Gateway URL"))?;
+    url.set_path("/api/client");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.into())
+}
+
+/// The ticket holds at most 8 addresses; a phone on the LAN needs the private IPv4 ones, which a
+/// computer with many interfaces could otherwise push out. Link-local IPv6 cannot be dialed without
+/// its interface; loopback goes last, for Nodes on one machine.
+fn invite_addrs(addrs: impl Iterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    let mut addrs: Vec<_> = addrs
+        .filter(|addr| !matches!(addr.ip(), std::net::IpAddr::V6(ip) if ip.is_unicast_link_local()))
+        .collect();
+    // Home LANs are mostly 192.168/16; container bridges and VPNs take 172.16/12 and 10/8.
+    addrs.sort_by_key(|addr| match addr.ip() {
+        ip if ip.is_loopback() => 5,
+        std::net::IpAddr::V4(ip) if ip.octets()[..2] == [192, 168] => 0,
+        std::net::IpAddr::V4(ip) if ip.octets()[0] == 10 => 1,
+        std::net::IpAddr::V4(ip) if ip.is_private() => 2,
+        std::net::IpAddr::V4(_) => 3,
+        std::net::IpAddr::V6(_) => 4,
+    });
+    addrs.truncate(8);
+    addrs
+}
+
+/// The ticket in an invite: `https://origin/join#vibeface1…`, the app's
+/// `vibeface://join?link=…` around either form, or `vibeface1…` alone. A Node joins over iroh,
+/// so the Gateway origin is not needed.
+pub fn parse_join_link(link: &str) -> Result<Ticket> {
+    parse_join_link_within(link.trim(), true)
+}
+
+fn parse_join_link_within(link: &str, nest: bool) -> Result<Ticket> {
+    const SHAPE: &str = "invite link must look like https://host/join#vibeface1…";
+    if link.starts_with("vibeface1") {
+        return Ok(Ticket::decode(link)?);
+    }
+    let url = reqwest::Url::parse(link).context(SHAPE)?;
+    if nest && url.scheme() == "vibeface" && url.host_str() == Some("join") {
+        let (_, inner) = url
+            .query_pairs()
+            .find(|(key, _)| key == "link")
+            .context(SHAPE)?;
+        return parse_join_link_within(&inner, false);
+    }
+    ensure!(
+        matches!(url.scheme(), "http" | "https") && url.path() == "/join",
+        SHAPE
+    );
+    Ok(Ticket::decode(
+        url.fragment().context("invite link has no ticket")?,
+    )?)
+}
+
+/// Saved so an interrupted join, from the terminal or the local page, resumes with the same
+/// commitment.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingJoin {
+    link: String,
+    name: String,
+    nonce: String,
+    /// `(network_id, admin_id, admin_nonce)` fixed before this Node reveals its nonce; the short code and the
+    /// joined network come from these, never from a later answer of the entry.
+    pinned: Option<(String, String, String)>,
+}
+
+/// The joining Node's side of `vibeface/join/1`, through the ticket's addresses. The relay
+/// admits a non-member holding the invite's derived token.
+struct JoinLink {
+    net: Arc<Net>,
+    entry: String,
+    _router: iroh::protocol::Router,
+}
+impl JoinLink {
+    async fn open(node: &Runtime, ticket: &Ticket) -> Result<Self> {
+        let entry = ticket.entry_id();
+        let token = net::relay_token(&ticket.invite_hash());
+        let relays = ticket
+            .entry
+            .relay_url
+            .iter()
+            .map(|url| {
+                let url = net::relay_url(url)?;
+                // A public entry's relay knows no invites; it admits its operator token.
+                let token = match (&node.config.network.entry, &node.entry_token) {
+                    (Some(entry), Some(own)) if net::relay_url(&entry.relay)? == url => own.clone(),
+                    _ => token.clone(),
+                };
+                Ok((url, Some(token)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut addrs: Vec<TransportAddr> = relays
+            .iter()
+            .map(|(url, _)| TransportAddr::Relay(url.clone()))
+            .collect();
+        addrs.extend(
+            ticket
+                .entry
+                .direct_addrs
+                .iter()
+                .copied()
+                .map(TransportAddr::Ip),
+        );
+        ensure!(
+            !addrs.is_empty() || !node.config.network.discovery.is_empty(),
+            "this invite carries no address and no discovery server is configured"
+        );
+        let config = NetworkConfig {
+            discovery: node.config.network.discovery.clone(),
+            bind: node
+                .config
+                .network
+                .bind
+                .map(|address| SocketAddr::new(address.ip(), 0)),
+            ..NetworkConfig::default()
+        };
+        let link = Arc::new(Net::bind(&node.identity.secret_key_hex, &config, 0, relays).await?);
+        let router = link.discovery_router();
+        link.learn(&EndpointAddr::from_parts(net::endpoint_id(&entry)?, addrs))
+            .await;
+        Ok(Self {
+            net: link,
+            entry,
+            _router: router,
+        })
+    }
+
+    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let request = json!({"method":method,"params":params});
+        let reply = self
+            .net
+            .request(&self.entry, net::JOIN, &request, CALL_TIMEOUT)
+            .await?;
+        Ok(reply["result"].clone())
+    }
+}
+
+/// `vibeface join`: this Node asks the ticket's entry to admit it and waits for approval.
+pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkState> {
+    let node = Runtime::open(dir).await?;
+    let report = |progress| match progress {
+        NodeJoin::Confirming { code, admin } => {
+            eprintln!("安全码：{code}。在「{admin}」上比对一致后允许。")
+        }
+        _ => eprintln!("已提交加入请求，等待管理设备批准。"),
+    };
+    join_as_node(&node, link, name, report, &tokio::sync::Notify::new()).await
+}
+
+/// How far this Node's own join has come; the local page and `vibeface join` show it while the
+/// manager approves.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum NodeJoin {
+    Waiting,
+    Confirming { code: String, admin: String },
+    Joined,
+    Failed { reason: String },
+    Cancelled,
+}
+
+/// The local page withdrew this join before the manager approved it.
+#[derive(Debug)]
+struct Cancelled;
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("join cancelled")
+    }
+}
+impl std::error::Error for Cancelled {}
+
+/// Who started this Node's join: its local page, by the capability it holds, or `vibeface join`
+/// through the maintenance socket only this computer's owner can reach.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum JoinOwner {
+    Page(String),
+    Terminal,
+}
+
+/// The join this Node runs for its own local page or terminal, one at a time.
+pub(crate) struct NodeJoinTask {
+    link: String,
+    owner: JoinOwner,
+    status: NodeJoin,
+    task: tokio::task::AbortHandle,
+    cancel: Arc<tokio::sync::Notify>,
+}
+
+/// Asks the invite's Node whether it would still take this link, before this Node commits to it
+/// and before the page asks for a name. Only the page holding the setup capability may ask.
+async fn check_link_for_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Value> {
+    ensure!(
+        !node.has_membership().await?,
+        "this Node already belongs to a personal network"
+    );
+    node.store
+        .lock()
+        .await
+        .verify_bootstrap_capability(text(params, "capability")?)?;
+    let ticket = parse_join_link(text(params, "link")?)?;
+    let link = JoinLink::open(node, &ticket).await?;
+    let reply = link
+        .call("join_check", json!({"secret":hex::encode(ticket.secret)}))
+        .await;
+    link.net.close().await;
+    reply
+}
+
+async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<NodeJoin> {
+    let owner = JoinOwner::Page(text(params, "capability")?.to_owned());
+    start_node_join(node, text(params, "link")?, text(params, "name")?, owner).await
+}
+
+/// Starts, or reports, this fresh Node's join. Asking again with the same link only reads how
+/// far it got, so a caller unsure whether its last ask arrived simply asks again. A new link
+/// from the same owner replaces an unfinished join; its commitment was never revealed for the
+/// new invite. A join someone else started is left alone.
+pub(crate) async fn start_node_join(
+    node: &Arc<Runtime>,
+    link: &str,
+    name: &str,
+    owner: JoinOwner,
+) -> Result<NodeJoin> {
+    // Every form of one invite is the same join.
+    let link = parse_join_link(link)?.encode()?;
+    let name = name.to_owned();
+    ensure!(name.chars().count() <= 128, "device name is too long");
+    {
+        let mut slot = node
+            .node_join
+            .lock()
+            .map_err(|_| anyhow!("join state unavailable"))?;
+        if let Some(current) = slot.as_ref() {
+            let ended = matches!(
+                current.status,
+                NodeJoin::Failed { .. } | NodeJoin::Cancelled
+            );
+            // An end without joining is reported once; asking again after that starts over.
+            if current.link == link && current.owner == owner {
+                let status = current.status.clone();
+                if ended {
+                    *slot = None;
+                }
+                return Ok(status);
+            }
+            ensure!(
+                ended || current.owner == owner,
+                "another join is already running on this computer"
+            );
+        }
+    }
+    ensure!(
+        !node.has_membership().await?,
+        "this Node already belongs to a personal network"
+    );
+    if let JoinOwner::Page(capability) = &owner {
+        node.store
+            .lock()
+            .await
+            .verify_bootstrap_capability(capability)?;
+    }
+    let mut slot = node
+        .node_join
+        .lock()
+        .map_err(|_| anyhow!("join state unavailable"))?;
+    if let Some(previous) = slot.take() {
+        previous.task.abort();
+        let _ = std::fs::remove_file(node.data_dir.join("join.json"));
+    }
+    // A commitment kept for another link belongs to a join nobody waits on any more.
+    forget_join_for_another_link(&node.data_dir, &link)?;
+    let runner = node.clone();
+    let joining = link.clone();
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let cancelled = cancel.clone();
+    let task = tokio::spawn(async move {
+        let report = |status: NodeJoin| {
+            if let Ok(mut slot) = runner.node_join.lock()
+                && let Some(current) = slot.as_mut()
+                && current.link == joining
+            {
+                current.status = status;
+            }
+        };
+        match join_as_node(&runner, &joining, &name, &report, &cancelled).await {
+            Ok(_) => report(NodeJoin::Joined),
+            Err(error) if error.is::<Cancelled>() => {
+                let _ = std::fs::remove_file(runner.data_dir.join("join.json"));
+                report(NodeJoin::Cancelled);
+            }
+            Err(error) => {
+                tracing::warn!(event = "join.local_failed", %error, "this Node's join failed");
+                // The entry may already hold the request, so the commitment stays: asking again
+                // with the same link resumes it instead of sending a second one.
+                let mut reason = error.to_string();
+                reason.truncate(reason.floor_char_boundary(512));
+                report(NodeJoin::Failed { reason });
+            }
+        }
+    })
+    .abort_handle();
+    *slot = Some(NodeJoinTask {
+        link,
+        owner,
+        status: NodeJoin::Waiting,
+        task,
+        cancel,
+    });
+    Ok(NodeJoin::Waiting)
+}
+
+fn forget_join_for_another_link(dir: &std::path::Path, link: &str) -> Result<()> {
+    let path = dir.join("join.json");
+    let pending = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<PendingJoin>(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if parse_join_link(&pending.link)?.encode()? != link {
+        std::fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
+/// Withdraws this Node's join for the page holding its local setup capability. Only waiting is
+/// cut short: once the manager approved, the join installs and the reply says so.
+fn cancel_node_join(node: &Runtime, params: &Value) -> Result<NodeJoin> {
+    let capability = text(params, "capability")?;
+    let slot = node
+        .node_join
+        .lock()
+        .map_err(|_| anyhow!("join state unavailable"))?;
+    let current = slot
+        .as_ref()
+        .filter(|current| current.owner == JoinOwner::Page(capability.to_owned()))
+        .context("no join from this page is running")?;
+    current.cancel.notify_one();
+    Ok(current.status.clone())
+}
+
+async fn unless_cancelled<T>(
+    cancel: &tokio::sync::Notify,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        result = work => result,
+        () = cancel.notified() => Err(Cancelled.into()),
+    }
+}
+
+/// Joins `node` to the network of the invite, resuming a join this Node already committed to.
+async fn join_as_node(
+    node: &Runtime,
+    link: &str,
+    name: &str,
+    report: impl Fn(NodeJoin),
+    cancel: &tokio::sync::Notify,
+) -> Result<NetworkState> {
+    let ticket = parse_join_link(link)?;
+    ensure!(
+        !node.has_membership().await?,
+        "this Node already belongs to a personal network"
+    );
+    let path = node.data_dir.join("join.json");
+    let mut pending = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<PendingJoin>(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PendingJoin {
+            link: link.trim().to_owned(),
+            name: name.to_owned(),
+            nonce: crate::crypto::random_hex(32),
+            pinned: None,
+        },
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        parse_join_link(&pending.link).is_ok_and(|pending| pending == ticket)
+            && pending.name == name,
+        "another join is in progress; delete join.json to abandon it"
+    );
+    crate::config::private_write(&path, &serde_json::to_vec(&pending)?)?;
+    let device = node.identity.device_id()?;
+    let client = unless_cancelled(cancel, JoinLink::open(node, &ticket)).await?;
+    let request: JoinRequest = serde_json::from_value(
+        unless_cancelled(
+            cancel,
+            client.call(
+                "join",
+                json!({"secret":hex::encode(ticket.secret),"public_key":device,"kind":IdentityKind::Node,"name":name,"commit":join_commit(&device, &pending.nonce)?}),
+            ),
+        )
+        .await?,
+    )?;
+    let invite = invite_id(&ticket.invite_hash())?;
+    ensure!(
+        request.invite_id == invite,
+        "entry answered for another invite"
+    );
+    let join_id = request.join_id;
+    report(NodeJoin::Waiting);
+    let deadline = Instant::now() + Duration::from_secs(11 * 60);
+    let approval = async {
+        let mut shown = false;
+        loop {
+            ensure!(
+                Instant::now() < deadline,
+                "approval timed out; run the same command again to resume"
+            );
+            let status = client
+                .call("join_status", json!({"join_id":join_id}))
+                .await?;
+            let request: JoinRequest = serde_json::from_value(status.clone())?;
+            match request.status {
+                JoinStatus::Joined => {
+                    let state: NetworkState = from_field(&status, "state")?;
+                    ensure!(
+                        pending.pinned.as_ref().map(|pin| pin.0.as_str())
+                            == Some(request.network_id.as_str())
+                            && state.genesis.network_id == request.network_id,
+                        "entry returned another personal network"
+                    );
+                    state.project()?.node(&device)?;
+                    node.install_membership(state.clone()).await?;
+                    let addresses: Vec<net::SignedAddress> =
+                        serde_json::from_value(status["addresses"].clone()).unwrap_or_default();
+                    node.merge_addresses(&request.network_id, addresses).await?;
+                    client.net.close().await;
+                    let _ = std::fs::remove_file(&path);
+                    return anyhow::Ok(state);
+                }
+                JoinStatus::Rejected | JoinStatus::Withdrawn | JoinStatus::Expired => {
+                    let _ = std::fs::remove_file(&path);
+                    bail!(
+                        "join request {:?}: {}",
+                        request.status,
+                        request.reason.as_deref().unwrap_or("expired")
+                    );
+                }
+                JoinStatus::Confirming if !shown => {
+                    let seen = (
+                        request.network_id,
+                        request.admin_id.context("entry omitted the manager")?,
+                        request
+                            .admin_nonce
+                            .context("entry omitted the manager nonce")?,
+                    );
+                    if pending.pinned.is_none() {
+                        pending.pinned = Some(seen.clone());
+                        crate::config::private_write(&path, &serde_json::to_vec(&pending)?)?;
+                    }
+                    let (network, admin, admin_nonce) =
+                        pending.pinned.as_ref().context("pinned")?;
+                    ensure!(
+                        *network == seen.0 && *admin == seen.1 && *admin_nonce == seen.2,
+                        "the entry changed the join after the short code was fixed; delete join.json and ask for a new link"
+                    );
+                    let code = short_code(
+                        network,
+                        &invite,
+                        &device,
+                        admin,
+                        admin_nonce,
+                        &pending.nonce,
+                    )?;
+                    let admin = status["admin_name"]
+                        .as_str()
+                        .unwrap_or("管理设备")
+                        .to_owned();
+                    report(NodeJoin::Confirming { code, admin });
+                    client
+                        .call(
+                            "join_status",
+                            json!({"join_id":join_id,"reveal":pending.nonce}),
+                        )
+                        .await?;
+                    shown = true;
+                }
+                _ => tokio::time::sleep(Duration::from_secs(2)).await,
+            }
+        }
+    };
+    tokio::pin!(approval);
+    tokio::select! {
+        result = &mut approval => result,
+        () = cancel.notified() => {
+            // Withdrawn at the entry, the request leaves every manager's list; one approved
+            // first still completes here.
+            let reply = client.call("join_withdraw", json!({"join_id":join_id})).await?;
+            let request: JoinRequest = serde_json::from_value(reply)?;
+            match request.status {
+                JoinStatus::Joined => approval.await,
+                _ => Err(Cancelled.into()),
+            }
+        }
+    }
+}
+
+fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
+    let text = value[key]
+        .as_str()
+        .with_context(|| format!("{key} is required"))?;
+    ensure!(
+        !text.is_empty() && text.len() <= 2048 && !text.chars().any(char::is_control),
+        "invalid {key}"
+    );
+    Ok(text)
+}
+fn from_field<T: serde::de::DeserializeOwned>(value: &Value, key: &str) -> Result<T> {
+    serde_json::from_value(
+        value
+            .get(key)
+            .cloned()
+            .with_context(|| format!("{key} is required"))?,
+    )
+    .with_context(|| format!("invalid {key}"))
+}
+fn validate_request(request: &Request) -> Result<()> {
+    ensure!(
+        !request.id.is_empty()
+            && request.id.len() <= 128
+            && request
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b)),
+        "invalid request ID"
+    );
+    ensure!(
+        !request.method.is_empty() && request.method.len() <= 64 && request.params.is_object(),
+        "invalid client method or params"
+    );
+    Ok(())
+}
+async fn send_frame(socket: &mut ClientSocket, record: Vec<u8>) -> Result<()> {
+    tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        socket.send(Message::Binary(record.into())),
+    )
+    .await
+    .context("client send timed out")?
+}
+async fn next_binary(socket: &mut ClientSocket) -> Result<Vec<u8>> {
+    while let Some(frame) = socket.next().await {
+        match frame? {
+            Message::Binary(bytes) => {
+                ensure!(bytes.len() <= 65_535, "client frame too large");
+                return Ok(bytes.to_vec());
+            }
+            Message::Text(text) => bail!("Gateway refused the connection: {text}"),
+            Message::Ping(_) | Message::Pong(_) => {}
+            _ => bail!("client channel accepts only encrypted binary frames"),
+        }
+    }
+    bail!("client disconnected")
+}
+async fn send_value<T: Serialize>(
+    socket: &mut ClientSocket,
+    channel: &mut Channel,
+    value: &T,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(value)?;
+    for record in channel.seal_message(&bytes)? {
+        send_frame(socket, record).await?;
+    }
+    Ok(())
+}
+async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Result<Vec<u8>> {
+    loop {
+        if let Some(value) = channel.open_record(&next_binary(socket).await?)? {
+            return Ok(value);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::{Genesis, Member, Revocation};
+
+    #[test]
+    fn join_links_from_the_app_or_a_bare_ticket_name_the_same_ticket() {
+        let ticket = Ticket::new(&LocalIdentity::generate().device_id().unwrap(), [7; 32]).unwrap();
+        let text = ticket.encode().unwrap();
+        let web = format!("http://192.168.1.10:4790/join#{text}");
+        let app = |link: &str| {
+            reqwest::Url::parse_with_params("vibeface://join", [("link", link)])
+                .unwrap()
+                .to_string()
+        };
+        for link in [web.clone(), text.clone(), app(&text), app(&web)] {
+            assert_eq!(parse_join_link(&link).unwrap(), ticket, "{link}");
+        }
+        assert!(parse_join_link(&app(&app(&text))).is_err());
+        assert!(parse_join_link(&format!("http://h/other#{text}")).is_err());
+    }
+
+    #[test]
+    fn invites_keep_private_ipv4_within_the_ticket_limit() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let mut many: Vec<_> = (0..8)
+            .map(|i| addr(&format!("[2001:db8::{i}]:4790")))
+            .collect();
+        many.extend([addr("[fe80::1]:4790"), addr("127.0.0.1:4790")]);
+        many.extend((17..27).map(|i| addr(&format!("172.{i}.0.1:4790"))));
+        many.push(addr("192.168.1.10:4790"));
+        let kept = invite_addrs(many.into_iter());
+        assert_eq!(kept.len(), 8);
+        assert_eq!(
+            kept[0],
+            addr("192.168.1.10:4790"),
+            "container bridges do not crowd out the home LAN"
+        );
+        assert!(!kept.contains(&addr("[fe80::1]:4790")));
+        assert_eq!(
+            invite_addrs([addr("127.0.0.1:9")].into_iter()),
+            [addr("127.0.0.1:9")],
+            "Nodes on one machine still join over loopback"
+        );
+    }
+
+    /// The payload of the next push this client receives.
+    async fn next_push(client: &mut Client) -> Result<Value> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let value: Value = serde_json::from_slice(
+                    &receive_value(&mut client.socket, &mut client.channel).await?,
+                )?;
+                if value["type"] == "changed" {
+                    return Ok(value["payload"].clone());
+                }
+            }
+        })
+        .await
+        .context("no push arrived")?
+    }
+
+    #[tokio::test]
+    async fn delivery_requires_a_current_managing_member_and_does_not_create_a_wallet_for_free_use()
+    -> Result<()> {
+        use crate::config::{self, Config};
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("delivery-principal-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
+        config.save(&dir)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let (root, admin, member, local) = (
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        );
+        let mut state = NetworkState::new(Genesis::create(
+            &root,
+            Member::client(&admin, "admin", true)?,
+            Member::node(&node.identity, "node")?,
+        )?)?;
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::client(&member, "member", false)?,
+        )?)?;
+        let network = state.genesis.network_id.clone();
+        node.install_membership(state.clone()).await?;
+        let session = |identity: &LocalIdentity| -> Result<Session> {
+            Ok(Session {
+                device_id: identity.device_id()?,
+                cookie: None,
+                subscribed: None,
+                observation: None,
+            })
+        };
+        let mut browser = session(&member)?;
+        assert_eq!(
+            dispatch(&node, &mut browser, "delivery", json!({"op":"status"})).await?["enabled"],
+            false
+        );
+        assert!(!dir.join("delivery").exists());
+        assert!(!dir.join("delivery-wallet.json").exists());
+        let change =
+            json!({"op":"configure","enabled":true,"charity_enabled":true,"paid_enabled":false});
+        assert!(
+            dispatch(&node, &mut browser, "delivery", change.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            dispatch(
+                &node,
+                &mut browser,
+                "delivery",
+                json!({"op":"confirm","intent_id":uuid::Uuid::new_v4().to_string()})
+            )
+            .await
+            .is_err()
+        );
+        node.local_access
+            .publish_listener("http://127.0.0.1:0".into(), node.identity.device_id()?)?;
+        let token = node
+            .local_access
+            .issue_from_local_setup(&node.identity.device_id()?, &network)?;
+        let cookie = node.local_access.exchange(
+            &token,
+            &node.identity.device_id()?,
+            &network,
+            &local.device_id()?,
+        )?;
+        let mut local_session = session(&local)?;
+        local_session.cookie = Some(cookie);
+        assert_eq!(
+            dispatch(&node, &mut local_session, "authenticate", json!({})).await?["principal"]["source"],
+            "local_session"
+        );
+        assert!(
+            dispatch(&node, &mut local_session, "delivery", change.clone())
+                .await
+                .is_err()
+        );
+        let mut manager = session(&admin)?;
+        assert_eq!(
+            dispatch(&node, &mut manager, "delivery", change).await?["enabled"],
+            true
+        );
+        assert!(!dir.join("delivery-wallet.json").exists());
+        assert!(
+            dispatch(
+                &node,
+                &mut manager,
+                "delivery",
+                json!({"op":"unlock","passphrase":"not-a-remote-wallet-api"})
+            )
+            .await
+            .is_err()
+        );
+        let replacement = LocalIdentity::generate();
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::client(&replacement, "replacement", true)?,
+        )?)?;
+        state.append(GovernanceEvent::revoke(
+            &replacement,
+            &state.project()?,
+            Revocation::new(&admin.device_id()?, None)?,
+        )?)?;
+        node.install_membership(state).await?;
+        assert!(
+            dispatch(
+                &node,
+                &mut manager,
+                "delivery",
+                json!({"op":"reconcile","order_id":"ab".repeat(32)})
+            )
+            .await
+            .is_err()
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn log_intake_needs_a_member_and_bounded_records_and_reading_needs_management()
+    -> Result<()> {
+        use crate::config::{self, Config};
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("log-intake-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
+        config.providers.execution = [crate::providers::Provider::Codex].into();
+        config.save(&dir)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let (root, admin, member) = (
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        );
+        let mut state = NetworkState::new(Genesis::create(
+            &root,
+            Member::client(&admin, "admin", true)?,
+            Member::node(&node.identity, "node")?,
+        )?)?;
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::client(&member, "browser", false)?,
+        )?)?;
+        node.install_membership(state).await?;
+        let session = |identity: &LocalIdentity| -> Result<Session> {
+            Ok(Session {
+                device_id: identity.device_id()?,
+                cookie: None,
+                subscribed: None,
+                observation: None,
+            })
+        };
+        let record =
+            json!({"level":"error","event":"web.uncaught","message":"TypeError: x is undefined"});
+        let mut stranger = session(&LocalIdentity::generate())?;
+        assert!(
+            dispatch(&node, &mut stranger, "log", json!({"records":[record]}))
+                .await
+                .is_err(),
+            "a browser outside the network cannot write"
+        );
+        let mut browser = session(&member)?;
+        let oversized =
+            json!({"level":"info","message":"x".repeat(crate::logging::MAX_RECORD_BYTES)});
+        assert!(
+            dispatch(&node, &mut browser, "log", json!({"records":[oversized]}))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            dispatch(&node, &mut browser, "log", json!({"records":[record]})).await?,
+            json!({"accepted":1})
+        );
+        assert!(
+            dispatch(&node, &mut browser, "logs", json!({}))
+                .await
+                .is_err(),
+            "reading needs management"
+        );
+        let mut manager = session(&admin)?;
+        assert!(
+            dispatch(&node, &mut manager, "logs", json!({"level":"warn"})).await?["records"]
+                .is_array()
+        );
+        assert!(
+            dispatch(&node, &mut manager, "logs", json!({"unknown":1}))
+                .await
+                .is_err()
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn node_settings_require_management_and_apply_without_restarting_or_losing_other_configuration()
+    -> Result<()> {
+        use crate::config::{self, Config, ManagerSettings};
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("node-settings-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
+        config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
+        config.providers.execution = [crate::providers::Provider::Codex].into();
+        config.save(&dir)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let root = LocalIdentity::generate();
+        let admin = LocalIdentity::generate();
+        let client = LocalIdentity::generate();
+        let mut state = NetworkState::new(Genesis::create(
+            &root,
+            Member::client(&admin, "admin", true)?,
+            Member::node(&node.identity, "node")?,
+        )?)?;
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::client(&client, "browser", false)?,
+        )?)?;
+        let network = state.genesis.network_id.clone();
+        node.install_membership(state).await?;
+        let session = |identity: &LocalIdentity| -> Result<Session> {
+            Ok(Session {
+                device_id: identity.device_id()?,
+                cookie: None,
+                subscribed: None,
+                observation: None,
+            })
+        };
+        for identity in [&client, &LocalIdentity::generate()] {
+            let mut unauthorized = session(identity)?;
+            assert!(
+                dispatch(&node, &mut unauthorized, "node_settings", json!({}))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                dispatch(
+                    &node,
+                    &mut unauthorized,
+                    "configure_node",
+                    json!({"roots":[],"manager":null})
+                )
+                .await
+                .is_err()
+            );
+        }
+        let mut manager_session = session(&admin)?;
+        assert_eq!(
+            dispatch(&node, &mut manager_session, "info", json!({})).await?["connection_entry"],
+            json!({"address":"http://127.0.0.1:4790","device_id":node.identity.device_id()?})
+        );
+        let initial = dispatch(&node, &mut manager_session, "node_settings", json!({})).await?;
+        assert_eq!(initial["settings"], json!({"roots":[],"manager":null}));
+        for invalid in [
+            json!({"provider":"unknown"}),
+            json!({"provider":"codex","prompt":"must not run"}),
+        ] {
+            assert!(
+                dispatch(&node, &mut manager_session, "provider_probe", invalid)
+                    .await
+                    .is_err()
+            );
+        }
+        let catalog = dispatch(
+            &node,
+            &mut manager_session,
+            "provider_models",
+            json!({"provider":"pi"}),
+        )
+        .await?;
+        assert_eq!(
+            catalog,
+            json!({"state":"unavailable","reason":"catalog_unavailable"})
+        );
+        let before = std::fs::read(dir.join("config.json"))?;
+        for invalid in [
+            json!({"roots":["relative-project"],"manager":null}),
+            json!({"roots":[],"manager":null,"codex_bin":"arbitrary"}),
+        ] {
+            assert!(
+                dispatch(&node, &mut manager_session, "configure_node", invalid)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before);
+            assert!(node.settings_snapshot().roots.is_empty());
+        }
+        let project = dir.join("project");
+        let workspace = std::path::PathBuf::from(
+            initial["defaults"]["workspace"]
+                .as_str()
+                .context("default workspace missing")?,
+        );
+        config::private_dir(&project)?;
+        assert!(!workspace.exists());
+        let mut latest = Config::load(&dir)?;
+        latest.network.relays.push("https://relay.example/".into());
+        latest.daily_decision_limit = 11;
+        latest.save(&dir)?;
+        let settings = crate::runtime::NodeSettings {
+            roots: vec![project.clone(), project.join(".")],
+            manager: Some(ManagerSettings {
+                provider: crate::providers::Provider::Cursor,
+                workspace: workspace.clone(),
+                model: "auto".into(),
+                reasoning_effort: None,
+                backup: Default::default(),
+            }),
+        };
+        let refused = dispatch(
+            &node,
+            &mut manager_session,
+            "configure_node",
+            serde_json::to_value(&settings)?,
+        )
+        .await
+        .expect_err("configure_node cannot turn the bot on");
+        assert!(
+            refused.to_string().contains("configure_provider"),
+            "{refused}"
+        );
+        assert!(Config::load(&dir)?.manager.is_none());
+        let choose_cursor =
+            json!({"provider":"cursor","bot":true,"bin":dir.join("missing-cursor-sdk")});
+        std::os::unix::fs::symlink(&project, &workspace)?;
+        assert!(
+            dispatch(
+                &node,
+                &mut manager_session,
+                "configure_provider",
+                choose_cursor.clone()
+            )
+            .await
+            .is_err(),
+            "the default workspace must be a real directory"
+        );
+        std::fs::remove_file(&workspace)?;
+        let chosen = dispatch(
+            &node,
+            &mut manager_session,
+            "configure_provider",
+            choose_cursor,
+        )
+        .await?;
+        assert!(workspace.is_dir());
+        assert_eq!(
+            chosen["settings"]["manager"]["provider"], "cursor",
+            "choosing the bot fills in the defaults"
+        );
+        assert_eq!(chosen["settings"]["manager"]["model"], "auto");
+        assert_eq!(
+            chosen["settings"]["manager"]["workspace"],
+            json!(workspace.canonicalize()?)
+        );
+        assert_eq!(chosen["providers"][1]["roles"], json!(["agent"]));
+        assert_eq!(chosen["providers"][0]["roles"], json!(["execution"]));
+        let mut missing_workspace = settings.clone();
+        missing_workspace.manager.as_mut().unwrap().workspace =
+            dir.join("custom-workspace-not-created");
+        assert!(
+            dispatch(
+                &node,
+                &mut manager_session,
+                "configure_node",
+                serde_json::to_value(missing_workspace)?
+            )
+            .await
+            .is_err()
+        );
+        assert!(!dir.join("custom-workspace-not-created").exists());
+        let saved = dispatch(
+            &node,
+            &mut manager_session,
+            "configure_node",
+            serde_json::to_value(&settings)?,
+        )
+        .await?;
+        assert!(workspace.is_dir());
+        assert_eq!(saved["settings"]["roots"], json!([project.canonicalize()?]));
+        assert_eq!(saved["readiness"]["manager"]["state"], "needs_setup");
+        assert_eq!(
+            saved["readiness"]["manager"]["issue"]["code"],
+            "not_installed"
+        );
+        assert!(node.info().get("manager_available").is_none());
+        let nodes = node
+            .rpc(
+                Access {
+                    network_id: network,
+                    human: true,
+                    conversation_id: None,
+                    manager: None,
+                },
+                json!({"method":"nodes"}),
+            )
+            .await?;
+        assert_eq!(
+            nodes["nodes"][0]["capabilities"]["roots"],
+            json!([project.canonicalize()?])
+        );
+        assert_eq!(nodes["nodes"][0]["capabilities"]["manager"], "cursor");
+        assert_eq!(
+            nodes["nodes"][0]["capabilities"]["manager_state"],
+            "needs_setup"
+        );
+        let persisted = Config::load(&dir)?;
+        assert_eq!(persisted.network.relays, latest.network.relays);
+        assert_eq!(persisted.daily_decision_limit, 11);
+        assert_eq!(
+            dispatch(
+                &node,
+                &mut manager_session,
+                "configure_node",
+                serde_json::to_value(&settings)?
+            )
+            .await?["settings"],
+            saved["settings"]
+        );
+        let mut codex_settings = settings.clone();
+        codex_settings.manager.as_mut().unwrap().provider = crate::providers::Provider::Codex;
+        assert!(
+            dispatch(
+                &node,
+                &mut manager_session,
+                "configure_node",
+                serde_json::to_value(&codex_settings)?,
+            )
+            .await
+            .is_err(),
+            "configure_node cannot move the bot"
+        );
+        let codex = dispatch(
+            &node,
+            &mut manager_session,
+            "configure_provider",
+            json!({"provider":"codex","bot":true}),
+        )
+        .await?;
+        let mut expected = saved["settings"].clone();
+        expected["manager"]["provider"] = json!("codex");
+        expected["manager"]["model"] = json!("");
+        assert_eq!(
+            codex["settings"], expected,
+            "only the provider and model move"
+        );
+        assert_eq!(
+            codex["providers"][0]["roles"],
+            json!(["agent", "execution"])
+        );
+        assert_eq!(codex["providers"][1]["state"], "off");
+        dispatch(
+            &node,
+            &mut manager_session,
+            "configure_provider",
+            json!({"provider":"cursor","bot":true}),
+        )
+        .await?;
+        drop(node);
+        let reopened = Runtime::reopen(&dir).await?;
+        assert_eq!(
+            serde_json::to_value(reopened.settings_snapshot())?,
+            saved["settings"]
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_keys_stay_in_the_private_file_and_one_call_chooses_what_providers_run()
+    -> Result<()> {
+        use crate::config::{self, Config};
+        use crate::providers::Provider;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("provider-keys-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let logs = dir.join("logs");
+        config::private_dir(&logs)?;
+        crate::logging::capture(&logs)?;
+        let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
+        config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
+        config.providers.execution = [Provider::Codex].into();
+        config.save(&dir)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let root = LocalIdentity::generate();
+        let admin = LocalIdentity::generate();
+        let client = LocalIdentity::generate();
+        let mut state = NetworkState::new(Genesis::create(
+            &root,
+            Member::client(&admin, "admin", true)?,
+            Member::node(&node.identity, "node")?,
+        )?)?;
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::client(&client, "browser", false)?,
+        )?)?;
+        let network = state.genesis.network_id.clone();
+        node.install_membership(state).await?;
+        let session = |identity: &LocalIdentity| -> Result<Session> {
+            Ok(Session {
+                device_id: identity.device_id()?,
+                cookie: None,
+                subscribed: None,
+                observation: None,
+            })
+        };
+        let codex_key = "fixture-codex-secret-0123456789";
+        let cursor_key = "fixture-cursor-secret-0123456789";
+        let user_codex_home = dir.join("user-codex-home");
+        config::private_dir(&user_codex_home)?;
+        let node_codex_home = dir.join("providers/codex");
+        std::fs::write(
+            node_codex_home.join("config.toml"),
+            "model_provider='fixture'\n[model_providers.fixture]\nenv_key='FIXTURE_PROVIDER_KEY'\n",
+        )?;
+        let set_codex = json!({"provider":"codex","bot":true,"bin":"/fixture/codex",
+            "env":{"FIXTURE_CODEX_KEY":codex_key,"CODEX_HOME":user_codex_home}});
+        let mut member = session(&client)?;
+        assert!(
+            dispatch(&node, &mut member, "configure_provider", set_codex.clone())
+                .await
+                .is_err(),
+            "only the owner changes providers"
+        );
+        assert!(!dir.join(crate::providers::ENV_FILE).exists());
+
+        let mut owner = session(&admin)?;
+        let set_node = json!({"roots":[user_codex_home.canonicalize()?],"manager":null});
+        let before_config = std::fs::read(dir.join("config.json"))?;
+        let before_settings = serde_json::to_value(node.settings_snapshot())?;
+        let before_providers = node.providers();
+        for (method, params) in [
+            ("configure_provider", set_codex.clone()),
+            ("configure_node", set_node.clone()),
+        ] {
+            let active = node.manager_controls.lock().await;
+            let mut queued = Box::pin(dispatch(&node, &mut owner, method, params));
+            assert!(futures_util::poll!(queued.as_mut()).is_pending());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before_config);
+            assert!(!dir.join(crate::providers::ENV_FILE).exists());
+            drop(queued);
+            drop(active);
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before_config);
+            assert!(!dir.join(crate::providers::ENV_FILE).exists());
+            assert_eq!(
+                serde_json::to_value(node.settings_snapshot())?,
+                before_settings
+            );
+            let providers = node.providers();
+            assert_eq!(providers.switches, before_providers.switches);
+            assert_eq!(providers.bins, before_providers.bins);
+            assert!(providers.env == before_providers.env);
+            assert!(
+                !node
+                    .pending_provider_launches
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+        }
+        let configured = dispatch(&node, &mut owner, "configure_node", set_node.clone()).await?;
+        assert_eq!(configured["settings"], set_node);
+        assert_eq!(
+            node.settings_snapshot().roots,
+            vec![user_codex_home.canonicalize()?]
+        );
+        assert_eq!(Config::load(&dir)?.roots, node.settings_snapshot().roots);
+        let saved = dispatch(&node, &mut owner, "configure_provider", set_codex).await?;
+        assert_eq!(
+            Config::load(&dir)?.bins.get(&Provider::Codex),
+            Some(&std::path::PathBuf::from("/fixture/codex"))
+        );
+        assert!(crate::providers::ProviderEnv::load(&dir)? == node.providers().env);
+        let cursor = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","env":{"CURSOR_API_KEY":cursor_key}}),
+        )
+        .await?;
+        let read = dispatch(&node, &mut owner, "node_settings", json!({})).await?;
+        for reply in [&saved, &cursor, &read] {
+            let text = reply.to_string();
+            assert!(
+                !text.contains(codex_key) && !text.contains(cursor_key),
+                "{text}"
+            );
+        }
+        assert_eq!(read["settings"]["manager"]["provider"], "codex");
+        let codex = &read["providers"][0];
+        assert_eq!(codex["provider"], "codex");
+        assert_eq!(codex["roles"], json!(["agent", "execution"]));
+        assert_eq!(codex["bin"], "/fixture/codex");
+        assert_eq!(codex["home"], node_codex_home.to_string_lossy().as_ref());
+        assert!(codex["env"].as_array().unwrap().contains(
+            &json!({"name":"FIXTURE_CODEX_KEY","set":true,"inherited":false,"required":false})
+        ));
+        assert!(codex["env"].as_array().unwrap().contains(
+            &json!({"name":"FIXTURE_PROVIDER_KEY","set":false,"inherited":false,"required":true})
+        ));
+        assert_eq!(
+            (codex["state"].clone(), codex["issues"].clone()),
+            (
+                json!("needs_setup"),
+                json!([{"code":"bin_missing","path":"/fixture/codex"},
+                    {"code":"env_missing","name":"FIXTURE_PROVIDER_KEY"}])
+            ),
+            "spawn uses the Node-owned program and provider root"
+        );
+        assert_eq!(read["providers"][1]["env"][0]["set"], true);
+        assert_eq!(
+            (
+                read["providers"][1]["state"].clone(),
+                read["providers"][1]["issues"].clone()
+            ),
+            (json!("off"), json!([])),
+            "Cursor runs nothing until a role is enabled"
+        );
+        assert_eq!(codex["app_server"]["mode"], "spawn");
+        assert_eq!(read["providers"][1]["app_server"], Value::Null);
+        let spawn = json!({"provider":"codex","app_server":{"mode":"spawn","socket":null}});
+        let moved = dispatch(&node, &mut owner, "configure_provider", spawn).await?;
+        assert_eq!(moved["providers"][0]["app_server"]["mode"], "spawn");
+        assert_eq!(
+            moved["providers"][0]["issues"],
+            json!([{"code":"bin_missing","path":"/fixture/codex"},
+                {"code":"env_missing","name":"FIXTURE_PROVIDER_KEY"}])
+        );
+        assert_eq!(
+            Config::load(&dir)?.providers.codex_app_server.mode,
+            crate::providers::AppServerMode::Spawn
+        );
+        let cursor_server =
+            json!({"provider":"cursor","app_server":{"mode":"spawn","socket":null}});
+        assert!(
+            dispatch(&node, &mut owner, "configure_provider", cursor_server)
+                .await
+                .is_err()
+        );
+
+        let codex_env = node.provider_env(Provider::Codex);
+        let cursor_env = node.provider_env(Provider::Cursor);
+        assert_eq!(codex_env["FIXTURE_CODEX_KEY"], codex_key);
+        assert!(!codex_env.contains_key("CURSOR_API_KEY"));
+        assert_eq!(cursor_env["CURSOR_API_KEY"], cursor_key);
+        assert!(!cursor_env.contains_key("FIXTURE_CODEX_KEY"));
+
+        crate::logging::write(&crate::logging::Record {
+            ts_ms: 1,
+            level: crate::logging::Level::Warn,
+            source: crate::logging::Source::Codex,
+            event: "codex.app_server.stderr".into(),
+            message: format!("Missing environment variable after {codex_key} and {cursor_key}"),
+            conversation_id: None,
+            work_id: None,
+            thread_id: None,
+            fields: Default::default(),
+        });
+        let mut files = vec![dir.clone()];
+        let mut checked = 0;
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(std::fs::read_dir(&path)?.map(|entry| entry.unwrap().path()));
+                continue;
+            }
+            if path.file_name() == Some(std::ffi::OsStr::new(crate::providers::ENV_FILE)) {
+                continue;
+            }
+            let bytes = std::fs::read(&path)?;
+            for key in [codex_key, cursor_key] {
+                assert!(
+                    !bytes
+                        .windows(key.len())
+                        .any(|window| window == key.as_bytes()),
+                    "{} holds a provider key",
+                    path.display()
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 3 && logs.join("node.log").is_file());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(dir.join(crate::providers::ENV_FILE))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        for invalid in [
+            json!({"provider":"unknown","execution":true}),
+            json!({"provider":"codex","roles":["agent"]}),
+            json!({"provider":"codex","enabled":false}),
+            json!({"provider":"codex","env":{"VIBEFACE_DATA_DIR":"/elsewhere"}}),
+        ] {
+            assert!(
+                dispatch(&node, &mut owner, "configure_provider", invalid)
+                    .await
+                    .is_err()
+            );
+        }
+        let cursor_enabled = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","execution":true}),
+        )
+        .await?;
+        assert_eq!(
+            cursor_enabled["providers"][1]["roles"],
+            json!(["execution"])
+        );
+        assert!(
+            Config::load(&dir)?
+                .providers
+                .execution
+                .contains(&Provider::Cursor)
+        );
+        let cursor_disabled = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","execution":false}),
+        )
+        .await?;
+        assert_eq!(cursor_disabled["providers"][1]["roles"], json!([]));
+        let off = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"codex","execution":false,"env":{"FIXTURE_CODEX_KEY":null}}),
+        )
+        .await?;
+        assert_eq!(off["providers"][0]["roles"], json!(["agent"]));
+        assert!(node.providers().switches.execution.is_empty());
+        assert!(matches!(
+            node.providers().codex_target(true),
+            crate::providers::CodexTarget::Spawn(_)
+        ));
+        assert!(
+            off["providers"][0]["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["name"] != "FIXTURE_CODEX_KEY")
+        );
+        let nodes = node
+            .rpc(
+                Access {
+                    network_id: network,
+                    human: true,
+                    conversation_id: None,
+                    manager: None,
+                },
+                json!({"method":"nodes"}),
+            )
+            .await?;
+        assert_eq!(nodes["nodes"][0]["capabilities"]["codex"]["enabled"], false);
+        let moved = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","bot":true}),
+        )
+        .await?;
+        assert_eq!(moved["settings"]["manager"]["provider"], "cursor");
+        assert_eq!(moved["settings"]["manager"]["model"], "auto");
+        assert_eq!(moved["providers"][0]["roles"], json!([]));
+        assert_eq!(moved["providers"][0]["state"], "off");
+        assert_eq!(moved["providers"][1]["roles"], json!(["agent"]));
+        let unchanged = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"codex","bot":false}),
+        )
+        .await?;
+        assert_eq!(
+            unchanged["settings"]["manager"]["provider"], "cursor",
+            "stopping the bot elsewhere leaves it running"
+        );
+        let stopped = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","bot":false}),
+        )
+        .await?;
+        assert_eq!(stopped["settings"]["manager"], Value::Null);
+        assert_eq!(stopped["readiness"]["manager"], Value::Null);
+        assert_eq!(stopped["providers"][1]["state"], "off");
+        let executing = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","execution":true}),
+        )
+        .await?;
+        assert_eq!(
+            executing["settings"]["manager"]["provider"], "cursor",
+            "tasks reach a device through its bot, so executing them starts one"
+        );
+        assert_eq!(
+            executing["providers"][1]["roles"],
+            json!(["agent", "execution"])
+        );
+        dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","bot":false,"execution":false}),
+        )
+        .await?;
+
+        drop(node);
+        let reopened = Runtime::reopen(&dir).await?;
+        let providers = reopened.providers();
+        assert!(reopened.manager().is_none());
+        assert!(providers.switches.execution.is_empty());
+        assert_eq!(
+            providers.bin(Provider::Codex),
+            std::path::PathBuf::from("/fixture/codex")
+        );
+        assert_eq!(
+            reopened.provider_env(Provider::Cursor)["CURSOR_API_KEY"],
+            cursor_key
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_a_local_page_of_a_removed_node_can_rejoin() -> Result<()> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("rejoin-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let mut config = crate::config::Config::local("127.0.0.1:4791".parse()?, vec![], false);
+        config.local_listen = "127.0.0.1:4792".parse()?;
+        config.save(&dir)?;
+        crate::config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        crate::config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let result = async {
+            let (root, admin, browser) = (
+                LocalIdentity::generate(),
+                LocalIdentity::generate(),
+                LocalIdentity::generate(),
+            );
+            let mut state = NetworkState::new(Genesis::create(
+                &root,
+                Member::client(&admin, "admin", true)?,
+                Member::node(&node.identity, "node")?,
+            )?)?;
+            let network = state.genesis.network_id.clone();
+            let node_id = node.identity.device_id()?;
+            node.install_membership(state.clone()).await?;
+            node.local_access
+                .publish_listener("http://127.0.0.1:4792".into(), node_id.clone())?;
+            let token = node
+                .local_access
+                .issue_from_local_setup(&node_id, &network)?;
+            let cookie =
+                node.local_access
+                    .exchange(&token, &node_id, &network, &browser.device_id()?)?;
+            let mut local = Session {
+                device_id: browser.device_id()?,
+                cookie: Some(cookie),
+                subscribed: None,
+                observation: None,
+            };
+            let mut remote_manager = Session {
+                device_id: admin.device_id()?,
+                cookie: None,
+                subscribed: None,
+                observation: None,
+            };
+            assert!(
+                dispatch(&node, &mut local, "rejoin", json!({}))
+                    .await
+                    .is_err(),
+                "a Node that is still a member keeps its data"
+            );
+            state.append(GovernanceEvent::revoke(
+                &admin,
+                &state.project()?,
+                Revocation::new(&node_id, None)?,
+            )?)?;
+            node.install_membership(state).await?;
+            assert!(
+                dispatch(&node, &mut remote_manager, "rejoin", json!({}))
+                    .await
+                    .is_err(),
+                "a browser that is not at this computer cannot start it over"
+            );
+            assert_eq!(
+                dispatch(&node, &mut local, "rejoin", json!({})).await?,
+                json!({"restarting":true})
+            );
+            tokio::time::timeout(Duration::from_secs(5), node.rejoin_requested()).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[tokio::test]
+    async fn the_local_page_cancels_a_waiting_join_but_not_an_approved_one() -> Result<()> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("node-join-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        crate::config::Config::local("127.0.0.1:4793".parse()?, vec![], false).save(&dir)?;
+        crate::config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        crate::config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let capability =
+            crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let result = async {
+            let mut ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [7; 32])?;
+            ticket.entry.direct_addrs = vec!["127.0.0.1:9".parse()?];
+            let params = json!({
+                "capability": capability.capability,
+                "link": format!("http://127.0.0.1:4793/join#{}", ticket.encode()?),
+                "name": "工作室 Mac",
+            });
+            let mut page = Session {
+                device_id: LocalIdentity::generate().device_id()?,
+                cookie: None,
+                subscribed: None,
+                observation: None,
+            };
+            let status = |value: Value| value["status"].as_str().unwrap_or_default().to_owned();
+            assert_eq!(
+                status(dispatch(&node, &mut page, "node_join", params.clone()).await?),
+                "waiting"
+            );
+            for _ in 0..50 {
+                if dir.join("join.json").exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                dir.join("join.json").exists(),
+                "the join committed to a nonce"
+            );
+            assert!(
+                dispatch(
+                    &node,
+                    &mut page,
+                    "node_join_cancel",
+                    json!({"capability": "0".repeat(64)})
+                )
+                .await
+                .is_err(),
+                "only the page that started the join can cancel it"
+            );
+            assert_eq!(
+                status(
+                    dispatch(
+                        &node,
+                        &mut page,
+                        "node_join_cancel",
+                        json!({"capability": capability.capability})
+                    )
+                    .await?
+                ),
+                "waiting"
+            );
+            let mut seen = String::new();
+            for _ in 0..50 {
+                seen = status(dispatch(&node, &mut page, "node_join", params.clone()).await?);
+                if seen != "waiting" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                seen, "cancelled",
+                "cancel ends the wait on the Node, not just the page"
+            );
+            assert!(
+                !dir.join("join.json").exists(),
+                "a cancelled join leaves no commitment"
+            );
+
+            dispatch(&node, &mut page, "node_join", params.clone()).await?;
+            node.node_join
+                .lock()
+                .map_err(|_| anyhow!("poisoned"))?
+                .as_mut()
+                .context("slot")?
+                .status = NodeJoin::Joined;
+            assert_eq!(
+                status(
+                    dispatch(
+                        &node,
+                        &mut page,
+                        "node_join_cancel",
+                        json!({"capability": capability.capability})
+                    )
+                    .await?
+                ),
+                "joined",
+                "an approved join is not reported as cancelled"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[tokio::test]
+    async fn a_failed_page_join_keeps_its_commitment_so_asking_again_resumes_it() -> Result<()> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("node-join-failed-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        crate::config::Config::local("127.0.0.1:4795".parse()?, vec![], false).save(&dir)?;
+        crate::config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        crate::config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let capability =
+            crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let result = async {
+            // No address and no discovery: the join fails after it committed, before reaching anyone.
+            let link = |secret: u8| -> Result<String> {
+                let ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [secret; 32])?;
+                Ok(format!("http://127.0.0.1:4795/join#{}", ticket.encode()?))
+            };
+            let params = |link: &str| json!({"capability": capability.capability, "link": link, "name": "工作室 Mac"});
+            let mut page = Session {
+                device_id: LocalIdentity::generate().device_id()?,
+                cookie: None,
+                subscribed: None,
+                observation: None,
+            };
+            let nonce = || -> Result<String> {
+                let pending: Value = serde_json::from_slice(&std::fs::read(dir.join("join.json"))?)?;
+                Ok(pending["nonce"].as_str().unwrap_or_default().to_owned())
+            };
+            let mut node_join = async |link: &str| -> Result<Value> {
+                for _ in 0..100 {
+                    let reply = dispatch(&node, &mut page, "node_join", params(link)).await?;
+                    if reply["status"] == "failed" {
+                        return Ok(reply);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                bail!("the join never failed")
+            };
+            let first = link(7)?;
+            let failed = node_join(&first).await?;
+            assert!(
+                failed["reason"].as_str().is_some_and(|reason| !reason.is_empty()),
+                "a failure says why: {failed}"
+            );
+            let sent = nonce()?;
+            node_join(&first).await?;
+            assert_eq!(
+                nonce()?,
+                sent,
+                "asking again with the same link resumes the request the entry may hold"
+            );
+            node_join(&link(8)?).await?;
+            assert_ne!(nonce()?, sent, "a new link drops the old commitment");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[tokio::test]
+    async fn local_browser_access_requires_a_launcher_and_preserves_membership_permissions()
+    -> Result<()> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        async fn connect_local(
+            origin: &str,
+            target: &str,
+            cookie: &str,
+            identity: &LocalIdentity,
+        ) -> Result<Client> {
+            let endpoint = origin.replace("http://", "ws://") + "/api/local/ws";
+            let mut request = endpoint.into_client_request()?;
+            request.headers_mut().insert("cookie", cookie.parse()?);
+            let (socket, _) = tokio_tungstenite::connect_async(request).await?;
+            Client::from_socket(ClientSocket::Client(Box::new(socket)), identity, target).await
+        }
+
+        async fn browser_node(
+            dir: &std::path::Path,
+            manager: &LocalIdentity,
+        ) -> Result<(Arc<Runtime>, LocalIdentity)> {
+            crate::config::private_dir(dir)?;
+            let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let local = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let mut config = crate::config::Config::local(reservation.local_addr()?, vec![], false);
+            config.local_listen = local.local_addr()?;
+            drop((reservation, local));
+            config.save(dir)?;
+            crate::config::private_write(
+                &dir.join("identity.json"),
+                &serde_json::to_vec(&LocalIdentity::generate())?,
+            )?;
+            crate::config::private_write(
+                &dir.join("data-epoch.json"),
+                &crate::config::data_epoch_marker(),
+            )?;
+            let node = Arc::new(Runtime::open(dir).await?);
+            let root = LocalIdentity::generate();
+            node.install_membership(NetworkState::new(Genesis::create(
+                &root,
+                Member::client(manager, "management browser", true)?,
+                Member::node(&node.identity, "local device")?,
+            )?)?)
+            .await?;
+            Ok((node, root))
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-local-browser-{}", uuid::Uuid::new_v4()));
+        let manager = LocalIdentity::generate();
+        let browser = LocalIdentity::generate();
+        let (node, root) = browser_node(&dir, &manager).await?;
+        let listen = node.config.listen;
+        let serving = node.clone();
+        let server = tokio::spawn(async move { crate::api::serve(serving, None).await });
+        let mut second_server = None;
+        let result: Result<()> = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !dir.join("local-access.json").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+            }).await?;
+            let launcher: crate::local_access::Launcher = serde_json::from_slice(&std::fs::read(dir.join("local-access.json"))?)?;
+            let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+            assert_eq!(http.get(format!("http://{listen}/api/local/info")).header("Forwarded", "for=127.0.0.1;host=localhost").send().await?.status(), 404);
+            let info: Value = http.get(format!("{}/api/local/info", launcher.origin)).send().await?.error_for_status()?.json().await?;
+            assert_eq!(info["has_session"], false);
+            let denied = http.post(format!("{}/api/local/launch", launcher.origin)).header("Origin", &launcher.origin).header("X-Forwarded-For", "127.0.0.1").json(&json!({})).send().await?;
+            assert_eq!(denied.status(), 401);
+            assert!(!denied.headers().contains_key("set-cookie"));
+            assert_eq!(http.get(format!("{}/api/local/ws", launcher.origin)).header("Connection", "Upgrade").header("Upgrade", "websocket").header("Sec-WebSocket-Version", "13").header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==").send().await?.status(), 401);
+
+            let mut cookies = vec![];
+            for identity in [&browser, &manager] {
+                let launch: Value = http.post(format!("{}/api/local/launch", launcher.origin)).bearer_auth(&launcher.capability).json(&json!({})).send().await?.error_for_status()?.json().await?;
+                let input = json!({"token":launch["token"],"node_id":launcher.node_id,"device_id":identity.device_id()?});
+                let exchanged = http.post(format!("{}/api/local/exchange", launcher.origin)).header("Origin", &launcher.origin).json(&input).send().await?.error_for_status()?;
+                let cookie = exchanged.headers().get("set-cookie").context("session cookie missing")?.to_str()?;
+                assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict") && cookie.contains("Path=/api/local"));
+                cookies.push(cookie.split(';').next().context("session cookie missing")?.to_owned());
+                assert_eq!(http.post(format!("{}/api/local/exchange", launcher.origin)).header("Origin", &launcher.origin).json(&input).send().await?.status(), 401);
+            }
+            let second_dir = dir.join("second");
+            let (second, _) = browser_node(&second_dir, &manager).await?;
+            second_server = Some(tokio::spawn(async move { crate::api::serve(second, None).await }));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !second_dir.join("local-access.json").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+            }).await?;
+            let second_launcher: crate::local_access::Launcher = serde_json::from_slice(&std::fs::read(second_dir.join("local-access.json"))?)?;
+            let first_origin = reqwest::Url::parse(&launcher.origin)?;
+            let second_origin = reqwest::Url::parse(&second_launcher.origin)?;
+            assert_eq!(first_origin.host_str(), Some("127.0.0.1"));
+            assert_eq!(second_origin.host_str(), first_origin.host_str());
+            assert_ne!(second_origin.port(), first_origin.port());
+            let launch: Value = http.post(format!("{}/api/local/launch", second_launcher.origin)).bearer_auth(&second_launcher.capability).json(&json!({})).send().await?.error_for_status()?.json().await?;
+            let input = json!({"token":launch["token"],"node_id":second_launcher.node_id,"device_id":browser.device_id()?});
+            let exchanged = http.post(format!("{}/api/local/exchange", second_launcher.origin)).header("Origin", &second_launcher.origin).json(&input).send().await?.error_for_status()?;
+            let second_cookie = exchanged.headers().get("set-cookie").context("second session cookie missing")?.to_str()?;
+            assert!(second_cookie.contains("HttpOnly") && second_cookie.contains("SameSite=Strict") && second_cookie.contains("Path=/api/local"));
+            let second_cookie = second_cookie.split(';').next().context("second session cookie missing")?;
+            let mut jar = std::collections::BTreeMap::new();
+            for cookie in [cookies[0].as_str(), second_cookie] {
+                let (name, value) = cookie.split_once('=').context("invalid session cookie")?;
+                jar.insert(name, value);
+            }
+            assert_eq!(jar.len(), 2, "same-host Nodes must retain separate cookies");
+            let shared_cookies = jar.iter().map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join("; ");
+            for origin in [&launcher.origin, &second_launcher.origin] {
+                let info: Value = http.get(format!("{origin}/api/local/info")).header("Cookie", &shared_cookies).send().await?.error_for_status()?.json().await?;
+                assert_eq!(info["has_session"], true);
+                assert_eq!(info["device_id"], browser.device_id()?);
+            }
+            let (first_name, _) = cookies[0].split_once('=').context("invalid session cookie")?;
+            let (_, second_value) = second_cookie.split_once('=').context("invalid second session cookie")?;
+            let wrong_node_cookie = format!("{first_name}={second_value}");
+            let info: Value = http.get(format!("{}/api/local/info", launcher.origin)).header("Cookie", &wrong_node_cookie).send().await?.error_for_status()?.json().await?;
+            assert_eq!(info["has_session"], false);
+            assert_eq!(http.get(format!("{}/api/local/ws", launcher.origin)).header("Cookie", &wrong_node_cookie).header("Connection", "Upgrade").header("Upgrade", "websocket").header("Sec-WebSocket-Version", "13").header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==").send().await?.status(), 401);
+            let mut second_local = connect_local(&second_launcher.origin, &second_launcher.node_id, &shared_cookies, &browser).await?;
+            assert_eq!(second_local.call("authenticate", json!({})).await?["principal"]["source"], "local_session");
+            let mut local = connect_local(&launcher.origin, &launcher.node_id, &shared_cookies, &browser).await?;
+            let auth = local.call("authenticate", json!({})).await?;
+            assert_eq!(auth["principal"]["source"], "local_session");
+            assert_eq!(auth["principal"]["can_manage"], false);
+            assert!(!auth["view"]["members"].as_array().context("members missing")?.iter().any(|member| member["device_id"] == browser.device_id().unwrap()));
+            assert!(local.call("join_status", json!({})).await.is_err());
+            let local_project = dir.join("local-project");
+            crate::config::private_dir(&local_project)?;
+            let settings = local.call("node_settings", json!({})).await?;
+            assert_eq!(settings["settings"]["manager"], Value::Null);
+            let saved = local.call("configure_node", json!({"roots":[local_project],"manager":null})).await?;
+            assert_eq!(saved["settings"]["roots"], json!([local_project.canonicalize()?]));
+            assert_eq!(local.call("authenticate", json!({})).await?["principal"]["can_manage"], false);
+            let before = std::fs::read(dir.join("config.json"))?;
+            assert!(node.configure_node(node.settings_snapshot(), &browser.device_id()?, Some(&"0".repeat(64))).await.is_err());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before);
+            let conversation = uuid::Uuid::new_v4().to_string();
+            let network = node.membership_state().await?.genesis.network_id;
+            let owner = browser.attest(&network, &conversation, crate::model::EventBody::ConversationOwner {
+                scheduler_node: node.identity.device_id()?, epoch: 1, attestation: None, cause: None })?;
+            let created = local.call("rpc", json!({"method":"create_conversation","conversation_id":conversation,"title":"Local browser",
+                "scheduler_node":node.identity.device_id()?,"owner_attestation":owner.attestation()})).await;
+            assert!(created.is_err(), "a local session's key is not a member's signature");
+            let conversations = local.call("rpc", json!({"method":"conversations"})).await?;
+            assert!(conversations["conversations"].is_array());
+            let mut wrong_key = connect_local(&launcher.origin, &launcher.node_id, &cookies[0], &LocalIdentity::generate()).await?;
+            assert!(wrong_key.call("authenticate", json!({})).await.is_err());
+            let mut signed = connect_local(&launcher.origin, &launcher.node_id, &cookies[1], &manager).await?;
+            let auth = signed.call("authenticate", json!({})).await?;
+            assert_eq!(auth["principal"]["source"], "membership");
+            assert_eq!(auth["principal"]["can_manage"], true);
+            let cookie = cookies[0].split_once('=').context("local cookie missing")?.1;
+            let browser_id = browser.device_id()?;
+            let mut local_session = Session {
+                device_id: browser_id.clone(), cookie: Some(cookie.into()),
+                subscribed: None, observation: None,
+            };
+            let save = node.config_save.lock().await;
+            let mut queued_disable = Box::pin(dispatch(&node, &mut local_session, "local_access", json!({"enabled":false})));
+            assert!(futures_util::poll!(queued_disable.as_mut()).is_pending());
+            node.local_access.set_enabled(false)?;
+            let after_close = std::fs::read(dir.join("config.json"))?;
+            drop(save);
+            assert!(queued_disable.await.is_err());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, after_close);
+            assert!(!crate::config::Config::load(&dir)?.local_auto_access);
+            let before = std::fs::read(dir.join("config.json"))?;
+            assert!(node.configure_node(node.settings_snapshot(), &browser.device_id()?, Some(cookie)).await.is_err());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before);
+            assert!(local.call("rpc", json!({"method":"conversations"})).await.is_err());
+            assert_eq!(second_local.call("authenticate", json!({})).await?["principal"]["source"], "local_session");
+            assert_eq!(signed.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
+            signed.call("local_access", json!({"enabled":true})).await?;
+            assert_eq!(http.get(format!("{}/api/local/ws", launcher.origin)).header("Cookie", &cookies[0]).header("Connection", "Upgrade").header("Upgrade", "websocket").header("Sec-WebSocket-Version", "13").header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==").send().await?.status(), 401);
+            node.local_access.set_enabled(false)?;
+            let mut manager_session = Session {
+                device_id: manager.device_id()?, cookie: None,
+                subscribed: None, observation: None,
+            };
+            let save = node.config_save.lock().await;
+            let mut queued_enable = Box::pin(dispatch(&node, &mut manager_session, "local_access", json!({"enabled":true})));
+            assert!(futures_util::poll!(queued_enable.as_mut()).is_pending());
+            let replacement_manager = LocalIdentity::generate();
+            let mut state = node.membership_state().await?;
+            let checkpoint = RootCheckpoint::recovery(&state, &root, &LocalIdentity::generate().device_id()?, vec![
+                Member::node(&node.identity, "local device")?,
+                Member::client(&replacement_manager, "replacement manager", true)?,
+            ], vec![], 0)?;
+            state.recover(checkpoint)?;
+            node.install_membership(state).await?;
+            let after_recovery = std::fs::read(dir.join("config.json"))?;
+            drop(save);
+            assert!(queued_enable.await.is_err());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, after_recovery);
+            assert!(!node.local_access.enabled());
+            node.local_access.set_enabled(true)?;
+            let mut state = node.membership_state().await?;
+            let node_id = node.identity.device_id()?;
+            let token = node.local_access.issue_from_local_setup(&node_id, &state.genesis.network_id)?;
+            let cookie = node.local_access.exchange(&token, &node_id, &state.genesis.network_id, &browser_id)?;
+            let mut settings = node.settings_snapshot();
+            settings.roots.clear();
+            let save = node.config_save.lock().await;
+            let mut queued_settings = Box::pin(node.configure_node(settings, &browser_id, Some(&cookie)));
+            assert!(futures_util::poll!(queued_settings.as_mut()).is_pending());
+            state.append(GovernanceEvent::revoke(&replacement_manager, &state.project()?, Revocation::new(&node_id, None)?)?)?;
+            node.install_membership(state.clone()).await?;
+            assert!(node.local_access.session(&cookie, &node_id, &state.genesis.network_id).is_ok());
+            let after_revoke = std::fs::read(dir.join("config.json"))?;
+            drop(save);
+            assert!(queued_settings.await.is_err());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, after_revoke);
+            assert_eq!(node.settings_snapshot().roots, vec![local_project.canonicalize()?]);
+            Ok(())
+        }.await;
+        server.abort();
+        let _ = server.await;
+        if let Some(server) = second_server {
+            server.abort();
+            let _ = server.await;
+        }
+        drop(node);
+        std::fs::remove_dir_all(&dir)?;
+        result
+    }
+
+    #[tokio::test]
+    async fn approve_recovery_accepts_a_near_due_checkpoint_and_is_idempotent() -> Result<()> {
+        use crate::config::{self, Config};
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("approve-recovery-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
+        config.save(&dir)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let (root, manager) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let mut state = NetworkState::new(Genesis::create(
+            &root,
+            Member::client(&manager, "manager", true)?,
+            Member::node(&node.identity, "node")?,
+        )?)?;
+        let now = crate::runtime::now_ms() as u64;
+        let checkpoint = RootCheckpoint::recovery(
+            &state,
+            &root,
+            &LocalIdentity::generate().device_id()?,
+            state.genesis.members(),
+            vec![],
+            now - vibeface_secure::membership::RECOVERY_DELAY_MS + 60_000,
+        )?;
+        state.recover_at(checkpoint.clone(), now)?;
+        node.install_membership(state.clone()).await?;
+
+        let mut session = Session {
+            device_id: manager.device_id()?,
+            cookie: None,
+            subscribed: None,
+            observation: None,
+        };
+        let view = state.project_at(now)?.clone();
+        let event = GovernanceEvent::unsigned(
+            &view,
+            &manager.device_id()?,
+            GovernanceAction::Approve {
+                checkpoint: checkpoint.hash()?,
+                at_ms: now,
+            },
+        )?
+        .sign(&manager)?;
+        for action in [
+            GovernanceAction::Approve {
+                checkpoint: "0".repeat(64),
+                at_ms: now,
+            },
+            GovernanceAction::Approve {
+                checkpoint: checkpoint.hash()?,
+                at_ms: now + 30_000,
+            },
+            GovernanceAction::Approve {
+                checkpoint: checkpoint.hash()?,
+                at_ms: now - RECOVERY_SKEW_MS - 1,
+            },
+        ] {
+            let mut invalid = event.clone();
+            invalid.action = action;
+            let invalid = invalid.sign(&manager)?;
+            assert!(
+                dispatch(
+                    &node,
+                    &mut session,
+                    "approve_recovery",
+                    json!({"event":invalid})
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(node.membership_state().await?.events.len(), 0);
+            assert_eq!(node.membership_state().await?.project()?.epoch, 1);
+        }
+        let mut stranger = Session {
+            device_id: LocalIdentity::generate().device_id()?,
+            cookie: None,
+            subscribed: None,
+            observation: None,
+        };
+        assert!(
+            dispatch(
+                &node,
+                &mut stranger,
+                "approve_recovery",
+                json!({"event":event})
+            )
+            .await
+            .is_err()
+        );
+        let first = dispatch(
+            &node,
+            &mut session,
+            "approve_recovery",
+            json!({"event":event}),
+        )
+        .await?;
+        assert_eq!(first["view"]["epoch"], 2);
+        assert!(first["view"]["pending"].is_null());
+        let events = node.membership_state().await?.events;
+        assert_eq!(events.len(), 1);
+
+        let second = dispatch(
+            &node,
+            &mut session,
+            "approve_recovery",
+            json!({"event":events[0]}),
+        )
+        .await?;
+        assert_eq!(second["view"], first["view"]);
+        assert_eq!(node.membership_state().await?.events.len(), 1);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_rpcs_admit_exactly_the_confirmed_device_over_the_gateway() -> Result<()> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use vibeface_secure::join::{INVITE_DOMAIN, invite_hash};
+
+        let dir = std::env::temp_dir().join(format!("vibeface-identity-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let public = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut config = crate::config::Config::local(public.local_addr()?, vec![], false);
+        config.local_listen = local.local_addr()?;
+        config.allowed_origins = vec!["https://app.example".into()];
+        drop((public, local));
+        config.save(&dir)?;
+        crate::config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        crate::config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        let capability =
+            crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let origin = node.config.public_url.clone();
+        let node_id = node.identity.device_id()?;
+        let server = tokio::spawn(crate::api::serve(node.clone(), None));
+        let result: Result<()> = async {
+            let connect = |identity: LocalIdentity| {
+                let (origin, node_id) = (origin.clone(), node_id.clone());
+                async move {
+                    for _ in 0..100 {
+                        match Client::connect(&origin, &identity, &node_id).await {
+                            Ok(client) => return Ok(client),
+                            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                        }
+                    }
+                    Client::connect(&origin, &identity, &node_id).await
+                }
+            };
+            let (root, admin) = (LocalIdentity::generate(), LocalIdentity::generate());
+            let mut manager = connect(admin.clone()).await?;
+            let public_info = manager.call("info", json!({})).await?;
+            assert_eq!(public_info["initialized"], false);
+            assert_eq!(public_info["name"], "Node");
+            assert!(public_info["network_id"].is_null());
+            assert!(public_info.get("connection_entry").is_none());
+            assert!(manager.call("directory", json!({})).await.is_err());
+            let genesis = Genesis::create(&root, Member::client(&admin, "admin", true)?, Member::node(&node.identity, "node")?)?;
+            let recover = json!({"genesis":genesis,"capability":capability.capability});
+            assert!(manager.call("recover", json!({"genesis":genesis,"capability":"00".repeat(32)})).await.is_err());
+            let created = manager.call("recover", recover.clone()).await?;
+            assert_eq!(created["principal"]["can_manage"], true);
+            assert_eq!(manager.call("recover", recover).await?["principal"], created["principal"]);
+            let network = genesis.network_id.clone();
+
+            let invite = |secret: [u8; 32]| -> Result<Value> {
+                let mut record = InviteRecord {
+                    network_id: network.clone(),
+                    invite_hash: invite_hash(&secret),
+                    issuer: admin.device_id()?,
+                    expires_at_ms: crate::runtime::now_ms() + 60_000,
+                    signature: String::new(),
+                };
+                record.signature = admin.sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;
+                Ok(json!({"record":record}))
+            };
+            let join = |device: &LocalIdentity, secret: [u8; 32], nonce: &str| -> Result<Value> {
+                Ok(json!({"secret":hex::encode(secret),"public_key":device.device_id()?,"kind":"client","name":"phone","commit":join_commit(&device.device_id()?, nonce)?}))
+            };
+            let code = |request: &Value, nonce: &str| -> Result<String> {
+                Ok(short_code(&network, request["invite_id"].as_str().context("invite_id")?, request["device_id"].as_str().context("device")?,
+                    request["admin_id"].as_str().context("admin")?, request["admin_nonce"].as_str().context("admin nonce")?, nonce)?)
+            };
+
+            let phone = LocalIdentity::generate();
+            let join_id = manager.call("invite", invite([1; 32])?).await?["join_id"].clone();
+            let mut joiner = connect(phone.clone()).await?;
+            let guest_auth = joiner.call("authenticate", json!({"network_id":network})).await?;
+            assert_eq!(guest_auth["principal"], Value::Null);
+            assert!(guest_auth.get("network_id").is_none());
+            let public_info = joiner.call("info", json!({})).await?;
+            assert_eq!(public_info["name"], "Node");
+            assert!(public_info["network_id"].is_null());
+            assert!(public_info.get("connection_entry").is_none());
+            assert!(joiner.call("directory", json!({})).await.is_err());
+            assert!(joiner.call("join", join(&LocalIdentity::generate(), [1; 32], &"aa".repeat(32))?).await.is_err(), "join key must be the channel key");
+            let nonce = "11".repeat(32);
+            let pending = joiner.call("join", join(&phone, [1; 32], &nonce)?).await?;
+            assert_eq!((&pending["join_id"], &pending["status"]), (&join_id, &json!("pending")));
+            assert_eq!(joiner.call("join", join(&phone, [1; 32], &nonce)?).await?["join_id"], join_id);
+            let admin_nonce = "22".repeat(32);
+            manager.call("approve", json!({"join_id":join_id,"admin_nonce":admin_nonce})).await?;
+            let seen = joiner.call("join_status", json!({"join_id":join_id})).await?;
+            assert_eq!(seen["status"], "confirming");
+            let phone_code = code(&seen, &nonce)?;
+            joiner.call("join_status", json!({"join_id":join_id,"reveal":nonce})).await?;
+            let listed = manager.call("join_status", json!({})).await?;
+            let request = &listed["requests"][0];
+            assert_eq!(code(request, request["joiner_nonce"].as_str().context("revealed nonce")?)?, phone_code);
+            let view = node.membership_state().await?.project()?;
+            let grant = GovernanceEvent::grant(&admin, &view, Member::client(&phone, "phone", true)?)?;
+            assert_eq!(manager.call("approve", json!({"join_id":join_id,"event":grant})).await?["status"], "joined");
+            let joined = joiner.call("join_status", json!({"join_id":join_id})).await?;
+            assert_eq!(joined["state"]["genesis"]["network_id"], network);
+            assert_eq!(joiner.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
+            let member_info = joiner.call("info", json!({})).await?;
+            assert_eq!(member_info["name"], "node");
+            assert_eq!(member_info["network_id"], network);
+            assert!(member_info.get("connection_entry").is_some());
+
+            let (liar, nonce) = (LocalIdentity::generate(), "33".repeat(32));
+            let liar_id = manager.call("invite", invite([2; 32])?).await?["join_id"].clone();
+            let mut liar_client = connect(liar.clone()).await?;
+            liar_client.call("join", join(&liar, [2; 32], &nonce)?).await?;
+            manager.call("approve", json!({"join_id":liar_id,"admin_nonce":"44".repeat(32)})).await?;
+            let voided = liar_client.call("join_status", json!({"join_id":liar_id,"reveal":"55".repeat(32)})).await?;
+            assert_eq!((&voided["status"], &voided["reason"]), (&json!("rejected"), &json!("commitment_mismatch")));
+            assert!(liar_client.call("join_status", json!({"join_id":liar_id,"reveal":nonce})).await.is_err());
+            let refused = LocalIdentity::generate();
+            let refused_id = manager.call("invite", invite([3; 32])?).await?["join_id"].clone();
+            connect(refused.clone()).await?.call("join", join(&refused, [3; 32], &nonce)?).await?;
+            assert_eq!(manager.call("approve", json!({"join_id":refused_id,"reject":true})).await?["status"], "rejected");
+            assert!(manager.call("approve", json!({"join_id":refused_id,"admin_nonce":"66".repeat(32)})).await.is_err());
+
+            let set_manage = |issuer: &LocalIdentity, view: &AuthorizationView, device: &LocalIdentity, name: &str, manage: bool| -> Result<GovernanceEvent> {
+                GovernanceEvent::unsigned(view, &issuer.device_id()?, GovernanceAction::Grant { member: Member::client(device, name, manage)? })?.sign(issuer)
+            };
+            let mut listening = connect(phone.clone()).await?;
+            listening.call("subscribe", json!({})).await?;
+            let view = node.membership_state().await?.project()?;
+            let demote = set_manage(&admin, &view, &phone, "phone", false)?;
+            assert!(joiner.call("grant", json!({"event":demote})).await.is_err(), "issuer must be the session");
+            manager.call("grant", json!({"event":demote})).await?;
+            manager.call("grant", json!({"event":demote})).await?;
+            assert_eq!(joiner.call("authenticate", json!({})).await?["principal"]["can_manage"], false);
+            assert!(listening.call("info", json!({})).await.is_err(), "a subscription reconnects to pick up the new permission");
+            let view = node.membership_state().await?.project()?;
+            let mut own = set_manage(&admin, &view, &phone, "phone", true)?;
+            own.issuer = phone.device_id()?;
+            assert!(joiner.call("grant", json!({"event":own.sign(&phone)?})).await.is_err(), "a demoted device cannot promote itself");
+            let stranger = set_manage(&admin, &view, &LocalIdentity::generate(), "stranger", true)?;
+            assert!(manager.call("grant", json!({"event":stranger})).await.is_err(), "new devices join through approve");
+            let mut alone = GovernanceEvent::unsigned(&view, &admin.device_id()?, GovernanceAction::Grant { member: Member::client(&phone, "phone", false)? })?;
+            alone.action = GovernanceAction::Grant { member: Member::client(&admin, "admin", false)? };
+            let error = manager.call("grant", json!({"event":alone.sign(&admin)?})).await.unwrap_err();
+            assert!(format!("{error:#}").contains(LAST_MANAGER), "{error:#}");
+            manager.call("grant", json!({"event":set_manage(&admin, &view, &phone, "phone", true)?})).await?;
+            assert_eq!(joiner.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
+            let view = node.membership_state().await?.project()?;
+            let rename = GovernanceEvent::grant(&admin, &view, Member::node(&node.identity, "工作室 Mac")?)?;
+            manager.call("grant", json!({"event":rename})).await?;
+            assert_eq!(node.membership_state().await?.project()?.node(&node_id)?.name, "工作室 Mac", "a manager renames a computer");
+            let view = node.membership_state().await?.project()?;
+            let as_client = GovernanceEvent::grant(&admin, &view, Member::new(&node_id, IdentityKind::Client, "工作室 Mac", false)?)?;
+            assert!(manager.call("grant", json!({"event":as_client})).await.is_err(), "a rename keeps the kind");
+
+            let view = node.membership_state().await?.project()?;
+            let revoke = GovernanceEvent::revoke(&admin, &view, Revocation::new(&phone.device_id()?, None)?)?;
+            assert!(joiner.call("revoke", json!({"event":revoke})).await.is_err(), "issuer must be the session");
+            let mut last = GovernanceEvent::unsigned(&view, &admin.device_id()?, GovernanceAction::Revoke(Revocation::new(&phone.device_id()?, None)?))?;
+            last.action = GovernanceAction::Revoke(Revocation::new(&admin.device_id()?, None)?);
+            manager.call("grant", json!({"event":set_manage(&admin, &view, &phone, "phone", false)?})).await?;
+            let error = manager.call("revoke", json!({"event":last.sign(&admin)?})).await.unwrap_err();
+            assert!(format!("{error:#}").contains(LAST_MANAGER), "{error:#}");
+            let view = node.membership_state().await?.project()?;
+            let mut forged = GovernanceEvent::unsigned(&view, &admin.device_id()?, GovernanceAction::Revoke(Revocation::new(&node_id, None)?))?;
+            forged.issuer = phone.device_id()?;
+            let error = joiner.call("revoke", json!({"event":forged.sign(&phone)?})).await.unwrap_err();
+            assert!(format!("{error:#}").contains("management permission required"), "{error:#}");
+            let mut watching = connect(phone.clone()).await?;
+            watching.call("subscribe", json!({})).await?;
+            let leave = GovernanceEvent::revoke(&phone, &view, Revocation::new(&phone.device_id()?, None)?)?;
+            let mut updates = node.events.subscribe();
+            assert_eq!(joiner.call("revoke", json!({"event":leave})).await?["revoked"], true, "an ordinary client leaves on its own");
+            assert!(std::iter::from_fn(|| updates.try_recv().ok()).any(|update| update.payload == json!({"type":"changed"})),
+                "open pages are told to reread the device list once a device leaves");
+            assert!(joiner.call("revoke", json!({"event":leave})).await.is_err(), "a left device cannot sign again");
+            assert!(joiner.call("directory", json!({})).await.is_err());
+            assert_eq!(joiner.call("authenticate", json!({})).await?["revoked"], true);
+            assert!(joiner.call("join_status", json!({"join_id":join_id})).await.is_err());
+            let revoked_info = joiner.call("info", json!({})).await?;
+            assert_eq!(revoked_info["name"], "Node");
+            assert!(revoked_info["network_id"].is_null());
+            assert!(revoked_info.get("connection_entry").is_none());
+            assert!(watching.call("info", json!({})).await.is_err(), "the revoked device's subscription is closed");
+            let rejoin = manager.call("invite", invite([4; 32])?).await?["join_id"].clone();
+            let error = connect(phone.clone()).await?.call("join", join(&phone, [4; 32], &nonce)?).await.unwrap_err();
+            assert!(format!("{error:#}").contains("already a member or was revoked"), "{error:#}");
+            let fresh = LocalIdentity::generate();
+            let mut rejoining = connect(fresh.clone()).await?;
+            assert_eq!(rejoining.call("join", join(&fresh, [4; 32], &nonce)?).await?["status"], "pending", "a new key joins with a new link");
+            manager.call("approve", json!({"join_id":rejoin,"admin_nonce":admin_nonce})).await?;
+            rejoining.call("join_status", json!({"join_id":rejoin,"reveal":nonce})).await?;
+            let grant = GovernanceEvent::grant(&admin, &node.membership_state().await?.project()?, Member::client(&fresh, "phone", false)?)?;
+            assert_eq!(manager.call("approve", json!({"join_id":rejoin,"event":grant})).await?["status"], "joined");
+            assert_eq!(rejoining.call("authenticate", json!({})).await?["principal"]["can_manage"], false);
+            rejoining.call("subscribe", json!({})).await?;
+            manager.call("subscribe", json!({})).await?;
+            let later = LocalIdentity::generate();
+            manager.call("invite", invite([5; 32])?).await?;
+            connect(later.clone()).await?.call("join", join(&later, [5; 32], &nonce)?).await?;
+            for client in [&mut manager, &mut rejoining] {
+                assert_eq!(next_push(client).await?, json!({"type":"changed"}),
+                    "a new join tells every open page to reread, and tells nothing about the request");
+            }
+
+            let replacement = LocalIdentity::generate();
+            let before = node.membership_state().await?;
+            let next = LocalIdentity::generate();
+            let members = vec![
+                Member::client(&admin, "admin", true)?,
+                Member::client(&replacement, "new laptop", true)?,
+                Member::node(&node.identity, "node")?,
+            ];
+            let now = crate::runtime::now_ms() as u64;
+            let checkpoint = RootCheckpoint::recovery(&before, &root, &next.device_id()?, members.clone(), vec![], now)?;
+            let backdated = RootCheckpoint::recovery(&before, &root, &next.device_id()?, members.clone(), vec![], 0)?;
+            let dropped = RootCheckpoint::recovery(&before, &root, &next.device_id()?, vec![Member::client(&replacement, "new laptop", true)?], vec![], now)?;
+            let mut recovering = connect(replacement.clone()).await?;
+            let expires = crate::runtime::now_ms() + 60_000;
+            let read_with = |signer: &LocalIdentity, checkpoints: &[&RootCheckpoint]| -> Result<Value> {
+                let payload = format!(r#"{{"device_id":"{}","expires_at_ms":{expires},"network_id":"{network}"}}"#, replacement.device_id()?);
+                Ok(json!({"expires_at_ms":expires,"signature":signer.sign_payload(RECOVERY_READ_DOMAIN, payload.as_bytes())?,"checkpoints":checkpoints}))
+            };
+            let read = |signer: &LocalIdentity| read_with(signer, &[]);
+            assert!(recovering.call("recovery_state", read(&admin)?).await.is_err(), "only the root may read");
+            assert_eq!(recovering.call("recovery_state", read(&root)?).await?["state"]["genesis"]["network_id"], network);
+            let submit = |checkpoints: Vec<&RootCheckpoint>| json!({"genesis":genesis,"checkpoints":checkpoints});
+            let refused = |error: anyhow::Error, reason: &str| assert!(format!("{error:#}").contains(reason), "{error:#}");
+            assert!(recovering.call("recover", submit(vec![&dropped])).await.is_err());
+            refused(recovering.call("recover", submit(vec![&backdated])).await.unwrap_err(), RECOVERY_TOO_OLD);
+            let first_since = manager.call("authenticate", json!({})).await?["recovery_since_ms"].clone();
+            let waiting = recovering.call("recover", submit(vec![&checkpoint])).await?;
+            assert_eq!(next_push(&mut manager).await?, json!({"type":"changed"}), "a waiting recovery reaches open manager pages at once");
+            assert_eq!((&waiting["principal"], &waiting["recovery"]["status"]), (&Value::Null, &json!("waiting")));
+            assert_eq!(waiting["recovery"]["effective_at_ms"], checkpoint.effective_at_ms());
+            assert_eq!(recovering.call("recover", submit(vec![&checkpoint])).await?["recovery"], waiting["recovery"], "a retry changes nothing");
+            assert!(recovering.call("directory", json!({})).await.is_err(), "a waiting device reads nothing");
+            let seen = manager.call("authenticate", json!({})).await?;
+            assert_eq!((&seen["view"]["pending"]["checkpoint"], &seen["recovery_since_ms"]), (&json!(checkpoint.hash()?), &first_since));
+            refused(recovering.call("recovery_state", read(&root)?).await.unwrap_err(), vibeface_secure::membership::RECOVERY_WAITING);
+            let veto = GovernanceEvent::unsigned(&node.membership_state().await?.project()?, &admin.device_id()?, GovernanceAction::Veto { checkpoint: checkpoint.hash()?, at_ms: now })?.sign(&admin)?;
+            assert!(recovering.call("veto", json!({"event":veto})).await.is_err(), "only a manager in effect stops it");
+            let stopped = manager.call("veto", json!({"event":veto})).await?;
+            assert_eq!(stopped["view"]["stopped"], json!([checkpoint.hash()?]));
+            assert_eq!(manager.call("veto", json!({"event":veto})).await?["view"], stopped["view"], "a retry changes nothing");
+            assert_eq!(recovering.call("authenticate", json!({})).await?["recovery"]["status"], "stopped");
+            refused(recovering.call("recovery_state", read_with(&next, &[&checkpoint])?).await.unwrap_err(), vibeface_secure::membership::RECOVERY_STOPPED);
+            recovering.call("recovery_state", read(&root)?).await?;
+            // A guest sends events only to carry its file's vetoes; anything else is dropped.
+            let before = node.membership_state().await?;
+            let stray = GovernanceEvent::grant(&admin, &before.project()?, Member::client(&LocalIdentity::generate(), "stray", true)?)?;
+            recovering.call("recover", json!({"genesis":genesis,"checkpoints":[&checkpoint],"events":[stray]})).await?;
+            assert_eq!(node.membership_state().await?, before, "a retry with other events changes nothing");
+
+            let (next, stopped) = (LocalIdentity::generate(), node.membership_state().await?);
+            let effective = RootCheckpoint::recovery(&stopped, &root, &next.device_id()?, members, vec![], 0)?;
+            let started = crate::runtime::now_ms();
+            let mut state = stopped.clone();
+            state.recover(effective.clone())?;
+            node.install_membership(state).await?;
+            let recovered = recovering.call("authenticate", json!({})).await?;
+            assert_eq!((&recovered["principal"]["can_manage"], &recovered["principal"]["epoch"]), (&json!(true), &json!(3)));
+            assert!(recovered["recovery_since_ms"].as_i64() >= Some(started), "a new recovery key restarts the date");
+            let chain = [&checkpoint, &effective];
+            refused(recovering.call("recovery_state", read_with(&root, &chain)?).await.unwrap_err(), vibeface_secure::membership::SUPERSEDED);
+            let after = node.membership_state().await?;
+            // The new file carries the veto, without which the root could not have signed again.
+            let carrying = |checkpoints: Vec<&RootCheckpoint>| json!({"genesis":genesis,"checkpoints":checkpoints,"events":after.events});
+            let stale = RootCheckpoint::rotation(&after, &root, &LocalIdentity::generate().device_id()?, now)?;
+            refused(recovering.call("recover", carrying(vec![&checkpoint, &effective, &stale])).await.unwrap_err(), vibeface_secure::membership::SUPERSEDED);
+            assert!(recovering.call("recover", submit(vec![&dropped])).await.is_err(), "a rival of the installed recovery conflicts");
+            let read_next = recovering.call("recovery_state", read_with(&next, &chain)?).await?;
+            assert_eq!(read_next["state"]["checkpoints"][1], serde_json::to_value(&effective)?);
+            let rotated = RootCheckpoint::rotation(&after, &next, &LocalIdentity::generate().device_id()?, now)?;
+            let started = crate::runtime::now_ms();
+            // The veto that let the root sign again is this Node's own history; the file need not carry it here.
+            recovering.call("recover", submit(vec![&checkpoint, &effective, &rotated])).await?;
+            recovering.call("recover", carrying(vec![&checkpoint, &effective, &rotated])).await?;
+            assert!(recovering.call("directory", json!({})).await?["recovery_since_ms"].as_i64() >= Some(started), "a rotation restarts the date");
+            assert_eq!(node.membership_state().await?.project()?.recovery_key, rotated.recovery_key);
+            assert!(recovering.call("recovery_state", read(&next)?).await.is_err(), "a rotation supersedes the file too");
+
+            assert!(Client::connect(&origin, &admin, &LocalIdentity::generate().device_id()?).await.is_err());
+
+            let ws = |page: &str| -> Result<_> {
+                let mut request = format!("{}/api/client", origin.replace("http://", "ws://")).into_client_request()?;
+                request.headers_mut().insert("origin", page.parse()?);
+                Ok(request)
+            };
+            let (socket, _) = tokio_tungstenite::connect_async(ws("https://app.example")?).await?;
+            let mut socket = ClientSocket::Client(Box::new(socket));
+            socket.send(Message::Text(json!({"type":"connect","target":node_id}).to_string().into())).await?;
+            let mut cross = Client::from_socket(socket, &admin, &node_id).await?;
+            assert_eq!(cross.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
+            assert!(tokio_tungstenite::connect_async(ws("https://evil.example")?).await.is_err());
+            let http = reqwest::Client::builder().no_proxy().build()?;
+            let other = http.post(format!("{origin}/api/local/setup")).header("origin", "https://app.example").json(&json!({})).send().await?;
+            assert_eq!(other.status(), 403);
+            Ok(())
+        }
+        .await;
+        server.abort();
+        let _ = server.await;
+        drop(node);
+        std::fs::remove_dir_all(&dir)?;
+        result
+    }
+
+    #[test]
+    fn rpc_client_identity_is_bound_to_the_noise_principal() {
+        let mut input = json!({"method":"notifications"});
+        bind_client_identity(&mut input, "actual-client").unwrap();
+        assert_eq!(input["client_id"], "actual-client");
+        assert!(
+            bind_client_identity(
+                &mut json!({"method":"ack","client_id":"another-client"}),
+                "actual-client"
+            )
+            .is_err()
+        );
+        assert!(bind_client_identity(&mut json!({"method":"operate","request":{"action":{"response":{"client_id":"business-data"}}}}), "actual-client").is_ok());
+        assert!(
+            bind_client_identity(
+                &mut json!({"method":"message","client_id":"actual-client"}),
+                "actual-client"
+            )
+            .is_ok()
+        );
+        assert!(
+            bind_client_identity(
+                &mut json!({"method":"message","attestation":{"device_id":"another-client","signature":""}}),
+                "actual-client"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn channel_requests_require_bounded_ids_and_object_params() {
+        let mut request = Request {
+            id: "valid-request".into(),
+            method: "info".into(),
+            params: json!({}),
+        };
+        assert!(validate_request(&request).is_ok());
+        request.params = json!("untyped payload");
+        assert!(validate_request(&request).is_err());
+        request.params = json!({});
+        request.id = "\n".into();
+        assert!(validate_request(&request).is_err());
+    }
+}

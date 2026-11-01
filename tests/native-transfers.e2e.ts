@@ -36,6 +36,7 @@ const test = base.extend<{ network: NativeNetwork }>({
     await new Promise<void>((done, fail) => listener.close(error => error ? fail(error) : done()));
     const args = [resolve(root, 'scripts/verify-node.py'), '--e2e-fixture', '--fixture-kind', 'delivery',
       '--fixture-port', String(address.port), '--binary', binary, '--crypto-module', crypto, '--artifacts', artifacts];
+    if (process.env.VIBEFACE_E2E_APP_DIR) args.push('--app-dir', process.env.VIBEFACE_E2E_APP_DIR);
     if (process.env.VIBEFACE_E2E_PROFILE_FILE) args.push('--fixture-profile', process.env.VIBEFACE_E2E_PROFILE_FILE);
     const child = spawn('python3', args, { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] });
     let pending: { resolve(value: Record<string, unknown>): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> } | null = null;
@@ -141,7 +142,7 @@ test('provider settings and queued cancellation work in the installed native app
   assert(wasm !== crypto);
   const inputs = { node: binary, crypto_js: crypto, crypto_wasm: wasm };
   const hashes = Object.fromEntries(await Promise.all(Object.entries(inputs).map(async ([name, path]) => [name, createHash('sha256').update(await readFile(path)).digest('hex')])));
-  const web = await bundleManifest(resolve(root, 'crates/node/web/dist/client'));
+  const web = await bundleManifest(resolve(root, 'apps/app/dist/client'));
   const built = await bundleManifest(appPath);
   const executable = (await execute('plutil', ['-extract', 'CFBundleExecutable', 'raw', '-o', '-', join(appPath, 'Info.plist')])).stdout.trim();
   assert(executable && !executable.includes('/') && /^[a-f0-9]{64}$/.test(built[executable]), 'The built app has its real native executable');
@@ -380,7 +381,7 @@ test('provider settings and queued cancellation work in the installed native app
   expect(reopened.execution_model).toBe('');
   expect(reopened.login_count).toBe(1);
   expect(await bundleManifest(installedPath)).toEqual(built);
-  expect(await bundleManifest(resolve(root, 'crates/node/web/dist/client'))).toEqual(web);
+  expect(await bundleManifest(resolve(root, 'apps/app/dist/client'))).toEqual(web);
   for (const [name, path] of Object.entries(inputs)) expect(createHash('sha256').update(await readFile(path)).digest('hex')).toBe(hashes[name]);
   const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
   await writeFile(join(publicPath, 'provider.json'), `${JSON.stringify({ status: 'ui_passed', source_commit: source,

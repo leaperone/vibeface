@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Bind generated Web/WASM files to their source inputs and exact output set."""
 import argparse
+import base64
+import fnmatch
 import hashlib
 import json
 import shutil
@@ -11,17 +13,60 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 RECEIPT = ".vibeface-build.json"
-OUTPUTS = {"crypto": "crates/node/web/generated", "web": "crates/node/web/dist/client"}
+OUTPUTS = {"crypto": "apps/app/generated", "web": "apps/app/dist/client"}
 COMMON = {".gitignore", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain", "scripts/build-inputs.py"}
 INPUTS = {
     "crypto": ("crates/secure/", "scripts/build-web-crypto.sh", "scripts/release-rustflags.py"),
-    "web": ("crates/node/web/", "packages/client/", "packages/theme/", "package.json",
+    "web": ("apps/app/", "packages/client/", "packages/theme/", "package.json",
             "pnpm-lock.yaml", "pnpm-workspace.yaml", "scripts/build-web.sh"),
 }
+CACHE_POLICIES = (
+    ("/", "no-store"),
+    ("/_shell.html", "no-store"),
+    ("/index.html", "no-store"),
+    ("/vibeface_secure.js", "no-store"),
+    ("/vibeface_secure_bg.wasm", "no-store"),
+    ("/sw.js", "no-cache"),
+    ("/manifest.webmanifest", "no-cache"),
+    ("/icon.svg", "no-cache"),
+    ("/assets/*", "public, max-age=31536000, immutable"),
+)
 
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def content_security_policy(shell):
+    hashes = []
+    rest = shell
+    while "<script" in rest:
+        _, script = rest.split("<script", 1)
+        try:
+            opening, content = script.split(">", 1)
+            body, rest = content.split("</script>", 1)
+        except ValueError as error:
+            raise ValueError("web shell contains an unclosed script tag") from error
+        if "src=" not in opening:
+            hashes.append("'sha256-" + base64.b64encode(hashlib.sha256(body.encode()).digest()).decode() + "'")
+    policy = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'"
+    if hashes:
+        policy += " " + " ".join(hashes)
+    return policy + "; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+
+
+def static_headers(policy):
+    # Netlify concatenates repeated Cache-Control fields, so the security wildcard has no cache rule.
+    lines = [
+        "/*",
+        "  Content-Security-Policy: " + policy,
+        "  X-Content-Type-Options: nosniff",
+        "  X-Frame-Options: DENY",
+        "  Referrer-Policy: no-referrer",
+    ]
+    for path, cache in CACHE_POLICIES:
+        lines.extend((path, "  Cache-Control: " + cache))
+    return "\n".join(lines) + "\n"
 
 
 def files(directory):
@@ -40,9 +85,9 @@ def files(directory):
 
 def sources(repo, component):
     if component == "web":
-        public = repo / "crates/node/web/public"
+        public = repo / "apps/app/public"
         tracked = set(subprocess.check_output(
-            ["git", "ls-files", "-z", "--", "crates/node/web/public"], cwd=repo
+            ["git", "ls-files", "-z", "--", "apps/app/public"], cwd=repo
         ).decode().split("\0"))
         if public.is_symlink():
             raise ValueError("public assets must not contain symlinks")
@@ -54,7 +99,7 @@ def sources(repo, component):
     ).decode().split("\0")
     result = {}
     for name in sorted(set(names) - {""}):
-        if name == "crates/node/web/src/routeTree.gen.ts":
+        if name == "apps/app/src/routeTree.gen.ts":
             continue
         if name not in COMMON and not any(name == item or name.startswith(item)
                                           for item in INPUTS[component]):
@@ -100,7 +145,18 @@ def finish(repo, component):
     if snapshot(repo, component) != inputs:
         raise ValueError("source inputs changed during the build; rebuild the component")
     output = repo / OUTPUTS[component]
-    receipt = {"version": 1, "component": component, "inputs": inputs, "outputs": files(output)}
+    extra = {}
+    if component == "web":
+        shell = output / "_shell.html"
+        if not shell.is_file() or shell.is_symlink():
+            raise ValueError("web output is missing a regular _shell.html")
+        policy = content_security_policy(shell.read_text())
+        headers = output / "_headers"
+        if headers.is_symlink():
+            raise ValueError("web output must not contain symlinks")
+        headers.write_text(static_headers(policy))
+        extra["content_security_policy"] = policy
+    receipt = {"version": 1, "component": component, "inputs": inputs, **extra, "outputs": files(output)}
     (output / RECEIPT).write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
     state.unlink()
 
@@ -113,6 +169,13 @@ def check(repo, component):
         raise ValueError(f"{component} build receipt is missing; run its build script") from error
     if receipt.get("version") != 1 or receipt.get("component") != component:
         raise ValueError("invalid build receipt")
+    if component == "web":
+        policy = receipt.get("content_security_policy")
+        if not isinstance(policy, str) or not policy:
+            raise ValueError("web build receipt has no content security policy")
+        headers = repo / OUTPUTS[component] / "_headers"
+        if headers.is_symlink() or not headers.is_file() or headers.read_text() != static_headers(policy):
+            raise ValueError("web static headers do not match the build receipt")
     if receipt.get("inputs") != snapshot(repo, component):
         raise ValueError(f"{component} source inputs changed; run its build script")
     if receipt.get("outputs") != files(output):
@@ -126,15 +189,35 @@ def self_test():
     with tempfile.TemporaryDirectory(prefix="fixture-", dir=scratch) as directory:
         repo = Path(directory)
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        (repo / ".gitignore").write_text(".artifacts/\ncrates/node/web/generated/\ncrates/node/web/dist/\n")
+        (repo / ".gitignore").write_text(".artifacts/\napps/app/generated/\napps/app/dist/\n")
         (repo / "Cargo.toml").write_text("source one")
         for component in OUTPUTS:
             prepare(repo, component)
             output = repo / OUTPUTS[component]
-            (output / "asset").write_text(component)
+            (output / ("_shell.html" if component == "web" else "asset")).write_text(
+                "<script>fixture</script>" if component == "web" else component
+            )
             finish(repo, component)
             check(repo, component)
-        public = repo / "crates/node/web/public"
+        headers = (repo / OUTPUTS["web"] / "_headers").read_text()
+        rules = []
+        for line in headers.splitlines():
+            if line and not line.startswith(" "):
+                pattern = line
+            elif line.startswith("  Cache-Control: "):
+                rules.append((pattern, line.split(": ", 1)[1]))
+        for path, expected in (
+            ("/", "no-store"),
+            ("/index.html", "no-store"),
+            ("/vibeface_secure.js", "no-store"),
+            ("/vibeface_secure_bg.wasm", "no-store"),
+            ("/sw.js", "no-cache"),
+            ("/assets/chunk-123.js", "public, max-age=31536000, immutable"),
+        ):
+            actual = [cache for pattern, cache in rules if fnmatch.fnmatchcase(path, pattern)]
+            if actual != [expected]:
+                raise AssertionError(f"{path}: expected one cache policy, got {actual}")
+        public = repo / "apps/app/public"
         public.mkdir(parents=True)
         (public / ".env").write_text("PRIVATE_DATA=must-not-ship")
         try:

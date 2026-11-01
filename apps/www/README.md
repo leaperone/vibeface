@@ -2,6 +2,8 @@
 
 `apps/www` builds the public portal for `www.vibeface.dev`. It contains the landing page, public downloads and community links, and the documentation pages sourced from the repository root `docs/` directory.
 
+Public document links are registered in `src/lib/public-docs.ts`. Document bodies, titles, and descriptions come from `docs/`; edit those source files so the website and repository keep the same instructions.
+
 Install dependencies from the repository root, then run the portal locally:
 
 ```sh
@@ -21,7 +23,7 @@ pnpm --filter vibeface-www run test:e2e:check
 pnpm --filter vibeface-www run test:e2e
 ```
 
-The deployable files are in `apps/www/dist/client`. Serve that directory with a static server to review deep links such as `/docs/install/`. The portal reuses the logo from `crates/node/web/public/icon.svg` in `public/logo.svg`, including the document navigation and favicon.
+The deployable files are in `apps/www/dist/client`. Serve that directory with a static server to review deep links such as `/docs/install/`. The portal reuses the logo from `apps/app/public/icon.svg` in `public/logo.svg`, including the document navigation and favicon.
 
 `.github/workflows/deploy-www.yml` dispatches `deploy-vibeface-www` to `leaperone/leaperone-releases` when matching changes reach `main`, or when the workflow runs manually. `apps/www/Dockerfile` builds a static Nginx container. `wrangler.toml` remains an optional Cloudflare Workers Static Assets configuration.
 

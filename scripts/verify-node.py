@@ -809,7 +809,7 @@ def websocket_send(stream, value):
 
 
 DATA_EPOCH = int(re.search(r"^pub const DATA_EPOCH: u32 = (\d+);$",
-                           (Path(__file__).resolve().parents[1] / "crates/node/src/config.rs").read_text(), re.M)[1])
+                           (Path(__file__).resolve().parents[1] / "crates/control/src/lib.rs").read_text(), re.M)[1])
 # These runs drive a fixture App Server the Node starts itself, not one already on the machine.
 SPAWN_APP_SERVER = {"mode": "spawn", "socket": None}
 APP_SERVER_SCHEMA = Path(__file__).resolve().parents[1] / "crates/bridge/schema/app-server-methods.json"
@@ -1720,7 +1720,7 @@ def verify_web_assets(node, module):
         if path in checked:
             continue
         checked.add(path)
-        if path == "/generated/vibeface_secure.js":
+        if path == "/vibeface_secure.js":
             continue
         require(len(checked) < 256, "static dependency traversal is bounded")
         content, asset_headers = fetch(path)
@@ -1739,7 +1739,7 @@ def verify_web_assets(node, module):
             require(b"__wbindgen_" not in content and b"vibeface_secure_bg" not in content,
                     "client chunks do not duplicate generated cryptography or embed a second WASM instance")
             for address in javascript_dependencies(content):
-                if address == "/generated/vibeface_secure.js":
+                if address == "/vibeface_secure.js":
                     uses_external_crypto = True
                 else:
                     require(address.startswith(("./", "../", "/assets/")), "client imports only trusted local modules")
@@ -1749,7 +1749,7 @@ def verify_web_assets(node, module):
                 address = reference.decode().strip()
                 if not address.startswith("data:"):
                     pending.append(urllib.parse.urljoin(path, address))
-    require(uses_external_crypto, "client chunks import the single same-origin generated cryptography module")
+    require(uses_external_crypto, "client chunks import the single same-origin cryptography module")
     require({"text/css", "text/javascript", "font/woff2"} <= content_types,
             "real JavaScript, CSS and bundled font resources are reachable")
     for path in ("/api", "/api/not-a-route", "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
@@ -1757,7 +1757,7 @@ def verify_web_assets(node, module):
         body, missing_headers = fetch(path, status=404)
         require(body != shell and missing_headers["Cache-Control"] == "no-store", "unknown API and assets return uncached 404, never the SPA shell")
     for path in (module, module.with_name("vibeface_secure_bg.wasm")):
-        content, crypto_headers = fetch("/generated/" + path.name)
+        content, crypto_headers = fetch("/" + path.name)
         require(hashlib.sha256(content).hexdigest() == file_sha256(path),
                 "served browser cryptography matches the verified package resource")
         require(crypto_headers["Cache-Control"] == "no-store", "mutable browser cryptography cannot be cached across updates")
@@ -2964,6 +2964,7 @@ def phase1_acceptance(options):
     run.mkdir(mode=0o700)
     binary = run / "vibeface"
     shutil.copy2(source_binary, binary)
+    shutil.copy2(options.core_binary, run / "vibeface-core")
     workspace = run / "workspace"
     workspace.mkdir()
     codex = fixture_wrapper(run, "fixture-codex", "--fixture-codex")
@@ -2972,7 +2973,8 @@ def phase1_acceptance(options):
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     nodes = []
     report = {"status": "running", "source_binary": str(source_binary),
-              "binary_sha256": file_sha256(binary), "provider_calls": 0,
+              "binary_sha256": file_sha256(binary),
+              "core_binary_sha256": file_sha256(run / "vibeface-core"), "provider_calls": 0,
               "coverage": "one real Node, durable Scheduler and signed log; fixture SDK",
               "evidence": [], "not_checked": ["real Cursor/Codex model success",
                   "rendered browser UI", "cross-device delivery (phase 2)",
@@ -3273,7 +3275,8 @@ def memory_sync_acceptance(options):
     run = options.artifacts.resolve() / ("memory-sync-" + uuid.uuid4().hex[:10])
     run.mkdir(mode=0o700)
     frozen = {}
-    for source, name in ((source_binary, "vibeface"), (source_module, "vibeface_secure.mjs"),
+    for source, name in ((source_binary, "vibeface"), (options.core_binary, "vibeface-core"),
+                         (source_module, "vibeface_secure.mjs"),
                          (source_module.with_name("vibeface_secure_bg.wasm"), "vibeface_secure_bg.wasm")):
         digest = file_sha256(source)
         shutil.copy2(source, run / name)
@@ -4577,7 +4580,7 @@ def discovery_acceptance(options):
         except (ConnectionRefusedError, TimeoutError):
             pass
         local = Client(f"http://127.0.0.1:{node.local_port}", None)
-        for path in ("/", "/api/info", "/api/client", "/api/local/info", "/generated/vibeface_secure_bg.wasm"):
+        for path in ("/", "/api/info", "/api/client", "/api/local/info", "/vibeface_secure_bg.wasm"):
             local.request(path, status=404)
         hook = json.loads(node_cli(node, "hook", "codex", "--test").stdout)
         require(hook["status"] == "accepted", "the headless Node handles a real local hook")
@@ -5276,7 +5279,7 @@ def delivery_probe(options, run, actor, targets, order_id, *, action=None):
     public = json.loads(result.stdout)
     require(public.get("passed") is True, "probe returned a positive bounded result")
     if action is None:
-        require(public["discovery"]["productSourceSha256"] == file_sha256(source / "crates/node/src/net/pkarr.rs"),
+        require(public["discovery"]["productSourceSha256"] == file_sha256(source / "apps/core/src/net/pkarr.rs"),
                 "probe resolves with the current product discovery implementation")
     return public
 
@@ -7885,9 +7888,14 @@ if __name__ == "__main__":
         fixture_codex(sys.argv[1:])
     else:
         parser = argparse.ArgumentParser(description=__doc__)
-        parser.add_argument("--binary", type=Path, required=True)
+        parser.add_argument("--binary", type=Path, required=True,
+                            help="the vibeface CLI binary used to create and run the isolated Nodes")
+        parser.add_argument("--core-binary", type=Path,
+                            help="the sibling vibeface-core binary to verify; defaults to --binary's sibling")
+        parser.add_argument("--app-dir", type=Path,
+                            help="development static output directory; packages discover sibling web/ automatically")
         parser.add_argument("--artifacts", type=Path, required=True)
-        parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "crates/node/web/generated/vibeface_secure.js")
+        parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "apps/app/dist/client/vibeface_secure.js")
         modes = parser.add_mutually_exclusive_group()
         modes.add_argument("--web-only", action="store_true", help="check packaged Web resources without Node business or provider scenarios")
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
@@ -7914,6 +7922,27 @@ if __name__ == "__main__":
         parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "proofs/delivery/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()
         try:
+            needs_process = not (arguments.delivery_ui_selfcheck or arguments.native_provider_selfcheck)
+            if needs_process:
+                program = shutil.which(str(arguments.binary)) if len(arguments.binary.parts) == 1 else str(arguments.binary)
+                require(program is not None, "the Vibeface CLI binary exists on PATH or at its explicit path")
+                launcher = Path(program)
+                arguments.binary = launcher.resolve(strict=True)
+                arguments.core_binary = (arguments.core_binary or arguments.binary.with_name("vibeface-core")).resolve(strict=True)
+                require(arguments.binary.is_file() and arguments.binary.stat().st_mode & 0o111,
+                        "the Vibeface CLI binary is executable")
+                require(arguments.core_binary.name == "vibeface-core", "the Core binary has the canonical name")
+                require(arguments.core_binary.is_file() and arguments.core_binary.stat().st_mode & 0o111,
+                        "the sibling Vibeface Core binary is executable")
+                if arguments.core_binary.parent != arguments.binary.parent:
+                    npm_root = arguments.binary.parent.parent if arguments.binary.name == "vibeface.mjs" else None
+                    require(npm_root is not None and (npm_root / "package.json").is_file()
+                            and arguments.core_binary.is_relative_to(npm_root / "vendor"),
+                            "an npm launcher may only use Core from its own vendor directory")
+            if arguments.app_dir is not None:
+                arguments.app_dir = arguments.app_dir.resolve(strict=True)
+                require(arguments.app_dir.is_dir(), "the explicit App output directory exists")
+                os.environ["VIBEFACE_APP_DIR"] = str(arguments.app_dir)
             require(30_000 <= arguments.delivery_ui_timeout_ms <= 86_400_000, "UI acceptance has a bounded explicit execution deadline")
             if arguments.native_provider_selfcheck:
                 native_provider_selfcheck(arguments)
