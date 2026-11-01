@@ -1,5 +1,5 @@
 packages:
-  - crates/node/web
+  - apps/app
   - packages/*
   - apps/*
 allowBuilds:

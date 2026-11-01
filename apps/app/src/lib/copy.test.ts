@@ -71,7 +71,7 @@ test("copy check flags jargon outside Details only", () => {
 
 test("user-facing copy avoids jargon outside Details", () => {
   // The shared client package and the phone app carry the same copy, so they are checked here too.
-  const roots = ["..", "../../../../../packages/client/src/", "../../../../../apps/mobile/app/", "../../../../../apps/mobile/src/"]
+  const roots = ["..", "../../../../packages/client/src/", "../../../../apps/mobile/app/", "../../../../apps/mobile/src/"]
   const found = roots.map((path) => new URL(path, import.meta.url)).flatMap((url) => {
     const root = fileURLToPath(url)
     return sources(root).flatMap((file) => violations(readFileSync(file, "utf8"), file.slice(root.length)))

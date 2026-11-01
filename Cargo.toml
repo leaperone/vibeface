@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/protocol", "crates/bridge", "crates/node", "crates/secure", "crates/secure-ffi", "crates/delivery"]
+members = ["crates/protocol", "crates/bridge", "apps/core", "crates/secure", "crates/secure-ffi", "crates/delivery"]
 exclude = ["proofs/delivery"]
 resolver = "3"
 

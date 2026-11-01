@@ -146,7 +146,7 @@ jobs:
               for key, value in {"VIBEFACE_E2E_SIMULATOR": simulator, "VIBEFACE_E2E_IOS_RUNTIME": runtime,
                                  "VIBEFACE_E2E_IOS_DEVICE_TYPE": device_type, "VIBEFACE_E2E_IOS_APP": str(app),
                                  "VIBEFACE_E2E_BINARY": str(pathlib.Path(".artifacts/native/target/release/vibeface").resolve()),
-                                 "VIBEFACE_E2E_CRYPTO_MODULE": str(pathlib.Path("crates/node/web/generated/vibeface_secure.js").resolve())}.items():
+                                 "VIBEFACE_E2E_CRYPTO_MODULE": str(pathlib.Path("apps/app/generated/vibeface_secure.js").resolve())}.items():
                   output.write(key + "=" + value + "\n")
           subprocess.run(["xcrun", "simctl", "boot", simulator], check=True)
           subprocess.run(["xcrun", "simctl", "bootstatus", simulator, "-b"], check=True)

@@ -418,7 +418,7 @@ mod tests {
         let actual = hex::encode(hasher.finalize());
         assert_eq!(
             actual, DATA_EPOCH_SCHEMA_SHA256,
-            "schema changed: bump DATA_EPOCH and update the recorded fingerprint DATA_EPOCH_SCHEMA_SHA256 in crates/node/src/config.rs"
+            "schema changed: bump DATA_EPOCH and update the recorded fingerprint DATA_EPOCH_SCHEMA_SHA256 in apps/core/src/config.rs"
         );
     }
 

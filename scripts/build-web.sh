@@ -4,7 +4,7 @@ set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 python3 "$repo/scripts/build-inputs.py" check crypto
 python3 "$repo/scripts/build-inputs.py" prepare web
-cd "$repo/crates/node/web"
+cd "$repo/apps/app"
 for asset in vibeface_secure.js vibeface_secure_bg.wasm vibeface_secure.d.ts; do
   [[ -s "generated/$asset" ]] || { echo 'Run scripts/build-web-crypto.sh before building the web client.' >&2; exit 1; }
 done

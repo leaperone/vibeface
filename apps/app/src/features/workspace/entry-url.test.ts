@@ -187,7 +187,7 @@ test("workspace preserves bot and message requests while routing native decision
     delete: async (key: string) => { outboxItems.delete(key) },
   }
   const modules = new Map<string, { exports: Record<string, unknown> }>()
-  const clientRoot = fileURLToPath(new URL("../../../../../../packages/client/src/", import.meta.url))
+  const clientRoot = fileURLToPath(new URL("../../../../../packages/client/src/", import.meta.url))
   function load(filename: string): Record<string, unknown> {
     const cached = modules.get(filename)
     if (cached) return cached.exports
@@ -535,7 +535,7 @@ test("workspace preserves bot and message requests while routing native decision
       await render().selectBot(botA)
       let shared = render()
       const device = { get ready() { return activeConnection }, phase: 'ready', link: { kind: 'online' }, entries: [], directory: null, identity: { deviceId: 'client' }, join() {}, cancelJoin() {}, leave() {} }
-      const bridge = componentHarness('../../../../../../apps/mobile/src/data/live.tsx', {
+      const bridge = componentHarness('../../../../../apps/mobile/src/data/live.tsx', {
         '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/identity/access.ts': { accessOf },
         '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/lib/node.ts': { entryAddress },
         '@vibeface/client/chat/protocol.ts': { botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, unreadCounts },
@@ -543,7 +543,7 @@ test("workspace preserves bot and message requests while routing native decision
         '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers }, '@vibeface/client/workspace/storage.ts': { storageOf }, '@vibeface/client/workspace/types.ts': { isSessionNotification: () => false },
         '@/platform': { mobilePlatform: { storage: browser.localStorage } }, './context': { WorkspaceProvider: 'NativeWorkspace' },
       }, {}, 'Live')
-      type NativeWorkspace = import('../../../../../../apps/mobile/src/data/types.ts').Workspace
+      type NativeWorkspace = import('../../../../../apps/mobile/src/data/types.ts').Workspace
       let native: NativeWorkspace
       const mobile = () => {
         shared = render()
@@ -553,7 +553,7 @@ test("workspace preserves bot and message requests while routing native decision
         return native
       }
       mobile()
-      const chat = componentHarness('../../../../../../apps/mobile/app/b/[botId].tsx', {
+      const chat = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
         'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: botA.bot_id }) },
         'expo-router/react-navigation': { useHeaderHeight: () => 0 },
         'react-native': { Platform: { OS: 'android' }, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
@@ -568,7 +568,7 @@ test("workspace preserves bot and message requests while routing native decision
         '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
       }, { requestAnimationFrame: (run: () => void) => run(), setInterval: () => 1, clearInterval() {} })
       const stack = { Screen: 'Screen', Protected: 'Protected' }
-      const layout = componentHarness('../../../../../../apps/mobile/app/_layout.tsx', {
+      const layout = componentHarness('../../../../../apps/mobile/app/_layout.tsx', {
         'expo-router': { Stack: stack }, 'expo-linking': { useLinkingURL: () => null }, '@/data/live': { LiveWorkspace: 'LiveWorkspace', useLive: () => shared },
         '@/data/context': { useWorkspace: () => ({ session: { phase: 'ready' } }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
         'uniwind': { useCSSVariable: () => ['white', 'black'] }, '@/lib/layout': { useWide: () => false }, 'react-native': { Platform: { OS: 'ios' }, View: 'View' },
@@ -706,7 +706,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   }
   const require = (specifier: string): unknown => {
     if (specifier === '@/features/chat/memory-summary') {
-      const filename = fileURLToPath(new URL('../../../../../../apps/mobile/src/features/chat/memory-summary.tsx', import.meta.url))
+      const filename = fileURLToPath(new URL('../../../../../apps/mobile/src/features/chat/memory-summary.tsx', import.meta.url))
       const compiled = transpileModule(readFileSync(filename, 'utf8'), { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
       const memoryModule = { exports: {} }
       new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInNewContext({ Error, TextEncoder, ...globals })(memoryModule.exports, require, memoryModule)
@@ -773,7 +773,7 @@ test("provider cards keep summary readiness, setup and execution details in thei
       defaults: { workspace: '/project' }, readiness: { manager: item.readiness }, providers: [item], display_paths: {}, suggested_roots: [],
     }
     const name = platform === 'web' ? 'ProviderCard' : 'ProviderRow'
-    const app = componentHarness(platform === 'web' ? '../devices/ai-settings.tsx' : '../../../../../../apps/mobile/app/ai.tsx', {
+    const app = componentHarness(platform === 'web' ? '../devices/ai-settings.tsx' : '../../../../../apps/mobile/app/ai.tsx', {
       '@vibeface/client/lib/node.ts': nodeSettings,
       '@vibeface/client/identity/copy.ts': { deviceCopy },
       '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
@@ -815,7 +815,7 @@ test("mobile provider probes discard settings that arrive after another call or 
       if (method === 'node_settings') return ++reads === 1 ? 'initial settings' : held.promise
       return method === 'configure_node' ? 'new settings' : 'probe result'
     } }
-    const app = componentHarness('../../../../../../apps/mobile/src/features/devices/remote-settings.tsx', {
+    const app = componentHarness('../../../../../apps/mobile/src/features/devices/remote-settings.tsx', {
       '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: connection }) },
     })
     const useCall = app.module.useCall
@@ -899,7 +899,7 @@ test('both task overviews preserve known records, show their coverage and only n
       '@vibeface/client/lib/errors.ts': errors, './inbox': { useInbox: () => [] }, './workspace-shell': { useCreateBot: () => () => {} },
       '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') }, '@/components/kit': { providerIcons: { codex: 'CodexIcon' } },
     }
-    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../../apps/mobile/src/features/home/tasks.tsx', dependencies)
+    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../apps/mobile/src/features/home/tasks.tsx', dependencies)
     const screen = platform === 'web' ? 'TasksOverview' : 'TasksScreen'
     const cardName = platform === 'web' ? 'TaskOverviewCard' : 'TaskRow'
     const mastheadName = platform === 'web' ? 'WorkspaceMasthead' : 'MobileMasthead'
@@ -953,7 +953,7 @@ test('both task overviews recover bounded Bot identities only from the current c
   for (const platform of ['web', 'native']) {
     const bots = Array.from({ length: 257 }, (_, index) => ({ ...parityBot, bot_id: `bot-${index + 1}`, conversation_id: `chat-${index + 1}`, name: `项目 Bot ${index + 1}` }))
     const shared = { ...parityShared(), conversationId: 'chat-1', bots, openWorks: [], overview: workspaceModel.parseWorkspaceOverview({ bots: bots.slice(0, 256), checks: [{ check_id: 'only-check', conversation_id: 'chat-257', trigger: 'message:one' }], truncated: true }) }
-    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../../apps/mobile/src/features/home/tasks.tsx', {
+    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../apps/mobile/src/features/home/tasks.tsx', {
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: () => [] },
       '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
       '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
@@ -993,7 +993,7 @@ test('both task overviews recover bounded Bot identities only from the current c
 test('both task overviews retain failure outcomes and causes across unordered snapshots', () => {
   for (const platform of ['web', 'native']) {
     const shared = parityShared()
-    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../../apps/mobile/src/features/home/tasks.tsx', {
+    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../apps/mobile/src/features/home/tasks.tsx', {
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: () => [] },
       '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
       '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
@@ -1038,7 +1038,7 @@ test('both task overviews reconcile raw confirmations and only fold task process
     shared.conversationId = 'other-chat'
     const entry = { ...parityNode, device_id: 'entry', local: true }
     const inbox = () => inboxItems({ device: { ready: null, joins: [], pendingRecovery: null, rotateHint: false }, workspace: shared })
-    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../../apps/mobile/src/features/home/tasks.tsx', {
+    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../apps/mobile/src/features/home/tasks.tsx', {
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: inbox },
       '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
       '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
@@ -1088,7 +1088,7 @@ test('both task details bind approval to current unfinished work and keep stops 
     const approval = { question_id: 'approval', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '继续吗', choices: [], author: 'worker', created_at_ms: 2, answer: null, closed: null, about: { node: 'worker', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' } }
     shared.data = parseConversation({ ...context, works: [parityWork({ work_id: 'old', state: 'finished', outcome: 'completed' }), parityWork()], questions: [approval] })
     let workId = 'old'
-    const app = componentHarness(platform === 'web' ? './task-detail.tsx' : '../../../../../../apps/mobile/app/b/[botId]/work/[workId].tsx', {
+    const app = componentHarness(platform === 'web' ? './task-detail.tsx' : '../../../../../apps/mobile/app/b/[botId]/work/[workId].tsx', {
       '@tanstack/react-router': { Link: 'Link', useNavigate: () => () => {} }, 'expo-router': { Stack: { Screen: 'Screen' }, useRouter: () => ({ push() {}, back() {} }), useLocalSearchParams: () => ({ botId: 'bot', workId }) },
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
       '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': taskLabels,
@@ -1213,7 +1213,7 @@ test('native context and task detail keep selection errors and foreign payloads 
     shared.isCurrent = () => generation === 1
     shared.selectBot = () => old.promise.then(() => {})
     shared.setView = (view) => { views.push(view) }
-    const app = componentHarness(route === 'context' ? '../../../../../../apps/mobile/app/b/[botId]/context.tsx' : '../../../../../../apps/mobile/app/b/[botId]/work/[workId].tsx', {
+    const app = componentHarness(route === 'context' ? '../../../../../apps/mobile/app/b/[botId]/context.tsx' : '../../../../../apps/mobile/app/b/[botId]/work/[workId].tsx', {
       'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot', workId: 'work' }), useRouter: () => ({ push() {}, back() {} }) },
       '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
       '@vibeface/client/lib/node.ts': { messageOf, providerNames }, '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel,
@@ -1270,7 +1270,7 @@ test('native context renders shared memory, external attribution, scheduler stat
     sent: [{ message_id: 'sent', to: 'chat', text: '协作请求', created_at_ms: 2 }],
   })
   shared.nodes = [{ ...parityNode, online: false }]
-  const app = componentHarness('../../../../../../apps/mobile/app/b/[botId]/context.tsx', {
+  const app = componentHarness('../../../../../apps/mobile/app/b/[botId]/context.tsx', {
     'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot' }) }, '@/data/live': { useLive: () => shared },
     '@vibeface/client/lib/node.ts': { messageOf, providerNames }, '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
     '@vibeface/client/workspace/bot-settings.ts': { formatWhen: () => '刚才', scheduleFrequency: () => '一次' },
@@ -1315,7 +1315,7 @@ test('context on both platforms separates compilation, sending, native cache and
       '@vibeface/client/lib/node.ts': { messageOf, providerNames }, '@vibeface/client/workspace/bot-settings.ts': { scheduleFrequency: () => '一次', formatWhen: () => '刚才' },
       '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') }, '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, SettingsGroup: 'SettingsGroup', SettingsRow: 'SettingsRow', Details: 'Details' },
     }
-    const app = componentHarness(platform === 'web' ? './context-panel.tsx' : '../../../../../../apps/mobile/app/b/[botId]/context.tsx', dependencies)
+    const app = componentHarness(platform === 'web' ? './context-panel.tsx' : '../../../../../apps/mobile/app/b/[botId]/context.tsx', dependencies)
     const render = () => nestedElements(app.render(platform === 'web' ? 'ContextPanel' : 'default', { bot: parityBot, data: shared.data, nodes: shared.nodes, connected: shared.connectionOnline, memory: shared, onBack() {} }), ['AgentContinuity', 'ContinuityLayer', 'ContextDetails', 'MemorySummary', 'ContinuityStat', 'ContextRecords', 'Fold'])
     try {
       let elements = render()
@@ -1351,7 +1351,7 @@ test('context on both platforms separates compilation, sending, native cache and
 test('native Stack focus restores non-chat views while the chat route owns its activation', () => {
   const views: string[] = []
   const stack = { Screen: 'Screen', Protected: 'Protected' }
-  const app = componentHarness('../../../../../../apps/mobile/app/_layout.tsx', {
+  const app = componentHarness('../../../../../apps/mobile/app/_layout.tsx', {
     'expo-router': { Stack: stack }, 'expo-linking': { useLinkingURL: () => null },
     '@/data/live': { LiveWorkspace: 'LiveWorkspace', useLive: () => ({ setView: (view: string) => { views.push(view) } }) },
     '@/data/context': { useWorkspace: () => ({ session: { phase: 'ready' } }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({}) },
@@ -1438,7 +1438,7 @@ test("a device confirmation stays visible when Bot filtering removes the first W
 
 test("mobile task attention counts unanswered questions and program checks and opens their inbox", () => {
   let inbox: unknown[] = [{ kind: "question", done: false }, { kind: "confirm", check: { kind: "process" } }, { kind: "question", done: true }]
-  const app = componentHarness("../../../../../../apps/mobile/src/features/home/tasks.tsx", {
+  const app = componentHarness("../../../../../apps/mobile/src/features/home/tasks.tsx", {
     "@/data/live": { useLive: () => null, useInbox: () => inbox },
     "@/data/context": { useWorkspace: () => ({ bots: [] }) },
     "@vibeface/client/identity/context.tsx": { useDevice: () => ({ directory: null }) },
@@ -1466,7 +1466,7 @@ test("mobile task overview shows an unbound question summary and Bot entry", () 
     question_id: "overview-question", conversation_id: "chat", bot: parityBot, text: "需要确认交付方式", severity: "attention", choices: [],
     request_id: null, work_id: null, about: { node: "worker", agent: "codex", session_id: "session", cwd: "/project", summary: "" }, created_at_ms: 1,
   }] })
-  const app = componentHarness("../../../../../../apps/mobile/src/features/home/tasks.tsx", {
+  const app = componentHarness("../../../../../apps/mobile/src/features/home/tasks.tsx", {
     "@/data/live": { useLive: () => shared, useInbox: () => [] },
     "@/data/context": { useWorkspace: () => ({ bots: shared.bots }) },
     "@vibeface/client/identity/context.tsx": { useDevice: () => ({ directory: null }) },
@@ -1621,7 +1621,7 @@ test("mobile questions select before sending, preserve literal text and retry on
     let hold = pendingResult()
     const shared = { writable: true, answered: {} as Record<string, string>, pendingAnswers: [] as { question_id: string; text: string }[], openWorks: [], nodes: [] }
     const question = { question_id: 'mobile', text: '\n是否允许继续？\n线上结果未知。', choices: [{ label: '允许' }, { label: '先核对配置' }, { label: '停下' }, { label: '保持现状' }], severity: 'attention', about: { node: 'worker', session_id: 's', cwd: '' }, answer: null, closed: null }
-    const app = componentHarness('../../../../../../apps/mobile/src/features/chat/question-card.tsx', {
+    const app = componentHarness('../../../../../apps/mobile/src/features/chat/question-card.tsx', {
       '@/data/context': { useWorkspace: () => ({ members: [], bots: [], actions: { answer: (...args: unknown[]) => { sent.push(args); return hold.promise } } }) },
       '@/data/live': { useLive: () => shared },
       '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'mobile', source: 'membership', can_manage: false } } }) },
@@ -1685,7 +1685,7 @@ test("remounted question cards identify the answer author and reserve warning st
     for (const scenario of [{ author: 'phone', mine: undefined, elsewhere: true, warned: false }, { author: 'gateway', mine: undefined, elsewhere: true, warned: false }, { author: 'self', mine: undefined, elsewhere: false, warned: false }, { author: 'phone', mine: '停下', elsewhere: true, warned: true }, { author: 'phone', mine: '继续', elsewhere: true, warned: false }]) {
       const question = { question_id: 'remount', text: '继续吗？\n线上结果未知。', choices: [{ label: '允许' }], severity: 'attention', about: { node: 'worker', session_id: 's', cwd: '' }, answer: { text: '继续', author: scenario.author }, closed: 'request_lost' }
       const shared = { writable: true, nodes: [], answered: scenario.mine === undefined ? {} : { remount: scenario.mine }, pendingAnswers: [{ question_id: 'remount', text: '旧草稿' }], bots: [], openWorks: [] }
-      const app = componentHarness(platform === 'web' ? './question-card.tsx' : '../../../../../../apps/mobile/src/features/chat/question-card.tsx', {
+      const app = componentHarness(platform === 'web' ? './question-card.tsx' : '../../../../../apps/mobile/src/features/chat/question-card.tsx', {
         '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared },
         '@/data/context': { useWorkspace: () => ({ members: [], bots: [] }) },
         '@/data/live': { useLive: () => shared },

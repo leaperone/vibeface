@@ -866,13 +866,13 @@ async fn frontend(method: Method, uri: axum::http::Uri) -> Response {
 async fn crypto_javascript() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../web/generated/vibeface_secure.js"),
+        include_str!("../../app/generated/vibeface_secure.js"),
     )
 }
 async fn crypto_wasm() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/wasm")],
-        include_bytes!("../web/generated/vibeface_secure_bg.wasm").as_slice(),
+        include_bytes!("../../app/generated/vibeface_secure_bg.wasm").as_slice(),
     )
 }
 

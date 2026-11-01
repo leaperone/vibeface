@@ -21,7 +21,7 @@ pnpm --filter vibeface-www run test:e2e:check
 pnpm --filter vibeface-www run test:e2e
 ```
 
-The deployable files are in `apps/www/dist/client`. Serve that directory with a static server to review deep links such as `/docs/install/`. The portal reuses the logo from `crates/node/web/public/icon.svg` in `public/logo.svg`, including the document navigation and favicon.
+The deployable files are in `apps/www/dist/client`. Serve that directory with a static server to review deep links such as `/docs/install/`. The portal reuses the logo from `apps/app/public/icon.svg` in `public/logo.svg`, including the document navigation and favicon.
 
 `.github/workflows/deploy-www.yml` dispatches `deploy-vibeface-www` to `leaperone/leaperone-releases` when matching changes reach `main`, or when the workflow runs manually. `apps/www/Dockerfile` builds a static Nginx container. `wrangler.toml` remains an optional Cloudflare Workers Static Assets configuration.
 

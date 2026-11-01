@@ -91,7 +91,7 @@ def checked_package(package, expected):
     if not (package / "vibeface").is_file() or (package / "vibeface").is_symlink():
         raise ValueError("Package Node binary is missing")
     for name in ("vibeface_secure.js", "vibeface_secure_bg.wasm"):
-        generated = ROOT / "crates/node/web/generated" / name
+        generated = ROOT / "apps/app/generated" / name
         if digest(package / "web" / name) != digest(generated):
             raise ValueError("Packaged cryptography differs from the same-run verified Web/WASM artifact")
     return info
@@ -2212,7 +2212,7 @@ def self_test():
         with patch(f"{__name__}.command", side_effect=RuntimeError("loader failure")), patch(f"{__name__}.glibc_failure", return_value=True):
             assert runtime(Path("/binary"), Path("/module"), Path(directory), log, {}) is False
         with patch(f"{__name__}.ROOT", Path(directory)):
-            generated = Path(directory) / "crates/node/web/generated"
+            generated = Path(directory) / "apps/app/generated"
             generated.mkdir(parents=True)
             sample = Path(directory) / "package"
             (sample / "web").mkdir(parents=True)

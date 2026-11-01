@@ -84,7 +84,7 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 
 ## 验证边界
 
-当前形状由这些源码提供：`crates/node/src/store.rs`、`crates/node/src/model.rs`、`crates/node/src/work.rs`、`crates/node/src/scheduling.rs`、`crates/node/src/runtime/work.rs`、`crates/node/src/runtime/chat_controls.rs`、`crates/node/src/runtime/schedule_delivery.rs`、`crates/node/src/store/questions.rs`、`crates/node/src/store/bot_settings.rs` 和 `packages/client/src/workspace/types.ts`。
+当前形状由这些源码提供：`apps/core/src/store.rs`、`apps/core/src/model.rs`、`apps/core/src/work.rs`、`apps/core/src/scheduling.rs`、`apps/core/src/runtime/work.rs`、`apps/core/src/runtime/chat_controls.rs`、`apps/core/src/runtime/schedule_delivery.rs`、`apps/core/src/store/questions.rs`、`apps/core/src/store/bot_settings.rs` 和 `packages/client/src/workspace/types.ts`。
 
 本轮只做静态阅读，没有安装依赖、编译、测试、启动应用、连接 Provider、操作浏览器或手机，也没有验证多 Node、弱网、NAT、relay、App Server resume、真实 UI 或无障碍表现。后续实现至少要用受控夹具验证：
 
@@ -94,7 +94,7 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 4. Node 重启或 native session 丢失后，checkpoint 和事件能重建可核对输入，并保留未知结果。
 5. Web 和移动端只显示清理后的摘要、步骤和审批，不泄露凭证、原始命令、diff 或 Provider token。
 
-现有 `docs/design/agent-direct-app-server.md` 声称已删除 executor，但当前 `crates/node/src/runtime/executor.rs` 仍有 `Executor` trait 和 Provider 选择实现。本设计以当前源码为准。
+现有 `docs/design/agent-direct-app-server.md` 声称已删除 executor，但当前 `apps/core/src/runtime/executor.rs` 仍有 `Executor` trait 和 Provider 选择实现。本设计以当前源码为准。
 
 参考报告实际位于 `/Users/harry/.vibe/planning/Volumes/ssd/project/vibeface/openbot-source-comparison-2026-10-30_11-31-26/reports/openbot-vibeface-comparison.md`。任务指定的两个同名路径不存在，因此没有把不存在的路径当作证据。
 

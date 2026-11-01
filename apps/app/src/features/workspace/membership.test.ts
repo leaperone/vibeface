@@ -21,7 +21,7 @@ const conversation = {
 const notMember = 'device is not a member of this personal network'
 const settle = () => new Promise(setImmediate)
 const sourceRoot = fileURLToPath(new URL('../../', import.meta.url))
-const clientRoot = fileURLToPath(new URL('../../../../../../packages/client/src/', import.meta.url))
+const clientRoot = fileURLToPath(new URL('../../../../../packages/client/src/', import.meta.url))
 const nodeRequire = createRequire(import.meta.url)
 
 /** Loads a TypeScript module the way the bundle sees it, with `stubs` for browser-only imports. */

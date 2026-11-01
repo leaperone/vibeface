@@ -141,7 +141,7 @@ test('provider settings and queued cancellation work in the installed native app
   assert(wasm !== crypto);
   const inputs = { node: binary, crypto_js: crypto, crypto_wasm: wasm };
   const hashes = Object.fromEntries(await Promise.all(Object.entries(inputs).map(async ([name, path]) => [name, createHash('sha256').update(await readFile(path)).digest('hex')])));
-  const web = await bundleManifest(resolve(root, 'crates/node/web/dist/client'));
+  const web = await bundleManifest(resolve(root, 'apps/app/dist/client'));
   const built = await bundleManifest(appPath);
   const executable = (await execute('plutil', ['-extract', 'CFBundleExecutable', 'raw', '-o', '-', join(appPath, 'Info.plist')])).stdout.trim();
   assert(executable && !executable.includes('/') && /^[a-f0-9]{64}$/.test(built[executable]), 'The built app has its real native executable');
@@ -380,7 +380,7 @@ test('provider settings and queued cancellation work in the installed native app
   expect(reopened.execution_model).toBe('');
   expect(reopened.login_count).toBe(1);
   expect(await bundleManifest(installedPath)).toEqual(built);
-  expect(await bundleManifest(resolve(root, 'crates/node/web/dist/client'))).toEqual(web);
+  expect(await bundleManifest(resolve(root, 'apps/app/dist/client'))).toEqual(web);
   for (const [name, path] of Object.entries(inputs)) expect(createHash('sha256').update(await readFile(path)).digest('hex')).toBe(hashes[name]);
   const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
   await writeFile(join(publicPath, 'provider.json'), `${JSON.stringify({ status: 'ui_passed', source_commit: source,

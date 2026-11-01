@@ -16,12 +16,12 @@ fn main() {
         String::from_utf8_lossy(&verified.stderr)
     );
     print!("{}", String::from_utf8(verified.stdout).unwrap());
-    let dist = manifest.join("web/dist/client");
-    println!("cargo:rerun-if-changed=web/dist/client");
+    let dist = manifest.join("../app/dist/client");
+    println!("cargo:rerun-if-changed=../app/dist/client");
     let shell = dist.join("_shell.html");
     assert!(
         shell.is_file(),
-        "web client is missing at {}. Run scripts/build-web.sh before cargo build",
+        "app client is missing at {}. Run scripts/build-web.sh before cargo build",
         shell.display()
     );
     let mut files = Vec::new();
@@ -55,7 +55,7 @@ fn main() {
 }
 
 fn delivery_abi(manifest: &Path) {
-    let schema = manifest.join("../delivery/abi/Statement.sol");
+    let schema = manifest.join("../../crates/delivery/abi/Statement.sol");
     let interface = manifest.join("src/delivery/abi.sol");
     println!("cargo:rerun-if-changed={}", schema.display());
     println!("cargo:rerun-if-changed={}", interface.display());

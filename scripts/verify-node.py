@@ -809,7 +809,7 @@ def websocket_send(stream, value):
 
 
 DATA_EPOCH = int(re.search(r"^pub const DATA_EPOCH: u32 = (\d+);$",
-                           (Path(__file__).resolve().parents[1] / "crates/node/src/config.rs").read_text(), re.M)[1])
+                           (Path(__file__).resolve().parents[1] / "apps/core/src/config.rs").read_text(), re.M)[1])
 # These runs drive a fixture App Server the Node starts itself, not one already on the machine.
 SPAWN_APP_SERVER = {"mode": "spawn", "socket": None}
 APP_SERVER_SCHEMA = Path(__file__).resolve().parents[1] / "crates/bridge/schema/app-server-methods.json"
@@ -5276,7 +5276,7 @@ def delivery_probe(options, run, actor, targets, order_id, *, action=None):
     public = json.loads(result.stdout)
     require(public.get("passed") is True, "probe returned a positive bounded result")
     if action is None:
-        require(public["discovery"]["productSourceSha256"] == file_sha256(source / "crates/node/src/net/pkarr.rs"),
+        require(public["discovery"]["productSourceSha256"] == file_sha256(source / "apps/core/src/net/pkarr.rs"),
                 "probe resolves with the current product discovery implementation")
     return public
 
@@ -7887,7 +7887,7 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--binary", type=Path, required=True)
         parser.add_argument("--artifacts", type=Path, required=True)
-        parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "crates/node/web/generated/vibeface_secure.js")
+        parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "apps/app/generated/vibeface_secure.js")
         modes = parser.add_mutually_exclusive_group()
         modes.add_argument("--web-only", action="store_true", help="check packaged Web resources without Node business or provider scenarios")
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")

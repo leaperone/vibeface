@@ -50,12 +50,12 @@ else
   target="$(rustc -vV | sed -n 's/^host: //p')"
   binary="$target_dir/release/vibeface"
 fi
-crypto="$repo/crates/node/web/generated"
+crypto="$repo/apps/app/generated"
 [[ -s "$crypto/vibeface_secure.js" && -s "$crypto/vibeface_secure_bg.wasm" ]] || {
   echo 'Browser cryptography is missing. Run scripts/build-web-crypto.sh before building a package.' >&2
   exit 1
 }
-[[ -s "$repo/crates/node/web/dist/client/_shell.html" ]] || {
+[[ -s "$repo/apps/app/dist/client/_shell.html" ]] || {
   echo 'Web client is missing. Run scripts/build-web.sh before building a package.' >&2
   exit 1
 }
@@ -99,9 +99,9 @@ if [[ "$target" == *-apple-darwin && -n "${VIBEFACE_CODESIGN_IDENTITY:-}" ]]; th
     xcrun notarytool log "$submission" --key "$VIBEFACE_NOTARY_KEY" --key-id "$VIBEFACE_NOTARY_KEY_ID" --issuer "$VIBEFACE_NOTARY_ISSUER"
   fi
 fi
-data_epoch="$(sed -n 's/^pub const DATA_EPOCH: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/crates/node/src/config.rs")"
-update_protocol="$(sed -n 's/^pub const UPDATE_PROTOCOL: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/crates/node/src/config.rs")"
-[[ -n "$data_epoch" && -n "$update_protocol" ]] || { echo 'DATA_EPOCH or UPDATE_PROTOCOL not found in crates/node/src/config.rs' >&2; exit 1; }
+data_epoch="$(sed -n 's/^pub const DATA_EPOCH: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/apps/core/src/config.rs")"
+update_protocol="$(sed -n 's/^pub const UPDATE_PROTOCOL: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/apps/core/src/config.rs")"
+[[ -n "$data_epoch" && -n "$update_protocol" ]] || { echo 'DATA_EPOCH or UPDATE_PROTOCOL not found in apps/core/src/config.rs' >&2; exit 1; }
 printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":%s,"data_epoch":%s}\n' "$version" "$target" "$source_commit" "$update_protocol" "$data_epoch" > "$package/BUILD-INFO.json"
 cp "$crypto/vibeface_secure.js" "$crypto/vibeface_secure_bg.wasm" "$package/web/"
 cp "$repo/scripts/install-node-service.sh" "$package/scripts/"

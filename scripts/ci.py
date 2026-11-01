@@ -23,17 +23,17 @@ DEPENDENTS = {
 }
 CRATES = dict(zip(("protocol", "bridge", "secure", "node", "secure-ffi", "delivery"), PACKAGES))
 PATH_RULES = (
-    ("delivery", ("crates/delivery/*", "proofs/delivery/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "crates/node/src/delivery/*", "crates/node/src/client.rs", "crates/node/src/config.rs", "crates/node/src/main.rs", "crates/node/src/maintenance.rs", "crates/node/src/net.rs", "crates/node/src/net/pkarr.rs", "crates/node/src/runtime.rs", "crates/node/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")),
-    ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
+    ("delivery", ("crates/delivery/*", "proofs/delivery/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/pkarr.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")),
+    ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("www", ("apps/www/*",)),
     ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*")),
     ("node", ("packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts")),
-    ("web", ("crates/node/web/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
+    ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
     ("secure", ("crates/secure/*", "scripts/crypto-client.mjs")),
     ("secure-ffi", ("crates/secure-ffi/*", "scripts/build-mobile-secure.sh")),
-    ("node", ("crates/node/*", "install.sh", "scripts/package-node.sh", "scripts/install-node-service.sh", "scripts/verify-node.py")),
+    ("node", ("apps/core/*", "install.sh", "scripts/package-node.sh", "scripts/install-node-service.sh", "scripts/verify-node.py")),
 )
 WWW_PATHS = ("apps/www/*", "docs/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 SLOW_TESTS = (
@@ -276,11 +276,11 @@ def run_check(packages, msrv=None):
 
 def self_test():
     from unittest.mock import patch
-    web = make_plan(["crates/node/web/src/routes/index.tsx"])
+    web = make_plan(["apps/app/src/routes/index.tsx"])
     assert web["rust_packages"] == [] and web["test_tiers"] == []
     assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
     assert web["package_mode"] == "web" and web["package_matrix"]["include"] == list(PLATFORMS[:1])
-    assert make_plan(["crates/node/web/src/content.md"])["web"]
+    assert make_plan(["apps/app/src/content.md"])["web"]
     www = make_plan(["apps/www/src/routes/index.tsx"])
     assert www["www"] and not www["web"] and not www["rust_packages"]
     assert www["required_jobs"] == ["quick-check", "www"]
@@ -297,20 +297,21 @@ def self_test():
         "delivery": ["vibeface", "vibeface-delivery"],
     }
     for crate, packages in expected.items():
-        plan = make_plan([f"crates/{crate}/src/lib.rs"])
+        source = "apps/core/src/lib.rs" if crate == "node" else f"crates/{crate}/src/lib.rs"
+        plan = make_plan([source])
         assert plan["rust_packages"] == packages and plan["test_tiers"] == ["fast"]
         assert plan["package_mode"] == "web" and plan["package_matrix"]["include"] == list(PLATFORMS[:1])
-    for path in ("crates/delivery/Cargo.toml", "crates/delivery/abi/Statement.sol", "proofs/delivery/guest/src/main.rs", "proofs/delivery/fixtures/manifest.json", "contracts/delivery/DeliveryEscrow.sol", "contracts/delivery/package-lock.json", "tests/fixtures/delivery-probe/Cargo.toml", "tests/fixtures/delivery-probe/Cargo.lock", "tests/fixtures/delivery-probe/src/main.rs", "crates/node/src/net/pkarr.rs", "crates/node/src/delivery/wallet.rs", "crates/node/src/client.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"):
+    for path in ("crates/delivery/Cargo.toml", "crates/delivery/abi/Statement.sol", "proofs/delivery/guest/src/main.rs", "proofs/delivery/fixtures/manifest.json", "contracts/delivery/DeliveryEscrow.sol", "contracts/delivery/package-lock.json", "tests/fixtures/delivery-probe/Cargo.toml", "tests/fixtures/delivery-probe/Cargo.lock", "tests/fixtures/delivery-probe/src/main.rs", "apps/core/src/net/pkarr.rs", "apps/core/src/delivery/wallet.rs", "apps/core/src/client.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"):
         selected = make_plan([path])
         assert selected["scopes"] == ["delivery"] and selected["delivery"]
         assert selected["rust_packages"] == expected["delivery"] and selected["web"]
         assert "delivery" in selected["required_jobs"]
         assert "package" in selected["required_jobs"] and selected["package_matrix"]["include"][0]["target"] == "x86_64-unknown-linux-gnu"
     assert not docs["delivery"] and not web["delivery"]
-    for path in ("Cargo.toml", "Cargo.lock", "crates/node/Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml", ".github/workflows/ci.yml", "scripts/ci.py", "new-build-input"):
+    for path in ("Cargo.toml", "Cargo.lock", "apps/core/Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml", ".github/workflows/ci.yml", "scripts/ci.py", "new-build-input"):
         assert make_plan([path])["rust_packages"] == list(PACKAGES)
-    assert make_plan(["crates/node/web/src/a.tsx", "crates/node/src/api.rs"])["rust_packages"] == ["vibeface"]
-    assert make_plan(["crates/node/schema.hcl"])["node"]
+    assert make_plan(["apps/app/src/a.tsx", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface"]
+    assert make_plan(["apps/core/schema.hcl"])["node"]
     assert make_plan(["install.sh"])["node"]
     for path in ("packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts"):
         shared = make_plan([path])
@@ -318,12 +319,12 @@ def self_test():
     for event in ("schedule", "workflow_dispatch", "merge_group"):
         assert make_plan(["README.md"], event)["rust_packages"] == list(PACKAGES)
     assert make_plan(["README.md"], "push")["docs_only"]
-    assert make_plan(["crates/node/web/src/a.tsx"], "push")["rust_packages"] == []
+    assert make_plan(["apps/app/src/a.tsx"], "push")["rust_packages"] == []
     assert make_plan(["README.md"], "push", ref_type="tag")["test_tiers"] == ["fast", "slow"]
     assert make_plan(["README.md"], "push", ref_type="tag")["package_matrix"]["include"] == list(PLATFORMS)
-    assert not make_plan(["crates/node/src/api.rs"])["npm"]
-    assert not make_plan(["crates/node/src/api.rs"], channel="stable")["npm"]
-    assert not make_plan(["crates/node/src/api.rs"], channel="rc")["npm"]
+    assert not make_plan(["apps/core/src/api.rs"])["npm"]
+    assert not make_plan(["apps/core/src/api.rs"], channel="stable")["npm"]
+    assert not make_plan(["apps/core/src/api.rs"], channel="rc")["npm"]
     for event in ("pull_request", "push", "merge_group"):
         core = make_plan(["Cargo.lock"], event)
         assert core["test_tiers"] == ["fast"] and not core["check_msrv"] and not core["npm"]
@@ -395,21 +396,21 @@ def self_test():
     scratch.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="git-", dir=scratch) as directory:
         git("init", "--quiet", cwd=directory)
-        source = Path(directory) / "crates/node/src/old.rs"
+        source = Path(directory) / "apps/core/src/old.rs"
         source.parent.mkdir(parents=True)
         source.write_text("test fixture\n")
         (Path(directory) / "README.md").write_text("docs\n")
         git("add", ".", cwd=directory)
         git("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "-c", "user.name=CI self-test", "-c", "user.email=ci@example.invalid", "commit", "--quiet", "-m", "base", cwd=directory)
         base = git("rev-parse", "HEAD", cwd=directory).decode().strip()
-        target = Path(directory) / "crates/node/web/old.rs"
+        target = Path(directory) / "apps/app/old.rs"
         target.parent.mkdir(parents=True)
         source.rename(target)
         (Path(directory) / "README.md").unlink()
         git("add", "-A", cwd=directory)
         git("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "-c", "user.name=CI self-test", "-c", "user.email=ci@example.invalid", "commit", "--quiet", "-m", "rename and delete", cwd=directory)
         paths = changed_paths(base, "HEAD", "pull_request", cwd=directory)
-        assert set(paths) == {"README.md", "crates/node/src/old.rs", "crates/node/web/old.rs"}
+        assert set(paths) == {"README.md", "apps/core/src/old.rs", "apps/app/old.rs"}
         assert make_plan(paths)["rust_packages"] == ["vibeface"]
         pr_head = git("rev-parse", "HEAD", cwd=directory).decode().strip()
         git("checkout", "--quiet", "--detach", base, cwd=directory)
@@ -453,7 +454,7 @@ def self_test():
             ] if check_msrv else [])
     root = Path(__file__).resolve().parent.parent
     subprocess.run(["python3", str(root / "scripts/build-inputs.py"), "self-test"], check=True)
-    config = (root / "crates/node/src/config.rs").read_text()
+    config = (root / "apps/core/src/config.rs").read_text()
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
     assert f'info["update_protocol"]=="{protocol}" && info["data_epoch"]=="{epoch}"' in (root / "install.sh").read_text(), "install.sh accepts the build's update protocol and data epoch"
     release_privacy_test(root, scratch)
@@ -533,7 +534,7 @@ def release_privacy_test(root, scratch):
 
     with tempfile.TemporaryDirectory(prefix="release-", dir=scratch) as directory:
         repo = Path(directory)
-        for name in ("scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/node/src/config.rs", "README.md"):
+        for name in ("scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "apps/core/src/config.rs", "README.md"):
             target = repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(root / name, target)
@@ -557,7 +558,7 @@ def release_privacy_test(root, scratch):
             assert subprocess.check_output([str(binary)], text=True).strip() == "/vibeface/private build.rs"
         (repo / "docs").mkdir()
         (repo / "docs/guide.md").write_text("public guide")
-        (repo / ".gitignore").write_text(".artifacts/\ntarget/\nbin/\nprivate build.rs\ncrates/node/web/generated/\ncrates/node/web/dist/\n.env\ncargo-called\n")
+        (repo / ".gitignore").write_text(".artifacts/\ntarget/\nbin/\nprivate build.rs\napps/app/generated/\napps/app/dist/\n.env\ncargo-called\n")
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         subprocess.run(["git", "add", "."], cwd=repo, check=True)
 
@@ -568,7 +569,7 @@ def release_privacy_test(root, scratch):
                 ("web", {"_shell.html": "fixture"}),
             ):
                 subprocess.run([*tool, "prepare", component], check=True)
-                output = repo / ("crates/node/web/generated" if component == "crypto" else "crates/node/web/dist/client")
+                output = repo / ("apps/app/generated" if component == "crypto" else "apps/app/dist/client")
                 for name, content in files.items():
                     (output / name).write_text(content)
                 subprocess.run([*tool, "finish", component], check=True)

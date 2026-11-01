@@ -178,7 +178,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     setTimeout: timer, clearTimeout: (id: number) => timers.delete(id), setInterval: timer, clearInterval: (id: number) => timers.delete(id),
   })
   const modules = new Map<string, { exports: Record<string, unknown> }>(), sourceRoot = fileURLToPath(new URL('../../', import.meta.url))
-  const clientRoot = fileURLToPath(new URL('../../../../../../packages/client/src/', import.meta.url))
+  const clientRoot = fileURLToPath(new URL('../../../../../packages/client/src/', import.meta.url))
   function load(filename: string): Record<string, unknown> {
     const cached = modules.get(filename)
     if (cached) return cached.exports

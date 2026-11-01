@@ -56,6 +56,6 @@ The essential Memory budget covers the entire serialized block. A data-only Memo
 
 ## Data format
 
-The Store uses data_epoch 12 for Memory metadata and the scoped scheduler-session schema. It opens only the matching database epoch and does not migrate an older data directory. The migration hash is recorded in crates/node/src/config.rs. Protocol clients must treat another epoch as an incompatible data format.
+The Store uses data_epoch 12 for Memory metadata and the scoped scheduler-session schema. It opens only the matching database epoch and does not migrate an older data directory. The migration hash is recorded in apps/core/src/config.rs. Protocol clients must treat another epoch as an incompatible data format.
 
 This contract does not add a shared device pool, shared Provider account, remote screen control, phone projection or a second history store.

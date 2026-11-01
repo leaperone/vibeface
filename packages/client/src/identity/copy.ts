@@ -26,7 +26,7 @@ export const joinCopy = {
 
 /**
  * Why this computer's join ended and what to do next, from the `reason` the Node reports. The patterns and words follow
- * `join_failure_text` in crates/node/src/main.rs, which `vibeface join` prints; only the next step is the page's own.
+ * `join_failure_text` in apps/core/src/main.rs, which `vibeface join` prints; only the next step is the page's own.
  */
 export const nodeJoinCopy = {
   used: '这条加入链接已经用过了。在管理设备上点“添加设备”重新生成，再粘贴新链接。',

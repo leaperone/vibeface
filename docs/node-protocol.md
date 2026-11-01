@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=12`，数据库 `user_version=12`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，epoch 12 使用本文定义的最终事件结构。同一个人网络中的所有 Node 必须使用该最终格式的构建，不能混跑其他 epoch 或旧的 epoch 12 开发快照。`data-epoch.json` 只检查本机目录，不参与 peer 握手。旧 Node 会因 `deny_unknown_fields` 拒绝新增的 `model`、`resolved` 等字段；协议版本 1 不代表这些不同结构可以互通。程序不迁移或清空旧数据。
+协议版本为 `1`，数据格式 `data_epoch=12`，数据库 `user_version=12`。共享结构以 `apps/core/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，epoch 12 使用本文定义的最终事件结构。同一个人网络中的所有 Node 必须使用该最终格式的构建，不能混跑其他 epoch 或旧的 epoch 12 开发快照。`data-epoch.json` 只检查本机目录，不参与 peer 握手。旧 Node 会因 `deny_unknown_fields` 拒绝新增的 `model`、`resolved` 等字段；协议版本 1 不代表这些不同结构可以互通。程序不迁移或清空旧数据。
 
 ## 身份与数据范围
 

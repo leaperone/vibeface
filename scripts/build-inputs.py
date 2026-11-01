@@ -11,11 +11,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 RECEIPT = ".vibeface-build.json"
-OUTPUTS = {"crypto": "crates/node/web/generated", "web": "crates/node/web/dist/client"}
+OUTPUTS = {"crypto": "apps/app/generated", "web": "apps/app/dist/client"}
 COMMON = {".gitignore", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain", "scripts/build-inputs.py"}
 INPUTS = {
     "crypto": ("crates/secure/", "scripts/build-web-crypto.sh", "scripts/release-rustflags.py"),
-    "web": ("crates/node/web/", "packages/client/", "packages/theme/", "package.json",
+    "web": ("apps/app/", "packages/client/", "packages/theme/", "package.json",
             "pnpm-lock.yaml", "pnpm-workspace.yaml", "scripts/build-web.sh"),
 }
 
@@ -40,9 +40,9 @@ def files(directory):
 
 def sources(repo, component):
     if component == "web":
-        public = repo / "crates/node/web/public"
+        public = repo / "apps/app/public"
         tracked = set(subprocess.check_output(
-            ["git", "ls-files", "-z", "--", "crates/node/web/public"], cwd=repo
+            ["git", "ls-files", "-z", "--", "apps/app/public"], cwd=repo
         ).decode().split("\0"))
         if public.is_symlink():
             raise ValueError("public assets must not contain symlinks")
@@ -54,7 +54,7 @@ def sources(repo, component):
     ).decode().split("\0")
     result = {}
     for name in sorted(set(names) - {""}):
-        if name == "crates/node/web/src/routeTree.gen.ts":
+        if name == "apps/app/src/routeTree.gen.ts":
             continue
         if name not in COMMON and not any(name == item or name.startswith(item)
                                           for item in INPUTS[component]):
@@ -126,7 +126,7 @@ def self_test():
     with tempfile.TemporaryDirectory(prefix="fixture-", dir=scratch) as directory:
         repo = Path(directory)
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        (repo / ".gitignore").write_text(".artifacts/\ncrates/node/web/generated/\ncrates/node/web/dist/\n")
+        (repo / ".gitignore").write_text(".artifacts/\napps/app/generated/\napps/app/dist/\n")
         (repo / "Cargo.toml").write_text("source one")
         for component in OUTPUTS:
             prepare(repo, component)
@@ -134,7 +134,7 @@ def self_test():
             (output / "asset").write_text(component)
             finish(repo, component)
             check(repo, component)
-        public = repo / "crates/node/web/public"
+        public = repo / "apps/app/public"
         public.mkdir(parents=True)
         (public / ".env").write_text("PRIVATE_DATA=must-not-ship")
         try:

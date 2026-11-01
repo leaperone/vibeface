@@ -68,7 +68,7 @@ jobs:
           version: v1.3.0
       - name: Validate migration files without opening a database
         if: needs.plan.outputs.rust == 'true'
-        run: atlas migrate validate --dir file://crates/node/migrations
+        run: atlas migrate validate --dir file://apps/core/migrations
       - name: Check workflow, selectors and shell scripts
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
@@ -149,10 +149,10 @@ jobs:
         with:
           name: crypto-web-${{ github.sha }}
           path: |
-            crates/node/web/generated/vibeface_secure.js
-            crates/node/web/generated/vibeface_secure_bg.wasm
-            crates/node/web/generated/*.d.ts
-            crates/node/web/generated/.vibeface-build.json
+            apps/app/generated/vibeface_secure.js
+            apps/app/generated/vibeface_secure_bg.wasm
+            apps/app/generated/*.d.ts
+            apps/app/generated/.vibeface-build.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
@@ -168,7 +168,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: crypto-web-${{ github.sha }}
-          path: crates/node/web/generated
+          path: apps/app/generated
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.9.0
@@ -182,7 +182,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: web-${{ github.sha }}
-          path: crates/node/web/dist/client
+          path: apps/app/dist/client
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
@@ -198,11 +198,11 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: crypto-web-${{ github.sha }}
-          path: crates/node/web/generated
+          path: apps/app/generated
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: web-${{ github.sha }}
-          path: crates/node/web/dist/client
+          path: apps/app/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
@@ -232,11 +232,11 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: crypto-web-${{ github.sha }}
-          path: crates/node/web/generated
+          path: apps/app/generated
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: web-${{ github.sha }}
-          path: crates/node/web/dist/client
+          path: apps/app/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -263,11 +263,11 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: crypto-web-${{ github.sha }}
-          path: crates/node/web/generated
+          path: apps/app/generated
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: web-${{ github.sha }}
-          path: crates/node/web/dist/client
+          path: apps/app/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -348,11 +348,11 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: crypto-web-${{ github.sha }}
-          path: crates/node/web/generated
+          path: apps/app/generated
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: web-${{ github.sha }}
-          path: crates/node/web/dist/client
+          path: apps/app/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt
@@ -440,7 +440,7 @@ jobs:
           python3 - "$package/BUILD-INFO.json" <<'PY'
           import json, os, pathlib, re, subprocess, sys
           info = json.load(open(sys.argv[1]))
-          config = pathlib.Path("crates/node/src/config.rs").read_text()
+          config = pathlib.Path("apps/core/src/config.rs").read_text()
           protocol, epoch = (int(re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1]) for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
           assert set(info) == {"version", "target", "source_commit", "update_protocol", "data_epoch"}
           assert info["update_protocol"] == protocol and info["data_epoch"] == epoch
@@ -636,11 +636,11 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: crypto-web-${{ github.sha }}
-          path: crates/node/web/generated
+          path: apps/app/generated
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: web-${{ github.sha }}
-          path: crates/node/web/dist/client
+          path: apps/app/dist/client
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: vibeface-android-${{ github.sha }}
