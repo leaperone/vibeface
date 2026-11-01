@@ -15,7 +15,6 @@ export const Route = createRootRoute({
         name: 'description',
         content: '在自己的 Mac 或 Linux 设备上运行 Vibeface Agent，连接工作空间、Provider 与个人数据。',
       },
-      { name: 'theme-color', content: '#ffffff' },
     ],
     links: [{ rel: 'icon', href: '/logo.svg', type: 'image/svg+xml' }],
   }),

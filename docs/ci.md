@@ -7,7 +7,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 `.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。每次触发都生成计划，`ci-gate` 要求选中的任务全部成功。没有顶层 `paths` 筛选。
 
-开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态。需要验证移动端或 macOS 时，从 Actions 手动运行对应 workflow。`main` push、定时、手动运行、merge queue 和 `v*` Tag 仍按各自计划检查；推送 `v*` Nightly Tag 才运行完整发布检查、原生制品和应用发布构建，合并后的制品与实际体验由开发者自行验收。
+开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态。需要验证移动端或 macOS 时，从 Actions 手动运行对应 workflow。`main` push、定时、手动运行、merge queue 和 `v*` Tag 仍按各自计划检查；推送 `v*` Tag 会运行完整发布检查、原生制品和应用发布构建，合并后的制品与实际体验由开发者自行验收。
 
 ## main 与 merge queue 的核心检查
 
