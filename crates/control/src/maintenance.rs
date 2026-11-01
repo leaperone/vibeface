@@ -242,7 +242,6 @@ async fn exchange(
     let mut stream = tokio::time::timeout(REQUEST_TIMEOUT, UnixStream::connect(socket))
         .await
         .context("maintenance connection timed out")??;
-    use std::os::unix::fs::MetadataExt;
     let expected_uid = unsafe { libc::geteuid() };
     ensure!(
         stream.peer_cred()?.uid() == expected_uid,
@@ -315,10 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_keeps_the_server_stream_until_drop() -> Result<()> {
-        let directory = std::env::temp_dir().join(format!(
-            "vibeface-maintenance-roundtrip-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let directory = Path::new("/tmp").join(format!("vf-m-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory)?;
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
         let socket = directory.join("maintenance.sock");
@@ -356,8 +352,14 @@ mod tests {
         let lease = acquire(&socket).await?;
         assert_eq!(lease.health["device_id"], "device");
         ready_rx.await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut closed_rx)
+                .await
+                .is_err(),
+            "the server must keep waiting while the lease is held"
+        );
         drop(lease);
-        closed_rx.await?;
+        tokio::time::timeout(Duration::from_secs(1), closed_rx).await??;
         let request = server.await??;
         assert!(
             serde_json::from_slice::<serde_json::Value>(&request)?
