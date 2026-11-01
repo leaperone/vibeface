@@ -25,6 +25,6 @@ pnpm --filter vibeface-www run test:e2e
 
 The deployable files are in `apps/www/dist/client`. Serve that directory with a static server to review deep links such as `/docs/install/`. The portal reuses the logo from `apps/app/public/icon.svg` in `public/logo.svg`, including the document navigation and favicon.
 
-`.github/workflows/deploy-www.yml` dispatches `deploy-vibeface-www` to `leaperone/leaperone-releases` when matching changes reach `main`, or when the workflow runs manually. `apps/www/Dockerfile` builds a static Nginx container. `wrangler.toml` remains an optional Cloudflare Workers Static Assets configuration.
+`.github/workflows/deploy-www.yml` dispatches `deploy-vibeface-www` to `leaperone/leaperone-releases` after a successful stable `www-v*` release, or when explicitly run on that stable tag. Nightly and RC tags publish reviewable static artifacts. `apps/www/Dockerfile` builds a static Nginx container. `wrangler.toml` remains an optional Cloudflare Workers Static Assets configuration.
 
 The portal does not include the user app, Node runtime, discovery service, credentials, or private workspace data. The public repository currently exposes Nightly Releases, so the download page links to the GitHub Releases page instead of claiming a stable package.
