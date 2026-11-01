@@ -33,10 +33,9 @@ json_fields() {
       }
       print page "." record "\t" k "\t" value
     }
-    { json=json $0 "\n" }
-    END {
-      if (invalid) exit 1
-      depth=0; record=0; expected=(mode=="releases" ? "[" : "{")
+    BEGIN { depth=0; record=0; expected=(mode=="releases" ? "[" : "{") }
+    {
+      json=$0
       while (length(json)) {
         sub(/^[ \t\r\n]+/,"",json)
         if (!length(json)) break
@@ -60,7 +59,9 @@ json_fields() {
         }
         previous=token
       }
-      if (!started || depth || !closed) error()
+    }
+    END {
+      if (invalid || !started || depth || !closed) exit 1
       if (mode=="releases") print record "\tcount\t" record
     }
   ' "$1"
@@ -452,6 +453,10 @@ JSON
   printf '[{"tag_name":"cli-v0.0.1-nightly.20261017.2","draft":false,"prerelease":true}]\n' > "$fixture/page2.json"
   json_fields "$fixture/page2.json" releases 2 >> "$fixture/fields"
   [[ $(select_release "$fixture/fields" nightly) == "cli-v$version" ]] || fail 'self-test: pagination changed version selection'
+  json_fields "$fixture/page2.json" releases 2 > "$fixture/compact-fields"
+  awk 'BEGIN { print "["; print "{"; print "\"tag_name\":\"cli-v0.0.1-nightly.20261017.2\","; print "\"draft\":false,"; print "\"prerelease\":true,"; printf "\"body\":\""; for (i=0;i<10000;i++) printf "ignored "; print "\""; print "}"; print "]" }' > "$fixture/pretty.json"
+  json_fields "$fixture/pretty.json" releases 2 > "$fixture/pretty-fields"
+  cmp "$fixture/compact-fields" "$fixture/pretty-fields" || fail 'self-test: pretty JSON changed release fields'
   case_dir="$test_dir/http-failure"
   mkdir "$case_dir"
   : > "$fixture/http-failure"
