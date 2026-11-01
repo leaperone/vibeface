@@ -321,7 +321,7 @@ mod tests {
         let listener = UnixListener::bind(&socket)?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         let (ready_tx, ready_rx) = oneshot::channel();
-        let (closed_tx, closed_rx) = oneshot::channel();
+        let (closed_tx, mut closed_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let mut request = Vec::new();
