@@ -94,7 +94,7 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 4. Node 重启或 native session 丢失后，checkpoint 和事件能重建可核对输入，并保留未知结果。
 5. Web 和移动端只显示清理后的摘要、步骤和审批，不泄露凭证、原始命令、diff 或 Provider token。
 
-现有 `docs/design/agent-direct-app-server.md` 声称已删除 executor，但当前 `crates/node/src/runtime/executor.rs` 仍有 `Executor` trait 和 Provider 选择实现。本设计以当前源码为准。
+Node 保留 `crates/node/src/runtime/executor.rs` 中的 `Executor` trait 和 Provider 选择实现，与 [Agent 直连 App Server 设计](agent-direct-app-server.md) 一致。
 
 参考报告实际位于 `/Users/harry/.vibe/planning/Volumes/ssd/project/vibeface/openbot-source-comparison-2026-10-30_11-31-26/reports/openbot-vibeface-comparison.md`。任务指定的两个同名路径不存在，因此没有把不存在的路径当作证据。
 
