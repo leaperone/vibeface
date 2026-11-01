@@ -7,7 +7,7 @@ description: 管理自己的设备、个人网络和本机 Agent。
 
 本文的命令默认使用数据目录 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定其他绝对路径，见[部署配置](deployment.md)。涉及安装的步骤还使用 `VIBEFACE_INSTALL_ROOT` 和 `VIBEFACE_BIN_DIR`，先设置这两个变量。
 
-本文使用 `vibeface` 管理自己的设备。先理解用途可阅读 [产品概览](overview.md)，Bot 分工与本机复用见 [Bot 与任务执行](bot-and-execution.md)。HTTP 与同步协议见 [协议参考](node-protocol.md)，出问题时见 [排障](troubleshooting.md)。
+本文是设备、Provider 和网络的详细配置参考。第一次使用先看[快速上手](quick-start.md)，加入或恢复设备看[首次配置](onboarding.md)，处理日常任务看[使用指南](user-guide.md)。Bot 分工与本机复用见 [Bot 与任务执行](bot-and-execution.md)。HTTP 与同步协议见 [协议参考](node-protocol.md)，出问题时见 [排障](troubleshooting.md)。
 
 ## 安装制品
 
@@ -20,7 +20,7 @@ cd vibeface-<version>-<target>
 ./vibeface --help
 ```
 
-包内包括 Rust 程序、文档和用户级服务安装脚本，不包含模型凭证或 Provider 程序。
+包内包括 `vibeface` CLI、`vibeface-core`、`web/` 静态网页、文档和用户级服务安装脚本，不包含模型凭证或 Provider 程序。CLI 启动同包 Core；App 本身不打包后台。
 
 从源码生成包时，先构建同一 Rust 密码学模块的浏览器资源。发布包已包含资源，安装发布包不需要这些构建工具。
 

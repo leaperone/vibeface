@@ -11,6 +11,9 @@ const required = [
   'security/index.html',
   'docs/index.html',
   'docs/overview/index.html',
+  'docs/quick-start/index.html',
+  'docs/onboarding/index.html',
+  'docs/user-guide/index.html',
   'docs/comparison/index.html',
   'docs/install/index.html',
   'docs/bot-and-execution/index.html',
@@ -65,6 +68,9 @@ for (const query of ['恢复包', '安全码']) {
 }
 for (const [query, url] of [
   ['长期 Bot 聊天', '/docs/overview'],
+  ['快速上手', '/docs/quick-start'],
+  ['首次配置', '/docs/onboarding'],
+  ['取消排队', '/docs/user-guide'],
   ['工作方式', '/docs/comparison'],
   ['协调角色', '/docs/bot-and-execution'],
   ['逐字流式进度', '/docs/history-sync'],

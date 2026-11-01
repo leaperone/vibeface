@@ -7,6 +7,9 @@ export const docs = defineDocs({
     async: true,
     files: [
       'overview.md',
+      'quick-start.md',
+      'onboarding.md',
+      'user-guide.md',
       'comparison.md',
       'install.md',
       'bot-and-execution.md',
