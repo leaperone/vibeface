@@ -7,6 +7,31 @@ description: 配置数据目录、网络边界与公共入口。
 
 先为每台 Node 选择数据目录、程序安装目录和需要启用的集成。下文的 `<...>` 都是占位符，运行前替换成部署环境中的实际值。配置保存在本机，不提交到仓库。部署前先了解 [Agent 分工](bot-and-execution.md) 与 [隐私和执行权限](privacy-security.md)。
 
+## 选择要部署的应用
+
+普通本机使用安装完整发行包即可，见[快速上手](quick-start.md)。需要自己托管时，先区分部署对象：
+
+| 部署对象 | 产物与用途 |
+| --- | --- |
+| 门户 `apps/www` | `pnpm --filter vibeface-www run build` 生成 `apps/www/dist/client`，用于介绍与文档。 |
+| 网页 App `apps/app` | `bash scripts/build-web-crypto.sh` 后运行 `bash scripts/build-web.sh`，生成 `apps/app/dist/client`，用于连接已有 Core。 |
+| Core `apps/core` | `vibeface-core` 后台，拥有本机身份、数据与运行中的任务。 |
+| CLI `apps/cli` | `vibeface` 管理命令，启动 Core、安装服务及管理更新。 |
+
+源码构建的工具链要求见 [README](../README.md#从源码构建)。`apps/mobile` 是单独构建的原生客户端，不是网页 App 的构建产物。
+
+## 独立托管网页 App
+
+将同一提交生成的 `apps/app/dist/client` 整个目录部署到可信的静态 HTTPS 站点。App 不包含 Core，不需要在静态站点运行 Rust 后台或 Node.js 网页服务。用户仍需自己的 Core 和设备授权。
+
+静态主机必须保留 JS、WASM 和图标等文件，并把不存在的页面路由回退到 `/_shell.html`。构建目录的 `_redirects` 提供此规则，也为 `/api/*` 和 `/sdk.v1.*` 保留 404；这些不是静态站点自己实现的后台接口。按 `_headers` 配置安全头与缓存规则。使用其他服务器时配置等效规则，不能把缺失的 API 请求也回退成 HTML。
+
+Core 默认只接受配置允许的网页来源。独立 App 的 HTTPS origin 需要加入目标 Core 的 `allowed_origins`，并具备浏览器可访问的可信 HTTPS/WSS 入口；具体字段见下文[配置网络入口](#配置网络入口)。不要因为静态页面能打开，就认定它已经能连接本机回环 Core。浏览器安全上下文、来源检查和设备加入批准仍然生效。
+
+本地完整发行包把静态文件放在两个二进制文件旁边的 `web/`。Core 直接读取该目录；源码运行时可用 `VIBEFACE_APP_DIR` 指定同提交生成的 `apps/app/dist/client`。这只是选择文件位置，App 仍不包含或启动 Core。
+
+公共发现服务是另一种 Core 配置，它只帮助发现与连接，不提供用户的执行环境，也不转发业务数据，见[只做发现的服务](node.md#运行不转发业务数据的公共发现服务)。`www.vibeface.dev` 的门户部署不等于独立 App 或发现服务已经部署。
+
 ## 指定数据目录
 
 默认数据目录是 `~/.vibeface`。要使用其他目录，在命令中传入 `--data-dir '<数据目录的绝对路径>'`，或设置环境变量：

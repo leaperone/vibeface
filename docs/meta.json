@@ -1,6 +1,9 @@
 {
   "pages": [
     "overview",
+    "quick-start",
+    "onboarding",
+    "user-guide",
     "comparison",
     "install",
     "bot-and-execution",

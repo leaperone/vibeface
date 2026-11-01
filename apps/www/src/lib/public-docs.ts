@@ -1,5 +1,8 @@
 export const PUBLIC_DOCS = [
   { file: 'overview.md', slug: 'overview' },
+  { file: 'quick-start.md', slug: 'quick-start' },
+  { file: 'onboarding.md', slug: 'onboarding' },
+  { file: 'user-guide.md', slug: 'user-guide' },
   { file: 'comparison.md', slug: 'comparison' },
   { file: 'install.md', slug: 'install' },
   { file: 'bot-and-execution.md', slug: 'bot-and-execution' },

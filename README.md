@@ -19,7 +19,7 @@
 ## ✨ 核心特性
 
 - 🤖 **聊天驱动的 bot**。创建有名称、职责和项目目录的 bot，在它的长期聊天里提要求。协调 Agent 用自己的 Shell 和文件工具读写本机，把改代码的任务派给本机或其他设备的 Agent。
-- 🌐 **个人设备网络**。所有 Node 设备运行同一个 `vibeface` Node，经 iroh QUIC 直连或经 relay 互通。A 设备上的 bot 可以把任务派给 B 设备执行。
+- 🌐 **个人设备网络**。每台 Node 运行 `vibeface-core` 后台，由 `vibeface` CLI 管理，经 iroh QUIC 直连或经 relay 互通。A 设备上的 bot 可以把任务派给 B 设备执行。
 - 🔁 **换设备接着干**。Bot 聊天、设置、任务阶段、摘要和结果写进签名 DAG 并在授权 Node 间同步，完整逐字进度不进入共享历史。A 离线时，在已同步的 C 打开原聊天，由本人切换负责人后接着协调。历史回放不启动旧工作，工程、登录和原生 SDK 状态不会自动迁移。
 - 🔐 **端到端加密入口**。浏览器和手机 App 用本机设备密钥与 Node 建立 Noise 通道。公网入口只转发密文，不加入个人网络。
 - 📦 **完整本机包**。包内同时提供 `vibeface` CLI、`vibeface-core` 和 `web/` 静态 SPA，生产环境不需要 Node.js Web 服务。
@@ -63,16 +63,18 @@ flowchart LR
 
 ## 🚀 快速开始
 
+初次使用先看 [快速上手](docs/quick-start.md)；添加设备或恢复身份看 [首次配置](docs/onboarding.md)，已完成配置后看 [日常使用指南](docs/user-guide.md)。功能边界见 [产品概览](docs/overview.md)，连接失败见 [排障](docs/troubleshooting.md)。
+
 ### 前置条件
 
 | 依赖 | 版本 | 用途 |
 |---|---|---|
 | macOS Apple Silicon、Linux x64 或 Linux ARM64（glibc） | | 运行平台 |
 | Node.js | 22+ | 仅 npm 安装入口需要 |
-| Codex CLI | 已安装并登录 | 可选，Codex bot 与执行任务 |
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | 已安装并登录 | 可选，Claude Code bot 与执行任务 |
+| Codex CLI | 已安装，按设备 AI 设置为 Node 登录 | 可选，Codex bot 与执行任务 |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | 已安装，按设备 AI 设置为 Node 登录 | 可选，Claude Code bot 与执行任务 |
 | [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) | 已安装并登录 | 可选，pi bot 与执行任务 |
-| [opencode](https://opencode.ai) | v2.2.0，已登录 | 可选，opencode bot 与执行任务 |
+| [opencode](https://opencode.ai) | v2.2.0，按设备 AI 设置为 Node 登录 | 可选，opencode bot 与执行任务 |
 | [Cursor SDK Bridge](https://github.com/cursor/sdk-bridge/releases/tag/v1.2.0) | v1.2.0 发布包，需按自己的环境验证 | 可选，Cursor Bot、协调 Agent 与执行任务 |
 
 ### 安装
@@ -86,6 +88,8 @@ vibeface --version
 
 npm 包内含完整平台程序和服务脚本，不在 postinstall 阶段下载、初始化或启动服务。在此之前，可从 [Releases](https://github.com/leaperone/vibeface/releases) 下载 GitHub 完整包，步骤见 [安装说明](docs/install.md)。
 
+当前源码的完整包需含 `vibeface`、`vibeface-core` 和 `web/`。Nightly `0.0.1-nightly.20261031.18` 仍是拆分前的包，不适用于当前 main 安装器；需要当前版本但尚无匹配发行包时，按[源码运行步骤](docs/quick-start.md#从源码准备当前版本)操作。
+
 ### 首次启动
 
 ```sh
@@ -95,9 +99,9 @@ vibeface
 数据目录默认为 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定其他绝对路径，见[部署配置](docs/deployment.md)。首次运行只在空目录或不存在的目录初始化，并监听 `127.0.0.1:4790`。然后：
 
 1. 在本机浏览器打开 `http://localhost:4790`（保存密钥需要安全上下文，请固定用 `localhost`）。
-2. 填写浏览器名称和恢复包口令，下载并保存加密恢复包，创建个人网络。
-3. 在设备页的 **AI** 中打开某个服务的 Bot 开关，在 **可用文件夹** 里添加项目目录。
-4. 创建 bot，进入它的聊天开始提要求。
+2. 选择 **新建我的网络**，填写电脑名称，设置恢复密码，下载并确认保存恢复文件。浏览器名称已有默认值。
+3. 在 **让这台电脑运行 Bot** 中选择服务，按页面提示完成认证，点 **检查可用性** 后开启 Bot。默认 Codex、Claude Code 和 OpenCode 需要为 Node 私有目录登录，原来在终端登录过不代表此目录已登录。
+4. 创建第一个 Bot，发送一条测试消息。需要操作项目时，在设备 **AI** 中启用 **执行任务**，并在 **可用文件夹** 里添加项目目录。
 
 ### 配置
 
@@ -195,7 +199,8 @@ bash scripts/package-node.sh
 │   ├── app/         # 独立 Web App，产出可由 Core 读取的 dist/client
 │   ├── cli/         # vibeface 命令行与本机控制客户端
 │   ├── core/        # vibeface-core 后台、存储、同步、调度与执行
-│   └── mobile/      # Expo iOS/Android 客户端，复用 packages/client
+│   ├── mobile/      # Expo iOS/Android 客户端，复用 packages/client
+│   └── www/         # 产品门户、公开文档与下载入口
 ├── crates/
 │   ├── control/     # CLI/Core 使用的无数据库控制 DTO 与客户端
 │   ├── bridge/      # Codex App Server 与 Agent 客户端

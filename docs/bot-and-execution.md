@@ -17,7 +17,7 @@ Bot 的名称、职责、项目偏好和聊天是共享记录。创建 Bot 不�
 
 ## 复用本机 Codex 与 Claude Code
 
-Vibeface 使用你已经安装并登录的程序，或本机服务中明确配置的认证环境。它不安装这些 Agent，不代你登录，也不包含模型与额度。本机运行程序仍可能把任务内容发送到所选模型服务。
+Vibeface 使用你已经安装的程序，以及为该 Node 配置的登录或认证环境。它不安装这些 Agent，不代你登录，也不包含模型与额度。原先的终端登录不一定适用于 Node 的私有运行目录，首次使用按设备 **AI** 设置提供的命令登录。本机运行程序仍可能把任务内容发送到所选模型服务。
 
 ### Codex
 
@@ -27,7 +27,7 @@ Node 可以连接已有 Codex App Server 的指定 socket，也可以用本机 `
 
 ### Claude Code
 
-Node 启动本机 `claude` CLI。它使用运行 Node 的同一用户下的登录，或为该服务配置的认证变量。续接原生 session 需要那台电脑保留对应的本机 transcript，不能只靠同步 Bot 聊天完成。
+Node 启动本机 `claude` CLI，并使用 `<data-dir>/providers/claude` 作为私有 `CLAUDE_CONFIG_DIR`，或使用为该服务配置的认证变量。按设备 **AI** 设置中的命令为此目录登录，不自动复制用户原有登录。续接原生 session 需要那台电脑保留对应的本机 transcript，不能只靠同步 Bot 聊天完成。
 
 同一台电脑上，本人另外打开的交互会话也不自动成为 Vibeface 的任务会话。准备方式和会话限制见 [使用 Claude Code、pi 或 opencode](node.md#使用-claude-codepi-或-opencode)。
 
