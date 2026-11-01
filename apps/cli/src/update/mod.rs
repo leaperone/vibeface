@@ -1079,6 +1079,16 @@ mod tests {
         fs::create_dir(directory.join("web")).unwrap();
         fs::write(directory.join("web/index.html"), b"web").unwrap();
         fs::write(directory.join("scripts/install-node-service.sh"), b"script").unwrap();
+        fs::set_permissions(
+            directory.join("vibeface"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::set_permissions(
+            directory.join("vibeface-core"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         fs::write(
             directory.join("BUILD-INFO.json"),
             format!(

@@ -267,6 +267,16 @@ mod tests {
         .unwrap();
         std::fs::write(package.join("vibeface"), b"binary").unwrap();
         std::fs::write(package.join("vibeface-core"), b"core").unwrap();
+        std::fs::set_permissions(
+            package.join("vibeface"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            package.join("vibeface-core"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         std::fs::create_dir(package.join("web")).unwrap();
         std::fs::write(package.join("web/index.html"), b"web").unwrap();
         std::fs::write(package.join("scripts/install-node-service.sh"), b"script").unwrap();
