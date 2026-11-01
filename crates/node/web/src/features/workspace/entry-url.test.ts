@@ -307,6 +307,26 @@ test("workspace preserves bot and message requests while routing native decision
     await state.refresh()
     state = render()
     assert.equal(state.selectedBot?.bot_id, "bot")
+    const retryMessage = { message_id: "retry-1", event_hash: "retry-event", role: "user", text: "改 README", created_at_ms: 1 }
+    const retryScheduler = { jobs: [{ trigger: "message:retry-1", state: "failed", message_id: "retry-1", failure: { kind: "rejected", detail: "没有执行" } }], unanswered: [] }
+    transcript = [retryMessage]
+    scheduler = retryScheduler
+    const heldRefresh = deferred()
+    conversationHold = heldRefresh
+    const refreshing = render().refresh()
+    await new Promise(setImmediate)
+    const retrying = render().retryReply("retry-1")
+    await new Promise(setImmediate)
+    assert.equal(messages.length, 0, "retry waits for an in-flight full read before sending")
+    heldRefresh.resolve({ ...context, messages: [retryMessage], scheduler: retryScheduler })
+    await refreshing
+    assert.equal(await retrying, true)
+    assert.equal(messages.length, 1)
+    assert.match(String(messages[0]?.text), /上次没回完/)
+    messages.splice(0)
+    conversationHold = null
+    scheduler = null
+    transcript = []
     stored.set("vibeface.ignored-inbox.client.network", JSON.stringify(["from-other-tab"]))
     unreadNotifications = [{ notification_id: "local-note", kind: "manager_attention", text: "看看进展", conversation_id: "chat" }]
     render().setView("tasks")

@@ -17,6 +17,8 @@ export const folderLabels = { project: "项目文件夹", botRun: "Bot 运行目
 export const botCopy = {
   notFound: "找不到这个 Bot",
   primaryHint: "接手没有 Bot 负责的会话",
+  /** The chat is kept but no longer listed; deleting the primary bot names the bot that takes its place. */
+  deleteHint: (successor: string | null) => successor ? `「${successor}」接任主 Bot` : "停止回复，聊天不再显示",
   empty: "还没有说明、定时任务和笔记",
   skills: (skills: SkillSet, count: number) => skills === null ? "Skill · 全部可用" : `Skill · ${count}`,
 }
@@ -144,10 +146,19 @@ export function formatIn(ms: number, now = Date.now()): string {
   return `${Math.round(minutes / 1440)} 天后`
 }
 
-/** Soonest next run first, paused last; ties keep the given order. */
-export function sortSchedules<T extends Pick<ScheduleView, "enabled" | "next_run_at_ms">>(schedules: readonly T[]): T[] {
+/**
+ * Soonest next run first, paused last; ties keep the given order. A one-time schedule is done once its time passed: the Node
+ * drops it on its next read, the list drops it now.
+ */
+export function sortSchedules<T extends Pick<ScheduleView, "enabled" | "next_run_at_ms" | "every_minutes" | "first_run_at_ms">>(schedules: readonly T[], now = Date.now()): T[] {
   const key = (schedule: T) => schedule.enabled ? schedule.next_run_at_ms ?? Number.MAX_SAFE_INTEGER : Number.MAX_VALUE
-  return [...schedules].sort((a, b) => key(a) - key(b))
+  return schedules.filter((schedule) => schedule.every_minutes !== undefined || schedule.first_run_at_ms > now).sort((a, b) => key(a) - key(b))
+}
+
+/** When this exact one-time schedule slot ran, as the time of its reply in the chat; null until it ran. */
+export function firedAt(messages: readonly { in_reply_to?: string; created_at_ms: number }[], scheduleId: string, firstRunAtMs: number): number | null {
+  const trigger = `schedule:${scheduleId}:${firstRunAtMs}`
+  return messages.find((message) => message.in_reply_to === trigger)?.created_at_ms ?? null
 }
 
 export type DiffLine = { kind: "removed" | "added"; text: string }

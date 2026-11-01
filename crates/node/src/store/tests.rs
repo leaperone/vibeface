@@ -3149,6 +3149,13 @@ fn a_bot_message_wakes_the_other_bot_once() -> Result<()> {
         (receipt.conversation_id.as_str(), receipt.trigger.as_str()),
         ("d", trigger.as_str())
     );
+    let unread = origin.pending_notifications(&net.network, "web")?;
+    assert!(
+        unread.iter().any(|note| note.kind == "bot_message"
+            && note.conversation_id == "d"
+            && note.notification_id == message.event_hash),
+        "the receiving chat counts the message as unread"
+    );
     let (again, _, written) = send(&mut origin, "s1", "Ops", "Check the backups", 11)?;
     assert!(!written && again.message_id == message.message_id);
     let changed = send(&mut origin, "s1", "d", "Other", 11).unwrap_err();
@@ -10505,5 +10512,45 @@ fn rejected_backup_switches_leave_jobs_sessions_and_checks_unchanged() -> Result
         );
         assert_eq!(store.version_vector(&net.network)?, basis, "{case}");
     }
+    Ok(())
+}
+
+#[test]
+fn bot_names_stay_unique_and_the_primary_has_a_named_successor() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    second_bot(&mut origin, &net, "Ops")?;
+    assert_eq!(
+        origin.primary_successor(&net.network)?.as_deref(),
+        Some("d")
+    );
+    let taken = origin
+        .create_bot_in_turn(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            "n1",
+            (" ops ", "", None),
+            5,
+        )
+        .unwrap_err();
+    assert!(
+        taken.to_string().contains("已经有叫「ops」的 Bot"),
+        "{taken}"
+    );
+    let renamed = origin
+        .change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            "r1",
+            rename("OPS"),
+            Provider::Codex,
+            6,
+        )
+        .unwrap_err();
+    assert!(renamed.to_string().contains("换个名字"), "{renamed}");
     Ok(())
 }
