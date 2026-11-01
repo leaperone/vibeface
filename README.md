@@ -63,6 +63,8 @@ flowchart LR
 
 ## 🚀 快速开始
 
+初次使用先看 [安装说明](docs/install.md)；已安装后看 [设备与日常操作](docs/node.md)。功能边界见 [产品概览](docs/overview.md)，连接失败见 [排障](docs/troubleshooting.md)。
+
 ### 前置条件
 
 | 依赖 | 版本 | 用途 |
