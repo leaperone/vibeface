@@ -265,11 +265,7 @@ fn browser_router_with_assets(
     let app = App::new(node, sites, assets);
     let mut routes = Router::new();
     if app.node.config.web_enabled {
-        routes = routes
-            .route("/generated/vibeface_secure.js", get(crypto_javascript))
-            .route("/generated/vibeface_secure_bg.wasm", get(crypto_wasm))
-            .route("/api/info", get(info))
-            .fallback(frontend);
+        routes = routes.route("/api/info", get(info)).fallback(frontend);
         if app.node.config.network.relay_mode != crate::net::RelayServiceMode::DiscoveryOnly {
             routes = routes
                 .route("/api/local/setup", post(local_setup))
@@ -895,26 +891,6 @@ fn static_response(file: static_assets::StaticFile, cache: &'static str) -> Resp
     response
 }
 
-async fn crypto_javascript(State(app): State<App>) -> Response {
-    let Some(assets) = app.assets.as_ref() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    assets
-        .read("/vibeface_secure.js")
-        .map(|file| static_response(file, "no-cache"))
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
-}
-
-async fn crypto_wasm(State(app): State<App>) -> Response {
-    let Some(assets) = app.assets.as_ref() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    assets
-        .read("/vibeface_secure_bg.wasm")
-        .map(|file| static_response(file, "no-cache"))
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1199,6 +1175,8 @@ mod tests {
                             "/api/info",
                             "/api/client",
                             "/api/local/info",
+                            "/vibeface_secure.js",
+                            "/vibeface_secure_bg.wasm",
                             "/generated/vibeface_secure.js",
                             "/generated/vibeface_secure_bg.wasm",
                         ] {
