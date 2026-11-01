@@ -73,6 +73,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const [conversationId, setConversationId] = useState("")
   const [data, setData] = useState<ConversationPayload | null>(null)
   const [notifications, setNotifications] = useState<NotificationRecord[]>([])
+  const [ignoredNotifications, setIgnoredNotifications] = useState<ReadonlySet<string>>(new Set())
   const [questions, setQuestions] = useState<Question[]>([])
   const [openWorks, setOpenWorks] = useState<OpenWork[]>([])
   const openWorksRef = useRef<OpenWork[]>([])
@@ -108,6 +109,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const botCreationRef = useRef<PendingBot | null>(null)
   const notificationsRef = useRef<NotificationRecord[]>([])
   const ackNotificationRef = useRef<(notification: NotificationRecord) => Promise<void>>(async () => {})
+  const ignoredNotificationsRef = useRef<ReadonlySet<string>>(new Set())
   const inFlight = useRef(new Set<string>())
   const refreshingRef = useRef(false)
   const refreshingConnection = useRef<ReadyConnection | null>(null)
@@ -137,6 +139,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (writeState.state !== "writable") throw new Error(writeNotices[writeState.state])
   }
   const scoped = (key: string) => networkKey(`${key}.${clientId}`, networkId)
+  const ignoredInboxKey = scoped("ignored-inbox")
+  const readIgnoredNotifications = () => {
+    const raw = readStorage<unknown>(ignoredInboxKey, [])
+    return new Set(Array.isArray(raw) ? raw.filter((item): item is string => typeof item === "string") : [])
+  }
   /** Unconfirmed messages and answers as the page shows them, read back from the outbox. */
   const syncPending = async () => {
     const items = await outbox.all()
@@ -194,6 +201,12 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (sequence !== readSequence.current) return next
     return showConversation(id, next)
   }
+  const acknowledgeNotification = async (notification: NotificationRecord) => {
+    await signedWrite("ack", notification.notification_id, "ack", { notification_id: notification.notification_id, attestation: await attest(notification.conversation_id, { type: "notification_acked", notification_id: notification.notification_id, client_id: clientId }) })
+    requireCurrent()
+    notificationsRef.current = notificationsRef.current.filter((item) => item.notification_id !== notification.notification_id)
+    setNotifications(notificationsRef.current)
+  }
   const showConversation = async (id: string, next: ConversationPayload) => {
     // While the entry catches up, what the page already showed stays on screen.
     const shown = dataRef.current
@@ -234,12 +247,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (joined && current() && readConnection.current === connection && viewRef.current === "chat" && platform.foreground()) {
       const seen = notificationsRef.current.filter((item) => item.conversation_id === id && !isSessionNotification(item))
       for (const notification of seen) {
-        try {
-          await signedWrite("ack", notification.notification_id, "ack", { notification_id: notification.notification_id, attestation: await attest(notification.conversation_id, { type: "notification_acked", notification_id: notification.notification_id, client_id: clientId }) })
-          requireCurrent()
-          notificationsRef.current = notificationsRef.current.filter((item) => item.notification_id !== notification.notification_id)
-          setNotifications(notificationsRef.current)
-        } catch (caught) { showError(caught, "标记已读"); break }
+        try { await acknowledgeNotification(notification) } catch (caught) { showError(caught, "标记已读"); break }
       }
     }
     return next
@@ -313,7 +321,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (activeId.current) await readConversation(activeId.current)
       requireCurrent()
       readConnection.current = connection
-      void notify(nextNotifications)
+      void notify(nextNotifications.filter((item) => !ignoredNotificationsRef.current.has(item.notification_id)))
       void refreshNotificationButton()
     } catch (caught) {
       // What the page shows stays; writes wait for the next full read.
@@ -339,7 +347,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const fresh = records.notifications.filter((item) => !notificationsRef.current.some((known) => known.notification_id === item.notification_id))
     notificationsRef.current = mergeNotifications(notificationsRef.current, records)
     setNotifications(notificationsRef.current)
-    void notify(fresh)
+    void notify(fresh.filter((item) => !ignoredNotificationsRef.current.has(item.notification_id)))
     const shown = dataRef.current
     if (id === activeId.current && readConnection.current === connection && shown?.conversation?.conversation_id === id) await showConversation(id, mergeConversation(shown, records))
   }
@@ -429,12 +437,23 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     inFlight.current = new Set()
     setMessageBusy(false); setLiveProgress([]); setError(null); setNoticeText("")
     try {
+      const nextIgnored = readIgnoredNotifications()
+      ignoredNotificationsRef.current = nextIgnored
+      setIgnoredNotifications(nextIgnored)
       if (initialBot) writeStorage(scoped("selected-bot"), initialBot)
       activeId.current = ""
       setConversationId(activeId.current)
       void loadPending().then(() => { if (alive.current) setBooted(true) }, (caught) => showError(caught, "读取待发消息"))
     } catch (caught) { showError(caught) }
-    const stop = tabs.listen((message) => { if (message.type === "outbox" && message.networkId === networkId) void syncPending().catch(() => {}) })
+    const stop = tabs.listen((message) => {
+      if (message.networkId !== networkId) return
+      if (message.type === "outbox") { void syncPending().catch(() => {}); return }
+      if (message.type !== "ignored-inbox") return
+      const merged = new Set([...ignoredNotificationsRef.current, ...readIgnoredNotifications()])
+      if (merged.size === ignoredNotificationsRef.current.size) return
+      ignoredNotificationsRef.current = merged
+      setIgnoredNotifications(merged)
+    })
     return () => { alive.current = false; stop() }
   }, [connection])
 
@@ -500,6 +519,25 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       reportLog({ level: "warn", event: "web.action_failed", message: messageOf(caught), fields: { action: label } })
       showError(caught, label)
     }
+  }
+  const ignoreNotifications = (ids: readonly string[]) => {
+    const allowed = new Set(notificationsRef.current.filter((item) => item.kind === "manager_attention" && ids.includes(item.notification_id)).map((item) => item.notification_id))
+    if (!allowed.size) return
+    // Another tab may have written since this connection last rendered; merge that value before saving.
+    const next = new Set([...ignoredNotificationsRef.current, ...readIgnoredNotifications()])
+    for (const id of allowed) next.add(id)
+    // shortcut: keep the latest 200 local reminder IDs, revisit when ignored history needs to be unbounded.
+    const saved = [...next].slice(-200)
+    writeStorage(ignoredInboxKey, saved, true)
+    ignoredNotificationsRef.current = new Set(saved)
+    setIgnoredNotifications(ignoredNotificationsRef.current)
+    tabs.post({ type: "ignored-inbox", networkId })
+  }
+  const markNotificationsRead = async (ids: readonly string[]) => {
+    requireCurrent()
+    if (!joined) throw new Error("本机管理不能标记网络提醒。用加入链接加入后再操作。")
+    const selected = notificationsRef.current.filter((item) => ids.includes(item.notification_id))
+    for (const notification of selected) await acknowledgeNotification(notification)
   }
   /** After a failed write: a refusal only rereads; an unknown outcome also pauses writes until the reread. */
   const requireControlRefresh = (caught: unknown) => {
@@ -612,7 +650,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       viewRef.current = next; setView(next); clearMessages()
       if (next === "chat" || next === "tasks") scheduleRefresh()
       else { onScreen.current = null; setFresh(new Set<string>()) }
-    }, nodes, conversationId, data, fresh, notifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
+    }, nodes, conversationId, data, fresh, notifications, ignoredNotifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
     joined, synced,
     writable: joined && booted && current() && readConnection.current === connection && writeState.state === "writable",
@@ -622,7 +660,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     logs: async (filter: LogFilter) => { requireCurrent(); return parseLogs(await connection.request("logs", filter)) },
     confirmWritable: async () => { requireCurrent(); setWriteState(parseWriteStatus(await connection.request("confirm_writable"))); scheduleRefresh() },
     syncText: !data ? "发一条消息开始对话。" : "已加载这台电脑上的记录。",
-    refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton, ackNotification,
+    refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton, ignoreNotifications, markNotificationsRead,
+    ackNotification,
     selectBot,
     createBot: (input: { name: string; instructions: string; project?: BotProject }) => withMutation("create-bot", async () => {
       const name = inputText(input.name, "Bot 名称", 512), instructions = input.instructions.trim()

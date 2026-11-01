@@ -3,7 +3,7 @@ import test from 'node:test'
 import { availability, parseNodeSettings, summaryReadiness, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
 import { cardState, chatTaskState, deviceForm, deviceOnline, entryLabel, externalSessionLabels, externalSessionStatus, fixOnDevice, formName, parseSummarySteps, promptSummary, schedulerStatus, staleTaskLabel, taskGroup, taskLabel, taskStale } from './labels.ts'
-import type { BotRecord, NodeInfo, Question, WorkCard, WorkRecord } from './types.ts'
+import type { BotRecord, NodeInfo, NotificationRecord, Question, WorkCard, WorkRecord } from './types.ts'
 
 const question = (id: string, closed = false): Question => ({
   question_id: id, conversation_id: 'c', bot: { bot_id: 'b', name: '助手' }, severity: 'normal', text: id, choices: [], about: { kind: 'general' },
@@ -20,7 +20,7 @@ const source = (manage: boolean, answered: Record<string, string> = {}): InboxSo
   device: { ready: { principal: { network_id: 'n', device_id: 'me', epoch: 1, source: 'membership', can_manage: manage }, entry: { device_id: 'mac' } }, joins: [join('pending'), join('joined')], pendingRecovery: null, rotateHint: false },
   workspace: {
     writeState: { state: 'writable', conflicts: [] }, questions: [question('open'), question('closed', true)], answered, openWorks: [], nodes: [unready], data: null,
-    messagePending: null, messageBusy: false, selectedBot: null, notifications: [], bots: [],
+    messagePending: null, messageBusy: false, selectedBot: null, notifications: [], ignoredNotifications: new Set(), bots: [],
   },
 })
 
@@ -202,4 +202,17 @@ test('losing the entry makes active tasks stale without claiming every target is
   assert.equal(externalSessionLabels[externalSessionStatus({ node: 'mac' }, [{ ...unready, revoked: true }])], '设备已撤权')
   assert.equal(externalSessionStatus({ node: 'mac' }, [{ ...unready, online: false }]), 'offline')
   assert.equal(externalSessionStatus({ node: 'other' }, [unready]), 'unknown')
+})
+
+test('manager attention keeps its notification identity and can be hidden locally', () => {
+  const attention = source(true)
+  const bot = { bot_id: 'b', conversation_id: 'c', name: '助手' } as unknown as BotRecord
+  const note = { notification_id: 'n1', kind: 'manager_attention', text: '看看进展', conversation_id: 'c' } satisfies NotificationRecord
+  attention.workspace.bots = [bot]
+  attention.workspace.notifications = [note]
+  const item = inboxItems(attention).find((candidate) => candidate.kind === 'attention')
+  assert.equal(item?.kind, 'attention')
+  if (item?.kind === 'attention') assert.equal(item.notification.notification_id, 'n1')
+  attention.workspace.ignoredNotifications = new Set(['n1'])
+  assert.equal(inboxItems(attention).some((candidate) => candidate.kind === 'attention'), false)
 })

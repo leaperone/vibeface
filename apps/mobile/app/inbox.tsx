@@ -1,6 +1,6 @@
 import { Link, type Href } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { Bot, ChevronRight, CircleAlert, CircleX, Copy, LoaderCircle, MessageCircle, Settings, X, Inbox as InboxIcon, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
+import { Bot, CheckCheck, ChevronRight, CircleAlert, CircleX, Copy, EyeOff, LoaderCircle, MessageCircle, Settings, X, Inbox as InboxIcon, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
 import { useRef } from 'react'
 import { Pressable, View } from 'react-native'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
@@ -20,6 +20,7 @@ import type { Question } from '@vibeface/client/workspace/types.ts'
 import { useInbox, useLive } from '@/data/live'
 import { useWide } from '@/lib/layout'
 import { move } from '@/lib/motion'
+import { useRun } from '@/lib/use-run'
 import { QuestionCard } from '@/features/chat/question-card'
 import { ConfirmCard, PendingMessageCard } from '@/features/chat/work'
 import { JoinRequests } from '@/features/devices/join-requests'
@@ -39,6 +40,7 @@ export default function Inbox() {
   const items = useInbox()
   const device = useDevice()
   const shared = useLive()
+  const { busy, error, status, run } = useRun()
   const wide = useWide()
   const bar = useHeaderHeight()
   const insets = useSafeAreaInsets()
@@ -57,8 +59,14 @@ export default function Inbox() {
   // The empty state fills what shows below the bar, known from the first frame so it never starts at the top.
   // Its extra 24 on top evens out the container's 16 top and 40 bottom padding, so it centres in that area.
   const below = Math.max(0, frame.height - bar - insets.bottom - 56)
+  const attention = items.filter((item): item is Extract<InboxItem, { kind: 'attention' }> => item.kind === 'attention')
   // Entering animations skip the first render: an inbox opened empty just shows it, one emptied by an answer fades it in.
   return <LayoutAnimationConfig skipEntering><KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-3 p-4 pb-10">
+    {attention.length && shared ? <View className="flex-row flex-wrap justify-end gap-2">
+      <Button variant="ghost" disabled={busy !== null} accessibilityLabel="忽略提醒" onPress={() => void run('ignore', async () => { shared.ignoreNotifications(attention.map((item) => item.notification.notification_id)) }, '已忽略提醒，仅此设备隐藏。')}><Icon as={EyeOff} /><Text>忽略提醒</Text></Button>
+      <Button variant="outline" disabled={busy !== null} accessibilityLabel="全部已读" onPress={() => void run('read', async () => { await shared.markNotificationsRead(attention.map((item) => item.notification.notification_id)) }, '提醒已标记为已读。')}><Icon as={CheckCheck} /><Text>全部已读</Text></Button>
+    </View> : null}
+    {error ? <ErrorText error={error} /> : status ? <Text role="status" className="text-meta text-muted-foreground">{status}</Text> : null}
     {items.map((item) => item.kind === 'recovery' ? <RecoveryPendingCard key={item.key} />
       : item.kind === 'rotate' ? <RotateHintCard key={item.key} />
       : item.kind === 'confirm' ? <ConfirmCard key={item.key} check={item.check} />

@@ -27,6 +27,14 @@ import * as workspaceModel from "@vibeface/client/workspace/model.ts"
 import * as workspaceQuestions from "@vibeface/client/workspace/questions.ts"
 import { inboxItems } from "@vibeface/client/workspace/inbox.ts"
 
+test("bulk inbox actions re-arm focus after an intervening list update", () => {
+  const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../../routes/_app/inbox.tsx"), "utf8")
+  const start = source.indexOf("const action = async (kind")
+  const action = source.slice(start, source.indexOf("\n  return <div", start))
+  assert.ok(action.indexOf("held.current = { key: bulkFocusKey") >= 0)
+  assert.ok(action.indexOf("held.current = { key: bulkFocusKey") < action.indexOf("setBusy(kind)"), "the action re-arms the sentinel before the list can change")
+})
+
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
   works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], questions: [], sessions: [],
@@ -299,6 +307,14 @@ test("workspace preserves bot and message requests while routing native decision
     await state.refresh()
     state = render()
     assert.equal(state.selectedBot?.bot_id, "bot")
+    stored.set("vibeface.ignored-inbox.client.network", JSON.stringify(["from-other-tab"]))
+    unreadNotifications = [{ notification_id: "local-note", kind: "manager_attention", text: "看看进展", conversation_id: "chat" }]
+    render().setView("tasks")
+    await render().refresh()
+    render().ignoreNotifications(["local-note"])
+    assert.deepEqual(JSON.parse(stored.get("vibeface.ignored-inbox.client.network") ?? "null"), ["from-other-tab", "local-note"], "ignoring merges the latest local storage from another tab")
+    unreadNotifications = []
+    render().setView("chat")
     failMessage = true
     await assert.rejects(state.sendMessage("work"), /connection lost/)
     state = render()
@@ -843,7 +859,7 @@ const parityShared = () => ({
   generation: 1, isCurrent: () => true, synced: true, connectionOnline: true, conversationId: 'chat', data: paritySnapshot(context),
   bots: [parityBot], selectedBot: parityBot, nodes: [parityNode], openWorks: [{ ...parityWork(), conversation_id: 'chat' }],
   overview: workspaceModel.parseWorkspaceOverview({}), questions: [] as ReturnType<typeof parseConversation>['questions'], answered: {} as Record<string, string>, liveProgress: [], writable: true,
-  writeState: { state: 'writable' as const, conflicts: [] }, notifications: [], messagePending: null, messageBusy: false,
+  writeState: { state: 'writable' as const, conflicts: [] }, notifications: [], ignoredNotifications: new Set<string>(), messagePending: null, messageBusy: false,
   setView(_view: string) {}, selectBot: async (_bot: typeof parityBot) => {}, interruptWork: async (_work: string) => {}, sendMessage: async () => true,
 })
 

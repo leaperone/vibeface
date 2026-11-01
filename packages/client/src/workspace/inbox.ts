@@ -14,7 +14,7 @@ export type InboxItem = { key: string; title: string; meta?: string } & (
   | { kind: "question"; question: Question; done: boolean }
   | { kind: "confirm"; check: PendingCheck }
   | { kind: "join"; join: JoinRequest }
-  | { kind: "attention"; bot: BotRecord }
+  | { kind: "attention"; bot: BotRecord; notification: NotificationRecord }
   | { kind: "session"; bot: BotRecord; notification: NotificationRecord }
   | { kind: "failed"; work: OpenWork; bot: BotRecord }
   | { kind: "setup"; device: string | undefined }
@@ -30,7 +30,7 @@ export type InboxSource = {
     writeState: WriteStatus; questions: readonly Question[]; answered: Readonly<Record<string, string>>
     openWorks: OpenWork[]; nodes: NodeInfo[]; data: { checks: CoordinationCheck[] } | null
     messagePending: unknown; messageBusy: boolean; selectedBot: BotRecord | null
-    notifications: readonly NotificationRecord[]; bots: readonly BotRecord[]
+    notifications: readonly NotificationRecord[]; ignoredNotifications: ReadonlySet<string>; bots: readonly BotRecord[]
   }
 }
 
@@ -64,9 +64,10 @@ export function inboxItems({ device, workspace }: InboxSource): InboxItem[] {
   if (workspace.messagePending && !workspace.messageBusy) items.push({ key: "undelivered", kind: "undelivered", title: "消息可能没送达", meta: workspace.selectedBot?.name })
   for (const join of openJoins(device)) items.push({ key: `join:${join.join_id}`, kind: "join", join, title: `${join.name || "新设备"} 想加入` })
   for (const note of workspace.notifications) {
+    if (note.kind === "manager_attention" && workspace.ignoredNotifications.has(note.notification_id)) continue
     const bot = workspace.bots.find((item) => item.conversation_id === note.conversation_id)
     if (!bot) continue
-    if (note.kind === "manager_attention") items.push({ key: `attention:${note.notification_id}`, kind: "attention", bot, title: note.text.trim() || "Bot 需要你看看", meta: bot.name })
+    if (note.kind === "manager_attention") items.push({ key: `attention:${note.notification_id}`, kind: "attention", bot, notification: note, title: note.text.trim() || "Bot 需要你看看", meta: bot.name })
     else if (isSessionNotification(note)) items.push({ key: `session:${note.notification_id}`, kind: "session", bot, notification: note, title: "接手了一个外部会话", meta: bot.name })
   }
   const unready = workspace.nodes.find((node) => botReadiness(node) === "needs_setup")
