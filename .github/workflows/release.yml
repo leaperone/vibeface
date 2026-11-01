@@ -1,0 +1,187 @@
+name: App releases
+on:
+  push:
+    tags: ['www-v*', 'app-v*', 'core-v*', 'cli-v*', 'mobile-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact existing app-prefixed tag
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  identity:
+    runs-on: ubuntu-24.04
+    outputs:
+      app: ${{ steps.plan.outputs.app }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: python3 scripts/release.py plan --tag "$RELEASE_TAG" --require-main --github-output "$GITHUB_OUTPUT"
+  static:
+    needs: identity
+    if: needs.identity.outputs.app == 'app' || needs.identity.outputs.app == 'www'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.identity.outputs.tag }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with: {version: 11.9.0}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '24'}
+      - run: pnpm install --frozen-lockfile
+      - name: Build and verify static component
+        env:
+          APP: ${{ needs.identity.outputs.app }}
+        run: |
+          if [[ "$APP" == app ]]; then
+            scripts/build-web-crypto.sh
+            scripts/build-web.sh
+            source_dir=apps/app/dist/client
+          else
+            pnpm --dir apps/www typecheck
+            pnpm --dir apps/www build
+            pnpm --dir apps/www check:static
+            source_dir=apps/www/dist/client
+          fi
+          python3 scripts/release.py component "$APP" --input "$source_dir" --output .artifacts/release
+      - name: Publish verified component
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP: ${{ needs.identity.outputs.app }}
+        run: python3 scripts/release.py publish "$APP" .artifacts/release
+  native:
+    needs: identity
+    if: needs.identity.outputs.app == 'core' || needs.identity.outputs.app == 'cli'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: macos-15, target: aarch64-apple-darwin}
+          - {runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu}
+          - {runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.identity.outputs.tag }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      - name: Build native component
+        env:
+          APP: ${{ needs.identity.outputs.app }}
+          TARGET: ${{ matrix.target }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$APP" == core ]]; then package=vibeface-core; else package=vibeface; fi
+          CARGO_ENCODED_RUSTFLAGS="$(python3 scripts/release-rustflags.py)"
+          export CARGO_ENCODED_RUSTFLAGS
+          cargo build --release --locked -p "$package" --target "$TARGET"
+          "target/$TARGET/release/$package" --version
+      - name: Sign and notarize macOS binary
+        if: runner.os == 'macOS'
+        env:
+          APP: ${{ needs.identity.outputs.app }}
+          TARGET: ${{ matrix.target }}
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: bash scripts/sign-release.sh "$APP" "target/$TARGET/release"
+      - name: Assemble immutable release
+        env:
+          APP: ${{ needs.identity.outputs.app }}
+          TARGET: ${{ matrix.target }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$APP" == core ]]; then
+            python3 scripts/release.py component core --target "$TARGET" --input "target/$TARGET/release/vibeface-core" --output .artifacts/release
+          else
+            python3 scripts/release.py compose --target "$TARGET" --binary "target/$TARGET/release/vibeface" --output .artifacts/release
+          fi
+          rm .artifacts/release/release.json
+      - name: Verify composed CLI and Core process
+        if: needs.identity.outputs.app == 'cli'
+        env:
+          VERSION: ${{ needs.identity.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir .artifacts/smoke
+          tar -xzf ".artifacts/release/vibeface-$VERSION-$TARGET.tar.gz" -C .artifacts/smoke
+          package="$PWD/.artifacts/smoke/vibeface-$VERSION-$TARGET"
+          "$package/vibeface" --help
+          python3 scripts/verify-node.py --binary "$package/vibeface" --core-binary "$package/vibeface-core" --crypto-module "$package/web/vibeface_secure.js" --artifacts .artifacts/release-smoke --web-only
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-${{ matrix.target }}
+          path: .artifacts/release/*
+          if-no-files-found: error
+  publish-native:
+    needs: [identity, native]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.identity.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: .artifacts/release
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '24'}
+      - name: Prepare npm distribution
+        if: needs.identity.outputs.app == 'cli' && contains(needs.identity.outputs.version, '-nightly.')
+        run: node scripts/package-npm.mjs --input .artifacts/release --source-commit "$(git rev-parse HEAD)"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: needs.identity.outputs.app == 'cli' && contains(needs.identity.outputs.version, '-nightly.')
+        with:
+          name: npm-package-${{ github.sha }}
+          path: .artifacts/npm/*
+          if-no-files-found: error
+      - name: Seal and publish complete release
+        env:
+          APP: ${{ needs.identity.outputs.app }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/release.py manifest "$APP" .artifacts/release
+          python3 scripts/release.py publish "$APP" .artifacts/release
+  mobile:
+    needs: identity
+    if: needs.identity.outputs.app == 'mobile'
+    uses: ./.github/workflows/release-apps.yml
+    with:
+      version: ${{ needs.identity.outputs.version }}
+      tag: ${{ needs.identity.outputs.tag }}
+    secrets: inherit
+    permissions:
+      contents: write
+  deploy-www:
+    needs: [identity, static]
+    if: needs.identity.outputs.app == 'www' && !contains(needs.identity.outputs.version, '-')
+    uses: ./.github/workflows/deploy-www.yml
+    secrets: inherit

@@ -6,12 +6,12 @@ on:
       version:
         required: true
         type: string
-      prerelease:
+      tag:
         required: true
-        type: boolean
+        type: string
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   VERSION: ${{ inputs.version }}
@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {persist-credentials: false}
+        with: {ref: "${{ inputs.tag }}", persist-credentials: false}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           targets: aarch64-linux-android,x86_64-linux-android
@@ -39,25 +39,8 @@ jobs:
       - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6
       - run: pnpm install --frozen-lockfile
       - run: scripts/build-mobile-secure.sh android
-      - name: Set Android nightly version
-        run: |
-          python3 - <<'PY'
-          import datetime, json, os, re
-          path = 'apps/mobile/app.json'
-          data = json.load(open(path))
-          version = os.environ['VERSION'].removeprefix('v')
-          match = re.search(r'nightly\.(\d{8})\.(\d+)$', version)
-          if match:
-              date = datetime.date.fromisoformat(match.group(1)[:4] + '-' + match.group(1)[4:6] + '-' + match.group(1)[6:])
-              code = (date - datetime.date(2020, 1, 1)).days * 100 + int(match.group(2))
-          else:
-              code = 1
-          data['expo']['version'] = version
-          data['expo'].setdefault('android', {})['versionCode'] = code
-          json.dump(data, open(path, 'w'), indent=2)
-          open(path, 'a').write('\n')
-          print(f'Android version={version} versionCode={code}')
-          PY
+      - name: Validate committed mobile version
+        run: python3 scripts/release.py plan --tag "${{ inputs.tag }}"
       - name: Build release APK
         working-directory: apps/mobile
         run: |
@@ -81,3 +64,9 @@ jobs:
           path: .artifacts/android/vibeface-*
           if-no-files-found: error
 
+      - name: Publish verified mobile preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/release.py manifest mobile .artifacts/android
+          python3 scripts/release.py publish mobile .artifacts/android

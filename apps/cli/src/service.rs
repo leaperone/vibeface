@@ -270,7 +270,7 @@ mod tests {
         std::fs::write(
             package.join("BUILD-INFO.json"),
             format!(
-                r#"{{"version":"1.2.3-nightly.20261019.1","update_protocol":{},"data_epoch":{}}}"#,
+                r#"{{"version":"1.2.3-nightly.20261019.1","core_version":"2.0.0","update_protocol":{},"data_epoch":{}}}"#,
                 vibeface_control::UPDATE_PROTOCOL,
                 vibeface_control::DATA_EPOCH
             ),
