@@ -856,9 +856,9 @@ async fn frontend(State(app): State<App>, method: Method, uri: axum::http::Uri) 
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     if static_assets::StaticAssets::is_unsafe_path(path)
-        || path == "/_headers"
-        || path == "/_redirects"
-        || path.split('/').any(|segment| segment.starts_with('.'))
+        || path
+            .split('/')
+            .any(|segment| segment.starts_with('.') || matches!(segment, "_headers" | "_redirects"))
     {
         return StatusCode::NOT_FOUND.into_response();
     }
