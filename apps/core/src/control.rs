@@ -568,6 +568,26 @@ fn create_private(path: &Path, bytes: &[u8]) -> Result<()> {
 
 pub fn restart_fresh(dir: &Path) -> Result<()> {
     validate_data_dir(dir)?;
+    match start_over(dir) {
+        Ok(archive) => tracing::info!(
+            event = "node.data_set_aside",
+            archive = %archive.display(),
+            "removed Node data set aside"
+        ),
+        Err(error) => tracing::error!(
+            event = "node.data_set_aside_failed",
+            %error,
+            "removed Node data could not be set aside"
+        ),
+    }
+    use std::os::unix::process::CommandExt;
+    let error = std::process::Command::new(std::env::current_exe()?)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    Err(error).context("restart the Node")
+}
+
+fn start_over(dir: &Path) -> Result<PathBuf> {
     let configuration = Config::load(dir)?;
     let entry_token = configuration
         .network
@@ -596,11 +616,7 @@ pub fn restart_fresh(dir: &Path) -> Result<()> {
         fs::rename(&archive, dir)?;
         return Err(error.into());
     }
-    use std::os::unix::process::CommandExt;
-    let error = std::process::Command::new(std::env::current_exe()?)
-        .args(std::env::args_os().skip(1))
-        .exec();
-    Err(error).context("restart the Node")
+    Ok(archive)
 }
 
 fn local_time_stamp() -> String {

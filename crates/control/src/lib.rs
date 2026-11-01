@@ -8,8 +8,10 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    io::Write as _,
     path::{Path, PathBuf},
     process::Stdio,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -19,6 +21,8 @@ use tokio::{
 pub const UPDATE_PROTOCOL: u32 = 1;
 pub const DATA_EPOCH: u32 = 12;
 pub const MAX_CONTROL_PACKET: usize = 1024 * 1024;
+const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A bounded request handled by a standalone core process.  The core owns all data access and
 /// turns these DTOs into its internal Config, identity and Store values.
@@ -88,7 +92,7 @@ impl ControlResponse {
     }
 }
 
-async fn read_bounded<R>(mut stream: R, limit: usize, label: &str) -> Result<Vec<u8>>
+async fn read_bounded<R>(mut stream: R, limit: usize, label: &str, forward: bool) -> Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -103,6 +107,11 @@ where
             bytes.len().saturating_add(count) <= limit,
             "core control {label} exceeds {limit} bytes"
         );
+        if forward {
+            let mut stderr = std::io::stderr().lock();
+            let _ = stderr.write_all(&chunk[..count]);
+            let _ = stderr.flush();
+        }
         bytes.extend_from_slice(&chunk[..count]);
     }
 }
@@ -128,7 +137,11 @@ pub async fn request(core: &Path, request: &ControlRequest) -> Result<Value> {
         bytes.len() <= MAX_CONTROL_PACKET,
         "core control request is too large"
     );
-    stdin.write_all(&bytes).await?;
+    if let Err(error) = tokio::time::timeout(CONTROL_WRITE_TIMEOUT, stdin.write_all(&bytes)).await {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(error).context("core control stdin timed out");
+    }
     drop(stdin);
     let stdout = child
         .stdout
@@ -138,10 +151,25 @@ pub async fn request(core: &Path, request: &ControlRequest) -> Result<Value> {
         .stderr
         .take()
         .context("core control stderr unavailable")?;
-    let streams = tokio::try_join!(
-        read_bounded(stdout, MAX_CONTROL_PACKET, "stdout"),
-        read_bounded(stderr, MAX_CONTROL_PACKET, "stderr"),
-    );
+    let forward_stderr = matches!(request, ControlRequest::Join { .. });
+    let streams = async {
+        tokio::try_join!(
+            read_bounded(stdout, MAX_CONTROL_PACKET, "stdout", false),
+            read_bounded(stderr, MAX_CONTROL_PACKET, "stderr", forward_stderr),
+        )
+    };
+    let streams = if forward_stderr {
+        streams.await
+    } else {
+        match tokio::time::timeout(CONTROL_IO_TIMEOUT, streams).await {
+            Ok(streams) => streams,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                bail!("core control request timed out; outcome may be unknown")
+            }
+        }
+    };
     let (output, error_output) = match streams {
         Ok(streams) => streams,
         Err(error) => {
@@ -156,9 +184,6 @@ pub async fn request(core: &Path, request: &ControlRequest) -> Result<Value> {
             "core control process failed: {}",
             String::from_utf8_lossy(&error_output)
         );
-    }
-    if matches!(request, ControlRequest::Join { .. }) && !error_output.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&error_output));
     }
     let response: ControlResponse =
         serde_json::from_slice(&output).context("invalid core control response")?;
