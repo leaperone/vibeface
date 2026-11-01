@@ -224,12 +224,12 @@ bash scripts/package-node.sh
 | [文件交付实验参考](docs/paid-delivery.md) | VDP-1 的角色、费用、钱包、证明与结算边界。 |
 | [排障](docs/troubleshooting.md) | `status`、`node.log`、诊断包，只读与分叉处理。 |
 | [构建与发布](docs/releasing.md) | 三个平台包、SHA256、Stable 与 Nightly 渠道、tag 规则。 |
-| [CI](docs/ci.md) | PR 核心检查与本地专项检查。 |
+| [CI](docs/ci.md) | 主分支、扩展 CI 与本地专项检查。 |
 
 ## 🤝 参与贡献
 
 - **报告问题**：在 [Issues](https://github.com/leaperone/vibeface/issues) 附上 `vibeface --version`、平台和 `vibeface status` 输出。诊断方法见 [排障](docs/troubleshooting.md)。请勿粘贴密钥或恢复包。
-- **提交 PR**：从 `main` 拉独立分支，使用 Conventional Commits。PR 由 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 执行核心检查。改动同步、恢复、调度或工具执行时，按 [docs/ci.md](docs/ci.md) 补跑本地专项并在 PR 中记录结果。
+- **提交 PR**：从 `main` 拉独立分支，使用 Conventional Commits。开发分支 PR 不自动运行 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml)，提交前运行相关本地检查，必要时手动触发扩展 CI。改动同步、恢复、调度或工具执行时，按 [docs/ci.md](docs/ci.md) 补跑本地专项并在 PR 中记录结果。
 
 提交前可在仓库根目录运行：
 

@@ -5,11 +5,11 @@ description: 了解 Vibeface 的 CI、制品和 Nightly 发布流程。
 
 # 构建与发布
 
-[CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 按改动范围选择 PR 和 `main` 的核心检查，Draft 与 Ready 相同；merge queue 执行全工作区核心检查，定时、手动和 `v*` tag 执行扩展回归。PR 与 `main` 只上传 Actions 制品，不创建公开版本，也不部署主机。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。具体选择规则见 [按改动选择 CI](ci.md)。
+[CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 按改动范围选择 `main` push 的核心检查；开发分支 PR 不触发 Actions，Draft 与 Ready 都不例外。merge queue 执行全工作区核心检查，定时、手动和 `v*` tag 执行扩展回归。`main` 的常规 CI 只上传 Actions 制品，不创建公开版本。门户另由 `deploy-www.yml` 请求部署。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。具体选择规则见 [按改动选择 CI](ci.md)。
 
 ## 可下载的包
 
-每个平台的 Actions artifact 包含 `vibeface-<version>-<target>.tar.gz` 和同名 `.sha256`。普通 PR 按需生成 Linux x64 包；扩展检查在三种架构的原生 runner 构建，解包后分别启动网页进程。多 Node、单 Node 调度、跨设备协作和公共入口的多进程验收只在 Linux x64 运行一次，聊天 Agent 与写入保护验收只在 macOS ARM64 运行一次，都不调用模型。
+每个平台的 Actions artifact 包含 `vibeface-<version>-<target>.tar.gz` 和同名 `.sha256`。`main` 的核心检查按需生成 Linux x64 包；扩展检查在三种架构的原生 runner 构建，解包后分别启动网页进程。多 Node、单 Node 调度、跨设备协作和公共入口的多进程验收只在 Linux x64 运行一次，聊天 Agent 与写入保护验收只在 macOS ARM64 运行一次，都不调用模型。
 
 | 平台 | Rust target | 构建和验收环境 |
 | --- | --- | --- |
@@ -17,7 +17,7 @@ description: 了解 Vibeface 的 CI、制品和 Nightly 发布流程。
 | Linux ARM64 | `aarch64-unknown-linux-gnu` | Ubuntu 24.04 ARM64 |
 | macOS Apple Silicon | `aarch64-apple-darwin` | macOS 15 ARM64 |
 
-Linux 包依赖 glibc，未在旧版发行版验收。扩展检查和 `v*` tag 产出的 macOS 包，`vibeface` 程序使用 Developer ID 签名，启用 hardened runtime，identifier 为 `cn.leaperone.vibeface`，并通过 Apple notarization。应用防火墙保持默认的“自动允许下载的已签名软件”设置时据此放行，安装和更新后不再询问是否接受传入连接。PR 产出的包不含 macOS 平台。本地运行 `scripts/package-node.sh` 时，只有设置 `VIBEFACE_CODESIGN_IDENTITY` 才签名；同时设置 `VIBEFACE_NOTARY_KEY`、`VIBEFACE_NOTARY_KEY_ID` 和 `VIBEFACE_NOTARY_ISSUER` 才提交 notarization，三者须同时设置，状态不是 `Accepted` 时打包失败。裸 Mach-O 无法 staple；带隔离属性的文件首次运行时由 Gatekeeper 在线核对公证记录。Apple 接受公证后，在线记录可能数分钟后才能查到，CI 因此按退避间隔重试 Gatekeeper 评估，最长约 14 分钟，只接受 `source=Notarized Developer ID`。
+Linux 包依赖 glibc，未在旧版发行版验收。扩展检查和 `v*` tag 产出的 macOS 包，`vibeface` 程序使用 Developer ID 签名，启用 hardened runtime，identifier 为 `cn.leaperone.vibeface`，并通过 Apple notarization。应用防火墙保持默认的“自动允许下载的已签名软件”设置时据此放行，安装和更新后不再询问是否接受传入连接。`main` 的核心检查不生成 macOS 包。本地运行 `scripts/package-node.sh` 时，只有设置 `VIBEFACE_CODESIGN_IDENTITY` 才签名；同时设置 `VIBEFACE_NOTARY_KEY`、`VIBEFACE_NOTARY_KEY_ID` 和 `VIBEFACE_NOTARY_ISSUER` 才提交 notarization，三者须同时设置，状态不是 `Accepted` 时打包失败。裸 Mach-O 无法 staple；带隔离属性的文件首次运行时由 Gatekeeper 在线核对公证记录。Apple 接受公证后，在线记录可能数分钟后才能查到，CI 因此按退避间隔重试 Gatekeeper 评估，最长约 14 分钟，只接受 `source=Notarized Developer ID`。
 
 macOS 打包需要以下仓库 secrets，缺任何一项时打包失败，不回退为未签名包：
 
@@ -49,7 +49,7 @@ cd vibeface-<version>-<target>
 
 `crypto-web` 在固定版本的 wasm-bindgen 工具链生成一份浏览器密码学资源，运行 native Rust 与 WASM 的实际 Noise 互通和篡改、重放、身份错配负例。`web` 下载这份资源及其真实 TypeScript 声明，以锁定的 pnpm 依赖生成 TanStack Start 静态 SPA。被选中的检查和打包任务下载同一份密码学资源和 SPA，再由 Rust 构建脚本内嵌。缺少资源时构建失败，不用空模块替代。
 
-质量检查按计划选择受影响的 crate，包含 Rust fmt、快慢测试、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法、Web TypeScript 检查和静态构建，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。README 和项目指引不触发构建，`docs/` 触发门户构建；Node Web-only PR 只构建 Linux x64 包并验收网页资源，不运行 Node 库业务测试。所有 PR 和 `main` 仅保留相关快速测试、Clippy 和 Linux x64 制品。慢测试、最低 Rust 版本和三平台制品移至定时、手动与 tag 扩展检查。`ci-gate` 要求本次计划中的任务全部成功。
+质量检查按计划选择受影响的 crate，包含 Rust fmt、快慢测试、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法、Web TypeScript 检查和静态构建，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。README 和项目指引不触发构建，`docs/` 触发门户构建；`main` 上仅修改 Node Web 时，只构建 Linux x64 包并验收网页资源，不运行 Node 库业务测试。`main` 核心检查仅保留相关快速测试、Clippy 和 Linux x64 制品。慢测试、最低 Rust 版本和三平台制品移至定时、手动与 tag 扩展检查。`ci-gate` 要求本次计划中的任务全部成功。
 
 打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch。扩展检查在 Linux x64 启动解包后的程序运行无账号网络验收；每个选中的平台独立启动网页进程，检查 SPA 路由、JavaScript、CSS、字体、每段内联脚本的 CSP hash、HEAD、缓存策略和未知资源的 404。Linux x64 还安装包内锁定的 SDK 依赖并导入模块，不开启模型会话。
 
@@ -76,7 +76,7 @@ pnpm --filter vibeface-www run build
 pnpm --filter vibeface-www run check:static
 ```
 
-产物在 `apps/www/dist/client`。CI 的 `www-<SHA>` artifact 包含相同目录，可用于审核或后续静态部署；CI 不自动部署域名。门户配置与验收命令见 [`apps/www/README.md`](../apps/www/README.md)。
+产物在 `apps/www/dist/client`。CI 的 `www-<SHA>` artifact 包含相同目录，可用于审核或后续静态部署；匹配 `apps/www/`、`docs/`、共享包或根 JS 依赖文件的 `main` push 会触发 `deploy-www.yml`，向 `leaperone/leaperone-releases` 发送部署请求。请求成功不代表站点已经上线，仍需检查目标仓库的部署结果和线上页面。门户配置与验收命令见 [`apps/www/README.md`](../apps/www/README.md)。
 
 ## 显式发布版本
 

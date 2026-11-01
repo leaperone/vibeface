@@ -19,7 +19,7 @@ type DocsLoaderData = {
 export const Route = createFileRoute('/docs/$')({
   component: DocsRoute,
   head: ({ params }) => {
-    const doc = PUBLIC_DOC_BY_SLUG.get(params._splat?.split('/').filter(Boolean)[0] ?? '')
+    const doc = PUBLIC_DOC_BY_SLUG.get(params._splat?.split('/').filter(Boolean)[0] ?? 'overview')
     return doc
       ? {
           meta: [
@@ -32,7 +32,7 @@ export const Route = createFileRoute('/docs/$')({
   },
   loader: async ({ params }) => {
     const path = params._splat?.split('/').filter(Boolean) ?? []
-    const page = source.getPage(path)
+    const page = source.getPage(path.length ? path : ['overview'])
     if (!page) throw notFound()
     await docs.getPage(page.path)?.preload()
     return {
