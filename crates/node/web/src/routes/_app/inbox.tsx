@@ -23,13 +23,14 @@ function InboxPage() {
   const workspace = useWorkspace()
   const attention = items.filter((item): item is Extract<typeof items[number], { kind: 'attention' }> => item.kind === 'attention')
   const [busy, setBusy] = useState<"ignore" | "read" | null>(null)
+  const bulkFocusKey = "__inbox-bulk__"
   // A handled card leaves with the button just pressed; the card now in its place, or the page title, takes the focus.
   const list = useRef<HTMLUListElement>(null)
   const held = useRef<{ key: string; index: number } | null>(null)
   const keys = items.map((item) => item.key).join('\n')
   useLayoutEffect(() => {
     const last = held.current
-    if (!last || items.some((item) => item.key === last.key)) return
+    if (!last || (last.key !== bulkFocusKey && items.some((item) => item.key === last.key))) return
     held.current = null
     const cards = list.current?.children
     const next = cards?.length ? cards[Math.min(last.index, cards.length - 1)] : document.getElementById('main')?.querySelector('h1')
@@ -50,8 +51,8 @@ function InboxPage() {
   }
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-3">
     {attention.length ? <div className="flex flex-wrap justify-end gap-2">
-      <Button type="button" variant="ghost" disabled={busy !== null} aria-busy={busy === "ignore" || undefined} onClick={() => void action("ignore")}><EyeOff aria-hidden="true" />忽略提醒</Button>
-      <Button type="button" variant="outline" disabled={busy !== null} aria-busy={busy === "read" || undefined} onClick={() => void action("read")}><CheckCheck aria-hidden="true" />全部已读</Button>
+      <Button type="button" variant="ghost" disabled={busy !== null} aria-busy={busy === "ignore" || undefined} onFocus={() => { held.current = { key: bulkFocusKey, index: 0 } }} onClick={() => void action("ignore")}><EyeOff aria-hidden="true" />忽略提醒</Button>
+      <Button type="button" variant="outline" disabled={busy !== null} aria-busy={busy === "read" || undefined} onFocus={() => { held.current = { key: bulkFocusKey, index: 0 } }} onClick={() => void action("read")}><CheckCheck aria-hidden="true" />全部已读</Button>
     </div> : null}
     <ul ref={list} className="grid gap-3" onFocus={(event) => {
       const index = [...event.currentTarget.children].findIndex((card) => card.contains(event.target))

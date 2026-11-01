@@ -139,6 +139,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (writeState.state !== "writable") throw new Error(writeNotices[writeState.state])
   }
   const scoped = (key: string) => networkKey(`${key}.${clientId}`, networkId)
+  const ignoredInboxKey = scoped("ignored-inbox")
+  const readIgnoredNotifications = () => {
+    const raw = readStorage<unknown>(ignoredInboxKey, [])
+    return new Set(Array.isArray(raw) ? raw.filter((item): item is string => typeof item === "string") : [])
+  }
   /** Unconfirmed messages and answers as the page shows them, read back from the outbox. */
   const syncPending = async () => {
     const items = await outbox.all()
@@ -432,8 +437,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     inFlight.current = new Set()
     setMessageBusy(false); setLiveProgress([]); setError(null); setNoticeText("")
     try {
-      const rawIgnored = readStorage<unknown>(scoped("ignored-inbox"), [])
-      const nextIgnored = new Set(Array.isArray(rawIgnored) ? rawIgnored.filter((item): item is string => typeof item === "string") : [])
+      const nextIgnored = readIgnoredNotifications()
       ignoredNotificationsRef.current = nextIgnored
       setIgnoredNotifications(nextIgnored)
       if (initialBot) writeStorage(scoped("selected-bot"), initialBot)
@@ -441,7 +445,15 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       setConversationId(activeId.current)
       void loadPending().then(() => { if (alive.current) setBooted(true) }, (caught) => showError(caught, "读取待发消息"))
     } catch (caught) { showError(caught) }
-    const stop = tabs.listen((message) => { if (message.type === "outbox" && message.networkId === networkId) void syncPending().catch(() => {}) })
+    const stop = tabs.listen((message) => {
+      if (message.networkId !== networkId) return
+      if (message.type === "outbox") { void syncPending().catch(() => {}); return }
+      if (message.type !== "ignored-inbox") return
+      const merged = new Set([...ignoredNotificationsRef.current, ...readIgnoredNotifications()])
+      if (merged.size === ignoredNotificationsRef.current.size) return
+      ignoredNotificationsRef.current = merged
+      setIgnoredNotifications(merged)
+    })
     return () => { alive.current = false; stop() }
   }, [connection])
 
@@ -511,13 +523,15 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const ignoreNotifications = (ids: readonly string[]) => {
     const allowed = new Set(notificationsRef.current.filter((item) => item.kind === "manager_attention" && ids.includes(item.notification_id)).map((item) => item.notification_id))
     if (!allowed.size) return
-    const next = new Set(ignoredNotificationsRef.current)
+    // Another tab may have written since this connection last rendered; merge that value before saving.
+    const next = new Set([...ignoredNotificationsRef.current, ...readIgnoredNotifications()])
     for (const id of allowed) next.add(id)
     // shortcut: keep the latest 200 local reminder IDs, revisit when ignored history needs to be unbounded.
     const saved = [...next].slice(-200)
-    writeStorage(scoped("ignored-inbox"), saved, true)
+    writeStorage(ignoredInboxKey, saved, true)
     ignoredNotificationsRef.current = new Set(saved)
     setIgnoredNotifications(ignoredNotificationsRef.current)
+    tabs.post({ type: "ignored-inbox", networkId })
   }
   const markNotificationsRead = async (ids: readonly string[]) => {
     requireCurrent()

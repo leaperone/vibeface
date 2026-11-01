@@ -299,6 +299,14 @@ test("workspace preserves bot and message requests while routing native decision
     await state.refresh()
     state = render()
     assert.equal(state.selectedBot?.bot_id, "bot")
+    stored.set("vibeface.ignored-inbox.client.network", JSON.stringify(["from-other-tab"]))
+    unreadNotifications = [{ notification_id: "local-note", kind: "manager_attention", text: "看看进展", conversation_id: "chat" }]
+    render().setView("tasks")
+    await render().refresh()
+    render().ignoreNotifications(["local-note"])
+    assert.deepEqual(JSON.parse(stored.get("vibeface.ignored-inbox.client.network") ?? "null"), ["from-other-tab", "local-note"], "ignoring merges the latest local storage from another tab")
+    unreadNotifications = []
+    render().setView("chat")
     failMessage = true
     await assert.rejects(state.sendMessage("work"), /connection lost/)
     state = render()
