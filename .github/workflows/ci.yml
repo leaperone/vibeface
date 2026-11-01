@@ -811,6 +811,7 @@ jobs:
       - name: Install npm artifact without lifecycle scripts
         env:
           PACKAGE_VERSION: ${{ needs.plan.outputs.version }}
+          PACKAGE_TARGET: ${{ matrix.target }}
         run: |
           prefix="$PWD/.artifacts/npm-installed"
           npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$PWD/.artifacts/npm/leaperone-vibeface-$PACKAGE_VERSION.tgz"

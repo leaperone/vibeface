@@ -7923,15 +7923,19 @@ if __name__ == "__main__":
             if needs_process:
                 program = shutil.which(str(arguments.binary)) if len(arguments.binary.parts) == 1 else str(arguments.binary)
                 require(program is not None, "the Vibeface CLI binary exists on PATH or at its explicit path")
-                arguments.binary = Path(program).resolve(strict=True)
+                launcher = Path(program)
+                arguments.binary = launcher.resolve(strict=True)
                 arguments.core_binary = (arguments.core_binary or arguments.binary.with_name("vibeface-core")).resolve(strict=True)
                 require(arguments.binary.is_file() and arguments.binary.stat().st_mode & 0o111,
                         "the Vibeface CLI binary is executable")
                 require(arguments.core_binary.name == "vibeface-core", "the Core binary has the canonical name")
                 require(arguments.core_binary.is_file() and arguments.core_binary.stat().st_mode & 0o111,
                         "the sibling Vibeface Core binary is executable")
-                require(arguments.core_binary.parent == arguments.binary.parent,
-                        "CLI and Core binaries come from one release directory")
+                if arguments.core_binary.parent != arguments.binary.parent:
+                    npm_root = arguments.binary.parent.parent if arguments.binary.name == "vibeface.mjs" else None
+                    require(npm_root is not None and (npm_root / "package.json").is_file()
+                            and arguments.core_binary.is_relative_to(npm_root / "vendor"),
+                            "an npm launcher may only use Core from its own vendor directory")
             if arguments.app_dir is not None:
                 arguments.app_dir = arguments.app_dir.resolve(strict=True)
                 require(arguments.app_dir.is_dir(), "the explicit App output directory exists")
