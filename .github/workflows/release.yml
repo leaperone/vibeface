@@ -49,6 +49,11 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with: {node-version: '24'}
       - run: pnpm install --frozen-lockfile
+      - name: Install App browser build tools
+        if: needs.identity.outputs.app == 'app'
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          npm install --global binaryen@132.0.0
       - name: Build and verify static component
         env:
           APP: ${{ needs.identity.outputs.app }}
