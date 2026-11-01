@@ -18,7 +18,7 @@ fail() { printf 'Vibeface installer: %s\n' "$*" >&2; exit 1; }
 
 # Parse only named fields; remote JSON is never evaluated as shell code.
 json_fields() {
-  awk -v mode="$2" -v page="${3:-0}" '
+  LC_ALL=C awk -v mode="$2" -v page="${3:-0}" '
     function error() { invalid=1; exit 1 }
     function field(value, k) {
       k=key; key=""
@@ -33,15 +33,31 @@ json_fields() {
       }
       print page "." record "\t" k "\t" value
     }
-    { json=json $0 "\n" }
-    END {
-      if (invalid) exit 1
-      depth=0; record=0; expected=(mode=="releases" ? "[" : "{")
-      while (length(json)) {
-        sub(/^[ \t\r\n]+/,"",json)
-        if (!length(json)) break
-        if (!match(json,/^("([^"\\]|\\.)*"|-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?|true|false|null|[][{}:,])/)) error()
-        token=substr(json,1,RLENGTH); json=substr(json,RLENGTH+1)
+    BEGIN { depth=0; record=0; expected=(mode=="releases" ? "[" : "{") }
+    {
+      json=$0
+      position=1; size=length(json)
+      while (position<=size) {
+        char=substr(json,position,1)
+        if (char ~ /[ \t\r\n]/) { position++; continue }
+        start=position
+        if (char=="\"") {
+          escaped=0; position++
+          while (position<=size) {
+            char=substr(json,position,1)
+            if (!escaped && char=="\"") break
+            if (!escaped && char=="\\") escaped=1; else escaped=0
+            position++
+          }
+          if (position>size) error()
+          position++
+        } else if (char ~ /[][{}:,]/) {
+          position++
+        } else {
+          while (position<=size && substr(json,position,1) !~ /[ \t\r\n]|[][{}:,]/) position++
+        }
+        token=substr(json,start,position-start)
+        if (token !~ /^"/ && token !~ /^(-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?|true|false|null|[][{}:,])$/) error()
         if (closed) error()
         if (!started++) { if (token!=expected) error() }
         at=(mode=="releases" ? 2 : 1)
@@ -60,7 +76,9 @@ json_fields() {
         }
         previous=token
       }
-      if (!started || depth || !closed) error()
+    }
+    END {
+      if (invalid || !started || depth || !closed) exit 1
       if (mode=="releases") print record "\tcount\t" record
     }
   ' "$1"
@@ -452,6 +470,10 @@ JSON
   printf '[{"tag_name":"cli-v0.0.1-nightly.20261017.2","draft":false,"prerelease":true}]\n' > "$fixture/page2.json"
   json_fields "$fixture/page2.json" releases 2 >> "$fixture/fields"
   [[ $(select_release "$fixture/fields" nightly) == "cli-v$version" ]] || fail 'self-test: pagination changed version selection'
+  json_fields "$fixture/page2.json" releases 2 > "$fixture/compact-fields"
+  awk 'BEGIN { print "["; print "{"; print "\"tag_name\":\"cli-v0.0.1-nightly.20261017.2\","; print "\"draft\":false,"; print "\"prerelease\":true,"; printf "\"body\":\""; for (i=0;i<10000;i++) printf "ignored "; print "\""; print "}"; print "]" }' > "$fixture/pretty.json"
+  json_fields "$fixture/pretty.json" releases 2 > "$fixture/pretty-fields"
+  cmp "$fixture/compact-fields" "$fixture/pretty-fields" || fail 'self-test: pretty JSON changed release fields'
   case_dir="$test_dir/http-failure"
   mkdir "$case_dir"
   : > "$fixture/http-failure"
