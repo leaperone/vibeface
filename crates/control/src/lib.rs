@@ -10,7 +10,6 @@ use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -19,8 +18,6 @@ use tokio::{
 
 pub const UPDATE_PROTOCOL: u32 = 1;
 pub const DATA_EPOCH: u32 = 12;
-pub const MAINTENANCE_PROTOCOL: u32 = 1;
-pub const MAINTENANCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_CONTROL_PACKET: usize = 1024 * 1024;
 
 /// A bounded request handled by a standalone core process.  The core owns all data access and
