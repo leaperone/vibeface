@@ -46,6 +46,11 @@ async fn main() -> Result<()> {
             Err(error) => vibeface_control::ControlResponse::failure(format!("{error:#}")),
         };
         let mut output = serde_json::to_vec(&response)?;
+        if output.len() > vibeface_control::MAX_CONTROL_PACKET {
+            output = serde_json::to_vec(&vibeface_control::ControlResponse::failure(
+                "core control response is too large",
+            ))?;
+        }
         output.push(b'\n');
         std::io::stdout().write_all(&output)?;
         return Ok(());

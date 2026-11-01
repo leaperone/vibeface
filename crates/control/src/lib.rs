@@ -88,6 +88,25 @@ impl ControlResponse {
     }
 }
 
+async fn read_bounded<R>(mut stream: R, limit: usize, label: &str) -> Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = stream.read(&mut chunk).await?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        ensure!(
+            bytes.len().saturating_add(count) <= limit,
+            "core control {label} exceeds {limit} bytes"
+        );
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+}
+
 /// Execute one bounded request in the sibling core binary and decode its single JSON response.
 pub async fn request(core: &Path, request: &ControlRequest) -> Result<Value> {
     ensure!(core.is_absolute(), "core executable path must be absolute");
@@ -111,27 +130,27 @@ pub async fn request(core: &Path, request: &ControlRequest) -> Result<Value> {
     );
     stdin.write_all(&bytes).await?;
     drop(stdin);
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .context("core control stdout unavailable")?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .context("core control stderr unavailable")?;
-    let mut output = Vec::new();
-    let mut error_output = Vec::new();
-    let (stdout_result, stderr_result) = tokio::join!(
-        stdout.read_to_end(&mut output),
-        stderr.read_to_end(&mut error_output),
+    let streams = tokio::try_join!(
+        read_bounded(stdout, MAX_CONTROL_PACKET, "stdout"),
+        read_bounded(stderr, MAX_CONTROL_PACKET, "stderr"),
     );
-    stdout_result?;
-    stderr_result?;
+    let (output, error_output) = match streams {
+        Ok(streams) => streams,
+        Err(error) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error);
+        }
+    };
     let status = child.wait().await?;
-    ensure!(
-        output.len() <= MAX_CONTROL_PACKET,
-        "core control response is too large"
-    );
     if !status.success() && output.is_empty() {
         bail!(
             "core control process failed: {}",
@@ -157,3 +176,28 @@ pub fn sibling_core(cli: &Path) -> Result<PathBuf> {
 
 pub mod agent;
 pub mod maintenance;
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn control_client_bounds_child_output_before_waiting_for_exit() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("vibeface-control-output-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"#!/bin/sh\nhead -c 1048577 /dev/zero\n")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        let error = request(
+            &path,
+            &ControlRequest::Inspect {
+                data_dir: "/tmp/vibeface-control-test".into(),
+            },
+        )
+        .await
+        .expect_err("oversized child output must be rejected");
+        assert!(error.to_string().contains("stdout exceeds"), "{error:#}");
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+}
