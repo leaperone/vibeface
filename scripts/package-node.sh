@@ -132,7 +132,7 @@ if [[ -f "$repo/LICENSE" ]]; then cp "$repo/LICENSE" "$package/"; fi
 cat > "$package/RUNTIME-REQUIREMENTS.md" <<'REQUIREMENTS'
 # Runtime requirements
 
-The archive contains the Rust node binary. Install the provider tools separately before enabling the bot.
+The archive contains the CLI, Core, and static browser application. Install the provider tools separately before enabling the bot.
 
 - Codex bots and native App Server access need the `codex` CLI and its authenticated account.
 - Cursor scheduling needs the official Cursor SDK bridge executable and CURSOR_API_KEY in the service environment.

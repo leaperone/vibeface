@@ -679,8 +679,8 @@ async fn join(options: Join) -> Result<()> {
             &data_dir,
             ControlRequest::Join {
                 data_dir: data_dir.clone(),
-                link: options.link,
-                name: options.name,
+                link: options.link.clone(),
+                name: options.name.clone(),
             },
         )
         .await?;
@@ -688,6 +688,9 @@ async fn join(options: Join) -> Result<()> {
             Some("joined") => {
                 println!("已加入。运行 vibeface 后就能连接。");
                 Ok(())
+            }
+            Some("waiting" | "confirming") => {
+                join_through_running_node(&data_dir, &options.link, &options.name).await
             }
             Some("failed") => bail!(join_failure_text(
                 result["reason"].as_str().unwrap_or_default()
@@ -738,7 +741,7 @@ async fn join_through_running_node(data_dir: &Path, link: &str, name: &str) -> R
         unreachable = 0;
         let status = response.join.unwrap_or(Value::Null);
         let state = status["status"].as_str().unwrap_or_default();
-        if shown.as_deref() != Some(state) {
+        if shown.as_ref() != Some(&status) {
             match state {
                 "waiting" => println!("已提交加入请求，等待管理设备批准。"),
                 "confirming" => println!(
@@ -756,7 +759,7 @@ async fn join_through_running_node(data_dir: &Path, link: &str, name: &str) -> R
                 "cancelled" => bail!("这次加入已在这台电脑的网页上取消。"),
                 _ => println!("{}", serde_json::to_string(&status)?),
             }
-            shown = Some(state.to_owned());
+            shown = Some(status.clone());
         }
         if state != "waiting" && state != "confirming" {
             return Ok(());
