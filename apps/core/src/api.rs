@@ -1,4 +1,5 @@
 use crate::{identity::local::BootstrapCapability, runtime::Runtime};
+mod static_assets;
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
@@ -13,9 +14,12 @@ use serde_json::{Value, json};
 use std::{
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
     sync::Arc,
 };
 use tokio::net::TcpListener;
+
+use static_assets::{DEFAULT_CONTENT_SECURITY_POLICY, StaticAssets};
 
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// The Cursor SDK posts tool calls to this path; `vibeface tool` posts the same shape.
@@ -32,14 +36,16 @@ struct App {
     node: Arc<Runtime>,
     sites: Vec<Site>,
     clients: Arc<tokio::sync::Semaphore>,
+    assets: Option<Arc<StaticAssets>>,
 }
 
 impl App {
-    fn new(node: Arc<Runtime>, sites: Vec<Site>) -> Self {
+    fn new(node: Arc<Runtime>, sites: Vec<Site>, assets: Option<Arc<StaticAssets>>) -> Self {
         Self {
             node,
             sites,
             clients: Arc::new(tokio::sync::Semaphore::new(MAX_CLIENT_SOCKETS)),
+            assets,
         }
     }
 }
@@ -115,7 +121,8 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub async fn serve(node: Arc<Runtime>) -> Result<()> {
+pub async fn serve(node: Arc<Runtime>, app_dir: Option<PathBuf>) -> Result<()> {
+    let assets = app_dir.map(StaticAssets::load).transpose()?.map(Arc::new);
     let site = Site::parse(&node.config.public_url)?;
     let sites = node
         .config
@@ -137,7 +144,7 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
         return match listener {
             Some(listener) => axum::serve(
                 listener,
-                browser_router(node.clone(), sites, false)
+                browser_router_with_assets(node.clone(), sites, false, assets.clone())
                     .into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
@@ -157,7 +164,12 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
         node.local_access
             .publish_listener(local_url.clone(), node.identity.device_id()?)?;
     }
-    let local = browser_router(node.clone(), vec![Site::parse(&local_url)?], true);
+    let local = browser_router_with_assets(
+        node.clone(),
+        vec![Site::parse(&local_url)?],
+        true,
+        assets.clone(),
+    );
     // Codex threads keep the tool URL they were created with, so the port is reused across
     // starts when free; a new port means new threads.
     let port_file = node.data_dir.join("tool-port");
@@ -184,7 +196,7 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
                 Some(listener) => {
                     axum::serve(
                         listener,
-                        browser_router(node.clone(), sites, false)
+                        browser_router_with_assets(node.clone(), sites, false, assets.clone())
                             .into_make_service_with_connect_info::<SocketAddr>(),
                     )
                     .await
@@ -211,7 +223,7 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
 }
 
 fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
-    let app = App::new(node, vec![site]);
+    let app = App::new(node, vec![site], None);
     Router::new()
         .route(TOOL_PATH, post(tool))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES / 2))
@@ -236,11 +248,21 @@ pub fn router(node: Arc<Runtime>) -> Router {
 }
 
 fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
-    browser_router(node, sites, false)
+    browser_router_with_assets(node, sites, false, None)
 }
 
+#[cfg(test)]
 fn browser_router(node: Arc<Runtime>, sites: Vec<Site>, local: bool) -> Router {
-    let app = App::new(node, sites);
+    browser_router_with_assets(node, sites, local, None)
+}
+
+fn browser_router_with_assets(
+    node: Arc<Runtime>,
+    sites: Vec<Site>,
+    local: bool,
+    assets: Option<Arc<StaticAssets>>,
+) -> Router {
+    let app = App::new(node, sites, assets);
     let mut routes = Router::new();
     if app.node.config.web_enabled {
         routes = routes
@@ -328,7 +350,10 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(web_assets::CONTENT_SECURITY_POLICY),
+        app.assets.as_ref().map_or_else(
+            || HeaderValue::from_static(DEFAULT_CONTENT_SECURITY_POLICY),
+            |assets| assets.content_security_policy.clone(),
+        ),
     );
     response
 }
@@ -822,11 +847,7 @@ async fn client_gateway(State(app): State<App>, websocket: WebSocketUpgrade) -> 
         })
 }
 
-mod web_assets {
-    include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
-}
-
-async fn frontend(method: Method, uri: axum::http::Uri) -> Response {
+async fn frontend(State(app): State<App>, method: Method, uri: axum::http::Uri) -> Response {
     let path = uri.path();
     if path == "/api" || path.starts_with("/api/") || path.starts_with("/sdk.v1.") {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
@@ -834,17 +855,25 @@ async fn frontend(method: Method, uri: axum::http::Uri) -> Response {
     if method != Method::GET && method != Method::HEAD {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    if let Some(file) = web_assets::get(path) {
-        let mut response = ([(header::CONTENT_TYPE, file.content_type)], file.body).into_response();
+    if path == "/_headers"
+        || path == "/_redirects"
+        || path.split('/').any(|segment| segment.starts_with('.'))
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(assets) = app.assets.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if path == "/" {
+        return static_response(assets.shell_file(), "no-cache");
+    }
+    if let Some(file) = assets.read(path).await {
         let cache = if path.starts_with("/assets/") {
             "public, max-age=31536000, immutable"
         } else {
             "no-cache"
         };
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
-        return response;
+        return static_response(file, cache);
     }
     if path == "/assets"
         || path.starts_with("/assets/")
@@ -854,26 +883,37 @@ async fn frontend(method: Method, uri: axum::http::Uri) -> Response {
     {
         return StatusCode::NOT_FOUND.into_response();
     }
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        web_assets::get("/_shell.html")
-            .expect("embedded SPA shell")
-            .body,
-    )
-        .into_response()
+    static_response(assets.shell_file(), "no-cache")
 }
 
-async fn crypto_javascript() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../../app/generated/vibeface_secure.js"),
-    )
+fn static_response(file: static_assets::StaticFile, cache: &'static str) -> Response {
+    let mut response = ([(header::CONTENT_TYPE, file.content_type)], file.body).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    response
 }
-async fn crypto_wasm() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/wasm")],
-        include_bytes!("../../app/generated/vibeface_secure_bg.wasm").as_slice(),
-    )
+
+async fn crypto_javascript(State(app): State<App>) -> Response {
+    let Some(assets) = app.assets.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    assets
+        .read("/vibeface_secure.js")
+        .await
+        .map(|file| static_response(file, "no-cache"))
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+}
+
+async fn crypto_wasm(State(app): State<App>) -> Response {
+    let Some(assets) = app.assets.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    assets
+        .read("/vibeface_secure_bg.wasm")
+        .await
+        .map(|file| static_response(file, "no-cache"))
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
 
 #[cfg(test)]

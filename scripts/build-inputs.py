@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bind generated Web/WASM files to their source inputs and exact output set."""
 import argparse
+import base64
 import hashlib
 import json
 import shutil
@@ -22,6 +23,28 @@ INPUTS = {
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def content_security_policy(shell):
+    hashes = []
+    rest = shell
+    while "<script" in rest:
+        _, script = rest.split("<script", 1)
+        try:
+            opening, content = script.split(">", 1)
+            body, rest = content.split("</script>", 1)
+        except ValueError as error:
+            raise ValueError("web shell contains an unclosed script tag") from error
+        if "src=" not in opening:
+            hashes.append("'sha256-" + base64.b64encode(hashlib.sha256(body.encode()).digest()).decode() + "'")
+    policy = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'"
+    if hashes:
+        policy += " " + " ".join(hashes)
+    return policy + "; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+
+
+def static_headers(policy):
+    return "/*\n  Content-Security-Policy: " + policy + "\n  X-Content-Type-Options: nosniff\n  X-Frame-Options: DENY\n  Referrer-Policy: no-referrer\n"
 
 
 def files(directory):
@@ -100,7 +123,18 @@ def finish(repo, component):
     if snapshot(repo, component) != inputs:
         raise ValueError("source inputs changed during the build; rebuild the component")
     output = repo / OUTPUTS[component]
-    receipt = {"version": 1, "component": component, "inputs": inputs, "outputs": files(output)}
+    extra = {}
+    if component == "web":
+        shell = output / "_shell.html"
+        if not shell.is_file() or shell.is_symlink():
+            raise ValueError("web output is missing a regular _shell.html")
+        policy = content_security_policy(shell.read_text())
+        headers = output / "_headers"
+        if headers.is_symlink():
+            raise ValueError("web output must not contain symlinks")
+        headers.write_text(static_headers(policy))
+        extra["content_security_policy"] = policy
+    receipt = {"version": 1, "component": component, "inputs": inputs, **extra, "outputs": files(output)}
     (output / RECEIPT).write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
     state.unlink()
 
@@ -113,6 +147,13 @@ def check(repo, component):
         raise ValueError(f"{component} build receipt is missing; run its build script") from error
     if receipt.get("version") != 1 or receipt.get("component") != component:
         raise ValueError("invalid build receipt")
+    if component == "web":
+        policy = receipt.get("content_security_policy")
+        if not isinstance(policy, str) or not policy:
+            raise ValueError("web build receipt has no content security policy")
+        headers = repo / OUTPUTS[component] / "_headers"
+        if headers.is_symlink() or not headers.is_file() or headers.read_text() != static_headers(policy):
+            raise ValueError("web static headers do not match the build receipt")
     if receipt.get("inputs") != snapshot(repo, component):
         raise ValueError(f"{component} source inputs changed; run its build script")
     if receipt.get("outputs") != files(output):
@@ -131,7 +172,9 @@ def self_test():
         for component in OUTPUTS:
             prepare(repo, component)
             output = repo / OUTPUTS[component]
-            (output / "asset").write_text(component)
+            (output / ("_shell.html" if component == "web" else "asset")).write_text(
+                "<script>fixture</script>" if component == "web" else component
+            )
             finish(repo, component)
             check(repo, component)
         public = repo / "apps/app/public"

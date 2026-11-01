@@ -22,4 +22,15 @@ pnpm --filter @vibeface/secure-native run typecheck
 pnpm --filter vibeface-mobile run typecheck
 pnpm run build
 [[ -s dist/client/_shell.html ]] || { echo 'SPA shell was not written to dist/client/_shell.html' >&2; exit 1; }
+cp generated/vibeface_secure.js generated/vibeface_secure_bg.wasm dist/client/
+[[ -s dist/client/vibeface_secure.js && -s dist/client/vibeface_secure_bg.wasm ]] || {
+  echo 'Browser crypto files were not copied into the static App output.' >&2
+  exit 1
+}
+cp dist/client/_shell.html dist/client/index.html
+cat > dist/client/_redirects <<'EOF'
+/api/* /__vibeface_missing_api__ 404
+/sdk.v1.* /__vibeface_missing_api__ 404
+/* /_shell.html 200
+EOF
 python3 "$repo/scripts/build-inputs.py" finish web

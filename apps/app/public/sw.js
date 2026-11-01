@@ -1,7 +1,7 @@
 // Keeps the app shell (HTML, scripts, styles, WASM) so the page opens while this Gateway is down.
 // Network first: an online Gateway always serves the current build; the cache is only the fallback.
 const CACHE = 'vibeface-shell-v1'
-const SHELL = ['/', '/generated/vibeface_secure.js', '/generated/vibeface_secure_bg.wasm', '/manifest.webmanifest', '/icon.svg']
+const SHELL = ['/', '/vibeface_secure.js', '/vibeface_secure_bg.wasm', '/manifest.webmanifest', '/icon.svg']
 const cacheable = url => url.origin === location.origin && !url.pathname.startsWith('/api/') && url.pathname !== '/sw.js'
 
 async function keep(urls) {
