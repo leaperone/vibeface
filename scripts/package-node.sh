@@ -64,13 +64,9 @@ web="$repo/apps/app/dist/client"
 release_rustflags="$(python3 "$repo/scripts/release-rustflags.py")"
 CARGO_ENCODED_RUSTFLAGS="$release_rustflags" cargo "${build_args[@]}"
 [[ -x "$cli_binary" && -x "$core_binary" ]] || { printf 'Release binaries are missing: %s and %s\n' "$cli_binary" "$core_binary" >&2; exit 1; }
-version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$repo/Cargo.toml" | head -n 1)"
+version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$repo/apps/cli/Cargo.toml" | head -n 1)"
 [[ -n "$version" && -n "$target" ]] || { echo 'Could not determine package version or target.' >&2; exit 1; }
 case "$version$target" in *[!a-zA-Z0-9._-]*) echo 'Invalid package version or target.' >&2; exit 1 ;; esac
-source_commit='null'
-if [[ -z "$(git status --porcelain --untracked-files=normal)" ]]; then
-  source_commit="\"$(git rev-parse HEAD)\""
-fi
 
 mkdir -p "$output"
 output="$(cd "$output" && pwd)"
@@ -104,10 +100,6 @@ if [[ "$target" == *-apple-darwin && -n "${VIBEFACE_CODESIGN_IDENTITY:-}" ]]; th
     xcrun notarytool log "$submission" --key "$VIBEFACE_NOTARY_KEY" --key-id "$VIBEFACE_NOTARY_KEY_ID" --issuer "$VIBEFACE_NOTARY_ISSUER"
   fi
 fi
-data_epoch="$(sed -n 's/^pub const DATA_EPOCH: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/crates/control/src/lib.rs")"
-update_protocol="$(sed -n 's/^pub const UPDATE_PROTOCOL: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/crates/control/src/lib.rs")"
-[[ -n "$data_epoch" && -n "$update_protocol" ]] || { echo 'DATA_EPOCH or UPDATE_PROTOCOL not found in crates/control/src/lib.rs' >&2; exit 1; }
-printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":%s,"data_epoch":%s}\n' "$version" "$target" "$source_commit" "$update_protocol" "$data_epoch" > "$package/BUILD-INFO.json"
 cp -a "$web/." "$package/web/"
 cp "$repo/scripts/install-node-service.sh" "$package/scripts/"
 cp "$repo/README.md" "$package/"
@@ -139,6 +131,7 @@ The archive contains the CLI, Core, and static browser application. Install the 
 
 Use absolute provider paths in `config.json` when running a background service. No credentials or provider runtimes are included.
 REQUIREMENTS
+PACKAGE_TARGET="$target" python3 "$repo/scripts/release.py" seal-bundle "$package"
 python3 - "$output/$name.tar.gz" "$package" "$name" <<'PY'
 import sys
 import tarfile

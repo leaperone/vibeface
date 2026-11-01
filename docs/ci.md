@@ -7,7 +7,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 `.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。每次触发都生成计划，`ci-gate` 要求选中的任务全部成功。没有顶层 `paths` 筛选。
 
-开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态。需要验证移动端或 macOS 时，从 Actions 手动运行对应 workflow。`main` push、定时、手动运行、merge queue 和 `v*` Tag 仍按各自计划检查；推送 `v*` Tag 会运行完整发布检查、原生制品和应用发布构建，合并后的制品与实际体验由开发者自行验收。
+开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态。需要验证移动端或 macOS 时，从 Actions 手动运行对应 workflow。`main` push、定时、手动运行、merge queue 和 应用前缀 tag Tag 仍按各自计划检查；推送 应用前缀 tag Tag 会运行完整发布检查、原生制品和应用发布构建，合并后的制品与实际体验由开发者自行验收。
 
 ## main 与 merge queue 的核心检查
 
@@ -113,7 +113,7 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 ## 定期、手动和发布检查
 
-每日 UTC 03:23 定时、Actions 中手动运行 `ci` 和 `v*` tag 强制执行扩展检查，不受路径影响。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或三平台打包。开发分支 PR 不触发 `ci`。`v*` tag 还会构建 macOS 和 Android 发布资产；手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
+每日 UTC 03:23 定时、Actions 中手动运行 `ci` 和 应用前缀 tag tag 强制执行扩展检查，不受路径影响。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或三平台打包。开发分支 PR 不触发 `ci`。应用前缀 tag tag 还会构建 macOS 和 Android 发布资产；手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
 
 | 扩展检查 | 执行范围 |
 | --- | --- |
@@ -208,3 +208,5 @@ Android 使用官方 Gradle 缓存动作和 Gradle build cache，保留 `arm64-v
 `ci-gate` 仍要求选中的任务成功，失败、取消、缺失或意外跳过均拒绝通过，并重新计算计划以防弱化覆盖。每次运行都使用固定名称汇总结果。它服务于 main、merge queue、定时、手动和 Tag 运行，不是开发分支 PR 的必需检查。
 
 GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate` 列为必需状态。开发分支可以直接合并；只有版本 Tag 的完整 gate、制品和发布检查仍是发布路径的一部分。
+
+应用前缀 tag 由 `release.yml` 独立校验、构建和发布，不进入普通 CI 的全产品发布链。参见 [构建与发布](releasing.md#按应用独立发布)。

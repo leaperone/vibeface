@@ -62,6 +62,7 @@ struct Policy {
 
 #[derive(Deserialize)]
 struct Manifest {
+    core_version: semver::Version,
     version: semver::Version,
     update_protocol: u32,
     data_epoch: u32,
@@ -361,7 +362,7 @@ pub async fn run(options: Update) -> Result<()> {
             let health: MaintenanceHealth = serde_json::from_value(lease.health.clone())
                 .context("maintenance response has invalid health")?;
             ensure!(
-                health.version == current.to_string(),
+                health.version == manifest(&previous)?.core_version.to_string(),
                 "running node does not match current package"
             );
             ensure!(
@@ -670,7 +671,7 @@ async fn wait_for_node_lock(data: &Path) -> Result<File> {
 }
 
 async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
-    let version = manifest(package)?.version.to_string();
+    let version = manifest(package)?.core_version.to_string();
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -1117,7 +1118,7 @@ mod tests {
         fs::write(
             directory.join("BUILD-INFO.json"),
             format!(
-                r#"{{"version":"{version}","update_protocol":{},"data_epoch":{}}}"#,
+                r#"{{"version":"{version}","core_version":"{version}","update_protocol":{},"data_epoch":{}}}"#,
                 vibeface_control::UPDATE_PROTOCOL,
                 vibeface_control::DATA_EPOCH
             ),
@@ -1239,7 +1240,7 @@ mod tests {
         fs::write(
             old.join("BUILD-INFO.json"),
             format!(
-                r#"{{"version":"1.0.0","update_protocol":{},"data_epoch":{}}}"#,
+                r#"{{"version":"1.0.0","core_version":"1.0.0","update_protocol":{},"data_epoch":{}}}"#,
                 vibeface_control::UPDATE_PROTOCOL,
                 vibeface_control::DATA_EPOCH + 1
             ),
@@ -1249,7 +1250,7 @@ mod tests {
         fs::write(
             old.join("BUILD-INFO.json"),
             format!(
-                r#"{{"version":"1.0.0","update_protocol":{},"data_epoch":{}}}"#,
+                r#"{{"version":"1.0.0","core_version":"1.0.0","update_protocol":{},"data_epoch":{}}}"#,
                 vibeface_control::UPDATE_PROTOCOL + 1,
                 vibeface_control::DATA_EPOCH
             ),

@@ -3,7 +3,7 @@ base_branch = "main"
 [[scope]]
 prefix = ""
 name = "CI policy and Python syntax"
-check = "python3 scripts/ci.py --self-test && python3 scripts/check-delivery.py --self-test && python3 scripts/install-delivery-toolchain.py --self-test && python3 scripts/run-delivery-live.py --self-test && actionlint .github/workflows/ci.yml"
+check = "python3 scripts/ci.py --self-test && python3 scripts/check-delivery.py --self-test && python3 scripts/install-delivery-toolchain.py --self-test && python3 scripts/run-delivery-live.py --self-test && actionlint"
 build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in (\"scripts/ci.py\", \"scripts/verify-node.py\", \"scripts/build-inputs.py\", \"scripts/check-delivery.py\", \"scripts/install-delivery-toolchain.py\", \"scripts/run-delivery-live.py\")]'"
 
 [[domain_check]]
@@ -39,7 +39,7 @@ command = "node --check scripts/crypto-client.mjs && node --check npm/bin/vibefa
 [[domain_check]]
 name = "Delivery scripts and workflow"
 trigger_paths = ["install.sh", "scripts/*.sh", ".github/workflows/**"]
-command = "bash -n install.sh && bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && bash install.sh --self-test && actionlint .github/workflows/ci.yml .github/workflows/npm-publish.yml"
+command = "bash -n install.sh && bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && bash install.sh --self-test && python3 scripts/release.py self-test && bash -n scripts/sign-release.sh && actionlint"
 
 [[domain_check]]
 name = "Migration integrity"

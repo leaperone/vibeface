@@ -105,8 +105,8 @@ pub async fn check(channel: Channel) -> Result<Option<Release>> {
 }
 
 fn channel_version(tag: &str, channel: Channel) -> Option<Version> {
-    let version = Version::parse(tag.strip_prefix('v')?).ok()?;
-    if !version.build.is_empty() || format!("v{version}") != tag {
+    let version = Version::parse(tag.strip_prefix("cli-v")?).ok()?;
+    if !version.build.is_empty() || format!("cli-v{version}") != tag {
         return None;
     }
     match channel {
@@ -351,11 +351,11 @@ pub async fn stage(release: &Release, install_root: &Path) -> Result<PathBuf> {
     let package =
         tokio::task::spawn_blocking(move || unpack(&archive_path, &unpack_root, &expected_name))
             .await??;
-    verify_build(&package, release)?;
+    let build = verify_build(&package, release)?;
     verify_binary(&package.join("vibeface"), &release.version, "vibeface").await?;
     verify_binary(
         &package.join("vibeface-core"),
-        &release.version,
+        &Version::parse(&build.core_version)?,
         "vibeface-core",
     )
     .await?;
@@ -593,6 +593,10 @@ fn unpack(archive: &Path, destination: &Path, root_name: &str) -> Result<PathBuf
 
 #[derive(Deserialize)]
 struct BuildInfo {
+    core_version: String,
+    core_source_commit: String,
+    app_version: String,
+    app_source_commit: String,
     version: String,
     target: String,
     source_commit: String,
@@ -600,12 +604,43 @@ struct BuildInfo {
     data_epoch: u32,
 }
 
-fn verify_build(package: &Path, release: &Release) -> Result<()> {
+fn verify_build(package: &Path, release: &Release) -> Result<BuildInfo> {
     let metadata = fs::symlink_metadata(package.join("BUILD-INFO.json"))?;
     ensure!(
         metadata.file_type().is_file() && metadata.len() <= 4096,
         "BUILD-INFO exceeds limit"
     );
+    let entries = tree(package)?;
+    let checksums = fs::read_to_string(package.join("FILES.sha256"))?;
+    ensure!(
+        checksums.len() <= 1024 * 1024,
+        "file checksums exceed limit"
+    );
+    let mut declared = BTreeMap::new();
+    for line in checksums.lines() {
+        let (hash, name) = line.split_once("  ").context("invalid file checksum")?;
+        ensure!(name != "FILES.sha256", "self-referencing checksum");
+        ensure!(
+            declared
+                .insert(PathBuf::from(name), hash.to_owned())
+                .is_none(),
+            "duplicate file checksum"
+        );
+    }
+    let actual: BTreeMap<_, _> = entries
+        .iter()
+        .filter_map(|(name, entry)| match entry {
+            TreeEntry::File { sha256, .. } if name != Path::new("FILES.sha256") => Some((
+                name.clone(),
+                sha256
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            )),
+            _ => None,
+        })
+        .collect();
+    ensure!(declared == actual, "package file checksums differ");
     let build: BuildInfo = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
         .context("package does not declare a supported update protocol and data epoch")?;
     ensure!(
@@ -613,6 +648,13 @@ fn verify_build(package: &Path, release: &Release) -> Result<()> {
             && build.target == release.target
             && build.source_commit == release.source_commit,
         "package build identity does not match the official release tag"
+    );
+    ensure!(
+        Version::parse(&build.core_version).is_ok()
+            && Version::parse(&build.app_version).is_ok()
+            && valid_commit(&build.core_source_commit)
+            && valid_commit(&build.app_source_commit),
+        "invalid component identity"
     );
     ensure!(
         build.update_protocol == UPDATE_PROTOCOL && build.data_epoch == DATA_EPOCH,
@@ -651,7 +693,7 @@ fn verify_build(package: &Path, release: &Release) -> Result<()> {
             && fs::read_dir(package.join("web"))?.next().is_some(),
         "package web directory is missing or empty"
     );
-    Ok(())
+    Ok(build)
 }
 
 async fn verify_binary(binary: &Path, version: &Version, name: &str) -> Result<()> {
@@ -750,28 +792,28 @@ mod tests {
     #[test]
     fn channels_accept_only_canonical_release_tags() {
         assert_eq!(
-            channel_version("v1.2.3", Channel::Stable),
+            channel_version("cli-v1.2.3", Channel::Stable),
             Some(Version::new(1, 2, 3))
         );
-        assert!(channel_version("v1.2.3-nightly.20260228.1", Channel::Nightly).is_some());
-        assert!(channel_version("v1.2.3-nightly.20240229.10", Channel::Nightly).is_some());
+        assert!(channel_version("cli-v1.2.3-nightly.20260228.1", Channel::Nightly).is_some());
+        assert!(channel_version("cli-v1.2.3-nightly.20240229.10", Channel::Nightly).is_some());
         for tag in [
             "1.2.3",
-            "v01.2.3",
-            "v1.2.3+build",
-            "v1.2.3-rc.1",
-            "v1.2.3-nightly.20260229.1",
-            "v1.2.3-nightly.20261301.1",
-            "v1.2.3-nightly.20260100.1",
-            "v1.2.3-nightly.20260101.0",
-            "v1.2.3-nightly.20260101.01",
-            "v1.2.3-nightly.20260101.1.extra",
+            "cli-v01.2.3",
+            "cli-v1.2.3+build",
+            "cli-v1.2.3-rc.1",
+            "cli-v1.2.3-nightly.20260229.1",
+            "cli-v1.2.3-nightly.20261301.1",
+            "cli-v1.2.3-nightly.20260100.1",
+            "cli-v1.2.3-nightly.20260101.0",
+            "cli-v1.2.3-nightly.20260101.01",
+            "cli-v1.2.3-nightly.20260101.1.extra",
         ] {
             assert!(channel_version(tag, Channel::Stable).is_none(), "{tag}");
             assert!(channel_version(tag, Channel::Nightly).is_none(), "{tag}");
         }
-        assert!(channel_version("v1.2.3", Channel::Nightly).is_none());
-        assert!(channel_version("v1.2.3-nightly.20260101.1", Channel::Stable).is_none());
+        assert!(channel_version("cli-v1.2.3", Channel::Nightly).is_none());
+        assert!(channel_version("cli-v1.2.3-nightly.20260101.1", Channel::Stable).is_none());
         assert!(
             Version::parse("1.2.3-nightly.20260102.1").unwrap()
                 > Version::parse("1.2.3-nightly.20260101.10").unwrap()
@@ -936,14 +978,14 @@ mod tests {
         fs::create_dir(&copy).unwrap();
         let release = Release {
             version: Version::new(0, 0, 2),
-            tag: "v0.0.2".to_owned(),
+            tag: "cli-v0.0.2".to_owned(),
             target: host_target().unwrap().to_owned(),
             source_commit: "a".repeat(40),
             archive_url: String::new(),
             checksum_url: String::new(),
             archive_size: 1,
         };
-        let build = serde_json::json!({"version": release.version.to_string(), "target": release.target, "source_commit": release.source_commit, "update_protocol": UPDATE_PROTOCOL, "data_epoch": DATA_EPOCH});
+        let build = serde_json::json!({"version": release.version.to_string(), "target": release.target, "source_commit": release.source_commit, "update_protocol": UPDATE_PROTOCOL, "data_epoch": DATA_EPOCH, "core_version": "0.0.3", "core_source_commit": "b".repeat(40), "app_version": "0.0.1", "app_source_commit": "c".repeat(40)});
         for dir in [&package, &copy] {
             for file in [
                 "README.md",
@@ -967,7 +1009,7 @@ mod tests {
             .unwrap();
             fs::write(
                 dir.join("vibeface-core"),
-                b"#!/bin/sh\nprintf 'vibeface-core 0.0.2\n'\n",
+                b"#!/bin/sh\nprintf 'vibeface-core 0.0.3\n'\n",
             )
             .unwrap();
             fs::create_dir_all(dir.join("web")).unwrap();
@@ -976,13 +1018,31 @@ mod tests {
             fs::set_permissions(dir.join("vibeface-core"), fs::Permissions::from_mode(0o755))
                 .unwrap();
         }
-        verify_build(&package, &release).unwrap();
+        for dir in [&package, &copy] {
+            let checksums = tree(dir)
+                .unwrap()
+                .into_iter()
+                .filter_map(|(path, entry)| {
+                    if let TreeEntry::File { sha256, .. } = entry {
+                        let hash = sha256
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>();
+                        Some(format!("{hash}  {}\n", path.display()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<String>();
+            fs::write(dir.join("FILES.sha256"), checksums).unwrap();
+        }
+        let component_build = verify_build(&package, &release).unwrap();
         verify_binary(&package.join("vibeface"), &release.version, "vibeface")
             .await
             .unwrap();
         verify_binary(
             &package.join("vibeface-core"),
-            &release.version,
+            &Version::parse(&component_build.core_version).unwrap(),
             "vibeface-core",
         )
         .await

@@ -3,7 +3,6 @@ name: ci
 on:
   push:
     branches: [main]
-    tags: ['v*']
   merge_group:
     types: [checks_requested]
   schedule:
@@ -442,7 +441,7 @@ jobs:
           info = json.load(open(sys.argv[1]))
           config = pathlib.Path("crates/control/src/lib.rs").read_text()
           protocol, epoch = (int(re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1]) for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
-          assert set(info) == {"version", "target", "source_commit", "update_protocol", "data_epoch"}
+          assert set(info) == {"version", "target", "source_commit", "update_protocol", "data_epoch", "core_version", "core_source_commit", "app_version", "app_source_commit"}
           assert info["update_protocol"] == protocol and info["data_epoch"] == epoch
           assert info["source_commit"] == os.environ["GITHUB_SHA"]
           assert info["target"] == os.environ["PACKAGE_TARGET"]
@@ -457,7 +456,7 @@ jobs:
           assert (web / "vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm")
           assert (binary.parent / "vibeface-core").stat().st_size > 0
           assert subprocess.check_output([str(binary), "--version"], text=True).strip() == f'vibeface {info["version"]}'
-          assert subprocess.check_output([str(binary.parent / "vibeface-core"), "--version"], text=True).strip() == f'vibeface-core {info["version"]}'
+          assert subprocess.check_output([str(binary.parent / "vibeface-core"), "--version"], text=True).strip() == f'vibeface-core {info["core_version"]}'
           PY
           "$package/vibeface" --help
           "$package/vibeface-core" --help
@@ -816,7 +815,8 @@ jobs:
           prefix="$PWD/.artifacts/npm-installed"
           npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$PWD/.artifacts/npm/leaperone-vibeface-$PACKAGE_VERSION.tgz"
           [[ "$("$prefix/bin/vibeface" --version)" == "vibeface $PACKAGE_VERSION" ]]
-          [[ "$("$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/vibeface-core" --version)" == "vibeface-core $PACKAGE_VERSION" ]]
+          core_version="$(node -p "require('$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/BUILD-INFO.json').core_version")"
+          [[ "$("$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/vibeface-core" --version)" == "vibeface-core $core_version" ]]
           "$prefix/bin/vibeface" --help
       - name: Verify npm startup and bundled web
         env:
@@ -838,78 +838,4 @@ jobs:
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
         run: python3 scripts/ci.py gate --needs-env CI_NEEDS ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_live && '--delivery-live' || '' }}
-
-  app-build:
-    needs: [plan]
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-    uses: ./.github/workflows/release-apps.yml
-    with:
-      version: v${{ needs.plan.outputs.version }}
-      prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
-
-  publish:
-    # ci-gate needs jobs that are skipped on tags; without !cancelled() a skipped ancestor skips this.
-    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.plan.result == 'success' && needs.ci-gate.result == 'success' && needs.package.result == 'success' && needs.app-build.result == 'success' }}
-    needs: [plan, ci-gate, package, app-build]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      RELEASE_TAG: ${{ github.ref_name }}
-      VERSION: ${{ needs.plan.outputs.version }}
-      RELEASE_CHANNEL: ${{ needs.plan.outputs.channel }}
-      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: node-package-*-${{ github.sha }}
-          path: packages
-          merge-multiple: true
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-android-${{ github.sha }}
-          path: packages
-      - name: Verify all assets before publishing
-        run: |
-          [[ "$RELEASE_TAG" == "v$VERSION" ]]
-          shopt -s nullglob
-          archives=(packages/*.tar.gz)
-          checksums=(packages/*.tar.gz.sha256 packages/*.apk.sha256)
-          files=(packages/*)
-          [[ "${#archives[@]}" == 3 && "${#checksums[@]}" == 4 && "${#files[@]}" == 9 ]]
-          for archive in "${archives[@]}"; do
-            name="$(basename "$archive")"
-            [[ "$name" == "vibeface-$VERSION-"*.tar.gz ]]
-            (cd packages && sha256sum -c "$name.sha256")
-          done
-          for archive in packages/*.apk; do
-            (cd packages && sha256sum -c "$(basename "$archive").sha256")
-          done
-          [[ "$(find packages -maxdepth 1 -name '*.provenance.json' | wc -l)" == 1 ]]
-      - name: Upload complete draft and publish
-        run: |
-          release_flags=(--prerelease="$PRERELEASE" --latest=false)
-          if [[ "$RELEASE_CHANNEL" == stable ]]; then
-            release_flags=(--prerelease=false --latest=true)
-          fi
-          if gh release view "$RELEASE_TAG" --json isDraft > "$RUNNER_TEMP/release.json"; then
-            python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["isDraft"], "Refusing to overwrite a public release"' "$RUNNER_TEMP/release.json"
-          else
-            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --generate-notes --target "$GITHUB_SHA" --prerelease="$PRERELEASE" --latest=false
-          fi
-          gh release upload "$RELEASE_TAG" packages/* --clobber
-          gh release view "$RELEASE_TAG" --json assets > "$RUNNER_TEMP/release-assets.json"
-          python3 - "$RUNNER_TEMP/release-assets.json" <<'PY'
-          import json, pathlib, sys
-          expected = sorted(p.name for p in pathlib.Path("packages").iterdir())
-          actual = sorted(a["name"] for a in json.load(open(sys.argv[1]))["assets"])
-          assert actual == expected, "Draft release asset set differs from verified packages"
-          PY
-          gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/release-download"
-          for asset in packages/*; do
-            cmp "$asset" "$RUNNER_TEMP/release-download/$(basename "$asset")"
-          done
-          gh release edit "$RELEASE_TAG" --draft=false "${release_flags[@]}"
 

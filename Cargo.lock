@@ -6358,7 +6358,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vibeface"
-version = "0.0.1-nightly.20261031.19"
+version = "0.0.1-nightly.20261101.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6419,7 +6419,7 @@ dependencies = [
 
 [[package]]
 name = "vibeface-core"
-version = "0.0.1-nightly.20261031.19"
+version = "0.0.1-nightly.20261101.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",

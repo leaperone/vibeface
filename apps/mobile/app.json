@@ -27,7 +27,8 @@
         "NSBonjourServices": [
           "_vibeface._udp"
         ]
-      }
+      },
+      "buildNumber": "1"
     },
     "android": {
       "package": "one.leaper.vibeface",
@@ -41,7 +42,8 @@
         "android.permission.ACCESS_NETWORK_STATE",
         "android.permission.ACCESS_WIFI_STATE",
         "android.permission.CHANGE_WIFI_MULTICAST_STATE"
-      ]
+      ],
+      "versionCode": 249601
     },
     "plugins": [
       "expo-router",
@@ -105,7 +107,17 @@
       ],
       "expo-secure-store",
       "expo-sharing",
-      ["expo-build-properties", { "android": { "usesCleartextTraffic": true } }]
-    ]
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ]
+    ],
+    "extra": {
+      "releaseVersion": "0.0.1-nightly.20261101.1"
+    }
   }
 }

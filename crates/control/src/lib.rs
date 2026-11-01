@@ -18,7 +18,7 @@ use tokio::{
     process::{Child, Command},
 };
 
-pub const UPDATE_PROTOCOL: u32 = 1;
+pub const UPDATE_PROTOCOL: u32 = 2;
 pub const DATA_EPOCH: u32 = 12;
 pub const MAX_CONTROL_PACKET: usize = 1024 * 1024;
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(30);
