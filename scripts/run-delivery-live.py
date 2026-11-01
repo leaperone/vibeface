@@ -88,8 +88,12 @@ def checked_package(package, expected):
     info = json.loads(regular(package / "BUILD-INFO.json"))
     if set(info) != {"version", "target", "source_commit", "update_protocol", "data_epoch"} or info["source_commit"] != expected or info["target"] != "x86_64-unknown-linux-gnu":
         raise ValueError("Package provenance differs from this Linux source commit")
-    if not (package / "vibeface").is_file() or (package / "vibeface").is_symlink():
-        raise ValueError("Package Node binary is missing")
+    for binary in (package / "vibeface", package / "vibeface-core"):
+        if not binary.is_file() or binary.is_symlink():
+            raise ValueError("Package CLI/Core binary is missing")
+    for name in ("_shell.html", "_headers", ".vibeface-build.json"):
+        if not (package / "web" / name).is_file():
+            raise ValueError("Package static output is incomplete")
     for name in ("vibeface_secure.js", "vibeface_secure_bg.wasm"):
         generated = ROOT / "apps/app/generated" / name
         if digest(package / "web" / name) != digest(generated):
@@ -1285,19 +1289,21 @@ def inside(package, expected):
         for component in ("crypto", "web"):
             command("verify " + component + " build inputs", ["python3", "scripts/build-inputs.py", "check", component], log)
         info = checked_package(package, expected)
-        binary, module = package / "vibeface", package / "web/vibeface_secure.js"
+        binary, core, module = package / "vibeface", package / "vibeface-core", package / "web/vibeface_secure.js"
+        environment["VIBEFACE_APP_DIR"] = str(package / "web")
         provenance = "same-run verified Linux package"
         enter("packaged-runtime")
         if not runtime(binary, module, run / "packaged-runtime", log, environment):
             enter("node-rebuild")
             flags = subprocess.check_output(["python3", "scripts/release-rustflags.py"], cwd=ROOT, env={**environment, "CARGO_TARGET_DIR": "/artifacts/node-target"}, text=True).strip()
-            command("build current Node for sandbox libc", ["cargo", "+1.98.1", "build", "--release", "--locked", "-p", "vibeface", "--target-dir", "/artifacts/node-target"],
+            command("build current CLI and Core for sandbox libc", ["cargo", "+1.98.1", "build", "--release", "--locked", "-p", "vibeface", "-p", "vibeface-core", "--target-dir", "/artifacts/node-target"],
                     log, env={**environment, "CARGO_ENCODED_RUSTFLAGS": flags})
             binary = Path("/artifacts/node-target/release/vibeface")
+            core = Path("/artifacts/node-target/release/vibeface-core")
             if not runtime(binary, module, run / "rebuilt-runtime", log, environment):
                 raise RuntimeError("Source-built Node failed the sandbox runtime check")
             provenance = "actual current-source build after explicit packaged GLIBC incompatibility"
-        summary["node"] = {"origin": provenance, "sha256": digest(binary), "packageSourceCommit": info["source_commit"],
+        summary["node"] = {"origin": provenance, "sha256": digest(binary), "coreSha256": digest(core), "packageSourceCommit": info["source_commit"],
                            "webRuntimePassed": True, "wasmSha256": digest(package / "web/vibeface_secure_bg.wasm")}
         enter("guest-toolchain")
         command("install fixed guest compiler", ["python3", "scripts/install-delivery-toolchain.py"], log, env=environment)
@@ -1323,8 +1329,8 @@ def inside(package, expected):
             "settlement_observer": "/work/contracts/delivery/observe-settlement.mjs"})
         try:
             enter("paid-acceptance")
-            command("thirteen genuine proofs, actual Web and Android order and independent observers", ["python3", "scripts/verify-node.py", "--delivery", "--binary", str(binary),
-                "--crypto-module", str(module), "--artifacts", str(run / "process"), "--delivery-probe", str(probe_target / "debug/vibeface-delivery-probe"),
+            command("thirteen genuine proofs, actual Web and Android order and independent observers", ["python3", "scripts/verify-node.py", "--delivery", "--binary", str(binary), "--core-binary", str(core),
+                "--app-dir", str(package / "web"), "--crypto-module", str(module), "--artifacts", str(run / "process"), "--delivery-probe", str(probe_target / "debug/vibeface-delivery-probe"),
                 "--delivery-config", str(configuration), "--delivery-source-root", "/work", "--delivery-profile", "/work/proofs/delivery/profile.json",
                 "--delivery-ui-control", str(UI / "control.json"), "--delivery-ui-timeout-ms", str(UI_TIMEOUT_MS)], log,
                 env={**environment, "VIBEFACE_DELIVERY_PROGRESS_COMMIT": expected})
@@ -2217,6 +2223,9 @@ def self_test():
             sample = Path(directory) / "package"
             (sample / "web").mkdir(parents=True)
             (sample / "vibeface").write_bytes(b"source-provenance-fixture-only")
+            (sample / "vibeface-core").write_bytes(b"source-provenance-core-fixture-only")
+            for name in ("_shell.html", "_headers", ".vibeface-build.json"):
+                (sample / "web" / name).write_text("fixture")
             for name in ("vibeface_secure.js", "vibeface_secure_bg.wasm"):
                 (generated / name).write_bytes(b"same-run-crypto")
                 (sample / "web" / name).write_bytes(b"same-run-crypto")

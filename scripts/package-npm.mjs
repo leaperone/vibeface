@@ -200,6 +200,8 @@ async function selfTest() {
     assert.equal(JSON.parse(fs.readFileSync(path.join(prefix, 'lib/node_modules/@leaperone/vibeface/package.json'), 'utf8')).name, '@leaperone/vibeface');
     const binary = path.join(prefix, 'bin/vibeface');
     assert.equal(run(binary, ['one two', '--flag']), '["one two","--flag"]\n');
+    const core = path.join(prefix, 'lib/node_modules/@leaperone/vibeface/vendor', targets[0], 'vibeface-core');
+    assert.equal(run(core, ['--version']), `vibeface-core ${version}\n`);
     assert.equal(spawnSync(binary, ['exit']).status, 23);
     const waiting = spawn(binary, ['wait'], { stdio: ['ignore', 'pipe', 'inherit'] });
     try {

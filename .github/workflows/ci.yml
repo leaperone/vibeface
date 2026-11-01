@@ -458,6 +458,7 @@ jobs:
           assert subprocess.check_output([str(binary.parent / "vibeface-core"), "--version"], text=True).strip() == f'vibeface-core {info["version"]}'
           PY
           "$package/vibeface" --help
+          "$package/vibeface-core" --help
           printf 'package=%s\n' "$package" >> "$GITHUB_OUTPUT"
       - name: Verify Developer ID signature
         if: matrix.target == 'aarch64-apple-darwin' && github.event_name != 'merge_group'
@@ -812,6 +813,7 @@ jobs:
           prefix="$PWD/.artifacts/npm-installed"
           npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$PWD/.artifacts/npm/leaperone-vibeface-$PACKAGE_VERSION.tgz"
           [[ "$("$prefix/bin/vibeface" --version)" == "vibeface $PACKAGE_VERSION" ]]
+          [[ "$("$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/vibeface-core" --version)" == "vibeface-core $PACKAGE_VERSION" ]]
           "$prefix/bin/vibeface" --help
       - name: Verify npm startup and bundled web
         env:

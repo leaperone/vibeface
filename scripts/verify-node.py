@@ -7892,7 +7892,7 @@ if __name__ == "__main__":
         parser.add_argument("--app-dir", type=Path,
                             help="development static output directory; packages discover sibling web/ automatically")
         parser.add_argument("--artifacts", type=Path, required=True)
-        parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "apps/app/generated/vibeface_secure.js")
+        parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "apps/app/dist/client/vibeface_secure.js")
         modes = parser.add_mutually_exclusive_group()
         modes.add_argument("--web-only", action="store_true", help="check packaged Web resources without Node business or provider scenarios")
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
