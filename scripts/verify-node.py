@@ -1720,7 +1720,7 @@ def verify_web_assets(node, module):
         if path in checked:
             continue
         checked.add(path)
-        if path == "/generated/vibeface_secure.js":
+        if path == "/vibeface_secure.js":
             continue
         require(len(checked) < 256, "static dependency traversal is bounded")
         content, asset_headers = fetch(path)
@@ -1739,7 +1739,7 @@ def verify_web_assets(node, module):
             require(b"__wbindgen_" not in content and b"vibeface_secure_bg" not in content,
                     "client chunks do not duplicate generated cryptography or embed a second WASM instance")
             for address in javascript_dependencies(content):
-                if address == "/generated/vibeface_secure.js":
+                if address == "/vibeface_secure.js":
                     uses_external_crypto = True
                 else:
                     require(address.startswith(("./", "../", "/assets/")), "client imports only trusted local modules")
@@ -1749,7 +1749,7 @@ def verify_web_assets(node, module):
                 address = reference.decode().strip()
                 if not address.startswith("data:"):
                     pending.append(urllib.parse.urljoin(path, address))
-    require(uses_external_crypto, "client chunks import the single same-origin generated cryptography module")
+    require(uses_external_crypto, "client chunks import the single same-origin cryptography module")
     require({"text/css", "text/javascript", "font/woff2"} <= content_types,
             "real JavaScript, CSS and bundled font resources are reachable")
     for path in ("/api", "/api/not-a-route", "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
@@ -1757,7 +1757,7 @@ def verify_web_assets(node, module):
         body, missing_headers = fetch(path, status=404)
         require(body != shell and missing_headers["Cache-Control"] == "no-store", "unknown API and assets return uncached 404, never the SPA shell")
     for path in (module, module.with_name("vibeface_secure_bg.wasm")):
-        content, crypto_headers = fetch("/generated/" + path.name)
+        content, crypto_headers = fetch("/" + path.name)
         require(hashlib.sha256(content).hexdigest() == file_sha256(path),
                 "served browser cryptography matches the verified package resource")
         require(crypto_headers["Cache-Control"] == "no-store", "mutable browser cryptography cannot be cached across updates")
@@ -4577,7 +4577,7 @@ def discovery_acceptance(options):
         except (ConnectionRefusedError, TimeoutError):
             pass
         local = Client(f"http://127.0.0.1:{node.local_port}", None)
-        for path in ("/", "/api/info", "/api/client", "/api/local/info", "/generated/vibeface_secure_bg.wasm"):
+        for path in ("/", "/api/info", "/api/client", "/api/local/info", "/vibeface_secure_bg.wasm"):
             local.request(path, status=404)
         hook = json.loads(node_cli(node, "hook", "codex", "--test").stdout)
         require(hook["status"] == "accepted", "the headless Node handles a real local hook")
