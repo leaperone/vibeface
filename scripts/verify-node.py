@@ -7885,7 +7885,12 @@ if __name__ == "__main__":
         fixture_codex(sys.argv[1:])
     else:
         parser = argparse.ArgumentParser(description=__doc__)
-        parser.add_argument("--binary", type=Path, required=True)
+        parser.add_argument("--binary", type=Path, required=True,
+                            help="the vibeface CLI binary used to create and run the isolated Nodes")
+        parser.add_argument("--core-binary", type=Path,
+                            help="the sibling vibeface-core binary to verify; defaults to --binary's sibling")
+        parser.add_argument("--app-dir", type=Path,
+                            help="development static output directory; packages discover sibling web/ automatically")
         parser.add_argument("--artifacts", type=Path, required=True)
         parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "apps/app/generated/vibeface_secure.js")
         modes = parser.add_mutually_exclusive_group()
@@ -7914,6 +7919,20 @@ if __name__ == "__main__":
         parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "proofs/delivery/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()
         try:
+            program = shutil.which(str(arguments.binary)) if len(arguments.binary.parts) == 1 else str(arguments.binary)
+            require(program is not None, "the Vibeface CLI binary exists on PATH or at its explicit path")
+            arguments.binary = Path(program).resolve(strict=True)
+            arguments.core_binary = (arguments.core_binary or arguments.binary.with_name("vibeface-core")).resolve(strict=True)
+            require(arguments.binary.is_file() and arguments.binary.stat().st_mode & 0o111,
+                    "the Vibeface CLI binary is executable")
+            require(arguments.core_binary.is_file() and arguments.core_binary.stat().st_mode & 0o111,
+                    "the sibling Vibeface Core binary is executable")
+            require(arguments.core_binary.parent == arguments.binary.parent,
+                    "CLI and Core binaries come from one release directory")
+            if arguments.app_dir is not None:
+                arguments.app_dir = arguments.app_dir.resolve(strict=True)
+                require(arguments.app_dir.is_dir(), "the explicit App output directory exists")
+                os.environ["VIBEFACE_APP_DIR"] = str(arguments.app_dir)
             require(30_000 <= arguments.delivery_ui_timeout_ms <= 86_400_000, "UI acceptance has a bounded explicit execution deadline")
             if arguments.native_provider_selfcheck:
                 native_provider_selfcheck(arguments)

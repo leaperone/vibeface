@@ -136,8 +136,9 @@ check_archive() {
 
 verify_package() {
   local package="$1" version="$2" target="$3" commit="$4" scratch="$5" entry
-  for entry in vibeface BUILD-INFO.json README.md RUNTIME-REQUIREMENTS.md \
+  for entry in vibeface vibeface-core BUILD-INFO.json README.md RUNTIME-REQUIREMENTS.md \
     scripts/install-node-service.sh docs/node.md docs/releasing.md \
+    web/_shell.html web/_headers web/.vibeface-build.json \
     web/vibeface_secure.js web/vibeface_secure_bg.wasm; do
     [[ -f "$package/$entry" && -s "$package/$entry" ]] || fail "package is missing $entry"
   done
@@ -146,8 +147,9 @@ verify_package() {
     { info[$2]=$3 }
     END { exit !(info["version"]==version && info["target"]==target && info["source_commit"]==commit && info["update_protocol"]=="1" && info["data_epoch"]=="12") }
   ' "$scratch/build-fields" || fail 'BUILD-INFO does not match the release, platform, source commit, or data epoch'
-  [[ -x "$package/vibeface" ]] || fail 'packaged CLI is not executable'
+  [[ -x "$package/vibeface" && -x "$package/vibeface-core" ]] || fail 'packaged CLI and Core binaries must be executable'
   [[ $("$package/vibeface" --version) == "vibeface $version" ]] || fail 'packaged CLI version does not match the release'
+  [[ $("$package/vibeface-core" --version) == "vibeface-core $version" ]] || fail 'packaged Core version does not match the release'
 }
 
 install_release() (
@@ -319,6 +321,7 @@ JSON
   mkdir -p "$fixture/source/$package"
   local entry
   for entry in README.md RUNTIME-REQUIREMENTS.md scripts/install-node-service.sh docs/node.md docs/releasing.md \
+    web/_shell.html web/_headers web/.vibeface-build.json \
     web/vibeface_secure.js web/vibeface_secure_bg.wasm; do
     mkdir -p "$fixture/source/$package/$(dirname "$entry")"
     printf 'test fixture\n' > "$fixture/source/$package/$entry"
@@ -326,7 +329,8 @@ JSON
   printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":12}\n' \
     "$version" "$target" > "$fixture/source/$package/BUILD-INFO.json"
   printf '#!/bin/sh\nprintf "vibeface %s\\n"\n' "$version" > "$fixture/source/$package/vibeface"
-  chmod +x "$fixture/source/$package/vibeface"
+  printf '#!/bin/sh\nprintf "vibeface-core %s\\n"\n' "$version" > "$fixture/source/$package/vibeface-core"
+  chmod +x "$fixture/source/$package/vibeface" "$fixture/source/$package/vibeface-core"
   repack_fixture() {
     tar -czf "$fixture/package.tar.gz" -C "$fixture/source" "$package"
     printf '%s  %s.tar.gz\n' "$(sha256 "$fixture/package.tar.gz")" "$package" > "$fixture/checksum"
