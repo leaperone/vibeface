@@ -1126,7 +1126,7 @@ mod tests {
 
     fn fake_bridge() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../bridge/tests/fixtures/fake-cursor-sdk-bridge")
+            .join("../../crates/bridge/tests/fixtures/fake-cursor-sdk-bridge")
     }
 
     async fn cursor_node() -> Result<(Arc<Runtime>, PathBuf, String, PathBuf)> {
