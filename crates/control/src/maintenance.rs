@@ -269,7 +269,7 @@ async fn exchange(
 /// accidentally dropped by a convenience function which returns only its response.
 pub async fn request(socket: &Path, command: MaintenanceCommand) -> Result<MaintenanceResponse> {
     ensure!(
-        !matches!(command, MaintenanceCommand::Acquire),
+        !matches!(&command, MaintenanceCommand::Acquire),
         "maintenance Acquire requires maintenance::acquire so its lease stream is retained"
     );
     let (_, response) = exchange(socket, command).await?;
