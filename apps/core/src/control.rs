@@ -1,16 +1,17 @@
 //! Core-owned one-shot operations used by the sibling CLI.
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use crate::{
     config::{self, Config, ManagerSettings},
     crypto::{self, LocalIdentity},
-    discovery, maintenance,
+    discovery,
     local_access::Launcher,
-    net::{self, NetworkConfig, PublicEntry, RelayServiceMode},
+    maintenance,
+    net::{self, NetworkConfig, RelayServiceMode},
     providers::{AppServer, AppServerMode, Provider, ProviderEnv},
     store::Store,
 };
 use anyhow::{Context, Result, bail, ensure};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -158,22 +159,138 @@ pub async fn inspect(data_dir: &Path) -> Result<Value> {
 
 async fn access(data_dir: &Path) -> Result<Value> {
     let info = inspect(data_dir).await?;
+    let epoch: Value =
+        serde_json::from_slice(&read_bounded(&data_dir.join("data-epoch.json"), 4096)?)?;
     ensure!(
-        info["web_enabled"] == true,
+        epoch == json!({"data_epoch": config::DATA_EPOCH}),
+        "data directory uses another format; existing data was preserved"
+    );
+    let configuration = Config::load(data_dir)?;
+    ensure!(
+        configuration.web_enabled
+            && maintenance::probe(data_dir)
+                .await
+                .map_or(true, |health| health.web_enabled),
         "browser access is disabled; restart without --no-web or enable web_enabled in config.json"
     );
-    let config = Config::load(data_dir)?;
-    let device_id = config::identity(data_dir)?.device_id()?;
-    if config.public_entry {
-        return Ok(json!({"url":config.public_url,"device_id":device_id,"public_entry":true}));
+    let identity = config::identity(data_dir)?;
+    let device_id = identity.device_id()?;
+    if configuration.public_entry {
+        return Ok(
+            json!({"url":configuration.public_url,"device_id":device_id,"public_entry":true}),
+        );
     }
-    let mut url = config.public_url.clone();
-    if config.listen.ip().is_loopback() || config.listen.ip().is_unspecified() {
-        url = format!("http://localhost:{}", config.listen.port());
+    let store = Store::open_readonly(data_dir.join("node.sqlite3"))?;
+    let initialized = store.has_network()?;
+    let capability = if initialized {
+        None
+    } else {
+        let capability: crate::identity::local::BootstrapCapability =
+            serde_json::from_slice(&read_bounded(&data_dir.join("bootstrap.json"), 4096)?)
+                .context("initial bootstrap capability is unavailable")?;
+        ensure!(
+            capability.capability.len() == 64 && hex::decode(&capability.capability).is_ok(),
+            "invalid local bootstrap capability"
+        );
+        Some(capability.capability)
+    };
+    if initialized && configuration.local_auto_access {
+        let path = data_dir.join("local-access.json");
+        let metadata = fs::symlink_metadata(&path)
+            .context("start the node before opening local browser access")?;
+        ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "local launcher credential must be a private regular file"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            ensure!(
+                metadata.permissions().mode() & 0o077 == 0,
+                "local launcher credential must be private"
+            );
+        }
+        let launcher: Launcher = serde_json::from_slice(&read_bounded(&path, 4096)?)?;
+        let mut url = config::http_origin(&launcher.origin)?;
+        ensure!(
+            url.scheme() == "http"
+                && url.host_str() == Some("127.0.0.1")
+                && launcher.node_id == device_id
+                && launcher.capability.len() == 64
+                && hex::decode(&launcher.capability).is_ok(),
+            "local launcher does not match this node"
+        );
+        let entry: Value = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?
+            .post(url.join("/api/local/launch")?)
+            .bearer_auth(launcher.capability)
+            .json(&json!({}))
+            .send()
+            .await
+            .context("local node is unavailable; start it before opening browser access")?
+            .error_for_status()?
+            .json()
+            .await?;
+        let token = entry["token"]
+            .as_str()
+            .filter(|token| token.len() == 64 && hex::decode(token).is_ok())
+            .context("invalid local browser entry")?;
+        ensure!(
+            entry["device_id"] == launcher.node_id && entry["url"] == launcher.origin,
+            "local browser entry does not match this node"
+        );
+        let listen = configuration.listen.ip();
+        if listen.is_loopback() || listen.is_unspecified() {
+            url =
+                config::http_origin(&format!("http://localhost:{}", configuration.listen.port()))?;
+        }
+        url.set_fragment(Some(&format!("local={token}&node={}", launcher.node_id)));
+        return Ok(json!({"url":url.to_string(),"device_id":launcher.node_id,"local":true}));
+    }
+    let mut url = config::http_origin(&configuration.public_url)?;
+    if url.scheme() == "http" && !is_loopback(&url) {
+        ensure!(
+            configuration.listen.ip().is_unspecified() || configuration.listen.ip().is_loopback(),
+            "use a trusted HTTPS frontend; the configured LAN-only listener has no loopback entry"
+        );
+        let host = if configuration.listen.is_ipv6() {
+            "[::1]"
+        } else {
+            "127.0.0.1"
+        };
+        url = config::http_origin(&format!("http://{host}:{}", configuration.listen.port()))?;
+    }
+    let entry = json!({"url":url.origin().ascii_serialization(),"device_id":device_id,"capability":capability});
+    if capability.is_some() {
+        url.set_fragment(Some(&format!(
+            "bootstrap={}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&entry)?)
+        )));
     }
     Ok(
-        json!({"url":url,"device_id":device_id,"local":false,"maintenance_socket":info["maintenance_socket"]}),
+        json!({"url":url.to_string(),"device_id":device_id,"local":false,"capability":capability,"maintenance_socket":info["maintenance_socket"]}),
     )
+}
+
+fn is_loopback(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
+fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= limit, "input file exceeds size limit");
+    Ok(bytes)
 }
 
 async fn set_local_access(data_dir: &Path, enabled: bool) -> Result<bool> {
@@ -324,11 +441,31 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
         &mut provider_env,
         &discovery::Host::current(),
     )?;
+    let public_entry = configuration.public_entry;
+    let discovery_only = configuration.network.relay_mode == RelayServiceMode::DiscoveryOnly;
+    let web_enabled = configuration.web_enabled;
+    let open = if !public_entry
+        && (configuration.listen.ip().is_loopback() || configuration.listen.ip().is_unspecified())
+    {
+        format!("http://localhost:{}", configuration.listen.port())
+    } else {
+        configuration.public_url.clone()
+    };
     initialize(&options.data_dir, configuration, entry_token)?;
     if provider_env != ProviderEnv::default() {
         provider_env.save(&options.data_dir)?;
     }
-    Ok(json!({"data_dir":fs::canonicalize(options.data_dir)?}))
+    let data_dir = fs::canonicalize(&options.data_dir)?;
+    let device_id = config::identity(&data_dir)?.device_id()?;
+    Ok(json!({
+        "data_dir": data_dir,
+        "web_enabled": web_enabled,
+        "open": web_enabled.then_some(open),
+        "discovery_only": discovery_only,
+        "public_entry": public_entry,
+        "device_id": device_id,
+        "relay_token_file": public_entry.then(|| options.data_dir.join(net::ENTRY_TOKEN_FILE)),
+    }))
 }
 
 fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) -> Result<()> {
@@ -406,11 +543,17 @@ fn create_private(path: &Path, bytes: &[u8]) -> Result<()> {
 
 pub fn restart_fresh(dir: &Path) -> Result<()> {
     let configuration = Config::load(dir)?;
+    let entry_token = configuration
+        .network
+        .entry
+        .is_some()
+        .then(|| net::read_token_file(&dir.join(net::ENTRY_TOKEN_FILE)))
+        .transpose()?;
     let name = dir
         .file_name()
         .context("data directory has no name")?
         .to_string_lossy();
-    let stamp = crate::runtime::now_ms();
+    let stamp = local_time_stamp();
     let archive = dir.with_file_name(format!("{name}-removed-{stamp}"));
     let fresh = dir.with_file_name(format!(".{name}-fresh-{stamp}"));
     ensure!(
@@ -418,17 +561,33 @@ pub fn restart_fresh(dir: &Path) -> Result<()> {
         "{} already exists",
         archive.display()
     );
-    initialize(&fresh, configuration, None)?;
+    initialize(&fresh, configuration, entry_token)?;
     fs::rename(dir, &archive)?;
     if let Err(error) = fs::rename(&fresh, dir) {
         fs::rename(&archive, dir)?;
         return Err(error.into());
     }
     use std::os::unix::process::CommandExt;
-    let error = std::process::Command::new(crate::sibling_cli())
+    let error = std::process::Command::new(std::env::current_exe()?)
         .args(std::env::args_os().skip(1))
         .exec();
     Err(error).context("restart the Node")
+}
+
+fn local_time_stamp() -> String {
+    let mut buffer = [0u8; 32];
+    let written = unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut tm);
+        libc::strftime(
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            c"%Y%m%d-%H%M%S".as_ptr(),
+            &tm,
+        )
+    };
+    String::from_utf8_lossy(&buffer[..written]).into_owned()
 }
 
 #[cfg(test)]
