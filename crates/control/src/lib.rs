@@ -10,12 +10,12 @@ use serde_json::Value;
 use std::{
     io::Write as _,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
+    process::{Child, Command},
 };
 
 pub const UPDATE_PROTOCOL: u32 = 1;
@@ -116,6 +116,16 @@ where
     }
 }
 
+async fn wait_for_exit(child: &mut Child, timeout: Option<Duration>) -> Result<ExitStatus> {
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, child.wait())
+            .await
+            .context("core control process did not exit before the deadline")?
+            .map_err(Into::into),
+        None => Ok(child.wait().await?),
+    }
+}
+
 /// Execute one bounded request in the sibling core binary and decode its single JSON response.
 pub async fn request(core: &Path, request: &ControlRequest) -> Result<Value> {
     ensure!(core.is_absolute(), "core executable path must be absolute");
@@ -137,10 +147,18 @@ pub async fn request(core: &Path, request: &ControlRequest) -> Result<Value> {
         bytes.len() <= MAX_CONTROL_PACKET,
         "core control request is too large"
     );
-    if let Err(error) = tokio::time::timeout(CONTROL_WRITE_TIMEOUT, stdin.write_all(&bytes)).await {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        return Err(error).context("core control stdin timed out");
+    match tokio::time::timeout(CONTROL_WRITE_TIMEOUT, stdin.write_all(&bytes)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error.into());
+        }
+        Err(error) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error).context("core control stdin timed out");
+        }
     }
     drop(stdin);
     let stdout = child
@@ -178,7 +196,16 @@ pub async fn request(core: &Path, request: &ControlRequest) -> Result<Value> {
             return Err(error);
         }
     };
-    let status = child.wait().await?;
+    let status = match wait_for_exit(&mut child, (!forward_stderr).then_some(CONTROL_IO_TIMEOUT))
+        .await
+    {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error).context("core control request timed out; outcome may be unknown");
+        }
+    };
     if !status.success() {
         bail!(
             "core control process failed: {}",
@@ -251,6 +278,22 @@ mod tests {
             "{error:#}"
         );
         std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_client_bounds_a_child_that_closes_streams_but_keeps_running() -> Result<()> {
+        let mut child = Command::new("sh")
+            .args(["-c", "exec sleep 1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let error = wait_for_exit(&mut child, Some(Duration::from_millis(20)))
+            .await
+            .expect_err("a hanging child must hit the wait deadline");
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        assert!(error.to_string().contains("deadline"), "{error:#}");
         Ok(())
     }
 }
