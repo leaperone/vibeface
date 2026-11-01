@@ -6402,8 +6402,8 @@ name = "vibeface-control"
 version = "0.0.1-nightly.20261031.19"
 dependencies = [
  "anyhow",
- "clap",
  "futures-util",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

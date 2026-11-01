@@ -19,7 +19,13 @@ fn outgoing_model(tracked: &Value) -> Result<Option<String>> {
     let resolved_model = value
         .get("model")
         .context("the frozen model selection has no model")?;
-    ensure!(matches!(value.get("provider").and_then(Value::as_str), Some("codex" | "cursor" | "claude" | "pi" | "opencode")), "the Node returned an invalid frozen model selection");
+    ensure!(
+        matches!(
+            value.get("provider").and_then(Value::as_str),
+            Some("codex" | "cursor" | "claude" | "pi" | "opencode")
+        ),
+        "the Node returned an invalid frozen model selection"
+    );
     match resolved_model {
         Value::Null => Ok(None),
         Value::String(model) => Ok(Some(model.clone())),
@@ -63,10 +69,7 @@ where
     let kind = found["kind"].as_str().unwrap_or_default();
     let thread = found["thread"].as_str();
     let cwd = found["cwd"].as_str().unwrap_or_default();
-    let args = if kind == "codex"
-        && thread.is_some()
-        && args["thread"].is_string()
-    {
+    let args = if kind == "codex" && thread.is_some() && args["thread"].is_string() {
         thread_arguments(args, cwd)
     } else {
         args.clone()

@@ -8,13 +8,13 @@ use std::{
 };
 
 /// Bumped whenever stored data stops being readable by the previous build.
-pub const DATA_EPOCH: u32 = 12;
+pub use vibeface_control::DATA_EPOCH;
 /// SHA-256 over the migration files (`migrations/*.sql`, by name) that `DATA_EPOCH` stores.
 /// Any schema change fails a test until both constants change together.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
     "9d80a43e554734b8fcb8fa8ec38bcdc37364d27c78d477f700cc4b5e3872324d";
 /// Bumped whenever a release package stops being installable by the previous updater.
-pub const UPDATE_PROTOCOL: u32 = 1;
+pub use vibeface_control::UPDATE_PROTOCOL;
 pub fn data_epoch_marker() -> Vec<u8> {
     format!(r#"{{"data_epoch":{DATA_EPOCH}}}"#).into_bytes()
 }
