@@ -2964,6 +2964,7 @@ def phase1_acceptance(options):
     run.mkdir(mode=0o700)
     binary = run / "vibeface"
     shutil.copy2(source_binary, binary)
+    shutil.copy2(options.core_binary, run / "vibeface-core")
     workspace = run / "workspace"
     workspace.mkdir()
     codex = fixture_wrapper(run, "fixture-codex", "--fixture-codex")
@@ -2972,7 +2973,8 @@ def phase1_acceptance(options):
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     nodes = []
     report = {"status": "running", "source_binary": str(source_binary),
-              "binary_sha256": file_sha256(binary), "provider_calls": 0,
+              "binary_sha256": file_sha256(binary),
+              "core_binary_sha256": file_sha256(run / "vibeface-core"), "provider_calls": 0,
               "coverage": "one real Node, durable Scheduler and signed log; fixture SDK",
               "evidence": [], "not_checked": ["real Cursor/Codex model success",
                   "rendered browser UI", "cross-device delivery (phase 2)",
@@ -3273,7 +3275,8 @@ def memory_sync_acceptance(options):
     run = options.artifacts.resolve() / ("memory-sync-" + uuid.uuid4().hex[:10])
     run.mkdir(mode=0o700)
     frozen = {}
-    for source, name in ((source_binary, "vibeface"), (source_module, "vibeface_secure.mjs"),
+    for source, name in ((source_binary, "vibeface"), (options.core_binary, "vibeface-core"),
+                         (source_module, "vibeface_secure.mjs"),
                          (source_module.with_name("vibeface_secure_bg.wasm"), "vibeface_secure_bg.wasm")):
         digest = file_sha256(source)
         shutil.copy2(source, run / name)
