@@ -115,9 +115,9 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 
 | 路径 | 方法 | 用途 |
 | --- | --- | --- |
-| `/`、`/assets/*` | GET | 内置网页客户端；`/assets/` 下为带哈希的不可变资源 |
+| `/`、`/assets/*` | GET | App 静态网页客户端；`/assets/` 下为带哈希的不可变资源 |
 | `/sw.js`、`/manifest.webmanifest`、`/icon.svg` | GET | 离线应用外壳和 PWA 清单，`no-cache` |
-| `/generated/vibeface_secure.js`、`/generated/vibeface_secure_bg.wasm` | GET | 同一 Rust 密码学实现的浏览器构建 |
+| `/vibeface_secure.js`、`/vibeface_secure_bg.wasm` | GET | 同一 Rust 密码学实现的浏览器构建 |
 | `/api/info` | GET | `device_id`、`version` 和 `public_entry` |
 | `/api/local/setup` | POST | 本机网页读取一次性初始化邀请或已有网络的当前入口；公共入口回 404 |
 | `/api/client` | GET，WebSocket upgrade | 浏览器网关 |
