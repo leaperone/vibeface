@@ -262,7 +262,7 @@ mod tests {
             std::env::temp_dir().join(format!("vibeface-control-status-{}", uuid::Uuid::new_v4()));
         std::fs::write(
             &path,
-            b"#!/bin/sh\nprintf '%s\\n' '{\"ok\":true,\"result\":{}}'\nexit 7\n",
+            b"#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"ok\":true,\"result\":{}}'\nexit 7\n",
         )?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
         let error = request(
