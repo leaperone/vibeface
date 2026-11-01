@@ -151,7 +151,7 @@ pub async fn request(core: &Path, request: &ControlRequest) -> Result<Value> {
         }
     };
     let status = child.wait().await?;
-    if !status.success() && output.is_empty() {
+    if !status.success() {
         bail!(
             "core control process failed: {}",
             String::from_utf8_lossy(&error_output)
@@ -197,6 +197,31 @@ mod tests {
         .await
         .expect_err("oversized child output must be rejected");
         assert!(error.to_string().contains("stdout exceeds"), "{error:#}");
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_client_rejects_ok_response_from_nonzero_child() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("vibeface-control-status-{}", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            b"#!/bin/sh\nprintf '%s\\n' '{\"ok\":true,\"result\":{}}'\nexit 7\n",
+        )?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        let error = request(
+            &path,
+            &ControlRequest::Inspect {
+                data_dir: "/tmp/vibeface-control-test".into(),
+            },
+        )
+        .await
+        .expect_err("nonzero child must not prove an accepted result");
+        assert!(
+            error.to_string().contains("core control process failed"),
+            "{error:#}"
+        );
         std::fs::remove_file(path)?;
         Ok(())
     }
