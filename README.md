@@ -71,10 +71,10 @@ flowchart LR
 |---|---|---|
 | macOS Apple Silicon、Linux x64 或 Linux ARM64（glibc） | | 运行平台 |
 | Node.js | 22+ | 仅 npm 安装入口需要 |
-| Codex CLI | 已安装并登录 | 可选，Codex bot 与执行任务 |
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | 已安装并登录 | 可选，Claude Code bot 与执行任务 |
+| Codex CLI | 已安装，按设备 AI 设置为 Node 登录 | 可选，Codex bot 与执行任务 |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | 已安装，按设备 AI 设置为 Node 登录 | 可选，Claude Code bot 与执行任务 |
 | [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) | 已安装并登录 | 可选，pi bot 与执行任务 |
-| [opencode](https://opencode.ai) | v2.2.0，已登录 | 可选，opencode bot 与执行任务 |
+| [opencode](https://opencode.ai) | v2.2.0，按设备 AI 设置为 Node 登录 | 可选，opencode bot 与执行任务 |
 | [Cursor SDK Bridge](https://github.com/cursor/sdk-bridge/releases/tag/v1.2.0) | v1.2.0 发布包，需按自己的环境验证 | 可选，Cursor Bot、协调 Agent 与执行任务 |
 
 ### 安装

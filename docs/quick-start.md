@@ -13,7 +13,7 @@ description: 从安装 Nightly 到创建个人网络，让第一台电脑上的 
 - 安装准备使用的 Agent，例如 Codex 或 Claude Code，并准备自己的模型服务和额度。
 - 准备一个已有的本机项目目录。首次尝试可以使用没有重要数据的练习项目。
 
-Vibeface 不提供模型账号，也不安装 Agent。它默认使用自己的 Provider 运行目录，原来在终端登录过不代表这里已经登录。后面会从设备设置复制对应的登录命令。
+Vibeface 不提供模型账号，也不安装 Agent。默认 Codex、Claude Code 和 OpenCode 使用自己的认证目录，原来在终端登录过不代表这里已经登录；后面会从设备设置复制对应的登录命令。pi 沿用本机认证，Cursor 使用单独配置的 `CURSOR_API_KEY`。
 
 ## 1. 安装 Nightly
 
