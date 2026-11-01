@@ -1017,8 +1017,7 @@ impl Runtime {
                 .provider_readiness(settings.provider, &settings.model)
                 .await,
         )?;
-        let program = std::env::current_exe()
-            .map_err(|error| manager::ManagerError::not_started(error.into()))?;
+        let program = crate::sibling_cli();
         let mut cli = format!("'{}'", program.to_string_lossy().replace('\'', r"'\''"));
         let mut config = ManagerConfig {
             tool_cli: Some(program),

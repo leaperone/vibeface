@@ -1,8 +1,8 @@
 //! Personal Node coordination, authenticated replication and local SDK tools.
-pub mod agent_cli;
 pub mod agent_context;
 pub mod api;
 pub mod client;
+pub mod control;
 pub mod config;
 pub mod crypto;
 pub mod delivery;
@@ -24,3 +24,12 @@ pub mod tools;
 pub mod triage;
 pub mod update;
 pub mod work;
+
+/// The CLI binary lives beside the core binary in packaged installs.  Backend processes use it
+/// when they need to ask a user-facing tool or hook to continue a turn.
+pub fn sibling_cli() -> std::path::PathBuf {
+    let current = std::env::current_exe().unwrap_or_else(|_| "vibeface-core".into());
+    current
+        .parent()
+        .map_or_else(|| "vibeface".into(), |parent| parent.join(if cfg!(windows) { "vibeface.exe" } else { "vibeface" }))
+}

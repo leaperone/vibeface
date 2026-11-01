@@ -404,7 +404,7 @@ impl Runtime {
             Tool::DispatchWork => {
                 let socket = self.codex.socket();
                 let (access, scope) = (&access, scope.as_str());
-                crate::agent_cli::dispatch(
+                vibeface_control::agent::dispatch(
                     &args,
                     |call_ref| async move { self.call_lookup(access, scope, &call_ref).await },
                     |args| async move { self.track_work(access, scope, &args).await },

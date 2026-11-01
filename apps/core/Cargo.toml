@@ -1,5 +1,5 @@
 [package]
-name = "vibeface"
+name = "vibeface-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -41,6 +41,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 vibeface-protocol.workspace = true
 vibeface-bridge.workspace = true
+vibeface-control.workspace = true
 vibeface-secure = { path = "../../crates/secure" }
 vibeface-delivery = { path = "../../crates/delivery" }
 zeroize = { version = "1", features = ["derive"] }

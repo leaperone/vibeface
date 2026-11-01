@@ -3302,7 +3302,7 @@ mod tests {
         let (node, root) = browser_node(&dir, &manager).await?;
         let listen = node.config.listen;
         let serving = node.clone();
-        let server = tokio::spawn(async move { crate::api::serve(serving).await });
+        let server = tokio::spawn(async move { crate::api::serve(serving, None).await });
         let mut second_server = None;
         let result: Result<()> = async {
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -3330,7 +3330,7 @@ mod tests {
             }
             let second_dir = dir.join("second");
             let (second, _) = browser_node(&second_dir, &manager).await?;
-            second_server = Some(tokio::spawn(async move { crate::api::serve(second).await }));
+            second_server = Some(tokio::spawn(async move { crate::api::serve(second, None).await }));
             tokio::time::timeout(Duration::from_secs(5), async {
                 while !second_dir.join("local-access.json").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
             }).await?;
@@ -3626,7 +3626,7 @@ mod tests {
         let node = Arc::new(Runtime::open(&dir).await?);
         let origin = node.config.public_url.clone();
         let node_id = node.identity.device_id()?;
-        let server = tokio::spawn(crate::api::serve(node.clone()));
+        let server = tokio::spawn(crate::api::serve(node.clone(), None));
         let result: Result<()> = async {
             let connect = |identity: LocalIdentity| {
                 let (origin, node_id) = (origin.clone(), node_id.clone());

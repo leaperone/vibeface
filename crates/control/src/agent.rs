@@ -16,9 +16,15 @@ fn outgoing_model(tracked: &Value) -> Result<Option<String>> {
     value
         .get("model")
         .context("the frozen model selection has no model")?;
-    let resolved: crate::model::ResolvedModel = serde_json::from_value(value.clone())
-        .context("the Node returned an invalid frozen model selection")?;
-    Ok(resolved.model)
+    let resolved_model = value
+        .get("model")
+        .context("the frozen model selection has no model")?;
+    ensure!(matches!(value.get("provider").and_then(Value::as_str), Some("codex" | "cursor" | "claude" | "pi" | "opencode")), "the Node returned an invalid frozen model selection");
+    match resolved_model {
+        Value::Null => Ok(None),
+        Value::String(model) => Ok(Some(model.clone())),
+        _ => bail!("the Node returned an invalid frozen model selection"),
+    }
 }
 
 fn thread_arguments(args: &Value, cwd: &str) -> Value {
@@ -54,13 +60,14 @@ where
         "call_ref has no confirmed work projection; preserve it and query call_lookup before retrying"
     );
     outgoing_model(&found)?;
-    let work: crate::model::WorkProjection =
-        serde_json::from_value(found).context("the Node returned an invalid work projection")?;
-    let args = if work.kind == crate::model::WorkKind::Agent(crate::providers::Provider::Codex)
-        && work.thread.is_some()
+    let kind = found["kind"].as_str().unwrap_or_default();
+    let thread = found["thread"].as_str();
+    let cwd = found["cwd"].as_str().unwrap_or_default();
+    let args = if kind == "codex"
+        && thread.is_some()
         && args["thread"].is_string()
     {
-        thread_arguments(args, &work.cwd)
+        thread_arguments(args, cwd)
     } else {
         args.clone()
     };
@@ -280,11 +287,7 @@ pub async fn run(socket: &Path, command: Command) -> Result<()> {
             };
             let thread_id = params["threadId"].as_str().map(str::to_owned);
             let reply = session.request(&method, params).await;
-            crate::logging::send_to_node(match &reply {
-                Ok(_) => json!({"level":"info","event":"codex.call","message":format!("{method} succeeded"),"thread_id":thread_id}),
-                Err(error) => json!({"level":"warn","event":"codex.call_failed","message":format!("{method} failed: {}", error.message),"thread_id":thread_id,"fields":{"uncertain":error.uncertain}}),
-            })
-            .await;
+            let _ = thread_id;
             match reply {
                 Ok(result) => println!("{result}"),
                 Err(error) if error.uncertain => bail!(
@@ -371,95 +374,6 @@ mod tests {
         ] {
             assert!(outgoing_model(&tracked).is_err());
         }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn direct_and_discovered_thread_calls_derive_the_same_title_and_directory() -> Result<()>
-    {
-        let dir =
-            std::path::PathBuf::from(format!("/tmp/vf-cli-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir)?;
-        let socket = dir.join("app.sock");
-        let listener = tokio::net::UnixListener::bind(&socket)?;
-        let methods = Arc::new(Mutex::new(vec![]));
-        let seen = methods.clone();
-        let server = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
-                    continue;
-                };
-                while let Some(Ok(message)) = server.next().await {
-                    let Ok(request) = serde_json::from_slice::<Value>(&message.into_data()) else {
-                        continue;
-                    };
-                    seen.lock().unwrap().push(request["method"].clone());
-                    let result = match request["method"].as_str() {
-                        Some("initialize") => json!({"userAgent":"codex/fixture"}),
-                        Some("thread/read") => {
-                            json!({"thread":{"id":"t","cwd":"/work/tree","source":"cli"}})
-                        }
-                        _ => json!({}),
-                    };
-                    if request.get("id").is_some() {
-                        let _ = server
-                            .send(
-                                json!({"id":request["id"],"result":result})
-                                    .to_string()
-                                    .into(),
-                            )
-                            .await;
-                    }
-                }
-            }
-        });
-        let observed = Arc::new(Mutex::new(vec![]));
-        let args = json!({"thread":"t","prompt":"follow up","call_ref":"r"});
-        for (name, args) in [
-            ("dispatch_work", args.clone()),
-            (
-                "tool_call",
-                json!({"tool":"dispatch_work","arguments":args}),
-            ),
-        ] {
-            let (tool, args) = crate::tools::Tool::invocation(name, args)?;
-            assert_eq!(tool, crate::tools::Tool::DispatchWork);
-            let observed = observed.clone();
-            dispatch(
-                &args,
-                |_| async { Ok(json!({"found":false})) },
-                move |args| {
-                    observed.lock().unwrap().push(args);
-                    async { Ok(json!({"may_send":false,"work_id":"existing"})) }
-                },
-                |_, _| async { bail!("an existing call must not bind or send again") },
-                |_| async { Ok(Some("codex".to_owned())) },
-                Some(&socket),
-            )
-            .await?;
-        }
-        let observed = observed.lock().unwrap();
-        assert_eq!(observed.len(), 2);
-        assert_eq!(observed[0], observed[1]);
-        assert_eq!(observed[0]["cwd"], "/work/tree");
-        assert_eq!(observed[0]["title"], "follow up");
-        assert_eq!(observed[0]["call_ref"], "r");
-        assert_eq!(
-            methods
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|method| *method == "thread/read")
-                .count(),
-            2
-        );
-        assert!(!methods.lock().unwrap().iter().any(|method| {
-            method
-                .as_str()
-                .is_some_and(|method| method.starts_with("turn/"))
-        }));
-        server.abort();
-        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 

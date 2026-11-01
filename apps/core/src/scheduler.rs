@@ -456,7 +456,7 @@ async fn prepare_turn_from(
         crate::providers::Sessions::Store(store) => store.to_owned(),
         crate::providers::Sessions::Process => String::new(),
     };
-    let tool_cli = std::env::current_exe()?;
+    let tool_cli = crate::sibling_cli();
     // A thread lists the tools once, with the guidance that holds for all its turns.
     let instance = provider.instance_per_bot().then(|| match scope {
         SessionScope::Main => CursorInstance::Bot {

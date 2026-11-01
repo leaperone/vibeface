@@ -1,0 +1,27 @@
+[package]
+name = "vibeface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+clap.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+libc = "0.2"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+tar.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+vibeface-bridge.workspace = true
+vibeface-control.workspace = true
+vibeface-protocol.workspace = true
+zeroize = { version = "1", features = ["derive"] }

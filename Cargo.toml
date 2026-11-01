@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/protocol", "crates/bridge", "apps/core", "crates/secure", "crates/secure-ffi", "crates/delivery"]
+members = ["crates/protocol", "crates/bridge", "crates/control", "apps/core", "apps/cli", "crates/secure", "crates/secure-ffi", "crates/delivery"]
 exclude = ["proofs/delivery"]
 resolver = "3"
 
@@ -35,3 +35,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 vibeface-protocol = { path = "crates/protocol" }
 vibeface-bridge = { path = "crates/bridge" }
+vibeface-control = { path = "crates/control" }
