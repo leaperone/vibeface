@@ -18,7 +18,7 @@ fail() { printf 'Vibeface installer: %s\n' "$*" >&2; exit 1; }
 
 # Parse only named fields; remote JSON is never evaluated as shell code.
 json_fields() {
-  awk -v mode="$2" -v page="${3:-0}" '
+  LC_ALL=C awk -v mode="$2" -v page="${3:-0}" '
     function error() { invalid=1; exit 1 }
     function field(value, k) {
       k=key; key=""
@@ -36,11 +36,28 @@ json_fields() {
     BEGIN { depth=0; record=0; expected=(mode=="releases" ? "[" : "{") }
     {
       json=$0
-      while (length(json)) {
-        sub(/^[ \t\r\n]+/,"",json)
-        if (!length(json)) break
-        if (!match(json,/^("([^"\\]|\\.)*"|-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?|true|false|null|[][{}:,])/)) error()
-        token=substr(json,1,RLENGTH); json=substr(json,RLENGTH+1)
+      position=1; size=length(json)
+      while (position<=size) {
+        char=substr(json,position,1)
+        if (char ~ /[ \t\r\n]/) { position++; continue }
+        start=position
+        if (char=="\"") {
+          escaped=0; position++
+          while (position<=size) {
+            char=substr(json,position,1)
+            if (!escaped && char=="\"") break
+            if (!escaped && char=="\\") escaped=1; else escaped=0
+            position++
+          }
+          if (position>size) error()
+          position++
+        } else if (char ~ /[][{}:,]/) {
+          position++
+        } else {
+          while (position<=size && substr(json,position,1) !~ /[ \t\r\n]|[][{}:,]/) position++
+        }
+        token=substr(json,start,position-start)
+        if (token !~ /^"/ && token !~ /^(-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?|true|false|null|[][{}:,])$/) error()
         if (closed) error()
         if (!started++) { if (token!=expected) error() }
         at=(mode=="releases" ? 2 : 1)
