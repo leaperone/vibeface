@@ -5,7 +5,16 @@ description: 在自己的 Mac 或 Linux 设备上安装 Vibeface Nightly，并�
 
 # 安装与管理节点
 
-本文的命令默认使用数据目录 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定其他绝对路径，见[部署配置](deployment.md)。涉及安装的步骤还使用 `VIBEFACE_INSTALL_ROOT` 和 `VIBEFACE_BIN_DIR`，先设置这两个变量。
+第一次使用可以先按[快速上手](quick-start.md)完成安装、建网和第一次对话。本文提供安装方式、后台服务和更新命令的详细说明。
+
+本文的命令默认使用数据目录 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定其他绝对路径，见[部署配置](deployment.md)。首次安装前设置安装目录和命令目录，例如：
+
+```sh
+export VIBEFACE_INSTALL_ROOT="$HOME/.local/share/vibeface"
+export VIBEFACE_BIN_DIR="$HOME/.local/bin"
+```
+
+已有安装使用原来的路径，不要另建目录绕过更新。安装后将 `VIBEFACE_BIN_DIR` 加入 PATH，或用完整路径运行 CLI。
 
 Vibeface 的完整 Rust 包包含 CLI `vibeface`、后台 Core `vibeface-core` 和 `web/` 静态 App。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64；Linux 包需要 glibc。macOS 发布包的两个程序使用 Developer ID 签名并通过 Apple notarization。系统设置保持默认的“自动允许下载的已签名软件接收传入连接”且未阻止所有传入连接时，应用防火墙直接放行，安装和更新后不再询问。
 
