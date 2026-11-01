@@ -12,19 +12,30 @@ import subprocess
 import tempfile
 
 
-PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface", "vibeface-secure-ffi", "vibeface-delivery")
+PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi", "vibeface-delivery")
 DEPENDENTS = {
     "protocol": ("bridge", "node"),
     "bridge": ("node",),
     "secure": ("node", "secure-ffi"),
     "node": (),
+    "control": (),
+    "cli": (),
     "secure-ffi": (),
     "delivery": ("node",),
 }
-CRATES = dict(zip(("protocol", "bridge", "secure", "node", "secure-ffi", "delivery"), PACKAGES))
+CRATES = {
+    "protocol": "vibeface-protocol",
+    "bridge": "vibeface-bridge",
+    "secure": "vibeface-secure",
+    "node": "vibeface-core",
+    "control": "vibeface-control",
+    "cli": "vibeface",
+    "secure-ffi": "vibeface-secure-ffi",
+    "delivery": "vibeface-delivery",
+}
 PATH_RULES = (
     ("delivery", ("crates/delivery/*", "proofs/delivery/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/pkarr.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")),
-    ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
+    ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("www", ("apps/www/*",)),
     ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*")),
     ("node", ("packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts")),
@@ -34,6 +45,8 @@ PATH_RULES = (
     ("secure", ("crates/secure/*", "scripts/crypto-client.mjs")),
     ("secure-ffi", ("crates/secure-ffi/*", "scripts/build-mobile-secure.sh")),
     ("node", ("apps/core/*", "install.sh", "scripts/package-node.sh", "scripts/install-node-service.sh", "scripts/verify-node.py")),
+    ("control", ("crates/control/*",)),
+    ("cli", ("apps/cli/*",)),
 )
 WWW_PATHS = ("apps/www/*", "docs/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 SLOW_TESTS = (
@@ -76,7 +89,9 @@ def scope_plan(scopes, event, ref_type, channel):
                 affected.add(dependent)
                 pending.extend(DEPENDENTS[dependent])
     packages = [package for crate, package in CRATES.items() if crate in affected]
-    web = full or "web" in scopes or "node" in affected
+    # Native releases contain both binaries and the web client, so CLI/control changes
+    # rebuild the complete package even though those crates do not import the Core.
+    web = full or "web" in scopes or bool(affected & {"node", "cli", "control"})
     www = full or "www" in scopes
     slow = "node" in affected and extended
     delivery = full or "delivery" in affected
@@ -250,16 +265,17 @@ def validate_slow_tests(names):
 
 def run_test(packages, tier):
     selected = package_args(packages)
-    if "vibeface" in packages:
-        listing_args = selected if tier == "fast" else ["-p", "vibeface", "--lib"]
+    test_package = "vibeface-core" if "vibeface-core" in packages else None
+    if test_package:
+        listing_args = selected if tier == "fast" else ["-p", test_package, "--lib"]
         listing = subprocess.check_output(["cargo", "test", "--locked", *listing_args, "--", "--list"], text=True)
         names = [line[:-6] for line in listing.splitlines() if line.endswith(": test")]
         fast = validate_slow_tests(names)
         print(f"Partition: {len(fast)} fast test names, {len(SLOW_TESTS)} exact slow tests", flush=True)
     if tier == "slow":
-        if "vibeface" not in packages:
-            raise ValueError("Slow tier requires the Node crate")
-        command = ["cargo", "test", "--locked", "-p", "vibeface", "--lib", "--", "--exact", "--include-ignored", *SLOW_TESTS]
+        if not test_package:
+            raise ValueError("Slow tier requires the Core crate")
+        command = ["cargo", "test", "--locked", "-p", test_package, "--lib", "--", "--exact", "--include-ignored", *SLOW_TESTS]
     else:
         skips = [argument for name in SLOW_TESTS for argument in ("--skip", name)]
         command = ["cargo", "test", "--locked", *selected, "--", *skips]
@@ -290,14 +306,16 @@ def self_test():
     docs = make_plan(["README.md", "docs/node.md"])
     assert docs["docs_only"] and docs["www"] and docs["required_jobs"] == ["quick-check", "www"]
     expected = {
-        "node": ["vibeface"],
-        "bridge": ["vibeface-bridge", "vibeface"],
-        "protocol": ["vibeface-protocol", "vibeface-bridge", "vibeface"],
-        "secure": ["vibeface-secure", "vibeface", "vibeface-secure-ffi"],
-        "delivery": ["vibeface", "vibeface-delivery"],
+        "node": ["vibeface-core"],
+        "bridge": ["vibeface-bridge", "vibeface-core"],
+        "protocol": ["vibeface-protocol", "vibeface-bridge", "vibeface-core"],
+        "secure": ["vibeface-secure", "vibeface-core", "vibeface-secure-ffi"],
+        "control": ["vibeface-control"],
+        "cli": ["vibeface"],
+        "delivery": ["vibeface-core", "vibeface-delivery"],
     }
     for crate, packages in expected.items():
-        source = "apps/core/src/lib.rs" if crate == "node" else f"crates/{crate}/src/lib.rs"
+        source = "apps/core/src/lib.rs" if crate == "node" else "apps/cli/src/lib.rs" if crate == "cli" else f"crates/{crate}/src/lib.rs"
         plan = make_plan([source])
         assert plan["rust_packages"] == packages and plan["test_tiers"] == ["fast"]
         assert plan["package_mode"] == "web" and plan["package_matrix"]["include"] == list(PLATFORMS[:1])
@@ -308,14 +326,16 @@ def self_test():
         assert "delivery" in selected["required_jobs"]
         assert "package" in selected["required_jobs"] and selected["package_matrix"]["include"][0]["target"] == "x86_64-unknown-linux-gnu"
     assert not docs["delivery"] and not web["delivery"]
-    for path in ("Cargo.toml", "Cargo.lock", "apps/core/Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml", ".github/workflows/ci.yml", "scripts/ci.py", "new-build-input"):
+    for path in ("Cargo.toml", "Cargo.lock", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml", ".github/workflows/ci.yml", "scripts/ci.py", "new-build-input"):
         assert make_plan([path])["rust_packages"] == list(PACKAGES)
-    assert make_plan(["apps/app/src/a.tsx", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface"]
+    assert make_plan(["apps/app/src/a.tsx", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
+    assert make_plan(["apps/cli/src/main.rs"])["rust_packages"] == ["vibeface"]
+    assert make_plan(["crates/control/src/lib.rs"])["rust_packages"] == ["vibeface-control"]
     assert make_plan(["apps/core/schema.hcl"])["node"]
     assert make_plan(["install.sh"])["node"]
     for path in ("packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts"):
         shared = make_plan([path])
-        assert shared["scopes"] == ["node"] and shared["rust_packages"] == ["vibeface"] and shared["web"]
+        assert shared["scopes"] == ["node"] and shared["rust_packages"] == ["vibeface-core"] and shared["web"]
     for event in ("schedule", "workflow_dispatch", "merge_group"):
         assert make_plan(["README.md"], event)["rust_packages"] == list(PACKAGES)
     assert make_plan(["README.md"], "push")["docs_only"]
@@ -411,7 +431,7 @@ def self_test():
         git("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "-c", "user.name=CI self-test", "-c", "user.email=ci@example.invalid", "commit", "--quiet", "-m", "rename and delete", cwd=directory)
         paths = changed_paths(base, "HEAD", "pull_request", cwd=directory)
         assert set(paths) == {"README.md", "apps/core/src/old.rs", "apps/app/old.rs"}
-        assert make_plan(paths)["rust_packages"] == ["vibeface"]
+        assert make_plan(paths)["rust_packages"] == ["vibeface-core"]
         pr_head = git("rev-parse", "HEAD", cwd=directory).decode().strip()
         git("checkout", "--quiet", "--detach", base, cwd=directory)
         upstream = Path(directory) / "docs/upstream.md"
@@ -445,12 +465,12 @@ def self_test():
                 expect_failure(lambda: release_metadata("branch", ""))
     for check_msrv in (False, True):
         with patch("subprocess.run") as run:
-            run_check(["vibeface"], "1.89" if check_msrv else None)
+            run_check(["vibeface", "vibeface-core", "vibeface-control"], "1.89" if check_msrv else None)
             commands = [call.args[0] for call in run.call_args_list]
-            assert commands[0] == ["cargo", "clippy", "--all-targets", "--locked", "-p", "vibeface", "--", "-D", "warnings"]
+            assert commands[0] == ["cargo", "clippy", "--all-targets", "--locked", "-p", "vibeface", "-p", "vibeface-core", "-p", "vibeface-control", "--", "-D", "warnings"]
             assert commands[1:] == ([
                 ["rustup", "toolchain", "install", "1.89", "--profile", "minimal"],
-                ["cargo", "+1.89", "check", "--locked", "-p", "vibeface"],
+                ["cargo", "+1.89", "check", "--locked", "-p", "vibeface", "-p", "vibeface-core", "-p", "vibeface-control"],
             ] if check_msrv else [])
     root = Path(__file__).resolve().parent.parent
     subprocess.run(["python3", str(root / "scripts/build-inputs.py"), "self-test"], check=True)
@@ -566,7 +586,7 @@ def release_privacy_test(root, scratch):
             tool = ["python3", str(repo / "scripts/build-inputs.py")]
             for component, files in (
                 ("crypto", {"vibeface_secure.js": "fixture", "vibeface_secure_bg.wasm": "fixture"}),
-                ("web", {"_shell.html": "fixture"}),
+                ("web", {"_shell.html": "fixture", "_headers": "/*\n  Content-Security-Policy: default-src 'self'\n", "vibeface_secure.js": "fixture", "vibeface_secure_bg.wasm": "wasm", ".vibeface-build.json": "{}"}),
             ):
                 subprocess.run([*tool, "prepare", component], check=True)
                 output = repo / ("apps/app/generated" if component == "crypto" else "apps/app/dist/client")
@@ -582,7 +602,7 @@ def release_privacy_test(root, scratch):
         environment.update({name: "" for name in ("VIBEFACE_CODESIGN_IDENTITY", "VIBEFACE_NOTARY_KEY", "VIBEFACE_NOTARY_KEY_ID", "VIBEFACE_NOTARY_ISSUER")})
         fake_cargo = repo / "bin/cargo"
         fake_cargo.parent.mkdir()
-        fake_cargo.write_text('#!/bin/sh\ntouch "$CARGO_MARKER"\n')
+        fake_cargo.write_text('#!/bin/sh\nset -eu\ntouch "$CARGO_MARKER"\nmkdir -p "$CARGO_TARGET_DIR/privacy-fixture/release"\nprintf "#!/bin/sh\\nprintf \\\"vibeface 0.0.1-nightly.20261031.19\\\\n\\\"\\n" > "$CARGO_TARGET_DIR/privacy-fixture/release/vibeface"\nprintf "#!/bin/sh\\nprintf \\\"vibeface-core 0.0.1-nightly.20261031.19\\\\n\\\"\\n" > "$CARGO_TARGET_DIR/privacy-fixture/release/vibeface-core"\nchmod +x "$CARGO_TARGET_DIR/privacy-fixture/release/vibeface" "$CARGO_TARGET_DIR/privacy-fixture/release/vibeface-core"\n')
         fake_cargo.chmod(0o755)
         marker = repo / "cargo-called"
         environment.update(PATH=f"{fake_cargo.parent}{os.pathsep}{environment['PATH']}", CARGO_MARKER=str(marker))
@@ -598,6 +618,7 @@ def release_privacy_test(root, scratch):
             assert archive.extractfile(f"{package}/docs/guide.md").read() == b"public guide"
             assert not any(entry.name.endswith(("/.env", "/untracked-note.md")) for entry in archive.getmembers())
             assert archive.getmember(f"{package}/vibeface").mode & 0o111
+            assert archive.getmember(f"{package}/vibeface-core").mode & 0o111
         (repo / "scripts/release-rustflags.py").write_text('raise RuntimeError("fixture failure")')
         generated()
         marker.unlink()
