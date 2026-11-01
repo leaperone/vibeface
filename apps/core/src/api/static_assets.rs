@@ -74,6 +74,10 @@ impl StaticAssets {
                 files.contains_key(name),
                 "static App file is missing: {name}"
             );
+            ensure!(
+                !files[name].body.is_empty(),
+                "static App file is empty: {name}"
+            );
         }
         let content_security_policy = HeaderValue::from_str(&receipt.content_security_policy)
             .context("static App receipt has an invalid CSP")?;
