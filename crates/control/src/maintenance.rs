@@ -136,18 +136,11 @@ pub struct MaintenanceResponse {
 #[must_use]
 pub struct Lease {
     pub health: Value,
-    stream: UnixStream,
-}
-
-impl Lease {
-    /// Access the held stream when a caller needs to keep it alive explicitly.
-    pub fn stream(&mut self) -> &mut UnixStream {
-        &mut self.stream
-    }
+    _stream: UnixStream,
 }
 
 fn validate_socket(socket: &Path) -> Result<()> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     ensure!(
         socket.is_absolute(),
         "maintenance socket path must be absolute"
@@ -161,8 +154,11 @@ fn validate_socket(socket: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     ensure!(
-        parent_metadata.is_dir() && !parent_metadata.file_type().is_symlink(),
-        "maintenance socket parent is not a private directory"
+        parent_metadata.is_dir()
+            && !parent_metadata.file_type().is_symlink()
+            && parent_metadata.uid() == unsafe { libc::geteuid() }
+            && parent_metadata.permissions().mode() & 0o077 == 0,
+        "maintenance socket parent is not a private directory owned by this user"
     );
     let socket_metadata = match std::fs::symlink_metadata(socket) {
         Ok(metadata) => metadata,
@@ -178,8 +174,9 @@ fn validate_socket(socket: &Path) -> Result<()> {
         "maintenance socket path is occupied by another file"
     );
     ensure!(
-        socket_metadata.uid() == parent_metadata.uid(),
-        "maintenance socket has unexpected ownership"
+        socket_metadata.uid() == parent_metadata.uid()
+            && socket_metadata.permissions().mode() & 0o077 == 0,
+        "maintenance socket has unexpected ownership or permissions"
     );
     Ok(())
 }
@@ -246,12 +243,7 @@ async fn exchange(
         .await
         .context("maintenance connection timed out")??;
     use std::os::unix::fs::MetadataExt;
-    let expected_uid = std::fs::symlink_metadata(
-        socket
-            .parent()
-            .context("maintenance socket has no parent")?,
-    )?
-    .uid();
+    let expected_uid = unsafe { libc::geteuid() };
     ensure!(
         stream.peer_cred()?.uid() == expected_uid,
         "maintenance socket requires its local owner"
@@ -284,14 +276,6 @@ pub async fn request(socket: &Path, command: MaintenanceCommand) -> Result<Maint
     Ok(response)
 }
 
-/// Compatibility name used by callers that spell out the transport operation.
-pub async fn maintenance_request(
-    socket: &Path,
-    command: MaintenanceCommand,
-) -> Result<MaintenanceResponse> {
-    request(socket, command).await
-}
-
 pub async fn acquire(socket: &Path) -> Result<Lease> {
     let (stream, response) = exchange(socket, MaintenanceCommand::Acquire).await?;
     ensure!(
@@ -302,22 +286,84 @@ pub async fn acquire(socket: &Path) -> Result<Lease> {
         health: response
             .health
             .context("maintenance response has no health")?,
-        stream,
+        _stream: stream,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixListener,
+        sync::oneshot,
+    };
 
     #[tokio::test]
     async fn request_refuses_acquire_without_dropping_a_lease() {
-        let socket =
-            std::env::temp_dir().join(format!("vibeface-maintenance-{}.sock", std::process::id()));
+        let socket = std::env::temp_dir().join(format!(
+            "vibeface-maintenance-refusal-{}.sock",
+            std::process::id()
+        ));
         let error = request(&socket, MaintenanceCommand::Acquire)
             .await
-            .unwrap_err();
+            .err()
+            .expect("Acquire must use the lease-returning API");
         assert!(error.to_string().contains("lease stream is retained"));
+    }
+
+    #[tokio::test]
+    async fn acquire_keeps_the_server_stream_until_drop() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "vibeface-maintenance-roundtrip-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory)?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        let socket = directory.join("maintenance.sock");
+        let listener = UnixListener::bind(&socket).await?;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+        let (closed_tx, closed_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                let count = stream.read(&mut byte).await?;
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&byte);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            let response = serde_json::json!({
+                "protocol": PROTOCOL,
+                "status": "ready",
+                "health": {"device_id":"device","version":"version"}
+            });
+            stream.write_all(&serde_json::to_vec(&response)?).await?;
+            stream.write_all(b"\n").await?;
+            let mut tail = Vec::new();
+            stream.read_to_end(&mut tail).await?;
+            let _ = closed_tx.send(());
+            Ok::<_, anyhow::Error>(request)
+        });
+        let lease = acquire(&socket).await?;
+        assert_eq!(lease.health["device_id"], "device");
+        assert!(!closed_rx.is_closed());
+        drop(lease);
+        closed_rx.await?;
+        let request = server.await??;
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&request)?
+                .get("command")
+                .is_some()
+        );
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[test]
