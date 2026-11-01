@@ -2,6 +2,8 @@
 
 `apps/www` builds the public portal for `www.vibeface.dev`. It contains the landing page, public downloads and community links, and the documentation pages sourced from the repository root `docs/` directory.
 
+Public document links are registered in `src/lib/public-docs.ts`. Document bodies, titles, and descriptions come from `docs/`; edit those source files so the website and repository keep the same instructions.
+
 Install dependencies from the repository root, then run the portal locally:
 
 ```sh

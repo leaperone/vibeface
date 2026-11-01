@@ -7,7 +7,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 `.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。每次触发都生成计划，`ci-gate` 要求选中的任务全部成功。没有顶层 `paths` 筛选。
 
-开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态。需要验证移动端或 macOS 时，从 Actions 手动运行对应 workflow。`main` push、定时、手动运行、merge queue 和 `v*` Tag 仍按各自计划检查；推送 `v*` Nightly Tag 才运行完整发布检查、原生制品和应用发布构建，合并后的制品与实际体验由开发者自行验收。
+开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态。需要验证移动端或 macOS 时，从 Actions 手动运行对应 workflow。`main` push、定时、手动运行、merge queue 和 `v*` Tag 仍按各自计划检查；推送 `v*` Tag 会运行完整发布检查、原生制品和应用发布构建，合并后的制品与实际体验由开发者自行验收。
 
 ## main 与 merge queue 的核心检查
 
@@ -28,7 +28,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 静态快检保留 Rust fmt、工作流与 shell 检查、JavaScript 语法、选择器和安装器自检。涉及 Rust 时校验 Atlas 迁移文件，不打开数据库。快速 Rust 测试保留权限、个人网络隔离、数据持久化、写操作去重与未知结果对账等已有回归，只跳过 `SLOW_TESTS` 明确列出的重型用例，目前是 10 万事件追加测试和超出待补依赖上限的 4 万事件追平测试。
 
-`www` 使用 Node.js 24 和冻结的 pnpm 依赖，依次运行 `typecheck`、`build`、`check:static`，上传 `apps/www/dist/client` 为 `www-<SHA>` 制品。门户与 Node 内嵌网页分别构建；根 `docs/` 是门户文档正文的唯一来源，修改文档也会触发 `www`。
+`www` 使用 Node.js 24 和冻结的 pnpm 依赖，依次运行 `typecheck`、`build`、`check:static`，上传 `apps/www/dist/client` 为 `www-<SHA>` 制品。门户与独立 App 分别构建；根 `docs/` 是门户文档正文的唯一来源，修改文档也会触发 `www`。
 
 改 `apps/core/migrations/` 下的 schema 必须同时提高共享控制 crate `crates/control/src/lib.rs` 的 `DATA_EPOCH`，并更新 `apps/core/src/config.rs` 中相邻的 `DATA_EPOCH_SCHEMA_SHA256`；否则 Node 快速测试 `schema_changes_bump_the_data_epoch` 失败。存储 epoch 不变时旧数据库能打开，运行中才因缺列出错，自更新也会误判可原地升级。`install.sh` 中写死的 epoch 一并修改，由 `ci.py --self-test` 核对。
 
@@ -113,7 +113,7 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 ## 定期、手动和发布检查
 
-每日 UTC 03:23 定时、Actions 中手动运行 `ci`、merge queue 和 `v*` tag 强制执行扩展检查，不受路径影响。开发分支 PR 不触发 `ci`。`v*` tag 还会构建 macOS 和 Android 发布资产；手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
+每日 UTC 03:23 定时、Actions 中手动运行 `ci` 和 `v*` tag 强制执行扩展检查，不受路径影响。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或三平台打包。开发分支 PR 不触发 `ci`。`v*` tag 还会构建 macOS 和 Android 发布资产；手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
 
 | 扩展检查 | 执行范围 |
 | --- | --- |

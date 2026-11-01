@@ -9,6 +9,7 @@ const required = [
   'download/index.html',
   'community/index.html',
   'security/index.html',
+  'docs/index.html',
   'docs/overview/index.html',
   'docs/comparison/index.html',
   'docs/install/index.html',
@@ -74,8 +75,6 @@ for (const [query, url] of [
   if (!matchesPage) fail(`search index does not match ${query} in ${url}`)
 }
 
-console.log(`checked ${htmlFiles.length} HTML pages, ${required.length} required outputs, and Chinese search terms`)
-
 function walk(directory) {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
     const path = resolve(directory, entry.name)
@@ -87,3 +86,29 @@ function fail(message) {
   console.error(`static check failed: ${message}`)
   process.exit(1)
 }
+
+const docsRoot = resolve('../../docs')
+const { pages } = JSON.parse(readFileSync(resolve(docsRoot, 'meta.json'), 'utf8'))
+for (const slug of pages) {
+  const source = readFileSync(resolve(docsRoot, `${slug}.md`), 'utf8')
+  const title = source.match(/^title: (.+)$/m)?.[1]
+  const description = source.match(/^description: (.+)$/m)?.[1]
+  if (!title || !description) fail(`${slug} is missing public metadata`)
+  const page = readFileSync(resolve(root, `docs/${slug}/index.html`), 'utf8')
+  if (!page.includes(`<title>${title} · Vibeface 文档</title>`)) fail(`${slug} has stale page title metadata`)
+  if (!page.includes(`content="${description}"`)) fail(`${slug} has stale description metadata`)
+}
+
+const anchors = new Map(htmlFiles.map((path) => [path, new Set([...readFileSync(path, 'utf8').matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]))]))
+for (const path of htmlFiles) {
+  for (const match of readFileSync(path, 'utf8').matchAll(/href="([^"]+)"/g)) {
+    const url = new URL(match[1].replaceAll('&amp;', '&'), `https://www.vibeface.dev/${path.slice(root.length + 1)}`)
+    if (url.origin !== 'https://www.vibeface.dev' || !url.hash) continue
+    const target = resolve(root, `.${decodeURIComponent(url.pathname)}`)
+    const page = target.endsWith('.html') ? target : resolve(target, 'index.html')
+    const ids = anchors.get(page)
+    if (ids && !ids.has(decodeURIComponent(url.hash.slice(1)))) fail(`${path.slice(root.length + 1)} points to missing anchor ${match[1]}`)
+  }
+}
+
+console.log(`checked ${htmlFiles.length} HTML pages, ${required.length} required outputs, public metadata, anchors, and Chinese search terms`)
