@@ -124,9 +124,9 @@ fn core_binary() -> Result<PathBuf> {
     vibeface_control::sibling_core(&std::env::current_exe()?)
 }
 
-async fn inspect(data: &Path) -> Result<InspectResult> {
+async fn inspect(data: &Path, core: &Path) -> Result<InspectResult> {
     let value = vibeface_control::request(
-        &core_binary()?,
+        core,
         &ControlRequest::Inspect {
             data_dir: data.to_owned(),
         },
@@ -347,7 +347,7 @@ pub async fn run(options: Update) -> Result<()> {
                 manifest(&candidate)?.version == latest.version,
                 "staged version changed"
             );
-            let inspected = inspect(&data).await?;
+            let inspected = inspect(&data, &core_binary()?).await?;
             prepare_firewall(&inspected, &policy.install_root, &candidate).await?;
             let service = Service::load(&data).await?;
             let lease = match maintenance::acquire(&inspected.maintenance_socket).await {
@@ -420,7 +420,7 @@ pub async fn run(options: Update) -> Result<()> {
 }
 
 async fn maintenance_commit(data: &Path) -> Result<()> {
-    let inspected = inspect(data).await?;
+    let inspected = inspect(data, &core_binary()?).await?;
     let response = maintenance::request(
         &inspected.maintenance_socket,
         vibeface_control::maintenance::MaintenanceCommand::Commit,
@@ -678,7 +678,7 @@ async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
         .build()?;
     let mut last = String::new();
     for _ in 0..150 {
-        match inspect(data).await {
+        match inspect(data, &package.join("vibeface-core")).await {
             Ok(inspected) => {
                 let running_version = inspected
                     .core_version
@@ -866,7 +866,7 @@ trait ServiceControl {
     async fn stop(&self) -> Result<()>;
     async fn start(&self) -> Result<()>;
     async fn device_id(&self, data: &Path) -> Result<String> {
-        Ok(inspect(data).await?.device_id)
+        Ok(inspect(data, &core_binary()?).await?.device_id)
     }
     async fn healthy(&self, data: &Path, package: &Path, device_id: &str) -> Result<()> {
         healthy(data, package, device_id).await
@@ -1066,6 +1066,34 @@ mod tests {
             PathBuf::from("/tmp").join(format!("vibeface-updater-{}", uuid::Uuid::new_v4()));
         private_dir(&directory).unwrap();
         fs::canonicalize(directory).unwrap()
+    }
+
+    #[tokio::test]
+    async fn update_health_inspects_the_candidate_core() -> Result<()> {
+        let root = sandbox();
+        let candidate = package(&root, "9.0.0");
+        let data = root.join("data");
+        let marker = root.join("candidate-inspected");
+        let response = serde_json::json!({"ok":true,"result":{
+            "status":"running","device_id":"unexpected","data_dir":data,
+            "maintenance_socket":root.join("socket"),"listen":"127.0.0.1:4790",
+            "version":"9.0.0","core_version":"9.0.0"
+        }});
+        let core = candidate.join("vibeface-core");
+        fs::write(
+            &core,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\ntouch '{}'\nprintf '%s\\n' '{}'\n",
+                marker.display(),
+                response
+            ),
+        )?;
+        fs::set_permissions(&core, fs::Permissions::from_mode(0o700))?;
+        let error = healthy(&data, &candidate, "expected").await.unwrap_err();
+        assert!(marker.exists(), "health must execute the candidate Core");
+        assert!(error.to_string().contains("unexpected version or identity"));
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     fn package(root: &Path, version: &str) -> PathBuf {
