@@ -337,10 +337,10 @@ async fn send_to_node(mut record: Value) {
     if let Some(message) = record["message"].as_str() {
         record["message"] = Value::String(message.chars().take(2_000).collect());
     }
-    if record["conversation_id"].is_null() {
-        if let Ok(conversation) = std::env::var("VIBEFACE_NODE_CONVERSATION") {
-            record["conversation_id"] = Value::String(conversation);
-        }
+    if record["conversation_id"].is_null()
+        && let Ok(conversation) = std::env::var("VIBEFACE_NODE_CONVERSATION")
+    {
+        record["conversation_id"] = Value::String(conversation);
     }
     let Ok(url) = std::env::var("VIBEFACE_TRIAGE_URL") else {
         return;

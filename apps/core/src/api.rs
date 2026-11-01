@@ -883,7 +883,7 @@ fn static_cache_control(path: &str) -> &'static str {
         "public, max-age=31536000, immutable"
     } else if matches!(
         path,
-        "/_shell.html" | "/index.html" | "/vibeface_secure.js" | "/vibeface_secure_bg.wasm"
+        "/" | "/_shell.html" | "/index.html" | "/vibeface_secure.js" | "/vibeface_secure_bg.wasm"
     ) {
         "no-store"
     } else {

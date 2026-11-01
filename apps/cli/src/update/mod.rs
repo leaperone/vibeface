@@ -187,6 +187,7 @@ pub(crate) fn lock_data_dir(data: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .open(data.join("node.lock"))?;
     file.try_lock()

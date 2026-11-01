@@ -2,6 +2,7 @@
 """Bind generated Web/WASM files to their source inputs and exact output set."""
 import argparse
 import base64
+import fnmatch
 import hashlib
 import json
 import shutil
@@ -199,11 +200,23 @@ def self_test():
             finish(repo, component)
             check(repo, component)
         headers = (repo / OUTPUTS["web"] / "_headers").read_text()
-        if headers.count("Cache-Control:") != len(CACHE_POLICIES):
-            raise AssertionError("static headers have duplicate or missing cache rules")
-        for path, cache in CACHE_POLICIES:
-            if f"{path}\n  Cache-Control: {cache}\n" not in headers:
-                raise AssertionError(f"static headers are missing the cache rule for {path}")
+        rules = []
+        for line in headers.splitlines():
+            if line and not line.startswith(" "):
+                pattern = line
+            elif line.startswith("  Cache-Control: "):
+                rules.append((pattern, line.split(": ", 1)[1]))
+        for path, expected in (
+            ("/", "no-store"),
+            ("/index.html", "no-store"),
+            ("/vibeface_secure.js", "no-store"),
+            ("/vibeface_secure_bg.wasm", "no-store"),
+            ("/sw.js", "no-cache"),
+            ("/assets/chunk-123.js", "public, max-age=31536000, immutable"),
+        ):
+            actual = [cache for pattern, cache in rules if fnmatch.fnmatchcase(path, pattern)]
+            if actual != [expected]:
+                raise AssertionError(f"{path}: expected one cache policy, got {actual}")
         public = repo / "apps/app/public"
         public.mkdir(parents=True)
         (public / ".env").write_text("PRIVATE_DATA=must-not-ship")

@@ -134,17 +134,12 @@ struct Init {
     relay_token_file: Option<PathBuf>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 enum RelayServiceMode {
+    #[default]
     Forward,
     DiscoveryOnly,
-}
-
-impl Default for RelayServiceMode {
-    fn default() -> Self {
-        Self::Forward
-    }
 }
 
 #[derive(Args)]
@@ -466,12 +461,10 @@ async fn main() -> Result<()> {
                 if let Some(device_id) = result["device_id"].as_str() {
                     println!("Discovery device ID: {device_id}");
                 }
-            } else if result["public_entry"] == true {
-                if let Some(path) = result["relay_token_file"].as_str() {
-                    println!(
-                        "Relay token: {path} (copy it to your Node and pass --relay-token-file)"
-                    );
-                }
+            } else if result["public_entry"] == true
+                && let Some(path) = result["relay_token_file"].as_str()
+            {
+                println!("Relay token: {path} (copy it to your Node and pass --relay-token-file)");
             }
             Ok(())
         }
@@ -1217,10 +1210,10 @@ async fn post_tool(name: &str, arguments: Value, call_id: &str) -> Result<Value>
     let status = response.status();
     let body = bounded_body(response).await?;
     if !status.is_success() {
-        if let Ok(error) = serde_json::from_slice::<Value>(&body) {
-            if error.get("call_record").is_some() {
-                eprintln!("{}", serde_json::to_string(&error)?);
-            }
+        if let Ok(error) = serde_json::from_slice::<Value>(&body)
+            && error.get("call_record").is_some()
+        {
+            eprintln!("{}", serde_json::to_string(&error)?);
         }
         let reason = serde_json::from_slice::<Value>(&body)
             .ok()
@@ -1726,12 +1719,12 @@ async fn logs(options: Logs) -> Result<()> {
             if line.len() > MAX_LOG_RECORD {
                 continue;
             }
-            if let Ok(record) = serde_json::from_slice::<LogValue>(&line) {
-                if log_matches(&record, &options, since) {
-                    records.push(record);
-                    if records.len() > options.limit.max(1) {
-                        records.remove(0);
-                    }
+            if let Ok(record) = serde_json::from_slice::<LogValue>(&line)
+                && log_matches(&record, &options, since)
+            {
+                records.push(record);
+                if records.len() > options.limit.max(1) {
+                    records.remove(0);
                 }
             }
         }
@@ -1764,12 +1757,11 @@ async fn logs(options: Logs) -> Result<()> {
             .map_or(0, |at| at + 1);
         offset += complete as u64;
         for line in bytes[..complete].split(|byte| *byte == b'\n') {
-            if line.len() <= MAX_LOG_RECORD {
-                if let Ok(record) = serde_json::from_slice::<LogValue>(line) {
-                    if log_matches(&record, &options, since) {
-                        print(&record)?;
-                    }
-                }
+            if line.len() <= MAX_LOG_RECORD
+                && let Ok(record) = serde_json::from_slice::<LogValue>(line)
+                && log_matches(&record, &options, since)
+            {
+                print(&record)?;
             }
         }
     }
@@ -2450,9 +2442,8 @@ mod tests {
 
     #[tokio::test]
     async fn hooks_install_uses_node_owned_provider_roots_by_default() -> Result<()> {
-        use std::sync::{Mutex, OnceLock};
-        static HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = HOME_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = HOME_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!("vibeface-hooks-{}", uuid::Uuid::new_v4()));
         let home = dir.join("home");
         let data = dir.join("data");
