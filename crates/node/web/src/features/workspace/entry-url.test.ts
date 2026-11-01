@@ -27,6 +27,14 @@ import * as workspaceModel from "@vibeface/client/workspace/model.ts"
 import * as workspaceQuestions from "@vibeface/client/workspace/questions.ts"
 import { inboxItems } from "@vibeface/client/workspace/inbox.ts"
 
+test("bulk inbox actions re-arm focus after an intervening list update", () => {
+  const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../../routes/_app/inbox.tsx"), "utf8")
+  const start = source.indexOf("const action = async (kind")
+  const action = source.slice(start, source.indexOf("\n  return <div", start))
+  assert.ok(action.indexOf("held.current = { key: bulkFocusKey") >= 0)
+  assert.ok(action.indexOf("held.current = { key: bulkFocusKey") < action.indexOf("setBusy(kind)"), "the action re-arms the sentinel before the list can change")
+})
+
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
   works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], questions: [], sessions: [],

@@ -40,6 +40,8 @@ function InboxPage() {
   if (!items.length && !workspace.nodes.length && !workspace.error) return <div className="mx-auto grid w-full max-w-(--page-width) gap-3" aria-busy="true"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
   if (!items.length) return <EmptyState icon={Inbox} title="没有待处理" action={<Button asChild variant="outline"><Link to="/"><MessageCircle aria-hidden="true" />回到消息</Link></Button>} />
   const action = async (kind: "ignore" | "read") => {
+    // A new reminder can update the list while this button remains focused; restore the sentinel at the action boundary.
+    held.current = { key: bulkFocusKey, index: 0 }
     setBusy(kind)
     await workspace.run(async () => {
       const ids = attention.map((item) => item.notification.notification_id)
