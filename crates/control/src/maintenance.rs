@@ -322,8 +322,9 @@ mod tests {
         std::fs::create_dir(&directory)?;
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
         let socket = directory.join("maintenance.sock");
-        let listener = UnixListener::bind(&socket).await?;
+        let listener = UnixListener::bind(&socket)?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+        let (ready_tx, ready_rx) = oneshot::channel();
         let (closed_tx, closed_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
@@ -346,6 +347,7 @@ mod tests {
             });
             stream.write_all(&serde_json::to_vec(&response)?).await?;
             stream.write_all(b"\n").await?;
+            let _ = ready_tx.send(());
             let mut tail = Vec::new();
             stream.read_to_end(&mut tail).await?;
             let _ = closed_tx.send(());
@@ -353,7 +355,7 @@ mod tests {
         });
         let lease = acquire(&socket).await?;
         assert_eq!(lease.health["device_id"], "device");
-        assert!(!closed_rx.is_closed());
+        ready_rx.await?;
         drop(lease);
         closed_rx.await?;
         let request = server.await??;
