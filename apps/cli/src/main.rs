@@ -1118,12 +1118,19 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
     vibeface_protocol::validate_id(call_id)
         .map_err(|error| anyhow::anyhow!("arguments.call_ref is invalid: {error}"))?;
     ensure!(
-        arguments["prompt"].is_string(),
+        arguments["prompt"]
+            .as_str()
+            .is_some_and(|prompt| !prompt.is_empty()),
         "dispatch_work requires a prompt"
     );
     ensure!(
-        arguments["thread"].is_string()
-            || (arguments["title"].is_string() && arguments["cwd"].is_string()),
+        arguments["thread"]
+            .as_str()
+            .is_some_and(|thread| !thread.is_empty())
+            || (arguments["title"]
+                .as_str()
+                .is_some_and(|title| !title.is_empty())
+                && arguments["cwd"].as_str().is_some_and(|cwd| !cwd.is_empty())),
         "dispatch_work requires thread or title and cwd"
     );
     let result = {
@@ -2202,6 +2209,25 @@ mod tests {
         };
         assert_eq!(options.data_dir, Path::new("/private/node"));
         assert!(
+            Cli::try_parse_from(["vibeface", "--data-dir", "/data/node", "--no-web"])
+                .unwrap()
+                .no_web
+        );
+        let explicit = Cli::try_parse_from([
+            "vibeface",
+            "serve",
+            "--data-dir",
+            "/data/node",
+            "--no-web",
+            "--app-dir",
+            "/app",
+        ])
+        .unwrap();
+        let Some(Action::Serve(options)) = explicit.command else {
+            panic!("expected serve")
+        };
+        assert!(options.no_web && options.app_dir.as_deref() == Some(Path::new("/app")));
+        assert!(
             Cli::try_parse_from([
                 "vibeface",
                 "--data-dir",
@@ -2251,6 +2277,81 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["vibeface", "access", "--enable", "--disable"]).is_err());
         assert!(Cli::try_parse_from(["vibeface", "status", "--enable"]).is_err());
+        for action in [
+            "install",
+            "start",
+            "stop",
+            "restart",
+            "status",
+            "uninstall",
+            "install-updater",
+            "uninstall-updater",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "vibeface",
+                    "service",
+                    action,
+                    "--data-dir",
+                    "/private/node data"
+                ])
+                .is_ok()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "vibeface",
+                "init",
+                "--data-dir",
+                "/data/node",
+                "--relay",
+                "https://relay.test",
+                "--relay-listen",
+                "0.0.0.0:3340",
+                "--relay-url",
+                "https://relay.test"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vibeface",
+                "init",
+                "--data-dir",
+                "/data/node",
+                "--manager",
+                "cursor",
+                "--workspace",
+                ".",
+                "--bin",
+                "cursor=/opt/bin/cursor-sdk-bridge"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vibeface",
+                "init",
+                "--data-dir",
+                "/data/node",
+                "--manager",
+                "cursor_sdk",
+                "--workspace",
+                "."
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vibeface",
+                "init",
+                "--data-dir",
+                "/data/node",
+                "--bin",
+                "/opt/bin/claude"
+            ])
+            .is_err()
+        );
         assert!(Cli::try_parse_from(["vibeface", "tool", "dispatch_work", "--json", "{}"]).is_ok());
         assert!(
             Cli::try_parse_from([
