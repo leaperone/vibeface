@@ -1,4 +1,5 @@
 //! Personal Node coordination, authenticated replication and local SDK tools.
+use anyhow::Context as _;
 pub mod agent_context;
 pub mod api;
 pub mod client;
@@ -26,16 +27,14 @@ pub mod work;
 
 /// The CLI binary lives beside the core binary in packaged installs.  Backend processes use it
 /// when they need to ask a user-facing tool or hook to continue a turn.
-pub fn sibling_cli() -> std::path::PathBuf {
-    let current = std::env::current_exe().unwrap_or_else(|_| "vibeface-core".into());
-    current.parent().map_or_else(
-        || "vibeface".into(),
-        |parent| {
-            parent.join(if cfg!(windows) {
-                "vibeface.exe"
-            } else {
-                "vibeface"
-            })
-        },
-    )
+pub fn sibling_cli() -> anyhow::Result<std::path::PathBuf> {
+    let current = std::env::current_exe().context("resolve the Core executable")?;
+    let parent = current
+        .parent()
+        .context("Core executable has no parent directory")?;
+    Ok(parent.join(if cfg!(windows) {
+        "vibeface.exe"
+    } else {
+        "vibeface"
+    }))
 }

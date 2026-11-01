@@ -157,6 +157,9 @@ pub async fn request(core: &Path, request: &ControlRequest) -> Result<Value> {
             String::from_utf8_lossy(&error_output)
         );
     }
+    if matches!(request, ControlRequest::Join { .. }) && !error_output.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&error_output));
+    }
     let response: ControlResponse =
         serde_json::from_slice(&output).context("invalid core control response")?;
     response.into_result()

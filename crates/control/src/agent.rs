@@ -290,7 +290,22 @@ pub async fn run(socket: &Path, command: Command) -> Result<()> {
             };
             let thread_id = params["threadId"].as_str().map(str::to_owned);
             let reply = session.request(&method, params).await;
-            let _ = thread_id;
+            send_to_node(match &reply {
+                Ok(_) => json!({
+                    "level":"info",
+                    "event":"codex.call",
+                    "message":format!("{method} succeeded"),
+                    "thread_id":thread_id
+                }),
+                Err(error) => json!({
+                    "level":"warn",
+                    "event":"codex.call_failed",
+                    "message":format!("{method} failed: {}", error.message),
+                    "thread_id":thread_id,
+                    "fields":{"uncertain":error.uncertain}
+                }),
+            })
+            .await;
             match reply {
                 Ok(result) => println!("{result}"),
                 Err(error) if error.uncertain => bail!(
@@ -316,6 +331,33 @@ pub async fn run(socket: &Path, command: Command) -> Result<()> {
     }
     session.close().await;
     Ok(())
+}
+
+async fn send_to_node(mut record: Value) {
+    if let Some(message) = record["message"].as_str() {
+        record["message"] = Value::String(message.chars().take(2_000).collect());
+    }
+    if record["conversation_id"].is_null() {
+        if let Ok(conversation) = std::env::var("VIBEFACE_NODE_CONVERSATION") {
+            record["conversation_id"] = Value::String(conversation);
+        }
+    }
+    let Ok(url) = std::env::var("VIBEFACE_TRIAGE_URL") else {
+        return;
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return;
+    };
+    let _ = client
+        .post(format!("{}/api/log", url.trim_end_matches('/')))
+        .json(&json!({"source":"agent","records":[record]}))
+        .send()
+        .await;
 }
 
 pub enum Command {

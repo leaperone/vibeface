@@ -1612,9 +1612,9 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
     let node = Runtime::open(dir).await?;
     let report = |progress| match progress {
         NodeJoin::Confirming { code, admin } => {
-            println!("安全码：{code}。在「{admin}」上比对一致后允许。")
+            eprintln!("安全码：{code}。在「{admin}」上比对一致后允许。")
         }
-        _ => println!("已提交加入请求，等待管理设备批准。"),
+        _ => eprintln!("已提交加入请求，等待管理设备批准。"),
     };
     join_as_node(&node, link, name, report, &tokio::sync::Notify::new()).await
 }

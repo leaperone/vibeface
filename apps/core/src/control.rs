@@ -97,7 +97,19 @@ pub async fn handle(request: vibeface_control::ControlRequest) -> Result<Value> 
     }
 }
 
+pub fn validate_data_dir(data_dir: &Path) -> Result<()> {
+    ensure!(data_dir.is_absolute(), "specify an absolute data directory");
+    if let Ok(metadata) = fs::symlink_metadata(data_dir) {
+        ensure!(
+            !metadata.file_type().is_symlink(),
+            "data directory must not be a symbolic link"
+        );
+    }
+    Ok(())
+}
+
 fn wallet(data_dir: &Path, operation: Value) -> Result<Value> {
+    validate_data_dir(data_dir)?;
     match operation.get("op").and_then(Value::as_str) {
         Some("backup") => {
             let output = operation["output"]
@@ -111,6 +123,7 @@ fn wallet(data_dir: &Path, operation: Value) -> Result<Value> {
 }
 
 pub async fn inspect(data_dir: &Path) -> Result<Value> {
+    validate_data_dir(data_dir)?;
     let data_dir = fs::canonicalize(data_dir)
         .context("initialized data directory is required; run vibeface init first")?;
     let configuration = Config::load(&data_dir)?;
@@ -294,6 +307,7 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 }
 
 async fn set_local_access(data_dir: &Path, enabled: bool) -> Result<bool> {
+    validate_data_dir(data_dir)?;
     match maintenance::set_local_access(data_dir, enabled).await {
         Ok(()) => Ok(true),
         Err(error)
@@ -314,6 +328,7 @@ async fn set_local_access(data_dir: &Path, enabled: bool) -> Result<bool> {
 }
 
 async fn join(data_dir: &Path, link: &str, name: &str) -> Result<Value> {
+    validate_data_dir(data_dir)?;
     if node_running(data_dir)? {
         let status = maintenance::join(data_dir, link, name).await?;
         return Ok(serde_json::to_value(status)?);
@@ -343,6 +358,7 @@ fn node_running(dir: &Path) -> Result<bool> {
 
 /// Start owns the data directory and may initialize only an absent or empty one.
 pub fn prepare_start(dir: &Path) -> Result<()> {
+    validate_data_dir(dir)?;
     let empty = match dir.symlink_metadata() {
         Ok(metadata) => {
             ensure!(
@@ -362,6 +378,15 @@ pub fn prepare_start(dir: &Path) -> Result<()> {
 }
 
 fn initialize_from_options(options: InitOptions) -> Result<Value> {
+    validate_data_dir(&options.data_dir)?;
+    ensure!(
+        options.entry.is_none() || options.relay_token_file.is_some(),
+        "--entry requires --relay-token-file"
+    );
+    ensure!(
+        options.entry_relay.is_none() || options.entry.is_some(),
+        "--entry-relay requires --entry"
+    );
     let roots: Vec<_> = options
         .roots
         .iter()
@@ -542,6 +567,7 @@ fn create_private(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub fn restart_fresh(dir: &Path) -> Result<()> {
+    validate_data_dir(dir)?;
     let configuration = Config::load(dir)?;
     let entry_token = configuration
         .network
@@ -561,7 +587,10 @@ pub fn restart_fresh(dir: &Path) -> Result<()> {
         "{} already exists",
         archive.display()
     );
-    initialize(&fresh, configuration, entry_token)?;
+    if let Err(error) = initialize(&fresh, configuration, entry_token) {
+        let _ = fs::remove_dir_all(&fresh);
+        return Err(error);
+    }
     fs::rename(dir, &archive)?;
     if let Err(error) = fs::rename(&fresh, dir) {
         fs::rename(&archive, dir)?;
@@ -639,6 +668,33 @@ mod tests {
         assert_eq!(fs::read(dir.join("existing-data")).unwrap(), b"original");
         assert!(!dir.join("identity.json").exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn control_rejects_relative_and_symlink_data_directories() {
+        assert!(validate_data_dir(Path::new("relative-node")).is_err());
+        let root = temp_dir("path-boundary");
+        fs::create_dir(&root).unwrap();
+        let target = root.join("target");
+        fs::create_dir(&target).unwrap();
+        let link = root.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(unix)]
+        assert!(validate_data_dir(&link).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initialization_rejects_an_entry_without_an_explicit_relay_token_file() {
+        let dir = temp_dir("entry-token");
+        let options: InitOptions = serde_json::from_value(json!({
+            "data_dir": dir,
+            "entry": "https://entry.example"
+        }))
+        .unwrap();
+        let error = initialize_from_options(options).unwrap_err().to_string();
+        assert!(error.contains("relay-token-file"), "{error}");
     }
 
     #[test]
