@@ -57,7 +57,7 @@ web="$repo/apps/app/dist/client"
   echo 'Browser cryptography is missing from the static output. Run scripts/build-web-crypto.sh and scripts/build-web.sh before building a package.' >&2
   exit 1
 }
-[[ -s "$web/_shell.html" && -s "$web/.vibeface-build.json" ]] || {
+[[ -s "$web/_shell.html" && -s "$web/index.html" && -s "$web/_redirects" && -s "$web/_headers" && -s "$web/.vibeface-build.json" ]] || {
   echo 'Web client is missing. Run scripts/build-web.sh before building a package.' >&2
   exit 1
 }
@@ -104,9 +104,9 @@ if [[ "$target" == *-apple-darwin && -n "${VIBEFACE_CODESIGN_IDENTITY:-}" ]]; th
     xcrun notarytool log "$submission" --key "$VIBEFACE_NOTARY_KEY" --key-id "$VIBEFACE_NOTARY_KEY_ID" --issuer "$VIBEFACE_NOTARY_ISSUER"
   fi
 fi
-data_epoch="$(sed -n 's/^pub const DATA_EPOCH: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/apps/core/src/config.rs")"
-update_protocol="$(sed -n 's/^pub const UPDATE_PROTOCOL: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/apps/core/src/config.rs")"
-[[ -n "$data_epoch" && -n "$update_protocol" ]] || { echo 'DATA_EPOCH or UPDATE_PROTOCOL not found in apps/core/src/config.rs' >&2; exit 1; }
+data_epoch="$(sed -n 's/^pub const DATA_EPOCH: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/crates/control/src/lib.rs")"
+update_protocol="$(sed -n 's/^pub const UPDATE_PROTOCOL: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/crates/control/src/lib.rs")"
+[[ -n "$data_epoch" && -n "$update_protocol" ]] || { echo 'DATA_EPOCH or UPDATE_PROTOCOL not found in crates/control/src/lib.rs' >&2; exit 1; }
 printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":%s,"data_epoch":%s}\n' "$version" "$target" "$source_commit" "$update_protocol" "$data_epoch" > "$package/BUILD-INFO.json"
 cp -a "$web/." "$package/web/"
 cp "$repo/scripts/install-node-service.sh" "$package/scripts/"

@@ -809,7 +809,7 @@ def websocket_send(stream, value):
 
 
 DATA_EPOCH = int(re.search(r"^pub const DATA_EPOCH: u32 = (\d+);$",
-                           (Path(__file__).resolve().parents[1] / "apps/core/src/config.rs").read_text(), re.M)[1])
+                           (Path(__file__).resolve().parents[1] / "crates/control/src/lib.rs").read_text(), re.M)[1])
 # These runs drive a fixture App Server the Node starts itself, not one already on the machine.
 SPAWN_APP_SERVER = {"mode": "spawn", "socket": None}
 APP_SERVER_SCHEMA = Path(__file__).resolve().parents[1] / "crates/bridge/schema/app-server-methods.json"

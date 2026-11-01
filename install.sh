@@ -138,7 +138,7 @@ verify_package() {
   local package="$1" version="$2" target="$3" commit="$4" scratch="$5" entry
   for entry in vibeface vibeface-core BUILD-INFO.json README.md RUNTIME-REQUIREMENTS.md \
     scripts/install-node-service.sh docs/node.md docs/releasing.md \
-    web/_shell.html web/_headers web/.vibeface-build.json \
+    web/_shell.html web/index.html web/_redirects web/_headers web/.vibeface-build.json \
     web/vibeface_secure.js web/vibeface_secure_bg.wasm; do
     [[ -f "$package/$entry" && -s "$package/$entry" ]] || fail "package is missing $entry"
   done
@@ -321,7 +321,7 @@ JSON
   mkdir -p "$fixture/source/$package"
   local entry
   for entry in README.md RUNTIME-REQUIREMENTS.md scripts/install-node-service.sh docs/node.md docs/releasing.md \
-    web/_shell.html web/_headers web/.vibeface-build.json \
+    web/_shell.html web/index.html web/_redirects web/_headers web/.vibeface-build.json \
     web/vibeface_secure.js web/vibeface_secure_bg.wasm; do
     mkdir -p "$fixture/source/$package/$(dirname "$entry")"
     printf 'test fixture\n' > "$fixture/source/$package/$entry"

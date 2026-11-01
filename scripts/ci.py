@@ -475,7 +475,7 @@ def self_test():
             ] if check_msrv else [])
     root = Path(__file__).resolve().parent.parent
     subprocess.run(["python3", str(root / "scripts/build-inputs.py"), "self-test"], check=True)
-    config = (root / "apps/core/src/config.rs").read_text()
+    config = (root / "crates/control/src/lib.rs").read_text()
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
     assert f'info["update_protocol"]=="{protocol}" && info["data_epoch"]=="{epoch}"' in (root / "install.sh").read_text(), "install.sh accepts the build's update protocol and data epoch"
     release_privacy_test(root, scratch)
@@ -561,7 +561,7 @@ def release_privacy_test(root, scratch):
 
     with tempfile.TemporaryDirectory(prefix="release-", dir=scratch) as directory:
         repo = Path(directory)
-        for name in ("scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "apps/core/src/config.rs", "README.md"):
+        for name in ("scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/control/src/lib.rs", "README.md"):
             target = repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(root / name, target)
@@ -593,7 +593,7 @@ def release_privacy_test(root, scratch):
             tool = ["python3", str(repo / "scripts/build-inputs.py")]
             for component, files in (
                 ("crypto", {"vibeface_secure.js": "fixture", "vibeface_secure_bg.wasm": "fixture"}),
-                ("web", {"_shell.html": "fixture", "_headers": "/*\n  Content-Security-Policy: default-src 'self'\n", "vibeface_secure.js": "fixture", "vibeface_secure_bg.wasm": "wasm", ".vibeface-build.json": "{}"}),
+                ("web", {"_shell.html": "fixture", "index.html": "fixture", "_redirects": "/* /_shell.html 200\n", "_headers": "/*\n  Content-Security-Policy: default-src 'self'\n", "vibeface_secure.js": "fixture", "vibeface_secure_bg.wasm": "wasm", ".vibeface-build.json": "{}"}),
             ):
                 subprocess.run([*tool, "prepare", component], check=True)
                 output = repo / ("apps/app/generated" if component == "crypto" else "apps/app/dist/client")

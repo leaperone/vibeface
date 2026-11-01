@@ -12,7 +12,7 @@ const repo = fileURLToPath(new URL('../', import.meta.url));
 const targets = ['aarch64-apple-darwin', 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-gnu'];
 const required = ['vibeface', 'vibeface-core', 'BUILD-INFO.json', 'README.md', 'RUNTIME-REQUIREMENTS.md',
   'scripts/install-node-service.sh', 'docs/node.md', 'docs/releasing.md',
-  'web/_shell.html', 'web/_headers', 'web/.vibeface-build.json',
+  'web/_shell.html', 'web/index.html', 'web/_redirects', 'web/_headers', 'web/.vibeface-build.json',
   'web/vibeface_secure.js', 'web/vibeface_secure_bg.wasm'];
 const run = (program, args, options = {}) => execFileSync(program, args, {
   encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, ...options,

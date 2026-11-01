@@ -91,7 +91,7 @@ def checked_package(package, expected):
     for binary in (package / "vibeface", package / "vibeface-core"):
         if not binary.is_file() or binary.is_symlink():
             raise ValueError("Package CLI/Core binary is missing")
-    for name in ("_shell.html", "_headers", ".vibeface-build.json"):
+    for name in ("_shell.html", "index.html", "_redirects", "_headers", ".vibeface-build.json"):
         if not (package / "web" / name).is_file():
             raise ValueError("Package static output is incomplete")
     for name in ("vibeface_secure.js", "vibeface_secure_bg.wasm"):
@@ -2224,7 +2224,7 @@ def self_test():
             (sample / "web").mkdir(parents=True)
             (sample / "vibeface").write_bytes(b"source-provenance-fixture-only")
             (sample / "vibeface-core").write_bytes(b"source-provenance-core-fixture-only")
-            for name in ("_shell.html", "_headers", ".vibeface-build.json"):
+            for name in ("_shell.html", "index.html", "_redirects", "_headers", ".vibeface-build.json"):
                 (sample / "web" / name).write_text("fixture")
             for name in ("vibeface_secure.js", "vibeface_secure_bg.wasm"):
                 (generated / name).write_bytes(b"same-run-crypto")
