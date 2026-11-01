@@ -77,7 +77,8 @@ impl StaticAssets {
         }
         let content_security_policy = HeaderValue::from_str(&receipt.content_security_policy)
             .context("static App receipt has an invalid CSP")?;
-        let headers = fs::read_to_string(root.join("_headers"))?;
+        let headers = std::str::from_utf8(&files["_headers"].body)
+            .context("static App headers are not UTF-8")?;
         ensure!(
             headers == static_headers(&receipt.content_security_policy),
             "static App headers do not match the receipt CSP"
