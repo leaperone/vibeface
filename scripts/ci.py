@@ -89,8 +89,6 @@ def scope_plan(scopes, event, ref_type, channel):
                 affected.add(dependent)
                 pending.extend(DEPENDENTS[dependent])
     packages = [package for crate, package in CRATES.items() if crate in affected]
-    # Native releases contain both binaries and the web client, so CLI/control changes
-    # rebuild the complete package even though those crates do not import the Core.
     web = full or "web" in scopes or bool(affected & {"node", "cli", "control"})
     www = full or "www" in scopes
     slow = "node" in affected and extended

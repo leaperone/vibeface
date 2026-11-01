@@ -86,18 +86,14 @@ struct Journal {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct InspectResult {
     status: String,
     device_id: String,
     data_dir: PathBuf,
     maintenance_socket: PathBuf,
     listen: SocketAddr,
-    public_entry: bool,
-    web_enabled: bool,
     version: Option<String>,
     core_version: Option<String>,
-    cli_version: Option<String>,
     #[serde(default)]
     error: Option<String>,
 }

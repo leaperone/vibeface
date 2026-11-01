@@ -52,23 +52,10 @@ impl Action {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct InspectResult {
     data_dir: PathBuf,
     device_id: String,
-    listen: std::net::SocketAddr,
-    local_listen: Option<std::net::SocketAddr>,
-    public_url: Option<String>,
-    public_entry: bool,
-    web_enabled: bool,
     maintenance_socket: PathBuf,
-    status: String,
-    #[serde(default)]
-    version: Option<String>,
-    #[serde(default)]
-    core_version: Option<String>,
-    #[serde(default)]
-    cli_version: Option<String>,
 }
 
 fn absolute_path(value: &str) -> Result<PathBuf, String> {
