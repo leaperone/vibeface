@@ -21,7 +21,7 @@ export const joinCopy = {
   joining: '加入中',
   noComputer: '还没有电脑？',
   installFirst: '先在电脑上安装 Vibeface',
-  installGuide: 'https://github.com/leaperone/vibeface/blob/main/docs/install.md',
+  installGuide: 'https://github.com/leaperone/vibeface/blob/main/packages/docs/install.md',
 }
 
 /**
@@ -249,7 +249,7 @@ export const waitingCopy = {
   forwardHint: '支持能收 HTTPS 消息的外部聊天，如 Grok Bot',
   urlHint: '外部聊天收消息的地址',
   secretHint: '自己设一串，外部聊天那边填同一串',
-  forwardHelp: 'https://github.com/leaperone/vibeface/blob/main/docs/node.md#转发到外部聊天',
+  forwardHelp: 'https://github.com/leaperone/vibeface/blob/main/packages/docs/node.md#转发到外部聊天',
   outlets: { record: '只在待处理', both: '也发给外部聊天' },
   /** The home tip after joining: one tap asks the system, closing it keeps it closed. */
   notifyTip: '会话等你时提醒你',

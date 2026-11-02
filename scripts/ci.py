@@ -34,10 +34,10 @@ CRATES = {
     "delivery": "vibeface-delivery",
 }
 PATH_RULES = (
-    ("delivery", ("crates/delivery/*", "proofs/delivery/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/pkarr.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")),
+    ("delivery", ("crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/pkarr.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")),
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("www", ("apps/www/*",)),
-    ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*")),
+    ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "packages/docs/*")),
     ("node", ("packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts")),
     ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
@@ -48,7 +48,7 @@ PATH_RULES = (
     ("control", ("crates/control/*",)),
     ("cli", ("apps/cli/*",)),
 )
-WWW_PATHS = ("apps/www/*", "docs/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
+WWW_PATHS = ("apps/www/*", "packages/docs/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 SLOW_TESTS = (
     "store::tests::append_100k_stays_flat",
     "runtime::peers::tests::a_round_left_behind_pulls_again_without_waiting_for_hello",
@@ -301,7 +301,7 @@ def self_test():
     assert make_plan(["packages/client/src/lib/transport.ts", "pnpm-lock.yaml"])["scopes"] == ["web", "www"]
     assert make_plan(["apps/mobile/app/_layout.tsx", "packages/theme/theme.css"])["scopes"] == ["web", "www"]
     assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-secure-ffi"]
-    docs = make_plan(["README.md", "docs/node.md"])
+    docs = make_plan(["README.md", "packages/docs/node.md"])
     assert docs["docs_only"] and docs["www"] and docs["required_jobs"] == ["quick-check", "www"]
     expected = {
         "node": ["vibeface-core"],
@@ -319,7 +319,7 @@ def self_test():
         assert plan["package_mode"] == "web" and plan["package_matrix"]["include"] == list(PLATFORMS[:1])
     assert make_plan(["crates/control/src/lib.rs"])["node"]
     assert make_plan(["crates/control/src/lib.rs"])["rust_packages"] == expected["control"]
-    for path in ("crates/delivery/Cargo.toml", "crates/delivery/abi/Statement.sol", "proofs/delivery/guest/src/main.rs", "proofs/delivery/fixtures/manifest.json", "contracts/delivery/DeliveryEscrow.sol", "contracts/delivery/package-lock.json", "tests/fixtures/delivery-probe/Cargo.toml", "tests/fixtures/delivery-probe/Cargo.lock", "tests/fixtures/delivery-probe/src/main.rs", "apps/core/src/net/pkarr.rs", "apps/core/src/delivery/wallet.rs", "apps/core/src/client.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"):
+    for path in ("crates/delivery/Cargo.toml", "crates/delivery/abi/Statement.sol", "crates/delivery/proof/guest/src/main.rs", "crates/delivery/proof/fixtures/manifest.json", "contracts/delivery/DeliveryEscrow.sol", "contracts/delivery/package-lock.json", "tests/fixtures/delivery-probe/Cargo.toml", "tests/fixtures/delivery-probe/Cargo.lock", "tests/fixtures/delivery-probe/src/main.rs", "apps/core/src/net/pkarr.rs", "apps/core/src/delivery/wallet.rs", "apps/core/src/client.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"):
         selected = make_plan([path])
         assert selected["scopes"] == ["delivery"] and selected["delivery"]
         assert selected["rust_packages"] == expected["delivery"] and selected["web"]
@@ -396,7 +396,7 @@ def self_test():
         broken["delivery-live"] = {"result": result}
         expect_failure(lambda: gate(broken, delivery_live=True))
     expect_failure(lambda: gate(needs, delivery_live=True))
-    delivery_plan = make_plan(["proofs/delivery/fixtures/manifest.json"])
+    delivery_plan = make_plan(["crates/delivery/proof/fixtures/manifest.json"])
     delivery_needs = {job: {"result": "success" if job in delivery_plan["required_jobs"] else "skipped"} for job in JOBS}
     delivery_needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(delivery_plan)}}
     gate(delivery_needs)

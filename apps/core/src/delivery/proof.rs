@@ -635,7 +635,7 @@ mod tests {
             command
                 .arg(
                     Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("../../proofs/delivery/confined-gnark.sh"),
+                        .join("../../crates/delivery/proof/confined-gnark.sh"),
                 )
                 .arg("--version")
                 .env_clear()

@@ -188,7 +188,7 @@ export class Exercise {
     assert.equal(deployment.schema_version, 1); assert.equal(deployment.chain_id, 31337); assert.equal(deployment.confirmations, 2);
     assert.equal(new URL(deployment.rpc_url).href, this.options.rpcUrl);
     for (const name of ['escrow', 'asset', 'funder']) assert(ADDRESS.test(deployment[name]));
-    assert.deepEqual(deployment.profile, regularJson(path.resolve(root, '../../proofs/delivery/profile.json')), 'deployment differs from fixed product profile');
+    assert.deepEqual(deployment.profile, regularJson(path.resolve(root, '../../crates/delivery/proof/profile.json')), 'deployment differs from fixed product profile');
     compile({ checkTrust: true });
     this.provider = new JsonRpcProvider(this.options.rpcUrl, undefined, { cacheTimeout: -1 });
     assert.equal((await this.provider.getNetwork()).chainId, 31337n);

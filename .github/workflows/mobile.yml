@@ -162,7 +162,7 @@ jobs:
           printf '%s\n' typecheck > .artifacts/native/private/stage.txt
           pnpm test:e2e:check > .artifacts/native/private/typecheck.log 2>&1
           printf '%s\n' selection > .artifacts/native/private/stage.txt
-          pnpm exec e2e list --config e2e.native.config.ts --grep '^provider ' --reporter json > .artifacts/native/private/selection.json 2> .artifacts/native/private/selection.log
+          pnpm exec e2e list --config tests/e2e/e2e.native.config.ts --grep '^provider ' --reporter json > .artifacts/native/private/selection.json 2> .artifacts/native/private/selection.log
           python3 - <<'PY'
           import json
           pairs = json.load(open(".artifacts/native/private/selection.json"))["pairs"]
@@ -170,7 +170,7 @@ jobs:
           PY
           printf '%s\n' ui-run > .artifacts/native/private/stage.txt
           set +e
-          pnpm exec e2e run --config e2e.native.config.ts --grep '^provider ' --trace off --video off --retries 0 > .artifacts/native/private/ui.log 2>&1
+          pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' --trace off --video off --retries 0 > .artifacts/native/private/ui.log 2>&1
           result=$?
           set -e
           echo "Native Provider e2e exit code: $result"
@@ -201,7 +201,7 @@ jobs:
               code = error.get("code")
               result = {"code": code if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) else "UNCLASSIFIED_ERROR"}
               source = error.get("source", source)
-              if isinstance(source, dict) and source.get("file") in {"tests/native-transfers.e2e.ts", "e2e.native.config.ts"}:
+              if isinstance(source, dict) and source.get("file") in {"tests/e2e/native-transfers.e2e.ts", "tests/e2e/e2e.native.config.ts"}:
                   line = source.get("line")
                   if type(line) is int and 1 <= line <= 100000:
                       result.update(file=source["file"], line=line)

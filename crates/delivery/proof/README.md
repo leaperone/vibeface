@@ -41,7 +41,7 @@ cd /work
 export HOME=/home/runner
 export CARGO_HOME=/cargo
 export RISC0_HOME=/risc0
-bash proofs/delivery/build.sh
+bash crates/delivery/proof/build.sh
 /artifacts/proof-target/release/vibeface-delivery-prover info
 ```
 

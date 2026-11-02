@@ -1,5 +1,5 @@
 {
-  "include": ["e2e.config.ts", "e2e.native.config.ts", "tests/**/*.e2e.ts"],
+  "include": ["e2e.config.ts", "e2e.native.config.ts", "e2e.paid.config.ts", "*.ts"],
   "compilerOptions": {
     "target": "ES2022",
     "module": "ESNext",

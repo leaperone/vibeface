@@ -70,7 +70,7 @@ impl ChainConfig {
         self.profile.validate()?;
         let expected: ProofProfile = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../proofs/delivery/profile.json"
+            "/../../crates/delivery/proof/profile.json"
         )))?;
         ensure!(
             self.profile == expected,
@@ -1504,7 +1504,7 @@ pub(super) mod tests {
             confirmations: 2,
             profile: serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../proofs/delivery/profile.json"
+                "/../../crates/delivery/proof/profile.json"
             )))
             .expect("built-in delivery profile"),
         }

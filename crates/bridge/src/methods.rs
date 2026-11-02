@@ -1,7 +1,7 @@
 //! Every App Server method this client knows, from `schema/app-server-methods.json`. The table
 //! says how a request may be used, how a notification enters the observed state and how a server
 //! request is answered. A Codex upgrade that adds a method fails the coverage test until it is
-//! classified here and in `docs/codex-app-server.md`.
+//! classified here and in `packages/docs/codex-app-server.md`.
 use serde_json::{Value, json};
 
 /// How a client request may be used.
@@ -349,7 +349,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     const SCHEMA: &str = include_str!("../schema/app-server-methods.json");
-    const DOC: &str = include_str!("../../../docs/codex-app-server.md");
+    const DOC: &str = include_str!("../../../packages/docs/codex-app-server.md");
 
     fn names<T>(table: &[(&str, T)]) -> BTreeSet<String> {
         table.iter().map(|(name, _)| (*name).to_owned()).collect()
@@ -387,7 +387,7 @@ mod tests {
             for method in &schema {
                 assert!(
                     DOC.contains(&format!("| `{method}` |")),
-                    "docs/codex-app-server.md does not list {method}"
+                    "packages/docs/codex-app-server.md does not list {method}"
                 );
             }
         }
