@@ -377,7 +377,8 @@ mod tests {
         let base = std::env::var_os("CARGO_TARGET_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.artifacts/proof-host-tests")
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../../.artifacts/proof-host-tests")
             });
         std::fs::create_dir_all(&base).unwrap();
         let directory = base.join(format!(

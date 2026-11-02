@@ -15,7 +15,7 @@ rustc-flags = [
 ]
 
 [dependencies]
-vibeface-delivery = { path = "../../../crates/delivery" }
+vibeface-delivery = { path = "../../" }
 risc0-zkvm = { version = "=3.0.6", default-features = false, features = ["std"] }
 
 [patch.crates-io]
