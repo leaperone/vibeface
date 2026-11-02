@@ -5,6 +5,7 @@ import { mobile } from '@e2e-dev/mobile';
 import { artifacts, deadline, facts, insideArtifacts, invitation, root } from './paid-delivery-control';
 
 const localArtifacts = resolve(import.meta.dirname, '.artifacts');
+const runnerArtifacts = resolve(localArtifacts, 'vdp/live-ui');
 const apk = process.env.VIBEFACE_E2E_ANDROID_APK;
 const serial = process.env.VIBEFACE_E2E_ANDROID_SERIAL;
 assert(apk && serial && /^emulator-[0-9]+$/.test(serial), 'Explicitly name the same-source release APK and dedicated task AVD');
@@ -15,7 +16,7 @@ for (const state of [process.env.AGENT_DEVICE_HOME, process.env.AGENT_DEVICE_STA
   const suffix = relative(artifacts, resolve(state));
   assert(suffix && !suffix.startsWith('..') && !suffix.startsWith('/'), 'Paid native driver state remains in this task');
 }
-process.env.PLAYWRIGHT_BROWSERS_PATH ??= resolve(localArtifacts, 'browsers');
+process.env.PLAYWRIGHT_BROWSERS_PATH ??= resolve(runnerArtifacts, 'browsers');
 const { web } = await import('@e2e-dev/web');
 const environment = await facts();
 
@@ -31,7 +32,7 @@ export default {
   video: 'off',
   timeout: deadline(),
   launchTimeout: 240000,
-  output: resolve(localArtifacts, 'paid-results'),
-  cache: { dir: resolve(localArtifacts, 'paid-cache') },
+  output: resolve(runnerArtifacts, 'e2e'),
+  cache: { dir: resolve(runnerArtifacts, 'cache') },
   secrets: { paidWebInvitation: () => invitation('web'), paidAndroidInvitation: () => invitation('android') },
 } satisfies E2EConfig;

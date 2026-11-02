@@ -201,7 +201,7 @@ jobs:
               code = error.get("code")
               result = {"code": code if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) else "UNCLASSIFIED_ERROR"}
               source = error.get("source", source)
-              if isinstance(source, dict) and source.get("file") in {"tests/e2e/native-transfers.e2e.ts", "tests/e2e/e2e.native.config.ts"}:
+              if isinstance(source, dict) and source.get("file") in {"native-transfers.e2e.ts", "e2e.native.config.ts"}:
                   line = source.get("line")
                   if type(line) is int and 1 <= line <= 100000:
                       result.update(file=source["file"], line=line)
@@ -213,7 +213,8 @@ jobs:
                   result["phase"] = error["phase"]
               return result
 
-          report_path = root / "e2e/report.json"
+          runner_root = pathlib.Path("tests/e2e/.artifacts/native")
+          report_path = runner_root / "e2e/report.json"
           if report_path.exists():
               try:
                   run = json.loads(report_path.read_text())["run"]
@@ -250,8 +251,7 @@ jobs:
               diagnostics["stage"] = "cleanup"
           finally:
               try:
-                  for name in ("network", "agent-device", "cache", "e2e", "private"):
-                      path = root / name
+                  for path in [*(root / name for name in ("network", "agent-device", "cache", "e2e", "private")), runner_root]:
                       assert not path.is_symlink()
                       if path.exists():
                           shutil.rmtree(path)

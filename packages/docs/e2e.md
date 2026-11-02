@@ -16,13 +16,13 @@ VIBEFACE_E2E_APP_DIR=/absolute/path/to/apps/app/dist/client \
 pnpm test:e2e
 ```
 
-程序的构建步骤见[源码构建](releasing.md#ci-验证范围)。首次运行会把 Chromium 下载到 `.artifacts/e2e/browsers/`。Linux CI 先执行以下命令：
+程序的构建步骤见[源码构建](releasing.md#ci-验证范围)。本地默认把 Chromium 下载到 `tests/e2e/.artifacts/browsers/`。Linux CI 先执行以下命令：
 
 ```sh
 PLAYWRIGHT_BROWSERS_PATH="$PWD/.artifacts/e2e/browsers" pnpm exec e2e-web install chromium --with-deps
 ```
 
-每项测试创建独立 Node 数据目录，使用随机本机端口，关闭模型执行和 Codex 会话扫描。测试结束后停止自己的进程，不连接已有 Node。测试控制口只监听 loopback，认证材料保存在 owner-only 文件。数据、日志、报告和下载文件位于 `.artifacts/e2e/`，不会提交。恢复密码每次随机生成，通过 e2e secrets 传入。
+每项测试创建独立 Node 数据目录，使用随机本机端口，关闭模型执行和 Codex 会话扫描。测试结束后停止自己的进程，不连接已有 Node。测试控制口只监听 loopback，认证材料保存在 owner-only 文件。Node 数据和控制文件位于 `.artifacts/e2e/`，runner 日志、报告和下载文件位于 `tests/e2e/.artifacts/`，都不会提交。恢复密码每次随机生成，通过 e2e secrets 传入。
 
 示例检查建网页面。核心测试依次建网、下载恢复文件、跳过 AI 设置、创建 Bot，再刷新确认它仍存在。传输测试启动发送 Node、接收 Node 和公共入口 Node，经真实界面创建两个独立个人网络，从“设置 → 实验室”开启文件传输，再到 `/settings/lab/transfers` 确认零费用订单，接受订单并重启接收 Node。它还关闭实验并刷新，检查记录仍在、已收到文件仍可保存、重开不新增订单且不改变原传输方式。浏览器下载的原文件必须通过 SHA-256 核对，免费过程不创建钱包或调用链上 RPC。这些测试不需要模型或登录。CI 使用本次提交打包出的 Linux 程序运行。
 
@@ -33,7 +33,7 @@ headless 传输测试仅阻止临时文件输入打开原生系统选择框，�
 只运行核心测试或显示浏览器：
 
 ```sh
-pnpm exec e2e run --config tests/e2e/e2e.config.ts tests/e2e/onboarding.e2e.ts
+pnpm exec e2e run --config tests/e2e/e2e.config.ts onboarding.e2e.ts
 pnpm exec e2e run --config tests/e2e/e2e.config.ts --headed
 ```
 
@@ -117,7 +117,7 @@ python3 scripts/verify-node.py --delivery \
 宿主必须提供以下环境变量。APK、serial 和 controller 都由本轮 CI 明确指定。
 
 ```sh
-VIBEFACE_DELIVERY_UI_CONTROL=/absolute/task/.artifacts/vdp/live-ui/control.json
+VIBEFACE_DELIVERY_UI_CONTROL=/absolute/task/tests/e2e/.artifacts/vdp/live-ui/control.json
 VIBEFACE_DELIVERY_UI_TIMEOUT_MS=3600000
 VIBEFACE_E2E_ANDROID_APK=/absolute/task/.artifacts/native/app-release.apk
 VIBEFACE_E2E_ANDROID_SERIAL=emulator-5554

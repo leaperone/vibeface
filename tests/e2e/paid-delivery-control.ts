@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { expect } from 'e2e';
 
 export const root = resolve(import.meta.dirname, '../..');
-export const artifacts = resolve(root, '.artifacts/vdp/live-ui');
+export const artifacts = resolve(root, 'tests/e2e/.artifacts/vdp/live-ui');
 export const roles = ['web', 'android', 'provider'] as const;
 export type UiRole = 'web' | 'android';
 export const inspectionKinds = ['source-partial', 'source-unknown', 'receiver-key-before', 'receiver-key-after'] as const;
@@ -56,8 +56,10 @@ function loopback(value: unknown): string {
   return url.origin;
 }
 export function insideArtifacts(value: string): string {
-  const path = resolve(value), suffix = relative(resolve(root, '.artifacts'), path);
-  assert(suffix && !suffix.startsWith('..') && !suffix.startsWith('/'), 'UI acceptance files remain in this task worktree artifacts');
+  const path = resolve(value);
+  const inside = [resolve(root, '.artifacts'), resolve(root, 'tests/e2e/.artifacts')]
+    .some(base => { const suffix = relative(base, path); return suffix && !suffix.startsWith('..') && !suffix.startsWith('/'); });
+  assert(inside, 'UI acceptance files remain in this task worktree artifacts');
   return path;
 }
 export function deadline(): number {

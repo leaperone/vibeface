@@ -6,6 +6,7 @@ import { mobile } from '@e2e-dev/mobile';
 
 const root = resolve(import.meta.dirname, '../..');
 const localArtifacts = resolve(import.meta.dirname, '.artifacts');
+const runnerArtifacts = resolve(localArtifacts, 'native');
 const app = process.env.VIBEFACE_E2E_IOS_APP;
 const simulator = process.env.VIBEFACE_E2E_SIMULATOR;
 assert(app && simulator && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(simulator), 'Explicitly name the build and dedicated simulator assigned to this acceptance task');
@@ -30,7 +31,7 @@ export default {
   cleanupTimeout: 90000,
   timeout: 240000,
   launchTimeout: 240000,
-  output: resolve(localArtifacts, 'native-results'),
-  cache: { dir: resolve(localArtifacts, 'native-cache') },
+  output: resolve(runnerArtifacts, 'e2e'),
+  cache: { dir: resolve(runnerArtifacts, 'cache') },
   secrets: { nativeInvitation: async () => (await readFile(invitation, 'utf8')).trim() },
 } satisfies E2EConfig;

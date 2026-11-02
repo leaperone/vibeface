@@ -31,7 +31,7 @@ const GAP_MS = 4000
 let showSchedule: ((id: string) => void) | null = null
 export const openSchedule = (id: string) => showSchedule?.(id)
 
-/** The chat route's title: the bot's avatar and name as one button that opens a view of the bot where its face can be picked, schedules paused, resumed or deleted and the bot itself deleted (docs/design/bot-config.md section 5). */
+/** The chat route's title: the bot's avatar and name as one button that opens a view of the bot where its face can be picked, schedules paused, resumed or deleted and the bot itself deleted (packages/docs/design/bot-config.md section 5). */
 export function BotPanelButton() {
   const workspace = useWorkspace()
   const { directory } = useDevice()

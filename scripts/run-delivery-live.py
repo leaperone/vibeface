@@ -25,7 +25,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / ".artifacts/vdp"
 PUBLIC = ARTIFACTS / "live-public"
-UI = ARTIFACTS / "live-ui"
+UI = ROOT / "tests/e2e/.artifacts/vdp/live-ui"
 UI_TIMEOUT_MS = 3_600_000
 LIVE_TIMEOUT_SECONDS = 20_700
 LIVE_PROGRESS = {
@@ -1156,7 +1156,7 @@ def checked_ui_evidence(summary, web, android, report):
     if report.get("schemaVersion") != "report-1" or run.get("status") != "passed" or run.get("exitCode") != 0 or run.get("errors") != [] or run.get("vcs", {}).get("commit") != summary["sourceCommit"] or run.get("vcs", {}).get("dirty") is not False:
         raise ValueError("The actual e2e runner must finish without run or cleanup errors")
     selected = [result for result in run.get("results", []) if result.get("selected") is True]
-    expected = {("vdp-paid-web", "web", "tests/e2e/paid-web-transfers.paid.ts"), ("vdp-paid-android", "android", "tests/e2e/paid-native-transfers.paid.ts")}
+    expected = {("vdp-paid-web", "web", "paid-web-transfers.paid.ts"), ("vdp-paid-android", "android", "paid-native-transfers.paid.ts")}
     if len(selected) != 2 or {(result.get("targetId"), result.get("platform"), result.get("file")) for result in selected} != expected or any(result.get("status") != "passed" or len(result.get("attempts", [])) != 1 or result["attempts"][0].get("status") != "passed" for result in selected):
         raise ValueError("Both actual paid UI tests must pass on their exact target without skip or retry")
     if any(run.get("summary", {}).get(field) != expected for field, expected in (("selected", 2), ("executed", 2), ("passed", 2), ("failed", 0), ("interrupted", 0), ("flaky", 0), ("skipped", 0))) or any(run.get("usage", {}).get(field) != 0 for field in ("modelTokens", "maxModelCallsInStep")):
@@ -1628,7 +1628,7 @@ def self_test_ui(directory):
     common = {"status": "passed", "orderId": ordinary["order_id"], "intentId": ordinary["intent_id"], "bytes": 4096, "sha256": ordinary["sha256"], "actualPairing": True}
     web = {**common, "actualFileSelection": True, "actualQuotation": True, "actualPaymentConfirmation": True, "reloadPreservedIntent": True, "settledWhileReceiverAppOffline": True, "earned": "17", "withdrawn": "17", "refunded": "0", "quotationScreenshot": "web.png"}
     android = {**common, **{field: True for field in ("actualAcceptance", "backgroundObserved", "receiverReverseRemoved", "existingAppConnectionTerminated", "actualOfflineVisible", "settledWhileBackgrounded", "sameOrderResumed", "actualSavedFile")}, "offlineScreenshot": "android-offline.png", "savedScreenshot": "android.png"}
-    results = [{"targetId": target, "platform": platform, "file": file, "selected": True, "status": "passed", "attempts": [{"status": "passed"}]} for target, platform, file in (("vdp-paid-web", "web", "tests/e2e/paid-web-transfers.paid.ts"), ("vdp-paid-android", "android", "tests/e2e/paid-native-transfers.paid.ts"))]
+    results = [{"targetId": target, "platform": platform, "file": file, "selected": True, "status": "passed", "attempts": [{"status": "passed"}]} for target, platform, file in (("vdp-paid-web", "web", "paid-web-transfers.paid.ts"), ("vdp-paid-android", "android", "paid-native-transfers.paid.ts"))]
     report = {"schemaVersion": "report-1", "run": {"status": "passed", "exitCode": 0, "errors": [], "vcs": {"commit": "1" * 40, "dirty": False}, "results": results,
               "summary": {"selected": 2, "executed": 2, "passed": 2, "failed": 0, "interrupted": 0, "flaky": 0, "skipped": 0}, "usage": {"modelTokens": 0, "maxModelCallsInStep": 0}}}
     assert checked_ui_evidence(summary, web, android, report)["passed"] == 2

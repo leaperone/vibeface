@@ -542,8 +542,8 @@ jobs:
         with:
           name: e2e-${{ github.sha }}
           path: |
-            .artifacts/e2e/results
-            !.artifacts/e2e/results/**/downloads/**
+            tests/e2e/.artifacts/results
+            !tests/e2e/.artifacts/results/**/downloads/**
           if-no-files-found: warn
           retention-days: 7
       - name: Verify unpacked Node scheduling and signed log without model calls
@@ -669,7 +669,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends ffmpeg acl
       - name: Prepare host Web and Android drivers without model calls
         env:
-          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.artifacts/vdp/live-ui/browsers
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/tests/e2e/.artifacts/vdp/live-ui/browsers
         run: |
           pnpm install --frozen-lockfile --filter .
           pnpm test:e2e:check
