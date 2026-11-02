@@ -4,7 +4,7 @@ import { relative, resolve } from 'node:path';
 import type { E2EConfig } from 'e2e';
 import { mobile } from '@e2e-dev/mobile';
 
-const root = import.meta.dirname;
+const root = resolve(import.meta.dirname, '../..');
 const app = process.env.VIBEFACE_E2E_IOS_APP;
 const simulator = process.env.VIBEFACE_E2E_SIMULATOR;
 assert(app && simulator && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(simulator), 'Explicitly name the build and dedicated simulator assigned to this acceptance task');
@@ -19,7 +19,7 @@ const inside = relative(resolve(root, '.artifacts/native'), resolve(invitation))
 assert(inside && !inside.startsWith('..') && !inside.startsWith('/'), 'Native invitation remains in this task');
 
 export default {
-  tests: ['tests/native-transfers.e2e.ts'],
+  tests: ['tests/e2e/native-transfers.e2e.ts'],
   targets: [{ name: 'vdp-ios', engine: mobile({ platform: 'ios', device: simulator, session: 'vdp-native-acceptance' }),
     app: { appPath: resolve(app), bundleId: 'one.leaper.vibeface' } }],
   workers: 1,

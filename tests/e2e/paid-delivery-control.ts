@@ -4,7 +4,7 @@ import { relative, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { expect } from 'e2e';
 
-export const root = resolve(import.meta.dirname, '..');
+export const root = resolve(import.meta.dirname, '../..');
 export const artifacts = resolve(root, '.artifacts/vdp/live-ui');
 export const roles = ['web', 'android', 'provider'] as const;
 export type UiRole = 'web' | 'android';

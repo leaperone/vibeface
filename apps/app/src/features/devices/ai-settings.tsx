@@ -12,7 +12,7 @@ import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
 import { availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, modelTyped, parseAppServerLink, parseNodeSettings, parseProvider, probeIssueText, effortOptions, type ModelChoice, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
-export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
+export const docs = "https://github.com/leaperone/vibeface/blob/main/packages/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
 const states: Record<Availability, { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: "可用", tone: "success", icon: CircleCheck },

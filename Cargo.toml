@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/protocol", "crates/bridge", "crates/control", "apps/core", "apps/cli", "crates/secure", "crates/secure-ffi", "crates/delivery"]
-exclude = ["proofs/delivery"]
+exclude = ["crates/delivery/proof"]
 resolver = "3"
 
 [workspace.package]

@@ -2,7 +2,7 @@
 """Regenerate crates/bridge/schema/app-server-methods.json from the installed Codex CLI.
 
 The Rust coverage test compares this file with the bridge method table and
-docs/codex-app-server.md, so a Codex upgrade that adds a method fails CI until
+packages/docs/codex-app-server.md, so a Codex upgrade that adds a method fails CI until
 the method is classified.
 """
 import argparse

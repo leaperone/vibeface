@@ -93,7 +93,7 @@ function fail(message) {
   process.exit(1)
 }
 
-const docsRoot = resolve('../../docs')
+const docsRoot = resolve('../../packages/docs')
 const { pages } = JSON.parse(readFileSync(resolve(docsRoot, 'meta.json'), 'utf8'))
 for (const slug of pages) {
   const source = readFileSync(resolve(docsRoot, `${slug}.md`), 'utf8')

@@ -83,7 +83,7 @@ jobs:
       - name: Check JavaScript syntax
         run: |
           node --check scripts/crypto-client.mjs
-          node --check npm/bin/vibeface.mjs
+          node --check apps/cli/npm/bin/vibeface.mjs
           node --check scripts/package-npm.mjs
           node scripts/package-npm.mjs --self-test
       - run: cargo fmt --all -- --check
@@ -300,7 +300,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
           workspaces: |
             . -> .artifacts/vdp/domain-target
-            proofs/delivery -> ../../.artifacts/vdp/proof-target
+            crates/delivery/proof -> ../../.artifacts/vdp/proof-target
       - name: Check public delivery fixtures when present
         run: python3 scripts/check-delivery.py --check-fixtures
       - name: Install checksum-pinned guest compiler in artifacts
@@ -509,7 +509,7 @@ jobs:
         run: |
           cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml -- --check
           cargo build --manifest-path tests/fixtures/delivery-probe/Cargo.toml --locked
-          python3 scripts/verify-node.py --delivery-charity --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts "$PWD/.artifacts/ci-delivery" --delivery-probe "$CARGO_TARGET_DIR/debug/vibeface-delivery-probe" --delivery-source-root "$PWD" --delivery-profile "$PWD/proofs/delivery/profile.json"
+          python3 scripts/verify-node.py --delivery-charity --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts "$PWD/.artifacts/ci-delivery" --delivery-probe "$CARGO_TARGET_DIR/debug/vibeface-delivery-probe" --delivery-source-root "$PWD" --delivery-profile "$PWD/crates/delivery/proof/profile.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ !cancelled() && needs.plan.outputs.delivery == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' }}
         with:

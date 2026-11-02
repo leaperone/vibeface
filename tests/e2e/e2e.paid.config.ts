@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { resolve, relative } from 'node:path';
 import type { E2EConfig } from 'e2e';
 import { mobile } from '@e2e-dev/mobile';
-import { artifacts, deadline, facts, insideArtifacts, invitation, root } from './tests/paid-delivery-control';
+import { artifacts, deadline, facts, insideArtifacts, invitation, root } from './paid-delivery-control';
 
 const apk = process.env.VIBEFACE_E2E_ANDROID_APK;
 const serial = process.env.VIBEFACE_E2E_ANDROID_SERIAL;
@@ -19,7 +19,7 @@ const { web } = await import('@e2e-dev/web');
 const environment = await facts();
 
 export default {
-  tests: ['tests/paid-web-transfers.paid.ts', 'tests/paid-native-transfers.paid.ts'],
+  tests: ['tests/e2e/paid-web-transfers.paid.ts', 'tests/e2e/paid-native-transfers.paid.ts'],
   targets: [
     { name: 'vdp-paid-web', engine: web(), app: { url: environment.nodes.web.url } },
     { name: 'vdp-paid-android', engine: mobile({ platform: 'android', device: serial, session: 'vdp-paid-acceptance' }),

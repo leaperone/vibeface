@@ -28,13 +28,13 @@ PLAYWRIGHT_BROWSERS_PATH="$PWD/.artifacts/e2e/browsers" pnpm exec e2e-web instal
 
 headless 传输测试仅阻止临时文件输入打开原生系统选择框，再用真实 `setInputFiles` 选择任务内文件。文件输入的 change 事件、原文件内容、产品加密和 Node 请求均保留真实路径。下载结果仍需独立核对 SHA-256。
 
-测试使用 `tests/fixtures.ts` 导出的 `test` 或 `deliveryTest`，每项测试均重建 Node。保持 `workers: 1` 和 `retries: 0`，避免重复执行有外部副作用的验收。
+测试使用 `tests/e2e/fixtures.ts` 导出的 `test` 或 `deliveryTest`，每项测试均重建 Node。保持 `workers: 1` 和 `retries: 0`，避免重复执行有外部副作用的验收。
 
 只运行核心测试或显示浏览器：
 
 ```sh
-pnpm exec e2e run tests/onboarding.e2e.ts
-pnpm test:e2e --headed
+pnpm exec e2e run --config tests/e2e/e2e.config.ts tests/e2e/onboarding.e2e.ts
+pnpm exec e2e run --config tests/e2e/e2e.config.ts --headed
 ```
 
 排查失败时，读取终端指向的 `trace.md`。不要上传 Node 数据目录或恢复文件。
@@ -67,7 +67,7 @@ python3 scripts/verify-node.py --delivery-charity \
 node contracts/delivery/install.mjs
 ```
 
-在同一任务目录创建权限为 `0600` 的配置文件，使用以下字段。`deployment_file` 指向当前 worktree 的 `.artifacts/` 下尚不存在的新文件。runner 自行启动并清理该次独立部署，拒绝复用旧输出或旧链。`prover` 必须含绝对路径 `program`、`r0vm`、`cgroup` 和与 `proofs/delivery/profile.json` 完全相同的 `profile`。金额均为十进制字符串，gas 上限以 wei 表示。
+在同一任务目录创建权限为 `0600` 的配置文件，使用以下字段。`deployment_file` 指向当前 worktree 的 `.artifacts/` 下尚不存在的新文件。runner 自行启动并清理该次独立部署，拒绝复用旧输出或旧链。`prover` 必须含绝对路径 `program`、`r0vm`、`cgroup` 和与 `crates/delivery/proof/profile.json` 完全相同的 `profile`。金额均为十进制字符串，gas 上限以 wei 表示。
 
 ```json
 {
@@ -112,7 +112,7 @@ python3 scripts/verify-node.py --delivery \
 
 真实 Rotate、Revoke、Register 各新增一份 key-binding 证明。Rotate 在一个旧窗口已 Held、另一个尚未 Held 的分支执行。原签名交易恢复后保留同一 Rotate 和旧密钥，最后的新 Active key 接收普通订单。普通订单是 4096 字节的 `ordinary-paid-ui.bin`，新增 source、hold、open 各一份。全任务共十三份不同证明，普通公开 bundle 有四项，其中 key-binding 与最终 Register 共用。
 
-宿主通过 `e2e.paid.config.ts` 运行两个平台过滤的测试，使用 `workers: 2` 和 `retries: 0`。测试扩展名是 `.paid.ts`，默认 e2e 测试不会发现这些需要控制器的用例。两个测试都通过真实邀请、安全码和管理权限入网。Web 选择实际文件、查看费用并确认原订单。Android release app 接受订单，实际后台、移除本任务的接收端口 reverse，并终止原 app 连接。只有前台实际出现离线状态才记录断线。后台 Node 完成结算后，恢复同一 reverse，手机回到原订单并保存文件。root AVD 仅读取该 app 的 transfers 文件核对大小与 SHA。
+宿主通过 `tests/e2e/e2e.paid.config.ts` 运行两个平台过滤的测试，使用 `workers: 2` 和 `retries: 0`。测试扩展名是 `.paid.ts`，默认 e2e 测试不会发现这些需要控制器的用例。两个测试都通过真实邀请、安全码和管理权限入网。Web 选择实际文件、查看费用并确认原订单。Android release app 接受订单，实际后台、移除本任务的接收端口 reverse，并终止原 app 连接。只有前台实际出现离线状态才记录断线。后台 Node 完成结算后，恢复同一 reverse，手机回到原订单并保存文件。root AVD 仅读取该 app 的 transfers 文件核对大小与 SHA。
 
 宿主必须提供以下环境变量。APK、serial 和 controller 都由本轮 CI 明确指定。
 
@@ -163,7 +163,7 @@ VIBEFACE_E2E_BINARY=/absolute/task/.artifacts/native/vibeface \
 VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/.artifacts/native/web/vibeface_secure.js \
 AGENT_DEVICE_HOME="$PWD/.artifacts/native/agent-device" \
 AGENT_DEVICE_STATE_DIR="$PWD/.artifacts/native/agent-device" \
-pnpm exec e2e run --config e2e.native.config.ts --grep '^receives a charity file'
+pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^receives a charity file'
 ```
 
 原生测试通过真实邀请码加入接收网络，检查手机与管理员的安全码相同，再授予管理权限。测试从私有任务文件读取一次性邀请码，像扫码一样以 `vibeface://join?link=` 打开应用。发送方经真实 Node 发出公益订单，原生界面接受并保存文件。测试只读该专用应用的 `Documents/transfers/`，以独立 SHA-256 核对实际保存的字节。没有安装新构建、执行原生界面或读取实际文件时，不能把入口准备完成或 Web 通过作为原生验收成功。
@@ -180,7 +180,7 @@ pnpm exec e2e run --config e2e.native.config.ts --grep '^receives a charity file
 umask 077
 mkdir -p .artifacts/native/private
 VIBEFACE_E2E_SOURCE_COMMIT="$(git rev-parse HEAD)" \
-pnpm exec e2e run --config e2e.native.config.ts --grep '^provider ' \
+pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' \
   --trace off --video off --retries 0 > .artifacts/native/private/ui.log 2>&1
 ```
 
@@ -200,6 +200,6 @@ native config 默认关闭 trace 和整段 video。原始日志、自动失败�
 
 ## 让编码代理使用 e2e
 
-项目已配置 Codex、Claude Code 和 Cursor 的 e2e MCP。安装依赖后重新打开可信项目会话。编写或运行测试前，读取 [e2e skill](../.agents/skills/e2e/SKILL.md)。
+项目已配置 Codex、Claude Code 和 Cursor 的 e2e MCP。安装依赖后重新打开可信项目会话。编写或运行测试前，读取 [e2e skill](../../.agents/skills/e2e/SKILL.md)。
 
 当前未选择 AI 模型。需要 `agent.act` 时，先选择订阅、API 或本地模型，再按 `pnpm exec e2e guide setup` 配置 provider。ChatGPT 订阅的登录命令为 `pnpm exec e2e login openai`，完成登录后再运行模型测试。不要把凭证写入仓库；CI 保持不调用真实模型。

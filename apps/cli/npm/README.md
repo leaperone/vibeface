@@ -1,6 +1,6 @@
 # Vibeface Nightly
 
-The Node stores its data in `~/.vibeface` by default; pass `--data-dir` or set `VIBEFACE_DATA_DIR` to use another absolute path. Configure external tools explicitly as described in [deployment configuration](https://github.com/leaperone/vibeface/blob/main/docs/deployment.md).
+The Node stores its data in `~/.vibeface` by default; pass `--data-dir` or set `VIBEFACE_DATA_DIR` to use another absolute path. Configure external tools explicitly as described in [deployment configuration](https://github.com/leaperone/vibeface/blob/main/packages/docs/deployment.md).
 
 Install Node.js 22 or newer, then install the Nightly CLI:
 
@@ -30,4 +30,4 @@ vibeface status
 
 An upgrade preserves data but does not convert an incompatible database. Different data epochs require a fresh data directory. Removing the npm package does not delete node data. Uninstall a background service with `vibeface service uninstall` before `npm uninstall -g @leaperone/vibeface`.
 
-Provider runtimes and credentials are configured separately. See [installation](https://github.com/leaperone/vibeface/blob/main/docs/install.md) and [releases](https://github.com/leaperone/vibeface/releases).
+Provider runtimes and credentials are configured separately. See [installation](https://github.com/leaperone/vibeface/blob/main/packages/docs/install.md) and [releases](https://github.com/leaperone/vibeface/releases).

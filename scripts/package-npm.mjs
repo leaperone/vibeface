@@ -116,7 +116,7 @@ function verify(archive, version, sourceCommit, scratch) {
   assert.deepEqual(metadata.bin, { vibeface: 'bin/vibeface.mjs' });
   assert(!metadata.scripts && !metadata.dependencies && !metadata.optionalDependencies, 'npm package must not run lifecycle scripts or download dependencies');
   assert.equal(fs.readFileSync(path.join(directory, 'bin/vibeface.mjs'), 'utf8'),
-    fs.readFileSync(path.join(repo, 'npm/bin/vibeface.mjs'), 'utf8'), 'launcher does not match the source');
+    fs.readFileSync(path.join(repo, 'apps/cli/npm/bin/vibeface.mjs'), 'utf8'), 'launcher does not match the source');
   assert.deepEqual(fs.readdirSync(path.join(directory, 'bin')), ['vibeface.mjs'], 'unexpected npm launcher file');
   assert.deepEqual(fs.readdirSync(path.join(directory, 'vendor')).sort(), [...targets].sort());
   const epochs = targets.map(target => nativePackage(path.join(directory, 'vendor', target), version, target, sourceCommit));
@@ -136,9 +136,9 @@ function pack(input, output, version, sourceCommit) {
     const directory = path.join(scratch, 'npm');
     fs.mkdirSync(path.join(directory, 'vendor'), { recursive: true });
     fs.mkdirSync(path.join(directory, 'bin'));
-    fs.copyFileSync(path.join(repo, 'npm/bin/vibeface.mjs'), path.join(directory, 'bin/vibeface.mjs'));
-    fs.copyFileSync(path.join(repo, 'npm/README.md'), path.join(directory, 'README.md'));
-    const metadata = JSON.parse(fs.readFileSync(path.join(repo, 'npm/package.json'), 'utf8'));
+    fs.copyFileSync(path.join(repo, 'apps/cli/npm/bin/vibeface.mjs'), path.join(directory, 'bin/vibeface.mjs'));
+    fs.copyFileSync(path.join(repo, 'apps/cli/npm/README.md'), path.join(directory, 'README.md'));
+    const metadata = JSON.parse(fs.readFileSync(path.join(repo, 'apps/cli/npm/package.json'), 'utf8'));
     fs.writeFileSync(path.join(directory, 'package.json'), `${JSON.stringify({ ...metadata, version, private: false }, null, 2)}\n`);
     const epochs = new Set();
     for (const [index, target] of targets.entries()) {

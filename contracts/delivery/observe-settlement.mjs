@@ -146,7 +146,7 @@ export async function observe({ bundleFile, rpcUrl, caseName = 'strict' }) {
     const statementBytes = value => coder.encode([statementType], [object(value)]);
     const profileFields = escrowArtifact.abi.find(item => item.type === 'constructor').inputs[0].components;
     const profileType = `tuple(${profileFields.map(field => `${field.type} ${field.name}`).join(',')})`;
-    const canonical = JSON.parse(readRegular(path.resolve(root, '../../proofs/delivery/profile.json')));
+    const canonical = JSON.parse(readRegular(path.resolve(root, '../../crates/delivery/proof/profile.json')));
     keys(canonical, ['guest_image_id', 'statement_schema_hash', 'crypto_suite', 'max_windows', 'max_window_bytes', 'max_total_bytes', 'max_guest_cycles', 'max_prover_memory_bytes']);
     const word = value => {
       assert(Array.isArray(value) && value.length === 32 && value.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255), 'invalid canonical profile Word');

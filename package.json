@@ -10,7 +10,7 @@
     "typescript": "^6.0.3"
   },
   "scripts": {
-    "test:e2e": "e2e run",
-    "test:e2e:check": "tsc --noEmit -p tsconfig.e2e.json && node --check scripts/e2e-node.mjs"
+    "test:e2e": "e2e run --config tests/e2e/e2e.config.ts",
+    "test:e2e:check": "tsc --noEmit -p tests/e2e/tsconfig.e2e.json && node --check scripts/e2e-node.mjs"
   }
 }
