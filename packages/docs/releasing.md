@@ -17,9 +17,9 @@ description: 了解 Vibeface 的 CI、制品和 Nightly 发布流程。
 | cli | `cli-v` | `apps/cli/Cargo.toml` | CLI、锁定 Core 和 App 的完整包 |
 | mobile | `mobile-v` | `apps/mobile/app.json` 的 `expo.extra.releaseVersion` | Android 预览 APK |
 
-五个应用各自使用 `0.0.1-nightly.YYYYMMDD.N`，日期为 UTC 准备日期，序号按应用递增。Mobile 的 `expo.version` 保持 `0.0.1`，原生 build number 独立递增。移动端 Nightly 不代表 TestFlight 或 App Store 已发布；iOS 仍需有效分发签名、provisioning profile 和 App Store Connect 权限。
+五个应用的首个正式版为 `0.0.1`，tag 分别为 `<app>-v0.0.1`。Nightly 使用 `0.0.1-nightly.YYYYMMDD.N`，日期为 UTC 准备日期，序号按应用递增。Mobile 的 `expo.version` 保持 `0.0.1`，原生 build number 独立递增。移动端 Nightly 不代表 TestFlight 或 App Store 已发布；iOS 仍需有效分发签名、provisioning profile 和 App Store Connect 权限。
 
-`release.yml` 只响应以上五种 tag。tag 必须与版本文件一致，源码必须已在 main。CLI 在 `apps/cli/release-lock.json` 中锁定 Core/App tag，组装时验证公开 release 的源码 SHA 和文件摘要，将独立版本与源码记录到 `BUILD-INFO.json`，`FILES.sha256` 覆盖包内文件。Core 和 App 必须先发布，CLI 才能组装。发布后不覆盖已有字节，重试先下载对账。
+`release.yml` 只响应以上五种 tag。tag 必须与版本文件一致，源码必须已在 main。CLI 在 `apps/cli/release-lock.json` 中锁定 Core/App tag，组装时验证公开 release 的源码 SHA 和文件摘要，将独立版本与源码记录到 `BUILD-INFO.json`，`FILES.sha256` 覆盖包内文件。CLI、Core 与 App 必须使用相同发布渠道。Core 和 App 必须先发布，CLI 才能组装。`COMPONENT-INFO.json` 与 `release.json` 的 schema 均为 1；旧 schema 和额外字段会被拒绝。发布后不覆盖已有字节，重试先下载对账。
 
 先完成独立分支、PR、相关测试并合并，再从已验证的提交创建具体 tag。例如 `git tag app-v0.0.1-nightly.20261101.1 <commit>`，随后 `git push origin app-v0.0.1-nightly.20261101.1`。若重跑，使用 `gh workflow run release.yml --ref <tag> -f tag=<tag>`。发布后核对 Actions 终态、release.json、实际下载摘要和平台运行结果。
 
@@ -130,11 +130,11 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。正在执行的操作、管理 Agent 调用或 `unknown` 结果会推迟升级。更新器不会为升级强行结束任务。更新只更换程序，不覆盖身份、历史、配置和凭证，也不更新 Codex、Cursor 或其他 Provider 程序。
 
-`BUILD-INFO.json` 声明 `update_protocol=2` 和 `data_epoch=12`，两者取自共享控制 crate `crates/control/src/lib.rs` 的 `UPDATE_PROTOCOL` 和 `DATA_EPOCH`。包协议 2 分别记录同目录 CLI、Core 和完整 `web/` 的版本与源码，校验各组件文件摘要。设备授权和业务记录使用单一 `node.sqlite3`，数据库 `user_version=12`，Atlas HCL 为 `apps/core/schema.hcl`。不同 epoch 的数据目录和节点不能混用。更新器只安装与本机存储 epoch 一致的包，不隐式转换或清空数据目录。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
+`BUILD-INFO.json` 声明 `update_protocol=1` 和 `data_epoch=1`，两者取自共享控制 crate `crates/control/src/lib.rs` 的 `UPDATE_PROTOCOL` 和 `DATA_EPOCH`。包协议 1 的 BUILD-INFO 只接受 `version`、`target`、`source_commit`、`update_protocol`、`data_epoch`、`core_version`、`core_source_commit`、`app_version` 和 `app_source_commit` 这 9 个字段。校验涵盖同目录 CLI、Core 和完整 `web/` 的版本、源码及文件摘要。设备授权和业务记录使用单一 `node.sqlite3`，数据库 `user_version=1`，Atlas HCL 为 `apps/core/schema.hcl`。不同 epoch 的数据目录和节点不能混用。更新器只安装与本机存储 epoch 一致的包，不隐式转换或清空数据目录。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
 
 ## 首次安装
 
-公开安装入口为仓库根 `install.sh`。默认选择最新 Stable，显式 `--channel nightly` 选择最新 Nightly；按数值版本比较，忽略 rc 和 draft，不使用 `/releases/latest` 获取 Nightly。当前只有 Nightly，Stable 安装会明确失败。命令和后续 CLI 管理见 [安装说明](install.md)。
+公开安装入口为仓库根 `install.sh`。默认选择最新 Stable，显式 `--channel nightly` 选择最新 Nightly；按数值版本比较，忽略 rc 和 draft，不使用 `/releases/latest` 获取 Nightly。如果尚无正式版，Stable 安装会明确失败。命令和后续 CLI 管理见 [安装说明](install.md)。
 
 安装器只依赖 Bash、curl、tar、gzip、系统文本工具及 `sha256sum` 或 `shasum`，不需要 jq、Python、Node.js 或 Rust。它解析公开 Releases 和 tag 对应的源码提交，下载完整包与准确同名的 SHA256，校验版本、target、源码身份、协议和 data epoch，并拒绝危险包路径、符号链接和特殊文件。校验通过后建立 `releases/<version>`、`current` 与用户 bin 链接，不覆盖已有安装、身份或服务。
 
@@ -142,13 +142,13 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 ## 手动建立受管安装或更换程序
 
-以下步骤用于从完整包手动建立受管安装。数据目录的 epoch 或共享结构与程序不一致时，必须使用全新数据目录重新初始化，并重新加入同版本节点。只有新旧程序都使用最终 epoch 12 结构时，更换程序才可保留原数据目录和身份。程序不兼容或迁移旧的开发格式。
+以下步骤用于从完整包手动建立受管安装。数据目录的 epoch 或共享结构与程序不一致时，必须使用全新数据目录重新初始化，并重新加入同版本节点。只有新旧程序都使用最终 epoch 1 结构时，更换程序才可保留原数据目录和身份。程序不兼容或迁移旧的开发格式。
 
 先停用旧更新定时服务，备份 `current` 目标、用户服务定义和私有启动脚本。确认维护状态空闲且无结果未知操作后，再停止 Node 用户服务并等待目录锁释放，然后备份完整数据目录。备份包括身份和历史，应保持私密。不要强行结束任务，也不要让新旧程序同时使用同一数据目录。
 
 校验并解压新包到受管安装根目录下的独立目录，通过 `current` 符号链接选择程序。例如，先将解压后的包移动到 `$VIBEFACE_INSTALL_ROOT/releases/<version>`，再创建指向它的 `$VIBEFACE_INSTALL_ROOT/current`。保留整个包，不单独复制 Rust binary；更新器需要同包的脚本和 `BUILD-INFO.json`。
 
-原子切换 `current` 后，建立 `$VIBEFACE_BIN_DIR/vibeface` 到 `current/vibeface` 的链接。Core 通过同一 `current` 目录发现 `vibeface-core` 和 `web/`，不能只替换 CLI。旧 CLI 链接只有在确认属于该受管安装时才可移除，不覆盖用户自有文件。使用全新或已确认属于 epoch 12 的数据目录前台启动，核对设备身份和状态，随后按 [后台运行说明](node.md#作为后台应用运行) 配置指向这一固定路径的用户服务。Linux 服务名是 `vibeface.service`，先卸载旧服务定义，避免双进程。停止前台进程后再启动用户服务。
+原子切换 `current` 后，建立 `$VIBEFACE_BIN_DIR/vibeface` 到 `current/vibeface` 的链接。Core 通过同一 `current` 目录发现 `vibeface-core` 和 `web/`，不能只替换 CLI。旧 CLI 链接只有在确认属于该受管安装时才可移除，不覆盖用户自有文件。使用全新或已确认属于 epoch 1 的数据目录前台启动，核对设备身份和状态，随后按 [后台运行说明](node.md#作为后台应用运行) 配置指向这一固定路径的用户服务。Linux 服务名是 `vibeface.service`，先卸载旧服务定义，避免双进程。停止前台进程后再启动用户服务。
 
 已有私有凭证启动脚本时，保留内容和私有权限，仅将末端启动路径改为 `current/vibeface`。不要用 `service install` 覆盖凭证脚本。核对新服务的 PID、版本、设备身份、历史及本机健康状态，再恢复原更新渠道和自动更新策略。
 

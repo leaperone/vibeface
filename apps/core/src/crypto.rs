@@ -851,7 +851,7 @@ mod tests {
         let body = EventBody::MemoryControlled {
             memory_id: "memory".into(),
             base: MemoryBase {
-                epoch: 12,
+                epoch: crate::config::DATA_EPOCH,
                 version: None,
             },
             after: Some("用中文".into()),
@@ -862,7 +862,7 @@ mod tests {
         };
         assert_eq!(
             request_key(&network, "chat", &body, "")?,
-            "e7a5478f88f2f3860ab397cea199305703b0a2e43f47662f559b695e2a9d25f6"
+            "d92a5487e2ff1845032721e6af4d56c32b40fd36d79fa93046887c2f4a48059f"
         );
         Ok(())
     }

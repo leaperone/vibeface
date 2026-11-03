@@ -60,12 +60,10 @@ struct Policy {
     install_root: PathBuf,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug)]
 struct Manifest {
     core_version: semver::Version,
     version: semver::Version,
-    update_protocol: u32,
-    data_epoch: u32,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -457,13 +455,10 @@ fn manifest(package: &Path) -> Result<Manifest> {
         metadata.is_file() && metadata.len() <= 64 * 1024,
         "invalid package manifest"
     );
-    let manifest: Manifest = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
-        .context("invalid package manifest")?;
-    ensure!(
-        manifest.update_protocol == vibeface_control::UPDATE_PROTOCOL
-            && manifest.data_epoch == vibeface_control::DATA_EPOCH,
-        "package does not support the current updater and data compatibility epoch; manual upgrade required"
-    );
+    let build: release::BuildInfo =
+        serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
+            .context("invalid package manifest")?;
+    build.validate()?;
     for file in [
         "vibeface",
         "vibeface-core",
@@ -497,7 +492,10 @@ fn manifest(package: &Path) -> Result<Manifest> {
             && fs::read_dir(package.join("web"))?.next().is_some(),
         "package web directory is missing or empty"
     );
-    Ok(manifest)
+    Ok(Manifest {
+        core_version: build.core_version.parse()?,
+        version: build.version.parse()?,
+    })
 }
 
 fn installed(root: &Path) -> Result<PathBuf> {
@@ -1117,14 +1115,20 @@ mod tests {
         .unwrap();
         fs::write(
             directory.join("BUILD-INFO.json"),
-            format!(
-                r#"{{"version":"{version}","core_version":"{version}","update_protocol":{},"data_epoch":{}}}"#,
-                vibeface_control::UPDATE_PROTOCOL,
-                vibeface_control::DATA_EPOCH
-            ),
+            serde_json::to_vec(&build_info(version)).unwrap(),
         )
         .unwrap();
         directory
+    }
+
+    fn build_info(version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": version, "target": "aarch64-apple-darwin", "source_commit": "a".repeat(40),
+            "core_version": version, "core_source_commit": "b".repeat(40),
+            "app_version": version, "app_source_commit": "c".repeat(40),
+            "update_protocol": vibeface_control::UPDATE_PROTOCOL,
+            "data_epoch": vibeface_control::DATA_EPOCH,
+        })
     }
 
     #[tokio::test]
@@ -1237,23 +1241,28 @@ mod tests {
         let escaped = package(&outside, "2.0.0");
         assert!(switch(&root, &escaped).is_err());
         assert_eq!(installed(&root).unwrap(), new);
+        for field in ["data_epoch", "update_protocol"] {
+            for value in [0, 2, 12] {
+                let mut build = build_info("1.0.0");
+                build[field] = serde_json::json!(value);
+                fs::write(
+                    old.join("BUILD-INFO.json"),
+                    serde_json::to_vec(&build).unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    manifest(&old)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("current update protocol and data epoch")
+                );
+            }
+        }
+        let mut build = build_info("1.0.0");
+        build["legacy"] = serde_json::json!(true);
         fs::write(
             old.join("BUILD-INFO.json"),
-            format!(
-                r#"{{"version":"1.0.0","core_version":"1.0.0","update_protocol":{},"data_epoch":{}}}"#,
-                vibeface_control::UPDATE_PROTOCOL,
-                vibeface_control::DATA_EPOCH + 1
-            ),
-        )
-        .unwrap();
-        assert!(manifest(&old).is_err());
-        fs::write(
-            old.join("BUILD-INFO.json"),
-            format!(
-                r#"{{"version":"1.0.0","core_version":"1.0.0","update_protocol":{},"data_epoch":{}}}"#,
-                vibeface_control::UPDATE_PROTOCOL + 1,
-                vibeface_control::DATA_EPOCH
-            ),
+            serde_json::to_vec(&build).unwrap(),
         )
         .unwrap();
         assert!(manifest(&old).is_err());

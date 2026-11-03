@@ -269,11 +269,15 @@ mod tests {
         std::fs::write(package.join("scripts/install-node-service.sh"), b"script").unwrap();
         std::fs::write(
             package.join("BUILD-INFO.json"),
-            format!(
-                r#"{{"version":"1.2.3-nightly.20261019.1","core_version":"2.0.0","update_protocol":{},"data_epoch":{}}}"#,
-                vibeface_control::UPDATE_PROTOCOL,
-                vibeface_control::DATA_EPOCH
-            ),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "1.2.3-nightly.20261019.1", "target": "aarch64-apple-darwin",
+                "source_commit": "a".repeat(40), "core_version": "2.0.0-nightly.20261019.1",
+                "core_source_commit": "b".repeat(40), "app_version": "1.0.0-nightly.20261019.1",
+                "app_source_commit": "c".repeat(40),
+                "update_protocol": vibeface_control::UPDATE_PROTOCOL,
+                "data_epoch": vibeface_control::DATA_EPOCH,
+            }))
+            .unwrap(),
         )
         .unwrap();
         let root = std::fs::canonicalize(root).unwrap();

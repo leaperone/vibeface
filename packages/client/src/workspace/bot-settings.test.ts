@@ -35,8 +35,8 @@ function memoryClient(rpc: (method: string, params: Record<string, unknown>) => 
 }
 
 test('Memory request key matches the Rust canonical payload vector', async () => {
-const payload = new TextEncoder().encode('{"body":{"after":"用中文","base":{"epoch":12,"version":null},"memory_id":"memory","type":"memory_controlled"},"network_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","scope_id":"chat"}')
-  assert.equal(await requestKey(payload, 'b'.repeat(64)), 'e7a5478f88f2f3860ab397cea199305703b0a2e43f47662f559b695e2a9d25f6')
+  const payload = new TextEncoder().encode('{"body":{"after":"用中文","base":{"epoch":1,"version":null},"memory_id":"memory","type":"memory_controlled"},"network_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","scope_id":"chat"}')
+  assert.equal(await requestKey(payload, 'b'.repeat(64)), 'd92a5487e2ff1845032721e6af4d56c32b40fd36d79fa93046887c2f4a48059f')
   assert.notEqual(await requestKey(payload, 'c'.repeat(64)), await requestKey(payload, 'b'.repeat(64)))
 })
 
@@ -223,7 +223,7 @@ test('Memory state, result and metadata fail closed on malformed or mismatched r
   assert.throws(() => parseMemoryControlResult({ ...result, operation_id: 'f'.repeat(64) }, 'memory', operationId))
   assert.throws(() => parseMemoryControlResult({ ...result, current: memoryState() }, 'memory', operationId))
   assert.throws(() => parseMemoryControlResult({ ...result, current: { ...result.current, memory_id: 'other' } }, 'memory', operationId))
-  for (const invalid of [{ control_revision: undefined }, { control_revision: -1 }, { control_revision: 0x1_0000_0000 }, { source_event_hash: null }, { origin: 'import' }, { epoch: DATA_EPOCH - 1 }]) {
+  for (const invalid of [{ control_revision: undefined }, { control_revision: -1 }, { control_revision: 0x1_0000_0000 }, { source_event_hash: null }, { origin: 'import' }, { epoch: 0 }, { epoch: 2 }, { epoch: 12 }]) {
     assert.throws(() => parseMemoryControlResult({ ...result, current: { ...result.current, metadata: { ...result.current.metadata, ...invalid } } }, 'memory', operationId))
   }
   assert.throws(() => parseMemoryControlResult({ ...result, state: 'success' }, 'memory', operationId))
@@ -318,7 +318,7 @@ test("conversation snapshots parse bot changes strictly", () => {
         { schedule_id: "r", name: "看依赖", prompt: "p", first_run_at_ms: 1, every_minutes: 1440, enabled: false, next_run_at_ms: null },
         { schedule_id: "o", name: "提醒", prompt: "p", first_run_at_ms: 5, enabled: true, depth: 1, next_run_at_ms: 5 },
       ],
-        memory: [{ memory_id: "m", text: "用中文", metadata: { epoch: 12, revision: "a".repeat(64), control_revision: 0, source_event_hash: "b".repeat(64), origin: "agent", user_controlled: false, essential: true } }], memory_sync_conflicts: { items: [], has_more: false },
+        memory: [{ memory_id: "m", text: "用中文", metadata: { epoch: 1, revision: "a".repeat(64), control_revision: 0, source_event_hash: "b".repeat(64), origin: "agent", user_controlled: false, essential: true } }], memory_sync_conflicts: { items: [], has_more: false },
     },
     changes: [
       { change_id: "c1", conversation_id: "chat", cause: { conversation_id: "chat", message_id: "u1" }, event_hash: "h1", created_at_ms: 2, change: { kind: "profile", name: { before: "旧", after: "新" } } },

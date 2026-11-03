@@ -592,16 +592,35 @@ fn unpack(archive: &Path, destination: &Path, root_name: &str) -> Result<PathBuf
 }
 
 #[derive(Deserialize)]
-struct BuildInfo {
-    core_version: String,
+#[serde(deny_unknown_fields)]
+pub(super) struct BuildInfo {
+    pub(super) core_version: String,
     core_source_commit: String,
     app_version: String,
     app_source_commit: String,
-    version: String,
+    pub(super) version: String,
     target: String,
     source_commit: String,
-    update_protocol: u32,
-    data_epoch: u32,
+    pub(super) update_protocol: u32,
+    pub(super) data_epoch: u32,
+}
+
+impl BuildInfo {
+    pub(super) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.update_protocol == UPDATE_PROTOCOL && self.data_epoch == DATA_EPOCH,
+            "package does not support the current update protocol and data epoch"
+        );
+        let version = Version::parse(&self.version)?;
+        for component in [&self.core_version, &self.app_version] {
+            let component = Version::parse(component)?;
+            ensure!(
+                component.pre.as_str().split('.').next() == version.pre.as_str().split('.').next(),
+                "CLI, Core and App must use the same release channel"
+            );
+        }
+        Ok(())
+    }
 }
 
 fn verify_build(package: &Path, release: &Release) -> Result<BuildInfo> {
@@ -643,6 +662,7 @@ fn verify_build(package: &Path, release: &Release) -> Result<BuildInfo> {
     ensure!(declared == actual, "package file checksums differ");
     let build: BuildInfo = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
         .context("package does not declare a supported update protocol and data epoch")?;
+    build.validate()?;
     ensure!(
         build.version == release.version.to_string()
             && build.target == release.target
@@ -650,15 +670,8 @@ fn verify_build(package: &Path, release: &Release) -> Result<BuildInfo> {
         "package build identity does not match the official release tag"
     );
     ensure!(
-        Version::parse(&build.core_version).is_ok()
-            && Version::parse(&build.app_version).is_ok()
-            && valid_commit(&build.core_source_commit)
-            && valid_commit(&build.app_source_commit),
+        valid_commit(&build.core_source_commit) && valid_commit(&build.app_source_commit),
         "invalid component identity"
-    );
-    ensure!(
-        build.update_protocol == UPDATE_PROTOCOL && build.data_epoch == DATA_EPOCH,
-        "package requires an unsupported update protocol or data epoch"
     );
     for file in [
         "vibeface",
@@ -986,6 +999,20 @@ mod tests {
             archive_size: 1,
         };
         let build = serde_json::json!({"version": release.version.to_string(), "target": release.target, "source_commit": release.source_commit, "update_protocol": UPDATE_PROTOCOL, "data_epoch": DATA_EPOCH, "core_version": "0.0.3", "core_source_commit": "b".repeat(40), "app_version": "0.0.1", "app_source_commit": "c".repeat(40)});
+        serde_json::from_value::<BuildInfo>(build.clone())
+            .unwrap()
+            .validate()
+            .unwrap();
+        for field in ["core_version", "app_version"] {
+            let mut mixed = build.clone();
+            mixed[field] = serde_json::json!("0.0.1-nightly.20261101.1");
+            assert!(
+                serde_json::from_value::<BuildInfo>(mixed)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
         for dir in [&package, &copy] {
             for file in [
                 "README.md",

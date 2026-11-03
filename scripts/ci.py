@@ -565,7 +565,7 @@ def release_privacy_test(root, scratch):
             shutil.copyfile(root / name, target)
         source = repo / "private build.rs"
         source.write_text('#[cfg(not(privacy_flag))] compile_error!("caller flag lost"); fn main() { println!("{}", file!()); }')
-        binary = repo / "target/privacy-fixture/release/vibeface"
+        binary = repo / "target/x86_64-unknown-linux-gnu/release/vibeface"
         binary.parent.mkdir(parents=True)
         environment = {**os.environ, "CARGO_TARGET_DIR": str(repo / "target"), "RUSTFLAGS": "--cfg privacy_flag"}
         environment.pop("CARGO_ENCODED_RUSTFLAGS", None)
@@ -609,11 +609,11 @@ def release_privacy_test(root, scratch):
         environment.update({name: "" for name in ("VIBEFACE_CODESIGN_IDENTITY", "VIBEFACE_NOTARY_KEY", "VIBEFACE_NOTARY_KEY_ID", "VIBEFACE_NOTARY_ISSUER")})
         fake_cargo = repo / "bin/cargo"
         fake_cargo.parent.mkdir()
-        fake_cargo.write_text('#!/bin/sh\nset -eu\ntouch "$CARGO_MARKER"\nmkdir -p "$CARGO_TARGET_DIR/privacy-fixture/release"\nprintf "#!/bin/sh\\nprintf \\\"vibeface 0.0.1-nightly.20261031.19\\\\n\\\"\\n" > "$CARGO_TARGET_DIR/privacy-fixture/release/vibeface"\nprintf "#!/bin/sh\\nprintf \\\"vibeface-core 0.0.1-nightly.20261031.19\\\\n\\\"\\n" > "$CARGO_TARGET_DIR/privacy-fixture/release/vibeface-core"\nchmod +x "$CARGO_TARGET_DIR/privacy-fixture/release/vibeface" "$CARGO_TARGET_DIR/privacy-fixture/release/vibeface-core"\n')
+        fake_cargo.write_text('#!/bin/sh\nset -eu\ntouch "$CARGO_MARKER"\nmkdir -p "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"\nprintf "#!/bin/sh\\nprintf \\\"vibeface 0.0.1\\\\n\\\"\\n" > "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/vibeface"\nprintf "#!/bin/sh\\nprintf \\\"vibeface-core 0.0.1\\\\n\\\"\\n" > "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/vibeface-core"\nchmod +x "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/vibeface" "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/vibeface-core"\n')
         fake_cargo.chmod(0o755)
         marker = repo / "cargo-called"
         environment.update(PATH=f"{fake_cargo.parent}{os.pathsep}{environment['PATH']}", CARGO_MARKER=str(marker))
-        subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--target", "privacy-fixture"], env=environment, check=True, stdout=subprocess.PIPE)
+        subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--target", "x86_64-unknown-linux-gnu"], env=environment, check=True, stdout=subprocess.PIPE)
         assert marker.exists(), "packaging must always rebuild the native binary"
         archive_path, = (repo / ".artifacts/packages").glob("*.tar.gz")
         with tarfile.open(archive_path) as archive:
@@ -629,7 +629,7 @@ def release_privacy_test(root, scratch):
         (repo / "scripts/release-rustflags.py").write_text('raise RuntimeError("fixture failure")')
         generated()
         marker.unlink()
-        assert subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--target", "privacy-fixture"], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode != 0
+        assert subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--target", "x86_64-unknown-linux-gnu"], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode != 0
         assert not marker.exists(), "a failed privacy setup must stop the build"
     print("Release privacy self-test passed: caller flags, source paths, archive owners and extended attributes")
 
