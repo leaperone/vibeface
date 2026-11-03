@@ -26,7 +26,7 @@ The revision is not a causal clock. Signed events, VersionVector, fork evidence,
 
 ProviderDescriptor and FailureKind remain the business boundary. Provider-specific runtimes keep their native protocols, session files, and read-back rules. Local adapter evidence may include a bounded, scrubbed stderr tail and process termination facts. These facts never enter events, peer outbox payloads, or shared workspace records.
 
-Any provider workaround records its scope, reason, generation, and removal condition in the local ledger. The ledger is diagnostic data. It does not select a backup provider or replay a turn.
+The Provider evidence helper exposes the bounded fields a local workaround ledger can record. This PR does not write a ledger entry until a concrete workaround is observed. A future ledger remains diagnostic data and cannot select a backup provider or replay a turn.
 
 ## Out of scope
 

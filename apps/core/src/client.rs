@@ -520,7 +520,7 @@ async fn serve_session(
                         };
                         send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":payload})).await?
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => send_value(&mut socket, &mut channel, &json!({"type":"resync"})).await?,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":{"type":"resync"}})).await?,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                     _ => {},
                 }

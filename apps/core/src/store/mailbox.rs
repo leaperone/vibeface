@@ -154,7 +154,8 @@ pub(crate) fn queue(
         params![conversation, trigger],
     )?;
     save(connection, &candidate)?;
-    Ok(candidate)
+    reconcile(connection, network, now_ms)?;
+    Ok(load_key(connection, &key(&candidate))?.unwrap_or(candidate))
 }
 
 impl Store {
@@ -336,5 +337,26 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn mailbox_bounds_active_entries_per_network() {
+        let connection = connection();
+        for index in 0..=MAX_ACTIVE {
+            queue(
+                &connection,
+                "n",
+                "c",
+                &format!("message:{index}"),
+                index as i64 + 1,
+            )
+            .unwrap();
+        }
+        let active = records(&connection)
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.state.active())
+            .count();
+        assert_eq!(active, MAX_ACTIVE);
     }
 }
