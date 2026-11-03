@@ -18,6 +18,7 @@ use std::{
 pub(crate) mod bot_settings;
 pub(crate) mod bots;
 mod log;
+pub(crate) mod mailbox;
 pub(crate) mod questions;
 mod reduce;
 pub(crate) mod scheduler;

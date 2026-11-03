@@ -514,13 +514,13 @@ async fn serve_session(
                         // A burst, such as a sync catching up, is cheaper as one full read than as records per event.
                         let payload = if events.len() > PUSH_BURST {
                             while events.try_recv().is_ok() {}
-                            json!({"type":"changed"})
+                            json!({"type":"resync"})
                         } else {
                             pushed(&node, &principal.network_id, &session.device_id, event.payload).await
                         };
                         send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":payload})).await?
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => send_value(&mut socket, &mut channel, &json!({"type":"changed"})).await?,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => send_value(&mut socket, &mut channel, &json!({"type":"resync"})).await?,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                     _ => {},
                 }
