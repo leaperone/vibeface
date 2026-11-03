@@ -1749,10 +1749,6 @@ impl Runtime {
                         &entry.trigger,
                         now,
                     )?;
-                    self.store
-                        .lock()
-                        .await
-                        .remove_outbox(&entry.conversation_id, &entry.trigger)?;
                     self.publish_changed(
                         network,
                         &entry.conversation_id,

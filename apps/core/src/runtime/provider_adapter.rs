@@ -150,7 +150,6 @@ fn redact_path_tokens(text: &str) -> String {
         .join(" ")
 }
 
-/// Facts observed after a provider process has ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TerminationEvidence {
     pub(super) success: bool,
@@ -174,7 +173,6 @@ impl From<ExitStatus> for TerminationEvidence {
     }
 }
 
-/// Whether a disconnected provider had an unresolved request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PendingDisconnectClassification {
     NoPending,

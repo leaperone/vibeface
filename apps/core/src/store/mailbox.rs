@@ -1,12 +1,10 @@
 use super::Store;
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
 
 const KEY_PREFIX: &str = "mailbox:";
 const MAX_ACTIVE: usize = 200;
-const TTL_MS: i64 = 24 * 60 * 60 * 1000;
 const RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_ATTEMPTS: u32 = 8;
 const BACKOFF_MS: i64 = 1_000;
@@ -89,39 +87,18 @@ fn delete(connection: &Connection, record: &MailboxRecord) -> Result<()> {
 }
 
 fn reconcile(connection: &Connection, network: &str, now_ms: i64) -> Result<()> {
-    let mut entries: Vec<_> = records(connection)?
+    let entries: Vec<_> = records(connection)?
         .into_iter()
         .filter(|record| record.network_id == network)
         .collect();
-    for record in &mut entries {
-        if record.state.active() && now_ms.saturating_sub(record.queued_at_ms) >= TTL_MS {
-            record.state = MailboxState::Dead;
-            record.last_error = Some("mailbox entry expired".into());
+    for record in &entries {
+        if !record.state.active() && now_ms.saturating_sub(record.queued_at_ms) >= RETENTION_MS {
             connection.execute(
                 "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
                 params![record.conversation_id, record.trigger],
             )?;
-            save(connection, record)?;
-        } else if !record.state.active()
-            && now_ms.saturating_sub(record.queued_at_ms) >= RETENTION_MS
-        {
             delete(connection, record)?;
         }
-    }
-    let mut active: Vec<_> = entries
-        .into_iter()
-        .filter(|record| record.state.active())
-        .collect();
-    active.sort_by_key(|record| Reverse(record.queued_at_ms));
-    for record in active.into_iter().skip(MAX_ACTIVE) {
-        let mut dead = record;
-        dead.state = MailboxState::Dead;
-        dead.last_error = Some("mailbox capacity exceeded".into());
-        connection.execute(
-            "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
-            params![dead.conversation_id, dead.trigger],
-        )?;
-        save(connection, &dead)?;
     }
     Ok(())
 }
@@ -152,10 +129,18 @@ pub(crate) fn queue(
             )?;
             return Ok(existing);
         }
-        if existing.state == MailboxState::Delivered {
+        if matches!(existing.state, MailboxState::Dead | MailboxState::Delivered) {
             return Ok(existing);
         }
     }
+    let active = records(connection)?
+        .into_iter()
+        .filter(|record| record.network_id == network && record.state.active())
+        .count();
+    anyhow::ensure!(
+        active < MAX_ACTIVE,
+        "mailbox capacity reached; existing deliveries remain queued"
+    );
     connection.execute(
         "INSERT OR IGNORE INTO scheduler_outbox(conversation_id,trigger) VALUES(?,?)",
         params![conversation, trigger],
@@ -188,7 +173,21 @@ impl Store {
             save(&self.connection, &candidate)?;
             return Ok(true);
         };
-        if !record.state.active() || record.next_attempt_ms > now_ms {
+        if record.state == MailboxState::Delivered {
+            self.connection.execute(
+                "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
+                params![conversation, trigger],
+            )?;
+            return Ok(false);
+        }
+        if !record.state.active() {
+            self.connection.execute(
+                "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
+                params![conversation, trigger],
+            )?;
+            return Ok(false);
+        }
+        if record.next_attempt_ms > now_ms {
             return Ok(false);
         }
         record.attempts = record.attempts.saturating_add(1);
@@ -227,7 +226,11 @@ impl Store {
             next_attempt_ms: now_ms,
             last_error: None,
         };
-        let Some(mut record) = load_key(&self.connection, &key(&candidate))? else {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut record) = load_key(&tx, &key(&candidate))? else {
+            tx.commit()?;
             return Ok(());
         };
         record.state = if unknown {
@@ -241,7 +244,15 @@ impl Store {
         if record.attempts >= MAX_ATTEMPTS {
             record.state = MailboxState::Dead;
         }
-        save(&self.connection, &record)
+        let terminal = record.state == MailboxState::Dead;
+        save(&tx, &record)?;
+        if terminal {
+            tx.execute(
+                "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
+                params![conversation, trigger],
+            )?;
+        }
+        Ok(tx.commit()?)
     }
 
     pub(crate) fn mailbox_delivered(
@@ -261,11 +272,19 @@ impl Store {
             next_attempt_ms: now_ms,
             last_error: None,
         };
-        if let Some(mut record) = load_key(&self.connection, &key(&candidate))? {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(mut record) = load_key(&tx, &key(&candidate))? {
             record.state = MailboxState::Delivered;
             record.next_attempt_ms = now_ms;
-            save(&self.connection, &record)?;
+            save(&tx, &record)?;
         }
+        tx.execute(
+            "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
+            params![conversation, trigger],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -331,25 +350,25 @@ mod tests {
     }
 
     #[test]
-    fn mailbox_expires_active_rows() {
+    fn mailbox_reconcile_keeps_active_rows() {
         let connection = connection();
         queue(&connection, "n", "c", "message:m", 1).unwrap();
-        reconcile(&connection, "n", TTL_MS + 1).unwrap();
+        reconcile(&connection, "n", RETENTION_MS + 1).unwrap();
         let record = records(&connection).unwrap().pop().unwrap();
-        assert_eq!(record.state, MailboxState::Dead);
+        assert_eq!(record.state, MailboxState::Queued);
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM scheduler_outbox", [], |row| row
                     .get::<_, i64>(0),)
                 .unwrap(),
-            0
+            1
         );
     }
 
     #[test]
-    fn mailbox_bounds_active_entries_per_network() {
+    fn mailbox_rejects_new_entries_at_capacity_without_evicting_existing() {
         let connection = connection();
-        for index in 0..=MAX_ACTIVE {
+        for index in 0..MAX_ACTIVE {
             queue(
                 &connection,
                 "n",
@@ -359,11 +378,90 @@ mod tests {
             )
             .unwrap();
         }
-        let active = records(&connection)
-            .unwrap()
-            .into_iter()
-            .filter(|record| record.state.active())
-            .count();
-        assert_eq!(active, MAX_ACTIVE);
+        assert!(queue(&connection, "n", "c", "message:overflow", 999).is_err());
+        assert_eq!(records(&connection).unwrap().len(), MAX_ACTIVE);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM scheduler_outbox", [], |row| row
+                    .get::<_, i64>(0),)
+                .unwrap(),
+            MAX_ACTIVE as i64
+        );
+    }
+
+    #[test]
+    fn delivered_state_removes_the_scheduler_outbox_entry() {
+        let mut store = Store::open(":memory:").unwrap();
+        queue(&store.connection, "n", "c", "message:m", 1).unwrap();
+        store.mailbox_delivered("n", "c", "message:m", 2).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM scheduler_outbox", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .mailbox_for_test("n", "c", "message:m")
+                .unwrap()
+                .map(|record| record.state),
+            Some(MailboxState::Delivered)
+        );
+    }
+
+    #[test]
+    fn delivered_rows_left_by_an_older_crash_are_reconciled_before_attempt() {
+        let mut store = Store::open(":memory:").unwrap();
+        let queued = queue(&store.connection, "n", "c", "message:m", 1).unwrap();
+        let mut delivered = load_key(&store.connection, &key(&queued)).unwrap().unwrap();
+        delivered.state = MailboxState::Delivered;
+        save(&store.connection, &delivered).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO scheduler_outbox(conversation_id,trigger) VALUES(?,?)",
+                params!["c", "message:m"],
+            )
+            .unwrap();
+        assert!(
+            !store
+                .mailbox_before_attempt("n", "c", "message:m", 2)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM scheduler_outbox", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn dead_rows_remove_the_scheduler_outbox_entry_atomically() {
+        let mut store = Store::open(":memory:").unwrap();
+        let queued = queue(&store.connection, "n", "c", "message:m", 1).unwrap();
+        let mut record = load_key(&store.connection, &key(&queued)).unwrap().unwrap();
+        record.state = MailboxState::Sending;
+        record.attempts = MAX_ATTEMPTS;
+        save(&store.connection, &record).unwrap();
+
+        store
+            .mailbox_failed("n", "c", "message:m", false, "retry limit", 2)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .mailbox_for_test("n", "c", "message:m")
+                .unwrap()
+                .map(|record| record.state),
+            Some(MailboxState::Dead)
+        );
+        assert_eq!(store.scheduler_outbox().unwrap().len(), 0);
     }
 }
