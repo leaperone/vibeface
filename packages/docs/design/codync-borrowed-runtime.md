@@ -4,7 +4,7 @@ This design borrows runtime mechanisms from Codync without changing Vibeface's s
 
 ## Delivery ordering
 
-All requests sent to one target Node use one per-device gate. Message delivery, work dispatch, and stop requests therefore keep one order for that target. Different target Nodes may still run in parallel.
+Scheduler delivery requests sent to one target Node use one per-device gate. Message delivery, work dispatch, and stop requests therefore keep one order for that target. Other peer RPCs keep their own idempotency and version checks. Different target Nodes may still run in parallel.
 
 The gate is local process state. The trigger, owner, and idempotency record remain in the Store. A lost reply does not create a second trigger.
 
