@@ -17,7 +17,7 @@ Vibeface 不提供模型账号，也不安装 Agent。默认 Codex、Claude Code
 
 ## 1. 安装 Nightly
 
-本指南对应拆分后的 CLI、Core 与 App。先检查 [Releases](https://github.com/leaperone/vibeface/releases) 中的完整包是否同时包含 `vibeface`、`vibeface-core` 和 `web/`。Nightly `0.0.1-nightly.20261031.18` 仍是拆分前的包，缺少 `vibeface-core`，不能交给当前 main 的安装器安装。旧包请使用包内或同版本文档。
+本指南对应 CLI、Core 与 App 的完整包。先检查 [Releases](https://github.com/leaperone/vibeface/releases) 中的包同时包含 `vibeface`、`vibeface-core` 和 `web/`。首次正式版使用 data epoch 1，旧开发版数据和包不受支持。首次运行使用全新数据目录。
 
 有匹配的完整包时，首次安装可执行以下命令。已经安装时，不重复运行安装器，按[更新说明](install.md#选择更新渠道)管理现有安装。
 

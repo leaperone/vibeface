@@ -1,7 +1,7 @@
 use super::types::{StoredOrder, parse_word};
 use alloy_primitives::U256;
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
@@ -85,18 +85,31 @@ impl ServiceStore {
         private_directory(&root)?;
         private_directory(&root.join("objects"))?;
         private_directory(&root.join("private"))?;
-        let db = crate::store::private_file_connection(&root.join("service.sqlite3"))?;
+        let mut db = crate::store::private_file_connection(&root.join("service.sqlite3"))?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
-        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
-            CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,network TEXT,intent TEXT NOT NULL,role TEXT NOT NULL,body TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS orders_intent ON orders(network,intent,role);
-            CREATE TABLE IF NOT EXISTS charity_orders(id TEXT PRIMARY KEY,network TEXT,intent TEXT NOT NULL,body TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS charity_intent ON charity_orders(network,intent);
-            CREATE TABLE IF NOT EXISTS objects(order_id TEXT NOT NULL,idx INTEGER NOT NULL,kind TEXT NOT NULL,hash TEXT NOT NULL,size INTEGER NOT NULL,committed INTEGER NOT NULL DEFAULT 0,complete INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(order_id,idx,kind));
-            CREATE TABLE IF NOT EXISTS private_values(id TEXT PRIMARY KEY,body BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS proof_jobs(digest TEXT PRIMARY KEY,path TEXT NOT NULL,size INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS gas_budgets(chain INTEGER NOT NULL,wallet TEXT NOT NULL,budget_group TEXT NOT NULL,cap TEXT NOT NULL,PRIMARY KEY(chain,wallet,budget_group));
-            CREATE TABLE IF NOT EXISTS transactions(id TEXT PRIMARY KEY,chain INTEGER NOT NULL,wallet TEXT NOT NULL,nonce INTEGER NOT NULL,intent TEXT NOT NULL,raw TEXT,hash TEXT,phase TEXT NOT NULL,block_number INTEGER,block_hash TEXT,error TEXT,checked_at INTEGER NOT NULL DEFAULT 0,UNIQUE(chain,wallet,nonce));")?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: u32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        match version {
+            0 => {
+                let objects: u32 = tx.query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                ensure!(
+                    objects == 0,
+                    "unversioned delivery database is not supported"
+                );
+                tx.execute_batch(include_str!("schema.sql"))?;
+                tx.pragma_update(None, "user_version", crate::config::DATA_EPOCH)?;
+            }
+            crate::config::DATA_EPOCH => {}
+            _ => anyhow::bail!(
+                "unsupported delivery database schema version {version}; initialize a fresh Node data directory"
+            ),
+        }
+        tx.commit()?;
+        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")?;
         Ok(Self {
             db,
             root,
@@ -719,6 +732,36 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vdp-store-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
         (ServiceStore::open(&dir, 200_000, 4).unwrap(), dir)
+    }
+    #[test]
+    fn schema_initializes_once_and_rejects_old_databases_without_changing_data() {
+        let (store, dir) = store();
+        let version: u32 = store
+            .db
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, crate::config::DATA_EPOCH);
+        store
+            .db
+            .execute(
+                "INSERT INTO private_values(id,body) VALUES('retained',x'0102')",
+                [],
+            )
+            .unwrap();
+        drop(store);
+        let store = ServiceStore::open(&dir, 200_000, 4).unwrap();
+        assert_eq!(store.value("retained").unwrap(), Some(vec![1, 2]));
+        drop(store);
+        let path = dir.join("delivery/service.sqlite3");
+        for version in [0, 2, 12] {
+            let db = Connection::open(&path).unwrap();
+            db.pragma_update(None, "user_version", version).unwrap();
+            drop(db);
+            let before = std::fs::read(&path).unwrap();
+            assert!(ServiceStore::open(&dir, 200_000, 4).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn nonce_is_reserved_before_signing_and_intent_is_immutable() {

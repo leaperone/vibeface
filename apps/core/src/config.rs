@@ -9,10 +9,9 @@ use std::{
 
 /// Bumped whenever stored data stops being readable by the previous build.
 pub use vibeface_control::DATA_EPOCH;
-/// SHA-256 over the migration files (`migrations/*.sql`, by name) that `DATA_EPOCH` stores.
-/// Any schema change fails a test until both constants change together.
+/// SHA-256 of the Core and delivery initial SQL schemas.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
-    "9d80a43e554734b8fcb8fa8ec38bcdc37364d27c78d477f700cc4b5e3872324d";
+    "74df49916d5da6e2702e7bf254c0bda97c3b5124a7a3c0b4e071c43d74134459";
 /// Bumped whenever a release package stops being installable by the previous updater.
 pub use vibeface_control::UPDATE_PROTOCOL;
 pub fn data_epoch_marker() -> Vec<u8> {
@@ -400,17 +399,19 @@ mod tests {
     #[test]
     fn schema_changes_bump_the_data_epoch() {
         use sha2::{Digest, Sha256};
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = root.join("migrations");
         let mut files: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
             .collect();
-        files.sort();
         assert!(!files.is_empty(), "no migrations in {}", dir.display());
+        files.push(root.join("src/delivery/schema.sql"));
+        files.sort();
         let mut hasher = Sha256::new();
         for path in files {
-            let name = path.file_name().unwrap().to_str().unwrap();
+            let name = path.strip_prefix(root).unwrap().to_str().unwrap();
             let body = std::fs::read(&path).unwrap();
             hasher.update(format!("{name}\0{}\0", body.len()));
             hasher.update(body);

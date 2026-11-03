@@ -592,16 +592,17 @@ fn unpack(archive: &Path, destination: &Path, root_name: &str) -> Result<PathBuf
 }
 
 #[derive(Deserialize)]
-struct BuildInfo {
-    core_version: String,
+#[serde(deny_unknown_fields)]
+pub(super) struct BuildInfo {
+    pub(super) core_version: String,
     core_source_commit: String,
     app_version: String,
     app_source_commit: String,
-    version: String,
+    pub(super) version: String,
     target: String,
     source_commit: String,
-    update_protocol: u32,
-    data_epoch: u32,
+    pub(super) update_protocol: u32,
+    pub(super) data_epoch: u32,
 }
 
 fn verify_build(package: &Path, release: &Release) -> Result<BuildInfo> {

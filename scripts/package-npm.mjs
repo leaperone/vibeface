@@ -18,6 +18,10 @@ const run = (program, args, options = {}) => execFileSync(program, args, {
   encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, ...options,
 });
 const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const control = fs.readFileSync(path.join(repo, 'crates/control/src/lib.rs'), 'utf8');
+const updateProtocol = Number(/pub const UPDATE_PROTOCOL: u32 = (\d+);/.exec(control)?.[1]);
+const dataEpoch = Number(/pub const DATA_EPOCH: u32 = (\d+);/.exec(control)?.[1]);
+assert(Number.isSafeInteger(updateProtocol) && Number.isSafeInteger(dataEpoch), 'missing release protocol constants');
 
 function verifyTarMetadata(compressed) {
   const bytes = gunzipSync(compressed, { maxOutputLength: 512 * 1024 * 1024 });
@@ -75,8 +79,10 @@ function nativePackage(directory, version, target, sourceCommit) {
     assert(file.isFile() && file.size > 0, `missing package file: ${entry}`);
   }
   const info = JSON.parse(fs.readFileSync(path.join(directory, 'BUILD-INFO.json'), 'utf8'));
-  assert.deepEqual([info.version, info.target, info.source_commit, info.update_protocol],
-    [version, target, sourceCommit, 2], 'native package identity mismatch');
+  assert.deepEqual(Object.keys(info).sort(), ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch',
+    'core_version', 'core_source_commit', 'app_version', 'app_source_commit'].sort(), 'unsupported build info fields');
+  assert.deepEqual([info.version, info.target, info.source_commit, info.update_protocol, info.data_epoch],
+    [version, target, sourceCommit, updateProtocol, dataEpoch], 'native package identity mismatch');
   for (const field of ['core_version', 'app_version']) assert(typeof info[field] === 'string' && info[field].length > 0, 'missing component version');
   for (const field of ['core_source_commit', 'app_source_commit']) assert(/^[a-f0-9]{40}$/.test(info[field]), 'invalid component source');
   const checked = new Set();
@@ -89,7 +95,6 @@ function nativePackage(directory, version, target, sourceCommit) {
   }
   const actual = fs.readdirSync(directory, { recursive: true }).filter(name => name !== 'FILES.sha256' && fs.lstatSync(path.join(directory, name)).isFile()).sort();
   assert.deepEqual([...checked].sort(), actual, 'file checksum coverage mismatch');
-  assert(Number.isSafeInteger(info.data_epoch) && info.data_epoch > 0 && info.data_epoch <= 0xffffffff, 'invalid data epoch');
   for (const binary of ['vibeface', 'vibeface-core']) {
     const executable = path.join(directory, binary);
     assert(fs.statSync(executable).mode & 0o111, `${binary} must be executable`);
@@ -191,7 +196,7 @@ async function selfTest() {
         fs.mkdirSync(path.dirname(path.join(directory, entry)), { recursive: true });
         fs.writeFileSync(path.join(directory, entry), 'fixture\n');
       }
-      fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ version, target, source_commit: commit, update_protocol: 2, core_version: version, core_source_commit: commit, app_version: version, app_source_commit: commit, data_epoch: 1 }));
+      fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ version, target, source_commit: commit, update_protocol: 1, core_version: version, core_source_commit: commit, app_version: version, app_source_commit: commit, data_epoch: 1 }));
       fs.writeFileSync(path.join(directory, 'web/vibeface_secure_bg.wasm'), Buffer.from([0, 97, 115, 109]));
       fs.writeFileSync(path.join(directory, 'vibeface'), '#!/usr/bin/env node\nif (process.env.VIBEFACE_PACK_ASSERT_NO_EXEC) process.exit(99);\nif (process.argv[2] === "--version") console.log(`vibeface ${process.env.VIBEFACE_FIXTURE_VERSION}`);\nelse if (process.argv[2] === "exit") process.exit(23);\nelse if (process.argv[2] === "wait") { process.on("SIGTERM", () => process.exit(42)); console.log("ready"); setInterval(() => {}, 1000); }\nelse console.log(JSON.stringify(process.argv.slice(2)));\n');
       fs.writeFileSync(path.join(directory, 'vibeface-core'), '#!/usr/bin/env node\nif (process.env.VIBEFACE_PACK_ASSERT_NO_EXEC) process.exit(99);\nif (process.argv[2] === "--version") console.log(`vibeface-core ${process.env.VIBEFACE_FIXTURE_VERSION}`);\nelse console.log(JSON.stringify(process.argv.slice(2)));\n');
@@ -232,19 +237,27 @@ async function selfTest() {
     assert.throws(() => pack(input, path.join(scratch, 'wrong-source'), version, 'b'.repeat(40)), /identity mismatch/);
     const manifest = path.join(sources.get(target), 'BUILD-INFO.json');
     const original = fs.readFileSync(manifest);
-    fs.writeFileSync(manifest, JSON.stringify({ version, target, source_commit: commit, update_protocol: 3, core_version: version, core_source_commit: commit, app_version: version, app_source_commit: commit, data_epoch: 1 }));
+    const build = JSON.parse(original);
+    for (const [field, value] of [['update_protocol', 0], ['update_protocol', 2], ['data_epoch', 0], ['data_epoch', 2], ['data_epoch', 12]]) {
+      fs.writeFileSync(manifest, JSON.stringify({ ...build, [field]: value }));
+      repack(target);
+      assert.throws(() => pack(input, path.join(scratch, `${field}-${value}`), version, commit), /identity mismatch/);
+    }
+    fs.writeFileSync(manifest, JSON.stringify({ ...build, legacy: true }));
     repack(target);
-    assert.throws(() => pack(input, path.join(scratch, 'bad-protocol'), version, commit), /identity mismatch/);
-    fs.writeFileSync(manifest, JSON.stringify({ version, target, source_commit: commit, update_protocol: 2, core_version: version, core_source_commit: commit, app_version: version, app_source_commit: commit, data_epoch: 2 }));
+    assert.throws(() => pack(input, path.join(scratch, 'unknown-field'), version, commit), /unsupported build info fields/);
+    fs.writeFileSync(manifest, JSON.stringify({ ...build, core_source_commit: 'c'.repeat(40) }));
     repack(target);
-    assert.throws(() => pack(input, path.join(scratch, 'mixed-epochs'), version, commit), /same component versions, sources and data epoch/);
+    assert.throws(() => pack(input, path.join(scratch, 'mixed-components'), version, commit), /same component versions, sources and data epoch/);
     for (const [platform, directory] of sources) {
-      fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ version, target: platform, source_commit: commit, update_protocol: 2, core_version: version, core_source_commit: commit, app_version: version, app_source_commit: commit, data_epoch: 2 }));
+      const info = JSON.parse(fs.readFileSync(path.join(directory, 'BUILD-INFO.json')));
+      fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ ...info, data_epoch: 2 }));
       repack(platform);
     }
-    pack(input, path.join(scratch, 'other-epoch'), version, commit);
+    assert.throws(() => pack(input, path.join(scratch, 'all-old-epoch'), version, commit), /identity mismatch/);
     for (const [platform, directory] of sources) {
-      fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ version, target: platform, source_commit: commit, update_protocol: 2, core_version: version, core_source_commit: commit, app_version: version, app_source_commit: commit, data_epoch: 1 }));
+      const info = JSON.parse(fs.readFileSync(path.join(directory, 'BUILD-INFO.json')));
+      fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ ...info, data_epoch: 1 }));
       repack(platform);
     }
     fs.writeFileSync(manifest, original);
@@ -253,7 +266,7 @@ async function selfTest() {
     assert.throws(() => pack(input, path.join(scratch, 'unsafe-archive'), version, commit), /links or special files/);
     assert.throws(() => nightly('1.2.3'), /Nightly versions/);
     assert.throws(() => nightly('1.2.3-nightly.20260229.1'), /invalid Nightly date/);
-    console.log('npm self-test passed: complete packages, consistent epochs 1 and 2, global install without scripts, arguments, exit status, signals, checksums, source identity, protocol and unsafe archive rejection.');
+    console.log('npm self-test passed: complete epoch-1 packages, old-epoch rejection, global install without scripts, arguments, exit status, signals, checksums, source identity, protocol and unsafe archive rejection.');
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }

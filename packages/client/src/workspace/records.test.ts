@@ -75,8 +75,8 @@ test("context state and queue reasons survive records without replacing a remote
     session_status: { resumable: true, pending_generation: true, native_id: 'private-native-id' },
     native_token: 'must-not-enter-client-state', rendered: 'private context',
   }
-  const conflict = { call_ref: 'remember', memory_id: 'memory', expected_epoch: 9, actual_epoch: 9, expected_revision: '', actual_revision: 'new', reason: 'revision_changed' }
-  const memory = { memory_id: 'memory', text: '已保存的事实', metadata: { epoch: 12, revision: 'c'.repeat(64), control_revision: 1, origin: 'user', user_controlled: true, essential: false, source_event_hash: 'd'.repeat(64), native_token: 'private-memory-token' } }
+  const conflict = { call_ref: 'remember', memory_id: 'memory', expected_epoch: 1, actual_epoch: 1, expected_revision: '', actual_revision: 'new', reason: 'revision_changed' }
+  const memory = { memory_id: 'memory', text: '已保存的事实', metadata: { epoch: 1, revision: 'c'.repeat(64), control_revision: 1, origin: 'user', user_controlled: true, essential: false, source_event_hash: 'd'.repeat(64), native_token: 'private-memory-token' } }
   const sync = { items: [{ memory_id: 'memory', losing_revision: 'a'.repeat(64), winning_revision: 'c'.repeat(64), losing_event_hash: 'b'.repeat(64), winning_event_hash: 'd'.repeat(64), reason: 'user_protected', text: 'private-conflict-text', signature: 'private-conflict-signature' }], has_more: true }
   const update = records({ context, memory: [memory], memory_staged_count: 2, memory_conflicts: [conflict], memory_sync_conflicts: sync, jobs: [{ trigger: 'a', state: 'queued', lane: 'main', hold_reason: 'active_turn', pending_check: false, context }] })
   const next = mergeConversation(shown, update)
@@ -92,7 +92,7 @@ test("context state and queue reasons survive records without replacing a remote
   assert.equal(next.bot_settings.memory_staged_count, 2)
   assert.equal(next.bot_settings.memory_sync_conflicts.items[0].reason, 'user_protected')
   assert.equal(next.bot_settings.memory_sync_conflicts.has_more, true)
-  assert.deepEqual(next.bot_settings.memory[0].metadata, { epoch: 12, revision: 'c'.repeat(64), control_revision: 1, origin: 'user', user_controlled: true, essential: false, source_event_hash: 'd'.repeat(64) })
+  assert.deepEqual(next.bot_settings.memory[0].metadata, { epoch: 1, revision: 'c'.repeat(64), control_revision: 1, origin: 'user', user_controlled: true, essential: false, source_event_hash: 'd'.repeat(64) })
   assert(!JSON.stringify(next).includes('must-not-enter-client-state'))
   assert(!JSON.stringify(next).includes('private context'))
   assert(!JSON.stringify(next).includes('private-native-id'))

@@ -32,7 +32,7 @@ function DownloadPage() {
           </>
         }
       />
-      <p className="section-copy">Nightly 0.0.1-nightly.20261031.18 仍是拆分前的包，不能用当前 main 的安装器安装。需要当前源码时，查看<a href="/docs/quick-start#从源码准备当前版本">源码运行步骤</a>；已有安装请先读<a href="/docs/install">安装与更新说明</a>。要添加浏览器或手机，查看<a href="/docs/onboarding">首次配置与加入设备</a>。</p>
+      <p className="section-copy">安装器只接受当前版本的完整包。旧开发版数据目录不受支持，首次运行请使用全新目录。需要当前源码时，查看<a href="/docs/quick-start#从源码准备当前版本">源码运行步骤</a>；已有安装请先读<a href="/docs/install">安装与更新说明</a>。要添加浏览器或手机，查看<a href="/docs/onboarding">首次配置与加入设备</a>。</p>
     </SiteLayout>
   )
 }

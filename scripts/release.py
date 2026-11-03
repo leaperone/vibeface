@@ -20,6 +20,7 @@ TARGETS = ('aarch64-apple-darwin', 'aarch64-unknown-linux-gnu', 'x86_64-unknown-
 VERSION = r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(nightly)\.([0-9]{8})\.([1-9][0-9]*)|-(rc)\.([1-9][0-9]*))?'
 MAX_ARCHIVE = 384 * 1024 * 1024
 MAX_UNPACKED = 512 * 1024 * 1024
+SCHEMA_VERSION = 1
 
 
 def require(condition, message):
@@ -36,7 +37,7 @@ def version(value):
     require(match, 'invalid release version')
     if match[4]:
         datetime.datetime.strptime(match[5], '%Y%m%d')
-    return 'nightly' if match[4] else 'rc' if match[6] else 'stable'
+    return 'nightly' if match[4] else 'rc' if match[7] else 'stable'
 
 
 def parse_tag(tag):
@@ -133,9 +134,18 @@ def unpack(archive, destination):
 
 def verify_component(directory, app, expected=None):
     info = json.loads((directory / 'COMPONENT-INFO.json').read_text())
-    require(info['app'] == app and info['schema'] == 2, 'wrong component identity')
-    require(parse_tag(info['tag'])[:2] == (app, info['version']), 'invalid component tag')
+    fields = {'app', 'version', 'tag', 'source_commit', 'channel', 'schema', 'target', 'files'}
+    if app == 'core':
+        fields.add('data_epoch')
+    require(set(info) == fields, 'unsupported component fields')
+    require(info['app'] == app and type(info['schema']) is int and info['schema'] == SCHEMA_VERSION, 'wrong component identity')
+    require(parse_tag(info['tag']) == (app, info['version'], info['channel']), 'invalid component tag')
     require(re.fullmatch(r'[a-f0-9]{40}', info['source_commit']), 'invalid component source')
+    if app == 'core':
+        require(type(info['data_epoch']) is int and info['data_epoch'] == control_constant('DATA_EPOCH') and info['target'] in TARGETS,
+                'unsupported Core data epoch or target')
+    else:
+        require(info['target'] is None, 'static component must not specify a native target')
     if app in ('app', 'www'):
         require(not any(p.name in ('vibeface', 'vibeface-core') for p in directory.rglob('*')), 'static component must not include native programs')
     if expected:
@@ -160,7 +170,7 @@ def pack_component(app, source, output, target=None):
             shutil.copy2(source, directory / 'vibeface-core')
         else:
             shutil.copytree(source, directory / ('web' if app == 'app' else 'site'))
-        info.update(schema=2, target=target, files=files(directory))
+        info.update(schema=SCHEMA_VERSION, target=target, files=files(directory))
         if app == 'core':
             info['data_epoch'] = control_constant('DATA_EPOCH')
         write_json(directory / 'COMPONENT-INFO.json', info)
@@ -181,6 +191,8 @@ def seal_bundle(directory, core=None, app=None):
     source = info['source_commit']
     core = core or {'version': read_version('core'), 'source_commit': source}
     app = app or {'version': read_version('app'), 'source_commit': source}
+    require(all(version(component['version']) == info['channel'] for component in (core, app)),
+            'CLI, Core and App must use the same release channel')
     build = dict(version=info['version'], target=os.environ['PACKAGE_TARGET'], source_commit=source,
                  update_protocol=control_constant('UPDATE_PROTOCOL'), data_epoch=control_constant('DATA_EPOCH'),
                  core_version=core['version'], core_source_commit=core['source_commit'],
@@ -199,16 +211,22 @@ def manifest(app, output):
             safe_name(path.name)
             assets.append({'name': path.name, 'size': path.stat().st_size, 'sha256': digest(path)})
     require(assets, 'release has no assets')
-    info.update(schema=2, assets=assets)
+    info.update(schema=SCHEMA_VERSION, assets=assets)
     write_json(output / 'release.json', info)
     return info
 
 
+def verify_release_identity(info):
+    require(set(info) == {'app', 'version', 'tag', 'source_commit', 'channel', 'schema', 'assets'},
+            'unsupported release manifest fields')
+    require(type(info['schema']) is int and info['schema'] == SCHEMA_VERSION, 'invalid release manifest schema')
+    require(parse_tag(info['tag']) == (info['app'], info['version'], info['channel']), 'invalid release identity')
+    require(re.fullmatch(r'[a-f0-9]{40}', info['source_commit']), 'invalid release commit')
+
+
 def verify_manifest(directory, expected=None):
     info = json.loads((directory / 'release.json').read_text())
-    require(info['schema'] == 2, 'invalid release manifest schema')
-    require(parse_tag(info['tag'])[:2] == (info['app'], info['version']), 'invalid release identity')
-    require(re.fullmatch(r'[a-f0-9]{40}', info['source_commit']), 'invalid release commit')
+    verify_release_identity(info)
     if expected:
         require(all(info[k] == v for k, v in expected.items()), 'release identity mismatch')
     names = set()
@@ -226,8 +244,10 @@ def verify_manifest(directory, expected=None):
 def fetch_component(app, target, destination):
     lock = json.loads((ROOT / 'apps/cli/release-lock.json').read_text())[app]
     tag = lock['tag']
-    require(parse_tag(tag)[0] == app, 'dependency tag names wrong component')
     require(set(lock) == {'tag'}, 'unsupported dependency lock fields')
+    component, value, channel = parse_tag(tag)
+    require(component == app, 'dependency tag names wrong component')
+    require(channel == version(read_version('cli')), 'CLI and dependency must use the same release channel')
     destination.mkdir(parents=True, exist_ok=True)
     data = json.loads(run('gh', 'release', 'view', tag, '--repo', 'leaperone/vibeface', '--json', 'isDraft,assets'))
     require(not data['isDraft'], 'dependency release is not public')
@@ -235,9 +255,10 @@ def fetch_component(app, target, destination):
     release_file = destination / 'release.json'
     subprocess.run(['gh', 'release', 'download', tag, '--repo', 'leaperone/vibeface', '--pattern', 'release.json', '--dir', str(destination)], check=True)
     release = json.loads(release_file.read_text())
-    require(release['source_commit'] == source and release['tag'] == tag and release['app'] == app and release['schema'] == 2,
+    verify_release_identity(release)
+    require(release['source_commit'] == source and release['tag'] == tag and release['app'] == app
+            and release['version'] == value and release['channel'] == channel,
             'dependency release source does not match tag')
-    value = parse_tag(tag)[1]
     name = f'vibeface-{app}-{value}' + (f'-{target}' if app == 'core' else '') + '.tar.gz'
     assets = [a for a in release['assets'] if a['name'] == name]
     require(len(assets) == 1, 'dependency archive is missing or ambiguous')
@@ -245,7 +266,9 @@ def fetch_component(app, target, destination):
     archive = destination / name; asset = assets[0]
     require(archive.stat().st_size == asset['size'] and digest(archive) == asset['sha256'], 'dependency archive checksum mismatch')
     directory = unpack(archive, destination / 'unpacked')
-    return directory, verify_component(directory, app, {'tag': tag, 'source_commit': source})
+    return directory, verify_component(directory, app, {
+        'tag': tag, 'source_commit': source, 'target': target if app == 'core' else None,
+    })
 
 
 def compose(target, binary, output):
@@ -308,8 +331,11 @@ def publish(app, directory):
 
 
 def self_test():
+    from unittest.mock import patch
     for app in APPS:
         assert parse_tag(f'{app}-v0.0.1-nightly.20261101.1') == (app, '0.0.1-nightly.20261101.1', 'nightly')
+        assert parse_tag(f'{app}-v0.0.1-rc.1') == (app, '0.0.1-rc.1', 'rc')
+        assert parse_tag(f'{app}-v0.0.1') == (app, '0.0.1', 'stable')
     for tag in ('v0.0.1', 'other-v0.0.1', 'cli-v01.0.1', 'core-v0.0.1-nightly.20260229.1', 'app-v1.0.0+extra'):
         try:
             parse_tag(tag)
@@ -324,10 +350,19 @@ def self_test():
         public_archive(directory, tmp / 'asset.tar.gz')
         extracted = unpack(tmp / 'asset.tar.gz', tmp / 'out')
         assert (extracted / 'test').read_text() == 'known content'
-        info = dict(app='app', schema=2, tag='app-v0.0.1', version='0.0.1',
-                    source_commit='a' * 40, files=files(extracted))
+        info = dict(app='app', schema=SCHEMA_VERSION, tag='app-v0.0.1', version='0.0.1',
+                    source_commit='a' * 40, channel='stable', target=None, files=files(extracted))
         write_json(extracted / 'COMPONENT-INFO.json', info)
         assert verify_component(extracted, 'app', {'source_commit': 'a' * 40}) == info
+        for change in ({'schema': 0}, {'schema': 2}, {'schema': True}, {'legacy': True}, {'channel': 'nightly'}):
+            write_json(extracted / 'COMPONENT-INFO.json', info | change)
+            try:
+                verify_component(extracted, 'app')
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'accepted invalid component fields {change}')
+        write_json(extracted / 'COMPONENT-INFO.json', info)
         for expected in ({'source_commit': 'b' * 40}, {'tag': 'app-v0.0.2'}):
             try:
                 verify_component(extracted, 'app', expected)
@@ -349,6 +384,31 @@ def self_test():
             pass
         else:
             raise AssertionError('accepted traversal')
+
+        release = dict(app='cli', version='0.0.1', tag='cli-v0.0.1', source_commit='a' * 40, channel='stable')
+        component = dict(version='0.0.1', source_commit='b' * 40)
+        with patch(f'{__name__}.identity', return_value=release), patch(f'{__name__}.run', return_value=''), \
+                patch.dict(os.environ, PACKAGE_TARGET=TARGETS[0]):
+            assert seal_bundle(directory, component, component)['data_epoch'] == control_constant('DATA_EPOCH')
+            for core, app in ((component | {'version': '0.0.1-nightly.20261101.1'}, component),
+                              (component, component | {'version': '0.0.1-rc.1'})):
+                try:
+                    seal_bundle(directory, core, app)
+                except ValueError as error:
+                    assert 'same release channel' in str(error)
+                else:
+                    raise AssertionError('accepted mixed release channels')
+            manifest('cli', directory)
+            assert verify_manifest(directory, release)['schema'] == SCHEMA_VERSION
+            declared = json.loads((directory / 'release.json').read_text())
+            for change in ({'schema': 0}, {'schema': 2}, {'schema': True}, {'legacy': True}, {'channel': 'nightly'}):
+                write_json(directory / 'release.json', declared | change)
+                try:
+                    verify_manifest(directory)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(f'accepted invalid release manifest {change}')
     print('release identities and archive self-tests passed')
 
 

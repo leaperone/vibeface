@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=12`，数据库 `user_version=12`。共享结构以 `apps/core/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，epoch 12 使用本文定义的最终事件结构。同一个人网络中的所有 Node 必须使用该最终格式的构建，不能混跑其他 epoch 或旧的 epoch 12 开发快照。`data-epoch.json` 只检查本机目录，不参与 peer 握手。旧 Node 会因 `deny_unknown_fields` 拒绝新增的 `model`、`resolved` 等字段；协议版本 1 不代表这些不同结构可以互通。程序不迁移或清空旧数据。
+协议版本为 `1`，数据格式 `data_epoch=1`，Core 和 delivery 数据库的 `user_version=1`。共享结构以 `apps/core/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。同一个人网络中的所有 Node 必须使用当前格式。`data-epoch.json` 检查本机目录，未知协议字段和旧格式会被拒绝。程序不迁移或清空旧数据。
 
 ## 身份与数据范围
 
@@ -85,15 +85,15 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 |---|---|
 | `identity.json` | 设备私钥，0600 |
 | `config.json` | 本机配置，0600 |
-| `data-epoch.json` | `{"data_epoch":12}`，程序拒绝其他 epoch |
-| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=12` |
+| `data-epoch.json` | `{"data_epoch":1}`，程序拒绝其他 epoch |
+| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=1` |
 | `bootstrap.json` | 建网前的一次性本机 capability，公共入口没有 |
 | `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；公共入口和使用它的成员 Node 各有一份 |
 | `blobs/sha256/<前两位>/<hash>` | 附件正文，`blobs/partial/` 为续传暂存 |
 | `local-sessions.json` | 本机会话的 cookie 摘要 |
 | `delivery-settings.json` | 可选文件交付设置，与 `config.json` 分开 |
 | `delivery-wallet.json` | 独立加密 EVM 钱包，0600，不包含接收密钥 |
-| `delivery/service.sqlite3` | 订单、接收密钥、证明任务、续传偏移、nonce 和签名交易账本；不进入共享 DAG |
+| `delivery/service.sqlite3` | 订单、接收密钥、证明任务、续传偏移、nonce 和签名交易账本；`user_version=1`，只初始化空库，不进入共享 DAG |
 | `delivery/objects/`、`delivery/private/` | 交付对象与本机私密材料，目录 0700、文件 0600；完整恢复需保留整个 `delivery/` |
 | `join.json` | `vibeface join` 或本机网页进行中的加入请求，重试时沿用同一请求 |
 | `codex-app-server.pid` | 托管 App Server 的进程组号 |
@@ -232,7 +232,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 
 工作接纳先读取已有 `work_id` 并校验完整请求，只有新工作读取可变设置。停用或切换 Bot 后，相同请求仍返回原状态且不重新发送。任务调度在 claim 和会话身份计算之前选择冻结的 Provider 与模型。`resolved.model=null` 固定 Provider 默认语义，不再读取 Node 后来修改的默认值，也不保证 Provider 内部实际型号不变。
 
-Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, origin, user_controlled, essential}`。`base` 为 `{epoch, version}`，version 为 null 或 `{revision, control_revision, source_event_hash}`，删除必须有 version。epoch 必须为当前 12。用户 operation_id 使用 `SHA256(attestation 签名输入 ‖ 签名设备)`，入口重算后核对，签名字节和 Node 外层事件不参与。本人操作计数为 base 计数加一，空 base 为 1。自动计数固定 0，revision 为完整事件 hash；用户 revision 为 operation_id。CAS 比较 epoch/revision/control_revision，source 另验真实等价来源。相同操作的多个封装以最小 hash 作为来源代表，不改变逻辑版本。
+Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, origin, user_controlled, essential}`。`base` 为 `{epoch, version}`，version 为 null 或 `{revision, control_revision, source_event_hash}`，删除必须有 version。epoch 必须为当前 1。用户 operation_id 使用 `SHA256(attestation 签名输入 ‖ 签名设备)`，入口重算后核对，签名字节和 Node 外层事件不参与。本人操作计数为 base 计数加一，空 base 为 1。自动计数固定 0，revision 为完整事件 hash；用户 revision 为 operation_id。CAS 比较 epoch/revision/control_revision，source 另验真实等价来源。相同操作的多个封装以最小 hash 作为来源代表，不改变逻辑版本。
 
 `memory_sync_conflicts` 为 `{items, has_more}`，最多 50 项。每项为 `{memory_id, losing_revision, winning_revision, losing_event_hash, winning_event_hash, reason}`，reason 为 user_protected、concurrent_automatic 或 concurrent_user。该页从入口 effective 历史的逻辑 base 链计算，同一本人操作先去重，赢家正常祖先排除，不包含候选正文。它与 owner 的本轮 `memory_conflicts` 独立，owner 不可达不影响入口共享冲突。
 
