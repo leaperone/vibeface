@@ -83,7 +83,7 @@ function nativePackage(directory, version, target, sourceCommit) {
     'core_version', 'core_source_commit', 'app_version', 'app_source_commit'].sort(), 'unsupported build info fields');
   assert.deepEqual([info.version, info.target, info.source_commit, info.update_protocol, info.data_epoch],
     [version, target, sourceCommit, updateProtocol, dataEpoch], 'native package identity mismatch');
-  for (const field of ['core_version', 'app_version']) assert(typeof info[field] === 'string' && info[field].length > 0, 'missing component version');
+  for (const field of ['core_version', 'app_version']) nightly(info[field]);
   for (const field of ['core_source_commit', 'app_source_commit']) assert(/^[a-f0-9]{40}$/.test(info[field]), 'invalid component source');
   const checked = new Set();
   for (const line of fs.readFileSync(path.join(directory, 'FILES.sha256'), 'utf8').trim().split('\n')) {
@@ -246,6 +246,11 @@ async function selfTest() {
     fs.writeFileSync(manifest, JSON.stringify({ ...build, legacy: true }));
     repack(target);
     assert.throws(() => pack(input, path.join(scratch, 'unknown-field'), version, commit), /unsupported build info fields/);
+    for (const field of ['core_version', 'app_version']) {
+      fs.writeFileSync(manifest, JSON.stringify({ ...build, [field]: '0.0.1' }));
+      repack(target);
+      assert.throws(() => pack(input, path.join(scratch, `mixed-${field}`), version, commit), /Nightly versions/);
+    }
     fs.writeFileSync(manifest, JSON.stringify({ ...build, core_source_commit: 'c'.repeat(40) }));
     repack(target);
     assert.throws(() => pack(input, path.join(scratch, 'mixed-components'), version, commit), /same component versions, sources and data epoch/);

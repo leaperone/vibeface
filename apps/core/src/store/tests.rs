@@ -43,6 +43,13 @@ fn first_release_schema_reopens_and_rejects_old_databases_without_modifying_them
         assert!(Store::open_readonly(&path).is_err());
         assert_eq!(std::fs::read(&path)?, before);
     }
+    let view_path = dir.join("view.sqlite3");
+    let db = Connection::open(&view_path)?;
+    db.execute_batch("CREATE VIEW old_view AS SELECT 1;")?;
+    drop(db);
+    let before = std::fs::read(&view_path)?;
+    assert!(Store::open(&view_path).is_err());
+    assert_eq!(std::fs::read(&view_path)?, before);
     std::fs::remove_dir_all(dir)?;
     Ok(())
 }

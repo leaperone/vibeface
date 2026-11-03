@@ -176,6 +176,13 @@ verify_package() {
     { info[$2]=$3 }
     END { exit !(NR==9 && info["version"]==version && info["target"]==target && info["source_commit"]==commit && info["update_protocol"]=="1" && info["data_epoch"]=="1" && info["core_version"]!="" && info["app_version"]!="" && info["core_source_commit"] ~ /^[a-f0-9]+$/ && length(info["core_source_commit"])==40 && info["app_source_commit"] ~ /^[a-f0-9]+$/ && length(info["app_source_commit"])==40) }
   ' "$scratch/build-fields" || fail 'BUILD-INFO does not match the release, platform, source commit, or data epoch'
+  local channel=stable prerelease=false component_version field
+  if [[ $version == *-nightly.* ]]; then channel=nightly; prerelease=true; fi
+  for field in core_version app_version; do
+    component_version=$(awk -F '\t' -v field="$field" '$2==field {print $3}' "$scratch/build-fields")
+    printf '0\ttag_name\tcli-v%s\n0\tdraft\tfalse\n0\tprerelease\t%s\n' "$component_version" "$prerelease" > "$scratch/component-fields"
+    [[ $(select_release "$scratch/component-fields" "$channel") == "cli-v$component_version" ]] || fail 'component version does not match the release channel'
+  done
   [[ -x "$package/vibeface" && -x "$package/vibeface-core" ]] || fail 'packaged CLI and Core binaries must be executable'
   [[ $("$package/vibeface" --version) == "vibeface $version" ]] || fail 'packaged CLI version does not match the release'
   local core_version
@@ -357,8 +364,8 @@ JSON
     mkdir -p "$fixture/source/$package/$(dirname "$entry")"
     printf 'test fixture\n' > "$fixture/source/$package/$entry"
   done
-  printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"1.0.0","app_source_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\n' \
-    "$version" "$target" "$version" > "$fixture/source/$package/BUILD-INFO.json"
+  printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"%s","app_source_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\n' \
+    "$version" "$target" "$version" "$version" > "$fixture/source/$package/BUILD-INFO.json"
   printf '#!/bin/sh\nprintf "vibeface %s\\n"\n' "$version" > "$fixture/source/$package/vibeface"
   printf '#!/bin/sh\nprintf "vibeface-core %s\\n"\n' "$version" > "$fixture/source/$package/vibeface-core"
   chmod +x "$fixture/source/$package/vibeface" "$fixture/source/$package/vibeface-core"
@@ -389,8 +396,8 @@ JSON
     target="$platform"
     package="vibeface-$version-$target"
     if [[ $old_package != "$package" ]]; then mv "$fixture/source/$old_package" "$fixture/source/$package"; fi
-    printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"1.0.0","app_source_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\n' \
-      "$version" "$target" "$version" > "$fixture/source/$package/BUILD-INFO.json"
+    printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"%s","app_source_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\n' \
+      "$version" "$target" "$version" "$version" > "$fixture/source/$package/BUILD-INFO.json"
     case "$target" in
       aarch64-apple-darwin) printf 'Darwin\n' > "$fixture/os"; printf 'arm64\n' > "$fixture/arch" ;;
       aarch64-unknown-linux-gnu) printf 'Linux\n' > "$fixture/os"; printf 'aarch64\n' > "$fixture/arch" ;;
@@ -451,6 +458,12 @@ JSON
   done
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
+  case_dir="$test_dir/mixed-channel"
+  mkdir "$case_dir"
+  sed 's/"app_version":"[^"]*"/"app_version":"0.0.1"/' "$fixture/supported-build" > "$fixture/source/$package/BUILD-INFO.json"
+  repack_fixture
+  expect_failure nightly 'component version does not match the release channel'
+  cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   case_dir="$test_dir/unknown-build-field"
   mkdir "$case_dir"
   sed 's/}$/,"legacy":true}/' "$fixture/supported-build" > "$fixture/source/$package/BUILD-INFO.json"
@@ -459,7 +472,7 @@ JSON
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   case_dir="$test_dir/manifest"
   mkdir "$case_dir"
-  printf '{"version":"wrong","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"1.0.0","app_source_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\n' "$target" "$version" > "$fixture/source/$package/BUILD-INFO.json"
+  printf '{"version":"wrong","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"%s","app_source_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\n' "$target" "$version" "$version" > "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
   expect_failure nightly 'BUILD-INFO does not match'
   case_dir="$test_dir/bin-conflict"

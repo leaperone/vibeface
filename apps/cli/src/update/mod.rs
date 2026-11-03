@@ -458,11 +458,7 @@ fn manifest(package: &Path) -> Result<Manifest> {
     let build: release::BuildInfo =
         serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
             .context("invalid package manifest")?;
-    ensure!(
-        build.update_protocol == vibeface_control::UPDATE_PROTOCOL
-            && build.data_epoch == vibeface_control::DATA_EPOCH,
-        "package does not support the current update protocol and data epoch"
-    );
+    build.validate()?;
     for file in [
         "vibeface",
         "vibeface-core",
