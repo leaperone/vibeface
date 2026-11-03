@@ -300,7 +300,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
           workspaces: |
             . -> .artifacts/vdp/domain-target
-            crates/delivery/proof -> ../../.artifacts/vdp/proof-target
+            crates/delivery/proof -> ../../../.artifacts/vdp/proof-target
       - name: Check public delivery fixtures when present
         run: python3 scripts/check-delivery.py --check-fixtures
       - name: Install checksum-pinned guest compiler in artifacts
