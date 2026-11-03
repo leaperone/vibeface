@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 const KEY_PREFIX: &str = "mailbox:";
 const MAX_ACTIVE: usize = 200;
 const RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-const MAX_ATTEMPTS: u32 = 8;
+const MAX_ATTEMPT_COUNT: u32 = 8;
 const BACKOFF_MS: i64 = 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,17 +190,7 @@ impl Store {
         if record.next_attempt_ms > now_ms {
             return Ok(false);
         }
-        record.attempts = record.attempts.saturating_add(1);
-        if record.attempts > MAX_ATTEMPTS {
-            record.state = MailboxState::Dead;
-            record.last_error = Some("mailbox retry limit exceeded".into());
-            self.connection.execute(
-                "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
-                params![conversation, trigger],
-            )?;
-            save(&self.connection, &record)?;
-            return Ok(false);
-        }
+        record.attempts = record.attempts.saturating_add(1).min(MAX_ATTEMPT_COUNT);
         record.state = MailboxState::Sending;
         record.next_attempt_ms = now_ms;
         save(&self.connection, &record)?;
@@ -241,17 +231,7 @@ impl Store {
         record.next_attempt_ms =
             now_ms + BACKOFF_MS * (1_i64 << record.attempts.saturating_sub(1).min(5));
         record.last_error = Some(crate::logging::scrub(detail).chars().take(512).collect());
-        if record.attempts >= MAX_ATTEMPTS {
-            record.state = MailboxState::Dead;
-        }
-        let terminal = record.state == MailboxState::Dead;
         save(&tx, &record)?;
-        if terminal {
-            tx.execute(
-                "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
-                params![conversation, trigger],
-            )?;
-        }
         Ok(tx.commit()?)
     }
 
@@ -443,12 +423,12 @@ mod tests {
     }
 
     #[test]
-    fn dead_rows_remove_the_scheduler_outbox_entry_atomically() {
+    fn retry_limit_keeps_the_scheduler_outbox_for_reconciliation() {
         let mut store = Store::open(":memory:").unwrap();
         let queued = queue(&store.connection, "n", "c", "message:m", 1).unwrap();
         let mut record = load_key(&store.connection, &key(&queued)).unwrap().unwrap();
         record.state = MailboxState::Sending;
-        record.attempts = MAX_ATTEMPTS;
+        record.attempts = MAX_ATTEMPT_COUNT;
         save(&store.connection, &record).unwrap();
 
         store
@@ -460,8 +440,8 @@ mod tests {
                 .mailbox_for_test("n", "c", "message:m")
                 .unwrap()
                 .map(|record| record.state),
-            Some(MailboxState::Dead)
+            Some(MailboxState::Queued)
         );
-        assert_eq!(store.scheduler_outbox().unwrap().len(), 0);
+        assert_eq!(store.scheduler_outbox().unwrap().len(), 1);
     }
 }
