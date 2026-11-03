@@ -185,18 +185,31 @@ def control_constant(name):
     return int(match[1])
 
 
+def verify_build_info(info):
+    require(set(info) == {'version', 'target', 'source_commit', 'update_protocol', 'data_epoch',
+                          'core_version', 'core_source_commit', 'app_version', 'app_source_commit'},
+            'unsupported build info fields')
+    require(info['target'] in TARGETS, 'unsupported build target')
+    for key, constant in (('update_protocol', 'UPDATE_PROTOCOL'), ('data_epoch', 'DATA_EPOCH')):
+        require(type(info[key]) is int and info[key] == control_constant(constant), 'unsupported build protocol or data epoch')
+    for key in ('source_commit', 'core_source_commit', 'app_source_commit'):
+        require(re.fullmatch(r'[a-f0-9]{40}', info[key]), 'invalid build source')
+    channel = version(info['version'])
+    require(all(version(info[key]) == channel for key in ('core_version', 'app_version')),
+            'CLI, Core and App must use the same release channel')
+
+
 def seal_bundle(directory, core=None, app=None):
     info = identity('cli')
     require(not run('git', 'status', '--porcelain'), 'package source must be clean')
     source = info['source_commit']
     core = core or {'version': read_version('core'), 'source_commit': source}
     app = app or {'version': read_version('app'), 'source_commit': source}
-    require(all(version(component['version']) == info['channel'] for component in (core, app)),
-            'CLI, Core and App must use the same release channel')
     build = dict(version=info['version'], target=os.environ['PACKAGE_TARGET'], source_commit=source,
                  update_protocol=control_constant('UPDATE_PROTOCOL'), data_epoch=control_constant('DATA_EPOCH'),
                  core_version=core['version'], core_source_commit=core['source_commit'],
                  app_version=app['version'], app_source_commit=app['source_commit'])
+    verify_build_info(build)
     write_json(directory / 'BUILD-INFO.json', build)
     content = files(directory, ('FILES.sha256',))
     (directory / 'FILES.sha256').write_text(''.join(f'{value}  {name}\n' for name, value in content.items()))
@@ -389,7 +402,15 @@ def self_test():
         component = dict(version='0.0.1', source_commit='b' * 40)
         with patch(f'{__name__}.identity', return_value=release), patch(f'{__name__}.run', return_value=''), \
                 patch.dict(os.environ, PACKAGE_TARGET=TARGETS[0]):
-            assert seal_bundle(directory, component, component)['data_epoch'] == control_constant('DATA_EPOCH')
+            build = seal_bundle(directory, component, component)
+            assert build['data_epoch'] == control_constant('DATA_EPOCH')
+            for change in ({'data_epoch': 12}, {'data_epoch': True}, {'update_protocol': 2}, {'legacy': True}):
+                try:
+                    verify_build_info(build | change)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(f'accepted invalid build info {change}')
             for core, app in ((component | {'version': '0.0.1-nightly.20261101.1'}, component),
                               (component, component | {'version': '0.0.1-rc.1'})):
                 try:

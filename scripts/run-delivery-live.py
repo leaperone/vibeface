@@ -20,6 +20,7 @@ import time
 import urllib.parse
 import uuid
 import zipfile
+from release import verify_build_info
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -86,7 +87,8 @@ def source_commit(expected):
 
 def checked_package(package, expected):
     info = json.loads(regular(package / "BUILD-INFO.json"))
-    if set(info) != {"version", "target", "source_commit", "update_protocol", "data_epoch"} or info["source_commit"] != expected or info["target"] != "x86_64-unknown-linux-gnu":
+    verify_build_info(info)
+    if info["source_commit"] != expected or info["target"] != "x86_64-unknown-linux-gnu":
         raise ValueError("Package provenance differs from this Linux source commit")
     for binary in (package / "vibeface", package / "vibeface-core"):
         if not binary.is_file() or binary.is_symlink():
@@ -2229,7 +2231,9 @@ def self_test():
             for name in ("vibeface_secure.js", "vibeface_secure_bg.wasm"):
                 (generated / name).write_bytes(b"same-run-crypto")
                 (sample / "web" / name).write_bytes(b"same-run-crypto")
-            info = {"version": "test", "target": "x86_64-unknown-linux-gnu", "source_commit": "1" * 40, "update_protocol": 1, "data_epoch": 3}
+            info = {"version": "0.0.1", "target": "x86_64-unknown-linux-gnu", "source_commit": "1" * 40,
+                    "update_protocol": 1, "data_epoch": 1, "core_version": "0.0.1", "core_source_commit": "2" * 40,
+                    "app_version": "0.0.1", "app_source_commit": "3" * 40}
             (sample / "BUILD-INFO.json").write_text(json.dumps(info))
             checked_package(sample, "1" * 40)
             for malformed in ({**info, "source_commit": "2" * 40}, {**info, "target": "another-target"}):
