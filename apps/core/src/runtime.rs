@@ -30,6 +30,7 @@ mod observation;
 pub mod opencode;
 mod peers;
 pub mod pi;
+mod provider_adapter;
 mod provider_probe;
 mod schedule_delivery;
 mod settings;
