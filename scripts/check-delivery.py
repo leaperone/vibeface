@@ -1332,7 +1332,7 @@ def self_test():
     assert build[-2] == container[-4]
     assert container[-3:] == ["bash", "-c", "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py"]
     env_pairs = [container[index + 1] for index, value in enumerate(container) if value == "--env"]
-    assert env_pairs == ["HOME=/home/runner"]
+    assert env_pairs == ["HOME=/home/runner", "PYTHONDONTWRITEBYTECODE=1"]
     assert not {"--env-file", "-e", "--privileged"}.intersection(container)
     deadline = str(int(time.time() * 1000) + 100000)
     with patch.dict(os.environ, {DEADLINE_ENV: deadline}), patch(f"{__name__}.source_commit", return_value="a" * 40):
