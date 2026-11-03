@@ -48,7 +48,7 @@ Linux 制品还使用 [e2e](e2e.md) 启动隔离 Node，在 Chromium 中验证�
 
 `scripts/check-delivery.py` 读取 `crates/delivery/proof/fixtures/manifest.json` 和四种关系的公开 Groth16 receipt。它通过规范入口重新编译 guest，核对 image ID、ELF SHA-256、唯一 `Statement.sol` 的 schema hash 和 47 槽 journal，再用本次构建的 host 验证 receipt。验证还要求 host 导出的 Groth16 seal 与对应公开 fixture 逐字一致，拒绝缺失或额外字段。旧 image、过期 schema、错误 journal、缺文件、dev mode 和跳过 guest 构建都会失败。
 
-核心 fixture 要求四种关系各一份证明，共九个公开文件；完整 live 流程的十三份唯一证明是另一项验收。现状是这些证明夹具需要在 x86_64 大内存机器上生成，CI 的 11 GiB runner 和 ARM Mac 都生成不了，仓库暂不包含 `crates/delivery/proof/fixtures/`。目录不存在时，检查打印 `skipped: no public proof fixture`，跳过 receipt 验证和 `verify-delivery.mjs`，guest 重编、profile、跨语言向量和其余合约检查照常运行。目录一旦提交就恢复完整验证，目录存在但内容不全仍然失败；文件较小不保证 Groth16 压缩所需内存较小。
+当前仓库已包含四种关系的九个核心公开 fixture；完整 live 流程的十三份唯一证明仍由显式手动实验生成和验收。默认检查会重建 guest 并验证这些 fixture，目录不存在时打印 `skipped: no public proof fixture`，跳过 receipt 验证和 `verify-delivery.mjs`，其余检查照常运行；目录存在但内容不全仍然失败。新的证明只在固定的 x86_64 sandbox 中按 11 GiB、零 swap 和 64 PIDs 的资源边界生成，文件较小不保证 Groth16 压缩所需内存较小。
 
 所有 receipt 还必须绑定产品的 `crates/delivery/proof/profile.json`。检查要求该文件与重编 guest 的 image、schema 相同，并固定为两个窗口、每窗 65,536 字节、总共 131,072 字节、64,000,000 cycles 和 16 GiB 内存上限。Rust fixture 命令显式读取该文件，以同一 ABI 生成 profile ID，再逐项核对 receipt；默认的 16 窗口测试 profile 不属于产品信任根。guest 不读取产品 profile 文件，避免 image 自引用。
 
