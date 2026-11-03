@@ -273,7 +273,7 @@ export function WaitingDot() {
   </span>
 }
 
-/** Collapsed by default. Jargon from docs/design/web-ux.md may only appear in here. */
+/** Collapsed by default. Jargon from packages/docs/design/web-ux.md may only appear in here. */
 export function Details({ children, label = "详细信息", className, open }: { children: ReactNode; label?: string; className?: string; open?: boolean }) {
   return <details open={open} className={cn("details text-meta", className)}>
     <summary className="hit-area relative inline-flex min-h-9 items-center gap-1 text-muted-foreground hover:text-foreground">

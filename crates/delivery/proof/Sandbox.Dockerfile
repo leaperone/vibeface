@@ -26,7 +26,7 @@ RUN set -eu; \
     python3 --version; \
     npm --version
 
-COPY --chmod=0555 proofs/delivery/confined-gnark.sh /usr/bin/docker
+COPY --chmod=0555 crates/delivery/proof/confined-gnark.sh /usr/bin/docker
 
 ENV CARGO_HOME=/cargo \
     RISC0_HOME=/risc0 \

@@ -11,7 +11,7 @@ import { execFile } from 'node:child_process';
 import { test as base } from '@e2e-dev/mobile';
 import { expect, secrets } from 'e2e';
 
-const root = resolve(import.meta.dirname, '..');
+const root = resolve(import.meta.dirname, '../..');
 const execute = promisify(execFile);
 function record(value: unknown): Record<string, unknown> {
   const valid = (input: unknown): input is Record<string, unknown> => input !== null && typeof input === 'object' && !Array.isArray(input);

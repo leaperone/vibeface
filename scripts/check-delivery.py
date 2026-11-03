@@ -14,8 +14,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / ".artifacts/vdp"
-FIXTURES = ROOT / "proofs/delivery/fixtures"
-PROFILE = ROOT / "proofs/delivery/profile.json"
+FIXTURES = ROOT / "crates/delivery/proof/fixtures"
+PROFILE = ROOT / "crates/delivery/proof/profile.json"
 STATEMENT_BYTES = 47 * 32
 PUBLIC_FIELDS = {"mode", "kind", "imageId", "profileId", "relation", "journal", "journalHash", "seal"}
 PROFILE_CAPS = {"crypto_suite": 1, "max_windows": 2, "max_window_bytes": 65_536, "max_total_bytes": 131_072,
@@ -135,7 +135,7 @@ def checked_verification(result, compiled, proof):
 
 def sandbox_commands(context):
     image = "vibeface-vdp-proof:check-" + hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]
-    build = ["docker", "build", "--platform", "linux/amd64", "--file", str(context / "proofs/delivery/Sandbox.Dockerfile"), "--tag", image, str(context)]
+    build = ["docker", "build", "--platform", "linux/amd64", "--file", str(context / "crates/delivery/proof/Sandbox.Dockerfile"), "--tag", image, str(context)]
     container = ["docker", "run", "--rm", "--platform", "linux/amd64", "--memory", "11g", "--memory-swap", "11g", "--pids-limit", "64", "--env", "HOME=/home/runner"]
     for source, destination in ((ROOT, "/work"), (ARTIFACTS / "cargo", "/cargo"), (ARTIFACTS / "cargo", "/home/runner/.cargo"), (ARTIFACTS / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts")):
         container.extend(["--mount", f"type=bind,source={source},target={destination}"])
@@ -149,7 +149,7 @@ def sandbox():
         (ARTIFACTS / name).mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="sandbox-build-", dir=ARTIFACTS) as directory:
         context = Path(directory)
-        for name in ("proofs/delivery/Sandbox.Dockerfile", "proofs/delivery/confined-gnark.sh"):
+        for name in ("crates/delivery/proof/Sandbox.Dockerfile", "crates/delivery/proof/confined-gnark.sh"):
             source = ROOT / name
             if source.is_symlink() or not source.is_file():
                 raise ValueError(f"Sandbox build requires a regular source file: {name}")
@@ -171,9 +171,9 @@ def check():
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     environment = {**os.environ, "RISC0_BUILD_LOCKED": "1"}
     target = Path("/artifacts/proof-target")
-    run(["cargo", "fmt", "--manifest-path", "proofs/delivery/Cargo.toml", "--all", "--", "--check"], env=environment)
-    run(["cargo", "fmt", "--manifest-path", "proofs/delivery/guest/Cargo.toml", "--", "--check"], env=environment)
-    run(["bash", "proofs/delivery/build.sh"], env=environment)
+    run(["cargo", "fmt", "--manifest-path", "crates/delivery/proof/Cargo.toml", "--all", "--", "--check"], env=environment)
+    run(["cargo", "fmt", "--manifest-path", "crates/delivery/proof/guest/Cargo.toml", "--", "--check"], env=environment)
+    run(["bash", "crates/delivery/proof/build.sh"], env=environment)
     prover = target / "release/vibeface-delivery-prover"
     compiled = json.loads(run([str(prover), "info"], capture_output=True, text=True, env=environment).stdout)
     if fixtures:
@@ -287,7 +287,7 @@ def self_test():
             raise AssertionError("A mismatched receipt export must fail")
     build, container = sandbox_commands(Path("/context"))
     assert build[:5] == ["docker", "build", "--platform", "linux/amd64", "--file"]
-    assert build[-1] == "/context" and build[5] == "/context/proofs/delivery/Sandbox.Dockerfile"
+    assert build[-1] == "/context" and build[5] == "/context/crates/delivery/proof/Sandbox.Dockerfile"
     assert container[:5] == ["docker", "run", "--rm", "--platform", "linux/amd64"]
     for flag, value in (("--memory", "11g"), ("--memory-swap", "11g"), ("--pids-limit", "64")):
         assert container[container.index(flag) + 1] == value

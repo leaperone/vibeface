@@ -7911,7 +7911,7 @@ if __name__ == "__main__":
         modes.add_argument("--delivery-charity", action="store_true", help="check free discovery, charity transfer, loopback service boundaries and durable restart")
         modes.add_argument("--delivery", action="store_true", help="check the full paid delivery flow; requires a private local deployment configuration")
         modes.add_argument("--delivery-ui-selfcheck", action="store_true", help="check only the local UI controller schema without starting Nodes, UI, chain or proofs")
-        parser.add_argument("--delivery-profile", type=Path, default=Path(__file__).resolve().parents[1] / "proofs/delivery/profile.json")
+        parser.add_argument("--delivery-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json")
         parser.add_argument("--delivery-source-root", type=Path, default=Path(__file__).resolve().parents[1])
         parser.add_argument("--delivery-probe", type=Path)
         parser.add_argument("--delivery-config", type=Path)
@@ -7919,7 +7919,7 @@ if __name__ == "__main__":
         parser.add_argument("--delivery-ui-timeout-ms", type=int, default=43_200_000)
         parser.add_argument("--fixture-kind", choices=("single", "delivery"), default="single", help=argparse.SUPPRESS)
         parser.add_argument("--fixture-port", type=int, help=argparse.SUPPRESS)
-        parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "proofs/delivery/profile.json", help=argparse.SUPPRESS)
+        parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()
         try:
             needs_process = not (arguments.delivery_ui_selfcheck or arguments.native_provider_selfcheck)

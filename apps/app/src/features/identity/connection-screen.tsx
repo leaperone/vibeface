@@ -73,7 +73,7 @@ function Scanner({ onTicket, onCancel }: { onTicket(ticket: string): void; onCan
 
 function Removed({ busy, run }: { busy: boolean; run: Run }) {
   const device = useDevice()
-  const commands = <Details><a href="https://github.com/leaperone/vibeface/blob/main/docs/deployment.md" target="_blank" rel="noreferrer" className="underline">用命令行重新加入</a></Details>
+  const commands = <Details><a href="https://github.com/leaperone/vibeface/blob/main/packages/docs/deployment.md" target="_blank" rel="noreferrer" className="underline">用命令行重新加入</a></Details>
   // On its own local page the rejoin first opens this computer, then carries on there.
   const setup = device.localSetup?.kind === 'initialized' && device.localSetup.removed ? device.localSetup : null
   const here = Boolean(setup)

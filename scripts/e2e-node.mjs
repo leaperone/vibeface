@@ -8,8 +8,9 @@ import { resolve } from 'node:path';
 
 const port = Number(process.argv[2]);
 assert(Number.isInteger(port) && port > 0 && port < 65536, 'Expected a TCP port');
+const repository = resolve(import.meta.dirname, '..');
 const binary = process.env.VIBEFACE_E2E_BINARY ?? 'vibeface';
-const root = resolve('.artifacts/e2e');
+const root = resolve(repository, '.artifacts/e2e');
 await mkdir(`${root}/control`, { recursive: true, mode: 0o700 });
 const token = randomBytes(32).toString('hex');
 let fixture;
@@ -36,12 +37,12 @@ async function stopFixture() {
 async function startFixture(kind) {
   assert(kind === 'single' || kind === 'delivery', 'Unknown fixture kind');
   await stopFixture();
-  const args = ['scripts/verify-node.py', '--e2e-fixture', '--binary', binary,
+  const args = [resolve(repository, 'scripts/verify-node.py'), '--e2e-fixture', '--binary', binary,
     '--artifacts', root, '--fixture-port', String(port), '--fixture-kind', kind];
   if (process.env.VIBEFACE_E2E_CRYPTO_MODULE) args.push('--crypto-module', process.env.VIBEFACE_E2E_CRYPTO_MODULE);
   if (process.env.VIBEFACE_E2E_APP_DIR) args.push('--app-dir', process.env.VIBEFACE_E2E_APP_DIR);
   if (process.env.VIBEFACE_E2E_PROFILE_FILE) args.push('--fixture-profile', process.env.VIBEFACE_E2E_PROFILE_FILE);
-  const child = spawn('python3', args, { stdio: ['pipe', 'pipe', 'inherit'] });
+  const child = spawn('python3', args, { cwd: repository, stdio: ['pipe', 'pipe', 'inherit'] });
   fixture = child;
   child.once('error', error => { pending?.reject(error); pending = undefined; });
   child.once('exit', code => {

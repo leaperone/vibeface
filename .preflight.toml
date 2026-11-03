@@ -13,7 +13,7 @@ command = "cargo fmt --all -- --check && python3 scripts/ci.py test --tier fast 
 
 [[domain_check]]
 name = "Delivery proof and settlement"
-trigger_paths = ["crates/delivery/**", "proofs/delivery/**", "contracts/delivery/**", "apps/core/src/delivery/**", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"]
+trigger_paths = ["crates/delivery/**", "crates/delivery/proof/**", "contracts/delivery/**", "apps/core/src/delivery/**", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"]
 command = "python3 scripts/check-delivery.py --check-fixtures && python3 scripts/check-delivery.py --sandbox"
 
 [[domain_check]]
@@ -28,13 +28,13 @@ command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && carg
 
 [[domain_check]]
 name = "Static www portal"
-trigger_paths = ["apps/www/**", "docs/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+trigger_paths = ["apps/www/**", "packages/docs/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
 command = "pnpm --filter vibeface-www run typecheck && pnpm --filter vibeface-www run build && pnpm --filter vibeface-www run check:static"
 
 [[domain_check]]
 name = "JavaScript syntax"
-trigger_paths = ["scripts/crypto-client.mjs", "npm/**", "scripts/package-npm.mjs"]
-command = "node --check scripts/crypto-client.mjs && node --check npm/bin/vibeface.mjs && node --check scripts/package-npm.mjs && node scripts/package-npm.mjs --self-test"
+trigger_paths = ["scripts/crypto-client.mjs", "apps/cli/npm/**", "scripts/package-npm.mjs"]
+command = "node --check scripts/crypto-client.mjs && node --check apps/cli/npm/bin/vibeface.mjs && node --check scripts/package-npm.mjs && node scripts/package-npm.mjs --self-test"
 
 [[domain_check]]
 name = "Delivery scripts and workflow"

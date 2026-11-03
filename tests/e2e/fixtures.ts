@@ -3,6 +3,8 @@ import { lstat, readFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import { test as base } from '@e2e-dev/web';
 
+const root = resolve(import.meta.dirname, '../..');
+const artifacts = resolve(root, '.artifacts/e2e');
 export type NodeInfo = { url: string; peer: string; directory: string };
 type Role = 'source' | 'receiver' | 'provider';
 type Control = (request: Record<string, unknown>) => Promise<unknown>;
@@ -20,7 +22,7 @@ function node(value: unknown): NodeInfo {
   assert(url.protocol === 'http:' && url.hostname === '127.0.0.1' && url.port && url.pathname === '/' && !url.search && !url.hash, 'Fixture uses literal loopback');
   const peer = text(fields.peer), directory = text(fields.directory);
   assert(/^[a-f0-9]{64}$/.test(peer), 'Fixture peer is a Node identity');
-  const inside = relative(resolve('.artifacts/e2e'), resolve(directory));
+  const inside = relative(artifacts, resolve(directory));
   assert(inside && !inside.startsWith('..') && !inside.startsWith('/'), 'Fixture data remains in this task');
   return { url: url.origin, peer, directory };
 }
@@ -29,7 +31,7 @@ async function control(baseUrl: string | undefined): Promise<Control> {
   assert(baseUrl, 'The e2e app has an allocated URL');
   const port = new URL(baseUrl).port;
   assert(/^[0-9]+$/.test(port));
-  const path = resolve(`.artifacts/e2e/control/${port}.json`);
+  const path = resolve(artifacts, `control/${port}.json`);
   const stat = await lstat(path);
   assert(stat.isFile() && !stat.isSymbolicLink() && (stat.mode & 0o077) === 0, 'Fixture control material is private');
   const fields = record(JSON.parse(await readFile(path, 'utf8')));

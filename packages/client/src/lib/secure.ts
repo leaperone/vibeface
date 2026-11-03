@@ -108,7 +108,7 @@ const RUNS = ['abcdefghijklmnopqrstuvwxyz', '01234567890', 'qwertyuiop', 'asdfgh
 export type PasswordProblem = 'short' | 'common' | 'simple'
 export type PasswordStrength = { level: 'weak'; problem: PasswordProblem } | { level: 'fair' | 'strong' }
 /**
- * How hard a new recovery password is to guess offline, by the rule docs/node.md#备份与恢复 states: at least 8
+ * How hard a new recovery password is to guess offline, by the rule packages/docs/node.md#备份与恢复 states: at least 8
  * characters, not a common password or a keyboard, counting or repeated run, and under 12 characters it mixes letters,
  * digits and other characters. 16 or more, or 12 or more mixing two kinds, is strong.
  */

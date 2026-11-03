@@ -5,7 +5,7 @@ description: 按应用前缀发布 Vibeface 的 www、app、core、cli 或 mobil
 
 # Vibeface release
 
-用户必须指定应用和渠道，或明确要求五个应用一起发布。遵守仓库 AGENTS.md，使用独立 worktree 和一个 PR。读取 docs/releasing.md、scripts/release.py 和目标应用版本文件。
+用户必须指定应用和渠道，或明确要求五个应用一起发布。遵守仓库 AGENTS.md，使用独立 worktree 和一个 PR。读取 packages/docs/releasing.md、scripts/release.py 和目标应用版本文件。
 
 Nightly 格式为 X.Y.Z-nightly.YYYYMMDD.N，日期取 UTC，序号按应用同日已存在 tag 的最大序号加一。不要使用可变 nightly tag。准备版本和 CLI 的 release-lock.json；Mobile 保持纯数字 marketing version，增加原生 build number。更新 Cargo.lock。
 

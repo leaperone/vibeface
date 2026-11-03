@@ -87,7 +87,7 @@ try {
   fs.closeSync(fs.openSync(statisticsFile, 'wx', 0o600));
   statisticsReserved = true;
   const root = path.dirname(fileURLToPath(import.meta.url));
-  const profile = JSON.parse(fs.readFileSync(path.resolve(root, '../../proofs/delivery/profile.json'), 'utf8'));
+  const profile = JSON.parse(fs.readFileSync(path.resolve(root, '../../crates/delivery/proof/profile.json'), 'utf8'));
   assert.deepEqual(Object.keys(profile).sort(), ['crypto_suite', 'guest_image_id', 'max_guest_cycles', 'max_prover_memory_bytes',
     'max_total_bytes', 'max_window_bytes', 'max_windows', 'statement_schema_hash'].sort(), 'invalid product proof profile');
   for (const field of ['guest_image_id', 'statement_schema_hash']) {

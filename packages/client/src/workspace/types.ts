@@ -212,7 +212,7 @@ export type SkillSet = string[] | null
 type SkillsEdit = { before: SkillSet; after: SkillSet }
 /** null: the face its id gives. */
 export type AvatarEdit = { before: Avatar | null; after: Avatar | null }
-/** `before` null is a new item, `after` null a removed one (docs/design/bot-config.md section 2). */
+/** `before` null is a new item, `after` null a removed one (packages/docs/design/bot-config.md section 2). */
 export type BotChange =
   | { kind: "profile"; name?: FieldEdit; instructions?: FieldEdit; model?: ModelEdit; reasoning_effort?: { provider: ProviderId; before: string | null; after: string | null }; skills?: SkillsEdit; avatar?: AvatarEdit }
   | { kind: "skill"; skill_id: string; before: BotSkill | null; after: BotSkill | null }

@@ -2,7 +2,7 @@ import { loader } from 'fumadocs-core/source'
 import { defineDocs } from 'fumadocs-mdx/macro'
 
 export const docs = defineDocs({
-  dir: '../../docs',
+  dir: '../../packages/docs',
   docs: {
     async: true,
     files: [

@@ -16,5 +16,5 @@ fi
 export CARGO_TARGET_DIR=/artifacts/proof-target
 export CARGO_BUILD_JOBS=2
 export RISC0_BUILD_LOCKED=1
-cargo +1.98.1 build --manifest-path proofs/delivery/Cargo.toml --release --locked -p vibeface-delivery-prover
+cargo +1.98.1 build --manifest-path crates/delivery/proof/Cargo.toml --release --locked -p vibeface-delivery-prover
 "$CARGO_TARGET_DIR/release/vibeface-delivery-prover" info

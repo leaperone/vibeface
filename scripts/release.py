@@ -267,7 +267,7 @@ def compose(target, binary, output):
         shutil.copy2(ROOT / 'README.md', directory / 'README.md')
         (directory / 'docs').mkdir()
         for name in ('node.md', 'releasing.md'):
-            shutil.copy2(ROOT / 'docs' / name, directory / 'docs' / name)
+            shutil.copy2(ROOT / 'packages/docs' / name, directory / 'docs' / name)
         (directory / 'RUNTIME-REQUIREMENTS.md').write_text('Requires separately configured Agent programs and credentials.\n')
         os.environ['PACKAGE_TARGET'] = target
         seal_bundle(directory, core_info, app_info)

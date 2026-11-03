@@ -405,7 +405,7 @@ S 是发送 Node，R 是接收 Node，P 是服务 Node。
 
 断线或进程重启后，保留原订单并点击**检查进度**。不要通过另建订单处理未知结果。公益收据不表示链上解密证明，也不表示真人阅读。
 
-付费实验还需按[proof 构建说明](../proofs/delivery/README.md)配置 Linux prover，并按[合约说明](../contracts/delivery/README.md)固定本机测试部署。仅切换网页开关不能创建这些配置。完整进程验收见[e2e 的付费模式](e2e.md#验证付费交付和实际结算)。
+付费实验还需按[proof 构建说明](../../crates/delivery/proof/README.md)配置 Linux prover，并按[合约说明](../../contracts/delivery/README.md)固定本机测试部署。仅切换网页开关不能创建这些配置。完整进程验收见[e2e 的付费模式](e2e.md#验证付费交付和实际结算)。
 
 在已启用服务的本机 Node 上管理独立钱包，口令由 TTY 关闭回显输入。以下命令不接受网页远程口令。
 

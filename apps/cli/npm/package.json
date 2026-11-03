@@ -16,7 +16,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/leaperone/vibeface.git",
-    "directory": "npm"
+    "directory": "apps/cli/npm"
   },
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",

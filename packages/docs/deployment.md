@@ -18,7 +18,7 @@ description: 配置数据目录、网络边界与公共入口。
 | Core `apps/core` | `vibeface-core` 后台，拥有本机身份、数据与运行中的任务。 |
 | CLI `apps/cli` | `vibeface` 管理命令，启动 Core、安装服务及管理更新。 |
 
-源码构建的工具链要求见 [README](../README.md#从源码构建)。`apps/mobile` 是单独构建的原生客户端，不是网页 App 的构建产物。
+源码构建的工具链要求见 [README](../../README.md#从源码构建)。`apps/mobile` 是单独构建的原生客户端，不是网页 App 的构建产物。
 
 ## 独立托管网页 App
 

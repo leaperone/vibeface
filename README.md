@@ -1,6 +1,6 @@
 <div align="center">
 
-<!-- Logo 占位：放入 docs/assets/logo.svg 后替换本行 -->
+<!-- Logo 占位：放入 packages/docs/assets/logo.svg 后替换本行 -->
 
 # Vibeface
 
@@ -9,7 +9,7 @@
 [![CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml/badge.svg)](https://github.com/leaperone/vibeface/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/leaperone/vibeface?include_prereleases&label=release)](https://github.com/leaperone/vibeface/releases)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange?logo=rust)](Cargo.toml)
-[![Platforms](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Linux%20x64%20%7C%20Linux%20arm64-lightgrey)](docs/releasing.md)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Linux%20x64%20%7C%20Linux%20arm64-lightgrey)](packages/docs/releasing.md)
 
 </div>
 
@@ -26,7 +26,7 @@
 - 📱 **原生移动端**。Expo iOS/Android 客户端复用同一套 client 协议、恢复包和加入链接，设备密钥保存在系统安全存储。
 
 > [!WARNING]
-> 文件交付仍是实验功能，默认关闭。公益转发不需要钱包；付费交付只接受本机 `chain_id=31337` 测试链，不接入真实资产。配置、费用和证据边界见[文件交付实验参考](docs/paid-delivery.md)。
+> 文件交付仍是实验功能，默认关闭。公益转发不需要钱包；付费交付只接受本机 `chain_id=31337` 测试链，不接入真实资产。配置、费用和证据边界见[文件交付实验参考](packages/docs/paid-delivery.md)。
 
 ## 🏗️ 工作原理
 
@@ -56,14 +56,14 @@ flowchart LR
 几条设计约束值得先知道：
 
 - 每个人管理自己的设备网络，网络之间完全隔离。公网服务器只是 Node 的一种部署方式，可以作为成员加入网络，也可以只当公共入口。
-- 公共入口默认不保存个人网络数据；显式启用文件交付后，独立 `delivery/` 保存交付对象、服务账本和本机恢复材料，可能含私钥及私密证明材料，须按凭证保管。启用交付不授予个人网络成员权限，见[文件交付实验参考](docs/paid-delivery.md#接收密钥和恢复材料)。
+- 公共入口默认不保存个人网络数据；显式启用文件交付后，独立 `delivery/` 保存交付对象、服务账本和本机恢复材料，可能含私钥及私密证明材料，须按凭证保管。启用交付不授予个人网络成员权限，见[文件交付实验参考](packages/docs/paid-delivery.md#接收密钥和恢复材料)。
 - bot 定义和共享聊天历史独立于本机 SDK 缓存。创建 bot 不会启动模型。
 - 写操作结果未知时先核对实际结果，不换 ID 或设备重发。
 - 数据目录带数据格式 epoch，程序只打开同一 epoch 的目录，不升级数据库。同一网络里的节点使用同一版本。
 
 ## 🚀 快速开始
 
-初次使用先看 [快速上手](docs/quick-start.md)；添加设备或恢复身份看 [首次配置](docs/onboarding.md)，已完成配置后看 [日常使用指南](docs/user-guide.md)。功能边界见 [产品概览](docs/overview.md)，连接失败见 [排障](docs/troubleshooting.md)。
+初次使用先看 [快速上手](packages/docs/quick-start.md)；添加设备或恢复身份看 [首次配置](packages/docs/onboarding.md)，已完成配置后看 [日常使用指南](packages/docs/user-guide.md)。功能边界见 [产品概览](packages/docs/overview.md)，连接失败见 [排障](packages/docs/troubleshooting.md)。
 
 ### 前置条件
 
@@ -86,9 +86,9 @@ npm install -g @leaperone/vibeface@nightly
 vibeface --version
 ```
 
-npm 包内含完整平台程序和服务脚本，不在 postinstall 阶段下载、初始化或启动服务。在此之前，可从 [Releases](https://github.com/leaperone/vibeface/releases) 下载 GitHub 完整包，步骤见 [安装说明](docs/install.md)。
+npm 包内含完整平台程序和服务脚本，不在 postinstall 阶段下载、初始化或启动服务。在此之前，可从 [Releases](https://github.com/leaperone/vibeface/releases) 下载 GitHub 完整包，步骤见 [安装说明](packages/docs/install.md)。
 
-当前源码的完整包需含 `vibeface`、`vibeface-core` 和 `web/`。Nightly `0.0.1-nightly.20261031.18` 仍是拆分前的包，不适用于当前 main 安装器；需要当前版本但尚无匹配发行包时，按[源码运行步骤](docs/quick-start.md#从源码准备当前版本)操作。
+当前源码的完整包需含 `vibeface`、`vibeface-core` 和 `web/`。Nightly `0.0.1-nightly.20261031.18` 仍是拆分前的包，不适用于当前 main 安装器；需要当前版本但尚无匹配发行包时，按[源码运行步骤](packages/docs/quick-start.md#从源码准备当前版本)操作。
 
 ### 首次启动
 
@@ -96,7 +96,7 @@ npm 包内含完整平台程序和服务脚本，不在 postinstall 阶段下载
 vibeface
 ```
 
-数据目录默认为 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定其他绝对路径，见[部署配置](docs/deployment.md)。首次运行只在空目录或不存在的目录初始化，并监听 `127.0.0.1:4790`。然后：
+数据目录默认为 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定其他绝对路径，见[部署配置](packages/docs/deployment.md)。首次运行只在空目录或不存在的目录初始化，并监听 `127.0.0.1:4790`。然后：
 
 1. 在本机浏览器打开 `http://localhost:4790`（保存密钥需要安全上下文，请固定用 `localhost`）。
 2. 选择 **新建我的网络**，填写电脑名称，设置恢复密码，下载并确认保存恢复文件。浏览器名称已有默认值。
@@ -128,7 +128,7 @@ vibeface init \
 | `--discovery` | 配置钉住身份的公共发现服务，Node 自动选择连接路径。 |
 | `--public-entry` | 不加入个人网络的公共入口或发现服务。 |
 
-使用 Cursor SDK 时，在运行 Node 的环境中设置 `CURSOR_API_KEY`。不要把密钥写进命令行、URL、Git 或聊天记录。Claude Code、pi 和 opencode 见 [使用 Claude Code、pi 或 opencode](docs/node.md#使用-claude-codepi-或-opencode)。全部字段见 [本机配置](docs/node-protocol.md#本机配置)。
+使用 Cursor SDK 时，在运行 Node 的环境中设置 `CURSOR_API_KEY`。不要把密钥写进命令行、URL、Git 或聊天记录。Claude Code、pi 和 opencode 见 [使用 Claude Code、pi 或 opencode](packages/docs/node.md#使用-claude-codepi-或-opencode)。全部字段见 [本机配置](packages/docs/node-protocol.md#本机配置)。
 
 ## 📖 使用指南
 
@@ -140,7 +140,7 @@ vibeface init \
 vibeface join '<加入链接>' --name '<设备显示名称>'
 ```
 
-数据目录为空或不存在时，`join` 先按直接启动的默认配置初始化；要预设执行目录或 relay，可先运行 `vibeface init`。加入链接由管理设备的 **添加设备** 生成。终端会显示 6 位安全码，在管理设备上核对一致后批准。不要在新设备上另建个人网络。详见 [添加自己的设备](docs/node.md#添加自己的设备)。
+数据目录为空或不存在时，`join` 先按直接启动的默认配置初始化；要预设执行目录或 relay，可先运行 `vibeface init`。加入链接由管理设备的 **添加设备** 生成。终端会显示 6 位安全码，在管理设备上核对一致后批准。不要在新设备上另建个人网络。详见 [添加自己的设备](packages/docs/node.md#添加自己的设备)。
 
 ### 跨设备派活与接续
 
@@ -162,11 +162,11 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 | `vibeface hooks` | 安装、移除或测试 Codex、Claude Code hooks 与 pi、opencode 扩展。 |
 | `vibeface logs` | 读取本机 Node 日志。 |
 
-完整说明运行 `vibeface --help`，或见 [安装与 CLI 管理](docs/install.md)。
+完整说明运行 `vibeface --help`，或见 [安装与 CLI 管理](packages/docs/install.md)。
 
 ### 公网部署
 
-有公网地址的服务器有两种用法。用 `init --public-entry` 运行公共入口，本地 Node 用 `--entry` 指向它。或者作为成员用 `init --relay-listen` 为个人网络运行 relay，其他 Node 用 `--relay` 指向它。见 [配置公共入口](docs/node.md#配置公共入口) 和 [Node 之间的连接](docs/node.md#node-之间的连接)。
+有公网地址的服务器有两种用法。用 `init --public-entry` 运行公共入口，本地 Node 用 `--entry` 指向它。或者作为成员用 `init --relay-listen` 为个人网络运行 relay，其他 Node 用 `--relay` 指向它。见 [配置公共入口](packages/docs/node.md#配置公共入口) 和 [Node 之间的连接](packages/docs/node.md#node-之间的连接)。
 
 ## 🛠️ 从源码构建
 
@@ -210,11 +210,12 @@ bash scripts/package-node.sh
 │   └── delivery/    # 文件交付的语句、加密与证明领域库
 ├── packages/        # 共享 client、主题与移动端原生安全模块
 ├── contracts/       # 交付托管合约、verifier 与本地测试链脚本
-├── proofs/          # 文件交付的 RISC Zero guest、host 与 profile
-├── npm/             # npm 分发包
+├── crates/delivery/proof/ # 文件交付的 RISC Zero guest、host 与 profile
+├── apps/cli/npm/    # CLI 的 npm 分发包
 ├── scripts/         # 网页与移动端构建、打包、CI 与验收脚本
-├── tests/           # e2e 场景、fixtures 与 delivery probe
-├── docs/            # 用户文档、协议参考与设计文档
+├── tests/fixtures/  # delivery probe 与受控夹具
+├── tests/e2e/       # 集成 Web、Native 与 paid delivery e2e
+├── packages/docs/   # 用户文档、协议参考与设计文档
 └── install.sh       # GitHub 完整包安装脚本
 ```
 
@@ -222,24 +223,24 @@ bash scripts/package-node.sh
 
 | 文档 | 内容 |
 |---|---|
-| [产品概览](docs/overview.md) | 用途、Bot 与执行的关系，以及从一台电脑开始的条件。 |
-| [选型比较](docs/comparison.md) | Codex、Claude Code、OpenClaw 与 Vibeface 各自适合的工作方式。 |
-| [Bot 与任务执行](docs/bot-and-execution.md) | 复用本机 Agent、协调与执行分工、任务结果回到原聊天。 |
-| [历史同步](docs/history-sync.md) | DAG 同步范围、换设备接手条件、同步与备份的区别。 |
-| [隐私与安全](docs/privacy-security.md) | 设备身份、谁能读到内容、凭证、本机权限与恢复边界。 |
-| [安装说明](docs/install.md) | npm Nightly、GitHub 完整包、初始化、状态和后台服务。 |
-| [部署配置](docs/deployment.md) | 数据目录、运行平台和首次部署时要启用的集成。 |
-| [部署与使用 Node](docs/node.md) | 局域网、公共入口、relay、SDK、后台运行、更新渠道、备份恢复。 |
-| [Node 协议参考](docs/node-protocol.md) | 配置、HTTP 与浏览器通道、业务 RPC、事件 DAG、写入保护、iroh 传输。 |
-| [文件交付实验参考](docs/paid-delivery.md) | VDP-1 的角色、费用、钱包、证明与结算边界。 |
-| [排障](docs/troubleshooting.md) | `status`、`node.log`、诊断包，只读与分叉处理。 |
-| [构建与发布](docs/releasing.md) | 三个平台包、SHA256、Stable 与 Nightly 渠道、tag 规则。 |
-| [CI](docs/ci.md) | 主分支、扩展 CI 与本地专项检查。 |
+| [产品概览](packages/docs/overview.md) | 用途、Bot 与执行的关系，以及从一台电脑开始的条件。 |
+| [选型比较](packages/docs/comparison.md) | Codex、Claude Code、OpenClaw 与 Vibeface 各自适合的工作方式。 |
+| [Bot 与任务执行](packages/docs/bot-and-execution.md) | 复用本机 Agent、协调与执行分工、任务结果回到原聊天。 |
+| [历史同步](packages/docs/history-sync.md) | DAG 同步范围、换设备接手条件、同步与备份的区别。 |
+| [隐私与安全](packages/docs/privacy-security.md) | 设备身份、谁能读到内容、凭证、本机权限与恢复边界。 |
+| [安装说明](packages/docs/install.md) | npm Nightly、GitHub 完整包、初始化、状态和后台服务。 |
+| [部署配置](packages/docs/deployment.md) | 数据目录、运行平台和首次部署时要启用的集成。 |
+| [部署与使用 Node](packages/docs/node.md) | 局域网、公共入口、relay、SDK、后台运行、更新渠道、备份恢复。 |
+| [Node 协议参考](packages/docs/node-protocol.md) | 配置、HTTP 与浏览器通道、业务 RPC、事件 DAG、写入保护、iroh 传输。 |
+| [文件交付实验参考](packages/docs/paid-delivery.md) | VDP-1 的角色、费用、钱包、证明与结算边界。 |
+| [排障](packages/docs/troubleshooting.md) | `status`、`node.log`、诊断包，只读与分叉处理。 |
+| [构建与发布](packages/docs/releasing.md) | 三个平台包、SHA256、Stable 与 Nightly 渠道、tag 规则。 |
+| [CI](packages/docs/ci.md) | 主分支、扩展 CI 与本地专项检查。 |
 
 ## 🤝 参与贡献
 
-- **报告问题**：在 [Issues](https://github.com/leaperone/vibeface/issues) 附上 `vibeface --version`、平台和 `vibeface status` 输出。诊断方法见 [排障](docs/troubleshooting.md)。请勿粘贴密钥或恢复包。
-- **提交 PR**：从 `main` 拉独立分支，使用 Conventional Commits。开发分支 PR 不自动运行 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml)，提交前运行相关本地检查，必要时手动触发扩展 CI。改动同步、恢复、调度或工具执行时，按 [docs/ci.md](docs/ci.md) 补跑本地专项并在 PR 中记录结果。
+- **报告问题**：在 [Issues](https://github.com/leaperone/vibeface/issues) 附上 `vibeface --version`、平台和 `vibeface status` 输出。诊断方法见 [排障](packages/docs/troubleshooting.md)。请勿粘贴密钥或恢复包。
+- **提交 PR**：从 `main` 拉独立分支，使用 Conventional Commits。开发分支 PR 不自动运行 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml)，提交前运行相关本地检查，必要时手动触发扩展 CI。改动同步、恢复、调度或工具执行时，按 [packages/docs/ci.md](packages/docs/ci.md) 补跑本地专项并在 PR 中记录结果。
 
 提交前可在仓库根目录运行：
 
