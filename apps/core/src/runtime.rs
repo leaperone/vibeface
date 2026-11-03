@@ -370,6 +370,7 @@ pub struct Runtime {
     router: Mutex<Option<iroh::protocol::Router>>,
     relay: Mutex<Option<iroh_relay::server::Server>>,
     sync_peers: std::sync::Mutex<HashMap<String, peers::PeerSync>>,
+    peer_delivery_locks: peers::PeerDeliveryLocks,
     /// Two syncs downloading the same attachment would share one staging file.
     /// ponytail: one download at a time; per-attachment locks if parallel downloads matter.
     blob_fetch: Mutex<()>,
@@ -571,6 +572,7 @@ impl Runtime {
             router: Mutex::new(None),
             relay: Mutex::new(None),
             sync_peers: std::sync::Mutex::new(HashMap::new()),
+            peer_delivery_locks: peers::PeerDeliveryLocks::default(),
             blob_fetch: Mutex::new(()),
             boot: uuid::Uuid::new_v4().simple().to_string(),
             sync_wakeup: tokio::sync::Notify::new(),

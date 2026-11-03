@@ -24,6 +24,24 @@ const MAX_FORK_PAGES: usize = 4;
 const ATTACHMENT_WAIT: Duration = Duration::from_secs(15);
 const JOIN_NOTICE_WAIT: Duration = Duration::from_secs(3);
 
+#[derive(Default)]
+pub(super) struct PeerDeliveryLocks {
+    peers: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl PeerDeliveryLocks {
+    pub(super) async fn lock(&self, device_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let peer = {
+            let mut peers = self.peers.lock().expect("peer delivery locks");
+            peers
+                .entry(device_id.to_owned())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        peer.lock_owned().await
+    }
+}
+
 /// `(author, seq, hash)` of a fork evidence event, the order the evidence is read in.
 type ForkKey = (String, u64, String);
 
@@ -1684,6 +1702,7 @@ impl Runtime {
         }
         let (local, network) = (&self.identity.device_id()?, &network);
         each_device(owned, |owner, entry| async move {
+            let _peer_delivery = self.peer_delivery_locks.lock(&owner).await;
             let delivered = if owner == *local {
                 self.store
                     .lock()
@@ -2050,6 +2069,61 @@ mod tests {
         )?;
         config::private_write(&dir.join("identity.json"), &serde_json::to_vec(identity)?)?;
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_delivery_locks_serialize_same_peer_and_allow_other_peers() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let locks = Arc::new(PeerDeliveryLocks::default());
+        let first_active = Arc::new(AtomicBool::new(false));
+        let same_peer_entered = Arc::new(AtomicBool::new(false));
+        let other_peer_parallel = Arc::new(AtomicBool::new(false));
+        let (first_ready_tx, first_ready_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+
+        let first = tokio::spawn({
+            let locks = locks.clone();
+            let first_active = first_active.clone();
+            async move {
+                let _guard = locks.lock("peer-a").await;
+                first_active.store(true, Ordering::SeqCst);
+                first_ready_tx.send(()).expect("first waiter");
+                release_first_rx.await.expect("first release");
+                first_active.store(false, Ordering::SeqCst);
+            }
+        });
+        first_ready_rx.await?;
+
+        let same_peer = tokio::spawn({
+            let locks = locks.clone();
+            let first_active = first_active.clone();
+            let same_peer_entered = same_peer_entered.clone();
+            async move {
+                let _guard = locks.lock("peer-a").await;
+                assert!(!first_active.load(Ordering::SeqCst));
+                same_peer_entered.store(true, Ordering::SeqCst);
+            }
+        });
+        let other_peer = tokio::spawn({
+            let locks = locks.clone();
+            let first_active = first_active.clone();
+            let other_peer_parallel = other_peer_parallel.clone();
+            async move {
+                let _guard = locks.lock("peer-b").await;
+                other_peer_parallel.store(first_active.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+        });
+
+        other_peer.await?;
+        assert!(other_peer_parallel.load(Ordering::SeqCst));
+        assert!(!same_peer_entered.load(Ordering::SeqCst));
+
+        release_first_tx.send(()).expect("release first peer");
+        first.await?;
+        same_peer.await?;
+        assert!(same_peer_entered.load(Ordering::SeqCst));
+        Ok(())
     }
 
     fn user(identity: &LocalIdentity, network: &str, id: &str) -> Result<Attestation> {
