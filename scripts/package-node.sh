@@ -110,13 +110,13 @@ import subprocess
 import sys
 
 repo, package = map(Path, sys.argv[1:])
-for name in subprocess.check_output(["git", "ls-files", "-z", "--", "docs"], cwd=repo).decode().split("\0"):
+for name in subprocess.check_output(["git", "ls-files", "-z", "--", "packages/docs"], cwd=repo).decode().split("\0"):
     if not name:
         continue
     source = repo / name
     if source.is_symlink() or any((repo / part).is_symlink() for part in Path(name).parents) or not source.is_file():
         raise SystemExit("Package documentation must be a regular tracked file")
-    destination = package / name
+    destination = package / "docs" / Path(name).relative_to("packages/docs")
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination)
 PY

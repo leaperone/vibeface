@@ -581,9 +581,9 @@ def release_privacy_test(root, scratch):
             subprocess.run(["rustc", "--crate-name", "privacy_fixture", "-Copt-level=3", "-Cdebuginfo=0", *flags, str(source), "-o", str(binary)], check=True)
             assert str(repo).encode() not in binary.read_bytes(), "release binary contains its source directory"
             assert subprocess.check_output([str(binary)], text=True).strip() == "/vibeface/private build.rs"
-        (repo / "docs").mkdir()
-        (repo / "docs/guide.md").write_text("public guide")
-        (repo / ".gitignore").write_text(".artifacts/\ntarget/\nbin/\nprivate build.rs\napps/app/generated/\napps/app/dist/\n.env\ndocs/untracked-note.md\ncargo-called\n")
+        (repo / "packages/docs").mkdir(parents=True)
+        (repo / "packages/docs/guide.md").write_text("public guide")
+        (repo / ".gitignore").write_text(".artifacts/\ntarget/\nbin/\nprivate build.rs\napps/app/generated/\napps/app/dist/\n.env\npackages/docs/untracked-note.md\ncargo-called\n")
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         subprocess.run(["git", "add", "."], cwd=repo, check=True)
 
@@ -602,10 +602,10 @@ def release_privacy_test(root, scratch):
                 subprocess.run([*tool, "finish", component], check=True)
 
         generated()
-        (repo / "docs/.env").write_text("PRIVATE_FIXTURE=must-not-be-packaged")
-        (repo / "docs/untracked-note.md").write_text("must-not-be-packaged")
+        (repo / "packages/docs/.env").write_text("PRIVATE_FIXTURE=must-not-be-packaged")
+        (repo / "packages/docs/untracked-note.md").write_text("must-not-be-packaged")
         if hasattr(os, "setxattr"):
-            os.setxattr(repo / "docs/guide.md", "user.build-host", b"private builder")
+            os.setxattr(repo / "packages/docs/guide.md", "user.build-host", b"private builder")
         environment.update({name: "" for name in ("VIBEFACE_CODESIGN_IDENTITY", "VIBEFACE_NOTARY_KEY", "VIBEFACE_NOTARY_KEY_ID", "VIBEFACE_NOTARY_ISSUER")})
         fake_cargo = repo / "bin/cargo"
         fake_cargo.parent.mkdir()
