@@ -144,10 +144,17 @@ pub(crate) fn queue(
         next_attempt_ms: now_ms,
         last_error: None,
     };
-    if let Some(existing) = load_key(connection, &key(&candidate))?
-        && (existing.state.active() || existing.state == MailboxState::Delivered)
-    {
-        return Ok(existing);
+    if let Some(existing) = load_key(connection, &key(&candidate))? {
+        if existing.state.active() {
+            connection.execute(
+                "INSERT OR IGNORE INTO scheduler_outbox(conversation_id,trigger) VALUES(?,?)",
+                params![conversation, trigger],
+            )?;
+            return Ok(existing);
+        }
+        if existing.state == MailboxState::Delivered {
+            return Ok(existing);
+        }
     }
     connection.execute(
         "INSERT OR IGNORE INTO scheduler_outbox(conversation_id,trigger) VALUES(?,?)",
