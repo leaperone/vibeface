@@ -33,7 +33,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-nightly\.[0-9]{8}\.[1-9][0-9]*$ ]]
+          [[ "$RELEASE_TAG" =~ ^cli-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-nightly\.[0-9]{8}\.[1-9][0-9]*$ ]]
           [[ "$GITHUB_REF" == "refs/tags/$RELEASE_TAG" ]]
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -52,15 +52,15 @@ jobs:
           source_commit="$(git rev-parse HEAD)"
           [[ "$source_commit" == "$GITHUB_SHA" ]]
           git merge-base --is-ancestor "$source_commit" origin/main
-          run_id="$(gh run list --workflow ci.yml --event push --commit "$source_commit" --limit 100 --json databaseId,headBranch,status,conclusion --jq '.[] | select(.headBranch == env.RELEASE_TAG and .status == "completed" and .conclusion == "success") | .databaseId' | head -n 1)"
+          run_id="$(gh run list --workflow release.yml --commit "$source_commit" --limit 100 --json databaseId,headBranch,status,conclusion --jq '.[] | select(.headBranch == env.RELEASE_TAG and .status == "completed" and .conclusion == "success") | .databaseId' | head -n 1)"
           [[ "$run_id" =~ ^[0-9]+$ ]]
           gh run download "$run_id" --name "npm-package-$source_commit" --dir .artifacts/npm
-          node scripts/package-npm.mjs --verify ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#v}.tgz" --source-commit "$source_commit"
+          node scripts/package-npm.mjs --verify ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#cli-v}.tgz" --source-commit "$source_commit"
       - name: Validate npm publication without registry writes
         if: ${{ !inputs.publish }}
         env:
           RELEASE_TAG: ${{ inputs.tag }}
-        run: npm publish ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#v}.tgz" --tag nightly --access public --dry-run --ignore-scripts
+        run: npm publish ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#cli-v}.tgz" --tag nightly --access public --dry-run --ignore-scripts
       - name: Publish using the configured npm trusted publisher
         if: ${{ inputs.publish }}
         env:
@@ -76,17 +76,17 @@ jobs:
               return version.replace('-nightly.', '.').split('.').map(BigInt);
             };
             const before = parts(tags.nightly);
-            const after = parts(process.env.RELEASE_TAG.slice(1));
+            const after = parts(process.env.RELEASE_TAG.slice(5));
             const difference = after.map((value, index) => value - before[index]).find(value => value !== 0n);
             assert(difference > 0n, 'Nightly must advance; reconcile an existing publication before retrying');
           }
           JS
-          npm publish ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#v}.tgz" --tag nightly --access public --provenance --ignore-scripts
+          npm publish ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#cli-v}.tgz" --tag nightly --access public --provenance --ignore-scripts
           node --input-type=module <<'JS'
           import assert from 'node:assert/strict';
           import { execFileSync } from 'node:child_process';
           import { readFileSync } from 'node:fs';
-          const version = process.env.RELEASE_TAG.slice(1);
+          const version = process.env.RELEASE_TAG.slice(5);
           const artifact = JSON.parse(readFileSync(`.artifacts/npm/leaperone-vibeface-${version}.tgz.json`, 'utf8'));
           const view = args => JSON.parse(execFileSync('npm', ['view', ...args, '--json', '--registry=https://registry.npmjs.org/'], { encoding: 'utf8' }));
           assert.equal(view([`@leaperone/vibeface@${version}`, 'dist.integrity']), artifact.integrity);

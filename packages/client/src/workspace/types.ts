@@ -1,4 +1,4 @@
-import type { ProviderId } from "../lib/node.ts"
+import type { ProviderId, ProviderReadiness } from "../lib/node.ts"
 import type { PendingMessage, TranscriptMessage } from "../chat/types.ts"
 import type { FailureKind } from "../lib/errors.ts"
 import type { Avatar } from "../avatar/face.ts"
@@ -9,10 +9,10 @@ export type NodeInfo = {
   local: boolean
   online: boolean
   revoked: boolean
-  capabilities?: { manager: string | null; manager_state: BotReadiness | null; relay: boolean; roots: string[]; codex_connected?: boolean }
+  capabilities?: { manager: string | null; manager_state: BotReadiness | null; manager_readiness?: ProviderReadiness | null; relay: boolean; roots: string[]; codex_connected?: boolean }
 }
-/** `ready` only when the bot's switch is on and its provider works; `starting` while it comes up; anything else needs the user. */
-export type BotReadiness = "ready" | "starting" | "needs_setup"
+/** `unverified` remains runnable while authentication or model availability has no evidence. */
+export type BotReadiness = "ready" | "starting" | "needs_setup" | "unverified"
 export type ConversationSummary = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }
 /** Where a work stands in the signed DAG. */
 export type WorkState = "accepted" | "running" | "interrupting" | "finished" | "unverified"
@@ -23,7 +23,8 @@ export type DispatchState = "dispatch_waiting" | "dispatch_rejected" | "dispatch
 /** A stop this device still carries: its device has not confirmed it, or the deadline passed. */
 export type StopState = "stop_waiting" | "stop_timed_out"
 export type WorkOutcome = "completed" | "failed" | "interrupted" | "rejected" | "unverified"
-export type WorkRecord = {
+export type ResolvedModel = { provider: ProviderId; model: string | null }
+type WorkFields = {
   work_id: string
   trigger: string
   target_node: string
@@ -31,8 +32,6 @@ export type WorkRecord = {
   /** A few words for the user; `prompt` is what the agent was asked to do. */
   title: string
   prompt: string
-  /** A dispatch delivery shows as a work row until its target answers. */
-  state: WorkState | DispatchState
   summary: string
   outcome: WorkOutcome | null
   result_text: string
@@ -45,6 +44,8 @@ export type WorkRecord = {
   dispatcher?: string
   /** The caller's idempotency key; absent in snapshots from older Nodes. */
   call_ref?: string
+  /** The dispatcher's optional model override. */
+  model?: string
   /** A follow-up work continues the prior work's provider session. */
   continues?: string
   /** The causal parent work, if this was dispatched as a child. */
@@ -58,23 +59,69 @@ export type WorkRecord = {
   turn_id?: string
   /** A stop sent while the device was unreachable: still retrying, or past its deadline. */
   stop?: StopState
+  coordination_job?: ManagerJob | null
+}
+export type WorkRecord = WorkFields & (
+  | { state: WorkState; resolved: ResolvedModel }
+  | { state: DispatchState; resolved?: never }
+)
+/** The fields a task card can read from either full work or an overview summary. */
+export type WorkCard = Pick<WorkRecord, "work_id" | "target_node" | "cwd" | "title" | "state" | "summary" | "outcome" | "failure_reason" | "failure" | "kind" | "dispatcher" | "call_ref" | "continues" | "parent" | "thread" | "thread_id" | "turn_id" | "phase" | "stop">
+export type OpenWorkCard = WorkCard & { conversation_id: string }
+export const providerStages = ['validate', 'install', 'launch', 'authentication', 'model_list', 'session_start', 'turn_start', 'run', 'read_back', 'interrupt', 'compact', 'handoff', 'record'] as const
+export type ProviderStage = typeof providerStages[number]
+export type TurnRuntime = {
+  provider: ProviderId; model: string | null; reasoning_effort: string | null; generation: string; session_generation: number; delivery_id: string
+  stage: ProviderStage; execution: 'not_started' | 'started' | 'unknown'; attempted_at_ms: number
+  switched_from: { provider: ProviderId; model: string | null; reasoning_effort: string | null } | null; switch_reason: FailureKind | null
 }
 export type ManagerJob = {
   trigger: string
   state: string
+  context?: ContextProjection | null
+  lane?: AgentLane
+  hold_reason?: QueueHoldReason
   message_id?: string
   reply_message_id?: string
   /** A failed or interrupted reply's cause; `detail` is the original text, for 技术详情. */
   failure?: { kind: FailureKind; detail: string }
+  runtime?: TurnRuntime | null
+  retryable?: boolean
   pending_check?: boolean
   /** How the reply a steered message joined ended. */
   outcome?: SteerOutcome
-  /** The owner device that reported it; absent for this device's own jobs. */
+  /** The device that reported this observation. */
   source_node?: string
+}
+export type AgentLane = 'main' | 'task' | 'schedule_routine' | 'bot_message'
+export type QueueHoldReason = 'active_turn' | 'steering_settlement' | 'provider_serial' | 'task_limit' | 'machine_slot' | 'pending_check' | 'backend_config_pending'
+export type ContextProjection = {
+  attempt_id: string
+  provider: ProviderId
+  stable_fingerprint: string
+  dynamic_fingerprint: string
+  session_generation: number
+  coverage: {
+    messages_omitted: number; works_omitted: number; dispatches_omitted: number
+    questions_omitted: number; attachments_omitted: number; memory_omitted: number
+    checkpoint_omitted: number; handoff_omitted: number; pending_checks_omitted: number
+    bot_indexes_omitted: Record<string, number>
+    history_retrieval: string
+  }
+  stable_bytes: number
+  dynamic_bytes: number
+  invalidation_reason: string | null
+  stage: 'compiled' | 'started' | 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'unknown'
+  session_status?: { resumable: boolean; pending_generation: boolean } | null
+}
+export type MemoryConflict = {
+  call_ref: string; memory_id: string; expected_epoch: number; actual_epoch: number
+  expected_revision: string; actual_revision: string; reason: string
 }
 export type SteerOutcome = 'answered' | 'unfinished' | 'unknown'
 export type SchedulerSnapshot = {
   jobs: ManagerJob[]
+  context?: ContextProjection | null
   /** Messages a former scheduling device left unanswered; only listed on the device that schedules now. */
   unanswered: string[]
   provider?: string
@@ -100,6 +147,11 @@ export type OpenWork = WorkRecord & { conversation_id: string }
 /** What one change touched, pushed by the Node so the page merges it without a reload. */
 export type ConversationRecords = {
   conversation_id: string
+  context?: ContextProjection | null
+  memory?: MemoryEntry[]
+  memory_staged_count?: number | null
+  memory_conflicts?: MemoryConflict[] | null
+  memory_sync_conflicts?: MemorySyncConflicts
   messages: TranscriptMessage[]
   works: WorkRecord[]
   last_message: LastMessage | null
@@ -135,15 +187,34 @@ export type BotModels = Partial<Record<ProviderId, string>>
 export type BotSkill = { name: string; description: string; body: string }
 /** Runs at `first_run_at_ms`, then every `every_minutes` when set; without it, once. `depth` > 0 is a reminder the bot set itself. */
 export type BotSchedule = { name: string; prompt: string; first_run_at_ms: number; every_minutes?: number; enabled: boolean; depth?: number }
-type MemoryEntry = { memory_id: string; text: string }
+export type MemoryVersion = { revision: string; control_revision: number; source_event_hash: string }
+export type MemoryBase = { epoch: number; version: MemoryVersion | null }
+export type MemoryMetadata = MemoryVersion & {
+  epoch: number; origin: 'agent' | 'user' | 'review'; user_controlled: boolean; essential: boolean
+}
+export type MemoryState = { memory_id: string; text: string | null; metadata: MemoryMetadata }
+export type MemoryEntry = MemoryState & { text: string }
+export type MemoryControlResult = {
+  state: 'applied' | 'already_recorded' | 'superseded' | 'conflict'
+  operation_id: string; current: MemoryState | null
+}
+export type MemoryStateResult = {
+  current: MemoryState | null; receipt: null | 'recorded' | 'superseded' | 'not_seen_here'
+}
+export type MemorySyncConflict = {
+  memory_id: string; losing_revision: string; winning_revision: string
+  losing_event_hash: string; winning_event_hash: string
+  reason: 'user_protected' | 'concurrent_automatic' | 'concurrent_user'
+}
+export type MemorySyncConflicts = { items: MemorySyncConflict[]; has_more: boolean }
 /** null: every shared skill, later ones included. */
 export type SkillSet = string[] | null
 type SkillsEdit = { before: SkillSet; after: SkillSet }
 /** null: the face its id gives. */
 export type AvatarEdit = { before: Avatar | null; after: Avatar | null }
-/** `before` null is a new item, `after` null a removed one (docs/design/bot-config.md section 2). */
+/** `before` null is a new item, `after` null a removed one (packages/docs/design/bot-config.md section 2). */
 export type BotChange =
-  | { kind: "profile"; name?: FieldEdit; instructions?: FieldEdit; model?: ModelEdit; skills?: SkillsEdit; avatar?: AvatarEdit }
+  | { kind: "profile"; name?: FieldEdit; instructions?: FieldEdit; model?: ModelEdit; reasoning_effort?: { provider: ProviderId; before: string | null; after: string | null }; skills?: SkillsEdit; avatar?: AvatarEdit }
   | { kind: "skill"; skill_id: string; before: BotSkill | null; after: BotSkill | null }
   | { kind: "schedule"; schedule_id: string; before: BotSchedule | null; after: BotSchedule | null }
   | { kind: "memory"; memory_id: string; before: string | null; after: string | null }
@@ -155,13 +226,14 @@ export type BotChangeRecord = { change_id: string; conversation_id: string; caus
 export type Overwritten = { change_id: string; by: string } & (
   | { field: "name" | "instructions"; value: string }
   | { field: "model"; provider: ProviderId; value: string }
+  | { field: "reasoning_effort"; provider: ProviderId; value: string | null }
   | { field: "skills"; value: SkillSet }
   | { field: "avatar"; value: Avatar | null })
 type SkillSummary = { skill_id: string; name: string; description: string }
 export type ScheduleView = BotSchedule & { schedule_id: string; next_run_at_ms: number | null }
 export type ScheduleAction = "pause" | "resume" | "delete"
 /** This bot's schedules still ahead, its notes, and the skill library every bot shares. */
-export type BotSettings = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[] }
+export type BotSettings = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[]; memory_sync_conflicts: MemorySyncConflicts; memory_staged_count?: number | null; memory_conflicts?: MemoryConflict[] | null }
 export type ConversationPayload = {
   conversation: ConversationSummary | null
   messages: TranscriptMessage[]
@@ -196,7 +268,7 @@ type LastMessage = { text: string; role: string; created_at_ms: number }
 /** What the bot does on the device serving this list: a message waiting or claimed, or a reply running. A bot another device schedules reads null once its message is delivered. */
 export type Busy = "thinking" | "replying" | null
 /** `avatar` null: the face its id gives. `avatar_version` names the face to change it, null before any change. */
-export type BotRecord = CreateBotRequest & { models: BotModels; skills: SkillSet; avatar: Avatar | null; avatar_version: string | null; event_hash: string; last_message: LastMessage | null; busy: Busy }
+export type BotRecord = CreateBotRequest & { models: BotModels; reasoning_efforts?: BotModels; skills: SkillSet; avatar: Avatar | null; avatar_version: string | null; event_hash: string; last_message: LastMessage | null; busy: Busy; successor?: true }
 
 export type OverviewBot = Pick<BotRecord, "bot_id" | "conversation_id" | "name">
 export type OverviewNode = Pick<NodeInfo, "device_id" | "name" | "online" | "revoked" | "local">
@@ -207,6 +279,7 @@ export type OverviewTaskKind = "work" | "check" | "dispatch"
 export type OverviewNavigation = { bot_id: string; conversation_id: string; work_id?: string }
 
 type OverviewTaskCommon = {
+  coordination_job?: ManagerJob | null
   item_id: string
   work_id: string | null
   conversation_id: string
@@ -240,6 +313,7 @@ export type OverviewTask =
   | (OverviewTaskCommon & { kind: "dispatch"; delivery_state: OverviewDeliveryState })
 
 export type OverviewQuestion = {
+  attention?: Question["attention"]
   kind: "question"
   question_id: string
   conversation_id: string
@@ -256,10 +330,15 @@ export type OverviewQuestion = {
 }
 
 export type OverviewJob = {
+  lane?: AgentLane
+  hold_reason?: QueueHoldReason
+  context?: ContextProjection | null
   job_id: string
   conversation_id: string | null
   trigger: string
   state: string
+  runtime?: TurnRuntime | null
+  retryable?: boolean
   message_id: string | null
   reply_message_id: string | null
   source_node: string | null
@@ -318,6 +397,33 @@ export type WorkspaceOverview = {
   next_cursor: string | null
 }
 
+export type WorkspaceActivityGroup = "attention" | "working" | "waiting"
+export type WorkspaceActivityJob = { conversation_id: string | null; job: ManagerJob | OverviewJob }
+export type WorkspaceActivityFacts = {
+  questions: Question[]
+  checks: PendingCheck[]
+  overviewQuestions: OverviewQuestion[]
+  overviewChecks: Extract<OverviewTask, { kind: "check" }>[]
+  jobs: (ManagerJob | OverviewJob)[]
+}
+export type WorkspaceActivityAttention = Question | PendingCheck | OverviewQuestion | Extract<OverviewTask, { kind: "check" }>
+type WorkspaceActivityBase = {
+  id: string
+  conversation_id: string | null
+  work_id: string | null
+  group: WorkspaceActivityGroup
+  state: string
+  facts: WorkspaceActivityFacts
+}
+export type WorkspaceActivity =
+  | (WorkspaceActivityBase & { kind: "work"; work: OpenWorkCard; projection?: Extract<OverviewTask, { kind: "work" | "dispatch" }> })
+  | (WorkspaceActivityBase & { kind: "turn"; job: ManagerJob | OverviewJob })
+  | (WorkspaceActivityBase & { kind: "attention"; attention: WorkspaceActivityAttention })
+export type WorkspaceActivityView = {
+  activities: WorkspaceActivity[]
+  groups: Record<WorkspaceActivityGroup, WorkspaceActivity[]>
+}
+
 export type PendingBot = CreateBotRequest & {
   submission: { state: "unconfirmed" | "rejected"; entry_node: string }
 }
@@ -335,6 +441,7 @@ export type Question = {
   conversation_id: string
   bot: { bot_id: string; name: string } | null
   severity: Severity
+  attention?: { kind: "question" | "approval" | "browser_takeover"; device_id: string | null }
   text: string
   choices: QuestionChoice[]
   about: QuestionSubject

@@ -1,0 +1,18 @@
+{
+  "pages": [
+    "overview",
+    "quick-start",
+    "onboarding",
+    "user-guide",
+    "comparison",
+    "install",
+    "bot-and-execution",
+    "history-sync",
+    "privacy-security",
+    "node",
+    "deployment",
+    "troubleshooting",
+    "releasing",
+    "ci"
+  ]
+}

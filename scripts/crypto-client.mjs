@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 
 const args = process.argv.slice(2);
 const argument = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback;
-const modulePath = resolve(argument('--module', 'crates/node/web/generated/vibeface_secure.js'));
+const modulePath = resolve(argument('--module', 'apps/app/generated/vibeface_secure.js'));
 const crypto = await import(pathToFileURL(modulePath));
 await crypto.default({ module_or_path: await readFile(join(dirname(modulePath), 'vibeface_secure_bg.wasm')) });
 const hex = value => Buffer.from(value).toString('hex');

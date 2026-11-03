@@ -54,8 +54,8 @@ const inviteState = (value: unknown): InviteState | null => {
   return state === 'open' || state === 'used' || state === 'expired' ? state : null
 }
 export type Invitation = { link: string; qr: string; publicEntry: boolean; expiresAt: number }
-/** What tabs of this origin tell each other: the leader's new entrance, or that the outbox changed. */
-type TabMessage = { type: 'entrance'; networkId: string; entry: ConnectionEntry } | { type: 'outbox'; networkId: string }
+/** What tabs of this origin tell each other: the leader's new entrance, an outbox change, or local inbox state. */
+type TabMessage = { type: 'entrance'; networkId: string; entry: ConnectionEntry } | { type: 'outbox'; networkId: string } | { type: 'ignored-inbox'; networkId: string }
 export type Tabs = { leader(): boolean; post(message: TabMessage): void; listen(listener: (message: TabMessage) => void): () => void }
 type DeviceContextValue = {
   connectionGeneration(): number

@@ -21,12 +21,12 @@ export const joinCopy = {
   joining: '加入中',
   noComputer: '还没有电脑？',
   installFirst: '先在电脑上安装 Vibeface',
-  installGuide: 'https://github.com/leaperone/vibeface/blob/main/docs/install.md',
+  installGuide: 'https://github.com/leaperone/vibeface/blob/main/packages/docs/install.md',
 }
 
 /**
  * Why this computer's join ended and what to do next, from the `reason` the Node reports. The patterns and words follow
- * `join_failure_text` in crates/node/src/main.rs, which `vibeface join` prints; only the next step is the page's own.
+ * `join_failure_text` in apps/core/src/main.rs, which `vibeface join` prints; only the next step is the page's own.
  */
 export const nodeJoinCopy = {
   used: '这条加入链接已经用过了。在管理设备上点“添加设备”重新生成，再粘贴新链接。',
@@ -217,9 +217,9 @@ export const deviceCopy = {
   /** 可用文件夹: what it is, and during setup that it can wait. */
   folders: (later: boolean) => later ? 'Bot 能读写的项目文件夹，可稍后添加' : 'Bot 能读写的项目文件夹',
   /** A computer's bot as `botReadiness` reports it; `null`: it has none set up. */
-  botStatus: { ready: '能运行 Bot', starting: 'Bot 启动中', needs_setup: 'Bot 需设置', none: '还没配置 Bot', unknown: '离线，状态未知' },
+  botStatus: { ready: '能运行 Bot', unverified: 'Bot 未验证，可尝试', starting: 'Bot 启动中', needs_setup: 'Bot 需设置', none: '还没配置 Bot', unknown: '离线，状态未知' },
   /** An offline computer reports nothing, so no bot there is unknown rather than none. */
-  botState: (bot: 'ready' | 'starting' | 'needs_setup' | null | undefined, online: boolean | undefined) => bot ?? (online === false ? 'unknown' as const : 'none' as const),
+  botState: (bot: 'ready' | 'unverified' | 'starting' | 'needs_setup' | null | undefined, online: boolean | undefined) => bot ?? (online === false ? 'unknown' as const : 'none' as const),
   /** This computer has a provider installed but no use of any turned on, as a computer that just joined starts. */
   aiOff: '这台电脑的 AI 还没开',
   /** Ends on what removal cannot do: whatever already reached that device stays there. */
@@ -236,7 +236,9 @@ export const deviceCopy = {
   /** How Codex work reaches an App Server: the one already running on that computer, or one Vibeface starts. */
   appServer: { system: '用已在运行的', spawn: '由 Vibeface 启动', useSpawn: '改由 Vibeface 启动' },
   /** The bot's model: a choice from the list its provider gives, with 其他… and 从列表选 switching to and from typing it. */
-  botModel: { label: 'Bot 模型', default: '默认', other: '其他…', pick: '从列表选' },
+  botModel: { label: '设备默认模型', default: '由 AI 服务决定', other: '其他…', pick: '从列表选' },
+  /** The model used by dispatched work when a task does not name one. */
+  executionModel: { label: '执行任务默认模型', default: '由 AI 服务决定', other: '其他…', pick: '从列表选' },
 }
 
 /** Settings → 会话等你时: how a session that needs the person reaches them. `outlets`: where it shows by default. */
@@ -247,7 +249,7 @@ export const waitingCopy = {
   forwardHint: '支持能收 HTTPS 消息的外部聊天，如 Grok Bot',
   urlHint: '外部聊天收消息的地址',
   secretHint: '自己设一串，外部聊天那边填同一串',
-  forwardHelp: 'https://github.com/leaperone/vibeface/blob/main/docs/node.md#转发到外部聊天',
+  forwardHelp: 'https://github.com/leaperone/vibeface/blob/main/packages/docs/node.md#转发到外部聊天',
   outlets: { record: '只在待处理', both: '也发给外部聊天' },
   /** The home tip after joining: one tap asks the system, closing it keeps it closed. */
   notifyTip: '会话等你时提醒你',

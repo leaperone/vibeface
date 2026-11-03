@@ -6,6 +6,13 @@ const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { fatal: true })
 const notRecoveryFile = '这不是恢复文件。选名字以 vibeface-recovery 开头的文件。'
 const damagedRecoveryFile = '这个恢复文件已损坏。选下载时的那个文件。'
+
+export async function requestKey(payload: Uint8Array, signer: string): Promise<string> {
+  const identity = encoder.encode(signer)
+  const signed = new Uint8Array(payload.length + identity.length)
+  signed.set(payload); signed.set(identity, payload.length)
+  return [...new Uint8Array(await crypto.subtle.digest('SHA-256', signed))].map(byte => byte.toString(16).padStart(2, '0')).join('')
+}
 /** What the device already trusts before it reads an authentication answer. */
 export type AuthenticationTrust = { kind: 'network'; networkId: string } | { kind: 'root'; networkId: string; genesis: unknown; checkpoint?: unknown } | { kind: 'local'; networkId: string; nodeId: string }
 /** A recovery file as the platform hands it over: a browser `File` or a phone's picked document. */
@@ -101,7 +108,7 @@ const RUNS = ['abcdefghijklmnopqrstuvwxyz', '01234567890', 'qwertyuiop', 'asdfgh
 export type PasswordProblem = 'short' | 'common' | 'simple'
 export type PasswordStrength = { level: 'weak'; problem: PasswordProblem } | { level: 'fair' | 'strong' }
 /**
- * How hard a new recovery password is to guess offline, by the rule docs/node.md#备份与恢复 states: at least 8
+ * How hard a new recovery password is to guess offline, by the rule packages/docs/node.md#备份与恢复 states: at least 8
  * characters, not a common password or a keyboard, counting or repeated run, and under 12 characters it mixes letters,
  * digits and other characters. 16 or more, or 12 or more mixing two kinds, is strong.
  */

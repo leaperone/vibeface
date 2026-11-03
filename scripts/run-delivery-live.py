@@ -20,12 +20,13 @@ import time
 import urllib.parse
 import uuid
 import zipfile
+from release import verify_build_info
 
 
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / ".artifacts/vdp"
 PUBLIC = ARTIFACTS / "live-public"
-UI = ARTIFACTS / "live-ui"
+UI = ROOT / "tests/e2e/.artifacts/vdp/live-ui"
 UI_TIMEOUT_MS = 3_600_000
 LIVE_TIMEOUT_SECONDS = 20_700
 LIVE_PROGRESS = {
@@ -86,12 +87,17 @@ def source_commit(expected):
 
 def checked_package(package, expected):
     info = json.loads(regular(package / "BUILD-INFO.json"))
-    if set(info) != {"version", "target", "source_commit", "update_protocol", "data_epoch"} or info["source_commit"] != expected or info["target"] != "x86_64-unknown-linux-gnu":
+    verify_build_info(info)
+    if info["source_commit"] != expected or info["target"] != "x86_64-unknown-linux-gnu":
         raise ValueError("Package provenance differs from this Linux source commit")
-    if not (package / "vibeface").is_file() or (package / "vibeface").is_symlink():
-        raise ValueError("Package Node binary is missing")
+    for binary in (package / "vibeface", package / "vibeface-core"):
+        if not binary.is_file() or binary.is_symlink():
+            raise ValueError("Package CLI/Core binary is missing")
+    for name in ("_shell.html", "index.html", "_redirects", "_headers", ".vibeface-build.json"):
+        if not (package / "web" / name).is_file():
+            raise ValueError("Package static output is incomplete")
     for name in ("vibeface_secure.js", "vibeface_secure_bg.wasm"):
-        generated = ROOT / "crates/node/web/generated" / name
+        generated = ROOT / "apps/app/generated" / name
         if digest(package / "web" / name) != digest(generated):
             raise ValueError("Packaged cryptography differs from the same-run verified Web/WASM artifact")
     return info
@@ -436,7 +442,7 @@ def dispatch(package_input, android_input, expected):
         (ARTIFACTS / name).mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="live-build-context-", dir=ARTIFACTS) as directory:
         context = Path(directory)
-        for name in ("proofs/delivery/Sandbox.Dockerfile", "proofs/delivery/confined-gnark.sh"):
+        for name in ("crates/delivery/proof/Sandbox.Dockerfile", "crates/delivery/proof/confined-gnark.sh"):
             target = context / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, target)
@@ -475,7 +481,7 @@ def dispatch(package_input, android_input, expected):
             os.close(os.open(authority, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
             ui_process = subprocess.Popen(["xvfb-run", "--auto-servernum", "--server-num", "91", "--auth-file", str(authority),
                 "--error-file", str(UI / "private-display.log"), "--server-args=-screen 0 1440x1000x24 -nolisten tcp",
-                "pnpm", "exec", "e2e", "run", "--config", "e2e.paid.config.ts", "--workers", "2", "--headed",
+                "pnpm", "exec", "e2e", "run", "--config", "tests/e2e/e2e.paid.config.ts", "--workers", "2", "--headed",
                 "--no-cache", "--retries", "0", "--video=off"], cwd=ROOT, env=environment, stdout=ui_log, stderr=ui_log, start_new_session=True)
             join_owned(proof_process, ui_process, android.process, deadline, observe=observe)
             finalize_ui(android_provenance)
@@ -1152,7 +1158,7 @@ def checked_ui_evidence(summary, web, android, report):
     if report.get("schemaVersion") != "report-1" or run.get("status") != "passed" or run.get("exitCode") != 0 or run.get("errors") != [] or run.get("vcs", {}).get("commit") != summary["sourceCommit"] or run.get("vcs", {}).get("dirty") is not False:
         raise ValueError("The actual e2e runner must finish without run or cleanup errors")
     selected = [result for result in run.get("results", []) if result.get("selected") is True]
-    expected = {("vdp-paid-web", "web", "tests/paid-web-transfers.paid.ts"), ("vdp-paid-android", "android", "tests/paid-native-transfers.paid.ts")}
+    expected = {("vdp-paid-web", "web", "paid-web-transfers.paid.ts"), ("vdp-paid-android", "android", "paid-native-transfers.paid.ts")}
     if len(selected) != 2 or {(result.get("targetId"), result.get("platform"), result.get("file")) for result in selected} != expected or any(result.get("status") != "passed" or len(result.get("attempts", [])) != 1 or result["attempts"][0].get("status") != "passed" for result in selected):
         raise ValueError("Both actual paid UI tests must pass on their exact target without skip or retry")
     if any(run.get("summary", {}).get(field) != expected for field, expected in (("selected", 2), ("executed", 2), ("passed", 2), ("failed", 0), ("interrupted", 0), ("flaky", 0), ("skipped", 0))) or any(run.get("usage", {}).get(field) != 0 for field in ("modelTokens", "maxModelCallsInStep")):
@@ -1285,24 +1291,26 @@ def inside(package, expected):
         for component in ("crypto", "web"):
             command("verify " + component + " build inputs", ["python3", "scripts/build-inputs.py", "check", component], log)
         info = checked_package(package, expected)
-        binary, module = package / "vibeface", package / "web/vibeface_secure.js"
+        binary, core, module = package / "vibeface", package / "vibeface-core", package / "web/vibeface_secure.js"
+        environment["VIBEFACE_APP_DIR"] = str(package / "web")
         provenance = "same-run verified Linux package"
         enter("packaged-runtime")
         if not runtime(binary, module, run / "packaged-runtime", log, environment):
             enter("node-rebuild")
             flags = subprocess.check_output(["python3", "scripts/release-rustflags.py"], cwd=ROOT, env={**environment, "CARGO_TARGET_DIR": "/artifacts/node-target"}, text=True).strip()
-            command("build current Node for sandbox libc", ["cargo", "+1.98.1", "build", "--release", "--locked", "-p", "vibeface", "--target-dir", "/artifacts/node-target"],
+            command("build current CLI and Core for sandbox libc", ["cargo", "+1.98.1", "build", "--release", "--locked", "-p", "vibeface", "-p", "vibeface-core", "--target-dir", "/artifacts/node-target"],
                     log, env={**environment, "CARGO_ENCODED_RUSTFLAGS": flags})
             binary = Path("/artifacts/node-target/release/vibeface")
+            core = Path("/artifacts/node-target/release/vibeface-core")
             if not runtime(binary, module, run / "rebuilt-runtime", log, environment):
                 raise RuntimeError("Source-built Node failed the sandbox runtime check")
             provenance = "actual current-source build after explicit packaged GLIBC incompatibility"
-        summary["node"] = {"origin": provenance, "sha256": digest(binary), "packageSourceCommit": info["source_commit"],
+        summary["node"] = {"origin": provenance, "sha256": digest(binary), "coreSha256": digest(core), "packageSourceCommit": info["source_commit"],
                            "webRuntimePassed": True, "wasmSha256": digest(package / "web/vibeface_secure_bg.wasm")}
         enter("guest-toolchain")
         command("install fixed guest compiler", ["python3", "scripts/install-delivery-toolchain.py"], log, env=environment)
         enter("guest-build")
-        command("build canonical actual guest and host", ["bash", "proofs/delivery/build.sh"], log, env=environment)
+        command("build canonical actual guest and host", ["bash", "crates/delivery/proof/build.sh"], log, env=environment)
         prover = Path("/artifacts/proof-target/release/vibeface-delivery-prover")
         enter("guest-info")
         compiled = json.loads(subprocess.check_output([str(prover), "info"], cwd=ROOT, env=environment))
@@ -1323,9 +1331,9 @@ def inside(package, expected):
             "settlement_observer": "/work/contracts/delivery/observe-settlement.mjs"})
         try:
             enter("paid-acceptance")
-            command("thirteen genuine proofs, actual Web and Android order and independent observers", ["python3", "scripts/verify-node.py", "--delivery", "--binary", str(binary),
-                "--crypto-module", str(module), "--artifacts", str(run / "process"), "--delivery-probe", str(probe_target / "debug/vibeface-delivery-probe"),
-                "--delivery-config", str(configuration), "--delivery-source-root", "/work", "--delivery-profile", "/work/proofs/delivery/profile.json",
+            command("thirteen genuine proofs, actual Web and Android order and independent observers", ["python3", "scripts/verify-node.py", "--delivery", "--binary", str(binary), "--core-binary", str(core),
+                "--app-dir", str(package / "web"), "--crypto-module", str(module), "--artifacts", str(run / "process"), "--delivery-probe", str(probe_target / "debug/vibeface-delivery-probe"),
+                "--delivery-config", str(configuration), "--delivery-source-root", "/work", "--delivery-profile", "/work/crates/delivery/proof/profile.json",
                 "--delivery-ui-control", str(UI / "control.json"), "--delivery-ui-timeout-ms", str(UI_TIMEOUT_MS)], log,
                 env={**environment, "VIBEFACE_DELIVERY_PROGRESS_COMMIT": expected})
         except RuntimeError:
@@ -1541,12 +1549,12 @@ def self_test_ui(directory):
         with patch.dict(os.environ, {"VIBEFACE_DELIVERY_PROGRESS_COMMIT": "private-wallet-marker"}), patch("runpy.run_path") as loader:
             driver["delivery_progress"](options)("first-proof-starting")
             loader.assert_not_called()
-    profile = json.loads((ROOT / "proofs/delivery/profile.json").read_bytes())
+    profile = json.loads((ROOT / "crates/delivery/proof/profile.json").read_bytes())
     chain = {"rpc_url": "http://127.0.0.1:12345", "chain_id": 31337, "confirmations": 2, "profile": profile,
              "escrow": "0x" + "1" * 40, "asset": "0x" + "2" * 40}
     configuration = {"prover": {"program": "/prover", "r0vm": "/r0vm", "cgroup": "/sys/fs/cgroup", "profile": profile},
                      **{key: "1" for key in ("max_service_amount", "source_gas_cap_wei", "provider_gas_cap_wei", "register_key_gas_cap_wei")}}
-    options = argparse.Namespace(delivery_ui_control=None, delivery_profile=ROOT / "proofs/delivery/profile.json")
+    options = argparse.Namespace(delivery_ui_control=None, delivery_profile=ROOT / "crates/delivery/proof/profile.json")
     stop_before_nodes = RuntimeError("self-test stops at the existing free-network gate")
     checkpoint = Mock(side_effect=stop_before_nodes)
     with patch.dict(driver["delivery_paid_run"].__globals__, {"delivery_charity_acceptance": checkpoint}):
@@ -1622,7 +1630,7 @@ def self_test_ui(directory):
     common = {"status": "passed", "orderId": ordinary["order_id"], "intentId": ordinary["intent_id"], "bytes": 4096, "sha256": ordinary["sha256"], "actualPairing": True}
     web = {**common, "actualFileSelection": True, "actualQuotation": True, "actualPaymentConfirmation": True, "reloadPreservedIntent": True, "settledWhileReceiverAppOffline": True, "earned": "17", "withdrawn": "17", "refunded": "0", "quotationScreenshot": "web.png"}
     android = {**common, **{field: True for field in ("actualAcceptance", "backgroundObserved", "receiverReverseRemoved", "existingAppConnectionTerminated", "actualOfflineVisible", "settledWhileBackgrounded", "sameOrderResumed", "actualSavedFile")}, "offlineScreenshot": "android-offline.png", "savedScreenshot": "android.png"}
-    results = [{"targetId": target, "platform": platform, "file": file, "selected": True, "status": "passed", "attempts": [{"status": "passed"}]} for target, platform, file in (("vdp-paid-web", "web", "tests/paid-web-transfers.paid.ts"), ("vdp-paid-android", "android", "tests/paid-native-transfers.paid.ts"))]
+    results = [{"targetId": target, "platform": platform, "file": file, "selected": True, "status": "passed", "attempts": [{"status": "passed"}]} for target, platform, file in (("vdp-paid-web", "web", "paid-web-transfers.paid.ts"), ("vdp-paid-android", "android", "paid-native-transfers.paid.ts"))]
     report = {"schemaVersion": "report-1", "run": {"status": "passed", "exitCode": 0, "errors": [], "vcs": {"commit": "1" * 40, "dirty": False}, "results": results,
               "summary": {"selected": 2, "executed": 2, "passed": 2, "failed": 0, "interrupted": 0, "flaky": 0, "skipped": 0}, "usage": {"modelTokens": 0, "maxModelCallsInStep": 0}}}
     assert checked_ui_evidence(summary, web, android, report)["passed"] == 2
@@ -2212,15 +2220,20 @@ def self_test():
         with patch(f"{__name__}.command", side_effect=RuntimeError("loader failure")), patch(f"{__name__}.glibc_failure", return_value=True):
             assert runtime(Path("/binary"), Path("/module"), Path(directory), log, {}) is False
         with patch(f"{__name__}.ROOT", Path(directory)):
-            generated = Path(directory) / "crates/node/web/generated"
+            generated = Path(directory) / "apps/app/generated"
             generated.mkdir(parents=True)
             sample = Path(directory) / "package"
             (sample / "web").mkdir(parents=True)
             (sample / "vibeface").write_bytes(b"source-provenance-fixture-only")
+            (sample / "vibeface-core").write_bytes(b"source-provenance-core-fixture-only")
+            for name in ("_shell.html", "index.html", "_redirects", "_headers", ".vibeface-build.json"):
+                (sample / "web" / name).write_text("fixture")
             for name in ("vibeface_secure.js", "vibeface_secure_bg.wasm"):
                 (generated / name).write_bytes(b"same-run-crypto")
                 (sample / "web" / name).write_bytes(b"same-run-crypto")
-            info = {"version": "test", "target": "x86_64-unknown-linux-gnu", "source_commit": "1" * 40, "update_protocol": 1, "data_epoch": 3}
+            info = {"version": "0.0.1", "target": "x86_64-unknown-linux-gnu", "source_commit": "1" * 40,
+                    "update_protocol": 1, "data_epoch": 1, "core_version": "0.0.1", "core_source_commit": "2" * 40,
+                    "app_version": "0.0.1", "app_source_commit": "3" * 40}
             (sample / "BUILD-INFO.json").write_text(json.dumps(info))
             checked_package(sample, "1" * 40)
             for malformed in ({**info, "source_commit": "2" * 40}, {**info, "target": "another-target"}):

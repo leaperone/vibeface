@@ -1,0 +1,12 @@
+{
+  "include": ["e2e.config.ts", "e2e.native.config.ts", "e2e.paid.config.ts", "*.ts"],
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  }
+}

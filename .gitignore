@@ -4,9 +4,10 @@ apps/www/.artifacts/
 apps/www/.source/
 apps/www/.tanstack/
 apps/www/dist/
+tests/e2e/.artifacts/
 /.worktrees/
 node_modules/
-/crates/node/web/generated/
+/apps/app/generated/
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal

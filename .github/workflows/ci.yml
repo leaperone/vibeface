@@ -1,11 +1,8 @@
 name: ci
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited]
   push:
     branches: [main]
-    tags: ['v*']
   merge_group:
     types: [checks_requested]
   schedule:
@@ -27,7 +24,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.delivery_small && 'delivery-small' || format('{0}-{1}', github.event_name, github.ref) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -80,7 +77,7 @@ jobs:
           version: v1.3.0
       - name: Validate migration files without opening a database
         if: needs.plan.outputs.rust == 'true'
-        run: atlas migrate validate --dir file://crates/node/migrations
+        run: atlas migrate validate --dir file://apps/core/migrations
       - name: Check workflow, selectors and shell scripts
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
@@ -96,7 +93,7 @@ jobs:
       - name: Check JavaScript syntax
         run: |
           node --check scripts/crypto-client.mjs
-          node --check npm/bin/vibeface.mjs
+          node --check apps/cli/npm/bin/vibeface.mjs
           node --check scripts/package-npm.mjs
           node scripts/package-npm.mjs --self-test
       - run: cargo fmt --all -- --check
@@ -161,10 +158,10 @@ jobs:
         with:
           name: crypto-web-${{ github.sha }}
           path: |
-            crates/node/web/generated/vibeface_secure.js
-            crates/node/web/generated/vibeface_secure_bg.wasm
-            crates/node/web/generated/*.d.ts
-            crates/node/web/generated/.vibeface-build.json
+            apps/app/generated/vibeface_secure.js
+            apps/app/generated/vibeface_secure_bg.wasm
+            apps/app/generated/*.d.ts
+            apps/app/generated/.vibeface-build.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
@@ -180,7 +177,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: crypto-web-${{ github.sha }}
-          path: crates/node/web/generated
+          path: apps/app/generated
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.9.0
@@ -194,7 +191,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: web-${{ github.sha }}
-          path: crates/node/web/dist/client
+          path: apps/app/dist/client
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
@@ -210,11 +207,11 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: crypto-web-${{ github.sha }}
-          path: crates/node/web/generated
+          path: apps/app/generated
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: web-${{ github.sha }}
-          path: crates/node/web/dist/client
+          path: apps/app/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
@@ -244,11 +241,11 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: crypto-web-${{ github.sha }}
-          path: crates/node/web/generated
+          path: apps/app/generated
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: web-${{ github.sha }}
-          path: crates/node/web/dist/client
+          path: apps/app/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -275,11 +272,11 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: crypto-web-${{ github.sha }}
-          path: crates/node/web/generated
+          path: apps/app/generated
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: web-${{ github.sha }}
-          path: crates/node/web/dist/client
+          path: apps/app/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -313,7 +310,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
           workspaces: |
             . -> .artifacts/vdp/domain-target
-            proofs/delivery -> ../../.artifacts/vdp/proof-target
+            crates/delivery/proof -> ../../../.artifacts/vdp/proof-target
       - name: Check public delivery fixtures when present
         run: python3 scripts/check-delivery.py --check-fixtures
       - name: Install checksum-pinned guest compiler in artifacts
@@ -360,11 +357,11 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: crypto-web-${{ github.sha }}
-          path: crates/node/web/generated
+          path: apps/app/generated
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: web-${{ github.sha }}
-          path: crates/node/web/dist/client
+          path: apps/app/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt
@@ -385,7 +382,7 @@ jobs:
           cache: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && 'pnpm' || '' }}
           cache-dependency-path: pnpm-lock.yaml
       - name: Import Developer ID signing identity
-        if: matrix.target == 'aarch64-apple-darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        if: matrix.target == 'aarch64-apple-darwin' && github.event_name != 'merge_group'
         env:
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -452,57 +449,67 @@ jobs:
           python3 - "$package/BUILD-INFO.json" <<'PY'
           import json, os, pathlib, re, subprocess, sys
           info = json.load(open(sys.argv[1]))
-          config = pathlib.Path("crates/node/src/config.rs").read_text()
+          config = pathlib.Path("crates/control/src/lib.rs").read_text()
           protocol, epoch = (int(re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1]) for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
-          assert set(info) == {"version", "target", "source_commit", "update_protocol", "data_epoch"}
+          assert set(info) == {"version", "target", "source_commit", "update_protocol", "data_epoch", "core_version", "core_source_commit", "app_version", "app_source_commit"}
           assert info["update_protocol"] == protocol and info["data_epoch"] == epoch
           assert info["source_commit"] == os.environ["GITHUB_SHA"]
           assert info["target"] == os.environ["PACKAGE_TARGET"]
           binary = pathlib.Path(sys.argv[1]).parent / "vibeface"
           web = binary.parent / "web"
+          assert (web / "_shell.html").stat().st_size > 0
+          assert (web / "index.html").stat().st_size > 0
+          assert (web / "_redirects").stat().st_size > 0
+          assert (web / "_headers").stat().st_size > 0
+          assert (web / ".vibeface-build.json").stat().st_size > 0
           assert (web / "vibeface_secure.js").stat().st_size > 0
           assert (web / "vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm")
+          assert (binary.parent / "vibeface-core").stat().st_size > 0
           assert subprocess.check_output([str(binary), "--version"], text=True).strip() == f'vibeface {info["version"]}'
+          assert subprocess.check_output([str(binary.parent / "vibeface-core"), "--version"], text=True).strip() == f'vibeface-core {info["core_version"]}'
           PY
           "$package/vibeface" --help
+          "$package/vibeface-core" --help
           printf 'package=%s\n' "$package" >> "$GITHUB_OUTPUT"
       - name: Verify Developer ID signature
-        if: matrix.target == 'aarch64-apple-darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        if: matrix.target == 'aarch64-apple-darwin' && github.event_name != 'merge_group'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: |
           set -o pipefail
-          codesign --verify --strict "$PACKAGE/vibeface"
-          details="$(codesign -dvvv "$PACKAGE/vibeface" 2>&1)"
-          printf '%s\n' "$details"
-          grep -qx 'Identifier=cn.leaperone.vibeface' <<< "$details"
-          grep -qx "TeamIdentifier=$VIBEFACE_CODESIGN_TEAM" <<< "$details"
-          grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime' <<< "$details"
-          binary_sha="$(shasum -a 256 "$PACKAGE/vibeface" | cut -d ' ' -f 1)"
-          delays=(15 30 60 120 120 120 120 120 120)
-          for attempt in $(seq 0 "${#delays[@]}"); do
-            assessment="$RUNNER_TEMP/gatekeeper-assessment-$attempt.txt"
-            if spctl -a -vvv --ignore-cache --no-cache -t open --context context:primary-signature "$PACKAGE/vibeface" >"$assessment" 2>&1; then
-              assessment_status=0
-            else
-              assessment_status=$?
-            fi
-            cat "$assessment"
-            printf 'Gatekeeper assessment %s exited %s\n' "$attempt" "$assessment_status"
-            test "$(shasum -a 256 "$PACKAGE/vibeface" | cut -d ' ' -f 1)" = "$binary_sha"
-            if test "$assessment_status" -eq 0; then
-              grep -qx 'source=Notarized Developer ID' "$assessment"
-              break
-            fi
-            if test "$assessment_status" -ne 3 || ! grep -qx 'source=Unnotarized Developer ID' "$assessment" || test "$attempt" -eq "${#delays[@]}"; then
-              exit "$assessment_status"
-            fi
-            sleep "${delays[$attempt]}"
+          for binary in "$PACKAGE/vibeface" "$PACKAGE/vibeface-core"; do
+            codesign --verify --strict "$binary"
+            details="$(codesign -dvvv "$binary" 2>&1)"
+            printf '%s\n' "$details"
+            grep -qx 'Identifier=cn.leaperone.vibeface' <<< "$details"
+            grep -qx "TeamIdentifier=$VIBEFACE_CODESIGN_TEAM" <<< "$details"
+            grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime' <<< "$details"
+            binary_sha="$(shasum -a 256 "$binary" | cut -d ' ' -f 1)"
+            delays=(15 30 60 120 120 120 120 120 120)
+            for attempt in $(seq 0 "${#delays[@]}"); do
+              assessment="$RUNNER_TEMP/gatekeeper-assessment-$(basename "$binary")-$attempt.txt"
+              if spctl -a -vvv --ignore-cache --no-cache -t open --context context:primary-signature "$binary" >"$assessment" 2>&1; then
+                assessment_status=0
+              else
+                assessment_status=$?
+              fi
+              cat "$assessment"
+              printf 'Gatekeeper assessment %s exited %s\n' "$attempt" "$assessment_status"
+              test "$(shasum -a 256 "$binary" | cut -d ' ' -f 1)" = "$binary_sha"
+              if test "$assessment_status" -eq 0; then
+                grep -qx 'source=Notarized Developer ID' "$assessment"
+                break
+              fi
+              if test "$assessment_status" -ne 3 || ! grep -qx 'source=Unnotarized Developer ID' "$assessment" || test "$attempt" -eq "${#delays[@]}"; then
+                exit "$assessment_status"
+              fi
+              sleep "${delays[$attempt]}"
+            done
           done
       - name: Verify packaged Web assets and process
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
       - name: Verify packaged free discovery and charity delivery over real Node processes
         if: needs.plan.outputs.delivery == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
@@ -512,7 +519,7 @@ jobs:
         run: |
           cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml -- --check
           cargo build --manifest-path tests/fixtures/delivery-probe/Cargo.toml --locked
-          python3 scripts/verify-node.py --delivery-charity --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts "$PWD/.artifacts/ci-delivery" --delivery-probe "$CARGO_TARGET_DIR/debug/vibeface-delivery-probe" --delivery-source-root "$PWD" --delivery-profile "$PWD/proofs/delivery/profile.json"
+          python3 scripts/verify-node.py --delivery-charity --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts "$PWD/.artifacts/ci-delivery" --delivery-probe "$CARGO_TARGET_DIR/debug/vibeface-delivery-probe" --delivery-source-root "$PWD" --delivery-profile "$PWD/crates/delivery/proof/profile.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ !cancelled() && needs.plan.outputs.delivery == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' }}
         with:
@@ -545,45 +552,45 @@ jobs:
         with:
           name: e2e-${{ github.sha }}
           path: |
-            .artifacts/e2e/results
-            !.artifacts/e2e/results/**/downloads/**
+            tests/e2e/.artifacts/results
+            !tests/e2e/.artifacts/results/**/downloads/**
           if-no-files-found: warn
           retention-days: 7
       - name: Verify unpacked Node scheduling and signed log without model calls
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-node --phase1
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-node --phase1
       - name: Verify multi-Node sync, entrances and delivery over iroh
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-multi-node
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-multi-node
       - name: Verify bot tools and startup event recovery
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'aarch64-apple-darwin'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-chat-agent --chat-agent
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-chat-agent --chat-agent
       - name: Verify cross-device coordination, owner moves and attachments
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-phase4 --phase4
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-phase4 --phase4
       - name: Verify the public entry and its relay token
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-public-entry --public-entry
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-public-entry --public-entry
       - name: Verify discovery-only assistance and headless Nodes
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-discovery --discovery
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-discovery --discovery
       - name: Verify write protection, status and diagnostics
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'aarch64-apple-darwin'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-phase5 --phase5
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-phase5 --phase5
       - name: Upload verified package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -621,7 +628,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
       - name: Remove signing keychain and notary key
-        if: always() && matrix.target == 'aarch64-apple-darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        if: always() && matrix.target == 'aarch64-apple-darwin' && github.event_name != 'merge_group'
         run: |
           security delete-keychain "$RUNNER_TEMP/vibeface-signing.keychain-db" 2> /dev/null || true
           rm -f "$RUNNER_TEMP/vibeface-notary.p8" "$RUNNER_TEMP/vibeface-signing.p12"
@@ -748,11 +755,11 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: crypto-web-${{ github.sha }}
-          path: crates/node/web/generated
+          path: apps/app/generated
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: web-${{ github.sha }}
-          path: crates/node/web/dist/client
+          path: apps/app/dist/client
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: vibeface-android-${{ github.sha }}
@@ -772,7 +779,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends ffmpeg acl
       - name: Prepare host Web and Android drivers without model calls
         env:
-          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.artifacts/vdp/live-ui/browsers
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/tests/e2e/.artifacts/vdp/live-ui/browsers
         run: |
           pnpm install --frozen-lockfile --filter .
           pnpm test:e2e:check
@@ -913,17 +920,20 @@ jobs:
       - name: Install npm artifact without lifecycle scripts
         env:
           PACKAGE_VERSION: ${{ needs.plan.outputs.version }}
+          PACKAGE_TARGET: ${{ matrix.target }}
         run: |
           prefix="$PWD/.artifacts/npm-installed"
           npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$PWD/.artifacts/npm/leaperone-vibeface-$PACKAGE_VERSION.tgz"
           [[ "$("$prefix/bin/vibeface" --version)" == "vibeface $PACKAGE_VERSION" ]]
+          core_version="$(node -p "require('$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/BUILD-INFO.json').core_version")"
+          [[ "$("$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/vibeface-core" --version)" == "vibeface-core $core_version" ]]
           "$prefix/bin/vibeface" --help
       - name: Verify npm startup and bundled web
         env:
           PACKAGE_TARGET: ${{ matrix.target }}
         run: |
           prefix="$PWD/.artifacts/npm-installed"
-          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --crypto-module "$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --web-only
+          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --core-binary "$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/vibeface-core" --crypto-module "$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --web-only
 
   ci-gate:
     name: ci-gate
@@ -938,77 +948,3 @@ jobs:
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
         run: python3 scripts/ci.py gate --needs-env CI_NEEDS ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_live && '--delivery-live' || '' }}
-
-  app-build:
-    needs: [plan]
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-    uses: ./.github/workflows/release-apps.yml
-    with:
-      version: v${{ needs.plan.outputs.version }}
-      prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
-
-  publish:
-    # ci-gate needs jobs that are skipped on tags; without !cancelled() a skipped ancestor skips this.
-    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.plan.result == 'success' && needs.ci-gate.result == 'success' && needs.package.result == 'success' && needs.app-build.result == 'success' }}
-    needs: [plan, ci-gate, package, app-build]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      RELEASE_TAG: ${{ github.ref_name }}
-      VERSION: ${{ needs.plan.outputs.version }}
-      RELEASE_CHANNEL: ${{ needs.plan.outputs.channel }}
-      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: node-package-*-${{ github.sha }}
-          path: packages
-          merge-multiple: true
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-android-${{ github.sha }}
-          path: packages
-      - name: Verify all assets before publishing
-        run: |
-          [[ "$RELEASE_TAG" == "v$VERSION" ]]
-          shopt -s nullglob
-          archives=(packages/*.tar.gz)
-          checksums=(packages/*.tar.gz.sha256 packages/*.apk.sha256)
-          files=(packages/*)
-          [[ "${#archives[@]}" == 3 && "${#checksums[@]}" == 4 && "${#files[@]}" == 9 ]]
-          for archive in "${archives[@]}"; do
-            name="$(basename "$archive")"
-            [[ "$name" == "vibeface-$VERSION-"*.tar.gz ]]
-            (cd packages && sha256sum -c "$name.sha256")
-          done
-          for archive in packages/*.apk; do
-            (cd packages && sha256sum -c "$(basename "$archive").sha256")
-          done
-          [[ "$(find packages -maxdepth 1 -name '*.provenance.json' | wc -l)" == 1 ]]
-      - name: Upload complete draft and publish
-        run: |
-          release_flags=(--prerelease="$PRERELEASE" --latest=false)
-          if [[ "$RELEASE_CHANNEL" == stable ]]; then
-            release_flags=(--prerelease=false --latest=true)
-          fi
-          if gh release view "$RELEASE_TAG" --json isDraft > "$RUNNER_TEMP/release.json"; then
-            python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["isDraft"], "Refusing to overwrite a public release"' "$RUNNER_TEMP/release.json"
-          else
-            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --generate-notes --target "$GITHUB_SHA" --prerelease="$PRERELEASE" --latest=false
-          fi
-          gh release upload "$RELEASE_TAG" packages/* --clobber
-          gh release view "$RELEASE_TAG" --json assets > "$RUNNER_TEMP/release-assets.json"
-          python3 - "$RUNNER_TEMP/release-assets.json" <<'PY'
-          import json, pathlib, sys
-          expected = sorted(p.name for p in pathlib.Path("packages").iterdir())
-          actual = sorted(a["name"] for a in json.load(open(sys.argv[1]))["assets"])
-          assert actual == expected, "Draft release asset set differs from verified packages"
-          PY
-          gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/release-download"
-          for asset in packages/*; do
-            cmp "$asset" "$RUNNER_TEMP/release-download/$(basename "$asset")"
-          done
-          gh release edit "$RELEASE_TAG" --draft=false "${release_flags[@]}"

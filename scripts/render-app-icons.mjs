@@ -21,7 +21,7 @@ const appIcon = svg(`<defs>${gradient}${glow}</defs>${glowBackground}${glowGlyph
 
 const icons = [
   { out: 'apps/mobile/assets/icon/app-icon.svg', svg: appIcon },
-  { out: 'crates/node/web/public/icon.svg', svg: svg(`<rect width="1024" height="1024" rx="224" fill="#0B100D"/>${glyph(GREEN)}`) },
+  { out: 'apps/app/public/icon.svg', svg: svg(`<rect width="1024" height="1024" rx="224" fill="#0B100D"/>${glyph(GREEN)}`) },
   { out: 'apps/mobile/assets/icon/ios-light.png', size: 1024, opaque: true, svg: appIcon },
   { out: 'apps/mobile/assets/icon/ios-tinted.png', size: 1024, opaque: true, svg: svg(`<rect width="1024" height="1024" fill="#000"/>${glyph('#FFF')}`) },
   { out: 'apps/mobile/assets/icon/android-foreground.png', size: 1024, opaque: false, svg: svg(`<defs>${glow}</defs>${glowGlyph}`) },

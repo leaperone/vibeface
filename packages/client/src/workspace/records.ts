@@ -15,11 +15,19 @@ export function mergeConversation(shown: ConversationPayload, records: Conversat
   const messages = byRank(upsert(shown.messages, records.messages, (item) => item.message_id))
   const works = upsert(shown.works.filter((item) => !delivery(item)).map(({ stop: _, ...item }) => item), records.works, (item) => item.work_id)
   // A push carries this device's jobs only; the owner's stay until the conversation is read again.
-  const remote = shown.scheduler?.jobs.filter((job) => job.source_node) ?? []
+  const remote = shown.scheduler?.jobs.filter((job) => job.source_node && job.source_node !== shown.local_node) ?? []
   const jobs = [...records.jobs.filter((job) => job.state !== "pending_delivery" || !remote.some((item) => item.trigger === job.trigger)), ...remote]
   return {
     ...shown, messages, works: withDeliveries(works, records.deliveries), checks: records.checks, questions: records.questions, sent: records.sent,
-    scheduler: shown.scheduler && { ...shown.scheduler, jobs, unanswered: records.unanswered },
+    scheduler: shown.scheduler && { ...shown.scheduler, jobs, unanswered: records.unanswered,
+      ...(!shown.scheduler.remote && records.context !== undefined ? { context: records.context } : {}),
+    },
+    bot_settings: { ...shown.bot_settings,
+      ...(records.memory === undefined ? {} : { memory: records.memory }),
+      ...(records.memory_sync_conflicts === undefined ? {} : { memory_sync_conflicts: records.memory_sync_conflicts }),
+      ...(!shown.scheduler?.remote && records.memory_staged_count !== undefined ? { memory_staged_count: records.memory_staged_count } : {}),
+      ...(!shown.scheduler?.remote && records.memory_conflicts !== undefined ? { memory_conflicts: records.memory_conflicts } : {}),
+    },
   }
 }
 

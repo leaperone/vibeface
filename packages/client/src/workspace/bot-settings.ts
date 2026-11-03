@@ -1,9 +1,14 @@
 import type { TranscriptMessage } from "../chat/types.ts"
 import { projectName } from "./questions.ts"
-import type { BotChange, BotChangeRecord, BotProject, BotSchedule, BotSettings, NodeInfo, Overwritten, ScheduleView, SkillSet } from "./types.ts"
+import type { BotChange, BotChangeRecord, BotProject, BotRecord, BotSchedule, BotSettings, NodeInfo, Overwritten, ScheduleView, SkillSet } from "./types.ts"
 import type { Avatar } from "../avatar/face.ts"
 import { avatarWords } from "../avatar/pick.ts"
-import { providerNames } from "../lib/node.ts"
+import { providerIds, providerNames, type ProviderId } from "../lib/node.ts"
+
+export function botModelRows(bot: Pick<BotRecord, "models" | "reasoning_efforts">, running: ProviderId | null): [ProviderId, string][] {
+  return (running ? [running] : providerIds.filter((provider) => bot.models[provider] !== undefined || bot.reasoning_efforts?.[provider] !== undefined))
+    .map((provider) => [provider, bot.models[provider] ?? ""])
+}
 
 /** A bot's project folder and the folder a device runs its bots in are different places, so they never share a name. */
 export const folderLabels = { project: "项目文件夹", botRun: "Bot 运行目录" } as const
@@ -12,6 +17,8 @@ export const folderLabels = { project: "项目文件夹", botRun: "Bot 运行目
 export const botCopy = {
   notFound: "找不到这个 Bot",
   primaryHint: "接手没有 Bot 负责的会话",
+  /** The chat is kept but no longer listed; deleting the primary bot names the bot that takes its place. */
+  deleteHint: (successor: string | null) => successor ? `「${successor}」接任主 Bot` : "停止回复，聊天不再显示",
   empty: "还没有说明、定时任务和笔记",
   skills: (skills: SkillSet, count: number) => skills === null ? "Skill · 全部可用" : `Skill · ${count}`,
 }
@@ -29,7 +36,7 @@ export function changeTitle(changes: readonly BotChange[]): string {
 }
 
 const settingNames = { name: "名称", instructions: "说明", skills: "Skill", avatar: "长相" } as const
-const settingName = (item: Overwritten) => item.field === "model" ? `${providerNames[item.provider]} 模型` : settingNames[item.field]
+const settingName = (item: Overwritten) => item.field === "model" ? `${providerNames[item.provider]} 模型` : item.field === "reasoning_effort" ? `${providerNames[item.provider]} 推理强度` : settingNames[item.field]
 
 function settingWords(item: Overwritten): string {
   switch (item.field) {
@@ -39,6 +46,7 @@ function settingWords(item: Overwritten): string {
       return line ? `「${line.length > 24 ? `${line.slice(0, 24)}…` : line}」` : "空白"
     }
     case "model": return item.value ? `「${item.value}」` : "设备默认"
+    case "reasoning_effort": return item.value ? `「${item.value}」` : "设备默认"
     case "skills": return item.value === null ? "全部可用" : `${item.value.length} 个`
     case "avatar": return item.value ? avatarWords(item.value) : "默认长相"
   }
@@ -63,6 +71,7 @@ export function restoreRequest(item: Overwritten, change: BotChange): { avatar: 
     case "name": return change.name ? { text: `把名称改回「${change.name.after}」` } : null
     case "instructions": return change.instructions ? { text: `把说明改回下面这段：\n\n${change.instructions.after}` } : null
     case "model": return change.model ? { text: `把 ${providerNames[change.model.provider]} 模型改回${change.model.after ? `「${change.model.after}」` : "设备默认"}` } : null
+    case "reasoning_effort": return change.reasoning_effort ? { text: `把 ${providerNames[change.reasoning_effort.provider]} 推理强度改回${change.reasoning_effort.after ? `「${change.reasoning_effort.after}」` : "设备默认"}` } : null
     case "skills": return change.skills ? { text: change.skills.after === null ? "把 Skill 改回全部可用" : `把 Skill 改回这几个：${change.skills.after.join("、")}` } : null
     case "avatar": return change.avatar ? { avatar: change.avatar.after } : null
   }
@@ -137,10 +146,19 @@ export function formatIn(ms: number, now = Date.now()): string {
   return `${Math.round(minutes / 1440)} 天后`
 }
 
-/** Soonest next run first, paused last; ties keep the given order. */
-export function sortSchedules<T extends Pick<ScheduleView, "enabled" | "next_run_at_ms">>(schedules: readonly T[]): T[] {
+/**
+ * Soonest next run first, paused last; ties keep the given order. A one-time schedule is done once its time passed: the Node
+ * drops it on its next read, the list drops it now.
+ */
+export function sortSchedules<T extends Pick<ScheduleView, "enabled" | "next_run_at_ms" | "every_minutes" | "first_run_at_ms">>(schedules: readonly T[], now = Date.now()): T[] {
   const key = (schedule: T) => schedule.enabled ? schedule.next_run_at_ms ?? Number.MAX_SAFE_INTEGER : Number.MAX_VALUE
-  return [...schedules].sort((a, b) => key(a) - key(b))
+  return schedules.filter((schedule) => schedule.every_minutes !== undefined || schedule.first_run_at_ms > now).sort((a, b) => key(a) - key(b))
+}
+
+/** When this exact one-time schedule slot ran, as the time of its reply in the chat; null until it ran. */
+export function firedAt(messages: readonly { in_reply_to?: string; created_at_ms: number }[], scheduleId: string, firstRunAtMs: number): number | null {
+  const trigger = `schedule:${scheduleId}:${firstRunAtMs}`
+  return messages.find((message) => message.in_reply_to === trigger)?.created_at_ms ?? null
 }
 
 export type DiffLine = { kind: "removed" | "added"; text: string }

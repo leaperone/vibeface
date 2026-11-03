@@ -27,7 +27,7 @@ const read = (file, limit) => {
 const readJson = (file, limit = 1024 * 1024) => JSON.parse(read(file, limit));
 const prover = '/artifacts/proof-target/release/vibeface-delivery-prover';
 const fixture = '/artifacts/domain-target/debug/examples/fixture';
-const profilePath = path.resolve(root, '../../proofs/delivery/profile.json');
+const profilePath = path.resolve(root, '../../crates/delivery/proof/profile.json');
 const recipe = 'delivery-small-public-test-v1';
 const relations = [1, 2, 3, 4];
 const sourceCommit = process.env.VIBEFACE_DELIVERY_SOURCE_COMMIT;

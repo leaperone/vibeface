@@ -16,7 +16,7 @@ export function useAction() {
     setError('')
     try { await action() } catch (caught) { setError(messageOf(caught)) } finally { setBusy(null) }
   }
-  return { busy, error, run }
+  return { busy, error, run, clear: () => setError('') }
 }
 
 export function ErrorText({ error }: { error: string }) {

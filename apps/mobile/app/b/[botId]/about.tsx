@@ -1,9 +1,9 @@
 import { Stack, useLocalSearchParams } from 'expo-router'
-import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, Cpu, FolderOpen, Inbox, Laptop, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, Cpu, FolderOpen, Inbox, Laptop, MessagesSquare, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, WifiOff, type LucideIcon } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Alert, Pressable, ScrollView, View } from 'react-native'
-import { botCopy, folderLabels, formatIn, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
-import { asProvider, messageOf, providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
+import { botCopy, botModelRows, folderLabels, formatIn, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
+import { asProvider, messageOf, providerNames } from '@vibeface/client/lib/node.ts'
 import type { BotProject, BotRecord } from '@vibeface/client/workspace/types.ts'
 import { useAvatarPick } from '@vibeface/client/avatar/pick.ts'
 import { AvatarPicker } from '@/components/avatar-picker'
@@ -18,11 +18,8 @@ import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@/data/context'
 import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { useLive } from '@/data/live'
+import { MemorySummary } from '@/features/chat/memory-summary'
 
-/**
- * A bot as the web's bot panel shows it: where it runs and on which model first, then its project, face, what it does, its schedules,
- * notes and the shared skills. The face and project are picked here; the rest changes by asking it in the chat.
- */
 export default function BotAbout() {
   const { botId } = useLocalSearchParams<{ botId: string }>()
   const shared = useLive()
@@ -43,9 +40,8 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
   const projectNow = bot.project ? projectKey(bot.project) : ''
   const owner = shared.conversationId === bot.conversation_id ? shared.data?.conversation?.owner : undefined
   const ownerNode = shared.nodes.find((node) => node.device_id === owner)
-  // The provider the bot runs on now, with its model; without one known, every model the bot chose.
   const running = asProvider(ownerNode?.capabilities?.manager)
-  const models = running ? [[running, bot.models[running] ?? '']] as [ProviderId, string][] : Object.entries(bot.models) as [ProviderId, string][]
+  const models = botModelRows(bot, running)
   const place = bot.project ? projectPlace(bot.project, owner, (id) => nodeName(id, lookup)) : ''
   const options: { key: string; project: BotProject | null; label: string }[] = [{ key: '', project: null, label: '不选' },
     ...(bot.project && !choices.some((item) => item.key === projectNow) ? [{ key: projectNow, project: bot.project, label: place }] : []), ...choices]
@@ -59,14 +55,16 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
           : <ActionButton variant="outline" size="sm" icon={Star} accessibilityHint={botCopy.primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
       </View>
     </View>
+    <SettingsGroup><SettingsRow icon={MessagesSquare} label="上下文和协作" description="共享摘要、外部会话记录和后台工作" href={`/b/${bot.bot_id}/context`} /></SettingsGroup>
     {owner || models.length ? <SettingsGroup>
       {owner ? <SettingsRow icon={Laptop} label="运行设备">
         {ownerNode && !ownerNode.online ? <Icon as={WifiOff} accessibilityLabel="离线" className="size-4 text-warning" /> : null}
         <Text numberOfLines={1} className="max-w-[50%] text-muted-foreground">{nodeName(owner, lookup)}</Text>
       </SettingsRow> : null}
-      {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={providerNames[provider]}>
+      {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={`${providerNames[provider]} 模型偏好`}>
         <Text numberOfLines={1} className={cn('max-w-[50%] text-muted-foreground', model && 'font-mono text-meta')}>{model || '设备默认'}</Text>
       </SettingsRow>) : <SettingsRow icon={Cpu} label="模型"><Text className="text-muted-foreground">设备默认</Text></SettingsRow>}
+      {models.map(([provider]) => <SettingsRow key={`effort:${provider}`} icon={Cpu} label={`${providerNames[provider]} 推理强度`}><Text className="text-meta text-muted-foreground">{bot.reasoning_efforts?.[provider] ?? '设备默认'}</Text></SettingsRow>)}
     </SettingsGroup> : null}
     {empty ? <View className="flex-row items-center gap-2"><Icon as={Inbox} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{botCopy.empty}</Text></View> : null}
     {bot.project || choices.length ? <Section icon={FolderOpen} title={folderLabels.project}>
@@ -108,8 +106,8 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
         </View>
       </View>)}
     </Section> : null}
-    {view?.memory.length ? <Section icon={NotebookPen} title="笔记" count={view.memory.length}>
-      {view.memory.map((note) => <Text key={note.memory_id} selectable numberOfLines={2} className="text-meta">{note.text}</Text>)}
+    {view ? <Section icon={NotebookPen} title="持久记忆" count={view.memory.length}>
+      <MemorySummary key={bot.conversation_id} settings={view} context={shared.data?.scheduler?.context} memory={shared} />
     </Section> : null}
     {view?.skills.length ? <Section icon={BookOpen} title={botCopy.skills(bot.skills, view.skills.length)}>
       {view.skills.map((skill) => <View key={skill.skill_id} className="gap-0.5">

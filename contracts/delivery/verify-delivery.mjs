@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { compile, artifact, artifacts, requireDependency, root, schema } from './compile.mjs';
 
-const canonicalProfile = JSON.parse(fs.readFileSync(path.resolve(root, '../../proofs/delivery/profile.json'), 'utf8'));
-const directory = process.argv[2] ? path.resolve(process.argv[2]) : path.resolve(root, '../../proofs/delivery/fixtures');
+const canonicalProfile = JSON.parse(fs.readFileSync(path.resolve(root, '../../crates/delivery/proof/profile.json'), 'utf8'));
+const directory = process.argv[2] ? path.resolve(process.argv[2]) : path.resolve(root, '../../crates/delivery/proof/fixtures');
 const read = name => {
   const file = path.join(directory, name);
   assert(fs.lstatSync(file).isFile(), `Fixture must be a regular file: ${name}`);

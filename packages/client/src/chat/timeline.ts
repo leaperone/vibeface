@@ -75,8 +75,8 @@ export function firstUnread<M extends Pick<TranscriptMessage, "message_id" | "ev
   return timeline.rest.find(waiting)
 }
 
-/** A bot's reply this device has not read; its notification ID is the hash of the event that wrote the message. */
-export const unreadReply = (notification: Pick<NotificationRecord, "kind">) => notification.kind === "manager_response" || notification.kind === "manager_attention"
+/** A bot's reply, or another bot's message, this device has not read; its notification ID is the hash of the event that wrote the message. */
+export const unreadReply = (notification: Pick<NotificationRecord, "kind">) => ["manager_response", "manager_attention", "bot_message"].includes(notification.kind)
 
 /**
  * What a chat's badge counts, per conversation: replies not read here and questions still waiting on the person.

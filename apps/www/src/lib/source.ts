@@ -2,11 +2,14 @@ import { loader } from 'fumadocs-core/source'
 import { defineDocs } from 'fumadocs-mdx/macro'
 
 export const docs = defineDocs({
-  dir: '../../docs',
+  dir: '../../packages/docs',
   docs: {
     async: true,
     files: [
       'overview.md',
+      'quick-start.md',
+      'onboarding.md',
+      'user-guide.md',
       'comparison.md',
       'install.md',
       'bot-and-execution.md',

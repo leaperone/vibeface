@@ -22,13 +22,13 @@ function HomePage() {
           <div className="hero-copy-block">
             <p className="hero-kicker">自己的设备，自己的 Agent <span aria-hidden="true">/</span> Nightly</p>
             <h1 id="hero-title">用聊天，指挥<br />自己的电脑。</h1>
-            <p className="hero-lede">复用本机已安装并登录的 Codex 或 Claude Code。Bot 协调，选定电脑执行，阶段与结果回到原聊天。模型服务与额度由你准备。</p>
+            <p className="hero-lede">让本机的 Codex 或 Claude Code 执行工作。Bot 协调，选定电脑执行，阶段与结果回到原聊天。按设备设置完成登录，模型服务与额度由你准备。</p>
             <div className="hero-actions">
-              <Link className="button button-primary" to="/docs/$" params={{ _splat: 'install' }}>开始安装 <ArrowRight size={16} aria-hidden="true" /></Link>
+              <Link className="button button-primary" to="/docs/$" params={{ _splat: 'quick-start' }}>快速上手 <ArrowRight size={16} aria-hidden="true" /></Link>
               <Link className="button button-quiet" to="/docs/$" params={{ _splat: 'overview' }}>先了解 Vibeface <ArrowRight size={16} aria-hidden="true" /></Link>
             </div>
             <ul className="hero-proof" aria-label="Vibeface 的核心边界">
-              <li><span>01</span><strong>本机执行</strong><small>复用已登录 Agent</small></li>
+              <li><span>01</span><strong>本机执行</strong><small>使用自己的 Agent</small></li>
               <li><span>02</span><strong>签名历史</strong><small>带因果依赖的 DAG</small></li>
               <li><span>03</span><strong>权限可见</strong><small>先知道谁能读到内容</small></li>
             </ul>
@@ -75,7 +75,7 @@ function HomePage() {
           </div>
           <p className="system-manifesto">协调可以迁移，<em>执行留在你选择的电脑。</em></p>
           <div className="system-details">
-            <article><h3>Bot 与执行分开</h3><p>协调与执行可以分别选择产品。复用自己电脑上的 Codex 或 Claude Code，各自准备程序、登录和项目。</p></article>
+            <article><h3>Bot 与执行分开</h3><p>协调与执行可以分别选择产品。使用自己电脑上的 Codex 或 Claude Code，按设备设置为 Vibeface 的运行目录登录，并准备项目。</p></article>
             <article><h3>共享 Bot 历史</h3><div><p>带签名和因果依赖的 DAG 同步 Bot 聊天、设置、任务阶段和结果。项目、依赖、登录与原生 SDK 状态不会自动迁移，完整逐字进度不作为共享历史保存。</p><a className="text-link" href="/docs/history-sync">了解同步范围 <ArrowRight size={16} aria-hidden="true" /></a></div></article>
             <article><h3>换台电脑继续</h3><p>另一台 Node 先同步，再由你选择“交给这台设备处理”，用共享记录建立本机 Agent 上下文。历史回放不会启动旧工作，断网时仍需核对任务状态。</p></article>
           </div>
@@ -113,11 +113,11 @@ function HomePage() {
         <section className="landing-section landing-start" aria-labelledby="start-title">
           <p className="section-eyebrow">05 / 开始</p>
           <h2 id="start-title">从一台电脑开始。</h2>
-          <p className="section-copy">准备一台支持的 Mac 或 Linux、已安装并登录的 Agent，以及自己的模型服务和项目目录。</p>
+          <p className="section-copy">准备一台支持的 Mac 或 Linux、已安装的 Agent，以及自己的模型服务和项目目录。先从一次对话开始，再添加其他设备。</p>
           <ol className="start-steps" role="list">
-            <li><a href="/docs/install">安装并启动 Node <ArrowUpRight size={16} aria-hidden="true" /></a></li>
-            <li><a href="/docs/node#配置管理-agent">配置 Agent 与可用目录 <ArrowUpRight size={16} aria-hidden="true" /></a></li>
-            <li><a href="/docs/node#创建机器人并处理结果">创建 Bot，交代第一项工作 <ArrowUpRight size={16} aria-hidden="true" /></a></li>
+            <li><a href="/docs/quick-start">快速上手：完成第一次对话 <ArrowUpRight size={16} aria-hidden="true" /></a></li>
+            <li><a href="/docs/onboarding">首次配置：登录 Agent 与加入设备 <ArrowUpRight size={16} aria-hidden="true" /></a></li>
+            <li><a href="/docs/user-guide">日常使用：查看任务与切换电脑 <ArrowUpRight size={16} aria-hidden="true" /></a></li>
           </ol>
           <p className="nightly-note">当前为 Nightly。正式版前不保留协议、数据格式和 API 的向后兼容。<a href="https://github.com/leaperone/vibeface/releases">查看 Nightly Releases <ArrowUpRight size={14} aria-hidden="true" /></a></p>
         </section>
