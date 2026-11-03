@@ -1703,6 +1703,15 @@ impl Runtime {
         let (local, network) = (&self.identity.device_id()?, &network);
         each_device(owned, |owner, entry| async move {
             let _peer_delivery = self.peer_delivery_locks.lock(&owner).await;
+            let now = now_ms();
+            if !self.store.lock().await.mailbox_before_attempt(
+                network,
+                &entry.conversation_id,
+                &entry.trigger,
+                now,
+            )? {
+                return Ok(());
+            }
             let delivered = if owner == *local {
                 self.store
                     .lock()
@@ -1713,22 +1722,58 @@ impl Runtime {
                 let request = json!({"type":"deliver","conversation_id":entry.conversation_id,
                         "trigger":entry.trigger});
                 self.peer_request(network, &owner, request).await
-            }?;
-            ensure!(
-                delivered["receipt"].is_object(),
-                "delivery answer had no receipt"
-            );
-            self.store
-                .lock()
-                .await
-                .remove_outbox(&entry.conversation_id, &entry.trigger)?;
-            self.publish_changed(
-                network,
-                &entry.conversation_id,
-                Changed::Job(&entry.trigger),
-            );
-            self.schedule_wakeup.notify_one();
-            Ok(())
+            };
+            match delivered {
+                Ok(delivered) => {
+                    if let Err(error) = (|| -> Result<()> {
+                        ensure!(
+                            delivered["receipt"].is_object(),
+                            "delivery answer had no receipt"
+                        );
+                        Ok(())
+                    })() {
+                        self.store.lock().await.mailbox_failed(
+                            network,
+                            &entry.conversation_id,
+                            &entry.trigger,
+                            false,
+                            &error.to_string(),
+                            now_ms(),
+                        )?;
+                        return Err(error);
+                    }
+                    let now = now_ms();
+                    self.store.lock().await.mailbox_delivered(
+                        network,
+                        &entry.conversation_id,
+                        &entry.trigger,
+                        now,
+                    )?;
+                    self.store
+                        .lock()
+                        .await
+                        .remove_outbox(&entry.conversation_id, &entry.trigger)?;
+                    self.publish_changed(
+                        network,
+                        &entry.conversation_id,
+                        Changed::Job(&entry.trigger),
+                    );
+                    self.schedule_wakeup.notify_one();
+                    Ok(())
+                }
+                Err(error) => {
+                    let unknown = net::Unanswered::is(&error);
+                    self.store.lock().await.mailbox_failed(
+                        network,
+                        &entry.conversation_id,
+                        &entry.trigger,
+                        unknown,
+                        &error.to_string(),
+                        now_ms(),
+                    )?;
+                    Err(error)
+                }
+            }
         })
         .await;
         Ok(())
@@ -3382,6 +3427,14 @@ mod tests {
             b.deliver_outbox().await?;
             assert!(b.store.lock().await.scheduler_outbox()?.is_empty());
             let trigger = crate::scheduling::message_trigger("m4");
+            assert_eq!(
+                b.store
+                    .lock()
+                    .await
+                    .mailbox_for_test(&network, "c", &trigger)?
+                    .map(|record| record.state),
+                Some(crate::store::mailbox::MailboxState::Delivered)
+            );
             a.store.lock().await.scheduler_job("c", &trigger)?
                 .context("the owner admitted the delivered message")?;
             let again = b.peer_request(&network, &ia.device_id()?,

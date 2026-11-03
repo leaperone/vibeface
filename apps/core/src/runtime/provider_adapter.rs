@@ -59,11 +59,7 @@ impl ScrubbedStderrTail {
 
         let mut bytes = Vec::with_capacity(STDERR_CAPTURE_LIMIT);
         let mut chunk = [0_u8; 4096];
-        loop {
-            let read = match reader.read(&mut chunk).await {
-                Ok(read) => read,
-                Err(_) => break,
-            };
+        while let Ok(read) = reader.read(&mut chunk).await {
             if read == 0 {
                 break;
             }
@@ -74,10 +70,6 @@ impl ScrubbedStderrTail {
             }
         }
         Self::from_bytes(&bytes)
-    }
-
-    pub(super) fn as_str(&self) -> &str {
-        &self.text
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -182,44 +174,6 @@ impl From<ExitStatus> for TerminationEvidence {
     }
 }
 
-/// A local deduplication key for a provider workaround ledger entry.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct WorkaroundKey {
-    pub(super) scope: String,
-    pub(super) reason: String,
-    pub(super) generation: String,
-    pub(super) removal_condition: String,
-}
-
-impl WorkaroundKey {
-    pub(super) fn new(
-        scope: impl Into<String>,
-        reason: impl Into<String>,
-        generation: impl Into<String>,
-        removal_condition: impl Into<String>,
-    ) -> Self {
-        Self {
-            scope: scope.into(),
-            reason: reason.into(),
-            generation: generation.into(),
-            removal_condition: removal_condition.into(),
-        }
-    }
-}
-
-/// The local diagnostic record's deduplication identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct WorkaroundLedgerRecord {
-    pub(super) key: WorkaroundKey,
-    pub(super) first_seen_ms: i64,
-}
-
-impl WorkaroundLedgerRecord {
-    pub(super) fn dedup_key(&self) -> &WorkaroundKey {
-        &self.key
-    }
-}
-
 /// Whether a disconnected provider had an unresolved request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PendingDisconnectClassification {
@@ -252,14 +206,14 @@ mod tests {
             )
             .as_bytes(),
         );
-        assert!(tail.as_str().chars().count() <= STDERR_TAIL_LIMIT);
-        assert!(!tail.as_str().contains("fixture-secret"));
-        assert!(!tail.as_str().contains("/private/path"));
+        assert!(tail.text.chars().count() <= STDERR_TAIL_LIMIT);
+        assert!(!tail.text.contains("fixture-secret"));
+        assert!(!tail.text.contains("/private/path"));
         assert_eq!(tail.safe_error(), Some("authentication_failed"));
     }
 
     #[test]
-    fn termination_evidence_keeps_exit_facts_and_workaround_keys_deduplicate() {
+    fn termination_evidence_keeps_exit_facts() {
         let status = std::process::Command::new("sh")
             .args(["-c", "exit 7"])
             .status()
@@ -267,15 +221,6 @@ mod tests {
         let evidence = TerminationEvidence::from(status);
         assert!(!evidence.success);
         assert_eq!(evidence.code, Some(7));
-
-        let first = WorkaroundKey::new("provider", "stderr", "generation", "restart");
-        let second = WorkaroundKey::new("provider", "stderr", "generation", "restart");
-        assert_eq!(first, second);
-        let record = WorkaroundLedgerRecord {
-            key: first.clone(),
-            first_seen_ms: 1,
-        };
-        assert_eq!(record.dedup_key(), &first);
     }
 
     #[test]

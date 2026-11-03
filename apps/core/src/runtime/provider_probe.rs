@@ -339,7 +339,7 @@ async fn claude_authentication(
     .flatten();
     let termination = status
         .as_ref()
-        .map(|status| TerminationEvidence::from(status.clone()));
+        .map(|status| TerminationEvidence::from(*status));
     let pending = status.is_none() || bytes.is_empty();
     drop(process);
     let tail = finish_stderr(stderr).await;
