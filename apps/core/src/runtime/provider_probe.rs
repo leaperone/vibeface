@@ -52,7 +52,7 @@ impl Runtime {
     fn probe_input(&self, provider: Provider, local: &providers::Local) -> ProbeInput {
         ProbeInput {
             bin: local.bin(provider),
-            env: local.env.get(provider).clone(),
+            env: local.launch_env(provider),
             server: provider
                 .on_app_server()
                 .then(|| local.switches.codex_app_server.clone()),
@@ -94,6 +94,7 @@ impl Runtime {
         local: &providers::Local,
     ) -> anyhow::Result<String> {
         let server = &local.switches.codex_app_server;
+        let env = local.launch_env(provider);
         let launch = if provider.on_app_server() && server.mode == AppServerMode::System {
             LaunchIdentity::System {
                 socket: server.socket.as_deref(),
@@ -101,7 +102,7 @@ impl Runtime {
         } else {
             LaunchIdentity::Process {
                 bin: local.bin(provider),
-                env: local.env.get(provider),
+                env: &env,
             }
         };
         self.identity
@@ -518,22 +519,25 @@ fn prerequisites(provider: Provider, local: &providers::Local) -> Option<ProbeIs
         return None;
     }
     let bin = local.bin(provider);
-    if !crate::discovery::runnable(&bin, std::env::var_os("PATH").as_ref()) {
+    let env = local.launch_env(provider);
+    let path = env
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| crate::discovery::Host::current().path);
+    if !crate::discovery::runnable(&bin, path.as_ref()) {
         return Some(ProbeIssue::new(
             ProbeStage::Install,
             ProbeCode::NotInstalled,
         ));
     }
-    let configured = local.env.get(provider);
-    let Ok(required) = provider.key_variables(configured) else {
+    let Ok(required) = provider.key_variables(&env) else {
         return Some(ProbeIssue::new(
             ProbeStage::Launch,
             ProbeCode::ConfigInvalid,
         ));
     };
     if required.iter().any(|name| {
-        !configured.contains_key(name)
-            && std::env::var_os(name).is_none_or(|value| value.is_empty())
+        !env.contains_key(name) && std::env::var_os(name).is_none_or(|value| value.is_empty())
     }) {
         return Some(ProbeIssue::new(
             ProbeStage::Authentication,
@@ -622,9 +626,15 @@ mod tests {
         }
         let with_node = node.provider_generation(provider, &nvm)?;
         assert_ne!(before_node, with_node);
-        assert_eq!(node.probe_input(provider, &nvm).env, nvm.launch_env(provider));
+        assert_eq!(
+            node.probe_input(provider, &nvm).env,
+            nvm.launch_env(provider)
+        );
         let effective_path = nvm.launch_env(provider)["PATH"].clone();
-        nvm.env.apply(provider, BTreeMap::from([("PATH".into(), Some(effective_path))]))?;
+        nvm.env.apply(
+            provider,
+            BTreeMap::from([("PATH".into(), Some(effective_path))]),
+        )?;
         assert_eq!(node.provider_generation(provider, &nvm)?, with_node);
         nvm.bins.remove(&provider);
         assert!(prerequisites(provider, &nvm).is_none());
