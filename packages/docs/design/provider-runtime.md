@@ -49,7 +49,7 @@ Bot 模型和执行任务默认模型是两个独立设置。执行任务在 Nod
 
 Codex 默认使用 Node-owned `<data-dir>/providers/codex`、sessions 和 hook 根，并由 Node 启动独立 App Server。Claude 使用 Node-owned `CLAUDE_CONFIG_DIR`、transcript 和 hook 根。Codex system 只有通过显式 socket 才接入外部服务，并共享该服务的会话。pi 只固定 `<data-dir>/providers/pi/sessions`，保留本机认证配置。OpenCode 使用 `<data-dir>/providers/opencode` 中的私有 XDG 数据、配置、状态和缓存，强制数据库与配置目录；外部 config override 和项目配置不参与该服务。启动和 session Shell 环境使用相同根。
 
-Codex 通过只读账户和模型接口检查，Claude Code 通过无 prompt 的登录状态命令检查，pi 通过无会话、无工具的 RPC 提供模型建议。Cursor 和 opencode 缺少已核实的账户查询时显示未确认。目录不完整时保留手填模型，不因某个模型未出现在列表中而阻止发送。
+Codex 通过只读账户和模型接口检查，Claude Code 通过无 prompt 的登录状态命令检查，pi 通过无会话、无工具的 RPC 提供模型建议。Cursor 通过 SDK bridge 的 `Me` 和 `ListModels` 分别检查账户与模型目录，不创建 Agent 或发送模型请求。OpenCode 缺少已核实的账户查询时显示未确认。目录不完整时保留手填模型，不因某个模型未出现在列表中而阻止发送。
 
 每轮提交模型与推理档位，并记录配置 generation 和会话 lineage。未指定模型时，实际模型保持未知。Codex、Claude Code 和 pi 的原生压缩事件更新 lineage。没有原生压缩的服务在上下文超过有界输入时交接新会话，摘要、决策、最近消息和 open work 仍来自 DAG。
 
