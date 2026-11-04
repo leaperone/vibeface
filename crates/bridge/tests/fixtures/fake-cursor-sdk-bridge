@@ -142,6 +142,8 @@ class Bridge(BaseHTTPRequestHandler):
             if mode == "timeout":
                 time.sleep(10)
             if mode == "malformed":
+                return self.answer(200, b'{"items":[{"id":"composer-2","displayName":42}]}')
+            if mode == "id_only":
                 return self.answer(200, b'{"items":[{"id":"composer-2"}]}')
             if mode == "oversize":
                 return self.answer(200, b'{"items":[{"id":"composer-2","displayName":"' + b"x" * 65536 + b'"}]}')

@@ -687,10 +687,13 @@ async fn provider_observation_reads_metadata_without_an_agent_turn() {
     let requests = root.join("requests.log");
     let (bridge, observation) = provider_observation_fixture(
         &root,
-        BTreeMap::from([(
-            "FAKE_BRIDGE_REQUEST_LOG".into(),
-            requests.display().to_string(),
-        )]),
+        BTreeMap::from([
+            (
+                "FAKE_BRIDGE_REQUEST_LOG".into(),
+                requests.display().to_string(),
+            ),
+            ("FAKE_BRIDGE_MODELS".into(), "id_only".into()),
+        ]),
     )
     .await
     .unwrap();
@@ -700,7 +703,7 @@ async fn provider_observation_reads_metadata_without_an_agent_turn() {
     );
     assert!(matches!(
         observation.catalog,
-        SdkCatalog::Available { ref models } if models.iter().any(|model| model.id == "composer-2")
+        SdkCatalog::Available { ref models } if models.iter().any(|model| model.id == "composer-2" && model.display_name == "composer-2")
     ));
     let calls = std::fs::read_to_string(&requests).unwrap();
     assert!(calls.contains("Me") && calls.contains("ListModels"));
