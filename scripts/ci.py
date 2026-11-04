@@ -4,12 +4,14 @@
 import argparse
 import datetime
 import fnmatch
+import http.client
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import tempfile
+import urllib.request
 
 
 PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi", "vibeface-delivery")
@@ -59,6 +61,29 @@ PLATFORMS = (
     {"runner": "macos-15", "target": "aarch64-apple-darwin"},
 )
 JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
+LOCAL_PROCESS_RULES = (
+    ("memory-sync", ("apps/core/src/store/bot_settings.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs", "apps/core/src/store/sync.rs", "apps/core/src/agent_context.rs", "apps/core/src/identity*", "crates/secure/*")),
+    ("auto-route", ("apps/core/src/identity*", "apps/core/src/crypto.rs", "apps/core/src/local_access.rs", "apps/core/src/net*", "crates/secure/*", "crates/control/*")),
+    ("default", ("apps/core/src/net*", "apps/core/src/discovery.rs", "apps/core/src/runtime/peers.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/log.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/fetch.rs", "apps/core/src/identity*", "crates/secure/*")),
+    ("phase1", ("apps/core/src/manager.rs", "apps/core/src/schedul*", "apps/core/src/work.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/followup.rs", "apps/core/src/runtime/schedule_delivery.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/store/work.rs", "apps/core/src/store/scheduler.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs")),
+    ("chat-agent", ("crates/bridge/*", "crates/control/*", "apps/cli/*", "apps/core/src/runtime/codex_server.rs", "apps/core/src/runtime/claude.rs", "apps/core/src/runtime/pi.rs", "apps/core/src/runtime/opencode.rs", "apps/core/src/runtime/provider_adapter.rs", "apps/core/src/runtime/provider_probe.rs", "apps/core/src/runtime/agent_tools.rs", "apps/core/src/runtime/chat_controls.rs", "apps/core/src/runtime/executor.rs", "apps/core/src/runtime/observation.rs", "apps/core/src/runtime/triage.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/followup.rs", "apps/core/src/runtime/bots.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/agent_context.rs", "apps/core/src/providers.rs", "apps/core/src/triage.rs", "apps/core/src/tools.rs", "apps/core/src/work.rs", "apps/core/src/manager.rs", "apps/core/src/control.rs", "apps/core/src/store/triage.rs", "apps/core/src/store/questions.rs", "apps/core/src/store/work.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/bots.rs")),
+    ("phase4", ("crates/bridge/*", "crates/control/*", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/agent_tools.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/work.rs", "apps/core/src/tools.rs", "apps/core/src/store/work.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/bots.rs", "apps/core/src/identity*", "apps/core/src/fetch.rs")),
+    ("public-entry", ("apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/identity*", "apps/core/src/local_access.rs", "apps/core/src/crypto.rs", "crates/control/*")),
+    ("discovery", ("apps/core/src/discovery.rs", "apps/core/src/net*", "apps/core/src/runtime/peers.rs")),
+    ("phase5", ("apps/core/src/store/*", "apps/core/src/identity*", "apps/core/src/maintenance.rs", "apps/core/src/logging.rs", "crates/control/*", "crates/secure/src/recovery.rs")),
+    ("delivery-charity", PATH_RULES[0][1]),
+)
+
+
+def local_process_modes(paths, full):
+    ordinary = {mode for mode, _ in LOCAL_PROCESS_RULES if mode != "delivery-charity"}
+    selected = {mode for mode, _ in LOCAL_PROCESS_RULES} if full else set()
+    for path in paths:
+        matched = {mode for mode, patterns in LOCAL_PROCESS_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)}
+        selected.update(matched)
+        if not matched & ordinary and (path.startswith(("apps/core/", "apps/cli/", "crates/")) or any(fnmatch.fnmatchcase(path, pattern) for scope, patterns in PATH_RULES if scope == "node" for pattern in patterns)):
+            selected.update(ordinary)
+    return [mode for mode, _ in LOCAL_PROCESS_RULES if mode in selected]
 
 
 def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly"):
@@ -67,7 +92,8 @@ def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly")
         scopes.add(next((scope for scope, patterns in PATH_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)), "full"))
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in WWW_PATHS):
             scopes.add("www")
-    return dict(scope_plan(scopes, event, ref_type, channel), changed_files=len(paths))
+    plan = scope_plan(scopes, event, ref_type, channel)
+    return dict(plan, changed_files=len(paths), local_process_modes=local_process_modes(paths, plan["full"]))
 
 
 def scope_plan(scopes, event, ref_type, channel):
@@ -143,27 +169,78 @@ def changed_paths(base, head, event, cwd=None):
     return [os.fsdecode(path) for path in git("diff", "--name-only", "--no-renames", "-z", base, head, cwd=cwd).split(b"\0") if path]
 
 
+def automatic_main_push(event):
+    return os.environ.get("GITHUB_ACTIONS") == "true" and event == "push" and os.environ.get("GITHUB_EVENT_NAME") == "push" and os.environ.get("GITHUB_REF") == "refs/heads/main"
+
+
+def successful_push_base(head):
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    token = os.environ.get("GH_TOKEN")
+    current_run = os.environ.get("GITHUB_RUN_ID", "")
+    if not token or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) or not current_run.isdigit():
+        return None
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repository}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100",
+        headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}", "X-GitHub-Api-Version": "2022-11-28"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            runs = json.load(response)["workflow_runs"]
+        if not isinstance(runs, list):
+            raise ValueError("Invalid workflow runs")
+        for run in runs:
+            if not isinstance(run, dict):
+                raise ValueError("Invalid workflow run")
+            if (run["repository"]["full_name"] != repository or run["path"] != ".github/workflows/ci.yml"
+                    or run["head_branch"] != "main" or run["event"] != "push"
+                    or run["status"] != "completed" or run["conclusion"] != "success"):
+                continue
+            if type(run["id"]) is not int or run["id"] <= 0 or not isinstance(run["head_sha"], str) or not re.fullmatch(r"[0-9a-f]{40}", run["head_sha"]):
+                raise ValueError("Invalid successful workflow run identity")
+            if run["id"] == int(current_run) or run["head_sha"] == head:
+                continue
+            git("merge-base", "--is-ancestor", run["head_sha"], head)
+            return run["head_sha"], run["id"]
+    except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
+        return None
+    return None
+
+
 def event_plan(args):
     event = args.event or os.environ.get("GITHUB_EVENT_NAME", "pull_request")
     ref_type = os.environ.get("GITHUB_REF_TYPE", "branch")
     payload_path = os.environ.get("GITHUB_EVENT_PATH")
     payload = json.loads(Path(payload_path).read_text()) if payload_path else {}
     base, head = args.base, args.head
+    reason, baseline_run = "event-range", None
+    forced = event in {"schedule", "workflow_dispatch", "merge_group"} or ref_type == "tag"
     if not base and event == "pull_request":
         pr = payload["pull_request"]
         base, head = pr["base"]["sha"], pr["head"]["sha"]
+    elif not base and automatic_main_push(event):
+        head = os.environ["GITHUB_SHA"]
+        if payload.get("after") != head:
+            raise ValueError("Push payload differs from the current commit")
+        baseline = successful_push_base(head)
+        base, baseline_run = baseline if baseline else (None, None)
+        reason = "successful-main-push" if baseline else "no-trusted-main-push"
     elif not base and event == "push":
         base, head = payload.get("before"), payload.get("after")
-    forced = event in {"schedule", "workflow_dispatch", "merge_group"} or ref_type == "tag"
+    known_range = bool(base and head and set(base) != {"0"})
+    head = git("rev-parse", "--verify", "--end-of-options", f"{head or 'HEAD'}^{{commit}}").decode().strip()
     if forced:
-        paths = []
-    elif not base or not head or set(base) == {"0"}:
-        paths = ["__unknown_build_inputs__"]
+        paths, base, reason = [], None, "full-event"
+    elif not known_range:
+        paths, base = ["__unknown_build_inputs__"], None
+        if reason != "no-trusted-main-push":
+            reason = "unknown-range"
     else:
+        base = git("rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}").decode().strip()
         paths = changed_paths(base, head, event)
     metadata = release_metadata(ref_type, os.environ.get("GITHUB_REF_NAME", ""))
     plan = make_plan(paths, event, ref_type, metadata["channel"])
     plan.update(metadata)
+    plan.update(coverage_base=base, coverage_head=head, coverage_reason=reason, baseline_run_id=baseline_run)
     return plan
 
 
@@ -213,6 +290,7 @@ def write_plan(plan, output=None):
         with open(summary, "a") as destination:
             destination.write(
                 "### Selected CI coverage\n\n"
+                f"- Frozen range: {plan['coverage_base'] or 'full coverage'} .. {plan['coverage_head']} ({plan['coverage_reason']})\n"
                 f"- Changed paths: {plan['changed_files']}\n"
                 f"- Full workspace scope: {plan['full']}\n"
                 f"- Coverage tier: {'extended' if plan['extended'] else 'core'}\n"
@@ -221,7 +299,46 @@ def write_plan(plan, output=None):
                 f"- Test tiers: {', '.join(plan['test_tiers']) or 'none'}\n"
                 f"- Package acceptance: {plan['package_mode'] if plan['web'] else 'none'}\n"
                 f"- Required jobs: {', '.join(plan['required_jobs'])}\n"
+                "\nLocal process checks to run separately, using current CLI/Core and JS/WASM paths:\n\n"
             )
+            for mode in plan["local_process_modes"]:
+                flag = "" if mode == "default" else f" --{mode}"
+                if mode == "delivery-charity":
+                    flag += ' --delivery-probe "$probe"'
+                destination.write(f'- `python3 scripts/verify-node.py --binary "$binary" --core-binary "$core" --crypto-module "$crypto" --artifacts .artifacts/local-{mode}{flag}`\n')
+            if not plan["local_process_modes"]:
+                destination.write("- None for these paths.\n")
+
+
+def frozen_plan(plan):
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        if plan["event"] != os.environ.get("GITHUB_EVENT_NAME") or plan["ref_type"] != os.environ.get("GITHUB_REF_TYPE") or plan["coverage_head"] != os.environ.get("GITHUB_SHA"):
+            raise ValueError("CI plan differs from the current event or commit")
+    head, base, reason = plan["coverage_head"], plan["coverage_base"], plan["coverage_reason"]
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head) or git("rev-parse", "HEAD").decode().strip() != head:
+        raise ValueError("CI coverage must use the checked-out commit")
+    forced = plan["event"] in {"schedule", "workflow_dispatch", "merge_group"} or plan["ref_type"] == "tag"
+    if forced:
+        if base is not None or reason != "full-event" or plan["baseline_run_id"] is not None:
+            raise ValueError("Invalid full-event coverage")
+        paths = []
+    elif base is None:
+        if reason not in {"no-trusted-main-push", "unknown-range"} or plan["baseline_run_id"] is not None:
+            raise ValueError("Invalid full coverage fallback")
+        paths = ["__unknown_build_inputs__"]
+    else:
+        if not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base):
+            raise ValueError("CI coverage requires a fixed base commit")
+        if automatic_main_push(plan["event"]):
+            if reason != "successful-main-push" or type(plan["baseline_run_id"]) is not int or plan["baseline_run_id"] <= 0 or base == head:
+                raise ValueError("Invalid successful main push baseline")
+            git("merge-base", "--is-ancestor", base, head)
+        elif reason != "event-range" or plan["baseline_run_id"] is not None:
+            raise ValueError("Invalid event coverage range")
+        paths = changed_paths(base, head, plan["event"])
+    if automatic_main_push(plan["event"]) and reason not in {"successful-main-push", "no-trusted-main-push"}:
+        raise ValueError("Main push coverage requires a successful ancestor or full fallback")
+    return make_plan(paths, plan["event"], plan["ref_type"], plan["channel"])
 
 
 def gate(needs, plan=None, delivery_live=False):
@@ -229,9 +346,13 @@ def gate(needs, plan=None, delivery_live=False):
         raise ValueError("CI plan did not succeed")
     if plan is None:
         plan = json.loads(needs["plan"]["outputs"]["plan"])
-    expected = scope_plan(
-        set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"]
-    )
+    if "coverage_head" in plan or os.environ.get("GITHUB_ACTIONS") == "true":
+        try:
+            expected = frozen_plan(plan)
+        except (KeyError, TypeError, subprocess.CalledProcessError) as error:
+            raise ValueError("Invalid frozen CI coverage") from error
+    else:
+        expected = scope_plan(set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"])
     if any(plan.get(key) != value for key, value in expected.items()):
         raise ValueError("Required coverage differs from the selected CI scope and scenario")
     if delivery_live and plan["event"] != "workflow_dispatch":
@@ -295,6 +416,7 @@ def self_test():
     assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
     assert web["package_mode"] == "web" and web["package_matrix"]["include"] == list(PLATFORMS[:1])
     assert make_plan(["apps/app/src/content.md"])["web"]
+    assert web["local_process_modes"] == []
     www = make_plan(["apps/www/src/routes/index.tsx"])
     assert www["www"] and not www["web"] and not www["rust_packages"]
     assert www["required_jobs"] == ["quick-check", "www"]
@@ -303,6 +425,30 @@ def self_test():
     assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-secure-ffi"]
     docs = make_plan(["README.md", "packages/docs/node.md"])
     assert docs["docs_only"] and docs["www"] and docs["required_jobs"] == ["quick-check", "www"]
+    assert docs["local_process_modes"] == [] and www["local_process_modes"] == []
+    assert make_plan(["apps/core/src/store/bot_settings.rs"])["local_process_modes"] == ["memory-sync", "phase5"]
+    assert make_plan(["apps/core/src/agent_context.rs"])["local_process_modes"] == ["memory-sync", "chat-agent"]
+    assert make_plan(["apps/core/src/providers.rs"])["local_process_modes"] == ["chat-agent"]
+    assert make_plan(["apps/core/src/store/mailbox.rs"])["local_process_modes"] == ["default", "phase1", "chat-agent", "phase4", "phase5"]
+    for path, modes in (
+        ("apps/core/src/store/reduce.rs", ["memory-sync", "phase1", "phase5"]),
+        ("apps/core/src/store/log.rs", ["memory-sync", "default", "phase1", "phase5"]),
+        ("apps/core/src/store/sync.rs", ["memory-sync", "default", "phase4", "phase5"]),
+        ("apps/core/src/identity.rs", ["memory-sync", "auto-route", "default", "phase4", "public-entry", "phase5"]),
+        ("apps/core/src/net.rs", ["auto-route", "default", "phase4", "public-entry", "discovery", "delivery-charity"]),
+        ("apps/core/src/runtime/peers.rs", ["default", "phase4", "public-entry", "discovery", "delivery-charity"]),
+        ("apps/core/src/runtime/codex_server.rs", ["chat-agent"]),
+        ("crates/secure/src/recovery.rs", ["memory-sync", "auto-route", "default", "phase5"]),
+        ("crates/bridge/src/codex.rs", ["chat-agent", "phase4"]),
+        ("crates/control/src/lib.rs", ["auto-route", "chat-agent", "phase4", "public-entry", "phase5"]),
+    ):
+        assert make_plan([path])["local_process_modes"] == modes, path
+    combined = make_plan(["apps/core/src/store/bot_settings.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/bot_settings.rs"])
+    assert combined["local_process_modes"] == ["memory-sync", "default", "phase1", "chat-agent", "phase4", "phase5"]
+    for path in ("apps/core/src/store.rs", "apps/core/src/model.rs", "apps/core/new-module.rs", "apps/core/src/runtime/new-module.rs", "crates/protocol/src/lib.rs"):
+        assert make_plan([path])["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-entry", "discovery", "phase5"]
+    assert make_plan(["Cargo.lock"])["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-entry", "discovery", "phase5", "delivery-charity"]
+    assert make_plan(["apps/core/src/delivery/charity.rs"])["local_process_modes"][-1] == "delivery-charity"
     expected = {
         "node": ["vibeface-core"],
         "bridge": ["vibeface-bridge", "vibeface-core", "vibeface-control", "vibeface"],
@@ -370,9 +516,11 @@ def self_test():
     broken = json.loads(json.dumps(www_needs))
     del broken["www"]
     expect_failure(lambda: gate(broken))
-    broken = json.loads(json.dumps(needs))
-    broken["rust-slow"]["result"] = "failure"
-    expect_failure(lambda: gate(broken))
+    for result in ("failure", "cancelled"):
+        broken = json.loads(json.dumps(needs))
+        broken["rust-slow"]["result"] = result
+        expect_failure(lambda: gate(broken))
+    gate({job: value for job, value in needs.items() if job != "rust-slow"})
     weakened = dict(web, required_jobs=["quick-check"])
     expect_failure(lambda: gate(needs, weakened))
     ready = make_plan([], "workflow_dispatch")
@@ -431,6 +579,7 @@ def self_test():
         paths = changed_paths(base, "HEAD", "pull_request", cwd=directory)
         assert set(paths) == {"README.md", "apps/core/src/old.rs", "apps/app/old.rs"}
         assert make_plan(paths)["rust_packages"] == ["vibeface-core"]
+        assert make_plan(paths)["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-entry", "discovery", "phase5"]
         pr_head = git("rev-parse", "HEAD", cwd=directory).decode().strip()
         git("checkout", "--quiet", "--detach", base, cwd=directory)
         upstream = Path(directory) / "docs/upstream.md"
@@ -443,14 +592,16 @@ def self_test():
         event_file = Path(directory) / "event.json"
         arguments = argparse.Namespace(event=None, base=new_base, head=pr_head)
         environment = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF_TYPE": "branch", "GITHUB_EVENT_PATH": str(event_file)}
-        with patch.dict(os.environ, environment), patch(f"{__name__}.changed_paths", return_value=paths) as diff, patch(f"{__name__}.release_metadata", return_value={"channel": "nightly"}):
+        fixture_git = git
+        with patch.dict(os.environ, environment), patch(f"{__name__}.git", side_effect=lambda *args, **kwargs: fixture_git(*args, cwd=directory)), patch(f"{__name__}.changed_paths", return_value=paths) as diff, patch(f"{__name__}.release_metadata", return_value={"channel": "nightly"}):
             for draft in (True, False):
                 event_file.write_text(json.dumps({"pull_request": {"base": {"sha": new_base}, "head": {"sha": pr_head}, "draft": draft}}))
                 arguments.base = None
                 selected = event_plan(arguments)
                 diff.assert_called_with(new_base, pr_head, "pull_request")
-                assert selected == make_plan(paths)
+                assert selected == dict(make_plan(paths), coverage_base=new_base, coverage_head=pr_head, coverage_reason="event-range", baseline_run_id=None)
                 assert selected["test_tiers"] == ["fast"]
+        coverage_self_test(directory, base, new_base)
         for version, channel in (("1.2.3", "stable"), ("1.2.3-rc.2", "rc"), ("1.2.3-nightly.20261019.1", "nightly")):
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
             with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)), patch(f"{__name__}.git") as ancestor:
@@ -472,6 +623,11 @@ def self_test():
                 ["cargo", "+1.89", "check", "--locked", "-p", "vibeface", "-p", "vibeface-core", "-p", "vibeface-control"],
             ] if check_msrv else [])
     root = Path(__file__).resolve().parent.parent
+    workflow = (root / ".github/workflows/ci.yml").read_text()
+    concurrency = workflow.split("concurrency:\n", 1)[1].split("\npermissions:", 1)[0]
+    assert "(github.event_name == 'workflow_dispatch' || github.run_attempt > 1) && github.run_id || ''" in concurrency
+    assert "cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == 1 }}" in concurrency
+    assert "fetch-depth: 0" in workflow.split("\n  ci-gate:\n", 1)[1]
     subprocess.run(["python3", str(root / "scripts/build-inputs.py"), "self-test"], check=True)
     config = (root / "crates/control/src/lib.rs").read_text()
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
@@ -479,6 +635,72 @@ def self_test():
     release_privacy_test(root, scratch)
     gatekeeper_test(root, scratch)
     print("CI selector, event, test partition, check commands, rename/delete, gate and installer epoch self-tests passed")
+
+
+def coverage_self_test(directory, base, nonancestor):
+    import io
+    from unittest.mock import patch
+
+    event_file = Path(directory) / "event.json"
+    event_file.unlink(missing_ok=True)
+
+    def commit(message):
+        git("add", "-A", cwd=directory)
+        git("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "-c", "user.name=CI self-test", "-c", "user.email=ci@example.invalid", "commit", "--quiet", "-m", message, cwd=directory)
+        return git("rev-parse", "HEAD", cwd=directory).decode().strip()
+
+    git("checkout", "--quiet", "--detach", base, cwd=directory)
+    (Path(directory) / "apps/core/src/old.rs").write_text("changed Rust input\n")
+    rust_head = commit("Rust change A")
+    (Path(directory) / "README.md").write_text("docs change B\n")
+    head = commit("docs change B")
+    event_file.write_text(json.dumps({"before": rust_head, "after": head}))
+    environment = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "push", "GITHUB_REF_TYPE": "branch", "GITHUB_REF": "refs/heads/main", "GITHUB_SHA": head, "GITHUB_REPOSITORY": "fixture/vibeface", "GITHUB_RUN_ID": "50", "GH_TOKEN": "fixture-token", "GITHUB_EVENT_PATH": str(event_file)}
+    args = argparse.Namespace(event=None, base=None, head=None)
+    successful = {"id": 7, "repository": {"full_name": "fixture/vibeface"}, "path": ".github/workflows/ci.yml", "head_branch": "main", "head_sha": base, "event": "push", "status": "completed", "conclusion": "success"}
+    fixture_git = git
+    with patch.dict(os.environ, environment), patch(f"{__name__}.git", side_effect=lambda *args, **kwargs: fixture_git(*args, cwd=directory)), patch(f"{__name__}.release_metadata", return_value={"channel": "nightly"}):
+        runs = [dict(successful, id=8, head_sha=rust_head, conclusion="cancelled"), dict(successful, id=9, head_sha=rust_head, conclusion="skipped"), successful]
+        with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps({"workflow_runs": runs}).encode())) as query:
+            cumulative = event_plan(args)
+            assert cumulative["coverage_base"] == base and cumulative["coverage_head"] == head and cumulative["baseline_run_id"] == 7
+            assert cumulative["scopes"] == ["docs", "node"] and cumulative["rust_packages"] == ["vibeface-core"]
+            assert cumulative["test_tiers"] == ["fast"] and not cumulative["extended"]
+            request = query.call_args.args[0]
+            assert request.full_url == "https://api.github.com/repos/fixture/vibeface/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100"
+            assert request.get_header("Authorization") == "Bearer fixture-token"
+        with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps({"workflow_runs": [dict(successful, head_sha=rust_head)]}).encode())):
+            narrowed = event_plan(args)
+            assert narrowed["coverage_base"] == rust_head and narrowed["scopes"] == ["docs"]
+            assert narrowed["required_jobs"] == ["quick-check"] and narrowed["local_process_modes"] == []
+        with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps({"workflow_runs": [dict(successful, head_sha=head)]}).encode())):
+            assert successful_push_base(rust_head) is None
+        cases = [[], [dict(successful, head_sha=nonancestor)], [dict(successful, head_sha=head)], [dict(successful, id=50)], [dict(successful, head_sha="bad-sha")], [dict(successful, event="workflow_dispatch")], [dict(successful, head_branch="feature")], [dict(successful, repository={"full_name": "other/repo"})], [dict(successful, path=".github/workflows/release.yml")], [dict(successful, status="in_progress")], [{}], None]
+        for runs in cases:
+            with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps({"workflow_runs": runs}).encode())):
+                fallback = event_plan(args)
+                assert fallback["coverage_base"] is None and fallback["coverage_reason"] == "no-trusted-main-push"
+                assert fallback["rust_packages"] == list(PACKAGES) and fallback["test_tiers"] == ["fast"]
+        for response in (OSError("API unavailable"), http.client.IncompleteRead(b""), urllib.error.HTTPError("https://api.github.com", 401, "unauthorized", {}, None), io.BytesIO(b"invalid JSON")):
+            with patch("urllib.request.urlopen", **({"side_effect": response} if isinstance(response, Exception) else {"return_value": response})):
+                assert event_plan(args)["rust_packages"] == list(PACKAGES)
+        with patch.dict(os.environ, {"GH_TOKEN": ""}), patch("urllib.request.urlopen", side_effect=AssertionError("No token must not query the API")):
+            assert event_plan(args)["coverage_base"] is None
+            assert event_plan(args)["full"]
+        needs = {job: {"result": "success" if job in cumulative["required_jobs"] else "skipped"} for job in JOBS}
+        needs["plan"] = {"result": "success"}
+        with patch("urllib.request.urlopen", side_effect=AssertionError("Gate must not query a later baseline")):
+            gate(needs, cumulative)
+            for altered in (dict(cumulative, coverage_head=rust_head), dict(cumulative, coverage_base=head), dict(cumulative, coverage_base=nonancestor), dict(cumulative, coverage_base=None), dict(cumulative, scopes=["docs"]), dict(cumulative, required_jobs=["quick-check"]), dict(cumulative, event="workflow_dispatch"), dict(cumulative, local_process_modes=[])):
+                expect_failure(lambda: gate(needs, altered))
+            gate({"plan": {"result": "success"}, **{job: {"result": "success"} for job in JOBS}}, fallback)
+            for event in ("schedule", "workflow_dispatch", "merge_group"):
+                with patch.dict(os.environ, {"GITHUB_EVENT_NAME": event}):
+                    selected = event_plan(argparse.Namespace(event=None, base=None, head=None))
+                    assert selected["full"] and selected["coverage_reason"] == "full-event"
+            explicit = event_plan(argparse.Namespace(event="push", base=rust_head, head=head))
+            assert explicit["scopes"] == ["docs"] and explicit["coverage_reason"] == "event-range"
+    print("Cumulative push coverage, API fallback and frozen gate self-tests passed")
 
 
 def gatekeeper_test(root, scratch):
@@ -668,7 +890,9 @@ def main():
             command.add_argument("--msrv", help="also check the declared minimum Rust version")
     args = parser.parse_args()
     if args.self_test:
-        self_test()
+        from unittest.mock import patch
+        with patch.dict(os.environ, {key: value for key, value in os.environ.items() if not key.startswith("GITHUB_") and key != "GH_TOKEN"}, clear=True):
+            self_test()
     elif args.command == "plan":
         write_plan(event_plan(args), args.github_output)
     elif args.command == "gate":
