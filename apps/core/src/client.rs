@@ -1536,7 +1536,6 @@ struct PendingJoin {
     pinned: Option<(String, String, String)>,
 }
 
-/// The joining Node's side of `vibeface/join/1`, through the ticket and configured relays.
 struct JoinLink {
     net: Arc<Net>,
     entry: String,
