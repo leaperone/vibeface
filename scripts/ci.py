@@ -625,8 +625,8 @@ def self_test():
     root = Path(__file__).resolve().parent.parent
     workflow = (root / ".github/workflows/ci.yml").read_text()
     concurrency = workflow.split("concurrency:\n", 1)[1].split("\npermissions:", 1)[0]
-    assert "github.event_name == 'workflow_dispatch' && github.run_id || ''" in concurrency
-    assert "cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}" in concurrency
+    assert "(github.event_name == 'workflow_dispatch' || github.run_attempt > 1) && github.run_id || ''" in concurrency
+    assert "cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == 1 }}" in concurrency
     assert "fetch-depth: 0" in workflow.split("\n  ci-gate:\n", 1)[1]
     subprocess.run(["python3", str(root / "scripts/build-inputs.py"), "self-test"], check=True)
     config = (root / "crates/control/src/lib.rs").read_text()
