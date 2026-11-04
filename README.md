@@ -164,6 +164,16 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 
 完整说明运行 `vibeface --help`，或见 [安装与 CLI 管理](packages/docs/install.md)。
 
+### 公共发现服务
+
+Vibeface 提供可选的公共发现服务，帮助 Node 查询地址和尝试直连：
+
+```text
+vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@discovery.vibeface.dev:4792
+```
+
+服务不会默认启用，也不提供网页入口或业务中继。首次初始化可使用 `--discovery`；已有节点的配置方法、可见元数据和连接限制见[使用公共发现服务](packages/docs/node.md#使用公共发现服务)。加入个人网络仍需邀请和批准。
+
 ### 公网部署
 
 有公网地址的服务器有两种用法。用 `init --public-entry` 运行公共入口，本地 Node 用 `--entry` 指向它。或者作为成员用 `init --relay-listen` 为个人网络运行 relay，其他 Node 用 `--relay` 指向它。见 [配置公共入口](packages/docs/node.md#配置公共入口) 和 [Node 之间的连接](packages/docs/node.md#node-之间的连接)。
