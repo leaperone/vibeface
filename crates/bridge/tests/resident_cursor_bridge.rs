@@ -8,7 +8,7 @@ use std::{
 use tokio::sync::watch;
 use vibeface_bridge::agent::{
     AgentFailure, AgentRunError, NativeStatus, SdkBridge, SdkCatalog, SdkProviderAuthentication,
-    SdkTurn, StartEvidence, ToolCallbackConfig,
+    SdkProviderObservation, SdkTurn, StartEvidence, ToolCallbackConfig,
 };
 use vibeface_bridge::failure::FailureKind;
 
@@ -77,6 +77,32 @@ async fn reply(
         .await
         .map(|result| result.output);
     (result, started.elapsed())
+}
+
+async fn provider_observation_fixture(
+    root: &Path,
+    env: BTreeMap<String, String>,
+) -> anyhow::Result<(SdkBridge, SdkProviderObservation)> {
+    let executable =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cursor-sdk-bridge");
+    let bridge = SdkBridge::new(
+        BTreeMap::new(),
+        ToolCallbackConfig {
+            url: "http://127.0.0.1:9".into(),
+            auth_token: "fixture-callback-token-".repeat(2),
+        },
+        Some(root.join("bridge.pid")),
+    )?;
+    let observation = bridge
+        .provider_observation(
+            &executable,
+            &root.join("workspace"),
+            &root.join("private-probe"),
+            "fixture-api-key",
+            &env,
+        )
+        .await?;
+    Ok((bridge, observation))
 }
 
 #[tokio::test]
@@ -659,30 +685,15 @@ async fn provider_observation_reads_metadata_without_an_agent_turn() {
     ));
     std::fs::create_dir_all(&root).unwrap();
     let requests = root.join("requests.log");
-    let executable =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cursor-sdk-bridge");
-    let bridge = SdkBridge::new(
-        BTreeMap::new(),
-        ToolCallbackConfig {
-            url: "http://127.0.0.1:9".into(),
-            auth_token: "fixture-callback-token-".repeat(2),
-        },
-        Some(root.join("bridge.pid")),
+    let (bridge, observation) = provider_observation_fixture(
+        &root,
+        BTreeMap::from([(
+            "FAKE_BRIDGE_REQUEST_LOG".into(),
+            requests.display().to_string(),
+        )]),
     )
+    .await
     .unwrap();
-    let observation = bridge
-        .provider_observation(
-            &executable,
-            &root.join("workspace"),
-            &root.join("private-probe"),
-            "fixture-api-key",
-            &BTreeMap::from([(
-                "FAKE_BRIDGE_REQUEST_LOG".into(),
-                requests.display().to_string(),
-            )]),
-        )
-        .await
-        .unwrap();
     assert_eq!(
         observation.authentication,
         SdkProviderAuthentication::Authenticated
@@ -693,9 +704,210 @@ async fn provider_observation_reads_metadata_without_an_agent_turn() {
     ));
     let calls = std::fs::read_to_string(&requests).unwrap();
     assert!(calls.contains("Me") && calls.contains("ListModels"));
-    assert!(!calls.lines().any(|method| {
-        matches!(method, "CreateAgent" | "ResumeAgent" | "Send" | "CancelRun")
+    assert!(calls.lines().all(|method| {
+        matches!(
+            method,
+            "GetVersion" | "SetToolCallback" | "Me" | "ListModels"
+        )
     }));
+    let shown = format!("{observation:?}");
+    assert!(!shown.contains("private@example.invalid"));
+    bridge.stop().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn provider_observation_keeps_authentication_when_catalog_fails() {
+    let root = std::env::temp_dir().join(format!(
+        "vibeface-cursor-provider-catalog-failure-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let (bridge, observation) = provider_observation_fixture(
+        &root,
+        BTreeMap::from([("FAKE_BRIDGE_MODELS".into(), "500".into())]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        observation.authentication,
+        SdkProviderAuthentication::Authenticated
+    );
+    assert_eq!(observation.catalog, SdkCatalog::Unavailable);
+    bridge.stop().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn provider_observation_maps_only_http_auth_status_to_sign_in_required() {
+    let root = std::env::temp_dir().join(format!(
+        "vibeface-cursor-provider-auth-failure-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let (bridge, observation) = provider_observation_fixture(
+        &root,
+        BTreeMap::from([
+            ("FAKE_BRIDGE_ME".into(), "401".into()),
+            ("FAKE_BRIDGE_MODELS".into(), "500".into()),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        observation.authentication,
+        SdkProviderAuthentication::SignInRequired
+    );
+    assert_eq!(observation.catalog, SdkCatalog::Unavailable);
+    bridge.stop().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn provider_observation_keeps_malformed_metadata_unknown() {
+    let root = std::env::temp_dir().join(format!(
+        "vibeface-cursor-provider-malformed-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let (bridge, observation) = provider_observation_fixture(
+        &root,
+        BTreeMap::from([
+            ("FAKE_BRIDGE_ME".into(), "malformed".into()),
+            ("FAKE_BRIDGE_MODELS".into(), "malformed".into()),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        observation.authentication,
+        SdkProviderAuthentication::Unknown
+    );
+    assert_eq!(observation.catalog, SdkCatalog::Unavailable);
+    bridge.stop().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn provider_observation_bounds_oversize_catalog_response() {
+    let root = std::env::temp_dir().join(format!(
+        "vibeface-cursor-provider-oversize-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let (bridge, observation) = provider_observation_fixture(
+        &root,
+        BTreeMap::from([("FAKE_BRIDGE_MODELS".into(), "oversize".into())]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        observation.authentication,
+        SdkProviderAuthentication::Authenticated
+    );
+    assert_eq!(observation.catalog, SdkCatalog::Unavailable);
+    bridge.stop().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn provider_observation_times_out_catalog_without_downgrading_authentication() {
+    let root = std::env::temp_dir().join(format!(
+        "vibeface-cursor-provider-timeout-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let (bridge, observation) = provider_observation_fixture(
+        &root,
+        BTreeMap::from([("FAKE_BRIDGE_MODELS".into(), "timeout".into())]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        observation.authentication,
+        SdkProviderAuthentication::Authenticated
+    );
+    assert_eq!(observation.catalog, SdkCatalog::Unavailable);
+    bridge.stop().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn provider_observation_does_not_wait_for_an_active_agent_owner() {
+    let root = std::env::temp_dir().join(format!(
+        "vibeface-cursor-provider-active-owner-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("gates")).unwrap();
+    let sends = root.join("sends.log");
+    let env = BTreeMap::from([
+        ("FAKE_BRIDGE_SEND_LOG".into(), sends.display().to_string()),
+        (
+            "FAKE_BRIDGE_GATE_DIR".into(),
+            root.join("gates").display().to_string(),
+        ),
+    ]);
+    let (bridge, _) = provider_observation_fixture(&root, env.clone())
+        .await
+        .unwrap();
+    let bridge = Arc::new(bridge);
+    let executable =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cursor-sdk-bridge");
+    let turn = SdkTurn {
+        owner: "coordination".into(),
+        executable: executable.clone(),
+        workspace: root.join("workspace"),
+        local_store_root: root.join("private-agent"),
+        api_key: "fixture-api-key".into(),
+        env: env.clone(),
+        model: "fixture-model".into(),
+        timeout_secs: 10,
+        custom_tools: BTreeMap::new(),
+        callback_token: None,
+        process_started: None,
+        run_started: None,
+    };
+    let running_bridge = bridge.clone();
+    let running = tokio::spawn(async move { reply(&running_bridge, &turn, "first-active").await });
+    wait_sends(&sends, "first-", 1).await;
+    let observation = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.provider_observation(
+            &executable,
+            &root.join("workspace"),
+            &root.join("private-probe"),
+            "fixture-api-key",
+            &env,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        observation.authentication,
+        SdkProviderAuthentication::Authenticated
+    );
+    assert!(!running.is_finished());
+    std::fs::write(root.join("gates/first"), b"").unwrap();
+    assert_eq!(running.await.unwrap().0.unwrap(), "done: first-active");
     bridge.stop().await;
     std::fs::remove_dir_all(root).unwrap();
 }

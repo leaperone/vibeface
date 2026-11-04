@@ -33,7 +33,11 @@ const AGENT_SERVICE: &str = "SdkAgentService";
 const CONTROL_SERVICE: &str = "SdkBridgeControlService";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
+const METADATA_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_METADATA_BYTES: usize = 65_536;
+const MAX_METADATA_MODELS: usize = 512;
 const OWNER_IDLE_RETIRE: Duration = Duration::from_secs(10 * 60);
+const PROVIDER_PROBE_OWNER: &str = "provider-probe";
 
 /// Durably records an SDK process group before the agent can act.
 pub type ProcessStarted = std::sync::Arc<
@@ -87,6 +91,31 @@ pub struct AgentResult {
     pub session_id: Option<String>,
     pub output: String,
     pub usage: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SdkProviderAuthentication {
+    Unknown,
+    Authenticated,
+    SignInRequired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SdkModel {
+    pub id: String,
+    pub display_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SdkCatalog {
+    Unavailable,
+    Available { models: Vec<SdkModel> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SdkProviderObservation {
+    pub authentication: SdkProviderAuthentication,
+    pub catalog: SdkCatalog,
 }
 
 /// How certain the end of a failed turn is; `ExecFailure` says why it failed.
@@ -455,6 +484,67 @@ impl SdkBridge {
                 format!("{error:#}"),
                 &self.secrets(api_key, env, "")
             ))
+        })
+    }
+
+    /// Reads Cursor account and model metadata without creating an agent or sending a prompt.
+    /// The dedicated owner keeps a readiness check from waiting behind an active Agent turn.
+    pub async fn provider_observation(
+        &self,
+        executable: &Path,
+        workspace: &Path,
+        local_store_root: &Path,
+        api_key: &str,
+        env: &BTreeMap<String, String>,
+    ) -> Result<SdkProviderObservation> {
+        validate_api_key(api_key)
+            .and_then(|_| validate_launch_env(env))
+            .and_then(|_| validate_private_directory(local_store_root))
+            .map_err(|_| anyhow!("cursor_provider_probe_config_invalid"))?;
+        let owner_slot = self
+            .owner_slot(PROVIDER_PROBE_OWNER)
+            .await
+            .map_err(|_| anyhow!("cursor_provider_probe_unavailable"))?;
+        let permit = owner_slot
+            .turn
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("cursor_provider_probe_unavailable"))?;
+        let _turn = OwnerTurn {
+            owner: owner_slot.clone(),
+            _permit: permit,
+        };
+        let admission = self
+            .admit(
+                &owner_slot,
+                executable,
+                workspace,
+                local_store_root,
+                api_key,
+                env,
+            )
+            .await
+            .map_err(|_| anyhow!("cursor_bridge_launch_failed"))?;
+        let live = &admission.0;
+        let mut authentication = metadata_authentication(
+            &live
+                .rpc
+                .metadata_unary("SdkCursorService", "Me", json!({}))
+                .await,
+        );
+        let models = live
+            .rpc
+            .metadata_unary("SdkCursorService", "ListModels", json!({}))
+            .await;
+        if authentication != SdkProviderAuthentication::Authenticated
+            && matches!(models, MetadataReply::Status(401 | 403))
+        {
+            authentication = SdkProviderAuthentication::SignInRequired;
+        }
+        Ok(SdkProviderObservation {
+            authentication,
+            catalog: metadata_catalog(&models, &self.secrets(api_key, env, &live.rpc.bearer)),
         })
     }
 
@@ -1614,6 +1704,71 @@ struct Rpc {
     client: reqwest::Client,
 }
 
+enum MetadataReply {
+    Json(Value),
+    Status(u16),
+    Unavailable,
+}
+
+fn metadata_authentication(reply: &MetadataReply) -> SdkProviderAuthentication {
+    match reply {
+        MetadataReply::Json(value) if value.get("user").is_some_and(metadata_user) => {
+            SdkProviderAuthentication::Authenticated
+        }
+        MetadataReply::Status(401 | 403) => SdkProviderAuthentication::SignInRequired,
+        _ => SdkProviderAuthentication::Unknown,
+    }
+}
+
+fn metadata_user(user: &Value) -> bool {
+    user.get("userId").is_some_and(|id| {
+        id.as_u64()
+            .or_else(|| id.as_str().and_then(|id| id.parse::<u64>().ok()))
+            .is_some_and(|id| id > 0)
+    }) || user
+        .get("userEmail")
+        .and_then(Value::as_str)
+        .is_some_and(metadata_text)
+}
+
+fn metadata_catalog(reply: &MetadataReply, secrets: &[&str]) -> SdkCatalog {
+    let MetadataReply::Json(value) = reply else {
+        return SdkCatalog::Unavailable;
+    };
+    let Some(items) = value.get("items").and_then(Value::as_array) else {
+        return SdkCatalog::Unavailable;
+    };
+    if items.len() > MAX_METADATA_MODELS {
+        return SdkCatalog::Unavailable;
+    }
+    let mut models = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            return SdkCatalog::Unavailable;
+        };
+        let Some(display_name) = item.get("displayName").and_then(Value::as_str) else {
+            return SdkCatalog::Unavailable;
+        };
+        if !metadata_text(id)
+            || !metadata_text(display_name)
+            || secrets
+                .iter()
+                .any(|secret| id.contains(secret) || display_name.contains(secret))
+        {
+            return SdkCatalog::Unavailable;
+        }
+        models.push(SdkModel {
+            id: id.to_owned(),
+            display_name: display_name.to_owned(),
+        });
+    }
+    SdkCatalog::Available { models }
+}
+
+fn metadata_text(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
 impl Rpc {
     fn request(&self, service: &str, method: &str) -> Result<reqwest::RequestBuilder> {
         let url = self
@@ -1654,6 +1809,32 @@ impl Rpc {
         }
         serde_json::from_slice(&bytes)
             .map_err(|_| anyhow!("Cursor SDK {method} returned invalid JSON"))
+    }
+
+    async fn metadata_unary(&self, service: &str, method: &str, body: Value) -> MetadataReply {
+        let request = match self.request(service, method) {
+            Ok(request) => request,
+            Err(_) => return MetadataReply::Unavailable,
+        };
+        let mut response = match request.json(&body).timeout(METADATA_TIMEOUT).send().await {
+            Ok(response) => response,
+            Err(_) => return MetadataReply::Unavailable,
+        };
+        let status = response.status();
+        if !status.is_success() {
+            return MetadataReply::Status(status.as_u16());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = match response.chunk().await {
+            Ok(chunk) => chunk,
+            Err(_) => return MetadataReply::Unavailable,
+        } {
+            if bytes.len() + chunk.len() > MAX_METADATA_BYTES {
+                return MetadataReply::Unavailable;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_or(MetadataReply::Unavailable, MetadataReply::Json)
     }
 
     async fn send<P, PF>(
@@ -2249,6 +2430,57 @@ pub(crate) async fn bounded_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_authentication_requires_a_profile_identity_and_exact_auth_status() {
+        for user in [
+            json!({"userId":"42"}),
+            json!({"userEmail":"private@example.invalid"}),
+        ] {
+            assert_eq!(
+                metadata_authentication(&MetadataReply::Json(json!({"user":user}))),
+                SdkProviderAuthentication::Authenticated
+            );
+        }
+        for value in [json!({}), json!({"user":{}}), json!({"user":null})] {
+            assert_eq!(
+                metadata_authentication(&MetadataReply::Json(value)),
+                SdkProviderAuthentication::Unknown
+            );
+        }
+        for status in [401, 403] {
+            assert_eq!(
+                metadata_authentication(&MetadataReply::Status(status)),
+                SdkProviderAuthentication::SignInRequired
+            );
+        }
+        assert_eq!(
+            metadata_authentication(&MetadataReply::Status(500)),
+            SdkProviderAuthentication::Unknown
+        );
+    }
+
+    #[test]
+    fn metadata_catalog_rejects_secret_or_invalid_model_fields() {
+        for item in [
+            json!({"id":"fixture-secret","displayName":"Model"}),
+            json!({"id":"model","displayName":"fixture-secret"}),
+            json!({"id":"model\ninvalid","displayName":"Model"}),
+            json!({"id":"model"}),
+        ] {
+            assert_eq!(
+                metadata_catalog(
+                    &MetadataReply::Json(json!({"items":[item]})),
+                    &["fixture-secret"]
+                ),
+                SdkCatalog::Unavailable
+            );
+        }
+        assert_eq!(
+            metadata_catalog(&MetadataReply::Json(json!({"items":[]})), &[]),
+            SdkCatalog::Available { models: vec![] }
+        );
+    }
 
     #[test]
     fn run_snapshots_accept_numeric_and_named_lifecycle_statuses() {

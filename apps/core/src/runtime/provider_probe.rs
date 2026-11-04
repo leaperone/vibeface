@@ -19,6 +19,7 @@ use tokio::{
     process::{Child, ChildStderr, Command},
     task::JoinHandle,
 };
+use vibeface_bridge::agent::{SdkCatalog, SdkProviderAuthentication, SdkProviderObservation};
 
 const OUTPUT_LIMIT: u64 = 64 * 1024;
 const PROBE_LIMIT: Duration = Duration::from_secs(5);
@@ -200,6 +201,40 @@ impl Runtime {
                     Err(issue) => probe.launch = LaunchCheck::Failed { issue },
                     Ok(None) => {}
                 },
+                Provider::Cursor => {
+                    let (api_key, env) = providers::cursor_launch(&input.env);
+                    if let (Some(bridge), Some(api_key)) = (self.cursor.get(), api_key) {
+                        let workspace = input
+                            .manager
+                            .as_ref()
+                            .map(|manager| manager.workspace.clone())
+                            .unwrap_or_else(|| self.data_dir.join("manager-workspace"));
+                        match bridge
+                            .provider_observation(
+                                &input.bin,
+                                &workspace,
+                                &self.data_dir.join("cursor/provider-probe"),
+                                &api_key,
+                                &env,
+                            )
+                            .await
+                        {
+                            Ok(observation) => {
+                                probe.launch = LaunchCheck::Launchable;
+                                probe.authentication = cursor_authentication(&observation);
+                                probe.catalog = cursor_catalog(&observation);
+                            }
+                            Err(_) => {
+                                probe.launch = LaunchCheck::Failed {
+                                    issue: ProbeIssue::new(
+                                        ProbeStage::Launch,
+                                        ProbeCode::LaunchFailed,
+                                    ),
+                                };
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -218,6 +253,34 @@ impl Runtime {
             }
         }
         self.provider_probe_snapshot(provider).await
+    }
+}
+
+fn cursor_authentication(observation: &SdkProviderObservation) -> Authentication {
+    match observation.authentication {
+        SdkProviderAuthentication::Authenticated => Authentication::Authenticated,
+        SdkProviderAuthentication::SignInRequired => Authentication::SignInRequired,
+        SdkProviderAuthentication::Unknown => Authentication::Unverified,
+    }
+}
+
+fn cursor_catalog(observation: &SdkProviderObservation) -> ModelCatalog {
+    let SdkCatalog::Available { models } = &observation.catalog else {
+        return ModelCatalog::default();
+    };
+    let models = models
+        .iter()
+        .filter(|model| safe_model_text(&model.id) && safe_model_text(&model.display_name))
+        .map(|model| ModelChoice {
+            id: model.id.clone(),
+            name: model.display_name.clone(),
+            default: false,
+            effort: EffortOptions::Unknown,
+        })
+        .collect();
+    ModelCatalog::Available {
+        models,
+        coverage: CatalogCoverage::Partial,
     }
 }
 
@@ -552,6 +615,176 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
+    use vibeface_bridge::agent::{SdkModel, SdkProviderAuthentication};
+
+    async fn cursor_probe_node(
+        env: BTreeMap<String, String>,
+    ) -> anyhow::Result<(std::sync::Arc<Runtime>, PathBuf)> {
+        let dir = std::env::temp_dir().join(format!(
+            "vibeface-cursor-provider-probe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        crate::config::private_dir(&dir)?;
+        let dir = dir.canonicalize()?;
+        let mut configuration = crate::config::Config::local("127.0.0.1:0".parse()?, vec![], false);
+        configuration.providers.execution = [Provider::Cursor].into();
+        configuration.bins.insert(
+            Provider::Cursor,
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../crates/bridge/tests/fixtures/fake-cursor-sdk-bridge"),
+        );
+        configuration.save(&dir)?;
+        crate::config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        crate::config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&crate::crypto::LocalIdentity::generate())?,
+        )?;
+        let mut variables = providers::ProviderEnv::default();
+        variables.apply(
+            Provider::Cursor,
+            env.into_iter()
+                .chain([("CURSOR_API_KEY".into(), "fixture-api-key".into())])
+                .map(|(name, value)| (name, Some(value)))
+                .collect(),
+        )?;
+        variables.save(&dir)?;
+        let node = std::sync::Arc::new(Runtime::open(&dir).await?);
+        node.tools_ready("http://127.0.0.1:9".into())?;
+        Ok((node, dir))
+    }
+
+    #[tokio::test]
+    async fn cursor_probe_confirms_metadata_and_keeps_unknown_models_attemptable()
+    -> anyhow::Result<()> {
+        let (node, dir) = cursor_probe_node(BTreeMap::new()).await?;
+        let probe = node.probe_provider(Provider::Cursor).await;
+        assert_eq!(probe.launch, LaunchCheck::Launchable);
+        assert_eq!(probe.authentication, Authentication::Authenticated);
+        assert_eq!(probe.readiness("composer-2"), ProviderProbeReadiness::Ready);
+        for model in ["auto", "custom-model"] {
+            let readiness = probe.readiness(model);
+            assert!(matches!(
+                readiness,
+                ProviderProbeReadiness::Unverified { .. }
+            ));
+            assert!(readiness.can_attempt());
+        }
+        node.cursor.get().unwrap().stop().await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cursor_probe_does_not_confirm_launch_when_bridge_exits_before_handshake()
+    -> anyhow::Result<()> {
+        let (node, dir) = cursor_probe_node(BTreeMap::from([(
+            "FAKE_BRIDGE_EXIT_BEFORE_READY".into(),
+            "1".into(),
+        )]))
+        .await?;
+        let probe = node.probe_provider(Provider::Cursor).await;
+        assert!(matches!(probe.launch, LaunchCheck::Failed { .. }));
+        assert_eq!(probe.authentication, Authentication::Unverified);
+        assert_eq!(probe.catalog, ModelCatalog::default());
+        node.cursor.get().unwrap().stop().await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cursor_probe_cannot_overwrite_a_replaced_configuration() -> anyhow::Result<()> {
+        let (node, dir) = cursor_probe_node(BTreeMap::new()).await?;
+        let ready = dir.join("me-ready");
+        let release = dir.join("me-release");
+        let provider = Provider::Cursor;
+        let mut original = node.providers();
+        original.env.apply(
+            provider,
+            BTreeMap::from([
+                ("FAKE_BRIDGE_ME".into(), Some("401".into())),
+                (
+                    "FAKE_BRIDGE_ME_READY".into(),
+                    Some(ready.display().to_string()),
+                ),
+                (
+                    "FAKE_BRIDGE_ME_RELEASE".into(),
+                    Some(release.display().to_string()),
+                ),
+            ]),
+        )?;
+        *node.providers.lock().unwrap() = original.clone();
+        let first = node.provider_probe_snapshot(provider).await;
+        let running = node.clone();
+        let pending = tokio::spawn(async move { running.probe_provider(provider).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        let mut changed = original.clone();
+        changed.env.apply(
+            provider,
+            BTreeMap::from([("CURSOR_API_KEY".into(), Some("fixture-new-key".into()))]),
+        )?;
+        *node.providers.lock().unwrap() = changed;
+        let between = node.provider_probe_snapshot(provider).await;
+        *node.providers.lock().unwrap() = original;
+        let current = node.provider_probe_snapshot(provider).await;
+        assert_ne!(first.config_id, between.config_id);
+        assert_ne!(first.config_id, current.config_id);
+        std::fs::write(release, b"ready")?;
+        let returned = pending.await?;
+        assert_eq!(returned, current);
+        assert_eq!(returned.authentication, Authentication::Unverified);
+        assert_eq!(returned.checked_at_ms, None);
+        node.cursor.get().unwrap().stop().await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_metadata_maps_to_authenticated_partial_catalog_without_inventing_auto() {
+        let observation = SdkProviderObservation {
+            authentication: SdkProviderAuthentication::Authenticated,
+            catalog: SdkCatalog::Available {
+                models: vec![SdkModel {
+                    id: "composer-2".into(),
+                    display_name: "Composer 2".into(),
+                }],
+            },
+        };
+        assert_eq!(
+            cursor_authentication(&observation),
+            Authentication::Authenticated
+        );
+        let ModelCatalog::Available { models, coverage } = cursor_catalog(&observation) else {
+            panic!("catalog should remain available")
+        };
+        assert_eq!(coverage, CatalogCoverage::Partial);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "composer-2");
+        assert!(!models.iter().any(|model| model.id == "auto"));
+    }
+
+    #[test]
+    fn cursor_metadata_unknowns_do_not_become_auth_failures() {
+        let observation = SdkProviderObservation {
+            authentication: SdkProviderAuthentication::Unknown,
+            catalog: SdkCatalog::Unavailable,
+        };
+        assert_eq!(
+            cursor_authentication(&observation),
+            Authentication::Unverified
+        );
+        assert_eq!(cursor_catalog(&observation), ModelCatalog::default());
+    }
 
     #[tokio::test]
     async fn runtime_generation_follows_effective_launch_and_not_probe_epochs() -> anyhow::Result<()>
