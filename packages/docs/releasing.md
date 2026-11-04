@@ -5,7 +5,7 @@ description: 了解 Vibeface 的 CI、制品和 Nightly 发布流程。
 
 # 构建与发布
 
-[CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 按改动范围选择 `main` push 的核心检查；开发分支 PR 不触发 Actions，Draft 与 Ready 都不例外。merge queue 执行全工作区核心检查，定时和手动执行扩展回归。`main` 的常规 CI 只上传 Actions 制品，不创建公开版本。门户仅在 www 正式版 tag 时由 `deploy-www.yml` 请求部署。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。具体选择规则见 [按改动选择 CI](ci.md)。
+[CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 按改动范围选择 `main` push 的核心检查；开发分支 PR 不触发 Actions，Draft 与 Ready 都不例外。merge queue 执行全工作区核心检查，定时和手动执行扩展回归。`main` 的常规 CI 只上传 Actions 制品，不创建公开版本。门户仅在 www 正式版 tag 时由 `deploy-www.yml` 请求部署，独立网页仅在 app 正式版 tag 时由 `deploy-app.yml` 请求部署。版本号含 `-` 时不自动发站。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。具体选择规则见 [按改动选择 CI](ci.md)。
 
 ## 按应用独立发布
 
@@ -22,6 +22,8 @@ description: 了解 Vibeface 的 CI、制品和 Nightly 发布流程。
 `release.yml` 只响应以上五种 tag。tag 必须与版本文件一致，源码必须已在 main。CLI 在 `apps/cli/release-lock.json` 中锁定 Core/App tag，组装时验证公开 release 的源码 SHA 和文件摘要，将独立版本与源码记录到 `BUILD-INFO.json`，`FILES.sha256` 覆盖包内文件。CLI、Core 与 App 必须使用相同发布渠道。Core 和 App 必须先发布，CLI 才能组装。`COMPONENT-INFO.json` 与 `release.json` 的 schema 均为 1；旧 schema 和额外字段会被拒绝。发布后不覆盖已有字节，重试先下载对账。
 
 先完成独立分支、PR、相关测试并合并，再从已验证的提交创建具体 tag。例如 `git tag app-v0.0.1-nightly.20261101.1 <commit>`，随后 `git push origin app-v0.0.1-nightly.20261101.1`。若重跑，使用 `gh workflow run release.yml --ref <tag> -f tag=<tag>`。发布后核对 Actions 终态、release.json、实际下载摘要和平台运行结果。
+
+`app` 的静态归档发布成功后，`deploy-app.yml` 使用 `VIBEFACE_RELEASE_DISPATCH_TOKEN` 向 `leaperone/leaperone-releases` 发送 `deploy-vibeface-app`，携带确切 tag 和源码 SHA。接收端校验 tag、main 祖先关系、release 清单和归档内容后部署到现有站点，并检查 `/`、`/connect`、`/join` 及首页引用的静态资源。HTTP 必须返回 200，响应内容必须与发布产物一致，循环跳转使验收失败。派发成功仅表示接收了请求，仍须核对发布仓库的部署与冒烟结果。
 
 ## 可下载的包
 
