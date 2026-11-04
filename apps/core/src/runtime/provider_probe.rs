@@ -606,6 +606,29 @@ mod tests {
             BTreeMap::from([("ANTHROPIC_API_KEY".into(), Some("unrelated-secret".into()))]),
         )?;
         assert_eq!(node.provider_generation(provider, &local)?, generation);
+
+        let bin = dir.join("nvm/bin");
+        std::fs::create_dir_all(&bin)?;
+        let mut nvm = local.clone();
+        nvm.bins.insert(provider, bin.join("codex"));
+        nvm.env.apply(
+            provider,
+            BTreeMap::from([("PATH".into(), Some(dir.join("empty").display().to_string()))]),
+        )?;
+        let before_node = node.provider_generation(provider, &nvm)?;
+        for name in ["codex", "node"] {
+            std::fs::write(bin.join(name), "#!/bin/sh\nexit 0\n")?;
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o700))?;
+        }
+        let with_node = node.provider_generation(provider, &nvm)?;
+        assert_ne!(before_node, with_node);
+        assert_eq!(node.probe_input(provider, &nvm).env, nvm.launch_env(provider));
+        let effective_path = nvm.launch_env(provider)["PATH"].clone();
+        nvm.env.apply(provider, BTreeMap::from([("PATH".into(), Some(effective_path))]))?;
+        assert_eq!(node.provider_generation(provider, &nvm)?, with_node);
+        nvm.bins.remove(&provider);
+        assert!(prerequisites(provider, &nvm).is_none());
+
         local.switches.codex_app_server.mode = AppServerMode::System;
         let system = node.provider_generation(provider, &local)?;
         assert_ne!(system, generation);
