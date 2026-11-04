@@ -20,6 +20,7 @@ jobs:
       app: ${{ steps.plan.outputs.app }}
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
+      source_sha: ${{ steps.plan.outputs.source_commit }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -189,4 +190,12 @@ jobs:
     needs: [identity, static]
     if: needs.identity.outputs.app == 'www' && !contains(needs.identity.outputs.version, '-')
     uses: ./.github/workflows/deploy-www.yml
+    secrets: inherit
+  deploy-app:
+    needs: [identity, static]
+    if: needs.identity.outputs.app == 'app' && !contains(needs.identity.outputs.version, '-')
+    uses: ./.github/workflows/deploy-app.yml
+    with:
+      tag: ${{ needs.identity.outputs.tag }}
+      source_sha: ${{ needs.identity.outputs.source_sha }}
     secrets: inherit
