@@ -176,7 +176,7 @@ App 扫这种二维码后，按邀请里写的局域网地址直接连发出邀�
 vibeface join 'https://gateway.example/join#vibeface1…' --name '<设备显示名称>'
 ```
 
-链接也可以是手机 App 复制的 `vibeface://join?link=…` 或单独的 `vibeface1…`。CLI 从 `#` 后读取邀请票据，通过 iroh 连接票据中的目标设备；链接前面的网页地址用于浏览器打开页面，不决定 CLI 的连接地址。
+链接也可以是手机 App 复制的 `vibeface://join?link=…` 或单独的 `vibeface1…`。CLI 解码邀请票据，通过 iroh 连接票据中的目标设备；链接前面的网页地址用于浏览器打开页面，不决定 CLI 的连接地址。
 
 邀请中的 relay 缺失或不可达时，Node 会复用新 Node 已配置的 `network.entry`、`network.relays`，以及显式启用的 `n0_relays`。使用同一 relay 要求两端都能到达它并具备对应授权；`network.entry` 还要求匹配的 `entry-token`。发现服务只提供地址提示，不授予私有 relay 使用权。
 
