@@ -420,6 +420,33 @@ vibeface wallet --data-dir /path/to/node-data backup /path/to/new-wallet-backup.
 自动化可用 `--passphrase-fd` 从所有者私有文件或管道读取口令。不要把口令写进命令参数或环境变量。钱包每次重启都保持锁定，损坏时显示 `unavailable`，只能在本机从独立备份恢复，不能覆盖创建。
 
 钱包备份和个人恢复文件都不包含订单接收私钥。停掉 Node 后备份完整数据目录，尤其是整个 `delivery/`。注册、轮换和撤销接收密钥的命令及原意图重试规则见[接收密钥和恢复材料](paid-delivery.md#接收密钥和恢复材料)。
+
+## 使用公共发现服务
+
+Vibeface 提供以下可选的公共发现服务，帮助不同用户各自网络中的 Node 查询已知设备的地址并尝试直连。它不会把个人网络合并，也不会授予成员权限；加入仍需邀请和批准。Node 不会默认连接这项服务。
+
+```text
+vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@discovery.vibeface.dev:4792
+```
+
+首次初始化且数据目录为空或不存在时，可以显式选择它：
+
+```sh
+vibeface init --discovery 'vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@discovery.vibeface.dev:4792'
+```
+
+已有节点先停止 Core，再把这个地址添加到数据目录 `config.json` 的 `network.discovery` 数组，保留其他配置。例如该字段的值为：
+
+```json
+[
+  "vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@discovery.vibeface.dev:4792"
+]
+```
+
+随后按原方式启动 Core。不要为修改发现配置重新运行 `init`，也不需要重新创建个人网络。
+
+服务使用 UDP 4792，通过地址中的设备编号核验身份，不经过 Cloudflare HTTP 代理。运营者能看到设备编号、UDP 地址和查询关系；地址登记只保存在内存中，不保存会话或附件。它不提供网页入口，不接受 `--relay` 或 `--entry` 的配置用途，也不转发业务数据。对称 NAT 或 UDP 被封锁时仍可能无法直连，需要另行配置普通中继。自建同类服务见下一节。
+
 ## 运行不转发业务数据的公共发现服务
 
 运营者可只提供发现和连接协助，不加入用户的个人网络，也不承担业务流量。初始化时选择 `discovery-only`：

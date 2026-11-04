@@ -18,9 +18,9 @@ The unknown state means that the target may have accepted the request. It does n
 
 ## Client projection recovery
 
-The Node assigns a local revision to each projection update. A client receives the revision with a delta. A broadcast lag or a revision gap produces a resync message, and the client reads a fresh snapshot.
+When a push burst or a broadcast lag can leave a client behind, the Node sends a `resync` message and the client reads a fresh snapshot. Progress updates also carry their own sequence, and a sequence gap schedules a refresh for that progress stream. This protocol does not attach a unified revision to every projection delta.
 
-The revision is not a causal clock. Signed events, VersionVector, fork evidence, and authorization projection remain the source of truth.
+The resync signal and progress sequence are not causal clocks. Signed events, VersionVector, fork evidence, and authorization projection remain the source of truth.
 
 ## Provider boundary
 

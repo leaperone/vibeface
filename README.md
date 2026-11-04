@@ -20,6 +20,7 @@
 - [What you can do](#what-you-can-do)
 - [Get started](#get-started)
 - [Add another device](#add-another-device)
+- [Public discovery service](#public-discovery-service)
 - [Privacy and permissions](#privacy-and-permissions)
 - [Documentation](#documentation)
 - [Build from source](#build-from-source)
@@ -63,6 +64,16 @@ vibeface join '<join link>' --name '<device name>'
 ```
 
 Compare the six-digit code on both devices before approving. Join the existing network instead of creating a new one. Read [first-time setup](packages/docs/onboarding.md) for joining and recovery.
+
+## Public discovery service
+
+Vibeface offers an optional public discovery service to look up Node addresses and try direct connections:
+
+```text
+vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@discovery.vibeface.dev:4792
+```
+
+Nodes do not connect to it by default. It has no web entry point and does not relay application data. Use `--discovery` during first initialization to opt in. See [Use the public discovery service](packages/docs/node.md#使用公共发现服务) for existing Node configuration, visible metadata, and connection limits. Joining a personal network still requires an invitation and approval.
 
 ## Privacy and permissions
 
