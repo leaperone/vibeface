@@ -2088,6 +2088,144 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn node_joins_reuse_the_configured_private_relay() -> Result<()> {
+        use crate::config::{self, Config};
+        use iroh::protocol::{AcceptError, ProtocolHandler, Router};
+        use iroh_relay::server::{Access, AccessControl, ClientRequest};
+        use vibeface_secure::join::INVITE_DOMAIN;
+
+        const OPERATOR_TOKEN: &str =
+            "1111111111111111111111111111111111111111111111111111111111111111";
+
+        #[derive(Debug)]
+        struct PrivateRelay;
+        impl AccessControl for PrivateRelay {
+            async fn on_connect(&self, request: &ClientRequest) -> Access {
+                if request
+                    .auth_token()
+                    .is_some_and(|token| net::same_token(&token, OPERATOR_TOKEN))
+                {
+                    Access::Allow
+                } else {
+                    Access::Deny { reason: None }
+                }
+            }
+        }
+
+        struct JoinServer(Arc<Runtime>);
+        impl std::fmt::Debug for JoinServer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("JoinServer")
+            }
+        }
+        impl ProtocolHandler for JoinServer {
+            async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+                let remote = net::device_id(&connection.remote_id());
+                serve_join(self.0.clone(), connection, remote)
+                    .await
+                    .map_err(|error| {
+                        AcceptError::from_err(std::io::Error::other(error.to_string()))
+                    })
+            }
+        }
+
+        async fn node(dir: &Path, network: NetworkConfig) -> Result<Arc<Runtime>> {
+            config::private_dir(dir)?;
+            let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
+            configuration.network = network;
+            configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
+            configuration.save(dir)?;
+            config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
+            config::private_write(
+                &dir.join("identity.json"),
+                &serde_json::to_vec(&LocalIdentity::generate())?,
+            )?;
+            config::private_write(&dir.join(net::ENTRY_TOKEN_FILE), OPERATOR_TOKEN.as_bytes())?;
+            Ok(Arc::new(Runtime::open(dir).await?))
+        }
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("private-relay-join-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let relay = net::spawn_relay("127.0.0.1:0".parse()?, Arc::new(PrivateRelay)).await?;
+        let relay_url = format!(
+            "http://{}",
+            relay.http_addr().context("relay listener missing")?
+        );
+        let network = |bind| NetworkConfig {
+            bind: Some(bind),
+            entry: Some(net::PublicEntry {
+                url: relay_url.clone(),
+                relay: relay_url.clone(),
+            }),
+            ..Default::default()
+        };
+        let target = node(&dir.join("target"), network("[::1]:0".parse()?)).await?;
+        let joining = node(&dir.join("joining"), network("127.0.0.1:0".parse()?)).await?;
+        let target_id = target.identity.device_id()?;
+        target
+            .install_membership(
+                target
+                    .identity
+                    .sign_network_fixture(1, vec![target_id.clone()])?,
+            )
+            .await?;
+        let admin = target.identity.fixture_admin();
+        let ticket = Ticket::new(&target_id, [7; 32])?;
+        let mut record = InviteRecord {
+            network_id: target.identity.fixture_network_id()?,
+            invite_hash: ticket.invite_hash(),
+            issuer: admin.device_id()?,
+            expires_at_ms: crate::runtime::now_ms() + 60_000,
+            signature: String::new(),
+        };
+        record.signature = admin.sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;
+        target
+            .store
+            .lock()
+            .await
+            .register_invite(&record, &record.issuer)?;
+        let target_net = Arc::new(
+            Net::bind(
+                &target.identity.secret_key_hex,
+                &target.config.network,
+                0,
+                vec![(net::relay_url(&relay_url)?, Some(OPERATOR_TOKEN.into()))],
+            )
+            .await?,
+        );
+        let router = Router::builder(target_net.endpoint.clone())
+            .accept(net::JOIN, JoinServer(target.clone()))
+            .spawn();
+        let result = async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while target_net.addr().relay_urls().next().is_none() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .context("the target did not connect to the private relay")?;
+            let link = JoinLink::open(&joining, &ticket).await?;
+            assert_eq!(
+                link.call("join_check", json!({"secret":hex::encode(ticket.secret)}))
+                    .await?,
+                json!({"invite":"open"})
+            );
+            assert_eq!(link.net.path_kind(&target_id), Some(net::PathKind::Relay));
+            link.net.close().await;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        router.shutdown().await?;
+        target_net.close().await;
+        relay.shutdown().await?;
+        drop((target, joining));
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
     /// The payload of the next push this client receives.
     async fn next_push(client: &mut Client) -> Result<Value> {
         tokio::time::timeout(Duration::from_secs(5), async {
