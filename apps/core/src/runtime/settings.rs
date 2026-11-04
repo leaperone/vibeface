@@ -430,7 +430,8 @@ impl Runtime {
                 ),
             }
         };
-        let observed = ProviderReadiness::from_prerequisites(self.host.installed(&bin), launchable);
+        let observed = ProviderReadiness::from_prerequisites(self.host.installed(&bin), launchable)
+            .with_probe(&probe, model);
         let state = if roles.is_empty() {
             "off"
         } else {

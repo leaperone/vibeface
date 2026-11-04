@@ -248,7 +248,17 @@ impl ProviderProbe {
                 ),
             };
         }
-        let known_model = match &self.catalog {
+        if !self.model_known(model.as_str()) {
+            return Unverified {
+                issue: ProbeIssue::new(ProbeStage::ModelList, ProbeCode::ModelUnverified),
+            };
+        }
+        ProviderProbeReadiness::Ready
+    }
+
+    fn model_known(&self, model: &str) -> bool {
+        let model = self.provider.model(model);
+        match &self.catalog {
             ModelCatalog::Available { models, .. } => models.iter().any(|choice| {
                 if model.is_empty() {
                     choice.default
@@ -257,13 +267,7 @@ impl ProviderProbe {
                 }
             }),
             ModelCatalog::Unavailable { .. } => false,
-        };
-        if !known_model {
-            return Unverified {
-                issue: ProbeIssue::new(ProbeStage::ModelList, ProbeCode::ModelUnverified),
-            };
         }
-        ProviderProbeReadiness::Ready
     }
 }
 
@@ -428,6 +432,7 @@ pub enum ReadinessEvidence {
     ModelCatalogNotObserved,
     ReadinessNotObserved,
     PrerequisitesRejected,
+    ProviderProbe,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -486,6 +491,40 @@ impl ProviderReadiness {
                 },
             ),
         }
+    }
+
+    pub fn with_probe(mut self, probe: &ProviderProbe, model: &str) -> Self {
+        let observed = |status| ProviderObservation::new(status, ReadinessEvidence::ProviderProbe);
+        match probe.launch {
+            LaunchCheck::Launchable => self.launchable = observed(ObservationStatus::Confirmed),
+            LaunchCheck::Failed { .. } => self.launchable = observed(ObservationStatus::Rejected),
+            LaunchCheck::Starting => self.launchable = observed(ObservationStatus::Unknown),
+            LaunchCheck::Unchecked => {}
+        }
+        self.authenticated = observed(match probe.authentication {
+            Authentication::Authenticated | Authentication::NotRequired => {
+                ObservationStatus::Confirmed
+            }
+            Authentication::SignInRequired => ObservationStatus::Rejected,
+            Authentication::Unverified => ObservationStatus::Unknown,
+        });
+        let readiness = probe.readiness(model);
+        self.model_known = observed(if probe.model_known(model) {
+            ObservationStatus::Confirmed
+        } else if matches!(&readiness, ProviderProbeReadiness::NeedsSetup { issue } if issue.code == ProbeCode::ModelUnavailable)
+        {
+            ObservationStatus::Rejected
+        } else {
+            ObservationStatus::Unknown
+        });
+        self.ready = observed(match readiness {
+            ProviderProbeReadiness::Ready => ObservationStatus::Confirmed,
+            ProviderProbeReadiness::NeedsSetup { .. } => ObservationStatus::Rejected,
+            ProviderProbeReadiness::Starting | ProviderProbeReadiness::Unverified { .. } => {
+                ObservationStatus::Unknown
+            }
+        });
+        self
     }
 }
 
@@ -1985,6 +2024,48 @@ requires_openai_auth = false
         );
         assert_eq!(missing.ready.status, ObservationStatus::Rejected);
         assert_eq!(missing.authenticated.status, ObservationStatus::Unknown);
+
+        let mut probe = ProviderProbe {
+            provider: Provider::Cursor,
+            config_id: "fixture".into(),
+            checked_at_ms: Some(1),
+            launch: LaunchCheck::Launchable,
+            authentication: Authentication::Authenticated,
+            catalog: ModelCatalog::Available {
+                models: vec![ModelChoice {
+                    id: "fixture-model".into(),
+                    name: "Fixture".into(),
+                    default: false,
+                    effort: EffortOptions::Unknown,
+                }],
+                coverage: CatalogCoverage::Partial,
+            },
+            version: None,
+        };
+        let observed = present.clone().with_probe(&probe, "fixture-model");
+        assert_eq!(observed.launchable.status, ObservationStatus::Confirmed);
+        assert_eq!(observed.authenticated.status, ObservationStatus::Confirmed);
+        assert_eq!(observed.model_known.status, ObservationStatus::Confirmed);
+        assert_eq!(observed.ready.status, ObservationStatus::Confirmed);
+        assert_eq!(observed.ready.evidence, ReadinessEvidence::ProviderProbe);
+        let unlisted = present.clone().with_probe(&probe, "auto");
+        assert_eq!(unlisted.model_known.status, ObservationStatus::Unknown);
+        assert_eq!(unlisted.ready.status, ObservationStatus::Unknown);
+        probe.catalog = ModelCatalog::default();
+        let without_catalog = present.clone().with_probe(&probe, "fixture-model");
+        assert_eq!(
+            without_catalog.authenticated.status,
+            ObservationStatus::Confirmed
+        );
+        assert_eq!(
+            without_catalog.model_known.status,
+            ObservationStatus::Unknown
+        );
+        assert_eq!(without_catalog.ready.status, ObservationStatus::Unknown);
+        probe.authentication = Authentication::SignInRequired;
+        let signed_out = present.with_probe(&probe, "fixture-model");
+        assert_eq!(signed_out.authenticated.status, ObservationStatus::Rejected);
+        assert_eq!(signed_out.ready.status, ObservationStatus::Rejected);
     }
 
     #[test]
