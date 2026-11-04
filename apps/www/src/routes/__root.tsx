@@ -1,4 +1,4 @@
-import { HeadContent, Outlet, Scripts, createRootRoute } from '@tanstack/react-router'
+import { HeadContent, Outlet, Scripts, createRootRoute, useRouterState } from '@tanstack/react-router'
 import { RootProvider } from 'fumadocs-ui/provider/tanstack'
 import { StaticSearchDialog } from '@/components/static-search-dialog'
 import '@fontsource-variable/geist'
@@ -22,8 +22,9 @@ export const Route = createRootRoute({
 })
 
 function RootComponent() {
+  const pathname = useRouterState({ select: (s) => s.location.pathname })
   return (
-    <html lang="zh-CN" suppressHydrationWarning>
+    <html lang={pathname === '/' ? 'en' : 'zh-CN'} suppressHydrationWarning>
       <head><HeadContent /></head>
       <body>
         <RootProvider

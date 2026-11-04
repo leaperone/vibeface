@@ -22,7 +22,7 @@ function HomePage() {
           <div className="hero-copy-block">
             <p className="hero-kicker">Your devices <span aria-hidden="true">/</span> Your agents <span aria-hidden="true">/</span> Nightly</p>
             <h1 id="hero-title">Your computers.<br />One conversation.</h1>
-            <p className="hero-lede">Vibeface lets a bot plan in chat, run work on the computer you choose, and return the result to the same thread.</p>
+            <p className="hero-lede">Ask a bot to work on your Mac or Linux computer. Choose where it runs and read the result in the same chat.</p>
             <div className="hero-actions">
               <Link className="button button-primary" to="/docs/$" params={{ _splat: 'quick-start' }}>Start with one computer <ArrowRight size={16} aria-hidden="true" /></Link>
               <Link className="button button-quiet" to="/docs/$" params={{ _splat: 'overview' }}>Read the overview <ArrowRight size={16} aria-hidden="true" /></Link>
@@ -58,11 +58,11 @@ function HomePage() {
           <div className="story-frame">
             <div className="story-frame-meta"><span>WORK LOOP / 01</span><span>PRIVATE NETWORK</span></div>
             <ol className="work-story" role="list">
-              <li><h3>Ask the bot</h3><p>Share the goal, project, and computer you want to use. The bot keeps the thread in view.</p></li>
+              <li><h3>Ask the bot</h3><p>Share the goal, project, and computer you want to use. The bot uses the thread to plan the work.</p></li>
               <li><h3>Choose a computer</h3><p>An approved computer runs the work with its local Agent, files, and tools.</p></li>
-              <li><h3>Read the result</h3><p>Stages and durable results return to the original thread. Check an unknown result before retrying.</p></li>
+              <li><h3>Read the result</h3><p>Updates and saved results return to the same chat. Check an unknown result before retrying.</p></li>
             </ol>
-            <div className="story-frame-result"><span>RETURNED TO THREAD</span><strong>The conversation keeps the context.</strong><small>Full word-for-word streaming progress stays with the source Node.</small></div>
+            <div className="story-frame-result"><span>RETURNED TO CHAT</span><strong>Your request and result, together.</strong><small>Live progress is temporary and does not sync.</small></div>
           </div>
         </section>
 
@@ -70,13 +70,13 @@ function HomePage() {
           <div className="system-intro">
             <p className="section-eyebrow">The system</p>
             <h2 id="system-title">Keep the context.<br />Keep your tools.</h2>
-            <p>Vibeface adds long-running bot coordination and shared history. Your Agent still runs on your computer.</p>
+            <p>Keep a bot's conversation across your computers. Work runs with the tools installed on each one.</p>
             <a className="text-link" href="/docs/bot-and-execution">See how work is split <ArrowRight size={16} aria-hidden="true" /></a>
           </div>
-          <p className="system-manifesto">Coordination can move. <em>Execution stays where you choose.</em></p>
+          <p className="system-manifesto">Continue the conversation elsewhere. <em>Choose where the work runs.</em></p>
           <div className="system-details">
             <article><h3>Conversation and execution</h3><p>Use a bot to coordinate work while Codex, Claude Code, pi, opencode, or Cursor runs it on the computer you choose.</p></article>
-            <article><h3>Shared history</h3><div><p>Approved devices share the conversation, settings, stages, and durable results. Project files, logins, and SDK state stay local.</p><a className="text-link" href="/docs/history-sync">See what syncs <ArrowRight size={16} aria-hidden="true" /></a></div></article>
+            <article><h3>Shared history</h3><div><p>Approved devices share conversations, settings, task updates, and saved results. Project files, logins, and Agent sessions stay on each computer.</p><a className="text-link" href="/docs/history-sync">See what syncs <ArrowRight size={16} aria-hidden="true" /></a></div></article>
             <article><h3>Continue elsewhere</h3><p>Open a synchronized thread on another computer and hand off the next turn. Replaying history never starts old work.</p></article>
           </div>
         </section>
@@ -87,7 +87,7 @@ function HomePage() {
           <p className="section-copy">Choose the layer that matches how you work.</p>
           <dl className="choice-list">
             <div><dt>Use Codex or Claude Code</dt><dd>You only need the product's own terminal, editor, or hosted flow.</dd></div>
-            <div><dt>Look at OpenClaw</dt><dd>You want a self-hosted gateway that connects agents to chat apps.</dd></div>
+              <div><dt>Look at OpenClaw</dt><dd>You want a self-hosted service that connects agents to chat apps.</dd></div>
             <div><dt>Choose Vibeface</dt><dd>You want one thread that can send work to your own computers and show the result back.</dd></div>
           </dl>
           <a className="text-link" href="/docs/comparison">Compare the options <ArrowRight size={16} aria-hidden="true" /></a>
@@ -100,11 +100,11 @@ function HomePage() {
             <dl className="trust-facts">
               <div><dt>Every device has its own identity</dt><dd>Each device has its own key. You approve new devices before they join.</dd></div>
               <div><dt>Connections are encrypted</dt><dd>A public entry point can relay ciphertext without joining your private network.</dd></div>
-              <div><dt>Credentials stay local</dt><dd>Provider settings do not sync. A secret you send in chat becomes part of the message.</dd></div>
+              <div><dt>Credentials stay local</dt><dd>AI service settings do not sync. A secret you send in chat becomes part of the shared conversation.</dd></div>
             </dl>
             <aside className="trust-boundary" aria-label="Permission boundaries to know before you start">
-              <p>Approved Nodes and the model service you choose still process task content. Use devices and entry points you trust.</p>
-              <p>Transport encryption does not encrypt the disk. Project folders are not an operating system sandbox, and Codex or Claude Code can access the host tools they are given.</p>
+              <p>Approved computers and the model service you choose handle your task content. Use devices and websites you trust.</p>
+              <p>Encrypted connections do not encrypt files on disk. Agents can run commands and edit files on the host. Project folder settings are not an operating system sandbox.</p>
               <a className="text-link" href="/docs/privacy-security">Read privacy and permissions <ArrowRight size={16} aria-hidden="true" /></a>
             </aside>
           </div>
@@ -115,11 +115,11 @@ function HomePage() {
           <h2 id="start-title">Begin with one computer.</h2>
           <p className="section-copy">Use a supported Mac or Linux computer, one installed Agent, a model service, and a project folder. Start with one conversation, then add another computer.</p>
           <ol className="start-steps" role="list">
-            <li><a href="/docs/quick-start">Start the quick start <span>Finish your first conversation</span> <ArrowUpRight size={16} aria-hidden="true" /></a></li>
+            <li><a href="/docs/quick-start">Follow the quick start <span>Finish your first conversation</span> <ArrowUpRight size={16} aria-hidden="true" /></a></li>
             <li><a href="/docs/onboarding">Set up a device <span>Sign in and add computers</span> <ArrowUpRight size={16} aria-hidden="true" /></a></li>
             <li><a href="/docs/user-guide">Read the user guide <span>Use tasks and switch computers</span> <ArrowUpRight size={16} aria-hidden="true" /></a></li>
           </ol>
-          <p className="nightly-note">Vibeface is Nightly. Protocols, data formats, and APIs may change before the first stable release. <a href="https://github.com/leaperone/vibeface/releases">View Nightly releases <ArrowUpRight size={14} aria-hidden="true" /></a></p>
+          <p className="nightly-note">Vibeface is in Nightly. Updates can break compatibility before the first stable release. <a href="https://github.com/leaperone/vibeface/releases">View Nightly releases <ArrowUpRight size={14} aria-hidden="true" /></a></p>
         </section>
       </div>
     </SiteLayout>

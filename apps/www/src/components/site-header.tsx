@@ -19,7 +19,7 @@ export function SiteHeader() {
   const pathname = useRouterState({ select: (s) => s.location.pathname })
 
   return (
-    <header className="site-header">
+    <header className="site-header" lang="en">
       <Link className="brand" to="/" aria-label="Vibeface home">
         <img className="brand-mark" src="/logo.svg" width="28" height="28" alt="" />
         <span>Vibeface</span>
