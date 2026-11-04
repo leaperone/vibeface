@@ -3689,9 +3689,9 @@ def acceptance(options):
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "coverage": "four real Node processes over iroh with a member relay; WASM browser client; fixture SDK",
               "not_checked": ["real NAT and public ingress (disjoint loopback IP families require the relay)",
-                              "attachment resume: no product path writes attachments yet; the Rust test "
-                              "member_nodes_sync_ranges_and_attachments_without_jobs_and_refuse_outsiders resumes 3 MiB",
-                              "non-member endpoints refused by sync and RPC (same Rust test)",
+                              "attachment resume is not covered here; --phase4 checks 64 MiB upload, restart and resume",
+                              "non-member endpoints refused by sync and RPC are covered by Rust test "
+                              "member_nodes_sync_ranges_and_attachments_without_jobs_and_refuse_outsiders",
                               "rendered browser UI", "provider models"]}
 
     def passed(name, **evidence):
