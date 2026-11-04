@@ -342,7 +342,7 @@ a:focus-visible, button:focus-visible { outline: 2px solid currentColor; outline
 .site-docs .prose a { color: var(--site-accent); text-decoration: underline; text-underline-offset: 3px; }
 .site-docs article code, .site-docs pre { border-color: var(--site-line); }
 @media (max-width: 960px) { .site-header { padding-inline: 24px; } .site--page main { padding-inline: 24px; } .site-footer { margin-inline: 24px; } }
-@media (max-width: 640px) { .site-header { gap: 16px; padding: 10px 20px; } .site-header nav { column-gap: 14px; font-size: 12px; } .site--page main { padding-inline: 20px; } .page-hero { padding-block: 64px 72px; } .page-hero h1 { font-size: clamp(38px, 10vw, 56px); } .page-hero-copy { font-size: 16px; } .site-footer { margin-inline: 20px; } }
+@media (max-width: 640px) { .site-header { gap: 16px; padding: 10px 20px; } .site-header nav { column-gap: 14px; font-size: 12px; } .site--page main { padding-inline: 20px; } .page-hero { padding-block: 64px 72px; } .page-hero h1 { font-size: clamp(38px, 10vw, 56px); } .page-hero-copy { font-size: 16px; } .site-footer { flex-wrap: wrap; margin-inline: 20px; } }
 
 .site-header { padding-block: 18px; }
 .site-header nav { gap: 24px; font-size: 13px; letter-spacing: .01em; }
