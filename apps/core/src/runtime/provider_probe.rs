@@ -1,4 +1,11 @@
-use super::{Runtime, codex_server::Link};
+use super::{
+    Runtime,
+    codex_server::Link,
+    provider_adapter::{
+        PendingDisconnectClassification, ScrubbedStderrTail, TerminationEvidence,
+        classify_pending_disconnect,
+    },
+};
 use crate::config::ManagerSettings;
 use crate::providers::{
     self, AppServer, AppServerMode, Authentication, CatalogCoverage, EffortOptions, LaunchCheck,
@@ -8,7 +15,10 @@ use crate::providers::{
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::{
+    process::{Child, ChildStderr, Command},
+    task::JoinHandle,
+};
 
 const OUTPUT_LIMIT: u64 = 64 * 1024;
 const PROBE_LIMIT: Duration = Duration::from_secs(5);
@@ -215,6 +225,42 @@ struct ProbeChild {
     group: i32,
 }
 
+fn stderr_task(stderr: Option<ChildStderr>) -> Option<JoinHandle<ScrubbedStderrTail>> {
+    stderr.map(|stderr| tokio::spawn(ScrubbedStderrTail::read(stderr)))
+}
+
+async fn finish_stderr(task: Option<JoinHandle<ScrubbedStderrTail>>) -> ScrubbedStderrTail {
+    let Some(task) = task else {
+        return ScrubbedStderrTail::default();
+    };
+    tokio::time::timeout(Duration::from_millis(250), task)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+}
+
+fn issue_with_evidence(
+    stage: ProbeStage,
+    code: ProbeCode,
+    tail: &ScrubbedStderrTail,
+    pending: bool,
+    termination: Option<&TerminationEvidence>,
+) -> ProbeIssue {
+    let mut issue = ProbeIssue::new(stage, code);
+    issue.safe_error = tail
+        .safe_error()
+        .or_else(|| {
+            matches!(
+                classify_pending_disconnect(pending, termination),
+                PendingDisconnectClassification::Unknown
+            )
+            .then_some("provider_disconnected")
+        })
+        .map(str::to_owned);
+    issue
+}
+
 impl Drop for ProbeChild {
     fn drop(&mut self) {
         // A cancelled probe must also stop helpers the CLI started.
@@ -249,7 +295,7 @@ fn spawn_probe(
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
     let child = command.spawn().map_err(|error| {
@@ -273,7 +319,10 @@ async fn claude_authentication(
 ) -> Result<Option<Authentication>, ProbeIssue> {
     let mut process = spawn_probe(input, fallback, &["auth", "status", "--json"])?;
     process.child.stdin.take();
+    let stderr = stderr_task(process.child.stderr.take());
     let Some(stdout) = process.child.stdout.take() else {
+        drop(process);
+        let _ = finish_stderr(stderr).await;
         return Ok(None);
     };
     let mut stdout = stdout.take(OUTPUT_LIMIT + 1);
@@ -288,7 +337,33 @@ async fn claude_authentication(
     .await
     .ok()
     .flatten();
-    Ok(status.and_then(|status| claude_authentication_response(&bytes, status.success())))
+    let termination = status
+        .as_ref()
+        .map(|status| TerminationEvidence::from(*status));
+    let pending = status.is_none() || bytes.is_empty();
+    drop(process);
+    let tail = finish_stderr(stderr).await;
+    if let Some(authentication) = status
+        .as_ref()
+        .and_then(|status| claude_authentication_response(&bytes, status.success()))
+    {
+        return Ok(Some(authentication));
+    }
+    if !tail.is_empty()
+        || matches!(
+            classify_pending_disconnect(pending, termination.as_ref()),
+            PendingDisconnectClassification::Unknown
+        )
+    {
+        return Err(issue_with_evidence(
+            ProbeStage::Authentication,
+            ProbeCode::AuthenticationUnverified,
+            &tail,
+            pending,
+            termination.as_ref(),
+        ));
+    }
+    Ok(None)
 }
 
 fn claude_authentication_response(bytes: &[u8], success: bool) -> Option<Authentication> {
@@ -315,18 +390,23 @@ async fn pi_catalog(
             "--no-extensions",
         ],
     )?;
+    let stderr = stderr_task(process.child.stderr.take());
     let (Some(mut stdin), Some(stdout)) = (process.child.stdin.take(), process.child.stdout.take())
     else {
+        drop(process);
+        let _ = finish_stderr(stderr).await;
         return Ok(None);
     };
     let stdout = stdout.take(OUTPUT_LIMIT + 1);
     let mut stdout = BufReader::new(stdout);
-    Ok(tokio::time::timeout(PROBE_LIMIT, async {
+    let mut pending = false;
+    let catalog = tokio::time::timeout(PROBE_LIMIT, async {
         stdin
             .write_all(b"{\"id\":\"provider-probe\",\"type\":\"get_available_models\"}\n")
             .await
             .ok()?;
         stdin.flush().await.ok()?;
+        pending = true;
         let mut total = 0;
         loop {
             let mut line = String::new();
@@ -348,7 +428,33 @@ async fn pi_catalog(
     })
     .await
     .ok()
-    .flatten())
+    .flatten();
+    let termination = process
+        .child
+        .try_wait()
+        .ok()
+        .flatten()
+        .map(TerminationEvidence::from);
+    drop(process);
+    let tail = finish_stderr(stderr).await;
+    if catalog.is_some() {
+        return Ok(catalog);
+    }
+    if !tail.is_empty()
+        || matches!(
+            classify_pending_disconnect(pending, termination.as_ref()),
+            PendingDisconnectClassification::Unknown
+        )
+    {
+        return Err(issue_with_evidence(
+            ProbeStage::ModelList,
+            ProbeCode::CatalogUnavailable,
+            &tail,
+            pending,
+            termination.as_ref(),
+        ));
+    }
+    Ok(None)
 }
 
 fn pi_model_catalog(data: &Value) -> Option<ModelCatalog> {
@@ -648,6 +754,23 @@ exit 1
                 .map_err(|_| anyhow::anyhow!("fixture failed to spawn"))?,
             Some(Authentication::SignInRequired)
         );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claude_probe_keeps_only_a_safe_stderr_category() -> anyhow::Result<()> {
+        let (dir, input) = fixture(
+            r#"
+printf '%s\n' 'Authorization: Bearer fixture-secret at /private/provider' >&2
+exit 2
+"#,
+        )?;
+        let issue = claude_authentication(&input, &dir).await.unwrap_err();
+        assert_eq!(issue.safe_error.as_deref(), Some("authentication_failed"));
+        let serialized = serde_json::to_string(&issue)?;
+        assert!(!serialized.contains("fixture-secret"));
+        assert!(!serialized.contains("/private/provider"));
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

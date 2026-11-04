@@ -24,6 +24,24 @@ const MAX_FORK_PAGES: usize = 4;
 const ATTACHMENT_WAIT: Duration = Duration::from_secs(15);
 const JOIN_NOTICE_WAIT: Duration = Duration::from_secs(3);
 
+#[derive(Default)]
+pub(super) struct PeerDeliveryLocks {
+    peers: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl PeerDeliveryLocks {
+    pub(super) async fn lock(&self, device_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let peer = {
+            let mut peers = self.peers.lock().expect("peer delivery locks");
+            peers
+                .entry(device_id.to_owned())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        peer.lock_owned().await
+    }
+}
+
 /// `(author, seq, hash)` of a fork evidence event, the order the evidence is read in.
 type ForkKey = (String, u64, String);
 
@@ -1684,6 +1702,16 @@ impl Runtime {
         }
         let (local, network) = (&self.identity.device_id()?, &network);
         each_device(owned, |owner, entry| async move {
+            let _peer_delivery = self.peer_delivery_locks.lock(&owner).await;
+            let now = now_ms();
+            if !self.store.lock().await.mailbox_before_attempt(
+                network,
+                &entry.conversation_id,
+                &entry.trigger,
+                now,
+            )? {
+                return Ok(());
+            }
             let delivered = if owner == *local {
                 self.store
                     .lock()
@@ -1694,22 +1722,54 @@ impl Runtime {
                 let request = json!({"type":"deliver","conversation_id":entry.conversation_id,
                         "trigger":entry.trigger});
                 self.peer_request(network, &owner, request).await
-            }?;
-            ensure!(
-                delivered["receipt"].is_object(),
-                "delivery answer had no receipt"
-            );
-            self.store
-                .lock()
-                .await
-                .remove_outbox(&entry.conversation_id, &entry.trigger)?;
-            self.publish_changed(
-                network,
-                &entry.conversation_id,
-                Changed::Job(&entry.trigger),
-            );
-            self.schedule_wakeup.notify_one();
-            Ok(())
+            };
+            match delivered {
+                Ok(delivered) => {
+                    if let Err(error) = (|| -> Result<()> {
+                        ensure!(
+                            delivered["receipt"].is_object(),
+                            "delivery answer had no receipt"
+                        );
+                        Ok(())
+                    })() {
+                        self.store.lock().await.mailbox_failed(
+                            network,
+                            &entry.conversation_id,
+                            &entry.trigger,
+                            false,
+                            &error.to_string(),
+                            now_ms(),
+                        )?;
+                        return Err(error);
+                    }
+                    let now = now_ms();
+                    self.store.lock().await.mailbox_delivered(
+                        network,
+                        &entry.conversation_id,
+                        &entry.trigger,
+                        now,
+                    )?;
+                    self.publish_changed(
+                        network,
+                        &entry.conversation_id,
+                        Changed::Job(&entry.trigger),
+                    );
+                    self.schedule_wakeup.notify_one();
+                    Ok(())
+                }
+                Err(error) => {
+                    let unknown = net::Unanswered::is(&error);
+                    self.store.lock().await.mailbox_failed(
+                        network,
+                        &entry.conversation_id,
+                        &entry.trigger,
+                        unknown,
+                        &error.to_string(),
+                        now_ms(),
+                    )?;
+                    Err(error)
+                }
+            }
         })
         .await;
         Ok(())
@@ -2050,6 +2110,61 @@ mod tests {
         )?;
         config::private_write(&dir.join("identity.json"), &serde_json::to_vec(identity)?)?;
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_delivery_locks_serialize_same_peer_and_allow_other_peers() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let locks = Arc::new(PeerDeliveryLocks::default());
+        let first_active = Arc::new(AtomicBool::new(false));
+        let same_peer_entered = Arc::new(AtomicBool::new(false));
+        let other_peer_parallel = Arc::new(AtomicBool::new(false));
+        let (first_ready_tx, first_ready_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+
+        let first = tokio::spawn({
+            let locks = locks.clone();
+            let first_active = first_active.clone();
+            async move {
+                let _guard = locks.lock("peer-a").await;
+                first_active.store(true, Ordering::SeqCst);
+                first_ready_tx.send(()).expect("first waiter");
+                release_first_rx.await.expect("first release");
+                first_active.store(false, Ordering::SeqCst);
+            }
+        });
+        first_ready_rx.await?;
+
+        let same_peer = tokio::spawn({
+            let locks = locks.clone();
+            let first_active = first_active.clone();
+            let same_peer_entered = same_peer_entered.clone();
+            async move {
+                let _guard = locks.lock("peer-a").await;
+                assert!(!first_active.load(Ordering::SeqCst));
+                same_peer_entered.store(true, Ordering::SeqCst);
+            }
+        });
+        let other_peer = tokio::spawn({
+            let locks = locks.clone();
+            let first_active = first_active.clone();
+            let other_peer_parallel = other_peer_parallel.clone();
+            async move {
+                let _guard = locks.lock("peer-b").await;
+                other_peer_parallel.store(first_active.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+        });
+
+        other_peer.await?;
+        assert!(other_peer_parallel.load(Ordering::SeqCst));
+        assert!(!same_peer_entered.load(Ordering::SeqCst));
+
+        release_first_tx.send(()).expect("release first peer");
+        first.await?;
+        same_peer.await?;
+        assert!(same_peer_entered.load(Ordering::SeqCst));
+        Ok(())
     }
 
     fn user(identity: &LocalIdentity, network: &str, id: &str) -> Result<Attestation> {
@@ -3308,6 +3423,14 @@ mod tests {
             b.deliver_outbox().await?;
             assert!(b.store.lock().await.scheduler_outbox()?.is_empty());
             let trigger = crate::scheduling::message_trigger("m4");
+            assert_eq!(
+                b.store
+                    .lock()
+                    .await
+                    .mailbox_for_test(&network, "c", &trigger)?
+                    .map(|record| record.state),
+                Some(crate::store::mailbox::MailboxState::Delivered)
+            );
             a.store.lock().await.scheduler_job("c", &trigger)?
                 .context("the owner admitted the delivered message")?;
             let again = b.peer_request(&network, &ia.device_id()?,

@@ -1428,9 +1428,12 @@ pub(crate) fn queue_delivery_from(
     conversation: &str,
     trigger: &str,
 ) -> Result<AdmissionReceipt> {
-    connection.execute(
-        "INSERT OR IGNORE INTO scheduler_outbox(conversation_id,trigger) VALUES(?,?)",
-        params![conversation, trigger],
+    super::mailbox::queue(
+        connection,
+        network,
+        conversation,
+        trigger,
+        crate::runtime::now_ms(),
     )?;
     Ok(OutboxEntry {
         conversation_id: conversation.into(),

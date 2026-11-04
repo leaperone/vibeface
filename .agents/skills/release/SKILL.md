@@ -73,6 +73,8 @@ GitHub 的 `immutable-app-release-tags` 规则保护这五类 tag，禁止更新
 
 发布成功后，下载并核对 `release.json` 的应用、tag、版本、源码 SHA、文件集合和 SHA-256。Core、App、WWW 还要核对 `COMPONENT-INFO.json`，CLI 核对 `BUILD-INFO.json`，Mobile 核对 APK 的 `.provenance.json`。上传成功不等于制品通过运行验收。
 
+App 的公网入口是 `https://app.vibeface.dev`。现有 App tag 只生成归档，不自动更新站点；部署后须核对线上资源的源码身份、SPA 路由、API 404 和首次连接页面。
+
 www Stable 还要跟踪 `leaperone/leaperone-releases` 的 `deploy-vibeface-www.yml`。该 workflow 的标题包含 `src=<SOURCE_SHA>`，用它匹配源码；其 `headSha` 属于部署仓库，不能拿来与 Vibeface 源码比较。确认下游部署成功后再检查 `www.vibeface.dev` 的实际页面。源码仓库 dispatch 成功不代表网站已经上线。
 
 npm 使用 [npm-publish.yml](../../../.github/workflows/npm-publish.yml)，当前仅支持 CLI Nightly。它不随 tag 自动公开发布：先验证同 tag 产物并 dry run，只有授权包含 npm 发布时才执行 publish。不要索取聊天凭证。

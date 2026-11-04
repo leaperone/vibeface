@@ -6,6 +6,12 @@ const manager = (sequence: number, progress: unknown, trigger = 'turn-a', invoca
   type: 'manager_progress', conversation_id: 'chat-a', trigger, source_node: 'scheduler-a', invocation_id, sequence, progress,
 })
 
+test('resync is a snapshot request and does not alter live progress', () => {
+  const event = parseChanged({ type: 'resync' })
+  assert.deepEqual(event, { type: 'resync' })
+  assert.deepEqual(mergeProgress([], event), [])
+})
+
 test('only the normalized progress contract crosses the changed boundary', () => {
   const event = manager(1, { type: 'text_snapshot', text: '', item_id: 'reply-a' })
   assert.equal(event.type, 'manager_progress')
