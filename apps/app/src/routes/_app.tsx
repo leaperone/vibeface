@@ -18,12 +18,14 @@ function AppLayout() {
   const onboarding = useOnboarding()
   // Onboarding ends on a pressed button that leaves with it; the workspace that follows takes the focus on its title.
   const [onboarded] = useState(onboarding !== null)
-  // The page that asked, not the connect page this layout is already leaving for.
-  const here = useRouterState({ select: (state) => (state.resolvedLocation ?? state.location).href })
+  const location = useRouterState({ select: (state) => state.location })
   const home = useRouterState({ select: (state) => state.location.pathname === '/' })
   const routeBot = useRouterState({ select: (state) => /^\/b\/([^/]+)/.exec(state.location.pathname)?.[1] ?? null })
   const access = accessOf({ ready: Boolean(ready), phase, joining: Boolean(joining), savedEntries: entries.length, invitation: Boolean(initialInvitation), offlineRetryMs: link.kind === 'offline' ? link.retryInMs : null })
-  if (access.kind === 'auth') return <Navigate to="/connect" search={here === '/' ? {} : { redirect: here }} replace />
+  if (access.kind === 'auth') {
+    if (location.pathname === '/connect') return null
+    return <Navigate to="/connect" search={location.href === '/' ? {} : { redirect: location.href }} replace />
+  }
   if (access.kind === 'resuming') return <ShellSkeleton home={home} retry={access.retryInSeconds} onRetry={retryNow} onLeave={disconnect} />
   if (!ready) return <ShellSkeleton home={home} />
   const key = `${ready.principal.network_id}:${ready.principal.device_id}`
