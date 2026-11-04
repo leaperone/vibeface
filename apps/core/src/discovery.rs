@@ -648,4 +648,35 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn codex_nvm_discovery_uses_semver_and_keeps_the_wrapper_path() -> Result<()> {
+        let root = scratch("nvm");
+        let versions = root.join(".nvm/versions/node");
+        for version in ["v9.0.0", "v20.9.0", "v20.10.0", "v99.0.0", "invalid"] {
+            let install = versions.join(version);
+            let wrapper = install.join("lib/node_modules/@openai/codex/bin/codex.js");
+            program(&wrapper);
+            std::fs::create_dir_all(install.join("bin"))?;
+            std::os::unix::fs::symlink(&wrapper, install.join("bin/codex"))?;
+            if version != "v99.0.0" {
+                program(&install.join("bin/node"));
+            }
+        }
+        let path_bin = root.join("path/codex");
+        let mut host = Host {
+            home: Some(root.clone()),
+            path: Some(root.join("path").into_os_string()),
+            ..Default::default()
+        };
+        let selected = versions.join("v20.10.0/bin/codex");
+        assert_eq!(host.program("codex"), Some(selected.clone()));
+        assert_ne!(selected.canonicalize()?, selected);
+        program(&path_bin);
+        assert_eq!(host.program("codex"), Some(path_bin));
+        host.path = None;
+        assert_eq!(host.program("codex"), Some(selected));
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 }

@@ -1479,6 +1479,65 @@ mod tests {
     }
 
     #[test]
+    fn selected_codex_wrapper_launches_with_its_sibling_node() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-codex-node-{}", uuid::Uuid::new_v4()));
+        let bin = dir.join("versions/node/v20.10.0/bin");
+        let module = bin.join("../lib/node_modules/@openai/codex/bin/codex.js");
+        std::fs::create_dir_all(module.parent().unwrap())?;
+        std::fs::create_dir_all(&bin)?;
+        std::fs::write(&module, "#!/usr/bin/env node\n")?;
+        std::fs::set_permissions(&module, std::fs::Permissions::from_mode(0o700))?;
+        std::os::unix::fs::symlink(&module, bin.join("codex"))?;
+        std::fs::write(
+            bin.join("node"),
+            "#!/bin/sh\nprintf 'fixture-node:%s\\n' \"$1\"\n",
+        )?;
+        std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o700))?;
+        let mut local = Local {
+            switches: Providers::default(),
+            bins: BTreeMap::from([(Provider::Codex, bin.join("codex"))]),
+            env: ProviderEnv::default(),
+        };
+        local.switches.execution.insert(Provider::Codex);
+        local.env.apply(
+            Provider::Codex,
+            BTreeMap::from([
+                (
+                    "PATH".into(),
+                    Some(dir.join("empty").to_string_lossy().into_owned()),
+                ),
+                ("FIXTURE_API_KEY".into(), Some("fixture-auth".into())),
+            ]),
+        )?;
+        let CodexTarget::Spawn(launch) = local.codex_target(false) else {
+            panic!("the selected Codex executes work");
+        };
+        let output = std::process::Command::new(&launch.bin)
+            .arg("--version")
+            .env_clear()
+            .envs(&launch.env)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout)?,
+            format!("fixture-node:{}\n", bin.join("codex").display())
+        );
+        assert_eq!(launch.env["FIXTURE_API_KEY"], "fixture-auth");
+        assert_eq!(
+            local.env.get(Provider::Codex)["PATH"],
+            dir.join("empty").to_string_lossy()
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn execution_model_overrides_are_separate_from_the_bot_and_clear_to_provider_default() {
         let mut providers = Providers::default();
         providers
