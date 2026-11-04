@@ -487,6 +487,7 @@ impl Runtime {
         dispatch: &Dispatch,
         notify: bool,
     ) -> Result<Result<Dispatch>> {
+        let _peer_delivery = self.peer_delivery_locks.lock(&dispatch.spec.target).await;
         let request = json!({"type":"dispatch_work","spec":dispatch.spec});
         let reply = match self
             .peer_request(network, &dispatch.spec.target, request)
@@ -1030,6 +1031,7 @@ impl Runtime {
     }
 
     async fn deliver_stop(&self, network: &str, request: &StopRequest) -> Result<Value> {
+        let _peer_delivery = self.peer_delivery_locks.lock(&request.target).await;
         self.peer_request(
             network,
             &request.target,

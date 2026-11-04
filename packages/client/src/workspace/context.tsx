@@ -480,6 +480,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const unsubscribe = connection.subscribe((event) => {
       if (!current()) return
       if (event.type === "records") { applyRecords(event.value).catch(() => scheduleRefresh()); return }
+      if (event.type === "resync") { scheduleRefresh(); return }
       if (event.type === "invalidate") {
         if (event.conversation_id === undefined) scheduleRefresh()
         else reloadScope(event.conversation_id).catch(() => scheduleRefresh())
