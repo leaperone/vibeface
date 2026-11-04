@@ -6,5 +6,5 @@ export function ThemeToggle() {
   const [mounted, setMounted] = useState(false)
   useEffect(() => setMounted(true), [])
   const dark = mounted && resolvedTheme === 'dark'
-  return <button className="theme-toggle" type="button" aria-label={dark ? '切换到浅色主题' : '切换到深色主题'} onClick={() => setTheme(dark ? 'light' : 'dark')}>{dark ? '浅色' : '深色'}</button>
+  return <button className="theme-toggle" type="button" aria-label={dark ? 'Switch to light theme' : 'Switch to dark theme'} onClick={() => setTheme(dark ? 'light' : 'dark')}>{dark ? 'Light' : 'Dark'}</button>
 }
