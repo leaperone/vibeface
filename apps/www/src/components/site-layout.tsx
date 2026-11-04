@@ -13,7 +13,7 @@ export function SiteLayout({ children, mainId = 'content', variant = 'landing' }
   return (
     <div className={`site site--${variant}`}>
       <a className="site-skip" href={`#${mainId}`}>
-        跳到内容
+        Skip to content
       </a>
       <SiteHeader />
       <main id={mainId} tabIndex={-1}>

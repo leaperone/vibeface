@@ -5,8 +5,8 @@ import { SiteLayout } from '@/components/site-layout'
 export const Route = createFileRoute('/')({
   head: () => ({
     meta: [
-      { title: 'Vibeface · 用聊天指挥自己的电脑' },
-      { name: 'description', content: '复用本机 Codex 或 Claude Code，让 Bot 协调自己的电脑，并在授权设备间查看共享任务历史。' },
+      { title: 'Vibeface · Your computers. One conversation.' },
+      { name: 'description', content: 'Chat with a bot, choose where work runs, and keep the result in the same conversation across your own computers.' },
       { name: 'theme-color', content: '#080b09' },
     ],
     links: [{ rel: 'canonical', href: 'https://www.vibeface.dev/' }],
@@ -20,106 +20,106 @@ function HomePage() {
       <div className="landing">
         <section className="landing-hero" aria-labelledby="hero-title">
           <div className="hero-copy-block">
-            <p className="hero-kicker">自己的设备，自己的 Agent <span aria-hidden="true">/</span> Nightly</p>
-            <h1 id="hero-title">用聊天，指挥<br />自己的电脑。</h1>
-            <p className="hero-lede">让本机的 Codex 或 Claude Code 执行工作。Bot 协调，选定电脑执行，阶段与结果回到原聊天。按设备设置完成登录，模型服务与额度由你准备。</p>
+            <p className="hero-kicker">Your devices <span aria-hidden="true">/</span> Your agents <span aria-hidden="true">/</span> Nightly</p>
+            <h1 id="hero-title">Your computers.<br />One conversation.</h1>
+            <p className="hero-lede">Vibeface lets a bot plan in chat, run work on the computer you choose, and return the result to the same thread.</p>
             <div className="hero-actions">
-              <Link className="button button-primary" to="/docs/$" params={{ _splat: 'quick-start' }}>快速上手 <ArrowRight size={16} aria-hidden="true" /></Link>
-              <Link className="button button-quiet" to="/docs/$" params={{ _splat: 'overview' }}>先了解 Vibeface <ArrowRight size={16} aria-hidden="true" /></Link>
+              <Link className="button button-primary" to="/docs/$" params={{ _splat: 'quick-start' }}>Start with one computer <ArrowRight size={16} aria-hidden="true" /></Link>
+              <Link className="button button-quiet" to="/docs/$" params={{ _splat: 'overview' }}>Read the overview <ArrowRight size={16} aria-hidden="true" /></Link>
             </div>
-            <ul className="hero-proof" aria-label="Vibeface 的核心边界">
-              <li><span>01</span><strong>本机执行</strong><small>使用自己的 Agent</small></li>
-              <li><span>02</span><strong>签名历史</strong><small>带因果依赖的 DAG</small></li>
-              <li><span>03</span><strong>权限可见</strong><small>先知道谁能读到内容</small></li>
+            <ul className="hero-proof" aria-label="Vibeface foundations">
+              <li><span>01</span><strong>Local execution</strong><small>Your Agent runs on your computer</small></li>
+              <li><span>02</span><strong>Shared context</strong><small>Keep the work in one thread</small></li>
+              <li><span>03</span><strong>Approved devices</strong><small>Choose who can connect</small></li>
             </ul>
           </div>
 
-          <figure className="hero-figure" aria-label="Bot 协调、本机 Agent 执行与共享历史的关系示意">
+          <figure className="hero-figure" aria-label="A visual map of a conversation, the selected computer, and shared history">
             <div className="hero-visual">
               <div className="visual-grid" aria-hidden="true" />
               <div className="visual-glow" aria-hidden="true" />
-              <div className="visual-readout" aria-hidden="true"><span>PERSONAL NETWORK / 01</span><strong>READY TO HAND OFF</strong></div>
+              <div className="visual-readout" aria-hidden="true"><span>PRIVATE NETWORK / 01</span><strong>READY TO HAND OFF</strong></div>
               <div className="orbit orbit-one" aria-hidden="true" />
               <div className="orbit orbit-two" aria-hidden="true" />
               <div className="orbit orbit-three" aria-hidden="true" />
               <div className="hero-logo"><img src="/logo.svg" width="144" height="144" alt="" /></div>
-              <a className="visual-node visual-node-top" href="/docs/bot-and-execution"><span>Bot 协调</span><small>理解需求，派发工作</small></a>
-              <a className="visual-node visual-node-left" href="/docs/bot-and-execution#工作如何回到原聊天"><span>本机 Agent 执行</span><small>在你选定的电脑上</small></a>
-              <a className="visual-node visual-node-right" href="/docs/history-sync"><span>共享历史</span><small>带签名的 DAG 记录</small></a>
+              <a className="visual-node visual-node-top" href="/docs/bot-and-execution"><span>Conversation</span><small>Shape the request, then hand it off</small></a>
+              <a className="visual-node visual-node-left" href="/docs/bot-and-execution#工作如何回到原聊天"><span>Selected computer</span><small>Your Agent uses local tools</small></a>
+              <a className="visual-node visual-node-right" href="/docs/history-sync"><span>Shared history</span><small>Stages and results return</small></a>
             </div>
-            <figcaption>关系示意 · 任务阶段与结果回到同一段 Bot 聊天。</figcaption>
+            <figcaption>One thread from request to result.</figcaption>
           </figure>
         </section>
 
         <section className="landing-section landing-story" aria-labelledby="story-title">
-          <p className="section-eyebrow">01 / 工作流</p>
-          <h2 id="story-title">一条需求，留在同一段聊天。</h2>
-          <p className="story-prompt"><span>示例需求</span>检查这个项目的失败测试，并说明需要怎样修改。</p>
+          <p className="section-eyebrow">The loop</p>
+          <h2 id="story-title">The work stays together.</h2>
+          <p className="story-prompt"><span>Example request</span>“Check the failing tests and tell me what to change.”</p>
           <div className="story-frame">
             <div className="story-frame-meta"><span>WORK LOOP / 01</span><span>PRIVATE NETWORK</span></div>
             <ol className="work-story" role="list">
-              <li><h3>把需求交给 Bot</h3><p>交代目标、项目和希望使用的设备。Bot 结合这段聊天的历史组织工作。</p></li>
-              <li><h3>选定电脑执行</h3><p>工作交给已授权、已准备好项目的电脑，由那里的 Agent 读取文件、运行工具。</p></li>
-              <li><h3>回原聊天看结果</h3><p>阶段和持久结果回到原聊天。结果不确定时先核对原任务，不直接重发。</p></li>
+              <li><h3>Ask the bot</h3><p>Share the goal, project, and computer you want to use. The bot keeps the thread in view.</p></li>
+              <li><h3>Choose a computer</h3><p>An approved computer runs the work with its local Agent, files, and tools.</p></li>
+              <li><h3>Read the result</h3><p>Stages and durable results return to the original thread. Check an unknown result before retrying.</p></li>
             </ol>
-            <div className="story-frame-result"><span>RETURNED TO CHAT</span><strong>阶段与持久结果回到原聊天</strong><small>完整逐字流式进度不作为共享历史保存。</small></div>
+            <div className="story-frame-result"><span>RETURNED TO THREAD</span><strong>The conversation keeps the context.</strong><small>Full word-for-word streaming progress stays with the source Node.</small></div>
           </div>
         </section>
 
         <section className="landing-system" id="system" aria-labelledby="system-title">
           <div className="system-intro">
-            <p className="section-eyebrow">02 / 结构</p>
-            <h2 id="system-title">保留上下文，<br />原有工具继续用。</h2>
-            <p>增加长期 Bot 协调和个人设备间的共享历史，执行仍交给本机的 Agent。</p>
-            <a className="text-link" href="/docs/bot-and-execution">看看分工怎么安排 <ArrowRight size={16} aria-hidden="true" /></a>
+            <p className="section-eyebrow">The system</p>
+            <h2 id="system-title">Keep the context.<br />Keep your tools.</h2>
+            <p>Vibeface adds long-running bot coordination and shared history. Your Agent still runs on your computer.</p>
+            <a className="text-link" href="/docs/bot-and-execution">See how work is split <ArrowRight size={16} aria-hidden="true" /></a>
           </div>
-          <p className="system-manifesto">协调可以迁移，<em>执行留在你选择的电脑。</em></p>
+          <p className="system-manifesto">Coordination can move. <em>Execution stays where you choose.</em></p>
           <div className="system-details">
-            <article><h3>Bot 与执行分开</h3><p>协调与执行可以分别选择产品。使用自己电脑上的 Codex 或 Claude Code，按设备设置为 Vibeface 的运行目录登录，并准备项目。</p></article>
-            <article><h3>共享 Bot 历史</h3><div><p>带签名和因果依赖的 DAG 同步 Bot 聊天、设置、任务阶段和结果。项目、依赖、登录与原生 SDK 状态不会自动迁移，完整逐字进度不作为共享历史保存。</p><a className="text-link" href="/docs/history-sync">了解同步范围 <ArrowRight size={16} aria-hidden="true" /></a></div></article>
-            <article><h3>换台电脑继续</h3><p>另一台 Node 先同步，再由你选择“交给这台设备处理”，用共享记录建立本机 Agent 上下文。历史回放不会启动旧工作，断网时仍需核对任务状态。</p></article>
+            <article><h3>Conversation and execution</h3><p>Use a bot to coordinate work while Codex, Claude Code, pi, opencode, or Cursor runs it on the computer you choose.</p></article>
+            <article><h3>Shared history</h3><div><p>Approved devices share the conversation, settings, stages, and durable results. Project files, logins, and SDK state stay local.</p><a className="text-link" href="/docs/history-sync">See what syncs <ArrowRight size={16} aria-hidden="true" /></a></div></article>
+            <article><h3>Continue elsewhere</h3><p>Open a synchronized thread on another computer and hand off the next turn. Replaying history never starts old work.</p></article>
           </div>
         </section>
 
         <section className="landing-section landing-comparison" aria-labelledby="comparison-title">
-          <p className="section-eyebrow">03 / 选择</p>
-          <h2 id="comparison-title">已经有 Agent，还需要这一层吗？</h2>
-          <p className="section-copy">原生工具也有远程与自动化入口。按你需要的工作方式选择。</p>
+          <p className="section-eyebrow">The choice</p>
+          <h2 id="comparison-title">Already have an Agent?</h2>
+          <p className="section-copy">Choose the layer that matches how you work.</p>
           <dl className="choice-list">
-            <div><dt>直接用 Codex 或 Claude Code</dt><dd>你已在终端、IDE 或官方入口完成工作，只需要该产品自己的流程。</dd></div>
-            <div><dt>了解 OpenClaw</dt><dd>你更关注自托管 Gateway，希望从常用聊天应用接入 Agent。</dd></div>
-            <div><dt>选择 Vibeface</dt><dd>你需要长期 Bot 协调、选择自己的执行电脑，并在授权设备间查看共享历史。</dd></div>
+            <div><dt>Use Codex or Claude Code</dt><dd>You only need the product's own terminal, editor, or hosted flow.</dd></div>
+            <div><dt>Look at OpenClaw</dt><dd>You want a self-hosted gateway that connects agents to chat apps.</dd></div>
+            <div><dt>Choose Vibeface</dt><dd>You want one thread that can send work to your own computers and show the result back.</dd></div>
           </dl>
-          <a className="text-link" href="/docs/comparison">比较适合你的用法 <ArrowRight size={16} aria-hidden="true" /></a>
+          <a className="text-link" href="/docs/comparison">Compare the options <ArrowRight size={16} aria-hidden="true" /></a>
         </section>
 
         <section className="landing-section landing-trust" aria-labelledby="trust-title">
-          <p className="section-eyebrow">04 / 边界</p>
-          <h2 id="trust-title">先知道谁能读到内容。</h2>
+          <p className="section-eyebrow">The boundary</p>
+          <h2 id="trust-title">Know where your work goes.</h2>
           <div className="trust-content">
             <dl className="trust-facts">
-              <div><dt>每台设备有自己的身份</dt><dd>设备各用独立密钥，新设备加入由管理设备核对并批准。</dd></div>
-              <div><dt>连接验证身份并加密</dt><dd>只负责转发的公共入口搬运密文，不因转发加入个人网络。</dd></div>
-              <div><dt>配置的凭证留在本机</dt><dd>Provider 配置不随历史同步。主动发进聊天的秘密仍会作为正文同步。</dd></div>
+              <div><dt>Every device has its own identity</dt><dd>Each device has its own key. You approve new devices before they join.</dd></div>
+              <div><dt>Connections are encrypted</dt><dd>A public entry point can relay ciphertext without joining your private network.</dd></div>
+              <div><dt>Credentials stay local</dt><dd>Provider settings do not sync. A secret you send in chat becomes part of the message.</dd></div>
             </dl>
-            <aside className="trust-boundary" aria-label="使用前需要了解的权限边界">
-              <p>授权 Node 与所选模型服务仍会处理任务内容。请只使用你信任的设备与网页。</p>
-              <p>传输加密不等于磁盘静态加密。项目目录检查不是操作系统沙箱，Codex 和 Claude Code 可完全访问宿主机。</p>
-              <a className="text-link" href="/docs/privacy-security">阅读隐私与权限说明 <ArrowRight size={16} aria-hidden="true" /></a>
+            <aside className="trust-boundary" aria-label="Permission boundaries to know before you start">
+              <p>Approved Nodes and the model service you choose still process task content. Use devices and entry points you trust.</p>
+              <p>Transport encryption does not encrypt the disk. Project folders are not an operating system sandbox, and Codex or Claude Code can access the host tools they are given.</p>
+              <a className="text-link" href="/docs/privacy-security">Read privacy and permissions <ArrowRight size={16} aria-hidden="true" /></a>
             </aside>
           </div>
         </section>
 
         <section className="landing-section landing-start" aria-labelledby="start-title">
-          <p className="section-eyebrow">05 / 开始</p>
-          <h2 id="start-title">从一台电脑开始。</h2>
-          <p className="section-copy">准备一台支持的 Mac 或 Linux、已安装的 Agent，以及自己的模型服务和项目目录。先从一次对话开始，再添加其他设备。</p>
+          <p className="section-eyebrow">Start here</p>
+          <h2 id="start-title">Begin with one computer.</h2>
+          <p className="section-copy">Use a supported Mac or Linux computer, one installed Agent, a model service, and a project folder. Start with one conversation, then add another computer.</p>
           <ol className="start-steps" role="list">
-            <li><a href="/docs/quick-start">快速上手：完成第一次对话 <ArrowUpRight size={16} aria-hidden="true" /></a></li>
-            <li><a href="/docs/onboarding">首次配置：登录 Agent 与加入设备 <ArrowUpRight size={16} aria-hidden="true" /></a></li>
-            <li><a href="/docs/user-guide">日常使用：查看任务与切换电脑 <ArrowUpRight size={16} aria-hidden="true" /></a></li>
+            <li><a href="/docs/quick-start">Start the quick start <span>Finish your first conversation</span> <ArrowUpRight size={16} aria-hidden="true" /></a></li>
+            <li><a href="/docs/onboarding">Set up a device <span>Sign in and add computers</span> <ArrowUpRight size={16} aria-hidden="true" /></a></li>
+            <li><a href="/docs/user-guide">Read the user guide <span>Use tasks and switch computers</span> <ArrowUpRight size={16} aria-hidden="true" /></a></li>
           </ol>
-          <p className="nightly-note">当前为 Nightly。正式版前不保留协议、数据格式和 API 的向后兼容。<a href="https://github.com/leaperone/vibeface/releases">查看 Nightly Releases <ArrowUpRight size={14} aria-hidden="true" /></a></p>
+          <p className="nightly-note">Vibeface is Nightly. Protocols, data formats, and APIs may change before the first stable release. <a href="https://github.com/leaperone/vibeface/releases">View Nightly releases <ArrowUpRight size={14} aria-hidden="true" /></a></p>
         </section>
       </div>
     </SiteLayout>
