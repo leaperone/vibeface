@@ -1197,7 +1197,15 @@ impl ProviderRoots {
         env
     }
 
-    pub fn apply(&self, local: &mut Local) -> Result<()> {
+    pub fn apply(
+        &self,
+        local: &mut Local,
+        codex_agent: bool,
+        host: &crate::discovery::Host,
+    ) -> Result<()> {
+        if local.launches(Provider::Codex) && local.switches.app_server_used(codex_agent) {
+            self.seed_codex_config(host)?;
+        }
         for provider in Provider::ALL {
             local.env.apply(
                 provider,
@@ -1209,6 +1217,55 @@ impl ProviderRoots {
         }
         Ok(())
     }
+
+    /// A new private home inherits only safe model/provider settings, never the user's auth
+    /// or session store. An existing private configuration always wins.
+    pub fn seed_codex_config(&self, host: &crate::discovery::Host) -> Result<bool> {
+        let target = self.codex_home.join("config.toml");
+        match std::fs::symlink_metadata(&target) {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => anyhow::bail!("could not inspect private Codex configuration"),
+        }
+        let Some(home) = host
+            .codex_home
+            .clone()
+            .or_else(|| host.home.as_ref().map(|home| home.join(".codex")))
+        else {
+            return Ok(false);
+        };
+        let Some(source) = crate::manager::read_codex_config(&home)? else {
+            return Ok(false);
+        };
+        let projected = crate::manager::codex_config_projection(&source)?;
+        if projected.is_empty() {
+            return Ok(false);
+        }
+        let bytes = toml::to_string(&projected)
+            .map_err(|_| anyhow::anyhow!("could not prepare private Codex configuration"))?;
+        crate::config::private_dir(&self.codex_home)?;
+        let temp = self
+            .codex_home
+            .join(format!(".config-{}.toml", uuid::Uuid::new_v4()));
+        crate::config::private_write(&temp, bytes.as_bytes())
+            .map_err(|_| anyhow::anyhow!("could not prepare private Codex configuration"))?;
+        // A hard link publishes complete contents without replacing a concurrent creator.
+        let created = match std::fs::hard_link(&temp, &target) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(_) => Err(anyhow::anyhow!(
+                "could not create private Codex configuration"
+            )),
+        };
+        std::fs::remove_file(temp).map_err(|_| {
+            anyhow::anyhow!("could not remove private Codex configuration staging file")
+        })?;
+        let created = created?;
+        if created {
+            std::fs::File::open(&self.codex_home)?.sync_all()?;
+        }
+        Ok(created)
+    }
 }
 
 impl Local {
@@ -1217,6 +1274,48 @@ impl Local {
             .get(&provider)
             .cloned()
             .unwrap_or_else(|| provider.default_bin().into())
+    }
+
+    /// npm's Codex wrapper uses `env node`; keep its selected installation's Node ahead of
+    /// any inherited version without changing the saved environment.
+    pub fn launch_env(&self, provider: Provider) -> BTreeMap<String, String> {
+        let mut env = self.env.get(provider).clone();
+        if provider != Provider::Codex {
+            return env;
+        }
+        let path = env
+            .get("PATH")
+            .map(std::ffi::OsString::from)
+            .or_else(|| crate::discovery::Host::current().path);
+        let mut program = self.bin(provider);
+        if program.components().count() == 1
+            && !program.is_absolute()
+            && let Some(found) = path
+                .iter()
+                .flat_map(std::env::split_paths)
+                .map(|dir| dir.join(&program))
+                .find(|path| crate::discovery::executable_file(path))
+        {
+            program = found;
+        }
+        let Some(bin) = program.parent().filter(|bin| bin.is_absolute()) else {
+            return env;
+        };
+        if !crate::discovery::executable_file(&bin.join("node")) {
+            return env;
+        }
+        let paths = std::iter::once(bin.to_path_buf()).chain(
+            path.iter()
+                .flat_map(std::env::split_paths)
+                .filter(|dir| dir != bin),
+        );
+        if let Some(path) = std::env::join_paths(paths)
+            .ok()
+            .and_then(|path| path.into_string().ok())
+        {
+            env.insert("PATH".into(), path);
+        }
+        env
     }
 
     /// Whether the Node starts the provider's program itself: Codex on the system App Server
@@ -1240,7 +1339,7 @@ impl Local {
             },
             (true, AppServerMode::Spawn) => CodexTarget::Spawn(CodexLaunch {
                 bin: self.bin(Provider::Codex),
-                env: self.env.get(Provider::Codex).clone(),
+                env: self.launch_env(Provider::Codex),
             }),
         }
     }
@@ -1533,6 +1632,198 @@ mod tests {
             local.env.get(Provider::Codex)["PATH"],
             dir.join("empty").to_string_lossy()
         );
+        assert_eq!(local.launch_env(Provider::Codex), launch.env);
+        assert!(local.launch_env(Provider::Cursor).is_empty());
+        local.bins.remove(&Provider::Codex);
+        local.env.apply(
+            Provider::Codex,
+            BTreeMap::from([(
+                "PATH".into(),
+                Some(format!(
+                    "{}:{}:{}",
+                    dir.join("empty").display(),
+                    bin.display(),
+                    bin.display()
+                )),
+            )]),
+        )?;
+        let from_path = local.launch_env(Provider::Codex);
+        assert_eq!(
+            std::env::split_paths(&from_path["PATH"]).collect::<Vec<_>>(),
+            vec![bin.clone(), dir.join("empty")]
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn private_codex_config_projects_selected_metadata_and_never_overwrites() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-codex-config-{}", uuid::Uuid::new_v4()));
+        let source = dir.join("global");
+        let fallback = dir.join("home/.codex");
+        crate::config::private_dir(&source)?;
+        crate::config::private_dir(&fallback)?;
+        std::fs::write(fallback.join("config.toml"), "model='wrong-source'")?;
+        std::fs::write(
+            source.join("config.toml"),
+            r#"
+model = "unused-model"
+model_provider = "unused"
+model_reasoning_effort = "high"
+profile = "selected"
+experimental_bearer_token = "SYNTHETIC_INLINE_SECRET"
+[profiles.selected]
+model = "selected-model"
+model_provider = "active"
+sandbox_mode = "danger-full-access"
+[model_providers.active]
+name = "Fixture provider"
+base_url = "https://api.example.test/v1"
+wire_api = "responses"
+env_key = "FIXTURE_API_KEY"
+env_http_headers = { "X-Fixture" = "FIXTURE_HEADER_TOKEN" }
+requires_openai_auth = false
+http_headers = { "Authorization" = "SYNTHETIC_INLINE_SECRET" }
+experimental_bearer_token = "SYNTHETIC_INLINE_SECRET"
+[model_providers.unused]
+env_key = "not-an-environment-name"
+base_url = "https://user:SYNTHETIC_INLINE_SECRET@example.test/?token=secret"
+[mcp_servers.fixture]
+command = "do-not-copy"
+[hooks]
+command = "do-not-copy"
+[projects."/private/project"]
+trust_level = "trusted"
+"#,
+        )?;
+        std::fs::write(source.join("auth.json"), "SYNTHETIC_AUTH_FILE")?;
+        std::fs::create_dir_all(source.join("sessions"))?;
+        let host = crate::discovery::Host {
+            codex_home: Some(source.clone()),
+            home: Some(dir.join("home")),
+            ..Default::default()
+        };
+        let roots = ProviderRoots::new(&dir.join("node"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let created = std::thread::scope(|scope| {
+            (0..8)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let roots = &roots;
+                    let host = &host;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        roots.seed_codex_config(host)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|task| task.join().unwrap())
+                .collect::<Result<Vec<_>>>()
+        })?;
+        assert_eq!(created.into_iter().filter(|created| *created).count(), 1);
+        let target = roots.codex_home.join("config.toml");
+        let bytes = std::fs::read(&target)?;
+        let projected: toml::Value = toml::from_str(std::str::from_utf8(&bytes)?)?;
+        let expected: toml::Value = toml::from_str(
+            r#"
+model = "selected-model"
+model_provider = "active"
+model_reasoning_effort = "high"
+[model_providers.active]
+name = "Fixture provider"
+base_url = "https://api.example.test/v1"
+wire_api = "responses"
+env_key = "FIXTURE_API_KEY"
+env_http_headers = { "X-Fixture" = "FIXTURE_HEADER_TOKEN" }
+requires_openai_auth = false
+"#,
+        )?;
+        assert_eq!(projected, expected);
+        assert_eq!(
+            std::fs::metadata(&target)?.permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&roots.codex_home)?.permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(!roots.codex_home.join("auth.json").exists());
+        assert!(!roots.codex_sessions.exists());
+        let bin = dir.join("fake-codex");
+        std::fs::write(&bin, "#!/bin/sh\n/bin/cat \"$CODEX_HOME/config.toml\"\n")?;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700))?;
+        let mut local = Local {
+            switches: Providers::default(),
+            bins: [(Provider::Codex, bin)].into_iter().collect(),
+            env: ProviderEnv::default(),
+        };
+        local.switches.execution.insert(Provider::Codex);
+        roots.apply(&mut local, false, &host)?;
+        let CodexTarget::Spawn(launch) = local.codex_target(false) else {
+            unreachable!()
+        };
+        assert_eq!(
+            Provider::Codex.key_variables(&launch.env)?,
+            vec!["FIXTURE_API_KEY", "FIXTURE_HEADER_TOKEN"]
+        );
+        let output = std::process::Command::new(launch.bin)
+            .env_clear()
+            .envs(launch.env)
+            .output()?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout, bytes);
+        std::fs::write(
+            source.join("config.toml"),
+            "invalid = [ SYNTHETIC_INLINE_SECRET",
+        )?;
+        assert!(!roots.seed_codex_config(&host)?);
+        assert_eq!(std::fs::read(&target)?, bytes);
+        let fallback_roots = ProviderRoots::new(&dir.join("fallback-node"));
+        assert!(fallback_roots.seed_codex_config(&crate::discovery::Host {
+            home: host.home.clone(),
+            ..Default::default()
+        })?);
+        assert!(
+            std::fs::read_to_string(fallback_roots.codex_home.join("config.toml"))?
+                .contains("wrong-source")
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_global_codex_config_blocks_only_enabled_private_codex() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-codex-enable-{}", uuid::Uuid::new_v4()));
+        let source = dir.join("global");
+        crate::config::private_dir(&source)?;
+        let host = crate::discovery::Host {
+            codex_home: Some(source.clone()),
+            ..Default::default()
+        };
+        for (index, config) in ["model='SYNTHETIC_INLINE_SECRET",
+            "model_provider='active'\n[model_providers.active]\nbase_url='https://api.example.test/?token=SYNTHETIC_INLINE_SECRET'"].into_iter().enumerate() {
+            std::fs::write(source.join("config.toml"), config)?;
+            let roots = ProviderRoots::new(&dir.join(index.to_string()));
+            let mut local = Local { switches: Providers::default(), bins: BTreeMap::new(), env: ProviderEnv::default() };
+            local.switches.execution.insert(Provider::Cursor);
+            roots.apply(&mut local, false, &host)?;
+            assert!(!roots.codex_home.join("config.toml").exists());
+            local.switches.execution.insert(Provider::Codex);
+            local.switches.codex_app_server = AppServer { mode: AppServerMode::System, socket: Some(dir.join("system.sock")) };
+            roots.apply(&mut local, false, &host)?;
+            roots.apply(&mut local, true, &host)?;
+            assert!(!roots.codex_home.join("config.toml").exists());
+            local.switches.codex_app_server.mode = AppServerMode::Spawn;
+            let error = roots.apply(&mut local, false, &host).unwrap_err();
+            assert!(!format!("{error:#}").contains("SYNTHETIC_INLINE_SECRET"));
+            local.switches.execution.remove(&Provider::Codex);
+            assert!(roots.apply(&mut local, true, &host).is_err());
+            assert!(!roots.codex_home.join("config.toml").exists());
+        }
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -1589,7 +1880,7 @@ mod tests {
             Provider::Opencode,
             BTreeMap::from([("ANTHROPIC_API_KEY".into(), Some("fixture-auth".into()))]),
         )?;
-        roots.apply(&mut local)?;
+        roots.apply(&mut local, false, &crate::discovery::Host::default())?;
         local.env.save(&dir)?;
         let loaded = ProviderEnv::load(&dir)?;
         for provider in Provider::ALL {

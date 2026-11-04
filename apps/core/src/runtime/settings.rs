@@ -43,9 +43,14 @@ fn provider_setup(
             argv.extend(["-u".into(), name.into()]);
         }
     }
+    let mut setup_env = roots.env(provider);
+    if provider == Provider::Codex
+        && let Some(path) = local.launch_env(provider).remove("PATH")
+    {
+        setup_env.insert("PATH".into(), path);
+    }
     argv.extend(
-        roots
-            .env(provider)
+        setup_env
             .into_iter()
             .map(|(name, value)| quote(&format!("{name}={value}"))),
     );
@@ -178,10 +183,6 @@ impl ProviderChange {
     }
 }
 
-fn executable(path: &Path) -> bool {
-    discovery::runnable(path, std::env::var_os("PATH").as_ref())
-}
-
 impl Runtime {
     pub(crate) async fn agent_configuration_snapshot(&self) -> (NodeSettings, providers::Local) {
         let _configuration = self.config_save.lock().await;
@@ -294,7 +295,7 @@ impl Runtime {
             instructions: String::new(),
             tool_env: self.agent_env(),
             tool_token: None,
-            provider_env: local.env.get(settings.provider).clone(),
+            provider_env: local.launch_env(settings.provider),
             process_started: None,
             codex_turn: None,
         })
@@ -302,7 +303,7 @@ impl Runtime {
 
     /// The variables this Node sets for `provider`, and only that provider.
     pub(crate) fn provider_env(&self, provider: Provider) -> BTreeMap<String, String> {
-        self.providers().env.get(provider).clone()
+        self.providers().launch_env(provider)
     }
 
     pub(crate) async fn manager_backend_ready(&self, provider: Provider) -> bool {
@@ -316,6 +317,7 @@ impl Runtime {
         settings: &NodeSettings,
     ) -> Value {
         let configured = local.env.get(provider);
+        let launch_env = local.launch_env(provider);
         let roots = ProviderRoots::new(&self.data_dir);
         let runtime_env = roots.env(provider);
         let app_server = &local.switches.codex_app_server;
@@ -331,12 +333,16 @@ impl Runtime {
         let launches = local.launches(provider);
         let mut issues = Vec::new();
         let bin = local.bin(provider);
-        let required = provider.key_variables(configured).unwrap_or_else(|_| {
+        let required = provider.key_variables(&launch_env).unwrap_or_else(|_| {
             issues.push(json!({"code":"config_invalid"}));
             vec![]
         });
         let inherited = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
-        let executable_missing = launches && !executable(&bin);
+        let launch_path = launch_env
+            .get("PATH")
+            .map(std::ffi::OsString::from)
+            .or(self.host.path.clone());
+        let executable_missing = launches && !discovery::runnable(&bin, launch_path.as_ref());
         let environment_missing = launches
             && required
                 .iter()
@@ -570,7 +576,11 @@ impl Runtime {
             manager: &mut manager,
             triage: &mut triage,
         })?;
-        self.enforce_provider_roots(&mut next)?;
+        let codex_agent = manager
+            .as_ref()
+            .is_some_and(|manager| manager.provider.on_app_server());
+        next.validate(codex_agent)?;
+        self.enforce_provider_roots(&mut next, codex_agent)?;
         let filled = discovery::missing(
             &Target {
                 local: &mut next,
@@ -589,10 +599,6 @@ impl Runtime {
             self.ensure_default_workspace(&chosen.workspace)?;
         }
         triage.validate()?;
-        let codex_agent = manager
-            .as_ref()
-            .is_some_and(|manager| manager.provider.on_app_server());
-        next.validate(codex_agent)?;
         let manager_changed = manager != previous_manager;
         let _active = self.manager_controls.lock().await;
         if manager_changed
@@ -1123,6 +1129,62 @@ impl Runtime {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn codex_setup_uses_selected_node_without_exposing_provider_keys() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-codex-setup-{}", uuid::Uuid::new_v4()));
+        let bin = dir.join("nvm/bin");
+        std::fs::create_dir_all(&bin)?;
+        std::fs::write(bin.join("codex"), "#!/usr/bin/env node\n")?;
+        std::fs::write(
+            bin.join("node"),
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$2\" \"$CODEX_HOME\" \"${FIXTURE_API_KEY-unset}\"\n",
+        )?;
+        for name in ["codex", "node"] {
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o700))?;
+        }
+        let mut local = providers::Local {
+            switches: Default::default(),
+            bins: [(Provider::Codex, bin.join("codex"))].into_iter().collect(),
+            env: Default::default(),
+        };
+        local.env.apply(
+            Provider::Codex,
+            BTreeMap::from([
+                (
+                    "PATH".into(),
+                    Some(dir.join("empty").to_string_lossy().into_owned()),
+                ),
+                (
+                    "FIXTURE_API_KEY".into(),
+                    Some("synthetic-secret-value".into()),
+                ),
+            ]),
+        )?;
+        let roots = ProviderRoots::new(&dir.join("node"));
+        let setup = provider_setup(Provider::Codex, &local, &roots).context("Codex setup")?;
+        let command = setup["command"].as_str().context("setup command")?;
+        assert!(
+            !command.contains("FIXTURE_API_KEY") && !command.contains("synthetic-secret-value")
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", command])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout)?,
+            format!("login|{}|unset\n", roots.codex_home.display())
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[test]
     fn private_setup_commands_run_with_the_same_roots_and_preserve_auth_environment() -> Result<()>

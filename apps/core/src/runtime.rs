@@ -459,8 +459,12 @@ fn id(v: &Value, key: &str) -> Result<String> {
     Ok(s.into())
 }
 impl Runtime {
-    pub(crate) fn enforce_provider_roots(&self, local: &mut crate::providers::Local) -> Result<()> {
-        ProviderRoots::new(&self.data_dir).apply(local)
+    pub(crate) fn enforce_provider_roots(
+        &self,
+        local: &mut crate::providers::Local,
+        codex_agent: bool,
+    ) -> Result<()> {
+        ProviderRoots::new(&self.data_dir).apply(local, codex_agent, &self.host)
     }
 
     pub async fn open(dir: &Path) -> Result<Self> {
@@ -508,15 +512,15 @@ impl Runtime {
             bins: config.bins.clone(),
             env: crate::providers::ProviderEnv::load(dir)?,
         };
-        provider_roots.apply(&mut local)?;
-        if !config.triage.scan_codex_sessions {
-            config.triage.codex_sessions = Some(provider_roots.codex_sessions.clone());
-        }
-        let providers = Arc::new(std::sync::Mutex::new(local));
         let codex_agent = config
             .manager
             .as_ref()
             .is_some_and(|manager| manager.provider.on_app_server());
+        provider_roots.apply(&mut local, codex_agent, &host)?;
+        if !config.triage.scan_codex_sessions {
+            config.triage.codex_sessions = Some(provider_roots.codex_sessions.clone());
+        }
+        let providers = Arc::new(std::sync::Mutex::new(local));
         let local = providers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

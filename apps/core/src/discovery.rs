@@ -38,6 +38,7 @@ impl std::error::Error for CodexMissing {}
 pub struct Host {
     pub codex_home: Option<PathBuf>,
     pub home: Option<PathBuf>,
+    pub nvm_dir: Option<PathBuf>,
     pub path: Option<OsString>,
 }
 
@@ -56,6 +57,7 @@ impl Host {
         Self {
             codex_home: dir(CODEX_HOME),
             home: dir("HOME"),
+            nvm_dir: dir("NVM_DIR"),
             path: std::env::var_os("PATH"),
         }
     }
@@ -88,10 +90,37 @@ impl Host {
         dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
         if name == "codex" {
             dirs.push("/Applications/Codex.app/Contents/Resources".into());
+            dirs.extend(self.nvm_bins());
         }
         dirs.into_iter()
             .map(|dir| dir.join(name))
             .find(|path| executable_file(path))
+    }
+
+    fn nvm_bins(&self) -> Vec<PathBuf> {
+        let Some(root) = self
+            .nvm_dir
+            .clone()
+            .or_else(|| self.home.as_ref().map(|home| home.join(".nvm")))
+        else {
+            return vec![];
+        };
+        if !root.is_absolute() {
+            return vec![];
+        }
+        let mut versions: Vec<_> = std::fs::read_dir(root.join("versions/node"))
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                let version = semver::Version::parse(name.to_str()?.strip_prefix('v')?).ok()?;
+                let bin = entry.path().join("bin");
+                executable_file(&bin.join("node")).then_some((version, bin))
+            })
+            .collect();
+        versions.sort_by(|(a, path_a), (b, path_b)| b.cmp(a).then(path_a.cmp(path_b)));
+        versions.into_iter().map(|(_, path)| path).collect()
     }
 
     /// `path` as the owner reads it in a question: under the home folder as `~/…`, elsewhere
@@ -166,7 +195,7 @@ impl Host {
     }
 }
 
-fn executable_file(path: &Path) -> bool {
+pub(crate) fn executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata()
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
@@ -333,9 +362,18 @@ pub fn missing(target: &Target, codex: bool, host: &Host) -> Result<Paths> {
             false => bot == Some(provider) || local.switches.execution.contains(&provider),
         };
         let bin = local.bin(provider);
+        let provider_host = Host {
+            path: local
+                .env
+                .get(provider)
+                .get("PATH")
+                .map(OsString::from)
+                .or(host.path.clone()),
+            ..host.clone()
+        };
         if launches
-            && !runnable(&bin, host.path.as_ref())
-            && let Some(found) = bare(&bin).and_then(|name| host.program(name))
+            && !runnable(&bin, provider_host.path.as_ref())
+            && let Some(found) = bare(&bin).and_then(|name| provider_host.program(name))
         {
             paths.bins.insert(provider, found);
         }
@@ -438,6 +476,7 @@ mod tests {
             codex_home: None,
             home: Some("/Users/a".into()),
             path: None,
+            ..Default::default()
         };
         let response = serde_json::json!({
             "roots": ["/Users/a/src", "/srv/shared"],
@@ -476,6 +515,7 @@ mod tests {
             codex_home: None,
             home: Some(root.clone()),
             path: None,
+            ..Default::default()
         };
         let (mut local, mut manager, mut triage) = (local(), None, TriageConfig::default());
         let target = Target {
@@ -502,6 +542,7 @@ mod tests {
             codex_home: None,
             home: Some(root.clone()),
             path: None,
+            ..Default::default()
         };
         let (mut local, mut manager, mut triage) = (local(), None, TriageConfig::default());
         let found = missing(
@@ -551,6 +592,7 @@ mod tests {
             codex_home: None,
             home: Some(root.clone()),
             path: None,
+            ..Default::default()
         };
         complete_saved(&dir, &host)?;
         let saved = Config::load(&dir)?;
@@ -582,6 +624,7 @@ mod tests {
             codex_home: None,
             home: Some(root.clone()),
             path: Some("/usr/bin:/bin".into()),
+            ..Default::default()
         };
         let mut manager = Some(ManagerSettings {
             provider: Provider::Cursor,
@@ -633,6 +676,7 @@ mod tests {
             codex_home: None,
             home: Some(root.clone()),
             path: Some("/usr/bin:/bin".into()),
+            ..Default::default()
         };
         for path in [".claude/local/claude", ".opencode/bin/opencode"].map(|p| root.join(p)) {
             program(&path);
@@ -658,9 +702,14 @@ mod tests {
             let wrapper = install.join("lib/node_modules/@openai/codex/bin/codex.js");
             program(&wrapper);
             std::fs::create_dir_all(install.join("bin"))?;
-            std::os::unix::fs::symlink(&wrapper, install.join("bin/codex"))?;
+            std::os::unix::fs::symlink(
+                "../lib/node_modules/@openai/codex/bin/codex.js",
+                install.join("bin/codex"),
+            )?;
             if version != "v99.0.0" {
                 program(&install.join("bin/node"));
+            } else {
+                std::fs::write(install.join("bin/node"), "not executable")?;
             }
         }
         let path_bin = root.join("path/codex");
@@ -676,6 +725,14 @@ mod tests {
         assert_eq!(host.program("codex"), Some(path_bin));
         host.path = None;
         assert_eq!(host.program("codex"), Some(selected));
+        let custom = root.join("custom-nvm");
+        std::fs::rename(root.join(".nvm"), &custom)?;
+        host.nvm_dir = Some(custom.clone());
+        host.home = None;
+        assert_eq!(
+            host.program("codex"),
+            Some(custom.join("versions/node/v20.10.0/bin/codex"))
+        );
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
