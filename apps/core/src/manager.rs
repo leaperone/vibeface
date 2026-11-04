@@ -1108,7 +1108,6 @@ fn codex_provider_keys(provider: &toml::Value) -> Result<Vec<String>> {
     Ok(keys)
 }
 
-/// Only the active model/provider metadata can enter a Node's private Codex home.
 pub(crate) fn codex_config_projection(source: &str) -> Result<toml::Table> {
     let config = codex_config(source)?;
     let profile = codex_profile(&config)?;

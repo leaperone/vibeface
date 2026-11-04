@@ -1746,8 +1746,11 @@ fn metadata_catalog(reply: &MetadataReply, secrets: &[&str]) -> SdkCatalog {
         let Some(id) = item.get("id").and_then(Value::as_str) else {
             return SdkCatalog::Unavailable;
         };
-        let Some(display_name) = item.get("displayName").and_then(Value::as_str) else {
-            return SdkCatalog::Unavailable;
+        let display_name = match item.get("displayName") {
+            None => id,
+            Some(Value::String(name)) if name.is_empty() => id,
+            Some(Value::String(name)) => name,
+            _ => return SdkCatalog::Unavailable,
         };
         if !metadata_text(id)
             || !metadata_text(display_name)
@@ -2466,7 +2469,8 @@ mod tests {
             json!({"id":"fixture-secret","displayName":"Model"}),
             json!({"id":"model","displayName":"fixture-secret"}),
             json!({"id":"model\ninvalid","displayName":"Model"}),
-            json!({"id":"model"}),
+            json!({"id":"model","displayName":42}),
+            json!({"id":"model","displayName":"\n"}),
         ] {
             assert_eq!(
                 metadata_catalog(
@@ -2480,6 +2484,20 @@ mod tests {
             metadata_catalog(&MetadataReply::Json(json!({"items":[]})), &[]),
             SdkCatalog::Available { models: vec![] }
         );
+        for item in [
+            json!({"id":"model"}),
+            json!({"id":"model","displayName":""}),
+        ] {
+            assert_eq!(
+                metadata_catalog(&MetadataReply::Json(json!({"items":[item]})), &[]),
+                SdkCatalog::Available {
+                    models: vec![SdkModel {
+                        id: "model".into(),
+                        display_name: "model".into()
+                    }]
+                }
+            );
+        }
     }
 
     #[test]

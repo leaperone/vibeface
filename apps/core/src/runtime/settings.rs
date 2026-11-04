@@ -430,8 +430,10 @@ impl Runtime {
                 ),
             }
         };
-        let observed = ProviderReadiness::from_prerequisites(self.host.installed(&bin), launchable)
-            .with_probe(&probe, model);
+        let installed =
+            discovery::runnable(&bin, launch_path.as_ref()) || self.host.installed(&bin);
+        let observed =
+            ProviderReadiness::from_prerequisites(installed, launchable).with_probe(&probe, model);
         let state = if roles.is_empty() {
             "off"
         } else {
@@ -636,6 +638,10 @@ impl Runtime {
             || next.bins != previous.bins
             || next.env != previous.env
         {
+            self.provider_probes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
             self.pending_provider_launches
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -784,6 +790,10 @@ impl Runtime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = settings;
         if manager_changed {
+            self.provider_probes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
             self.pending_provider_launches
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }

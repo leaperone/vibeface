@@ -727,25 +727,27 @@ mod tests {
             }
         })
         .await?;
-        let mut changed = original.clone();
-        changed.env.apply(
-            provider,
-            BTreeMap::from([("CURSOR_API_KEY".into(), Some("fixture-new-key".into()))]),
-        )?;
-        *node.providers.lock().unwrap() = changed;
-        let between = node.provider_probe_snapshot(provider).await;
-        *node.providers.lock().unwrap() = original;
+        let save = node.config_save.lock().await;
+        for key in ["fixture-new-key", "fixture-api-key"] {
+            node.write_providers(|target| {
+                target.local.env.apply(
+                    provider,
+                    BTreeMap::from([("CURSOR_API_KEY".into(), Some(key.into()))]),
+                )
+            })
+            .await?;
+        }
+        drop(save);
         let current = node.provider_probe_snapshot(provider).await;
-        assert_ne!(first.config_id, between.config_id);
-        assert_ne!(first.config_id, current.config_id);
         std::fs::write(release, b"ready")?;
         let returned = pending.await?;
-        assert_eq!(returned, current);
-        assert_eq!(returned.authentication, Authentication::Unverified);
-        assert_eq!(returned.checked_at_ms, None);
         node.cursor.get().unwrap().stop().await;
         drop(node);
         std::fs::remove_dir_all(dir)?;
+        assert_ne!(first.config_id, current.config_id);
+        assert_eq!(returned, current);
+        assert_eq!(returned.authentication, Authentication::Unverified);
+        assert_eq!(returned.checked_at_ms, None);
         Ok(())
     }
 
@@ -871,6 +873,10 @@ mod tests {
         assert_eq!(node.provider_generation(provider, &nvm)?, with_node);
         nvm.bins.remove(&provider);
         assert!(prerequisites(provider, &nvm).is_none());
+        let status = node
+            .provider_status(provider, &nvm, &node.settings_snapshot())
+            .await;
+        assert_eq!(status["installed"], true);
 
         local.switches.codex_app_server.mode = AppServerMode::System;
         let system = node.provider_generation(provider, &local)?;
