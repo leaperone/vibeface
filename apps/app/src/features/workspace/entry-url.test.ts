@@ -672,6 +672,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     })
   }
   const react = {
+    lazy: () => 'Lazy', Suspense: 'Suspense',
     createContext: () => ({}), useContext: () => null,
     useId: () => 'component',
     useSyncExternalStore: (_subscribe: unknown, snapshot: () => unknown) => snapshot(),
@@ -733,6 +734,45 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     module: module.exports,
   }
 }
+
+test("anonymous workspace navigation preserves the requested page without redirecting twice", async (t) => {
+  for (const [requested, resolved] of [
+    ['/', undefined],
+    ['/settings', undefined],
+    ['/b/bot?conversation=chat#latest', undefined],
+    ['/settings', '/join'],
+    ['/b/bot?conversation=chat#latest', '/connect'],
+    ['/settings', '/settings'],
+  ] satisfies [string, string | undefined][]) await t.test(`${requested} after ${resolved ?? 'initial load'}`, () => {
+    const location = (href: string) => ({ href, pathname: new URL(href, 'https://app.vibeface.dev').pathname })
+    const state = { location: location(requested), resolvedLocation: resolved ? location(resolved) : undefined }
+    const app = componentHarness('../../routes/_app.tsx', {
+      '@tanstack/react-router': {
+        createFileRoute: () => () => ({}), Navigate: 'Navigate',
+        useNavigate: () => () => {},
+        useRouterState: ({ select }: { select: (value: typeof state) => unknown }) => select(state),
+      },
+      '@vibeface/client/identity/access.ts': { accessOf },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({
+        ready: null, phase: 'disconnected', entries: [], initialInvitation: '', joining: false, link: { kind: 'idle' },
+      }) },
+      '@/features/identity/onboarding-flag': { useOnboarding: () => null },
+    }, {}, 'AppLayout')
+    try {
+      const navigation = app.render('AppLayout').filter(({ type }) => type === 'Navigate')
+      assert.equal(navigation.length, 1)
+      assert.equal(navigation[0]?.props.to, '/connect')
+      assert.equal(navigation[0]?.props.replace, true)
+      const search: Record<string, string> = requested === '/' ? {} : { redirect: requested }
+      assert.equal(JSON.stringify(navigation[0]?.props.search), JSON.stringify(search))
+      state.location = location('/connect?' + new URLSearchParams(search))
+      for (let render = 0; render < 3; render++) {
+        assert.equal(app.render('AppLayout').filter(({ type }) => type === 'Navigate').length, 0,
+          'the pending connect page must not become another return target')
+      }
+    } finally { app.close() }
+  })
+})
 
 const pendingResult = () => {
   let resolve: (value: unknown) => void = () => {}, reject: (cause: Error) => void = () => {}
