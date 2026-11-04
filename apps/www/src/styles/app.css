@@ -444,7 +444,7 @@ a:focus-visible, button:focus-visible { outline: 2px solid currentColor; outline
   .visual-node small { font-size: 10px; }
   .visual-node-top { right: 1%; top: 8%; }
   .visual-node-left { left: 0; top: calc(50% + var(--hero-logo-size) / 2 + 8px); }
-  .visual-node-right { bottom: 3%; right: 1%; }
+  .visual-node-right { bottom: 12px; right: 1%; }
   .landing-section, .landing-system { padding-block: 64px 72px; }
   .story-prompt { font-size: 20px; margin-block: 28px 34px; }
   .story-frame { border-radius: 20px; }
