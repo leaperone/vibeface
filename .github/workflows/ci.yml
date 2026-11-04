@@ -15,7 +15,8 @@ on:
         default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ (github.event_name == 'workflow_dispatch' || github.run_attempt > 1) && github.run_id || '' }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == 1 }}
 
 permissions:
   contents: read
@@ -23,6 +24,9 @@ permissions:
 jobs:
   plan:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
     outputs:
       plan: ${{ steps.select.outputs.plan }}
       web: ${{ steps.select.outputs.web }}
@@ -46,6 +50,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Select checks from the complete change and event
         id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci.py plan --github-output "$GITHUB_OUTPUT"
 
   quick-check:
@@ -833,6 +839,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Require every check selected for this commit and scenario
         env:
