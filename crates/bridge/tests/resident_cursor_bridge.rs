@@ -7,8 +7,8 @@ use std::{
 };
 use tokio::sync::watch;
 use vibeface_bridge::agent::{
-    AgentFailure, AgentRunError, NativeStatus, SdkBridge, SdkTurn, StartEvidence,
-    ToolCallbackConfig,
+    AgentFailure, AgentRunError, NativeStatus, SdkBridge, SdkCatalog, SdkProviderAuthentication,
+    SdkTurn, StartEvidence, ToolCallbackConfig,
 };
 use vibeface_bridge::failure::FailureKind;
 
@@ -644,6 +644,58 @@ async fn run_id_callback_precedes_progress_and_known_run_probe_reads_terminal_st
         .cancel(&turn, result.session_id.as_deref().unwrap(), &run_id)
         .await
         .unwrap();
+    bridge.stop().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn provider_observation_reads_metadata_without_an_agent_turn() {
+    let root = std::env::temp_dir().join(format!(
+        "vibeface-cursor-provider-probe-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let requests = root.join("requests.log");
+    let executable =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cursor-sdk-bridge");
+    let bridge = SdkBridge::new(
+        BTreeMap::new(),
+        ToolCallbackConfig {
+            url: "http://127.0.0.1:9".into(),
+            auth_token: "fixture-callback-token-".repeat(2),
+        },
+        Some(root.join("bridge.pid")),
+    )
+    .unwrap();
+    let observation = bridge
+        .provider_observation(
+            &executable,
+            &root.join("workspace"),
+            &root.join("private-probe"),
+            "fixture-api-key",
+            &BTreeMap::from([(
+                "FAKE_BRIDGE_REQUEST_LOG".into(),
+                requests.display().to_string(),
+            )]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        observation.authentication,
+        SdkProviderAuthentication::Authenticated
+    );
+    assert!(matches!(
+        observation.catalog,
+        SdkCatalog::Available { ref models } if models.iter().any(|model| model.id == "composer-2")
+    ));
+    let calls = std::fs::read_to_string(&requests).unwrap();
+    assert!(calls.contains("Me") && calls.contains("ListModels"));
+    assert!(!calls.lines().any(|method| {
+        matches!(method, "CreateAgent" | "ResumeAgent" | "Send" | "CancelRun")
+    }));
     bridge.stop().await;
     std::fs::remove_dir_all(root).unwrap();
 }
