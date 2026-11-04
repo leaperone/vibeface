@@ -51,6 +51,19 @@ test('portal serves docs and searches Chinese content', async ({ app, screen, br
   await expect(screen.getByRole('link', { name: 'Docs' })).toBeVisible()
   await expect(screen.getByRole('link', { name: 'Download' })).toBeVisible()
   expect(await browser.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
+  await browser.setViewport({ width: 320, height: 844 })
+  expect(await browser.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
+  expect(await browser.evaluate(() => {
+    const nodes = [...document.querySelectorAll('.visual-node')].map((node) => node.getBoundingClientRect())
+    return nodes.some((a, i) => nodes.slice(i + 1).some((b) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top))
+  })).toBe(false)
+  expect(await browser.evaluate(() => {
+    const diagram = document.querySelector('.hero-visual')!.getBoundingClientRect()
+    return [...document.querySelectorAll('.visual-node')].every((node) => {
+      const rect = node.getBoundingClientRect()
+      return rect.left >= diagram.left && rect.right <= diagram.right && rect.top >= diagram.top && rect.bottom <= diagram.bottom
+    })
+  })).toBe(true)
 
   await app.open('/404.html')
   await expect(screen.getByRole('heading', '这条路径没有内容。')).toBeVisible()

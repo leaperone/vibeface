@@ -4,7 +4,7 @@
 
 **在聊天里提需求，用自己的电脑执行，在同一段对话里查看结果。**
 
-[English](README.md) · [简体中文](README.zh-CN.md)
+[English](README.md) · [简体中文](https://github.com/leaperone/vibeface/blob/main/README.zh-CN.md)
 
 [![CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml/badge.svg)](https://github.com/leaperone/vibeface/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/leaperone/vibeface?include_prereleases&label=release)](https://github.com/leaperone/vibeface/releases)

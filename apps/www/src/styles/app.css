@@ -439,6 +439,7 @@ a:focus-visible, button:focus-visible { outline: 2px solid currentColor; outline
   .visual-readout span { font-size: 8px; }
   .visual-readout strong { font-size: 9px; }
   .visual-node { max-width: 164px; padding: 11px 13px; }
+  .visual-node-left, .visual-node-right { max-width: calc(50% - 4px); }
   .visual-node span { font-size: 12px; }
   .visual-node small { font-size: 10px; }
   .visual-node-top { right: 1%; top: 8%; }
