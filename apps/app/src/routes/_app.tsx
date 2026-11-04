@@ -18,13 +18,13 @@ function AppLayout() {
   const onboarding = useOnboarding()
   // Onboarding ends on a pressed button that leaves with it; the workspace that follows takes the focus on its title.
   const [onboarded] = useState(onboarding !== null)
-  const location = useRouterState({ select: (state) => state.location })
+  const returnTo = useRouterState({ select: (state) => state.location.pathname === '/connect' ? null : state.location.href })
   const home = useRouterState({ select: (state) => state.location.pathname === '/' })
   const routeBot = useRouterState({ select: (state) => /^\/b\/([^/]+)/.exec(state.location.pathname)?.[1] ?? null })
   const access = accessOf({ ready: Boolean(ready), phase, joining: Boolean(joining), savedEntries: entries.length, invitation: Boolean(initialInvitation), offlineRetryMs: link.kind === 'offline' ? link.retryInMs : null })
   if (access.kind === 'auth') {
-    if (location.pathname === '/connect') return null
-    return <Navigate to="/connect" search={location.href === '/' ? {} : { redirect: location.href }} replace />
+    if (returnTo === null) return null
+    return <Navigate to="/connect" search={returnTo === '/' ? {} : { redirect: returnTo }} replace />
   }
   if (access.kind === 'resuming') return <ShellSkeleton home={home} retry={access.retryInSeconds} onRetry={retryNow} onLeave={disconnect} />
   if (!ready) return <ShellSkeleton home={home} />
