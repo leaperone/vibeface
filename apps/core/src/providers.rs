@@ -589,7 +589,7 @@ impl ProviderDescriptor {
                 SandboxMode::ProviderControlled,
                 false,
                 ConcurrencyMode::Serial,
-                CapabilitySupport::Unsupported,
+                CapabilitySupport::Supported,
                 TextStreamMode::DeltaAndSnapshot,
                 CancelEvidence::ProviderTerminal,
             ),
@@ -1968,6 +1968,9 @@ requires_openai_auth = false
         for provider in Provider::ALL {
             let descriptor = ProviderDescriptor::for_provider(provider);
             assert_eq!(descriptor.provider, provider);
+            if provider == Provider::Cursor {
+                assert_eq!(descriptor.model_catalog, CapabilitySupport::Supported);
+            }
             assert_eq!(descriptor.prompt_mode, provider.prompt_mode());
             assert_eq!(descriptor.steer, provider.supports_steer());
             assert!(descriptor.workspace_required);
