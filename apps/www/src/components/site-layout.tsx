@@ -11,9 +11,9 @@ type SiteLayoutProps = {
 
 export function SiteLayout({ children, mainId = 'content', variant = 'landing' }: SiteLayoutProps) {
   return (
-    <div className={`site site--${variant}`}>
-      <a className="site-skip" href={`#${mainId}`}>
-        跳到内容
+    <div className={`site site--${variant}`} lang={variant === 'landing' ? 'en' : 'zh-CN'}>
+      <a className="site-skip" href={`#${mainId}`} lang="en">
+        Skip to content
       </a>
       <SiteHeader />
       <main id={mainId} tabIndex={-1}>
