@@ -2425,6 +2425,18 @@ test('unknown task detail asks with check wording, navigates on success, and kee
     elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
     assert.equal(findActionProps(elements, '先查结果')?.disabled, true)
     assert.equal(elements.some(({ props }) => props.label === '我已自行核对'), true)
+    workspace.connectionOnline = true
+    navigated = false
+    let release: ((value: boolean) => void) | undefined
+    workspace.sendMessage = async (text: string) => {
+      sent = text
+      return new Promise<boolean>((resolve) => { release = resolve })
+    }
+    const querying = (ask.action as () => Promise<void>)()
+    app.render('TaskDetail', { botId: 'other-bot', workId: 'other-work' })
+    release?.(true)
+    await querying
+    assert.equal(navigated, false, 'a late receipt cannot pull the person back to a task they left')
   } finally { app.close() }
 })
 

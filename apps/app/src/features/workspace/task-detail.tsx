@@ -58,7 +58,10 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const workspace = useWorkspace()
   const activeTask = useRef<{ botId: string; workId: string } | null>({ botId, workId })
   activeTask.current = { botId, workId }
-  useEffect(() => () => { activeTask.current = null }, [])
+  useEffect(() => {
+    activeTask.current = { botId, workId }
+    return () => { activeTask.current = null }
+  }, [botId, workId])
   const { directory } = useDevice()
   const action = useAction()
   const lookup = { nodes: workspace.nodes, directory }
