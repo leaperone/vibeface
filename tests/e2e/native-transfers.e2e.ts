@@ -237,7 +237,7 @@ test('provider settings and queued cancellation work in the installed native app
   expect((await inspect()).authentication).toBe('sign_in_required');
   const setup = (await inspect()).setup;
   await expect(screen.getByText(setup.command, { exact: true })).toBeVisible();
-  await screen.getByRole('button', '复制Codex 私有目录登录命令', { exact: true }).click();
+  await screen.getByRole('button', '复制Codex 私有目录认证命令', { exact: true }).click();
   await expect.poll(() => device.clipboard()).toBe(setup.command);
   const copied = await device.clipboard();
   assert.equal(copied, setup.command);
