@@ -238,6 +238,10 @@ Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, 
 
 ## 可靠调度回执
 
+本人普通输入使用 `InputPosted`。`message` 请求必需携带 `target`、`intent`、目标内 `sequence`，Task 修改还核验 `expected_revision`。目标可以是 Bot Main、稳定业务 Task、已登记 Work、Routine、频道成员或频道 Task。签名覆盖目标、意图、顺序、revision、正文、完整附件和汇报选项。审批回答仍使用绑定原 `question_id` 的签名 `MessagePosted`，不能由普通输入冒充。
+
+`workspace_command` 持久化频道、任务、Assignment 和队列控制命令。相同 command ID 回读原结果，改变内容须换 ID。`workspace_state` 与 `workspace_history` 是有界共享投影，保留截断说明和已核验发言身份。`scope_context` 返回确切目标的本机编译来源与省略数量，`input_receipt` 返回该消息的逐阶段证据。Main 快照只包含 Main 消息和私有 job 投影；`scope_jobs` 另供明确目标选择，不携带原始提示、错误正文或私密会话内容。
+
 调度 job 以 `(conversation_id, trigger)` 为键，`trigger` 为 `message:<message_id>`、`work:<work_id>`、`task:<work_id>`、`schedule:<schedule_id>:<slot_ms>` 或 `bot_message:<message_id>`，重试和同步都不会产生第二个 job。`message` 返回 `accepted`、`state`、`trigger`、`message_id` 和 `receipt`：
 
 ```json
@@ -261,7 +265,13 @@ Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, 
 
 `bot_message:<message_id>` 由写入 `BotMessaged` 的发送方负责人接纳（对方会话也归它调度时），否则进 outbox，经 `deliver` 交给对方负责人。同步只存消息，不排 job。每个轮次有深度：本人消息和回答为 0，schedule 轮取其 `depth`，bot 消息轮取 `hops`，工作结果和 Agent 任务沿派发链继承；提醒和 bot 消息的深度为当前加一，超过 4 时拒绝。
 
-job 状态为 `queued`、`steering`、`claimed`、`running`、`cancelling`、`reconciling`、`completed`、`failed`、`cancelled`、`interrupted` 或 `steered`，后五种是终态。Codex 回复进行中时，同一会话排队的用户消息（无附件、需要回复）先在本机记为 `steering`，再以消息 ID 为 `clientUserMessageId` 发 `turn/steer` 并入当前回合，发送前核对目标是本进程启动的回复且未被停止或移走；App Server 明确拒绝时回到 `queued`，其余（含超时）保持 `steering`。目标回复结束后才按线程回读结算：消息所在回合 `completed` 即 `steered`（`outcome=answered`），在其他终态回合即 `steered`（`outcome=unfinished`，随宿主回复的终态），线程里没有它且目标回合已结束即回到 `queued`，绝不重发；消息只出现在其他回合也算 `unfinished`。只有回读成功且读到目标回合才结算，读取失败或读不到目标回合保持 `steering`，连续 10 分钟读不到（中间读到一次即重新计时）则记为 `steered`（`outcome=unknown`，网页显示“不确定 Bot 看到了没有”）。未定期间本机仍拥有的会话不领取后续消息，会话已移走时排队消息照常交给新所有者；停止 `steering` 消息即停止它并入的回复。steer 记在本机调度状态，同步和恢复不会重放；结算为 `answered` 时在同一事务写一条 `message_steered`，让以后的负责人不把这条消息算作未回复。Cursor 始终排队。跨重启的 `running` 与 `cancelling` 进入 `reconciling` 并登记待核对，只查询原回合，不自动重新调用 SDK；查到结果或由本人确认后才记录终态。Bot 回答 `MessagePosted(assistant)` 与 job 终态在同一事务提交，`status` 为 `completed`、`failed`、`stopped` 或 `interrupted`，停止或中断时保留已输出的部分文字。`failed` 与 `interrupted` 带 `failure`（失败类别，见下），原始错误只留在本机 job 与 `node.log`，客户端按类别给出说明。
+job 状态为 `queued`、`steering`、`claimed`、`running`、`cancelling`、`reconciling`、`completed`、`failed`、`cancelled`、`interrupted` 或 `steered`，后五种是终态。普通继续输入解析到确切的活动 attempt，附件全部验证后先登记 `steering` 再调用 Provider。显式 Defer 不参与活动补充。同目标的旧输入和未准备附件阻止后续输入越过，不同目标的投递与回读独立运行。Provider 明确拒绝才回到 `queued`，超时或写入结果未知保留核对，不能直接重发。
+
+逐条 receipt 分开保存 Provider 接受与实际原生回合归属。Codex 以稳定 `clientUserMessageId` 回读，Claude 以已登记 UUID 和持续输入组恢复，pi 与 OpenCode 读取各自原生记录。输入可能属于实际后续回合，必须记录其真实 turn。工具调用中的中间 assistant 消息不证明整个回答完成。只有原生证据证明输入及其终态才能结算为 `answered` 或 `unfinished`；仅有提交或接收不能显示模型已读。不可读与宿主结束后持续 Pending 分别计时，不能解释成一个固定的总等待期限。确认未到达才允许后续调度，持续无法核定则保留 `unknown`。
+
+steer 状态只在本机调度日志保存，同步和恢复不重放输入。结算为 `answered` 时同事务写入 `message_steered`，避免新 owner 把它当未回复。当前 Cursor 独立 Bridge 没有暴露新版 SDK 的文本 steer，不能声称活动补充已支持。
+
+跨重启的 `running` 与 `cancelling` 进入 `reconciling` 并登记待核对，只查询原回合。Bot 回答与 job 终态在同一事务提交，`status` 为 `completed`、`failed`、`stopped` 或 `interrupted`，停止或中断保留已输出部分。`failed` 与 `interrupted` 带失败类别，原始错误留在本机 job 与 `node.log`，客户端按类别说明。
 
 失败类别 `failure` 取 `missing_key`、`auth_failed`、`quota`、`missing_binary`、`execution_disabled`、`no_model`、`no_bot`、`writer_busy`、`rejected`、`transport`、`timed_out`、`restarted`、`lost` 或 `unknown`。本仓库自己的错误在产生处直接给出类别；Cursor SDK 与 Codex App Server 的上游错误只在 `crates/bridge/src/failure.rs` 一处识别，Codex 回合错误先看 `codexErrorInfo`。回复、工作结果（`WorkFinished.failure`）、本机 job（`failure {kind, detail}`）和被拒的派发（含 `deliveries` 与 `workspace_overview.tasks`）都带同一类别。目标设备没有 Bot 接任务时拒绝派发并给出 `no_bot`；客户端按类别判断能否到那台设备的设置里修复，不匹配原因文字。
 

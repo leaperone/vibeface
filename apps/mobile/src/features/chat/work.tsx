@@ -7,7 +7,7 @@ import { failureText, taskError, workFailure, type FailureKind } from '@vibeface
 import { botProviderNotice, canRetryJob, runtimeLabel } from '@vibeface/client/chat/protocol.ts'
 import { providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
 import { changeTitle, firedAt, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
-import { chatTaskState, interruptedCopy, nodeName, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { chatTaskState, interruptedCopy, nodeName, queueHoldLabels, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
@@ -20,6 +20,7 @@ import { Input } from '@/components/ui/input'
 import { Text } from '@/components/ui/text'
 import { useLive } from '@/data/live'
 import { cn } from '@/lib/utils'
+import { InputStatus } from '@/features/workspace/workspace'
 
 export type Row = { key: string; node: ReactNode }
 
@@ -40,7 +41,7 @@ export function confirmText(check: Pick<WorkCheck, 'reason' | 'detail'>, device:
  * What the chat shows besides messages, as on the web: tasks after the message that started them, what a turn changed
  * after its reply, and everything waiting on the person (a device to take over, results to confirm) at the end.
  */
-export function useChatExtras(conversationId: string, botId: string, edit?: (text: string) => void) {
+export function useChatExtras(conversationId: string, botId: string) {
   const shared = useLive()
   const { directory } = useDevice()
   const data = shared && shared.conversationId === conversationId ? shared.data : null
@@ -69,14 +70,7 @@ export function useChatExtras(conversationId: string, botId: string, edit?: (tex
     if (job.runtime) add(at, { key: `runtime:${job.trigger}`, node: <Text className="text-meta text-muted-foreground">{runtimeLabel(job.runtime)}</Text> })
     if (job.state === 'reconciling' || job.pending_check) cards.push(<ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => shared.refresh()}>再查一次</ActionButton>}><Text className="text-meta text-muted-foreground">设备正在查询上次回复，系统不会自动重发。</Text></ActionCard>)
     const message = data.messages.find((message) => message.message_id === job.message_id && message.role === 'user')
-    if (job.state === 'queued' && message) add(job.message_id, { key: `queued:${job.trigger}`, node: <View className="flex-row flex-wrap gap-2">
-      <ActionButton variant="ghost" disabled={!shared.writable} action={() => shared.cancelManager(job.trigger)}>取消排队</ActionButton>
-      {!message.attachments?.length && edit ? <ActionButton variant="ghost" disabled={!shared.writable} action={async () => {
-        if (!await shared.cancelManager(job.trigger)) throw new Error('还没确认取消，请先再查一次。')
-        edit(message.text)
-      }}>取消并编辑重发</ActionButton> : null}
-      <ActionButton variant="ghost" action={() => shared.refresh()}>再查一次</ActionButton>
-    </View> })
+    if (job.state === 'queued' && message) add(job.message_id, { key: `queued:${job.trigger}`, node: <Text className="text-meta text-muted-foreground">{job.hold_reason ? queueHoldLabels[job.hold_reason] : '等待开始工作'}</Text> })
     if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id)) add(at, { key: `job:${job.trigger}`, node: <JobLine job={job} /> })
   }
   const changes = placeChanges(data.messages, data.changes)
@@ -85,7 +79,7 @@ export function useChatExtras(conversationId: string, botId: string, edit?: (tex
   for (const [at, turns] of changes.after) for (const records of turns) add(at, changeRow(records))
   const first = changes.first.map(changeRow)
 
-  if (shared.messagePending && !shared.messageBusy) cards.push(<PendingMessageCard key="undelivered" />)
+  for (const pending of shared.pendingMessages.filter((item) => item.conversation_id === conversationId && item.target.kind === 'bot_main')) cards.push(<InputStatus key={`delivery:${pending.message_id}`} pending={pending} />)
   const providerNotice = botProviderNotice(shared.nodes, data.conversation?.owner)
   if (providerNotice) cards.push(<View key="provider" role="status"><Text className="text-meta text-muted-foreground">{providerNotice}</Text><ActionButton variant="ghost" action={() => shared.refresh()}>再查一次</ActionButton></View>)
   const owner = data.conversation?.owner
@@ -298,18 +292,4 @@ function BeforeAfter({ before, after }: { before: string; after: string }) {
     <Icon as={ArrowRight} accessibilityLabel="改为" className="size-4 text-muted-foreground" />
     <Text>{after}</Text>
   </View>
-}
-
-export function PendingMessageCard() {
-  const shared = useLive()
-  const pending = shared?.messagePending
-  if (!shared || !pending || shared.messageBusy) return null
-  return <ActionCard icon={CircleQuestionMark} title="消息可能没送达" actions={<>
-    <ActionButton variant="ghost" disabled={!shared.writable || pending.rejected === undefined} action={() => shared.releaseMessagePending()}>不发了</ActionButton>
-    <ActionButton variant="ghost" action={() => shared.refresh()}>再查一次</ActionButton>
-    <ActionButton disabled={!shared.writable || shared.incomplete} action={() => shared.sendMessage(pending.text)}>重新发送</ActionButton>
-  </>}>
-    <Text numberOfLines={3} className="text-meta text-muted-foreground">{pending.text}</Text>
-    <Text className="text-meta text-muted-foreground">{pending.rejected === undefined ? '结果未知，重新发送会沿用原消息编号。只有设备明确拒绝后才可放弃。' : pending.rejected}</Text>
-  </ActionCard>
 }

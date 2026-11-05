@@ -92,10 +92,17 @@ async function selfTest() {
     await call(a, { op: 'finish' }); await call(b, { op: 'finish' });
     const signature = await call(b, { op: 'sign', domain: 'client-challenge', data: '010203' });
     crypto.verify(bi.device_id, 'client-challenge', bytes('010203'), signature);
-    const body = { type: 'message_posted', message_id: 'm1', role: 'user', text: 'hi', report_results: true };
+    const body = { type: 'input_posted', message_id: 'm1', target: { kind: 'bot_main', bot_id: 'fixture-bot' }, intent: 'continue', sequence: 1, text: 'hi', report_results: true };
     const attestation = await call(a, { op: 'attest', network_id: bi.device_id, scope_id: 'c1', body });
     assert.equal(attestation.device_id, ai.device_id);
     crypto.verify(ai.device_id, 'attestation', crypto.attestationPayload(bi.device_id, 'c1', JSON.stringify(body)), attestation.signature);
+    for (const changed of [
+      { ...body, target: { kind: 'task', task_id: 'another-task' } },
+      { ...body, intent: 'defer' },
+      { ...body, sequence: 2 },
+      { ...body, expected_revision: 2 },
+      { ...body, attachments: [{ hash: '00'.repeat(32), size: 1, name: 'changed.txt' }] },
+    ]) assert.throws(() => crypto.verify(ai.device_id, 'attestation', crypto.attestationPayload(bi.device_id, 'c1', JSON.stringify(changed)), attestation.signature));
     return { a, b };
   }
   try {

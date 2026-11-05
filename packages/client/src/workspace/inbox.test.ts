@@ -3,7 +3,8 @@ import test from 'node:test'
 import { availability, parseNodeSettings, summaryReadiness, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
 import { cardState, chatTaskState, deviceForm, deviceOnline, entryLabel, externalSessionLabels, externalSessionStatus, fixOnDevice, formName, parseSummarySteps, promptSummary, schedulerStatus, staleTaskLabel, taskGroup, taskLabel, taskStale } from './labels.ts'
-import type { BotRecord, NodeInfo, NotificationRecord, Question, WorkCard, WorkRecord } from './types.ts'
+import { isMainNotification, type BotRecord, type NodeInfo, type NotificationRecord, type PendingMessage, type Question, type WorkCard, type WorkRecord } from './types.ts'
+import { parseNotifications } from './model.ts'
 
 const question = (id: string, closed = false): Question => ({
   question_id: id, conversation_id: 'c', bot: { bot_id: 'b', name: '助手' }, severity: 'normal', text: id, choices: [], about: { kind: 'general' },
@@ -20,8 +21,26 @@ const source = (manage: boolean, answered: Record<string, string> = {}): InboxSo
   device: { ready: { principal: { network_id: 'n', device_id: 'me', epoch: 1, source: 'membership', can_manage: manage }, entry: { device_id: 'mac' } }, joins: [join('pending'), join('joined')], pendingRecovery: null, rotateHint: false },
   workspace: {
     writeState: { state: 'writable', conflicts: [] }, questions: [question('open'), question('closed', true)], answered, openWorks: [], nodes: [unready], data: null,
-    messagePending: null, messageBusy: false, selectedBot: null, notifications: [], ignoredNotifications: new Set(), bots: [],
+    pendingMessages: [], notifications: [], ignoredNotifications: new Set(), bots: [],
   },
+})
+
+test('unknown inputs keep separate Inbox IDs and their original Task and Channel targets', () => {
+  const state = source(false)
+  const pending = (message_id: string, target: PendingMessage['target'], delivery: PendingMessage['delivery']): PendingMessage => ({ message_id, conversation_id: 'c', target, delivery, text: message_id, intent: 'continue', sequence: 1, created_at_ms: 1 })
+  state.workspace.pendingMessages = [pending('task-input', { kind: 'task', task_id: 'task' }, 'unknown'), pending('saved-main', { kind: 'bot_main', bot_id: 'b' }, 'saved'), pending('channel-input', { kind: 'channel_task', channel_id: 'channel', task_id: 'other', bot_id: 'b' }, 'unknown')]
+  const items = inboxItems(state).flatMap((item) => item.kind === 'undelivered' ? [item] : [])
+  assert.deepEqual(items.map((item) => item.key), ['undelivered:task-input', 'undelivered:channel-input'])
+  assert.deepEqual(items.map((item) => item.message.target), [{ kind: 'task', task_id: 'task' }, { kind: 'channel_task', channel_id: 'channel', task_id: 'other', bot_id: 'b' }])
+  assert.equal(waitingItems(items).length, 2)
+})
+
+test('Main acknowledgements require an exact BotMain notification target', () => {
+  const note = { notification_id: 'note', conversation_id: 'c', kind: 'message', text: '更新' }
+  const notes = parseNotifications({ notifications: [{ ...note, target: { kind: 'bot_main', bot_id: 'b' } }, { ...note, target: { kind: 'bot_main', bot_id: 'other' } }, { ...note, target: { kind: 'task', task_id: 'task' } }, note] })
+  assert.deepEqual(notes.map((item) => isMainNotification(item, 'b')), [true, false, false, false])
+  assert.equal(isMainNotification(notes[0], undefined), false)
+  assert.deepEqual(notes[2].target, { kind: 'task', task_id: 'task' })
 })
 
 test('待处理 counts the same items wherever it shows: open questions, joins to approve and a bot device to set up', () => {

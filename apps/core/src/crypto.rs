@@ -133,7 +133,9 @@ impl LocalIdentity {
             signature,
         });
         match &mut body {
-            EventBody::ConversationOwner { attestation, .. }
+            EventBody::InputPosted { attestation, .. }
+            | EventBody::WorkspaceCommanded { attestation, .. }
+            | EventBody::ConversationOwner { attestation, .. }
             | EventBody::BotCreated { attestation, .. }
             | EventBody::BotDeleted { attestation, .. }
             | EventBody::MessagePosted { attestation, .. }
@@ -341,6 +343,13 @@ enum UserSignature {
 
 fn validate_attestation(event: &Event) -> Result<()> {
     let rule = match &event.body {
+        EventBody::InputPosted { .. } => UserSignature::Required,
+        EventBody::WorkspaceCommanded {
+            command: crate::workspace::WorkspaceCommand::AssignmentProgress { .. },
+            ..
+        }
+        | EventBody::WorkspaceCommanded { cause: Some(_), .. } => UserSignature::Forbidden,
+        EventBody::WorkspaceCommanded { .. } => UserSignature::Required,
         // The web signs an answer; one that comes through a decision token is the Node's own.
         EventBody::MessagePosted {
             role: Role::User,
@@ -466,6 +475,87 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
     }
     let id = |value: &str| vibeface_protocol::validate_id(value).map_err(anyhow::Error::msg);
     match &event.body {
+        EventBody::InputPosted {
+            message_id,
+            target,
+            sequence,
+            expected_revision,
+            text,
+            attachments,
+            report_results,
+            ..
+        } => {
+            id(message_id)?;
+            crate::store::workspace::validate_target(target)?;
+            ensure!(
+                *sequence > 0 && *sequence <= i64::MAX as u64,
+                "invalid input sequence"
+            );
+            ensure!(
+                expected_revision.is_none_or(|revision| revision > 0),
+                "invalid input revision"
+            );
+            ensure!(
+                text.len() <= 65536 && (!text.trim().is_empty() || !attachments.is_empty()),
+                "invalid input text"
+            );
+            ensure!(
+                report_results.is_some(),
+                "an input carries its reporting choice"
+            );
+            crate::store::workspace::validate_attachments(attachments)?;
+            ensure!(
+                attachments
+                    .iter()
+                    .map(Attachment::blob)
+                    .eq(event.blobs.iter().cloned()),
+                "input attachments do not match event blobs"
+            );
+        }
+        EventBody::WorkspaceCommanded {
+            command_id,
+            command,
+            acting_assignment,
+            attestation,
+            cause,
+        } => {
+            if let Some(id) = acting_assignment {
+                vibeface_protocol::validate_id(id).map_err(anyhow::Error::msg)?;
+            }
+            ensure!(
+                acting_assignment.is_none() || (attestation.is_none() && cause.is_some()),
+                "only a Bot's command has an acting assignment"
+            );
+            id(command_id)?;
+            ensure!(
+                event.scope_id == crate::workspace::WORKSPACE_SCOPE,
+                "invalid workspace command scope"
+            );
+            ensure!(
+                !(attestation.is_some() && cause.is_some()),
+                "a command has one authority"
+            );
+            crate::store::workspace::validate_command(command)?;
+            if let Some(cause) = cause {
+                id(&cause.conversation_id)?;
+                id(&cause.message_id)?;
+            }
+            let attachments = match command {
+                crate::workspace::WorkspaceCommand::PostChannelMessage { attachments, .. }
+                | crate::workspace::WorkspaceCommand::ControlInput {
+                    action: crate::workspace::InputControl::Edit { attachments, .. },
+                    ..
+                } => attachments.as_slice(),
+                _ => &[],
+            };
+            ensure!(
+                attachments
+                    .iter()
+                    .map(Attachment::blob)
+                    .eq(event.blobs.iter().cloned()),
+                "workspace attachments do not match event blobs"
+            );
+        }
         EventBody::MessagePosted {
             message_id,
             role,
@@ -567,7 +657,9 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         } => {
             id(work_id)?;
             match trigger.split_once(':').unwrap_or_default() {
-                ("message" | "work" | "task" | "bot_message", trigger_id) => id(trigger_id)?,
+                ("message" | "work" | "task" | "assignment" | "bot_message", trigger_id) => {
+                    id(trigger_id)?
+                }
                 ("schedule", _) => ensure!(
                     crate::scheduling::parse_schedule_trigger(trigger).is_some(),
                     "invalid schedule trigger"
@@ -636,6 +728,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         }
         EventBody::QuestionAsked {
             question_id: question,
+            target,
             attention,
             text,
             choices,
@@ -643,6 +736,9 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             ..
         } => {
             question_id(question)?;
+            if let Some(target) = target {
+                crate::store::workspace::validate_target(target)?;
+            }
             ensure!(
                 !text.trim().is_empty() && text.len() <= 1024,
                 "a question is 1-1024 bytes"
@@ -1115,6 +1211,15 @@ mod tests {
         identity
             .sign_event(event(Provider::Codex))
             .expect("matching frozen provider should be valid");
+        let mut assigned = event(Provider::Codex);
+        if let EventBody::WorkDispatched { trigger, .. } = &mut assigned.body {
+            *trigger = "assignment:assignment-1".into();
+        }
+        identity.sign_event(assigned.clone())?;
+        if let EventBody::WorkDispatched { trigger, .. } = &mut assigned.body {
+            *trigger = "assignment:invalid/id".into();
+        }
+        assert!(identity.sign_event(assigned).is_err());
         assert!(identity.sign_event(event(Provider::Claude)).is_err());
         let mut missing = serde_json::to_value(event(Provider::Codex))?;
         missing["body"]

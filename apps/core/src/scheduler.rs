@@ -173,7 +173,7 @@ const CONSTRAINTS: &[&str] = &[
     "Operate only inside this personal network and conversation.",
     "Your Shell has full access to this device. Hand longer coding work to a coding agent through dispatch_work; it registers the work with the Node, runs one turn with full access on a provider this device executes work on (agent names which), the Node watches it, and its result comes back to you as a new turn.",
     "Your turn ends after you dispatch. Do not wait or poll for work to finish; tell the user what was started.",
-    "dispatch_work runs on this device unless target_node names another of the user's devices; then that device's bot gets the task. continues names an earlier work to follow up on; it goes on from that work's session. dispatch_work with thread adds the prompt to an existing session on this device as a work, whose result comes back to you as a work_result turn: any Codex thread but a sub-agent's, steering its running turn or starting one, but for another agent only a session one of this device's works ran in. Reusing call_ref in the same turn only reads back. For Codex, `vibeface codex send <thread> <text> --id <call_ref>` is its Shell form; where it says it runs only inside a bot turn, use dispatch_work. `vibeface codex call <method> [json]` calls Codex App Server methods that read or manage threads; it refuses methods that start, steer or stop a turn (turn/start, turn/steer, turn/interrupt, thread/start, thread/fork, thread/compact/start, thread/shellCommand, thread/revert, thread/inject_items, review/start): start or steer through dispatch_work and stop through interrupt_work, so the Node tracks every turn. `vibeface codex watch <thread>` streams a Codex thread's events.",
+    "dispatch_work runs on this device unless target_node names another of the user's devices; then that device's bot gets the task. continues names an earlier work to follow up on; it goes on from that work's session. dispatch_work with thread adds the prompt to an existing session on this device as a work, whose result comes back to you as a work_result turn: a Codex thread other than a sub-agent's, steering its running turn or starting one, or another agent's session one of this device's works ran in. The session's actual directory must be verified inside the current allowed roots. Reusing call_ref in the same turn only reads back. For Codex, `vibeface codex send <thread> <text> --id <call_ref>` is its Shell form; where it says it runs only inside a bot turn, use dispatch_work. `vibeface codex call <method> [json]` calls Codex App Server methods that read or manage threads; it refuses methods that start, steer or stop a turn (turn/start, turn/steer, turn/interrupt, thread/start, thread/fork, thread/compact/start, thread/shellCommand, thread/revert, thread/inject_items, review/start): start or steer through dispatch_work and stop through interrupt_work, so the Node tracks every turn. `vibeface codex watch <thread>` streams a Codex thread's events.",
     "Write what you send to a coding agent (a dispatch_work prompt, `vibeface codex send` text) as the task itself: the goal, where, limits and what done means. Do not relay the chat (no \"the user says ...\"); quote the user only when exact wording matters. When you need the result in a set shape, give the format and a short example.",
     "When something fails or behaves unexpectedly, record it with `vibeface log <warn|error|info> <message> --conversation <id> [--work <id>] [--thread <id>]` so it can be debugged later; never put secrets in it.",
     "Reuse call_ref only to retry the same dispatch; a retry never starts a second turn. An unknown outcome is settled by the Node, never by dispatching again.",
@@ -337,6 +337,7 @@ fn turn_settings(
 }
 
 struct PreparedTurn {
+    permission_epoch: u64,
     settings: crate::config::ManagerSettings,
     local_settings: crate::runtime::NodeSettings,
     provider_local: crate::providers::Local,
@@ -353,7 +354,8 @@ async fn prepare_turn(
     conversation: &str,
     scope: &SessionScope,
 ) -> Result<PreparedTurn> {
-    let (local_settings, provider_local) = node.agent_configuration_snapshot().await;
+    let (local_settings, provider_local, permission_epoch) =
+        node.agent_configuration_snapshot().await;
     prepare_turn_from(
         node,
         network,
@@ -362,6 +364,7 @@ async fn prepare_turn(
         local_settings,
         provider_local,
         None,
+        permission_epoch,
     )
     .await
 }
@@ -371,14 +374,57 @@ async fn prepare_turn_from(
     network: &str,
     conversation: &str,
     scope: &SessionScope,
-    local_settings: crate::runtime::NodeSettings,
+    mut local_settings: crate::runtime::NodeSettings,
     provider_local: crate::providers::Local,
     selected: Option<crate::config::ManagerSettings>,
+    permission_epoch: u64,
 ) -> Result<PreparedTurn> {
     let explicit = selected.is_some();
     let Some(mut settings) = selected.or_else(|| local_settings.manager.clone()) else {
         bail!("this Node has no configured management SDK")
     };
+    if let SessionScope::WorkspaceTask { task_id } = scope {
+        let store = node.store.lock().await;
+        let task = store
+            .workspace_task(network, task_id)?
+            .context("task not found")?;
+        let assignment = task
+            .current_assignment
+            .as_ref()
+            .map(|id| store.workspace_assignment(network, id))
+            .transpose()?
+            .flatten()
+            .context("task has no execution assignment")?;
+        ensure!(
+            assignment.execution_node == node.identity.device_id()?,
+            "task assignment belongs to another Node"
+        );
+        let mut allowed = local_settings.roots.clone();
+        allowed.push(settings.workspace.clone());
+        let allowed = allowed
+            .into_iter()
+            .map(|root| root.canonicalize().map_err(Into::into))
+            .collect::<Result<Vec<_>>>()?;
+        let roots = assignment
+            .resource_roots
+            .iter()
+            .map(|root| PathBuf::from(root).canonicalize().map_err(Into::into))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            !roots.is_empty()
+                && roots
+                    .iter()
+                    .all(|root| allowed.iter().any(|allowed| root.starts_with(allowed))),
+            "task resource permission was revoked"
+        );
+        ensure!(
+            roots
+                .iter()
+                .any(|root| settings.workspace.starts_with(root)),
+            "task workspace is outside its assignment snapshot"
+        );
+        local_settings.roots = roots;
+    }
     let resolved = if let SessionScope::Task { work_id } = scope {
         let store = node.store.lock().await;
         Some(
@@ -468,6 +514,11 @@ async fn prepare_turn_from(
             conversation: conversation.into(),
             work_id: work_id.clone(),
         },
+        SessionScope::WorkspaceTask { task_id } => CursorInstance::WorkspaceTask {
+            network: network.into(),
+            conversation: conversation.into(),
+            task_id: task_id.clone(),
+        },
         SessionScope::Routine { trigger } => CursorInstance::Routine {
             network: network.into(),
             conversation: conversation.into(),
@@ -490,6 +541,7 @@ async fn prepare_turn_from(
     }
     let session_config = session_identity(&config, &provider_local, &stable, tool_url, &server)?;
     Ok(PreparedTurn {
+        permission_epoch,
         settings,
         local_settings,
         provider_local,
@@ -575,6 +627,7 @@ async fn turn(
         return Ok(Some(invocation_value(&job, &network)));
     }
     let PreparedTurn {
+        permission_epoch,
         mut settings,
         local_settings,
         provider_local,
@@ -677,8 +730,9 @@ async fn turn(
                     wants_fresh.then(|| store.turn_history(&network, &conversation, &job, None)).transpose()?,
                 )
             };
+            let attachment_events=node.store.lock().await.input_attachment_events(&network,&job.reply_to)?;
             let pending = node
-                .fetch_turn_attachments(&network, history.shown_events().chain(fresh_history.iter().flat_map(|history| history.shown_events())))
+                .fetch_turn_attachments(&network, history.shown_events().chain(fresh_history.iter().flat_map(|history| history.shown_events())).chain(attachment_events.iter()))
                 .await;
             history.pending_blobs = pending.clone();
             if let Some(fresh) = &mut fresh_history {
@@ -686,9 +740,21 @@ async fn turn(
             }
             let ((prompt, shown_now), fresh) = {
                 let store = node.store.lock().await;
-                let works = store.works(&network, &conversation)?;
-                let dispatches = store.undelivered_dispatches(&network, &conversation)?;
+                let works = store.works(&network, &conversation)?.into_iter().filter_map(|work| match store.scheduler_work_in_scope(&network,&job,&work.work_id) {
+                    Ok(true) => Some(Ok(work)), Ok(false) => None, Err(error) => Some(Err(error)),
+                }).collect::<Result<Vec<_>>>()?;
+                let dispatches = store.undelivered_dispatches(&network, &conversation)?.into_iter().filter_map(|dispatch| match store.scheduler_work_in_scope(&network,&job,&dispatch.spec.work_id) {
+                    Ok(true) => Some(Ok(dispatch)), Ok(false) => None, Err(error) => Some(Err(error)),
+                }).collect::<Result<Vec<_>>>()?;
                 let mut bot = bot_value(&store, &network, &conversation, crate::runtime::now_ms())?;
+                if let Some(sessions)=bot["sessions"].as_array_mut() {
+                    let mut filtered=Vec::new();
+                    for session in sessions.drain(..) {
+                        if store.scheduler_native_in_scope(&network,&job,session["session_id"].as_str().unwrap_or(""))? { filtered.push(session); }
+                    }
+                    *sessions=filtered;
+                }
+                if job.scope!=SessionScope::Main { bot["sent"]=json!([]); }
                 bot["configured_bot"] = stable.bot.clone();
                 bot["skills"] = json!(stable.skills);
                 fit_bot(&mut bot, INDEX_BUDGET);
@@ -723,6 +789,7 @@ async fn turn(
                 });
                 let pending_checks: Vec<_> = store.pending_checks()?.into_iter()
                     .filter(|check| check.conversation_id == conversation)
+                    .filter(|check| store.scheduler_job(&conversation,&check.trigger).ok().flatten().is_some_and(|source| source.scope == job.scope))
                     .map(|check| json!({"check_id":check.check_id,"trigger":check.trigger,
                         "detail":if crate::model::looks_secret(&check.detail) { "[redacted]" } else { prefix(&check.detail, 1_000) },
                         "created_at_ms":check.created_at_ms}))
@@ -746,7 +813,9 @@ async fn turn(
                             memories: Some(&memories) },
                     )?;
                     shown.dynamic = Some(dynamic.fingerprint.clone());
+                    let (sources, sources_omitted) = context_sources(&dynamic, history)?;
                     shown.context = Some(crate::scheduling::ContextProjection {
+                        network_id:network.clone(), scope:job.scope.clone(),
                         attempt_id: attempt.id.clone(), provider,
                         stable_fingerprint: stable.fingerprint.digest.clone(),
                         dynamic_fingerprint: dynamic.fingerprint.clone(),
@@ -755,6 +824,7 @@ async fn turn(
                         invalidation_reason: claimed.invalidation.as_ref().map(|value| value.reason.clone()),
                         stage: crate::scheduling::ContextStage::Compiled,
                         session_status: None,
+                        sources, sources_omitted, inputs:vec![], inputs_omitted:0,
                     });
                     let compiled = CompiledTurn::new(stable.clone(), dynamic, provider.prompt_mode());
                     let prompt = compiled.prompt();
@@ -776,7 +846,10 @@ async fn turn(
             let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
             // The backend may still be starting with the Node.
             node.manager_backend_ready(provider).await;
-            config.custom_tools = provider.tools_for(job.kind);
+            config.custom_tools = provider.tools_for(job.tool_kind());
+            if history.task_context.as_ref().is_some_and(|context|context["task"]["reply_only"] == true) {
+                config.custom_tools.retain(|name,_|crate::tools::Tool::parse(name).is_some_and(|tool|tool.effect() == crate::tools::Effect::Read));
+            }
             config.tool_token = Some(token.clone());
             config.process_started = Some(process_recorder(&node, &attempt.id));
             config.codex_turn = Some(turn_recorder(&node, &network, &job, &server, shown.clone(), fresh_prompt));
@@ -787,7 +860,7 @@ async fn turn(
             ]);
             if !started && matches!(
                 job.kind,
-                TriggerKind::WorkResult | TriggerKind::AgentTask | TriggerKind::Schedule | TriggerKind::BotMessage
+                TriggerKind::WorkResult | TriggerKind::AgentTask | TriggerKind::WorkspaceTask | TriggerKind::Schedule | TriggerKind::BotMessage
             ) {
                 node.store.lock().await.reserve_budget(
                     &network,
@@ -796,7 +869,7 @@ async fn turn(
                 )?;
             }
             let cancel = node
-                .register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger, provider)
+                .register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger, provider,permission_epoch)
                 .await?;
             registered = true;
             tools_fenced = false;
@@ -817,6 +890,8 @@ async fn turn(
             let first = match ensure_readiness(&readiness) {
               Err(error) => Err(error),
               Ok(()) => {
+                ensure!(node.local_permission_epoch.load(std::sync::atomic::Ordering::Acquire) == permission_epoch,"management permissions changed before native submission");
+                let _native_lease = node.manager_input_lease(&attempt.id,provider).await?;
                 node.store.lock().await.update_turn_runtime(
                     &conversation, &trigger, &attempt.id, ProviderStage::TurnStart, TurnExecution::Unknown,
                 )?;
@@ -896,7 +971,7 @@ async fn turn(
                     selected.backup.automatic = false;
                     let next = prepare_turn_from(
                         &node, &network, &conversation, &scope,
-                        local_settings.clone(), provider_local.clone(), Some(selected),
+                        local_settings.clone(), provider_local.clone(), Some(selected), permission_epoch,
                     ).await.map_err(ManagerError::not_started)?;
                     if node.provider_configuration_pending(next.session_config.provider, &provider_local) {
                         return Err(ManagerError::not_started(anyhow::anyhow!("backup provider is starting")));
@@ -1045,6 +1120,15 @@ async fn turn(
     }
     .await;
     node.finish_manager_attempt(&attempt.id).await;
+    if let Err(error) = node.store.lock().await.settle_workspace_assignment(
+        &node.identity,
+        &network,
+        &job,
+        crate::runtime::now_ms(),
+    ) {
+        tracing::warn!(event="workspace.assignment.reconcile_pending",%error,"assignment waits for lifecycle reconciliation");
+    }
+    node.publish_changed(&network, crate::workspace::WORKSPACE_SCOPE, Changed::Reload);
     match (&final_result, &job.state) {
         (Err(error), _) => {
             tracing::error!(event = "agent.turn.finished", trigger, error = %format!("{error:#}"), "agent turn could not be recorded")
@@ -1213,9 +1297,9 @@ pub(crate) fn turn_recorder(
                 started_trigger.clone(),
             );
             Box::pin(async move {
-                {
+                let workspace_started = {
                     let mut store = node.store.lock().await;
-                    store.update_turn_runtime(
+                    let started = store.update_turn_runtime(
                         &conversation,
                         &trigger,
                         &attempt,
@@ -1223,8 +1307,22 @@ pub(crate) fn turn_recorder(
                         TurnExecution::Started,
                     )?;
                     store.record_context_started(&attempt)?;
-                }
+                    store.started_workspace_assignment(
+                        &node.identity,
+                        &network,
+                        &started,
+                        crate::runtime::now_ms(),
+                    )?;
+                    matches!(started.scope, SessionScope::WorkspaceTask { .. })
+                };
                 node.publish_changed(&network, &conversation, Changed::Job(&trigger));
+                if workspace_started {
+                    node.publish_changed(
+                        &network,
+                        crate::workspace::WORKSPACE_SCOPE,
+                        Changed::Reload,
+                    );
+                }
                 Ok(())
             })
         })),
@@ -1503,9 +1601,71 @@ fn attachment_rows(attachments: &[crate::model::Attachment], pending: &BTreeSet<
 }
 
 /// A message as the prompt lists it; `author` and `seq` name it for the context tool.
+fn context_sources(dynamic: &DynamicContext, history: &TurnHistory) -> Result<(Vec<Value>, usize)> {
+    let mut sources = Vec::new();
+    if dynamic.trigger.event.is_some()
+        && let Some(event) = &history.trigger
+    {
+        sources.push(json!({"kind":"trigger","event_id":event.hash,"author":event.event.author,"seq":event.event.seq}));
+    }
+    for row in &dynamic.messages.entries {
+        if let Some(event) = history
+            .recent
+            .events
+            .iter()
+            .find(|event| row["author"] == event.event.author && row["seq"] == event.event.seq)
+        {
+            sources.push(json!({"kind":"message","event_id":event.hash,"author":event.event.author,"seq":event.event.seq}));
+        }
+    }
+    for (kind, section, key) in [
+        ("work", &dynamic.works, "work_id"),
+        ("dispatch", &dynamic.dispatches, "work_id"),
+        ("question", &dynamic.questions, "question_id"),
+        ("attachment", &dynamic.attachments, "hash"),
+    ] {
+        for row in &section.entries {
+            if let Some(reference) = row[key].as_str() {
+                sources.push(json!({"kind":kind,"reference":reference}));
+            }
+        }
+    }
+    for (kind, value) in [
+        ("checkpoint", dynamic.checkpoint.as_ref()),
+        ("handoff", dynamic.handoff.as_ref()),
+    ] {
+        if let Some(value) = value {
+            sources.push(
+                json!({"kind":kind,"reference":crate::crypto::digest(&serde_json::to_vec(value)?)}),
+            );
+        }
+    }
+    for key in ["entries", "upserts"] {
+        if let Some(entries) = dynamic.memory[key].as_array() {
+            for entry in entries {
+                if let Some(id) = entry["memory_id"].as_str() {
+                    sources.push(json!({"kind":"memory","reference":id}));
+                }
+            }
+        }
+    }
+    let omitted = sources.len().saturating_sub(64);
+    sources.truncate(64);
+    Ok((sources, omitted))
+}
+
 fn message_row(event: &Event, pending: &BTreeSet<String>) -> Option<Value> {
     let (author, seq) = (&event.author, event.seq);
     match &event.body {
+        EventBody::InputPosted {
+            text,
+            attachments,
+            target,
+            ..
+        } => Some(json!({
+            "author":author,"seq":seq,"role":"user","created_at_ms":event.created_at_ms,
+            "text":prefix(text,4_000),"attachments":attachment_rows(attachments,pending),"target":target,
+        })),
         EventBody::MessagePosted {
             role,
             text,
@@ -1616,6 +1776,10 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
             continue;
         }
         match &event.event.body {
+            EventBody::InputPosted { text, .. } => {
+                lines.push(format!("用户：{}", prefix(text, 280)));
+                requests.push(prefix(text, 300).to_owned());
+            }
             EventBody::MessagePosted {
                 role,
                 text,
@@ -1696,6 +1860,8 @@ pub(crate) fn work_row(work: &WorkProjection) -> Value {
 
 /// The history one turn's prompt reads, built by `Store::turn_history` at the job's basis.
 pub(crate) struct TurnHistory {
+    pub task_context: Option<Value>,
+    pub effective_input: Option<crate::workspace::QueuedInput>,
     /// Events after `since`, in shared order.
     pub recent: Context,
     /// What the prompt leaves to `checkpoint` or to the resumed session.
@@ -1887,7 +2053,15 @@ fn compile_dynamic_with_limit(
     });
     let trigger_event = running.or_else(|| history.trigger.as_ref().map(|event| {
         let blobs = &event.event.blobs;
-        json!({"author":event.event.author,"seq":event.event.seq,"body":bounded(&agent_event_body(&event.event.body),4_000),"blobs":blobs,
+        let mut body=agent_event_body(&event.event.body);
+        if let Some(effective)=&history.effective_input {
+            body["text"]=json!(effective.input.text);
+            body["attachments"]=json!(effective.input.attachments);
+            body["source_event"]=json!(effective.source_event);
+            body["control_event"]=json!(effective.control_event);
+        }
+        json!({"author":event.event.author,"seq":event.event.seq,"body":bounded(&body,4_000),"blobs":blobs,
+            "effective_input":history.effective_input,
             "pending_download":blobs.iter().filter(|blob| pending.contains(&blob.hash)).map(|blob| &blob.hash).collect::<Vec<_>>()})
     })).or_else(|| dispatches.iter().find(|dispatch| job.trigger == crate::scheduling::work_trigger(&dispatch.spec.work_id))
         .map(|dispatch| json!({"body":dispatch_row(dispatch)})));
@@ -1979,20 +2153,40 @@ fn compile_dynamic_with_limit(
     }
     let mut attachments = Vec::new();
     let mut attachment_hashes = BTreeSet::new();
+    if let Some(input) = &history.effective_input {
+        for file in &input.input.attachments {
+            attachment_hashes.insert(file.hash.clone());
+            attachments.push(json!({"hash":file.hash,"size":file.size,"name":file.name,"pending_download":pending.contains(&file.hash)}));
+        }
+    }
     for event in history.shown_events().collect::<Vec<_>>().into_iter().rev() {
+        if history.effective_input.is_some()
+            && history
+                .trigger
+                .as_ref()
+                .is_some_and(|trigger| trigger.hash == event.hash)
+        {
+            continue;
+        }
         if let EventBody::MessagePosted {
+            attachments: files, ..
+        }
+        | EventBody::InputPosted {
             attachments: files, ..
         } = &event.event.body
         {
             for file in files {
-                if attachment_hashes.insert(&file.hash) {
+                if attachment_hashes.insert(file.hash.clone()) {
                     attachments.push(json!({"hash":file.hash,"size":file.size,
                         "name":file.name,"pending_download":pending.contains(&file.hash)}));
                 }
             }
         }
     }
-    let role = match (job.kind, schedule) {
+    let role = if matches!(job.scope, SessionScope::WorkspaceTask { .. }) {
+        "Run the task in task.task using this Bot's existing authority. task.assignment fixes its execution revision, sources and resources. Treat later input as a correction within that authority, never as new directory, settings or approval permission. Read the shared task graph with workspace_state and workspace_history. A reply-only task only reads and returns its result; the Node records completion from this actual turn. When the task is complete, give its result in the user's language.".to_owned()
+    } else {
+        match (job.kind, schedule) {
         (TriggerKind::AgentTask, _) => "You are this user's bot on this device, running a task another of their devices delegated here (the trigger event). Do it with this device's tools and change files only through dispatch_work on this device. Your final reply is the task's result for the delegating bot.".to_owned(),
         (TriggerKind::Schedule, Some(entry)) if entry.schedule.depth > 0 => format!(
             "You are this user's chat bot. A reminder you set yourself earlier, {:?}, is due; the trigger event holds your note. Follow it up now: read this host with your own tools and change it through dispatch_work. Your reply goes to the user, in their language. A reminder turn cannot change your settings.",
@@ -2006,6 +2200,7 @@ fn compile_dynamic_with_limit(
         (TriggerKind::Answer, _) if settings_card => "You are this user's chat bot. The trigger event is the user's answer to the settings card you raised with propose_provider_config (trigger.question). Call apply_provider_config with question.question_id now: it writes the paths only when the answer allowed them, and dispatches nothing. Then tell the user in their language what changed on this device, or that nothing changed.".to_owned(),
         (TriggerKind::Answer, _) => "You are this user's chat bot. The trigger event is the user's answer to a question you asked (trigger.question, about a session question.about.agent runs on question.about.node): act on it now. When question.about.request_id is set, answer that held request with `vibeface respond <request_id> <json> --node <question.about.node>`. Otherwise, for a Codex thread, turn the answer into the instruction the thread needs and send it with dispatch_work, thread set to question.about.session_id and call_ref to the answer's message_id: the message steers the thread's running turn or starts one as a work, and its result comes back as a work_result turn. Another agent's session takes nothing from you once its request is gone; tell the user to answer it there. Reusing the same call_ref in this turn only reads back. Reply in the user's language; an answer cannot change your settings.".to_owned(),
         _ => "You are this user's chat bot. Read this host with your own tools and change it through dispatch_work. Reply in the user's language.".to_owned(),
+    }
     };
     let instructions = if thread.is_some() || extras.rules_in_stable {
         role
@@ -2113,6 +2308,8 @@ fn compile_dynamic_with_limit(
             schema_version: agent_context::SCHEMA_VERSION,
             network_id: context.network_id.clone(),
             conversation_id: context.scope_id.clone(),
+            scope: job.scope.clone(),
+            task_context: history.task_context.clone(),
             basis: job.basis.clone(),
             trigger: DynamicTrigger {
                 trigger: job.trigger.clone(),
@@ -2120,7 +2317,17 @@ fn compile_dynamic_with_limit(
                 event: trigger_event.clone(),
                 question: question.clone(),
                 unavailable_tools: if thread.is_some() {
-                    let offered = tools(job.kind);
+                    let mut offered = tools(job.tool_kind());
+                    if history
+                        .task_context
+                        .as_ref()
+                        .is_some_and(|context| context["task"]["reply_only"] == true)
+                    {
+                        offered.retain(|name, _| {
+                            crate::tools::Tool::parse(name)
+                                .is_some_and(|tool| tool.effect() == crate::tools::Effect::Read)
+                        });
+                    }
                     tools(TriggerKind::Human)
                         .into_keys()
                         .filter(|name| !offered.contains_key(name))
@@ -2259,6 +2466,7 @@ mod tests {
             .collect();
         let basis = BTreeMap::from([("a".into(), 30)]);
         let job = SchedulerJob {
+            scope: SessionScope::Main,
             conversation_id: "c".into(),
             trigger: "message:m30".into(),
             kind: TriggerKind::Human,
@@ -2273,6 +2481,8 @@ mod tests {
         };
         (
             TurnHistory {
+                task_context: None,
+                effective_input: None,
                 trigger: events.last().cloned(),
                 recent: Context {
                     network_id: "n".into(),
@@ -2446,6 +2656,7 @@ mod tests {
     #[test]
     fn an_agent_task_streams_into_its_work_not_the_chat() {
         let job = |kind, trigger: &str, reply_to: &str| SchedulerJob {
+            scope: SessionScope::Main,
             conversation_id: "c".into(),
             trigger: trigger.into(),
             kind,

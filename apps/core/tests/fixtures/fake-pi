@@ -199,8 +199,10 @@ for line in sys.stdin:
         respond(command, {"disposition": "started"})
         threading.Thread(target=turn, args=(command["message"],), daemon=True).start()
     elif kind == "steer":
+        content = [{"type": "text", "text": command["message"]}] + command.get("images", [])
+        log({"steer": command["message"], "images": command.get("images", [])})
         with state:
-            steers.append(command["message"])
+            steers.append(content)
             state.notify_all()
         respond(command, {"disposition": "queued"})
     elif kind == "abort":

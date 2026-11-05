@@ -34,7 +34,7 @@ fn text(value: impl serde::Serialize) -> Result<String> {
 }
 
 /// Every table `apply` writes. A rebuild clears exactly these; nothing else is derived from the log.
-pub(crate) const TABLES: [&str; 16] = [
+pub(crate) const TABLES: [&str; 17] = [
     "conversations",
     "messages",
     "bots",
@@ -51,6 +51,7 @@ pub(crate) const TABLES: [&str; 16] = [
     "notification_acks",
     "questions",
     "session_owners",
+    "workspace_projection",
 ];
 
 /// Who owns a session, in any order the records arrive: the latest attribution or mute by
@@ -126,6 +127,24 @@ pub(crate) fn apply(
                 params![network, scope, bot_id, name, instructions, project.as_ref().map(serde_json::to_string).transpose()?, hash, rank, cause.as_ref().map(serde_json::to_string).transpose()?],
             )?;
         }
+        EventBody::WorkspaceCommanded { .. } => {
+            super::workspace::apply_projection(connection, network, hash, event, rank)?
+        }
+        EventBody::InputPosted {
+            message_id,
+            target,
+            text: body,
+            attachments,
+            report_results,
+            ..
+        } => {
+            connection.execute(
+                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,report_results,attachments,target) VALUES(?,?,?,?,?,?,'user',?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,text=excluded.text,created_at_ms=excluded.created_at_ms,report_results=excluded.report_results,attachments=excluded.attachments,target=excluded.target WHERE excluded.rank<rank",
+                params![network,scope,message_id,hash,rank,event.body.attestation().expect("validated input signature").device_id,body,event.created_at_ms,report_results,serde_json::to_string(attachments)?,serde_json::to_string(target)?],
+            )?;
+            super::workspace::refresh_reply_targets(connection, network, scope)?;
+            super::workspace::apply_projection(connection, network, hash, event, rank)?;
+        }
         EventBody::MessagePosted {
             message_id,
             role,
@@ -158,6 +177,7 @@ pub(crate) fn apply(
                     serde_json::to_string(attachments)?
                 ],
             )?;
+            super::workspace::refresh_reply_targets(connection, network, scope)?;
             if *role == Role::Assistant {
                 let kind = if *status == Some(ReplyStatus::Completed) {
                     "manager_response"
@@ -172,6 +192,7 @@ pub(crate) fn apply(
                 "UPDATE messages SET steered_into=? WHERE network_id=? AND conversation_id=? AND message_id=? AND role='user'",
                 params![reply, network, scope, message_id],
             )?;
+            super::workspace::refresh_reply_targets(connection, network, scope)?;
         }
         EventBody::WorkDispatched { work_id, .. } => {
             connection.execute(
@@ -263,6 +284,7 @@ pub(crate) fn apply(
                 "INSERT INTO questions(network_id,question_id,conversation_id,rank,author,created_at_ms,node,session_id,request_id,body) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,question_id) DO UPDATE SET conversation_id=excluded.conversation_id,rank=excluded.rank,author=excluded.author,created_at_ms=excluded.created_at_ms,node=excluded.node,session_id=excluded.session_id,request_id=excluded.request_id,body=excluded.body WHERE excluded.rank<rank",
                 params![network, question_id, scope, rank, event.author, event.created_at_ms, about.node, about.session_id, about.request_id, serde_json::to_string(&event.body)?],
             )?;
+            super::workspace::refresh_reply_targets(connection, network, scope)?;
             notify(connection, network, hash, scope, "question", question, rank)?;
         }
         // Follows the question in its author's log. Only the device that asked and held the

@@ -25,12 +25,12 @@ pub struct ManagerAccess {
 const OWNER_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) struct ActiveManager {
-    access: Access,
+    pub(super) access: Access,
     /// The provider the reply runs on, whatever the device switched to since.
-    provider: crate::providers::Provider,
-    token: String,
-    cancel: watch::Sender<bool>,
-    fenced: AtomicBool,
+    pub(super) provider: crate::providers::Provider,
+    pub(super) token: String,
+    pub(super) cancel: watch::Sender<bool>,
+    pub(super) fenced: AtomicBool,
     admission: Arc<RwLock<()>>,
 }
 
@@ -74,8 +74,13 @@ impl Runtime {
         attempt_id: &str,
         trigger: &str,
         provider: crate::providers::Provider,
+        captured_permission_epoch: u64,
     ) -> Result<watch::Receiver<bool>> {
         let mut controls = self.manager_controls.lock().await;
+        ensure!(
+            self.local_permission_epoch.load(Ordering::Acquire) == captured_permission_epoch,
+            "management permissions changed before this attempt registered"
+        );
         if let Some(active) = controls.get(attempt_id) {
             return Ok(active.cancel.subscribe());
         }
@@ -139,13 +144,59 @@ impl Runtime {
         Ok(receiver)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn register_manager_attempt_fixture(
+        &self,
+        token: String,
+        access: Access,
+        attempt_id: &str,
+        trigger: &str,
+        provider: crate::providers::Provider,
+    ) -> Result<watch::Receiver<bool>> {
+        self.register_manager_attempt(
+            token,
+            access,
+            attempt_id,
+            trigger,
+            provider,
+            self.local_permission_epoch.load(Ordering::Acquire),
+        )
+        .await
+    }
+
     /// The provider a reply of this process runs on.
+    #[cfg(test)]
     pub(super) async fn attempt_provider(
         &self,
         attempt_id: &str,
     ) -> Option<crate::providers::Provider> {
         let controls = self.manager_controls.lock().await;
         controls.get(attempt_id).map(|active| active.provider)
+    }
+
+    pub(crate) async fn manager_input_lease(
+        &self,
+        attempt_id: &str,
+        provider: crate::providers::Provider,
+    ) -> Result<OwnedRwLockReadGuard<()>> {
+        let active = self
+            .manager_controls
+            .lock()
+            .await
+            .get(attempt_id)
+            .cloned()
+            .context("management invocation is no longer active")?;
+        let guard = active.admission.clone().read_owned().await;
+        ensure!(
+            !active.fenced.load(Ordering::Acquire) && active.provider == provider,
+            "management input target is no longer valid"
+        );
+        Self::check_manager_permission(
+            &*self.store.lock().await,
+            &self.identity.device_id()?,
+            &active.access,
+        )?;
+        Ok(guard)
     }
 
     pub async fn fence_manager_attempt(&self, attempt_id: &str) -> Result<()> {

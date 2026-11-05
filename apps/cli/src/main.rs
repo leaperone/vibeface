@@ -1385,10 +1385,19 @@ async fn hook(options: Hook) -> Result<()> {
         event.git_branch = git(&event.cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
         event.git_head = git(&event.cwd, &["rev-parse", "HEAD"]);
     }
-    let body = serde_json::to_value(&event)?;
+    let mut body = serde_json::to_value(&event)?;
     if options.dry_run {
         println!("{}", serde_json::to_string_pretty(&body)?);
         return Ok(());
+    }
+    if let Some(kind) = event.hold {
+        let questions = match options.agent {
+            triage::Provider::Claude => input["tool_input"].get("questions"),
+            triage::Provider::Opencode => input.get("questions"),
+            _ => None,
+        };
+        body["_request"] = json!({"provider":event.agent,"session_id":event.session_id,
+            "turn_id":event.turn_id,"kind":kind,"questions":questions});
     }
     let sent = async {
         let url = local_node_url(&options.local).await?;
@@ -1417,6 +1426,10 @@ async fn hook(options: Hook) -> Result<()> {
         }
         Err(error) => {
             let mut spool_body = body;
+            spool_body
+                .as_object_mut()
+                .context("hook event must be an object")?
+                .remove("_request");
             spool_body["hold"] = Value::Null;
             let spool = options.local.data_dir.join(triage::SPOOL_DIR);
             private_dir(&spool)?;

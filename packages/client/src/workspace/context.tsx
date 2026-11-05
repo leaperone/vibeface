@@ -7,28 +7,29 @@ import { requestKey } from "../lib/secure.ts"
 import type { Platform } from "../lib/platform.ts"
 import type { Tabs } from "../identity/context.tsx"
 import { mergeProgress, type LiveProgress } from "../lib/progress.ts"
-import { isQueuedReceipt, prepareSend, retryText } from "../chat/protocol.ts"
+import { inputEventBody, inputTargetKey, isQueuedReceipt, prepareSend, retryText } from "../chat/protocol.ts"
 import { taskActive } from "./labels.ts"
 import { outcomeUnknown } from "../lib/errors.ts"
-import { botReach } from "../chat/protocol.ts"
 import { byRank, unreadReply } from "../chat/timeline.ts"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePrimary, parsePendingBot, record,
   parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords, parseWorkspaceOverview, attachmentName, signedOrder, attachmentLimit,
+  parseInputReceipt, parsePendingMessage, parseScopeContext, parseWorkDetail, parseWorkspaceCommand, parseWorkspaceCommandResult, parseWorkspaceHistory, parseWorkspaceState,
 } from "./model.ts"
 import type { Attachment } from "../chat/types.ts"
 import type { Avatar } from "../avatar/face.ts"
 import { avatarWrite } from "../avatar/pick.ts"
-import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions } from "./records.ts"
+import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions, mergeWorkspaceState } from "./records.ts"
 import { answerBody, answerId } from "./questions.ts"
 import { memoryController, memoryResultLabel, memorySaved } from "./memory.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
 import type {
   AnswerResult, ConversationPayload, MemoryBase, MemoryControlResult, NodeInfo, NotificationRecord, PendingAnswer, Question,
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, WriteState, WriteStatus, OpenWork, ScheduleAction, WorkspaceOverview,
+  InputControlAction, InputOptions, InputReceipt, InputTarget, WorkDetailWork, WorkspaceCommand, WorkspaceCommandResult, WorkspaceDomainState, WorkspaceFilter,
 } from "./types.ts"
-import { isSessionNotification } from "./types.ts"
+import { isMainNotification, isSessionNotification } from "./types.ts"
 
 const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
   aligning: "正在和你的其他设备同步，稍后就能发送。",
@@ -37,6 +38,7 @@ const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
 }
 
 type InterruptedReply = { trigger: string; conversation_id: string; after?: string; text: string }
+type LocalTask = { target: Extract<InputTarget, { kind: 'task' | 'channel_task' }>; conversation_id: string; command?: Extract<WorkspaceCommand, { kind: 'create_task' }>; saved: boolean }
 
 /** A file the person attached: a browser `File` or a picked document on a phone. */
 type AttachmentFile = { name: string; arrayBuffer(): Promise<ArrayBuffer> }
@@ -46,7 +48,7 @@ const soleTab: Tabs = { leader: () => true, post() {}, listen: () => () => {} }
 const faceSuperseded = "Bot 的长相刚在别处改过，之前没确认的那次修改没有再发送。"
 const responded = (caught: unknown) => caught instanceof Error && "responded" in caught && caught.responded === true
 
-function useWorkspaceState(platform: Platform, connection: ReadyConnection, openConversation: (conversationId: string) => void = () => {}, tabs: Tabs = soleTab, initialBot: string | null = null) {
+function useWorkspaceState(platform: Platform, connection: ReadyConnection, openConversation: (conversationId: string, target?: InputTarget) => void = () => {}, tabs: Tabs = soleTab, initialBot: string | null = null) {
   const { notifier } = platform
   const { readStorage, writeStorage } = storageOf(platform.storage)
   const networkId = connection.principal.network_id
@@ -80,13 +82,19 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const [questions, setQuestions] = useState<Question[]>([])
   const [openWorks, setOpenWorks] = useState<OpenWork[]>([])
   const openWorksRef = useRef<OpenWork[]>([])
+  const knownWorks = useRef(new Map<string, WorkDetailWork>())
   const [overview, setOverview] = useState<WorkspaceOverview | null>(null)
+  const [workspaceState, setWorkspaceState] = useState<WorkspaceDomainState | null>(null)
+  const workspaceStateRef = useRef<WorkspaceDomainState | null>(null)
+  const workspaceReadSequence = useRef(0)
   /** Answers this browser saw land, by question, until the network's own reads show them. */
   const [answered, setAnswered] = useState<Readonly<Record<string, string>>>({})
   const [pendingAnswers, setPendingAnswers] = useState<PendingAnswer[]>([])
   const answersRef = useRef<PendingAnswer[]>([])
   const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([])
   const [bots, setBots] = useState<BotRecord[]>([])
+  const botsRef = useRef<BotRecord[]>([])
+  botsRef.current = bots
   const [primary, setPrimary] = useState<string | null>(null)
   const [pendingBot, setPendingBot] = useState<PendingBot | null>(null)
   const [refreshing, setRefreshing] = useState(false)
@@ -114,6 +122,15 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const ackNotificationRef = useRef<(notification: NotificationRecord) => Promise<void>>(async () => {})
   const ignoredNotificationsRef = useRef<ReadonlySet<string>>(new Set())
   const inFlight = useRef(new Set<string>())
+  const messageSaves = useRef(new Map<string, Promise<void>>())
+  const channelTasks = useRef(new Map<string, LocalTask>())
+  const messageTargets = useRef(new Set<string>())
+  const workspaceWrites = useRef(new Map<string, Promise<WorkspaceCommandResult>>())
+  const flushMessagesRef = useRef<() => void>(() => {})
+  const renderedConnection = useRef(connection)
+  renderedConnection.current = connection
+  const loadedMessageConnection = useRef<ReadyConnection | null>(null)
+  const localMessageSaves = useRef(0)
   const refreshingRef = useRef(false)
   const refreshingConnection = useRef<ReadyConnection | null>(null)
   const refreshAgain = useRef(false)
@@ -151,12 +168,25 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   /** Unconfirmed messages and answers as the page shows them, read back from the outbox. */
   const syncPending = async () => {
     const items = await outbox.all()
-    const next: PendingMessage[] = items.filter((item) => item.method === "message").map((item) => ({
-      message_id: String(item.params.message_id), conversation_id: String(item.params.conversation_id), text: String(item.params.text),
-      report_results: item.params.report_results !== false, ...(item.rejected === undefined ? {} : { rejected: item.rejected }),
-    }))
+    const next = items.filter((item) => item.method === "message").map(parsePendingMessage).sort((a, b) => a.created_at_ms - b.created_at_ms || a.sequence - b.sequence)
     const answers: PendingAnswer[] = items.filter((item) => item.method === "answer" && item.rejected === undefined)
       .map((item) => ({ question_id: String(item.params.question_id), text: String(item.params.text) }))
+    if (renderedConnection.current !== connection || !alive.current) return
+    for (const [key, task] of channelTasks.current) {
+      const pending = next.some((input) => inputTargetKey(input.target) === inputTargetKey(task.target))
+      const saving = messageSaves.current.has(messageLane(task))
+      if (task.saved && !pending && !saving) channelTasks.current.delete(key)
+    }
+    for (const pending of next) {
+      if (pending.target.kind !== 'channel_task') continue
+      const target = pending.target, key = inputTargetKey({ kind: 'channel_member', channel_id: target.channel_id, bot_id: target.bot_id })
+      if (channelTasks.current.has(key)) continue
+      const tasks = next.filter((input) => input.target.kind === 'channel_task' && input.target.channel_id === target.channel_id && input.target.bot_id === target.bot_id)
+      if (new Set(tasks.map((input) => inputTargetKey(input.target))).size !== 1) continue
+      const stored = items.find((item) => item.method === 'message' && item.params.message_id === pending.message_id)?.prerequisite
+      const command = stored ? parseWorkspaceCommand(stored.params.command) : undefined
+      channelTasks.current.set(key, { target, conversation_id: pending.conversation_id, saved: true, ...(command?.kind === 'create_task' && command.task_id === target.task_id ? { command } : {}) })
+    }
     messagesRef.current = next
     answersRef.current = answers
     if (alive.current) { setPendingMessages(next); setPendingAnswers(answers) }
@@ -205,6 +235,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (sequence !== readSequence.current) return next
     return showConversation(id, next)
   }
+  const notificationForMain = (notification: NotificationRecord, id: string) => notification.conversation_id === id && isMainNotification(notification, botsRef.current.find((bot) => bot.conversation_id === id)?.bot_id)
   const acknowledgeNotification = async (notification: NotificationRecord) => {
     await signedWrite("ack", notification.notification_id, "ack", { notification_id: notification.notification_id, attestation: await attest(notification.conversation_id, { type: "notification_acked", notification_id: notification.notification_id, client_id: clientId }) })
     requireCurrent()
@@ -223,7 +254,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (viewRef.current !== "chat" || !platform.foreground()) onScreen.current = null
     else if (onScreen.current?.id !== id || onScreen.current.connection !== connection) {
       onScreen.current = { id, connection }
-      setFresh(new Set([...notificationsRef.current.filter((item) => item.conversation_id === id && unreadReply(item)).map((item) => item.notification_id), ...next.questions.map((question) => `question:${question.question_id}`)]))
+      setFresh(new Set([...notificationsRef.current.filter((item) => notificationForMain(item, id) && unreadReply(item)).map((item) => item.notification_id), ...next.questions.map((question) => `question:${question.question_id}`)]))
     }
     // A message or an answer settles once the Node's own history holds it.
     const admitted = (item: PendingMessage) => item.conversation_id === id && next.messages.some((message) => message.message_id === item.message_id)
@@ -246,10 +277,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     setLiveProgress((previous) => previous.filter((progress) => {
       if (progress.kind === "native") return next.works.some((item) => item.target_node === progress.target_node && item.work_id === progress.work_id && item.state !== "finished")
       const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
-      return !job || (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state)
+      return Boolean(job && (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "interrupted", "rejected"].includes(job.state))
     }))
     if (joined && current() && readConnection.current === connection && viewRef.current === "chat" && platform.foreground()) {
-      const seen = notificationsRef.current.filter((item) => item.conversation_id === id && !isSessionNotification(item))
+      const seen = notificationsRef.current.filter((item) => notificationForMain(item, id) && !isSessionNotification(item))
       for (const notification of seen) {
         try { await acknowledgeNotification(notification) } catch (caught) { showError(caught, "标记已读"); break }
       }
@@ -272,14 +303,14 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (seen.has(item.notification_id)) continue
       if (isSessionNotification(item) && platform.sessionNotifications === false) continue
       seen.add(item.notification_id)
-      if (viewRef.current === "chat" && item.conversation_id === activeId.current && platform.foreground()) continue
+      if (viewRef.current === "chat" && notificationForMain(item, activeId.current) && platform.foreground()) continue
       try {
         notifier.show({ title: item.kind === "question" ? "Vibeface · 需要你回答" : isSessionNotification(item) ? "Vibeface · 接手会话" : "Vibeface · 进展", body: item.text, tag: item.notification_id }, () => {
           if (!current()) return
           if (isSessionNotification(item)) {
-            void ackNotificationRef.current(item).then(() => { if (current()) openConversation(item.conversation_id) }, () => {})
+            void ackNotificationRef.current(item).then(() => { if (current()) openConversation(item.conversation_id, item.target) }, () => {})
           } else {
-            openConversation(item.conversation_id)
+            openConversation(item.conversation_id, item.target)
           }
         })
       } catch { /* The persisted inbox remains available when system alerts fail. */ }
@@ -326,6 +357,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       const nextBots = parseBots(rawBots), nextQuestions = parseQuestions(rawQuestions)
       openWorksRef.current = parseOpenWorks(rawWorks)
       if (rawOverview !== null) setOverview(parseWorkspaceOverview(rawOverview))
+      botsRef.current = nextBots
       setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setPrimary(parsePrimary(rawBots)); setWriteState(parseWriteStatus(rawWrite)); setQuestions(nextQuestions); setOpenWorks(openWorksRef.current)
       if (botCreationRef.current && nextBots.some((item) => item.bot_id === botCreationRef.current?.bot_id)) clearPendingBot()
       notificationsRef.current = nextNotifications
@@ -335,6 +367,9 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (activeId.current) await readConversation(activeId.current)
       requireCurrent()
       readConnection.current = connection
+      loadedMessageConnection.current = connection
+      flushMessagesRef.current()
+      void readWorkspaceState().catch(showRefreshError)
       void notify(nextNotifications.filter((item) => !ignoredNotificationsRef.current.has(item.notification_id)))
       void refreshNotificationButton()
       resolveRefresh()
@@ -373,7 +408,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (viewRef.current === "tasks") scheduleRefresh()
     const rawBots = await connection.rpc("bots")
     requireCurrent()
-    setBots(parseBots(rawBots)); setPrimary(parsePrimary(rawBots))
+    const next = parseBots(rawBots)
+    botsRef.current = next; setBots(next); setPrimary(parsePrimary(rawBots))
     if (id === activeId.current && readConnection.current === connection) await readConversation(id)
   }
 
@@ -408,7 +444,6 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (item.method === "answer") return !parseQuestions(await connection.rpc("questions")).some((question) => question.question_id === item.params.question_id)
     const id = String(item.params.conversation_id)
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
-    if (item.method === "message") return context.messages.some((message) => message.message_id === item.params.message_id)
     if (item.method === "control_schedule") {
       // Only schedules still ahead are listed, so a missing one is deleted or done either way.
       const schedule = context.bot_settings.schedules.find((entry) => entry.schedule_id === item.params.schedule_id)
@@ -425,7 +460,9 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   /** After a (re)connection: confirm what the entry has, resubmit the rest byte for byte, stop at an unknown. */
   const settleOutbox = async () => {
     if (!tabs.leader() || !current()) return
-    const result = await settle({ ...outbox, all: async () => (await outbox.all()).filter(item => item.method !== "control_memory") }, {
+    flushMessagesRef.current()
+    for (const item of (await outbox.all()).filter((item) => item.method === 'workspace_command' && item.rejected === undefined)) void submitWorkspaceCommand(item).catch((caught) => showError(caught, '确认操作结果'))
+    const result = await settle({ ...outbox, all: async () => (await outbox.all()).filter(item => item.method !== "control_memory" && item.method !== 'message' && item.method !== 'workspace_command') }, {
       recorded: async (item) => { requireCurrent(); return recorded(item) },
       submit: async (item) => { requireCurrent(); await connection.rpc(item.method, item.params) },
     })
@@ -452,6 +489,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   useEffect(() => {
     alive.current = true
     inFlight.current = new Set()
+    messageTargets.current = new Set()
+    messageSaves.current = new Map()
+    workspaceWrites.current = new Map()
+    localMessageSaves.current = 0
     setMessageBusy(false); setLiveProgress([]); setError(null); setNoticeText("")
     try {
       const nextIgnored = readIgnoredNotifications()
@@ -464,7 +505,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     } catch (caught) { showError(caught) }
     const stop = tabs.listen((message) => {
       if (message.networkId !== networkId) return
-      if (message.type === "outbox") { void syncPending().catch(() => {}); return }
+      if (message.type === "outbox") { void syncPending().then(() => flushMessagesRef.current()).catch(() => {}); return }
       if (message.type !== "ignored-inbox") return
       const merged = new Set([...ignoredNotificationsRef.current, ...readIgnoredNotifications()])
       if (merged.size === ignoredNotificationsRef.current.size) return
@@ -487,6 +528,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         return
       }
       if (event.conversation_id !== activeId.current) return
+      const shown = dataRef.current
+      const known = event.type === 'manager_progress'
+        ? shown?.scheduler?.jobs.some((job) => job.scope.kind === 'main' && job.trigger === event.trigger)
+        : shown?.works.some((work) => work.work_id === event.work_id && work.target_node === event.target_node)
+      if (!known) { scheduleRefresh(); return }
       setLiveProgress((previous) => {
         const next = mergeProgress(previous, event)
         if (next.some((item) => item.needsRefresh && !previous.find((prior) => prior.key === item.key)?.needsRefresh)) scheduleRefresh()
@@ -557,6 +603,72 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const selected = notificationsRef.current.filter((item) => ids.includes(item.notification_id))
     for (const notification of selected) await acknowledgeNotification(notification)
   }
+  const showWorkspace = (next: WorkspaceDomainState | WorkspaceCommandResult, scoped = false) => {
+    if (!current()) return
+    workspaceStateRef.current = mergeWorkspaceState(workspaceStateRef.current, next, scoped)
+    setWorkspaceState(workspaceStateRef.current)
+  }
+  const readWorkspaceState = async (filter: WorkspaceFilter = {}) => {
+    requireCurrent()
+    const sequence = ++workspaceReadSequence.current
+    const next = parseWorkspaceState(await connection.rpc('workspace_state', filter))
+    requireCurrent()
+    if (sequence === workspaceReadSequence.current) showWorkspace(next, filter.channel_id !== undefined || filter.task_id !== undefined)
+    return next
+  }
+  const readWorkspaceHistory = async (filter: WorkspaceFilter = {}) => {
+    requireCurrent()
+    const next = parseWorkspaceHistory(await connection.rpc('workspace_history', filter))
+    requireCurrent()
+    const admitted = next.events.flatMap((event) => event.body.type === 'input_posted' ? [{ ...event.body, conversation_id: event.scope_id }] : [])
+    let cleared = false
+    for (const item of (await outbox.all()).filter((item) => item.method === 'message')) {
+      const pending = parsePendingMessage(item)
+      if (!admitted.some((input) => input.message_id === pending.message_id && input.conversation_id === pending.conversation_id && inputTargetKey(input.target) === inputTargetKey(pending.target))) continue
+      await outbox.delete(item.key); cleared = true
+    }
+    if (cleared) await outboxChanged()
+    return next
+  }
+  const queueWorkspaceCommand = async (input: WorkspaceCommand, persist = true): Promise<OutboxItem> => {
+    const parsed = parseWorkspaceCommand(input)
+    const command = parsed.kind === 'post_channel_message' && !parsed.attachments.length ? (({ attachments: _, ...rest }) => rest)(parsed) : parsed
+    const commandId = await requestKey(platform.secure.attestationPayload(networkId, 'workspace', JSON.stringify({ type: 'workspace_commanded', command })), clientId)
+    const key = outboxKey('workspace-command', commandId)
+    const existing = (await outbox.all()).find((item) => item.key === key)
+    if (existing) return existing
+    const attestation = await attest('workspace', { type: 'workspace_commanded', command_id: commandId, command })
+    const item = { key, method: 'workspace_command', params: { command_id: commandId, command, attestation }, created_at_ms: Date.now() }
+    return persist ? enqueue(outbox, item) : item
+  }
+  const submitWorkspaceCommand = (item: OutboxItem) => {
+    const running = workspaceWrites.current.get(item.key)
+    if (running) return running
+    const writes = workspaceWrites.current
+    const submission = (async () => {
+      requireCurrent()
+      try {
+        const receipt = parseWorkspaceCommandResult(await connection.rpc('workspace_command', item.params))
+        requireCurrent()
+        if (receipt.command_id !== item.params.command_id) throw new Error('返回的操作和原操作不一致，内容已保留。请再查一次。')
+        workspaceReadSequence.current += 1
+        showWorkspace(receipt)
+        await outbox.delete(item.key)
+        return receipt
+      } catch (caught) {
+        if (responded(caught)) await outbox.put({ ...item, rejected: caught instanceof Error ? caught.message : String(caught) })
+        throw caught
+      } finally { writes.delete(item.key) }
+    })()
+    writes.set(item.key, submission)
+    return submission
+  }
+  const workspaceCommand = (command: WorkspaceCommand) => withMutation(`workspace-command:${JSON.stringify(command)}`, async () => {
+    const item = await queueWorkspaceCommand(command)
+    const receipt = await submitWorkspaceCommand(item)
+    scheduleRefresh()
+    return receipt
+  })
   /** After a failed write: a refusal only rereads; an unknown outcome also pauses writes until the reread. */
   const requireControlRefresh = (caught: unknown) => {
     if (!current()) return
@@ -567,66 +679,288 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     }
     scheduleRefresh()
   }
-  /** A retry, here or through another entrance, sends the same signed request; nothing is re-signed. */
-  /** Sends one file to the entry in 1 MiB chunks; an interrupted upload continues where the entry's disk stopped. */
-  const uploadAttachment = async (id: string, file: AttachmentFile): Promise<Attachment> => {
+  const prepareAttachment = async (file: AttachmentFile) => {
     const bytes = new Uint8Array(await file.arrayBuffer())
     if (!bytes.length || bytes.length > attachmentLimit) throw new Error(`附件「${file.name}」需在 64 MiB 以内且不能为空。`)
     const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+    let binary = ''
+    for (let index = 0; index < bytes.length; index += 0x8000) binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000))
+    return { hash, size: bytes.length, name: attachmentName(file.name), data: btoa(binary) }
+  }
+  const uploadAttachment = async (id: string, file: NonNullable<OutboxItem['uploads']>[number]) => {
+    const bytes = Uint8Array.from(atob(file.data), (character) => character.charCodeAt(0))
+    if (!bytes.length || bytes.length !== file.size || bytes.length > attachmentLimit) throw new Error('本地附件内容不完整，已保留原输入。')
     let offset = 0
     for (;;) {
       requireCurrent()
       const chunk = bytes.subarray(offset, offset + 1024 * 1024)
       let binary = ""
       for (let index = 0; index < chunk.length; index += 0x8000) binary += String.fromCharCode(...chunk.subarray(index, index + 0x8000))
-      const reply = record(await connection.rpc("upload_attachment", { conversation_id: id, hash, size: bytes.length, offset, data: btoa(binary) }))
-      if (reply.complete === true) return { hash, size: bytes.length, name: attachmentName(file.name) }
-      offset = Number(reply.offset)
+      const reply = record(await connection.rpc("upload_attachment", { conversation_id: id, hash: file.hash, size: bytes.length, offset, data: btoa(binary) }))
+      if (reply.complete === true) return
+      if (typeof reply.offset !== 'number' || !Number.isSafeInteger(reply.offset) || reply.offset < 0 || reply.offset > bytes.length || reply.offset === offset) throw new Error('附件上传进度无效，已保留原输入。')
+      offset = reply.offset
     }
   }
-  const submitMessage = async (text: string, files: AttachmentFile[] = [], sent: Attachment[] = []) => {
-    requireContext()
-    const id = activeId.current
-    const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
-    const prepared = prepareSend({ conversationId: id, text, pending: prior, reportResults: true, files: files.length + sent.length > 0 || prior?.text === "" })
-    if (!prepared.ok) throw new Error(prepared.error)
-    const key = outboxKey("message", prepared.pending.message_id)
-    let item = prior ? (await outbox.all()).find((entry) => entry.key === key) : undefined
-    if (!item) {
-      const { body } = prepared
-      const uploaded: Attachment[] = [...sent]
-      for (const file of files) uploaded.push(await uploadAttachment(id, file))
-      const attachments = signedOrder(uploaded)
-      const extra = attachments.length ? { attachments } : {}
-      const attestation = await attest(body.conversation_id, { type: "message_posted", message_id: body.message_id, role: "user", text: body.text, ...extra, report_results: body.report_results })
-      item = await enqueue(outbox, { key, method: "message", params: { ...body, ...extra, attestation }, created_at_ms: Date.now() })
-    } else if (item.rejected !== undefined) {
-      item = { ...item, rejected: undefined }
-      await outbox.put(item)
-    }
-    requireWritable()
-    await outboxChanged()
-    try {
-      const receipt = await connection.rpc("message", item.params)
-      requireCurrent()
-      if (!isQueuedReceipt(receipt, prepared.pending)) {
-        if (activeId.current === id) await refreshRef.current().catch(showRefreshError)
-        return false
-      }
-      // History first, so the sent message is shown from it before its pending copy goes and never blinks out between.
-      if (activeId.current === id) await refreshRef.current().catch(showRefreshError)
-      await outbox.delete(key)
+  const targetConversation = (target: InputTarget, explicit?: string) => {
+    const task = 'task_id' in target ? workspaceStateRef.current?.tasks.find((item) => item.task_id === target.task_id) : undefined
+    const botId = 'bot_id' in target ? target.bot_id : task?.owner_bot
+    const bot = botsRef.current.find((item) => item.bot_id === botId)
+    const work = target.kind === 'work' ? openWorksRef.current.find((item) => item.work_id === target.work_id) ?? [...knownWorks.current.values()].find((item) => item.work_id === target.work_id) : undefined
+    const pending = messagesRef.current.find((item) => inputTargetKey(item.target) === inputTargetKey(target))
+    const id = bot?.conversation_id ?? work?.conversation_id ?? (target.kind === 'work' && dataRef.current?.works.some((item) => item.work_id === target.work_id) ? dataRef.current.conversation?.conversation_id : undefined) ?? pending?.conversation_id ?? explicit
+    if (!id || explicit && explicit !== id || !botsRef.current.some((item) => item.conversation_id === id)) throw new Error('还没读取这个输入目标，先查询它的任务或 Bot。')
+    return id
+  }
+  const readWork = async (input: { conversation_id: string; work_id: string }) => {
+    requireCurrent()
+    const detail = parseWorkDetail(await connection.rpc('work_detail', input))
+    requireCurrent()
+    if (detail.work.conversation_id !== input.conversation_id || detail.work.work_id !== input.work_id) throw new Error('设备返回了其他工作的详情。')
+    knownWorks.current.set(JSON.stringify([input.conversation_id, input.work_id]), detail.work)
+    return detail
+  }
+  const messageLane = (message: Pick<PendingMessage, 'target' | 'conversation_id'>) => {
+    const target = message.target
+    const scope = target.kind === 'task' || target.kind === 'channel_task' ? JSON.stringify(['workspace_task', target.task_id]) : inputTargetKey(target)
+    return `${message.conversation_id}:${scope}`
+  }
+  const queryInput = async (input: { message_id: string; target: InputTarget; conversation_id?: string }): Promise<InputReceipt> => {
+    requireCurrent()
+    const id = targetConversation(input.target, input.conversation_id)
+    const receipt = parseInputReceipt(await connection.rpc('input_receipt', { message_id: input.message_id, conversation_id: id, target: input.target }))
+    requireCurrent()
+    if (receipt.message_id !== input.message_id || inputTargetKey(receipt.target) !== inputTargetKey(input.target)) throw new Error('输入回执和查询目标不匹配，已保留原输入。')
+    const item = (await outbox.all()).find((item) => item.key === outboxKey('message', input.message_id))
+    if (item) {
+      await outbox.put({ ...item, receipt, delivery: receipt.stage === 'unknown' || receipt.stage === 'refused' ? 'unknown' : 'accepted' })
       await outboxChanged()
-      setNoticeText("")
-      return true
-    } catch (caught) {
-      if (current() && responded(caught)) {
-        await outbox.put({ ...item, rejected: caught instanceof Error ? caught.message : String(caught) })
-        await outboxChanged()
+    }
+    return receipt
+  }
+  const readScopeContext = async (input: { target: InputTarget; conversation_id?: string }) => {
+    requireCurrent()
+    const id = targetConversation(input.target, input.conversation_id)
+    const next = parseScopeContext(await connection.rpc('scope_context', { conversation_id: id, target: input.target }))
+    requireCurrent()
+    if (next.conversation_id !== id || inputTargetKey(next.target) !== inputTargetKey(input.target)) throw new Error('设备返回了其他目标的上下文。')
+    return next
+  }
+  const flushMessageTarget = async (lane: string) => {
+    const targets = messageTargets.current
+    if (targets.has(lane) || !current() || !tabs.leader()) return
+    targets.add(lane)
+    try {
+      for (;;) {
+        if (!current()) return
+        const item = (await outbox.all()).filter((item) => item.method === 'message' && item.delivery !== 'accepted' && messageLane(parsePendingMessage(item)) === lane).sort((a, b) => Number(a.params.sequence) - Number(b.params.sequence) || a.created_at_ms - b.created_at_ms)[0]
+        if (!item || item.rejected !== undefined) return
+        const pending = parsePendingMessage(item)
+        if (item.delivery === 'unknown' || item.delivery === 'submitting' || item.delivery === undefined) {
+          await queryInput(pending)
+          const checked = (await outbox.all()).find((entry) => entry.key === item.key)
+          if (checked?.delivery !== 'accepted') return
+          continue
+        }
+        let sending = item
+        try {
+          if (item.prerequisite) {
+            const command = parseWorkspaceCommand(item.prerequisite.params.command)
+            const known = command.kind === 'create_task' && workspaceStateRef.current?.tasks.some((task) => task.task_id === command.task_id && task.owner_bot === command.owner_bot && task.channel_id === command.channel_id)
+            if (!known) await submitWorkspaceCommand(item.prerequisite)
+            sending = { ...sending, prerequisite: undefined }
+          }
+          if (item.uploads?.length) {
+            sending = { ...sending, delivery: 'uploading' }
+            await outbox.put(sending); await outboxChanged()
+            for (const file of item.uploads) await uploadAttachment(pending.conversation_id, file)
+          }
+          requireCurrent()
+          if (!(await outbox.all()).some((entry) => entry.key === item.key)) continue
+          sending = { ...sending, delivery: 'submitting' }
+          await outbox.put(sending); await outboxChanged()
+          const receipt = await connection.rpc('message', item.params)
+          requireCurrent()
+          const result = record(receipt)
+          if (result.accepted === false && result.message_id === pending.message_id && typeof result.reason === 'string') {
+            const notSaved = result.code === 'input_not_saved' && result.stored === false
+            const conflict = result.code === 'input_conflict' && result.stored === true
+            if (notSaved || conflict) {
+              if ((await outbox.all()).some((entry) => entry.key === item.key)) await outbox.put({ ...sending, delivery: notSaved ? 'saved' : 'unknown', rejected: result.reason })
+              await outboxChanged()
+              showError(new Error(result.reason))
+              return
+            }
+          }
+          if (!isQueuedReceipt(receipt, pending)) throw new Error('接收设备还没确认收到这条输入。请查询原消息。')
+          if ((await outbox.all()).some((entry) => entry.key === item.key)) await outbox.put({ ...sending, delivery: 'accepted', uploads: undefined, receipt: { message_id: pending.message_id, target: pending.target, stage: 'entry_accepted', actual_turn_id: null, reason: null, retry_safe: false } })
+          await outboxChanged()
+          scheduleRefresh()
+        } catch (caught) {
+          if (renderedConnection.current !== connection) return
+          const submitted = sending.delivery === 'submitting'
+          if ((await outbox.all()).some((entry) => entry.key === item.key)) await outbox.put({ ...sending, delivery: submitted ? 'unknown' : 'saved', ...(!submitted && responded(caught) ? { rejected: caught instanceof Error ? caught.message : String(caught) } : {}) })
+          await outboxChanged()
+          showError(caught, submitted ? '确认输入是否送达' : '发送已保存的输入')
+          return
+        }
       }
-      throw caught
+    } catch (caught) { showError(caught, '查询已保存的输入') }
+    finally { targets.delete(lane) }
+  }
+  const flushMessages = () => {
+    if (!current() || !tabs.leader()) return
+    void outbox.all().then((items) => {
+      const lanes = new Set(items.filter((item) => item.method === 'message' && item.delivery !== 'accepted').map((item) => messageLane(parsePendingMessage(item))))
+      for (const lane of lanes) void flushMessageTarget(lane)
+    }).catch((caught) => showError(caught, '读取已保存的输入'))
+  }
+  flushMessagesRef.current = flushMessages
+  const canSaveMessages = joined && booted && loadedMessageConnection.current === connection && renderedConnection.current === connection && writeState.state === 'writable' && bots.length > 0
+  const sendMessage = async (text: string, files: AttachmentFile[] = [], sent: Attachment[] = [], options?: InputOptions) => {
+    if (!canSaveMessages || !alive.current) throw new Error(writeState.state === 'writable' ? '先读取已授权的工作区，再保存输入。' : writeNotices[writeState.state])
+    const selected = bots.find((bot) => bot.conversation_id === activeId.current)
+    let target: InputTarget = options?.target ?? (selected ? { kind: 'bot_main', bot_id: selected.bot_id } : (() => { throw new Error('还没选 Bot。先选一个。') })())
+    const id = targetConversation(target, options?.conversation_id)
+    let revision = options?.expected_revision
+    let localTask: LocalTask | undefined
+    if (options?.intent === 'new_task' || target.kind === 'channel_member') {
+      if (!files.length && !sent.length) inputText(text, '消息内容', 65536)
+      const bot = botsRef.current.find((bot) => bot.conversation_id === id)
+      if (!bot) throw new Error('输入目标没有可用的 Bot。')
+      const channelKey = target.kind === 'channel_member' ? inputTargetKey(target) : undefined
+      localTask = channelKey && options?.intent !== 'new_task' ? channelTasks.current.get(channelKey) : undefined
+      if (!localTask) {
+        const taskId = newId(), channelId = 'channel_id' in target ? target.channel_id : undefined
+        const sources = target.kind === 'work' ? knownWorks.current.get(JSON.stringify([id, target.work_id]))?.source_events ?? [] : []
+        const command: Extract<WorkspaceCommand, { kind: 'create_task' }> = { kind: 'create_task', task_id: taskId, ...(channelId ? { channel_id: channelId } : {}), owner_bot: bot.bot_id, title: text.trim().slice(0, 80) || '附件任务', request: text.trim() || '附件输入', expected_result: '', source_events: [...sources], dependencies: [], reply_only: false }
+        localTask = { target: channelId ? { kind: 'channel_task', channel_id: channelId, task_id: taskId, bot_id: bot.bot_id } : { kind: 'task', task_id: taskId }, conversation_id: id, command, saved: false }
+        if (channelKey) channelTasks.current.set(channelKey, localTask)
+      }
+      target = localTask.target
+      revision = localTask.saved ? options?.expected_revision : 1
+    }
+    const lane = messageLane({ target, conversation_id: id })
+    const saves = messageSaves.current
+    const previous = saves.get(lane) ?? Promise.resolve()
+    localMessageSaves.current += 1; setMessageBusy(true)
+    const save = previous.catch(() => {}).then(async () => {
+      const uploads = await Promise.all(files.map(prepareAttachment))
+      if (renderedConnection.current !== connection || !alive.current) throw new Error('工作区已切换，输入仍留在编辑器。')
+      let prerequisite: OutboxItem | undefined
+      if (target.kind === 'task' || target.kind === 'channel_task') {
+        const key = inputTargetKey(target)
+        prerequisite = (await outbox.all()).find((item) => item.method === 'message' && item.prerequisite && inputTargetKey(parsePendingMessage(item).target) === key)?.prerequisite
+      }
+      if (!prerequisite && localTask?.command) {
+        if (!localTask.saved) localTask.command = { ...localTask.command, title: text.trim().slice(0, 80) || '附件任务', request: text.trim() || '附件输入' }
+        prerequisite = await queueWorkspaceCommand(localTask.command, false)
+      }
+      if ('task_id' in target && revision === undefined) {
+        const taskId = target.task_id
+        const key = inputTargetKey(target)
+        revision = workspaceStateRef.current?.tasks.find((task) => task.task_id === taskId)?.revision
+          ?? [...messagesRef.current].reverse().find((item) => inputTargetKey(item.target) === key)?.expected_revision
+      }
+      if ('task_id' in target && revision === undefined) throw new Error('任务版本尚未读取，先查询任务。')
+      const sequenceKey = scoped('input-sequences'), sequences = record(readStorage<unknown>(sequenceKey, {}, true)), key = messageLane({ target, conversation_id: id })
+      const prior = sequences[key]
+      if (prior !== undefined && (typeof prior !== 'number' || !Number.isSafeInteger(prior) || prior < 0)) throw new Error('本地输入顺序损坏，已暂停发送。')
+      const sequence = (typeof prior === 'number' ? prior : 0) + 1
+      const prepared = prepareSend({ conversationId: id, text, target, sequence, intent: options?.intent ?? 'continue', expected_revision: revision, reportResults: true, files: files.length + sent.length > 0 })
+      if (!prepared.ok) throw new Error(prepared.error)
+      const attachments = signedOrder([...sent, ...uploads.map(({ data: _, ...file }) => file)])
+      const body = { ...prepared.body, ...(attachments.length ? { attachments } : {}) }
+      writeStorage(sequenceKey, { ...sequences, [key]: sequence }, true)
+      const attestation = await attest(id, inputEventBody(body))
+      if (renderedConnection.current !== connection || !alive.current) throw new Error('工作区已切换，输入仍留在编辑器。')
+      const queued = await enqueue(outbox, { key: outboxKey('message', body.message_id), method: 'message', params: { ...body, attestation }, created_at_ms: prepared.pending.created_at_ms, uploads, delivery: 'saved', ...(prerequisite ? { prerequisite } : {}) })
+      if (localTask) localTask.saved = true
+      await outboxChanged().catch((caught) => showError(caught, '读取已保存的输入'))
+      try { options?.onSaved?.(parsePendingMessage(queued)) }
+      catch (caught) { showError(caught, '更新已保存输入的目标') }
+      flushMessages()
+    })
+    saves.set(lane, save)
+    try { await save; return true }
+    finally {
+      if (saves.get(lane) === save) saves.delete(lane)
+      localMessageSaves.current = Math.max(0, localMessageSaves.current - 1)
+      if (renderedConnection.current === connection && alive.current) setMessageBusy(localMessageSaves.current > 0)
     }
   }
+  const retryPendingMessage = async (messageId: string) => {
+    if (renderedConnection.current !== connection || !alive.current) throw new Error('工作区已切换，先读取当前输入。')
+    const item = (await outbox.all()).find((item) => item.key === outboxKey('message', messageId))
+    if (!item) throw new Error('这条输入已不在本地待发送队列。')
+    const pending = parsePendingMessage(item)
+    if (messageTargets.current.has(messageLane(pending))) throw new Error('正在处理这个目标的输入，请稍后查询。')
+    const queued = workspaceStateRef.current?.inputs.find((input) => input.input.message_id === messageId)
+    if (queued?.cancelled || queued?.deferred) throw new Error('这条输入已保存到设备。请查看状态，再使用对应操作。')
+    if (pending.delivery === 'unknown' || pending.delivery === 'submitting' || pending.delivery === 'accepted') {
+      const receipt = await queryInput(pending)
+      if (!receipt.retry_safe) { setNoticeText(receipt.reason ?? '已保留原输入，未重复提交。'); return }
+    }
+    const latest = (await outbox.all()).find((entry) => entry.key === item.key)
+    if (!latest) return
+    await outbox.put({ ...latest, rejected: undefined, receipt: undefined, delivery: 'saved' })
+    await outboxChanged()
+    flushMessages()
+  }
+  const releaseMessagePending = async (messageId: string) => {
+    if (renderedConnection.current !== connection || !alive.current) throw new Error('工作区已切换，先读取当前输入。')
+    const item = (await outbox.all()).find((item) => item.key === outboxKey('message', messageId))
+    if (!item) throw new Error('这条输入已不在本地待发送队列。')
+    const pending = parsePendingMessage(item)
+    if (messageTargets.current.has(messageLane(pending))) throw new Error('这个目标仍在提交输入，先查询原输入的结果。')
+    if (pending.delivery === 'unknown' || pending.delivery === 'submitting' || pending.delivery === 'accepted') {
+      await queryInput(pending)
+      throw new Error('设备已保存这条输入。请从列表中取消，或继续查询结果。')
+    }
+    await outbox.delete(item.key)
+    await outboxChanged()
+    flushMessages()
+    setNoticeText('已放弃这条未发送的输入。')
+  }
+  const interruptRegisteredWork = async (id: string, workId: string) => {
+    requireCurrent()
+    const work = (dataRef.current?.conversation?.conversation_id === id ? dataRef.current.works.find((item) => item.work_id === workId) : undefined)
+      ?? openWorksRef.current.find((item) => item.conversation_id === id && item.work_id === workId)
+      ?? knownWorks.current.get(JSON.stringify([id, workId]))
+    if (!work || work.outcome || !['accepted', 'running'].includes(work.state)) throw new Error('这个工作现在停不了。再查一次。')
+    let receipt: Record<string, unknown>
+    try { receipt = record(await connection.rpc('interrupt_work', { conversation_id: id, work_id: workId })) }
+    catch (caught) { requireControlRefresh(caught); throw caught }
+    requireCurrent()
+    setNoticeText(receipt.waiting_for_device === true ? '已请求停止这个工作，等待设备确认。' : '已请求停止这个工作。')
+    scheduleRefresh()
+  }
+  const stopInputTarget = (options: { target: InputTarget; expected_revision?: number }) => withMutation(`stop-target:${inputTargetKey(options.target)}`, async () => {
+    const target = options.target
+    if (target.kind === 'task' || target.kind === 'channel_task') {
+      const state = await readWorkspaceState({ task_id: target.task_id })
+      const task = state.tasks.find((item) => item.task_id === target.task_id)
+      if (!task) throw new Error('这个任务没有读取到，先查询任务。')
+      const affected = state.assignments.filter((item) => item.task_id === task.task_id && item.state !== 'completed' && item.state !== 'stopped')
+      await workspaceCommand({ kind: 'control_task', task_id: task.task_id, expected_revision: options.expected_revision ?? task.revision, action: 'stop' })
+      setNoticeText(`已记录停止请求，涉及 ${affected.length} 项执行${affected.some((item) => item.state === 'unknown') ? '，部分结果尚未确认' : ''}。仍需运行设备确认。`)
+      return
+    }
+    const id = targetConversation(target)
+    if (target.kind === 'work') {
+      await interruptRegisteredWork(id, target.work_id)
+      return
+    }
+    if (target.kind === 'channel_member') throw new Error('先选择频道中的具体任务，再请求停止。')
+    const context = parseConversation(await connection.rpc('conversation', { conversation_id: id }), id)
+    const triggers = target.kind === 'routine' ? [target.trigger] : context.scheduler?.jobs.filter((job) => !['completed', 'failed', 'cancelled', 'interrupted', 'rejected', 'steered'].includes(job.state) && job.scope.kind === 'main').map((job) => job.trigger) ?? []
+    if (!triggers.length) throw new Error('这个目标当前没有可停止的回复。')
+    const receipts = await Promise.all(triggers.map((trigger) => connection.rpc('cancel_manager', { conversation_id: id, trigger }).then(record)))
+    requireCurrent()
+    const unknown = receipts.some((receipt) => receipt.unconfirmed === true)
+    setNoticeText(`已请求停止 ${triggers.length} 项回复${unknown ? '，仍有请求未确认' : ''}。已派发的工作需单独停止。`)
+    scheduleRefresh()
+  })
   const sameProject = (left?: BotProject, right?: BotProject) => left?.target_node === right?.target_node && left?.cwd === right?.cwd
   const clearPendingBot = () => {
     writeStorage(scoped("pending-bot"), null, true)
@@ -649,13 +983,6 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     selectConversation(bot.conversation_id)
     await refreshRef.current()
   }
-  /** `sent`: files already on the Node, which a retry sends again without uploading. */
-  const sendMessage = (input: string, files: AttachmentFile[] = [], sent: Attachment[] = []) => withMutation(`message:${activeId.current}`, async () => {
-    if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("还没选 Bot。先选一个。")
-    if (botReach(nodesRef.current) === "needs_setup") throw new Error("运行 Bot 的设备需设置。先检查 AI 服务认证和模型。")
-    setMessageBusy(true)
-    try { return await submitMessage(input, files, sent) } finally { if (current()) setMessageBusy(false) }
-  })
   /**
    * 重试 for the newest reply, which failed or was stopped. The conversation is read again first, so a reply that went on since
    * is not repeated; a reply that may have done part of its work is followed by a message asking the bot to check before redoing.
@@ -678,17 +1005,18 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const incomplete = !data
   // The lists hold this connection's first full read and the Node is not aligning with other devices; until then an empty list means not yet known.
   const synced = readConnection.current === connection && writeState.state !== "aligning"
-  const messagePending = pendingMessages.find((item) => item.conversation_id === conversationId) ?? null
   const chatSlot = { conversationId: conversationId || null }
 
   return {
-    info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
+    info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，输入可保存在本机；结果未知的输入只查询，不自动重发。",
     error, noticeText, view, setView: (next: WorkspaceView) => {
       viewRef.current = next; setView(next); clearMessages()
       if (next === "chat" || next === "tasks") scheduleRefresh()
       else { onScreen.current = null; setFresh(new Set<string>()) }
     }, nodes, conversationId, data, fresh, notifications, ignoredNotifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
-    refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
+    refreshing, incomplete, chatSlot, pendingMessages, messageBusy, canSaveMessages, liveProgress, interrupted,
+    workspaceState, readWorkspaceState, readWorkspaceHistory, workspaceCommand, queryInput, readScopeContext, readWork, stopInputTarget, retryPendingMessage, releaseMessagePending,
+    controlInput: (input: { message_id: string; expected_event: string; action: InputControlAction }) => workspaceCommand({ kind: 'control_input', ...input }),
     joined, synced,
     writable: joined && booted && current() && readConnection.current === connection && writeState.state === "writable",
     writeNotice: readConnection.current !== connection ? "正在补读这台电脑的记录，已暂停写入。" : "",
@@ -849,17 +1177,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       setOpenWorks(openWorksRef.current)
       if (viewRef.current === "tasks") scheduleRefresh()
     }),
-    interruptWork: (workId: string) => withMutation(`work-control:${workId}`, async () => {
-      const id = activeId.current, context = requireBotContext(id)
-      const work = context.works.find((item) => item.work_id === workId)
-      if (!work || work.outcome || !["accepted", "running"].includes(work.state)) throw new Error("这个任务现在停不了。再查一次。")
-      let receipt: Record<string, unknown>
-      try { receipt = record(await connection.rpc("interrupt_work", { conversation_id: id, work_id: workId })) }
-      catch (caught) { requireControlRefresh(caught); throw caught }
-      requireCurrent()
-      setNoticeText(receipt.waiting_for_device === true ? "已请求、等待设备确认。" : "已请求停止任务。")
-      if (activeId.current === id) await refreshRef.current()
-    }),
+    interruptWork: (workId: string) => withMutation(`work-control:${workId}`, () => interruptRegisteredWork(activeId.current, workId)),
     /**
      * The person's answer to a question: a message whose ID comes from the question, so any retry is the same write.
      * An unknown outcome stays in the outbox; trying again sends the stored request without signing anew.
@@ -920,20 +1238,6 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (activeId.current !== id) throw new Error("对话已切换。回到原对话重新打开产物。")
       return result
     },
-    releaseMessagePending: () => withMutation(`message:${activeId.current}`, async () => {
-      requireCurrent()
-      const id = activeId.current, original = messagesRef.current.find((item) => item.conversation_id === id)
-      if (!original) throw new Error("原消息还在发送。稍等一下。")
-      if (original.rejected === undefined) throw new Error("只有设备明确返回失败后才能放弃。断线或超时就重新发送或再查一次。")
-      const complete = await readConversation(id)
-      requireContext(id)
-      const still = messagesRef.current.find((item) => item.conversation_id === id)
-      if (still?.message_id !== original.message_id || complete.messages.some((item) => item.message_id === original.message_id)) throw new Error("原消息状态有变化。再查一次。")
-      requireWritable()
-      await outbox.delete(outboxKey("message", original.message_id))
-      await outboxChanged()
-      setNoticeText("已放弃这条消息，没有重发。")
-    }),
     enableNotifications: async () => {
       requireCurrent()
       const granted = await notifier.permission()
@@ -953,7 +1257,7 @@ export function useWorkspace() {
   if (!value) throw new Error("工作区组件缺少上下文。")
   return value
 }
-export function WorkspaceProvider({ platform, connection, openConversation, tabs, initialBot = null, children }: { platform: Platform; connection: ReadyConnection; openConversation: (conversationId: string) => void; tabs: Tabs; initialBot?: string | null; children: ReactNode }) {
+export function WorkspaceProvider({ platform, connection, openConversation, tabs, initialBot = null, children }: { platform: Platform; connection: ReadyConnection; openConversation: (conversationId: string, target?: InputTarget) => void; tabs: Tabs; initialBot?: string | null; children: ReactNode }) {
   const value = useWorkspaceState(platform, connection, openConversation, tabs, initialBot)
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>
 }

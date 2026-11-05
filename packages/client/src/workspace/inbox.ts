@@ -3,13 +3,14 @@ import type { ClientPrincipal, JoinRequest, PendingRecovery } from "../lib/node.
 import { failedWork, nodeName } from "./labels.ts"
 import { botReadiness, workChecks } from "./model.ts"
 import { openQuestions } from "./questions.ts"
-import { isSessionNotification, type BotRecord, type CoordinationCheck, type NodeInfo, type NotificationRecord, type OpenWork, type PendingCheck, type Question, type WriteStatus } from "./types.ts"
+import { isSessionNotification, type BotRecord, type CoordinationCheck, type NodeInfo, type NotificationRecord, type OpenWork, type PendingCheck, type PendingMessage, type Question, type WriteStatus } from "./types.ts"
 
 export type WriteCardKind = "read_only" | "forked" | "conflicts"
 
 /** One thing waiting on the person. `done`: a question this device just answered, shown until the network's list drops it. */
 export type InboxItem = { key: string; title: string; meta?: string } & (
-  | { kind: "recovery" } | { kind: "rotate" } | { kind: "undelivered" }
+  | { kind: "recovery" } | { kind: "rotate" }
+  | { kind: "undelivered"; message: PendingMessage }
   | { kind: "write"; write: WriteCardKind }
   | { kind: "question"; question: Question; done: boolean }
   | { kind: "confirm"; check: PendingCheck }
@@ -29,7 +30,7 @@ export type InboxSource = {
   workspace: {
     writeState: WriteStatus; questions: readonly Question[]; answered: Readonly<Record<string, string>>
     openWorks: OpenWork[]; nodes: NodeInfo[]; data: { checks: CoordinationCheck[] } | null
-    messagePending: unknown; messageBusy: boolean; selectedBot: BotRecord | null
+    pendingMessages: readonly PendingMessage[]
     notifications: readonly NotificationRecord[]; ignoredNotifications: ReadonlySet<string>; bots: readonly BotRecord[]
   }
 }
@@ -61,7 +62,11 @@ export function inboxItems({ device, workspace }: InboxSource): InboxItem[] {
     const bot = workspace.bots.find((item) => item.conversation_id === work.conversation_id)
     if (bot && failedWork(work)) items.push({ key: `failed:${work.work_id}`, kind: "failed", work, bot, title: work.title || "任务没有完成", meta: nodeName(work.target_node, { nodes: workspace.nodes }) })
   }
-  if (workspace.messagePending && !workspace.messageBusy) items.push({ key: "undelivered", kind: "undelivered", title: "消息可能没送达", meta: workspace.selectedBot?.name })
+  for (const message of workspace.pendingMessages.filter((item) => item.delivery === 'unknown' || item.rejected !== undefined)) items.push({
+    key: `undelivered:${message.message_id}`, kind: 'undelivered', message,
+    title: message.rejected === undefined ? '输入结果需要确认' : '输入被拒绝',
+    meta: workspace.bots.find((bot) => bot.conversation_id === message.conversation_id)?.name,
+  })
   for (const join of openJoins(device)) items.push({ key: `join:${join.join_id}`, kind: "join", join, title: `${join.name || "新设备"} 想加入` })
   for (const note of workspace.notifications) {
     if (note.kind === "manager_attention" && workspace.ignoredNotifications.has(note.notification_id)) continue

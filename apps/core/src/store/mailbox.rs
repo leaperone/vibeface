@@ -268,6 +268,40 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn mailbox_rejected(
+        &mut self,
+        network: &str,
+        conversation: &str,
+        trigger: &str,
+        detail: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        let candidate = MailboxRecord {
+            network_id: network.into(),
+            conversation_id: conversation.into(),
+            trigger: trigger.into(),
+            state: MailboxState::Dead,
+            attempts: 0,
+            queued_at_ms: now_ms,
+            next_attempt_ms: now_ms,
+            last_error: None,
+        };
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut record = load_key(&tx, &key(&candidate))?.unwrap_or(candidate);
+        record.state = MailboxState::Dead;
+        record.next_attempt_ms = now_ms;
+        record.last_error = Some(crate::logging::scrub(detail).chars().take(512).collect());
+        save(&tx, &record)?;
+        tx.execute(
+            "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
+            params![conversation, trigger],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn mailbox_for_test(
         &self,
@@ -370,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn delivered_state_removes_the_scheduler_outbox_entry() {
+    fn terminal_mailbox_states_remove_outbox_without_treating_rejection_as_delivered() {
         let mut store = Store::open(":memory:").unwrap();
         queue(&store.connection, "n", "c", "message:m", 1).unwrap();
         store.mailbox_delivered("n", "c", "message:m", 2).unwrap();
@@ -389,6 +423,22 @@ mod tests {
                 .unwrap()
                 .map(|record| record.state),
             Some(MailboxState::Delivered)
+        );
+        queue(&store.connection, "n", "c", "message:refused", 3).unwrap();
+        store
+            .mailbox_rejected("n", "c", "message:refused", "stale owner epoch", 4)
+            .unwrap();
+        let rejected = store
+            .mailbox_for_test("n", "c", "message:refused")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected.state, MailboxState::Dead);
+        assert_eq!(rejected.last_error.as_deref(), Some("stale owner epoch"));
+        assert!(store.scheduler_outbox().unwrap().is_empty());
+        assert!(
+            !store
+                .mailbox_before_attempt("n", "c", "message:refused", 5)
+                .unwrap()
         );
     }
 

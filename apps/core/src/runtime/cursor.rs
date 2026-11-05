@@ -1,6 +1,6 @@
 use super::*;
 use crate::manager::CursorInstance;
-use crate::runtime::executor::{Executor, SteerAck, SteerTrace};
+use crate::runtime::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec, WorkState};
 use futures_util::future::BoxFuture;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -225,6 +225,48 @@ pub(super) struct CursorExecutor {
 }
 
 impl CursorExecutor {
+    pub(super) async fn native_directory(&self, session: &str) -> Result<PathBuf> {
+        vibeface_protocol::validate_id(session).map_err(anyhow::Error::msg)?;
+        if let Some(owner) = self.owner_for_agent(session) {
+            ensure!(
+                owner.workspace.is_absolute(),
+                "the Cursor owner directory is not absolute"
+            );
+            return Ok(owner.workspace);
+        }
+        let mut directories = std::collections::BTreeSet::new();
+        match std::fs::read_dir(self.data_dir.join("cursor").join("replies")) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry?.path();
+                    if path
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                    {
+                        let locator: ReplyLocator = serde_json::from_slice(&std::fs::read(path)?)?;
+                        if locator.agent == session {
+                            ensure!(
+                                locator.workspace.is_absolute(),
+                                "the Cursor reply directory is not absolute"
+                            );
+                            directories.insert(locator.workspace);
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        ensure!(
+            directories.len() == 1,
+            "the Cursor session has no unique private owner directory"
+        );
+        directories
+            .into_iter()
+            .next()
+            .context("the Cursor session directory is unavailable")
+    }
+
     pub(super) fn new(
         bridge: Arc<std::sync::OnceLock<Arc<SdkBridge>>>,
         providers: Arc<StdMutex<crate::providers::Local>>,
@@ -766,9 +808,11 @@ impl Executor for CursorExecutor {
         &'a self,
         _: &'a crate::scheduling::SteerTarget,
         _: &'a str,
-        _: &'a str,
+        _: &'a SteerInput,
     ) -> BoxFuture<'a, SteerAck> {
-        Box::pin(async { SteerAck::Refused("Cursor SDK has no native steer".into()) })
+        Box::pin(async {
+            SteerAck::Refused("the current Cursor SDK Bridge exposes no native steer".into())
+        })
     }
 
     fn read_back<'a>(
@@ -1000,6 +1044,16 @@ mod tests {
         )
         .await?;
         let agent = result.session_id.context("agent ID")?;
+        assert_eq!(
+            node.cursor_executor.native_directory(&agent).await?,
+            workspace
+        );
+        assert!(
+            node.cursor_executor
+                .native_directory("missing-agent")
+                .await
+                .is_err()
+        );
         let journal = calls.lock().unwrap_or_else(PoisonError::into_inner).clone();
         assert_eq!(journal.len(), 2);
         assert_eq!(journal[0], (agent.clone(), None));
@@ -1026,6 +1080,10 @@ mod tests {
             reasoning_effort: None,
             backup: Default::default(),
         });
+        assert_eq!(
+            node.cursor_executor.native_directory(&agent).await?,
+            workspace
+        );
         let expected = Probe::Terminal {
             turn_id: run.into(),
             status: vibeface_bridge::turn::TurnStatus::Completed,
@@ -1175,6 +1233,14 @@ mod tests {
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state).await?;
+        super::super::claude::tests::conversation(
+            &node,
+            &admin,
+            &network,
+            "conversation",
+            "prompt",
+        )
+        .await?;
         Ok((node, dir, network, workspace, admin))
     }
 
@@ -1296,6 +1362,8 @@ mod tests {
                 },
             )?;
             let context = ContextProjection {
+                network_id: network.into(),
+                scope: SessionScope::Main,
                 attempt_id: attempt.clone(),
                 provider: Provider::Cursor,
                 stable_fingerprint: configuration.stable_fingerprint.clone(),
@@ -1307,6 +1375,10 @@ mod tests {
                 invalidation_reason: None,
                 stage: ContextStage::Compiled,
                 session_status: None,
+                sources: Vec::new(),
+                sources_omitted: 0,
+                inputs: Vec::new(),
+                inputs_omitted: 0,
             };
             store.record_compiled_context("start-state", &job.trigger, &attempt, &context)?;
             store.mark_started("start-state", &job.trigger, &attempt)?;
@@ -1623,6 +1695,15 @@ mod tests {
             "{finished:?}"
         );
         assert_eq!(finished.text, "done: build it");
+        let agent = node
+            .cursor_executor
+            .owner_for_work(&spec.work_id)?
+            .agent_id
+            .context("work agent")?;
+        assert_eq!(
+            node.cursor_executor.native_directory(&agent).await?,
+            workspace
+        );
         let (_, created) = node.store.lock().await.accept_work_fixture(
             &node.identity,
             &network,

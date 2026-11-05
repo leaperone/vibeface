@@ -240,6 +240,9 @@ fn place(
             return pending(connection, network, envelope, dep);
         }
     }
+    if let Err(error) = super::workspace::authorize_event(connection, network, event) {
+        return Ok(IngestStatus::Rejected(error.to_string()));
+    }
     if let Err(error) = authorize_memory(connection, network, event) {
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
@@ -762,6 +765,10 @@ pub(crate) fn append_from(
     {
         deps.push(version.source_event_hash.clone());
     }
+    deps.extend(super::workspace::additional_dependencies(
+        connection, network, &body,
+    )?);
+    deps.retain(|hash| prev.as_ref() != Some(hash));
     let envelope = identity.sign_event(Event {
         version: WIRE_VERSION,
         network_id: network.into(),
@@ -775,6 +782,7 @@ pub(crate) fn append_from(
         blobs,
     })?;
     let event = check_event(network, &envelope).context("appended event is invalid")?;
+    super::workspace::authorize_event(connection, network, &event)?;
     authorize_memory(connection, network, &event)?;
     authorize_cause(connection, network, &event)?;
     authorize_owner(connection, network, &event)?;

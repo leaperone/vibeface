@@ -33,6 +33,11 @@ pub enum CursorInstance {
         conversation: String,
         work_id: String,
     },
+    WorkspaceTask {
+        network: String,
+        conversation: String,
+        task_id: String,
+    },
     Routine {
         network: String,
         conversation: String,
@@ -66,6 +71,16 @@ impl CursorInstance {
                 network.len(),
                 conversation.len(),
                 work_id.len()
+            ),
+            Self::WorkspaceTask {
+                network,
+                conversation,
+                task_id,
+            } => format!(
+                "workspace_task:{}:{network}:{}:{conversation}:{}:{task_id}",
+                network.len(),
+                conversation.len(),
+                task_id.len()
             ),
             Self::Routine {
                 network,
@@ -852,20 +867,28 @@ where
     .map_err(|e| error(ManagerFailure::Unknown, native, own(e.to_string())))?;
     *start.lock().unwrap() = StartEvidence::Started;
     stage.enter(ProviderStage::Record);
-    if let Some(record) = &config.codex_turn
-        && let Err(e) = (record.record)(thread.clone(), Some(turn.clone())).await
-    {
-        let stopped = stop_turn(&mut session, &thread, &turn).await;
-        let kind = if stopped {
-            ManagerFailure::Failed
-        } else {
-            ManagerFailure::Unknown
-        };
-        return Err(error(
-            kind,
-            native,
-            own(format!("record the Codex turn: {e}")),
-        ));
+    if let Some(record) = &config.codex_turn {
+        let recorded: Result<()> = async {
+            (record.record)(thread.clone(), Some(turn.clone())).await?;
+            if let Some(started) = &record.started {
+                started(turn.clone()).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = recorded {
+            let stopped = stop_turn(&mut session, &thread, &turn).await;
+            let kind = if stopped {
+                ManagerFailure::Failed
+            } else {
+                ManagerFailure::Unknown
+            };
+            return Err(error(
+                kind,
+                native,
+                own(format!("record the Codex turn: {e}")),
+            ));
+        }
     }
     stage.enter(ProviderStage::Run);
     let mut answer = Answer::default();
@@ -1310,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_task_and_routine_instances_do_not_share_the_bot_or_work_store() {
+    fn cursor_scopes_do_not_share_the_bot_or_work_store() {
         let network = "network".to_owned();
         let conversation = "conversation".to_owned();
         let instances = [
@@ -1322,6 +1345,16 @@ mod tests {
                 network: network.clone(),
                 conversation: conversation.clone(),
                 work_id: "same".into(),
+            },
+            CursorInstance::WorkspaceTask {
+                network: network.clone(),
+                conversation: conversation.clone(),
+                task_id: "same".into(),
+            },
+            CursorInstance::WorkspaceTask {
+                network: network.clone(),
+                conversation: conversation.clone(),
+                task_id: "another".into(),
             },
             CursorInstance::Routine {
                 network: network.clone(),
@@ -1339,7 +1372,7 @@ mod tests {
             .into_iter()
             .map(|instance| instance.key())
             .collect();
-        assert_eq!(keys.len(), 5);
+        assert_eq!(keys.len(), 7);
     }
 
     #[derive(Clone, Copy, PartialEq)]
@@ -1784,6 +1817,9 @@ mod tests {
         let fake = fake_app_server(Turn::Answers);
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = recorded.clone();
+        let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let start = started.clone();
+        let recorded_before_start = recorded.clone();
         let config = ManagerConfig {
             model: "gpt-fixture".into(),
             reasoning_effort: Some("high".into()),
@@ -1792,7 +1828,14 @@ mod tests {
             tool_token: Some("turn-token-secret".into()),
             codex_turn: Some(CodexTurn {
                 client_id: "attempt-1".into(),
-                started: None,
+                started: Some(Arc::new(move |turn| {
+                    assert_eq!(
+                        recorded_before_start.lock().unwrap().last(),
+                        Some(&("thread-1".into(), Some(turn.clone())))
+                    );
+                    start.lock().unwrap().push(turn);
+                    Box::pin(async { Ok(()) })
+                })),
                 record: Arc::new(move |thread, turn| {
                     record.lock().unwrap().push((thread, turn));
                     Box::pin(async { Ok(()) })
@@ -1830,6 +1873,7 @@ mod tests {
                 ("thread-1".to_owned(), Some("turn-1".to_owned()))
             ]
         );
+        assert_eq!(*started.lock().unwrap(), ["turn-1"]);
         let started = fake.calls("thread/start");
         assert_eq!(
             started[0]["config"]["shell_environment_policy.set"]["VIBEFACE_TOOL_TOKEN"],

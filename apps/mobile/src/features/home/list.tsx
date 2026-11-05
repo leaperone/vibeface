@@ -1,6 +1,6 @@
 import { Link, usePathname, type Href } from 'expo-router'
-import { BellRing, Bot, ChevronRight, Inbox, ListChecks, Plus, RotateCw, Settings, ShieldAlert, Star, WifiOff, X } from 'lucide-react-native'
-import { useState, type ReactNode } from 'react'
+import { BellRing, Bot, ChevronRight, Inbox, ListChecks, MessagesSquare, Plus, RotateCw, Settings, ShieldAlert, Star, WifiOff, X } from 'lucide-react-native'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Alert, Pressable, ScrollView, View } from 'react-native'
 import Animated, { FadeIn, FadeOut, LayoutAnimationConfig, LinearTransition, ReduceMotion } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
@@ -43,9 +43,12 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
   const pathname = usePathname()
   const insets = useSafeAreaInsets()
   const shared = useLive()
+  const latest = useRef(shared)
+  latest.current = shared
+  useEffect(() => { void latest.current?.readWorkspaceState().catch(() => {}) }, [shared?.generation])
   // Until the first read lands an empty list is not yet known, so rows hold their place instead of 还没有 Bot.
   const empty = emptyHome({ synced: Boolean(shared?.synced), link: device.link })
-  const waiting = waitingItems(useInbox()).length
+  const waiting = waitingItems(useInbox()).length + (shared?.workspaceState?.tasks ?? []).filter((task) => ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'].includes(task.state)).length
   const bots = [...workspace.bots].sort((a, b) => (b.last_message?.created_at_ms ?? -1) - (a.last_message?.created_at_ms ?? -1))
   const now = Date.now()
   const canCreate = Boolean(shared && (shared.writable || shared.pendingBot))
@@ -73,6 +76,10 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
       </Link>
     </Item> : null}
     <NotifyTip />
+    <View className="mt-2 flex-row items-center px-3"><Text role="heading" className="flex-1 text-meta font-medium text-muted-foreground">频道</Text><Link href="/channels" replace={replace} asChild><Button variant="ghost" size="icon" accessibilityLabel="管理频道"><Icon as={Plus} className="text-muted-foreground" /></Button></Link></View>
+    {(shared?.workspaceState?.channels ?? []).map((channel) => <Link key={channel.channel_id} href={`/channel/${channel.channel_id}`} replace={replace} asChild><Pressable accessibilityRole="link" accessibilityState={{ selected: active(`/channel/${channel.channel_id}`) }} className={cn('min-h-14 flex-row items-center gap-3 rounded-xl px-3 py-3 active:bg-muted', active(`/channel/${channel.channel_id}`) && 'bg-muted')}><Icon as={MessagesSquare} className="text-muted-foreground" /><Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{channel.title}</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Pressable></Link>)}
+    {!shared?.workspaceState?.channels.length ? <Link href="/channels" replace={replace} asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-3 rounded-xl px-3 py-2 active:bg-muted"><Icon as={MessagesSquare} className="text-muted-foreground" /><Text className="text-meta text-muted-foreground">查看频道</Text></Pressable></Link> : null}
+    <Text role="heading" className="mb-1 mt-4 px-3 text-meta font-medium text-muted-foreground">Bot</Text>
     {bots.length ? bots.map((bot, index) => {
       const last = bot.last_message, mood = botMood(bot, workspace, shared), primary = workspace.primary === bot.conversation_id
       return <Item key={bot.bot_id} layout={move}>

@@ -6,6 +6,7 @@ import { useOnboarding } from '@/features/identity/onboarding-flag'
 import { WorkspaceProvider } from '@vibeface/client/workspace/context.tsx'
 import { ShellSkeleton, WorkspaceShell } from '@/features/workspace/workspace-shell'
 import { webPlatform } from '@/lib/platform'
+import type { InputTarget } from '@vibeface/client/workspace/types.ts'
 
 const Onboarding = lazy(() => import('@/features/identity/onboarding').then((module) => ({ default: module.Onboarding })))
 
@@ -29,7 +30,11 @@ function AppLayout() {
   if (access.kind === 'resuming') return <ShellSkeleton home={home} retry={access.retryInSeconds} onRetry={retryNow} onLeave={disconnect} />
   if (!ready) return <ShellSkeleton home={home} />
   const key = `${ready.principal.network_id}:${ready.principal.device_id}`
-  return <WorkspaceProvider key={key} platform={webPlatform} connection={ready} tabs={tabs} initialBot={routeBot && decodeURIComponent(routeBot)} openConversation={(id) => { void navigate({ to: '/', search: { conversation: id } }) }}>
+  return <WorkspaceProvider key={key} platform={webPlatform} connection={ready} tabs={tabs} initialBot={routeBot && decodeURIComponent(routeBot)} openConversation={(id, target?: InputTarget) => {
+    if (target?.kind === 'task' || target?.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: target.task_id } })
+    else if (target?.kind === 'channel_member') void navigate({ to: '/channels/$channelId', params: { channelId: target.channel_id } })
+    else void navigate({ to: '/', search: { conversation: id, ...(target?.kind === 'work' ? { work: target.work_id } : target?.kind === 'routine' ? { routine: target.trigger } : {}) } })
+  }}>
     {onboarding ? <Suspense fallback={<ShellSkeleton />}><Onboarding /></Suspense> : <WorkspaceShell landing={onboarded}><Outlet /></WorkspaceShell>}
   </WorkspaceProvider>
 }

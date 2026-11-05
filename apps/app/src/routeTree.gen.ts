@@ -17,10 +17,13 @@ import { Route as AppInboxRouteImport } from './routes/_app/inbox'
 import { Route as AppSettingsRouteImport } from './routes/_app/settings'
 import { Route as AppTasksRouteImport } from './routes/_app/tasks'
 import { Route as AppBBotIdRouteImport } from './routes/_app/b.$botId'
+import { Route as AppChannelsIndexRouteImport } from './routes/_app/channels.index'
+import { Route as AppChannelsChannelIdRouteImport } from './routes/_app/channels.$channelId'
 import { Route as AppDevicesIndexRouteImport } from './routes/_app/devices.index'
 import { Route as AppDevicesDeviceIdRouteImport } from './routes/_app/devices.$deviceId'
 import { Route as AppSettingsLabRouteImport } from './routes/_app/settings_.lab'
 import { Route as AppSettingsLogsRouteImport } from './routes/_app/settings_.logs'
+import { Route as AppTasksTaskIdRouteImport } from './routes/_app/tasks_.$taskId'
 import { Route as AppSettingsLabTransfersRouteImport } from './routes/_app/settings_.lab_.transfers'
 import { Route as AppBBotIdWorkWorkIdRouteImport } from './routes/_app/b.$botId.work.$workId'
 
@@ -63,6 +66,16 @@ const AppBBotIdRoute = AppBBotIdRouteImport.update({
   path: '/b/$botId',
   getParentRoute: () => AppRoute,
 } as any)
+const AppChannelsIndexRoute = AppChannelsIndexRouteImport.update({
+  id: '/channels/',
+  path: '/channels/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppChannelsChannelIdRoute = AppChannelsChannelIdRouteImport.update({
+  id: '/channels/$channelId',
+  path: '/channels/$channelId',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppDevicesIndexRoute = AppDevicesIndexRouteImport.update({
   id: '/devices/',
   path: '/devices/',
@@ -81,6 +94,11 @@ const AppSettingsLabRoute = AppSettingsLabRouteImport.update({
 const AppSettingsLogsRoute = AppSettingsLogsRouteImport.update({
   id: '/settings_/logs',
   path: '/settings/logs',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppTasksTaskIdRoute = AppTasksTaskIdRouteImport.update({
+  id: '/tasks_/$taskId',
+  path: '/tasks/$taskId',
   getParentRoute: () => AppRoute,
 } as any)
 const AppSettingsLabTransfersRoute = AppSettingsLabTransfersRouteImport.update({
@@ -102,9 +120,12 @@ export interface FileRoutesByFullPath {
   '/settings': typeof AppSettingsRoute
   '/tasks': typeof AppTasksRoute
   '/b/$botId': typeof AppBBotIdRouteWithChildren
+  '/channels/$channelId': typeof AppChannelsChannelIdRoute
   '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
   '/settings/lab': typeof AppSettingsLabRoute
   '/settings/logs': typeof AppSettingsLogsRoute
+  '/tasks/$taskId': typeof AppTasksTaskIdRoute
+  '/channels/': typeof AppChannelsIndexRoute
   '/devices/': typeof AppDevicesIndexRoute
   '/settings/lab/transfers': typeof AppSettingsLabTransfersRoute
   '/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
@@ -117,9 +138,12 @@ export interface FileRoutesByTo {
   '/tasks': typeof AppTasksRoute
   '/': typeof AppIndexRoute
   '/b/$botId': typeof AppBBotIdRouteWithChildren
+  '/channels/$channelId': typeof AppChannelsChannelIdRoute
   '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
   '/settings/lab': typeof AppSettingsLabRoute
   '/settings/logs': typeof AppSettingsLogsRoute
+  '/tasks/$taskId': typeof AppTasksTaskIdRoute
+  '/channels': typeof AppChannelsIndexRoute
   '/devices': typeof AppDevicesIndexRoute
   '/settings/lab/transfers': typeof AppSettingsLabTransfersRoute
   '/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
@@ -134,9 +158,12 @@ export interface FileRoutesById {
   '/_app/tasks': typeof AppTasksRoute
   '/_app/': typeof AppIndexRoute
   '/_app/b/$botId': typeof AppBBotIdRouteWithChildren
+  '/_app/channels/$channelId': typeof AppChannelsChannelIdRoute
   '/_app/devices/$deviceId': typeof AppDevicesDeviceIdRoute
   '/_app/settings_/lab': typeof AppSettingsLabRoute
   '/_app/settings_/logs': typeof AppSettingsLogsRoute
+  '/_app/tasks_/$taskId': typeof AppTasksTaskIdRoute
+  '/_app/channels/': typeof AppChannelsIndexRoute
   '/_app/devices/': typeof AppDevicesIndexRoute
   '/_app/settings_/lab_/transfers': typeof AppSettingsLabTransfersRoute
   '/_app/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
@@ -151,9 +178,12 @@ export interface FileRouteTypes {
     | '/settings'
     | '/tasks'
     | '/b/$botId'
+    | '/channels/$channelId'
     | '/devices/$deviceId'
     | '/settings/lab'
     | '/settings/logs'
+    | '/tasks/$taskId'
+    | '/channels/'
     | '/devices/'
     | '/settings/lab/transfers'
     | '/b/$botId/work/$workId'
@@ -166,9 +196,12 @@ export interface FileRouteTypes {
     | '/tasks'
     | '/'
     | '/b/$botId'
+    | '/channels/$channelId'
     | '/devices/$deviceId'
     | '/settings/lab'
     | '/settings/logs'
+    | '/tasks/$taskId'
+    | '/channels'
     | '/devices'
     | '/settings/lab/transfers'
     | '/b/$botId/work/$workId'
@@ -182,9 +215,12 @@ export interface FileRouteTypes {
     | '/_app/tasks'
     | '/_app/'
     | '/_app/b/$botId'
+    | '/_app/channels/$channelId'
     | '/_app/devices/$deviceId'
     | '/_app/settings_/lab'
     | '/_app/settings_/logs'
+    | '/_app/tasks_/$taskId'
+    | '/_app/channels/'
     | '/_app/devices/'
     | '/_app/settings_/lab_/transfers'
     | '/_app/b/$botId/work/$workId'
@@ -254,6 +290,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppBBotIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/channels/': {
+      id: '/_app/channels/'
+      path: '/channels'
+      fullPath: '/channels/'
+      preLoaderRoute: typeof AppChannelsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/channels/$channelId': {
+      id: '/_app/channels/$channelId'
+      path: '/channels/$channelId'
+      fullPath: '/channels/$channelId'
+      preLoaderRoute: typeof AppChannelsChannelIdRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/devices/': {
       id: '/_app/devices/'
       path: '/devices'
@@ -280,6 +330,13 @@ declare module '@tanstack/react-router' {
       path: '/settings/logs'
       fullPath: '/settings/logs'
       preLoaderRoute: typeof AppSettingsLogsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/tasks_/$taskId': {
+      id: '/_app/tasks_/$taskId'
+      path: '/tasks/$taskId'
+      fullPath: '/tasks/$taskId'
+      preLoaderRoute: typeof AppTasksTaskIdRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/settings_/lab_/transfers': {
@@ -317,9 +374,12 @@ interface AppRouteChildren {
   AppTasksRoute: typeof AppTasksRoute
   AppIndexRoute: typeof AppIndexRoute
   AppBBotIdRoute: typeof AppBBotIdRouteWithChildren
+  AppChannelsChannelIdRoute: typeof AppChannelsChannelIdRoute
   AppDevicesDeviceIdRoute: typeof AppDevicesDeviceIdRoute
   AppSettingsLabRoute: typeof AppSettingsLabRoute
   AppSettingsLogsRoute: typeof AppSettingsLogsRoute
+  AppTasksTaskIdRoute: typeof AppTasksTaskIdRoute
+  AppChannelsIndexRoute: typeof AppChannelsIndexRoute
   AppDevicesIndexRoute: typeof AppDevicesIndexRoute
   AppSettingsLabTransfersRoute: typeof AppSettingsLabTransfersRoute
 }
@@ -330,9 +390,12 @@ const AppRouteChildren: AppRouteChildren = {
   AppTasksRoute: AppTasksRoute,
   AppIndexRoute: AppIndexRoute,
   AppBBotIdRoute: AppBBotIdRouteWithChildren,
+  AppChannelsChannelIdRoute: AppChannelsChannelIdRoute,
   AppDevicesDeviceIdRoute: AppDevicesDeviceIdRoute,
   AppSettingsLabRoute: AppSettingsLabRoute,
   AppSettingsLogsRoute: AppSettingsLogsRoute,
+  AppTasksTaskIdRoute: AppTasksTaskIdRoute,
+  AppChannelsIndexRoute: AppChannelsIndexRoute,
   AppDevicesIndexRoute: AppDevicesIndexRoute,
   AppSettingsLabTransfersRoute: AppSettingsLabTransfersRoute,
 }

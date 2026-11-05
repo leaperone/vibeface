@@ -3,7 +3,7 @@
 //! Before a prompt is sent the Node keeps where pi writes the session, so after a restart it
 //! reads the turn back from that file and never sends it again.
 use super::claude::Processes;
-use super::executor::{Executor, SteerAck, SteerTrace};
+use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::*;
 use crate::manager::{CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
 use crate::scheduling::{SteerOutcome, SteerTarget};
@@ -609,6 +609,18 @@ impl Process {
 }
 
 impl Pi {
+    pub(super) async fn native_directory(&self, session: &str) -> Result<PathBuf> {
+        let cwd = self
+            .pointer(session)?
+            .context("the pi session has no local pointer")?
+            .cwd;
+        ensure!(
+            cwd.is_absolute(),
+            "the pi session directory is not absolute"
+        );
+        Ok(cwd)
+    }
+
     /// Ends the pi processes an earlier Node run left, so their turns are read back as they are.
     pub(crate) fn new(data_dir: &Path) -> Self {
         Self {
@@ -998,7 +1010,16 @@ impl Pi {
         );
         stage.enter(ProviderStage::Record);
         let recorded = match &config.codex_turn {
-            Some(record) => (record.record)(session.clone(), Some(turn.clone())).await,
+            Some(record) => {
+                async {
+                    (record.record)(session.clone(), Some(turn.clone())).await?;
+                    if let Some(started) = &record.started {
+                        started(turn.clone()).await?;
+                    }
+                    anyhow::Ok(())
+                }
+                .await
+            }
             None => Ok(()),
         };
         let outcome = match recorded {
@@ -1446,22 +1467,36 @@ impl Executor for Pi {
         &'a self,
         into: &'a SteerTarget,
         message_id: &'a str,
-        text: &'a str,
+        input: &'a SteerInput,
     ) -> BoxFuture<'a, SteerAck> {
-        let message = format!(
-            "{STEER_LEAD} Take it into account and answer it in this same reply.\n\n{}",
-            json!({"message_id":message_id,"text":text})
-        );
+        let message = format!("{STEER_LEAD}\n\n{}", input.message(message_id));
         Box::pin(async move {
             let Some(live) = self.live_turn(&into.thread_id, &into.turn_id) else {
                 return SteerAck::Refused("the pi turn is not running".into());
             };
+            let images: Vec<Value> = input
+                .files
+                .iter()
+                .filter(|file| file.is_image())
+                .map(|file| json!({"type":"image","data":file.base64(),"mimeType":file.mime_type}))
+                .collect();
+            if input
+                .files
+                .iter()
+                .filter(|file| file.is_image())
+                .any(|file| file.bytes.len() as u64 > MAX_IMAGE)
+            {
+                return SteerAck::Refused("pi images must be at most 10 MiB".into());
+            }
             match live
                 .rpc
-                .call(json!({"type":"steer","message":message}), ANSWER)
+                .call(
+                    json!({"type":"steer","message":message,"images":images}),
+                    ANSWER,
+                )
                 .await
             {
-                Reply::Done(_) => SteerAck::Accepted,
+                Reply::Done(_) => SteerAck::Accepted { turn_id: None },
                 Reply::Refused(error) => SteerAck::Refused(error),
                 Reply::Unsent => SteerAck::Refused("the pi turn ended".into()),
                 Reply::Lost => SteerAck::Unknown,
@@ -1476,31 +1511,47 @@ impl Executor for Pi {
     ) -> BoxFuture<'a, Option<SteerTrace>> {
         Box::pin(async move {
             let pointer = self.pointer(&into.thread_id).ok()??;
-            if self.live_turn(&into.thread_id, &into.turn_id).is_some()
-                || self.processes.tracked(pointer.group)
-            {
-                return Some(SteerTrace::Pending);
-            }
             let entries = entries(&pointer.file).ok()?;
             let Some(turn) = entries.iter().position(|entry| entry["id"] == into.turn_id) else {
                 return Some(SteerTrace::TargetUnseen);
             };
-            let run = run(&entries, turn);
             let marker = format!("\"message_id\":{}", json!(message_id));
-            let Some(at) = run.iter().position(|entry| {
+            let Some(at) = entries.iter().position(|entry| {
                 is_message(entry, "user") && text(&entry["message"]).contains(&marker)
             }) else {
-                return Some(SteerTrace::NotArrived);
+                return Some(
+                    if self.live_turn(&into.thread_id, &into.turn_id).is_some()
+                        || self.processes.tracked(pointer.group)
+                    {
+                        SteerTrace::Pending
+                    } else {
+                        SteerTrace::NotArrived
+                    },
+                );
             };
-            let answered = run[at..]
+            let actual = entries[..=at]
+                .iter()
+                .rposition(|entry| {
+                    is_message(entry, "user") && !text(&entry["message"]).starts_with(STEER_LEAD)
+                })
+                .unwrap_or(turn);
+            let turn_id = entries[actual]["id"].as_str()?.to_owned();
+            if self.live_turn(&into.thread_id, &turn_id).is_some() {
+                return Some(SteerTrace::Received { turn_id });
+            }
+            let actual_run = run(&entries, actual);
+            let answered = actual_run[at - actual..]
                 .iter()
                 .rev()
                 .find(|entry| is_message(entry, "assistant"))
                 .is_some_and(|entry| entry["message"]["stopReason"] == "stop");
-            Some(SteerTrace::Ended(match answered {
-                true => SteerOutcome::Answered,
-                false => SteerOutcome::Unfinished,
-            }))
+            Some(SteerTrace::Ended {
+                turn_id,
+                outcome: match answered {
+                    true => SteerOutcome::Answered,
+                    false => SteerOutcome::Unfinished,
+                },
+            })
         })
     }
 }
@@ -1723,20 +1774,22 @@ mod tests {
     async fn node(dir: &Path, mode: &str) -> Result<(Arc<Runtime>, String)> {
         let data = dir.join("node");
         config::private_dir(&data)?;
-        let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![dir.to_owned()], false);
         configuration.providers.execution = [Provider::Pi].into();
         configuration.save(&data)?;
         config::private_write(&data.join("data-epoch.json"), &config::data_epoch_marker())?;
         let identity = LocalIdentity::generate();
         config::private_write(&data.join("identity.json"), &serde_json::to_vec(&identity)?)?;
         let node = Arc::new(Runtime::open(&data).await?);
+        let admin = LocalIdentity::generate();
         let state = NetworkState::new(Genesis::create(
             &LocalIdentity::generate(),
-            Member::client(&LocalIdentity::generate(), "admin", true)?,
+            Member::client(&admin, "admin", true)?,
             Member::node(&node.identity, "node")?,
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state).await?;
+        super::super::claude::tests::conversation(&node, &admin, &network, "c", "m1").await?;
         let mut local = node.providers.lock().unwrap();
         local.bins.insert(Provider::Pi, fake());
         let variables = env(dir, mode).into_iter().map(|(k, v)| (k, Some(v)));
@@ -1960,7 +2013,32 @@ mod tests {
         let dir = scratch("steer");
         let pi = Arc::new(Pi::new(&dir));
         let turns = Turns::default();
-        let config = bot(&dir, &pi, "wait", Some(&turns));
+        let mut config = bot(&dir, &pi, "wait", Some(&turns));
+        let native_starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_starts = native_starts.clone();
+        let start_ready = Arc::new(tokio::sync::Notify::new());
+        let marked = start_ready.clone();
+        config.codex_turn.as_mut().unwrap().started = Some(Arc::new(move |turn| {
+            recorded_starts.lock().unwrap().push(turn);
+            marked.notify_one();
+            Box::pin(async { Ok(()) })
+        }));
+        let bytes = b"\x89PNG\r\n\x1a\nfull-fixture-image".to_vec();
+        let image_path = dir.join("image.png");
+        std::fs::write(&image_path, &bytes)?;
+        let input = SteerInput {
+            text: "also this".into(),
+            files: vec![super::super::executor::PreparedAttachment {
+                attachment: Attachment {
+                    hash: crate::crypto::digest(&bytes),
+                    size: bytes.len() as u64,
+                    name: "image.png".into(),
+                },
+                local_path: image_path,
+                mime_type: "image/png".into(),
+                bytes: bytes.clone(),
+            }],
+        };
         let (_stop, cancel) = watch::channel(false);
         let reply = run_manager(
             &config,
@@ -1971,7 +2049,11 @@ mod tests {
             |_| async { anyhow::Ok(()) },
         );
         let steer = async {
+            tokio::time::timeout(Duration::from_secs(5), start_ready.notified())
+                .await
+                .expect("the held turn reports its actual native start");
             let (thread_id, turn_id) = started(&turns).await;
+            assert_eq!(*native_starts.lock().unwrap(), vec![turn_id.clone()]);
             let into = SteerTarget {
                 provider: Provider::Pi,
                 attempt_id: "a".into(),
@@ -1979,23 +2061,46 @@ mod tests {
                 turn_id,
             };
             assert_eq!(
-                pi.send_turn(&into, "m-1", "also this").await,
-                SteerAck::Accepted
+                pi.send_turn(&into, "m-1", &input).await,
+                SteerAck::Accepted { turn_id: None }
             );
             into
         };
         let (reply, into) = tokio::join!(reply, steer);
         assert_eq!(reply?.output, "Got it");
+        let pointer = pi.pointer(&into.thread_id)?.context("pi session")?;
+        let entries = entries(&pointer.file)?;
+        let content = entries
+            .iter()
+            .find(|entry| text(&entry["message"]).contains("\"message_id\":\"m-1\""))
+            .context("steered input")?["message"]["content"]
+            .clone();
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(
+            content[1]["data"],
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
         assert_eq!(
             pi.read_back(&into, "m-1").await,
-            Some(SteerTrace::Ended(SteerOutcome::Answered))
+            Some(SteerTrace::Ended {
+                turn_id: into.turn_id.clone(),
+                outcome: SteerOutcome::Answered
+            })
         );
         assert_eq!(
             pi.read_back(&into, "m-2").await,
             Some(SteerTrace::NotArrived)
         );
         assert_eq!(
-            pi.send_turn(&into, "m-3", "late").await,
+            pi.send_turn(
+                &into,
+                "m-3",
+                &SteerInput {
+                    text: "late".into(),
+                    files: vec![]
+                }
+            )
+            .await,
             SteerAck::Refused("the pi turn is not running".into())
         );
         std::fs::remove_dir_all(&dir)?;
@@ -2170,6 +2275,8 @@ mod tests {
             .into_iter()
             .find_map(|work| work.thread_id)
             .context("a session")?;
+        assert_eq!(node.pi.native_directory(&session).await?, dir);
+        assert!(node.pi.native_directory("missing-session").await.is_err());
         let file = node.pi.pointer(&session)?.context("pointer")?.file;
         let pi = node.pi.clone();
         let elsewhere = dir.join("elsewhere");

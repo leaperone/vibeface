@@ -78,14 +78,14 @@ impl Runtime {
             tool.effect() == Effect::Read || access.manager.is_some(),
             "work changes require a live agent invocation"
         );
-        let kind = if let Some(manager) = &access.manager {
+        let mut kind = if let Some(manager) = &access.manager {
             Some(
                 self.store
                     .lock()
                     .await
                     .scheduler_job(&scope, &manager.trigger)?
                     .context("this turn is not running here")?
-                    .kind,
+                    .tool_kind(),
             )
         } else {
             None
@@ -102,7 +102,63 @@ impl Runtime {
                 .context("agent tool admission timed out")??;
         *stage = "execution";
         let network = access.network_id.as_str();
+        if let Some(manager) = &access.manager {
+            let store = self.store.lock().await;
+            let job = store
+                .scheduler_job(&scope, &manager.trigger)?
+                .context("this turn is not running here")?;
+            if let crate::scheduling::SessionScope::WorkspaceTask { task_id } = &job.scope {
+                let task = store
+                    .workspace_task(network, task_id)?
+                    .context("task not found")?;
+                ensure!(
+                    !task.reply_only || tool.effect() == Effect::Read,
+                    "reply-only tasks cannot dispatch or control other work"
+                );
+                if task.reply_only {
+                    kind = None;
+                }
+            }
+            if matches!(tool, Tool::InterruptWork | Tool::BindWork | Tool::WaitWork) {
+                if let Some(work_id) = args["work_id"].as_str() {
+                    ensure!(
+                        store.scheduler_work_in_scope(network, &job, work_id)?,
+                        "work is outside this task scope"
+                    );
+                }
+            }
+            if matches!(tool, Tool::DispatchWork | Tool::TrackWork) {
+                for key in ["continues", "parent"] {
+                    if let Some(work_id) = args[key].as_str() {
+                        ensure!(
+                            store.scheduler_work_in_scope(network, &job, work_id)?,
+                            "work is outside this task scope"
+                        );
+                    }
+                }
+            }
+            if matches!(
+                tool,
+                Tool::DispatchWork | Tool::TrackWork | Tool::HandOverSession
+            ) {
+                if let Some(thread) = args[if tool == Tool::HandOverSession {
+                    "session_id"
+                } else {
+                    "thread"
+                }]
+                .as_str()
+                {
+                    ensure!(
+                        store.scheduler_native_in_scope(network, &job, thread)?,
+                        "native session is outside this task scope"
+                    );
+                }
+            }
+        }
         match tool {
+            Tool::WorkspaceState | Tool::WorkspaceHistory | Tool::WorkspaceCommand => {
+                self.agent_workspace(&access, &scope, tool, &args).await
+            }
             Tool::Search => Tool::search(args, kind),
             Tool::Describe => Tool::describe(args, kind),
             Tool::Call => unreachable!("discovery calls are resolved before admission"),
@@ -117,8 +173,47 @@ impl Runtime {
             // Dispatches the DAG does not name yet are listed too, so none is sent twice.
             Tool::WorkStatus => {
                 let store = self.store.lock().await;
-                let works = store.works(network, &scope)?;
-                let dispatches = store.undelivered_dispatches(network, &scope)?;
+                let job = access
+                    .manager
+                    .as_ref()
+                    .map(|manager| {
+                        store
+                            .scheduler_job(&scope, &manager.trigger)?
+                            .context("this turn is not running here")
+                    })
+                    .transpose()?;
+                let works = store
+                    .works(network, &scope)?
+                    .into_iter()
+                    .filter_map(|work| {
+                        match job
+                            .as_ref()
+                            .map(|job| store.scheduler_work_in_scope(network, job, &work.work_id))
+                            .transpose()
+                        {
+                            Ok(Some(false)) => None,
+                            Ok(_) => Some(Ok(work)),
+                            Err(error) => Some(Err(error)),
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let dispatches = store
+                    .undelivered_dispatches(network, &scope)?
+                    .into_iter()
+                    .filter_map(|dispatch| {
+                        match job
+                            .as_ref()
+                            .map(|job| {
+                                store.scheduler_work_in_scope(network, job, &dispatch.spec.work_id)
+                            })
+                            .transpose()
+                        {
+                            Ok(Some(false)) => None,
+                            Ok(_) => Some(Ok(dispatch)),
+                            Err(error) => Some(Err(error)),
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 drop(store);
                 work_status(&works, &dispatches, &args)
             }
@@ -206,11 +301,37 @@ impl Runtime {
                 now_ms(),
             ),
             Tool::ListSessions => {
-                let sessions = self
-                    .store
-                    .lock()
-                    .await
-                    .attributed_sessions(network, &scope)?;
+                let store = self.store.lock().await;
+                let job = access
+                    .manager
+                    .as_ref()
+                    .map(|manager| {
+                        store
+                            .scheduler_job(&scope, &manager.trigger)?
+                            .context("this turn is not running here")
+                    })
+                    .transpose()?;
+                let sessions = store
+                    .attributed_sessions(network, &scope)?
+                    .into_iter()
+                    .filter_map(|session| {
+                        match job
+                            .as_ref()
+                            .map(|job| {
+                                store.scheduler_native_in_scope(
+                                    network,
+                                    job,
+                                    session["session_id"].as_str().unwrap_or(""),
+                                )
+                            })
+                            .transpose()
+                        {
+                            Ok(Some(false)) => None,
+                            Ok(_) => Some(Ok(session)),
+                            Err(error) => Some(Err(error)),
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 list_sessions(&sessions, &args)
             }
             Tool::DeleteBot => {
@@ -460,6 +581,152 @@ impl Runtime {
         }
     }
 
+    async fn agent_workspace(
+        &self,
+        access: &Access,
+        conversation: &str,
+        tool: Tool,
+        args: &Value,
+    ) -> Result<Value> {
+        let network = &access.network_id;
+        let mut store = self.store.lock().await;
+        let job = access
+            .manager
+            .as_ref()
+            .map(|manager| {
+                store
+                    .scheduler_job(conversation, &manager.trigger)?
+                    .context("this turn is not running here")
+            })
+            .transpose()?;
+        if tool == Tool::WorkspaceCommand {
+            let manager = access
+                .manager
+                .as_ref()
+                .context("workspace commands need a current Bot turn")?;
+            let job = job.as_ref().context("this turn is not running here")?;
+            let command: crate::workspace::WorkspaceCommand =
+                serde_json::from_value(args["command"].clone())?;
+            let command_id = format!(
+                "workspace-{}",
+                crate::crypto::digest(&serde_json::to_vec(&(
+                    network,
+                    conversation,
+                    &manager.trigger,
+                    field(args, "call_ref")?
+                ))?)
+            );
+            let receipt = store.workspace_agent_command(
+                &self.identity,
+                network,
+                &job,
+                &command_id,
+                command,
+                now_ms(),
+            )?;
+            drop(store);
+            self.publish_changed(
+                network,
+                crate::workspace::WORKSPACE_SCOPE,
+                Changed::Event(&receipt.event_hash),
+            );
+            self.schedule_wakeup.notify_one();
+            self.outbox_wakeup.notify_one();
+            return Ok(serde_json::to_value(receipt)?);
+        }
+        let own_task = job.as_ref().and_then(|job| match &job.scope {
+            crate::scheduling::SessionScope::WorkspaceTask { task_id } => Some(task_id.as_str()),
+            _ => None,
+        });
+        let task_id = args["task_id"].as_str().or(own_task);
+        let channel_id = args["channel_id"].as_str();
+        let bot = store
+            .bot_for_conversation(network, conversation)?
+            .context("Bot not found")?;
+        if let Some(task_id) = task_id {
+            let task = store
+                .workspace_task(network, task_id)?
+                .context("task not found")?;
+            let root = store
+                .workspace_task(network, &task.root_task_id)?
+                .context("root task not found")?;
+            if let Some(own_id) = own_task {
+                let own = store
+                    .workspace_task(network, own_id)?
+                    .context("task not found")?;
+                ensure!(
+                    own.root_task_id == task.root_task_id,
+                    "task is outside this root"
+                );
+            } else {
+                ensure!(
+                    task.owner_bot == bot.bot_id || root.owner_bot == bot.bot_id,
+                    "task is outside this Bot scope"
+                );
+            }
+            ensure!(
+                channel_id.is_none_or(|channel| task.channel_id.as_deref() == Some(channel)),
+                "channel is outside this task"
+            );
+        }
+        if let Some(channel_id) = channel_id {
+            let state = store.workspace_state(network, Some(channel_id), None, 512)?;
+            ensure!(
+                state
+                    .channels
+                    .iter()
+                    .any(|channel| channel.channel_id == channel_id
+                        && channel.members.contains(&bot.bot_id)),
+                "Bot is outside this channel"
+            );
+        }
+        let limit = args["limit"].as_u64().unwrap_or(100).clamp(1, 512) as usize;
+        if tool == Tool::WorkspaceState {
+            let mut state = store.workspace_state(network, channel_id, task_id, limit)?;
+            if task_id.is_none() && channel_id.is_none() {
+                let root_ids = state
+                    .tasks
+                    .iter()
+                    .filter(|task| task.owner_bot == bot.bot_id)
+                    .map(|task| task.root_task_id.clone())
+                    .collect::<BTreeSet<_>>();
+                state
+                    .tasks
+                    .retain(|task| root_ids.contains(&task.root_task_id));
+                let task_ids = state
+                    .tasks
+                    .iter()
+                    .map(|task| task.task_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                state
+                    .assignments
+                    .retain(|assignment| task_ids.contains(assignment.task_id.as_str()));
+                state
+                    .channels
+                    .retain(|channel| channel.members.contains(&bot.bot_id));
+                state
+                    .inputs
+                    .retain(|input| match &input.input.route.target {
+                        crate::workspace::InputTarget::Task { task_id }
+                        | crate::workspace::InputTarget::ChannelTask { task_id, .. } => {
+                            task_ids.contains(task_id.as_str())
+                        }
+                        crate::workspace::InputTarget::BotMain { bot_id } => bot_id == &bot.bot_id,
+                        _ => false,
+                    });
+            }
+            return Ok(serde_json::to_value(state)?);
+        }
+        ensure!(
+            task_id.is_some() || channel_id.is_some(),
+            "workspace history requires a task or channel"
+        );
+        let (events, truncated) = store.workspace_history(network, channel_id, task_id, limit)?;
+        Ok(
+            json!({"events":events,"coverage":{"limit":limit,"truncated":truncated,"scope":if task_id.is_some(){"task"}else{"channel"}}}),
+        )
+    }
+
     async fn agent_history(
         &self,
         access: &Access,
@@ -468,15 +735,25 @@ impl Runtime {
         args: &Value,
     ) -> Result<Value> {
         let store = self.store.lock().await;
-        let basis = match &access.manager {
-            Some(manager) => {
+        let job = access
+            .manager
+            .as_ref()
+            .map(|manager| {
                 store
                     .scheduler_job(scope, &manager.trigger)?
-                    .context("this turn is not running here")?
-                    .basis
+                    .context("this turn is not running here")
+            })
+            .transpose()?;
+        let mut basis = job
+            .as_ref()
+            .map(|job| job.basis.clone())
+            .unwrap_or(store.version_vector(&access.network_id)?);
+        if let Some(job) = &job {
+            for event in store.scheduler_late_inputs(&access.network_id, job)? {
+                let seq = basis.entry(event.event.author).or_default();
+                *seq = (*seq).max(event.event.seq);
             }
-            None => store.version_vector(&access.network_id)?,
-        };
+        }
         let at = if tool == Tool::HistoryRead {
             &args["at"]
         } else {
@@ -489,6 +766,17 @@ impl Runtime {
             let event = store
                 .scope_event(&access.network_id, scope, author, seq)?
                 .context("no event with this author and seq in this conversation")?;
+            if let Some(job) = &job {
+                ensure!(
+                    store.scheduler_event_allowed(&access.network_id, job, &event)?,
+                    "event is outside this turn scope and delivered inputs"
+                );
+            } else {
+                ensure!(
+                    store.main_event_allowed(&access.network_id, scope, &event)?,
+                    "event is outside this Main scope"
+                );
+            }
             ensure!(
                 at["event_id"].is_null() || at["event_id"] == event.hash,
                 "event_id does not match this conversation's author and seq"
@@ -515,8 +803,31 @@ impl Runtime {
         };
         let query = args["query"].as_str().unwrap_or("").to_lowercase();
         let limit = args["limit"].as_u64().unwrap_or(20) as usize;
-        let (events, mut more) =
-            store.history_page(&access.network_id, scope, &basis, at, &kinds, 100)?;
+        let (events, mut more) = match &job {
+            Some(job) => store.scheduler_history_page(
+                &access.network_id,
+                job,
+                at,
+                crate::store::HistoryFilter {
+                    kinds: &kinds,
+                    author: None,
+                    keyword: None,
+                },
+                100,
+            )?,
+            None => store.main_history_page(
+                &access.network_id,
+                scope,
+                &basis,
+                at,
+                crate::store::HistoryFilter {
+                    kinds: &kinds,
+                    author: None,
+                    keyword: None,
+                },
+                100,
+            )?,
+        };
         let mut rows = Vec::new();
         let mut next = Value::Null;
         let mut used = 0;
@@ -554,22 +865,51 @@ impl Runtime {
     async fn agent_context(&self, access: &Access, scope: &str, args: &Value) -> Result<Value> {
         let network = access.network_id.as_str();
         let store = self.store.lock().await;
-        if let Some(hash) = args["blob_hash"].as_str() {
-            return blob_page(&store, network, scope, hash, args);
-        }
-        let basis = match &access.manager {
-            Some(manager) => {
+        let job = access
+            .manager
+            .as_ref()
+            .map(|manager| {
                 store
                     .scheduler_job(scope, &manager.trigger)?
-                    .context("this turn is not running here")?
-                    .basis
+                    .context("this turn is not running here")
+            })
+            .transpose()?;
+        if let Some(hash) = args["blob_hash"].as_str() {
+            let source = match &job {
+                Some(job) => store.scheduler_blob_scope(network, job, hash)?,
+                None => store.main_blob_scope(network, scope, hash)?,
             }
-            None => store.version_vector(network)?,
-        };
+            .context("attachment is outside this scope and delivered inputs")?;
+            return blob_page(&store, network, &source, hash, args);
+        }
+        let mut basis = job
+            .as_ref()
+            .map(|job| job.basis.clone())
+            .unwrap_or(store.version_vector(network)?);
+        if let Some(job) = &job {
+            for event in store.scheduler_late_inputs(network, job)? {
+                let seq = basis.entry(event.event.author).or_default();
+                *seq = (*seq).max(event.event.seq);
+            }
+        }
         if !args["at"].is_null() {
             let (author, seq) = position(&args["at"], &basis)?;
-            let offset = args["offset"].as_u64().unwrap_or(0) as usize;
-            return event_page(&store, network, scope, author, seq, offset);
+            let event = store
+                .scope_event(network, scope, author, seq)?
+                .context("event not found")?;
+            let allowed = match &job {
+                Some(job) => store.scheduler_event_allowed(network, job, &event)?,
+                None => store.main_event_allowed(network, scope, &event)?,
+            };
+            ensure!(allowed, "event is outside this scope and delivered inputs");
+            return event_page(
+                &store,
+                network,
+                scope,
+                author,
+                seq,
+                args["offset"].as_u64().unwrap_or(0) as usize,
+            );
         }
         let at = match (&args["before"], &args["after"]) {
             (Value::Null, Value::Null) => None,
@@ -580,6 +920,19 @@ impl Runtime {
         let at = at
             .map(|(at, after)| position(at, &basis).map(|(author, seq)| (author, seq, after)))
             .transpose()?;
+        if let Some((author, seq, _)) = at {
+            let event = store
+                .scope_event(network, scope, author, seq)?
+                .context("event not found")?;
+            let allowed = match &job {
+                Some(job) => store.scheduler_event_allowed(network, job, &event)?,
+                None => store.main_event_allowed(network, scope, &event)?,
+            };
+            ensure!(
+                allowed,
+                "history cursor is outside this scope and delivered inputs"
+            );
+        }
         let kinds: Vec<String> = match &args["types"] {
             Value::Null => vec![],
             types => serde_json::from_value(types.clone()).context("types lists event types")?,
@@ -593,10 +946,20 @@ impl Runtime {
             .map(|value| value.as_str().context("keyword must be a string"))
             .transpose()?;
         let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
-        let (events, more) = if author.is_none() && keyword.is_none() {
-            store.history_page(network, scope, &basis, at, &kinds, limit)?
+        let (events, more) = if let Some(job) = &job {
+            store.scheduler_history_page(
+                network,
+                job,
+                at,
+                crate::store::HistoryFilter {
+                    kinds: &kinds,
+                    author,
+                    keyword,
+                },
+                limit,
+            )?
         } else {
-            store.search_history_page(
+            store.main_history_page(
                 network,
                 scope,
                 &basis,
@@ -642,8 +1005,13 @@ impl Runtime {
             .manager
             .as_ref()
             .context("call lookup requires an agent invocation")?;
-        let id = WorkSpec::id(scope, &manager.trigger, call_ref);
         let store = self.store.lock().await;
+        let job = store
+            .scheduler_job(scope, &manager.trigger)?
+            .context("this turn is not registered here")?;
+        let work_trigger =
+            store.scheduler_work_trigger(network, &self.identity.device_id()?, &job)?;
+        let id = WorkSpec::id(scope, &work_trigger, call_ref);
         if let Some(work) = store
             .works(network, scope)?
             .into_iter()
@@ -717,7 +1085,18 @@ impl Runtime {
         }
         let agent: Option<Provider> =
             serde_json::from_value(args["agent"].clone()).context("agent names a provider")?;
-        let work_id = WorkSpec::id(scope, &manager.trigger, call_ref);
+        let work_trigger = {
+            let store = self.store.lock().await;
+            let job = store
+                .scheduler_job(scope, &manager.trigger)?
+                .context("this turn is not registered here")?;
+            store.scheduler_work_trigger(network, &local, &job)?
+        };
+        let work_id = WorkSpec::id(scope, &work_trigger, call_ref);
+        ensure!(
+            !work_trigger.starts_with("assignment:") || target == local,
+            "task work stays on its assigned device"
+        );
         let kind = if target == local {
             RequestedWorkKind::Agent(agent)
         } else {
@@ -738,7 +1117,7 @@ impl Runtime {
         let request = WorkRequest {
             work_id,
             conversation: scope.into(),
-            trigger: manager.trigger.clone(),
+            trigger: work_trigger,
             target: target.clone(),
             dispatcher: local.clone(),
             call_ref: call_ref.into(),
@@ -1175,7 +1554,7 @@ mod tests {
             conversation_id: Some("c".into()),
             manager: None,
         };
-        node.register_manager_attempt(
+        node.register_manager_attempt_fixture(
             "tools-history".into(),
             idle,
             &attempt,
@@ -1286,7 +1665,7 @@ mod tests {
             conversation_id: Some("c".into()),
             manager: None,
         };
-        node.register_manager_attempt(
+        node.register_manager_attempt_fixture(
             "tools-replay".into(),
             idle.clone(),
             &attempt,
@@ -1408,7 +1787,7 @@ mod tests {
             .lock()
             .await
             .record_turn_runtime("c", &trigger, &attempt, &runtime)?;
-        node.register_manager_attempt(
+        node.register_manager_attempt_fixture(
             "old-token".into(),
             idle.clone(),
             &attempt,
@@ -1460,8 +1839,14 @@ mod tests {
             .lock()
             .await
             .record_turn_runtime("c", &trigger, &attempt, &runtime)?;
-        node.register_manager_attempt("new-token".into(), idle, &attempt, &trigger, Provider::Pi)
-            .await?;
+        node.register_manager_attempt_fixture(
+            "new-token".into(),
+            idle,
+            &attempt,
+            &trigger,
+            Provider::Pi,
+        )
+        .await?;
         let current = node
             .agent_tokens
             .lock()

@@ -16,21 +16,20 @@ type Props = {
   onFiles: (files: Attachment[]) => void
   /** Why sending is off, in place of the placeholder, or under the box while it holds a draft; null when it is allowed. */
   blocked: string | null
-  /** A message is on its way: the button rests, and nothing below the box appears and shifts it. */
   sending: boolean
   onSend: () => void
-  /** Present while a reply runs and can be cancelled: the send button becomes stop. */
   onStop?: () => void
   /** A follow-up under the blocked note, kept on the composer's column. */
   children?: ReactNode
   /** The bot's accent for the live send button; the neutral fill without it. */
   tint?: { fill: string; ink: string }
+  target?: ReactNode
+  sendLabel?: string
+  label?: string
 }
 
-export function Composer({ value, onChange, files, onFiles, blocked, sending, onSend, onStop, children, tint }: Props) {
-  // While writing a follow-up, keep Send available and move Stop beside it.
+export function Composer({ value, onChange, files, onFiles, blocked, sending, onSend, onStop, children, tint, target, sendLabel = '发送', label = '给 Bot 发消息' }: Props) {
   const drafting = value.trim().length > 0 || files.length > 0
-  const stop = drafting ? undefined : onStop
   const canSend = !blocked && !sending && drafting
   const armed = canSend
   const pick = async () => {
@@ -39,6 +38,7 @@ export function Composer({ value, onChange, files, onFiles, blocked, sending, on
     onFiles([...files, ...picked.assets.map((asset) => ({ uri: asset.uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null }))])
   }
   return <View className="gap-2 bg-background px-4 pb-3">
+    {target ? <View className="w-full max-w-3xl self-center">{target}</View> : null}
     <View className="w-full max-w-3xl self-center rounded-2xl border border-input bg-card shadow-sm">
       {files.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 px-3 pt-3">
         {files.map((file, index) => <View key={`${file.uri}:${index}`} className="max-w-48 flex-row items-center rounded-full bg-muted ps-3">
@@ -48,19 +48,19 @@ export function Composer({ value, onChange, files, onFiles, blocked, sending, on
           </Pressable>
         </View>)}
       </ScrollView> : null}
-      <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel="给 Bot 发消息" placeholder={blocked ?? '发消息'} placeholderTextColorClassName="accent-muted-foreground" multiline maxLength={100000}
+      <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel={label} placeholder={blocked ?? '发消息'} placeholderTextColorClassName="accent-muted-foreground" multiline maxLength={100000}
         className="max-h-40 min-h-11 px-4 pt-3 pb-1 font-sans text-body text-foreground" value={value} onChangeText={onChange} />
       <View className="flex-row items-center justify-between ps-0.5 pe-1.5 pb-1.5">
         <Button variant="ghost" size="icon" className="rounded-full" accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} onPress={pick}>
           <Icon as={Paperclip} className="text-muted-foreground" />
         </Button>
-        {drafting && onStop ? <Button instant size="icon" variant="outline" className="rounded-full shadow-none" accessibilityLabel="停止" onPress={onStop}>
+        {onStop ? <Button instant size="icon" variant="outline" className="rounded-full shadow-none" accessibilityLabel="停止" onPress={onStop}>
           <Icon as={Square} className="fill-foreground" />
         </Button> : null}
         {/* Idle, the disabled default button rests muted; ready, it takes the bot's tint. */}
-        <Button instant size="icon" variant={stop ? 'outline' : 'default'} className="rounded-full shadow-none" style={armed && tint ? { backgroundColor: tint.fill } : undefined} accessibilityLabel={stop ? '停止' : sending ? '发送中' : '发送'} disabled={!stop && !canSend}
-          onPress={stop ?? (sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() })}>
-          {stop ? <Icon as={Square} className="fill-foreground" /> : sending ? <Icon as={LoaderCircle} /> : <Icon as={ArrowUp} color={armed ? tint?.ink : undefined} />}
+        <Button instant size="icon" variant="default" className="rounded-full shadow-none" style={armed && tint ? { backgroundColor: tint.fill } : undefined} accessibilityLabel={sending ? '本地保存中' : sendLabel} disabled={!canSend}
+          onPress={sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() }}>
+          {sending ? <Icon as={LoaderCircle} /> : <Icon as={ArrowUp} color={armed ? tint?.ink : undefined} />}
         </Button>
       </View>
     </View>

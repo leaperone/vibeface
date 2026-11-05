@@ -24,6 +24,9 @@ export function PromptInput({
   files = [],
   onFiles,
   above,
+  target,
+  sendLabel = '发送',
+  label = '给 Bot 发消息',
   tint,
   children,
 }: {
@@ -40,6 +43,9 @@ export function PromptInput({
   onFiles?: (files: File[]) => void
   /** Floats over the transcript, just above the box. */
   above?: ReactNode
+  target?: ReactNode
+  sendLabel?: string
+  label?: string
   /** The bot's tint, taken by the send button once there is something to send. */
   tint?: { fill: string; ink: string }
   children?: ReactNode
@@ -51,9 +57,7 @@ export function PromptInput({
   const [open, setOpen] = useState(false)
   // Buttons keep the focus on the text, so a tap acts instead of collapsing the box under the finger.
   const keepFocus = (event: MouseEvent) => event.preventDefault()
-  // A written message is always sendable; while writing, Stop moves beside Send instead of leaving.
   const drafting = Boolean(value.trim() || files.length)
-  const stop = drafting ? undefined : onStop
   // Caught on pick: the upload would only refuse it after the person pressed Send.
   const unfits = (file: File) => !file.size || file.size > attachmentLimit
   const unfit = files.find(unfits)
@@ -87,6 +91,7 @@ export function PromptInput({
         onSubmit()
       }}
     >
+      {target ? <div className="mb-2 flex min-w-0 flex-wrap items-center gap-2 text-meta">{target}</div> : null}
       <div className="relative">
         <div data-toast-above="" className="absolute start-0 bottom-full flex pb-2 empty:hidden">{above}</div>
         <InputGroup className="rounded-2xl bg-card shadow-sm dark:bg-card has-[[data-slot=input-group-control]:focus-visible]:ring-2">
@@ -98,10 +103,7 @@ export function PromptInput({
             maxLength={100000}
             value={value}
             placeholder={disabled && reason ? reason : files.length ? '给附件写句说明' : '发消息'}
-            disabled={disabled}
-            // Read-only, not disabled, while sending: a disabled box drops focus, which folds it and closes a phone's keyboard.
-            readOnly={busy}
-            aria-label="给 Bot 发消息"
+            aria-label={label}
             aria-describedby={note ? 'manager-hint' : undefined}
             title="Enter 发送，Shift+Enter 换行"
             rows={1}
@@ -130,23 +132,22 @@ export function PromptInput({
               </span>)}
             </> : null}
             <span className="ms-auto flex shrink-0 gap-1">
-              {drafting && onStop ? <InputGroupButton type="button" variant="outline" size="icon-sm" aria-label="停止" title="停止" className="size-9 rounded-full max-md:size-11" onMouseDown={keepFocus} onClick={onStop}>
+              {onStop ? <InputGroupButton type="button" variant="outline" size="icon-sm" aria-label="停止" title="停止" className="size-9 rounded-full max-md:size-11" onMouseDown={keepFocus} onClick={onStop}>
                 <SquareIcon aria-hidden="true" className="fill-current" />
               </InputGroupButton> : null}
               <InputGroupButton
-                type={stop ? 'button' : 'submit'}
-                variant={stop ? 'outline' : 'default'}
+                type="submit"
+                variant="default"
                 size="icon-sm"
-                disabled={!stop && !sendable}
+                disabled={!sendable}
                 aria-busy={busy || undefined}
-                aria-label={stop ? '停止' : '发送'}
-                title={stop ? '停止' : '发送'}
-                style={!stop && sendable && tint ? { backgroundColor: tint.fill, color: tint.ink } : undefined}
-                className={cn('size-9 rounded-full max-md:size-11', !stop && (sendable ? 'hover:opacity-88' : 'bg-muted text-muted-foreground disabled:opacity-100'))}
+                aria-label={sendLabel}
+                title={sendLabel}
+                style={sendable && tint ? { backgroundColor: tint.fill, color: tint.ink } : undefined}
+                className={cn('size-9 rounded-full max-md:size-11', sendable ? 'hover:opacity-88' : 'bg-muted text-muted-foreground disabled:opacity-100')}
                 onMouseDown={keepFocus}
-                onClick={stop}
               >
-                {stop ? <SquareIcon aria-hidden="true" className="fill-current" /> : busy ? <Spinner aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}
+                {busy ? <Spinner aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}
               </InputGroupButton>
             </span>
           </InputGroupAddon>

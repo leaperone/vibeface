@@ -14,7 +14,7 @@ use vibeface_bridge::{
 /// An interrupt the App Server took is checked against the turn once this passes without its end.
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// A stop not confirmed by then shows as still trying; it is retried until its work ends.
-const STOP_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const STOP_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Reconciliation reads the turn of each running or unverified work this often, so an end the
 /// event stream missed is still recorded.
 const LIVE_PROBE_MS: i64 = 60_000;
@@ -153,8 +153,7 @@ impl Runtime {
         spec: &WorkRequest,
         kind: WorkKind,
     ) -> Result<()> {
-        // A send goes into a thread that already exists, often outside the roots; it picks no directory.
-        if spec.thread.is_none() {
+        if spec.thread.is_none() || !spec.cwd.is_empty() {
             self.allowed_path(&spec.cwd)?;
         }
         let conversation = store
@@ -237,6 +236,18 @@ impl Runtime {
                     "an agent task only starts work on its own device"
                 );
             }
+            Some(("assignment", assignment_id)) => {
+                ensure!(
+                    crate::store::workspace::assignment_work_allowed_from(
+                        &store.connection,
+                        network,
+                        assignment_id,
+                        &spec.dispatcher,
+                        &spec.conversation
+                    )?,
+                    "this assignment does not authorize work in this conversation"
+                );
+            }
             _ => bail!("invalid work trigger"),
         }
         if let Some(original) = &spec.continues {
@@ -308,6 +319,17 @@ impl Runtime {
             if let Some(existing) = store.accepted_work(network, &request)? {
                 existing
             } else {
+                if let Some(envelope) = store.peer_dispatch_envelope(network, &request)? {
+                    store.authorize_node(network, &request.dispatcher)?;
+                    ensure!(
+                        store.peer_command_dependencies(network, &envelope)?,
+                        "dispatch dependencies are still missing"
+                    );
+                }
+                ensure!(
+                    !store.peer_cancelled(network, &request.conversation, &request.work_id)?,
+                    "work was cancelled before dispatch admission"
+                );
                 let first = (|| {
                     let proposed = self.resolve_work_model(&store, network, &request)?;
                     let kind = match request.kind {
@@ -412,8 +434,7 @@ impl Runtime {
         })
     }
 
-    /// Another Node's dispatch. The dispatcher may be ahead of this Node, so a refusal is retried
-    /// once after syncing from it; a second refusal is final and the dispatcher reports it.
+    #[cfg(test)]
     pub(super) async fn accept_remote_dispatch(
         self: &Arc<Self>,
         network: &str,
@@ -433,18 +454,10 @@ impl Runtime {
             spec.work_id == WorkSpec::id(&spec.conversation, &spec.trigger, &spec.call_ref),
             "work ID does not match its call"
         );
-        let first = self
+        let record = self
             .accept_dispatch(network, spec.clone(), &Value::Null)
-            .await;
-        let record = match first {
-            Ok(admitted) => Ok(admitted.record),
-            Err(_) => {
-                self.sync_peer(network, origin).await?;
-                self.accept_dispatch(network, spec, &Value::Null)
-                    .await
-                    .map(|admitted| admitted.record)
-            }
-        };
+            .await
+            .map(|admitted| admitted.record);
         Ok(match record {
             Ok(record) => {
                 json!({"work_id":record.work_id,"state":record.state.name()})
@@ -487,18 +500,38 @@ impl Runtime {
         dispatch: &Dispatch,
         notify: bool,
     ) -> Result<Result<Dispatch>> {
-        let _peer_delivery = self.peer_delivery_locks.lock(&dispatch.spec.target).await;
-        let request = json!({"type":"dispatch_work","spec":dispatch.spec});
+        let lane = format!("dispatch:{network}:{}", dispatch.spec.work_id);
+        let _peer_delivery = self.peer_delivery_locks.lock(&lane).await;
+        let command = self
+            .store
+            .lock()
+            .await
+            .peer_dispatch_command(network, &dispatch.spec)?;
+        let command_id = command.envelope.command_id.clone();
+        let request = json!({"type":"dispatch_work","command":command.envelope});
         let reply = match self
-            .peer_request(network, &dispatch.spec.target, request)
+            .peer_request(network, &command.target_node, request)
             .await
         {
             Ok(reply) => reply,
             Err(error) => return Ok(Err(error)),
         };
-        let state = if reply["work_id"] == dispatch.spec.work_id.as_str() {
+        ensure!(
+            reply["admission"]["command_id"] == command_id,
+            "dispatch answer belongs to another command"
+        );
+        let admission = reply["admission"]["state"]
+            .as_str()
+            .context("dispatch answer had no admission state")?;
+        if matches!(admission, "saved" | "waiting_dependencies") {
+            return Ok(Ok(dispatch.clone()));
+        }
+        let state = if admission == "owner_accepted"
+            && reply["work_id"] == dispatch.spec.work_id.as_str()
+        {
             DispatchState::Accepted
         } else {
+            ensure!(admission == "rejected", "invalid dispatch admission answer");
             DispatchState::Rejected {
                 reason: reply["rejected"]
                     .as_str()
@@ -784,6 +817,11 @@ impl Runtime {
 
     /// Keeps the user's stop until its work ends. A stop asked again keeps its first request.
     async fn hold_stop(&self, request: &StopRequest) -> Result<bool> {
+        let _input = self
+            .work_input_lock(&request.work_id)
+            .await
+            .write_owned()
+            .await;
         let mut store = self.store.lock().await;
         if store
             .stop_requests()?
@@ -991,22 +1029,31 @@ impl Runtime {
         scope: &str,
         work_id: &str,
     ) -> Result<Value> {
-        let work = self
-            .store
-            .lock()
-            .await
-            .works(network, scope)?
-            .into_iter()
-            .find(|work| work.work_id == work_id)
-            .context("work not found in this conversation")?;
-        if work.target_node == self.identity.device_id()? {
+        let target = {
+            let store = self.store.lock().await;
+            let work_target = store
+                .works(network, scope)?
+                .into_iter()
+                .find(|work| work.work_id == work_id)
+                .map(|work| work.target_node);
+            work_target
+                .or(store
+                    .dispatch(work_id)?
+                    .filter(|dispatch| {
+                        dispatch.spec.conversation == scope
+                            && dispatch.state == DispatchState::Pending
+                    })
+                    .map(|dispatch| dispatch.spec.target))
+                .context("work not found in this conversation")?
+        };
+        if target == self.identity.device_id()? {
             return self.interrupt_work(network, work_id).await;
         }
         let at = now_ms();
         let request = StopRequest {
             work_id: work_id.into(),
             conversation: scope.into(),
-            target: work.target_node,
+            target,
             requested_at_ms: at,
             deadline_ms: at + STOP_DELIVERY_TIMEOUT.as_millis() as i64,
             timed_out: false,
@@ -1017,7 +1064,9 @@ impl Runtime {
                 .await
             {
                 Ok(Ok(reply)) => {
-                    self.drop_stop(work_id).await?;
+                    if reply["admission"]["state"] == "owner_accepted" {
+                        self.drop_stop(work_id).await?;
+                    }
                     self.publish_changed(network, scope, Changed::Work(work_id));
                     return Ok(reply);
                 }
@@ -1031,39 +1080,72 @@ impl Runtime {
     }
 
     async fn deliver_stop(&self, network: &str, request: &StopRequest) -> Result<Value> {
-        let _peer_delivery = self.peer_delivery_locks.lock(&request.target).await;
-        self.peer_request(
-            network,
-            &request.target,
-            json!({"type":"interrupt_work","conversation_id":request.conversation,
-                "work_id":request.work_id,"human":true}),
-        )
-        .await
+        let command = self
+            .store
+            .lock()
+            .await
+            .peer_stop_command(network, request)?;
+        let command_id = command.envelope.command_id.clone();
+        let reply = self
+            .peer_request(
+                network,
+                &command.target_node,
+                json!({"type":"interrupt_work","command":command.envelope}),
+            )
+            .await?;
+        ensure!(
+            reply["admission"]["command_id"] == command_id && reply["work_id"] == request.work_id,
+            "stop answer belongs to another command"
+        );
+        let state = reply["admission"]["state"]
+            .as_str()
+            .context("stop answer had no admission state")?;
+        ensure!(
+            matches!(state, "saved" | "waiting_dependencies" | "owner_accepted"),
+            "stop was not accepted: {}",
+            reply["rejected"].as_str().unwrap_or(state)
+        );
+        Ok(reply)
     }
 
     /// Retries waiting dispatches and the stops held for other devices' works.
     pub(super) async fn deliver_work_requests(self: &Arc<Self>, network: &str) -> Result<()> {
         let dispatches = self.store.lock().await.dispatches()?;
-        let pending = dispatches
+        for dispatch in dispatches
             .into_iter()
             .filter(|dispatch| dispatch.state == DispatchState::Pending)
-            .map(|dispatch| (dispatch.spec.target.clone(), dispatch));
+        {
+            let lane = format!("dispatch_worker:{network}:{}", dispatch.spec.work_id);
+            let Some(guard) = self.peer_delivery_locks.try_lock(&lane) else {
+                continue;
+            };
+            let (node, network) = (self.clone(), network.to_owned());
+            tokio::spawn(async move {
+                let _guard = guard;
+                if let Err(error) = node
+                    .offer_dispatch(&network, &dispatch, true)
+                    .await
+                    .and_then(|answer| answer.map(drop))
+                {
+                    tracing::debug!(%error, "dispatch waits for its target");
+                }
+            });
+        }
         let local = self.identity.device_id()?;
         let stops = self.store.lock().await.stop_requests()?;
-        let held = stops
-            .into_iter()
-            .filter(|request| request.target != local)
-            .map(|request| (request.target.clone(), request));
-        tokio::join!(
-            peers::each_device(pending.collect(), |_, dispatch| async move {
-                self.offer_dispatch(network, &dispatch, true)
-                    .await?
-                    .map(drop)
-            }),
-            peers::each_device(held.collect(), |_, request| {
-                self.deliver_held_stop(network, request)
-            }),
-        );
+        for request in stops.into_iter().filter(|request| request.target != local) {
+            let lane = format!("stop_worker:{network}:{}", request.work_id);
+            let Some(guard) = self.peer_delivery_locks.try_lock(&lane) else {
+                continue;
+            };
+            let (node, network) = (self.clone(), network.to_owned());
+            tokio::spawn(async move {
+                let _guard = guard;
+                if let Err(error) = node.deliver_held_stop(&network, request).await {
+                    tracing::debug!(%error, "stop waits for its target");
+                }
+            });
+        }
         Ok(())
     }
 
@@ -1076,13 +1158,16 @@ impl Runtime {
         mut request: StopRequest,
     ) -> Result<()> {
         let work_id = request.work_id.clone();
-        let ended = self
-            .store
-            .lock()
-            .await
-            .works(network, &request.conversation)?
-            .iter()
-            .any(|work| work.work_id == work_id && work.outcome.is_some());
+        let ended = {
+            let store = self.store.lock().await;
+            store
+                .works(network, &request.conversation)?
+                .iter()
+                .any(|work| work.work_id == work_id && work.outcome.is_some())
+                || store
+                    .dispatch(&work_id)?
+                    .is_some_and(|dispatch| dispatch.state.ended())
+        };
         if !ended && !request.timed_out && now_ms() >= request.deadline_ms {
             request.timed_out = true;
             self.store.lock().await.save_stop_request(&request)?;
@@ -1092,9 +1177,15 @@ impl Runtime {
             if !self.stop_attempt_due(&work_id) {
                 return Ok(());
             }
-            tokio::time::timeout(STOP_ATTEMPT_TIMEOUT, self.deliver_stop(network, &request))
-                .await
-                .map_err(|_| crate::net::Unanswered::error("stop request timed out".into()))??;
+            let reply =
+                tokio::time::timeout(STOP_ATTEMPT_TIMEOUT, self.deliver_stop(network, &request))
+                    .await
+                    .map_err(|_| {
+                        crate::net::Unanswered::error("stop request timed out".into())
+                    })??;
+            if reply["admission"]["state"] != "owner_accepted" {
+                return Ok(());
+            }
         }
         self.drop_stop(&work_id).await?;
         self.publish_changed(network, &request.conversation, Changed::Work(&work_id));

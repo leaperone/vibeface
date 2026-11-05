@@ -6,13 +6,14 @@
 - 有选项的问题默认收起自由输入，选择“自己写回答”才展开有可见标签的多行输入。无选项直接输入。切换选项保留手写草稿，数字按原文字发送，Enter 和输入法确认都不发送。
 - 问题正文首个非空行是具体决定，其余段落说明已知情况、影响和为什么需要本人回答；未知信息明确说明。选项只列真实替代方案，0 到 8 个是协议范围，不是数量目标。
 - Web 任务概览保留任务状态，用待处理数量链接代替重复的问题和确认卡片。待处理、聊天与任务详情仍可回答同一问题。
-- 发送会回答本题并让 Bot 按回答继续处理。已有回答先显示真实胜者，再判失效；结果未知时只重试原回答，不能换答。
+- 发送会回答本题。普通问题让 Bot 在原 Task 或 Main 继续，挂起的原生请求走独立控制通路。已有回答先显示真实胜者，再判失效；结果未知时只查询原回答，不能换答。
 
 ## 1. 行为
 
 - 协调 Agent 要本人拍板时，在拥有该会话的 Bot 聊天里发一条提问：问题、可选答案、所涉设备和项目。提问是会话事件，和消息一样同步。
-- 本人的回答（选择或输入后发送）是这个聊天里发给 Bot 的一条消息。网页和手机不把它显示成单独的消息气泡，而是折进所答问题的卡片里。Bot 把它当作普通一轮的输入，输入里写明回答的是哪个问题，再自己执行，例如 `vibeface codex send|respond`。
-- 每个问题只有一个回答 ID，由问题 ID 派生。网页、Grok 或重试写的回答都是这一个 ID，所以“已回答”是一个事实，Bot 只为它跑一轮。两端同时写下不同文字时 rank 小者胜，输方把自己的回答换成“已由另一端回答：<胜者文字>”，不让它悄悄消失。回答的 `author` 不是本设备时（另一台设备签名的回答，或 Grok 经入口电脑写下的回答），网页和手机也显示“已由另一端回答”，卡片重新挂载后不丢；只有输掉竞争时才用警告样式。
+- 本人的回答是绑定原问题的一条消息，网页和手机把它折进问题卡片。普通问题按原目标排入后续 Answer 轮。带 live request 的问题不进入被挂起 Task 的 scheduler；执行设备从私有控制队列递交给原请求，避免等原 Task 释放槽位形成死锁。
+- 允许本次和拒绝仅来自真实请求支持的动作。Node 绑定原问题和唯一答案、请求、会话、turn、transport generation 及权限版本。基础审批直接构造原生响应。文字题使用捕获配置的独立 Coordination session，按原题型校验后只发送一次，不恢复 Main 或 Task 原生会话。普通自由文字不能猜成批准，未知结果不重放。
+- 每个问题只有一个回答 ID，由问题 ID 派生。网页、Grok 或重试写的回答都是这一个 ID，所以“已回答”是一个事实。普通问题只排一次后续轮，live 请求只保存一项控制。两端同时写下不同文字时 rank 小者胜，输方把自己的回答换成“已由另一端回答：<胜者文字>”，不让它悄悄消失。回答的 `author` 不是本设备时（另一台设备签名的回答，或 Grok 经入口电脑写下的回答），网页和手机也显示“已由另一端回答”，卡片重新挂载后不丢；只有输掉竞争时才用警告样式。
 - Grok 经现有 webhook 发件箱收到同一个问题，经现有 `POST /api/decision` 回答，落成聊天里的同一条回答。任一侧回答后，提问方 Node 再经发件箱通知 Grok 已回答。
 - 待处理页列出全部会话里未回答的问题，可以就地回答，并能跳到对应聊天。
 
@@ -63,10 +64,12 @@ Subject {                             // 问题所涉的设备、项目和 sessi
 
 Choice {
 	label: String,                    // 1-120 字符，同一问题内唯一
+	action: Option<QuestionAction>,   // 可信原请求生成的 allow_once 或 deny；普通选项为空
 }
 
 QuestionAsked {                       // 写在拥有该 session 的 Bot 会话
 	question_id: String,              // "q-" + digest(node, event_id)
+	target: Option<InputTarget>,       // 已核验的原 Main、Task、Work 或 Routine；未知保持空
 	severity: Severity,               // info | attention | urgent
 	text: String,                     // 问题本身，≤1024 字节
 	choices: Vec<Choice>,             // ≤8；文字回答始终可用
@@ -98,7 +101,7 @@ SessionMuted {                        // 写在当前接手 Bot 的会话 scope�
 }
 ```
 
-签名规则：普通本人消息仍须设备签名。回答消息签名可选：网页回答带本人签名，Grok 经 decision token 回答由收到它的 Node 无签名写入。回答一轮的触发类型为 `answer`，不提供改设置的工具。
+签名规则：网页回答须本人设备签名。Grok 经已验证的 decision token 回答，由入口 Node 保存同一答案及私有授权绑定。普通无签名消息不能进入本人控制通路。普通问题后续轮的触发类型为 `answer`，保持原目标且不提供改设置工具；live request 的答案不用 Answer job。
 
 投影：
 
@@ -118,7 +121,7 @@ SessionMuted {                        // 写在当前接手 Bot 的会话 scope�
 
 Agent 侧（CLI → `/api/triage`）：
 
-- `vibeface triage raise --event-id ID --severity S --question TEXT [--choice LABEL]... [--request-id R] [--attention-kind question|approval|browser-takeover]`：写入拥有该 session 的 Bot 会话。同一 session 同一请求已有未答问题时返回原问题。需要本人在事件设备的浏览器继续操作时指定 `browser-takeover`；不传时根据挂起请求推断提问或审批。卡片类型不授予操作权限，也不能改变接管设备。带 `--request-id` 时请求挂起到回答为止，回答后再给 Bot 120 秒应答，超时按方法回退。
+- `vibeface triage raise --event-id ID --severity S --question TEXT [--choice LABEL]... [--request-id R] [--attention-kind question|approval|browser-takeover]`：写入拥有该 session 的 Bot 会话。同一 session 同一请求已有未答问题时返回原问题。需要本人在事件设备的浏览器继续操作时指定 `browser-takeover`；不传时根据挂起请求推断提问或审批。卡片类型不授予操作权限，也不能改变接管设备。带 `--request-id` 时请求挂起到回答为止，回答沿独立私有控制递交原请求；失效 transport 和未知发送结果不自动重放。
 - `vibeface triage dismiss --event-id ID`：不变。
 - `vibeface respond REQUEST_ID RESULT_JSON [--node DEVICE]`：带 `--node` 时经设备转发，应答仍只一次。本机 Node 地址参数为 `--node-url`。
 - 协调工具 `hand_over_session { node, session_id, version, to? | stop_following? }`：Bot 把名下的会话转给 `to`（Bot 的会话 ID 或名称），或不再关注；`version` 是 `bot.sessions` 里的版本，即最后改动归属的事件 hash 前 16 位。返回 `{node, session_id, conversation_id, muted, version, changed}`，状态已成立时 `changed = false`、不写事件；版本已变时拒绝。

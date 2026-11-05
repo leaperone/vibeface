@@ -6,11 +6,12 @@ import { answerBody, answerLabel, attentionLabel, awaitsAnswer, declined, foldAn
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/path/to/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
   question_id, conversation_id: "chat", bot: { bot_id: "bot", name: "Bot" }, severity: "attention", text: "要不要继续",
+  target: { kind: 'bot_main', bot_id: 'bot' },
   choices: [{ label: "继续" }, { label: "看看" }], about, author: "gateway", created_at_ms, answer: null, ...extra,
 })
 const snapshot = (extra: Record<string, unknown>) => ({
   conversation: { conversation_id: "chat", title: "Bot", owner: "gateway", owner_epoch: 1 }, messages: [], works: [], deliveries: [],
-  checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], questions: [], sessions: [], ...extra,
+  checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], sent_coverage: { scope: 'main', omitted_unknown: 0 }, questions: [], sessions: [], ...extra,
 })
 
 test("questions parse from the list and the chat snapshot, and fail closed on shapes the web cannot show", () => {

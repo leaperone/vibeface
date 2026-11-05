@@ -227,7 +227,7 @@ def message_at(connection, network, conversation, message_id):
     for row in rows:
         event = json.loads(json.loads(row[0])["canonical_body"])
         body = event["body"]
-        if event["scope_id"] == conversation and body.get("type") == "message_posted" and body.get("message_id") == message_id:
+        if event["scope_id"] == conversation and body.get("type") == "input_posted" and body.get("message_id") == message_id:
             return body["text"]
     return None
 
@@ -293,7 +293,9 @@ def run_sample(artifact, iteration, run, payload, digest, verify):
         target.connect(b.device_id)
         verify.wait_for("the management client is known at B", lambda: target.authenticate(network))
         conversation = "free-perf-conversation"
-        a.client.rpc("create_conversation", conversation_id=conversation, title="Free performance fixture")
+        a.client.rpc("create_bot", bot_id="free-perf-bot", conversation_id=conversation,
+                     name="Free performance fixture", instructions="",
+                     project={"target_node": a.device_id, "cwd": str(workspace)})
         verify.wait_for("all three members have the same initial history", lambda: verify.converged(nodes, network), timeout=60)
         target.rpc("conversation", conversation_id=conversation)
         clients["client_a"] = a.client

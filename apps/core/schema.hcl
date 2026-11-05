@@ -272,6 +272,10 @@ table "messages" {
     null = true
     type = text
   }
+  column "target" {
+    null = true
+    type = text
+  }
   primary_key {
     columns = [column.network_id, column.conversation_id, column.message_id]
   }
@@ -1073,6 +1077,11 @@ table "scheduler_sessions" {
 }
 table "scheduler_jobs" {
   schema = schema.main
+  column "scope" {
+    null = false
+    type = text
+    default = "main"
+  }
   column "conversation_id" {
     null = false
     type = text
@@ -1373,4 +1382,19 @@ table "work_stops" {
   }
 }
 schema "main" {
+}
+
+table "workspace_projection" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "state" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id]
+  }
 }

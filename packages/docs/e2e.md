@@ -22,13 +22,15 @@ pnpm test:e2e
 PLAYWRIGHT_BROWSERS_PATH="$PWD/.artifacts/e2e/browsers" pnpm exec e2e-web install chromium --with-deps
 ```
 
-每项测试创建独立 Node 数据目录，使用随机本机端口，关闭模型执行和 Codex 会话扫描。测试结束后停止自己的进程，不连接已有 Node。测试控制口只监听 loopback，认证材料保存在 owner-only 文件。Node 数据和控制文件位于 `.artifacts/e2e/`，runner 日志、报告和下载文件位于 `tests/e2e/.artifacts/`，都不会提交。恢复密码每次随机生成，通过 e2e secrets 传入。
+每项测试创建独立 Node 数据目录，使用随机本机端口，关闭 Codex 会话扫描。默认 fixture 关闭模型执行；`workspaceTest` 启用本次测试的受控 Codex 程序，不连接真实模型。测试结束后停止自己的进程，不连接已有 Node。测试控制口只监听 loopback，认证材料保存在 owner-only 文件。Node 数据和控制文件位于 `.artifacts/e2e/`，runner 日志、报告和下载文件位于 `tests/e2e/.artifacts/`，都不会提交。恢复密码每次随机生成，通过 e2e secrets 传入。
 
 示例检查建网页面。核心测试依次建网、下载恢复文件、跳过 AI 设置、创建 Bot，再刷新确认它仍存在。传输测试启动发送 Node、接收 Node 和公共入口 Node，经真实界面创建两个独立个人网络，从“设置 → 实验室”开启文件传输，再到 `/settings/lab/transfers` 确认零费用订单，接受订单并重启接收 Node。它还关闭实验并刷新，检查记录仍在、已收到文件仍可保存、重开不新增订单且不改变原传输方式。浏览器下载的原文件必须通过 SHA-256 核对，免费过程不创建钱包或调用链上 RPC。这些测试不需要模型或登录。CI 使用本次提交打包出的 Linux 程序运行。
 
 headless 传输测试仅阻止临时文件输入打开原生系统选择框，再用真实 `setInputFiles` 选择任务内文件。文件输入的 change 事件、原文件内容、产品加密和 Node 请求均保留真实路径。下载结果仍需独立核对 SHA-256。
 
-测试使用 `tests/e2e/fixtures.ts` 导出的 `test` 或 `deliveryTest`，每项测试均重建 Node。保持 `workers: 1` 和 `retries: 0`，避免重复执行有外部副作用的验收。
+测试使用 `tests/e2e/fixtures.ts` 导出的 `test`、`deliveryTest` 或 `workspaceTest`，每项测试均重建 Node。保持 `workers: 1` 和 `retries: 0`，避免重复执行有外部副作用的验收。
+
+`workspace.e2e.ts` 从真实表单创建 Bot、独立 Task 和频道，检查连续补充、稍后队列控制、Context 来源、scope 隔离及窄屏输入和停止。控制器只释放固定的受控 Provider 门，并读取实际原生输入和回合记录，不直接写业务表。390px 网页通过不能替代原生手机制品验收。
 
 只运行核心测试或显示浏览器：
 
@@ -167,6 +169,21 @@ pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^receives a ch
 ```
 
 原生测试通过真实邀请码加入接收网络，检查手机与管理员的安全码相同，再授予管理权限。测试从私有任务文件读取一次性邀请码，像扫码一样以 `vibeface://join?link=` 打开应用。发送方经真实 Node 发出公益订单，原生界面接受并保存文件。测试只读该专用应用的 `Documents/transfers/`，以独立 SHA-256 核对实际保存的字节。没有安装新构建、执行原生界面或读取实际文件时，不能把入口准备完成或 Web 通过作为原生验收成功。
+
+## 验证原生工作台
+
+`workspace.native.ts` 使用同一任务构建的 iOS App 和受控 Node。先新建名称以 `vibeface-workspace-` 开头的专属模拟器并启动，把 UUID 写入 `.artifacts/native/workspace/simulator.txt`。不得复用其他任务的模拟器。邀请文件保持在同一目录，权限为 `0600`。
+
+```sh
+VIBEFACE_E2E_IOS_APP=/absolute/task/.artifacts/native/Vibeface.app \
+VIBEFACE_E2E_SIMULATOR="$TASK_SIMULATOR_UUID" \
+VIBEFACE_E2E_SOURCE_COMMIT="$TASK_SOURCE_COMMIT" \
+VIBEFACE_E2E_BINARY=/absolute/task/target/debug/vibeface \
+VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/apps/app/dist/client/vibeface_secure.js \
+pnpm exec e2e run --config tests/e2e/e2e.workspace.native.config.ts workspace.native.ts:123 --retries 0 --video off
+```
+
+用例核对已安装 App 与构建文件，通过邀请、安全码和管理授权加入，再从原生界面创建 Bot、Task 和频道，检查补充、Context、队列编辑取消及停止后的草稿。`acceptance.json` 只在全部界面步骤通过后写入，`cleanup.json` 只在受控 fixture 正常退出后写入。运行结束后，操作者还需停止并删除本任务的模拟器。模拟器通过不代表真机、Android 或真实模型验收。
 
 ## 验证原生 Provider 设置和队列取消
 

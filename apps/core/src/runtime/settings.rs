@@ -184,9 +184,16 @@ impl ProviderChange {
 }
 
 impl Runtime {
-    pub(crate) async fn agent_configuration_snapshot(&self) -> (NodeSettings, providers::Local) {
+    pub(crate) async fn agent_configuration_snapshot(
+        &self,
+    ) -> (NodeSettings, providers::Local, u64) {
         let _configuration = self.config_save.lock().await;
-        (self.settings_snapshot(), self.providers())
+        (
+            self.settings_snapshot(),
+            self.providers(),
+            self.local_permission_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 
     pub(crate) fn provider_configuration_pending(
@@ -527,8 +534,9 @@ impl Runtime {
     }
 
     /// Chooses or stops the bot on a provider, turns its execution on or off, sets the
-    /// provider's program and variables. Active turns keep their launch until they end. This is the only place
-    /// that decides what each provider is used for. The variables are written only to this
+    /// provider's program and variables. Launch changes apply to the next turn; disabling a
+    /// role revokes it now. This is the only place that decides what each provider is used for.
+    /// The variables are written only to this
     /// Node's private file.
     pub(crate) async fn configure_provider(
         &self,
@@ -570,7 +578,8 @@ impl Runtime {
     ) -> Result<Paths> {
         let previous = self.providers();
         let mut next = previous.clone();
-        let previous_manager = self.settings_snapshot().manager;
+        let previous_settings = self.settings_snapshot();
+        let previous_manager = previous_settings.manager.clone();
         let mut manager = previous_manager.clone();
         let previous_triage = self.triage.config();
         let mut triage = previous_triage.clone();
@@ -603,7 +612,17 @@ impl Runtime {
         }
         triage.validate()?;
         let manager_changed = manager != previous_manager;
-        let _active = self.manager_controls.lock().await;
+        let active = self.manager_controls.lock().await;
+        let mut next_settings = previous_settings.clone();
+        next_settings.manager = manager.clone();
+        self.fence_revoked_permissions(
+            &active,
+            &previous_settings,
+            &next_settings,
+            &previous,
+            &next,
+        )
+        .await?;
         if manager_changed
             || next.switches != previous.switches
             || next.bins != previous.bins
@@ -645,7 +664,7 @@ impl Runtime {
             self.pending_provider_launches
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        drop(_active);
+        drop(active);
         self.schedule_wakeup.notify_one();
         Ok(filled)
     }
@@ -779,12 +798,16 @@ impl Runtime {
                 .canonicalize()
                 .context("manager workspace does not exist")?;
         }
-        let _active = self.manager_controls.lock().await;
+        let active = self.manager_controls.lock().await;
+        let previous = self.settings_snapshot();
+        let providers = self.providers();
+        self.fence_revoked_permissions(&active, &previous, &settings, &providers, &providers)
+            .await?;
         let mut configuration = Config::load(directory)?;
         configuration.manager = settings.manager.clone();
         configuration.roots = settings.roots.clone();
         configuration.save(directory)?;
-        let manager_changed = self.settings_snapshot().manager != settings.manager;
+        let manager_changed = previous.manager != settings.manager;
         *self
             .settings
             .lock()
@@ -797,7 +820,7 @@ impl Runtime {
             self.pending_provider_launches
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        drop(_active);
+        drop(active);
         drop(_work);
         drop(_save);
         if manager_changed {
@@ -990,6 +1013,11 @@ impl Runtime {
         );
         let body = crate::model::EventBody::QuestionAsked {
             question_id: question_id.clone(),
+            target: self
+                .store
+                .lock()
+                .await
+                .trigger_input_target(network, scope, trigger)?,
             attention: crate::model::AttentionRequest {
                 kind: crate::model::AttentionKind::Approval,
                 device_id: Some(device.clone()),
@@ -999,6 +1027,7 @@ impl Runtime {
             choices: [ALLOW, DENY]
                 .map(|label| crate::model::Choice {
                     label: label.into(),
+                    action: None,
                 })
                 .into(),
             about: crate::model::Subject {

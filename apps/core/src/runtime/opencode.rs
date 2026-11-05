@@ -3,7 +3,7 @@
 //! Sessions live in opencode's own store, so a work is read back from there after a restart and
 //! never sent again. v2 keeps a shell environment per session; each turn replaces it before
 //! prompting, blanks model keys and injects only that turn's Node tool credentials.
-use super::executor::{Executor, SteerAck, SteerTrace};
+use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::*;
 use crate::manager::{self, ManagerConfig, ManagerError, ManagerFailure, Sdk};
 use crate::scheduling::{SteerOutcome, SteerTarget};
@@ -49,9 +49,6 @@ pub struct Opencode {
     http: reqwest::Client,
     /// Bot turns in progress by session: what a steer joins.
     live: std::sync::Mutex<HashMap<String, Live>>,
-    /// Steered messages a completed turn answered.
-    /// ponytail: in memory and cleared past 1024; one forgotten reads back as unfinished.
-    answered: std::sync::Mutex<BTreeSet<String>>,
     /// Uses of the serve in progress; while any lasts, a changed launch waits.
     users: Arc<std::sync::atomic::AtomicUsize>,
     unresolved_uses: std::sync::Mutex<HashMap<String, Use>>,
@@ -234,6 +231,26 @@ enum Sent {
 }
 
 impl Opencode {
+    pub(super) async fn native_directory(&self, session: &str) -> Result<PathBuf> {
+        vibeface_protocol::validate_id(session).map_err(anyhow::Error::msg)?;
+        let (conn, _serving) = self.conn().await?;
+        let native = self
+            .session(&conn, session)
+            .await?
+            .context("the opencode session does not exist")?;
+        ensure!(native["id"] == session, "opencode returned another session");
+        let cwd = PathBuf::from(
+            native["location"]["directory"]
+                .as_str()
+                .context("the opencode session has no native directory")?,
+        );
+        ensure!(
+            cwd.is_absolute(),
+            "the opencode session directory is not absolute"
+        );
+        Ok(cwd)
+    }
+
     pub(crate) fn open(
         data_dir: &Path,
         bin: PathBuf,
@@ -255,7 +272,6 @@ impl Opencode {
                 .connect_timeout(Duration::from_secs(5))
                 .build()?,
             live: Default::default(),
-            answered: Default::default(),
             users: Default::default(),
             unresolved_uses: Default::default(),
             starting: Default::default(),
@@ -923,15 +939,13 @@ impl Opencode {
             error,
         };
         let finished = |reply: &Value| {
-            !reply["time"]["completed"].is_null()
-                && if infer_work_end {
-                    later || !matches!(reply["finish"].as_str(), Some("tool-calls" | "unknown"))
-                } else {
-                    matches!(
-                        reply["finish"].as_str(),
-                        Some("stop" | "length" | "content-filter")
-                    )
-                }
+            if infer_work_end {
+                !reply["time"]["completed"].is_null()
+                    && (later
+                        || !matches!(reply["finish"].as_str(), Some("tool-calls" | "unknown")))
+            } else {
+                final_reply(reply)
+            }
         };
         Ok(match &chain.reply {
             Some(reply) if reply["error"]["type"] == "aborted" => {
@@ -1248,6 +1262,7 @@ impl Opencode {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
         let mut ticks = tokio::time::interval(TICK);
         let mut streaming = true;
+        let mut reported_start = false;
         let messages = loop {
             let check = tokio::select! {
                 biased;
@@ -1286,6 +1301,7 @@ impl Opencode {
                             event["type"].as_str(),
                             Some(
                                 "session.idle"
+                                    | "session.step.started"
                                     | "session.execution.succeeded"
                                     | "session.execution.failed"
                                     | "session.execution.interrupted"
@@ -1312,7 +1328,35 @@ impl Opencode {
                 break Err(failed(native, lost));
             }
             let errored = seen.error.is_some();
-            if let Ok(Some(messages)) = self.settled(&conn, &session, errored).await {
+            let settled = self.settled(&conn, &session, errored).await.ok().flatten();
+            if !reported_start {
+                let native_started = match &settled {
+                    Some(messages) => chain(messages, &message).reply.is_some(),
+                    None => self
+                        .tail(&conn, &session, &message)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|messages| chain(&messages, &message).reply.is_some()),
+                };
+                if native_started {
+                    if let Some(started) = config
+                        .codex_turn
+                        .as_ref()
+                        .and_then(|turn| turn.started.as_ref())
+                        && let Err(error) = started(message.clone()).await
+                    {
+                        let last = self.close(&session);
+                        guard.terminal = self.stop_run(&conn, &session, &last).await;
+                        break Err(unknown(
+                            native,
+                            &format!("record the opencode native start: {error}"),
+                        ));
+                    }
+                    reported_start = true;
+                }
+            }
+            if let Some(messages) = settled {
                 guard.terminal = true;
                 break Ok(messages);
             }
@@ -1345,16 +1389,6 @@ impl Opencode {
             }
             Some(reply) => reply,
         };
-        let mut answered = self.answered.lock().expect("answered");
-        if answered.len() > 1024 {
-            answered.clear();
-        }
-        for (id, chain) in sent.iter().zip(&chains).skip(1) {
-            if chain.terminal() && chain.reply.as_ref().is_some_and(|r| r["error"].is_null()) {
-                answered.insert(id.clone());
-            }
-        }
-        drop(answered);
         let text = chains
             .iter()
             .map(|chain| chain.text.as_str())
@@ -1541,9 +1575,16 @@ struct Chain {
 
 impl Chain {
     fn terminal(&self) -> bool {
-        (self.reply.as_ref())
-            .is_some_and(|reply| !reply["time"]["completed"].is_null() || !reply["error"].is_null())
+        (self.reply.as_ref()).is_some_and(|reply| final_reply(reply) || !reply["error"].is_null())
     }
+}
+
+fn final_reply(reply: &Value) -> bool {
+    !reply["time"]["completed"].is_null()
+        && matches!(
+            reply["finish"].as_str(),
+            Some("stop" | "length" | "content-filter")
+        )
 }
 
 /// Each v2 user message owns the assistant messages until the next user message.
@@ -1943,7 +1984,7 @@ impl Executor for Opencode {
         &'a self,
         into: &'a SteerTarget,
         message_id: &'a str,
-        text: &'a str,
+        input: &'a SteerInput,
     ) -> BoxFuture<'a, SteerAck> {
         Box::pin(async move {
             let id = steer_message(message_id);
@@ -1960,16 +2001,30 @@ impl Executor for Opencode {
             let Some((conn, _directory, mut body)) = joined else {
                 return SteerAck::Refused("the reply already ended".into());
             };
-            let message = json!({"message_id":message_id,"text":text});
             body["id"] = json!(id);
-            body["text"] = json!(format!(
-                "The user sent another message in this conversation while you were replying. Take it into account and answer it in this same reply.\n\n{message}"
-            ));
+            body["text"] = json!(input.message(message_id));
+            body.as_object_mut().expect("prompt body").remove("files");
+            if !input.files.is_empty() {
+                let mut files = Vec::new();
+                for file in &input.files {
+                    let Ok(uri) = reqwest::Url::from_file_path(&file.local_path) else {
+                        if let Some(turn) = self.live.lock().expect("live").get_mut(&into.thread_id)
+                        {
+                            turn.sent.retain(|sent| *sent != id);
+                        }
+                        return SteerAck::Refused(
+                            "an attachment has no absolute file reference".into(),
+                        );
+                    };
+                    files.push(json!({"uri":uri.as_str(),"name":file.attachment.name}));
+                }
+                body["files"] = json!(files);
+            }
             body["delivery"] = json!("steer");
             match self.send(&conn, &into.thread_id, &body).await {
                 Sent::Taken => {
                     self.touch(&into.thread_id);
-                    SteerAck::Accepted
+                    SteerAck::Accepted { turn_id: Some(id) }
                 }
                 Sent::Refused(failure) => {
                     if let Some(turn) = self.live.lock().expect("live").get_mut(&into.thread_id) {
@@ -1989,19 +2044,49 @@ impl Executor for Opencode {
     ) -> BoxFuture<'a, Option<SteerTrace>> {
         Box::pin(async move {
             let id = steer_message(message_id);
-            if self.answered.lock().expect("answered").contains(&id) {
-                return Some(SteerTrace::Ended(SteerOutcome::Answered));
-            }
             let (conn, _serving) = self.conn().await.ok()?;
             if self.session(&conn, &into.thread_id).await.ok()?.is_none() {
                 return Some(SteerTrace::TargetUnseen);
             }
-            Some(
-                match self.received(&conn, &into.thread_id, &id).await.ok()? {
-                    false => SteerTrace::NotArrived,
-                    true => SteerTrace::Ended(SteerOutcome::Unfinished),
-                },
-            )
+            let messages = self.tail(&conn, &into.thread_id, &id).await.ok()?;
+            let busy = self.busy(&conn, &into.thread_id).await.ok()?;
+            let Some(messages) = messages else {
+                let queued = self
+                    .inbox(&conn, &into.thread_id)
+                    .await
+                    .ok()?
+                    .iter()
+                    .any(|message| message["id"] == id);
+                return Some(if busy || queued {
+                    SteerTrace::Pending
+                } else {
+                    SteerTrace::NotArrived
+                });
+            };
+            let chain = chain(&messages, &id);
+            let turn_id = id;
+            if chain.terminal() {
+                return Some(SteerTrace::Ended {
+                    turn_id,
+                    outcome: if chain
+                        .reply
+                        .as_ref()
+                        .is_some_and(|reply| reply["error"].is_null())
+                    {
+                        SteerOutcome::Answered
+                    } else {
+                        SteerOutcome::Unfinished
+                    },
+                });
+            }
+            Some(if busy {
+                SteerTrace::Received { turn_id }
+            } else {
+                SteerTrace::Ended {
+                    turn_id,
+                    outcome: SteerOutcome::Unfinished,
+                }
+            })
         })
     }
 }
@@ -2637,7 +2722,8 @@ mod tests {
     async fn node(place: &Place) -> Result<(Arc<Runtime>, String)> {
         let data = place.dir.join("node");
         config::private_dir(&data)?;
-        let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        let mut configuration =
+            Config::local("127.0.0.1:0".parse()?, vec![place.dir.join("work")], false);
         configuration.providers.execution = [Provider::Opencode].into();
         configuration.bins.insert(Provider::Opencode, fixture());
         configuration.save(&data)?;
@@ -2652,13 +2738,15 @@ mod tests {
         env.apply(Provider::Opencode, variables.collect())?;
         env.save(&data)?;
         let node = Arc::new(Runtime::open(&data).await?);
+        let admin = LocalIdentity::generate();
         let state = NetworkState::new(Genesis::create(
             &LocalIdentity::generate(),
-            Member::client(&LocalIdentity::generate(), "admin", true)?,
+            Member::client(&admin, "admin", true)?,
             Member::node(&node.identity, "node")?,
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state).await?;
+        super::super::claude::tests::conversation(&node, &admin, &network, "c", "m1").await?;
         Ok((node, network))
     }
 
@@ -2666,6 +2754,18 @@ mod tests {
     async fn dispatch(node: &Arc<Runtime>, network: &str, spec: &WorkSpec) -> Result<()> {
         let at = now_ms();
         (node.store.lock().await).accept_work_fixture(&node.identity, network, spec.clone(), at)?;
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .works(network, &spec.conversation)?
+                .into_iter()
+                .find(|work| work.work_id == spec.work_id)
+                .context("accepted work")?
+                .cwd,
+            spec.cwd,
+            "the admitted work retains its exact requested directory"
+        );
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();
         let sends = (node.start_work(opencode.as_ref(), network, spec, None, &args)).await?;
@@ -2872,10 +2972,39 @@ mod tests {
         let place = Place::new().await?;
         let server = place.opencode()?;
         let turns = Turns::default();
-        let config = bot(&place, &server, "attempt-1", &turns);
+        let mut config = bot(&place, &server, "attempt-1", &turns);
+        let native_starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_starts = native_starts.clone();
+        let start_ready = Arc::new(tokio::sync::Notify::new());
+        let marked = start_ready.clone();
+        config.codex_turn.as_mut().unwrap().started = Some(Arc::new(move |turn| {
+            recorded_starts.lock().unwrap().push(turn);
+            marked.notify_one();
+            Box::pin(async { Ok(()) })
+        }));
+        let bytes = b"%PDF-complete-fixture-content".to_vec();
+        let path = place.dir.join("attached.pdf");
+        std::fs::write(&path, &bytes)?;
+        let input = SteerInput {
+            text: "also this".into(),
+            files: vec![super::super::executor::PreparedAttachment {
+                attachment: Attachment {
+                    hash: crate::crypto::digest(&bytes),
+                    size: bytes.len() as u64,
+                    name: "attached.pdf".into(),
+                },
+                local_path: path.clone(),
+                mime_type: "application/pdf".into(),
+                bytes,
+            }],
+        };
         let (_, never) = watch::channel(false);
         let steer = async {
+            tokio::time::timeout(Duration::from_secs(5), start_ready.notified())
+                .await
+                .expect("the held turn reports its actual native start");
             let (thread_id, turn_id) = started(&turns).await;
+            assert_eq!(*native_starts.lock().unwrap(), vec![turn_id.clone()]);
             let into = SteerTarget {
                 provider: Provider::Opencode,
                 attempt_id: "attempt-1".into(),
@@ -2883,28 +3012,113 @@ mod tests {
                 turn_id,
             };
             assert_eq!(
-                server.send_turn(&into, "m-1", "also this").await,
-                SteerAck::Accepted
+                server.send_turn(&into, "m-1", &input).await,
+                SteerAck::Accepted {
+                    turn_id: Some(steer_message("m-1"))
+                }
             );
             into
         };
         let ((reply, _, _), into) = tokio::join!(turn(&place, &config, "HOLD", None, never), steer);
         let output = reply?.output;
+        assert_eq!(
+            place.prompts()[1]["body"]["files"][0],
+            json!({"uri":reqwest::Url::from_file_path(path).unwrap().as_str(),"name":"attached.pdf"})
+        );
         assert!(
             output.starts_with("first\n\nre:") && output.contains("also this"),
             "{output}"
         );
         assert_eq!(
             server.read_back(&into, "m-1").await,
-            Some(SteerTrace::Ended(SteerOutcome::Answered))
+            Some(SteerTrace::Ended {
+                turn_id: steer_message("m-1"),
+                outcome: SteerOutcome::Answered
+            })
         );
         assert_eq!(
             server.read_back(&into, "m-2").await,
             Some(SteerTrace::NotArrived)
         );
         assert_eq!(
-            server.send_turn(&into, "m-3", "late").await,
+            server
+                .send_turn(
+                    &into,
+                    "m-3",
+                    &SteerInput {
+                        text: "late".into(),
+                        files: vec![]
+                    }
+                )
+                .await,
             SteerAck::Refused("the reply already ended".into())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn steer_readback_waits_for_a_final_reply_after_tools() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let (conn, _serving) = server.conn().await?;
+        let session = server
+            .create(&conn, place.dir.to_str().context("directory")?, None)
+            .await
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        assert_eq!(server.native_directory(&session).await?, place.dir);
+        assert!(server.native_directory("ses_missing").await.is_err());
+        let id = steer_message("input-tools");
+        let target = SteerTarget {
+            provider: Provider::Opencode,
+            attempt_id: "attempt-tools".into(),
+            thread_id: session.clone(),
+            turn_id: "original-message".into(),
+        };
+        for finish in ["tool-calls", "unknown"] {
+            {
+                let mut fake = place.fake.lock().unwrap();
+                let found = fake.sessions.get_mut(&session).context("session")?;
+                found.busy = true;
+                found.messages = vec![
+                    json!({"id":id,"type":"user","time":{"created":now_ms()}}),
+                    json!({"id":"tool-step","type":"assistant","time":{"created":now_ms(),"completed":now_ms()},
+                        "finish":finish,"content":[]}),
+                ];
+            }
+            assert_eq!(
+                server.read_back(&target, "input-tools").await,
+                Some(SteerTrace::Received {
+                    turn_id: id.clone()
+                })
+            );
+        }
+        place
+            .fake
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&session)
+            .unwrap()
+            .messages[1]["finish"] = json!("stop");
+        assert_eq!(
+            server.read_back(&target, "input-tools").await,
+            Some(SteerTrace::Ended {
+                turn_id: id.clone(),
+                outcome: SteerOutcome::Answered
+            })
+        );
+        {
+            let mut fake = place.fake.lock().unwrap();
+            let reply = &mut fake.sessions.get_mut(&session).unwrap().messages[1];
+            reply["finish"] = json!("tool-calls");
+            reply["error"] = json!({"type":"aborted","message":"cancelled during tools"});
+        }
+        assert_eq!(
+            server.read_back(&target, "input-tools").await,
+            Some(SteerTrace::Ended {
+                turn_id: id,
+                outcome: SteerOutcome::Unfinished
+            })
         );
         Ok(())
     }
@@ -3023,9 +3237,18 @@ mod tests {
                 };
                 assert_eq!(
                     server
-                        .send_turn(&target, &format!("m-{index}"), &format!("only-{index}"))
+                        .send_turn(
+                            &target,
+                            &format!("m-{index}"),
+                            &SteerInput {
+                                text: format!("only-{index}"),
+                                files: vec![]
+                            }
+                        )
                         .await,
-                    SteerAck::Accepted
+                    SteerAck::Accepted {
+                        turn_id: Some(steer_message(&format!("m-{index}")))
+                    }
                 );
             }
             started
@@ -3160,6 +3383,39 @@ mod tests {
         crate::work::transition(&mut work, Signal::ThreadCreated(session));
         assert!(matches!(server.probe(&work).await?, Probe::Running { .. }));
         assert_eq!(place.prompts().len(), 1);
+        let turns = Turns::default();
+        let mut config = bot(&place, &server, "queued-attempt", &turns);
+        let native_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marked = native_started.clone();
+        config.codex_turn.as_mut().unwrap().started = Some(Arc::new(move |_| {
+            marked.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }));
+        let (stop, cancel) = watch::channel(false);
+        let cancel_queued = async {
+            let (session, _) = started(&turns).await;
+            assert!(
+                place.fake.lock().unwrap().sessions[&session]
+                    .messages
+                    .is_empty()
+            );
+            assert!(
+                !native_started.load(std::sync::atomic::Ordering::SeqCst),
+                "a queued prompt is not a native start"
+            );
+            stop.send(true).unwrap();
+        };
+        let ((result, _, _), ()) =
+            tokio::join!(turn(&place, &config, "INBOX", None, cancel), cancel_queued);
+        assert!(
+            result
+                .err()
+                .context("the queued turn was cancelled")?
+                .downcast_ref::<ManagerError>()
+                .context("manager error")?
+                .cancelled()
+        );
+        assert!(!native_started.load(std::sync::atomic::Ordering::SeqCst));
         Ok(())
     }
 

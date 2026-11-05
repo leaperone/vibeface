@@ -640,7 +640,7 @@ mod tests {
             conversation_id: Some("c".into()),
             manager: None,
         };
-        node.register_manager_attempt(
+        node.register_manager_attempt_fixture(
             "token".into(),
             idle.clone(),
             &attempt,

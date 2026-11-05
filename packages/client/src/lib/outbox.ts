@@ -1,3 +1,5 @@
+import type { InputReceipt } from '../workspace/types.ts'
+
 /**
  * Signed writes the entry has not confirmed. A write is kept byte-for-byte until the network
  * shows it recorded; it is never re-signed or sent to a different conversation.
@@ -8,6 +10,11 @@ export type OutboxItem = {
   params: Record<string, unknown>
   created_at_ms: number
   rejected?: string
+  /** Local message bytes stay here until the Node has the signed input. */
+  uploads?: { hash: string; size: number; name: string; data: string }[]
+  delivery?: 'saved' | 'uploading' | 'submitting' | 'accepted' | 'unknown'
+  receipt?: InputReceipt
+  prerequisite?: Pick<OutboxItem, 'key' | 'method' | 'params' | 'created_at_ms'>
 }
 
 export interface OutboxStore {

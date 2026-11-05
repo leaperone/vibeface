@@ -47,6 +47,73 @@ pub enum RequestKind {
     Continue,
 }
 
+/// Local transport evidence, never accepted from a hook or shared through the DAG.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HeldAnswerRequest {
+    pub node: String,
+    pub request_id: String,
+    pub provider: Provider,
+    pub session_id: String,
+    pub turn_id: String,
+    pub transport: String,
+    pub generation: String,
+    pub permission_epoch: u64,
+    pub owner_epoch: Option<u64>,
+    pub response: AnswerResponse,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum AnswerResponse {
+    Approval {
+        allow_once: Option<Value>,
+        deny: Value,
+    },
+    CodexQuestion {
+        questions: Value,
+    },
+    ClaudeQuestion {
+        questions: Value,
+    },
+    OpencodeQuestion {
+        questions: Value,
+    },
+    Continue,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HookRequest {
+    pub provider: Provider,
+    pub session_id: String,
+    pub turn_id: String,
+    pub kind: RequestKind,
+    pub questions: Option<Value>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AnswerAuthority {
+    Signed,
+    DecisionToken,
+}
+
+/// One standing answer may control only the original, still live request.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HeldAnswerControl {
+    pub network: String,
+    pub conversation_id: String,
+    pub question_id: String,
+    pub question_hash: String,
+    pub answer_id: String,
+    pub answer_hash: String,
+    pub request: HeldAnswerRequest,
+    pub authority: AnswerAuthority,
+}
+
 /// Normalized event (design 4.1). Hooks send it without `node`, `host` and `event_id`; the
 /// receiving Node fills those in `seal`, so every source derives the same ID.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
@@ -435,15 +502,15 @@ decide. Keep TEXT within 1024 UTF-8 bytes. Say when something is unknown; never 
 code or raw output as the question. Offer only real alternatives, each --choice a complete action and its relevant \
 consequence within 120 characters. Never put a destructive action first. Use zero to eight choices; \
 eight is only the protocol limit, not a target. Do not pad the list with later, other or keep researching, and do not imply \
-a recommendation by putting the likely answer first. The user can always write an answer. While a question about the \
+a recommendation by putting the likely answer first. Ordinary questions accept text. Held approvals use only the Node's trusted actions. While a question about the \
 same session is unanswered, a raise returns it. \
-The answer comes back to that bot as a new turn, and it acts on it. Use `--attention-kind browser-takeover` when the user must continue in the browser on the event's device. Omit the flag to infer question or approval from the held request. The card kind grants no authority.\n\
+Ordinary answers return in the question's original scope. A held request's answer controls only that original live request through a private coordination claim. Use `--attention-kind browser-takeover` when the user must continue in the browser on the event's device. Omit the flag to infer question or approval from the held request. The card kind grants no authority.\n\
 - Otherwise: `{cli} triage dismiss --event-id ID`.\n\
 - An event with a request_id is a request its session holds until it is answered: a Codex App Server \
 request, or one the session's hook, plugin or extension waits on. `{cli} requests` shows each in full. \
 Answer it yourself with `{cli} respond REQUEST_ID 'RESULT_JSON'` (a Codex thread already runs with full \
 access). Only when the user must decide, add `--request-id REQUEST_ID` to the raise: an App Server \
-request then waits for the answer, and the bot has {answer_within_secs} seconds after it to respond; any other request still ends {hook_answer_within_secs} seconds \
+request then waits for the answer, and private answer control has {answer_within_secs} seconds after it to respond. After raising, do not respond as a Bot. Any other request still ends {hook_answer_within_secs} seconds \
 after it came. A request neither answered nor raised is declined after {answer_within_secs} seconds \
 ({hook_answer_within_secs} for one that is not the App Server's) or when this turn ends; one that is not the App Server's \
 goes back to its session undecided.\n\

@@ -1,4 +1,5 @@
 import type { FailureKind } from "../lib/errors.ts"
+import type { InputIntent, InputReceipt, InputTarget } from "../workspace/types.ts"
 
 export type ReplyStatus = "completed" | "stopped" | "interrupted" | "failed"
 /** A file on a user's message: hex SHA-256, byte size and its cleaned file name. */
@@ -20,13 +21,22 @@ export type TranscriptMessage = {
   rank?: string
   /** On a `bot` message: the other bot that wrote it. */
   sender?: { conversation_id: string; name: string }
+  target?: InputTarget
 }
 export type PendingMessage = {
   message_id: string
   conversation_id: string
   text: string
   report_results?: boolean
+  target: InputTarget
+  intent: InputIntent
+  sequence: number
+  expected_revision?: number
+  attachments?: Attachment[]
+  created_at_ms: number
+  delivery: 'saved' | 'uploading' | 'submitting' | 'accepted' | 'unknown'
+  receipt?: InputReceipt
   /** The entry's refusal, kept so the person can drop it; a lost answer leaves this unset. */
   rejected?: string
 }
-export type MessageRequest = Pick<PendingMessage, "conversation_id" | "message_id" | "text" | "report_results">
+export type MessageRequest = Pick<PendingMessage, "conversation_id" | "message_id" | "text" | "report_results" | "target" | "intent" | "sequence" | "expected_revision" | "attachments">
