@@ -7849,6 +7849,7 @@ def e2e_fixture(options):
                     result = {"manager": {key: manager[key] for key in ("provider", "model", "reasoning_effort")} if manager is not None else None,
                               "roles": provider["roles"], "execution_model": provider["execution_model"], "setup": provider["setup"],
                               "login_count": len(fixture_records(run, "native-provider-login.jsonl")),
+                              "app_server_link_state": provider["app_server"]["link"]["state"],
                               "readiness": provider["readiness"]["state"], "catalog": provider["probe"]["catalog"]["state"],
                               "authentication": provider["probe"]["authentication"],
                               "checked_at_ms": provider["probe"]["checked_at_ms"],

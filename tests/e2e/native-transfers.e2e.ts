@@ -121,10 +121,12 @@ function providerInspection(value: Record<string, unknown>) {
   assert(Array.isArray(value.roles) && value.roles.every(role => role === 'agent' || role === 'execution'));
   assert(typeof value.execution_model === 'string');
   assert(typeof value.login_count === 'number' && Number.isSafeInteger(value.login_count) && value.login_count >= 0);
+  const link = text(value.app_server_link_state);
+  assert(['connected', 'starting', 'off', 'not_found', 'handshake_failed', 'launch_failed'].includes(link));
   const setup = record(value.setup);
   return { manager, roles: value.roles, execution_model: value.execution_model, login_count: value.login_count,
     setup: { directory: text(setup.directory), command: text(setup.command) },
-    readiness: text(value.readiness), authentication: text(value.authentication), catalog: text(value.catalog),
+    app_server_link_state: link, readiness: text(value.readiness), authentication: text(value.authentication), catalog: text(value.catalog),
     checked_at_ms: value.checked_at_ms, checked: value.checked_at_ms !== null,
     jobs: value.jobs.map((item: unknown) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state) }; }),
     running_invocations: value.running_invocations, queued_invocations: value.queued_invocations };
@@ -137,7 +139,7 @@ test('provider settings and queued cancellation work in the installed native app
   assert(simulator && appPath && binary && crypto && source && /^[a-f0-9]{40}$/.test(source), 'Provider acceptance pins its source and actual artifacts');
   const publicPath = resolve(root, '.artifacts/native/public');
   await mkdir(publicPath, { recursive: true, mode: 0o700 });
-  for (const name of ['provider.json', 'provider-navigation.json', 'provider-initial.png', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png', 'terminology-device-kinds.png']) {
+  for (const name of ['provider.json', 'provider-navigation.json', 'provider-probe.json', 'provider-initial.png', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png', 'terminology-device-kinds.png']) {
     await unlink(join(publicPath, name)).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
   const wasm = crypto.replace(/\.js$/, '_bg.wasm');
@@ -242,7 +244,10 @@ test('provider settings and queued cancellation work in the installed native app
   };
   const inspect = async () => providerInspection(await network.call({ op: 'native_provider_inspect' }));
   const probeButton = screen.getByRole('button', 'Codex 检查可用性', { exact: true });
+  const codexRow = () => screen.getByRole('button', /^Codex，/);
   const probe = async () => {
+    await expect.poll(async () => (await inspect()).app_server_link_state, { timeout: 30000 }).toBe('connected');
+    await expect(codexRow()).toHaveAccessibleName(/^Codex，(?:运行 Bot，)?执行任务，(?:未验证，可尝试|需设置|可用)$/, { timeout: 30000 });
     await expect(probeButton).toBeEnabled({ timeout: 30000 });
     const before = (await inspect()).checked_at_ms;
     await probeButton.click();
@@ -252,7 +257,6 @@ test('provider settings and queued cancellation work in the installed native app
     }).toBe(true);
     await expect(probeButton).toBeEnabled({ timeout: 30000 });
   };
-  const codexRow = () => screen.getByRole('button', /^Codex，/);
   const botDetails = screen.getByRole('button', '运行 Bot', { exact: true });
   const executionDetails = screen.getByRole('button', '执行任务', { exact: true });
   const modelButton = () => screen.getByRole('button', /^设备默认模型，/);
@@ -299,8 +303,16 @@ test('provider settings and queued cancellation work in the installed native app
   await expect.poll(async () => (await inspect()).roles, { timeout: 15000 }).toEqual(['execution']);
   expect((await inspect()).manager).toBeNull();
   await probe();
+  const firstProbe = await inspect();
+  await writeFile(join(publicPath, 'provider-probe.json'), `${JSON.stringify({
+    link: firstProbe.app_server_link_state,
+    readiness: ['ready', 'starting', 'needs_setup', 'unverified'].includes(firstProbe.readiness) ? firstProbe.readiness : 'unknown',
+    authentication: ['unverified', 'authenticated', 'not_required', 'sign_in_required'].includes(firstProbe.authentication) ? firstProbe.authentication : 'unknown',
+    catalog: ['available', 'unavailable'].includes(firstProbe.catalog) ? firstProbe.catalog : 'unknown',
+    checked: firstProbe.checked,
+  })}\n`, { mode: 0o600 });
   await expect(codexRow()).toHaveAccessibleName('Codex，执行任务，需设置');
-  expect((await inspect()).authentication).toBe('sign_in_required');
+  expect(firstProbe.authentication).toBe('sign_in_required');
   const setup = (await inspect()).setup;
   await expect(screen.getByText(setup.command, { exact: true })).toBeVisible();
   await screen.getByRole('button', '复制Codex 私有目录认证命令', { exact: true }).click();

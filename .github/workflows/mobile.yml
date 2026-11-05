@@ -314,6 +314,7 @@ jobs:
           name: native-provider-ios-${{ github.sha }}
           path: |
             .artifacts/native/public/provider.json
+            .artifacts/native/public/provider-probe.json
             .artifacts/native/public/provider-initial.png
             .artifacts/native/public/provider-selectable.png
             .artifacts/native/public/provider-controlled.png
