@@ -2134,7 +2134,7 @@ def self_test():
     assert command_line[command_line.index("--memory") + 1] == command_line[command_line.index("--memory-swap") + 1] == "11g"
     assert command_line[command_line.index("--pids-limit") + 1] == "64"
     environments = [command_line[index + 1] for index, value in enumerate(command_line) if value == "--env"]
-    assert environments == ["HOME=/home/runner", "TOKIO_WORKER_THREADS=2",
+    assert environments == ["HOME=/home/runner", "PYTHONDONTWRITEBYTECODE=1", "TOKIO_WORKER_THREADS=2",
                              f"VIBEFACE_DELIVERY_UI_UID={os.getuid()}", f"VIBEFACE_DELIVERY_UI_GID={os.getgid()}"]
     assert command_line[-1] == "1" * 40 and command_line[-3] == str(Path("/work/.artifacts/vdp/live-input/package"))
     assert command_line.count(original[-4]) == 1
