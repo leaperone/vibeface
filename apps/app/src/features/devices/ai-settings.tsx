@@ -379,8 +379,9 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
   const [bin, setBin] = useState(item.bin)
   useEffect(() => setBin(item.bin), [item.bin])
   const working = busy !== ""
-  const missingKey = compact ? item.env.find((row) => row.required && !row.set && !row.inherited) : undefined
-  const issue: ProviderIssue | undefined = item.state === "needs_setup" ? item.issues[0] : compact && !item.installed ? { code: "bin_missing", path: item.bin } : missingKey ? { code: "env_missing", name: missingKey.name } : undefined
+  const launches = item.app_server?.mode !== "system"
+  const missingKey = compact && launches ? item.env.find((row) => row.required && !row.set && !row.inherited) : undefined
+  const issue: ProviderIssue | undefined = item.state === "needs_setup" ? item.issues[0] : compact && launches && !item.installed ? { code: "bin_missing", path: item.bin } : missingKey ? { code: "env_missing", name: missingKey.name } : undefined
   const server = item.app_server
   // The use last asked for: when the device found no Codex folder, the folder typed in turns it on in the same write.
   const [asked, setAsked] = useState<"bot" | "execution" | null>(null)
@@ -461,7 +462,7 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
       </div>
     {compact ? <div className="flex basis-full items-center gap-3 ps-8"><div className="grid min-w-0 flex-1 gap-1">
       <dl className="flex flex-wrap gap-x-4 gap-y-1 text-meta text-muted-foreground">
-        <div className="flex gap-1"><dt>程序</dt><dd>{item.installed ? "已找到" : "未找到"}</dd></div>
+        <div className="flex gap-1"><dt>程序</dt><dd>{!launches ? "外部服务" : item.installed ? "已找到" : "未找到"}</dd></div>
         <div className="flex gap-1"><dt>认证</dt><dd>{missingKey ? "需填写密钥" : { authenticated: "已认证", not_required: "无需登录", sign_in_required: "需登录", unverified: "未验证" }[item.probe.authentication]}</dd></div>
         <div className="flex gap-1"><dt>模型</dt><dd>{providerObservationStates[item.observed.model_known.status]}</dd></div>
       </dl>

@@ -863,6 +863,41 @@ test("automatic connection checks both services without changing uses and reads 
   })
 })
 
+test("compact system provider cards use external service evidence without local prerequisites", async (t) => {
+  for (const mode of ['system', 'spawn'] satisfies NonNullable<ProviderStatus['app_server']>['mode'][]) for (const installed of [false, true]) for (const authentication of ['authenticated', 'unverified', 'sign_in_required'] satisfies ProviderStatus['probe']['authentication'][]) await t.test(`${mode} installed=${installed} ${authentication}`, () => {
+    const item: ProviderStatus = {
+      provider: 'codex', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex',
+      app_server: { mode, socket: '/fixture/codex.sock', link: { state: 'connected', socket: '/fixture/codex.sock', user_agent: 'fixture' } },
+      execution_model: '', execution_readiness: { state: 'ready' }, setup: null, installed, home: null, sessions: null,
+      env: [{ name: 'FIXTURE_KEY', set: false, inherited: false, required: true }], state: 'ready', issues: [], readiness: { state: 'ready' },
+      probe: { provider: 'codex', config_id: 'fixture', checked_at_ms: null, launch: { state: 'launchable' }, authentication, catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
+      observed: { installed: { status: 'rejected', evidence: 'binary_discovery' }, launchable: { status: 'confirmed', evidence: 'app_server_handshake' }, authenticated: { status: 'confirmed', evidence: 'provider_probe' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
+    }
+    const response: NodeSettingsResponse = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: null }, providers: [item], display_paths: {}, suggested_roots: [] }
+    const app = componentHarness('../devices/ai-settings.tsx', {
+      '@vibeface/client/lib/node.ts': nodeSettings,
+      '@vibeface/client/identity/copy.ts': { deviceCopy },
+      '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
+      '@/lib/glossary': { terms: { bot: { icon: 'Bot' }, task: { icon: 'Tasks' }, secret: { icon: 'Key' } } },
+    }, {}, 'ProviderCard')
+    try {
+      const elements = app.render('ProviderCard', { item, response, onboarding: false, compact: true, busy: '', models: null, error: '' })
+      const evidence = elements.filter(({ type }) => type === 'dl').map(elementText).join('')
+      if (mode === 'system') {
+        assert.match(evidence, /程序外部服务/)
+        assert.ok(evidence.includes(`认证${{ authenticated: '已认证', unverified: '未验证', sign_in_required: '需登录' }[authentication]}`))
+        assert.equal(elements.filter(({ props }) => props.name === 'FIXTURE_KEY').length, 0, 'an external service never requests the private key')
+        assert.ok(!elements.some((element) => elementText(element).includes('找不到 Codex 程序')))
+      } else {
+        assert.ok(evidence.includes(`程序${installed ? '已找到' : '未找到'}`))
+        assert.match(evidence, /认证需填写密钥/)
+        assert.equal(elements.filter(({ props }) => props.name === 'FIXTURE_KEY').length, installed ? 1 : 0)
+        assert.equal(elements.some((element) => elementText(element).includes('找不到 Codex 程序')), !installed)
+      }
+    } finally { app.close() }
+  })
+})
+
 test("provider cards keep summary readiness, setup and execution details in their own roles", async (t) => {
   const ready: ProviderReadiness = { state: 'ready' }
   const signIn: ProviderReadiness = { state: 'needs_setup', issue: { stage: 'authentication', code: 'sign_in_required' } }

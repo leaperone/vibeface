@@ -42,6 +42,8 @@ fn registered_login_shell() -> Result<Option<Shell>> {
 
 pub(super) async fn missing(names: &[String], host: &Host) -> Result<BTreeMap<String, String>> {
     let mut inherited = BTreeMap::new();
+    #[cfg(test)]
+    inherited.extend(host.inherited_env.clone());
     if !cfg!(test) {
         for name in names {
             if let Some(value) = std::env::var_os(name) {

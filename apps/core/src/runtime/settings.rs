@@ -571,8 +571,8 @@ impl Runtime {
             .await;
         drop(_work);
         drop(_save);
-        self.apply_provider_launches().await?;
         saved?;
+        self.apply_provider_launches().await?;
         self.probe_provider(provider).await;
         self.node_settings().await
     }
@@ -601,23 +601,17 @@ impl Runtime {
             .as_ref()
             .is_some_and(|manager| manager.provider.on_app_server());
         next.validate(codex_agent)?;
-        let mut config_created = self.enforce_provider_roots(&mut next, codex_agent)?;
+        let roots = ProviderRoots::new(&self.data_dir);
+        roots.apply(&mut next)?;
         let requested = connect.as_ref().map(|connect| connect.provider);
-        if requested == Some(Provider::Codex) && next.launches(Provider::Codex) {
-            config_created |= ProviderRoots::new(&self.data_dir).seed_codex_config(&self.host)?;
-        }
-        if config_created {
-            self.codex.configuration_changed();
-            self.provider_probes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
-            self.pending_provider_launches
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            self.schedule_wakeup.notify_one();
-        }
+        let codex_config = if requested == Some(Provider::Codex) && next.launches(Provider::Codex) {
+            roots.prepare_codex_config(&self.host)?
+        } else {
+            None
+        };
         if let Some(connect) = &connect {
-            discovery::complete_local(&mut next, connect, &self.host).await?;
+            discovery::complete_local(&mut next, connect, codex_config.as_deref(), &self.host)
+                .await?;
         }
         let filled = discovery::missing(
             &Target {
@@ -654,6 +648,11 @@ impl Runtime {
         if next.env != previous.env {
             next.env.save(&self.data_dir)?;
         }
+        let config_created = codex_config
+            .as_deref()
+            .map(|projected| roots.publish_codex_config(projected))
+            .transpose()?
+            .unwrap_or(false);
         if !filled.is_empty() {
             tracing::info!(event = "providers.discovered", filled = ?filled.names(), "filled missing provider paths from this computer");
         }
@@ -668,7 +667,11 @@ impl Runtime {
         if triage != previous_triage {
             self.triage.set_config(triage);
         }
-        if manager_changed
+        if config_created {
+            self.codex.configuration_changed();
+        }
+        if config_created
+            || manager_changed
             || next.switches != previous.switches
             || next.bins != previous.bins
             || next.env != previous.env
@@ -1176,6 +1179,146 @@ impl Runtime {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[tokio::test]
+    async fn local_source_failure_keeps_private_configuration_and_running_launch() -> Result<()> {
+        for full_environment in [false, true] {
+            let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.artifacts")
+                .join(format!("local-settings-failure-{}", uuid::Uuid::new_v4()));
+            crate::config::private_dir(&dir)?;
+            let bin = dir.join("codex");
+            std::fs::write(&bin, "#!/bin/sh\nexit 1\n")?;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700))?;
+            let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
+            config.providers.execution = [Provider::Codex].into();
+            config.bins.insert(Provider::Codex, bin.clone());
+            config.bins.insert(Provider::Cursor, bin);
+            config.save(&dir)?;
+            crate::config::private_write(
+                &dir.join("data-epoch.json"),
+                &crate::config::data_epoch_marker(),
+            )?;
+            crate::config::private_write(
+                &dir.join("identity.json"),
+                &serde_json::to_vec(&crate::crypto::LocalIdentity::generate())?,
+            )?;
+            if full_environment {
+                let mut env = providers::ProviderEnv::default();
+                env.apply(
+                    Provider::Codex,
+                    (0..63)
+                        .map(|index| (format!("FIXTURE_{index}"), Some("synthetic-value".into())))
+                        .collect(),
+                )?;
+                env.save(&dir)?;
+            }
+            let mut node = Runtime::open(&dir).await?;
+            let source = dir.join("source");
+            std::fs::create_dir_all(&source)?;
+            std::fs::write(
+                source.join("config.toml"),
+                "model_provider='fixture'\n[model_providers.fixture]\nenv_key='FIXTURE_CONNECT_KEY'\n",
+            )?;
+            node.host.codex_home = Some(source);
+            node.host.inherited_env.insert(
+                "FIXTURE_CONNECT_KEY".into(),
+                if full_environment {
+                    "synthetic-key".into()
+                } else {
+                    "x".repeat(4097)
+                },
+            );
+            let previous = node.providers();
+            previous.env.save(&dir)?;
+            let saved_env = std::fs::read(dir.join(providers::ENV_FILE))?;
+            let launch = previous.codex_target(false);
+            assert!(!node.codex.configuration_pending(&launch));
+            let target = ProviderRoots::new(&dir).codex_home.join("config.toml");
+            let error = {
+                let _save = node.config_save.lock().await;
+                node.write_providers(
+                    |_| Ok(()),
+                    Some(discovery::LocalConnect {
+                        provider: Provider::Codex,
+                        explicit_env_names: BTreeSet::new(),
+                    }),
+                )
+                .await
+                .err()
+                .context("invalid source must fail")?
+            };
+            assert!(error.is::<discovery::LocalSourceError>());
+            assert!(
+                !target.exists(),
+                "a failed source must not publish prospective configuration"
+            );
+            assert!(node.providers().env == previous.env);
+            assert!(node.providers().codex_target(false) == launch);
+            assert_eq!(std::fs::read(dir.join(providers::ENV_FILE))?, saved_env);
+            assert!(
+                !node
+                    .pending_provider_launches
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+            assert!(!node.codex.configuration_pending(&launch));
+            for provider in [Some(Provider::Cursor), None] {
+                let _save = node.config_save.lock().await;
+                node.write_providers(
+                    |_| Ok(()),
+                    provider.map(|provider| discovery::LocalConnect {
+                        provider,
+                        explicit_env_names: BTreeSet::new(),
+                    }),
+                )
+                .await?;
+                assert!(
+                    !target.exists(),
+                    "unrelated writes must not publish Codex configuration"
+                );
+                assert!(node.providers().env == previous.env);
+                assert!(node.providers().codex_target(false) == launch);
+                assert_eq!(std::fs::read(dir.join(providers::ENV_FILE))?, saved_env);
+                assert!(
+                    !node
+                        .pending_provider_launches
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                );
+                assert!(!node.codex.configuration_pending(&launch));
+            }
+            node.host
+                .inherited_env
+                .insert("FIXTURE_CONNECT_KEY".into(), "synthetic-key".into());
+            {
+                let _save = node.config_save.lock().await;
+                node.write_providers(
+                    |target| {
+                        target.local.env.apply(
+                            Provider::Codex,
+                            BTreeMap::from([("FIXTURE_0".into(), None)]),
+                        )
+                    },
+                    Some(discovery::LocalConnect {
+                        provider: Provider::Codex,
+                        explicit_env_names: BTreeSet::new(),
+                    }),
+                )
+                .await?;
+            }
+            assert!(target.is_file());
+            assert_eq!(
+                node.providers().env.get(Provider::Codex)["FIXTURE_CONNECT_KEY"],
+                "synthetic-key"
+            );
+            assert!(
+                node.pending_provider_launches
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+            drop(node);
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn config_only_local_connection_invalidates_probe_and_waits_for_an_idle_runtime()

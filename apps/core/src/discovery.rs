@@ -23,13 +23,15 @@ pub(crate) struct LocalConnect {
 }
 
 impl LocalConnect {
-    fn names(&self, local: &Local) -> Result<Vec<String>> {
+    fn names(&self, local: &Local, codex_config: Option<&str>) -> Result<Vec<String>> {
         if !local.launches(self.provider) {
             return Ok(vec![]);
         }
-        Ok(self
-            .provider
-            .key_variables(local.env.get(self.provider))
+        let keys = match (self.provider, codex_config) {
+            (Provider::Codex, Some(source)) => crate::manager::provider_keys_from_config(source),
+            _ => self.provider.key_variables(local.env.get(self.provider)),
+        };
+        Ok(keys
             .map_err(|_| LocalSourceError)?
             .into_iter()
             .filter(|name| {
@@ -56,12 +58,13 @@ impl std::error::Error for LocalSourceError {}
 pub(crate) async fn complete_local(
     local: &mut Local,
     connect: &LocalConnect,
+    codex_config: Option<&str>,
     host: &Host,
 ) -> Result<bool> {
     if !local.launches(connect.provider) {
         return Ok(false);
     }
-    let names = connect.names(local)?;
+    let names = connect.names(local, codex_config)?;
     let values = environment::missing(&names, host).await?;
     if values.is_empty() {
         return Ok(false);
@@ -107,6 +110,8 @@ pub struct Host {
     pub home: Option<PathBuf>,
     pub nvm_dir: Option<PathBuf>,
     pub path: Option<OsString>,
+    #[cfg(test)]
+    pub inherited_env: BTreeMap<String, String>,
 }
 
 impl Host {
@@ -126,6 +131,8 @@ impl Host {
             home: dir("HOME"),
             nvm_dir: dir("NVM_DIR"),
             path: std::env::var_os("PATH"),
+            #[cfg(test)]
+            inherited_env: BTreeMap::new(),
         }
     }
 
@@ -704,7 +711,7 @@ exec /bin/sh -c "$2"
 
     #[test]
     fn local_completion_keeps_private_values_and_explicit_removals_per_provider() -> Result<()> {
-        let (dir, host, _) = environment_fixture("private", "exit 1");
+        let (dir, _, _) = environment_fixture("private", "exit 1");
         let roots = crate::providers::ProviderRoots::new(&dir);
         std::fs::create_dir_all(&roots.codex_home)?;
         std::fs::write(
@@ -712,7 +719,7 @@ exec /bin/sh -c "$2"
             "model_provider='selected'\n[model_providers.selected]\nenv_key='PRIVATE_KEY'\nenv_http_headers={a='REMOVED_KEY',b='MISSING_KEY'}\n[model_providers.other]\nenv_key='OTHER_KEY'\n",
         )?;
         let mut local = local();
-        roots.apply(&mut local, false, &host)?;
+        roots.apply(&mut local)?;
         local.env.apply(
             Provider::Codex,
             BTreeMap::from([("PRIVATE_KEY".into(), Some("synthetic-private".into()))]),
@@ -721,19 +728,19 @@ exec /bin/sh -c "$2"
             provider: Provider::Codex,
             explicit_env_names: ["REMOVED_KEY".into()].into(),
         };
-        assert_eq!(connect.names(&local)?, vec!["MISSING_KEY"]);
+        assert_eq!(connect.names(&local, None)?, vec!["MISSING_KEY"]);
         let cursor = LocalConnect {
             provider: Provider::Cursor,
             explicit_env_names: BTreeSet::new(),
         };
-        assert_eq!(cursor.names(&local)?, vec!["CURSOR_API_KEY"]);
+        assert_eq!(cursor.names(&local, None)?, vec!["CURSOR_API_KEY"]);
         local.env.apply(
             Provider::Cursor,
             BTreeMap::from([("CURSOR_API_KEY".into(), Some("synthetic-private".into()))]),
         )?;
-        assert!(cursor.names(&local)?.is_empty());
+        assert!(cursor.names(&local, None)?.is_empty());
         local.switches.codex_app_server.mode = AppServerMode::System;
-        assert!(connect.names(&local)?.is_empty());
+        assert!(connect.names(&local, None)?.is_empty());
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

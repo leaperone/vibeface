@@ -61,4 +61,4 @@ Codex 通过只读账户和模型接口检查，Claude Code 通过无 prompt 的
 
 私有 Codex、Claude Code 和 OpenCode 根可能需要重新认证。`ProviderStatus.setup` 返回非敏感目录和可复制登录命令，Web 与 Mobile 提供复制和重新检查入口。Node 不自动登录，不读取个人 OAuth、钥匙串或 GUI 令牌。Codex/Cursor 启动已启用用途、开启用途及 `configure_provider {connect_local:true}` 共用本机补缺：已有私有环境优先，只将当前服务声明且本次未显式编辑的缺失变量从 Node 环境、受限交互登录 shell 补入 `ProviderEnv`。程序、路径、模型和用途保持原选择。完整契约见[本机 AI 服务接入](local-provider-onboarding.md)。未确认的认证仍显示未知，已确认缺少登录时显示需要设置。
 
-存储使用 epoch 9 最终结构与事件协议 1。同一网络要求所有 Node 使用本轮最终格式，不能混用 epoch 8 或 epoch 9 的旧开发快照；本机 epoch 校验不是 peer 握手。旧形状会拒绝新增字段。程序不会迁移或清空旧 epoch 8 数据。受控协议、真实账户、模型理解质量和手机验收分别记录证据。
+存储使用 epoch 1 最终结构与事件协议 1。同一网络要求所有 Node 使用本轮最终格式，不能混用旧开发快照；本机 epoch 校验不是 peer 握手。旧形状会拒绝新增字段。程序不会迁移或清空旧数据。受控协议、真实账户、模型理解质量和手机验收分别记录证据。
