@@ -628,6 +628,14 @@ def self_test():
     assert "(github.event_name == 'workflow_dispatch' || github.run_attempt > 1) && github.run_id || ''" in concurrency
     assert "cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == 1 }}" in concurrency
     assert "fetch-depth: 0" in workflow.split("\n  ci-gate:\n", 1)[1]
+    for job in ("rust-check", "rust-fast", "rust-slow"):
+        block = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  \w|\Z)", workflow)[1]
+        dependency = "[plan, quick-check]" if job == "rust-check" else "plan"
+        assert f"    needs: {dependency}\n" in block
+        assert "actions/download-artifact@" not in block
+    package = re.search(r"(?ms)^  package:\n(.*?)(?=^  \w|\Z)", workflow)[1]
+    assert "    needs: [plan, crypto-web, web]\n" in package
+    assert "name: crypto-web-${{ github.sha }}" in package and "name: web-${{ github.sha }}" in package
     subprocess.run(["python3", str(root / "scripts/build-inputs.py"), "self-test"], check=True)
     config = (root / "crates/control/src/lib.rs").read_text()
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
