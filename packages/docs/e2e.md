@@ -192,7 +192,7 @@ pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' \
 
 native config 默认关闭 trace 和整段 video。原始日志、自动失败截图、e2e report、邀请、恢复文件、Node 数据与 driver 状态都属于私有材料，不能递归上传 `.artifacts/native/`。CI 只上传固定的 `provider.json`、`provider-initial.png`、`provider-selectable.png`、`provider-controlled.png` 和 `provider-typed.png`。
 
-`provider-initial.png` 是唯一的配对前诊断图。它只在本次 CI 新建的专属 simulator 上，重新安装、清除钥匙串并启动 App 后主动拍摄，且早于首次 `secrets.get` 和邀请输入。用例核对 simulator 文件、实际 UUID、Booted 状态以及包含当前 run ID 和 attempt 的专属名称。此时 App 尚未接收邀请、登录命令或凭证，也没有旧应用数据；初始图只用于查看路由、系统弹窗和空表单。其他三张图仍只在配对后的设置页保存。诊断图不代表配对或表单验收通过。最终收据只有在一个目标测试真实通过、fixture 退出、专属 simulator 删除和私有状态清理后才标为 `passed`。
+`provider-initial.png` 是唯一的配对前诊断图。它只在本次 CI 新建的专属 simulator 上，重新安装、清除钥匙串并启动 App 后主动拍摄，且早于首次 `secrets.get` 和邀请输入。用例核对 simulator 文件、实际 UUID、Booted 状态以及包含当前 run ID 和 attempt 的专属名称。此时 App 尚未接收邀请、登录命令或凭证，也没有旧应用数据；初始图只用于查看路由、系统弹窗和空表单。其他三张图仍只在配对后的设置页保存。诊断图不代表配对或表单验收通过。 导航诊断仅记录固定阶段和已知界面的布尔状态，不输出界面文本、加入链接、命令或剪贴板内容。最终收据只有在一个目标测试真实通过、fixture 退出、专属 simulator 删除和私有状态清理后才标为 `passed`。
 
 失败收据与 stdout 只保留固定阶段、报告是否可读，以及从实际 e2e report 提取的受限错误码、已知 API 名和两个验收文件的行号。错误 message、stack、locator label、值和原始报告不会导出。报告尚未生成时仍保留失败阶段，完整私有日志随后按原清理规则删除。
 
