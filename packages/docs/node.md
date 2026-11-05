@@ -176,7 +176,9 @@ App 扫这种二维码后，按邀请里写的局域网地址直接连发出邀�
 vibeface join 'https://gateway.example/join#vibeface1…' --name '<设备显示名称>'
 ```
 
-链接也可以是手机 App 复制的 `vibeface://join?link=…` 或单独的 `vibeface1…`：Node 按邀请里的地址经 iroh 加入，不需要网页入口。
+链接也可以是手机 App 复制的 `vibeface://join?link=…` 或单独的 `vibeface1…`。CLI 解码邀请票据，通过 iroh 连接票据中的目标设备；链接前面的网页地址用于浏览器打开页面，不决定 CLI 的连接地址。
+
+邀请中的 relay 缺失或不可达时，Node 会复用新 Node 已配置的 `network.entry`、`network.relays`，以及显式启用的 `n0_relays`。使用同一 relay 要求两端都能到达它并具备对应授权；`network.entry` 还要求匹配的 `entry-token`。发现服务只提供地址提示，不授予私有 relay 使用权。
 
 命令显示 6 位安全码并等待批准；在管理设备上比对安全码一致后点**一致，允许**，命令完成加入。Node 原本没在运行时，再启动它（后台服务用 `vibeface service start`）。`--name` 必须明确指定设备名，不读取系统主机名。设备名和已有设备或进行中的请求重名时，Node 自动加序号，例如“我的电脑 2”，重试同一请求沿用该名称。连接中断或按了 Ctrl-C 时，用同一链接、名称和目录重跑，命令先核对原请求，不重新创建；Node 正在运行时，按 Ctrl-C 不会取消加入，批准后照样完成。链接已用过、过期或被拒绝时，命令说明原因，请在管理设备上重新生成链接。
 
