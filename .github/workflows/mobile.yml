@@ -49,7 +49,7 @@ jobs:
         env:
           SOURCE_COMMIT: ${{ github.sha }}
           PYTHONPATH: scripts
-        run: python3 -c 'import os, runpy; runpy.run_path("scripts/run-delivery-live.py")["source_commit"](os.environ["SOURCE_COMMIT"])'
+        run: python3 -B -c 'import os, runpy; runpy.run_path("scripts/run-delivery-live.py")["source_commit"](os.environ["SOURCE_COMMIT"])'
       - name: Build the release APK
         working-directory: apps/mobile
         run: |
