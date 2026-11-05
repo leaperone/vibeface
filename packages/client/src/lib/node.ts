@@ -59,7 +59,7 @@ export type ProviderObservation = {
   evidence: 'binary_discovery' | 'launch_prerequisites' | 'app_server_handshake' | 'app_server_starting' | 'app_server_unavailable' | 'managed_launch_failed' | 'configuration_invalid' | 'authentication_not_observed' | 'model_catalog_not_observed' | 'readiness_not_observed' | 'prerequisites_rejected' | 'provider_probe'
 }
 export type ProviderObservations = Record<'installed' | 'launchable' | 'authenticated' | 'model_known' | 'ready', ProviderObservation>
-export const providerObservationLabels: Record<string, string> = { installed: '程序安装', launchable: '程序启动', authenticated: '登录状态', model_known: '模型可用性', ready: '完整可用性' }
+export const providerObservationLabels: Record<string, string> = { installed: '程序安装', launchable: '程序启动', authenticated: '认证状态', model_known: '模型可用性', ready: '完整可用性' }
 export const providerObservationStates: Record<ProviderObservation['status'], string> = { confirmed: '已确认', rejected: '未满足', unknown: '未验证' }
 /**
  * One local provider of the connected Node. `roles` is what it runs now: `agent` while the bot
@@ -324,9 +324,9 @@ export function probeIssueText(provider: ProviderId, issue: ProbeIssue): string 
   const name = providerNames[provider]
   const messages: Record<ProbeCode, string> = {
     not_installed: `找不到 ${name} 程序，请在运行设备安装或检查路径`, config_invalid: `${name} 配置无法读取，请检查运行设备上的配置`,
-    missing_credential: `${name} 缺少登录信息，请在运行设备设置`, launch_unverified: `${name} 尚未检查启动，请检查可用性`,
-    launch_failed: `${name} 没能启动，请在运行设备检查程序`, sign_in_required: `${name} 需要登录，请在运行设备完成登录`,
-    authentication_unverified: `${name} 登录尚未确认，可发送消息或先检查可用性`, catalog_unavailable: `${name} 模型列表暂不可用，可继续手填模型`,
+    missing_credential: `${name} 缺少认证信息，请在运行设备设置`, launch_unverified: `${name} 尚未检查启动，请检查可用性`,
+    launch_failed: `${name} 没能启动，请在运行设备检查程序`, sign_in_required: `${name} 需要完成认证，请在运行设备登录或配置 API 密钥`,
+    authentication_unverified: `${name} 认证状态尚未确认，可发送消息或先检查可用性`, catalog_unavailable: `${name} 模型列表暂不可用，可继续手填模型`,
     model_unverified: `${name} 尚未确认这个模型，可发送消息或先检查可用性`, model_unavailable: `${name} 无法使用所选模型，请检查模型设置`,
   }
   return messages[issue.code]

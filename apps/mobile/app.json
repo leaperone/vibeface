@@ -43,7 +43,7 @@
         "android.permission.ACCESS_WIFI_STATE",
         "android.permission.CHANGE_WIFI_MULTICAST_STATE"
       ],
-      "versionCode": 249601
+      "versionCode": 250001
     },
     "plugins": [
       "expo-router",
@@ -117,7 +117,7 @@
       ]
     ],
     "extra": {
-      "releaseVersion": "0.0.1"
+      "releaseVersion": "0.0.1-nightly.20261105.1"
     }
   }
 }

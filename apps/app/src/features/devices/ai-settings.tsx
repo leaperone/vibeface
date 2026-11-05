@@ -418,8 +418,8 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
         <p>在运行 AI 的电脑上执行以下命令，为独立目录登录或配置，再点“检查可用性”。不会复制已有登录信息。</p>
         <FolderPath path={item.setup.directory} shown={display[item.setup.directory]} />
         <div className="flex min-w-0 gap-2">
-          <Input readOnly aria-label={`${name} 私有目录登录命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />
-          <Button type="button" variant="outline" onClick={() => { if (item.setup) void navigator.clipboard.writeText(item.setup.command).then(() => toast("已复制登录命令", { tone: "success" }), () => toast("请选中命令后复制", { tone: "warning" })) }}><Copy aria-hidden="true" />复制命令</Button>
+          <Input readOnly aria-label={`${name} 私有目录认证命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />
+          <Button type="button" variant="outline" onClick={() => { if (item.setup) void navigator.clipboard.writeText(item.setup.command).then(() => toast("已复制认证命令", { tone: "success" }), () => toast("请选中命令后复制", { tone: "warning" })) }}><Copy aria-hidden="true" />复制命令</Button>
         </div>
       </div> : null}
       <div className="flex flex-wrap items-center gap-2 text-meta text-muted-foreground">
