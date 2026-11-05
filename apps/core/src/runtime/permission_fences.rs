@@ -266,32 +266,32 @@ mod tests {
                     "group":0,"after":Value::Null}))?,
             )?;
         }
-        let mut store = node.store.lock().await;
-        store.accept_work_fixture(
-            &node.identity,
-            network,
-            WorkSpec {
-                work_id: work_id.into(),
-                conversation: "c".into(),
-                trigger: "message:m1".into(),
-                target: local.clone(),
-                dispatcher: local,
-                call_ref: work_id.into(),
-                kind: WorkKind::Agent(provider),
+        let spec = WorkSpec {
+            work_id: work_id.into(),
+            conversation: "c".into(),
+            trigger: "message:m1".into(),
+            target: local.clone(),
+            dispatcher: local,
+            call_ref: work_id.into(),
+            kind: WorkKind::Agent(provider),
+            model: None,
+            resolved: ResolvedModel {
+                provider,
                 model: None,
-                resolved: ResolvedModel {
-                    provider,
-                    model: None,
-                },
-                cwd: cwd.to_string_lossy().into_owned(),
-                title: work_id.into(),
-                prompt: "work".into(),
-                continues: None,
-                parent: None,
-                thread: Some(target.thread_id.clone()),
             },
-            now_ms(),
-        )?;
+            cwd: cwd.to_string_lossy().into_owned(),
+            title: work_id.into(),
+            prompt: "work".into(),
+            continues: None,
+            parent: None,
+            thread: Some(target.thread_id.clone()),
+        };
+        let mut store = node.store.lock().await;
+        store.accept_work_fixture(&node.identity, network, spec.clone(), now_ms())?;
+        let actual_cwd = cwd.canonicalize()?;
+        let actual_cwd = actual_cwd.to_str().context("fixture cwd")?;
+        store.reserve_work_native_submission(network, &spec, actual_cwd)?;
+        store.begin_reserved_work_native_input(network, &spec, &target.thread_id, actual_cwd)?;
         store.apply_work_signal(
             &node.identity,
             network,
@@ -303,6 +303,27 @@ mod tests {
             now_ms(),
         )?;
         Ok(target)
+    }
+
+    #[test]
+    fn assignment_roots_reject_two_aliases_of_one_physical_directory() -> Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("vibeface-canonical-roots-{}", uuid::Uuid::new_v4()));
+        let actual = directory.join("actual");
+        std::fs::create_dir_all(&actual)?;
+        let actual = actual.canonicalize()?;
+        Runtime::validate_assignment_roots(&[actual.to_string_lossy().into_owned()])?;
+        for name in ["first-alias", "second-alias"] {
+            let alias = directory.join(name);
+            std::os::unix::fs::symlink(&actual, &alias)?;
+            let signed_roots = vec![alias.to_string_lossy().into_owned()];
+            let error = Runtime::validate_assignment_roots(&signed_roots)
+                .expect_err("aliases cannot lock distinct physical resources");
+            assert!(error.to_string().contains("actual canonical directories"));
+            assert_eq!(signed_roots[0], alias.to_string_lossy());
+        }
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -357,7 +378,9 @@ mod tests {
         let retained = retained.canonicalize()?;
         let retained_alias = directory.join("retained-alias");
         std::os::unix::fs::symlink(&retained, &retained_alias)?;
-        let removed = directory.canonicalize()?;
+        let removed = directory.join("removed");
+        std::fs::create_dir(&removed)?;
+        let removed = removed.canonicalize()?;
         let network = &access.network_id;
         let target = running_work(&node, network, &removed, "removed", Provider::Codex).await?;
         let kept =
@@ -404,7 +427,7 @@ mod tests {
             ));
         }
         let mut restored = node.settings_snapshot();
-        restored.roots = vec![removed];
+        restored.roots = vec![directory.canonicalize()?];
         node.configure_node(restored, &admin.device_id()?, None)
             .await?;
         assert_eq!(node.local_permission_epoch.load(Ordering::Acquire), 1);
@@ -434,9 +457,19 @@ mod tests {
         let (node, admin, directory) = node().await?;
         let (trigger, attempt, access, cancel) = active_turn(&node, &admin, &directory).await?;
         let network = &access.network_id;
-        let cwd = directory.canonicalize()?;
-        let target = running_work(&node, network, &cwd, "codex-work", Provider::Codex).await?;
-        let other = running_work(&node, network, &cwd, "pi-work", Provider::Pi).await?;
+        let codex_directory = directory.join("codex-work");
+        let pi_directory = directory.join("pi-work");
+        std::fs::create_dir(&codex_directory)?;
+        std::fs::create_dir(&pi_directory)?;
+        let target = running_work(
+            &node,
+            network,
+            &codex_directory,
+            "codex-work",
+            Provider::Codex,
+        )
+        .await?;
+        let other = running_work(&node, network, &pi_directory, "pi-work", Provider::Pi).await?;
         let save = node.config_save.lock().await;
         node.write_providers(|target| {
             target.local.switches.execution.remove(&Provider::Codex);

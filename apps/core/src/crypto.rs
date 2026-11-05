@@ -250,7 +250,7 @@ pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
         .finalize()
         .into()
 }
-fn decode32(value: &str) -> Result<[u8; 32]> {
+pub(crate) fn decode32(value: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(value).context("invalid hexadecimal key/hash")?;
     bytes
         .try_into()

@@ -243,7 +243,7 @@ test("context state and queue reasons survive records without replacing a remote
   assert.throws(() => records({ memory_staged_count: -1 }))
   assert.throws(() => records({ memory: [{ ...memory, metadata: { ...memory.metadata, origin: 'unknown' } }] }))
   assert.equal(mergeConversation(next, records({ memory_staged_count: null, memory_conflicts: null })).bot_settings.memory_staged_count, null)
-  for (const hold_reason of ['provider_serial', 'task_limit', 'machine_slot', 'pending_check', 'backend_config_pending', 'attachment_preparation', 'earlier_input']) assert.equal(records({ jobs: [{ scope: mainScope, trigger: 'a', state: 'queued', hold_reason }] }).jobs[0].hold_reason, hold_reason)
+  for (const hold_reason of ['provider_serial', 'task_limit', 'machine_slot', 'pending_check', 'backend_config_pending', 'attachment_preparation', 'earlier_input', 'resource_conflict']) assert.equal(records({ jobs: [{ scope: mainScope, trigger: 'a', state: 'queued', hold_reason }] }).jobs[0].hold_reason, hold_reason)
 })
 
 test('a task coordination queue stays separate from its shared work state', () => {

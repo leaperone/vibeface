@@ -359,8 +359,10 @@ async fn prepare_turn(
     prepare_turn_from(
         node,
         network,
-        conversation,
-        scope,
+        &SessionKey {
+            conversation_id: conversation.to_owned(),
+            scope: scope.clone(),
+        },
         local_settings,
         provider_local,
         None,
@@ -372,13 +374,16 @@ async fn prepare_turn(
 async fn prepare_turn_from(
     node: &Runtime,
     network: &str,
-    conversation: &str,
-    scope: &SessionScope,
+    session: &SessionKey,
     mut local_settings: crate::runtime::NodeSettings,
     provider_local: crate::providers::Local,
     selected: Option<crate::config::ManagerSettings>,
     permission_epoch: u64,
 ) -> Result<PreparedTurn> {
+    let SessionKey {
+        conversation_id: conversation,
+        scope,
+    } = session;
     let explicit = selected.is_some();
     let Some(mut settings) = selected.or_else(|| local_settings.manager.clone()) else {
         bail!("this Node has no configured management SDK")
@@ -399,6 +404,8 @@ async fn prepare_turn_from(
             assignment.execution_node == node.identity.device_id()?,
             "task assignment belongs to another Node"
         );
+        Runtime::validate_assignment_roots(&assignment.resource_roots)
+            .map_err(ManagerError::not_started)?;
         let mut allowed = local_settings.roots.clone();
         allowed.push(settings.workspace.clone());
         let allowed = allowed
@@ -970,7 +977,8 @@ async fn turn(
                     selected.reasoning_effort = backup.reasoning_effort;
                     selected.backup.automatic = false;
                     let next = prepare_turn_from(
-                        &node, &network, &conversation, &scope,
+                        &node, &network,
+                        &SessionKey { conversation_id: conversation.clone(), scope: scope.clone() },
                         local_settings.clone(), provider_local.clone(), Some(selected), permission_epoch,
                     ).await.map_err(ManagerError::not_started)?;
                     if node.provider_configuration_pending(next.session_config.provider, &provider_local) {

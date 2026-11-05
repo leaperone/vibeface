@@ -893,8 +893,17 @@ impl Runtime {
             self.publish_changed(network, &request.conversation, Changed::Work(&work_id));
             return Ok(());
         };
-        // An unbound work is interrupted once its turn binds.
+        // pi may still wait for get_state before it has a turn to interrupt.
         if record.state.handle().is_none() {
+            if record.kind == WorkKind::Agent(Provider::Pi) && self.stop_attempt_due(&work_id) {
+                let _input = self.work_input_lock(&work_id).await.write_owned().await;
+                tokio::time::timeout(
+                    STOP_ATTEMPT_TIMEOUT,
+                    self.work_executor(&record)?.interrupt(&record),
+                )
+                .await
+                .context("pi preparation stop timed out")??;
+            }
             return Ok(());
         }
         let at = now_ms();

@@ -3399,8 +3399,11 @@ pub(super) mod tests {
                 error: None
             }
         );
-        let path = transcript(projects_dir(&place.env()).as_deref(), &target.thread_id)
-            .context("work transcript")?;
+        let locator: SteerLocator = serde_json::from_slice(&std::fs::read(
+            node.claude.processes.steer_locator_path("work-input")?,
+        )?)?;
+        let path =
+            transcript(Some(&locator.projects), &target.thread_id).context("work transcript")?;
         let rows: Vec<Value> = records(&path).collect();
         let last = rows
             .iter()
@@ -3547,9 +3550,15 @@ pub(super) mod tests {
         let refused: Vec<_> = [a, b].into_iter().filter_map(Result::err).collect();
         assert_eq!(refused.len(), 1, "the start of the other one says why");
         assert!(
-            format!("{:#}", refused[0]).contains("still runs another work in this session"),
+            format!("{:#}", refused[0]).contains("resource_conflict"),
             "{:#}",
             refused[0]
+        );
+        assert_eq!(
+            refused[0]
+                .downcast_ref::<ExecFailure>()
+                .map(|failure| failure.kind),
+            Some(FailureKind::WriterBusy)
         );
         let mut rejected = 0;
         for spec in &specs {
@@ -3570,6 +3579,11 @@ pub(super) mod tests {
             }
         }
         assert_eq!(rejected, 1, "one session runs one work at a time");
+        assert_eq!(
+            place.user_frames(),
+            2,
+            "the first turn and exactly one concurrent work reached Claude"
+        );
         Ok(())
     }
 

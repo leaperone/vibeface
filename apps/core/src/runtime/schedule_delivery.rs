@@ -161,15 +161,13 @@ impl Runtime {
             if !matches!(
                 job.state,
                 JobState::Steering { .. } | JobState::Steered { .. }
+            ) && let Err(error) = self.store.lock().await.settle_workspace_assignment(
+                &self.identity,
+                network,
+                &job,
+                now_ms(),
             ) {
-                if let Err(error) = self.store.lock().await.settle_workspace_assignment(
-                    &self.identity,
-                    network,
-                    &job,
-                    now_ms(),
-                ) {
-                    tracing::warn!(event="workspace.assignment.reconcile_pending",%error,"assignment lifecycle remains pending");
-                }
+                tracing::warn!(event="workspace.assignment.reconcile_pending",%error,"assignment lifecycle remains pending");
             }
         }
         let assignments = self
@@ -682,8 +680,7 @@ impl Runtime {
                 network,
                 &local,
                 boot,
-                &candidate.conversation_id,
-                &candidate.trigger,
+                (&candidate.conversation_id, &candidate.trigger),
                 &candidate.into,
                 Some(&candidate.source_event.hash),
             )? {

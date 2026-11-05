@@ -17,7 +17,7 @@ export type SessionScope = { kind: 'main' } | { kind: 'workspace_task'; task_id:
 export type InputReceipt = {
   message_id: string; target: InputTarget
   stage: 'entry_accepted' | 'owner_accepted' | 'submitting' | 'provider_accepted' | 'associated' | 'refused' | 'unknown'
-  actual_turn_id: string | null; reason: string | null; retry_safe: boolean
+  actual_turn_id: string | null; reason: string | null; retry_safe: boolean; control_event: string | null
 }
 export type ScopeContext = { conversation_id: string; target: InputTarget } & (
   | { available: true; context: ContextProjection; reason: null }
@@ -57,7 +57,7 @@ export type WorkspaceCommand =
   | { kind: 'revise_task'; task_id: string; expected_revision: number; request: string; expected_result: string; dependencies: string[] }
   | { kind: 'control_task'; task_id: string; expected_revision: number; action: WorkspaceTaskAction }
   | { kind: 'assign_task'; task_id: string; expected_revision: number; assignment_id: string; bot_id: string; execution_node: string; bot_owner_epoch: number; channel_owner_epoch?: number; work_id?: string; resource_roots: string[]; automatic: boolean }
-  | { kind: 'assignment_progress'; assignment_id: string; revision: number; state: WorkspaceAssignment['state']; input_event?: string; evidence_event?: string; result?: string }
+  | { kind: 'assignment_progress'; assignment_id: string; revision: number; state: WorkspaceAssignment['state']; input_event?: string; evidence_event?: string; execution?: TurnRuntime['execution']; result?: string }
   | { kind: 'control_input'; message_id: string; expected_event: string; action: InputControlAction }
 export type WorkspaceDomainState = { channels: WorkspaceChannel[]; tasks: WorkspaceTask[]; assignments: WorkspaceAssignment[]; inputs: QueuedInput[]; coverage: { limit: number; truncated: boolean } }
 export type WorkspaceCommandResult = Omit<WorkspaceDomainState, 'coverage'> & { command_id: string; event_hash: string; duplicate: boolean }
@@ -178,7 +178,7 @@ export type ScopeJob = {
   hold_reason?: QueueHoldReason
 }
 export type AgentLane = 'main' | 'task' | 'schedule_routine' | 'bot_message'
-export type QueueHoldReason = 'active_turn' | 'steering_settlement' | 'provider_serial' | 'task_limit' | 'machine_slot' | 'pending_check' | 'backend_config_pending' | 'attachment_preparation' | 'earlier_input'
+export type QueueHoldReason = 'active_turn' | 'steering_settlement' | 'provider_serial' | 'task_limit' | 'machine_slot' | 'pending_check' | 'backend_config_pending' | 'attachment_preparation' | 'earlier_input' | 'resource_conflict'
 export type ContextProjection = {
   scope: SessionScope
   sources: { kind: 'trigger' | 'message' | 'work' | 'dispatch' | 'checkpoint' | 'handoff' | 'memory' | 'question' | 'attachment'; event_id?: string; author?: string; seq?: number; reference?: string }[]

@@ -221,6 +221,8 @@ pub enum WorkspaceCommand {
         revision: u64,
         state: AssignmentState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution: Option<crate::scheduling::TurnExecution>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         input_event: Option<EventHash>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence_event: Option<EventHash>,

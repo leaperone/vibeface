@@ -1263,7 +1263,10 @@ impl Opencode {
         let mut ticks = tokio::time::interval(TICK);
         let mut streaming = true;
         let mut reported_start = false;
+        let mut settled_since = None;
         let messages = loop {
+            let mut native_start_event = false;
+            let mut terminal_event = false;
             let check = tokio::select! {
                 biased;
                 _ = agent::wait_for_cancel(&mut cancel) => {
@@ -1289,6 +1292,8 @@ impl Opencode {
                 event = events.recv(), if streaming => match event {
                     Some(event) => {
                         let event = manager::redact(event, &secrets);
+                        native_start_event = event["type"] == "session.step.started"
+                            && event["data"]["assistantMessageID"].is_string();
                         if let Some(update) = seen.apply(&event)
                             && let Err(e) = progress(update).await
                         {
@@ -1297,16 +1302,16 @@ impl Opencode {
                             guard.terminal = self.stop_run(&conn, &session, &last).await;
                             break Err(unknown(native, &e.to_string()));
                         }
-                        matches!(
+                        terminal_event = matches!(
                             event["type"].as_str(),
                             Some(
                                 "session.idle"
-                                    | "session.step.started"
                                     | "session.execution.succeeded"
                                     | "session.execution.failed"
                                     | "session.execution.interrupted"
                             )
-                        )
+                        );
+                        terminal_event
                     }
                     None => {
                         streaming = false;
@@ -1315,7 +1320,7 @@ impl Opencode {
                 },
                 _ = ticks.tick() => true,
             };
-            if !check {
+            if !check && (!native_start_event || reported_start) {
                 continue;
             }
             if (self.running().await).is_none_or(|now| now.started_ms != conn.started_ms) {
@@ -1328,17 +1333,22 @@ impl Opencode {
                 break Err(failed(native, lost));
             }
             let errored = seen.error.is_some();
-            let settled = self.settled(&conn, &session, errored).await.ok().flatten();
+            let settled = if check {
+                self.settled(&conn, &session, errored).await.ok().flatten()
+            } else {
+                None
+            };
             if !reported_start {
-                let native_started = match &settled {
-                    Some(messages) => chain(messages, &message).reply.is_some(),
-                    None => self
-                        .tail(&conn, &session, &message)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some_and(|messages| chain(&messages, &message).reply.is_some()),
-                };
+                let native_started = native_start_event
+                    || match &settled {
+                        Some(messages) => chain(messages, &message).reply.is_some(),
+                        None => self
+                            .tail(&conn, &session, &message)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|messages| chain(&messages, &message).reply.is_some()),
+                    };
                 if native_started {
                     if let Some(started) = config
                         .codex_turn
@@ -1357,8 +1367,15 @@ impl Opencode {
                 }
             }
             if let Some(messages) = settled {
+                let observed = settled_since.get_or_insert_with(tokio::time::Instant::now);
+                // A polled end can arrive before the stream's progress and terminal frames.
+                if streaming && !terminal_event && observed.elapsed() < TICK {
+                    continue;
+                }
                 guard.terminal = true;
                 break Ok(messages);
+            } else if check {
+                settled_since = None;
             }
         }?;
         let sent = self.posted(&session).0;
@@ -2511,6 +2528,8 @@ mod tests {
                 "session.execution.interrupted",
                 json!({"sessionID":session,"reason":"user"}),
             ));
+        }
+        if fake.sessions.contains_key(&session) {
             api.idle(&mut fake, &session);
         }
         Json(json!({"interrupted":true}))
@@ -2546,10 +2565,11 @@ mod tests {
             let dir =
                 std::env::temp_dir().join(format!("vibeface-opencode-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(dir.join("work"))?;
+            std::fs::create_dir_all(dir.join("fixture-state"))?;
             let dir = dir.canonicalize()?;
             let fake = Arc::<std::sync::Mutex<Fake>>::default();
             let api = Api {
-                dir: dir.clone(),
+                dir: dir.join("fixture-state"),
                 fake: fake.clone(),
                 events: tokio::sync::broadcast::channel(1024).0,
             };
@@ -2590,7 +2610,10 @@ mod tests {
         /// The fixture's variables: where it records and where the fake API listens.
         fn env(&self) -> BTreeMap<String, String> {
             BTreeMap::from([
-                ("FAKE_OPENCODE_DIR".into(), self.dir.display().to_string()),
+                (
+                    "FAKE_OPENCODE_DIR".into(),
+                    self.dir.join("fixture-state").display().to_string(),
+                ),
                 ("FAKE_OPENCODE_PORT".into(), self.port.to_string()),
                 ("FAKE_API_KEY".into(), "fixture-key".into()),
             ])
@@ -2607,7 +2630,7 @@ mod tests {
 
         /// What the fixture recorded of the serves it stood in for.
         fn recorded(&self, name: &str) -> String {
-            std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
+            std::fs::read_to_string(self.dir.join("fixture-state").join(name)).unwrap_or_default()
         }
     }
 
@@ -3671,8 +3694,13 @@ mod tests {
             .await
             .expect_err("the session runs another work");
         assert!(
-            format!("{busy:#}").contains("still holds this opencode session"),
+            format!("{busy:#}").contains("resource_conflict"),
             "the dispatch says why: {busy:#}"
+        );
+        assert_eq!(
+            busy.downcast_ref::<ExecFailure>()
+                .map(|failure| failure.kind),
+            Some(FailureKind::WriterBusy)
         );
         assert_eq!(
             place.fake.lock().unwrap().sessions[&session].model,
@@ -3711,17 +3739,53 @@ mod tests {
             call_ref: "w-2".into(),
             ..unsure.clone()
         };
-        for work in [&unsure, &second] {
-            let mut store = node.store.lock().await;
-            store.accept_work_fixture(&node.identity, &network, work.clone(), now_ms())?;
-        }
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            &network,
+            unsure.clone(),
+            now_ms(),
+        )?;
+        let input = node
+            .work_start_lease(&network, &unsure, Some(&session))
+            .await?;
+        node.signal_work(
+            &network,
+            &unsure.work_id,
+            Signal::ThreadCreated(session.clone()),
+        )
+        .await?;
+        drop(input);
+        let unknown = node
+            .signal_work(&network, &unsure.work_id, Signal::Probed(Probe::Missing))
+            .await?;
+        assert!(matches!(unknown.state, WorkState::Unverified { .. }));
+        assert!(
+            node.store
+                .lock()
+                .await
+                .work_native_submission_reserved(&unsure.work_id)?
+        );
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            &network,
+            second.clone(),
+            now_ms(),
+        )?;
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();
         let busy = node
             .start_work(opencode.as_ref(), &network, &second, Some(&session), &args)
             .await
             .expect_err("the unsure work holds the session");
-        assert!(format!("{busy:#}").contains("still holds"), "{busy:#}");
+        assert!(
+            format!("{busy:#}").contains("resource_conflict"),
+            "{busy:#}"
+        );
+        assert_eq!(
+            busy.downcast_ref::<ExecFailure>()
+                .map(|failure| failure.kind),
+            Some(FailureKind::WriterBusy)
+        );
         let refused = (node.store.lock().await.work_record("w-2")?).context("recorded")?;
         assert_eq!(
             refused.state,
@@ -3730,6 +3794,21 @@ mod tests {
             }
         );
         assert!(place.prompts().is_empty(), "nothing went into the session");
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .work_record(&unsure.work_id)?
+                .context("unknown work")?
+                .state,
+            unknown.state
+        );
+        assert!(
+            node.store
+                .lock()
+                .await
+                .work_native_submission_reserved(&unsure.work_id)?
+        );
         Ok(())
     }
 

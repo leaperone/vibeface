@@ -140,8 +140,11 @@ function inputControlAction(value: unknown): InputControlAction {
 }
 export function parseInputReceipt(value: unknown): InputReceipt {
   const data = record(value), stage = inputStage(data.stage), retrySafe = flag(data.retry_safe)
+  const controlEvent = data.control_event === null ? null : text(data.control_event)
+  if (controlEvent !== null && !/^[a-f0-9]{64}$/i.test(controlEvent)) throw new Error('输入回执的操作引用格式不对。')
+  if (retrySafe && controlEvent === null) throw new Error('输入回执缺少安全重试所需的操作引用。')
   if (retrySafe && (stage === 'unknown' || stage === 'submitting' || stage === 'provider_accepted' || stage === 'associated')) throw new Error('输入回执不能将已提交或未知结果标记为可重发。')
-  return { message_id: text(data.message_id), target: parseInputTarget(data.target), stage, actual_turn_id: data.actual_turn_id == null ? null : text(data.actual_turn_id), reason: data.reason == null ? null : text(data.reason), retry_safe: retrySafe }
+  return { message_id: text(data.message_id), target: parseInputTarget(data.target), stage, actual_turn_id: data.actual_turn_id == null ? null : text(data.actual_turn_id), reason: data.reason == null ? null : text(data.reason), retry_safe: retrySafe, control_event: controlEvent }
 }
 function inputStage(stage: unknown): InputReceipt['stage'] {
   if (stage !== 'entry_accepted' && stage !== 'owner_accepted' && stage !== 'submitting' && stage !== 'provider_accepted' && stage !== 'associated' && stage !== 'refused' && stage !== 'unknown') throw new Error('输入回执无法识别。')
@@ -163,9 +166,10 @@ export function parseScopeContext(value: unknown): ScopeContext {
 export function parsePendingMessage(item: OutboxItem): PendingMessage {
   const data = record(item.params), delivery = item.delivery ?? 'unknown'
   if (!['saved', 'uploading', 'submitting', 'accepted', 'unknown'].includes(delivery)) throw new Error('本地输入状态无法识别。')
+  if (item.rejection_code !== undefined && item.rejection_code !== 'input_not_saved' && item.rejection_code !== 'input_conflict') throw new Error('本地输入拒绝原因无法识别。')
   const sequence = number(data.sequence)
   if (!sequence) throw new Error('本地输入顺序无效。')
-  return { message_id: text(data.message_id), conversation_id: text(data.conversation_id), text: text(data.text), target: parseInputTarget(data.target), intent: parseInputIntent(data.intent), sequence, expected_revision: optionalNumber(data.expected_revision), attachments: attachments(data.attachments), report_results: data.report_results == null ? undefined : flag(data.report_results), created_at_ms: number(item.created_at_ms), delivery, ...(item.rejected === undefined ? {} : { rejected: item.rejected }), ...(item.receipt === undefined ? {} : { receipt: parseInputReceipt(item.receipt) }) }
+  return { message_id: text(data.message_id), conversation_id: text(data.conversation_id), text: text(data.text), target: parseInputTarget(data.target), intent: parseInputIntent(data.intent), sequence, expected_revision: optionalNumber(data.expected_revision), attachments: attachments(data.attachments), report_results: data.report_results == null ? undefined : flag(data.report_results), created_at_ms: number(item.created_at_ms), delivery, ...(item.rejected === undefined ? {} : { rejected: item.rejected }), ...(item.rejection_code === undefined ? {} : { rejection_code: item.rejection_code }), ...(item.receipt === undefined ? {} : { receipt: parseInputReceipt(item.receipt) }) }
 }
 function taskAction(value: unknown): WorkspaceTask['action'] {
   if (value === 'continue' || value === 'stop' || value === 'cancel' || value === 'defer') return value
@@ -205,7 +209,7 @@ export function parseWorkspaceCommand(value: unknown): WorkspaceCommand {
     case 'revise_task': return { kind: data.kind, task_id: text(data.task_id), expected_revision: number(data.expected_revision), request: text(data.request), expected_result: text(data.expected_result), dependencies: texts(data.dependencies) }
     case 'control_task': return { kind: data.kind, task_id: text(data.task_id), expected_revision: number(data.expected_revision), action: taskAction(data.action) }
     case 'assign_task': return { kind: data.kind, task_id: text(data.task_id), expected_revision: number(data.expected_revision), assignment_id: text(data.assignment_id), bot_id: text(data.bot_id), execution_node: text(data.execution_node), bot_owner_epoch: number(data.bot_owner_epoch), channel_owner_epoch: optionalNumber(data.channel_owner_epoch), work_id: optionalText(data.work_id), resource_roots: texts(data.resource_roots), automatic: flag(data.automatic) }
-    case 'assignment_progress': return { kind: data.kind, assignment_id: text(data.assignment_id), revision: number(data.revision), state: assignmentState(data.state), input_event: optionalText(data.input_event), evidence_event: optionalText(data.evidence_event), result: optionalText(data.result) }
+    case 'assignment_progress': return { kind: data.kind, assignment_id: text(data.assignment_id), revision: number(data.revision), state: assignmentState(data.state), input_event: optionalText(data.input_event), evidence_event: optionalText(data.evidence_event), ...(data.execution == null ? {} : { execution: turnExecution(data.execution) }), result: optionalText(data.result) }
     case 'control_input': return { kind: data.kind, message_id: text(data.message_id), expected_event: text(data.expected_event), action: inputControlAction(data.action) }
     default: throw new Error('操作类型无法识别。')
   }
@@ -265,8 +269,11 @@ export function parseTurnRuntime(value: unknown): TurnRuntime | null {
   if (value == null) return null
   const data = record(value), previous = recordOrNull(data.switched_from)
   const nullable = (value: unknown) => value == null ? null : text(value)
-  if (data.execution !== 'not_started' && data.execution !== 'started' && data.execution !== 'unknown') throw new Error('回合执行状态无法识别。')
-  return { provider: provider(data.provider), model: nullable(data.model), reasoning_effort: nullable(data.reasoning_effort), generation: text(data.generation), session_generation: number(data.session_generation), delivery_id: text(data.delivery_id), stage: providerStage(data.stage), execution: data.execution, attempted_at_ms: number(data.attempted_at_ms), switched_from: previous ? { provider: provider(previous.provider), model: nullable(previous.model), reasoning_effort: nullable(previous.reasoning_effort) } : null, switch_reason: failureKind(data.switch_reason) ?? null }
+  return { provider: provider(data.provider), model: nullable(data.model), reasoning_effort: nullable(data.reasoning_effort), generation: text(data.generation), session_generation: number(data.session_generation), delivery_id: text(data.delivery_id), stage: providerStage(data.stage), execution: turnExecution(data.execution), attempted_at_ms: number(data.attempted_at_ms), switched_from: previous ? { provider: provider(previous.provider), model: nullable(previous.model), reasoning_effort: nullable(previous.reasoning_effort) } : null, switch_reason: failureKind(data.switch_reason) ?? null }
+}
+function turnExecution(value: unknown): TurnRuntime['execution'] {
+  if (value === 'not_started' || value === 'started' || value === 'unknown') return value
+  throw new Error('执行状态无法识别。')
 }
 function agentLane(value: unknown): AgentLane | undefined {
   switch (value) {
@@ -278,7 +285,7 @@ function agentLane(value: unknown): AgentLane | undefined {
 function queueHold(value: unknown): QueueHoldReason | undefined {
   switch (value) {
     case null: case undefined: return undefined
-    case 'active_turn': case 'steering_settlement': case 'provider_serial': case 'task_limit': case 'machine_slot': case 'pending_check': case 'backend_config_pending': case 'attachment_preparation': case 'earlier_input': return value
+    case 'active_turn': case 'steering_settlement': case 'provider_serial': case 'task_limit': case 'machine_slot': case 'pending_check': case 'backend_config_pending': case 'attachment_preparation': case 'earlier_input': case 'resource_conflict': return value
     default: throw new Error('未知的排队原因。')
   }
 }

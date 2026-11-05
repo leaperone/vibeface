@@ -58,9 +58,12 @@ function CreateWorkspaceTask({ open, onOpenChange, botId }: { open: boolean; onO
   const [request, setRequest] = useState('')
   const taskId = useRef(newId())
   const submission = useRef<Extract<WorkspaceCommand, { kind: 'create_task' }> | null>(null)
+  useEffect(() => { if (!submission.current) setSelected(botId ?? '') }, [botId])
+  const selectedId = workspace.bots.find((bot) => bot.bot_id === selected)?.bot_id
+    ?? workspace.bots.find((bot) => bot.bot_id === (botId ?? workspace.selectedBot?.bot_id))?.bot_id ?? workspace.bots[0]?.bot_id ?? ''
   return <Sheet open={open} onOpenChange={onOpenChange}><SheetContent className="overflow-y-auto"><SheetHeader><SheetTitle>新任务</SheetTitle><SheetDescription>选择 Bot，任务后续的补充留在同一个对话里。</SheetDescription></SheetHeader>
     <form className="grid gap-4 px-4 pb-6" onSubmit={(event) => { event.preventDefault(); void action.run('create-task', async () => {
-      const owner = workspace.bots.find((bot) => bot.bot_id === (submission.current?.owner_bot ?? selected))
+      const owner = workspace.bots.find((bot) => bot.bot_id === (submission.current?.owner_bot ?? selectedId))
       if (!owner) throw new Error('请选择一个 Bot。')
       const command: Extract<WorkspaceCommand, { kind: 'create_task' }> = submission.current ?? { kind: 'create_task', task_id: taskId.current, owner_bot: owner.bot_id, title: title.trim(), request: request.trim(), expected_result: title.trim(), source_events: [], dependencies: [], reply_only: false }
       submission.current = command
@@ -73,11 +76,11 @@ function CreateWorkspaceTask({ open, onOpenChange, botId }: { open: boolean; onO
       await navigate({ to: '/tasks/$taskId', params: { taskId: task.task_id } })
       submission.current = null; taskId.current = newId(); setTitle(''); setRequest('')
     }) }}>
-      <label className="grid gap-2 text-meta font-medium">交给哪个 Bot<NativeSelect aria-label="任务 Bot" required disabled={Boolean(submission.current)} value={selected} onChange={(event) => setSelected(event.currentTarget.value)}>{workspace.bots.map((bot) => <NativeSelectOption key={bot.bot_id} value={bot.bot_id}>{bot.name}</NativeSelectOption>)}</NativeSelect></label>
+      <label className="grid gap-2 text-meta font-medium">交给哪个 Bot<NativeSelect aria-label="任务 Bot" required disabled={Boolean(submission.current)} value={submission.current?.owner_bot ?? selectedId} onChange={(event) => setSelected(event.currentTarget.value)}>{workspace.bots.map((bot) => <NativeSelectOption key={bot.bot_id} value={bot.bot_id}>{bot.name}</NativeSelectOption>)}</NativeSelect></label>
       <label className="grid gap-2 text-meta font-medium">任务名称<Input required readOnly={Boolean(submission.current)} maxLength={512} value={title} onChange={(event) => setTitle(event.currentTarget.value)} placeholder="例如：检查官网导航" /></label>
       <label className="grid gap-2 text-meta font-medium">交代内容<Textarea required readOnly={Boolean(submission.current)} maxLength={100000} className="min-h-36" value={request} onChange={(event) => setRequest(event.currentTarget.value)} placeholder="描述要完成的事情和需要保留的约束" /></label>
       <InlineError error={action.error} />{submission.current ? <p role="status" className="text-meta text-muted-foreground">原交代已保留，重试会继续确认同一个任务。</p> : null}
-      <Button type="submit" disabled={Boolean(action.busy) || !workspace.writable}>{action.busy ? '正在保存任务' : '创建并发送'}</Button>
+      <Button type="submit" disabled={Boolean(action.busy) || !workspace.writable || !selectedId}>{action.busy ? '正在保存任务' : '创建并发送'}</Button>
     </form>
   </SheetContent></Sheet>
 }

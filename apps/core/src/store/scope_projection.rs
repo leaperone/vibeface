@@ -5,7 +5,7 @@ use crate::{
     scheduling::{SessionScope, parse_schedule_trigger},
     workspace::InputTarget,
 };
-use anyhow::Result;
+use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use std::collections::BTreeSet;
 
@@ -411,9 +411,70 @@ impl Store {
         thread: &str,
         turn: &str,
     ) -> Result<Option<InputTarget>> {
+        let foreign: bool = self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM scheduler_sessions WHERE native_id=?1 AND conversation_id<>?2
+                UNION ALL SELECT 1 FROM manager_turns t JOIN scheduler_jobs j ON j.attempt_id=t.attempt_id
+                    WHERE t.thread_id=?1 AND j.conversation_id<>?2)",
+            params![thread, conversation],
+            |row| row.get(0),
+        )?;
+        ensure!(!foreign, "native session belongs to another conversation");
+        let bindings = self
+            .connection
+            .prepare(
+                "SELECT r.work_id,COALESCE(r.turn_id,w.turn_id) FROM work_runs r LEFT JOIN works w
+                ON w.network_id=?1 AND w.work_id=r.work_id
+             WHERE r.thread_id=?2 OR w.thread_id=?2 OR json_extract(w.dispatch,'$.thread')=?2
+             ORDER BY r.work_id",
+            )?
+            .query_map(params![network, thread], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut reassigned = false;
+        let mut work_ids = Vec::new();
+        for (work_id, work_turn) in bindings {
+            let work = self
+                .work_record(&work_id)?
+                .context("native work binding is missing")?;
+            let owner: Option<String> = self
+                .connection
+                .query_row(
+                    "SELECT s.conversation_id FROM session_owners s JOIN works w
+                    ON w.network_id=s.network_id AND w.work_id=?3 AND w.target_node=s.node
+                 WHERE s.network_id=?1 AND s.session_id=?2 AND s.attribution IS NOT NULL
+                    AND s.muted=0 AND s.rank>w.dispatch_rank
+                    AND NOT EXISTS(SELECT 1 FROM bot_deletions d
+                        WHERE d.network_id=s.network_id AND d.conversation_id=s.conversation_id)",
+                    params![network, thread, work.work_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if work.conversation != conversation {
+                ensure!(
+                    work.state.finished() && owner.as_deref() == Some(conversation),
+                    "native session belongs to another conversation"
+                );
+                reassigned = true;
+            } else if work.state.finished() {
+                ensure!(
+                    owner.as_deref().is_none_or(|owner| owner == conversation),
+                    "native session was handed to another conversation"
+                );
+            }
+            if work.conversation == conversation
+                && (turn.is_empty()
+                    || work_turn
+                        .as_deref()
+                        .is_none_or(|work_turn| work_turn == turn))
+            {
+                work_ids.push(work_id);
+            }
+        }
         let mut statement = self.connection.prepare(
             "SELECT j.scope FROM manager_turns t JOIN scheduler_jobs j ON j.attempt_id=t.attempt_id
-             WHERE j.conversation_id=?1 AND t.thread_id=?2 AND (t.turn_id=?3 OR t.turn_id IS NULL)
+             WHERE j.conversation_id=?1 AND t.thread_id=?2 AND (?3='' OR t.turn_id=?3 OR t.turn_id IS NULL)
              UNION SELECT scope FROM scheduler_sessions WHERE conversation_id=?1 AND native_id=?2",
         )?;
         let scopes = statement
@@ -421,39 +482,71 @@ impl Store {
                 row.get::<_, String>(0)
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut target = None;
+        let mut candidates = Vec::new();
+        if reassigned {
+            candidates.push(
+                main_target_from(&self.connection, network, conversation)?
+                    .target()
+                    .context("the native session's new owner has no Bot")?,
+            );
+        }
         for scope in scopes {
-            let Some(candidate) = session_target_from(
-                &self.connection,
-                network,
-                conversation,
-                &SessionScope::from_storage_key(&scope)?,
-            )?
-            else {
-                return Ok(None);
-            };
-            if target.as_ref().is_some_and(|target| target != &candidate) {
-                return Ok(None);
-            }
-            target = Some(candidate);
+            candidates.push(
+                session_target_from(
+                    &self.connection,
+                    network,
+                    conversation,
+                    &SessionScope::from_storage_key(&scope)?,
+                )?
+                .context("native session has an unknown scope target")?,
+            );
         }
-        if target.is_some() {
-            return Ok(target);
+        for work_id in work_ids {
+            candidates.push(InputTarget::Work { work_id });
         }
-        let work_ids = self.connection
-            .prepare("SELECT work_id FROM work_runs WHERE conversation_id=? AND thread_id=? AND (turn_id=? OR turn_id IS NULL)")?
-            .query_map(params![conversation, thread, turn], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        match work_ids.as_slice() {
-            [work_id] => session_target_from(
-                &self.connection,
-                network,
-                conversation,
-                &SessionScope::Task {
-                    work_id: work_id.clone(),
+        let mut target = None;
+        let mut scope = None;
+        for candidate in candidates {
+            let (candidate, main_work) = match candidate {
+                InputTarget::Work { work_id } => match target_from(
+                    &self.connection,
+                    network,
+                    conversation,
+                    Source::Work(work_id.clone()),
+                )? {
+                    Destination::Scoped(target) => (target, false),
+                    Destination::Main(_) => (InputTarget::Work { work_id }, true),
+                    Destination::Unknown => bail!("native work has an unknown input target"),
                 },
-            ),
-            _ => Ok(None),
+                candidate => (candidate, false),
+            };
+            let candidate_scope = if main_work {
+                SessionScope::Main
+            } else {
+                match &candidate {
+                    InputTarget::BotMain { .. } | InputTarget::ChannelMember { .. } => {
+                        SessionScope::Main
+                    }
+                    InputTarget::Task { task_id } | InputTarget::ChannelTask { task_id, .. } => {
+                        SessionScope::WorkspaceTask {
+                            task_id: task_id.clone(),
+                        }
+                    }
+                    InputTarget::Work { work_id } => SessionScope::Task {
+                        work_id: work_id.clone(),
+                    },
+                    InputTarget::Routine { trigger, .. } => SessionScope::Routine {
+                        trigger: trigger.clone(),
+                    },
+                }
+            };
+            ensure!(
+                scope.as_ref().is_none_or(|scope| scope == &candidate_scope),
+                "native session has conflicting scope bindings"
+            );
+            scope = Some(candidate_scope);
+            target.get_or_insert(candidate);
         }
+        Ok(target)
     }
 }

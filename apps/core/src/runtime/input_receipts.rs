@@ -29,6 +29,18 @@ fn receipt_identity(value: &Value, message_id: &str, target: &InputTarget) -> Re
         value["retry_safe"].is_boolean(),
         "input receipt has no retry evidence"
     );
+    let control = value
+        .get("control_event")
+        .context("input receipt has no control reference")?;
+    if let Some(hash) = control.as_str() {
+        crate::crypto::decode32(hash)?;
+    } else {
+        ensure!(control.is_null(), "invalid input control reference");
+    }
+    ensure!(
+        value["retry_safe"] != true || control.is_string(),
+        "safe retry has no exact input control reference"
+    );
     ensure!(
         value["stage"] != "unknown" || value["retry_safe"] == false,
         "unknown input receipt cannot authorize a retry"
@@ -121,7 +133,7 @@ impl Runtime {
             {
                 Ok(value) => value,
                 Err(_) => json!({"message_id":message_id,"target":target,"stage":"unknown",
-                    "actual_turn_id":null,"reason":"执行设备接收状态尚未确认。","retry_safe":false}),
+                    "actual_turn_id":null,"control_event":null,"reason":"执行设备接收状态尚未确认。","retry_safe":false}),
             }
         };
         receipt_identity(&value, &message_id, &target)?;
@@ -139,13 +151,17 @@ mod tests {
             task_id: "task-a".into(),
         };
         let mut value = json!({"message_id":"m1","target":target,"stage":"unknown",
-            "actual_turn_id":null,"reason":null,"retry_safe":false});
+            "actual_turn_id":null,"control_event":null,"reason":null,"retry_safe":false});
         receipt_identity(&value, "m1", &target)?;
         value["target"]["task_id"] = json!("task-b");
         assert!(receipt_identity(&value, "m1", &target).is_err());
         value["target"] = serde_json::to_value(&target)?;
         value["retry_safe"] = json!(true);
         assert!(receipt_identity(&value, "m1", &target).is_err());
+        value["stage"] = json!("refused");
+        assert!(receipt_identity(&value, "m1", &target).is_err());
+        value["control_event"] = json!("a".repeat(64));
+        receipt_identity(&value, "m1", &target)?;
         value["retry_safe"] = json!(false);
         assert!(receipt_identity(&value, "m2", &target).is_err());
         Ok(())

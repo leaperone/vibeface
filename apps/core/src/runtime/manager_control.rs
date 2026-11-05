@@ -191,11 +191,39 @@ impl Runtime {
             !active.fenced.load(Ordering::Acquire) && active.provider == provider,
             "management input target is no longer valid"
         );
-        Self::check_manager_permission(
-            &*self.store.lock().await,
-            &self.identity.device_id()?,
-            &active.access,
-        )?;
+        let store = self.store.lock().await;
+        let local = self.identity.device_id()?;
+        Self::check_manager_permission(&store, &local, &active.access)?;
+        let manager = active
+            .access
+            .manager
+            .as_ref()
+            .context("manager metadata missing")?;
+        let scope = active
+            .access
+            .conversation_id
+            .as_deref()
+            .context("manager scope missing")?;
+        let job = store
+            .scheduler_job(scope, &manager.trigger)?
+            .context("manager job missing")?;
+        if let Some(assignment) = crate::store::workspace::workspace_assignment_for_job_from(
+            &store.connection,
+            &active.access.network_id,
+            &local,
+            &job,
+        )? && let Err(error) = Self::validate_assignment_roots(&assignment.resource_roots)
+        {
+            if !job.tool_calls
+                && !job.pending_check
+                && job.runtime.as_ref().is_some_and(|runtime| {
+                    runtime.execution == crate::scheduling::TurnExecution::NotStarted
+                })
+            {
+                return Err(crate::manager::ManagerError::not_started(error));
+            }
+            return Err(error);
+        }
         Ok(guard)
     }
 

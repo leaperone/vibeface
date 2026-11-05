@@ -542,7 +542,7 @@ A 已派发 B 后掉线时，从 C 打开原业务会话，等待 DAG 补齐，�
 
 本机 scheduler 按 Provider descriptor 检查实际 Bot/provider instance 的并发能力。Serial instance 的回合互斥，其他 Bot 可并行；Parallel instance 可同时运行主聊天和独立 task。`config.json` 的 `scheduling.machine_slots` 默认 4，限制本机所有 Bot 协调回合；`scheduling.task_limit` 默认 2，限制单个 Bot 的并行 Agent task。两者不限制独立编码工作的执行器。结果未知的回合继续占用 slot，先核对再释放。排队状态按真实 gate 显示当前回合、steer 核对、Provider 串行、task 上限、机器 slot 或待核对。本人消息优先，其余按 admission sequence、会话与 trigger 稳定排序；受阻 task 不挡住可运行的本人消息。业务 Task Assignment 在本机核验已声明资源目录冲突，同目录写任务需要等待。该约束不构成跨设备全局文件锁。多个 Agent 修改同一项目时，仍使用独立 worktree 或独立根目录隔离。
 
-浏览器在 IndexedDB 中保留尚未确认的消息和它的设备签名，入口把消息写进自己的签名日志并回执后删除。入口回执 `pending_delivery` 时，由入口负责继续投递给调度 Node，浏览器不再重发。回执丢失时，浏览器经同一或另一个访问地址原样重发同一请求，Node 按消息编号返回原来的结果。刷新后重试须使用原内容和汇报意图；改写正文会被拒绝，避免把新内容误当成旧操作重试。
+浏览器在 IndexedDB 中逐条保存输入、附件和设备签名。入口确认保存后由入口继续投递，客户端回读原消息的逐阶段状态；历史确认接纳后才清理普通本地记录。拒绝和未知项保留原身份，查询结果未知不重发。只有明确未开始且 Node 允许重试的失败输入，才显示“重试原输入”，用新的签名 Release 继续原任务。取消的输入不能复活。详细回执与幂等边界见 [可靠调度回执](node-protocol.md#可靠调度回执)。
 
 ## 作为后台应用运行
 

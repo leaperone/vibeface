@@ -206,7 +206,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `conversation` | `conversation_id` | 会话（含负责人与 `owner_epoch`）、机器人、消息、`works`（DAG 投影，含 `state`）、`deliveries`（本机还在转交的派发和停止请求）、`changes`、`bot_settings`、`sent`（本 bot 发给其他 bot 的消息 `{message_id, to, text, created_at_ms}`，`to` 是对方会话）、`checks`、`questions`（本会话的提问及回答）、`sessions`（归给本 Bot 的外来会话，含 `muted`）、`local_node`、调度队列和 `observation_targets`（本次观察进度的设备）。负责人是其他设备时，入口限时向它读取 `scheduler_jobs`，带 `source_node` 合并进调度队列，只用于显示、不写本地；`scheduler.remote` 为 `{owner, reachable}`，联系不上时 `reachable: false` |
 | `open_works` | 无 | 全网仍要本人看的工作 `{works}`：没有结果或结果未知的工作；每个会话最新结束的工作失败或被拒、且还没跟进的那一项；以及本机发出、被拒且还没跟进的派发。跟进指之后又有工作结束、本人在它结束后发的消息有了完成的回复、它的汇报回合回复完成，或本人在待处理关掉它。只在 SQL 里选出这些工作，不读整段历史。派发项的 `state` 为 `dispatch_rejected`，没有 `outcome`。只有本人客户端能调用 |
 | `workspace_overview` | 可选 `conversation_id`、`limit`（1 至 256，默认 256）、`include_finished`（默认 `false`）、`include_sessions`（默认 `true`）；不支持 `cursor` | 本机所知事实的有界只读汇总，只给本人客户端：`{schema: 1, generated_at_ms, network_epoch, heads, consistency, truncated, conversations, bots, tasks, questions, checks, jobs, sessions, deliveries, relations, coverage}`。只含未删除 Bot 的会话。不带 `include_finished` 时 `tasks` 只取 `open_works` 那部分工作，已结束的只按 SQL 计数进 `coverage.omitted_finished`；本机还没被接收、被拒（仍未跟进）或结果未知的派发，以及已接收但工作还没同步来的派发（`accepted_waiting_sync`）也列进 `tasks` 和 `deliveries`。各列表超过 `limit` 时截断，`truncated` 为 `true`，`coverage.omitted_*` 给出截掉的条数。负责人是其他设备的会话不去问它，列进 `coverage.remote_owners`，此时 `consistency` 为 `partial` |
-| `message` | `conversation_id`、`message_id`、`text`、可选 `attachments`、`report_results`、`attestation` | 保存本人消息并返回调度回执；带附件时 `text` 可以为空 |
+| `message` | `conversation_id`、`message_id`、`target`、`intent`、`sequence`、`text`、`attestation`，Task 目标还须 `expected_revision`，可选 `attachments`、`report_results` | 保存绑定目标的本人输入并返回调度回执；带附件时 `text` 可以为空。字段和回执约束见下文可靠调度回执 |
 | `set_owner` | `conversation_id`、`scheduler_node`、`epoch`、`attestation` | 换会话负责人，`epoch` 必须等于当前 `owner_epoch + 1` |
 | `cancel_manager` | `conversation_id`、`trigger` | 请求停止指定管理轮，不停止已派发的工作；排队中的回合记为已停止并写一条 `stopped` 回复。本机不持有该回合时转给会话负责人，超时返回 `{cancel_requested: false, unconfirmed: true, owner}`，不重发，客户端重读会话对账 |
 | `reply_unanswered` | `conversation_id`、`message_ids` | 本机作为负责人，为其中仍未回复的消息排队回复，返回 `{receipts}`；重试不会再排 |
@@ -240,9 +240,9 @@ Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, 
 
 本人普通输入使用 `InputPosted`。`message` 请求必需携带 `target`、`intent`、目标内 `sequence`，Task 修改还核验 `expected_revision`。目标可以是 Bot Main、稳定业务 Task、已登记 Work、Routine、频道成员或频道 Task。签名覆盖目标、意图、顺序、revision、正文、完整附件和汇报选项。审批回答仍使用绑定原 `question_id` 的签名 `MessagePosted`，不能由普通输入冒充。
 
-`workspace_command` 持久化频道、任务、Assignment 和队列控制命令。相同 command ID 回读原结果，改变内容须换 ID。`workspace_state` 与 `workspace_history` 是有界共享投影，保留截断说明和已核验发言身份。`scope_context` 返回确切目标的本机编译来源与省略数量，`input_receipt` 返回该消息的逐阶段证据。Main 快照只包含 Main 消息和私有 job 投影；`scope_jobs` 另供明确目标选择，不携带原始提示、错误正文或私密会话内容。
+`workspace_command` 持久化频道、任务、Assignment 和队列控制命令。相同 command ID 回读原结果，改变内容须换 ID。`workspace_state` 与 `workspace_history` 是有界共享投影，保留截断说明和已核验发言身份。`scope_context` 返回确切目标的本机编译来源与省略数量，`input_receipt` 返回该消息的逐阶段证据。Main 快照只包含 Main 消息和私有 job 投影；`scope_jobs` 另供明确目标选择，不携带原始提示、错误正文或私密会话内容。 `input_receipt.control_event` 是确切输入控制事件的哈希，不可达时为 null。`retry_safe=true` 必须带有效控制引用，未知结果始终为 false。
 
-调度 job 以 `(conversation_id, trigger)` 为键，`trigger` 为 `message:<message_id>`、`work:<work_id>`、`task:<work_id>`、`schedule:<schedule_id>:<slot_ms>` 或 `bot_message:<message_id>`，重试和同步都不会产生第二个 job。`message` 返回 `accepted`、`state`、`trigger`、`message_id` 和 `receipt`：
+调度 job 以 `(conversation_id, trigger)` 为键，`trigger` 为 `message:<message_id>`、`work:<work_id>`、`task:<work_id>`、`assignment:<assignment_id>`、`schedule:<schedule_id>:<slot_ms>` 或 `bot_message:<message_id>`，重试和同步都不会产生第二个 job。`message` 返回 `accepted`、`state`、`trigger`、`message_id` 和 `receipt`：
 
 ```json
 {
@@ -253,7 +253,7 @@ Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, 
 }
 ```
 
-会话负责人由 `ConversationOwner` 决定。入口不是负责人时，消息写入入口自己的日志并留在本机 outbox，回执 `state=pending_delivery`，入口每 3 秒经 `vibeface/rpc/1` 的 `deliver` 投递一次，负责人按触发事件幂等接纳。投递、待派发的工作和待送达的停止请求按目标设备同时进行，同一设备按顺序；某台设备连不上或超时没有回应时，本轮不再向它发其余请求，留到下一轮，不耽误发往其他设备的请求。投递时才解析负责人，所以换负责人后旧负责人尚未开始的 job 交给新负责人。浏览器收到入口回执即删除自己的 outbox 项。
+会话负责人由 `ConversationOwner` 决定。入口不是负责人时，消息写入入口自己的日志并留在本机 outbox，回执 `state=pending_delivery`。入口通过持久 PeerEnvelope 短准入投递，远端先保存命令并返回 `saved`，缺失的事件由后台同步补齐，只有 `owner_accepted` 才结清入口 outbox。同一逻辑目标按 sequence 顺序投递，不同目标独立推进，同一远端设备的其他 scope 不等待慢请求。未知且没有保存证据的命令阻止同目标后项越过。首次发送前在 Store 内绑定目标 Node，可能已发送后只查询原身份，不自动转投另一 Node。客户端保存入口回执后继续回读逐条输入状态，历史确认接纳后才清理普通本地 outbox 项，拒绝或未知项继续保留。
 
 回合以 `owner_epoch` 为 fence。领取 job 时记下当时的 `owner_epoch`，之后工具调用的权限检查要求本机仍是负责人且 epoch 未变，换走再换回也算失效。旧负责人收到更高 epoch 的 `conversation_owner` 后立即拒绝该回合的后续工具写入，并走停止回复的取消路径结束它：取消得到确认时回复状态为已停止，未确认时记为中断并留待核对，不重做也不交给新负责人重放。Agent 任务在工作所在设备运行，不受负责人 fence。
 

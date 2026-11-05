@@ -56,6 +56,7 @@ impl TriggerKind {
 pub enum QueueHoldReason {
     AttachmentPreparation,
     EarlierInput,
+    ResourceConflict,
     ActiveTurn,
     SteeringSettlement,
     ProviderSerial,
@@ -317,7 +318,7 @@ pub struct SteerReceipt {
 pub enum JobState {
     Queued,
     /// One registered native submission, with acceptance saved separately from its result.
-    /// An uncertain submission is only read back, never sent again.
+    /// An uncertain submission is read back; only explicit NotArrived permits requeue.
     Steering {
         into: SteerTarget,
         #[serde(default, skip_serializing_if = "Option::is_none")]

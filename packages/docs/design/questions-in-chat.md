@@ -72,7 +72,7 @@ QuestionAsked {                       // 写在拥有该 session 的 Bot 会话
 	target: Option<InputTarget>,       // 已核验的原 Main、Task、Work 或 Routine；未知保持空
 	severity: Severity,               // info | attention | urgent
 	text: String,                     // 问题本身，≤1024 字节
-	choices: Vec<Choice>,             // ≤8；文字回答始终可用
+	choices: Vec<Choice>,             // ≤8；普通问题可用文字回答，原生审批只接受绑定的真实动作
 	about: Subject,
 	attention: AttentionRequest,
 }

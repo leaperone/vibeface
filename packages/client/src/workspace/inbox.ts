@@ -62,9 +62,9 @@ export function inboxItems({ device, workspace }: InboxSource): InboxItem[] {
     const bot = workspace.bots.find((item) => item.conversation_id === work.conversation_id)
     if (bot && failedWork(work)) items.push({ key: `failed:${work.work_id}`, kind: "failed", work, bot, title: work.title || "任务没有完成", meta: nodeName(work.target_node, { nodes: workspace.nodes }) })
   }
-  for (const message of workspace.pendingMessages.filter((item) => item.delivery === 'unknown' || item.rejected !== undefined)) items.push({
+  for (const message of workspace.pendingMessages.filter((item) => item.delivery === 'unknown' || item.rejected !== undefined || item.receipt?.stage === 'refused')) items.push({
     key: `undelivered:${message.message_id}`, kind: 'undelivered', message,
-    title: message.rejected === undefined ? '输入结果需要确认' : '输入被拒绝',
+    title: message.rejected !== undefined || message.receipt?.stage === 'refused' ? '输入被拒绝' : '输入结果需要确认',
     meta: workspace.bots.find((bot) => bot.conversation_id === message.conversation_id)?.name,
   })
   for (const join of openJoins(device)) items.push({ key: `join:${join.join_id}`, kind: "join", join, title: `${join.name || "新设备"} 想加入` })

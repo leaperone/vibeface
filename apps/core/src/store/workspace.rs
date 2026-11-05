@@ -23,6 +23,10 @@ struct Graph {
     inputs: BTreeMap<String, InputControlState>,
     queue_order: Vec<String>,
     last_rank: String,
+    #[serde(default)]
+    stopped: BTreeMap<String, AssignmentStopProof>,
+    #[serde(default)]
+    retry_blocked: BTreeSet<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommandResult {
@@ -41,6 +45,14 @@ struct InputControlState {
     cancelled: bool,
     text: Option<String>,
     attachments: Option<Vec<Attachment>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AssignmentStopProof {
+    event_hash: String,
+    evidence_event: String,
+    source_event: String,
+    revision: u64,
 }
 
 fn valid_id(value: &str) -> Result<()> {
@@ -138,11 +150,9 @@ pub(crate) fn validate_command(command: &WorkspaceCommand) -> Result<()> {
                     );
                     validate_attachments(attachments)?;
                 }
-                InputControl::Move { before_message_id } => {
-                    if let Some(id) = before_message_id {
-                        valid_id(id)?;
-                    }
-                }
+                InputControl::Move {
+                    before_message_id: Some(id),
+                } => valid_id(id)?,
                 _ => {}
             }
         }
@@ -266,6 +276,7 @@ pub(crate) fn validate_command(command: &WorkspaceCommand) -> Result<()> {
             valid_roots(resource_roots)?;
         }
         WorkspaceCommand::AssignmentProgress {
+            execution,
             assignment_id,
             revision,
             state,
@@ -274,6 +285,11 @@ pub(crate) fn validate_command(command: &WorkspaceCommand) -> Result<()> {
             result,
         } => {
             valid_id(assignment_id)?;
+            ensure!(
+                *execution != Some(crate::scheduling::TurnExecution::NotStarted)
+                    || *state == AssignmentState::Stopped,
+                "not-started evidence belongs to a stopped assignment"
+            );
             ensure!(*revision > 0, "invalid assignment revision");
             ensure!(
                 *state != AssignmentState::Proposed,
@@ -363,6 +379,61 @@ impl Graph {
             }
         }
         Ok(())
+    }
+    fn startup_retry_assignment(
+        &self,
+        message_id: &str,
+        owner: &str,
+        rearmed: bool,
+    ) -> Result<Option<String>> {
+        let Some(input) = self.inputs.get(message_id) else {
+            return Ok(None);
+        };
+        let mut found = None;
+        for assignment in self.assignments.values().filter(|assignment| {
+            assignment.trigger_message_id.as_deref() == Some(message_id)
+                && assignment.source_event.as_ref() == Some(&input.source_event)
+        }) {
+            let Some(proof) = self.stopped.get(&assignment.assignment_id) else {
+                continue;
+            };
+            let Some(task) = self.tasks.get(&assignment.task_id) else {
+                continue;
+            };
+            if !(assignment.state == AssignmentState::Stopped
+                || (rearmed && assignment.state == AssignmentState::Proposed))
+                || self.retry_blocked.contains(&assignment.assignment_id)
+                || assignment.execution_node != owner
+                || assignment.accepted_revision.is_some()
+                || assignment.adopted_revision.is_some()
+                || assignment.completed_revision.is_some()
+                || assignment.submitted_result.is_some()
+                || task.current_assignment.as_deref() != Some(assignment.assignment_id.as_str())
+                || task.action != TaskAction::Continue
+                || task.revision != assignment.started_revision
+                || proof.revision != assignment.started_revision
+                || proof.source_event != input.source_event
+            {
+                continue;
+            }
+            ensure!(found.is_none(), "input has multiple retry assignments");
+            found = Some(assignment.assignment_id.clone());
+        }
+        Ok(found)
+    }
+    fn releasable_assignment(&self, message_id: &str, event: &Event) -> Result<Option<String>> {
+        let Some(id) = self.startup_retry_assignment(message_id, &event.author, false)? else {
+            return Ok(None);
+        };
+        let proof = self
+            .stopped
+            .get(&id)
+            .context("retry stop proof is missing")?;
+        Ok(
+            (direct_parent(event, &proof.event_hash)
+                && direct_parent(event, &proof.evidence_event))
+            .then_some(id),
+        )
     }
     fn refresh(&mut self) {
         for task in self.tasks.values_mut() {
@@ -506,6 +577,11 @@ impl Graph {
                         "queue destination is outside the target"
                     );
                 }
+                let retry = if *action == InputControl::Release {
+                    self.releasable_assignment(message_id, event)?
+                } else {
+                    None
+                };
                 let input = self.inputs.get_mut(message_id).expect("validated input");
                 match action {
                     InputControl::Release => input.deferred = false,
@@ -517,6 +593,14 @@ impl Graph {
                     InputControl::Move { .. } => {}
                 }
                 input.control_event = hash.into();
+                if let Some(id) = retry {
+                    let assignment = self
+                        .assignments
+                        .get_mut(&id)
+                        .expect("validated retry assignment");
+                    assignment.state = AssignmentState::Proposed;
+                    assignment.result = None;
+                }
                 if let InputControl::Move { before_message_id } = action {
                     self.queue_order.retain(|id| id != message_id);
                     let position = before_message_id
@@ -693,6 +777,8 @@ impl Graph {
                         .get_mut(parent_task_id.as_ref().expect("validated parent"))
                         .expect("validated parent");
                     parent.dependencies.push(task_id.clone());
+                    let parent_id = parent_task_id.as_ref().expect("validated parent");
+                    self.dependencies(parent_id, &self.tasks[parent_id].dependencies)?;
                 }
             }
             WorkspaceCommand::ReviseTask {
@@ -702,7 +788,10 @@ impl Graph {
                 expected_result,
                 dependencies,
             } => {
-                self.task(task_id, *expected_revision)?;
+                ensure!(
+                    self.task(task_id, *expected_revision)?.action != TaskAction::Cancel,
+                    "cancelled tasks cannot be revised"
+                );
                 self.dependencies(task_id, dependencies)?;
                 let task = self.tasks.get_mut(task_id).expect("validated task");
                 task.revision += 1;
@@ -724,6 +813,11 @@ impl Graph {
                     task.action != TaskAction::Cancel || *action == TaskAction::Cancel,
                     "cancelled tasks cannot restart"
                 );
+                if matches!(action, TaskAction::Stop | TaskAction::Cancel)
+                    && let Some(id) = &task.current_assignment
+                {
+                    self.retry_blocked.insert(id.clone());
+                }
                 task.action = *action;
                 task.event_hash = hash.into();
                 task.updated_at_ms = event.created_at_ms;
@@ -866,6 +960,7 @@ impl Graph {
                 state,
                 result,
                 evidence_event,
+                execution,
                 ..
             } => {
                 let assignment = self
@@ -974,6 +1069,27 @@ impl Graph {
                 assignment.state = *state;
                 if result.is_some() {
                     assignment.result = result.clone();
+                }
+                if *state == AssignmentState::Unknown {
+                    self.retry_blocked.insert(assignment_id.clone());
+                }
+                if *state == AssignmentState::Stopped
+                    && *execution == Some(crate::scheduling::TurnExecution::NotStarted)
+                {
+                    self.stopped.insert(
+                        assignment_id.clone(),
+                        AssignmentStopProof {
+                            event_hash: hash.into(),
+                            evidence_event: evidence_event
+                                .clone()
+                                .context("not-started stop needs its failed reply")?,
+                            source_event: assignment
+                                .source_event
+                                .clone()
+                                .context("not-started stop needs its original input")?,
+                            revision: *revision,
+                        },
+                    );
                 }
             }
         }
@@ -1250,6 +1366,7 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                 state,
                 input_event,
                 evidence_event,
+                execution,
                 ..
             } = command
             {
@@ -1265,6 +1382,39 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                     assignment.execution_node == event.author,
                     "only the executing Node records assignment evidence"
                 );
+                if *execution == Some(crate::scheduling::TurnExecution::NotStarted) {
+                    ensure!(
+                        *state == AssignmentState::Stopped
+                            && assignment.accepted_revision.is_none()
+                            && assignment.adopted_revision.is_none(),
+                        "not-started evidence cannot erase execution"
+                    );
+                    let source = assignment
+                        .source_event
+                        .as_ref()
+                        .context("not-started evidence has no original input")?;
+                    ensure!(
+                        direct_parent(event, source),
+                        "not-started evidence must name its original source"
+                    );
+                    let original = known
+                        .get(source)
+                        .context("original task input is missing")?;
+                    ensure!(
+                        matches!(&original.body, EventBody::InputPosted { message_id, target, expected_revision, .. } if assignment.trigger_message_id.as_ref() == Some(message_id) && target_task(target) == Some(assignment.task_id.as_str()) && *expected_revision == Some(assignment.started_revision)),
+                        "not-started evidence is outside the original task input"
+                    );
+                    let proof = evidence_event
+                        .as_ref()
+                        .and_then(|hash| known.get(hash))
+                        .context("not-started evidence needs its failed reply")?;
+                    ensure!(
+                        proof.author == assignment.execution_node
+                            && proof.scope_id == original.scope_id
+                            && matches!(&proof.body, EventBody::MessagePosted { role: Role::Assistant, status: Some(ReplyStatus::Failed), in_reply_to, failure: Some(failure), .. } if in_reply_to.as_ref() == assignment.trigger_message_id.as_ref() && !matches!(failure, FailureKind::Unknown | FailureKind::Lost | FailureKind::Restarted)),
+                        "not-started evidence is not the original failed reply"
+                    );
+                }
                 if *state == AssignmentState::Adopted {
                     let input = input_event
                         .as_ref()
@@ -1498,6 +1648,7 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                 WorkspaceCommand::ControlInput {
                     message_id,
                     expected_event,
+                    action,
                     ..
                 } => {
                     ensure!(
@@ -1525,6 +1676,22 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                         owner == event.author,
                         "only the target owner accepts input controls"
                     );
+                    if *action == InputControl::Release {
+                        let ended = graph.assignments.values().any(|assignment| {
+                            assignment.trigger_message_id.as_deref() == Some(message_id)
+                                && assignment.source_event.as_ref() == Some(&input.source_event)
+                                && matches!(
+                                    assignment.state,
+                                    AssignmentState::Stopped
+                                        | AssignmentState::Unknown
+                                        | AssignmentState::Completed
+                                )
+                        });
+                        ensure!(
+                            !ended || graph.releasable_assignment(message_id, event)?.is_some(),
+                            "input has no proven startup failure to release"
+                        );
+                    }
                 }
                 WorkspaceCommand::CreateChannel {
                     members,
@@ -1595,7 +1762,6 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                     execution_node,
                     bot_owner_epoch,
                     work_id,
-                    resource_roots: _,
                     ..
                 } => {
                     membership_from(connection, network)?.node(execution_node)?;
@@ -1865,7 +2031,45 @@ fn resource_conflicts_from(
         }
     }
     for work in super::reduce::open_works_from(connection, network, None)? {
+        let accepted_without_reservation: bool = if work.state == WorkStatus::Accepted
+            && matches!(work.kind, WorkKind::Agent(_))
+            && work.thread_id.is_none()
+            && work.turn_id.is_none()
+        {
+            connection.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM work_runs
+                    WHERE work_id=?1 AND conversation_id=?2
+                      AND (state='accepted' OR
+                           (state='starting' AND ?3 IS NOT NULL AND thread_id=?3))
+                      AND turn_id IS NULL AND codex_epoch IS NULL
+                      AND outcome IS NULL AND evidence IS NULL AND probe IS NULL
+                      AND result_text='' AND progress='' AND progress_at_ms=0
+                 ) AND NOT EXISTS(SELECT 1 FROM identity_meta WHERE key=?4)",
+                params![
+                    work.work_id,
+                    work.conversation_id,
+                    work.thread,
+                    format!("work-native-submission:{}", work.work_id)
+                ],
+                |row| row.get(0),
+            )?
+        } else {
+            false
+        };
+        if accepted_without_reservation {
+            continue;
+        }
+        let own_assignment_work = except_assignment
+            .and_then(|id| graph.assignments.get(id))
+            .is_some_and(|assignment| {
+                work.trigger == format!("assignment:{}", assignment.assignment_id)
+                    && work.dispatcher == assignment.execution_node
+                    && bot_scope(connection, network, &assignment.bot_id)
+                        .is_ok_and(|scope| scope == work.conversation_id)
+            });
         if work.target_node == node
+            && !own_assignment_work
             && work.state != WorkStatus::Finished
             && Some(work.work_id.as_str()) != except_work
             && roots.iter().any(|root| overlap(root, &work.cwd))
@@ -1873,21 +2077,40 @@ fn resource_conflicts_from(
             conflicts.insert(format!("work:{}", work.work_id));
         }
     }
-    let mut statement=connection.prepare("SELECT conversation_id,scope FROM scheduler_jobs WHERE state IN ('claimed','running','cancelling','reconciling')")?;
+    let requesting_work = except_work
+        .map(|id| super::reduce::work_from(connection, network, id))
+        .transpose()?
+        .flatten();
+    let mut statement=connection.prepare("SELECT conversation_id,scope,trigger FROM scheduler_jobs WHERE state IN ('claimed','running','cancelling','reconciling')")?;
     let sessions = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (conversation, scope) in sessions {
+    for (conversation, scope, trigger) in sessions {
+        let own_requesting_job = requesting_work.as_ref().is_some_and(|work| {
+            work.dispatcher == node
+                && work.target_node == node
+                && work.conversation_id == conversation
+                && work.trigger == trigger
+        });
+        if own_requesting_job {
+            continue;
+        }
         let this_assignment = except_assignment
             .and_then(|id| graph.assignments.get(id))
             .is_some_and(|assignment| {
-                scope
-                    == SessionScope::WorkspaceTask {
-                        task_id: assignment.task_id.clone(),
-                    }
-                    .storage_key()
+                bot_scope(connection, network, &assignment.bot_id)
+                    .is_ok_and(|bot| bot == conversation)
+                    && scope
+                        == SessionScope::WorkspaceTask {
+                            task_id: assignment.task_id.clone(),
+                        }
+                        .storage_key()
             });
         if this_assignment {
             continue;
@@ -1962,7 +2185,16 @@ pub(crate) fn additional_dependencies(
                     hashes.insert(expected_event.clone());
                     let input = workspace_input_from(connection, network, message_id)?
                         .context("input not found")?;
-                    hashes.insert(input.source_event);
+                    hashes.insert(input.source_event.clone());
+                    for assignment in graph.assignments.values().filter(|assignment| {
+                        assignment.trigger_message_id.as_deref() == Some(message_id)
+                            && assignment.source_event.as_ref() == Some(&input.source_event)
+                    }) {
+                        if let Some(proof) = graph.stopped.get(&assignment.assignment_id) {
+                            hashes.insert(proof.event_hash.clone());
+                            hashes.insert(proof.evidence_event.clone());
+                        }
+                    }
                     scopes.insert(input.conversation_id);
                 }
                 WorkspaceCommand::CreateChannel { members, .. }
@@ -2013,6 +2245,7 @@ pub(crate) fn additional_dependencies(
                 } => {
                     if let Some(assignment) = graph.assignments.get(assignment_id) {
                         hashes.insert(assignment.event_hash.clone());
+                        hashes.extend(assignment.source_event.iter().cloned());
                     }
                     hashes.extend(input_event.iter().chain(evidence_event.iter()).cloned());
                 }
@@ -2255,7 +2488,10 @@ impl Store {
         let key = request_key(network, WORKSPACE_SCOPE, &body, &identity.device_id()?)?;
         if !graph.commands.contains_key(command_id) {
             if let EventBody::WorkspaceCommanded {
-                command: WorkspaceCommand::ControlInput { message_id, .. },
+                command:
+                    WorkspaceCommand::ControlInput {
+                        message_id, action, ..
+                    },
                 ..
             } = &body
             {
@@ -2267,15 +2503,21 @@ impl Store {
                         == identity.device_id()?,
                     "only the target owner accepts input controls"
                 );
-                ensure!(
-                    super::scheduler::workspace_input_editable_from(
+                let editable = match action {
+                    InputControl::Release => super::scheduler::workspace_input_releasable_from(
                         &tx,
                         network,
                         &original.conversation_id,
-                        message_id
+                        message_id,
                     )?,
-                    "input has started or needs reconciliation"
-                );
+                    _ => super::scheduler::workspace_input_editable_from(
+                        &tx,
+                        network,
+                        &original.conversation_id,
+                        message_id,
+                    )?,
+                };
+                ensure!(editable, "input has started or needs reconciliation");
             }
             if let EventBody::WorkspaceCommanded {
                 command:
@@ -2287,22 +2529,21 @@ impl Store {
                     },
                 ..
             } = &body
+                && *execution_node == identity.device_id()?
             {
-                if *execution_node == identity.device_id()? {
-                    ensure!(
-                        resource_conflicts_from(
-                            &tx,
-                            network,
-                            execution_node,
-                            resource_roots,
-                            None,
-                            &graph,
-                            work_id.as_deref()
-                        )?
-                        .is_empty(),
-                        "workspace root is occupied"
-                    );
-                }
+                ensure!(
+                    resource_conflicts_from(
+                        &tx,
+                        network,
+                        execution_node,
+                        resource_roots,
+                        None,
+                        &graph,
+                        work_id.as_deref()
+                    )?
+                    .is_empty(),
+                    "workspace root is occupied"
+                );
             }
         }
         let controlled_input = match &body {
@@ -3094,7 +3335,52 @@ impl Store {
         result: Option<String>,
         at: i64,
     ) -> Result<()> {
+        let execution = if state == AssignmentState::Stopped {
+            let assignment = self
+                .workspace_assignment(network, assignment_id)?
+                .context("assignment not found")?;
+            if let Some(source) = &assignment.trigger_message_id {
+                let scope = bot_scope(&self.connection, network, &assignment.bot_id)?;
+                let job =
+                    self.scheduler_job(&scope, &crate::scheduling::message_trigger(source))?;
+                let outbox: bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM scheduler_outbox WHERE conversation_id=? AND trigger=?)", params![scope, crate::scheduling::message_trigger(source)], |row| row.get(0))?;
+                let original = job
+                    .as_ref()
+                    .map(|job| {
+                        workspace_assignment_for_job_from(
+                            &self.connection,
+                            network,
+                            &identity.device_id()?,
+                            job,
+                        )
+                    })
+                    .transpose()?
+                    .flatten();
+                if !outbox
+                    && original
+                        .as_ref()
+                        .is_some_and(|original| original.assignment_id == assignment.assignment_id)
+                    && assignment.accepted_revision.is_none()
+                    && assignment.adopted_revision.is_none()
+                    && job.as_ref().is_some_and(|job| {
+                        job.retryable()
+                            && job.runtime.as_ref().is_some_and(|runtime| {
+                                runtime.execution == crate::scheduling::TurnExecution::NotStarted
+                            })
+                    })
+                {
+                    Some(crate::scheduling::TurnExecution::NotStarted)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let command = WorkspaceCommand::AssignmentProgress {
+            execution,
             assignment_id: assignment_id.into(),
             revision,
             state,
@@ -3125,6 +3411,12 @@ impl Store {
         command: WorkspaceCommand,
         at: i64,
     ) -> Result<WorkspaceCommandReceipt> {
+        if let WorkspaceCommand::AssignmentProgress { execution, .. } = &command {
+            ensure!(
+                execution.is_none(),
+                "only Node lifecycle records execution evidence"
+            );
+        }
         let stored = self
             .scheduler_job(&job.conversation_id, &job.trigger)?
             .context("workspace tool has no current job")?;
@@ -3134,24 +3426,17 @@ impl Store {
             "workspace tool belongs to an inactive attempt"
         );
         let graph = Graph::read(&self.connection, network)?;
-        let acting_assignment = if let SessionScope::WorkspaceTask { task_id } = job.session_scope()
+        let acting_assignment = if matches!(job.session_scope(), SessionScope::WorkspaceTask { .. })
         {
-            let assignment = if let Some(id) = job.trigger.strip_prefix("assignment:") {
-                graph.assignments.get(id)
-            } else {
-                graph.assignments.values().find(|assignment| {
-                    assignment.task_id == task_id
-                        && assignment.trigger_message_id.as_deref() == Some(job.reply_to.as_str())
-                })
-            };
             Some(
-                assignment
-                    .filter(|assignment| {
-                        assignment.execution_node == identity.device_id().unwrap_or_default()
-                    })
-                    .context("current job has no matching assignment")?
-                    .assignment_id
-                    .clone(),
+                workspace_assignment_for_job_from(
+                    &self.connection,
+                    network,
+                    &identity.device_id()?,
+                    job,
+                )?
+                .context("current job has no matching assignment")?
+                .assignment_id,
             )
         } else {
             None
@@ -3207,13 +3492,12 @@ impl Store {
                 identity, network, command_id, command, None, None, None, at,
             )
         } else {
-            let source = if let Some(id) = job.trigger.strip_prefix("assignment:") {
+            let source = if let Some(id) = acting_assignment.as_deref() {
                 let assignment = graph
                     .assignments
                     .get(id)
                     .filter(|assignment| {
                         assignment.execution_node == identity.device_id().unwrap_or_default()
-                            && assignment.assignment_id == job.reply_to
                     })
                     .context("workspace tool has no active assignment")?;
                 let source = assignment
@@ -3978,7 +4262,14 @@ impl Store {
             return Ok(());
         }
         if work.outcome.is_none() {
-            if assignment.state == AssignmentState::Proposed {
+            let started = journal.as_ref().is_some_and(|record| {
+                matches!(
+                    record.state,
+                    crate::work::WorkState::Running { .. }
+                        | crate::work::WorkState::Interrupting { .. }
+                )
+            });
+            if assignment.state == AssignmentState::Proposed && started {
                 self.record_assignment_state(
                     identity,
                     network,
@@ -4084,6 +4375,91 @@ pub(crate) fn workspace_assignment_for_job_from(
     if job.trigger != crate::scheduling::message_trigger(&job.reply_to) {
         return Ok(None);
     }
+    if job.kind == crate::scheduling::TriggerKind::Answer {
+        let Some(answer) =
+            super::message_from(connection, network, &job.conversation_id, &job.reply_to)?
+        else {
+            return Ok(None);
+        };
+        let Some(question) = answer
+            .answers
+            .as_deref()
+            .filter(|_| answer.role == Role::User)
+        else {
+            return Ok(None);
+        };
+        let Some(asked) = super::event_about_from(
+            connection,
+            network,
+            &job.conversation_id,
+            "question_asked",
+            question,
+        )?
+        else {
+            return Ok(None);
+        };
+        let EventBody::QuestionAsked {
+            target: Some(target),
+            about,
+            ..
+        } = &asked.event.body
+        else {
+            return Ok(None);
+        };
+        if asked.event.author != local
+            || about.node != local
+            || target_task(target) != Some(task_id.as_str())
+            || job.basis.get(&asked.event.author).copied().unwrap_or(0) < asked.event.seq
+        {
+            return Ok(None);
+        }
+        let known = ancestors(connection, network, &asked.event)?;
+        let at_question = graph_at(connection, network, Some(&known))?;
+        let Some(task) = at_question.tasks.get(&task_id) else {
+            return Ok(None);
+        };
+        if let InputTarget::ChannelTask {
+            channel_id, bot_id, ..
+        } = target
+            && (task.channel_id.as_ref() != Some(channel_id) || task.owner_bot != *bot_id)
+        {
+            return Ok(None);
+        }
+        let Some(original) = task
+            .current_assignment
+            .as_ref()
+            .and_then(|id| at_question.assignments.get(id))
+        else {
+            return Ok(None);
+        };
+        if original.execution_node != local
+            || original.bot_id != task.owner_bot
+            || !matches!(
+                original.state,
+                AssignmentState::Accepted | AssignmentState::Adopted
+            )
+            || bot_scope(connection, network, &original.bot_id)? != job.conversation_id
+        {
+            return Ok(None);
+        }
+        let trigger = original.trigger_message_id.as_ref().map_or_else(
+            || format!("assignment:{}", original.assignment_id),
+            |input| crate::scheduling::message_trigger(input),
+        );
+        let native: Option<String> = connection.query_row("SELECT t.thread_id FROM manager_turns t JOIN scheduler_jobs j ON j.attempt_id=t.attempt_id WHERE j.conversation_id=? AND j.trigger=?", params![job.conversation_id,trigger], |row| row.get(0)).optional()?;
+        if native.is_some_and(|thread| thread != about.session_id) {
+            return Ok(None);
+        }
+        return Ok(graph
+            .assignments
+            .get(&original.assignment_id)
+            .filter(|current| {
+                current.event_hash == original.event_hash
+                    && current.execution_node == local
+                    && current.bot_id == original.bot_id
+            })
+            .cloned());
+    }
     let Some(input) = workspace_input_from(connection, network, &job.reply_to)? else {
         return Ok(None);
     };
@@ -4106,4 +4482,118 @@ pub(crate) fn workspace_assignment_for_job_from(
         }
     }
     Ok(found)
+}
+
+pub(crate) fn assignment_resources_available_from(
+    connection: &Connection,
+    network: &str,
+    assignment: &Assignment,
+) -> Result<bool> {
+    let graph = Graph::read(connection, network)?;
+    let Some(stored) = graph.assignments.get(&assignment.assignment_id) else {
+        return Ok(false);
+    };
+    if stored.event_hash != assignment.event_hash
+        || stored.execution_node != assignment.execution_node
+        || stored.resource_roots != assignment.resource_roots
+        || stored.work_id != assignment.work_id
+    {
+        return Ok(false);
+    }
+    Ok(resource_conflicts_from(
+        connection,
+        network,
+        &stored.execution_node,
+        &stored.resource_roots,
+        Some(&stored.assignment_id),
+        &graph,
+        stored.work_id.as_deref(),
+    )?
+    .is_empty())
+}
+
+pub(crate) fn work_resources_available_from(
+    connection: &Connection,
+    network: &str,
+    work: &WorkProjection,
+) -> Result<bool> {
+    if work.cwd.is_empty() {
+        return Ok(false);
+    }
+    let graph = Graph::read(connection, network)?;
+    let assignment = work
+        .trigger
+        .strip_prefix("assignment:")
+        .and_then(|id| graph.assignments.get(id))
+        .filter(|assignment| {
+            work.dispatcher == assignment.execution_node
+                && bot_scope(connection, network, &assignment.bot_id)
+                    .is_ok_and(|scope| scope == work.conversation_id)
+        });
+    Ok(resource_conflicts_from(
+        connection,
+        network,
+        &work.target_node,
+        std::slice::from_ref(&work.cwd),
+        assignment.map(|assignment| assignment.assignment_id.as_str()),
+        &graph,
+        Some(&work.work_id),
+    )?
+    .is_empty())
+}
+
+pub(crate) fn workspace_input_release_allowed_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    message_id: &str,
+) -> Result<bool> {
+    let graph = Graph::read(connection, network)?;
+    let Some(input) = graph.inputs.get(message_id) else {
+        return Ok(false);
+    };
+    if input.cancelled {
+        return Ok(false);
+    }
+    let Some(original) = workspace_input_from(connection, network, message_id)? else {
+        return Ok(false);
+    };
+    let resolved = resolve_with_graph(connection, network, &input.target, &graph)?;
+    if resolved.owner_node != local
+        || resolved.task_revision != original.input.route.expected_revision
+    {
+        return Ok(false);
+    }
+    if resolved.task_id.is_none() {
+        return Ok(true);
+    }
+    if resolved
+        .task_id
+        .as_ref()
+        .and_then(|id| graph.tasks.get(id))
+        .is_none_or(|task| task.action != TaskAction::Continue)
+    {
+        return Ok(false);
+    }
+    if graph
+        .startup_retry_assignment(message_id, local, false)?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    let Some(id) = graph.startup_retry_assignment(message_id, local, true)? else {
+        return Ok(false);
+    };
+    let proof = graph
+        .stopped
+        .get(&id)
+        .context("retry stop proof is missing")?;
+    let Some(release) = log::event_from(connection, network, &input.control_event)? else {
+        return Ok(false);
+    };
+    Ok(release.author == local
+        && direct_parent(&release, &proof.event_hash)
+        && direct_parent(&release, &proof.evidence_event)
+        && matches!(&release.body, EventBody::WorkspaceCommanded { command_id, command: WorkspaceCommand::ControlInput { message_id: released, action: InputControl::Release, .. }, attestation: Some(_), .. }
+            if released == message_id && graph.commands.get(command_id).is_some_and(|command| command.event_hash == input.control_event && command.error.is_none())))
 }

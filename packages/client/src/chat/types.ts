@@ -1,5 +1,6 @@
 import type { FailureKind } from "../lib/errors.ts"
 import type { InputIntent, InputReceipt, InputTarget } from "../workspace/types.ts"
+import type { OutboxItem } from "../lib/outbox.ts"
 
 export type ReplyStatus = "completed" | "stopped" | "interrupted" | "failed"
 /** A file on a user's message: hex SHA-256, byte size and its cleaned file name. */
@@ -38,5 +39,6 @@ export type PendingMessage = {
   receipt?: InputReceipt
   /** The entry's refusal, kept so the person can drop it; a lost answer leaves this unset. */
   rejected?: string
+  rejection_code?: OutboxItem['rejection_code']
 }
 export type MessageRequest = Pick<PendingMessage, "conversation_id" | "message_id" | "text" | "report_results" | "target" | "intent" | "sequence" | "expected_revision" | "attachments">

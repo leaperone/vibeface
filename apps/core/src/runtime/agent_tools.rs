@@ -119,13 +119,13 @@ impl Runtime {
                     kind = None;
                 }
             }
-            if matches!(tool, Tool::InterruptWork | Tool::BindWork | Tool::WaitWork) {
-                if let Some(work_id) = args["work_id"].as_str() {
-                    ensure!(
-                        store.scheduler_work_in_scope(network, &job, work_id)?,
-                        "work is outside this task scope"
-                    );
-                }
+            if matches!(tool, Tool::InterruptWork | Tool::BindWork | Tool::WaitWork)
+                && let Some(work_id) = args["work_id"].as_str()
+            {
+                ensure!(
+                    store.scheduler_work_in_scope(network, &job, work_id)?,
+                    "work is outside this task scope"
+                );
             }
             if matches!(tool, Tool::DispatchWork | Tool::TrackWork) {
                 for key in ["continues", "parent"] {
@@ -140,19 +140,17 @@ impl Runtime {
             if matches!(
                 tool,
                 Tool::DispatchWork | Tool::TrackWork | Tool::HandOverSession
-            ) {
-                if let Some(thread) = args[if tool == Tool::HandOverSession {
-                    "session_id"
-                } else {
-                    "thread"
-                }]
-                .as_str()
-                {
-                    ensure!(
-                        store.scheduler_native_in_scope(network, &job, thread)?,
-                        "native session is outside this task scope"
-                    );
-                }
+            ) && let Some(thread) = args[if tool == Tool::HandOverSession {
+                "session_id"
+            } else {
+                "thread"
+            }]
+            .as_str()
+            {
+                ensure!(
+                    store.scheduler_native_in_scope(network, &job, thread)?,
+                    "native session is outside this task scope"
+                );
             }
         }
         match tool {
@@ -619,7 +617,7 @@ impl Runtime {
             let receipt = store.workspace_agent_command(
                 &self.identity,
                 network,
-                &job,
+                job,
                 &command_id,
                 command,
                 now_ms(),
@@ -1251,15 +1249,7 @@ impl Runtime {
         network: &str,
         thread: &str,
     ) -> Result<Option<Provider>> {
-        let runs = store.work_records_on_thread(thread)?;
-        Ok(runs.iter().find_map(|run| match run.kind {
-            WorkKind::Agent(provider)
-                if matches!(store.conversation(network, &run.conversation), Ok(Some(_))) =>
-            {
-                Some(provider)
-            }
-            _ => None,
-        }))
+        store.local_work_provider_on_thread(network, &self.identity.device_id()?, thread)
     }
 }
 

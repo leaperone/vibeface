@@ -25,11 +25,11 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 | --- | --- |
 | `WorkspaceTask` | 稳定 `task_id` 保存请求、预期结果、来源、依赖、revision 和当前 Assignment。后续输入保持同一 Task，不跳回 Main。底层 Work 仍是一次执行生命周期。 |
 | `Channel` | 保存目的、成员、默认协调 Bot、协调 Node、revision 和 owner epoch。频道历史只合并关联任务及已核验身份的发言。 |
-| `Assignment` | 固定任务 revision、Bot、执行 Node、资源目录和因果 basis。接受、采用、完成分别记录，旧 revision 的结果不能证明新请求已完成。 |
+| `Assignment` | 固定任务 revision、Bot、执行 Node、资源目录和因果 basis。执行 Node 要求目录为实际 canonical 目录，拒绝符号链接别名。接受、采用、完成分别记录，旧 revision 的结果不能证明新请求已完成。 |
 | `InputPosted` | 本人签名绑定目标、意图、目标内 sequence、预期 revision、正文、附件和汇报选项。相同 message ID 只允许回读原意图。 |
 | `open_works` | `Store::open_works(network, scope)` 按 SQL 找出存在 dispatch 且没有结束记录、结果为 `unverified`，或仍待本人看的失败工作；后者是会话里最近结束的失败或被拒工作，之后没有更晚结束的工作、Bot 没有对它做出后续回复（它的结果报告轮的回复，或对失败之后本人消息的回复；派发它的那一轮的回复不算），也没有本人在待处理关掉它（`NotificationAcked`，`client_id = "inbox"`）。本机被拒的派发（未接收）同样列出，直到本人关掉、Bot 对它的报告轮写出已完成的回复，或在没有报告轮时（派发轮内直接得知被拒，或关掉了结果汇报），派发它的那一轮之后本人发的消息有了已完成的回复。已完成的工作不在此列表。 |
 | `ConversationPayload` | 客户端快照包含 `conversation`、`messages`、`works`、`scheduler`、`checks`、`local_node`、`changes`、`overwritten`、`bot_settings`、`questions`、`sessions`、`sent`。工作区从这些字段建立链接，不另建任务事实。 |
-| `scheduler_jobs` | job 主键语义为 `(conversation_id, trigger)`。`trigger` 可为 `message:<id>`、`work:<id>`、`task:<id>`、`bot_message:<id>` 或 `schedule:<id>:<slot>`。job 还保存 `kind`、顺序、`basis` 版本向量、`reply_to`、固定 `message_id` 和状态。 |
+| `scheduler_jobs` | job 主键语义为 `(conversation_id, trigger)`。`trigger` 可为 `message:<id>`、`work:<id>`、`task:<id>`、`assignment:<id>`、`bot_message:<id>` 或 `schedule:<id>:<slot>`。job 还保存 `kind`、顺序、`basis` 版本向量、`reply_to`、固定 `message_id` 和状态。 |
 | `scheduler_sessions` | 本机 Provider resume 指针，含 `native_id`、`native_token`、`covers`、`owner_epoch`、`sdk_config`、`permission_version`、`active` 和下一序号。它不是完整 transcript，也不是同步到 DAG 的上下文。 |
 | `ContextCheckpoint` | DAG 事件，含 `covers`、`summary`、`recent_user_requests`、`open_work`、`decisions`。它压缩提示预算，不删除旧事件，不等于 Provider 的 KV memory。 |
 | `message_bot` | 写入接收 Bot conversation 的 `BotMessaged { message_id, from, text, hops }`，触发 `bot_message:<message_id>` job。远端目标先进入 outbox。相同轮次和 `call_ref` 重试只回读同一消息。 |
@@ -75,7 +75,7 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 
 `input_receipt` 区分入口保存、owner 接纳、提交中、Provider 接受、实际回合归属、拒绝和未知。Provider 接受不表示模型已读。附件保留完整引用与内容，同目标不得越过尚未准备好的附件。不同目标的投递和旧输入回读独立推进。
 
-稍后队列的编辑、释放、取消和移动通过 `ControlInput`，以 `control_event` 做 CAS。owner 重新核验尚未开始，不能仅凭客户端的 deferred 标记编辑已提交输入。未知写入只查询原 ID，不换 ID 重发。停止使用独立控制路径，保留未发送草稿和焦点。
+稍后队列的编辑、释放、取消和移动通过 `ControlInput`，以 `control_event` 做 CAS。owner 重新核验尚未开始，不能仅凭客户端的 deferred 标记编辑已提交输入。明确启动前失败可由本人用新的签名 Release 重试，必须绑定最新 control_event，并由 Node 证明原 job 为 NotStarted、没有工具调用、未决检查或在途 outbox。任务 Assignment 同时引用原失败与未启动证据，保留原输入和旧失败历史，重试回复有独立稳定身份。取消、Unknown、已经开始或 revision 改变均不能复活。未知写入只查询原 ID，不换 ID 重发。停止使用独立控制路径，保留未发送草稿和焦点。
 
 ## 未知结果和用户动作
 

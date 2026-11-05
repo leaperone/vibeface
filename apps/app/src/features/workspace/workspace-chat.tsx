@@ -11,6 +11,7 @@ import { Chat, type ChatEntry } from '@/features/chat/elements/chat'
 import { PromptInput } from '@/features/chat/elements/prompt-input'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import { inputTargetKey } from '@vibeface/client/chat/protocol.ts'
 import { networkKey, storageOf } from '@vibeface/client/workspace/storage.ts'
 import type { ContextProjection, InputControlAction, InputIntent, InputReceipt, InputTarget, PendingMessage, QueuedInput, ScopeContext, WorkspaceHistory, WorkspaceTask } from '@vibeface/client/workspace/types.ts'
 import { webPlatform } from '@/lib/platform'
@@ -190,7 +191,7 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
     const actor = event.speaker
     const speaker = actor.kind === 'bot' ? workspace.bots.find((bot) => bot.bot_id === actor.bot_id)?.name ?? 'Bot 未加载' : actor.kind === 'human' ? '你' : workspace.nodes.find((node) => node.device_id === actor.device_id)?.name ?? '执行设备'
     if (body.type === 'input_posted' || body.type === 'message_posted') {
-      entries.push({ key: event.event_hash, anchor: body.type === 'input_posted', message: { message_id: body.message_id, event_hash: event.event_hash, role: body.type === 'input_posted' ? 'user' : channelId && actor.kind === 'bot' ? 'bot' : body.role, text: body.text, created_at_ms: event.created_at_ms, attachments: body.attachments, ...(body.type === 'message_posted' ? { in_reply_to: body.in_reply_to, status: body.status, ...(channelId && actor.kind === 'bot' ? { sender: { conversation_id: workspace.bots.find((bot) => bot.bot_id === actor.bot_id)?.conversation_id ?? '', name: speaker } } : {}) } : {}) } })
+      entries.push({ key: event.event_hash, conversationId: event.scope_id, anchor: body.type === 'input_posted', message: { message_id: body.message_id, event_hash: event.event_hash, role: body.type === 'input_posted' ? 'user' : channelId && actor.kind === 'bot' ? 'bot' : body.role, text: body.text, created_at_ms: event.created_at_ms, attachments: body.attachments, ...(body.type === 'message_posted' ? { in_reply_to: body.in_reply_to, status: body.status, ...(channelId && actor.kind === 'bot' ? { sender: { conversation_id: workspace.bots.find((bot) => bot.bot_id === actor.bot_id)?.conversation_id ?? '', name: speaker } } : {}) } : {}) } })
       if (body.type === 'input_posted' && body.target.kind === 'channel_task' && onReply) { const reply = body.target; entries.push({ key: `reply:${event.event_hash}`, node: <Button type="button" variant="ghost" size="sm" onClick={() => onReply(reply.task_id, reply.bot_id)}><Reply aria-hidden="true" />回复这个任务</Button> }) }
     } else if (body.type === 'work_finished') entries.push({ key: event.event_hash, node: <div className="grid gap-2 rounded-xl border bg-card p-4"><p className="text-meta font-medium">工作结果 · {body.outcome === 'completed' ? '已完成' : body.outcome === 'interrupted' ? '已停止' : '需要留意'}</p><p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{body.result_text || body.failure_reason || '没有结果文本'}</p></div> })
     else if (body.type === 'workspace_commanded') {
@@ -203,7 +204,7 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
   }
   const postedIds = new Set((history?.events ?? []).flatMap((event) => event.body.type === 'input_posted' ? [event.body.message_id] : []))
   for (const question of workspace.questions.filter((question) => question.target && (channelId ? (question.target.kind === 'channel_task' || question.target.kind === 'channel_member') && question.target.channel_id === channelId : sameTarget(question.target, target)))) entries.push({ key: `question:${question.question_id}`, node: <QuestionCard question={question} inTask /> })
-  for (const item of pending) if (!postedIds.has(item.message_id)) entries.push({ key: item.message_id, anchor: true, message: { message_id: item.message_id, event_hash: item.message_id, role: 'user', text: item.text, created_at_ms: item.created_at_ms, state: 'sending' } })
+  for (const item of pending) if (!postedIds.has(item.message_id)) entries.push({ key: item.message_id, conversationId: item.conversation_id, anchor: true, message: { message_id: item.message_id, event_hash: item.message_id, role: 'user', text: item.text, created_at_ms: item.created_at_ms, state: 'sending' } })
   for (const item of pending) entries.push({ key: `delivery:${item.message_id}`, node: <WorkspaceInputStatus pending={item} refresh={refresh} /> })
   const busy = task && ['running', 'update_pending'].includes(task.state)
   const sendLabel = intent === 'defer' ? '保存为稍后处理' : intent === 'new_task' ? '发送为新任务' : busy ? '补充当前工作' : '发送'
@@ -226,11 +227,14 @@ export function WorkspaceInputStatus({ pending, refresh }: { pending: PendingMes
   const workspace = useWorkspace()
   const action = useAction()
   const receipt = pending.receipt
+  const queued = workspace.workspaceState?.inputs.find((item) => item.conversation_id === pending.conversation_id && item.input.message_id === pending.message_id)
+  const canRetry = workspace.writable && pending.delivery === 'accepted' && receipt?.stage === 'refused' && receipt.retry_safe === true && Boolean(receipt.control_event?.trim()) && pending.rejection_code !== 'input_conflict'
+    && receipt.message_id === pending.message_id && inputTargetKey(receipt.target) === inputTargetKey(pending.target) && !queued?.cancelled && !queued?.deferred
   return <div role="status" className="grid gap-2 rounded-lg bg-muted/60 px-3 py-2 text-meta">
-    <p className={pending.rejected || pending.delivery === 'unknown' || receipt?.stage === 'unknown' ? 'text-warning' : 'text-muted-foreground'}>{pending.rejected ? `已拒绝 · ${pending.rejected}` : receipt ? receiptLabels[receipt.stage] : deliveryLabels[pending.delivery]}</p>
+    <p className={pending.rejected || pending.delivery === 'unknown' || receipt?.stage === 'unknown' ? 'text-warning' : 'text-muted-foreground'}>{pending.rejected ? `已拒绝 · ${pending.rejected}` : pending.delivery === 'unknown' && receipt?.stage === 'refused' && receipt.retry_safe ? '重试请求待确认' : receipt ? receiptLabels[receipt.stage] : deliveryLabels[pending.delivery]}</p>
     {receipt?.actual_turn_id ? <p className="break-all text-muted-foreground">实际回合 · {receipt.actual_turn_id}</p> : null}
     {receipt?.reason ? <p className="text-muted-foreground">{receipt.reason}</p> : null}
-    <div className="flex flex-wrap gap-2"><Button type="button" variant="ghost" size="sm" disabled={Boolean(action.busy)} onClick={() => void action.run('query', async () => { await workspace.queryInput({ message_id: pending.message_id, target: pending.target, conversation_id: pending.conversation_id }); await refresh?.() })}><CircleQuestionMark aria-hidden="true" />查询结果</Button>{pending.rejected ? <Button type="button" variant="ghost" size="sm" disabled={Boolean(action.busy)} onClick={() => void action.run('release', () => workspace.releaseMessagePending(pending.message_id))}>不再发送</Button> : null}</div>
+    <div className="flex flex-wrap gap-2"><Button type="button" variant="ghost" size="sm" disabled={Boolean(action.busy)} onClick={() => void action.run('query', async () => { await workspace.queryInput({ message_id: pending.message_id, target: pending.target, conversation_id: pending.conversation_id }); await refresh?.() })}><CircleQuestionMark aria-hidden="true" />查询结果</Button>{canRetry ? <Button type="button" variant="outline" size="sm" disabled={Boolean(action.busy)} onClick={() => { if (canRetry) void action.run('retry-input', () => workspace.retryPendingMessage(pending.message_id)) }}>重试原输入</Button> : null}{pending.rejected ? <Button type="button" variant="ghost" size="sm" disabled={Boolean(action.busy)} onClick={() => void action.run('release', () => workspace.releaseMessagePending(pending.message_id))}>不再发送</Button> : null}</div>
     <InlineError error={action.error} />
   </div>
 }

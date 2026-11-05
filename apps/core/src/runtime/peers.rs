@@ -2008,11 +2008,10 @@ impl Runtime {
             }
             match &envelope.payload {
                 PeerCommand::Deliver { conversation_id, trigger } => {
-                    if let Some(("message", message_id)) = trigger.split_once(':') {
-                        if let Some(receipt) = self.accept_held_answer_delivery(network, conversation_id, message_id).await? {
+                    if let Some(("message", message_id)) = trigger.split_once(':')
+                        && let Some(receipt) = self.accept_held_answer_delivery(network, conversation_id, message_id).await? {
                             return Ok(Some(json!({"receipt":receipt})));
                         }
-                    }
                     let receipt = {
                         let mut store = self.store.lock().await;
                         store.authorize_node(network, &command.origin)?;
@@ -2026,7 +2025,7 @@ impl Runtime {
                     } else { Ok(None) }
                 }
                 PeerCommand::Dispatch { spec } => {
-                    let admitted = self.accept_dispatch(network, spec.clone(), &Value::Null).await?;
+                    let admitted = self.accept_dispatch(network, spec.as_ref().clone(), &Value::Null).await?;
                     Ok(Some(json!({"work_id":admitted.record.work_id,"state":admitted.record.state.name()})))
                 }
                 PeerCommand::Stop { conversation_id, work_id } => {
@@ -2782,6 +2781,7 @@ mod tests {
                 &network,
                 "accepted-for-work",
                 WorkspaceCommand::AssignmentProgress {
+                    execution: None,
                     assignment_id: "assignment".into(),
                     revision: 1,
                     state: crate::workspace::AssignmentState::Accepted,

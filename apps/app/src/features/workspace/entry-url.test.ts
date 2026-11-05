@@ -7,15 +7,16 @@ import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
 import { entryAddress, entryJson, entryKey, messageOf, parseEntry, parseInfo, providerNames } from "@vibeface/client/lib/node.ts"
 import * as nodeSettings from "@vibeface/client/lib/node.ts"
+import type { OutboxItem } from '@vibeface/client/lib/outbox.ts'
 import type { NodeSettingsResponse, ProviderReadiness, ProviderStatus, ReadyConnection } from "@vibeface/client/lib/node.ts"
-import type { InputOptions, InputTarget, PendingMessage, WorkRecord, WorkspaceDomainState } from "@vibeface/client/workspace/types.ts"
+import type { InputReceipt, InputOptions, InputTarget, PendingMessage, WorkRecord, WorkspaceDomainState } from "@vibeface/client/workspace/types.ts"
 import { cardState, nodeName, taskGroup } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
 import { botCopy, folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
 import { agentName, answerLabel, attentionLabel, approvalTask, awaitsAnswer, declined, foldAnswers, projectName, questionMeta, questionOpen, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
 import * as errors from "@vibeface/client/lib/errors.ts"
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
-import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
+import { messageKey, replyStatusLabel, inputTargetKey, awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
 import { deviceCopy, setUpOnManager } from "@vibeface/client/identity/copy.ts"
 import { chatTimeline, firstUnread, unreadCounts } from "@vibeface/client/chat/timeline.ts"
 import { accessOf } from "@vibeface/client/identity/access.ts"
@@ -180,10 +181,10 @@ test("workspace preserves bot and message requests while routing native decision
   })
   const signed: string[] = [], attestation = { device_id: "client", signature: "signature" }
   const botBody = (pending: unknown) => ({ ...JSON.parse(JSON.stringify(parseCreateBot(pending))), scheduler_node: "gateway", owner_attestation: attestation, attestation })
-  const outboxItems = new Map<string, { key: string }>()
+  const outboxItems = new Map<string, OutboxItem>()
   const memoryOutbox = {
     all: async () => [...outboxItems.values()].map((item) => structuredClone(item)),
-    put: async (item: { key: string }) => { outboxItems.set(item.key, structuredClone(item)) },
+    put: async (item: OutboxItem) => { outboxItems.set(item.key, structuredClone(item)) },
     delete: async (key: string) => { outboxItems.delete(key) },
   }
   const modules = new Map<string, { exports: Record<string, unknown> }>()
@@ -233,6 +234,8 @@ test("workspace preserves bot and message requests while routing native decision
   let unreadNotifications: { notification_id: string; kind: string; text: string; conversation_id: string; target?: InputTarget }[] = []
   const messages: Record<string, unknown>[] = [], controls: Record<string, unknown>[] = [], creations: Record<string, unknown>[] = []
   let failControl = false, failBotCheck = false, failMessage = false, inputQuerySafe = false
+  let inputControlEvent = 'c'.repeat(64), inputQueryStage: InputReceipt['stage'] | null = null
+  const inputReleases: Record<string, unknown>[] = []
   const questionRow = { question_id: "q1", conversation_id: "chat" as string | null, bot: { bot_id: "bot", name: "Bot" } as { bot_id: string; name: string } | null, severity: "attention", text: "要不要继续", choices: [{ label: "继续" }, { label: "停下" }], about: { node: "worker", agent: "codex", session_id: "thread", cwd: "/project", summary: "改登录" }, author: "gateway", created_at_ms: 1, answer: null }
   const otherRow = { ...questionRow, question_id: "s1", conversation_id: "other" }
   let questionRows: Record<string, unknown>[] = [questionRow, otherRow]
@@ -254,7 +257,15 @@ test("workspace preserves bot and message requests while routing native decision
       if (method === "open_works") return { works: [] }
       if (method === "workspace_overview") return {}
       if (method === "workspace_state") return { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } }
-      if (method === "input_receipt") return { message_id: body.message_id, target: body.target, stage: inputQuerySafe ? "refused" : "unknown", actual_turn_id: null, reason: "原输入待确认", retry_safe: inputQuerySafe }
+      if (method === "input_receipt") return { message_id: body.message_id, target: body.target, stage: inputQueryStage ?? (inputQuerySafe ? "refused" : transcript.some((message) => message.message_id === body.message_id) ? "entry_accepted" : "unknown"), actual_turn_id: null, reason: "原输入待确认", retry_safe: inputQuerySafe, control_event: inputQuerySafe || inputQueryStage ? inputControlEvent : null }
+      if (method === 'workspace_command') {
+        const command = workspaceModel.parseWorkspaceCommand(body.command)
+        assert.ok(command.kind === 'control_input' && command.action.kind === 'release')
+        assert.equal(command.expected_event, inputControlEvent)
+        assert.ok(messages.some((message) => message.message_id === command.message_id), 'Release refers to the original stored input')
+        inputReleases.push(JSON.parse(JSON.stringify(body)))
+        throw new Error('release acknowledgement lost')
+      }
       if (method === 'upload_attachment') return uploadHold ? uploadHold.promise : { complete: true }
       if (method === "answer") {
         answers.push(JSON.parse(JSON.stringify(body)))
@@ -343,24 +354,58 @@ test("workspace preserves bot and message requests while routing native decision
     unreadNotifications = []
     render().setView("chat")
     failMessage = true
-    assert.equal(await render().sendMessage("work"), true)
+    assert.equal(await render().sendMessage("work", [{ name: "retry.txt", arrayBuffer: async () => new Uint8Array([7, 8, 9]).buffer }]), true)
     await new Promise(setImmediate)
     state = render()
     const saved = state.pendingMessages.find((item) => item.text === "work")
     assert.ok(saved)
     const pending = JSON.parse(JSON.stringify(saved))
-    assert.deepEqual(messages[0], { conversation_id: "chat", message_id: pending.message_id, target: { kind: "bot_main", bot_id: "bot" }, intent: "continue", sequence: pending.sequence, text: "work", report_results: true, attestation })
-    assert.equal(signed.at(-1), `attestation|network|chat|${JSON.stringify({ type: "input_posted", message_id: pending.message_id, target: pending.target, intent: pending.intent, sequence: pending.sequence, text: "work", report_results: true })}`)
+    assert.deepEqual(messages[0], { conversation_id: "chat", message_id: pending.message_id, target: { kind: "bot_main", bot_id: "bot" }, intent: "continue", sequence: pending.sequence, text: "work", attachments: pending.attachments, report_results: true, attestation })
+    assert.equal(signed.at(-1), `attestation|network|chat|${JSON.stringify({ type: "input_posted", message_id: pending.message_id, target: pending.target, intent: pending.intent, sequence: pending.sequence, text: "work", attachments: pending.attachments, report_results: true })}`)
     assert.equal(render().canSaveMessages, true, "an unknown prior input leaves local saving available")
     failMessage = false
     connection.entry.device_id = "other-gateway"
-    await render().retryPendingMessage(pending.message_id)
-    assert.equal(messages.length, 1, "unknown writes are queried without replay")
-    inputQuerySafe = true
-    await render().retryPendingMessage(pending.message_id)
-    await new Promise(setImmediate)
-    inputQuerySafe = false
-    assert.deepEqual(messages[1], messages[0], "another entrance receives the same signed request")
+    const inputUiErrors: string[] = []
+    let inputWork = Promise.resolve()
+    const inputUi = componentHarness('./workspace-chat.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/chat/protocol.ts': { inputTargetKey },
+      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, action: () => Promise<void>) => { inputWork = action().catch((cause) => { inputUiErrors.push(String(cause)) }); return inputWork } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+    })
+    const inputButton = (label: string) => {
+      const saved = render().pendingMessages.find((item) => item.message_id === pending.message_id)
+      assert.ok(saved)
+      return inputUi.render('WorkspaceInputStatus', { pending: saved }).find(({ type, props }) => type === 'Button' && componentText(props.children) === label)?.props
+    }
+    const pressInput = async (label: string) => { const press = inputButton(label)?.onClick; assert.ok(press); press(); await inputWork; await settleComponent() }
+    try {
+      await pressInput('查询结果')
+      assert.equal(inputButton('重试原输入'), undefined, 'unknown writes are queried without replay')
+      assert.equal(messages.length, 1)
+      inputQuerySafe = true
+      await pressInput('查询结果')
+      transcript = [{ ...posted(pending.message_id), target: pending.target, attachments: pending.attachments }]
+      await render().refresh()
+      assert.ok(inputButton('重试原输入'), 'a stored safe refusal survives history until the user chooses recovery')
+      await pressInput('重试原输入')
+      assert.equal(inputReleases.length, 1, inputUiErrors.join(' | '))
+      assert.equal(messages.length, 1, 'the recovery is a Release CAS, never a second message write')
+      assert.equal(inputButton('重试原输入'), undefined, 'a lost Release answer must not offer another Release')
+      await pressInput('查询结果')
+      const unresolved = render().pendingMessages.find((item) => item.message_id === pending.message_id)
+      assert.equal(unresolved?.delivery, 'unknown', 'an old refused receipt cannot confirm the lost Release')
+      const retained = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === pending.message_id)
+      assert.ok(retained)
+      assert.deepEqual(retained.params, messages[0], 'original ID, signature, sequence and attachments stay unchanged')
+      assert.equal(signed.filter((value) => value.includes('"type":"input_posted"') && value.includes(pending.message_id)).length, 1)
+      assert.equal(inputReleases.length, 1)
+      const retainedControl = [...outboxItems.values()].find((item) => item.method === 'workspace_command')
+      assert.ok(retainedControl); assert.deepEqual(retainedControl.params, inputReleases[0], 'the unknown Release retains its original signed control request')
+      inputControlEvent = 'd'.repeat(64); inputQuerySafe = false; inputQueryStage = 'entry_accepted'
+      await pressInput('查询结果')
+      const settled = render().pendingMessages.find((item) => item.message_id === pending.message_id)
+      assert.ok(!settled || settled.delivery === 'accepted')
+      if (settled) assert.equal(inputButton('重试原输入'), undefined)
+    } finally { inputUi.close(); inputQuerySafe = false; inputQueryStage = null }
     connection.entry.device_id = "gateway"
     await render().refresh()
     assert.equal(render().pendingMessages.length, 0)
@@ -461,7 +506,7 @@ test("workspace preserves bot and message requests while routing native decision
     await render().createBot({ name: "corrected project", instructions: "" })
     assert.equal(render().pendingBot, null)
     assert.equal(render().selectedBot?.name, "corrected project")
-    assert.equal(messages.length, 2)
+    assert.equal(messages.length, 1, "Bot creation and recovery never re-post the stored input")
 
     await t.test("new connections wait for their own complete read and retain unknown writes without replay", async () => {
       knownBots = [bot]
@@ -503,6 +548,7 @@ test("workspace preserves bot and message requests while routing native decision
         await new Promise(setImmediate)
         assert.equal(messages.length, before + 1, "reconnect queries the original input without replaying its write")
         transcript = [...transcript, posted(original.message_id)]
+        await render().queryInput(original)
         await render().refresh()
         assert.equal(render().pendingMessages.some((item) => item.message_id === original.message_id), false)
       }
@@ -611,7 +657,13 @@ test("workspace preserves bot and message requests while routing native decision
       }
       current.rpc = async (method, body = {}) => {
         if (method === 'workspace_state') return domain
-        if (method === 'workspace_command') { commands.push(JSON.parse(JSON.stringify(body))); return creating.promise }
+        if (method === 'workspace_command') {
+          const command = workspaceModel.parseWorkspaceCommand(body.command)
+          assert.ok(command.kind === 'create_task')
+          assert.ok(command.expected_result.trim(), 'Node valid_text rejects an empty expected result')
+          assert.ok(new TextEncoder().encode(command.expected_result).length <= 16384)
+          commands.push(JSON.parse(JSON.stringify(body))); return creating.promise
+        }
         if (method === 'workspace_history') return {
           events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...message, type: 'input_posted' } })),
           coverage: { limit: 128, truncated: false, scope: 'task' },
@@ -650,6 +702,105 @@ test("workspace preserves bot and message requests while routing native decision
       } finally { current.rpc = originalRpc }
     })
 
+    await t.test('Main and Work explicit NewTask use a real valid expected result and preserve Work sources', async () => {
+      const current = activeConnection, originalRpc = current.rpc
+      const sourceEvents = ['a'.repeat(64)]
+      for (const kind of ['main', 'work']) {
+        const before = messages.length, commands: Extract<import('@vibeface/client/workspace/types.ts').WorkspaceCommand, { kind: 'create_task' }>[] = []
+        let domain: WorkspaceDomainState = { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } }
+        current.rpc = async (method, body = {}) => {
+          if (method === 'workspace_state') return domain
+          if (method === 'work_detail') return { work: { ...work, conversation_id: 'chat', target: null, source_events: sourceEvents }, coverage: { source: 'shared_history', complete: false } }
+          if (method === 'workspace_command') {
+            const command = workspaceModel.parseWorkspaceCommand(body.command)
+            assert.ok(command.kind === 'create_task')
+            assert.ok(command.expected_result.trim(), 'the real Node requires nonempty expected_result')
+            assert.ok(new TextEncoder().encode(command.expected_result).length <= 16384)
+            assert.deepEqual(command.source_events, kind === 'work' ? sourceEvents : [])
+            commands.push(command)
+            const event = 'd'.repeat(64)
+            domain = { ...domain, tasks: [{ ...command, root_task_id: command.task_id, revision: 1, action: 'continue', request_event: event, event_hash: event, created_at_ms: 1, updated_at_ms: 1, state: 'not_started' }] }
+            return { ...domain, command_id: body.command_id, event_hash: event, duplicate: false }
+          }
+          if (method === 'workspace_history') return { events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...message, type: 'input_posted' } })), coverage: { limit: 128, truncated: false, scope: 'task' } }
+          return originalRpc(method, body)
+        }
+        try {
+          await render().readWorkspaceState()
+          if (kind === 'work') await render().readWork({ conversation_id: 'chat', work_id: work.work_id })
+          let saved: PendingMessage | undefined
+          const target: InputTarget = kind === 'work' ? { kind: 'work', work_id: work.work_id } : { kind: 'bot_main', bot_id: bot.bot_id }
+          assert.equal(await render().sendMessage(`${kind} new task original request`, [], undefined, { target, intent: 'new_task', onSaved: (input) => { saved = input } }), true)
+          await settleComponent()
+          assert.ok(saved && saved.target.kind === 'task')
+          assert.equal(commands.length, 1)
+          assert.equal(commands[0].task_id, saved.target.task_id)
+          assert.equal(messages.length, before + 1)
+          assert.equal((messages.at(-1)?.target as { task_id: string }).task_id, saved.target.task_id)
+          await render().readWorkspaceHistory({ task_id: saved.target.task_id })
+        } finally { current.rpc = originalRpc }
+      }
+    })
+
+    await t.test('Task and Channel attachment reads follow the signed event scope while Main stays on another Bot', async () => {
+      const current = activeConnection, originalRpc = current.rpc
+      const otherBot = { ...bot, bot_id: 'attachment-bot', conversation_id: 'attachment-chat', name: '附件 Bot' }
+      knownBots = [bot, otherBot]
+      await render().refresh(); await render().selectBot(bot)
+      const bytes = new TextEncoder().encode('test')
+      const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+      const calls: Record<string, unknown>[] = []
+      let delayedMainRead: ReturnType<typeof deferred> | null = null
+      let target: InputTarget = { kind: 'task', task_id: 'attachment-task' }
+      current.rpc = async (method, body = {}) => {
+        if (method === 'workspace_history') return { events: [{ event_hash: 'attachment-event', created_at_ms: 1, scope_id: otherBot.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { type: 'input_posted', message_id: 'attachment-input', target, intent: 'continue', sequence: 1, expected_revision: 1, text: '任务附件', attachments: [{ hash, size: bytes.length, name: 'scope.txt' }] } }], coverage: { limit: 128, truncated: false, scope: target.kind === 'task' ? 'task' : 'channel' } }
+        if (method === 'read_artifact') {
+          calls.push(JSON.parse(JSON.stringify(body)))
+          if (delayedMainRead) return delayedMainRead.promise
+          assert.equal(body.conversation_id, otherBot.conversation_id, 'the fake Node enforces attachment ownership')
+          return { blob_hash: hash, offset: 0, size: bytes.length, next_offset: null, ...(body.binary ? { data: btoa('test') } : { text: 'test' }) }
+        }
+        return originalRpc(method, body)
+      }
+      try {
+        for (const channel of [false, true]) {
+          target = channel ? { kind: 'channel_task', channel_id: 'attachment-channel', task_id: 'attachment-task', bot_id: otherBot.bot_id } : { kind: 'task', task_id: 'attachment-task' }
+          const shared = { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: activeConnection, directory: null }) } }
+          const scope = componentHarness('./workspace-chat.tsx', shared, { setInterval: () => 1, clearInterval() {} }, 'ScopedConversation')
+          const props = { target, conversationId: otherBot.conversation_id, label: '附件任务', ...(channel ? { channelId: 'attachment-channel' } : {}) }
+          const chat = componentHarness('../chat/elements/chat.tsx', { '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } })
+          const message = componentHarness('../chat/elements/message.tsx', { ...shared, '@vibeface/client/chat/protocol.ts': { messageKey, replyStatusLabel }, '@vibeface/client/lib/errors.ts': errors })
+          let downloads = 0
+          const artifact = componentHarness('../chat/elements/artifact.tsx', { ...shared, '@vibeface/client/workspace/model.ts': { formatSize } }, { crypto, Blob, URL: { createObjectURL: () => 'blob:fixture', revokeObjectURL() {} }, document: { createElement: () => ({ click() { downloads++ } }) }, window: { setTimeout: () => 1 } })
+          try {
+            scope.render('ScopedConversation', props); await settleComponent()
+            const chatProps = scope.render('ScopedConversation', props).find(({ type }) => type === 'Chat')?.props
+            assert.ok(chatProps)
+            const messageProps = chat.render('Chat', chatProps).find(({ type }) => type === 'Message')?.props
+            assert.ok(messageProps); assert.equal(messageProps.conversationId, otherBot.conversation_id)
+            const artifactProps = message.render('Message', messageProps).find(({ type }) => type === 'Artifact')?.props
+            assert.ok(artifactProps); assert.equal(artifactProps.conversationId, otherBot.conversation_id)
+            const controls = () => artifact.render('Artifact', artifactProps)
+            const open = controls().find(({ props }) => props.label === '打开')?.props.action
+            assert.ok(open); await open()
+            assert.equal(controls().find(({ type }) => type === 'pre')?.props.children, 'test', String(render().error))
+            const download = controls().find(({ props }) => props.label === '下载')?.props.action
+            assert.ok(download); await download(); assert.equal(downloads, 1)
+            assert.equal(render().conversationId, bot.conversation_id, 'attachment reads do not select another Main')
+          } finally { scope.close(); chat.close(); message.close(); artifact.close() }
+        }
+        assert.equal(calls.length, 4)
+        assert.ok(calls.every((call) => call.conversation_id === otherBot.conversation_id))
+        delayedMainRead = deferred()
+        const oldMain = render().readArtifact(hash)
+        await render().selectBot(otherBot)
+        delayedMainRead.resolve({ blob_hash: hash, offset: 0, size: bytes.length, next_offset: null, text: 'test' })
+        await assert.rejects(oldMain, /对话已切换/)
+        delayedMainRead = null
+        await render().selectBot(bot)
+      } finally { current.rpc = originalRpc; knownBots = [bot]; await render().refresh() }
+    })
+
     await t.test('retained native chat focus restores its route through the real live bridge without acknowledging the previously selected Bot', async () => {
       const botA = { ...bot, name: 'Bot A' }, botB = { ...bot, bot_id: 'bot-b', conversation_id: 'chat-b', name: 'Bot B' }
       knownBots = [botA, botB]
@@ -660,7 +811,10 @@ test("workspace preserves bot and message requests while routing native decision
       await render().selectBot(botA)
       let shared = render()
       const device = { get ready() { return activeConnection }, phase: 'ready', link: { kind: 'online' }, entries: [], directory: null, identity: { deviceId: 'client' }, join() {}, cancelJoin() {}, leave() {} }
+      const fileReads = new Map<string, ReturnType<typeof deferred>>()
+      class SelectedFile { readonly uri: string; constructor(uri: string) { this.uri = uri } arrayBuffer() { const read = fileReads.get(this.uri); assert.ok(read); return read.promise } }
       const bridge = componentHarness('../../../../../apps/mobile/src/data/live.tsx', {
+        'expo-file-system': { File: SelectedFile },
         '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/identity/access.ts': { accessOf },
         '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/lib/node.ts': { entryAddress },
         '@vibeface/client/chat/protocol.ts': { botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, unreadCounts },
@@ -669,6 +823,7 @@ test("workspace preserves bot and message requests while routing native decision
         '@/platform': { mobilePlatform: { storage: browser.localStorage } }, './context': { WorkspaceProvider: 'NativeWorkspace' },
       }, {}, 'Live')
       type NativeWorkspace = import('../../../../../apps/mobile/src/data/types.ts').Workspace
+      const mainSaves: ReturnType<NativeWorkspace['actions']['send']>[] = []
       let native: NativeWorkspace
       const mobile = () => {
         shared = render()
@@ -681,6 +836,8 @@ test("workspace preserves bot and message requests while routing native decision
       let routine: string | undefined
       const chat = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
         'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: botA.bot_id, routine }) },
+        '@vibeface/client/lib/node.ts': { messageOf },
+        '@/platform': { mobilePlatform: { storage: browser.localStorage } },
         'expo-router/react-navigation': { useHeaderHeight: () => 0 },
         'react-native': { Platform: { OS: 'android' }, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
         'react-native-keyboard-controller': { useReanimatedKeyboardAnimation: () => ({ height: { value: 0 } }) },
@@ -755,6 +912,61 @@ test("workspace preserves bot and message requests while routing native decision
           routine = undefined
           chat.render('default'); chat.render('default')
         }
+        const mainActions = mobile().actions, originalMainSend = mainActions.send
+        mainActions.send = (...args) => { const saved = originalMainSend(...args); mainSaves.push(saved); return saved }
+        const composer = () => chat.render('default').find(({ type }) => type === 'Composer')?.props
+        const attach = (uri: string) => { const input = composer()?.onFiles; assert.ok(typeof input === 'function'); const files = [{ uri, name: uri.split('/').at(-1), size: 3 }]; input(files); return files }
+        const sendDraft = () => { const send = composer()?.onSend; assert.ok(typeof send === 'function'); send() }
+        const storedDraft = () => JSON.parse(stored.get(`vibeface.${networkKey('bot-drafts', 'network')}`) ?? '{}').chat
+        const preparing = deferred(); fileReads.set('file:///first.txt', preparing)
+        const sentBefore = messages.length
+        composer()?.onChange?.('原草稿仍在准备附件')
+        attach('file:///first.txt'); sendDraft(); sendDraft(); await settleComponent()
+        composer()?.onChange?.('原草稿仍在准备附件'); sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, 1, 'repeated taps and unchanged text cannot submit the same pending draft twice')
+        assert.equal(composer()?.value, '原草稿仍在准备附件')
+        assert.equal(storedDraft(), '原草稿仍在准备附件', 'the durable text remains recoverable before local enqueue')
+        assert.equal(render().pendingMessages.some((item) => item.text === '原草稿仍在准备附件'), false, 'the file read is still before durable acceptance')
+        const preparingLater = deferred(); fileReads.set('file:///later.txt', preparingLater)
+        composer()?.onChange?.('后来输入的内容')
+        const laterFiles = attach('file:///later.txt')
+        sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, 2, 'editing creates a separate draft that can save while the first is preparing')
+        preparing.resolve(new Uint8Array([1, 2, 3]).buffer)
+        await mainSaves[0]; await settleComponent(); mobile()
+        assert.equal(composer()?.value, '后来输入的内容')
+        assert.equal(composer()?.files, laterFiles, 'local acceptance cannot remove attachments selected after submission')
+        assert.equal(storedDraft(), '后来输入的内容')
+        preparingLater.resolve(new Uint8Array([4, 5, 6]).buffer)
+        await mainSaves[1]; await settleComponent(); mobile()
+        assert.equal(composer()?.value, '')
+        assert.deepEqual(messages.slice(sentBefore).map((message) => message.text), ['原草稿仍在准备附件', '后来输入的内容'])
+        assert.equal(new Set(messages.slice(sentBefore).map((message) => message.message_id)).size, 2, 'each edited draft produces exactly one input identity')
+        const matching = deferred(); fileReads.set('file:///matching.txt', matching)
+        composer()?.onChange?.('保存后才清空')
+        attach('file:///matching.txt'); sendDraft(); await settleComponent()
+        assert.equal(storedDraft(), '保存后才清空')
+        matching.resolve(new Uint8Array([7, 8, 9]).buffer)
+        await mainSaves[2]; await settleComponent(); mobile()
+        assert.equal(composer()?.value, '')
+        const clearedFiles = composer()?.files
+        assert.ok(Array.isArray(clearedFiles)); assert.equal(clearedFiles.length, 0)
+        assert.equal(storedDraft(), '', 'only the still-matching draft clears after the real client saves it')
+        const failedRead = deferred(); fileReads.set('file:///retry.txt', failedRead)
+        composer()?.onChange?.('附件失败后可重发')
+        attach('file:///retry.txt'); sendDraft(); await settleComponent()
+        failedRead.reject(new Error('file unavailable'))
+        await assert.rejects(mainSaves[3], /file unavailable/); await settleComponent(); mobile()
+        assert.equal(storedDraft(), '附件失败后可重发')
+        const retriedRead = deferred(); fileReads.set('file:///retry.txt', retriedRead)
+        sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, 5, 'a failed local save releases only its pending draft guard')
+        retriedRead.resolve(new Uint8Array([10, 11, 12]).buffer)
+        await mainSaves[4]; await settleComponent(); mobile()
+        assert.equal(storedDraft(), '')
+        assert.equal(messages.slice(sentBefore).filter((message) => message.text === '附件失败后可重发').length, 1)
+        mainActions.send = originalMainSend
+
         await render().refresh()
         assert.deepEqual(acknowledgements.slice(ackBefore), ['native-a'])
         assert.equal(render().notifications.some((item) => item.notification_id === 'native-b'), true)
@@ -797,7 +1009,31 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(shared.view, 'tasks', 'a completed read from a blurred chat cannot reactivate the chat view')
         assert.deepEqual(acknowledgements.slice(ackBefore), ['native-a'])
         conversationHold = null
-      } finally { chat.close(); layout.close(); bridge.close() }
+      } finally {
+        for (const read of fileReads.values()) read.resolve(new Uint8Array([0]).buffer)
+        await Promise.allSettled(mainSaves)
+        chat.close(); layout.close(); bridge.close()
+      }
+    })
+    await t.test('a cancelled safe-false refusal settles transport, allows its next input and never releases the cancellation', async () => {
+      knownBots = [bot]
+      await render().refresh(); await render().selectBot(bot)
+      const before = messages.length, releases = inputReleases.length
+      failMessage = true
+      assert.equal(await render().sendMessage('cancelled head'), true)
+      await settleComponent()
+      const head = render().pendingMessages.find((item) => item.text === 'cancelled head')
+      assert.ok(head); assert.equal(head.delivery, 'unknown')
+      failMessage = false; inputQuerySafe = false; inputQueryStage = 'refused'
+      try {
+        assert.equal(await render().sendMessage('following input'), true)
+        await settleComponent()
+        assert.deepEqual(messages.slice(before).map((message) => message.text), ['cancelled head', 'following input'])
+        assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'accepted')
+        await render().retryPendingMessage(head.message_id)
+        assert.equal(inputReleases.length, releases, 'safe=false cannot release a cancelled input')
+        assert.equal(messages.slice(before).filter((message) => message.message_id === head.message_id).length, 1)
+      } finally { inputQueryStage = null; failMessage = false }
     })
   } finally {
     for (const effect of effects.values()) effect.cleanup?.()
@@ -1077,6 +1313,81 @@ const parityShared = () => ({
     if (!work) throw new Error('共享历史中找不到这个工作')
     return { work: { ...work, target: work.target ?? null, source_events: ['a'.repeat(64)], conversation_id: input.conversation_id }, coverage: { source: 'shared_history' as const, complete: false as const } }
   },
+})
+
+test('both pending input controls retry only a matching safe refusal and keep all scope targets', async () => {
+  const targets: InputTarget[] = [{ kind: 'bot_main', bot_id: 'bot' }, { kind: 'task', task_id: 'task' }, { kind: 'channel_task', channel_id: 'channel', task_id: 'task', bot_id: 'bot' }, { kind: 'work', work_id: 'work' }, { kind: 'routine', bot_id: 'bot', trigger: 'schedule:one' }, { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }]
+  for (const platform of ['web', 'native']) for (const target of targets) {
+    let pending: PendingMessage = { message_id: 'original', conversation_id: 'chat', target, intent: 'continue', text: '保留原交代', sequence: 1, created_at_ms: 1, delivery: 'unknown', attachments: [{ hash: 'a'.repeat(64), size: 3, name: 'notes.txt' }] }
+    const retries: string[] = []
+    const shared = { ...parityShared(), workspaceState: { channels: [], tasks: [], assignments: [], inputs: [] as WorkspaceDomainState['inputs'], coverage: { limit: 128, truncated: false } },
+      queryInput: async () => { pending = { ...pending, delivery: 'accepted', receipt: { message_id: pending.message_id, target, stage: 'refused', retry_safe: true, control_event: 'c'.repeat(64), actual_turn_id: null, reason: '可以重试原输入' } } },
+      retryPendingMessage: async (id: string) => { retries.push(id) },
+      sendMessage: async () => { throw new Error('must not create another input') },
+    }
+    const app = componentHarness(platform === 'web' ? './workspace-chat.tsx' : '../../../../../apps/mobile/src/features/workspace/workspace.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared }, '@vibeface/client/chat/protocol.ts': { inputTargetKey },
+      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, action: () => Promise<void>) => action() }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+      '@/lib/use-run': { useRun: () => ({ busy: null, error: '', run: async (_key: string, action: () => Promise<void>) => action() }) }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+    })
+    const render = () => app.render(platform === 'web' ? 'WorkspaceInputStatus' : 'InputStatus', { pending })
+    const button = (label: string) => render().find(({ type, props }) => type === 'Button' && componentText(props.children) === label)?.props
+    const press = async (label: string) => { const control = button(label); assert.ok(control); const action = platform === 'web' ? control.onClick : control.onPress; assert.ok(typeof action === 'function'); action(); await settleComponent() }
+    try {
+      assert.equal(button('重试原输入'), undefined, 'unknown delivery alone never authorizes replay')
+      await press('查询结果')
+      const accepted = pending
+      assert.ok(accepted.receipt)
+      const acceptedReceipt = accepted.receipt
+      assert.ok(button('重试原输入'))
+      for (const delivery of ['saved', 'unknown', 'uploading', 'submitting'] as const) { pending = { ...accepted, delivery }; assert.equal(button('重试原输入'), undefined) }
+      pending = accepted
+      await press('重试原输入')
+      assert.deepEqual(retries, ['original'])
+      assert.equal(pending, accepted, 'the UI never replaces the original input or its attachments')
+      for (const stage of ['unknown', 'provider_accepted', 'associated', 'submitting'] as const) { pending = { ...accepted, receipt: { ...acceptedReceipt, stage } }; assert.equal(button('重试原输入'), undefined) }
+      for (const receipt of [{ ...acceptedReceipt, retry_safe: false }, { ...acceptedReceipt, control_event: null }, { ...acceptedReceipt, control_event: '' }, { ...acceptedReceipt, control_event: ' ' }, { ...acceptedReceipt, message_id: 'different' }, { ...acceptedReceipt, target: { kind: 'bot_main' as const, bot_id: 'different' } }]) { pending = { ...accepted, receipt }; assert.equal(button('重试原输入'), undefined) }
+      pending = { ...accepted, rejection_code: 'input_conflict' }; assert.equal(button('重试原输入'), undefined)
+      pending = { ...accepted, delivery: 'unknown' }; assert.match(componentText(render()), /重试请求待确认/); assert.equal(button('重试原输入'), undefined)
+      pending = accepted
+      shared.writable = false; assert.equal(button('重试原输入'), undefined); shared.writable = true
+      const queued: WorkspaceDomainState['inputs'][number] = { input: { message_id: pending.message_id, target, intent: 'defer', sequence: 1, text: pending.text }, conversation_id: 'chat', source_event: 'source', control_event: 'control', effective_order: 1, deferred: true, cancelled: false }
+      shared.workspaceState.inputs = [queued]; assert.equal(button('重试原输入'), undefined)
+      shared.workspaceState.inputs = [{ ...queued, deferred: false, cancelled: true }]; assert.equal(button('重试原输入'), undefined)
+    } finally { app.close() }
+  }
+})
+
+test('new task creation uses the displayed default Bot after the catalog loads and the Bot filter changes', async () => {
+  for (const mode of ['cold', 'filter']) {
+    const other = { ...parityBot, bot_id: 'other', conversation_id: 'other-chat', name: '另一个 Bot' }
+    const commands: unknown[] = []
+    const shared = { ...parityShared(), bots: [] as ReturnType<typeof parseBot>[], selectedBot: undefined,
+      workspaceCommand: async (command: unknown) => { commands.push(command); return { tasks: [{ task_id: 'created-task', revision: 1 }] } },
+      sendMessage: async () => true,
+    }
+    let botId: string | undefined
+    if (mode === 'filter') { shared.bots = [parityBot, other]; botId = parityBot.bot_id }
+    const app = componentHarness('./workspace-tasks.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/workspace/storage.ts': { newId: () => 'created-task' },
+      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, action: () => Promise<void>) => action() }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+    }, {}, 'CreateWorkspaceTask')
+    const render = () => app.render('CreateWorkspaceTask', { open: true, onOpenChange() {}, botId })
+    const owner = () => render().find(({ type }) => type === 'NativeSelect')?.props.value
+    try {
+      if (mode === 'cold') { assert.equal(owner(), ''); shared.bots = [parityBot] }
+      else { assert.equal(owner(), parityBot.bot_id); botId = other.bot_id; render() }
+      const expected = mode === 'cold' ? parityBot.bot_id : other.bot_id
+      assert.equal(owner(), expected, 'the visible default is also the command owner without changing the select')
+      const fields = render()
+      fields.find(({ type }) => type === 'Input')?.props.onChange?.({ currentTarget: { value: '检查界面' } })
+      fields.find(({ type }) => type === 'Textarea')?.props.onChange?.({ currentTarget: { value: '检查当前界面的操作' } })
+      const submit = render().find(({ type }) => type === 'form')?.props.onSubmit
+      assert.ok(submit); submit({ preventDefault() {} }); await settleComponent()
+      assert.equal(commands.length, 1)
+      assert.equal((commands[0] as { owner_bot: string }).owner_bot, expected)
+    } finally { app.close() }
+  }
 })
 
 test('routine input links preserve their exact trigger', () => {

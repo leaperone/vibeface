@@ -43,7 +43,7 @@ export function FoldedText({ text }: { text: string }) {
  * the schedule whose run produced this reply. `retry` is 重试 after this reply failed or was stopped.
  */
 /** `detail`: the device's own words for a failed reply, folded under its cause. */
-export function Message({ message, schedule, time: shown, retry, detail }: { message: ChatMessage; schedule?: string; time?: string; retry?: () => Promise<void>; detail?: string }) {
+export function Message({ message, conversationId, schedule, time: shown, retry, detail }: { message: ChatMessage; conversationId?: string; schedule?: string; time?: string; retry?: () => Promise<void>; detail?: string }) {
   const { connectionOnline, data, selectedBot } = useWorkspace()
   const owner = data?.conversation?.owner
   const user = message.role === 'user'
@@ -58,7 +58,7 @@ export function Message({ message, schedule, time: shown, retry, detail }: { mes
   const time = when ? <time dateTime={when.toISOString()} className={shown ? `${user ? 'px-1 ' : ''}text-meta text-muted-foreground` : 'sr-only'}>{shown ?? full}</time> : null
   if (user) return <div className="flex min-w-0 flex-col items-end gap-1" data-message-id={messageKey(message)}>
     {message.text ? <div title={full} className="min-w-0 max-w-[85%] rounded-2xl rounded-br-md bg-secondary px-4 py-2 text-secondary-foreground ring-1 ring-border/60 [overflow-wrap:anywhere] sm:max-w-[75%] data-[sending]:opacity-70" data-sending={message.state === 'sending' || message.state === 'queued' || message.state === 'merging' || undefined}><span className="sr-only">你：</span><FoldedText text={message.text} /></div> : null}
-    {message.attachments?.map((file) => <div key={file.hash} className="w-full min-w-0 max-w-[85%] sm:max-w-[75%]"><Artifact file={file} /></div>)}
+    {message.attachments?.map((file) => <div key={`${conversationId ?? ''}:${file.hash}`} className="w-full min-w-0 max-w-[85%] sm:max-w-[75%]"><Artifact file={file} conversationId={conversationId} /></div>)}
     {message.state === 'queued' ? <span className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Clock aria-hidden="true" className="size-3.5" />排队中</span>
       : message.state === 'merging' ? <span className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Merge aria-hidden="true" className="size-3.5" />已登记为回合补充</span>
       : message.state === 'merged' ? <span className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Merge aria-hidden="true" className="size-3.5" />{mergedLabels[message.merged ?? 'unknown']}</span> : time}

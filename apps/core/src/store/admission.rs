@@ -22,7 +22,7 @@ pub(crate) enum PeerCommand {
         trigger: String,
     },
     Dispatch {
-        spec: WorkRequest,
+        spec: Box<WorkRequest>,
     },
     Stop {
         conversation_id: String,
@@ -417,7 +417,7 @@ impl Store {
         request: &WorkRequest,
     ) -> Result<Option<PeerEnvelope>> {
         let payload = PeerCommand::Dispatch {
-            spec: request.clone(),
+            spec: Box::new(request.clone()),
         };
         let entry: Option<PeerAdmission> = load(
             &self.connection,
@@ -493,10 +493,10 @@ impl Store {
             Some(("assignment", assignment_id)) => {
                 let assignment = self.delivery_assignment(network, conversation, assignment_id)?;
                 let mut refs = vec![assignment.event_hash];
-                if let Some(source) = assignment.source_event {
-                    if refs[0] != source {
-                        refs.push(source);
-                    }
+                if let Some(source) = assignment.source_event
+                    && refs[0] != source
+                {
+                    refs.push(source);
                 }
                 Ok((Some(assignment.started_revision), 0, refs))
             }
@@ -758,7 +758,9 @@ impl Store {
         network: &str,
         spec: &WorkRequest,
     ) -> Result<PeerOutbound> {
-        let payload = PeerCommand::Dispatch { spec: spec.clone() };
+        let payload = PeerCommand::Dispatch {
+            spec: Box::new(spec.clone()),
+        };
         if let Some(bound) = self.bound_peer_command(network, &payload)? {
             ensure!(
                 bound.envelope.payload == payload,
@@ -910,42 +912,41 @@ impl Store {
                 conversation_id,
                 trigger,
             } => {
-                if let Some(("message", message_id)) = trigger.split_once(':') {
-                    if held_answer_subject_from(
+                if let Some(("message", message_id)) = trigger.split_once(':')
+                    && held_answer_subject_from(
                         &self.connection,
                         network,
                         conversation_id,
                         message_id,
                     )?
                     .is_some()
-                    {
-                        let Some(receipt) =
-                            self.held_answer_receipt(network, conversation_id, message_id)?
-                        else {
-                            return Ok(None);
-                        };
-                        if !self.peer_original_metadata(network, envelope)? {
-                            return Ok(None);
-                        }
-                        return Ok(Some(json!({"receipt":receipt})));
+                {
+                    let Some(receipt) =
+                        self.held_answer_receipt(network, conversation_id, message_id)?
+                    else {
+                        return Ok(None);
+                    };
+                    if !self.peer_original_metadata(network, envelope)? {
+                        return Ok(None);
                     }
+                    return Ok(Some(json!({"receipt":receipt})));
                 }
                 let mut job = self.scheduler_job(conversation_id, trigger)?;
-                if job.is_none() {
-                    if let Some(("assignment", assignment_id)) = trigger.split_once(':') {
-                        let assignment = self.workspace_assignment(network, assignment_id)?;
-                        if let Some(source) =
-                            assignment.and_then(|assignment| assignment.trigger_message_id)
-                        {
-                            let source = crate::scheduling::message_trigger(&source);
-                            if self.peer_delivery_receipt_matches(
-                                network,
-                                conversation_id,
-                                trigger,
-                                &source,
-                            )? {
-                                job = self.scheduler_job(conversation_id, &source)?;
-                            }
+                if job.is_none()
+                    && let Some(("assignment", assignment_id)) = trigger.split_once(':')
+                {
+                    let assignment = self.workspace_assignment(network, assignment_id)?;
+                    if let Some(source) =
+                        assignment.and_then(|assignment| assignment.trigger_message_id)
+                    {
+                        let source = crate::scheduling::message_trigger(&source);
+                        if self.peer_delivery_receipt_matches(
+                            network,
+                            conversation_id,
+                            trigger,
+                            &source,
+                        )? {
+                            job = self.scheduler_job(conversation_id, &source)?;
                         }
                     }
                 }
@@ -1075,25 +1076,25 @@ impl Store {
         if !self.peer_original_metadata(network, envelope)? {
             return Ok(false);
         }
-        if let PeerCommand::Dispatch { spec } = &envelope.payload {
-            if let Some(("assignment", assignment_id)) = spec.trigger.split_once(':') {
-                let assignment =
-                    self.delivery_assignment(network, &spec.conversation, assignment_id)?;
-                let task = self
-                    .workspace_task(network, &assignment.task_id)?
-                    .context("assignment task is missing")?;
-                ensure!(
-                    envelope.revision == Some(task.revision)
-                        && super::workspace::assignment_work_allowed_from(
-                            &self.connection,
-                            network,
-                            assignment_id,
-                            &spec.dispatcher,
-                            &spec.conversation
-                        )?,
-                    "assignment no longer authorizes this Work revision"
-                );
-            }
+        if let PeerCommand::Dispatch { spec } = &envelope.payload
+            && let Some(("assignment", assignment_id)) = spec.trigger.split_once(':')
+        {
+            let assignment =
+                self.delivery_assignment(network, &spec.conversation, assignment_id)?;
+            let task = self
+                .workspace_task(network, &assignment.task_id)?
+                .context("assignment task is missing")?;
+            ensure!(
+                envelope.revision == Some(task.revision)
+                    && super::workspace::assignment_work_allowed_from(
+                        &self.connection,
+                        network,
+                        assignment_id,
+                        &spec.dispatcher,
+                        &spec.conversation
+                    )?,
+                "assignment no longer authorizes this Work revision"
+            );
         }
         Ok(true)
     }

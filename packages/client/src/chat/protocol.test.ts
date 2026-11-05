@@ -1,13 +1,30 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, inputEventBody, inputTargetKey, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, retryText, roleLabel, reachDevice } from './protocol.ts'
+import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, inputEventBody, inputTargetKey, inputTaskCommand, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, retryText, roleLabel, reachDevice } from './protocol.ts'
 import type { ManagerJob, TurnRuntime } from '../workspace/types.ts'
-import { parseInputReceipt, parseNodes, parsePendingMessage, parseTurnRuntime } from '../workspace/model.ts'
+import { parseInputReceipt, parseNodes, parsePendingMessage, parseTurnRuntime, parseWorkspaceCommand } from '../workspace/model.ts'
 import { enqueue, type OutboxItem } from '../lib/outbox.ts'
 
 const prepareMainSend = (input: Omit<Parameters<typeof prepareSend>[0], 'target' | 'sequence'>) => prepareSend({ ...input, target: { kind: 'bot_main', bot_id: 'bot' }, sequence: 1 })
 
 const ready = { hasConversation: true, loaded: true, bot: 'ready' as const }
+test('automatic Task commands meet the Node expected-result contract and retain their source', () => {
+  const sources = ['a'.repeat(64), 'b'.repeat(64)]
+  for (const input of [
+    { task_id: 'main-task', owner_bot: 'bot', text: '  检查项目  ' },
+    { task_id: 'channel-task', owner_bot: 'bot', channel_id: 'channel', text: '给出频道调查结论' },
+    { task_id: 'work-task', owner_bot: 'bot', text: '先看原工作结果，再继续完成', source_events: sources },
+    { task_id: 'attachment-task', owner_bot: 'bot', text: '' },
+  ]) {
+    const command = inputTaskCommand(input)
+    assert.equal(command.task_id, input.task_id)
+    assert.equal(command.request, input.text.trim() || '附件输入')
+    assert.ok(command.expected_result.trim().length > 0)
+    assert.ok(Buffer.byteLength(command.expected_result, 'utf8') <= 16384)
+    assert.deepEqual(command.source_events, 'source_events' in input ? sources : [])
+  }
+  assert.deepEqual(sources, ['a'.repeat(64), 'b'.repeat(64)])
+})
 test('send waits for a loaded conversation', () => {
   assert.equal(roleLabel('user'), '你')
   assert.equal(roleLabel('assistant'), 'Bot')
@@ -97,9 +114,17 @@ test('a persisted unknown input retains the original signature, attachment bytes
   assert.deepEqual(restored.attachments, [attachment])
   assert.deepEqual((await store.all())[0].params, item.params)
   assert.deepEqual((await store.all())[0].uploads, item.uploads)
-  assert.equal(parseInputReceipt({ message_id: restored.message_id, target: restored.target, stage: 'provider_accepted', actual_turn_id: null, reason: null, retry_safe: false }).actual_turn_id, null)
-  assert.throws(() => parseInputReceipt({ message_id: restored.message_id, target: restored.target, stage: 'read', actual_turn_id: null, reason: null, retry_safe: false }))
-  assert.throws(() => parseInputReceipt({ message_id: restored.message_id, target: restored.target, stage: 'unknown', actual_turn_id: null, reason: null, retry_safe: true }))
+  const receipt = { message_id: restored.message_id, target: restored.target, stage: 'provider_accepted', actual_turn_id: null, reason: null, retry_safe: false, control_event: null }
+  assert.equal(parseInputReceipt(receipt).actual_turn_id, null)
+  assert.equal(parseInputReceipt(receipt).control_event, null)
+  const safe = { ...receipt, stage: 'refused', retry_safe: true, control_event: 'a'.repeat(64) }
+  assert.equal(parseInputReceipt(safe).control_event, safe.control_event)
+  assert.equal(parseInputReceipt({ ...safe, control_event: 'A'.repeat(64) }).control_event, 'A'.repeat(64))
+  for (const control_event of [undefined, null, 1, '', 'a'.repeat(63), 'g'.repeat(64)]) assert.throws(() => parseInputReceipt({ ...safe, control_event }))
+  assert.throws(() => parseInputReceipt({ ...receipt, control_event: undefined }))
+  for (const rejection_code of ['input_not_saved', 'input_conflict'] satisfies NonNullable<OutboxItem['rejection_code']>[]) assert.equal(parsePendingMessage({ ...item, rejection_code }).rejection_code, rejection_code)
+  assert.throws(() => parseInputReceipt({ ...receipt, stage: 'read' }))
+  for (const stage of ['unknown', 'submitting', 'provider_accepted', 'associated']) assert.throws(() => parseInputReceipt({ ...safe, stage }))
 })
 
 test('Enter submits only after IME composition finishes and Shift Enter remains a newline', () => {
@@ -143,6 +168,14 @@ test('retry requires explicit not-started evidence and an affirmative job receip
   for (const changed of [{ ...job, runtime: null }, { ...job, pending_check: true }, { ...job, retryable: false }, { ...job, state: 'reconciling' }, { ...job, runtime: { ...runtime, execution: 'unknown' as const } }, { ...job, runtime: { ...runtime, execution: 'started' as const } }]) assert.equal(canRetryJob(changed), false)
   assert.deepEqual(parseTurnRuntime(runtime), runtime)
   assert.throws(() => parseTurnRuntime({ ...runtime, execution: 'maybe' }))
+  const progress = { kind: 'assignment_progress', assignment_id: 'assignment', revision: 1, state: 'accepted' }
+  for (const execution of ['not_started', 'started', 'unknown']) {
+    const parsed = parseWorkspaceCommand({ ...progress, execution })
+    assert.equal(parsed.kind === 'assignment_progress' && parsed.execution, execution)
+  }
+  assert.equal('execution' in parseWorkspaceCommand(progress), false)
+  assert.throws(() => parseWorkspaceCommand({ ...progress, execution: true }))
+  assert.throws(() => parseWorkspaceCommand({ ...progress, execution: 'maybe' }))
   assert.match(runtimeLabel(runtime), /默认模型，实际模型未确认/)
   assert.doesNotMatch(runtimeLabel(runtime), /medium/)
   assert.match(runtimeLabel({ ...runtime, provider: 'pi', switched_from: { provider: 'claude', model: 'opus', reasoning_effort: 'high' }, switch_reason: 'quota' }), /由 Claude Code 的 opus 切换/)

@@ -3,6 +3,30 @@ use crate::scheduling::SteerTarget;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 impl Runtime {
+    pub(crate) fn validate_assignment_roots(roots: &[String]) -> Result<()> {
+        for root in roots {
+            let path = PathBuf::from(root);
+            let actual = path
+                .canonicalize()
+                .context("assignment resource directory does not exist")?;
+            ensure!(
+                path.is_absolute() && actual == path && actual.is_dir(),
+                "assignment resource roots must name their actual canonical directories"
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_work_assignment_roots(store: &Store, network: &str, trigger: &str) -> Result<()> {
+        if let Some(id) = trigger.strip_prefix("assignment:") {
+            let assignment = store
+                .workspace_assignment(network, id)?
+                .context("work assignment missing")?;
+            Self::validate_assignment_roots(&assignment.resource_roots)?;
+        }
+        Ok(())
+    }
+
     async fn work_native_directory(
         &self,
         provider: Provider,
@@ -71,9 +95,10 @@ impl Runtime {
         store.authorize_node(network, &local)?;
         ensure!(work.target == local, "work targets another Node");
         ensure!(
-            store.work_native_write_allowed(network, &work.work_id)?,
+            store.work_native_authority_allowed(network, &work.work_id)?,
             "work has no active authority for native submission"
         );
+        Self::validate_work_assignment_roots(&store, network, &work.trigger)?;
         if let WorkKind::Agent(provider) = work.kind {
             ensure!(
                 provider == work.resolved.provider
@@ -147,12 +172,13 @@ impl Runtime {
             self.work_native_directory(work.resolved.provider, thread, "")
                 .await?;
         }
-        self.work_native_directory(
-            work.resolved.provider,
-            thread.filter(|_| work.resolved.provider != Provider::Pi || work.thread.is_some()),
-            &work.cwd,
-        )
-        .await?;
+        let actual_cwd = self
+            .work_native_directory(
+                work.resolved.provider,
+                thread.filter(|_| work.resolved.provider != Provider::Pi || work.thread.is_some()),
+                &work.cwd,
+            )
+            .await?;
         let mut store = self.store.lock().await;
         store.authorize_node(network, &local)?;
         ensure!(
@@ -173,10 +199,80 @@ impl Runtime {
                 "work execution permission was revoked"
             );
         }
+        Self::validate_work_assignment_roots(&store, network, &work.trigger)?;
         ensure!(
-            store.reserve_work_native_submission(network, work)?,
+            store.reserve_work_native_submission(
+                network,
+                work,
+                actual_cwd
+                    .to_str()
+                    .context("native work directory is not UTF-8")?,
+            )?,
             "work native submission was already reserved; query the original work"
         );
+        Ok(guard)
+    }
+
+    pub(super) async fn work_first_input_lease(
+        &self,
+        network: &str,
+        work: &crate::work::WorkSpec,
+        actual_session: &str,
+    ) -> Result<OwnedRwLockWriteGuard<()>> {
+        let guard = self
+            .work_input_lock(&work.work_id)
+            .await
+            .write_owned()
+            .await;
+        let local = self.identity.device_id()?;
+        let permission_epoch = self
+            .local_permission_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        ensure!(
+            work.target == local
+                && work.kind == WorkKind::Agent(work.resolved.provider)
+                && self
+                    .providers()
+                    .switches
+                    .execution
+                    .contains(&work.resolved.provider),
+            "work execution permission was revoked"
+        );
+        {
+            let store = self.store.lock().await;
+            store.authorize_node(network, &local)?;
+            ensure!(
+                store.work_native_authority_allowed(network, &work.work_id)?
+                    && store.work_native_submission_reserved(&work.work_id)?,
+                "work no longer permits its first native input"
+            );
+            Self::validate_work_assignment_roots(&store, network, &work.trigger)?;
+        }
+        let actual_cwd = self
+            .work_native_directory(work.resolved.provider, Some(actual_session), &work.cwd)
+            .await?;
+        let mut store = self.store.lock().await;
+        store.authorize_node(network, &local)?;
+        ensure!(
+            self.providers()
+                .switches
+                .execution
+                .contains(&work.resolved.provider)
+                && self
+                    .local_permission_epoch
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == permission_epoch,
+            "work permissions changed before native input"
+        );
+        Self::validate_work_assignment_roots(&store, network, &work.trigger)?;
+        store.begin_reserved_work_native_input(
+            network,
+            work,
+            actual_session,
+            actual_cwd
+                .to_str()
+                .context("native work directory is not UTF-8")?,
+        )?;
         Ok(guard)
     }
 
@@ -216,10 +312,13 @@ impl Runtime {
             "work input target is no longer active"
         );
         let work = store.work(network, work_id)?.context("work not found")?;
+        Self::validate_work_assignment_roots(&store, network, &work.trigger)?;
         drop(store);
-        self.work_native_directory(work.resolved.provider, Some(&into.thread_id), &work.cwd)
+        let actual_cwd = self
+            .work_native_directory(work.resolved.provider, Some(&into.thread_id), &work.cwd)
             .await?;
         let store = self.store.lock().await;
+        Self::validate_work_assignment_roots(&store, network, &work.trigger)?;
         ensure!(
             self.providers().switches.execution.contains(&into.provider)
                 && store
@@ -230,7 +329,14 @@ impl Runtime {
                         work_id
                     )?
                     .as_ref()
-                    == Some(into),
+                    == Some(into)
+                && store.work_native_resources_available(
+                    network,
+                    work_id,
+                    actual_cwd
+                        .to_str()
+                        .context("native work directory is not UTF-8")?,
+                )?,
             "work input permission changed before native submission"
         );
         Ok(guard)

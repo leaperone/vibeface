@@ -3,11 +3,17 @@ import { newId } from '../workspace/storage.ts'
 import type { MessageRequest, PendingMessage, TranscriptMessage } from './types.ts'
 import { failureText } from '../lib/errors.ts'
 import { asProvider, providerNames, probeIssueText } from '../lib/node.ts'
-import type { InputIntent, InputTarget, ManagerJob, ProviderStage, TurnRuntime, NodeInfo, WorkspaceInputBody } from '../workspace/types.ts'
+import type { InputIntent, InputTarget, ManagerJob, ProviderStage, TurnRuntime, NodeInfo, WorkspaceCommand, WorkspaceInputBody } from '../workspace/types.ts'
 import type { FailureKind } from '../lib/errors.ts'
 
 /** An empty chat's first messages: project questions for a bot with a folder, otherwise what any bot can do from chat. */
 export const starters = { project: ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？'], general: ['你能帮我做什么？', '每天早上 9 点提醒我', '记住：回复用中文'] }
+
+export function inputTaskCommand(input: { task_id: string; owner_bot: string; text: string; channel_id?: string; source_events?: readonly string[] }): Extract<WorkspaceCommand, { kind: 'create_task' }> {
+  const request = inputText(input.text.trim() || '附件输入', '任务交代', 65536)
+  return { kind: 'create_task', task_id: input.task_id, ...(input.channel_id === undefined ? {} : { channel_id: input.channel_id }), owner_bot: input.owner_bot, title: input.text.trim().slice(0, 80) || '附件任务', request,
+    expected_result: '按交代完成工作，并说明结果和未完成的部分。', source_events: [...(input.source_events ?? [])], dependencies: [], reply_only: false }
+}
 
 type SendGate = {
   hasConversation: boolean

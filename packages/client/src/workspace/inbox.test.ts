@@ -33,6 +33,11 @@ test('unknown inputs keep separate Inbox IDs and their original Task and Channel
   assert.deepEqual(items.map((item) => item.key), ['undelivered:task-input', 'undelivered:channel-input'])
   assert.deepEqual(items.map((item) => item.message.target), [{ kind: 'task', task_id: 'task' }, { kind: 'channel_task', channel_id: 'channel', task_id: 'other', bot_id: 'b' }])
   assert.equal(waitingItems(items).length, 2)
+  const refused = pending('refused-main', { kind: 'bot_main', bot_id: 'b' }, 'accepted')
+  refused.receipt = { message_id: refused.message_id, target: refused.target, stage: 'refused', actual_turn_id: null, reason: '认证尚未就绪', retry_safe: true, control_event: 'a'.repeat(64) }
+  state.workspace.pendingMessages = [refused]
+  const refusedItems = inboxItems(state).flatMap((item) => item.kind === 'undelivered' ? [item] : [])
+  assert.deepEqual(refusedItems.map((item) => [item.key, item.title, item.message.receipt?.control_event]), [['undelivered:refused-main', '输入被拒绝', 'a'.repeat(64)]])
 })
 
 test('Main acknowledgements require an exact BotMain notification target', () => {

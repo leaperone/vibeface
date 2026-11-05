@@ -34,6 +34,7 @@ export const queueHoldLabels: Record<QueueHoldReason, string> = {
   task_limit: '等待 Bot 任务名额', machine_slot: '等待设备运行名额', pending_check: '等待确认上一轮结果',
   backend_config_pending: '等待当前 AI 回合结束后切换配置',
   attachment_preparation: '正在准备附件', earlier_input: '等待此目标前面的输入先发送',
+  resource_conflict: '等待正在使用的工作目录释放',
 }
 export const agentLaneLabels: Record<AgentLane, string> = { main: '主对话', task: '独立任务', schedule_routine: '定时任务', bot_message: 'Bot 消息' }
 export const inputReceiptLabels: Record<InputReceipt['stage'], string> = { entry_accepted: '接收设备已保存', owner_accepted: '运行设备已接收', submitting: '正在提交给 AI', provider_accepted: 'AI 服务已接受', associated: '已确认实际回合', refused: '已拒绝', unknown: '结果未知' }
