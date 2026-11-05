@@ -240,6 +240,7 @@ test('provider settings and queued cancellation work in the installed native app
     await screen.scrollUntilVisible(button, { direction: 'down' });
     await button.click();
     await expect.poll(async () => (await inspect()).execution_model, { timeout: 15000 }).toBe(model);
+    await screen.scrollUntilVisible(executionDetails, { direction: 'up' });
   };
   const screenshot = async (name: string) => { await copyFile(await app.screenshot(name), join(publicPath, `${name}.png`)); };
   await openSettings();
