@@ -7851,7 +7851,7 @@ def e2e_fixture(options):
                               "login_count": len(fixture_records(run, "native-provider-login.jsonl")),
                               "readiness": provider["readiness"]["state"], "catalog": provider["probe"]["catalog"]["state"],
                               "authentication": provider["probe"]["authentication"],
-                              "checked": provider["probe"]["checked_at_ms"] is not None,
+                              "checked_at_ms": provider["probe"]["checked_at_ms"],
                               "jobs": [{"trigger": row["trigger"], "state": row["state"]} for row in jobs
                                        if row["trigger"] in (native_queue["running_trigger"], native_queue["queued_trigger"])],
                               "running_invocations": sum(row["trigger"] == native_queue["running_trigger"] for row in calls),

@@ -114,7 +114,8 @@ function providerInspection(value: Record<string, unknown>) {
     assert(saved.reasoning_effort === null || typeof saved.reasoning_effort === 'string');
     manager = { provider: text(saved.provider), model: saved.model, reasoning_effort: saved.reasoning_effort };
   }
-  assert(typeof value.checked === 'boolean' && Array.isArray(value.jobs));
+  assert(value.checked_at_ms === null || typeof value.checked_at_ms === 'number' && Number.isSafeInteger(value.checked_at_ms) && value.checked_at_ms >= 0);
+  assert(Array.isArray(value.jobs));
   assert(typeof value.running_invocations === 'number' && Number.isSafeInteger(value.running_invocations) && value.running_invocations >= 0);
   assert(typeof value.queued_invocations === 'number' && Number.isSafeInteger(value.queued_invocations) && value.queued_invocations >= 0);
   assert(Array.isArray(value.roles) && value.roles.every(role => role === 'agent' || role === 'execution'));
@@ -123,7 +124,8 @@ function providerInspection(value: Record<string, unknown>) {
   const setup = record(value.setup);
   return { manager, roles: value.roles, execution_model: value.execution_model, login_count: value.login_count,
     setup: { directory: text(setup.directory), command: text(setup.command) },
-    readiness: text(value.readiness), authentication: text(value.authentication), catalog: text(value.catalog), checked: value.checked,
+    readiness: text(value.readiness), authentication: text(value.authentication), catalog: text(value.catalog),
+    checked_at_ms: value.checked_at_ms, checked: value.checked_at_ms !== null,
     jobs: value.jobs.map((item: unknown) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state) }; }),
     running_invocations: value.running_invocations, queued_invocations: value.queued_invocations };
 }
@@ -242,7 +244,12 @@ test('provider settings and queued cancellation work in the installed native app
   const probeButton = screen.getByRole('button', 'Codex 检查可用性', { exact: true });
   const probe = async () => {
     await expect(probeButton).toBeEnabled({ timeout: 30000 });
+    const before = (await inspect()).checked_at_ms;
     await probeButton.click();
+    await expect.poll(async () => {
+      const checked = (await inspect()).checked_at_ms;
+      return checked !== null && checked !== before;
+    }).toBe(true);
     await expect(probeButton).toBeEnabled({ timeout: 30000 });
   };
   const codexRow = () => screen.getByRole('button', /^Codex，/);
