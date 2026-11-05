@@ -204,6 +204,21 @@ jobs:
                   return None
               code = error.get("code")
               result = {"code": code if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) else "UNCLASSIFIED_ERROR"}
+              message = error.get("message")
+              if code == "ENGINE_FAILURE" and isinstance(message, str):
+                  result["engine_reason"] = next((reason for needle, reason in (
+                      ("could not be masked", "secure-mask"),
+                      ("app_not_running", "app-not-running"),
+                      ("app is not running", "app-not-running"),
+                      ("main thread", "main-thread"),
+                      ("main-thread", "main-thread"),
+                      ("wedged", "runner-wedged"),
+                      ("runner busy", "runner-busy"),
+                      ("presentation", "presentation"),
+                      ("timed out", "timeout"),
+                      ("snapshot", "snapshot"),
+                      ("screenshot", "screenshot"),
+                  ) if needle in message.lower()), "unknown")
               source = error.get("source", source)
               if isinstance(source, dict) and source.get("file") in {"native-transfers.e2e.ts", "e2e.native.config.ts"}:
                   line = source.get("line")

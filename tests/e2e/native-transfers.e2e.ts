@@ -160,6 +160,7 @@ test('provider settings and queued cancellation work in the installed native app
   expect(await bundleManifest(installedPath)).toEqual(built);
   await device.clearKeychain();
   await app.open();
+  await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
   const run = process.env.GITHUB_RUN_ID, attempt = process.env.GITHUB_RUN_ATTEMPT;
   if (run !== undefined || attempt !== undefined) {
     assert(run && attempt && /^[0-9]+$/.test(run) && /^[0-9]+$/.test(attempt));
@@ -171,7 +172,6 @@ test('provider settings and queued cancellation work in the installed native app
     assert.equal(assigned[0].state, 'Booted');
     await copyFile(await app.screenshot('provider-initial'), join(publicPath, 'provider-initial.png'));
   }
-  await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
   await screen.getByRole('textbox', /^加入链接(?:$|[\s,，])/).fill(secrets.get('nativeInvitation'), { timeout: 30000 });
   await expect(screen.getByText('已填入加入链接', { exact: true })).toBeVisible();
   const deviceName = screen.getByRole('textbox', /^这台设备的名字(?:$|[\s,，])/);
