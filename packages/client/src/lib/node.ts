@@ -52,6 +52,11 @@ export type ProviderIssue = { code: 'bin_missing'; path: string } | { code: 'env
 export type AppServerLink = { state: 'off' } | { state: 'starting' } | { state: 'connected'; socket: string; user_agent: string }
   | { state: 'not_found'; candidates: string[] } | { state: 'handshake_failed'; socket: string; reason: string } | { state: 'launch_failed'; reason: string }
 export type AppServerMode = 'system' | 'spawn'
+/** A private settings edit on the connected computer; local completion never enables a use. */
+export type ProviderChange = {
+  provider: ProviderId; bot?: boolean; execution?: boolean; execution_model?: string; bin?: string
+  env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null }; connect_local?: boolean
+}
 /** `socket` is required when enabling a system App Server connection. */
 export type AppServer = { mode: AppServerMode; socket: string | null; link: AppServerLink }
 export type ProviderObservation = {

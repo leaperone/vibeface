@@ -146,6 +146,7 @@ test('backend English and gateway refusal codes reach the page as plain Chinese'
   assert.equal(failureText('unknown'), '', 'an unknown kind is worded by its caller')
   for (const kind of failureKinds) if (kind !== 'unknown') assert.match(failureText(kind), /[一-鿿]/, kind)
   assert.match(humanError('client response timed out; outcome may be unknown'), /结果未知/)
+  assert.equal(humanError('could not read local AI service settings; retry or configure the service manually'), '读取这台电脑的 AI 服务设置失败。重试或手动设置。')
   assert.equal(humanError('已断开设备连接。'), '已断开设备连接。')
   assert.match(humanError('peer did not answer in time'), /另一台设备没有回应/)
   assert.match(humanError('Codex rejected request: {"code":-32600,"message":"no rollout found for thread id 01a15c84"}'), /新对话还没准备好/)

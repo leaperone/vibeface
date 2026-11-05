@@ -15,6 +15,7 @@ export const spentInviteText = '这条加入链接已用过或已过期。在已
 /** A join link the Node will not take again: already answered, or past its time, in the Node's words or ours. */
 export const spentInvite = new RegExp(`ticket has already been used|ticket is unknown or already expired|ticket has expired|^(${[spentInviteText, nodeJoinCopy.used, nodeJoinCopy.expired].join('|')})$`, 'i')
 const patterns: [RegExp, string][] = [
+  [/could not read local AI service settings/i, '读取这台电脑的 AI 服务设置失败。重试或手动设置。'],
   [/face changed since you saw it/i, 'Bot 的长相刚在别处改过，这次没有改，已显示最新的长相。'],
   [/artifact is not UTF-8 text/i, '这个文件不是文字，下载后再打开。'],
   [/log has forked/i, '这个节点的数据被复制过，已暂停发送。去待处理看看。'],
