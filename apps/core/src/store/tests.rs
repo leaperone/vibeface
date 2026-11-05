@@ -1019,6 +1019,68 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
 }
 
 #[test]
+fn a_steer_target_waiting_for_reconciliation_is_not_treated_as_active() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let local = net.a.device_id()?;
+
+    say(&mut store, &net, "m1", true)?;
+    let first = store
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let (trigger, attempt) = (
+        first.job.trigger.clone(),
+        first.job.state.attempt().context("attempt")?.id.clone(),
+    );
+    store.mark_started("c", &trigger, &attempt)?;
+    store.record_manager_turn(&attempt, "system", "thread", Some("turn"), &Default::default())?;
+
+    say(&mut store, &net, "m2", true)?;
+    let into = store
+        .steer_candidates(&net.network, &local, "boot", Provider::Codex)?
+        .pop()
+        .context("steer candidate")?
+        .into;
+    let m2 = message_trigger("m2");
+    assert!(store.begin_steer(&net.network, &local, "boot", "c", &m2, &into)?);
+
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        JobOutcome::Interrupted {
+            failure: ExecFailure::new(
+                FailureKind::Lost,
+                "the reply process ended unexpectedly; its result is unverified",
+            ),
+            process_unconfirmed: true,
+        },
+        "",
+        3,
+    )?;
+
+    assert!(
+        !store.steer_host_active("c", &attempt)?,
+        "a reconciliating host no longer guarantees a running target turn"
+    );
+
+    let settled = store
+        .request_manager_cancel(&net.a, &net.network, "c", &m2)?
+        .context("steering message")?;
+    assert_eq!(
+        settled.state,
+        JobState::Steered {
+            into,
+            outcome: SteerOutcome::Unknown
+        }
+    );
+    Ok(())
+}
+
+#[test]
 fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
