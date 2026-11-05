@@ -1087,6 +1087,7 @@ fn account_authentication(account: &Value) -> Authentication {
         account["requiresOpenaiAuth"].as_bool(),
         account.get("account"),
     ) {
+        (Some(false), _) => Authentication::NotRequired,
         (Some(true), Some(Value::Null)) => Authentication::SignInRequired,
         (Some(true), Some(value)) if value["type"] == "chatgpt" => Authentication::Authenticated,
         _ => Authentication::Unverified,
@@ -1237,7 +1238,11 @@ mod tests {
             account_authentication(
                 &json!({"requiresOpenaiAuth":false,"account":{"type":"apiKey"}})
             ),
-            Authentication::Unverified
+            Authentication::NotRequired
+        );
+        assert_eq!(
+            account_authentication(&json!({"requiresOpenaiAuth":false,"account":null})),
+            Authentication::NotRequired
         );
         assert_eq!(
             account_authentication(&json!({})),

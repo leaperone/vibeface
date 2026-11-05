@@ -51,8 +51,7 @@ jobs:
       - name: Verify generated native sources match this commit
         env:
           SOURCE_COMMIT: ${{ github.sha }}
-          PYTHONPATH: scripts
-        run: python3 -c 'import os, runpy; runpy.run_path("scripts/run-delivery-live.py")["source_commit"](os.environ["SOURCE_COMMIT"])'
+        run: python3 -B scripts/run-delivery-live.py --verify-source-commit "$SOURCE_COMMIT"
       - name: Build the release APK
         working-directory: apps/mobile
         run: |
@@ -80,6 +79,8 @@ jobs:
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          cache-on-failure: true
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.9.0
@@ -198,6 +199,16 @@ jobs:
           stage = stage_path.read_text().strip() if stage_path.exists() else "not_started"
           stages = {"host-source", "host-build", "simulator-create", "typecheck", "selection", "ui-run"}
           diagnostics = {"stage": stage if stage in stages else "not_started", "report": "missing", "failures": []}
+          navigation_path = public / "provider-navigation.json"
+          if navigation_path.exists():
+              try:
+                  navigation = json.loads(navigation_path.read_text())
+                  keys = {"settings_visible", "connected_computer_link", "current_entry", "can_rename", "ai_link", "device_missing"}
+                  assert set(navigation) == keys | {"stage"} and navigation["stage"] in {"settings", "device"}
+                  assert all(value is None or type(value) is bool for key, value in navigation.items() if key in keys)
+                  diagnostics["navigation"] = navigation
+              except (OSError, ValueError, TypeError, AssertionError):
+                  diagnostics["navigation"] = {"stage": "invalid"}
 
           def safe_error(error, source=None, api=None):
               if not isinstance(error, dict):
@@ -208,6 +219,15 @@ jobs:
               if code == "ENGINE_FAILURE" and isinstance(message, str):
                   result["engine_reason"] = next((reason for needle, reason in (
                       ("could not be masked", "secure-mask"),
+                      ("no focused text input was available for typing", "text-input-not-focused"),
+                      ("reliable text synthesis is unavailable while the software keyboard is hidden", "text-synthesis-unavailable"),
+                      ("the runner could not confirm the typed text reached the field", "text-commit-unobserved"),
+                      ("the runner could not clear the field before typing", "text-clear-unobserved"),
+                      ("the text is longer than one runner command can type at this pace", "text-synthesis-budget"),
+                      ("text entry read-back did not match", "text-entry-mismatch"),
+                      ("no text input found at the provided coordinates to clear", "text-input-target-missing"),
+                      ("no focused text input to clear", "text-input-target-missing"),
+                      ("xctest recorded a failure while executing", "xctest-recorded-failure"),
                       ("app_not_running", "app-not-running"),
                       ("app is not running", "app-not-running"),
                       ("main thread", "main-thread"),

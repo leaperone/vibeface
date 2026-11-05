@@ -785,7 +785,7 @@ test("provider cards keep summary readiness, setup and execution details in thei
   const ready: ProviderReadiness = { state: 'ready' }
   const signIn: ProviderReadiness = { state: 'needs_setup', issue: { stage: 'authentication', code: 'sign_in_required' } }
   const model: ProviderReadiness = { state: 'unverified', issue: { stage: 'model_list', code: 'model_unverified' } }
-  const signInText = 'Codex 需要登录，请在运行设备完成登录'
+  const signInText = 'Codex 需要完成认证，请在运行设备登录或配置 API 密钥'
   const modelText = 'Codex 尚未确认这个模型，可发送消息或先检查可用性'
   const cases: (Pick<ProviderStatus, 'roles' | 'readiness' | 'execution_readiness'> & {
     name: string; label: string; reason: string; setup: boolean; executionLabel: string | null; executionReason: string

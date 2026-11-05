@@ -115,7 +115,7 @@ test('the shared readiness reason names the provider and device without blocking
   const [node] = parseNodes({ nodes: [{ device_id: 'mac', name: '我的 Mac', online: true, local: false, revoked: false, capabilities: { manager: 'claude', manager_state: 'unverified', manager_readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }, roots: [], relay: false } }] })
   assert.equal(botCanSend(botReach([node])), true)
   assert.match(botProviderNotice([node]), /Claude Code · 我的 Mac/)
-  assert.match(botProviderNotice([node]), /登录尚未确认/)
+  assert.match(botProviderNotice([node]), /认证状态尚未确认/)
 })
 
 test('重试 sends the message as it was only when the reply provably did nothing', () => {

@@ -652,7 +652,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   /** `sent`: files already on the Node, which a retry sends again without uploading. */
   const sendMessage = (input: string, files: AttachmentFile[] = [], sent: Attachment[] = []) => withMutation(`message:${activeId.current}`, async () => {
     if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("还没选 Bot。先选一个。")
-    if (botReach(nodesRef.current) === "needs_setup") throw new Error("运行 Bot 的设备需设置。先检查 AI 服务登录和模型。")
+    if (botReach(nodesRef.current) === "needs_setup") throw new Error("运行 Bot 的设备需设置。先检查 AI 服务认证和模型。")
     setMessageBusy(true)
     try { return await submitMessage(input, files, sent) } finally { if (current()) setMessageBusy(false) }
   })

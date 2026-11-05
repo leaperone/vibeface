@@ -139,7 +139,7 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
       {item.setup && (assistant || execution) && ['needs_setup', 'unverified'].includes(readiness.state) ? <View className="gap-2">
         <Text className="text-meta text-muted-foreground">在运行该节点的电脑或服务器上执行以下命令，为独立目录登录或配置，再点“检查可用性”。不会复制已有登录信息。</Text>
         <Text selectable className="font-mono text-meta text-muted-foreground">{item.setup.directory}</Text>
-        <CopyableId value={item.setup.command} label={`${name} 私有目录登录命令`} />
+        <CopyableId value={item.setup.command} label={`${name} 私有目录认证命令`} />
       </View> : null}
       <Text className="text-meta text-muted-foreground">{item.probe.checked_at_ms === null ? '尚未主动检查' : `检查于 ${new Date(item.probe.checked_at_ms).toLocaleString()}`}</Text>
       <Button variant="ghost" className="self-start" disabled={busy !== ''} onPress={() => void probe()}><Icon as={busy === `${item.provider}:probe` ? LoaderCircle : PlugZap} /><Text>检查可用性</Text></Button>

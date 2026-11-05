@@ -17,7 +17,8 @@ import { mobilePlatform } from '@/platform'
 import { WorkspaceProvider } from './context'
 import type { ChatMessage, Connection, Conversation, Member, Session, Workspace, WorkspaceActions } from './types'
 
-const busyStates = ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling']
+const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
+const streamingStates = [...busyStates, 'publishing']
 const empty = { bots: [], primary: null, unread: {}, questions: [], members: [], conversations: {} }
 const noTabs = { leader: () => true, post() {}, listen: () => () => {} }
 
@@ -133,7 +134,7 @@ function Live({ children }: { children: ReactNode }) {
     const streamed = shared.liveProgress.filter((progress): progress is Extract<typeof progress, { kind: 'manager' }> => progress.kind === 'manager' && progress.conversation_id === conversationId && Boolean(progress.text))
     const handedOver = streamed.some((progress) => landed(progress.text))
     const live = streamed.find((progress) => !landed(progress.text)
-      && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))))
+      && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))))
     // The user message it answers, as the final reply's in_reply_to names it, so the two share a row: the one still
     // sending, or else the latest in the history.
     const liveTrigger = live && (sending ? shared.messagePending?.message_id : data.messages.findLast((message) => message.role === 'user')?.message_id)
@@ -149,7 +150,7 @@ function Live({ children }: { children: ReactNode }) {
     const pending = shared.messagePending
     if (pending && !data.messages.some((message) => message.message_id === pending.message_id)) messages.push({ message_id: pending.message_id, event_hash: pending.message_id, role: 'user', text: pending.text, created_at_ms: Date.now(), state: 'sending' })
     if (live) messages.push({ message_id: `live:${live.key}`, event_hash: `live:${live.key}`, role: 'assistant', text: live.text, created_at_ms: Date.now(), state: 'streaming', in_reply_to: liveTrigger })
-    const stopJob = jobs.find((job) => data.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
+    const stopJob = jobs.find((job) => data.scheduler?.capabilities?.cancel === true && ['queued', 'steering', 'claimed', 'running'].includes(job.state))
     conversations[conversationId] = {
       messages, before: timeline.before, rest: timeline.rest, answers: folded.answers, hidden: folded.hidden, works: data.works,
       unread: unread ? 'question_id' in unread ? `q:${unread.question_id}` : unread.message_id : null,
@@ -219,7 +220,7 @@ function Live({ children }: { children: ReactNode }) {
       },
       async stop(id) {
         await select(id)
-        const job = latest.current.data?.scheduler?.jobs.find((item) => ['queued', 'claimed', 'running'].includes(item.state))
+        const job = latest.current.data?.scheduler?.jobs.find((item) => ['queued', 'steering', 'claimed', 'running'].includes(item.state))
         if (job) await latest.current.cancelManager(job.trigger)
       },
       answer: (question, text) => latest.current.answer(question, text),

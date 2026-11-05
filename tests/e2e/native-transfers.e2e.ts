@@ -135,7 +135,7 @@ test('provider settings and queued cancellation work in the installed native app
   assert(simulator && appPath && binary && crypto && source && /^[a-f0-9]{40}$/.test(source), 'Provider acceptance pins its source and actual artifacts');
   const publicPath = resolve(root, '.artifacts/native/public');
   await mkdir(publicPath, { recursive: true, mode: 0o700 });
-  for (const name of ['provider.json', 'provider-initial.png', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png', 'terminology-device-kinds.png']) {
+  for (const name of ['provider.json', 'provider-navigation.json', 'provider-initial.png', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png', 'terminology-device-kinds.png']) {
     await unlink(join(publicPath, name)).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
   const wasm = crypto.replace(/\.js$/, '_bg.wasm');
@@ -200,9 +200,40 @@ test('provider settings and queued cancellation work in the installed native app
   await copyFile(await app.screenshot('terminology-device-kinds'), join(publicPath, 'terminology-device-kinds.png'));
   await clientKind.click();
   await expect(screen.getByText('手机 App／浏览器', { exact: true })).toBeVisible();
-  const openSettings = async () => {
-    await openLink(`vibeface://device/${network.receiver}`);
+  await screen.getByRole('button', '关闭', { exact: true }).click();
+  const navigation = async (stage: 'settings' | 'device') => {
+    const present: Record<string, boolean | null> = {};
+    for (const [key, locator] of Object.entries({
+      settings_visible: screen.getByText('我的设备', { exact: true }),
+      connected_computer_link: screen.getByRole('link', /当前连接/),
+      current_entry: screen.getByText('当前连接', { exact: true }),
+      can_rename: screen.getByRole('button', /^改名 /),
+      ai_link: screen.getByRole('link', 'Bot 与任务', { exact: true }),
+      device_missing: screen.getByText('找不到这个设备', { exact: true }),
+    })) {
+      try { present[key] = await locator.count() > 0; }
+      catch { present[key] = null; }
+    }
+    await writeFile(join(publicPath, 'provider-navigation.json'), `${JSON.stringify({ stage, ...present })}\n`, { mode: 0o600 });
+  };
+  const openSettings = async (from: 'home' | 'ai') => {
+    if (from === 'home') {
+      await screen.getByRole('link', '设置', { exact: true }).click();
+      await expect(screen.getByText('我的设备', { exact: true })).toBeVisible();
+      await navigation('settings');
+      const computer = screen.getByRole('link', /当前连接/);
+      await expect(computer).toHaveCount(1);
+      await screen.scrollUntilVisible(computer, { direction: 'down' });
+      await computer.click();
+    } else await device.back();
     await expect(screen.getByText('节点', { exact: true })).toBeVisible({ timeout: 30000 });
+    await expect(screen.getByText('当前连接', { exact: true })).toBeVisible();
+    await navigation('device');
+    const details = screen.getByRole('button', '详细信息', { exact: true });
+    await details.click();
+    await screen.getByRole('button', '复制设备编号', { exact: true }).click();
+    await expect.poll(() => device.clipboard()).toBe(network.receiver);
+    await details.click();
     const link = screen.getByRole('link', 'Bot 与任务', { exact: true });
     await screen.scrollUntilVisible(link, { direction: 'down', timeout: 30000 });
     await link.click();
@@ -243,8 +274,8 @@ test('provider settings and queued cancellation work in the installed native app
     await screen.scrollUntilVisible(executionDetails, { direction: 'up' });
   };
   const screenshot = async (name: string) => { await copyFile(await app.screenshot(name), join(publicPath, `${name}.png`)); };
-  await openSettings();
-  const initialProvider = screen.getByRole('button', 'Codex，未验证，可尝试', { exact: true });
+  await openSettings('home');
+  const initialProvider = screen.getByRole('button', 'Codex，尚未确认', { exact: true });
   await expect(initialProvider).toBeVisible();
   await expect(screen.getByText('尚未主动检查', { exact: true }).first()).toBeVisible();
   expect((await inspect()).checked).toBe(false);
@@ -261,7 +292,7 @@ test('provider settings and queued cancellation work in the installed native app
   expect((await inspect()).authentication).toBe('sign_in_required');
   const setup = (await inspect()).setup;
   await expect(screen.getByText(setup.command, { exact: true })).toBeVisible();
-  await screen.getByRole('button', '复制Codex 私有目录登录命令', { exact: true }).click();
+  await screen.getByRole('button', '复制Codex 私有目录认证命令', { exact: true }).click();
   await expect.poll(() => device.clipboard()).toBe(setup.command);
   const copied = await device.clipboard();
   assert.equal(copied, setup.command);
@@ -302,7 +333,7 @@ test('provider settings and queued cancellation work in the installed native app
   await screen.scrollUntilVisible(screen.getByLabel('Codex 运行 Bot', { exact: true }), { direction: 'up' });
   await screen.getByLabel('Codex 运行 Bot', { exact: true }).click();
   await expect.poll(async () => (await inspect()).manager?.provider, { timeout: 15000 }).toBe('codex');
-  await openSettings();
+  await openSettings('ai');
   await codexRow().click();
   await expect(botDetails).not.toBeExpanded();
   await expect(executionDetails).not.toBeExpanded();
@@ -341,7 +372,7 @@ test('provider settings and queued cancellation work in the installed native app
   await saveExecution('');
   await expect(executionButton()).toHaveAccessibleName('执行任务默认模型，由 AI 服务决定');
   expect((await inspect()).manager).toEqual({ provider: 'codex', model: 'native-selectable', reasoning_effort: 'high' });
-  await openSettings();
+  await openSettings('ai');
   await codexRow().click();
   await botDetails.click();
   await expect(modelButton()).toHaveAccessibleName('设备默认模型，Native selectable');
