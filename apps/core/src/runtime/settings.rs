@@ -1046,13 +1046,13 @@ impl Runtime {
                 .iter()
                 .map(|provider| provider.label())
                 .collect();
-            format!("要让这台电脑用 {} 执行任务吗？", names.join("、"))
+            format!("要让这个节点用 {} 执行任务吗？", names.join("、"))
         } else if only_folder {
             format!("要让 Bot 在 {} 里工作吗？", shown(&roots[0]))
         } else if paths.is_empty() {
             "要让 Bot 在这些文件夹里工作吗？".to_owned()
         } else {
-            "要改这台电脑的这些 AI 设置吗？".to_owned()
+            "要改这个节点的这些 AI 设置吗？".to_owned()
         }];
         if let Some(server) = &paths.app_server {
             lines.push(match (&server.mode, &server.socket) {

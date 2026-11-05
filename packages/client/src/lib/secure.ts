@@ -36,14 +36,14 @@ export function secureKit(secure: SecureApi) {
     const auth = record(value)
     const principal = parsePrincipal(auth.principal)
     const state = record(auth.state)
-    if (principal.device_id !== own.deviceId || expected && principal.network_id !== expected.networkId) throw new Error('电脑返回的身份和这台设备对不上。')
-    if (expected?.kind === 'root' && (!same(state.genesis, expected.genesis) || expected.checkpoint !== undefined && !array(state.checkpoints).some(item => same(item, expected.checkpoint)))) throw new Error('电脑返回的设备记录和这里保存的对不上。')
+    if (principal.device_id !== own.deviceId || expected && principal.network_id !== expected.networkId) throw new Error('节点返回的身份和这台设备对不上。')
+    if (expected?.kind === 'root' && (!same(state.genesis, expected.genesis) || expected.checkpoint !== undefined && !array(state.checkpoints).some(item => same(item, expected.checkpoint)))) throw new Error('节点返回的设备记录和这里保存的对不上。')
     const view = verifiedView(state, principal.network_id, nodeNow(auth))
     if (principal.epoch !== view.epoch || !same(auth.view, view)) throw new Error('设备列表没通过校验。')
     const revoked = (id: string) => view.revoked.some(item => item.device_id === id)
     if (principal.source === 'local_session') {
       const node = expected?.kind === 'local' ? view.members.find(member => member.device_id === expected.nodeId) : undefined
-      if (!node || node.kind !== 'node' || revoked(node.device_id)) throw new Error('本机连接和这台电脑对不上。')
+      if (!node || node.kind !== 'node' || revoked(node.device_id)) throw new Error('本机连接和这个节点对不上。')
       return { auth, principal, view }
     }
     const member = view.members.find(item => item.device_id === own.deviceId)
@@ -54,7 +54,7 @@ export function secureKit(secure: SecureApi) {
   function verifyRemoval(value: unknown, nodeId: string, networkId: string): boolean {
     const auth = record(value)
     if (auth.node_revoked !== true) return false
-    if (networkId && auth.network_id !== networkId) throw new Error('这台电脑属于另一组设备。确认连的是自己的设备。')
+    if (networkId && auth.network_id !== networkId) throw new Error('这个节点属于另一组设备。确认连的是自己的设备。')
     if (!verifiedView(auth.state, text(auth.network_id), nodeNow(auth)).revoked.some(item => item.device_id === nodeId)) throw new Error('设备说它已被移出，但记录没通过校验。')
     return true
   }

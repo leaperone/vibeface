@@ -78,7 +78,7 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
   const setup = device.localSetup?.kind === 'initialized' && device.localSetup.removed ? device.localSetup : null
   const here = Boolean(setup)
   const canRejoin = device.removedLocally || Boolean(setup?.local_launch)
-  return <Panel icon={MonitorX} title={here || device.removedLocally ? '这台电脑已被移出' : '所连的电脑已被移出'}>
+  return <Panel icon={MonitorX} title={here || device.removedLocally ? '这个节点已被移出' : '所连的节点已被移出'}>
     {canRejoin ? <>
       <p className="text-muted-foreground">点重新加入，再用已有设备的加入链接把它加回来</p>
       <p className="flex items-center gap-2 text-meta text-muted-foreground"><Archive aria-hidden="true" className="size-4 shrink-0" />旧数据改名保留，不会删除</p>
@@ -106,7 +106,7 @@ function NodeJoin() {
   const joining = device.nodeJoining!
   const [cancelling, setCancelling] = useState(false)
   return <Panel icon={Hourglass} title={joining.status === 'joined' ? '已加入' : joinCopy.waiting}>
-    {joining.status === 'joined' ? <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />正在打开这台电脑</p> : <>
+    {joining.status === 'joined' ? <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />正在打开这个节点</p> : <>
       {joining.code ? <Reached /> : null}
       <JoinCode code={joining.code} admin={joining.admin} />
       <Button type="button" variant="ghost" className="-ms-3 w-fit" disabled={cancelling} onClick={() => { setCancelling(true); device.cancelNodeJoin().catch(() => setCancelling(false)) }}>
@@ -164,7 +164,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const scannable = canScan()
   const scanFirst = scannable && touchFirst()
   const savedName = device.localSetup?.kind === 'initialized' ? device.entryName(device.localSetup.entry) : ''
-  const computerName = savedName || '这台电脑'
+  const computerName = savedName || '这个节点'
   const removed = device.error === BROWSER_REMOVED
   // A computer in use opens fully only for a browser already in; any other browser joins, or just manages it from here.
   const localSetup = device.localSetup
@@ -254,14 +254,14 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   let body: ReactNode
   // The join card holds its own failure, next to where a new link goes in.
   let alertInBody = false
-  if (device.phase === 'blocked') body = <EmptyState icon={ShieldAlert} title="在这台电脑上打开，或用加入链接" />
+  if (device.phase === 'blocked') body = <EmptyState icon={ShieldAlert} title="在节点本机打开，或用加入链接" />
   else if (device.phase === 'key_lost') body = <Panel icon={ShieldAlert} title="需要重新加入">
     <p className="text-muted-foreground">这个浏览器保存的登录信息不见了。</p>
     <Button type="button" className="w-fit justify-self-end" disabled={busy} onClick={() => void run(device.replaceLostKey)}>重新开始</Button>
   </Panel>
   else if (device.phase === 'removed') body = <Removed busy={busy} run={run} />
   else if (device.phase === 'restarting') body = <Panel icon={LoaderCircle} busy title="正在重新开始">
-    <p className="text-muted-foreground">旧数据已改名保留。这台电脑重启好后，用加入链接把它加回来。</p>
+    <p className="text-muted-foreground">旧数据已改名保留。这个节点重启好后，用加入链接把它加回来。</p>
   </Panel>
   else if (device.recovery) body = <RecoveryWaiting />
   else if (device.nodeJoining) body = <NodeJoin />
@@ -271,7 +271,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   else if (choosing) body = <StartChoice onCreate={() => setCreating(true)} onJoin={() => chooseLane('invite')} />
   else if (active === 'local' && setup && !names) body = <NamesStep initial={draftNames} onNext={setNames} onBack={() => setCreating(false)} />
   else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => { setDraftNames(names); setNames(null) }} run={run} />
-  else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title={device.localSetup.kind === 'initialized' ? computerName : '这台电脑'}>
+  else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title={device.localSetup.kind === 'initialized' ? computerName : '这个节点'}>
     {device.localSetup.kind !== 'initialized' ? <p className="text-muted-foreground">用已有设备的加入链接，或恢复文件</p>
       : local === 'open' ? <Button type="button" className="w-full sm:w-fit sm:justify-self-end" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}><LogIn aria-hidden="true" />打开</Button>
       : <>
@@ -295,9 +295,9 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   else if (active === 'recovery') body = usable ? <RecoveryControls only="restore" /> : null
   else {
     alertInBody = true
-    body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '扫码加入' : thisComputer ? '把这台电脑加入我的设备' : removed ? '重新加入' : '加入我的设备'}>
+    body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '扫码加入' : thisComputer ? '把这个节点加入我的网络' : removed ? '重新加入' : '加入我的设备'}>
       {/* A failure or the removal notice already says where to go next. */}
-      {failed || removed ? null : <p className="-mt-2 text-meta text-muted-foreground">{joinCopy.linkSource(publicEntry && !thisComputer ? '你的电脑' : undefined)}</p>}
+      {failed || removed ? null : <p className="-mt-2 text-meta text-muted-foreground">{joinCopy.linkSource(publicEntry && !thisComputer ? '你的节点' : undefined)}</p>}
       {alert}
       {scanning && purpose !== 'link' ? <Scanner onTicket={(ticket) => { setInvitation(ticket); setScanning(false) }} onCancel={() => setScanning(false)} /> : <form className="grid gap-4" onSubmit={submitInvitation}>
         <fieldset disabled={linking || !usable} className="grid gap-4">
@@ -312,7 +312,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
             <Button ref={claimFocus} type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
           </p>}
           {thisComputer
-            ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></Field>
+            ? <Field label="这个节点叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></Field>
             : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={lastBrowserName() || defaultBrowserName()} /></Field>}
           {purpose === 'link' ? <Button type="submit" className="w-fit justify-self-end" aria-busy={linking || undefined}>{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}{linking ? joinCopy.joining : joinCopy.join}</Button> : null}
         </fieldset>
@@ -329,7 +329,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     {device.phase === 'initializing' ? <Skeleton className="h-48" /> : body}
     {other}
     {device.identity && !focused && step !== 2 ? <Details key={step ?? active}>
-      {alertInBody && !publicEntry && !thisComputer ? <p>另一台电脑上运行 <code>vibeface join</code> 加这条链接。</p> : null}
+      {alertInBody && !publicEntry && !thisComputer ? <p>在新节点的电脑或服务器上运行 <code>vibeface join</code> 加这条链接。</p> : null}
       <CopyDiagnostics lines={[['这个浏览器', device.identity.deviceId]]} />
       {usable ? <Details label="手动填写地址">
         <form className="grid gap-3" noValidate onSubmit={(event) => {
@@ -366,9 +366,9 @@ function StartChoice({ onCreate, onJoin }: { onCreate(): void; onJoin(): void })
 
 /** Only the computer's name asks for a thought; the browser takes its suggested name unless someone opens it. */
 function NamesStep({ computer, initial, onNext, onBack }: { computer?: string; initial: Names | null; onNext(names: Names): void; onBack(): void }) {
-  return <Panel icon={Laptop} title="给这台电脑起名">
+  return <Panel icon={Laptop} title="给这个节点起名">
     <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; onNext({ computer: value(form, 'computer').trim(), browser: value(form, 'browser').trim() || defaultBrowserName() }) }}>
-      <Input key={computer} name="computer" aria-label="这台电脑叫什么？" required maxLength={128} autoComplete="off" defaultValue={initial?.computer || computer || defaultComputerName()} />
+      <Input key={computer} name="computer" aria-label="这个节点叫什么？" required maxLength={128} autoComplete="off" defaultValue={initial?.computer || computer || defaultComputerName()} />
       <Details label="这个浏览器的名字">
         <Input name="browser" aria-label="这个浏览器叫什么？" maxLength={128} autoComplete="off" className="text-foreground" defaultValue={initial?.browser ?? defaultBrowserName()} />
       </Details>

@@ -141,7 +141,7 @@ test('the app reaches a Node on its LAN directly: no Gateway, no connect frame, 
   assert.equal((await channel.request('info') as { device_id: string }).device_id, app.target)
   channel.close(); await settle()
   assert.equal(app.open(), 0)
-  await assert.rejects(app.connect({ kind: 'lan', addrs: ['192.168.1.99:7001'], device_id: app.target }), /在局域网里连不上这台电脑/)
+  await assert.rejects(app.connect({ kind: 'lan', addrs: ['192.168.1.99:7001'], device_id: app.target }), /在局域网里连不上这个节点/)
 })
 
 test('on the LAN, an impostor is refused and a text frame is the Node refusing', async () => {

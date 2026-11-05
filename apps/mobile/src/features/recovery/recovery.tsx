@@ -69,7 +69,7 @@ export function RecoveryRestore({ link }: { link?: string | null }) {
         <Text className="text-meta text-muted-foreground">{recoveryCopy.target}</Text>
         <Text numberOfLines={1} ellipsizeMode="middle">{entryAddress(target)}</Text>
       </View>
-      <Button variant="ghost" size="icon" accessibilityLabel="换一台电脑" disabled={locked} onPress={() => setTarget(null)}><Icon as={X} /></Button>
+      <Button variant="ghost" size="icon" accessibilityLabel="换一个节点" disabled={locked} onPress={() => setTarget(null)}><Icon as={X} /></Button>
     </View>
     <FilePick picked={picked} onPick={setPicked} disabled={locked} />
     <Input {...passwordProps} accessibilityLabel="恢复密码" placeholder="恢复密码" value={password} onChangeText={setPassword} editable={!locked} />

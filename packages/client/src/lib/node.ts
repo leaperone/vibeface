@@ -115,7 +115,7 @@ export function parseEntry(value: unknown): ConnectionEntry {
   }
   const address = validEndpoint(text(v.address))
   if (v.local !== true) return { kind: 'gateway', address, device_id }
-  if (address !== (globalThis as { location?: { origin: string } }).location?.origin) throw new Error('本机打开时只能连这台电脑。')
+  if (address !== (globalThis as { location?: { origin: string } }).location?.origin) throw new Error('本机打开时只能连这个节点。')
   return { kind: 'local', address, device_id }
 }
 export const entryJson = (entry: ConnectionEntry) => entry.kind === 'lan' ? { device_id: entry.device_id, addrs: entry.addrs }
@@ -187,7 +187,7 @@ export function parseLocalSetup(value: unknown, origin: string): LocalSetup {
     setup = { kind: 'initialized', entry, removed: boolean(v.removed) }
     if (v.local_launch !== undefined) {
       const launch = record(v.local_launch), url = new URL(text(launch.url)), device_id = validTarget(launch.device_id), token = text(launch.token)
-      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.pathname !== '/' || url.search || url.hash || device_id !== entry.device_id || !/^[a-f0-9]{64}$/.test(token)) throw new Error('本机链接和这台电脑对不上。')
+      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.pathname !== '/' || url.search || url.hash || device_id !== entry.device_id || !/^[a-f0-9]{64}$/.test(token)) throw new Error('本机链接和这个节点对不上。')
       setup.local_launch = { url: url.origin, device_id, token }
     }
   }

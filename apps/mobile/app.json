@@ -23,7 +23,7 @@
       },
       "infoPlist": {
         "NSCameraUsageDescription": "扫描加入二维码",
-        "NSLocalNetworkUsageDescription": "用于在局域网内直接连接你自己的电脑。",
+        "NSLocalNetworkUsageDescription": "用于发现并直接连接局域网内你自己的 Vibeface 节点。",
         "NSBonjourServices": [
           "_vibeface._udp"
         ]
