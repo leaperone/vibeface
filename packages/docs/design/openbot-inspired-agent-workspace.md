@@ -33,7 +33,7 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 
 `WorkProjection` 的共享状态是 `accepted`、`running`、`interrupting`、`finished`、`unverified`，结果可以是 `completed`、`failed`、`interrupted`、`rejected`、`unverified`。本机运行记录还会暂时使用 `starting`，不应扩展为共享状态。
 
-`scheduler_jobs` 当前状态是 `queued`、`claimed`、`running`、`cancelling`、`completed`、`failed`、`cancelled`、`interrupted`、`steering`、`steered`。`claim_next` 对一个 conversation 一次只领取一个 active job。不同 conversation 可以并行，源码没有 OpenBot 式 Node-wide turn slot。
+`scheduler_jobs` 当前状态是 `queued`、`claimed`、`running`、`cancelling`、`reconciling`、`completed`、`failed`、`cancelled`、`interrupted`、`steering`、`steered`。active job 按 `SessionScope` 隔离，同一 scope 不并行启动新轮；不同 scope 仍受 Node 的 `machine_slots`、Bot 的 `task_limit` 和 Provider instance 串行门约束。
 
 ## 目标信息架构
 
@@ -57,7 +57,7 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 
 ### 队列和协作
 
-队列按 job `sequence` 排序，并保留人类消息优先规则。跨 conversation 的并行状态按各自 Node 和 job 展示，不合并成未定义的全局并发限制。
+队列按 job `sequence` 排序，并保留人类消息优先规则。跨 conversation 的并行状态按各自 Node 和 job 展示，等待原因保留设备槽、Bot 任务上限和 Provider 串行门的区别，不合并成跨 Node 的全局队列。
 
 快照未提供执行顺序字段时，UI 只能显示观察到的调用状态，不能称为实际排队顺序。`queued`、`cancelling` 和已写回复但尚待同步的 `publishing` 使用各自的状态文案。历史调用与等待执行的调用分开，不能统一标为正在运行。
 
@@ -90,7 +90,7 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 
 1. 多 Bot 总览能合并 `open_works`，并保持 settled、`unverified` 和 delivery 的边界。
 2. 同一 `call_ref` 的 `message_bot` 和 `dispatch_work` 重试只回读，不产生第二条消息或第二个副作用回合。
-3. conversation 单 active job、跨 conversation 并行、steering 和取消与 scheduler projection 一致。
+3. scope 单 active job、跨 scope 并行、Node 槽、Provider 串行门、steering 和取消与 scheduler projection 一致。
 4. Node 重启或 native session 丢失后，checkpoint 和事件能重建可核对输入，并保留未知结果。
 5. Web 和移动端只显示清理后的摘要、步骤和审批，不泄露凭证、原始命令、diff 或 Provider token。
 

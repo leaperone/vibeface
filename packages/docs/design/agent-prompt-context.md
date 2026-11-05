@@ -20,7 +20,7 @@ Handoff is a bounded recovery record. It carries the source Provider and stable 
 
 A local SchedulerSession stores its generation and a bounded lineage in the serialized shown state. Each main chat, task and routine owns a separate durable scheduler record and Memory writer. A routine discards its Provider session after completion. Stable and runtime fingerprints are stored separately. The runtime digest uses the same captured binary, workspace, environment and backend lease as execution. When the stable configuration, runtime configuration or owner epoch changes, claim_next_in_session clears the native ID, native token, covers and shown data, increments the generation and records the source Provider, old stable and runtime fingerprints, source covers and handoff revision. The active turn keeps its old generation. The next turn starts with the new one. A captured backend lease pins the selected configuration before claiming; a concurrent settings save cannot move that turn to a different backend.
 
-Provider session IDs, transcripts, tokens, environment values and credentials never enter shared events. Only bounded, redacted handoff information can cross a Node boundary.
+Local resume tokens, credentials, environment values and private native transcripts never enter shared events. External session attribution can share its session ID, directory and bounded summary, and WorkProgress can carry thread and turn references. These references are attribution and execution evidence, not transferable resume credentials. Handoff information remains bounded and redacted.
 
 ## Memory
 
