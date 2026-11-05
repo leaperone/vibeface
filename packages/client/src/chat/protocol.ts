@@ -39,7 +39,7 @@ export function runtimeLabel(runtime: TurnRuntime): string {
   const model = runtime.model ? `提交模型 ${runtime.model}` : 'AI 服务默认模型，实际模型未确认'
   const effort = runtime.reasoning_effort ? `提交推理强度 ${runtime.reasoning_effort}` : '推理强度由 AI 服务决定'
   const switched = runtime.switched_from ? `，由 ${providerNames[runtime.switched_from.provider]} 的 ${runtime.switched_from.model ?? '默认模型'} 切换` : ''
-  const stages: Record<ProviderStage, string> = { validate: '检查设置', install: '检查程序', launch: '启动程序', authentication: '检查登录', model_list: '检查模型', session_start: '开始会话', turn_start: '提交回合', run: '执行回合', read_back: '查询结果', interrupt: '中断回合', compact: '整理上下文', handoff: '交接上下文', record: '记录结果' }
+  const stages: Record<ProviderStage, string> = { validate: '检查设置', install: '检查程序', launch: '启动程序', authentication: '检查认证', model_list: '检查模型', session_start: '开始会话', turn_start: '提交回合', run: '执行回合', read_back: '查询结果', interrupt: '中断回合', compact: '整理上下文', handoff: '交接上下文', record: '记录结果' }
   const reason = runtime.switch_reason ? `，原因 ${failureText(runtime.switch_reason) || 'AI 服务未能启动'}` : ''
   return `${providerNames[runtime.provider]} · ${model} · ${effort} · ${stages[runtime.stage]}${switched}${reason}`
 }
@@ -54,7 +54,7 @@ export function botProviderNotice(nodes: NodeInfo[], owner?: string | null): str
   const readiness = node.capabilities.manager_readiness
   if (readiness && 'issue' in readiness && provider) return `${prefix} · ${probeIssueText(provider, readiness.issue)}。检查状态${readiness.state === 'unverified' ? '尚未确认' : '需设置'}。`
   if (node.capabilities.manager_state === 'unverified') return `${prefix} 尚未确认可用，可发送消息或在设备设置检查。`
-  if (node.capabilities.manager_state === 'needs_setup') return `${prefix} 需设置，请在运行设备检查登录和模型。`
+  if (node.capabilities.manager_state === 'needs_setup') return `${prefix} 需设置，请在运行设备检查认证和模型。`
   if (node.capabilities.manager_state === 'starting') return `${prefix} 正在启动，请稍后查询。`
   return ''
 }

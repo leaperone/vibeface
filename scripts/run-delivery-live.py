@@ -14,12 +14,16 @@ import signal
 import shutil
 import socket
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
 import urllib.parse
 import uuid
 import zipfile
+
+# Local helper imports must not dirty the checkout before provenance checks.
+sys.dont_write_bytecode = True
 from release import verify_build_info
 
 
@@ -2106,6 +2110,44 @@ def self_test_videos(directory):
                 raise AssertionError("The host must independently inspect the actual MP4 and matching duration")
 
 
+def self_test_source_cli(directory):
+    repo = directory / "source-cli"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    for name in ("run-delivery-live.py", "release.py"):
+        shutil.copy2(ROOT / "scripts" / name, scripts / name)
+
+    def git(*args):
+        return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args],
+                              cwd=repo, check=True, capture_output=True, text=True)
+
+    git("init", "-q")
+    git("add", "scripts")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
+    expected = git("rev-parse", "HEAD").stdout.strip()
+
+    environment = os.environ.copy()
+    environment.pop("PYTHONDONTWRITEBYTECODE", None)
+    environment.pop("PYTHONPYCACHEPREFIX", None)
+
+    def verify(commit, succeeds):
+        result = subprocess.run([sys.executable, str(scripts / "run-delivery-live.py"),
+                                 "--verify-source-commit", commit], cwd=repo, env=environment,
+                                capture_output=True, text=True)
+        assert (result.returncode == 0) == succeeds, result.stderr
+
+    verify(expected, True)
+    assert not git("status", "--porcelain").stdout
+    verify("0" * 40, False)
+    extra = repo / "untracked.txt"
+    extra.write_text("untracked source")
+    verify(expected, False)
+    extra.unlink()
+    with (scripts / "release.py").open("a") as stream:
+        stream.write("\n# changed source\n")
+    verify(expected, False)
+
+
 def self_test():
     from copy import deepcopy
     from unittest.mock import patch
@@ -2170,6 +2212,7 @@ def self_test():
         else:
             raise AssertionError("Failed, old-size or invalid capacity evidence must not be exported as success")
     with tempfile.TemporaryDirectory(prefix="live-self-test-", dir=ARTIFACTS) as directory:
+        self_test_source_cli(Path(directory))
         paid = self_test_ui(Path(directory))
         self_test_exports(Path(directory), paid)
         self_test_partial_evidence(Path(directory))
@@ -2261,11 +2304,16 @@ if __name__ == "__main__":
     parser.add_argument("--package", type=Path)
     parser.add_argument("--android", type=Path)
     parser.add_argument("--record-android-apk", type=Path)
+    parser.add_argument("--verify-source-commit", metavar="SHA", help="Verify the exact clean checkout without starting a build or service")
     parser.add_argument("--source-commit")
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
-    if args.self_test:
+    if args.verify_source_commit is not None:
+        if any((args.package, args.android, args.record_android_apk, args.source_commit, args.inside, args.self_test)):
+            parser.error("--verify-source-commit cannot be combined with another action")
+        source_commit(args.verify_source_commit)
+    elif args.self_test:
         ARTIFACTS.mkdir(parents=True, exist_ok=True)
         self_test()
     elif args.record_android_apk and args.source_commit and not (args.package or args.android or args.inside):
@@ -2273,4 +2321,4 @@ if __name__ == "__main__":
     elif args.package and args.source_commit and (args.inside or args.android) and not args.record_android_apk:
         inside(args.package.resolve(strict=True), args.source_commit) if args.inside else dispatch(args.package.resolve(strict=True), args.android.resolve(strict=True), args.source_commit)
     else:
-        parser.error("Provide --package, --android and --source-commit, or --record-android-apk and --source-commit")
+        parser.error("Provide --package, --android and --source-commit, --record-android-apk and --source-commit, or --verify-source-commit")

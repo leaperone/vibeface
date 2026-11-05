@@ -135,7 +135,7 @@ export type FailureKind = 'missing_key' | 'auth_failed' | 'quota' | 'missing_bin
 const settings = '去「设备 → Bot 与任务」'
 const failures: Record<FailureKind, string> = {
   missing_key: `AI 服务缺少密钥。${settings}填好后再试。`,
-  auth_failed: `AI 服务登录没通过。${settings}检查密钥后再试。`,
+  auth_failed: `AI 服务认证没通过。${settings}检查密钥后再试。`,
   quota: 'AI 服务的用量到上限了。等额度恢复后再试。',
   missing_binary: `这台电脑上找不到 AI 服务的程序。${settings}检查。`,
   execution_disabled: `这台电脑上这个 AI 服务没开执行任务。${settings}打开。`,
