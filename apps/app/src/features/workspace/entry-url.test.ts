@@ -9,13 +9,14 @@ import { entryAddress, entryJson, entryKey, messageOf, parseEntry, parseInfo, pr
 import * as nodeSettings from "@vibeface/client/lib/node.ts"
 import type { NodeSettingsResponse, ProviderReadiness, ProviderStatus, ReadyConnection } from "@vibeface/client/lib/node.ts"
 import type { WorkRecord } from "@vibeface/client/workspace/types.ts"
+import type { PendingMessage } from "@vibeface/client/chat/types.ts"
 import { cardState, nodeName, taskGroup } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
 import { botCopy, folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
 import { agentName, answerLabel, attentionLabel, approvalTask, awaitsAnswer, declined, foldAnswers, projectName, questionMeta, questionOpen, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
 import * as errors from "@vibeface/client/lib/errors.ts"
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
-import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
+import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice, messageKey, replyStatusLabel } from "@vibeface/client/chat/protocol.ts"
 import { deviceCopy, setUpOnManager } from "@vibeface/client/identity/copy.ts"
 import { chatTimeline, firstUnread, unreadCounts } from "@vibeface/client/chat/timeline.ts"
 import { accessOf } from "@vibeface/client/identity/access.ts"
@@ -905,6 +906,72 @@ function componentText(node: unknown): string {
   if (Array.isArray(node)) return node.map(componentText).join('')
   if (node && typeof node === 'object' && 'props' in node && node.props && typeof node.props === 'object' && 'children' in node.props) return componentText(node.props.children)
   return ''
+}
+
+type HarnessElement = { type: unknown; props: Record<string, unknown> }
+
+function findActionProps(node: unknown, label: string): Record<string, unknown> | undefined {
+  if (!node || typeof node !== 'object') return undefined
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findActionProps(item, label)
+      if (found) return found
+    }
+    return undefined
+  }
+  if ('props' in node && node.props && typeof node.props === 'object') {
+    const props = node.props as Record<string, unknown>
+    if (componentText(node).includes(label) && (props.action || props.onClick)) return props
+    if ('children' in props) return findActionProps(props.children, label)
+  }
+  return undefined
+}
+
+function renderComponent(element: HarnessElement) {
+  assert.equal(typeof element.type, 'function')
+  return (element.type as (props: unknown) => unknown)(element.props)
+}
+
+function conversationHarness(workspace: () => Record<string, unknown>, device: Record<string, unknown> = {}) {
+  const chatGlobals = {
+    setInterval: () => 1, clearInterval() {},
+    matchMedia: () => ({ matches: false }),
+    document: { getElementById: () => ({ focus() {}, scrollIntoView() {} }), hidden: false, addEventListener() {}, removeEventListener() {} },
+    IntersectionObserver: class {
+      observe() {}
+      disconnect() {}
+      constructor(callback: (entries: { isIntersecting: boolean }[]) => void) { callback([{ isIntersecting: false }]) }
+    },
+  }
+  const app = componentHarness('../chat/conversation-screen.tsx', {
+    '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) },
+    '@/lib/glossary': { terms: { inbox: { label: '待处理', icon: 'InboxIcon' }, undelivered: { icon: 'UndeliveredIcon' }, approval: { icon: 'ApprovalIcon' } } },
+    '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) },
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: workspace },
+    '@vibeface/client/workspace/labels.ts': taskLabels,
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { can_manage: false, source: 'membership' } }, retryNow: () => {}, ...device }) },
+    '@vibeface/client/identity/copy.ts': { setUpOnManager },
+    '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters },
+    '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread },
+    '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger },
+    '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks },
+    '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject },
+    '@vibeface/client/lib/errors.ts': errors,
+  }, chatGlobals)
+  const messages = componentHarness('../chat/elements/message.tsx', {
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: workspace },
+    '@vibeface/client/chat/protocol.ts': { messageKey, replyStatusLabel },
+    '@vibeface/client/lib/errors.ts': errors,
+  })
+  const render = () => app.render('ConversationScreen')
+  const composer = () => render().find(({ type }) => type === 'PromptInput')?.props as Record<string, unknown> | undefined
+  const chatEntries = () => (render().find(({ type }) => type === 'Chat')?.props.entries ?? []) as { key: string; message?: { message_id: string; state?: string; text?: string }; node?: HarnessElement }[]
+  const messageTree = (messageId: string) => {
+    const message = chatEntries().find((entry) => entry.message?.message_id === messageId)?.message
+    assert.ok(message)
+    return messages.render('Message', { message })
+  }
+  return { app: { close: () => { app.close(); messages.close() } }, render, composer, chatEntries, messageTree, findAction: (label: string) => findActionProps(composer()?.above, label) }
 }
 
 const parityBot = parseBot({ bot_id: 'bot', conversation_id: 'chat', name: '项目 Bot', instructions: '', models: {}, skills: null, avatar: null, avatar_version: null, event_hash: 'bot-event', last_message: null, busy: null })
@@ -2168,6 +2235,196 @@ test("a closed question neither waits on the person nor hides 思考中", () => 
     assert.equal(thinking(), true, "a question its device closed is not the bot's status")
     questions = [question("open", null)]
     assert.equal(thinking(), false, "an open question is the status already")
+  } finally { app.close() }
+})
+
+test('offline chat keeps reconnect and stale waiting summary above the composer, then drops the stale prefix when back online', () => {
+  let connectionOnline = false
+  let retried = 0
+  const question = { question_id: 'wait-q', conversation_id: 'chat', bot: null, severity: 'attention' as const, text: '继续吗？', choices: [{ label: '继续' }],
+    about: { node: 'gateway', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
+  const workspace = () => ({
+    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), messagePending: null, messageBusy: false,
+    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', name: '本机', online: true, local: true, revoked: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }],
+    liveProgress: [], interrupted: [], writable: connectionOnline, selectedBot: parityBot, connectionOnline, answered: {},
+    data: { ...parseConversation(context, 'chat'), questions: [question], scheduler: null, messages: [] },
+    refresh: async () => {},
+  })
+  const harness = conversationHarness(workspace, { retryNow: () => { retried++ } })
+  try {
+    const above = componentText(harness.composer()?.above)
+    assert.match(above, /重试连接/)
+    assert.match(above, /最近记录 · /)
+    assert.ok(harness.composer()?.disabled)
+    const reconnect = harness.findAction('重试连接')?.onClick
+    assert.equal(typeof reconnect, 'function')
+    if (typeof reconnect === 'function') reconnect()
+    assert.equal(retried, 1)
+    connectionOnline = true
+    assert.doesNotMatch(componentText(harness.composer()?.above), /最近记录 · /)
+    assert.match(componentText(harness.composer()?.above), /待处理/)
+    assert.equal(harness.composer()?.disabled, false)
+  } finally { harness.app.close() }
+})
+
+test('merged and in-flight user messages show honest status labels and refresh-only 再查一次', async () => {
+  let refreshed = 0, sent = 0
+  let connectionOnline = true
+  const baseAsk = { message_id: 'm0', event_hash: 'm0', role: 'user' as const, text: 'first', created_at_ms: 0 }
+  const build = (jobs: object[], messages: object[], pending: PendingMessage | null = null) => ({
+    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), messagePending: pending, messageBusy: false,
+    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: connectionOnline, local: true, revoked: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }],
+    liveProgress: [], interrupted: [], writable: true, selectedBot: parityBot, connectionOnline,
+    data: { ...parseConversation(context, 'chat'), messages, scheduler: { jobs, unanswered: [], capabilities: { streaming: true, cancel: true, steer: true } } },
+    refresh: async () => { refreshed++ }, sendMessage: async () => { sent++; return true },
+  })
+  let current = build([], [], { message_id: 'pending', text: 'sending', conversation_id: 'chat' })
+  const harness = conversationHarness(() => current)
+  try {
+    assert.match(componentText(harness.messageTree('pending')), /正在确认送达/)
+    current = build(
+      [{ trigger: 'message:m0', state: 'running', message_id: 'm0' }, { trigger: 'message:m1', state: 'queued', message_id: 'm1' }],
+      [baseAsk, { message_id: 'm1', event_hash: 'm1', role: 'user', text: 'queued', created_at_ms: 1 }],
+    )
+    assert.match(componentText(harness.messageTree('m1')), /已排队/)
+    for (const [outcome, label] of [['answered', '已加入本轮'], ['unfinished', '已加入本轮，回复未完成'], ['unknown', '补充结果尚未确认']] as const) {
+      current = build([{ trigger: 'message:m2', state: 'steered', message_id: 'm2', outcome }], [{ message_id: 'm2', event_hash: 'm2', role: 'user', text: outcome, created_at_ms: 2 }])
+      const tree = harness.messageTree('m2')
+      assert.ok(componentText(tree).includes(label))
+      assert.doesNotMatch(componentText(tree), /已接受|已送达/)
+      if (outcome === 'unknown') {
+        refreshed = 0; sent = 0
+        const action = findActionProps(tree, '再查一次')
+        assert.ok(action?.action)
+        await (action.action as () => Promise<void>)()
+        assert.equal(refreshed, 1)
+        assert.equal(sent, 0)
+        connectionOnline = false
+        current = { ...current, connectionOnline }
+        assert.equal(findActionProps(harness.messageTree('m2'), '再查一次')?.disabled, true)
+      }
+    }
+  } finally { harness.app.close() }
+})
+
+test('queued message edit respects draft occupancy and only repopulates the composer after a confirmed cancel', async () => {
+  let draft = 'draft stays', cancelled = 0, confirmed = true
+  let delayed = false, completeCancel: (() => void) | undefined
+  const workspace = () => ({
+    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), messagePending: null, messageBusy: false,
+    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, local: true, revoked: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }],
+    liveProgress: [], interrupted: [], writable: true, selectedBot: parityBot, connectionOnline: true, answered: {},
+    data: { ...parseConversation(context, 'chat'), messages: [
+      { message_id: 'm0', event_hash: 'm0', role: 'user', text: 'running', created_at_ms: 0 },
+      { message_id: 'm1', event_hash: 'm1', role: 'user', text: 'queued text', created_at_ms: 1 },
+    ], scheduler: { jobs: [{ trigger: 'message:m0', state: 'running', message_id: 'm0' }, { trigger: 'message:m1', state: 'queued', message_id: 'm1' }], unanswered: [], capabilities: { streaming: true, cancel: true, steer: false } } },
+    refresh: async () => {}, cancelManager: async () => {
+      cancelled++
+      if (delayed) return new Promise<boolean>((resolve) => { completeCancel = () => resolve(true) })
+      return confirmed
+    },
+  })
+  const harness = conversationHarness(workspace)
+  const queuedNode = () => {
+    const entry = harness.chatEntries().find(({ key }) => key.startsWith('queued-actions:'))
+    assert.ok(entry?.node)
+    return renderComponent(entry.node)
+  }
+  try {
+    const change = harness.composer()?.onChange
+    assert.equal(typeof change, 'function')
+    if (typeof change !== 'function') return
+    change(draft)
+    const blocked = findActionProps(queuedNode(), '取消并编辑重发')
+    assert.equal(blocked?.disabled, true)
+    assert.equal(blocked?.title, '先发送或清空输入框，再编辑排队消息')
+    change('')
+    confirmed = false
+    await (findActionProps(queuedNode(), '取消并编辑重发')?.action as () => Promise<void>)().catch(() => {})
+    assert.equal(harness.composer()?.value, '')
+    confirmed = true
+    await (findActionProps(queuedNode(), '取消并编辑重发')?.action as () => Promise<void>)()
+    assert.equal(cancelled, 2)
+    assert.equal(harness.composer()?.value, 'queued text')
+    change('')
+    delayed = true
+    const cancelAndEdit = findActionProps(queuedNode(), '取消并编辑重发')?.action
+    assert.equal(typeof cancelAndEdit, 'function')
+    if (typeof cancelAndEdit !== 'function') return
+    const editing = cancelAndEdit()
+    change('new draft typed while waiting')
+    completeCancel?.()
+    await assert.rejects(editing, /输入框的新内容已保留/)
+    assert.equal(harness.composer()?.value, 'new draft typed while waiting')
+  } finally { harness.app.close() }
+})
+
+test('task detail keeps long progress collapsed by default and finished tasks keep their result over stale progress', () => {
+  const workspace = {
+    generation: 1, connectionOnline: true, writable: true, incomplete: false, selectedBot: parityBot, nodes: [parityNode], answered: {},
+    data: parseConversation({ ...context, works: [parityWork({ state: 'finished', outcome: 'completed', result_text: '最终结果', summary: '✓ 读记录\n→ 核对结果\n· 等待同步' })] }),
+    liveProgress: [{ kind: 'native', work_id: 'work', target_node: 'worker', text: '旧进展行', sequence: 1 }],
+  }
+  const app = componentHarness('./task-detail.tsx', {
+    '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' },
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace },
+    '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_kind: string, action: () => Promise<void>) => action() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) }),
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+    '@vibeface/client/workspace/labels.ts': taskLabels,
+    '@vibeface/client/lib/errors.ts': errors,
+    '@vibeface/client/workspace/questions.ts': workspaceQuestions,
+    '@vibeface/client/workspace/model.ts': workspaceModel,
+    '@vibeface/client/lib/node.ts': { providerNames },
+  }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
+  try {
+    const elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    assert.equal(elements.some(({ props }) => props.text === '最终结果'), true)
+    assert.doesNotMatch(componentText(elements), /旧进展行/)
+    const steps = elements.find(({ props }) => props.label === '最近步骤摘要 · 3')
+    assert.equal(steps?.props.open, false)
+    assert.equal(elements.some(({ props }) => props.label === '详细进展'), false)
+  } finally { app.close() }
+})
+
+test('unknown task detail asks with check wording, navigates on success, and keeps manual settlement available', async () => {
+  let navigated = false, sent: string | null = null
+  let connectionOnline = true
+  const work = parityWork({ state: 'unverified', outcome: 'unverified', failure_reason: '无法证明结果' })
+  const workspace = {
+    generation: 1, isCurrent: () => true, connectionOnline, writable: true, incomplete: false, selectedBot: parityBot, nodes: [parityNode], answered: {},
+    data: parseConversation({ ...context, works: [work] }),
+    liveProgress: [],
+    sendMessage: async (text: string) => { sent = text; return false },
+    resolveCheck: async () => {},
+  }
+  const app = componentHarness('./task-detail.tsx', {
+    '@tanstack/react-router': { useNavigate: () => () => { navigated = true }, Link: 'Link' },
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace },
+    '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_kind: string, action: () => Promise<void>) => action() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) }),
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+    '@vibeface/client/workspace/labels.ts': taskLabels,
+    '@vibeface/client/lib/errors.ts': errors,
+    '@vibeface/client/workspace/questions.ts': workspaceQuestions,
+    '@vibeface/client/workspace/model.ts': workspaceModel,
+    '@vibeface/client/lib/node.ts': { providerNames },
+    './task-activity': { confirmText: () => '设备无法报告结果', BackOnline: 'BackOnline' },
+  }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
+  try {
+    let elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    assert.match(componentText(elements), /还不知道做完没有/)
+    const ask = findActionProps(elements, '先查结果')
+    assert.ok(ask?.action)
+    assert.equal(ask.disabled, false)
+    await (ask.action as () => Promise<void>)()
+    assert.equal(sent, followUpCopy.check.ask('核对项目'))
+    assert.equal(navigated, false)
+    workspace.sendMessage = async (text: string) => { sent = text; return true }
+    await (ask.action as () => Promise<void>)()
+    assert.equal(navigated, true)
+    workspace.connectionOnline = false
+    elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    assert.equal(findActionProps(elements, '先查结果')?.disabled, true)
+    assert.equal(elements.some(({ props }) => props.label === '我已自行核对'), true)
   } finally { app.close() }
 })
 

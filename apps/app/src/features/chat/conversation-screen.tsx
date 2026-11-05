@@ -57,6 +57,8 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const dark = useDark()
   const tint = bot ? botTint(faceOf(bot.bot_id, bot.avatar).hue, dark) : undefined
   const text = drafts.get(conversationId) ?? ''
+  const input = useRef({ conversationId, text, hasFiles: files.length > 0 })
+  input.current = { conversationId, text, hasFiles: files.length > 0 }
   const jobs = data?.scheduler?.jobs ?? []
   const unanswered = data?.scheduler?.unanswered ?? []
   const activeJobs = jobs.filter((job) => busyStates.includes(job.state))
@@ -138,7 +140,11 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
     entries.push(...announced.get(message.message_id) ?? [])
     for (const job of jobs) {
       if (job.message_id !== message.message_id) continue
-      if (job.state === 'queued' && message.role === 'user') entries.push({ key: `queued-actions:${job.trigger}`, node: <QueuedMessage job={job} text={message.text} attachments={Boolean(message.attachments?.length)} canEdit={!text.trim() && !files.length} edit={(value) => setText(value)} /> })
+      if (job.state === 'queued' && message.role === 'user') entries.push({ key: `queued-actions:${job.trigger}`, node: <QueuedMessage job={job} text={message.text} attachments={Boolean(message.attachments?.length)} canEdit={!text.trim() && !files.length} edit={(value) => {
+        if (!workspace.isCurrent() || input.current.conversationId !== conversationId) throw new Error('对话已切换，未替换输入内容。')
+        if (input.current.text.trim() || input.current.hasFiles) throw new Error('已取消排队，输入框的新内容已保留。原消息仍在记录中。')
+        setText(value)
+      }} /> })
       // Tasks follow the reply that started them once it is here, so the cause reads before its effect.
       const started = tasks.filter((task) => task.trigger === job.trigger).flatMap(taskRows)
       if (job.reply_message_id && replied.has(job.reply_message_id) && message.role === 'user') announced.set(job.reply_message_id, started)
@@ -257,7 +263,10 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
       return next
     })
   }
-  const setText = (value: string) => setDrafts((current) => new Map(current).set(conversationId, value))
+  const setText = (value: string) => {
+    input.current = { ...input.current, text: value }
+    setDrafts((current) => new Map(current).set(conversationId, value))
+  }
 
   if (missing) return <section className="conversation-screen" aria-label="对话"><Chat key="missing" entries={[]} empty={<NoBot />} /></section>
   if (bot && !data) return <section className="conversation-screen" aria-label="对话"><ChatSkeleton /></section>

@@ -56,6 +56,9 @@ function inertAround(keep: Element) {
  */
 export function TaskDetail({ botId, workId, from }: { botId: string; workId: string; from?: "inbox" | "tasks" }) {
   const workspace = useWorkspace()
+  const activeTask = useRef<{ botId: string; workId: string } | null>({ botId, workId })
+  activeTask.current = { botId, workId }
+  useEffect(() => () => { activeTask.current = null }, [])
   const { directory } = useDevice()
   const action = useAction()
   const lookup = { nodes: workspace.nodes, directory }
@@ -74,14 +77,15 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const progress = workspace.liveProgress.find((item) => item.kind === "native" && item.work_id === workId && item.target_node === device)
   const progressText = progress?.text?.trim() ?? ""
   const stale = Boolean(state && taskStale(state, workspace.connectionOnline))
-  const conciseProgress = work ? taskProgress(work, workspace.liveProgress).trim().split(/\r?\n/).filter((line) => line.trim()).at(-1) ?? "" : ""
+  const plan = parseSummarySteps(work?.summary ?? "")
+  const conciseProgress = plan ? plan.find((step) => step.state === "current")?.text ?? ""
+    : work ? taskProgress(work, workspace.liveProgress).trim().split(/\r?\n/).filter((line) => line.trim()).at(-1) ?? "" : ""
   const progressStatus = progress?.status && progress.status !== "awaiting_input" ? progressLabel(progress.status) : ""
   const progressHeadline = taskActive(state) ? conciseProgress || (progressStatus !== "进行中" ? progressStatus : "") : ""
-  const plan = parseSummarySteps(work?.summary ?? "")
   const navigate = useNavigate()
   const askBotCheck = async () => {
     if (!work || !(await workspace.sendMessage(followUpCopy.check.ask(work.title || "这个任务")))) return
-    void navigate({ to: "/b/$botId", params: { botId } })
+    if (workspace.isCurrent() && activeTask.current?.botId === botId && activeTask.current.workId === workId) void navigate({ to: "/b/$botId", params: { botId } })
   }
   const canAskCheck = workspace.writable && workspace.connectionOnline && !workspace.incomplete && check?.reason !== "offline"
   // Any entry forwards the stop; an unreachable device gets it when it is back.
