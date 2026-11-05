@@ -882,6 +882,8 @@ test("compact system provider cards use external service evidence without local 
     }, {}, 'ProviderCard')
     try {
       const elements = app.render('ProviderCard', { item, response, onboarding: false, compact: true, busy: '', models: null, error: '' })
+      const summary = elements.find(({ type, props }) => type === 'span' && props.className === 'truncate')
+      assert.equal(elementText(summary), mode === 'system' || installed ? '可用' : '未安装', 'the main state follows readiness for system services')
       const evidence = elements.filter(({ type }) => type === 'dl').map(elementText).join('')
       if (mode === 'system') {
         assert.match(evidence, /程序外部服务/)

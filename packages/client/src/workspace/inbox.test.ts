@@ -112,9 +112,9 @@ test('the capsule names the computer from the directory once it lists it, not by
 })
 
 test('an installed provider remains unverified until the device confirms readiness', () => {
-  type Status = Pick<ProviderStatus, 'installed' | 'roles' | 'readiness' | 'execution_readiness'>
+  type Status = Pick<ProviderStatus, 'app_server' | 'installed' | 'roles' | 'readiness' | 'execution_readiness'>
   const unverified: ProviderStatus['readiness'] = { state: 'unverified', issue: { stage: 'model_list', code: 'model_unverified' } }
-  const provider = (extra: Partial<Status> = {}): Status => ({ installed: true, roles: ['agent'], readiness: unverified, execution_readiness: unverified, ...extra })
+  const provider = (extra: Partial<Status> = {}): Status => ({ app_server: null, installed: true, roles: ['agent'], readiness: unverified, execution_readiness: unverified, ...extra })
   assert.equal(availability(provider()), 'unverified')
   assert.equal(availability(provider({ installed: false })), 'missing')
   assert.equal(availability(provider({ readiness: { state: 'needs_setup', issue: { stage: 'authentication', code: 'sign_in_required' } } })), 'needs_setup')
@@ -132,15 +132,28 @@ test('an installed provider remains unverified until the device confirms readine
   const botNeedsSetup = provider({ roles: ['agent', 'execution'], readiness: { state: 'needs_setup', issue: { stage: 'model_list', code: 'model_unavailable' } }, execution_readiness: { state: 'ready' } })
   assert.equal(summaryReadiness(botNeedsSetup), botNeedsSetup.readiness)
   assert.equal(availability(botNeedsSetup), 'needs_setup')
+  const system: NonNullable<ProviderStatus['app_server']> = { mode: 'system', socket: '/fixture/codex.sock', link: { state: 'off' } }
+  for (const readiness of [unverified, { state: 'ready' }, { state: 'starting' }, botNeedsSetup.readiness] satisfies ProviderStatus['readiness'][]) {
+    const status = provider({ app_server: system, installed: false, readiness })
+    assert.equal(availability(status), readiness.state, 'a system service does not need a local program')
+    assert.equal(availability({ ...status, roles: ['execution'], execution_readiness: readiness }), readiness.state)
+    assert.equal(availability({ ...status, app_server: { ...system, mode: 'spawn' } }), 'missing', 'a spawned service still needs its program')
+  }
 })
 
 test('a provider shows whether it can be used before any use is picked', () => {
-  const provider = (extra: Partial<ProviderStatus>) => ({ state: 'off', installed: true, env: [], ...extra }) as Pick<ProviderStatus, 'state' | 'installed' | 'env'>
+  type Status = Pick<ProviderStatus, 'app_server' | 'state' | 'installed' | 'env'>
+  const provider = (extra: Partial<Status>): Status => ({ app_server: null, state: 'off', installed: true, env: [], ...extra })
   assert.equal(availability(provider({})), 'unverified')
   assert.equal(availability(provider({ installed: false })), 'missing')
   assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: false, required: true }] })), 'needs_setup')
   assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: true, required: true }] })), 'unverified')
   assert.equal(availability(provider({ state: 'starting' })), 'starting')
+  for (const installed of [false, true]) {
+    const system = provider({ installed, app_server: { mode: 'system', socket: '/fixture/codex.sock', link: { state: 'off' } }, env: [{ name: 'FIXTURE_KEY', set: false, inherited: false, required: true }] })
+    assert.equal(availability(system), 'unverified', 'an unused system service does not need local launch prerequisites')
+    assert.equal(availability({ ...system, state: 'unverified' }), 'unverified')
+  }
 })
 
 test('provider observations preserve unknown prerequisites and discard private fields', () => {

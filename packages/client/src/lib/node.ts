@@ -222,14 +222,13 @@ export type Availability = Exclude<ProviderStatus['state'], 'off'> | 'missing'
 export function summaryReadiness(item: Pick<ProviderStatus, 'roles' | 'readiness' | 'execution_readiness'>): ProviderReadiness {
   return item.roles.includes('execution') && !item.roles.includes('agent') ? item.execution_readiness : item.readiness
 }
-export function availability(item: Pick<ProviderStatus, 'state' | 'installed' | 'env'> | Pick<ProviderStatus, 'installed' | 'roles' | 'readiness' | 'execution_readiness'>): Availability {
-  if ('roles' in item) return item.installed ? summaryReadiness(item).state : 'missing'
-  if ('state' in item) {
-    if (item.state !== 'off') return item.state
-    if (!item.installed) return 'missing'
-    if (item.env.some((row) => row.required && !row.set && !row.inherited)) return 'needs_setup'
-    return 'unverified'
-  }
+export function availability(item: Pick<ProviderStatus, 'app_server' | 'state' | 'installed' | 'env'> | Pick<ProviderStatus, 'app_server' | 'installed' | 'roles' | 'readiness' | 'execution_readiness'>): Availability {
+  const launches = item.app_server?.mode !== 'system'
+  if ('roles' in item) return !launches || item.installed ? summaryReadiness(item).state : 'missing'
+  if (item.state !== 'off') return item.state
+  if (!launches) return 'unverified'
+  if (!item.installed) return 'missing'
+  if (item.env.some((row) => row.required && !row.set && !row.inherited)) return 'needs_setup'
   return 'unverified'
 }
 

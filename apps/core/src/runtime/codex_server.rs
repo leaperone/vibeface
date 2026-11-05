@@ -589,6 +589,9 @@ impl Inner {
             && target.leases.is_empty()
             && let Some(pending) = target.pending.take()
         {
+            if !matches!(pending, CodexTarget::Spawn(_)) {
+                target.configuration_reload_pending = false;
+            }
             target.current = pending;
             self.set_link(Link::Starting);
             self.changed.notify_one();
@@ -1522,6 +1525,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_private_configuration_does_not_block_a_deferred_system_or_off_target() -> Result<()>
+    {
+        let dir = artifacts("codex-config-retarget")?;
+        let (program, ran) = recording_codex(&dir)?;
+        let target = CodexTarget::Spawn(CodexLaunch {
+            bin: program,
+            env: BTreeMap::new(),
+        });
+        let mut outcomes = Vec::new();
+        for next in [
+            CodexTarget::System(dir.join("system.sock")),
+            CodexTarget::Off,
+        ] {
+            let (events, _) = mpsc::unbounded_channel();
+            let server =
+                CodexServer::open(target.clone(), &LocalIdentity::generate(), &dir, events)?;
+            let mut lease = server.lease("manager:config-fixture".into(), &target)?;
+            server.configuration_changed();
+            server.retarget(next.clone());
+            lease.retain_until_read_back();
+            drop(lease);
+            assert!(server.inner.target.lock().unwrap().current == target);
+            assert!(server.configuration_pending(&next));
+            assert!(server.lease("manager:new-fixture".into(), &next).is_err());
+            server.release_manager("config-fixture");
+            outcomes.push((
+                next.server(),
+                server.configuration_pending(&next),
+                server.lease("manager:new-fixture".into(), &next).is_ok(),
+            ));
+            server.stop().await;
+            std::fs::remove_dir_all(server.socket().parent().unwrap())?;
+        }
+        assert!(!ran.exists());
+        std::fs::remove_dir_all(dir)?;
+        assert_eq!(
+            outcomes,
+            [("system".into(), false, true), ("off".into(), false, false)],
+            "applied non-Spawn targets finish configuration work; only system accepts turns"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn new_private_configuration_reloads_the_same_launch_after_active_leases_end()
     -> Result<()> {
         let dir = artifacts("codex-config-reload")?;
@@ -1550,6 +1597,17 @@ mod tests {
         let pid: i32 = first[0].parse()?;
         let lease = server.lease("manager:config-fixture".into(), &target)?;
         server.configuration_changed();
+        for next in [
+            CodexTarget::System(dir.join("system.sock")),
+            CodexTarget::Off,
+        ] {
+            server.retarget(next);
+            server.retarget(target.clone());
+            assert!(
+                server.configuration_pending(&target),
+                "cancelling a deferred target still reloads the new private configuration"
+            );
+        }
         server.retarget(target.clone());
         assert!(server.configuration_pending(&target));
         assert!(group_alive(pid));
