@@ -402,6 +402,7 @@ test('provider settings and queued cancellation work in the installed native app
   await network.call({ op: 'native_provider_stage', stage: 'ready' });
   await screen.scrollUntilVisible(screen.getByRole('button', '检查可用性', { exact: true }).first(), { direction: 'up' });
   await probe();
+  await expect.poll(async () => (await inspect()).catalog).toBe('available');
   await screen.scrollUntilVisible(typed, { direction: 'down' });
   await expect(screen.getByRole('button', '从列表选', { exact: true }).first()).toBeVisible({ timeout: 30000 });
   await typed.fill(' native-controlled ');
