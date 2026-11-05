@@ -196,6 +196,16 @@ jobs:
           stage = stage_path.read_text().strip() if stage_path.exists() else "not_started"
           stages = {"host-source", "host-build", "simulator-create", "typecheck", "selection", "ui-run"}
           diagnostics = {"stage": stage if stage in stages else "not_started", "report": "missing", "failures": []}
+          navigation_path = public / "provider-navigation.json"
+          if navigation_path.exists():
+              try:
+                  navigation = json.loads(navigation_path.read_text())
+                  keys = {"settings_visible", "connected_computer_link", "current_entry", "can_rename", "ai_link", "device_missing"}
+                  assert set(navigation) == keys | {"stage"} and navigation["stage"] in {"settings", "device"}
+                  assert all(value is None or type(value) is bool for key, value in navigation.items() if key in keys)
+                  diagnostics["navigation"] = navigation
+              except (OSError, ValueError, TypeError, AssertionError):
+                  diagnostics["navigation"] = {"stage": "invalid"}
 
           def safe_error(error, source=None, api=None):
               if not isinstance(error, dict):
