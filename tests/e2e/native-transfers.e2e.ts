@@ -275,7 +275,7 @@ test('provider settings and queued cancellation work in the installed native app
   };
   const screenshot = async (name: string) => { await copyFile(await app.screenshot(name), join(publicPath, `${name}.png`)); };
   await openSettings('home');
-  const initialProvider = screen.getByRole('button', 'Codex，尚未确认', { exact: true });
+  const initialProvider = screen.getByRole('button', 'Codex，未验证，可尝试', { exact: true });
   await expect(initialProvider).toBeVisible();
   await expect(screen.getByText('尚未主动检查', { exact: true }).first()).toBeVisible();
   expect((await inspect()).checked).toBe(false);
