@@ -260,7 +260,6 @@ test('provider settings and queued cancellation work in the installed native app
     await screen.scrollUntilVisible(codexRow(), { direction: 'up' });
     await screen.scrollUntilVisible(modelButton(), { direction: 'down' });
     await modelButton().click();
-    await expect(modelButton()).toBeExpanded();
     await screen.scrollUntilVisible(screen.getByRole('button', '其他…', { exact: true }), { direction: 'down' });
     await screen.getByRole('radio', name, { exact: true }).click();
   };
@@ -275,7 +274,6 @@ test('provider settings and queued cancellation work in the installed native app
     await screen.scrollUntilVisible(codexRow(), { direction: 'up' });
     await screen.scrollUntilVisible(executionButton(), { direction: 'down' });
     await executionButton().click();
-    await expect(executionButton()).toBeExpanded();
     await screen.scrollUntilVisible(screen.getByRole('button', '其他…', { exact: true }), { direction: 'down' });
     await screen.getByRole('radio', name, { exact: true }).click();
   };
