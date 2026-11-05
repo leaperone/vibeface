@@ -48,7 +48,7 @@ jobs:
       - name: Verify generated native sources match this commit
         env:
           SOURCE_COMMIT: ${{ github.sha }}
-        run: python3 -c 'import os, runpy; runpy.run_path("scripts/run-delivery-live.py")["source_commit"](os.environ["SOURCE_COMMIT"])'
+        run: python3 -B scripts/run-delivery-live.py --verify-source-commit "$SOURCE_COMMIT"
       - name: Build the release APK
         working-directory: apps/mobile
         run: |
