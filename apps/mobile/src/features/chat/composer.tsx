@@ -28,8 +28,11 @@ type Props = {
 }
 
 export function Composer({ value, onChange, files, onFiles, blocked, sending, onSend, onStop, children, tint }: Props) {
-  const canSend = !blocked && !sending && (value.trim().length > 0 || files.length > 0)
-  const armed = canSend && !onStop
+  // While writing a follow-up, keep Send available and move Stop beside it.
+  const drafting = value.trim().length > 0 || files.length > 0
+  const stop = drafting ? undefined : onStop
+  const canSend = !blocked && !sending && drafting
+  const armed = canSend
   const pick = async () => {
     const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })
     if (picked.canceled) return
@@ -51,11 +54,13 @@ export function Composer({ value, onChange, files, onFiles, blocked, sending, on
         <Button variant="ghost" size="icon" className="rounded-full" accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} onPress={pick}>
           <Icon as={Paperclip} className="text-muted-foreground" />
         </Button>
+        {drafting && onStop ? <Button instant size="icon" variant="outline" className="rounded-full shadow-none" accessibilityLabel="停止" onPress={onStop}>
+          <Icon as={Square} className="fill-foreground" />
+        </Button> : null}
         {/* Idle, the disabled default button rests muted; ready, it takes the bot's tint. */}
-        <Button instant size="icon" variant={onStop || sending ? 'outline' : 'default'} className="rounded-full shadow-none" style={armed && tint ? { backgroundColor: tint.fill } : undefined} accessibilityLabel={onStop || sending ? '停止' : '发送'} disabled={!onStop && !sending && !canSend}
-          // While the send goes out the stop look holds at full strength and ignores taps, so the button changes once.
-          onPress={onStop ?? (sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() })}>
-          {onStop || sending ? <Icon as={Square} className="fill-foreground" /> : <Icon as={ArrowUp} color={armed ? tint?.ink : undefined} />}
+        <Button instant size="icon" variant={stop ? 'outline' : 'default'} className="rounded-full shadow-none" style={armed && tint ? { backgroundColor: tint.fill } : undefined} accessibilityLabel={stop ? '停止' : sending ? '发送中' : '发送'} disabled={!stop && !canSend}
+          onPress={stop ?? (sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() })}>
+          {stop ? <Icon as={Square} className="fill-foreground" /> : <Icon as={ArrowUp} color={armed ? tint?.ink : undefined} />}
         </Button>
       </View>
     </View>

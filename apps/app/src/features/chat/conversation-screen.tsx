@@ -66,7 +66,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const reach = botReach(workspace.nodes), agentReady = botCanSend(reach)
   const sendDisabled = !workspace.writable || !bot || !agentReady || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
   const botBusy = activeJobs.length > 0
-  const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
+  const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'steering', 'claimed', 'running'].includes(job.state))
   const lookup = { nodes: workspace.nodes, directory }
 
   const pendingRow = (message: ChatMessage, retry?: () => Promise<void>): ChatEntry => ({ key: message.message_id, anchor: message.role === 'user', message, retry })
@@ -114,7 +114,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const retry = retryOf(endedAsk)
   const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
   // A message sent while the bot replies waits behind that reply, so it shows after it until its own turn starts.
-  const replying = jobs.some((job) => ['claimed', 'running', 'cancelling'].includes(job.state))
+  const replying = jobs.some((job) => ['claimed', 'steering', 'running', 'cancelling'].includes(job.state))
   const queued = new Set(replying ? jobs.filter((job) => job.message_id && ['pending_delivery', 'queued', 'steering'].includes(job.state)).map((job) => job.message_id) : [])
   // Steering already went into the running reply; it only settles once that reply ends.
   const merging = new Set(jobs.filter((job) => job.state === 'steering').map((job) => job.message_id))

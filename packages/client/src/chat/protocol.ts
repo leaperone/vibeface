@@ -54,7 +54,7 @@ export function botProviderNotice(nodes: NodeInfo[], owner?: string | null): str
   const readiness = node.capabilities.manager_readiness
   if (readiness && 'issue' in readiness && provider) return `${prefix} · ${probeIssueText(provider, readiness.issue)}。检查状态${readiness.state === 'unverified' ? '尚未确认' : '需设置'}。`
   if (node.capabilities.manager_state === 'unverified') return `${prefix} 尚未确认可用，可发送消息或在设备设置检查。`
-  if (node.capabilities.manager_state === 'needs_setup') return `${prefix} 需设置，请在运行设备检查登录和模型。`
+  if (node.capabilities.manager_state === 'needs_setup') return `${prefix} 需设置，请在运行设备检查认证和模型。`
   if (node.capabilities.manager_state === 'starting') return `${prefix} 正在启动，请稍后查询。`
   return ''
 }
