@@ -56,7 +56,7 @@ export type AppServerMode = 'system' | 'spawn'
 export type AppServer = { mode: AppServerMode; socket: string | null; link: AppServerLink }
 export type ProviderObservation = {
   status: 'confirmed' | 'rejected' | 'unknown'
-  evidence: 'binary_discovery' | 'launch_prerequisites' | 'app_server_handshake' | 'app_server_starting' | 'app_server_unavailable' | 'managed_launch_failed' | 'configuration_invalid' | 'authentication_not_observed' | 'model_catalog_not_observed' | 'readiness_not_observed' | 'prerequisites_rejected'
+  evidence: 'binary_discovery' | 'launch_prerequisites' | 'app_server_handshake' | 'app_server_starting' | 'app_server_unavailable' | 'managed_launch_failed' | 'configuration_invalid' | 'authentication_not_observed' | 'model_catalog_not_observed' | 'readiness_not_observed' | 'prerequisites_rejected' | 'provider_probe'
 }
 export type ProviderObservations = Record<'installed' | 'launchable' | 'authenticated' | 'model_known' | 'ready', ProviderObservation>
 export const providerObservationLabels: Record<string, string> = { installed: '程序安装', launchable: '程序启动', authenticated: '登录状态', model_known: '模型可用性', ready: '完整可用性' }
@@ -256,7 +256,7 @@ export const providerIds: readonly ProviderId[] = ['codex', 'cursor', 'claude', 
 export const asProvider = (value: unknown): ProviderId | null => providerIds.includes(value as ProviderId) ? value as ProviderId : null
 const providerRoles: ProviderRole[] = ['agent', 'execution']
 const providerStates: ProviderStatus['state'][] = ['ready', 'unverified', 'needs_setup', 'starting', 'off']
-const observationEvidence: ProviderObservation['evidence'][] = ['binary_discovery', 'launch_prerequisites', 'app_server_handshake', 'app_server_starting', 'app_server_unavailable', 'managed_launch_failed', 'configuration_invalid', 'authentication_not_observed', 'model_catalog_not_observed', 'readiness_not_observed', 'prerequisites_rejected']
+const observationEvidence: ProviderObservation['evidence'][] = ['binary_discovery', 'launch_prerequisites', 'app_server_handshake', 'app_server_starting', 'app_server_unavailable', 'managed_launch_failed', 'configuration_invalid', 'authentication_not_observed', 'model_catalog_not_observed', 'readiness_not_observed', 'prerequisites_rejected', 'provider_probe']
 function oneOf<T extends string>(value: unknown, options: readonly T[]): T {
   if (!options.includes(value as T)) throw new Error('AI 状态格式不对。')
   return value as T

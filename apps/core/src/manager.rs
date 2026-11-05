@@ -1007,38 +1007,82 @@ pub(crate) fn provider_environment_keys(env: &BTreeMap<String, String>) -> Resul
     let Some(home) = home else {
         return Ok(vec![]);
     };
-    let path = home.join("config.toml");
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-    ensure!(
-        std::fs::metadata(&path)?.len() <= 1_048_576,
-        "Codex configuration is too large"
-    );
-    provider_keys_from_config(&std::fs::read_to_string(path)?)
+    read_codex_config(&home)?
+        .map_or_else(|| Ok(vec![]), |source| provider_keys_from_config(&source))
 }
+
+pub(crate) fn read_codex_config(home: &Path) -> Result<Option<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(home.join("config.toml"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => anyhow::bail!("could not read Codex provider configuration"),
+    };
+    ensure!(
+        file.metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 1_048_576),
+        "Codex provider configuration must be a file of at most 1048576 bytes"
+    );
+    let mut source = String::new();
+    file.take(1_048_577)
+        .read_to_string(&mut source)
+        .map_err(|_| anyhow::anyhow!("could not read Codex provider configuration"))?;
+    ensure!(
+        source.len() <= 1_048_576,
+        "Codex provider configuration is too large"
+    );
+    Ok(Some(source))
+}
+
+fn codex_config(source: &str) -> Result<toml::Value> {
+    toml::from_str(source).map_err(|_| anyhow::anyhow!("invalid Codex provider configuration"))
+}
+
+fn codex_profile(config: &toml::Value) -> Result<Option<&toml::Value>> {
+    let Some(profile) = config.get("profile") else {
+        return Ok(None);
+    };
+    let name = profile.as_str().context("invalid Codex profile")?;
+    config
+        .get("profiles")
+        .and_then(|profiles| profiles.get(name))
+        .filter(|profile| profile.is_table())
+        .map(Some)
+        .context("invalid Codex profile")
+}
+
 fn provider_keys_from_config(source: &str) -> Result<Vec<String>> {
-    let config: toml::Value =
-        toml::from_str(source).context("invalid Codex provider configuration")?;
-    let profile = config
-        .get("profile")
-        .and_then(toml::Value::as_str)
-        .and_then(|p| config.get("profiles")?.get(p));
+    let config = codex_config(source)?;
+    let profile = codex_profile(&config)?;
     let provider = profile
         .and_then(|p| p.get("model_provider"))
         .or_else(|| config.get("model_provider"))
-        .and_then(toml::Value::as_str);
+        .map(|value| value.as_str().context("invalid Codex model provider"))
+        .transpose()?;
     let Some(provider) = provider.and_then(|p| config.get("model_providers")?.get(p)) else {
         return Ok(vec![]);
     };
+    codex_provider_keys(provider)
+}
+
+fn codex_provider_keys(provider: &toml::Value) -> Result<Vec<String>> {
     let mut keys = vec![];
-    if let Some(key) = provider.get("env_key").and_then(toml::Value::as_str) {
-        keys.push(key.to_owned());
+    if let Some(key) = provider.get("env_key") {
+        keys.push(
+            key.as_str()
+                .context("invalid provider environment key")?
+                .to_owned(),
+        );
     }
-    if let Some(headers) = provider
-        .get("env_http_headers")
-        .and_then(toml::Value::as_table)
-    {
+    if let Some(headers) = provider.get("env_http_headers") {
+        let headers = headers
+            .as_table()
+            .context("invalid provider header environment keys")?;
         for value in headers.values() {
             keys.push(
                 value
@@ -1062,6 +1106,94 @@ fn provider_keys_from_config(source: &str) -> Result<Vec<String>> {
     keys.sort();
     keys.dedup();
     Ok(keys)
+}
+
+pub(crate) fn codex_config_projection(source: &str) -> Result<toml::Table> {
+    let config = codex_config(source)?;
+    let profile = codex_profile(&config)?;
+    let mut projected = toml::Table::new();
+    for name in ["model", "model_reasoning_effort", "model_provider"] {
+        if let Some(value) = profile
+            .and_then(|profile| profile.get(name))
+            .or_else(|| config.get(name))
+        {
+            let text = codex_metadata_text(value)?;
+            ensure!(text.len() <= 256, "invalid Codex model metadata");
+            projected.insert(name.into(), value.clone());
+        }
+    }
+    let Some(name) = projected
+        .get("model_provider")
+        .and_then(toml::Value::as_str)
+    else {
+        return Ok(projected);
+    };
+    let Some(provider) = config
+        .get("model_providers")
+        .and_then(|providers| providers.get(name))
+    else {
+        return Ok(projected);
+    };
+    ensure!(provider.is_table(), "invalid Codex model provider");
+    let mut allowed = toml::Table::new();
+    for field in ["name", "base_url", "wire_api", "env_key"] {
+        if let Some(value) = provider.get(field) {
+            let text = codex_metadata_text(value)?;
+            if field == "base_url" {
+                let url = reqwest::Url::parse(text)
+                    .map_err(|_| anyhow::anyhow!("invalid Codex provider URL"))?;
+                ensure!(
+                    matches!(url.scheme(), "http" | "https")
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none(),
+                    "Codex provider URL must use HTTP without credentials, query or fragment"
+                );
+            }
+            allowed.insert(field.into(), value.clone());
+        }
+    }
+    if let Some(value) = provider.get("requires_openai_auth") {
+        ensure!(
+            value.is_bool(),
+            "invalid Codex provider authentication metadata"
+        );
+        allowed.insert("requires_openai_auth".into(), value.clone());
+    }
+    if let Some(value) = provider.get("env_http_headers") {
+        let headers = value
+            .as_table()
+            .context("invalid provider header environment keys")?;
+        ensure!(
+            headers
+                .keys()
+                .all(|name| reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_ok()),
+            "invalid Codex provider header name"
+        );
+        allowed.insert("env_http_headers".into(), value.clone());
+    }
+    let allowed = toml::Value::Table(allowed);
+    codex_provider_keys(&allowed)?;
+    projected.insert(
+        "model_providers".into(),
+        toml::Value::Table([(name.to_owned(), allowed)].into_iter().collect()),
+    );
+    Ok(projected)
+}
+
+fn codex_metadata_text(value: &toml::Value) -> Result<&str> {
+    let text = value.as_str().context("invalid Codex provider metadata")?;
+    ensure!(
+        !text.is_empty()
+            && text.len() <= 4096
+            && text.trim() == text
+            && !text.chars().any(char::is_control)
+            && !crate::model::looks_secret(text),
+        "invalid Codex provider metadata"
+    );
+    Ok(text)
 }
 pub(crate) fn redact_string(mut text: String, secrets: &[String]) -> String {
     for secret in secrets.iter().filter(|value| !value.is_empty()) {
@@ -1583,6 +1715,40 @@ mod tests {
             .is_err()
         );
         assert!(provider_keys_from_config("model='default'")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn codex_config_projection_rejects_unsafe_metadata_without_echoing_source() -> Result<()> {
+        for url in [
+            "https://user:SYNTHETIC_INLINE_SECRET@api.example.test/v1",
+            "https://api.example.test/v1?api_key=SYNTHETIC_INLINE_SECRET",
+            "https://api.example.test/v1#SYNTHETIC_INLINE_SECRET",
+            "file:///SYNTHETIC_INLINE_SECRET",
+            "SYNTHETIC_INLINE_SECRET",
+        ] {
+            let source =
+                format!("model_provider='active'\n[model_providers.active]\nbase_url={url:?}");
+            let error = codex_config_projection(&source).unwrap_err();
+            assert!(!format!("{error:#}").contains("SYNTHETIC_INLINE_SECRET"));
+        }
+        for source in [
+            "model='SYNTHETIC_INLINE_SECRET",
+            "profile='missing'",
+            "model_provider='active'\n[model_providers.active]\nenv_key='invalid-name'",
+            "model_provider='active'\n[model_providers.active]\nenv_http_headers={Authorization='Bearer SYNTHETIC_INLINE_SECRET'}",
+            "model_provider='active'\n[model_providers.active]\nenv_http_headers={'invalid header'='KEY'}",
+        ] {
+            let error = codex_config_projection(source).unwrap_err();
+            assert!(!format!("{error:#}").contains("SYNTHETIC_INLINE_SECRET"));
+        }
+        let error = provider_keys_from_config("model='SYNTHETIC_INLINE_SECRET").unwrap_err();
+        assert!(!format!("{error:#}").contains("SYNTHETIC_INLINE_SECRET"));
+        let dir = workspace();
+        assert!(read_codex_config(&dir)?.is_none());
+        std::fs::write(dir.join("config.toml"), vec![b'x'; 1_048_577])?;
+        assert!(read_codex_config(&dir).is_err());
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 

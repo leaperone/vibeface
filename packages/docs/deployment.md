@@ -63,10 +63,13 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 用到 Codex 或 Cursor 而程序路径缺失时，Node 在 `init`、启动和网页打开开关时从本机找出并写进配置，之后照写下的用，不再每次猜。Codex 的运行数据由 Node 隔离管理：
 
 - 默认 App Server 模式是 `spawn`，Node 使用 `<data-dir>/providers/codex` 作为 `CODEX_HOME`，并在 `<data-dir>/providers/codex/sessions` 保存自己的会话。
-- Node 不扫描 `$HOME/.codex` 或用户 control socket。只有明确选择 `system` 并填写绝对 socket 才连接外部 App Server。
-- 只写了名字的程序（`codex`、`cursor-sdk-bridge`）在 PATH 里找不到时，再找 `~/.local/bin`、`/opt/homebrew/bin`、`/usr/local/bin`，Codex 还找 `/Applications/Codex.app/Contents/Resources`。服务进程的 PATH 很短，这一步让它们也能找到。
+- Node 不扫描用户的会话或 control socket。只有明确选择 `system` 并填写绝对 socket 才连接外部 App Server。
+- 只写了名字的程序（`codex`、`cursor-sdk-bridge`）在 PATH 里找不到时，再找 `~/.local/bin`、`/opt/homebrew/bin` 和 `/usr/local/bin`。Codex 还查找 NVM 的 Node 安装目录和 `/Applications/Codex.app/Contents/Resources`。NVM 根目录取 `NVM_DIR`，未设置时取 `~/.nvm`。
+- NVM 安装的程序使用同一 `bin` 目录下的 Node。后台服务无需加载 shell 配置，也不依赖终端中执行过 `nvm use`。
 
 已写下的程序路径不被替换。Node-owned Codex 运行目录由 Node 创建和维护，不从用户目录查找，也不在普通 Provider 环境变量中修改。密钥不在查找范围内。
+
+启用 Node 独立 App Server 且私有 `config.toml` 尚不存在时，Node 从用户的 Codex 配置中初始化当前选中的模型、Provider 地址和认证环境变量名称。已有私有配置保持不变。初始化不复制登录文件、密钥、固定认证请求头、会话、hooks、MCP 或项目信任设置。设备 **AI** 设置会按私有配置提示所需变量，变量值仍需单独配置。源配置无效时，Codex 启用失败并保留原设置，使用其他 Provider 不受影响。
 
 使用已经运行的 Codex App Server 时，也可以直接给出它的 socket：
 
@@ -96,6 +99,8 @@ Codex spawn、Claude Code 和 OpenCode 的本机 CLI 已登录，不代表 Node 
 Codex 命令设置 `<data-dir>/providers/codex` 的 `CODEX_HOME` 后执行 `codex login`。Claude Code 设置 `<data-dir>/providers/claude` 的 `CLAUDE_CONFIG_DIR` 后执行 `claude auth login`。OpenCode 命令固定 `<data-dir>/providers/opencode` 内的 XDG 与数据库路径，清除外部 config override，再执行 `opencode --standalone auth login`，防止登录到用户已有后台服务。按 Provider 保存的合法认证变量与 Node 继承的认证环境继续生效，Node 不自动读取或复制用户 auth 文件或密钥。
 
 pi 的认证目录不变，只有 session 目录固定为 `<data-dir>/providers/pi/sessions`。OpenCode 的数据、配置、状态和缓存分别位于私有根的 `data`、`config`、`state` 和 `cache`，项目配置不会覆盖此运行配置。Codex system 模式共享明确指定的外部服务会话，使用该服务自身的登录入口。
+
+Cursor 的**检查可用性**启动 SDK bridge，并查询账户和模型目录。检查不会创建 Agent 或发送模型请求。账户验证与模型目录分别显示结果，目录查询失败不会抹掉已确认的认证状态。目录不完整时，未列出的模型仍可手动填写。
 
 ## 配置会话扫描和 hooks
 
