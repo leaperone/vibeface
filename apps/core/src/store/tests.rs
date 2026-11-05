@@ -1034,7 +1034,13 @@ fn a_steer_target_waiting_for_reconciliation_is_not_treated_as_active() -> Resul
         first.job.state.attempt().context("attempt")?.id.clone(),
     );
     store.mark_started("c", &trigger, &attempt)?;
-    store.record_manager_turn(&attempt, "system", "thread", Some("turn"), &Default::default())?;
+    store.record_manager_turn(
+        &attempt,
+        "system",
+        "thread",
+        Some("turn"),
+        &Default::default(),
+    )?;
 
     say(&mut store, &net, "m2", true)?;
     let into = store
