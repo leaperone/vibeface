@@ -21,6 +21,9 @@ import time
 import urllib.parse
 import uuid
 import zipfile
+
+# Local helper imports must not dirty the checkout before provenance checks.
+sys.dont_write_bytecode = True
 from release import verify_build_info
 
 
@@ -2123,12 +2126,18 @@ def self_test_source_cli(directory):
     git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
     expected = git("rev-parse", "HEAD").stdout.strip()
 
+    environment = os.environ.copy()
+    environment.pop("PYTHONDONTWRITEBYTECODE", None)
+    environment.pop("PYTHONPYCACHEPREFIX", None)
+
     def verify(commit, succeeds):
-        result = subprocess.run([sys.executable, "-B", str(scripts / "run-delivery-live.py"),
-                                 "--verify-source-commit", commit], cwd=repo, capture_output=True, text=True)
+        result = subprocess.run([sys.executable, str(scripts / "run-delivery-live.py"),
+                                 "--verify-source-commit", commit], cwd=repo, env=environment,
+                                capture_output=True, text=True)
         assert (result.returncode == 0) == succeeds, result.stderr
 
     verify(expected, True)
+    assert not git("status", "--porcelain").stdout
     verify("0" * 40, False)
     extra = repo / "untracked.txt"
     extra.write_text("untracked source")
