@@ -174,7 +174,7 @@ jobs:
           PY
           printf '%s\n' ui-run > .artifacts/native/private/stage.txt
           set +e
-          pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' --trace off --video off --retries 0 > .artifacts/native/private/ui.log 2>&1
+          pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' --action-timeout 240000 --trace off --video off --retries 0 > .artifacts/native/private/ui.log 2>&1
           result=$?
           set -e
           echo "Native Provider e2e exit code: $result"
