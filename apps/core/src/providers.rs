@@ -1042,8 +1042,8 @@ impl ProviderEnv {
     }
 
     pub fn save(&self, dir: &Path) -> Result<()> {
-        crate::config::private_write(&dir.join(ENV_FILE), &serde_json::to_vec(self)?)?;
         self.hide_values();
+        crate::config::private_write(&dir.join(ENV_FILE), &serde_json::to_vec(self)?)?;
         Ok(())
     }
 
@@ -1090,7 +1090,7 @@ impl ProviderEnv {
     }
 }
 
-fn validate(provider: Provider, name: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_env_name(name: &str) -> Result<()> {
     ensure!(
         !name.is_empty()
             && name.len() <= 256
@@ -1099,6 +1099,11 @@ fn validate(provider: Provider, name: &str, value: &str) -> Result<()> {
             }),
         "variable names use letters, digits and underscores"
     );
+    Ok(())
+}
+
+fn validate(provider: Provider, name: &str, value: &str) -> Result<()> {
+    validate_env_name(name)?;
     ensure!(
         !name.starts_with("VIBEFACE_")
             && !provider
@@ -1236,15 +1241,13 @@ impl ProviderRoots {
         env
     }
 
+    /// Returns whether this call published a new private Codex configuration.
     pub fn apply(
         &self,
         local: &mut Local,
         codex_agent: bool,
         host: &crate::discovery::Host,
-    ) -> Result<()> {
-        if local.launches(Provider::Codex) && local.switches.app_server_used(codex_agent) {
-            self.seed_codex_config(host)?;
-        }
+    ) -> Result<bool> {
         for provider in Provider::ALL {
             local.env.apply(
                 provider,
@@ -1254,7 +1257,10 @@ impl ProviderRoots {
                     .collect(),
             )?;
         }
-        Ok(())
+        if local.launches(Provider::Codex) && local.switches.app_server_used(codex_agent) {
+            return self.seed_codex_config(host);
+        }
+        Ok(false)
     }
 
     /// A new private home inherits only safe model/provider settings, never the user's auth
@@ -1273,10 +1279,13 @@ impl ProviderRoots {
         else {
             return Ok(false);
         };
-        let Some(source) = crate::manager::read_codex_config(&home)? else {
+        let Some(source) = crate::manager::read_codex_config(&home)
+            .map_err(|_| crate::discovery::LocalSourceError)?
+        else {
             return Ok(false);
         };
-        let projected = crate::manager::codex_config_projection(&source)?;
+        let projected = crate::manager::codex_config_projection(&source)
+            .map_err(|_| crate::discovery::LocalSourceError)?;
         if projected.is_empty() {
             return Ok(false);
         }

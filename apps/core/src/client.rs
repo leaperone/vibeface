@@ -2954,7 +2954,7 @@ mod tests {
             node_codex_home.join("config.toml"),
             "model_provider='fixture'\n[model_providers.fixture]\nenv_key='FIXTURE_PROVIDER_KEY'\n",
         )?;
-        let set_codex = json!({"provider":"codex","bot":true,"bin":"/fixture/codex",
+        let set_codex = json!({"provider":"codex","connect_local":true,"bot":true,"bin":"/fixture/codex",
             "env":{"FIXTURE_CODEX_KEY":codex_key,"CODEX_HOME":user_codex_home}});
         let mut member = session(&client)?;
         assert!(
@@ -3014,10 +3014,26 @@ mod tests {
             &node,
             &mut owner,
             "configure_provider",
-            json!({"provider":"cursor","env":{"CURSOR_API_KEY":cursor_key}}),
+            json!({"provider":"cursor","connect_local":true,"env":{"CURSOR_API_KEY":cursor_key}}),
         )
         .await?;
         let read = dispatch(&node, &mut owner, "node_settings", json!({})).await?;
+        let private_env = std::fs::read(dir.join(crate::providers::ENV_FILE))?;
+        let private_env_modified =
+            std::fs::metadata(dir.join(crate::providers::ENV_FILE))?.modified()?;
+        let repeated = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","connect_local":true}),
+        )
+        .await?;
+        assert_eq!(repeated["providers"][1]["roles"], json!([]));
+        assert!(std::fs::read(dir.join(crate::providers::ENV_FILE))? == private_env);
+        assert_eq!(
+            std::fs::metadata(dir.join(crate::providers::ENV_FILE))?.modified()?,
+            private_env_modified
+        );
         for reply in [&saved, &cursor, &read] {
             let text = reply.to_string();
             assert!(

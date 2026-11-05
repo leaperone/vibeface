@@ -463,7 +463,7 @@ impl Runtime {
         &self,
         local: &mut crate::providers::Local,
         codex_agent: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         ProviderRoots::new(&self.data_dir).apply(local, codex_agent, &self.host)
     }
 
@@ -516,7 +516,54 @@ impl Runtime {
             .manager
             .as_ref()
             .is_some_and(|manager| manager.provider.on_app_server());
-        provider_roots.apply(&mut local, codex_agent, &host)?;
+        match provider_roots.apply(&mut local, codex_agent, &host) {
+            Ok(_) => {}
+            Err(error) if error.is::<crate::discovery::LocalSourceError>() => {
+                tracing::warn!(
+                    event = "providers.local_source_failed",
+                    "could not read local AI service settings; configure the service manually"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        let mut completed_env = false;
+        for provider in [Provider::Codex, Provider::Cursor] {
+            let enabled = if provider == Provider::Codex {
+                local.switches.app_server_used(codex_agent)
+            } else {
+                config
+                    .manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.provider == provider)
+                    || local.switches.execution.contains(&provider)
+            };
+            if !enabled {
+                continue;
+            }
+            match crate::discovery::complete_local(
+                &mut local,
+                &crate::discovery::LocalConnect {
+                    provider,
+                    explicit_env_names: BTreeSet::new(),
+                },
+                &host,
+            )
+            .await
+            {
+                Ok(changed) => completed_env |= changed,
+                Err(error) if error.is::<crate::discovery::LocalSourceError>() => {
+                    tracing::warn!(
+                        event = "providers.local_source_failed",
+                        provider = provider.name(),
+                        "could not read local AI service settings; configure the service manually"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if completed_env {
+            local.env.save(dir)?;
+        }
         if !config.triage.scan_codex_sessions {
             config.triage.codex_sessions = Some(provider_roots.codex_sessions.clone());
         }
