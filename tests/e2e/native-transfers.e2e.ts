@@ -239,11 +239,11 @@ test('provider settings and queued cancellation work in the installed native app
     await link.click();
   };
   const inspect = async () => providerInspection(await network.call({ op: 'native_provider_inspect' }));
+  const probeButton = screen.getByRole('button', 'Codex 检查可用性', { exact: true });
   const probe = async () => {
-    const button = screen.getByRole('button', '检查可用性', { exact: true }).first();
-    await expect(button).toBeEnabled({ timeout: 30000 });
-    await button.click();
-    await expect(button).toBeEnabled({ timeout: 30000 });
+    await expect(probeButton).toBeEnabled({ timeout: 30000 });
+    await probeButton.click();
+    await expect(probeButton).toBeEnabled({ timeout: 30000 });
   };
   const codexRow = () => screen.getByRole('button', /^Codex，/);
   const botDetails = screen.getByRole('button', '运行 Bot', { exact: true });
@@ -387,7 +387,7 @@ test('provider settings and queued cancellation work in the installed native app
   await screen.getByRole('button', 'high', { exact: true }).click();
   await save('native-selectable', 'high');
   await network.call({ op: 'native_provider_stage', stage: 'catalog_unknown' });
-  await screen.scrollUntilVisible(screen.getByRole('button', '检查可用性', { exact: true }).first(), { direction: 'up' });
+  await screen.scrollUntilVisible(probeButton, { direction: 'up' });
   await probe();
   await expect(screen.getByText('模型列表暂不可用，可继续手填。已保存的模型保持不变。', { exact: true })).toBeVisible();
   expect((await inspect()).manager).toEqual({ provider: 'codex', model: 'native-selectable', reasoning_effort: 'high' });
@@ -400,7 +400,7 @@ test('provider settings and queued cancellation work in the installed native app
   await save('native-custom-model', 'high');
   await screenshot('provider-typed');
   await network.call({ op: 'native_provider_stage', stage: 'ready' });
-  await screen.scrollUntilVisible(screen.getByRole('button', '检查可用性', { exact: true }).first(), { direction: 'up' });
+  await screen.scrollUntilVisible(probeButton, { direction: 'up' });
   await probe();
   await expect.poll(async () => (await inspect()).catalog).toBe('available');
   await screen.scrollUntilVisible(typed, { direction: 'down' });

@@ -142,7 +142,7 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
         <CopyableId value={item.setup.command} label={`${name} 私有目录认证命令`} />
       </View> : null}
       <Text className="text-meta text-muted-foreground">{item.probe.checked_at_ms === null ? '尚未主动检查' : `检查于 ${new Date(item.probe.checked_at_ms).toLocaleString()}`}</Text>
-      <Button variant="ghost" className="self-start" disabled={busy !== ''} onPress={() => void probe()}><Icon as={busy === `${item.provider}:probe` ? LoaderCircle : PlugZap} /><Text>检查可用性</Text></Button>
+      <Button variant="ghost" className="self-start" accessibilityLabel={`${name} 检查可用性`} disabled={busy !== ''} onPress={() => void probe()}><Icon as={busy === `${item.provider}:probe` ? LoaderCircle : PlugZap} /><Text>检查可用性</Text></Button>
       {manager && item.probe.catalog.state === 'available' && item.probe.catalog.coverage === 'partial' ? <Text className="text-meta text-muted-foreground">模型列表可能不完整，可手填其他模型。</Text> : null}
       {manager && item.probe.catalog.state === 'unavailable' ? <Text className="text-meta text-muted-foreground">模型列表暂不可用，可继续手填。已保存的模型保持不变。</Text> : null}
     </View>
