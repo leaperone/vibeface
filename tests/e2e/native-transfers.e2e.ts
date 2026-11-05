@@ -257,8 +257,11 @@ test('provider settings and queued cancellation work in the installed native app
   const executionDetails = screen.getByRole('button', '执行任务', { exact: true });
   const modelButton = () => screen.getByRole('button', /^设备默认模型，/);
   const select = async (name: string) => {
+    await screen.scrollUntilVisible(codexRow(), { direction: 'up' });
     await screen.scrollUntilVisible(modelButton(), { direction: 'down' });
     await modelButton().click();
+    await expect(modelButton()).toBeExpanded();
+    await screen.scrollUntilVisible(screen.getByRole('button', '其他…', { exact: true }), { direction: 'down' });
     await screen.getByRole('radio', name, { exact: true }).click();
   };
   const save = async (model: string, effort: string | null) => {
@@ -269,8 +272,11 @@ test('provider settings and queued cancellation work in the installed native app
   };
   const executionButton = () => screen.getByRole('button', /^执行任务默认模型，/);
   const selectExecution = async (name: string) => {
+    await screen.scrollUntilVisible(codexRow(), { direction: 'up' });
     await screen.scrollUntilVisible(executionButton(), { direction: 'down' });
     await executionButton().click();
+    await expect(executionButton()).toBeExpanded();
+    await screen.scrollUntilVisible(screen.getByRole('button', '其他…', { exact: true }), { direction: 'down' });
     await screen.getByRole('radio', name, { exact: true }).click();
   };
   const saveExecution = async (model: string) => {
