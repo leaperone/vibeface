@@ -39,7 +39,7 @@ PATH_RULES = (
     ("delivery", ("crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/pkarr.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")),
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("www", ("apps/www/*",)),
-    ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "packages/docs/*")),
+    ("docs", ("README.md", "README.zh-CN.md", "AGENTS.md", "CLAUDE.md", "packages/docs/*")),
     ("node", ("packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts")),
     ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
@@ -425,6 +425,11 @@ def self_test():
     assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-secure-ffi"]
     docs = make_plan(["README.md", "packages/docs/node.md"])
     assert docs["docs_only"] and docs["www"] and docs["required_jobs"] == ["quick-check", "www"]
+    for path in ("README.md", "README.zh-CN.md"):
+        assert make_plan([path])["required_jobs"] == ["quick-check"]
+    assert make_plan(["README.zh-CN.md", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
+    for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py"):
+        assert make_plan([path])["full"]
     assert docs["local_process_modes"] == [] and www["local_process_modes"] == []
     assert make_plan(["apps/core/src/store/bot_settings.rs"])["local_process_modes"] == ["memory-sync", "phase5"]
     assert make_plan(["apps/core/src/agent_context.rs"])["local_process_modes"] == ["memory-sync", "chat-agent"]
@@ -567,6 +572,7 @@ def self_test():
         source.parent.mkdir(parents=True)
         source.write_text("test fixture\n")
         (Path(directory) / "README.md").write_text("docs\n")
+        (Path(directory) / "README.zh-CN.md").write_text("docs\n")
         git("add", ".", cwd=directory)
         git("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "-c", "user.name=CI self-test", "-c", "user.email=ci@example.invalid", "commit", "--quiet", "-m", "base", cwd=directory)
         base = git("rev-parse", "HEAD", cwd=directory).decode().strip()
@@ -574,10 +580,11 @@ def self_test():
         target.parent.mkdir(parents=True)
         source.rename(target)
         (Path(directory) / "README.md").unlink()
+        (Path(directory) / "README.zh-CN.md").unlink()
         git("add", "-A", cwd=directory)
         git("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", "-c", "user.name=CI self-test", "-c", "user.email=ci@example.invalid", "commit", "--quiet", "-m", "rename and delete", cwd=directory)
         paths = changed_paths(base, "HEAD", "pull_request", cwd=directory)
-        assert set(paths) == {"README.md", "apps/core/src/old.rs", "apps/app/old.rs"}
+        assert set(paths) == {"README.md", "README.zh-CN.md", "apps/core/src/old.rs", "apps/app/old.rs"}
         assert make_plan(paths)["rust_packages"] == ["vibeface-core"]
         assert make_plan(paths)["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-entry", "discovery", "phase5"]
         pr_head = git("rev-parse", "HEAD", cwd=directory).decode().strip()
@@ -628,6 +635,14 @@ def self_test():
     assert "(github.event_name == 'workflow_dispatch' || github.run_attempt > 1) && github.run_id || ''" in concurrency
     assert "cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == 1 }}" in concurrency
     assert "fetch-depth: 0" in workflow.split("\n  ci-gate:\n", 1)[1]
+    for job in ("rust-check", "rust-fast", "rust-slow"):
+        block = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  \w|\Z)", workflow)[1]
+        dependency = "[plan, quick-check]" if job == "rust-check" else "plan"
+        assert f"    needs: {dependency}\n" in block
+        assert "actions/download-artifact@" not in block
+    package = re.search(r"(?ms)^  package:\n(.*?)(?=^  \w|\Z)", workflow)[1]
+    assert "    needs: [plan, crypto-web, web]\n" in package
+    assert "name: crypto-web-${{ github.sha }}" in package and "name: web-${{ github.sha }}" in package
     subprocess.run(["python3", str(root / "scripts/build-inputs.py"), "self-test"], check=True)
     config = (root / "crates/control/src/lib.rs").read_text()
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
@@ -652,7 +667,7 @@ def coverage_self_test(directory, base, nonancestor):
     git("checkout", "--quiet", "--detach", base, cwd=directory)
     (Path(directory) / "apps/core/src/old.rs").write_text("changed Rust input\n")
     rust_head = commit("Rust change A")
-    (Path(directory) / "README.md").write_text("docs change B\n")
+    (Path(directory) / "README.zh-CN.md").write_text("docs change B\n")
     head = commit("docs change B")
     event_file.write_text(json.dumps({"before": rust_head, "after": head}))
     environment = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "push", "GITHUB_REF_TYPE": "branch", "GITHUB_REF": "refs/heads/main", "GITHUB_SHA": head, "GITHUB_REPOSITORY": "fixture/vibeface", "GITHUB_RUN_ID": "50", "GH_TOKEN": "fixture-token", "GITHUB_EVENT_PATH": str(event_file)}

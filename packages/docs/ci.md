@@ -27,7 +27,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 | 改动 | 核心检查 |
 | --- | --- |
-| `README.md`、`AGENTS.md`、`CLAUDE.md` | 静态快检，不构建或运行 Rust 测试 |
+| `README.md`、`README.zh-CN.md`、`AGENTS.md`、`CLAUDE.md` | 静态快检，不构建或运行 Rust 测试 |
 | `apps/www/`、`packages/docs/` | 门户类型检查、静态构建和产物检查，不运行 Rust 测试 |
 | `apps/app/`、Web 构建脚本 | 浏览器密码学互通、Web 测试与类型检查、静态构建、Linux x64 完整包及网页进程验收 |
 | 共享主题、根 JS package、pnpm workspace 或 lockfile | Node Web 检查与门户检查 |
@@ -46,7 +46,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 Web 路径优先于 Node 路径，只有 `packages/client/src/avatar/face.ts` 与 `derived-faces.json` 例外：它们按 Node 路径选取，因为这组向量也是 Node Rust 测试的输入，核对 Node 由 bot ID 派生的长相与客户端一致；Node 受影响时 Web 检查照常运行。Node 对 Protocol、Bridge、Secure 的依赖用于向上扩展检查范围。PR 按 `merge-base(base, head)..head` 的完整差异选取，删除与重命名包括旧、新路径。无法识别的输入选择整个工作区核心检查。
 
-`delivery` 路径先于通用 Node 和 Cargo 路径匹配。它包括 `crates/delivery/`、`crates/delivery/proof/`、`contracts/delivery/`、`tests/fixtures/delivery-probe/`、`apps/core/src/delivery/`、发现实现、服务入口与本地钱包边界，以及两个 delivery 验收脚本。Delivery 领域库向上触发 Node 检查，因此 Rust 任务所需的 Web 和密码学资源仍会构建。完整工作区检查也要求 `delivery` 任务成功。
+`delivery` 路径先于通用 Node 和 Cargo 路径匹配。它包括 `crates/delivery/`、`crates/delivery/proof/`、`contracts/delivery/`、`tests/fixtures/delivery-probe/`、`apps/core/src/delivery/`、发现实现、服务入口与本地钱包边界，以及两个 delivery 验收脚本。Delivery 领域库向上触发 Node 检查，因此制品验收所需的 Web 和密码学资源仍会构建。完整工作区检查也要求 `delivery` 任务成功。
 
 Linux 制品核对 checksum、源码提交、版本、target、WASM 和存储 epoch，再以 `verify-node.py --web-only` 启动真实进程，检查网页资源、SPA 路由、CSP、缓存与 404。它不执行多 Node 业务验收，也不验证浏览器渲染。
 
@@ -255,6 +255,8 @@ Node 之间的传输、同步、地址簿、跨入口转发和投递改动跑默
 
 CI 固定的 Chromium 用例覆盖指定 Web 流程；任务特定的页面验收、其他浏览器渲染、真正模型调用、实体设备授权、实际公网 NAT 与用户后台服务安装需单独按任务验收，不属于 CI 的通过声明。
 
+Rust 快、慢组在计划生成后直接开始，Clippy 另等待静态快检。它们不等待或下载 Web 构建产物。制品任务继续等待 Web 和密码学资源，并执行原有的源码身份、真实进程和浏览器验收。
+
 ## 缓存与并发
 
 `ci` 按事件类型和 Git ref 分组，仅 `main` push 的首次运行自动取消旧的同组运行，累计覆盖范围保留旧运行尚未通过的改动。每次手动运行和 `run_attempt > 1` 的重跑再按 `run_id` 分组，因此重跑旧提交不会挤掉新提交的检查，显式 `delivery_live` 不会被后续 push 取消，也不会被另一条手动运行替换其 pending 位置。定时和 merge queue 不取消正在执行的同组运行，同组仍最多保留一个等待运行。主分支核心检查可以与定时完整检查同时进行。应用 tag 不触发普通 `ci`，发布与部署工作流使用各自的并发规则。 `delivery_small` 仍使用前文的跨 ref 串行分组，不按 `run_id` 拆组，也不取消正在执行的实验。
@@ -262,6 +264,10 @@ CI 固定的 Chromium 用例覆盖指定 Web 流程；任务特定的页面验�
 Linux x64 制品任务使用 pnpm 缓存，并按 runner、架构和 `pnpm-lock.yaml` 缓存 Chromium 二进制。浏览器的系统依赖从 Ubuntu 官方镜像下载，沿用签名仓库配置。每次仍执行冻结依赖安装、浏览器与系统依赖安装以及完整浏览器用例。缓存只包含浏览器文件，不包含测试结果、Node 数据或下载的恢复文件。
 
 `ci` 工作流中的 Rust 缓存仅在 `refs/heads/main` 或显式 `workflow_dispatch` 时保存。手动运行可为相同 ref 的后续运行预热。新增 profile 或缓存 key 在首次保存前需要冷构建。应用 tag 使用独立发布工作流，不属于本节缓存保存规则。
+
+Rust 缓存命中不表示当前 workspace 无需编译。每次仍由 Cargo 核对源码和构建参数；评估缓存时同时记录编译、保存与还原的耗时。
+
+当前 pinned `rust-cache` 主要保存第三方依赖，未启用 `cache-workspace-crates`。单独打开该选项仍不能保证新 checkout 复用本项目产物：Cargo 会因源码文件时间更新而重编，而且精确命中的不可变缓存不会追加保存。这里保留现有配置，不通过改写源码时间绕过 Cargo 的失效检查。
 
 Android 使用官方 Gradle 缓存动作和 Gradle build cache，保留 `arm64-v8a` 与 `x86_64` 的 release 构建。手动运行可以写入其 Git ref 的缓存。缓存命中仍需执行原构建和制品检查，不能替代本次提交的验收。
 

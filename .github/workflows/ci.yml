@@ -202,21 +202,13 @@ jobs:
           retention-days: 14
 
   rust-check:
-    needs: [plan, quick-check, crypto-web, web]
+    needs: [plan, quick-check]
     if: needs.plan.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: crypto-web-${{ github.sha }}
-          path: apps/app/generated
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: web-${{ github.sha }}
-          path: apps/app/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
@@ -231,7 +223,7 @@ jobs:
         run: python3 scripts/ci.py check --plan-env CI_PLAN --msrv "$MSRV"
 
   rust-fast:
-    needs: [plan, crypto-web, web]
+    needs: plan
     if: needs.plan.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     env:
@@ -243,14 +235,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: crypto-web-${{ github.sha }}
-          path: apps/app/generated
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: web-${{ github.sha }}
-          path: apps/app/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -262,7 +246,7 @@ jobs:
         run: /usr/bin/time -v python3 scripts/ci.py test --tier fast --plan-env CI_PLAN
 
   rust-slow:
-    needs: [plan, crypto-web, web]
+    needs: plan
     if: needs.plan.outputs.slow == 'true'
     runs-on: ubuntu-24.04
     env:
@@ -274,14 +258,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: crypto-web-${{ github.sha }}
-          path: apps/app/generated
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: web-${{ github.sha }}
-          path: apps/app/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
