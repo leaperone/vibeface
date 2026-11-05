@@ -1,6 +1,6 @@
 import * as DocumentPicker from 'expo-document-picker'
 import * as Haptics from 'expo-haptics'
-import { ArrowUp, Paperclip, Square, X } from 'lucide-react-native'
+import { ArrowUp, LoaderCircle, Paperclip, Square, X } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Pressable, ScrollView, TextInput, View } from 'react-native'
 import { Button } from '@/components/ui/button'
@@ -60,7 +60,7 @@ export function Composer({ value, onChange, files, onFiles, blocked, sending, on
         {/* Idle, the disabled default button rests muted; ready, it takes the bot's tint. */}
         <Button instant size="icon" variant={stop ? 'outline' : 'default'} className="rounded-full shadow-none" style={armed && tint ? { backgroundColor: tint.fill } : undefined} accessibilityLabel={stop ? '停止' : sending ? '发送中' : '发送'} disabled={!stop && !canSend}
           onPress={stop ?? (sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() })}>
-          {stop ? <Icon as={Square} className="fill-foreground" /> : <Icon as={ArrowUp} color={armed ? tint?.ink : undefined} />}
+          {stop ? <Icon as={Square} className="fill-foreground" /> : sending ? <Icon as={LoaderCircle} /> : <Icon as={ArrowUp} color={armed ? tint?.ink : undefined} />}
         </Button>
       </View>
     </View>
