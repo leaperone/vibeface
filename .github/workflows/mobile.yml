@@ -283,5 +283,6 @@ jobs:
             .artifacts/native/public/provider-selectable.png
             .artifacts/native/public/provider-controlled.png
             .artifacts/native/public/provider-typed.png
+            .artifacts/native/public/terminology-device-kinds.png
           if-no-files-found: error
           retention-days: 7
