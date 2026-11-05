@@ -27,7 +27,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 | 改动 | 核心检查 |
 | --- | --- |
-| `README.md`、`AGENTS.md`、`CLAUDE.md` | 静态快检，不构建或运行 Rust 测试 |
+| `README.md`、`README.zh-CN.md`、`AGENTS.md`、`CLAUDE.md` | 静态快检，不构建或运行 Rust 测试 |
 | `apps/www/`、`packages/docs/` | 门户类型检查、静态构建和产物检查，不运行 Rust 测试 |
 | `apps/app/`、Web 构建脚本 | 浏览器密码学互通、Web 测试与类型检查、静态构建、Linux x64 完整包及网页进程验收 |
 | 共享主题、根 JS package、pnpm workspace 或 lockfile | Node Web 检查与门户检查 |
