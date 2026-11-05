@@ -40,5 +40,5 @@ export type PendingMessage = {
   /** The entry's refusal, kept so the person can drop it; a lost answer leaves this unset. */
   rejected?: string
   rejection_code?: OutboxItem['rejection_code']
-}
+} & Pick<OutboxItem, 'release_expected_event' | 'release_command_id'>
 export type MessageRequest = Pick<PendingMessage, "conversation_id" | "message_id" | "text" | "report_results" | "target" | "intent" | "sequence" | "expected_revision" | "attachments">

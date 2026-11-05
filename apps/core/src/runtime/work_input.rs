@@ -17,7 +17,11 @@ impl Runtime {
         Ok(())
     }
 
-    fn validate_work_assignment_roots(store: &Store, network: &str, trigger: &str) -> Result<()> {
+    pub(super) fn validate_work_assignment_roots(
+        store: &Store,
+        network: &str,
+        trigger: &str,
+    ) -> Result<()> {
         if let Some(id) = trigger.strip_prefix("assignment:") {
             let assignment = store
                 .workspace_assignment(network, id)?
@@ -27,7 +31,7 @@ impl Runtime {
         Ok(())
     }
 
-    async fn work_native_directory(
+    pub(super) async fn work_native_directory(
         &self,
         provider: Provider,
         thread: Option<&str>,

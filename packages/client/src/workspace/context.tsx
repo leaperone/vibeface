@@ -15,7 +15,7 @@ import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePrimary, parsePendingBot, record,
   parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords, parseWorkspaceOverview, attachmentName, signedOrder, attachmentLimit,
-  parseInputReceipt, parsePendingMessage, parseScopeContext, parseWorkDetail, parseWorkspaceCommand, parseWorkspaceCommandResult, parseWorkspaceHistory, parseWorkspaceState,
+  parseInputReceipt, parsePendingMessage, parseScopeContext, parseWorkDetail, parseWorkspaceCommand, parseWorkspaceCommandResult, parseWorkspaceCommandNotSaved, parseWorkspaceHistory, parseWorkspaceState,
 } from "./model.ts"
 import type { Attachment } from "../chat/types.ts"
 import type { Avatar } from "../avatar/face.ts"
@@ -27,7 +27,7 @@ import { networkKey, newId, storageOf } from "./storage.ts"
 import type {
   AnswerResult, ConversationPayload, MemoryBase, MemoryControlResult, NodeInfo, NotificationRecord, PendingAnswer, Question,
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, WriteState, WriteStatus, OpenWork, ScheduleAction, WorkspaceOverview,
-  InputControlAction, InputOptions, InputReceipt, InputTarget, WorkDetailWork, WorkspaceCommand, WorkspaceCommandResult, WorkspaceDomainState, WorkspaceFilter,
+  InputControlAction, InputOptions, InputReceipt, InputTarget, WorkDetailWork, WorkspaceCommand, WorkspaceCommandResult, WorkspaceCommandNotSaved, WorkspaceDomainState, WorkspaceFilter,
 } from "./types.ts"
 import { isMainNotification, isSessionNotification } from "./types.ts"
 
@@ -47,6 +47,9 @@ type NotificationButton = { label: string; disabled: boolean; state: "off" | "on
 const soleTab: Tabs = { leader: () => true, post() {}, listen: () => () => {} }
 const faceSuperseded = "Bot 的长相刚在别处改过，之前没确认的那次修改没有再发送。"
 const responded = (caught: unknown) => caught instanceof Error && "responded" in caught && caught.responded === true
+class WorkspaceCommandNotSavedError extends Error {
+  constructor(receipt: WorkspaceCommandNotSaved) { super(receipt.reason || '这次操作未保存。请读取最新状态后再操作。') }
+}
 
 function useWorkspaceState(platform: Platform, connection: ReadyConnection, openConversation: (conversationId: string, target?: InputTarget) => void = () => {}, tabs: Tabs = soleTab, initialBot: string | null = null) {
   const { notifier } = platform
@@ -648,16 +651,27 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const writes = workspaceWrites.current
     const submission = (async () => {
       requireCurrent()
+      let sending = item
       try {
-        const receipt = parseWorkspaceCommandResult(await connection.rpc('workspace_command', item.params))
+        if (sending.command_rejection !== undefined) {
+          sending = { ...sending, command_rejection: undefined, rejected: undefined }
+          await outbox.put(sending)
+        }
+        const result = await connection.rpc('workspace_command', sending.params)
         requireCurrent()
+        const rejection = parseWorkspaceCommandNotSaved(result, sending.params.command_id)
+        if (rejection) {
+          await outbox.put({ ...sending, command_rejection: rejection, rejected: rejection.reason })
+          throw new WorkspaceCommandNotSavedError(rejection)
+        }
+        const receipt = parseWorkspaceCommandResult(result)
         if (receipt.command_id !== item.params.command_id) throw new Error('返回的操作和原操作不一致，内容已保留。请再查一次。')
         workspaceReadSequence.current += 1
         showWorkspace(receipt)
         await outbox.delete(item.key)
         return receipt
       } catch (caught) {
-        if (responded(caught)) await outbox.put({ ...item, rejected: caught instanceof Error ? caught.message : String(caught) })
+        if (responded(caught)) await outbox.put({ ...sending, rejected: caught instanceof Error ? caught.message : String(caught) })
         throw caught
       } finally { writes.delete(item.key) }
     })()
@@ -732,11 +746,16 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const receipt = parseInputReceipt(await connection.rpc('input_receipt', { message_id: input.message_id, conversation_id: id, target: input.target }))
     requireCurrent()
     if (receipt.message_id !== input.message_id || inputTargetKey(receipt.target) !== inputTargetKey(input.target)) throw new Error('输入回执和查询目标不匹配，已保留原输入。')
-    const item = (await outbox.all()).find((item) => item.key === outboxKey('message', input.message_id))
+    const items = await outbox.all(), item = items.find((item) => item.key === outboxKey('message', input.message_id))
     if (item) {
-      const releaseUnconfirmed = item.release_expected_event !== undefined && (!receipt.control_event?.trim() || receipt.control_event === item.release_expected_event)
+      const releaseRejected = item.release_expected_event !== undefined && items.some((entry) => {
+        if (entry.method !== 'workspace_command' || entry.command_rejection === undefined || entry.params.command_id !== item.release_command_id) return false
+        const command = parseWorkspaceCommand(entry.params.command)
+        return command.kind === 'control_input' && command.action.kind === 'release' && command.message_id === input.message_id && command.expected_event === item.release_expected_event && parseWorkspaceCommandNotSaved(entry.command_rejection, item.release_command_id) !== null
+      })
+      const releaseUnconfirmed = item.release_expected_event !== undefined && !releaseRejected && (!receipt.control_event?.trim() || receipt.control_event === item.release_expected_event)
       const uncertain = receipt.stage === 'unknown' || releaseUnconfirmed
-      await outbox.put({ ...item, receipt: releaseUnconfirmed ? item.receipt ?? receipt : receipt, delivery: uncertain ? 'unknown' : 'accepted', ...(!releaseUnconfirmed ? { release_expected_event: undefined } : {}) })
+      await outbox.put({ ...item, receipt: releaseUnconfirmed ? item.receipt ?? receipt : receipt, delivery: uncertain ? 'unknown' : 'accepted', ...(!releaseUnconfirmed ? { release_expected_event: undefined, release_command_id: undefined } : {}) })
       await outboxChanged()
       if (!uncertain) flushMessagesRef.current()
     }
@@ -924,7 +943,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (latest.rejection_code === 'input_conflict') throw new Error('设备保存的原输入和本地内容不同，已保留两边内容。请先查看原输入。')
       requireWritable()
       const control = await queueWorkspaceCommand({ kind: 'control_input', message_id: messageId, expected_event: receipt.control_event, action: { kind: 'release' } })
-      await outbox.put({ ...latest, receipt, delivery: 'unknown', release_expected_event: receipt.control_event })
+      const commandId = control.params.command_id
+      if (typeof commandId !== 'string') throw new Error('本地操作缺少编号，原输入已保留。请再查询。')
+      if (control.command_rejection !== undefined) await outbox.put({ ...control, command_rejection: undefined, rejected: undefined })
+      await outbox.put({ ...latest, receipt, delivery: 'unknown', release_expected_event: receipt.control_event, release_command_id: commandId })
       await outboxChanged()
       resume = false
       let failure: unknown
@@ -934,6 +956,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       catch (caught) { throw failure ?? caught }
       const confirmed = (await outbox.all()).find((entry) => entry.key === item.key)
       resume = confirmed?.delivery === 'accepted'
+      if (failure instanceof WorkspaceCommandNotSavedError) throw failure
       if (confirmed?.release_expected_event !== undefined) {
         if (failure !== undefined) throw failure
         setNoticeText('重试结果尚未确认，原输入已保留。请再查询。')
@@ -949,14 +972,22 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (!item) throw new Error('这条输入已不在本地待发送队列。')
     const pending = parsePendingMessage(item)
     if (messageTargets.current.has(messageLane(pending))) throw new Error('这个目标仍在提交输入，先查询原输入的结果。')
-    if (pending.delivery === 'unknown' || pending.delivery === 'submitting' || pending.delivery === 'accepted') {
-      await queryInput(pending)
-      throw new Error('设备已保存这条输入。请从列表中取消，或继续查询结果。')
+    if (pending.rejection_code === 'input_conflict') throw new Error('设备保存的原输入和本地内容不同，已保留两边内容。请先查看原输入。')
+    let notice = '已放弃这条未发送的输入。'
+    if (pending.delivery === 'unknown' || pending.delivery === 'submitting' || pending.delivery === 'accepted' || pending.receipt !== undefined || pending.release_expected_event !== undefined || pending.release_command_id !== undefined) {
+      const receipt = await queryInput(pending)
+      const latest = (await outbox.all()).find((entry) => entry.key === item.key)
+      if (!latest) return
+      const checked = parsePendingMessage(latest)
+      if (checked.message_id !== pending.message_id || checked.conversation_id !== pending.conversation_id || inputTargetKey(checked.target) !== inputTargetKey(pending.target)) throw new Error('本地输入已变化，内容仍保留。请再查询。')
+      if (checked.rejection_code === 'input_conflict' || checked.delivery !== 'accepted' || receipt.stage !== 'refused' || checked.receipt?.stage !== 'refused' || checked.release_expected_event !== undefined || checked.release_command_id !== undefined) throw new Error('这条输入还不能关闭提醒，原内容已保留。请继续查询结果。')
+      notice = '已关闭这条输入的提醒。'
     }
+    requireCurrent()
     await outbox.delete(item.key)
     await outboxChanged()
     flushMessages()
-    setNoticeText('已放弃这条未发送的输入。')
+    setNoticeText(notice)
   }
   const interruptRegisteredWork = async (id: string, workId: string) => {
     requireCurrent()

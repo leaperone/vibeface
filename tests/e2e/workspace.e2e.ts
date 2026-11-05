@@ -242,6 +242,31 @@ test('keeps personal Tasks, deferred inputs and directed Channel results in thei
   await expect(channelChat).toContainText('workspace-channel-directed:complete', { timeout: 20000 });
   const taskLink = channelChat.getByRole('link').filter({ hasText: 'workspace-channel-directed' });
   await expect(taskLink).toHaveCount(1);
+  const channelSend = channelChat.getByRole('button', /^(发送|补充当前工作)$/);
+  for (const control of [channelComposer, channelSend]) {
+    const bounds = await control.boundingBox();
+    assert(bounds, 'The narrow Channel input and send button render');
+    expect(bounds.x).toBeGreaterThanOrEqual(0);
+    expect(bounds.y).toBeGreaterThanOrEqual(0);
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(390);
+    expect(bounds.y + bounds.height).toBeLessThanOrEqual(844);
+  }
+  const channelLayout = await browser.evaluate(() => {
+    const panel = document.querySelector('section[aria-label="频道对话"]');
+    const form = panel?.querySelector(':scope > form');
+    const history = panel?.querySelector('[aria-label="聊天记录"]');
+    if (!(panel instanceof HTMLElement) || !(form instanceof HTMLFormElement) || !(history instanceof HTMLElement)) throw new Error('The Channel must render its composer and history viewport');
+    const composer = form.getBoundingClientRect(), timeline = history.getBoundingClientRect();
+    return { width: window.innerWidth, height: window.innerHeight, scrollWidth: document.documentElement.scrollWidth,
+      panelHeight: panel.getBoundingClientRect().height, composerHeight: composer.height, composerTop: composer.top,
+      historyHeight: timeline.height, historyBottom: timeline.bottom };
+  });
+  expect({ width: channelLayout.width, height: channelLayout.height }).toEqual({ width: 390, height: 844 });
+  expect(channelLayout.scrollWidth).toBeLessThanOrEqual(channelLayout.width);
+  expect(channelLayout.panelHeight).toBeGreaterThan(0);
+  expect(channelLayout.composerHeight).toBeLessThanOrEqual(channelLayout.height / 2);
+  expect(channelLayout.historyHeight).toBeGreaterThanOrEqual(channelLayout.panelHeight / 4);
+  expect(channelLayout.historyBottom).toBeLessThanOrEqual(channelLayout.composerTop);
   await app.screenshot('workspace-channel-directed-narrow');
   await taskLink.click();
   await expect(browser).toHaveURL(/\/tasks\/[^/?#]+$/);

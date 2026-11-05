@@ -2,12 +2,21 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, inputEventBody, inputTargetKey, inputTaskCommand, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, retryText, roleLabel, reachDevice } from './protocol.ts'
 import type { ManagerJob, TurnRuntime } from '../workspace/types.ts'
-import { parseInputReceipt, parseNodes, parsePendingMessage, parseTurnRuntime, parseWorkspaceCommand } from '../workspace/model.ts'
+import { parseInputReceipt, parseNodes, parsePendingMessage, parseTurnRuntime, parseWorkspaceCommand, parseWorkspaceCommandNotSaved } from '../workspace/model.ts'
 import { enqueue, type OutboxItem } from '../lib/outbox.ts'
 
 const prepareMainSend = (input: Omit<Parameters<typeof prepareSend>[0], 'target' | 'sequence'>) => prepareSend({ ...input, target: { kind: 'bot_main', bot_id: 'bot' }, sequence: 1 })
 
 const ready = { hasConversation: true, loaded: true, bot: 'ready' as const }
+test('a command refusal settles only the exact explicitly unsaved write', () => {
+  const commandId = 'c'.repeat(64)
+  const refusal = { accepted: false, code: 'workspace_command_not_saved', stored: false, command_id: commandId, reason: '任务已更新，本次操作未保存。' }
+  assert.deepEqual(parseWorkspaceCommandNotSaved(refusal, commandId), refusal)
+  assert.equal(parseWorkspaceCommandNotSaved({ ...refusal, reason: '' }, commandId)?.reason, '')
+  for (const changed of [{ command_id: 'd'.repeat(64) }, { command_id: undefined }, { accepted: true }, { stored: true }, { stored: undefined }, { reason: undefined }]) assert.throws(() => parseWorkspaceCommandNotSaved({ ...refusal, ...changed }, commandId))
+  assert.equal(parseWorkspaceCommandNotSaved({ ...refusal, code: 'forward_error' }, commandId), null)
+  assert.equal(parseWorkspaceCommandNotSaved({ responded: true, message: 'ACK lost' }, commandId), null)
+})
 test('automatic Task commands meet the Node expected-result contract and retain their source', () => {
   const sources = ['a'.repeat(64), 'b'.repeat(64)]
   for (const input of [
@@ -114,6 +123,9 @@ test('a persisted unknown input retains the original signature, attachment bytes
   assert.deepEqual(restored.attachments, [attachment])
   assert.deepEqual((await store.all())[0].params, item.params)
   assert.deepEqual((await store.all())[0].uploads, item.uploads)
+  const releasing = parsePendingMessage({ ...item, release_expected_event: 'a'.repeat(64), release_command_id: 'c'.repeat(64) })
+  assert.equal(releasing.release_expected_event, 'a'.repeat(64))
+  assert.equal(releasing.release_command_id, 'c'.repeat(64))
   const receipt = { message_id: restored.message_id, target: restored.target, stage: 'provider_accepted', actual_turn_id: null, reason: null, retry_safe: false, control_event: null }
   assert.equal(parseInputReceipt(receipt).actual_turn_id, null)
   assert.equal(parseInputReceipt(receipt).control_event, null)

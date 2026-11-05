@@ -4,7 +4,7 @@ file written the way pi writes it.
 
 PI_CODING_AGENT_SESSION_DIR holds the sessions. FAKE_PI_LOG gets one JSON line per start and
 per prompt. FAKE_PI_MODE picks "reply", "wait", "crash", "fail", "fail-key", "refuse",
-"refuse-model", "prompt-lost" or "prompt-pending". Standard library only.
+"refuse-model", "prompt-lost", "prompt-pending" or "retry-abort". Standard library only.
 FAKE_PI_STATE_GATE delays get_state until that file exists, while EOF still ends the process.
 """
 import json
@@ -22,6 +22,7 @@ STATE_GATE = os.environ.get("FAKE_PI_STATE_GATE")
 out = threading.Lock()
 state = threading.Condition()
 steers, aborted, running = [], [False], [False]
+aborts = 0
 
 
 def log(record):
@@ -139,7 +140,7 @@ def turn(text):
         failed = reply("fixture failure", "error")
         failed["errorMessage"] = "No API key found for fake." if MODE == "fail-key" else "fixture failure"
         end(failed)
-    elif MODE == "wait":
+    elif MODE in ("wait", "retry-abort"):
         start("assistant")
         stream("Working")
         wait(lambda: steers or aborted[0])
@@ -221,7 +222,11 @@ for line in sys.stdin:
             state.notify_all()
         respond(command, {"disposition": "queued"})
     elif kind == "abort":
+        aborts += 1
         log({"abort": True, "session": session})
+        if MODE == "retry-abort" and aborts == 1:
+            respond(command)
+            continue
         with state:
             aborted[0] = True
             state.notify_all()

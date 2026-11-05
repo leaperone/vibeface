@@ -236,6 +236,8 @@ test("workspace preserves bot and message requests while routing native decision
   let failControl = false, failBotCheck = false, failMessage = false, inputQuerySafe = false
   let inputControlEvent = 'c'.repeat(64), inputQueryStage: InputReceipt['stage'] | null = null
   const inputReleases: Record<string, unknown>[] = []
+  const inputReceiptOverrides = new Map<string, InputReceipt>(), inputReceiptQueries: Record<string, unknown>[] = []
+  let inputReleaseReply: ((body: Record<string, unknown>) => unknown) | null = null
   const questionRow = { question_id: "q1", conversation_id: "chat" as string | null, bot: { bot_id: "bot", name: "Bot" } as { bot_id: string; name: string } | null, severity: "attention", text: "要不要继续", choices: [{ label: "继续" }, { label: "停下" }], about: { node: "worker", agent: "codex", session_id: "thread", cwd: "/project", summary: "改登录" }, author: "gateway", created_at_ms: 1, answer: null }
   const otherRow = { ...questionRow, question_id: "s1", conversation_id: "other" }
   let questionRows: Record<string, unknown>[] = [questionRow, otherRow]
@@ -257,13 +259,17 @@ test("workspace preserves bot and message requests while routing native decision
       if (method === "open_works") return { works: [] }
       if (method === "workspace_overview") return {}
       if (method === "workspace_state") return { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } }
-      if (method === "input_receipt") return { message_id: body.message_id, target: body.target, stage: inputQueryStage ?? (inputQuerySafe ? "refused" : transcript.some((message) => message.message_id === body.message_id) ? "entry_accepted" : "unknown"), actual_turn_id: null, reason: "原输入待确认", retry_safe: inputQuerySafe, control_event: inputQuerySafe || inputQueryStage ? inputControlEvent : null }
+      if (method === "input_receipt") {
+        inputReceiptQueries.push(JSON.parse(JSON.stringify(body)))
+        return inputReceiptOverrides.get(String(body.message_id)) ?? { message_id: body.message_id, target: body.target, stage: inputQueryStage ?? (inputQuerySafe ? "refused" : transcript.some((message) => message.message_id === body.message_id) ? "entry_accepted" : "unknown"), actual_turn_id: null, reason: "原输入待确认", retry_safe: inputQuerySafe, control_event: inputQuerySafe || inputQueryStage ? inputControlEvent : null }
+      }
       if (method === 'workspace_command') {
         const command = workspaceModel.parseWorkspaceCommand(body.command)
         assert.ok(command.kind === 'control_input' && command.action.kind === 'release')
         assert.equal(command.expected_event, inputControlEvent)
         assert.ok(messages.some((message) => message.message_id === command.message_id), 'Release refers to the original stored input')
         inputReleases.push(JSON.parse(JSON.stringify(body)))
+        if (inputReleaseReply) return inputReleaseReply(body)
         throw new Error('release acknowledgement lost')
       }
       if (method === 'upload_attachment') return uploadHold ? uploadHold.promise : { complete: true }
@@ -1024,8 +1030,13 @@ test("workspace preserves bot and message requests while routing native decision
       await settleComponent()
       const head = render().pendingMessages.find((item) => item.text === 'cancelled head')
       assert.ok(head); assert.equal(head.delivery, 'unknown')
-      failMessage = false; inputQuerySafe = false; inputQueryStage = 'refused'
+      const inbox = () => inboxItems({ device: { ready: activeConnection, joins: [], pendingRecovery: null, rotateHint: false }, workspace: render() })
+      failMessage = false
       try {
+        await assert.rejects(render().releaseMessagePending(head.message_id))
+        assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'unknown')
+        assert.ok(inbox().some((item) => item.key === `undelivered:${head.message_id}`), 'an unknown reminder cannot be dismissed')
+        inputQuerySafe = false; inputQueryStage = 'refused'
         assert.equal(await render().sendMessage('following input'), true)
         await settleComponent()
         assert.deepEqual(messages.slice(before).map((message) => message.text), ['cancelled head', 'following input'])
@@ -1033,7 +1044,163 @@ test("workspace preserves bot and message requests while routing native decision
         await render().retryPendingMessage(head.message_id)
         assert.equal(inputReleases.length, releases, 'safe=false cannot release a cancelled input')
         assert.equal(messages.slice(before).filter((message) => message.message_id === head.message_id).length, 1)
+        const saved = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
+        assert.ok(saved)
+        inputQueryStage = 'unknown'
+        await assert.rejects(render().releaseMessagePending(head.message_id))
+        assert.ok(outboxItems.has(saved.key), 'a stale refused card cannot close after the fresh result becomes unknown')
+        inputQueryStage = 'refused'; await render().queryInput(head)
+        await memoryOutbox.put({ ...saved, rejected: '原输入内容不同', rejection_code: 'input_conflict' })
+        await assert.rejects(render().releaseMessagePending(head.message_id))
+        assert.ok(outboxItems.has(saved.key), 'a conflict keeps both copies for reconciliation')
+        await memoryOutbox.put(saved); await render().queryInput(head)
+        const rpcConnection = activeConnection, originalRpc = rpcConnection.rpc
+        const closeCalls: string[] = []
+        const history = { events: [{ event_hash: 'a'.repeat(64), created_at_ms: 1, scope_id: head.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...messages[before], type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
+        rpcConnection.rpc = async (method, body = {}) => { closeCalls.push(method); return method === 'workspace_history' ? history : originalRpc(method, body) }
+        let closeWork = Promise.resolve()
+        const status = componentHarness('./workspace-chat.tsx', {
+          '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/chat/protocol.ts': { inputTargetKey },
+          '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, action: () => Promise<void>) => { closeWork = action(); return closeWork } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+        })
+        try {
+          const sharedHistory = JSON.parse(JSON.stringify(await render().readWorkspaceHistory()))
+          const cancelled = render().pendingMessages.find((item) => item.message_id === head.message_id)
+          assert.ok(cancelled); assert.equal(cancelled.rejected, undefined); assert.ok(inbox().some((item) => item.key === `undelivered:${head.message_id}`))
+          const close = status.render('WorkspaceInputStatus', { pending: cancelled }).find(({ type, props }) => type === 'Button' && componentText(props.children) === '关闭提醒')?.props.onClick
+          assert.ok(typeof close === 'function')
+          const writes = messages.length, commands = inputReleases.length, signatures = signed.length
+          closeCalls.splice(0); close(); await closeWork; await settleComponent()
+          assert.deepEqual(closeCalls, ['input_receipt'], 'closing only queries the terminal receipt and sends no write')
+          assert.equal(render().pendingMessages.some((item) => item.message_id === head.message_id), false)
+          assert.equal(inbox().some((item) => item.key === `undelivered:${head.message_id}`), false, 'the cancelled input leaves Inbox after closing its local reminder')
+          assert.equal(outboxItems.has(saved.key), false)
+          assert.deepEqual(JSON.parse(JSON.stringify(await render().readWorkspaceHistory())), sharedHistory, 'closing the local reminder preserves shared history')
+          assert.equal(messages.length, writes); assert.equal(inputReleases.length, commands); assert.equal(signed.length, signatures)
+        } finally { status.close(); rpcConnection.rpc = originalRpc }
       } finally { inputQueryStage = null; failMessage = false }
+    })
+    for (const outcome of ['not_saved', 'wrong_id', 'stored', 'responded', 'forward_ack']) await t.test(`Release ${outcome} only settles its exact proven unwritten command before advancing the lane`, async () => {
+      knownBots = [bot]
+      await render().refresh(); await render().selectBot(bot)
+      inputControlEvent = 'e'.repeat(64)
+      const before = messages.length, releases = inputReleases.length
+      const firstText = `Release ${outcome} original`, nextText = `Release ${outcome} following`
+      const response = deferred(), requested = deferred()
+      void response.promise.catch(() => {})
+      let recovery = Promise.resolve<PromiseSettledResult<void>[]>([])
+      try {
+        failMessage = true
+        assert.equal(await render().sendMessage(firstText, [{ name: 'original.txt', arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer }]), true)
+        await settleComponent(); failMessage = false
+        const head = render().pendingMessages.find((item) => item.text === firstText)
+        assert.ok(head)
+        const receipt: InputReceipt = { message_id: head.message_id, target: head.target, stage: 'refused', actual_turn_id: null, reason: '原输入已拒绝', retry_safe: true, control_event: inputControlEvent }
+        inputReceiptOverrides.set(head.message_id, receipt)
+        await render().queryInput(head)
+        inputReleaseReply = (body) => { requested.resolve(body); return response.promise }
+        recovery = Promise.allSettled([render().retryPendingMessage(head.message_id)])
+        const request = nodeSettings.record(JSON.parse(JSON.stringify(await requested.promise)))
+        assert.equal(typeof request.command_id, 'string')
+        const original = messages[before]
+        const releasing = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
+        assert.ok(releasing); assert.equal(releasing.delivery, 'unknown'); assert.equal(releasing.release_expected_event, receipt.control_event); assert.equal(releasing.release_command_id, request.command_id)
+        await assert.rejects(render().releaseMessagePending(head.message_id))
+        assert.ok(outboxItems.has(releasing.key), 'an in-flight Release cannot be dismissed')
+        assert.equal(await render().sendMessage(nextText), true)
+        await settleComponent()
+        const following = render().pendingMessages.find((item) => item.text === nextText)
+        assert.ok(following)
+        assert.deepEqual(messages.slice(before).map((message) => message.text), [firstText], 'the following input waits for the Release result')
+        inputReceiptOverrides.set(head.message_id, { ...receipt, retry_safe: false })
+        const queries = inputReceiptQueries.length
+        const refusal = { accepted: false, code: 'workspace_command_not_saved', stored: false, command_id: request.command_id, reason: '任务版本已变化，操作未写入。' }
+        if (outcome === 'responded') response.reject(Object.assign(new Error('owner response could not be confirmed'), { responded: true }))
+        else if (outcome === 'forward_ack') response.reject(new Error('forward acknowledgement lost'))
+        else response.resolve({ ...refusal, ...(outcome === 'wrong_id' ? { command_id: 'another-command' } : outcome === 'stored' ? { stored: true } : {}) })
+        const [completed] = await recovery
+        await settleComponent()
+        assert.ok(inputReceiptQueries.slice(queries).some((query) => query.message_id === head.message_id), 'the Release result is followed by a fresh query of the original input')
+        const checked = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
+        const control = [...outboxItems.values()].find((item) => item.method === 'workspace_command' && item.params.command_id === request.command_id)
+        assert.ok(checked); assert.deepEqual(checked.params, original, 'the original ID, signature, sequence and attachments are unchanged')
+        assert.ok(control); assert.deepEqual(control.params, request, 'the original signed Release request remains durable')
+        if (outcome === 'not_saved') {
+          assert.equal(completed.status, 'rejected')
+          if (completed.status === 'rejected') assert.match(String(completed.reason), /任务版本已变化/)
+          assert.equal(checked.delivery, 'accepted'); assert.equal(checked.release_expected_event, undefined); assert.equal(checked.release_command_id, undefined)
+          assert.equal(checked.receipt?.control_event, receipt.control_event); assert.equal(checked.receipt?.retry_safe, false)
+          assert.deepEqual(control.command_rejection, refusal, 'only the exact trusted prewrite proof is durable')
+        } else {
+          assert.equal(completed.status, 'rejected')
+          assert.equal(checked.delivery, 'unknown'); assert.equal(checked.release_expected_event, receipt.control_event); assert.equal(checked.release_command_id, request.command_id)
+          assert.equal(control.command_rejection, undefined, 'an ambiguous or mismatched response is not an unwritten proof')
+          await render().queryInput(head)
+          await render().retryPendingMessage(head.message_id)
+          await assert.rejects(render().releaseMessagePending(head.message_id))
+          await settleComponent()
+          const stillUnknown = render().pendingMessages.find((item) => item.message_id === head.message_id)
+          assert.equal(stillUnknown?.delivery, 'unknown')
+          assert.deepEqual(messages.slice(before).map((message) => message.text), [firstText], 'an old safe-false receipt cannot unblock an unconfirmed Release')
+          inputReceiptOverrides.set(head.message_id, { ...receipt, retry_safe: false, control_event: 'f'.repeat(64) })
+          await render().queryInput(head); await settleComponent()
+        }
+        assert.equal(inputReleases.length, releases + 1, 'queries never create another Release command')
+        assert.deepEqual(messages.slice(before).map((message) => message.text), [firstText, nextText])
+        assert.deepEqual(messages.slice(before).map((message) => message.message_id), [head.message_id, following.message_id])
+        assert.equal(signed.filter((value) => value.includes('"type":"input_posted"') && value.includes(head.message_id)).length, 1, 'the original input is never re-signed')
+        assert.equal(signed.filter((value) => value.includes('"type":"workspace_commanded"') && value.includes('"kind":"control_input"') && value.includes(String(request.command_id))).length, 1, 'the Release keeps its original signed identity')
+      } finally {
+        response.reject(new Error('fixture cleanup'))
+        await recovery
+        for (const receipt of inputReceiptOverrides.values()) {
+          inputReceiptOverrides.set(receipt.message_id, { ...receipt, retry_safe: false, control_event: 'f'.repeat(64) })
+          await render().queryInput(receipt)
+        }
+        await settleComponent()
+        inputReleaseReply = null; inputReceiptOverrides.clear(); failMessage = false
+      }
+    })
+    await t.test('a restored new Release identity cannot consume an older unwritten proof for the same input and CAS', async () => {
+      const previous = [...outboxItems.values()].find((item) => item.method === 'workspace_command' && item.command_rejection !== undefined)
+      assert.ok(previous?.command_rejection)
+      const command = workspaceModel.parseWorkspaceCommand(previous.params.command)
+      assert.ok(command.kind === 'control_input' && command.action.kind === 'release')
+      const original = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === command.message_id)
+      assert.ok(original)
+      const oldProof = structuredClone(previous)
+      const secondId = previous.params.command_id === 'a'.repeat(64) ? 'b'.repeat(64) : 'a'.repeat(64)
+      const second: OutboxItem = { ...previous, key: previous.key.replace(String(previous.params.command_id), secondId), params: { ...previous.params, command_id: secondId }, rejected: undefined, command_rejection: undefined }
+      const receipt: InputReceipt = { message_id: command.message_id, target: workspaceModel.parsePendingMessage(original).target, stage: 'refused', actual_turn_id: null, reason: '原输入已拒绝', retry_safe: false, control_event: command.expected_event }
+      // Restore the durable state of another command whose forward acknowledgement was lost; requestKey stays real.
+      await memoryOutbox.put(second)
+      await memoryOutbox.put({ ...original, receipt, delivery: 'unknown', release_expected_event: command.expected_event, release_command_id: secondId })
+      inputReceiptOverrides.set(command.message_id, receipt)
+      const before = messages.length, releases = inputReleases.length
+      try {
+        await render().queryInput(receipt)
+        const waiting = render().pendingMessages.find((item) => item.message_id === command.message_id)
+        assert.equal(waiting?.delivery, 'unknown', 'an old proof cannot settle a different current Release ID')
+        assert.equal(await render().sendMessage('following restored Release'), true)
+        await settleComponent()
+        const following = render().pendingMessages.find((item) => item.text === 'following restored Release')
+        assert.ok(following)
+        await render().retryPendingMessage(command.message_id); await settleComponent()
+        const retained = [...outboxItems.values()].find((item) => item.key === original.key)
+        assert.ok(retained); assert.equal(retained.delivery, 'unknown'); assert.equal(retained.release_expected_event, command.expected_event); assert.equal(retained.release_command_id, secondId)
+        assert.deepEqual(retained.params, original.params)
+        assert.deepEqual(outboxItems.get(previous.key), oldProof, 'the first command keeps its exact durable proof')
+        assert.deepEqual(outboxItems.get(second.key)?.params, second.params, 'the second command keeps its own request identity')
+        assert.equal(inputReleases.length, releases, 'restored unknown control requests are only queried')
+        assert.equal(messages.length, before, 'the same lane remains blocked until this command is reconciled')
+        inputReceiptOverrides.set(command.message_id, { ...receipt, control_event: 'f'.repeat(64) })
+        await render().queryInput(receipt); await settleComponent()
+        assert.deepEqual(messages.slice(before).map((message) => message.message_id), [following.message_id])
+      } finally {
+        inputReceiptOverrides.set(command.message_id, { ...receipt, control_event: 'f'.repeat(64) })
+        await render().queryInput(receipt); await settleComponent()
+        inputReceiptOverrides.clear()
+      }
     })
   } finally {
     for (const effect of effects.values()) effect.cleanup?.()
@@ -1319,10 +1486,11 @@ test('both pending input controls retry only a matching safe refusal and keep al
   const targets: InputTarget[] = [{ kind: 'bot_main', bot_id: 'bot' }, { kind: 'task', task_id: 'task' }, { kind: 'channel_task', channel_id: 'channel', task_id: 'task', bot_id: 'bot' }, { kind: 'work', work_id: 'work' }, { kind: 'routine', bot_id: 'bot', trigger: 'schedule:one' }, { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }]
   for (const platform of ['web', 'native']) for (const target of targets) {
     let pending: PendingMessage = { message_id: 'original', conversation_id: 'chat', target, intent: 'continue', text: '保留原交代', sequence: 1, created_at_ms: 1, delivery: 'unknown', attachments: [{ hash: 'a'.repeat(64), size: 3, name: 'notes.txt' }] }
-    const retries: string[] = []
+    const retries: string[] = [], closed: string[] = []
     const shared = { ...parityShared(), workspaceState: { channels: [], tasks: [], assignments: [], inputs: [] as WorkspaceDomainState['inputs'], coverage: { limit: 128, truncated: false } },
       queryInput: async () => { pending = { ...pending, delivery: 'accepted', receipt: { message_id: pending.message_id, target, stage: 'refused', retry_safe: true, control_event: 'c'.repeat(64), actual_turn_id: null, reason: '可以重试原输入' } } },
       retryPendingMessage: async (id: string) => { retries.push(id) },
+      releaseMessagePending: async (id: string) => { closed.push(id) },
       sendMessage: async () => { throw new Error('must not create another input') },
     }
     const app = componentHarness(platform === 'web' ? './workspace-chat.tsx' : '../../../../../apps/mobile/src/features/workspace/workspace.tsx', {
@@ -1335,25 +1503,42 @@ test('both pending input controls retry only a matching safe refusal and keep al
     const press = async (label: string) => { const control = button(label); assert.ok(control); const action = platform === 'web' ? control.onClick : control.onPress; assert.ok(typeof action === 'function'); action(); await settleComponent() }
     try {
       assert.equal(button('重试原输入'), undefined, 'unknown delivery alone never authorizes replay')
+      assert.equal(button('关闭提醒'), undefined); assert.equal(button('不再发送'), undefined)
       await press('查询结果')
       const accepted = pending
       assert.ok(accepted.receipt)
       const acceptedReceipt = accepted.receipt
       assert.ok(button('重试原输入'))
-      for (const delivery of ['saved', 'unknown', 'uploading', 'submitting'] as const) { pending = { ...accepted, delivery }; assert.equal(button('重试原输入'), undefined) }
+      assert.ok(button('关闭提醒'))
+      for (const delivery of ['saved', 'unknown', 'uploading', 'submitting'] as const) { pending = { ...accepted, delivery }; assert.equal(button('重试原输入'), undefined); assert.equal(button('关闭提醒'), undefined) }
       pending = accepted
       await press('重试原输入')
       assert.deepEqual(retries, ['original'])
       assert.equal(pending, accepted, 'the UI never replaces the original input or its attachments')
-      for (const stage of ['unknown', 'provider_accepted', 'associated', 'submitting'] as const) { pending = { ...accepted, receipt: { ...acceptedReceipt, stage } }; assert.equal(button('重试原输入'), undefined) }
+      await press('关闭提醒')
+      pending = { ...accepted, receipt: { ...acceptedReceipt, retry_safe: false, control_event: null } }
+      assert.ok(button('关闭提醒'), 'closing a terminal reminder needs no retry authorization or control event')
+      await press('关闭提醒')
+      assert.deepEqual(closed, ['original', 'original'])
+      for (const stage of ['unknown', 'entry_accepted', 'owner_accepted', 'provider_accepted', 'associated', 'submitting'] as const) { pending = { ...accepted, receipt: { ...acceptedReceipt, stage } }; assert.equal(button('重试原输入'), undefined); assert.equal(button('关闭提醒'), undefined) }
       for (const receipt of [{ ...acceptedReceipt, retry_safe: false }, { ...acceptedReceipt, control_event: null }, { ...acceptedReceipt, control_event: '' }, { ...acceptedReceipt, control_event: ' ' }, { ...acceptedReceipt, message_id: 'different' }, { ...acceptedReceipt, target: { kind: 'bot_main' as const, bot_id: 'different' } }]) { pending = { ...accepted, receipt }; assert.equal(button('重试原输入'), undefined) }
-      pending = { ...accepted, rejection_code: 'input_conflict' }; assert.equal(button('重试原输入'), undefined)
+      for (const receipt of [{ ...acceptedReceipt, message_id: 'different' }, { ...acceptedReceipt, target: { kind: 'bot_main' as const, bot_id: 'different' } }]) { pending = { ...accepted, receipt }; assert.equal(button('关闭提醒'), undefined) }
+      for (const marker of [{ release_expected_event: 'c'.repeat(64) }, { release_command_id: 'a'.repeat(64) }]) {
+        pending = { ...accepted, ...marker }; assert.equal(button('重试原输入'), undefined); assert.equal(button('关闭提醒'), undefined)
+        pending = { ...pending, delivery: 'saved', rejected: '尚未确认' }; assert.equal(button('不再发送'), undefined)
+      }
+      pending = { ...accepted, rejection_code: 'input_conflict', rejected: '原内容不同' }; assert.equal(button('重试原输入'), undefined); assert.equal(button('关闭提醒'), undefined); assert.equal(button('不再发送'), undefined)
       pending = { ...accepted, delivery: 'unknown' }; assert.match(componentText(render()), /重试请求待确认/); assert.equal(button('重试原输入'), undefined)
+      pending = { ...pending, rejected: '尚未确认' }; assert.equal(button('关闭提醒'), undefined); assert.equal(button('不再发送'), undefined)
       pending = accepted
-      shared.writable = false; assert.equal(button('重试原输入'), undefined); shared.writable = true
+      shared.writable = false; assert.equal(button('重试原输入'), undefined); assert.ok(button('关闭提醒'), 'closing only the local reminder needs no write permission'); shared.writable = true
       const queued: WorkspaceDomainState['inputs'][number] = { input: { message_id: pending.message_id, target, intent: 'defer', sequence: 1, text: pending.text }, conversation_id: 'chat', source_event: 'source', control_event: 'control', effective_order: 1, deferred: true, cancelled: false }
       shared.workspaceState.inputs = [queued]; assert.equal(button('重试原输入'), undefined)
-      shared.workspaceState.inputs = [{ ...queued, deferred: false, cancelled: true }]; assert.equal(button('重试原输入'), undefined)
+      assert.ok(button('关闭提醒'), 'the matched refused receipt determines closure, not a queue flag')
+      shared.workspaceState.inputs = [{ ...queued, deferred: false, cancelled: true }]; assert.equal(button('重试原输入'), undefined); assert.ok(button('关闭提醒'))
+      pending = { ...accepted, delivery: 'saved', receipt: undefined, rejected: '原输入未保存', rejection_code: 'input_not_saved' }
+      assert.equal(button('关闭提醒'), undefined); assert.ok(button('不再发送'))
+      await press('不再发送'); assert.deepEqual(closed, ['original', 'original', 'original'])
     } finally { app.close() }
   }
 })

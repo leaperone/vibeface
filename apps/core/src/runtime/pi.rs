@@ -1259,7 +1259,7 @@ impl Pi {
                 return send(Report::Probe);
             }
         };
-        // Live before it runs, so a stop finds it.
+        // Keep the turn interruptible before reporting its native handle.
         let stopping = Arc::new(AtomicBool::new(false));
         lock(&self.live).insert(
             session.clone(),
@@ -1612,7 +1612,9 @@ impl Executor for Pi {
 
     fn interrupt<'a>(&'a self, work: &'a WorkRecord) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            if let Some(stop) = lock(&self.preparing).get(&work.work_id) {
+            if work.state.handle().is_none()
+                && let Some(stop) = lock(&self.preparing).get(&work.work_id)
+            {
                 let _ = stop.send(true);
                 return Ok(());
             }
@@ -2710,6 +2712,105 @@ mod tests {
             }
         );
         assert_eq!(record.text, "Working");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_running_pi_work_retries_native_abort_until_it_settles() -> Result<()> {
+        let dir = scratch("abort-retry");
+        let (node, network) = node(&dir, "retry-abort").await?;
+        dispatch(&node, &network, &dir).await?;
+        let running = work(&node, |state| state.handle().is_some()).await?;
+        let handle = running.state.handle().context("native handle")?;
+        let group = node
+            .pi
+            .pointer(&handle.thread_id)?
+            .context("pointer")?
+            .group;
+        let aborts = || {
+            log(&dir)
+                .iter()
+                .filter(|entry| entry["abort"] == true)
+                .count()
+        };
+        let mut absent_handle = handle.clone();
+        absent_handle.turn_id.push_str("-missing");
+        let absent = WorkRecord {
+            state: WorkState::Running {
+                handle: absent_handle,
+            },
+            ..running.clone()
+        };
+        let missing = node
+            .pi
+            .interrupt(&absent)
+            .await
+            .expect_err("an unknown native handle must not cancel preparation");
+        assert!(format!("{missing:#}").contains("pi is not running this work"));
+        assert_eq!(aborts(), 0);
+        node.stop_work(&network, "c", "w-1").await?;
+        wait_for_abort(&dir).await?;
+        assert_eq!(aborts(), 1, "the first native abort reached pi");
+        let first = node
+            .store
+            .lock()
+            .await
+            .work_record("w-1")?
+            .context("work")?;
+        assert!(matches!(first.state, WorkState::Interrupting { .. }));
+        assert_eq!(
+            node.pi.probe(&first).await?,
+            Probe::Running {
+                turn_id: handle.turn_id.clone(),
+                epoch: 0
+            }
+        );
+        let mut held = node
+            .store
+            .lock()
+            .await
+            .stop_requests()?
+            .into_iter()
+            .find(|request| request.work_id == "w-1")
+            .context("the unsettled turn keeps its stop request")?;
+        held.deadline_ms = now_ms() - 1;
+        node.store.lock().await.save_stop_request(&held)?;
+        node.reconcile_works(&network).await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while aborts() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the stop retry sent another native abort")?;
+        let finished = work(&node, WorkState::finished).await?;
+        assert_eq!(
+            finished.state,
+            WorkState::Finished {
+                outcome: WorkOutcome::Interrupted
+            }
+        );
+        assert_eq!(
+            node.pi.probe(&running).await?,
+            Probe::Terminal {
+                turn_id: handle.turn_id.clone(),
+                status: TurnStatus::Interrupted,
+                text: "Working".into(),
+                error: None,
+            }
+        );
+        assert!(ended(group).await, "settled pi ended its process");
+        assert!(node.store.lock().await.stop_requests()?.is_empty());
+        assert!(!lock(&node.pi.preparing).contains_key("w-1"));
+        assert!(
+            node.pi
+                .live_turn(&handle.thread_id, &handle.turn_id)
+                .is_none()
+        );
+        node.reconcile_works(&network).await?;
+        assert_eq!(aborts(), 2, "a settled turn receives no further abort");
+        assert_eq!(prompts(&dir), ["do it"], "the prompt was never resent");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

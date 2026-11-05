@@ -61,6 +61,7 @@ export type WorkspaceCommand =
   | { kind: 'control_input'; message_id: string; expected_event: string; action: InputControlAction }
 export type WorkspaceDomainState = { channels: WorkspaceChannel[]; tasks: WorkspaceTask[]; assignments: WorkspaceAssignment[]; inputs: QueuedInput[]; coverage: { limit: number; truncated: boolean } }
 export type WorkspaceCommandResult = Omit<WorkspaceDomainState, 'coverage'> & { command_id: string; event_hash: string; duplicate: boolean }
+export type WorkspaceCommandNotSaved = { accepted: false; code: 'workspace_command_not_saved'; stored: false; command_id: string; reason: string }
 export type WorkspaceInputBody = {
   type: 'input_posted'; message_id: string; target: InputTarget; intent: InputIntent; sequence: number; expected_revision?: number
   text: string; attachments?: Attachment[]; report_results?: boolean

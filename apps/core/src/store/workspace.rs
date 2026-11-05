@@ -3,7 +3,7 @@ use super::{Store, conversation_from, log, membership_from};
 use crate::{
     crypto::{LocalIdentity, request_key},
     model::*,
-    scheduling::SessionScope,
+    scheduling::{SessionScope, TriggerKind},
     workspace::*,
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -2002,6 +2002,12 @@ fn workspace_input_from(
     }
     Ok(found)
 }
+#[derive(Clone, Copy)]
+enum ResourceQuery<'a> {
+    Assignment(Option<&'a str>),
+    Work(&'a str),
+}
+
 fn resource_conflicts_from(
     connection: &Connection,
     network: &str,
@@ -2009,9 +2015,13 @@ fn resource_conflicts_from(
     roots: &[String],
     except_assignment: Option<&str>,
     graph: &Graph,
-    except_work: Option<&str>,
+    query: ResourceQuery<'_>,
 ) -> Result<Vec<String>> {
     valid_roots(roots)?;
+    let except_work = match query {
+        ResourceQuery::Assignment(work) => work,
+        ResourceQuery::Work(work) => Some(work),
+    };
     let mut conflicts = BTreeSet::new();
     for assignment in graph.assignments.values().filter(|assignment| {
         assignment.execution_node == node
@@ -2060,21 +2070,42 @@ fn resource_conflicts_from(
         if accepted_without_reservation {
             continue;
         }
-        let own_assignment_work = except_assignment
-            .and_then(|id| graph.assignments.get(id))
-            .is_some_and(|assignment| {
-                work.trigger == format!("assignment:{}", assignment.assignment_id)
-                    && work.dispatcher == assignment.execution_node
-                    && bot_scope(connection, network, &assignment.bot_id)
-                        .is_ok_and(|scope| scope == work.conversation_id)
-            });
+        let own_assignment_work = matches!(query, ResourceQuery::Assignment(_))
+            && except_assignment
+                .and_then(|id| graph.assignments.get(id))
+                .is_some_and(|assignment| {
+                    work.trigger == format!("assignment:{}", assignment.assignment_id)
+                        && work.dispatcher == assignment.execution_node
+                        && bot_scope(connection, network, &assignment.bot_id)
+                            .is_ok_and(|scope| scope == work.conversation_id)
+                });
         if work.target_node == node
             && !own_assignment_work
             && work.state != WorkStatus::Finished
             && Some(work.work_id.as_str()) != except_work
-            && roots.iter().any(|root| overlap(root, &work.cwd))
         {
-            conflicts.insert(format!("work:{}", work.work_id));
+            let reservation: Option<String> = connection
+                .query_row(
+                    "SELECT value FROM identity_meta WHERE key=?",
+                    [format!("work-native-submission:{}", work.work_id)],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let occupied = match reservation {
+                Some(reservation) => {
+                    let reservation: serde_json::Value = serde_json::from_str(&reservation)?;
+                    let cwd = reservation["native_cwd"]
+                        .as_str()
+                        .context("native work reservation has no directory")?
+                        .to_owned();
+                    valid_roots(std::slice::from_ref(&cwd))?;
+                    cwd
+                }
+                None => work.cwd,
+            };
+            if roots.iter().any(|root| overlap(root, &occupied)) {
+                conflicts.insert(format!("work:{}", work.work_id));
+            }
         }
     }
     let requesting_work = except_work
@@ -2366,7 +2397,7 @@ impl Store {
             roots,
             except_assignment,
             &graph,
-            except_work,
+            ResourceQuery::Assignment(except_work),
         )
     }
     pub fn post_workspace_input(
@@ -2490,7 +2521,9 @@ impl Store {
             if let EventBody::WorkspaceCommanded {
                 command:
                     WorkspaceCommand::ControlInput {
-                        message_id, action, ..
+                        message_id,
+                        expected_event,
+                        action,
                     },
                 ..
             } = &body
@@ -2503,6 +2536,17 @@ impl Store {
                         == identity.device_id()?,
                     "only the target owner accepts input controls"
                 );
+                let current = graph
+                    .inputs
+                    .get(message_id)
+                    .context("input projection is missing")?;
+                if current.control_event != *expected_event {
+                    return Err(crate::workspace::WorkspaceCommandNotSaved::new(
+                        command_id,
+                        "input control version changed",
+                    )
+                    .into());
+                }
                 let editable = match action {
                     InputControl::Release => super::scheduler::workspace_input_releasable_from(
                         &tx,
@@ -2517,7 +2561,13 @@ impl Store {
                         message_id,
                     )?,
                 };
-                ensure!(editable, "input has started or needs reconciliation");
+                if !editable {
+                    return Err(crate::workspace::WorkspaceCommandNotSaved::new(
+                        command_id,
+                        "input has started or needs reconciliation",
+                    )
+                    .into());
+                }
             }
             if let EventBody::WorkspaceCommanded {
                 command:
@@ -2539,7 +2589,7 @@ impl Store {
                         resource_roots,
                         None,
                         &graph,
-                        work_id.as_deref()
+                        ResourceQuery::Assignment(work_id.as_deref())
                     )?
                     .is_empty(),
                     "workspace root is occupied"
@@ -4361,6 +4411,50 @@ pub(crate) fn workspace_assignment_for_job_from(
     let SessionScope::WorkspaceTask { task_id } = job.session_scope() else {
         return Ok(None);
     };
+    if job.kind == TriggerKind::WorkResult {
+        let Some(work_id) = job.trigger.strip_prefix("work:") else {
+            return Ok(None);
+        };
+        let (conversation, dispatcher, trigger) =
+            if let Some(work) = super::reduce::work_from(connection, network, work_id)? {
+                (work.conversation_id, work.dispatcher, work.trigger)
+            } else if let Some(dispatch) = super::work::dispatch_from(connection, work_id)?
+                && dispatch.state.ended()
+            {
+                (
+                    dispatch.spec.conversation,
+                    dispatch.spec.dispatcher,
+                    dispatch.spec.trigger,
+                )
+            } else {
+                return Ok(None);
+            };
+        if conversation != job.conversation_id || dispatcher != local {
+            return Ok(None);
+        }
+        let (reply_to, kind) = match trigger.split_once(':') {
+            Some(("assignment", id)) => (id.to_owned(), TriggerKind::Human),
+            Some(("message", id)) => {
+                let Some(message) = super::message_from(connection, network, &conversation, id)?
+                    .filter(|message| message.role == Role::User)
+                else {
+                    return Ok(None);
+                };
+                let kind = if message.answers.is_some() {
+                    TriggerKind::Answer
+                } else {
+                    TriggerKind::Human
+                };
+                (id.to_owned(), kind)
+            }
+            _ => return Ok(None),
+        };
+        let mut origin = job.clone();
+        origin.trigger = trigger;
+        origin.reply_to = reply_to;
+        origin.kind = kind;
+        return workspace_assignment_for_job_from(connection, network, local, &origin);
+    }
     let graph = Graph::read(connection, network)?;
     if let Some(id) = job.trigger.strip_prefix("assignment:") {
         let Some(assignment) = graph.assignments.get(id) else {
@@ -4507,7 +4601,7 @@ pub(crate) fn assignment_resources_available_from(
         &stored.resource_roots,
         Some(&stored.assignment_id),
         &graph,
-        stored.work_id.as_deref(),
+        ResourceQuery::Assignment(stored.work_id.as_deref()),
     )?
     .is_empty())
 }
@@ -4537,7 +4631,7 @@ pub(crate) fn work_resources_available_from(
         std::slice::from_ref(&work.cwd),
         assignment.map(|assignment| assignment.assignment_id.as_str()),
         &graph,
-        Some(&work.work_id),
+        ResourceQuery::Work(&work.work_id),
     )?
     .is_empty())
 }

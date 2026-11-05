@@ -9,7 +9,7 @@ import type {
   BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, OpenWorkCard, WorkCard, SkillSet, SteerOutcome, Busy,
   WorkPhase, WorkDetail, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation, OverviewConversation, OverviewSession,
   AgentLane, QueueHoldReason, ContextProjection, ManagerJob, ScopeJob, SentCoverage, MemoryConflict,
-  InputTarget, InputIntent, InputReceipt, InputControlAction, QueuedInput, ScopeContext, SessionScope, WorkspaceChannel, WorkspaceTask, WorkspaceAssignment, WorkspaceCommand, WorkspaceCommandResult, WorkspaceDomainState, WorkspaceHistory, WorkspaceHistoryBody, WorkspaceInputBody, WorkspaceSpeaker,
+  InputTarget, InputIntent, InputReceipt, InputControlAction, QueuedInput, ScopeContext, SessionScope, WorkspaceChannel, WorkspaceTask, WorkspaceAssignment, WorkspaceCommand, WorkspaceCommandResult, WorkspaceCommandNotSaved, WorkspaceDomainState, WorkspaceHistory, WorkspaceHistoryBody, WorkspaceInputBody, WorkspaceSpeaker,
 } from "./types.ts"
 import { parseMemoryEntry, parseMemorySyncConflicts } from "./memory.ts"
 import { answerId, questionOpen } from "./questions.ts"
@@ -169,7 +169,7 @@ export function parsePendingMessage(item: OutboxItem): PendingMessage {
   if (item.rejection_code !== undefined && item.rejection_code !== 'input_not_saved' && item.rejection_code !== 'input_conflict') throw new Error('本地输入拒绝原因无法识别。')
   const sequence = number(data.sequence)
   if (!sequence) throw new Error('本地输入顺序无效。')
-  return { message_id: text(data.message_id), conversation_id: text(data.conversation_id), text: text(data.text), target: parseInputTarget(data.target), intent: parseInputIntent(data.intent), sequence, expected_revision: optionalNumber(data.expected_revision), attachments: attachments(data.attachments), report_results: data.report_results == null ? undefined : flag(data.report_results), created_at_ms: number(item.created_at_ms), delivery, ...(item.rejected === undefined ? {} : { rejected: item.rejected }), ...(item.rejection_code === undefined ? {} : { rejection_code: item.rejection_code }), ...(item.receipt === undefined ? {} : { receipt: parseInputReceipt(item.receipt) }) }
+  return { message_id: text(data.message_id), conversation_id: text(data.conversation_id), text: text(data.text), target: parseInputTarget(data.target), intent: parseInputIntent(data.intent), sequence, expected_revision: optionalNumber(data.expected_revision), attachments: attachments(data.attachments), report_results: data.report_results == null ? undefined : flag(data.report_results), created_at_ms: number(item.created_at_ms), delivery, ...(item.rejected === undefined ? {} : { rejected: item.rejected }), ...(item.rejection_code === undefined ? {} : { rejection_code: item.rejection_code }), ...(item.receipt === undefined ? {} : { receipt: parseInputReceipt(item.receipt) }), ...(item.release_expected_event === undefined ? {} : { release_expected_event: text(item.release_expected_event) }), ...(item.release_command_id === undefined ? {} : { release_command_id: text(item.release_command_id) }) }
 }
 function taskAction(value: unknown): WorkspaceTask['action'] {
   if (value === 'continue' || value === 'stop' || value === 'cancel' || value === 'defer') return value
@@ -225,6 +225,13 @@ export function parseWorkspaceState(value: unknown): WorkspaceDomainState {
 export function parseWorkspaceCommandResult(value: unknown): WorkspaceCommandResult {
   const data = record(value)
   return { ...workspaceProjection(data), command_id: text(data.command_id), event_hash: text(data.event_hash), duplicate: flag(data.duplicate) }
+}
+export function parseWorkspaceCommandNotSaved(value: unknown, expectedCommandId: unknown): WorkspaceCommandNotSaved | null {
+  const data = record(value)
+  if (data.code !== 'workspace_command_not_saved') return null
+  const commandId = text(data.command_id)
+  if (data.accepted !== false || data.stored !== false || commandId !== expectedCommandId) throw new Error('操作拒绝回执和原操作不一致，内容已保留。请再查一次。')
+  return { accepted: false, code: data.code, stored: false, command_id: commandId, reason: text(data.reason) }
 }
 function workspaceHistoryBody(value: unknown): WorkspaceHistoryBody {
   const data = record(value)

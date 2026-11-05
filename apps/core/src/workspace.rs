@@ -10,6 +10,30 @@ pub const MAX_AUTOMATIC_ASSIGNMENTS: usize = 8;
 pub const MAX_TASK_DEPTH: usize = 4;
 pub const MAX_MEMBER_REPLIES: usize = 2;
 
+/// A ControlInput qualification or CAS check rejected the command before any append.
+#[derive(Debug)]
+pub(crate) struct WorkspaceCommandNotSaved {
+    pub command_id: String,
+    pub reason: String,
+}
+
+impl WorkspaceCommandNotSaved {
+    pub(crate) fn new(command_id: &str, reason: &'static str) -> Self {
+        Self {
+            command_id: command_id.to_owned(),
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkspaceCommandNotSaved {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for WorkspaceCommandNotSaved {}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InputTarget {

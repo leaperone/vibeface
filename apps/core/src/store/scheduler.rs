@@ -924,17 +924,25 @@ fn holds_turn(
     session: &SchedulerSession,
     job: &SchedulerJob,
 ) -> Result<bool> {
-    if let SessionScope::WorkspaceTask { task_id } = &job.scope
-        && !super::workspace::task_input_allowed_from(connection, network, task_id)?
-    {
-        return Ok(false);
-    }
-    if matches!(job.scope, SessionScope::WorkspaceTask { .. })
-        && let Some(assignment) =
+    if let SessionScope::WorkspaceTask { task_id } = &job.scope {
+        let Some(assignment) =
             super::workspace::workspace_assignment_for_job_from(connection, network, local, job)?
-        && !super::workspace::assignment_resources_available_from(connection, network, &assignment)?
-    {
-        return Ok(false);
+        else {
+            return Ok(false);
+        };
+        if super::workspace::workspace_task_from(connection, network, task_id)?
+            .and_then(|task| task.current_assignment)
+            .as_deref()
+            != Some(assignment.assignment_id.as_str())
+            || !super::workspace::task_input_allowed_from(connection, network, task_id)?
+            || !super::workspace::assignment_resources_available_from(
+                connection,
+                network,
+                &assignment,
+            )?
+        {
+            return Ok(false);
+        }
     }
     if job.kind == TriggerKind::AgentTask {
         return Ok(
@@ -1782,6 +1790,30 @@ impl Store {
             [format!("work-native-submission:{work_id}")],
             |row| row.get(0),
         )?)
+    }
+
+    pub(crate) fn work_native_directory_matches_reservation(
+        &self,
+        network: &str,
+        work: &WorkProjection,
+        actual_cwd: &str,
+    ) -> Result<bool> {
+        let encoded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM identity_meta WHERE key=?",
+                [format!("work-native-submission:{}", work.work_id)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(encoded) = encoded else {
+            return Ok(false);
+        };
+        let reservation: Value = serde_json::from_str(&encoded)?;
+        Ok(reservation["network_id"] == network
+            && reservation["work_id"] == work.work_id
+            && reservation["conversation_id"] == work.conversation_id
+            && reservation["native_cwd"] == actual_cwd)
     }
 
     pub(crate) fn reserve_work_native_submission(
@@ -3059,9 +3091,13 @@ fn cause_from(
         .map(|dispatch| (dispatch.spec.conversation, dispatch.spec.trigger)))
 }
 
-/// The user message a trigger ultimately answers, followed through the dispatch chain, so any
-/// owner can report a result whose turn ran on another Node.
-fn origin_message(connection: &Connection, network: &str, trigger: &str) -> Result<Option<String>> {
+/// The fixed reply anchor a result follows, even when another Node ran the work.
+fn origin_message(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    trigger: &str,
+) -> Result<Option<String>> {
     let mut trigger = trigger.to_owned();
     for _ in 0..64 {
         match trigger.split_once(':') {
@@ -3070,6 +3106,81 @@ fn origin_message(connection: &Connection, network: &str, trigger: &str) -> Resu
                 Some((_, cause)) => trigger = cause,
                 None => return Ok(None),
             },
+            Some(("assignment", id)) => {
+                let Some(assignment) =
+                    super::workspace::workspace_assignment_from(connection, network, id)?
+                else {
+                    return Ok(None);
+                };
+                let bot_scope: Option<String> = connection
+                    .query_row(
+                        "SELECT conversation_id FROM bots WHERE network_id=? AND bot_id=?",
+                        params![network, assignment.bot_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if bot_scope.as_deref() != Some(conversation) {
+                    return Ok(None);
+                }
+                let Some(source) = assignment.source_event.as_deref() else {
+                    return Ok(None);
+                };
+                let effective:bool=connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE network_id=? AND hash=? AND effective=1)",
+                    params![network,source], |row|row.get(0),
+                )?;
+                if !effective {
+                    return Ok(None);
+                }
+                let Some(source) = super::log::event_from(connection, network, source)? else {
+                    return Ok(None);
+                };
+                return Ok(
+                    match (assignment.trigger_message_id.as_deref(), source.body) {
+                        (
+                            Some(input),
+                            EventBody::InputPosted {
+                                message_id,
+                                target,
+                                expected_revision,
+                                attestation: Some(_),
+                                ..
+                            },
+                        ) if input == message_id => {
+                            let same_task = matches!(target,crate::workspace::InputTarget::Task {ref task_id}|crate::workspace::InputTarget::ChannelTask {ref task_id,..} if *task_id==assignment.task_id);
+                            Some(
+                                if same_task
+                                    && expected_revision == Some(assignment.started_revision)
+                                    && source.scope_id == conversation
+                                {
+                                    message_id
+                                } else {
+                                    assignment.assignment_id
+                                },
+                            )
+                        }
+                        (
+                            Some(input),
+                            EventBody::MessagePosted {
+                                message_id,
+                                role: Role::User,
+                                answers: None,
+                                attestation: Some(_),
+                                ..
+                            },
+                        ) if input == message_id => Some(assignment.assignment_id),
+                        (
+                            None,
+                            EventBody::WorkspaceCommanded {
+                                command:
+                                    crate::workspace::WorkspaceCommand::CreateTask { task_id, .. },
+                                ..
+                            },
+                        ) if task_id == assignment.task_id => Some(assignment.assignment_id),
+                        _ => None,
+                    },
+                );
+            }
             Some(("schedule", _)) => return Ok(Some(trigger)),
             _ => return Ok(None),
         }
@@ -3086,7 +3197,7 @@ fn admit_report_from(
     work_id: &str,
 ) -> Result<Option<AdmissionReceipt>> {
     let trigger = work_trigger(work_id);
-    let Some(reply_to) = origin_message(connection, network, &trigger)? else {
+    let Some(reply_to) = origin_message(connection, network, conversation, &trigger)? else {
         return Ok(None);
     };
     let report = message_from(connection, network, conversation, &reply_to)?

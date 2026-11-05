@@ -783,4 +783,90 @@ pub(super) mod tests {
             check,
         ))
     }
+
+    #[tokio::test]
+    async fn an_approval_lease_cannot_borrow_a_replacement_assignment() -> Result<()> {
+        use crate::{
+            model::EventBody,
+            workspace::{AssignmentState, WorkspaceCommand},
+        };
+        let (node, admin, dir) = super::super::triage::tests::node().await?;
+        let result = async {
+            let root = dir.canonicalize()?;
+            let first_root = root.join("first");
+            let next_root = root.join("next");
+            std::fs::create_dir_all(&first_root)?;
+            std::fs::create_dir_all(&next_root)?;
+            {
+                let mut settings = node.settings.lock().unwrap();
+                settings.roots = vec![root.clone()];
+                settings.manager = Some(crate::config::ManagerSettings {
+                    provider: crate::providers::Provider::Codex,
+                    workspace: root,
+                    model: "fixture".into(),
+                    reasoning_effort: None,
+                    backup: Default::default(),
+                });
+            }
+            super::super::triage::tests::bot(&node, &admin, "c", "Task Bot", &[]).await?;
+            let network = node.store.lock().await.network()?.context("network")?;
+            let local = node.identity.device_id()?;
+            let command = |store: &mut crate::store::Store, id: &str, command: WorkspaceCommand| -> Result<_> {
+                let signed = admin.attest(&network, crate::workspace::WORKSPACE_SCOPE,
+                    EventBody::WorkspaceCommanded { command_id: id.into(), command: command.clone(),
+                        acting_assignment: None, attestation: None, cause: None })?;
+                store.apply_workspace_command(&node.identity, &network, id, command,
+                    signed.attestation().cloned(), None, None, now_ms())
+            };
+            let (job, first, attempt) = {
+                let mut store = node.store.lock().await;
+                command(&mut store, "create", serde_json::from_value(json!({
+                    "kind":"create_task","task_id":"lease-task","owner_bot":"c","title":"lease",
+                    "request":"lease","expected_result":"result","source_events":[],"dependencies":[],"reply_only":false
+                }))?)?;
+                let input = admin.attest(&network, "c", serde_json::from_value(json!({
+                    "type":"input_posted","message_id":"lease-input","target":{"kind":"task","task_id":"lease-task"},
+                    "intent":"continue","sequence":1,"expected_revision":1,"text":"run","report_results":true
+                }))?)?;
+                store.append_event(&node.identity, &network, "c", input, vec![], now_ms())?;
+                let first = store.ensure_workspace_assignment(&node.identity, &network, "lease-task",
+                    &[first_root.to_string_lossy().into_owned()], now_ms())?.context("first allocation")?;
+                let job = store.claim_next_fixture(&node.identity, &network, "c", &node.boot, "lease-fence")?.context("Task claim")?.job;
+                let attempt = job.state.attempt().context("attempt")?.id.clone();
+                store.mark_started("c", &job.trigger, &attempt)?;
+                store.started_workspace_assignment(&node.identity, &network, &job, now_ms())?;
+                (job, first, attempt)
+            };
+            let _cancel = node.register_manager_attempt_fixture("lease-token".into(), Access {
+                network_id: network.clone(), human: false, conversation_id: Some("c".into()), manager: None,
+            }, &attempt, &job.trigger, crate::providers::Provider::Codex).await?;
+            drop(node.manager_input_lease(&attempt, crate::providers::Provider::Codex).await?);
+            {
+                let mut store = node.store.lock().await;
+                let proof = store.append_event(&node.identity, &network, "c", serde_json::from_value(json!({
+                    "type":"message_posted","message_id":"shared-stop","role":"assistant","text":"stopped",
+                    "in_reply_to":"lease-input","status":"stopped"
+                }))?, vec![], now_ms())?;
+                store.apply_workspace_command(&node.identity, &network, "stop-first", WorkspaceCommand::AssignmentProgress {
+                    execution: None, assignment_id: first.assignment_id.clone(), revision: 1,
+                    state: AssignmentState::Stopped, input_event: None, evidence_event: Some(proof.hash), result: None,
+                }, None, None, None, now_ms())?;
+                command(&mut store, "replace", WorkspaceCommand::AssignTask {
+                    task_id: "lease-task".into(), expected_revision: 1, assignment_id: "lease-replacement".into(),
+                    bot_id: "c".into(), execution_node: local.clone(), bot_owner_epoch: first.bot_owner_epoch,
+                    channel_owner_epoch: None, work_id: None,
+                    resource_roots: vec![next_root.to_string_lossy().into_owned()], automatic: false,
+                })?;
+                assert!(crate::store::workspace::task_input_allowed_from(&store.connection, &network, "lease-task")?);
+                assert!(crate::store::workspace::assignment_resources_available_from(&store.connection, &network, &first)?);
+                assert!(matches!(store.scheduler_job("c", &job.trigger)?.unwrap().state, JobState::Running { .. }));
+            }
+            assert!(node.manager_input_lease(&attempt, crate::providers::Provider::Codex).await.is_err(),
+                "a colocated approval must reject the still-running old manager before native response");
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
 }

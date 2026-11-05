@@ -1,4 +1,4 @@
-import type { InputReceipt } from '../workspace/types.ts'
+import type { InputReceipt, WorkspaceCommandNotSaved } from '../workspace/types.ts'
 
 /**
  * Signed writes the entry has not confirmed. A write is kept byte-for-byte until the network
@@ -16,6 +16,8 @@ export type OutboxItem = {
   delivery?: 'saved' | 'uploading' | 'submitting' | 'accepted' | 'unknown'
   receipt?: InputReceipt
   release_expected_event?: string
+  release_command_id?: string
+  command_rejection?: WorkspaceCommandNotSaved
   prerequisite?: Pick<OutboxItem, 'key' | 'method' | 'params' | 'created_at_ms'>
 }
 

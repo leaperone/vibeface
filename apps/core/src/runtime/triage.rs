@@ -1356,6 +1356,17 @@ impl Runtime {
             leases.push(self.manager_input_lease(attempt, *provider).await?);
         }
         let input = self.work_input_lock(&work_id).await.read_owned().await;
+        let cwd = {
+            let store = self.store.lock().await;
+            let work = store
+                .work(&control.network, &work_id)?
+                .context("the request's work is missing")?;
+            Self::validate_work_assignment_roots(&store, &control.network, &work.trigger)?;
+            work.cwd
+        };
+        let actual_cwd = self
+            .work_native_directory(request.provider, Some(&request.session_id), &cwd)
+            .await?;
         let store = self.store.lock().await;
         store.authorize_node(&control.network, &request.node)?;
         let runs = store.work_records_on_thread(&request.session_id)?;
@@ -1405,7 +1416,17 @@ impl Runtime {
                     == request.permission_epoch,
             "the request's execution permission was revoked"
         );
-        self.allowed_path(&work.cwd)?;
+        Self::validate_work_assignment_roots(&store, &control.network, &work.trigger)?;
+        ensure!(
+            store.work_native_directory_matches_reservation(
+                &control.network,
+                &work,
+                actual_cwd
+                    .to_str()
+                    .context("native work directory is not UTF-8")?,
+            )?,
+            "the request's native directory differs from the reserved work"
+        );
         if parent.is_none() {
             let owner = store
                 .conversation(&control.network, &record.conversation)?
@@ -4335,27 +4356,33 @@ pub(super) mod tests {
                 sequence: 1, expected_revision: Some(1), text: input.text.clone(), attachments: vec![],
                 report_results: Some(true), attestation: None,
             })?;
-            let (trigger, task_attempt) = {
+            let (trigger, task_attempt, task_job) = {
                 let mut store = node.store.lock().await;
                 store.apply_workspace_command(&node.identity, &network, "create-held-task", command,
                     signed.attestation().cloned(), None, None, now_ms())?;
                 store.post_workspace_input(&node.identity, &network, input,
                     signed_input.attestation().cloned().context("signed input")?, now_ms())?;
-                store.admit_delivery(&node.identity.device_id()?, &network, "c", "message:task-input")?
-                    .context("Task input admission")?;
+                let assignment = store.ensure_workspace_assignment(&node.identity, &network, "held-task",
+                    &[dir.canonicalize()?.display().to_string()], now_ms())?.context("Task assignment")?;
+                assert_eq!(assignment.trigger_message_id.as_deref(), Some("task-input"));
                 let claimed = store.claim_next_fixture(&node.identity, &network, "c", &node.boot, "fixture")?.context("Task claim")?;
                 assert_eq!(claimed.job.scope, crate::scheduling::SessionScope::WorkspaceTask { task_id: "held-task".into() });
                 let trigger = claimed.job.trigger.clone();
                 let attempt = claimed.job.state.attempt().context("Task attempt")?.id.clone();
-                store.mark_started("c", &trigger, &attempt)?;
+                let job = store.mark_started("c", &trigger, &attempt)?;
                 store.save_scheduler_native_id("c", &trigger, &attempt, "t-1", "held-task-token", true)?;
-                store.record_manager_turn(&attempt, "system", "t-1", Some("u-1"), &Default::default())?;
-                (trigger, attempt)
+                (trigger, attempt, job)
             };
+            let (mut server, handed) = app_server(&node).await?;
+            let native_thread = handed.params["threadId"].as_str().context("native Task thread")?;
+            let native_turn = handed.params["turnId"].as_str().context("native Task turn")?;
+            let native = crate::scheduler::turn_recorder(&node, &network, &task_job, "system",
+                Arc::new(std::sync::Mutex::new(Default::default())), None);
+            (native.record)(native_thread.into(), Some(native_turn.into())).await?;
+            native.started.context("Task native start callback")?(native_turn.into()).await?;
             let _cancel = node.register_manager_attempt_fixture("held-task-token".into(), Access {
                 network_id: network.clone(), human: false, conversation_id: Some("c".into()), manager: None,
             }, &task_attempt, &trigger, Provider::Codex).await?;
-            let (mut server, handed) = app_server(&node).await?;
             node.on_codex_request(&handed).await;
             let (question, request_id) = raise_for(&node).await?;
             let card = node.store.lock().await.question(&network, &question)?.context("approval")?;
@@ -4447,21 +4474,28 @@ pub(super) mod tests {
         use futures_util::SinkExt as _;
         for (change, deny) in [
             ("standalone", false),
+            ("assigned", false),
             ("pause", false),
             ("pause", true),
             ("cancel", false),
             ("cancel", true),
             ("revise", false),
             ("revise", true),
+            ("retarget", false),
+            ("retarget", true),
+            ("native-cwd", false),
+            ("native-cwd", true),
         ] {
             let (node, admin, dir) = node().await?;
             let mut socket_task = None;
             let result = async {
                 with_agent(&node);
-                let directory = dir.canonicalize()?;
+                let root = dir.canonicalize()?;
+                let directory = root.join("work");
+                std::fs::create_dir(&directory)?;
                 {
                     let mut settings = node.settings.lock().unwrap();
-                    settings.roots = vec![directory.clone()];
+                    settings.roots = vec![root.clone()];
                     settings.manager.as_mut().context("manager")?.workspace = directory.clone();
                 }
                 bot(&node, &admin, "c", "Task Bot", &[]).await?;
@@ -4469,7 +4503,8 @@ pub(super) mod tests {
                 let local = node.identity.device_id()?;
                 let (mut socket, handed) = app_server(&node).await?;
                 let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
-                let native_directory = directory.display().to_string();
+                let native_directory = Arc::new(std::sync::Mutex::new(directory.display().to_string()));
+                let served_directory = native_directory.clone();
                 socket_task = Some(tokio::spawn(async move {
                     loop {
                         let message = read(&mut socket).await;
@@ -4478,7 +4513,7 @@ pub(super) mod tests {
                         } else if message.get("id").is_some() && message.get("method").is_some() {
                             let result = match message["method"].as_str() {
                                 Some("thread/read" | "thread/resume") => {
-                                    json!({"thread":{"id":"t-1","cwd":native_directory,
+                                    json!({"thread":{"id":"t-1","cwd":lock(&served_directory).clone(),
                                     "turns":[{"id":"u-1","status":"inProgress","items":[]}]}})
                                 }
                                 _ => json!({}),
@@ -4564,31 +4599,37 @@ pub(super) mod tests {
                     "assignment:held-assignment".into()
                 };
                 let work_id = crate::work::WorkSpec::id("c", &trigger, "held-child");
+                let spec = crate::work::WorkSpec {
+                    work_id: work_id.clone(),
+                    conversation: "c".into(),
+                    trigger,
+                    target: local.clone(),
+                    dispatcher: local,
+                    call_ref: "held-child".into(),
+                    kind: crate::model::WorkKind::Agent(Provider::Codex),
+                    model: None,
+                    resolved: ResolvedModel {
+                        provider: Provider::Codex,
+                        model: None,
+                    },
+                    cwd: if change == "native-cwd" {
+                        String::new()
+                    } else {
+                        directory.display().to_string()
+                    },
+                    title: "child".into(),
+                    prompt: "do the accepted task".into(),
+                    continues: None,
+                    parent: None,
+                    thread: Some("t-1".into()),
+                };
                 node.store.lock().await.accept_work_fixture(
                     &node.identity,
                     &network,
-                    crate::work::WorkSpec {
-                        work_id: work_id.clone(),
-                        conversation: "c".into(),
-                        trigger,
-                        target: local.clone(),
-                        dispatcher: local,
-                        call_ref: "held-child".into(),
-                        kind: crate::model::WorkKind::Agent(Provider::Codex),
-                        model: None,
-                        resolved: ResolvedModel {
-                            provider: Provider::Codex,
-                            model: None,
-                        },
-                        cwd: directory.display().to_string(),
-                        title: "child".into(),
-                        prompt: "do the accepted task".into(),
-                        continues: None,
-                        parent: None,
-                        thread: Some("t-1".into()),
-                    },
+                    spec.clone(),
                     now_ms(),
                 )?;
+                drop(node.work_start_lease(&network, &spec, Some("t-1")).await?);
                 node.signal_work(
                     &network,
                     &work_id,
@@ -4618,7 +4659,7 @@ pub(super) mod tests {
                     if deny { "拒绝" } else { "允许本次" },
                 )
                 .await?;
-                if change == "standalone" {
+                if matches!(change, "standalone" | "assigned") {
                     let attempt = {
                         let mut store = node.store.lock().await;
                         let TriageAdmission::Claimed(attempt) =
@@ -4662,29 +4703,47 @@ pub(super) mod tests {
                         json!({"decision":"accept"})
                     );
                 } else {
-                    let command = match change {
-                        "pause" | "cancel" => WorkspaceCommand::ControlTask {
-                            task_id: "held-source".into(),
-                            expected_revision: 1,
-                            action: if change == "pause" {
-                                TaskAction::Stop
-                            } else {
-                                TaskAction::Cancel
+                    if matches!(change, "retarget" | "native-cwd") {
+                        let replacement = root.join("other");
+                        std::fs::create_dir(&replacement)?;
+                        if change == "retarget" {
+                            std::fs::rename(&directory, root.join("previous-work"))?;
+                            std::os::unix::fs::symlink(&replacement, &directory)?;
+                            assert_eq!(
+                                node.allowed_path(directory.to_str().context("work directory")?)?,
+                                replacement.canonicalize()?,
+                                "the Node's broad root alone still permits the replaced path"
+                            );
+                        } else {
+                            *lock(&native_directory) = replacement.display().to_string();
+                        }
+                    } else {
+                        let command = match change {
+                            "pause" | "cancel" => WorkspaceCommand::ControlTask {
+                                task_id: "held-source".into(),
+                                expected_revision: 1,
+                                action: if change == "pause" {
+                                    TaskAction::Stop
+                                } else {
+                                    TaskAction::Cancel
+                                },
                             },
-                        },
-                        "revise" => WorkspaceCommand::ReviseTask {
-                            task_id: "held-source".into(),
-                            expected_revision: 1,
-                            request: "new task revision".into(),
-                            expected_result: "new result".into(),
-                            dependencies: vec![],
-                        },
-                        _ => unreachable!(),
-                    };
-                    human_workspace_command(&node, &admin, "change-held-source", command).await?;
+                            "revise" => WorkspaceCommand::ReviseTask {
+                                task_id: "held-source".into(),
+                                expected_revision: 1,
+                                request: "new task revision".into(),
+                                expected_result: "new result".into(),
+                                dependencies: vec![],
+                            },
+                            _ => unreachable!(),
+                        };
+                        human_workspace_command(&node, &admin, "change-held-source", command).await?;
+                    }
                     {
                         let store = node.store.lock().await;
-                        assert!(!store.work_native_write_allowed(&network, &work_id)?);
+                        if !matches!(change, "retarget" | "native-cwd") {
+                            assert!(!store.work_native_write_allowed(&network, &work_id)?);
+                        }
                         assert!(
                             store.stop_requests()?.is_empty(),
                             "the source command precedes asynchronous native cancellation"
@@ -4710,7 +4769,12 @@ pub(super) mod tests {
                             .wake_agent()
                             .await
                             .expect_err("an obsolete assignment cannot approve its Work");
-                        assert!(error.to_string().contains("current authority"), "{error:#}");
+                        let reason = match change {
+                            "retarget" => "assignment resource roots",
+                            "native-cwd" => "native directory differs from the reserved work",
+                            _ => "current authority",
+                        };
+                        assert!(error.to_string().contains(reason), "{change}: {error:#}");
                         assert!(lock(&node.triage.requests).contains_key(&request_id));
                         assert!(lock(&node.triage.answered).is_empty());
                         assert!(received.try_recv().is_err());
@@ -7599,15 +7663,17 @@ pub(super) mod tests {
             let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
             node.register_manager_attempt_fixture("retry-token".into(), Access { network_id: network.clone(), human: false, conversation_id: Some("c".into()), manager: None }, &attempt, &trigger, Provider::Codex).await?;
             let access = node.agent_tokens.lock().await.get("retry-token").cloned().context("access")?;
-            let args = |call: &str, explicit: bool| {
-                let mut args = json!({"cwd":dir.display().to_string(),"call_ref":call,"title":"task","prompt":"controlled work"});
+            let args = |call: &str, explicit: bool| -> Result<Value> {
+                let cwd = dir.join(call);
+                std::fs::create_dir(&cwd)?;
+                let mut args = json!({"cwd":cwd.display().to_string(),"call_ref":call,"title":"task","prompt":"controlled work"});
                 if explicit { args["agent"] = json!("pi"); }
-                args
+                Ok(args)
             };
             let mut original = Vec::new();
             for (call, explicit) in [("explicit", true), ("implicit", false), ("provider-default", false)] {
                 if call == "provider-default" { node.providers.lock().unwrap().switches.execution_models.remove(&Provider::Pi); }
-                let args = args(call, explicit);
+                let args = args(call, explicit)?;
                 let first = node.tool(access.clone(), "track_work", args.clone()).await?;
                 assert_eq!(first["may_send"], false);
                 assert_eq!(first["resolved"], json!({"provider":"pi","model":if call == "provider-default" { Value::Null } else { json!("fake/frozen") }}));
