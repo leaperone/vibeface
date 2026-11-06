@@ -8,7 +8,7 @@ import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanima
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useCSSVariable, useUniwind, withUniwind } from 'uniwind'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
-import { awaitsDevice, botReach, botCanSend, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, composerHint, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
@@ -177,6 +177,7 @@ export default function ChatScreen() {
     workspace.actions.send(id, text.trim(), files).catch(() => { unsettled.current = { text: text.trim(), seen: sent(text.trim()) }; setDraft({ text, files }) }).finally(() => setLaunching(false))
   }
   const rows = chat ? entries(chat, extras, bot, offline) : []
+  const setupBlocked = !offline && blocked === composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) && (reach === 'needs_setup' || reach === 'none' || reach === 'offline')
   // 重试 on the newest reply once it failed or was stopped, as on the web.
   const newest = chat?.messages.at(-1)
   const asked = newest && ['failed', 'stopped'].includes(newest.status ?? '') ? newest.in_reply_to : undefined
@@ -264,9 +265,14 @@ export default function ChatScreen() {
         {scrollButton.id === id && scrollButton.visible ? <View pointerEvents="box-none" className={ios ? 'absolute -top-13 w-full max-w-3xl self-center items-end px-4' : 'absolute -top-14 w-full max-w-3xl self-center items-end px-4'}>
           <Button variant="outline" size="icon" className="rounded-full bg-card shadow-sm" accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
         </View> : null}
-        <OfflineBar chat className="mx-4 mb-2 self-center" />
         <Composer chrome={chrome} value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
-          blocked={blocked} sending={launching || (chat?.sending ?? false)} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} tint={tint} />
+          blocked={blocked} sending={launching || (chat?.sending ?? false)} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} tint={tint}>
+          {offline ? <OfflineBar chat className="self-center" /> : setupBlocked && rows.length ? <View role="status" className="flex-row flex-wrap items-center gap-x-2 px-2">
+            <Text className="text-meta text-muted-foreground">{blocked}</Text>
+            {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild><Button variant="ghost" size="sm"><Text>{reach === 'offline' ? '查看设备' : '去设置'}</Text></Button></Link>
+              : <Text className="text-meta text-muted-foreground">{setUpOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))}</Text>}
+          </View> : null}
+        </Composer>
       </View>
     </KeyboardStickyView>
   </View>

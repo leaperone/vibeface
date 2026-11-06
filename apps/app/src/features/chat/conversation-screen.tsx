@@ -25,7 +25,7 @@ import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import type { ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
-import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
 import { chatTimeline, firstUnread } from '@vibeface/client/chat/timeline.ts'
 import './chat.css'
@@ -322,7 +322,6 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         }}
       >
         <InlineError error={sendError} className="basis-full" />
-        {botProviderNotice(workspace.nodes, data?.conversation?.owner) ? <p role="status" className="basis-full text-meta text-muted-foreground">{botProviderNotice(workspace.nodes, data?.conversation?.owner)}</p> : null}
         {needsSetup && !starting && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
     </section>

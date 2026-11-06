@@ -17,7 +17,7 @@ import { agentName, answerLabel, attentionLabel, approvalTask, awaitsAnswer, dec
 import * as errors from "@vibeface/client/lib/errors.ts"
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
 import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice, messageKey, replyStatusLabel } from "@vibeface/client/chat/protocol.ts"
-import { deviceCopy, setUpOnManager } from "@vibeface/client/identity/copy.ts"
+import { deviceCopy, offlineCopy, setUpOnManager } from "@vibeface/client/identity/copy.ts"
 import { chatTimeline, firstUnread, unreadCounts } from "@vibeface/client/chat/timeline.ts"
 import { accessOf } from "@vibeface/client/identity/access.ts"
 import { storageOf } from "@vibeface/client/workspace/storage.ts"
@@ -567,7 +567,7 @@ test("workspace preserves bot and message requests while routing native decision
         'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme }), useCSSVariable: () => theme === 'dark' ? 'black' : 'white' },
         '@/data/context': { useWorkspace: () => native }, '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
         '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/home.ts': { unreachable },
-        '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+        '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
         '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
         '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
         '@/features/chat/chrome': { ChatMaterial: 'ChatMaterial', useChatChrome: () => glass ? { kind: 'glass', colorScheme: theme } : { kind: 'solid' } },
@@ -2429,6 +2429,119 @@ test('changing the recovery password keeps what was typed when it fails, and cle
   } finally { app.close() }
 })
 
+test('native chat folds runtime diagnostics and retains result checks without provider availability cards', async () => {
+  let refreshed = 0
+  const runtime = workspaceModel.parseTurnRuntime({ provider: 'codex', model: 'submitted-model', reasoning_effort: 'high', generation: 'generation', session_generation: 1, delivery_id: 'delivery', stage: 'record', execution: 'started', attempted_at_ms: 1, switched_from: null, switch_reason: null })
+  const job = { trigger: 'message:one', message_id: 'one', reply_message_id: 'reply', state: 'completed', runtime }
+  const shared = { ...parityShared(), refresh: async () => { refreshed++ }, nodes: [{ ...parityNode, capabilities: { ...parityNode.capabilities, manager_state: 'unverified' as const } }] }
+  shared.data = parseConversation({ ...context, messages: [{ message_id: 'reply', event_hash: 'reply', role: 'assistant', text: '完成', created_at_ms: 2 }], scheduler: { jobs: [job], unanswered: [] } })
+  const extras = componentHarness('../../../../../apps/mobile/src/features/chat/work.tsx', {
+    '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+    '@vibeface/client/chat/protocol.ts': { canRetryJob, runtimeLabel }, '@vibeface/client/workspace/model.ts': workspaceModel,
+    '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleTrigger }, '@vibeface/client/workspace/labels.ts': taskLabels,
+    '@vibeface/client/workspace/questions.ts': { questionOpen }, '@vibeface/client/lib/errors.ts': errors,
+  })
+  const details = componentHarness('../../../../../apps/mobile/src/components/kit.tsx', {
+    'react-native-reanimated': { default: { View: 'AnimatedView' } }, 'uniwind': { withUniwind: (value: unknown) => value },
+    '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+  })
+  const render = () => { extras.render('useChatExtras', 'chat'); return extras.output as { after: Map<string, { key: string; node: HarnessElement }[]>; cards: HarnessElement[] } }
+  try {
+    const result = render()
+    assert.equal(botReach(shared.nodes), 'unverified')
+    assert.equal(result.cards.length, 0, 'unverified readiness is sendable without a provider card')
+    const row = result.after.get('reply')?.find((row) => row.key === 'runtime:message:one')?.node
+    assert.ok(row)
+    assert.equal(row.type, 'Details')
+    assert.equal(row.props.label, '运行信息')
+    details.render('Details', row.props)
+    assert.doesNotMatch(componentText(details.output), /Codex|submitted-model|提交推理强度|记录结果/)
+    const toggle = details.render('Details', row.props).find(({ props }) => props.accessibilityRole === 'button')
+    assert.deepEqual(JSON.parse(JSON.stringify(toggle?.props.accessibilityState)), { expanded: false })
+    assert.equal(typeof toggle?.props.onPress, 'function')
+    if (typeof toggle?.props.onPress === 'function') toggle.props.onPress()
+    details.render('Details', row.props)
+    assert.match(componentText(details.output), /Codex · 提交模型 submitted-model · 提交推理强度 high · 记录结果/)
+    for (const current of [{ ...job, state: 'reconciling' }, { ...job, state: 'failed', pending_check: true }]) {
+      shared.data.scheduler!.jobs = [current]
+      const cards = render().cards
+      assert.equal(cards.length, 1)
+      assert.equal(cards[0].props.title, '这次回复的结果待确认')
+      const action = findActionProps(cards[0].props.actions, '再查一次')?.action
+      assert.equal(typeof action, 'function')
+      if (typeof action === 'function') await action()
+    }
+    assert.equal(refreshed, 2, 'result reconciliation remains a read-only action')
+    shared.data.works = [parityWork({ state: 'unverified', outcome: 'unverified', failure_reason: '无法证明结果' })]
+    shared.data.checks = [{ check_id: 'process', conversation_id: 'chat', trigger: 'message:one', attempt_id: 'attempt', detail: '进程还在运行', process_groups: [42], created_at_ms: 1 }]
+    const cards = render().cards
+    assert.equal(cards.filter(({ type }) => typeof type === 'function' && type.name === 'ConfirmCard').length, 2, 'unknown work and running-process checks stay visible')
+  } finally { extras.close(); details.close() }
+})
+
+test('native composer shows one actionable blocker while preserving send gates on iOS and Android', () => {
+  for (const os of ['ios', 'android']) {
+    let retried = 0
+    const live = { ...parityShared(), nodes: parseNodes({ nodes: [{ ...parityNode, capabilities: { ...parityNode.capabilities, manager_state: 'unverified' } }] }) }
+    const conversation: import('../../../../../apps/mobile/src/data/types.ts').Conversation = {
+      messages: [{ message_id: 'one', event_hash: 'one', role: 'user', text: 'hello', created_at_ms: 1 }], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null,
+      works: [], replying: false, status: null, stoppable: false, blocked: null, sending: false,
+    }
+    const workspace = { bots: [parityBot], conversations: { chat: conversation }, members: [], primary: null, actions: { open() {} }, connection: { entry: '工作设备' } }
+    const device = { link: { kind: 'online' }, ready: { entry: { device_id: 'gateway' }, principal: { can_manage: true } }, retryNow: () => { retried++ } }
+    const screen = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
+      'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot' }) }, 'expo-router/react-navigation': { useHeaderHeight: () => 96 },
+      'react-native': { Platform: { OS: os }, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
+      'react-native-keyboard-controller': { useReanimatedKeyboardAnimation: () => ({ height: { value: 0 }, progress: { value: 0 } }) },
+      'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read(), useSharedValue: (value: number) => ({ value }) },
+      'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 34 }), useSafeAreaFrame: () => ({ width: 390 }) },
+      'uniwind': { withUniwind: (value: unknown) => value, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
+      '@/data/context': { useWorkspace: () => workspace }, '@/data/live': { useLive: () => live }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
+      '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+      '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy },
+      '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
+      '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/features/chat/chrome': { useChatChrome: () => ({ kind: 'solid' }) }, '@/lib/layout': { useWide: () => false },
+    })
+    const composer = componentHarness('../../../../../apps/mobile/src/features/chat/composer.tsx', { 'react-native': { Platform: { OS: os }, TextInput: 'TextInput', View: 'View' } })
+    const offline = componentHarness('../../../../../apps/mobile/src/components/connection-pill.tsx', {
+      '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@/data/context': { useWorkspace: () => workspace },
+      '@vibeface/client/identity/copy.ts': { offlineCopy }, '@vibeface/client/workspace/home.ts': { unreachable }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+    })
+    const props = () => screen.render('default').find(({ type }) => type === 'Composer')!.props
+    const render = () => composer.render('Composer', { ...props(), value: 'draft' })
+    try {
+      assert.equal(props().blocked, null)
+      assert.equal(props().children, null, 'unverified readiness adds no availability prompt')
+      assert.equal(render().find(({ props }) => props.accessibilityLabel === '发送')?.props.disabled, false)
+      device.link.kind = 'offline'
+      assert.equal(props().blocked, '离线，恢复后可发送')
+      assert.equal(render().find(({ type }) => type === 'TextInput')?.props.placeholder, '发消息')
+      assert.doesNotMatch(componentText(composer.output), /离线，恢复后可发送/)
+      const recovery = offline.render('OfflineBar', { chat: true })
+      assert.equal(recovery.filter(({ props }) => props.role === 'status').length, 1)
+      const retry = recovery.find(({ type }) => type === 'Button')?.props.onPress
+      assert.equal(typeof retry, 'function')
+      if (typeof retry === 'function') retry()
+      assert.equal(retried, 1)
+      assert.equal(render().find(({ props }) => props.accessibilityLabel === '发送')?.props.disabled, true)
+      device.link.kind = 'online'
+      for (const state of ['needs_setup', 'none', 'offline'] as const) {
+        live.nodes = state === 'none' ? [] : parseNodes({ nodes: [{ ...parityNode, online: state !== 'offline', capabilities: { ...parityNode.capabilities, manager_state: 'needs_setup' } }] })
+        conversation.blocked = composerHint({ hasConversation: true, loaded: true, bot: botReach(live.nodes) })
+        const elements = render()
+        assert.equal(elements.find(({ type }) => type === 'TextInput')?.props.placeholder, '发消息')
+        assert.equal(componentText(composer.output).split(conversation.blocked).length - 1, 1)
+        const links = screen.render('default').filter(({ type, props }) => type === 'Link' && componentText(props.children).includes(state === 'offline' ? '查看设备' : '去设置'))
+        assert.equal(links.filter(({ props }) => props.href === (state === 'none' ? '/ai' : '/device/worker')).length, 1)
+      }
+      conversation.blocked = '当前设备仅可查看'
+      assert.equal(props().children, null, 'setup does not replace a higher-priority write blocker')
+      assert.equal(render().find(({ type }) => type === 'TextInput')?.props.placeholder, conversation.blocked)
+      assert.equal(render().find(({ props }) => props.accessibilityLabel === '发送')?.props.disabled, true)
+    } finally { screen.close(); composer.close(); offline.close() }
+  }
+})
+
 test("conversation blocks sending until an online node can run the manager Agent", () => {
   let sent = 0, refreshed = 0
   const workspace = (nodes: unknown[]) => ({
@@ -2455,6 +2568,8 @@ test("conversation blocks sending until an online node can run the manager Agent
     assert.equal(sent, 1)
     currentWorkspace = workspace([{ device_id: 'gateway', online: true, capabilities: { manager: 'codex', manager_state: 'unverified', roots: [] } }])
     assert.equal(composer()?.disabled, false, 'unknown authentication can be tried without claiming readiness')
+    assert.equal(composer()?.reason, '')
+    assert.doesNotMatch(componentText(composer()?.children), /尚未确认|检查状态|可用性|Codex/)
     composer()?.onSubmit?.()
     assert.equal(sent, 2)
     currentWorkspace.data = { ...context, conversation: { ...context.conversation, owner: 'away' } }

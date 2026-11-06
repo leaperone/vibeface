@@ -22,7 +22,7 @@ type Props = {
   onSend: () => void
   /** Present while a reply runs and can be cancelled: the send button becomes stop. */
   onStop?: () => void
-  /** A follow-up under the blocked note, kept on the composer's column. */
+  /** An actionable blocker that replaces the placeholder and draft note. */
   children?: ReactNode
   /** The bot's accent for the live send button; the neutral fill without it. */
   tint?: { fill: string; ink: string }
@@ -52,7 +52,7 @@ export function Composer({ chrome, value, onChange, files, onFiles, blocked, sen
       {stop ? <Icon as={Square} className="fill-foreground" /> : sending ? <Icon as={LoaderCircle} /> : <Icon as={ArrowUp} color={armed ? tint?.ink : undefined} />}
     </Button>
   </>
-  const input = <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel="给 Bot 发消息" placeholder={blocked ?? '发消息'} placeholderTextColorClassName="accent-muted-foreground" multiline maxLength={100000}
+  const input = <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel="给 Bot 发消息" placeholder={children ? '发消息' : blocked ?? '发消息'} placeholderTextColorClassName="accent-muted-foreground" multiline maxLength={100000}
     className={ios ? 'max-h-40 min-h-11 min-w-0 flex-1 ps-3.5 pe-2 py-2.5 font-sans text-body text-foreground' : 'max-h-40 min-h-11 px-4 pt-3 pb-1 font-sans text-body text-foreground'} value={value} onChangeText={onChange} />
   const box = <>
     {files.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 px-3 pt-3">
@@ -76,7 +76,7 @@ export function Composer({ chrome, value, onChange, files, onFiles, blocked, sen
       <ChatMaterial chrome={chrome} className="min-w-0 flex-1">{box}</ChatMaterial>
     </View> : <View className="w-full max-w-3xl self-center rounded-2xl border border-input bg-card shadow-sm">{box}</View>}
     {blocked && value || children ? <View className={ios ? 'w-full max-w-3xl self-center rounded-xl bg-card py-1' : 'w-full max-w-3xl self-center'}>
-      {blocked && value ? <Text className="px-2 text-meta text-muted-foreground">{blocked}</Text> : null}
+      {blocked && value && !children ? <Text className="px-2 text-meta text-muted-foreground">{blocked}</Text> : null}
       {children}
     </View> : null}
   </View>
