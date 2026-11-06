@@ -7798,7 +7798,7 @@ def e2e_fixture(options):
             entry.start()
             member.start()
             def admitted():
-                status = node_status(member).get("bootstrap") or {}
+                status = (node_status(member).get("bootstrap") or {}).get("status") or {}
                 return status if status.get("state") == "admitted" else None
             state = wait_for("fresh member registers a public Relay lease", admitted)
             require(state["gateway_url"] == gateway_url and state["relay_url"] == relay_url,
@@ -7845,7 +7845,7 @@ def e2e_fixture(options):
                     require(bootstrap_kind, "bootstrap info belongs to its controlled fixture")
                     result = {**details(), "invitation": bootstrap_invitation,
                               "issuer": nodes["discovery"].device_id,
-                              "bootstrap": node_status(nodes["member"])["bootstrap"],
+                              "bootstrap": node_status(nodes["member"])["bootstrap"]["status"],
                               "member_has_operator_token": (nodes["member"].directory / "entry-token").exists(),
                               "catalog_reads": bootstrap_site.catalog_reads}
                 elif op == "bootstrap_pairing":
@@ -7994,7 +7994,14 @@ def e2e_fixture(options):
                     raise ValueError("unsupported fixture operation")
                 print(json.dumps({"ok": True, "result": result}), flush=True)
             except Exception as error:
-                print(json.dumps({"ok": False, "error": type(error).__name__}), flush=True)
+                print(json.dumps({"ok": False, "error": type(error).__name__, "frames": [
+                    f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+                    for frame in traceback.extract_tb(error.__traceback__)[-4:]]}), flush=True)
+    except Exception as error:
+        print(json.dumps({"ok": False, "error": type(error).__name__, "frames": [
+            f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+            for frame in traceback.extract_tb(error.__traceback__)[-4:]]}), flush=True)
+        raise SystemExit(1) from None
     finally:
         cleanup_failed = False
         actions = ([bootstrap_site.close] if bootstrap_site else [])

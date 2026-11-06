@@ -18,6 +18,7 @@ let pending;
 let ready;
 let changing = false;
 let stopping = false;
+class FixtureError extends Error {}
 
 function object(value) {
   assert(value && typeof value === 'object' && !Array.isArray(value), 'Expected fixture object');
@@ -60,7 +61,11 @@ async function startFixture(kind) {
       assert(waiter, 'Unexpected fixture response');
       if ('ready' in value) { ready = object(value.ready); waiter.resolve(ready); }
       else if (value.ok === true) waiter.resolve(value.result);
-      else waiter.reject(new Error('Fixture operation failed'));
+      else {
+        const kind = typeof value.error === 'string' && /^[A-Za-z]+Error$/.test(value.error) ? value.error : 'Error';
+        const frames = Array.isArray(value.frames) ? value.frames.filter(frame => typeof frame === 'string' && /^[A-Za-z0-9_.-]+:[0-9]+:[A-Za-z0-9_<>]+$/.test(frame)) : [];
+        waiter.reject(new FixtureError(`Fixture ${kind}${frames.length ? ` at ${frames.join(', ')}` : ''}`));
+      }
     } catch (error) { waiter?.reject(error); pending = undefined; child.kill('SIGTERM'); }
   });
   return first;
@@ -91,8 +96,8 @@ const control = createServer(async (request, response) => {
     else if (['restart', 'inspect', 'bootstrap_info', 'bootstrap_pairing', 'bootstrap_approve'].includes(value.op)) result = await command(value);
     else throw new Error('Unknown fixture operation');
     response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(result));
-  } catch {
-    response.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Fixture operation failed' }));
+  } catch (error) {
+    response.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: error instanceof FixtureError ? error.message : 'Fixture operation failed' }));
   } finally { changing = false; }
 });
 await new Promise((done, fail) => { control.once('error', fail); control.listen(0, '127.0.0.1', done); });

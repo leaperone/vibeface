@@ -684,7 +684,7 @@ impl GrantAdmission {
         let signed = SignedGrant::parse(token)?;
         let device = endpoint_id(&signed.claims()?.device_id)?;
         let grant = signed.verify(&self.issuer, &device, &self.relay, now_ms)?;
-        self.remember(device, grant.expires_at_ms, now_ms);
+        self.remember(device, grant.expires_at_ms, now_ms)?;
         Ok(grant)
     }
 
@@ -693,8 +693,8 @@ impl GrantAdmission {
         if let Some(token) = token
             && let Ok(grant) = SignedGrant::parse(token)
                 .and_then(|signed| signed.verify(&self.issuer, device, &self.relay, now_ms))
+            && self.remember(*device, grant.expires_at_ms, now_ms).is_ok()
         {
-            self.remember(*device, grant.expires_at_ms, now_ms);
             return true;
         }
         self.admitted
@@ -712,21 +712,18 @@ impl GrantAdmission {
             .copied()
     }
 
-    fn remember(&self, device: EndpointId, until_ms: i64, now_ms: i64) {
+    fn remember(&self, device: EndpointId, until_ms: i64, now_ms: i64) -> Result<()> {
         let mut admitted = self.admitted.lock().expect("relay admissions");
-        if admitted.len() >= MAX_ADMITTED && !admitted.contains_key(&device) {
-            admitted.retain(|_, until| *until > now_ms);
-            if admitted.len() >= MAX_ADMITTED
-                && let Some(victim) = admitted
-                    .iter()
-                    .min_by_key(|(_, until)| **until)
-                    .map(|(device, _)| *device)
-            {
-                admitted.remove(&victim);
-            }
+        if let Some(entry) = admitted.get_mut(&device) {
+            *entry = (*entry).max(until_ms);
+            return Ok(());
         }
-        let entry = admitted.entry(device).or_insert(until_ms);
-        *entry = (*entry).max(until_ms);
+        if admitted.len() >= MAX_ADMITTED {
+            admitted.retain(|_, until| *until > now_ms);
+        }
+        ensure!(admitted.len() < MAX_ADMITTED, "relay admission table is full");
+        admitted.insert(device, until_ms);
+        Ok(())
     }
 
     /// Drops every admission, as a relay restart would.
@@ -1767,23 +1764,74 @@ mod tests {
     }
 
     #[test]
-    fn relay_admission_memory_stays_bounded() -> Result<()> {
+    fn relay_admission_refuses_new_identity_when_full_and_preserves_leases() -> Result<()> {
+        let discovery = LocalIdentity::generate();
+        let issuer = Issuer::new(
+            discovery.clone(),
+            config("https://relay.example", "https://app.example"),
+        )?;
         let admission = GrantAdmission::new(
-            LocalIdentity::generate().device_id()?,
+            discovery.device_id()?,
             "https://relay.example".parse().unwrap(),
         )?;
         let now = now_ms();
-        let mut first = None;
-        for i in 0..MAX_ADMITTED + 8 {
+        let first = LocalIdentity::generate().device_id()?;
+        let first_device = endpoint_id(&first)?;
+        let first_token = issuer.grant(&first, "https://relay.example", ip(), now)?;
+        let first_grant = admission.register(first_token.as_str(), now)?;
+        for _ in 1..MAX_ADMITTED {
             let device = endpoint_id(&LocalIdentity::generate().device_id()?)?;
-            first.get_or_insert(device);
-            admission.remember(device, now + 1000 + i as i64, now);
+            admission.remember(device, first_grant.expires_at_ms, now)?;
         }
-        assert!(admission.admitted.lock().unwrap().len() <= MAX_ADMITTED);
-        assert!(
-            admission.admitted_until(&first.unwrap()).is_none(),
-            "the soonest to expire made room"
+        let before = admission.admitted.lock().unwrap().clone();
+        let newcomer = endpoint_id(&LocalIdentity::generate().device_id()?)?;
+        let token = issuer.grant(&device_id(&newcomer), "https://relay.example", ip(), now)?;
+        assert!(admission.register(token.as_str(), now).is_err());
+        assert!(!admission.admits(&newcomer, Some(token.as_str()), now));
+        assert_eq!(*admission.admitted.lock().unwrap(), before);
+        let later = now + 1000;
+        let token = issuer.grant(&first, "https://relay.example", ip(), later)?;
+        let renewed = admission.register(token.as_str(), later)?;
+        assert!(renewed.expires_at_ms > first_grant.expires_at_ms);
+        admission.register(first_token.as_str(), later)?;
+        assert_eq!(
+            admission.admitted_until(&first_device),
+            Some(renewed.expires_at_ms)
         );
+        assert!(admission.admits(&first_device, None, later));
+        assert_eq!(admission.admitted.lock().unwrap().len(), MAX_ADMITTED);
+        Ok(())
+    }
+
+    #[test]
+    fn relay_admission_reuses_slots_after_expiry() -> Result<()> {
+        let discovery = LocalIdentity::generate();
+        let issuer = Issuer::new(
+            discovery.clone(),
+            config("https://relay.example", "https://app.example"),
+        )?;
+        let admission = GrantAdmission::new(
+            discovery.device_id()?,
+            "https://relay.example".parse().unwrap(),
+        )?;
+        let now = now_ms();
+        let first = endpoint_id(&LocalIdentity::generate().device_id()?)?;
+        admission.remember(first, now + 1000, now)?;
+        for _ in 1..MAX_ADMITTED {
+            let device = endpoint_id(&LocalIdentity::generate().device_id()?)?;
+            admission.remember(device, now + 1000, now)?;
+        }
+        let replacement = endpoint_id(&LocalIdentity::generate().device_id()?)?;
+        let later = now + 2000;
+        let token = issuer.grant(&device_id(&replacement), "https://relay.example", ip(), later)?;
+        let grant = admission.register(token.as_str(), later)?;
+        assert_eq!(admission.admitted.lock().unwrap().len(), 1);
+        assert!(admission.admitted_until(&first).is_none());
+        assert_eq!(
+            admission.admitted_until(&replacement),
+            Some(grant.expires_at_ms)
+        );
+        assert!(admission.admits(&replacement, None, later));
         Ok(())
     }
 

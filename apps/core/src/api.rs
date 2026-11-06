@@ -517,7 +517,8 @@ fn unavailable(error: impl std::fmt::Display) -> ApiError {
     ApiError(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
 }
 
-/// The client behind a loopback reverse proxy, else the connecting peer.
+/// When the TCP peer is loopback, optional single `X-Real-IP` set by a trusted local reverse proxy;
+/// otherwise the connecting peer IP. Never trusts `X-Forwarded-For` or `Forwarded`.
 fn client_ip(request: &Request) -> IpAddr {
     let peer = request
         .extensions()
@@ -529,9 +530,6 @@ fn client_ip(request: &Request) -> IpAddr {
     }
     let headers = request.headers();
     one_header(headers, "x-real-ip")
-        .or_else(|| {
-            one_header(headers, "x-forwarded-for").and_then(|chain| chain.split(',').next())
-        })
         .and_then(|ip| ip.trim().parse().ok())
         .unwrap_or(peer)
 }
@@ -1417,5 +1415,52 @@ mod tests {
         assert_eq!(bearer(&headers), Some("secret"));
         headers.append(header::AUTHORIZATION, "Bearer second".parse().unwrap());
         assert!(bearer(&headers).is_none());
+    }
+
+    fn request_from_peer(peer: IpAddr, build: impl FnOnce(&mut HeaderMap)) -> Request {
+        let mut headers = HeaderMap::new();
+        build(&mut headers);
+        let mut request = Request::builder()
+            .uri("/bootstrap/grant")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        *request.headers_mut() = headers;
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer, 40_000)));
+        request
+    }
+
+    #[test]
+    fn client_ip_loopback_accepts_only_a_single_valid_x_real_ip() {
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        let from_header: IpAddr = "203.0.113.55".parse().unwrap();
+        let r = request_from_peer(peer, |headers| {
+            headers.insert("x-real-ip", "203.0.113.55".parse().unwrap());
+        });
+        assert_eq!(client_ip(&r), from_header);
+        let r = request_from_peer(peer, |headers| {
+            headers.append("x-real-ip", "203.0.113.1".parse().unwrap());
+            headers.append("x-real-ip", "203.0.113.2".parse().unwrap());
+        });
+        assert_eq!(client_ip(&r), peer);
+        let r = request_from_peer(peer, |headers| {
+            headers.insert("x-real-ip", "not-an-ip".parse().unwrap());
+        });
+        assert_eq!(client_ip(&r), peer);
+    }
+
+    #[test]
+    fn client_ip_ignores_forwarded_headers_and_non_loopback_spoofing() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let r = request_from_peer(loopback, |headers| {
+            headers.insert("x-forwarded-for", "203.0.113.1, 198.51.100.2".parse().unwrap());
+        });
+        assert_eq!(client_ip(&r), loopback);
+        let public: IpAddr = "198.51.100.9".parse().unwrap();
+        let r = request_from_peer(public, |headers| {
+            headers.insert("x-real-ip", "127.0.0.1".parse().unwrap());
+        });
+        assert_eq!(client_ip(&r), public);
     }
 }

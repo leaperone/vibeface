@@ -44,7 +44,7 @@ bash scripts/build-web.sh
 
 ```sh
 ./vibeface init \
-	--root /absolute/path/to/projects
+    --root /absolute/path/to/projects
 ./vibeface serve
 ```
 
@@ -88,11 +88,11 @@ bash scripts/build-web.sh
 
 ```sh
 ./vibeface init \
-	--root /absolute/path/to/projects \
-	--manager cursor \
-	--workspace /absolute/path/to/manager-workspace \
-	--model auto \
-	--bin cursor=/absolute/path/to/bin/cursor-sdk-bridge
+    --root /absolute/path/to/projects \
+    --manager cursor \
+    --workspace /absolute/path/to/manager-workspace \
+    --model auto \
+    --bin cursor=/absolute/path/to/bin/cursor-sdk-bridge
 ```
 
 此命令用于尚未初始化的 Node。默认使用 `auto` 模型。SDK 程序在本机运行，模型请求仍发往 Cursor 服务，消耗 Cursor 额度。
@@ -109,10 +109,10 @@ Codex Bot 的回合在 Codex App Server 上运行。装好并登录 Codex 后，
 
 ```sh
 ./vibeface init \
-	--root /absolute/path/to/projects \
-	--manager codex \
-	--codex-socket '<App Server socket 的绝对路径>' \
-	--workspace /absolute/path/to/manager-workspace
+    --root /absolute/path/to/projects \
+    --manager codex \
+    --codex-socket '<App Server socket 的绝对路径>' \
+    --workspace /absolute/path/to/manager-workspace
 ```
 
 可用 `--model` 指定模型，省略时使用 Codex 配置中的默认模型。
@@ -190,10 +190,10 @@ vibeface join 'https://gateway.example/join#vibeface1…' --name '<设备显示�
 
 ```json
 {
-	"listen": "0.0.0.0:4790",
-	"public_url": "http://192.168.1.10:4790",
-	"allowed_origins": [],
-	"allow_insecure_lan": true
+    "listen": "0.0.0.0:4790",
+    "public_url": "http://192.168.1.10:4790",
+    "allowed_origins": [],
+    "allow_insecure_lan": true
 }
 ```
 
@@ -252,8 +252,8 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
    ```sh
    export VIBEFACE_ENTRY_DATA_DIR='<入口 Node 数据目录的绝对路径>'
    vibeface init --data-dir "$VIBEFACE_ENTRY_DATA_DIR" \
-   	--public-entry \
-   	--public-url https://vb.example.com \
+    --public-entry \
+    --public-url https://vb.example.com \
        --relay-listen 127.0.0.1:3340 \
        --relay-url https://vb.example.com
    vibeface serve --data-dir "$VIBEFACE_ENTRY_DATA_DIR"
@@ -265,37 +265,45 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
    ```nginx
    map $http_upgrade $connection_upgrade {
-   	default upgrade;
-   	''      close;
+    default upgrade;
+    ''      close;
    }
 
    server {
-   	listen 443 ssl http2;
-   	server_name vb.example.com;
-   	ssl_certificate     /etc/letsencrypt/live/vb.example.com/fullchain.pem;
-   	ssl_certificate_key /etc/letsencrypt/live/vb.example.com/privkey.pem;
+    listen 443 ssl http2;
+    server_name vb.example.com;
+    ssl_certificate     /etc/letsencrypt/live/vb.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/vb.example.com/privkey.pem;
 
-   	location ~ ^/(relay|ping|generate_204)$ {
-   		proxy_pass http://127.0.0.1:3340;
-   		proxy_http_version 1.1;
-   		proxy_set_header Upgrade $http_upgrade;
-   		proxy_set_header Connection $connection_upgrade;
-   		proxy_set_header Host $host;
-   		proxy_read_timeout 1h;
-   	}
+    location ~ ^/(relay|ping|generate_204)$ {
+        proxy_pass http://127.0.0.1:3340;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Forwarded "";
+        proxy_set_header X-Forwarded-For "";
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 1h;
+    }
 
-   	location / {
-   		proxy_pass http://127.0.0.1:4790;
-   		proxy_http_version 1.1;
-   		proxy_set_header Upgrade $http_upgrade;
-   		proxy_set_header Connection $connection_upgrade;
-   		proxy_set_header Host $host;
-   		proxy_read_timeout 1h;
-   	}
+    location / {
+        proxy_pass http://127.0.0.1:4790;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Forwarded "";
+        proxy_set_header X-Forwarded-For "";
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 1h;
+    }
    }
    ```
 
-   `Host` 必须是 `public_url` 的主机名，Node 会拒绝其他 Host。
+   `Host` 必须与 `public_url` 的主机名一致。Core 只在 TCP 对端为回环时读取单个 `X-Real-IP`，忽略 `Forwarded` 和 `X-Forwarded-For`。反代必须覆盖 `X-Real-IP` 并清空这两个转发头，后端仅监听回环地址。域名经过 CDN 时，先用官方 CDN IP 段限制 `set_real_ip_from` 的信任来源，再让 `$remote_addr` 表示经过校验的客户端地址。
 
 4. 在个人电脑上指定服务器的 SSH 地址、步骤 2 选择的数据目录，以及本机用于接收令牌的临时文件，再复制 `entry-token`：
 
@@ -311,8 +319,8 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
    ```sh
    vibeface init \
-   	--root /absolute/path/to/projects \
-   	--entry https://vb.example.com \
+    --root /absolute/path/to/projects \
+    --entry https://vb.example.com \
        --relay-token-file "$VIBEFACE_RELAY_TOKEN_FILE"
    vibeface serve
    ```
@@ -380,8 +388,8 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 
 ```sh
 vibeface init \
-	--relay-listen 127.0.0.1:3340 --relay-url https://relay.example \
-	--public-url https://vibe.example
+    --relay-listen 127.0.0.1:3340 --relay-url https://relay.example \
+    --public-url https://vibe.example
 vibeface join '<管理设备给出的加入链接>' --name '<设备显示名称>'
 ```
 
@@ -466,8 +474,8 @@ vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@disc
 
 ```sh
 vibeface init --data-dir /srv/vibeface-discovery \
-	--public-entry --relay-mode discovery-only \
-	--relay-listen 0.0.0.0:4792 --no-web
+    --public-entry --relay-mode discovery-only \
+    --relay-listen 0.0.0.0:4792 --no-web
 vibeface serve --data-dir /srv/vibeface-discovery
 ```
 
@@ -479,8 +487,8 @@ vibeface serve --data-dir /srv/vibeface-discovery
 
 ```sh
 vibeface init --data-dir /absolute/personal-node \
-	--bootstrap 'vibeface://<发现服务设备编号>@discovery.example:4792' \
-	--bootstrap-https https://<入口域名>/bootstrap
+    --bootstrap 'vibeface://<发现服务设备编号>@discovery.example:4792' \
+    --bootstrap-https https://<入口域名>/bootstrap
 ```
 
 只做地址查询、不接入它发布的公共入口时，改传 `--bootstrap off --discovery 'vibeface://…'`；已有 Node 可在 `config.json` 的 `network.discovery` 数组里添加同一 URL 后重启。发现服务的编号通过 QUIC TLS 校验，域名解析结果不能冒充运营者。不要把这个地址传给 `--relay` 或 `--entry`，它没有业务转发能力。
@@ -599,9 +607,9 @@ vibeface service uninstall
 
 ```sh
 "$VIBEFACE_INSTALL_ROOT/current/vibeface" update configure \
-	--install-root "$VIBEFACE_INSTALL_ROOT" \
-	--channel stable \
-	--automatic true
+    --install-root "$VIBEFACE_INSTALL_ROOT" \
+    --channel stable \
+    --automatic true
 ```
 
 将 `stable` 改为 `nightly` 可跟随开发预发布。Stable 不会安装 Nightly；尚无正式版时不会自动更换版本。切换渠道不触发降级。更新渠道和安装目录必须先配置；已有 Nightly 安装应显式选择 `nightly`。
@@ -622,9 +630,9 @@ vibeface service uninstall
 
 ```sh
 "$VIBEFACE_INSTALL_ROOT/current/vibeface" update configure \
-	--install-root "$VIBEFACE_INSTALL_ROOT" \
-	--channel stable \
-	--automatic false
+    --install-root "$VIBEFACE_INSTALL_ROOT" \
+    --channel stable \
+    --automatic false
 ```
 
 这会移除更新定时服务，手动 `check` 和 `apply` 仍可使用。`vibeface service install-updater` 和 `uninstall-updater` 可单独安装或移除定时服务，不改变已保存的更新策略。策略的 `automatic` 为 `false` 时，即使手动安装定时服务也不会自动更新。重新配置自动更新会重新安装或移除定时服务。

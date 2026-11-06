@@ -48,8 +48,11 @@ async function control(baseUrl: string | undefined): Promise<Control> {
   assert(url.protocol === 'http:' && url.hostname === '127.0.0.1' && url.port && url.pathname === '/' && !url.search && !url.hash, 'Control stays on literal loopback');
   assert(/^[a-f0-9]{64}$/.test(token));
   return async request => {
-    const response = await fetch(url, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(request), signal: AbortSignal.timeout(30000) });
-    assert(response.ok, `Fixture operation returned ${response.status}`);
+    const response = await fetch(url, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(request), signal: AbortSignal.timeout(90000) });
+    if (!response.ok) {
+      const failure = record(await response.json());
+      assert.fail(`Fixture ${text(request.op)} returned ${response.status}: ${text(failure.error)}`);
+    }
     return response.json();
   };
 }
