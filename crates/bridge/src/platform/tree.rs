@@ -66,7 +66,7 @@ impl Tree {
             let id = child.id().context("the program exited at once")?;
             let started = job
                 .adopt(&child)
-                .and_then(|()| job.token(id))
+                .and_then(|()| job.token(key, id))
                 .and_then(|token| super::winjob::resume_process(id).map(|()| token));
             match started {
                 Ok(token) => Ok((
@@ -170,10 +170,9 @@ pub struct Leftover {
 impl Leftover {
     /// Looks up the tree `token` describes. `Ok(None)` means nothing of it is left, which is the
     /// normal case after a clean exit.
-    pub fn find(token: &str, key: &str) -> Result<Option<Self>> {
+    pub fn find(token: &str) -> Result<Option<Self>> {
         #[cfg(unix)]
         {
-            let _ = key;
             let Some(group) = token
                 .trim()
                 .parse::<i32>()
@@ -187,7 +186,7 @@ impl Leftover {
         #[cfg(windows)]
         {
             let recorded: super::winjob::Record = token.trim().parse()?;
-            match super::winjob::Job::open(key)? {
+            match super::winjob::Job::open(recorded.key())? {
                 Some(job) => Ok(Some(Self { job, recorded })),
                 None => Ok(None),
             }
@@ -266,18 +265,18 @@ fn signal_group(group: i32, signal: i32) -> bool {
 
 /// Whether a tree recorded under `token` could still be running, used where the Node only needs
 /// to know whether to wait rather than to end anything.
-pub fn token_is_running(token: &str, key: &str) -> bool {
-    Leftover::find(token, key).is_ok_and(|found| found.is_some())
+pub fn token_is_running(token: &str) -> bool {
+    Leftover::find(token).is_ok_and(|found| found.is_some())
 }
 
-/// Ends the tree `token` names when it is still running and every program in it is one the Node
-/// started. `accept` sees each member and answers whether it is the Node's own program.
-pub fn stop_recorded(
-    token: &str,
-    key: &str,
-    accept: impl Fn(&str) -> bool,
-) -> Result<Option<Vec<String>>> {
-    let Some(leftover) = Leftover::find(token, key)? else {
+/// Ends the tree `token` names when it is still running and at least one program in it is one
+/// the Node started. `accept` sees each member and answers whether it is the Node's own program.
+///
+/// `Ok(None)` means nothing was ended, either because nothing is left or because what is left
+/// is not the recorded program. An error means the record could not be trusted, which is left
+/// for the caller to report rather than acted on.
+pub fn stop_recorded(token: &str, accept: impl Fn(&str) -> bool) -> Result<Option<Vec<String>>> {
+    let Some(leftover) = Leftover::find(token)? else {
         return Ok(None);
     };
     ensure!(

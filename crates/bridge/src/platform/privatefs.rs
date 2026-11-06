@@ -101,7 +101,10 @@ pub fn create_dir(path: &Path) -> Result<()> {
         );
         return restrict_dir(path);
     }
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)?;
     }
     #[cfg(unix)]
@@ -263,7 +266,10 @@ pub fn create_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         sync_dir(parent)?;
     }
     Ok(())
@@ -318,7 +324,10 @@ pub fn read_private_bounded(path: &Path, limit: u64, label: &str) -> Result<Vec<
     let file = open_no_follow(path).with_context(|| format!("open {label}"))?;
     let mut bytes = Vec::new();
     file.take(limit + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() as u64 <= limit, "{label} exceeds its size limit");
+    ensure!(
+        bytes.len() as u64 <= limit,
+        "{label} exceeds its size limit"
+    );
     Ok(bytes)
 }
 

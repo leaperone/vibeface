@@ -114,8 +114,19 @@ pub struct Listener {
     inner: tokio::net::UnixListener,
     #[cfg(windows)]
     pending: tokio::net::windows::named_pipe::NamedPipeServer,
-    #[cfg(windows)]
     endpoint: Endpoint,
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        // A Unix socket leaves its directory entry behind when the listener closes, so the next
+        // run would find a dead file in its place. A Windows pipe name is freed with its last
+        // handle, which the field above just dropped.
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(self.endpoint.path());
+        #[cfg(windows)]
+        let _ = &self.endpoint;
+    }
 }
 
 impl Listener {
@@ -127,7 +138,10 @@ impl Listener {
             let inner = tokio::net::UnixListener::bind(endpoint.path())
                 .with_context(|| format!("claim the local endpoint {endpoint}"))?;
             super::privatefs::restrict_file(endpoint.path())?;
-            Ok(Self { inner })
+            Ok(Self {
+                inner,
+                endpoint: endpoint.clone(),
+            })
         }
         #[cfg(windows)]
         {
@@ -340,6 +354,30 @@ impl AsyncWrite for Stream {
                 PipeSide::Client(client) => Pin::new(client).poll_shutdown(context),
             }
         }
+    }
+}
+
+/// Two connected ends of one local connection, used where a test or a probe needs a stream
+/// without a program on the other side.
+pub async fn pair() -> Result<(Stream, Stream)> {
+    #[cfg(unix)]
+    {
+        let (left, right) = tokio::net::UnixStream::pair()?;
+        Ok((Stream { inner: left }, Stream { inner: right }))
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let endpoint = Endpoint::from_path(Path::new(&format!(
+            r"\\.\pipe\vibeface-pair-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )))?;
+        let mut listener = Listener::bind(&endpoint).await?;
+        let accepted = tokio::spawn(async move { listener.accept().await });
+        let client = Stream::connect(&endpoint).await?;
+        Ok((accepted.await??, client))
     }
 }
 

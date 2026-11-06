@@ -29,8 +29,7 @@ use windows_sys::Win32::{
     Storage::FileSystem::FILE_ALL_ACCESS,
     System::{
         SystemServices::{
-            ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
-            SECURITY_DESCRIPTOR_REVISION,
+            ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
         },
         Threading::{GetCurrentProcess, OpenProcessToken},
     },
@@ -141,7 +140,6 @@ impl Drop for LocalAcl {
 /// A security descriptor granting the current account full access and no other account any
 /// access, with inheritance blocked so a permissive parent cannot widen it.
 pub struct OwnerOnly {
-    user: Sid,
     acl: LocalAcl,
     descriptor: Box<SECURITY_DESCRIPTOR>,
 }
@@ -192,18 +190,10 @@ impl OwnerOnly {
                 && SetSecurityDescriptorDaclChecked(&mut descriptor, acl.0)
                 && SetSecurityDescriptorProtected(&mut descriptor)
         } {
-            Ok(Self {
-                user,
-                acl,
-                descriptor,
-            })
+            Ok(Self { acl, descriptor })
         } else {
             Err(io::Error::last_os_error())
         }
-    }
-
-    pub fn user(&self) -> &Sid {
-        &self.user
     }
 
     /// Attributes usable while `self` is alive. The descriptor keeps pointers into `self`, so
@@ -211,9 +201,7 @@ impl OwnerOnly {
     pub fn attributes(&self) -> SECURITY_ATTRIBUTES {
         SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: (&raw const *self.descriptor)
-                .cast::<c_void>()
-                .cast_mut(),
+            lpSecurityDescriptor: (&raw const *self.descriptor).cast::<c_void>().cast_mut(),
             bInheritHandle: 0,
         }
     }
@@ -735,8 +723,8 @@ pub fn create_junction(target: &Path, alias: &Path) -> io::Result<()> {
     use windows_sys::Win32::{
         Foundation::GENERIC_WRITE,
         Storage::FileSystem::{
-            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
         },
         System::{IO::DeviceIoControl, Ioctl::FSCTL_SET_REPARSE_POINT},
     };
@@ -789,8 +777,8 @@ pub fn read_junction(alias: &Path) -> io::Result<std::path::PathBuf> {
         Foundation::GENERIC_READ,
         Storage::FileSystem::{
             CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            MAXIMUM_REPARSE_DATA_BUFFER_SIZE, OPEN_EXISTING,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
+            OPEN_EXISTING,
         },
         System::{
             IO::DeviceIoControl, Ioctl::FSCTL_GET_REPARSE_POINT,
@@ -870,11 +858,8 @@ const MOUNT_POINT_FIELDS_LEN: usize = 8;
 
 fn mount_point_buffer(target: &Path) -> io::Result<Vec<u8>> {
     use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
-    let mut substitute: Vec<u16> = wide(std::ffi::OsString::from(format!(
-        r"\??\{}",
-        target.display()
-    ))
-    .as_os_str());
+    let mut substitute: Vec<u16> =
+        wide(std::ffi::OsString::from(format!(r"\??\{}", target.display())).as_os_str());
     // The print name a person sees in Explorer is the plain path.
     let print: Vec<u16> = wide(target.as_os_str());
     let substitute_bytes = (substitute.len() - 1) * 2;
@@ -882,7 +867,9 @@ fn mount_point_buffer(target: &Path) -> io::Result<Vec<u8>> {
     let path_bytes = substitute_bytes + 2 + print_bytes + 2;
     let data_length = MOUNT_POINT_FIELDS_LEN + path_bytes;
     if data_length > u16::MAX as usize {
-        return Err(io::Error::other("managed directory target path is too long"));
+        return Err(io::Error::other(
+            "managed directory target path is too long",
+        ));
     }
     let mut buffer = Vec::with_capacity(REPARSE_HEADER_LEN + data_length);
     buffer.extend_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());

@@ -33,6 +33,12 @@ const MAX_MEMBERS: usize = 1024;
 /// An owned kernel handle.
 struct Owned(HANDLE);
 
+// SAFETY: a kernel handle is a process-wide value every thread may use, and this wrapper hands
+// out no interior references, so moving or sharing it across threads is sound.
+unsafe impl Send for Owned {}
+// SAFETY: as above.
+unsafe impl Sync for Owned {}
+
 impl Drop for Owned {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -80,13 +86,8 @@ impl Job {
     pub fn open(key: &str) -> Result<Option<Self>> {
         let name = job_name(key)?;
         // SAFETY: `name` is NUL-terminated.
-        let handle = unsafe {
-            OpenJobObjectW(
-                JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE,
-                0,
-                name.as_ptr(),
-            )
-        };
+        let handle =
+            unsafe { OpenJobObjectW(JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE, 0, name.as_ptr()) };
         if handle.is_null() {
             let error = io::Error::last_os_error();
             if error.raw_os_error().map(|code| code as u32) == Some(ERROR_FILE_NOT_FOUND) {
@@ -200,37 +201,50 @@ impl Job {
         unsafe { TerminateJobObject(self.handle.0, 1) };
     }
 
-    /// Whether the root process the journal recorded is still a member of this job, with the
-    /// same start moment and the same image. A process id alone proves nothing on Windows.
+    /// Whether the root process the journal recorded is still a member of this job and still
+    /// started at the recorded moment. A process identifier alone proves nothing on Windows.
     pub fn holds_recorded_root(&self, record: &Record) -> bool {
         self.members().is_ok_and(|ids| {
             ids.contains(&record.process)
                 && started_at(record.process).is_ok_and(|started| started == record.started)
-                && image_of(record.process).is_ok_and(|image| image == record.image)
         })
     }
 
     /// The journal record for the tree rooted at `process`.
-    pub fn token(&self, process: u32) -> Result<String> {
+    pub fn token(&self, key: &str, process: u32) -> Result<String> {
         Ok(Record {
             process,
             started: started_at(process)?,
-            image: image_of(process)?,
+            key: key.to_owned(),
         }
         .to_string())
     }
 }
 
-/// What the journal stores about a managed tree on Windows.
+/// What the journal stores about a managed tree on Windows: which job holds it, which process
+/// roots it, and when that process started.
+///
+/// The start moment is what makes the record safe. Windows hands a process identifier to a new
+/// program as soon as the old one is gone, so an identifier on its own proves nothing; the pair
+/// of identifier and start moment names exactly one program for as long as it runs.
+///
+/// The fields are separated by a character no Windows path may contain, so a record never needs
+/// escaping and never runs into a program path.
 pub struct Record {
     process: u32,
     started: u64,
-    image: String,
+    key: String,
+}
+
+impl Record {
+    pub fn key(&self) -> &str {
+        &self.key
+    }
 }
 
 impl std::fmt::Display for Record {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{} {} {}", self.process, self.started, self.image)
+        write!(formatter, "{}|{}|{}", self.process, self.started, self.key)
     }
 }
 
@@ -238,8 +252,8 @@ impl std::str::FromStr for Record {
     type Err = anyhow::Error;
 
     fn from_str(value: &str) -> Result<Self> {
-        let mut fields = value.trim().splitn(3, ' ');
-        let (Some(process), Some(started), Some(image)) =
+        let mut fields = value.trim().splitn(3, '|');
+        let (Some(process), Some(started), Some(key)) =
             (fields.next(), fields.next(), fields.next())
         else {
             bail!("the recorded program journal is not in this Node's format");
@@ -247,7 +261,7 @@ impl std::str::FromStr for Record {
         Ok(Self {
             process: process.parse()?,
             started: started.parse()?,
-            image: image.to_owned(),
+            key: key.to_owned(),
         })
     }
 }
@@ -274,15 +288,7 @@ fn started_at(process: u32) -> Result<u64> {
     // SAFETY: as above.
     let mut user = unsafe { std::mem::zeroed() };
     // SAFETY: as above.
-    if unsafe {
-        GetProcessTimes(
-            handle.0,
-            &mut created,
-            &mut exited,
-            &mut kernel,
-            &mut user,
-        )
-    } == 0
+    if unsafe { GetProcessTimes(handle.0, &mut created, &mut exited, &mut kernel, &mut user) } == 0
     {
         return Err(io::Error::last_os_error().into());
     }
@@ -306,13 +312,13 @@ fn image_of(process: u32) -> Result<String> {
 
 /// Lets a process that was started suspended run, once it has joined its job.
 pub fn resume_process(process: u32) -> Result<()> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
         },
         Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
     };
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     // SAFETY: a thread snapshot takes no process id.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
