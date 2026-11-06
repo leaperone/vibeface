@@ -1128,8 +1128,8 @@ mod tests {
     fn build_info(version: &str) -> serde_json::Value {
         serde_json::json!({
             "version": version, "target": "aarch64-apple-darwin", "source_commit": "a".repeat(40),
-            "core_version": version, "core_source_commit": "b".repeat(40),
-            "app_version": version, "app_source_commit": "c".repeat(40),
+            "core_version": version, "core_source_commit": "a".repeat(40),
+            "app_version": version, "app_source_commit": "a".repeat(40),
             "update_protocol": vibeface_control::UPDATE_PROTOCOL,
             "data_epoch": vibeface_control::DATA_EPOCH,
         })

@@ -5,41 +5,40 @@ description: 了解 Vibeface 的 CI、制品和 Nightly 发布流程。
 
 # 构建与发布
 
-[CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 按改动范围选择 `main` push 的核心检查；开发分支 PR 不触发 Actions，Draft 与 Ready 都不例外。merge queue 执行全工作区核心检查，定时和手动执行扩展回归。`main` 的常规 CI 只上传 Actions 制品，不创建公开版本。门户仅在 www 正式版 tag 时由 `deploy-www.yml` 请求部署，独立网页仅在 app 正式版 tag 时由 `deploy-app.yml` 请求部署。版本号含 `-` 时不自动发站。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。具体选择规则见 [按改动选择 CI](ci.md)。
+[CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 按改动范围选择 `main` push 的核心检查；开发分支 PR 不触发 Actions，Draft 与 Ready 都不例外。merge queue 执行全工作区核心检查，定时和手动执行扩展回归。`main` 的常规 CI 只上传 Actions 制品，不创建公开版本。门户仅在 www 正式版 Tag 时由 `deploy-www.yml` 请求部署，网页 App 在产品正式版 Tag 时由 `deploy-app.yml` 请求部署。版本号含 `-` 时不自动发站。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。具体选择规则见 [按改动选择 CI](ci.md)。
 
-## 按应用独立发布
+## 按产品组合发布
 
-| 应用 | tag 前缀 | 版本来源 | 发布产物 |
-| --- | --- | --- | --- |
-| www | `www-v` | `apps/www/package.json` | 静态门户归档 |
-| app | `app-v` | `apps/app/package.json` | 独立网页归档，不含 Core |
-| core | `core-v` | `apps/core/Cargo.toml` | 三个平台的 Core 程序 |
-| cli | `cli-v` | `apps/cli/Cargo.toml` | CLI、锁定 Core 和 App 的完整包 |
-| mobile | `mobile-v` | `apps/mobile/app.json` 的 `expo.extra.releaseVersion` | Android 预览 APK |
+Core、CLI、Web App 和 Mobile 共享一个版本、一个 `v<version>` Tag 与一个 GitHub Release。`www-v<version>` 只发布独立官网与文档。产品版本以 `apps/cli/Cargo.toml` 为准，Core、Web App 和 Mobile 的发行版本必须与之相等。
 
-五个应用的首个正式版为 `0.0.1`，tag 分别为 `<app>-v0.0.1`。Nightly 使用 `0.0.1-nightly.YYYYMMDD.N`，日期为 UTC 准备日期，序号按应用递增。Mobile 的 `expo.version` 保持 `0.0.1`，原生 build number 独立递增。移动端 Nightly 不代表 TestFlight 或 App Store 已发布；iOS 仍需有效分发签名、provisioning profile 和 App Store Connect 权限。
+| 发布组 | Tag | 交付物 |
+| --- | --- | --- |
+| product | `v<version>` | 三个平台的完整电脑包与 Core、Web App 归档、Android APK，以及各自校验信息 |
+| www | `www-v<version>` | 静态官网与文档归档 |
 
-`release.yml` 只响应以上五种 tag。tag 必须与版本文件一致，源码必须已在 main。CLI 在 `apps/cli/release-lock.json` 中锁定 Core/App tag，组装时验证公开 release 的源码 SHA 和文件摘要，将独立版本与源码记录到 `BUILD-INFO.json`，`FILES.sha256` 覆盖包内文件。CLI、Core 与 App 必须使用相同发布渠道。Core 和 App 必须先发布，CLI 才能组装。`COMPONENT-INFO.json` 与 `release.json` 的 schema 均为 1；旧 schema 和额外字段会被拒绝。发布后不覆盖已有字节，重试先下载对账。
+首个正式版为 `0.0.1`。Nightly 使用 `0.0.1-nightly.YYYYMMDD.N`，日期取 UTC 准备日期，序号按发布组递增。Mobile 的 `expo.version` 保持 `0.0.1`，Android versionCode 独立递增。当前 Mobile 发行目标是 Android APK，不代表 TestFlight、App Store 或 OTA 交付。
 
-先完成独立分支、PR、相关测试并合并，再从已验证的提交创建具体 tag。例如 `git tag app-v0.0.1-nightly.20261101.1 <commit>`，随后 `git push origin app-v0.0.1-nightly.20261101.1`。若重跑，使用 `gh workflow run release.yml --ref <tag> -f tag=<tag>`。发布后核对 Actions 终态、release.json、实际下载摘要和平台运行结果。
+身份检查后，Web、macOS 原生程序、Linux x64 原生程序、Linux ARM64 原生程序和 Android 同时构建。原生任务一次编译本平台 CLI 与 Core。每个平台的组包只等自己的原生输入和 Web，不等待其他平台，也不读取另一个公开 Release。
+
+流水线按不可变 artifact ID 传递输入，核对源码、版本、目标平台、完整文件集合及 SHA-256。所有目标通过后汇总 17 个载荷文件与一个 `release.json`，由唯一发布任务上传、回读验证，再公开 Release。缺失、错源、损坏或失败目标都会阻止公开。
+
+`COMPONENT-INFO.json` 与 `release.json` 的 schema 保持 1。`BUILD-INFO.json` 仍包含九个既有字段，CLI、Core、App 的版本和源码提交必须完全一致。数据 epoch 与更新协议保持 1。旧公开 Tag 与字节保持不可变，不创建旧应用前缀别名。
 
 ## 每日 Nightly 的发布约束
 
-每日 Nightly 的协调入口是 `ci.yml` 的 `daily-nightly` job。启用后，它只在 UTC 03:23 的 main 定时扩展检查及 `ci-gate` 成功后运行，手动 `workflow_dispatch` 和普通 main push 均不运行发布协调。即使业务源码没有变化，每天仍为 WWW、App、Core、CLI 和 Mobile 分配新 Nightly。
+协调入口仍是 `ci.yml` 的 `daily-nightly`，只在 UTC 03:23 的 main 定时扩展检查和 `ci-gate` 成功后执行。手动 CI 和普通 main push 不发布每日 Nightly。产品四应用分配一个共同版本和 `v` Tag，官网独立分配版本和 `www-v` Tag；即使业务源码没有变化，每日仍递增版本。
 
-启用前须明确授权未来每日机械版本 PR 的自动 squash，并配置单仓库 fine-grained secret `NIGHTLY_RELEASE_TOKEN`，授予 Contents、Pull requests 和 Actions 所需读写权限。当前实现交付不代表该 secret 已配置或每日发布已启用；缺少它时 job 明确失败，不使用其他发布 token 替代，也不修改保护规则。PAT 本身没有路径级限制。受信协调脚本通过 PR 仓库、作者、base、head 和逐字节机械 tree 校验限制合并范围。普通 `GITHUB_TOKEN` 只在协调 job 申请必要的 Contents、Actions 写权限，负责版本分支、tag 和精确 dispatch；PAT 只用于创建与立即 squash 合并版本 PR，使真实 main push 正常触发 CI。
+启用需要明确授权未来每日机械版本 PR 自动 squash，并配置单仓库 fine-grained `NIGHTLY_RELEASE_TOKEN`。实现或合并代码不代表凭证已配置或自动发布已启用。PAT 只处理受信版本 PR 创建与普通 squash；版本分支、只创建的 Tag 和精确 dispatch 使用 job 级 `GITHUB_TOKEN`。缺少凭证时明确失败，不挪用部署 token 或修改保护规则。
 
-`scripts/daily-nightly.py` 从原定时 run 的 `created_at` 恢复 UTC 日期，以 `bot/daily-nightly/YYYYMMDD` 查找所有状态的唯一版本 PR。它先复用原 PR 和已预留版本，再考虑分配。每应用按已提交基准、该日远端 tag 和 manifest 的最大序号加一。版本提交只改五应用版本、Cargo.lock 的两个本仓包版本、CLI 的 Core/App tag 锁和 Android `versionCode`。Mobile marketing version 和 iOS buildNumber 保持不变，Cargo 只运行 `metadata --locked --no-deps`，不重新解析依赖。
+原 schedule run 的 `created_at` 固定 UTC 日期。协调器先恢复同一天的唯一版本 PR、版本与实际 squash SHA，校验完整机械 tree、作者、base、head 和 Android versionCode。已有但格式不兼容的日任务停止处理，不另建第二个 PR 或重新分配版本。
 
-协调器用固定 head 普通 squash，不使用 auto-merge 或 admin。原 PR head 必须等于从原 base 机械生成的完整 tree。若 main 已前进，真实 squash 提交也必须恰好等于在其实际 main 父提交上生成同批固定版本的 tree，否则停止。随后只接受真实合并 SHA 的 `ci.yml`、`event=push`、`head_branch=main` 和终态 success；缺失、pending、其他 SHA 或取消均不能放行。取消时只恢复原 run。相同日期重跑继续使用原 PR、版本和真实合并 SHA，不再递增。
+只有实际合并 SHA 的 main push CI success 放行。产品与官网可并行启动独立发布运行，产品内部按依赖并行构建；不再先公开 Core、App 再启动 CLI。由 `GITHUB_TOKEN` 创建 Tag 后显式 dispatch，并指定 `publish=true`。
 
-WWW、App、Core 和 Mobile 的精确 tag 发布可并行运行。Core 和 App 的公开制品下载验证成功后才启动 CLI。已有 tag 必须指向同一真实合并 SHA，tag 只创建、不移动。由 `GITHUB_TOKEN` 创建 tag 后显式 dispatch `release.yml`，不依赖 token push 自动触发。写入响应未知时先查询 PR、ref 或原 run 对账，不盲重试。已有公开且验证通过的 Release 直接复用。
-
-static 和 Android 构建先把完整待发布集合连同 `release.json` 保存为 Actions artifact，再由独立 publisher 发布。Core 和 CLI 保留原有 native artifact 与 publisher 分层。失败恢复只重跑原 run 的失败 publisher job，不重建归档；原 artifact 缺失、过期、构建失败或公开字节冲突时停止。所有已关联 runs 都要跟踪到终态，某应用失败不省略其他已启动 runs。最终下载五份公开 manifest，核对完整文件集合、大小、摘要、组件身份、CLI 构建锁，以及 APK 实际包名、marketing version、versionCode 和 provenance。CLI Nightly 还会自动发布 npm。即使 GitHub Release 已公开，npm job 失败仍使每日协调器失败，需先对账再手动重跑原 run 的失败 job。Nightly 不触发生产站点部署或 iOS 分发。
+网络响应未知时先查询 PR、ref 或原 run 对账。发布恢复复用原运行的完整产品 artifact，禁止重建后覆盖公开字节。npm 失败单独报告失败；核对 registry 后恢复原 npm artifact，不把 GitHub Release 成功当作 npm 成功。缺失、过期或字节冲突的原制品阻止恢复。
 
 ## Stable App 的站点部署
 
-仅 Stable `app-vX.Y.Z` 的静态归档发布成功后，`deploy-app.yml` 使用 `VIBEFACE_RELEASE_DISPATCH_TOKEN` 向 `leaperone/leaperone-releases` 发送 `deploy-vibeface-app`，携带确切 tag 和源码 SHA。接收端校验 tag、main 祖先关系、release 清单和归档内容后部署到现有站点，并检查 `/`、`/connect`、`/join` 及首页引用的静态资源。源站首页必须与发布产物一致；公网入口和静态资源必须返回 200，页面须保留原启动脚本，静态资源须与产物一致。公网检查允许现有 Cloudflare 外部统计脚本，循环跳转使验收失败。派发成功仅表示接收了请求，仍须核对发布仓库的部署与冒烟结果。
+仅 Stable `vX.Y.Z` 的完整产品发布成功后，`deploy-app.yml` 使用 `VIBEFACE_RELEASE_DISPATCH_TOKEN` 向 `leaperone/leaperone-releases` 发送 `deploy-vibeface-app`，携带确切 tag 和源码 SHA。接收端校验 tag、main 祖先关系、release 清单和归档内容后部署到现有站点，并检查 `/`、`/connect`、`/join` 及首页引用的静态资源。源站首页必须与发布产物一致；公网入口和静态资源必须返回 200，页面须保留原启动脚本，静态资源须与产物一致。公网检查允许现有 Cloudflare 外部统计脚本，循环跳转使验收失败。派发成功仅表示接收了请求，仍须核对发布仓库的部署与冒烟结果。
 
 ## 可下载的包
 
@@ -51,7 +50,7 @@ static 和 Android 构建先把完整待发布集合连同 `release.json` 保存
 | Linux ARM64 | `aarch64-unknown-linux-gnu` | Ubuntu 24.04 ARM64 |
 | macOS Apple Silicon | `aarch64-apple-darwin` | macOS 15 ARM64 |
 
-Linux 包依赖 glibc，未在旧版发行版验收。扩展检查和 Core/CLI tag 产出的 macOS 包，`vibeface` 与 `vibeface-core` 程序使用 Developer ID 签名，启用 hardened runtime，identifier 为 `cn.leaperone.vibeface`，并通过 Apple notarization。应用防火墙保持默认的“自动允许下载的已签名软件”设置时据此放行，安装和更新后不再询问是否接受传入连接。`main` 的核心检查不生成 macOS 包。本地运行 `scripts/package-node.sh` 时，只有设置 `VIBEFACE_CODESIGN_IDENTITY` 才签名；同时设置 `VIBEFACE_NOTARY_KEY`、`VIBEFACE_NOTARY_KEY_ID` 和 `VIBEFACE_NOTARY_ISSUER` 才提交 notarization，三者须同时设置，状态不是 `Accepted` 时打包失败。裸 Mach-O 无法 staple；带隔离属性的文件首次运行时由 Gatekeeper 在线核对公证记录。Apple 接受公证后，在线记录可能数分钟后才能查到，CI 因此按退避间隔重试 Gatekeeper 评估，最长约 14 分钟，只接受 `source=Notarized Developer ID`。独立 Core/CLI 发布入口验证签名和公证 `Accepted`，Gatekeeper 在线验收另行记录。
+Linux 包依赖 glibc，未在旧版发行版验收。扩展检查和产品 Tag 产出的 macOS 包，`vibeface` 与 `vibeface-core` 程序使用 Developer ID 签名，启用 hardened runtime，identifier 为 `cn.leaperone.vibeface`，并通过 Apple notarization。应用防火墙保持默认的“自动允许下载的已签名软件”设置时据此放行，安装和更新后不再询问是否接受传入连接。`main` 的核心检查不生成 macOS 包。本地运行 `scripts/package-node.sh` 时，只有设置 `VIBEFACE_CODESIGN_IDENTITY` 才签名；同时设置 `VIBEFACE_NOTARY_KEY`、`VIBEFACE_NOTARY_KEY_ID` 和 `VIBEFACE_NOTARY_ISSUER` 才提交 notarization，三者须同时设置，状态不是 `Accepted` 时打包失败。裸 Mach-O 无法 staple；带隔离属性的文件首次运行时由 Gatekeeper 在线核对公证记录。Apple 接受公证后，在线记录可能数分钟后才能查到，CI 因此按退避间隔重试 Gatekeeper 评估，最长约 14 分钟，只接受 `source=Notarized Developer ID`。产品发布入口验证签名和公证 `Accepted`，Gatekeeper 在线验收另行记录。
 
 macOS 打包需要以下仓库 secrets，缺任何一项时打包失败，不回退为未签名包：
 
@@ -79,7 +78,7 @@ cd vibeface-<version>-<target>
 
 运行任务前须另装并登录相应 Provider。Cursor 管理路径需另装 Cursor SDK Bridge 并配置凭证。初始化、配对、服务安装和公网 TLS 见 [Node 使用说明](node.md)。
 
-App 的 static 发布使用 pnpm 与 Rust 工具缓存。`build-web.sh` 自身执行冻结的按需依赖安装，因此发布入口不再提前安装整个 workspace；www 仍独立安装。工具版本和生成物来源校验照常执行。
+产品发布的 static 任务复用 pnpm 与 Rust 工具缓存。`build-web.sh` 自身执行冻结的按需依赖安装，因此 Product 不再提前安装整个 workspace；www 仍独立安装。工具版本和生成物来源校验照常执行。
 
 ## CI 验证范围
 
@@ -116,30 +115,32 @@ pnpm --filter vibeface-www run check:static
 
 ## 显式发布版本
 
-五个应用独立版本。以下以 CLI 为例，其他应用使用各自的前缀和版本来源。
+| 渠道 | 产品 Tag | GitHub Release |
+| --- | --- | --- |
+| stable | `vX.Y.Z` | 正式版本，不强制占用官网的 Latest |
+| nightly | `vX.Y.Z-nightly.YYYYMMDD.N` | 预发布，不标记为 Latest |
+| rc | `vX.Y.Z-rc.N` | 预发布，不标记为 Latest |
 
-| 渠道 | Tag 格式 | 示例 | GitHub Release |
-| --- | --- | --- | --- |
-| stable | `cli-vX.Y.Z` | `cli-v0.0.1` | 正式版本，不使用仓库共用 Latest |
-| nightly | `cli-vX.Y.Z-nightly.YYYYMMDD.N` | `cli-v0.0.1-nightly.20261017.1` | 预发布，不标记为 Latest |
-| rc | `cli-vX.Y.Z-rc.N` | `cli-v0.0.1-rc.1` | 预发布，不标记为 Latest |
+数字不带前导零，日期必须有效。Tag 一经创建不可移动、删除重用或覆盖，不创建可变 `nightly` Tag，不追加 build metadata。
 
-`X.Y.Z` 是目标正式版本，数字不带前导零。nightly 日期按发布时的 UTC 日历日期填写，`N` 是该目标版本、当天从 `1` 递增的发布序号；rc 的 `N` 则在该目标版本内从 `1` 递增。日期必须有效，序号不带前导零。例如 `0.0.1-nightly.20261017.1` 表示目标正式版本 `0.0.1` 在 UTC 2026-10-17 的第一个 Nightly。
+1. 在同一 PR 更新四个产品版本及必要的 Cargo.lock，完成检查并按授权合并。
+2. 核对该完整提交的 main push CI success，再创建并推送 `v<version>`。一个产品 Tag 构建全部产品目标。
+3. 核对流水线全部生产者、组包和完整汇总成功，确认唯一 publisher 公开 Release。
+4. 下载并验证完整清单、包内来源、SHA-256 和实际运行结果。npm 与部署分别核对。
 
-nightly 表示开发预发布，需选择 Nightly 更新渠道或手动下载，不能通过 GitHub 的 Latest 稳定版入口获取。tag 一经发布不可移动、删除重用或覆盖；不创建可变的 `nightly` tag，不追加 build metadata 或 SHA。包内 `BUILD-INFO.json` 记录实际源码提交。
+手动验证默认只构建，既不创建 Tag，也不公开 Release：
 
-1. 通过同一个 PR 更新目标应用版本和必要的依赖锁，完成相关检查并合并到 `main`。
-2. 在已验证提交创建并推送 `<app>-v<version>` tag。tag 与该应用版本必须完全一致。
-3. 查看 `release.yml` 的目标应用构建结果。Core/CLI 覆盖三个原生平台；App/www 检查静态构建；Mobile 构建 Android 预览。
-4. 发布任务创建独立 draft Release，验证文件集合与下载摘要后公开。CLI 不混入 Android APK。
+```sh
+gh workflow run release.yml --ref <branch> -f app=product -F publish=false
+```
 
-只有发布任务拥有 `contents: write` 权限。失败留下的 draft 可以在修复原因后重跑；公开 Release 不会被覆盖。同名公开版本需要更正时，使用新的版本和 tag。合并 PR 不会自动推送 tag。
+真实发布的手动入口只能引用现存精确 Tag，例如 `--ref v<version> -f app=product -f tag=v<version> -F publish=true`。网站使用 `app=www` 与 `www-v<version>`。先查询同一 Tag、SHA 的原 run，不为一次未知响应重复派发。失败的 publisher 只消费原完整 artifact，不能为同一 Tag 重建替换字节。
 
 ## 更新渠道
 
 npm Nightly 的制品与发布流程见下面的 npm 章节。npm 安装由 npm 更新，不使用本节的 Rust 自更新器。
 
-Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，不使用 Actions 的临时制品。Stable 只选择 `cli-vX.Y.Z` 正式版，Nightly 只选择 `cli-vX.Y.Z-nightly.YYYYMMDD.N` 预发布；两者都不选择 rc。更新器比较数值版本，不按 Release 创建时间或字符串排序，不自动降级。尚无正式版时，Stable 报告没有匹配版本，不回退到 Nightly。
+Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，不使用 Actions 的临时制品。Stable 只选择 `vX.Y.Z` 正式版，Nightly 只选择 `vX.Y.Z-nightly.YYYYMMDD.N` 预发布；两者都不选择 rc。更新器比较数值版本，不按 Release 创建时间或字符串排序，不自动降级。尚无正式版时，Stable 报告没有匹配版本，不回退到 Nightly。
 
 更新器没有默认策略；先用 `update configure` 明确指定渠道、是否自动更新及安装根目录，再检查或应用更新。策略保存在数据目录的私有 `update.json`，不进入共享会话或 DAG。命令见 [选择更新渠道](node.md#选择更新渠道)。首次建立受管安装可使用 [公开安装命令](install.md)，已安装的节点使用 `update apply`。
 
@@ -181,7 +182,7 @@ npm 包名为 `@leaperone/vibeface`，已公开首版 `0.0.1-nightly.20261106.1`
 
 `scripts/package-npm.mjs` 接收三个平台的完整 `.tar.gz` 与同名 SHA256，要求三个平台的 CLI 版本、CLI 源码、锁定组件身份及包协议一致，平台字段分别匹配各自 target。它拒绝危险路径、链接、特殊文件、校验错配和缺失资源，把完整包放入 `vendor/<target>`，再生成一个含全部平台的 `.tgz`。只有一个 npm 发布身份和一次发布操作，代价是下载包含其他平台的程序。没有 postinstall、运行期下载或新增 npm 依赖。
 
-定时和手动扩展 CI 生成 `npm-package-<SHA>-<producer_attempt>` artifact。CLI Nightly 发布生成 `npm-package-<SHA>-<producer_attempt>`，由 `publish-native` 输出不可变 artifact id。npm job 使用该 id 下载，失败后单独重跑仍使用原 producer 的制品，不按当前 run attempt 拼接名称。两种 artifact 都包含 `.tgz` 和记录源码 SHA、SHA256、npm integrity 的 JSON。CI 在三个原生平台上以 `--ignore-scripts` 全局安装到隔离 prefix，然后验证版本，并以 `--web-only` 验证启动和随包网页，不重复完整多节点验收。Stable 和 rc 延续现有 GitHub 发布流程，不生成 npm 包。
+定时和手动扩展 CI 生成 `npm-package-<SHA>-<producer_attempt>` artifact。产品 Nightly 汇总生成 `npm-package-<SHA>-<producer_attempt>`，由 `collect` 输出不可变 artifact ID。npm job 使用该 id 下载，失败后单独重跑仍使用原 producer 的制品，不按当前 run attempt 拼接名称。两种 artifact 都包含 `.tgz` 和记录源码 SHA、SHA256、npm integrity 的 JSON。CI 在三个原生平台上以 `--ignore-scripts` 全局安装到隔离 prefix，然后验证版本，并以 `--web-only` 验证启动和随包网页，不重复完整多节点验收。Stable 和 rc 延续现有 GitHub 发布流程，不生成 npm 包。
 
 本地检查与打包命令如下。输入目录只能包含对应版本的三个包与三个 checksum，默认输出 `.artifacts/npm`，已有同名制品会被保留并报错：
 
@@ -191,7 +192,7 @@ node scripts/package-npm.mjs --input /absolute/path/to/verified-packages --sourc
 node scripts/package-npm.mjs --verify /absolute/path/to/leaperone-vibeface-<version>.tgz --source-commit <full-commit-sha>
 ```
 
-`release.yml` 在 CLI Nightly 的 `publish-native` 成功后自动调用可复用的 `npm-publish.yml` 并公开发布。两个工作流保留同一 tag 的 `GITHUB_SHA` 和 `GITHUB_REF`，npm provenance 对应制品源码。发布前核对来源仓库、run id、源码 SHA、tag、artifact id、有效期、名称和 producer attempt，再执行 `package-npm.mjs --verify`；发布阶段不重新构建。
+`release.yml` 在产品 Nightly 的 `publish` 成功后自动调用可复用的 `npm-publish.yml` 并公开发布。两个工作流保留同一 tag 的 `GITHUB_SHA` 和 `GITHUB_REF`，npm provenance 对应制品源码。发布前核对来源仓库、run id、源码 SHA、tag、artifact id、有效期、名称和 producer attempt，再执行 `package-npm.mjs --verify`；发布阶段不重新构建。
 
 发布使用 GitHub-hosted Ubuntu、Node.js 24 和 npm 12.2.2。调用方与被调用方都授予 `id-token: write`，发布 job 使用 `npm-release` environment，不配置 `NODE_AUTH_TOKEN` 或长期 npm token。
 
@@ -207,8 +208,8 @@ GitHub 的同名 environment 及 tag 访问策略由仓库远端设置控制。�
 手动入口默认 `publish=false`，只接受与输入相同的 tag ref。它要求该 tag 和源码 SHA 只有一个成功的 `release.yml` run，以及一个有效 npm artifact；无法唯一定位时停止。该 tag 必须已经包含本工作流与脚本。dry run 命令如下：
 
 ```sh
-gh workflow run npm-publish.yml --repo leaperone/vibeface --ref cli-v<version> \
-  -f tag=cli-v<version> -F publish=false
+gh workflow run npm-publish.yml --repo leaperone/vibeface --ref v<version> \
+  -f tag=v<version> -F publish=false
 ```
 
 需要手动公开发布时，把 `publish` 设为 true。若原发布 run 的 npm job 失败，优先对账后使用 `gh run rerun <run-id> --failed`，复用原 artifact id；不要重建归档。每日协调器不会自动重试 npm 失败。

@@ -155,11 +155,11 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 ## 定期、手动和发布检查
 
-每日 UTC 03:23 定时和 Actions 中手动运行 `ci` 强制执行扩展检查，不受路径影响。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或三平台打包。开发分支 PR 不触发 `ci`。应用前缀 tag 由独立的 `release.yml` 路由，仅构建目标应用。`ci` 的手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
+每日 UTC 03:23 定时和 Actions 中手动运行 `ci` 强制执行扩展检查，不受路径影响。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或三平台打包。开发分支 PR 不触发 `ci`。产品 `v` Tag 由 `release.yml` 并行构建全部产品目标，`www-v` 独立构建官网。`ci` 的手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
 
 每日 Nightly 接在同一 schedule run 的 `ci-gate` 后，不新增第二套定时全量 CI。`daily-nightly` 仅接受 main 的 schedule，使用固定 concurrency 且不取消进行中的协调。启用需要明确授权未来每日机械版本 PR 自动 squash，并配置专用单仓库 `NIGHTLY_RELEASE_TOKEN`；当前实现不代表凭证或自动发布已启用。该 PAT 需 Contents、Pull requests、Actions 所需权限，只处理版本 PR 创建和普通 squash；版本 branch、tag 与精确 workflow dispatch 使用 job 级 `GITHUB_TOKEN`。未配置时明确失败，不修改权限或保护规则。
 
-协调脚本先验证精确机械版本 diff 和 `cargo metadata --locked --no-deps`，合并后只接受真实 squash SHA 的 main push CI success，再启动现有应用 tag 构建。不会为版本分支再派发一轮全量检查，也不为合并 SHA 再跑扩展全量 CI。原 run 的 `created_at` 固定当日身份，重跑复用原 PR、版本、SHA 和留存制品。quick-check 与 preflight 注册 `python3 scripts/daily-nightly.py --self-test` 及 Python 语法检查，涵盖真实临时 Git、篡改 diff、依赖发布门、未知写入对账和原 artifact 恢复。具体发布顺序与停止条件见 [每日 Nightly 的发布约束](releasing.md#每日-nightly-的发布约束)。
+协调脚本先验证精确机械版本 diff 和 `cargo metadata --locked --no-deps`，合并后只接受真实 squash SHA 的 main push CI success，再并行启动产品与官网发布组。不会为版本分支再派发一轮全量检查，也不为合并 SHA 再跑扩展全量 CI。原 run 的 `created_at` 固定当日身份，重跑复用原 PR、版本、SHA 和留存制品。quick-check 与 preflight 注册 `python3 scripts/daily-nightly.py --self-test` 及 Python 语法检查，涵盖真实临时 Git、篡改 diff、完整产品发布门、未知写入对账和原 artifact 恢复。具体发布顺序与停止条件见 [每日 Nightly 的发布约束](releasing.md#每日-nightly-的发布约束)。
 
 | 扩展检查 | 执行范围 |
 | --- | --- |
@@ -193,7 +193,7 @@ Rust 缓存同时覆盖 iOS FFI 的 `target` 和 host 的 `.artifacts/native/tar
 
 CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK 和 App Server 夹具，`--phase5` 不启动 App Server。模拟协议通过不能证明真实模型理解需求或正确选择工具。
 
-只有显式应用版本 tag 进入发布路径。tag 必须与目标应用版本一致且提交已进入 `main`；`release.yml` 校验身份并只构建目标应用，再按该应用的规则核对和发布制品。稳定 `app-vX.Y.Z` 在静态制品完成后调用 `deploy-app.yml`，派发到 `leaperone-releases` 部署；稳定 `www` 也有独立部署入口。`main` 的普通 CI 不发布或部署应用，派发成功也不能代替部署结果。发布前继续校验资产清单并下载逐字节比对，详见 [构建与发布](releasing.md)。
+产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本与 main 中的固定源码。产品先并行构建 Web、三个原生平台和 Android，再按平台组包；只有完整汇总成功才公开一个 Release。`publish=false` 手动入口只验证并生成制品。Stable 产品与官网各自保留部署入口，Nightly 不发站；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
 
 ## 本地按改动补充验收
 
@@ -299,4 +299,4 @@ Android 使用官方 Gradle 缓存动作和 Gradle build cache，保留 `arm64-v
 
 GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate` 列为必需状态。仓库开发流程仍要求相关本地验证、最终 HEAD 的 preflight 和明确合并授权。合并后的 CI 与应用 tag 的制品、发布和部署检查分别记录。
 
-应用前缀 tag 由 `release.yml` 独立校验、构建和发布，不进入普通 CI 的全产品发布链。参见 [构建与发布](releasing.md#按应用独立发布)。
+产品与官网 Tag 由 `release.yml` 独立校验和发布；main 的普通 CI 不公开产品。参见 [按产品组合发布](releasing.md#按产品组合发布)。
