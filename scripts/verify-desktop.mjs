@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { inspectAuthenticode, requireAuthenticode } from './windows-signing.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const ELECTRON_VERSION = '45.2.3';
@@ -100,9 +101,18 @@ function verifyApplication(root, target, receipt) {
 
 /** Real signature assessment; an unsigned preview is reported, never presented as signed. */
 function verifySignature(application, target, receipt) {
-  if (target !== 'aarch64-apple-darwin' || process.platform !== 'darwin') {
-    return receipt.signed ? 'claimed; verify on the target platform' : 'unsigned development preview';
+  if (target === 'x86_64-pc-windows-msvc') {
+    assert.equal(process.platform, 'win32', 'Windows signatures must be verified on Windows');
+    const executable = path.join(application, 'Vibeface.exe');
+    if (!receipt.signed) {
+      assert.equal(inspectAuthenticode(executable).status, 'NotSigned', 'an unsigned preview must carry no product signature');
+      return 'unsigned development preview';
+    }
+    requireAuthenticode(executable);
+    for (const name of ['vibeface.exe', 'vibeface-core.exe']) requireAuthenticode(path.join(application, 'resources/runtime', name));
+    return 'Authenticode and trusted timestamp verified on Windows';
   }
+  assert.equal(process.platform, 'darwin', 'macOS signatures must be verified on macOS');
   const verified = spawnSync('codesign', ['--verify', '--strict', '--deep', application], { encoding: 'utf8' });
   if (!receipt.signed) {
     assert.notEqual(verified.status, 0, 'an unsigned receipt must not describe a validly signed application');
@@ -135,6 +145,9 @@ function verify({ target, input, distribution, scratch }) {
   const extracted = extract(path.join(input, `vibeface-desktop-${version}-${target}.zip`), path.join(scratch, 'app'));
   const { application } = verifyApplication(extracted, target, receipt);
   const signature = verifySignature(application, target, receipt);
+  if (target === 'x86_64-pc-windows-msvc' && receipt.signed) {
+    requireAuthenticode(path.join(input, `vibeface-desktop-${version}-${target}.exe`));
+  }
   console.log(`Verified desktop ${target} ${version} from ${receipt.source_commit}; signature: ${signature}`);
   return receipt;
 }

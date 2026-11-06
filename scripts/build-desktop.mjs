@@ -7,6 +7,8 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import { requireAuthenticode } from './windows-signing.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const desktop = path.join(repo, 'apps/desktop');
@@ -153,6 +155,12 @@ function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   const archive = runtimeArchive ?? path.join(path.dirname(runtimeDir), `vibeface-${version}-${target}.tar.gz`);
   assert(fs.statSync(archive).isFile(), `the released runtime archive is required beside --runtime-dir or named with --runtime-archive`);
   const { signed, signing } = signingState(target, sign);
+  const channel = version.includes('-nightly.') ? 'nightly' : version.includes('-rc.') ? 'rc' : 'stable';
+  assert(signed || channel !== 'stable', 'a stable desktop distribution requires a configured signer');
+  if (signed && target === 'x86_64-pc-windows-msvc') {
+    for (const program of ['vibeface.exe', 'vibeface-core.exe']) requireAuthenticode(path.join(runtimeDir, program));
+  }
+
 
   const stage = path.join(desktop, '.build');
   fs.rmSync(stage, { recursive: true, force: true });
@@ -161,7 +169,8 @@ function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   copyRuntime(runtimeDir, runtimeStage);
   verifySealedRuntime(runtimeStage, sealed);
 
-  run('pnpm', ['--dir', desktop, 'exec', 'electron-builder', '--config', path.join(desktop, 'electron-builder.cjs'),
+  const builderCli = createRequire(path.join(desktop, 'package.json')).resolve('electron-builder/cli.js');
+  run(process.execPath, [builderCli, '--config', path.join(desktop, 'electron-builder.cjs'),
     platform.flag, '--publish', 'never'], {
     cwd: repo,
     stdio: 'inherit',
@@ -190,8 +199,10 @@ function build({ target, runtimeDir, output, runtimeArchive, sign }) {
     artifacts[name] = hash(destination);
     fs.writeFileSync(`${destination}.sha256`, `${artifacts[name]}  ${name}\n`);
   }
-  const channel = version.includes('-nightly.') ? 'nightly' : version.includes('-rc.') ? 'rc' : 'stable';
-  assert(signed || channel !== 'stable', 'a stable desktop distribution requires a signed application');
+  if (signed && target === 'x86_64-pc-windows-msvc') {
+    requireAuthenticode(path.join(electronOut, 'win-unpacked/Vibeface.exe'));
+    requireAuthenticode(path.join(output, `${base}.exe`));
+  }
   const receipt = {
     schema: SCHEMA_VERSION, app: 'desktop', target, version, tag: `v${version}`, channel,
     source_commit: sourceCommit, electron: ELECTRON_VERSION, signed, signing,

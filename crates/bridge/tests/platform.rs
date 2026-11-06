@@ -418,3 +418,21 @@ async fn codex_uses_a_native_unix_socket_instead_of_an_invented_pipe_url() -> Re
     std::fs::remove_dir_all(directory)?;
     Ok(())
 }
+
+#[tokio::test]
+async fn two_programs_with_the_same_label_have_independent_trees() -> Result<()> {
+    let (mut first, mut first_child) = tree::Tree::spawn(long_lived(), "same-provider", true)?;
+    let (mut second, mut second_child) = tree::Tree::spawn(long_lived(), "same-provider", true)?;
+    let distinct = first.token() != second.token();
+    first.stop();
+    let _ = first_child.wait().await;
+    let survived = second.is_running();
+    second.stop();
+    let _ = second_child.wait().await;
+    assert!(distinct, "each launch records its own process tree");
+    assert!(
+        survived,
+        "ending one provider does not end another with the same label"
+    );
+    Ok(())
+}

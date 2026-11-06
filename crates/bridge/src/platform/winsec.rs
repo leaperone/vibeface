@@ -153,7 +153,7 @@ impl OwnerOnly {
     }
 
     fn for_user(user: Sid, container: bool) -> io::Result<Self> {
-        let mut entry = EXPLICIT_ACCESS_W {
+        let entry = EXPLICIT_ACCESS_W {
             grfAccessPermissions: OWNER_ACCESS,
             grfAccessMode: SET_ACCESS,
             grfInheritance: if container {
@@ -171,7 +171,7 @@ impl OwnerOnly {
         };
         let mut acl: *mut ACL = std::ptr::null_mut();
         // SAFETY: one entry is described by `entry`, and no prior list is merged in.
-        checked(unsafe { SetEntriesInAclW(1, &mut entry, std::ptr::null(), &mut acl) })?;
+        checked(unsafe { SetEntriesInAclW(1, &entry, std::ptr::null(), &mut acl) })?;
         let acl = LocalAcl(acl);
         let mut descriptor = Box::new(unsafe { std::mem::zeroed::<SECURITY_DESCRIPTOR>() });
         // SAFETY: `descriptor` is a correctly sized, writable SECURITY_DESCRIPTOR.
@@ -927,7 +927,9 @@ pub fn read_junction(alias: &Path) -> io::Result<std::path::PathBuf> {
         .filter(|end| *end <= returned)
         .ok_or_else(|| io::Error::other("reparse record names no target"))?;
     let units: Vec<u16> = buffer[start..end]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     let target = std::ffi::OsString::from_wide(&units);

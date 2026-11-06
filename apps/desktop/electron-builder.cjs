@@ -65,8 +65,8 @@ module.exports = {
   win: {
     target: [{ target: 'nsis', arch: [arch] }, { target: 'zip', arch: [arch] }],
     artifactName,
-    // No Authenticode certificate is configured for development previews; nothing is faked.
-    signtoolOptions: signed ? { signingHashAlgorithms: ['sha256'] } : undefined,
+    // The signing hook preserves the exact bytes of the already sealed native runtime.
+    signtoolOptions: signed ? { signingHashAlgorithms: ['sha256'], sign: path.join(desktop, 'scripts/windows-sign.cjs') } : undefined,
   },
   nsis: {
     // A per-user installer: no administrator rights, no WSL, no Developer Mode.

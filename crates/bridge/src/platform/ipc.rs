@@ -79,11 +79,8 @@ impl Endpoint {
         #[cfg(windows)]
         {
             let name = path.to_string_lossy().into_owned();
-            let address = if name.starts_with(r"\\.\pipe\") {
-                ensure!(
-                    !name[r"\\.\pipe\".len()..].contains('\\'),
-                    "a pipe must be on this machine"
-                );
+            let address = if let Some(suffix) = name.strip_prefix(r"\\.\pipe\") {
+                ensure!(!suffix.contains('\\'), "a pipe must be on this machine");
                 WindowsAddress::Pipe(name)
             } else {
                 ensure!(

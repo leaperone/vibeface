@@ -10,7 +10,7 @@
 use anyhow::{Context as _, Result, bail, ensure};
 use std::io;
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, HANDLE},
+    Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, GetLastError, HANDLE},
     System::{
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -51,6 +51,7 @@ impl Drop for Owned {
 /// A job object holding one managed process tree.
 pub struct Job {
     handle: Owned,
+    key: String,
 }
 
 fn job_name(key: &str) -> Result<Vec<u16>> {
@@ -69,15 +70,31 @@ impl Job {
     /// Creates the job for `key`, replacing nothing: a name another live job already holds is
     /// returned as an error so two Nodes never share one tree.
     pub fn create(key: &str) -> Result<Self> {
-        let name = job_name(key)?;
-        // SAFETY: `name` is NUL-terminated and no attributes are supplied.
-        let handle = unsafe { CreateJobObjectW(std::ptr::null(), name.as_ptr()) };
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let key = format!(
+            "{key}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let name = job_name(&key)?;
+        let security = super::winsec::OwnerOnly::new(false)?;
+        let attributes = security.attributes();
+        // SAFETY: the name and security descriptor remain valid throughout creation.
+        let handle = unsafe { CreateJobObjectW(&attributes, name.as_ptr()) };
         if handle.is_null() {
-            return Err(io::Error::last_os_error()).map_err(Into::into);
+            return Err(io::Error::last_os_error().into());
         }
+        // SAFETY: this immediately follows CreateJobObjectW, before any other Windows call.
+        let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
         let job = Self {
             handle: Owned(handle),
+            key,
         };
+        ensure!(
+            !existed,
+            "the managed program's job is already owned; no process was attached"
+        );
         job.end_members_with_the_job()?;
         Ok(job)
     }
@@ -86,8 +103,15 @@ impl Job {
     pub fn open(key: &str) -> Result<Option<Self>> {
         let name = job_name(key)?;
         // SAFETY: `name` is NUL-terminated.
-        let handle =
-            unsafe { OpenJobObjectW(JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE, 0, name.as_ptr()) };
+        let handle = unsafe {
+            OpenJobObjectW(
+                JOB_OBJECT_QUERY
+                    | JOB_OBJECT_TERMINATE
+                    | windows_sys::Win32::Storage::FileSystem::READ_CONTROL,
+                0,
+                name.as_ptr(),
+            )
+        };
         if handle.is_null() {
             let error = io::Error::last_os_error();
             if error.raw_os_error().map(|code| code as u32) == Some(ERROR_FILE_NOT_FOUND) {
@@ -95,9 +119,15 @@ impl Job {
             }
             return Err(error.into());
         }
-        Ok(Some(Self {
+        let job = Self {
             handle: Owned(handle),
-        }))
+            key: key.to_owned(),
+        };
+        ensure!(
+            super::winsec::handle_is_private(job.handle.0)?,
+            "the recorded job is not private to this account"
+        );
+        Ok(Some(job))
     }
 
     fn end_members_with_the_job(&self) -> Result<()> {
@@ -211,11 +241,11 @@ impl Job {
     }
 
     /// The journal record for the tree rooted at `process`.
-    pub fn token(&self, key: &str, process: u32) -> Result<String> {
+    pub fn token(&self, process: u32) -> Result<String> {
         Ok(Record {
             process,
             started: started_at(process)?,
-            key: key.to_owned(),
+            key: self.key.clone(),
         }
         .to_string())
     }

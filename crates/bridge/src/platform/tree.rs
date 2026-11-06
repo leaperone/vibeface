@@ -70,7 +70,7 @@ impl Tree {
             let id = child.id().context("the program exited at once")?;
             let started = job
                 .adopt(&child)
-                .and_then(|()| job.token(key, id))
+                .and_then(|()| job.token(id))
                 .and_then(|token| super::winjob::resume_process(id).map(|()| token));
             match started {
                 Ok(token) => Ok((

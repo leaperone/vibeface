@@ -43,6 +43,7 @@ jobs:
           RELEASE_APP: ${{ inputs.app || (startsWith(github.ref_name, 'www-v') && 'www' || 'product') }}
           RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          WINDOWS_SIGNING_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 -B - <<'PY'
@@ -57,6 +58,8 @@ jobs:
                   raise SystemExit('Publishing requires the exact existing tag as the workflow ref')
               command += ['--require-main', '--publish']
           result = json.loads(subprocess.check_output(command, text=True))
+          if scope == 'product' and result['channel'] == 'stable' and os.environ['WINDOWS_SIGNING_CONFIGURED'] != 'true':
+              raise SystemExit('Stable product builds require a Windows Authenticode certificate before any producers start')
           if result['source_commit'] != os.environ['GITHUB_SHA']:
               raise SystemExit('Build source differs from the workflow commit')
           if publish:
@@ -155,6 +158,11 @@ jobs:
       source_sha: ${{ needs.identity.outputs.source_sha }}
       runner: windows-2025
       target: x86_64-pc-windows-msvc
+    secrets:
+      WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      WINDOWS_CERTIFICATE_SUBJECT: ${{ secrets.WINDOWS_CERTIFICATE_SUBJECT }}
+      WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
   android:
     needs: [identity]
     if: needs.identity.outputs.app == 'product'
@@ -228,6 +236,12 @@ jobs:
       runner: windows-2025
       target: x86_64-pc-windows-msvc
       native_artifact_id: ${{ needs.compose-windows.outputs.artifact_id }}
+      sign: true
+    secrets:
+      WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      WINDOWS_CERTIFICATE_SUBJECT: ${{ secrets.WINDOWS_CERTIFICATE_SUBJECT }}
+      WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
   collect:
     needs: [identity, static, compose-macos, compose-linux-x64, compose-linux-arm64, compose-windows, desktop-macos, desktop-windows, android]
     if: >-

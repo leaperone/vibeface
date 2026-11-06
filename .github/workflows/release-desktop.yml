@@ -13,6 +13,10 @@ on:
       APPLE_API_KEY_P8_BASE64: {required: false}
       APPLE_API_KEY_ID: {required: false}
       APPLE_API_ISSUER_ID: {required: false}
+      WINDOWS_CERTIFICATE_PFX_BASE64: {required: false}
+      WINDOWS_CERTIFICATE_PASSWORD: {required: false}
+      WINDOWS_CERTIFICATE_SUBJECT: {required: false}
+      WINDOWS_CERTIFICATE_THUMBPRINT: {required: false}
     outputs:
       artifact_id:
         value: ${{ jobs.desktop.outputs.artifact_id }}
@@ -72,16 +76,21 @@ jobs:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
         run: bash scripts/import-mac-identity.sh
+      - uses: ./.github/actions/msvc-environment
+        if: runner.os == 'Windows'
       - name: Build the desktop application around the sealed runtime
         env:
           TARGET: ${{ inputs.target }}
           RUNTIME_DIR: ${{ steps.runtime.outputs.dir }}
           RUNTIME_ARCHIVE: ${{ steps.runtime.outputs.archive }}
           SIGN: ${{ inputs.sign }}
+          WIN_CSC_LINK: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          VIBEFACE_WINDOWS_EXPECTED_SUBJECT: ${{ secrets.WINDOWS_CERTIFICATE_SUBJECT }}
+          VIBEFACE_WINDOWS_EXPECTED_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
         run: |
           arguments=(--target "$TARGET" --runtime-dir "$RUNTIME_DIR" --runtime-archive "$RUNTIME_ARCHIVE" --output .artifacts/desktop)
-          # Windows has no configured Authenticode certificate, so it produces an explicit unsigned preview.
-          if [[ "$SIGN" == true && "$TARGET" == *-apple-darwin ]]; then arguments+=(--sign); fi
+          if [[ "$SIGN" == true && ( "$TARGET" == *-apple-darwin || -n "$WIN_CSC_LINK" ) ]]; then arguments+=(--sign); fi
           node scripts/build-desktop.mjs "${arguments[@]}"
       - name: Verify the built application and its provenance
         env:
