@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, inputEventBody, inputTargetKey, inputTaskCommand, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, retryText, roleLabel, reachDevice } from './protocol.ts'
+import { awaitsDevice, botReach, botCanSend, canRetryJob, inputEventBody, inputTargetKey, inputTaskCommand, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, retryText, roleLabel, reachDevice } from './protocol.ts'
 import type { ManagerJob, TurnRuntime } from '../workspace/types.ts'
 import { parseInputReceipt, parseNodes, parsePendingMessage, parseTurnRuntime, parseWorkspaceCommand, parseWorkspaceCommandNotSaved } from '../workspace/model.ts'
 import { enqueue, type OutboxItem } from '../lib/outbox.ts'
@@ -193,11 +193,9 @@ test('retry requires explicit not-started evidence and an affirmative job receip
   assert.match(runtimeLabel({ ...runtime, provider: 'pi', switched_from: { provider: 'claude', model: 'opus', reasoning_effort: 'high' }, switch_reason: 'quota' }), /由 Claude Code 的 opus 切换/)
 })
 
-test('the shared readiness reason names the provider and device without blocking unverified sends', () => {
+test('unverified provider authentication remains sendable', () => {
   const [node] = parseNodes({ nodes: [{ device_id: 'mac', name: '我的 Mac', online: true, local: false, revoked: false, capabilities: { manager: 'claude', manager_state: 'unverified', manager_readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }, roots: [], relay: false } }] })
   assert.equal(botCanSend(botReach([node])), true)
-  assert.match(botProviderNotice([node]), /Claude Code · 我的 Mac/)
-  assert.match(botProviderNotice([node]), /认证状态尚未确认/)
 })
 
 test('重试 sends the message as it was only when the reply provably did nothing', () => {

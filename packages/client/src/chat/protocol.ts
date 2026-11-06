@@ -2,7 +2,7 @@ import { botReadiness, inputText } from '../workspace/model.ts'
 import { newId } from '../workspace/storage.ts'
 import type { MessageRequest, PendingMessage, TranscriptMessage } from './types.ts'
 import { failureText } from '../lib/errors.ts'
-import { asProvider, providerNames, probeIssueText } from '../lib/node.ts'
+import { providerNames } from '../lib/node.ts'
 import type { InputIntent, InputTarget, ManagerJob, ProviderStage, TurnRuntime, NodeInfo, WorkspaceCommand, WorkspaceInputBody } from '../workspace/types.ts'
 import type { FailureKind } from '../lib/errors.ts'
 
@@ -49,22 +49,6 @@ export function runtimeLabel(runtime: TurnRuntime): string {
   const reason = runtime.switch_reason ? `，原因 ${failureText(runtime.switch_reason) || 'AI 服务未能启动'}` : ''
   return `${providerNames[runtime.provider]} · ${model} · ${effort} · ${stages[runtime.stage]}${switched}${reason}`
 }
-export function botProviderNotice(nodes: NodeInfo[], owner?: string | null): string {
-  const node = nodes.find((item) => !item.revoked && item.device_id === owner && item.capabilities?.manager)
-    ?? nodes.find((item) => !item.revoked && item.online && item.capabilities?.manager)
-    ?? nodes.find((item) => !item.revoked && item.capabilities?.manager)
-  if (!node?.capabilities?.manager) return ''
-  const provider = asProvider(node.capabilities.manager)
-  const prefix = `${provider ? providerNames[provider] : node.capabilities.manager} · ${node.name || '运行设备'}`
-  if (!node.online) return `${prefix} 离线，先恢复设备连接，再查询回复结果。`
-  const readiness = node.capabilities.manager_readiness
-  if (readiness && 'issue' in readiness && provider) return `${prefix} · ${probeIssueText(provider, readiness.issue)}。检查状态${readiness.state === 'unverified' ? '尚未确认' : '需设置'}。`
-  if (node.capabilities.manager_state === 'unverified') return `${prefix} 尚未确认可用，可发送消息或在设备设置检查。`
-  if (node.capabilities.manager_state === 'needs_setup') return `${prefix} 需设置，请在运行设备检查认证和模型。`
-  if (node.capabilities.manager_state === 'starting') return `${prefix} 正在启动，请稍后查询。`
-  return ''
-}
-
 /** The device a person goes to while the bot cannot reply: the one to set up, else the one that is offline. */
 export function reachDevice(nodes: NodeInfo[], reach: BotReach): string | undefined {
   if (reach === 'needs_setup') return nodes.find((node) => botReadiness(node) === 'needs_setup')?.device_id

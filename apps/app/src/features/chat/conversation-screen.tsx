@@ -28,7 +28,7 @@ import { PromptInput } from './elements/prompt-input'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { InputQueue, TargetContextButton, WorkspaceInputStatus } from '@/features/workspace/workspace-chat'
 import type { InputIntent, InputTarget } from '@vibeface/client/workspace/types.ts'
-import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
 import { chatTimeline, firstUnread } from '@vibeface/client/chat/timeline.ts'
 import { networkKey, storageOf } from '@vibeface/client/workspace/storage.ts'
@@ -325,7 +325,6 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         <InlineError error={sendError} className="basis-full" />
         {inputTarget.kind !== "bot_main" ? <p className="basis-full">上方是 Bot 主聊天记录，当前输入补充所选工作。</p> : null}
         {stopSharing.length > 1 ? <p className="basis-full text-warning">停止会影响这些工作 · {stopSharing.map((work) => work.title || "工作").join("、")}</p> : null}
-        {botProviderNotice(workspace.nodes, data?.conversation?.owner) ? <p role="status" className="basis-full text-meta text-muted-foreground">{botProviderNotice(workspace.nodes, data?.conversation?.owner)}</p> : null}
         {needsSetup && !starting && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
     </section>

@@ -20,6 +20,7 @@ import { ErrorText } from '@/components/action'
 import { useLive } from '@/data/live'
 import type { Attachment } from '@/data/types'
 import { Composer } from '@/features/chat/composer'
+import { useChatChrome } from '@/features/chat/chrome'
 import { Markdown } from '@/features/chat/markdown'
 import { QuestionCard } from '@/features/chat/question-card'
 import { mobilePlatform } from '@/platform'
@@ -213,6 +214,7 @@ export function InputStatus({ pending }: { pending: PendingMessage }) {
 
 export function ScopedWorkspaceScreen({ taskId, channelId }: { taskId?: string; channelId?: string }) {
   const shared = useLive()
+  const chrome = useChatChrome()
   const { ready } = useDevice()
   const insets = useSafeAreaInsets()
   const [history, setHistory] = useState<WorkspaceHistory | null>(null)
@@ -292,7 +294,7 @@ export function ScopedWorkspaceScreen({ taskId, channelId }: { taskId?: string; 
       {history && !history.events.length ? <Text className="text-center text-meta text-muted-foreground">发送一条交代开始对话。</Text> : null}<Text className="text-meta text-muted-foreground">{history ? `已加载最近 ${history.events.length} 条${history.coverage.truncated ? '，更早的记录未加载' : ''}。` : '尚未读取历史。'}执行服务是否接收、输入归入哪个回合，请查看每条输入的状态。</Text>
       {error || actionError ? <ErrorText error={error || actionError} /> : null}
     </KeyboardAwareScrollView>
-    <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}><View style={{ paddingBottom: insets.bottom }}><Composer value={text} onChange={changeText} files={files} onFiles={setFiles} blocked={shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={`发给 ${label}`} sendLabel={intent === 'defer' ? '保存为稍后处理' : intent === 'new_task' ? '发送为新任务' : active ? '补充当前工作' : '发送'} target={<InputOptions label={label} options={options} selected={selected || (task ? `task:${task.task_id}` : taskId ? `task:${taskId}` : `member:${bot.bot_id}`)} onSelect={(option) => { selectionRevision.current++; setSelected(option.key); setSavedInput(null); if (option.target.kind === 'channel_task' || option.target.kind === 'channel_member') { setRecipient(option.target.bot_id); storage.writeStorage(selectionKey, { bot_id: option.target.bot_id, ...(option.target.kind === 'channel_task' ? { task_id: option.target.task_id } : {}) }); if (option.target.kind === 'channel_task') void shared.readWorkspaceState({ task_id: option.target.task_id }).catch((cause) => setError(messageOf(cause))) } }} intent={intent} onIntent={setIntent} pending={pending} />} onStop={task && !['completed', 'cancelled', 'deferred'].includes(task.state) ? () => void shared.stopInputTarget({ target, expected_revision: task.revision }).catch((cause) => setError(messageOf(cause))) : undefined} onSend={() => {
+    <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}><View style={{ paddingBottom: insets.bottom }}><Composer chrome={chrome} value={text} onChange={changeText} files={files} onFiles={setFiles} blocked={shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={`发给 ${label}`} sendLabel={intent === 'defer' ? '保存为稍后处理' : intent === 'new_task' ? '发送为新任务' : active ? '补充当前工作' : '发送'} target={<InputOptions label={label} options={options} selected={selected || (task ? `task:${task.task_id}` : taskId ? `task:${taskId}` : `member:${bot.bot_id}`)} onSelect={(option) => { selectionRevision.current++; setSelected(option.key); setSavedInput(null); if (option.target.kind === 'channel_task' || option.target.kind === 'channel_member') { setRecipient(option.target.bot_id); storage.writeStorage(selectionKey, { bot_id: option.target.bot_id, ...(option.target.kind === 'channel_task' ? { task_id: option.target.task_id } : {}) }); if (option.target.kind === 'channel_task') void shared.readWorkspaceState({ task_id: option.target.task_id }).catch((cause) => setError(messageOf(cause))) } }} intent={intent} onIntent={setIntent} pending={pending} />} onStop={task && !['completed', 'cancelled', 'deferred'].includes(task.state) ? () => void shared.stopInputTarget({ target, expected_revision: task.revision }).catch((cause) => setError(messageOf(cause))) : undefined} onSend={() => {
       const submittedDraft = draft
       if (savingDrafts.current.has(submittedDraft)) return
       savingDrafts.current.add(submittedDraft)

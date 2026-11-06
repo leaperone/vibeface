@@ -2,14 +2,16 @@ import * as DocumentPicker from 'expo-document-picker'
 import * as Haptics from 'expo-haptics'
 import { ArrowUp, LoaderCircle, Paperclip, Square, X } from 'lucide-react-native'
 import type { ReactNode } from 'react'
-import { Pressable, ScrollView, TextInput, View } from 'react-native'
+import { Platform, Pressable, ScrollView, TextInput, View } from 'react-native'
 import { Button } from '@/components/ui/button'
 import { caret } from '@/components/ui/input'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import type { Attachment } from '@/data/types'
+import { ChatMaterial, type ChatChrome } from './chrome'
 
 type Props = {
+  chrome: ChatChrome
   value: string
   onChange: (value: string) => void
   files: Attachment[]
@@ -19,7 +21,7 @@ type Props = {
   sending: boolean
   onSend: () => void
   onStop?: () => void
-  /** A follow-up under the blocked note, kept on the composer's column. */
+  /** Status and actions shown below the input. */
   children?: ReactNode
   /** The bot's accent for the live send button; the neutral fill without it. */
   tint?: { fill: string; ink: string }
@@ -28,7 +30,8 @@ type Props = {
   label?: string
 }
 
-export function Composer({ value, onChange, files, onFiles, blocked, sending, onSend, onStop, children, tint, target, sendLabel = '发送', label = '给 Bot 发消息' }: Props) {
+export function Composer({ chrome, value, onChange, files, onFiles, blocked, sending, onSend, onStop, children, tint, target, sendLabel = '发送', label = '给 Bot 发消息' }: Props) {
+  const ios = Platform.OS === 'ios'
   const drafting = value.trim().length > 0 || files.length > 0
   const canSend = !blocked && !sending && drafting
   const armed = canSend
@@ -37,34 +40,43 @@ export function Composer({ value, onChange, files, onFiles, blocked, sending, on
     if (picked.canceled) return
     onFiles([...files, ...picked.assets.map((asset) => ({ uri: asset.uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null }))])
   }
-  return <View className="gap-2 bg-background px-4 pb-3">
+  const attach = <Button variant="ghost" size="icon" className={ios ? 'size-13 rounded-full' : 'rounded-full'} accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} onPress={pick}>
+    <Icon as={Paperclip} className="text-muted-foreground" />
+  </Button>
+  const controls = <>
+    {onStop ? <Button instant size="icon" variant="outline" className="rounded-full shadow-none" accessibilityLabel="停止" onPress={onStop}>
+      <Icon as={Square} className="fill-foreground" />
+    </Button> : null}
+    <Button instant size="icon" variant="default" className="rounded-full shadow-none" style={armed && tint ? { backgroundColor: tint.fill } : undefined} accessibilityLabel={sending ? '本地保存中' : sendLabel} disabled={!canSend}
+      onPress={sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() }}>
+      {sending ? <Icon as={LoaderCircle} /> : <Icon as={ArrowUp} color={armed ? tint?.ink : undefined} />}
+    </Button>
+  </>
+  const input = <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel={label} placeholder={blocked ?? '发消息'} placeholderTextColorClassName="accent-muted-foreground" multiline maxLength={100000}
+    className={ios ? 'max-h-40 min-h-11 min-w-0 flex-1 ps-3.5 pe-2 py-2.5 font-sans text-body text-foreground' : 'max-h-40 min-h-11 px-4 pt-3 pb-1 font-sans text-body text-foreground'} value={value} onChangeText={onChange} />
+  const box = <>
+    {files.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 px-3 pt-3">
+      {files.map((file, index) => <View key={`${file.uri}:${index}`} className="max-w-48 flex-row items-center rounded-full bg-muted ps-3">
+        <Text numberOfLines={1} className="shrink text-meta">{file.name}</Text>
+        <Pressable accessibilityRole="button" accessibilityLabel={`移除 ${file.name}`} hitSlop={6} className="size-8 items-center justify-center" onPress={() => onFiles(files.filter((_, at) => at !== index))}>
+          <Icon as={X} className="size-3.5" />
+        </Pressable>
+      </View>)}
+    </ScrollView> : null}
+    {ios ? <View className="min-h-13 flex-row items-end p-1">
+      {input}<View className="flex-row gap-1">{controls}</View>
+    </View> : <>
+      {input}
+      <View className="flex-row items-center justify-between ps-0.5 pe-1.5 pb-1.5">{attach}{controls}</View>
+    </>}
+  </>
+  return <View pointerEvents={ios ? 'box-none' : undefined} className={ios ? 'gap-2 px-4 pb-2' : 'gap-2 bg-background px-4 pb-3'}>
     {target ? <View className="w-full max-w-3xl self-center">{target}</View> : null}
-    <View className="w-full max-w-3xl self-center rounded-2xl border border-input bg-card shadow-sm">
-      {files.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 px-3 pt-3">
-        {files.map((file, index) => <View key={`${file.uri}:${index}`} className="max-w-48 flex-row items-center rounded-full bg-muted ps-3">
-          <Text numberOfLines={1} className="shrink text-meta">{file.name}</Text>
-          <Pressable accessibilityRole="button" accessibilityLabel={`移除 ${file.name}`} hitSlop={6} className="size-8 items-center justify-center" onPress={() => onFiles(files.filter((_, at) => at !== index))}>
-            <Icon as={X} className="size-3.5" />
-          </Pressable>
-        </View>)}
-      </ScrollView> : null}
-      <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel={label} placeholder={blocked ?? '发消息'} placeholderTextColorClassName="accent-muted-foreground" multiline maxLength={100000}
-        className="max-h-40 min-h-11 px-4 pt-3 pb-1 font-sans text-body text-foreground" value={value} onChangeText={onChange} />
-      <View className="flex-row items-center justify-between ps-0.5 pe-1.5 pb-1.5">
-        <Button variant="ghost" size="icon" className="rounded-full" accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} onPress={pick}>
-          <Icon as={Paperclip} className="text-muted-foreground" />
-        </Button>
-        {onStop ? <Button instant size="icon" variant="outline" className="rounded-full shadow-none" accessibilityLabel="停止" onPress={onStop}>
-          <Icon as={Square} className="fill-foreground" />
-        </Button> : null}
-        {/* Idle, the disabled default button rests muted; ready, it takes the bot's tint. */}
-        <Button instant size="icon" variant="default" className="rounded-full shadow-none" style={armed && tint ? { backgroundColor: tint.fill } : undefined} accessibilityLabel={sending ? '本地保存中' : sendLabel} disabled={!canSend}
-          onPress={sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() }}>
-          {sending ? <Icon as={LoaderCircle} /> : <Icon as={ArrowUp} color={armed ? tint?.ink : undefined} />}
-        </Button>
-      </View>
-    </View>
-    {blocked && value || children ? <View className="w-full max-w-3xl self-center">
+    {ios ? <View pointerEvents="box-none" className="w-full max-w-3xl flex-row items-end gap-2 self-center">
+      <ChatMaterial chrome={chrome} className="size-13">{attach}</ChatMaterial>
+      <ChatMaterial chrome={chrome} className="min-w-0 flex-1">{box}</ChatMaterial>
+    </View> : <View className="w-full max-w-3xl self-center rounded-2xl border border-input bg-card shadow-sm">{box}</View>}
+    {blocked && value || children ? <View className={ios ? 'w-full max-w-3xl self-center rounded-xl bg-card py-1' : 'w-full max-w-3xl self-center'}>
       {blocked && value ? <Text className="px-2 text-meta text-muted-foreground">{blocked}</Text> : null}
       {children}
     </View> : null}
