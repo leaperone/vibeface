@@ -1,3 +1,5 @@
+mod desktop_parent;
+
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::{
@@ -26,6 +28,9 @@ struct CoreArgs {
     /// Read one bounded control request from stdin and write one bounded JSON response.
     #[arg(long, hide = true)]
     control: bool,
+    /// Stop this desktop-owned Core normally when its parent's private stdin pipe closes.
+    #[arg(long, hide = true, conflicts_with = "control")]
+    desktop_parent_stdin: bool,
 }
 
 #[tokio::main]
@@ -55,6 +60,7 @@ async fn main() -> Result<()> {
         std::io::stdout().write_all(&output)?;
         return Ok(());
     }
+    let mut desktop_parent = desktop_parent::DesktopParent::watch(args.desktop_parent_stdin)?;
     let data_dir = args
         .data_dir
         .or_else(|| std::env::var_os("VIBEFACE_DATA_DIR").map(PathBuf::from))
@@ -80,12 +86,23 @@ async fn main() -> Result<()> {
     let mut runtime = Runtime::open(&data_dir).await?;
     runtime.config.web_enabled &= !args.no_web;
     let runtime = Arc::new(runtime);
-    runtime.start().await?;
+    let startup = tokio::select! {
+        result = runtime.start() => result,
+        result = desktop_parent.closed() => {
+            runtime.shutdown().await;
+            return result;
+        }
+    };
+    if let Err(error) = startup {
+        runtime.shutdown().await;
+        return Err(error);
+    }
     let mut rejoin = false;
     let result = tokio::select! {
         result = vibeface_core::api::serve(runtime.clone(), app_dir) => result,
         result = vibeface_core::maintenance::serve(runtime.clone(), data_dir.clone()) => result,
         _ = runtime.rejoin_requested() => { rejoin = true; Ok(()) }
+        result = desktop_parent.closed() => result,
         stop = vibeface_bridge::platform::stop::requested() => stop.map(drop).map_err(Into::into),
     };
     runtime.shutdown().await;
