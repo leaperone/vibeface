@@ -7,7 +7,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const desktop = __dirname;
-const repo = path.resolve(desktop, '../..');
 const ELECTRON_VERSION = '45.2.3';
 const PLATFORMS = {
   'aarch64-apple-darwin': { os: 'mac', arch: 'arm64' },
@@ -25,6 +24,8 @@ const metadata = JSON.parse(fs.readFileSync(path.join(desktop, 'package.json'), 
 assert.equal(metadata.main, 'dist/main/index.cjs', 'the desktop package must point at the compiled main entry');
 assert.equal((metadata.devDependencies ?? {}).electron, ELECTRON_VERSION, `the desktop package must pin electron ${ELECTRON_VERSION}`);
 
+assert(!signed || target !== 'aarch64-apple-darwin' || process.env.VIBEFACE_CODESIGN_TEAM,
+  'notarizing the macOS application needs the Developer ID team identifier');
 const { arch } = PLATFORMS[target];
 const artifactName = `vibeface-desktop-\${version}-${target}.\${ext}`;
 
@@ -52,12 +53,13 @@ module.exports = {
     artifactName,
     hardenedRuntime: true,
     gatekeeperAssess: false,
-    entitlements: path.join(repo, 'scripts/desktop/entitlements.mac.plist'),
-    entitlementsInherit: path.join(repo, 'scripts/desktop/entitlements.mac.plist'),
+    entitlements: path.join(desktop, 'build/entitlements.mac.plist'),
+    entitlementsInherit: path.join(desktop, 'build/entitlements.mac.plist'),
     // Re-signing the application must not touch the already signed and sealed CLI and Core.
     signIgnore: ['Contents/Resources/runtime/'],
     identity: signed ? undefined : null,
-    notarize: false,
+    // Notarization uses the existing Developer ID and App Store Connect key, then staples the app.
+    notarize: signed ? { teamId: process.env.VIBEFACE_CODESIGN_TEAM } : false,
     extendInfo: { NSHighResolutionCapable: true, LSMinimumSystemVersion: '12.0.0' },
   },
   win: {

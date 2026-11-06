@@ -93,13 +93,26 @@ function readDesktopPackage(version) {
 }
 
 /** Signing identity resolution: real credentials or an explicitly recorded unsigned preview. */
+const MAC_SIGNING_VARS = ['VIBEFACE_CODESIGN_IDENTITY', 'VIBEFACE_CODESIGN_TEAM', 'VIBEFACE_NOTARY_KEY',
+  'VIBEFACE_NOTARY_KEY_ID', 'VIBEFACE_NOTARY_ISSUER'];
+
 function signingState(target, requested) {
   const configured = target === 'aarch64-apple-darwin'
-    ? Boolean(process.env.VIBEFACE_CODESIGN_IDENTITY)
+    ? MAC_SIGNING_VARS.every(name => process.env[name])
     : Boolean(process.env.WIN_CSC_LINK || process.env.CSC_LINK);
   if (!requested) return { signed: false, signing: 'unsigned-development-preview' };
   assert(configured, `--sign needs a configured signing certificate for ${target}; no signature is ever claimed without one`);
   return { signed: true, signing: PLATFORMS[target].signing };
+}
+
+/** The App Store Connect key electron-builder notarizes with, from the existing release secrets. */
+function notaryEnvironment(target, signed) {
+  if (!signed || target !== 'aarch64-apple-darwin') return {};
+  return {
+    APPLE_API_KEY: process.env.VIBEFACE_NOTARY_KEY,
+    APPLE_API_KEY_ID: process.env.VIBEFACE_NOTARY_KEY_ID,
+    APPLE_API_ISSUER: process.env.VIBEFACE_NOTARY_ISSUER,
+  };
 }
 
 function copyRuntime(source, destination) {
@@ -159,6 +172,7 @@ function build({ target, runtimeDir, output, runtimeArchive, sign }) {
       VIBEFACE_DESKTOP_OUT: electronOut,
       VIBEFACE_DESKTOP_SIGN: signed ? '1' : '',
       CSC_IDENTITY_AUTO_DISCOVERY: signed ? 'true' : 'false',
+      ...notaryEnvironment(target, signed),
     },
   });
   verifySealedRuntime(packagedRuntime(electronOut, target), sealed);
@@ -261,6 +275,18 @@ function selfTest() {
     assert.deepEqual(signingState('aarch64-apple-darwin', false), { signed: false, signing: 'unsigned-development-preview' });
     for (const platform of Object.keys(PLATFORMS)) {
       assert.throws(() => signingState(platform, true), /configured signing certificate/, platform);
+    }
+    // A partial macOS credential set must never pass as signed, and never reaches notarization.
+    for (const absent of MAC_SIGNING_VARS) {
+      const environment = Object.fromEntries(MAC_SIGNING_VARS.filter(name => name !== absent).map(name => [name, 'set']));
+      const restore = { ...process.env };
+      Object.assign(process.env, environment);
+      try {
+        assert.throws(() => signingState('aarch64-apple-darwin', true), /configured signing certificate/, absent);
+        assert.deepEqual(notaryEnvironment('aarch64-apple-darwin', false), {}, 'an unsigned build never reads notary keys');
+      } finally {
+        process.env = restore;
+      }
     }
     console.log('desktop build self-test passed: sealed runtime verification, cohort identity, packaging immutability and honest signing status.');
   } finally {

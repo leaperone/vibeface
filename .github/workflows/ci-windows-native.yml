@@ -1,0 +1,84 @@
+name: Windows native checks
+# Called from ci.yml so a manual dispatch on a branch can reach it; it never dispatches on its own.
+on:
+  workflow_call:
+    inputs:
+      source_sha: {type: string, required: true}
+      package_artifact: {type: string, required: true}
+permissions:
+  contents: read
+jobs:
+  rust:
+    name: windows rust
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run: {shell: bash}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ inputs.source_sha }}', persist-credentials: false}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with: {components: clippy}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ci-windows-native
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with: {python-version: '3.12'}
+      - name: Select this platform's Python
+        run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
+      - name: Confirm the host really is the MSVC target
+        run: |
+          rustc -vV
+          test "$(rustc -vV | sed -n 's/^host: //p')" = x86_64-pc-windows-msvc
+          cl.exe 2>&1 | head -n 1 | grep -q 'Microsoft (R) C/C++'
+      - name: Lint the Windows Core, CLI and platform crates
+        run: '"$PY" -B scripts/ci.py check --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface-core vibeface-control vibeface'
+      - name: Run the native Windows tests
+        run: '"$PY" -B scripts/ci.py test --tier fast --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface-core vibeface-control vibeface'
+
+  process:
+    name: windows packaged processes
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run: {shell: bash}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ inputs.source_sha }}', persist-credentials: false}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with: {python-version: '3.12'}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ inputs.package_artifact }}
+          path: .artifacts/packages
+      - name: Select this platform's Python
+        run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
+      - name: Unpack the verified Windows package
+        id: unpack
+        run: |
+          shopt -s nullglob
+          archives=(.artifacts/packages/*.tar.gz)
+          [[ "${#archives[@]}" == 1 ]]
+          name="$(basename "${archives[0]}" .tar.gz)"
+          (cd .artifacts/packages && shasum -a 256 -c "$name.tar.gz.sha256")
+          mkdir -p .artifacts/unpacked
+          tar -xzf "${archives[0]}" -C .artifacts/unpacked
+          printf 'package=%s\n' "$PWD/.artifacts/unpacked/$name" >> "$GITHUB_OUTPUT"
+      - name: Verify real Windows processes, private IPC, service, update and provider fixtures
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: |
+          # scripts/verify-windows-node.py ships with the Windows runtime; without it this check cannot pass.
+          [[ -f scripts/verify-windows-node.py ]] || { echo '::error::scripts/verify-windows-node.py is missing from this source; the Windows process verification cannot run.'; exit 1; }
+          "$PY" -B scripts/verify-windows-node.py --binary "$PACKAGE/vibeface.exe" --core-binary "$PACKAGE/vibeface-core.exe" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-windows-node
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ !cancelled() }}
+        with:
+          name: windows-node-${{ inputs.source_sha }}-${{ github.run_attempt }}
+          path: .artifacts/ci-windows-node
+          if-no-files-found: warn
+          retention-days: 7

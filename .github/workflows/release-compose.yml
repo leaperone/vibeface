@@ -15,6 +15,8 @@ permissions:
 jobs:
   compose:
     runs-on: ${{ inputs.runner }}
+    defaults:
+      run: {shell: bash}
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -32,6 +34,8 @@ jobs:
           path: .artifacts/app-input
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with: {node-version: '24'}
+      - name: Select this platform's Python
+        run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
       - name: Compose from this run's exact inputs
         id: package
         env:
@@ -39,18 +43,30 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          chmod +x .artifacts/native-input/vibeface .artifacts/native-input/vibeface-core
-          version=$(python3 -B scripts/release.py plan --app product | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
-          python3 -B scripts/release.py compose --target "$TARGET" --native-dir .artifacts/native-input --app-archive ".artifacts/app-input/vibeface-app-$version.tar.gz" --output .artifacts/release
+          exe=''
+          if [[ "$TARGET" == *-windows-* ]]; then exe='.exe'; fi
+          chmod +x ".artifacts/native-input/vibeface$exe" ".artifacts/native-input/vibeface-core$exe"
+          version=$("$PY" -B scripts/release.py plan --app product | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+          "$PY" -B scripts/release.py compose --target "$TARGET" --native-dir .artifacts/native-input --app-archive ".artifacts/app-input/vibeface-app-$version.tar.gz" --output .artifacts/release
           mkdir .artifacts/smoke
           tar -xzf ".artifacts/release/vibeface-$version-$TARGET.tar.gz" -C .artifacts/smoke
-          echo "package=$PWD/.artifacts/smoke/vibeface-$version-$TARGET" >> "$GITHUB_OUTPUT"
+          {
+            printf 'package=%s\n' "$PWD/.artifacts/smoke/vibeface-$version-$TARGET"
+            printf 'archive=%s\n' "$PWD/.artifacts/release/vibeface-$version-$TARGET.tar.gz"
+            printf 'exe=%s\n' "$exe"
+          } >> "$GITHUB_OUTPUT"
       - name: Verify the composed programs and Web resources
         env:
           PACKAGE: ${{ steps.package.outputs.package }}
+          EXE: ${{ steps.package.outputs.exe }}
         run: |
-          "$PACKAGE/vibeface" --help
-          python3 -B scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/release-smoke --web-only
+          "$PACKAGE/vibeface$EXE" --help
+          "$PACKAGE/vibeface-core$EXE" --version
+          # The Windows process, private IPC, service and provider checks run in the Windows native
+          # workflow with the Windows verifier; this verifier covers the POSIX platforms.
+          if [[ -z "$EXE" ]]; then
+            "$PY" -B scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/release-smoke --web-only
+          fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         id: upload
         with:

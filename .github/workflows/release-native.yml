@@ -19,6 +19,8 @@ permissions:
 jobs:
   build:
     runs-on: ${{ inputs.runner }}
+    defaults:
+      run: {shell: bash}
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -26,6 +28,8 @@ jobs:
         with: {ref: '${{ inputs.source_sha }}', persist-credentials: false}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      - name: Select this platform's Python
+        run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
       - name: Build both native programs
         env:
           TARGET: ${{ inputs.target }}
@@ -33,7 +37,7 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(rustc -vV | sed -n 's/^host: //p')" = "$TARGET"
-          CARGO_ENCODED_RUSTFLAGS="$(python3 scripts/release-rustflags.py)"
+          CARGO_ENCODED_RUSTFLAGS="$("$PY" -B scripts/release-rustflags.py)"
           export CARGO_ENCODED_RUSTFLAGS
           cargo build --release --locked -p vibeface -p vibeface-core --target "$TARGET"
       - name: Sign and notarize both macOS programs
@@ -49,7 +53,7 @@ jobs:
       - name: Bind native inputs to the source
         env:
           TARGET: ${{ inputs.target }}
-        run: python3 -B scripts/release.py stage-native --target "$TARGET" --input "target/$TARGET/release" --output .artifacts/native-input
+        run: '"$PY" -B scripts/release.py stage-native --target "$TARGET" --input "target/$TARGET/release" --output .artifacts/native-input'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         id: upload
         with:

@@ -21,6 +21,10 @@ on:
         description: 'Optional explicit same-source small-experiment run ID to reuse verified public parts'
         type: string
         default: ''
+      desktop:
+        description: 'Also run the hosted Windows native checks and the real Mac and Windows desktop window tests'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.delivery_small && 'delivery-small' || format('{0}-{1}-{2}', github.event_name, github.ref, (github.event_name == 'workflow_dispatch' || github.run_attempt > 1) && github.run_id || '') }}
@@ -91,18 +95,25 @@ jobs:
           python3 scripts/install-delivery-toolchain.py --self-test
           python3 scripts/run-delivery-live.py --self-test
           python3 scripts/daily-nightly.py --self-test
-          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/release.py", "scripts/daily-nightly.py")]'
+          python3 scripts/release.py --self-test
+          python3 scripts/package-node-windows.py --self-test
+          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/release.py", "scripts/package-node-windows.py", "scripts/check-release-workflow.py", "scripts/daily-nightly.py")]'
           bash -n install.sh
-          bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
-          shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
+          bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/import-mac-identity.sh
+          shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/import-mac-identity.sh
           bash install.sh --self-test
       - name: Check JavaScript syntax
         run: |
           node --check scripts/crypto-client.mjs
           node --check apps/cli/npm/bin/vibeface.mjs
           node --check scripts/package-npm.mjs
+          node --check scripts/build-desktop.mjs
+          node --check scripts/verify-desktop.mjs
+          node --check apps/desktop/electron-builder.cjs
           node scripts/package-npm.mjs --self-test
           node scripts/publish-npm.mjs --self-test
+          node scripts/build-desktop.mjs --self-test
+          node scripts/verify-desktop.mjs --self-test
       - run: cargo fmt --all -- --check
 
   www:
@@ -328,6 +339,9 @@ jobs:
     if: needs.plan.outputs.package == 'true'
     name: package (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.package_matrix) }}
@@ -372,53 +386,23 @@ jobs:
           APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-        run: |
-          for name in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
-            [[ -n "${!name}" ]] || { echo "::error::Repository secret $name is required to sign and notarize macOS packages."; exit 1; }
-          done
-          echo "::add-mask::$APPLE_API_KEY_ID"
-          echo "::add-mask::$APPLE_API_ISSUER_ID"
-          keychain="$RUNNER_TEMP/vibeface-signing.keychain-db"
-          keychain_password="$(openssl rand -hex 32)"
-          echo "::add-mask::$keychain_password"
-          umask 077
-          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/vibeface-signing.p12"
-          printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/vibeface-notary.p8"
-          security create-keychain -p "$keychain_password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$keychain_password" "$keychain"
-          security import "$RUNNER_TEMP/vibeface-signing.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -f pkcs12 -T /usr/bin/codesign
-          rm -f "$RUNNER_TEMP/vibeface-signing.p12"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
-          existing=()
-          while IFS= read -r line; do
-            line="${line#"${line%%[![:space:]]*}"}"
-            existing+=("${line//\"/}")
-          done < <(security list-keychains -d user)
-          security list-keychains -d user -s "$keychain" "${existing[@]}"
-          identities="$(security find-identity -v -p codesigning "$keychain" | grep '"Developer ID Application: ' || true)"
-          [[ -n "$identities" && "$(wc -l <<< "$identities")" -eq 1 ]] || { echo '::error::Expected exactly one Developer ID Application identity in the certificate.'; exit 1; }
-          identity="$(awk '{print $2}' <<< "$identities")"
-          team="$(sed -n 's/.*(\([A-Z0-9]\{10\}\))"$/\1/p' <<< "$identities")"
-          [[ "$identity" =~ ^[0-9A-F]{40}$ && -n "$team" ]] || { echo '::error::Could not resolve the signing identity or team.'; exit 1; }
-          {
-            printf 'VIBEFACE_CODESIGN_IDENTITY=%s\n' "$identity"
-            printf 'VIBEFACE_CODESIGN_TEAM=%s\n' "$team"
-            printf 'VIBEFACE_NOTARY_KEY=%s\n' "$RUNNER_TEMP/vibeface-notary.p8"
-            printf 'VIBEFACE_NOTARY_KEY_ID=%s\n' "$APPLE_API_KEY_ID"
-            printf 'VIBEFACE_NOTARY_ISSUER=%s\n' "$APPLE_API_ISSUER_ID"
-          } >> "$GITHUB_ENV"
+        run: bash scripts/import-mac-identity.sh
+      - name: Select this platform's Python
+        run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
       - name: Build native release package
         run: |
           [[ "$(rustc -vV | sed -n 's/^host: //p')" == "$PACKAGE_TARGET" ]]
-          bash scripts/package-node.sh --target "$PACKAGE_TARGET"
+          if [[ "$PACKAGE_TARGET" == *-windows-* ]]; then
+            "$PY" scripts/package-node-windows.py
+          else
+            bash scripts/package-node.sh --target "$PACKAGE_TARGET"
+          fi
           if [[ -n "${VIBEFACE_NOTARY_KEY:-}" ]]; then
             security delete-keychain "$RUNNER_TEMP/vibeface-signing.keychain-db"
             rm -f "$VIBEFACE_NOTARY_KEY"
           fi
       - name: Verify checksum and unpacked source identity
         id: unpack
-        shell: bash
         run: |
           shopt -s nullglob
           archives=(.artifacts/packages/*.tar.gz)
@@ -429,7 +413,7 @@ jobs:
           mkdir -p .artifacts/unpacked
           tar -xzf "$archive" -C .artifacts/unpacked
           package="$PWD/.artifacts/unpacked/$name"
-          python3 - "$package/BUILD-INFO.json" <<'PY'
+          "$PY" - "$package/BUILD-INFO.json" <<'PY'
           import json, os, pathlib, re, subprocess, sys
           info = json.load(open(sys.argv[1]))
           config = pathlib.Path("crates/control/src/lib.rs").read_text()
@@ -438,7 +422,8 @@ jobs:
           assert info["update_protocol"] == protocol and info["data_epoch"] == epoch
           assert info["source_commit"] == os.environ["GITHUB_SHA"]
           assert info["target"] == os.environ["PACKAGE_TARGET"]
-          binary = pathlib.Path(sys.argv[1]).parent / "vibeface"
+          suffix = ".exe" if info["target"].endswith("-pc-windows-msvc") else ""
+          binary = pathlib.Path(sys.argv[1]).parent / f"vibeface{suffix}"
           web = binary.parent / "web"
           assert (web / "_shell.html").stat().st_size > 0
           assert (web / "index.html").stat().st_size > 0
@@ -447,13 +432,18 @@ jobs:
           assert (web / ".vibeface-build.json").stat().st_size > 0
           assert (web / "vibeface_secure.js").stat().st_size > 0
           assert (web / "vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm")
-          assert (binary.parent / "vibeface-core").stat().st_size > 0
+          assert (binary.parent / f"vibeface-core{suffix}").stat().st_size > 0
+          installer = "install-node-service.ps1" if suffix else "install-node-service.sh"
+          assert (binary.parent / "scripts" / installer).stat().st_size > 0
           assert subprocess.check_output([str(binary), "--version"], text=True).strip() == f'vibeface {info["version"]}'
-          assert subprocess.check_output([str(binary.parent / "vibeface-core"), "--version"], text=True).strip() == f'vibeface-core {info["core_version"]}'
+          assert subprocess.check_output([str(binary.parent / f"vibeface-core{suffix}"), "--version"], text=True).strip() == f'vibeface-core {info["core_version"]}'
           PY
-          "$package/vibeface" --help
-          "$package/vibeface-core" --help
+          exe=''
+          if [[ "$PACKAGE_TARGET" == *-windows-* ]]; then exe='.exe'; fi
+          "$package/vibeface$exe" --help
+          "$package/vibeface-core$exe" --help
           printf 'package=%s\n' "$package" >> "$GITHUB_OUTPUT"
+          printf 'exe=%s\n' "$exe" >> "$GITHUB_OUTPUT"
       - name: Verify Developer ID signature
         if: matrix.target == 'aarch64-apple-darwin' && github.event_name != 'merge_group'
         env:
@@ -490,6 +480,7 @@ jobs:
             done
           done
       - name: Verify packaged Web assets and process
+        if: matrix.target != 'x86_64-pc-windows-msvc'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
@@ -883,6 +874,9 @@ jobs:
     needs: [plan, npm-package]
     if: needs.plan.outputs.npm == 'true'
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.package_matrix) }}
@@ -901,27 +895,67 @@ jobs:
           name: npm-package-${{ github.sha }}
           path: .artifacts/npm
       - name: Install npm artifact without lifecycle scripts
+        id: install
         env:
           PACKAGE_VERSION: ${{ needs.plan.outputs.version }}
           PACKAGE_TARGET: ${{ matrix.target }}
         run: |
           prefix="$PWD/.artifacts/npm-installed"
           npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$PWD/.artifacts/npm/leaperone-vibeface-$PACKAGE_VERSION.tgz"
-          [[ "$("$prefix/bin/vibeface" --version)" == "vibeface $PACKAGE_VERSION" ]]
-          core_version="$(node -p "require('$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/BUILD-INFO.json').core_version")"
-          [[ "$("$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/vibeface-core" --version)" == "vibeface-core $core_version" ]]
-          "$prefix/bin/vibeface" --help
+          if [[ "$PACKAGE_TARGET" == *-windows-* ]]; then
+            exe='.exe'
+            launcher="$prefix/vibeface"
+            vendor="$prefix/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET"
+          else
+            exe=''
+            launcher="$prefix/bin/vibeface"
+            vendor="$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET"
+          fi
+          [[ "$("$launcher" --version)" == "vibeface $PACKAGE_VERSION" ]]
+          core_version="$(node -p "require('$vendor/BUILD-INFO.json').core_version")"
+          [[ "$("$vendor/vibeface-core$exe" --version)" == "vibeface-core $core_version" ]]
+          "$launcher" --help
+          printf 'vendor=%s\n' "$vendor" >> "$GITHUB_OUTPUT"
       - name: Verify npm startup and bundled web
+        if: matrix.target != 'x86_64-pc-windows-msvc'
         env:
-          PACKAGE_TARGET: ${{ matrix.target }}
+          VENDOR: ${{ steps.install.outputs.vendor }}
         run: |
           prefix="$PWD/.artifacts/npm-installed"
-          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --core-binary "$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/vibeface-core" --crypto-module "$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --web-only
+          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --core-binary "$VENDOR/vibeface-core" --crypto-module "$VENDOR/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --web-only
+
+  windows-native:
+    needs: [plan, package]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && contains(needs.plan.outputs.package_matrix, 'x86_64-pc-windows-msvc') }}
+    uses: ./.github/workflows/ci-windows-native.yml
+    with:
+      source_sha: ${{ github.sha }}
+      package_artifact: node-package-x86_64-pc-windows-msvc-${{ github.sha }}
+
+  desktop-macos:
+    needs: [plan, package]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && contains(needs.plan.outputs.package_matrix, 'aarch64-apple-darwin') }}
+    uses: ./.github/workflows/ci-desktop.yml
+    with:
+      source_sha: ${{ github.sha }}
+      runner: macos-15
+      target: aarch64-apple-darwin
+      package_artifact: node-package-aarch64-apple-darwin-${{ github.sha }}
+
+  desktop-windows:
+    needs: [plan, package]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && contains(needs.plan.outputs.package_matrix, 'x86_64-pc-windows-msvc') }}
+    uses: ./.github/workflows/ci-desktop.yml
+    with:
+      source_sha: ${{ github.sha }}
+      runner: windows-2025
+      target: x86_64-pc-windows-msvc
+      package_artifact: node-package-x86_64-pc-windows-msvc-${{ github.sha }}
 
   ci-gate:
     name: ci-gate
     if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.delivery_small) }}
-    needs: [plan, quick-check, crypto-web, web, www, rust-check, rust-fast, rust-slow, delivery, delivery-live, package, npm-package, npm-smoke]
+    needs: [plan, quick-check, crypto-web, web, www, rust-check, rust-fast, rust-slow, delivery, delivery-live, package, npm-package, npm-smoke, windows-native, desktop-macos, desktop-windows]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -931,7 +965,7 @@ jobs:
       - name: Require every check selected for this commit and scenario
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
-        run: python3 scripts/ci.py gate --needs-env CI_NEEDS ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_live && '--delivery-live' || '' }}
+        run: python3 scripts/ci.py gate --needs-env CI_NEEDS ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_live && '--delivery-live' || '' }} ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && '--desktop' || '' }}
 
   daily-nightly:
     needs: ci-gate

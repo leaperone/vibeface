@@ -147,6 +147,14 @@ jobs:
       source_sha: ${{ needs.identity.outputs.source_sha }}
       runner: ubuntu-24.04-arm
       target: aarch64-unknown-linux-gnu
+  native-windows:
+    needs: [identity]
+    if: needs.identity.outputs.app == 'product'
+    uses: ./.github/workflows/release-native.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: windows-2025
+      target: x86_64-pc-windows-msvc
   android:
     needs: [identity]
     if: needs.identity.outputs.app == 'product'
@@ -185,13 +193,50 @@ jobs:
       target: aarch64-unknown-linux-gnu
       native_artifact_id: ${{ needs.native-linux-arm64.outputs.artifact_id }}
       app_artifact_id: ${{ needs.static.outputs.artifact_id }}
+  compose-windows:
+    needs: [identity, static, native-windows]
+    if: needs.identity.outputs.app == 'product'
+    uses: ./.github/workflows/release-compose.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: windows-2025
+      target: x86_64-pc-windows-msvc
+      native_artifact_id: ${{ needs.native-windows.outputs.artifact_id }}
+      app_artifact_id: ${{ needs.static.outputs.artifact_id }}
+  desktop-macos:
+    needs: [identity, compose-macos]
+    if: needs.identity.outputs.app == 'product'
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: macos-15
+      target: aarch64-apple-darwin
+      native_artifact_id: ${{ needs.compose-macos.outputs.artifact_id }}
+      sign: true
+    secrets:
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+  desktop-windows:
+    needs: [identity, compose-windows]
+    if: needs.identity.outputs.app == 'product'
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: windows-2025
+      target: x86_64-pc-windows-msvc
+      native_artifact_id: ${{ needs.compose-windows.outputs.artifact_id }}
   collect:
-    needs: [identity, static, compose-macos, compose-linux-x64, compose-linux-arm64, android]
+    needs: [identity, static, compose-macos, compose-linux-x64, compose-linux-arm64, compose-windows, desktop-macos, desktop-windows, android]
     if: >-
       always() && !cancelled() && needs.identity.result == 'success' && needs.static.result == 'success' &&
       (needs.identity.outputs.app == 'www' ||
       (needs.compose-macos.result == 'success' && needs.compose-linux-x64.result == 'success' &&
-      needs.compose-linux-arm64.result == 'success' && needs.android.result == 'success'))
+      needs.compose-linux-arm64.result == 'success' && needs.compose-windows.result == 'success' &&
+      needs.desktop-macos.result == 'success' && needs.desktop-windows.result == 'success' &&
+      needs.android.result == 'success'))
     runs-on: ubuntu-24.04
     outputs:
       release_artifact_id: ${{ steps.release-artifact.outputs.artifact-id }}
@@ -229,6 +274,24 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         if: needs.identity.outputs.app == 'product'
         with:
+          artifact-ids: ${{ needs.compose-windows.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/input/native/x86_64-pc-windows-msvc
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.identity.outputs.app == 'product'
+        with:
+          artifact-ids: ${{ needs.desktop-macos.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/input/desktop/aarch64-apple-darwin
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.identity.outputs.app == 'product'
+        with:
+          artifact-ids: ${{ needs.desktop-windows.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/input/desktop/x86_64-pc-windows-msvc
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.identity.outputs.app == 'product'
+        with:
           artifact-ids: ${{ needs.android.outputs.artifact_id }}
           merge-multiple: true
           path: .artifacts/input/mobile
@@ -251,7 +314,7 @@ jobs:
           SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
         run: |
           mkdir .artifacts/npm-input
-          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc; do
             cp ".artifacts/release/vibeface-$VERSION-$target.tar.gz" ".artifacts/release/vibeface-$VERSION-$target.tar.gz.sha256" .artifacts/npm-input/
           done
           node scripts/package-npm.mjs --input .artifacts/npm-input --source-commit "$SOURCE_SHA"
