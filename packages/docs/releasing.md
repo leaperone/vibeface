@@ -27,7 +27,7 @@ description: 了解 Vibeface 的 CI、制品和 Nightly 发布流程。
 
 ## 可下载的包
 
-每个平台的 Actions artifact 包含 `vibeface-<version>-<target>.tar.gz` 和同名 `.sha256`。`main` 的核心检查按需生成 Linux x64 包；扩展检查在三种架构的原生 runner 构建，解包后分别启动网页进程。多 Node、单 Node 调度、跨设备协作和公共入口的多进程验收只在 Linux x64 运行一次，聊天 Agent 与写入保护验收只在 macOS ARM64 运行一次，都不调用模型。
+每个平台的 Actions artifact 包含 `vibeface-<version>-<target>.tar.gz` 和同名 `.sha256`。`main` 的核心检查按需生成 Linux x64 包；扩展检查在三种架构的原生 runner 构建，解包后分别启动网页进程。多 Node、调度、跨设备协作和公共入口的多进程验收只在 Linux x64 运行一次，聊天 Agent 与写入保护验收只在 macOS ARM64 运行一次，都不调用模型。macOS 两项独立进程验收并行执行，保留各自状态和完整观察。
 
 | 平台 | Rust target | 构建和验收环境 |
 | --- | --- | --- |
@@ -57,11 +57,13 @@ cd vibeface-<version>-<target>
 
 包内有 Rust 程序、浏览器密码学 JS/WASM、文档、用户级服务安装脚本和 `BUILD-INFO.json`，不含身份、配置、数据库、Provider 程序或模型凭证。打包要求干净 Git 提交，记录版本、target、源码提交和各组件身份；存在未提交更改时拒绝生成发行包。
 
-发布构建脚本把本机源码、用户目录和工具缓存路径替换成通用路径；压缩包清除构建账号和扩展属性。打包拒绝过期生成物、额外文件和跳过原生构建。
+发布构建脚本把本机源码、用户目录和工具缓存路径替换成通用路径；压缩包清除构建账号和扩展属性。打包拒绝过期生成物和额外文件。默认重新编译原生程序；CI 可显式消费通过同 run、同源码、target 和完整摘要校验的原生输入，不接受任意二进制或无校验的跳过构建。
 
 自定义 Rust 编译参数通过 `RUSTFLAGS` 或 `CARGO_ENCODED_RUSTFLAGS` 传入，后者优先。发布脚本保留这些参数并追加路径映射；按 Cargo 的优先级，此时不使用配置文件中的 `rustflags`。
 
 运行任务前须另装并登录相应 Provider。Cursor 管理路径需另装 Cursor SDK Bridge 并配置凭证。初始化、配对、服务安装和公网 TLS 见 [Node 使用说明](node.md)。
+
+App 的 static 发布使用 pnpm 与 Rust 工具缓存。`build-web.sh` 自身执行冻结的按需依赖安装，因此发布入口不再提前安装整个 workspace；www 仍独立安装。工具版本和生成物来源校验照常执行。
 
 ## CI 验证范围
 
@@ -76,7 +78,6 @@ cd vibeface-<version>-<target>
 ```sh
 bash scripts/build-web-crypto.sh
 bash scripts/build-web.sh
-cargo build --release -p vibeface -p vibeface-core --locked
 bash scripts/package-node.sh
 ```
 
@@ -164,7 +165,7 @@ npm 包名为 `@leaperone/vibeface`，Nightly 使用同名不可变版本和 `ni
 
 `scripts/package-npm.mjs` 接收三个平台的完整 `.tar.gz` 与同名 SHA256，要求三个平台的 CLI 版本、CLI 源码、锁定组件身份及包协议一致，平台字段分别匹配各自 target。它拒绝危险路径、链接、特殊文件、校验错配和缺失资源，把完整包放入 `vendor/<target>`，再生成一个含全部平台的 `.tgz`。只有一个 npm 发布身份和一次发布操作，代价是下载包含其他平台的程序。没有 postinstall、运行期下载或新增 npm 依赖。
 
-定时、手动扩展 CI 和 CLI Nightly 发布生成 `npm-package-<SHA>` artifact，包含 `.tgz` 和记录源码 SHA、SHA256、npm integrity 的 JSON。CI 在三个原生平台上以 `--ignore-scripts` 全局安装到隔离 prefix，然后验证版本，并以 `--web-only` 验证启动和随包网页，不重复完整多节点验收。Stable 和 rc 延续现有 GitHub 发布流程，不生成 npm 包。
+定时和手动扩展 CI 生成 `npm-package-<SHA>-<attempt>` artifact，CLI Nightly 发布也生成 npm 分发制品，包含 `.tgz` 和记录源码 SHA、SHA256、npm integrity 的 JSON。CI 在三个原生平台上以 `--ignore-scripts` 全局安装到隔离 prefix，然后验证版本，并以 `--web-only` 验证启动和随包网页，不重复完整多节点验收。Stable 和 rc 延续现有 GitHub 发布流程，不生成 npm 包。
 
 本地检查与打包命令如下。输入目录只能包含对应版本的三个包与三个 checksum，默认输出 `.artifacts/npm`，已有同名制品会被保留并报错：
 

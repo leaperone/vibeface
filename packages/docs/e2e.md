@@ -138,6 +138,12 @@ python3 scripts/verify-node.py --delivery-ui-selfcheck \
   --binary /usr/bin/true --artifacts .artifacts/paid-ui-selfcheck
 ```
 
+## 重跑 iOS Provider 验收
+
+`mobile.yml` 将构建和验收分成 `ios-build`、`ios-accept`。前者只上传白名单中的 App ZIP、host CLI/Core、Web/WASM 与来源清单，邀请、Node 数据和 driver 状态在后者创建。恢复后核对摘要、执行位、签名、entitlements 和实际安装的 bundle 字节，再执行原来的真实配对与 Provider 测试。构建成功不代表 UI 通过。
+
+UI 失败时可运行 `gh run rerun <run-id> --failed`，复用该 run 已成功构建的不可变输入，不重新构建 App。清理步骤同时判定最终 UI 结果，清理成功不能掩盖测试失败。每次验收使用新的专属模拟器，并上传带 attempt 的公开诊断。
+
 ## 验证原生接收和本地文件
 
 原生验收使用已有 e2e mobile 引擎，必须指定当前任务构建的 `.app`、Node、匹配 WASM，以及专用模拟器的 UUID。该入口会重新安装本任务应用并清除该专用模拟器的钥匙串。不要指定其他任务正在使用的模拟器。

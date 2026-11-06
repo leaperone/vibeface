@@ -40,7 +40,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 静态快检保留 Rust fmt、工作流与 shell 检查、JavaScript 语法、选择器和安装器自检。涉及 Rust 时校验 Atlas 迁移文件，不打开数据库。快速 Rust 测试保留权限、个人网络隔离、数据持久化、写操作去重与未知结果对账等已有回归，只跳过 `SLOW_TESTS` 明确列出的重型用例，目前是 10 万事件追加测试和超出待补依赖上限的 4 万事件追平测试。
 
-`www` 使用 Node.js 24 和冻结的 pnpm 依赖，依次运行 `typecheck`、`build`、`check:static`，上传 `apps/www/dist/client` 为 `www-<SHA>` 制品。门户与独立 App 分别构建；根 `packages/docs/` 是门户文档正文的唯一来源，修改文档也会触发 `www`。
+`www` 使用 Node.js 24 和冻结的 pnpm 依赖，依次运行 `typecheck`、`build`、`check:static`，上传 `apps/www/dist/client` 为 `www-<SHA>-<attempt>` 制品。门户与独立 App 分别构建；根 `packages/docs/` 是门户文档正文的唯一来源，修改文档也会触发 `www`。
 
 改 `apps/core/migrations/` 或 `apps/core/src/delivery/schema.sql` 的 schema 必须同时提高共享控制 crate `crates/control/src/lib.rs` 的 `DATA_EPOCH`，并更新 `apps/core/src/config.rs` 中相邻的 `DATA_EPOCH_SCHEMA_SHA256`；否则 Node 快速测试 `schema_changes_bump_the_data_epoch` 失败。存储 epoch 不变时旧数据库能打开，运行中才因缺列出错，自更新也会误判可原地升级。`install.sh` 中写死的 epoch 一并修改，由 `ci.py --self-test` 核对。
 
@@ -51,6 +51,10 @@ Web 路径优先于 Node 路径，只有 `packages/client/src/avatar/face.ts` �
 Linux 制品核对 checksum、源码提交、版本、target、WASM 和存储 epoch，再以 `verify-node.py --web-only` 启动真实进程，检查网页资源、SPA 路由、CSP、缓存与 404。它不执行多 Node 业务验收，也不验证浏览器渲染。
 
 Linux 制品还使用 [e2e](e2e.md) 启动隔离 Node，在 Chromium 中验证建网页面以及建网、下载恢复文件、跳过 AI 设置、创建 Bot 和刷新后保留的流程。它不调用真实模型。CI 上传浏览器测试报告，排除下载的恢复文件和 Node 数据。
+
+原生编译由每个平台的 `native-*` 任务执行，与 crypto/Web 并行。对应 `package-*` 只等待本平台原生输入和共享 Web，不等待其他平台。两个窄 reusable workflow 共用构建与组包配方；Rust 检查不下载 Web。最终 gate 逐项要求计划选中的 native、package 及原有检查成功。
+
+原生输入使用带来源清单的 tar 保存执行位，记录干净源码 commit/tree、target、workflow、run、producer job 与 attempt，以及完整文件集的大小、模式和 SHA-256。消费方从成功上游接收不可变 artifact ID，按同 run、同源码核对输入；失败重跑允许使用较早的成功 producer attempt。缺失输出、来源不符、额外文件或摘要不同均失败，不取分支 latest，也不静默重新编译。
 
 ## 可验证交付的核心检查
 
@@ -158,14 +162,28 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 | Rust 快、慢测试及 Clippy | 整个工作区；慢组为精确名称的 `SLOW_TESTS` |
 | 最低 Rust 版本 | 安装 Cargo 声明的 MSRV，检查整个工作区 |
 | 原生 release 制品 | Linux x64、Linux ARM64、macOS ARM64，分别校验身份并启动网页进程 |
-| 单 Node 调度与事件日志验收 | Linux x64 一次，使用 `--phase1` |
+| 调度与事件日志验收 | Linux x64 一次，使用 `--phase1` |
 | 多 Node 同步、入口与投递验收 | Linux x64 一次，不带模式参数，四台 Node 经 iroh 和成员 relay 互连 |
-| 聊天 Agent 模拟协议验收 | macOS ARM64 一次，使用 `--chat-agent` |
+| 聊天 Agent 模拟协议验收 | macOS ARM64 一次，两个隔离 Node，使用 `--chat-agent` |
 | 跨设备协作、换负责人与附件验收 | Linux x64 一次，使用 `--phase4` |
 | 公共入口与 relay 令牌验收 | Linux x64 一次，使用 `--public-entry` |
 | 仅发现、普通 relay 回退与无网页验收 | Linux x64 一次，使用 `--discovery` |
 | 写入保护、状态与诊断包验收 | macOS ARM64 一次，使用 `--phase5` |
 | Nightly npm 包 | 组装三个原生包，三个平台分别安装、检查版本并执行 `--web-only` 冒烟 |
+
+macOS 的 `--chat-agent` 与 `--phase5` 在同一组包任务内并行。两者使用同一签名包的独立副本、数据目录与互不重叠的端口区间，分别保存退出码；任一失败则组包失败。保留原来的去重、真实定时、deadline 和重启观察，聊天内部仍顺序执行。
+
+普通手动运行默认保留每次验收。开发期间可显式传入 `feedback=true`，让同分支的新反馈替换旧反馈，检查范围不减少。付费 live/small、带 resume 意图及显式重跑不进入该取消组，main push 的累计覆盖规则仍生效。
+
+```sh
+gh workflow run ci.yml --ref <分支> -f feedback=true
+# 最终验收使用默认输入，保留此 run。
+gh workflow run ci.yml --ref <分支>
+```
+
+`mobile.yml` 的普通手动运行要求 Android、`ios-build` 和 `ios-accept` 全部成功。Android-only 调用只要求 APK 构建。iOS 构建上传完整公共输入，包含 App ZIP、host CLI/Core、Web/WASM 与各 receipt；验收任务恢复同一输入后创建新模拟器和私有 fixture，继续真实秘密输入、配对、Provider 操作与取消验收。UI 失败后使用 `gh run rerun <run-id> --failed` 只重跑失败任务；成功 producer 的 artifact ID 和 attempt 必须保留，缺失即失败。`mobile` 同样提供默认关闭的 `feedback` 输入。
+
+Rust 缓存同时覆盖 iOS FFI 的 `target` 和 host 的 `.artifacts/native/target`，仍由 Cargo 正常检查依赖失效。未缓存 Pods、DerivedData 或 driver 状态。锁定的 RN/Hermes 下载器在远端校验值缺失时允许跳过校验，因此未增加其共享下载缓存。
 
 快、慢测试组均使用 `opt-level=1`，保留调试断言和整数溢出检查，调试信息使用 `line-tables-only` 保留回溯文件和行号，共享独立的 `test-opt1` Rust 缓存；Clippy 使用单独的 `check` 缓存。两组运行前校验每个慢测试名恰好匹配一个已有测试。慢组用 `--include-ignored` 运行列出的用例，其他 `ignored` 用例仍默认忽略。两组测试命令用 `/usr/bin/time -v` 记录 CPU 与 maxRSS；maxRSS 不能当作并发进程树的总峰值。
 

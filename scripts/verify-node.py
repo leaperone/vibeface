@@ -115,13 +115,15 @@ def maintenance(node, command):
 
 
 _port_base = [int(os.environ.get("VIBEFACE_PORT_BASE", "0"))]
+_port_limit = int(os.environ.get("VIBEFACE_PORT_LIMIT", "65536"))
+require(0 <= _port_base[0] < _port_limit <= 65536, "valid exclusive port range")
 _assigned_ports = set()
 
 
 def available_port():
-    """A free TCP/UDP loopback port; VIBEFACE_PORT_BASE pins a known range."""
     while True:
         port = _port_base[0]
+        require(port < _port_limit, "the assigned port range is not exhausted")
         if port:
             _port_base[0] += 1
         with socket.socket() as stream, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
@@ -2858,7 +2860,7 @@ def chat_agent_acceptance(options):
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     nodes = []
     report = {"status": "running", "source_binary": str(binary), "binary_sha256": file_sha256(binary),
-              "provider_calls": 0, "coverage": "one real Node; fixture SDK driving the real vibeface CLIs against a managed fixture App Server",
+              "provider_calls": 0, "coverage": "two isolated real Nodes; fixture SDK driving the real vibeface CLIs against a managed fixture App Server",
               "evidence": [], "not_checked": ["real provider model behavior", "rendered browser UI",
                   "cross-device work (phase 2)", "OS sandboxing of SDK host tools"]}
 
@@ -7888,6 +7890,11 @@ if __name__ == "__main__":
     if "--fixture-codex" in sys.argv:
         fixture_codex(sys.argv[1:])
     else:
+        def interrupt_acceptance(*_):
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGINT, interrupt_acceptance)
+        signal.signal(signal.SIGTERM, interrupt_acceptance)
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--binary", type=Path, required=True,
                             help="the vibeface CLI binary used to create and run the isolated Nodes")
