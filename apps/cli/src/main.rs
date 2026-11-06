@@ -401,7 +401,7 @@ struct Hooks {
     /// Provider configuration home directory.
     #[arg(long, value_parser = absolute_path)]
     home: Option<PathBuf>,
-    /// Show the operation without applying it.
+    /// Preview hook file changes for install or uninstall.
     #[arg(long)]
     dry_run: bool,
 }
