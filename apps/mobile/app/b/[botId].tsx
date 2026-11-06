@@ -8,7 +8,7 @@ import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanima
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useCSSVariable, useUniwind, withUniwind } from 'uniwind'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
-import { awaitsDevice, botReach, botCanSend, composerHint, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
@@ -297,7 +297,7 @@ export default function ChatScreen() {
         {scrollButton.id === id && scrollButton.visible ? <View pointerEvents="box-none" className={ios ? 'absolute -top-13 w-full max-w-3xl self-center items-end px-4' : 'absolute -top-14 w-full max-w-3xl self-center items-end px-4'}>
           <Button variant="outline" size="icon" className="rounded-full bg-card shadow-sm" accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
         </View> : null}
-        <Composer chrome={chrome} value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
+        <Composer chrome={chrome} value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })} attachmentScope={JSON.stringify([device.ready?.principal.network_id ?? '', id, inputTargetKey(inputTarget), intent])}
           blocked={blocked} sending={false} onSend={send} onStop={(inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live?.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined} tint={tint}
           sendLabel={intent === 'defer' ? '保存为稍后处理' : intent === 'new_task' ? '发送为新任务' : targetBusy ? '补充当前工作' : '发送'}
           target={<InputOptions label={targetOption.label} options={targetOptions} selected={targetOption.key} onSelect={(option) => setSelectedTarget(option.key)} intent={intent} onIntent={setIntent} pending={pending} />}

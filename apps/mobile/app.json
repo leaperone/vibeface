@@ -43,6 +43,10 @@
         "android.permission.ACCESS_WIFI_STATE",
         "android.permission.CHANGE_WIFI_MULTICAST_STATE"
       ],
+      "blockedPermissions": [
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+      ],
       "versionCode": 250004
     },
     "plugins": [
@@ -55,6 +59,14 @@
           "cameraPermission": "扫描加入二维码",
           "microphonePermission": false,
           "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": false,
+          "cameraPermission": "扫描加入二维码",
+          "microphonePermission": false
         }
       ],
       [

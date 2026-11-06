@@ -857,7 +857,7 @@ test("workspace preserves bot and message requests while routing native decision
         'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme }), useCSSVariable: () => theme === 'dark' ? 'black' : 'white' },
         '@/data/context': { useWorkspace: () => native }, '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
         '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/home.ts': { unreachable },
-        '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+        '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
         '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
         '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
         '@/features/chat/chrome': { ChatMaterial: 'ChatMaterial', useChatChrome: () => glass ? { kind: 'glass', colorScheme: theme } : { kind: 'solid' } },
@@ -2106,7 +2106,8 @@ test('composers save each pending draft once and let edited drafts save independ
       assert.deepEqual(saved, [
         { text: '第一份草稿', attachments: [{ name: 'first.txt', bytes: [1, 2, 3] }] }, { text: '第二份草稿', attachments: [{ name: 'later.txt', bytes: [4, 5, 6] }] }, { text: '第二份草稿', attachments: [{ name: 'later.txt', bytes: [4, 5, 6] }] },
       ])
-      const target = example.name.endsWith('Task') ? { kind: 'task', task_id: 'task' } : example.name === 'web Main' ? { kind: 'bot_main', bot_id: 'bot' } : example.component.includes('Scoped') ? { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' } : { kind: 'work', work_id: 'work' }
+      const target: InputTarget = example.name.endsWith('Task') ? { kind: 'task', task_id: 'task' } : example.name === 'web Main' ? { kind: 'bot_main', bot_id: 'bot' } : example.component.includes('Scoped') ? { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' } : { kind: 'work', work_id: 'work' }
+      if (example.native) assert.equal(composer().attachmentScope, JSON.stringify(['network', 'chat', target.kind === 'work' ? ['work', target.work_id] : inputTargetKey(target), example.component.includes('Scoped') ? 'continue' : 'defer']))
       assert.deepEqual(JSON.parse(JSON.stringify(attempts.map((item) => item.target))), [target, target, target])
       const failed = pendingResult(); reads.set('retry.txt', failed)
       composer().onChange?.('原样重试'); const retryFiles = attach('retry.txt'); submit()
@@ -3709,6 +3710,212 @@ test('native chat folds runtime diagnostics and retains result checks without pr
   } finally { extras.close(); details.close() }
 })
 
+test('native composer adds photos and files without replacing current attachments or drafts', async (t) => {
+  type Attachment = import('../../../../../apps/mobile/src/data/types.ts').Attachment
+  type NativeButton = { text: string; onPress?: () => void; style?: string }
+  for (const os of ['ios', 'android']) await t.test(os, async () => {
+    const original = { uri: 'file:///report.pdf', name: 'report.pdf', size: 20, mimeType: 'application/pdf' }
+    const current = { uri: 'file:///current.txt', name: 'current.txt', size: null, mimeType: null }
+    const cache = new Map([
+      ['file:///cache/original.heic', { name: 'original.heic', size: 30, type: 'image/heic' }],
+      ['file:///cache/transparent.png', { name: 'transparent.png', size: 40, type: 'image/png' }],
+      ['file:///cache/photo.jpg', { name: 'photo.jpg', size: 50, type: 'image/jpeg' }],
+    ])
+    let files: Attachment[] = [original], updates = 0, renders = 0, usedCallback = 0
+    let photos = pendingResult(), documents = pendingResult(), selected: (() => void) | undefined
+    const photoCalls: unknown[] = [], fileCalls: unknown[] = []
+    const alerts: { title: string; message?: string; buttons?: NativeButton[] }[] = []
+    let sheet: { options: string[]; cancelButtonIndex: number } | undefined, sheetSelect: ((index: number) => void) | undefined
+    const app = componentHarness('../../../../../apps/mobile/src/features/chat/composer.tsx', {
+      'react-native': {
+        Platform: { OS: os }, TextInput: 'TextInput', View: 'View',
+        ActionSheetIOS: { showActionSheetWithOptions(options: typeof sheet, select: typeof sheetSelect) { sheet = options; sheetSelect = select } },
+        Alert: { alert(title: string, message?: string, buttons?: NativeButton[]) { alerts.push({ title, message, buttons }) } },
+      },
+      'expo-image-picker': {
+        UIImagePickerPreferredAssetRepresentationMode: { Current: 'current' },
+        launchImageLibraryAsync(options: unknown) { photoCalls.push(options); return photos.promise },
+      },
+      'expo-document-picker': { getDocumentAsync(options: unknown) { fileCalls.push(options); return documents.promise } },
+      'expo-file-system': { File: class {
+        readonly name: string; readonly size: number; readonly type: string
+        constructor(uri: string) {
+          const file = cache.get(uri)
+          assert.ok(file)
+          this.name = file.name; this.size = file.size; this.type = file.type
+        }
+      } },
+    })
+    const render = () => {
+      const callback = ++renders
+      return app.render('Composer', {
+        chrome: { kind: 'solid' }, value: '保留草稿', onChange() {}, files, attachmentScope: JSON.stringify(['network', 'chat', ['bot_main', 'bot'], 'continue']),
+        onFiles(next: Attachment[]) { usedCallback = callback; updates++; files = next }, blocked: null, sending: false, onSend() {},
+      })
+    }
+    const choose = (index: number) => {
+      const attach = render().find(({ props }) => String(props.accessibilityLabel).startsWith('添加附件'))?.props.onPress
+      assert.equal(typeof attach, 'function')
+      if (typeof attach === 'function') attach()
+      if (os === 'ios') {
+        assert.deepEqual(JSON.parse(JSON.stringify(sheet)), { options: ['照片图库', '文件', '取消'], cancelButtonIndex: 2 })
+        selected = () => sheetSelect?.(index)
+      } else {
+        const menu = alerts.at(-1)
+        assert.ok(menu)
+        assert.equal(menu?.title, '添加附件')
+        assert.deepEqual(Array.from(menu.buttons ?? [], ({ text }) => text), ['照片图库', '文件', '取消'])
+        selected = menu.buttons?.[index]?.onPress
+      }
+      selected?.()
+    }
+    const snapshot = () => JSON.parse(JSON.stringify(files))
+    try {
+      choose(0)
+      selected?.()
+      assert.equal(photoCalls.length, 1, 'only one picker can run at once')
+      assert.equal(fileCalls.length, 0)
+      assert.deepEqual(JSON.parse(JSON.stringify(photoCalls[0])), { mediaTypes: ['images'], allowsMultipleSelection: true, quality: 1, preferredAssetRepresentationMode: 'current' })
+      files = [current]; render()
+      photos.resolve({ canceled: false, assets: [
+        { uri: 'file:///cache/original.heic', fileName: null },
+        { uri: 'file:///cache/transparent.png' },
+        { uri: 'file:///cache/photo.jpg', fileName: 'holiday.jpg', fileSize: 50, mimeType: 'image/jpeg' },
+      ] })
+      await settleComponent()
+      assert.equal(usedCallback, renders, 'completion uses the current draft setter')
+      assert.deepEqual(snapshot(), [current,
+        { uri: 'file:///cache/original.heic', name: 'original.heic', size: 30, mimeType: 'image/heic' },
+        { uri: 'file:///cache/transparent.png', name: 'transparent.png', size: 40, mimeType: 'image/png' },
+        { uri: 'file:///cache/photo.jpg', name: 'holiday.jpg', size: 50, mimeType: 'image/jpeg' },
+      ])
+      assert.equal(render().find(({ type }) => type === 'TextInput')?.props.value, '保留草稿')
+      const selectedFiles = snapshot()
+      photos = pendingResult(); choose(0); photos.resolve({ canceled: true, assets: null }); await settleComponent()
+      choose(2)
+      assert.equal(updates, 1, 'picker cancellation and menu cancellation leave the draft alone')
+      assert.deepEqual(snapshot(), selectedFiles)
+      photos = pendingResult(); choose(0); photos.reject(new Error('无法读取所选照片')); await settleComponent()
+      assert.equal(alerts.at(-1)?.title, '未能添加附件')
+      assert.equal(alerts.at(-1)?.message, '无法读取所选照片')
+      assert.deepEqual(snapshot(), selectedFiles)
+      photos = pendingResult(); choose(0); photos.reject(new Error('照片权限已拒绝')); await settleComponent()
+      assert.equal(alerts.at(-1)?.message, '照片权限已拒绝')
+      assert.deepEqual(snapshot(), selectedFiles, 'permission denial preserves the draft attachments')
+      choose(1)
+      assert.equal(fileCalls.length, 1, 'an error releases the picker for another attempt')
+      assert.deepEqual(JSON.parse(JSON.stringify(fileCalls[0])), { multiple: true, copyToCacheDirectory: true })
+      documents.resolve({ canceled: false, assets: [
+        { uri: 'file:///report.pdf', name: 'report.pdf', size: 20, mimeType: 'application/pdf' },
+        { uri: 'file:///notes.txt', name: 'notes.txt' },
+      ] })
+      await settleComponent()
+      assert.deepEqual(snapshot(), [...selectedFiles, original, { uri: 'file:///notes.txt', name: 'notes.txt', size: null, mimeType: null }])
+      documents = pendingResult(); choose(1); documents.resolve({ canceled: true, assets: null }); await settleComponent()
+      assert.equal(updates, 2)
+      const remove = render().find(({ props }) => props.accessibilityLabel === '移除 transparent.png')?.props.onPress
+      assert.equal(typeof remove, 'function')
+      if (typeof remove === 'function') remove()
+      assert.equal(files.some(({ name }) => name === 'transparent.png'), false)
+      assert.equal(files.some(({ name }) => name === 'holiday.jpg'), true)
+    } finally { app.close() }
+  })
+})
+
+test('native attachment results cannot cross a draft scope or survive its disabled or unmounted lifetime', async (t) => {
+  type NativeButton = { text: string; onPress?: () => void }
+  for (const os of ['ios', 'android']) for (const source of ['photos', 'files']) for (const change of ['bot', 'bot-roundtrip', 'network', 'work', 'work-roundtrip', 'intent', 'blocked', 'blocked-roundtrip', 'sending', 'unmounted', 'stale-menu', 'blocked-before-menu', 'sending-before-menu']) await t.test(`${os} ${source} ${change}`, async () => {
+    const live = parityShared()
+    const conversation: import('../../../../../apps/mobile/src/data/types.ts').Conversation = {
+      messages: [], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null,
+      works: [parityWork()], replying: false, status: null, stoppable: false, blocked: null,
+    }
+    const workspace = { bots: [parityBot, { ...parityBot, bot_id: 'other', conversation_id: 'other-chat' }], conversations: { chat: conversation, 'other-chat': { ...conversation } }, members: [], primary: null, actions: { open() {} }, connection: { entry: '工作设备' } }
+    const device = { link: { kind: 'online' }, ready: { entry: { device_id: 'gateway' }, principal: { network_id: 'network', can_manage: true } } }
+    let botId = 'bot', sending = false, calls = 0, selected: (() => void) | undefined
+    const result = pendingResult()
+    const screen = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
+      'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId }) }, 'expo-router/react-navigation': { useHeaderHeight: () => 96 },
+      'react-native': { Platform: { OS: os }, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
+      'react-native-keyboard-controller': { useReanimatedKeyboardAnimation: () => ({ height: { value: 0 }, progress: { value: 0 } }) },
+      'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read(), useSharedValue: (value: number) => ({ value }) },
+      'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 34 }), useSafeAreaFrame: () => ({ width: 390 }) },
+      'uniwind': { withUniwind: (value: unknown) => value, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
+      '@/data/context': { useWorkspace: () => workspace }, '@/data/live': { useLive: () => live }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
+      '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+      '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy },
+      '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
+      '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
+    })
+    const composer = componentHarness('../../../../../apps/mobile/src/features/chat/composer.tsx', {
+      'react-native': {
+        Platform: { OS: os }, TextInput: 'TextInput', View: 'View',
+        ActionSheetIOS: { showActionSheetWithOptions(_options: unknown, select: (index: number) => void) { selected = () => select(source === 'photos' ? 0 : 1) } },
+        Alert: { alert(_title: string, _message?: string, buttons?: NativeButton[]) { selected = buttons?.[source === 'photos' ? 0 : 1]?.onPress } },
+      },
+      'expo-image-picker': { UIImagePickerPreferredAssetRepresentationMode: { Current: 'current' }, launchImageLibraryAsync() { calls++; return result.promise } },
+      'expo-document-picker': { getDocumentAsync() { calls++; return result.promise } },
+      'expo-file-system': { File: class { name = 'photo.jpg'; size = 20; type = 'image/jpeg' } },
+    })
+    const props = () => {
+      screen.render('default')
+      const current = screen.render('default').find(({ type }) => type === 'Composer')?.props
+      assert.ok(current)
+      return current
+    }
+    const render = () => composer.render('Composer', { ...props(), sending })
+    const selectTarget = (key: 'main' | 'work:work') => {
+      const select = screen.render('default').find(({ type }) => type === 'InputOptions')?.props.onSelect
+      assert.ok(typeof select === 'function'); select({ key })
+      render()
+    }
+    try {
+      props().onChange?.('A 草稿')
+      const original = [{ uri: 'file:///a.txt', name: 'a.txt', size: 1, mimeType: 'text/plain' }]
+      const onFiles = props().onFiles; assert.ok(typeof onFiles === 'function'); onFiles(original)
+      const scope = props().attachmentScope
+      assert.equal(typeof scope, 'string')
+      if (change === 'blocked-before-menu') conversation.blocked = '当前设备仅可查看'
+      if (change === 'sending-before-menu') sending = true
+      const attach = render().find(({ props }) => String(props.accessibilityLabel).startsWith('添加附件'))?.props.onPress
+      assert.ok(typeof attach === 'function'); attach()
+      if (change.endsWith('-before-menu')) assert.equal(calls, 0, 'a disabled composer cannot open a picker even when its handler is invoked')
+      else if (change !== 'stale-menu') { assert.ok(selected); selected(); assert.equal(calls, 1) }
+      if (change === 'bot' || change === 'bot-roundtrip' || change === 'stale-menu') {
+        botId = 'other'; render()
+        props().onChange?.('B 草稿')
+        const setFiles = props().onFiles; assert.ok(typeof setFiles === 'function')
+        setFiles([{ uri: 'file:///b.txt', name: 'b.txt', size: 2, mimeType: 'text/plain' }]); render()
+        if (change === 'bot-roundtrip') { botId = 'bot'; render(); assert.equal(props().attachmentScope, scope) }
+      }
+      if (change === 'network') { device.ready.principal.network_id = 'other-network'; render() }
+      if (change === 'work' || change === 'work-roundtrip') { selectTarget('work:work'); if (change === 'work-roundtrip') { selectTarget('main'); assert.equal(props().attachmentScope, scope) } }
+      if (change === 'intent') {
+        const intent = screen.render('default').find(({ type }) => type === 'InputOptions')?.props.onIntent
+        assert.ok(typeof intent === 'function'); intent('defer'); render()
+      }
+      if (change === 'blocked' || change === 'blocked-roundtrip') { conversation.blocked = '当前设备仅可查看'; render(); if (change === 'blocked-roundtrip') { conversation.blocked = null; render() } }
+      if (change === 'sending') { sending = true; render() }
+      if (['bot', 'network', 'work', 'intent', 'stale-menu'].includes(change)) assert.notEqual(props().attachmentScope, scope)
+      if (change === 'unmounted') composer.close()
+      if (change === 'stale-menu') { assert.ok(selected); selected(); assert.equal(calls, 0, 'a menu opened in A cannot start a picker in B') }
+      if (change === 'blocked' || change === 'sending') {
+        const button = render().find(({ props }) => String(props.accessibilityLabel).startsWith('添加附件'))?.props
+        assert.equal(button?.disabled, true)
+        assert.ok(typeof button?.onPress === 'function'); button.onPress(); assert.equal(calls, 1)
+      }
+      const before = JSON.stringify(props().files), text = props().value
+      result.resolve({ canceled: false, assets: [{ uri: 'file:///photo.jpg', name: 'photo.jpg', fileName: 'photo.jpg', size: 20, mimeType: 'image/jpeg' }] })
+      await settleComponent()
+      assert.equal(JSON.stringify(props().files), before, 'late completion leaves the actual bound draft setter untouched')
+      assert.equal(props().value, text)
+      botId = 'bot'
+      assert.equal(props().value, 'A 草稿')
+      assert.equal(JSON.stringify(props().files), JSON.stringify(original), 'the original draft also retains its attachments')
+    } finally { composer.close(); screen.close() }
+  })
+})
+
 test('native composer preserves local input and visible blockers with compact chat chrome on iOS and Android', () => {
   for (const os of ['ios', 'android']) {
     let retried = 0
@@ -3727,7 +3934,7 @@ test('native composer preserves local input and visible blockers with compact ch
       'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 34 }), useSafeAreaFrame: () => ({ width: 390 }) },
       'uniwind': { withUniwind: (value: unknown) => value, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
       '@/data/context': { useWorkspace: () => workspace }, '@/data/live': { useLive: () => live }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
-      '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+      '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
       '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy },
       '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
       '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/features/chat/chrome': { useChatChrome: () => ({ kind: 'solid' }) }, '@/lib/layout': { useWide: () => false },
