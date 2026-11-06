@@ -1121,7 +1121,8 @@ def fixture_codex(arguments):
                    "custom_tool_schemas": {name: json.loads(schema) for name, schema in advertised}}
         bot = BotTurn(stream, thread, turn)
         fixture_record(run, "codex-inputs.jsonl", {"event": "turn_started", "thread_id": thread["id"], "turn_id": turn["id"]})
-        bot.send("turn/started", {"turn": turn})
+        with state_lock:
+            bot.send("turn/started", {"turn": turn})
         try:
             fixture_manager(run, initial, bot)
         except Exception as error:
@@ -1396,7 +1397,8 @@ def fixture_codex(arguments):
                         def delayed_reply(response=copy.deepcopy(result), request_id=message["id"], gate=held["gate"]):
                             try:
                                 wait_for("the controlled read response is released", lambda: Path(gate).exists(), timeout=120)
-                                websocket_send(stream, {"id": request_id, "result": response})
+                                with state_lock:
+                                    websocket_send(stream, {"id": request_id, "result": response})
                             except (AssertionError, OSError):
                                 pass
                         threading.Thread(target=delayed_reply, daemon=True).start()

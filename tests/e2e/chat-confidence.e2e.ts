@@ -46,6 +46,13 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     await desktopTask.getByText('详细进展', { exact: true }).click();
     assert.equal(await detailOpen(), true);
     await expect(desktopTask.getByText(summary, { exact: true })).toBeVisible();
+    await expect(screen.getByRole('textbox', '给 Bot 发消息')).toBeVisible();
+    await expect(desktopTask.getByRole('textbox', '补充给 整理本月运营情况')).toBeVisible();
+    const mainInput = await browser.evaluate(() => ({
+      count: document.querySelectorAll('textarea[id="message-text"]').length,
+      focusLabel: document.getElementById('message-text')?.getAttribute('aria-label') ?? null,
+    }));
+    assert.deepEqual(mainInput, { count: 1, focusLabel: '给 Bot 发消息' });
     await app.screenshot('chat-confidence-progress-desktop');
 
     const finish = { type: 'work_finished', work_id: work, outcome: 'unverified', result_text: '', failure_reason: '这次的结果无法确认。' };

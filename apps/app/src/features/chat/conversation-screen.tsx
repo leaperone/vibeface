@@ -289,6 +289,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         </div> : workspace.synced ? <NoBot /> : null}
       />
       {bot && inputTarget ? <PromptInput
+        id="message-text"
         above={<div className="flex max-w-full flex-col items-start gap-2">
           {!workspace.connectionOnline ? <p role="status" className="flex min-h-8 max-w-full flex-wrap items-center gap-1.5 rounded-xl border bg-card ps-2.5 pe-1 text-meta font-medium max-md:min-h-11">
           <WifiOff aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="min-w-0 break-words">连不上{ready ? nodeName(ready.entry.device_id, lookup) : '设备'}</span>

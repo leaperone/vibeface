@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/input-group'
 
 export function PromptInput({
+  id,
   value,
   hint,
   reason,
@@ -30,6 +31,7 @@ export function PromptInput({
   tint,
   children,
 }: {
+  id?: string
   value: string
   hint: string
   reason: string
@@ -97,7 +99,7 @@ export function PromptInput({
         <InputGroup className="rounded-2xl bg-card shadow-sm dark:bg-card has-[[data-slot=input-group-control]:focus-visible]:ring-2">
           <InputGroupTextarea
             ref={textRef}
-            id="message-text"
+            id={id}
             name="text"
             required={!files.length}
             maxLength={100000}
