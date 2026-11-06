@@ -712,11 +712,11 @@ jobs:
                   oaepHash: 'sha256' }, key).toString('base64'), ciphertext: ciphertext.toString('base64') };
             } finally { key.fill(0); }
           }
-          function captureRunnerLog(error) {
-            const result = { scope: runnerLogScope, status: 'unavailable', reason: 'path-mismatch',
+          function captureRunnerLog() {
+            const result = { scope: runnerLogScope, status: 'unavailable', reason: 'ownership-unproven',
               source_bytes: null, captured_bytes: 0, offset: null, capped: null, source_changed: null };
             const expected = join(state, 'sessions', session, 'runner.log');
-            if (error?.details?.logPath !== expected || expected.toLowerCase().includes('trash')) return result;
+            if (expected.toLowerCase().includes('trash')) return result;
             let fd, bytes;
             try {
               result.reason = 'ownership-unproven';
@@ -774,7 +774,7 @@ jobs:
               report[name].status = 'failed';
               report[name].error = safeError(error);
               report[name].error.startup_classification = await startupClassification(error);
-              if (name === 'prepare') report[name].error.encrypted_runner_log = captureRunnerLog(error);
+              if (name === 'prepare') report[name].error.encrypted_runner_log = captureRunnerLog();
               return false;
             } finally {
               report[name].duration_ms = ms(performance.now() - started);
@@ -879,9 +879,6 @@ jobs:
             assert.equal(Buffer.from(encrypted.wrapped_key, 'base64').length, 384);
             assert.equal(Buffer.from(encrypted.ciphertext, 'base64').length, Buffer.byteLength(sentinel));
             assert(!JSON.stringify(encrypted).includes(sentinel));
-            assert.deepEqual(captureRunnerLog({ details: { logPath: 'not-the-task-log' } }),
-              { scope: runnerLogScope, status: 'unavailable', reason: 'path-mismatch',
-                source_bytes: null, captured_bytes: 0, offset: null, capped: null, source_changed: null });
           }
           const mode = process.argv[2];
           if (mode === 'self-check') { selfCheck(); process.exit(0); }
