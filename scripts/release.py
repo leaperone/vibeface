@@ -28,8 +28,8 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def run(*args, cwd=ROOT):
-    return subprocess.check_output(args, cwd=cwd, text=True).strip()
+def run(*args, cwd=None):
+    return subprocess.check_output(args, cwd=cwd or ROOT, text=True).strip()
 
 
 def version(value):
@@ -47,7 +47,8 @@ def parse_tag(tag):
     return app, value, version(value)
 
 
-def read_version(app, root=ROOT):
+def read_version(app, root=None):
+    root = root or ROOT
     require(app in APPS, 'unknown app')
     directory = root / 'apps' / app
     if app in ('core', 'cli'):
@@ -59,7 +60,8 @@ def read_version(app, root=ROOT):
     return data['expo']['extra']['releaseVersion'] if app == 'mobile' else data['version']
 
 
-def identity(app, root=ROOT):
+def identity(app, root=None):
+    root = root or ROOT
     value = read_version(app, root)
     return {'app': app, 'version': value, 'tag': f'{app}-v{value}',
             'source_commit': run('git', 'rev-parse', 'HEAD', cwd=root), 'channel': version(value)}
@@ -284,6 +286,73 @@ def fetch_component(app, target, destination):
     })
 
 
+def mobile_provenance(apk):
+    expo = json.loads((ROOT / 'apps/mobile/app.json').read_text())['expo']
+    candidates = sorted((Path(os.environ.get('ANDROID_HOME', '/nonexistent')) / 'build-tools').glob('*/aapt'))
+    tool = shutil.which('aapt') or (str(candidates[-1]) if candidates else None)
+    require(tool, 'Android aapt is required to verify APK identity')
+    badging = run(tool, 'dump', 'badging', str(apk.resolve()))
+    match = re.search(r"^package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']+)'", badging, re.M)
+    require(match, 'APK has no Android package identity')
+    package, code, marketing = match.groups()
+    require((package, int(code), marketing) == (expo['android']['package'], expo['android']['versionCode'], expo['version']),
+            'APK package, versionCode or marketing version mismatch')
+    return dict(version=read_version('mobile'), sourceCommit=run('git', 'rev-parse', 'HEAD'), sha256=digest(apk),
+                applicationId=package, versionCode=int(code), versionName=marketing)
+
+
+def verify_public(app, destination):
+    expected = identity(app)
+    tag = expected['tag']
+    view = json.loads(run('gh', 'release', 'view', tag, '--repo', 'leaperone/vibeface', '--json', 'isDraft,assets'))
+    require(not view['isDraft'], 'release is not public')
+    source = json.loads(run('gh', 'api', f'repos/leaperone/vibeface/commits/{tag}'))['sha']
+    require(source == expected['source_commit'], 'public tag source mismatch')
+    require(not destination.exists(), 'download destination already exists')
+    destination.mkdir(parents=True)
+    subprocess.run(['gh', 'release', 'download', tag, '--repo', 'leaperone/vibeface', '--dir', str(destination)], check=True)
+    info = verify_manifest(destination, expected)
+    prefix = f'vibeface-{app}-{expected["version"]}' if app != 'cli' else f'vibeface-{expected["version"]}'
+    archives = [prefix + (f'-{target}' if target else '') + '.tar.gz'
+                for target in (TARGETS if app in ('core', 'cli') else (None,))]
+    if app == 'mobile':
+        name = f'vibeface-{expected["version"]}-android.apk'
+        names = {name, name + '.sha256', name + '.provenance.json'}
+        require(json.loads((destination / (name + '.provenance.json')).read_text()) == mobile_provenance(destination / name),
+                'APK provenance mismatch')
+        archives = [name]
+    else:
+        names = {name + suffix for name in archives for suffix in ('', '.sha256')}
+    require({asset['name'] for asset in info['assets']} == names, 'release asset set does not match app')
+    require({asset['name'] for asset in view['assets']} == names | {'release.json'}
+            and len(view['assets']) == len(names) + 1, 'public release contains unexpected or duplicate assets')
+    for index, name in enumerate(archives):
+        require((destination / (name + '.sha256')).read_text() == f'{digest(destination / name)}  {name}\n',
+                'release checksum file mismatch')
+        if app == 'mobile':
+            continue
+        directory = unpack(destination / name, destination.parent / (destination.name + f'-unpacked-{index}'))
+        if app != 'cli':
+            verify_component(directory, app, dict(expected, target=TARGETS[index] if app == 'core' else None))
+        else:
+            build = json.loads((directory / 'BUILD-INFO.json').read_text())
+            verify_build_info(build)
+            pins = dict(version=expected['version'], source_commit=source, target=TARGETS[index])
+            lock = json.loads((ROOT / 'apps/cli/release-lock.json').read_text())
+            require(set(lock) == {'core', 'app'}, 'unsupported CLI dependency lock')
+            for component in ('core', 'app'):
+                require(set(lock[component]) == {'tag'}, 'unsupported dependency lock fields')
+                component_app, value, channel = parse_tag(lock[component]['tag'])
+                require(component_app == component and channel == expected['channel'], 'CLI dependency channel mismatch')
+                pins[component + '_version'] = value
+                pins[component + '_source_commit'] = json.loads(run('gh', 'api', f'repos/leaperone/vibeface/commits/{lock[component]["tag"]}'))['sha']
+            require(all(build[key] == value for key, value in pins.items()), 'CLI build dependency pin mismatch')
+            content = files(directory, ('FILES.sha256',))
+            require((directory / 'FILES.sha256').read_text() == ''.join(f'{value}  {name}\n' for name, value in content.items()),
+                    'CLI bundled content changed')
+    return info
+
+
 def compose(target, binary, output):
     require(target in TARGETS, 'unsupported platform')
     require(not run('git', 'status', '--porcelain'), 'release source must be clean')
@@ -376,6 +445,68 @@ def self_test():
             else:
                 raise AssertionError(f'accepted invalid component fields {change}')
         write_json(extracted / 'COMPONENT-INFO.json', info)
+        public = tmp / 'public'; public.mkdir()
+        public_archive(extracted, public / 'vibeface-app-0.0.1.tar.gz')
+        expected = {key: info[key] for key in ('app', 'version', 'tag', 'source_commit', 'channel')}
+        with patch(f'{__name__}.identity', side_effect=lambda app: dict(expected)):
+            declared = manifest('app', public)
+
+        def download(*args, **kwargs):
+            command = args[0]
+            assert command[:3] == ['gh', 'release', 'download']
+            destination = Path(command[command.index('--dir') + 1])
+            for path in public.iterdir():
+                shutil.copy2(path, destination / path.name)
+            return subprocess.CompletedProcess(command, 0)
+
+        def public_query(*args, **kwargs):
+            if args[:3] == ('gh', 'release', 'view'):
+                return json.dumps(dict(isDraft=False, assets=[{'name': p.name} for p in public.iterdir()]))
+            assert args[:2] == ('gh', 'api')
+            return json.dumps(dict(sha=expected['source_commit']))
+
+        with patch(f'{__name__}.identity', side_effect=lambda app: dict(expected)), \
+                patch(f'{__name__}.run', side_effect=public_query), patch(f'{__name__}.subprocess.run', side_effect=download):
+            assert verify_public('app', tmp / 'download-valid') == declared
+            changed = json.loads(json.dumps(declared)); changed['assets'][0]['sha256'] = '0' * 64
+            write_json(public / 'release.json', changed)
+            try:
+                verify_public('app', tmp / 'download-bad-checksum')
+            except ValueError as error:
+                assert 'checksum' in str(error)
+            else:
+                raise AssertionError('accepted corrupt public archive')
+            for path in public.iterdir():
+                path.unlink()
+            expected = dict(expected, app='core', tag='core-v0.0.1')
+            name = f'vibeface-core-0.0.1-{TARGETS[0]}.tar.gz'
+            public_archive(extracted, public / name)
+            manifest('core', public)
+            try:
+                verify_public('core', tmp / 'download-missing-targets')
+            except ValueError as error:
+                assert 'asset set' in str(error)
+            else:
+                raise AssertionError('accepted incomplete Core target set')
+
+        apk = tmp / 'fixture.apk'; apk.write_bytes(b'APK fixture')
+        expo = json.loads((ROOT / 'apps/mobile/app.json').read_text())['expo']
+        badging = f"package: name='{expo['android']['package']}' versionCode='{expo['android']['versionCode']}' versionName='{expo['version']}'"
+        def android_query(*args):
+            return 'a' * 40 if args[0] == 'git' else badging
+        with patch(f'{__name__}.shutil.which', return_value='aapt'), patch(f'{__name__}.run', side_effect=android_query):
+            assert mobile_provenance(apk) == dict(version=read_version('mobile'), sourceCommit='a' * 40, sha256=digest(apk),
+                applicationId=expo['android']['package'], versionCode=expo['android']['versionCode'], versionName=expo['version'])
+            for changed in (badging.replace(expo['android']['package'], 'wrong.package'),
+                            badging.replace(str(expo['android']['versionCode']), '1'), badging.replace(expo['version'], '9.9.9'), 'bad APK'):
+                with patch(f'{__name__}.run', return_value=changed):
+                    try:
+                        mobile_provenance(apk)
+                    except ValueError:
+                        pass
+                    else:
+                        raise AssertionError('accepted incorrect APK identity')
+
         for expected in ({'source_commit': 'b' * 40}, {'tag': 'app-v0.0.2'}):
             try:
                 verify_component(extracted, 'app', expected)
@@ -442,6 +573,8 @@ def main():
     p = sub.add_parser('manifest'); p.add_argument('app', choices=APPS); p.add_argument('directory', type=Path)
     p = sub.add_parser('compose'); p.add_argument('--target', required=True); p.add_argument('--binary', type=Path, required=True); p.add_argument('--output', type=Path, required=True)
     p = sub.add_parser('publish'); p.add_argument('app', choices=APPS); p.add_argument('directory', type=Path)
+    p = sub.add_parser('verify-public'); p.add_argument('app', choices=APPS); p.add_argument('--output', required=True, type=Path)
+    p = sub.add_parser('mobile-provenance'); p.add_argument('apk', type=Path)
     sub.add_parser('self-test')
     args = parser.parse_args()
     if args.command == 'plan':
@@ -466,6 +599,8 @@ def main():
     elif args.command == 'manifest': manifest(args.app, args.directory)
     elif args.command == 'compose': compose(args.target, args.binary, args.output)
     elif args.command == 'publish': publish(args.app, args.directory)
+    elif args.command == 'verify-public': print(json.dumps(verify_public(args.app, args.output)))
+    elif args.command == 'mobile-provenance': write_json(args.apk.with_name(args.apk.name + '.provenance.json'), mobile_provenance(args.apk))
     else: self_test()
 
 

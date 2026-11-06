@@ -516,7 +516,7 @@ def self_test():
     for path in ("README.md", "README.zh-CN.md"):
         assert make_plan([path])["required_jobs"] == ["quick-check"]
     assert make_plan(["README.zh-CN.md", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
-    for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py"):
+    for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py", "scripts/daily-nightly.py"):
         assert make_plan([path])["full"]
     assert docs["local_process_modes"] == [] and www["local_process_modes"] == []
     assert make_plan(["apps/core/src/store/bot_settings.rs"])["local_process_modes"] == ["memory-sync", "phase5"]

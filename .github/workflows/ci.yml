@@ -94,7 +94,8 @@ jobs:
           python3 scripts/check-delivery.py --self-test
           python3 scripts/install-delivery-toolchain.py --self-test
           python3 scripts/run-delivery-live.py --self-test
-          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")]'
+          python3 scripts/daily-nightly.py --self-test
+          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/release.py", "scripts/daily-nightly.py")]'
           bash -n install.sh
           bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
           shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
@@ -756,3 +757,30 @@ jobs:
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
         run: python3 scripts/ci.py gate --needs-env CI_NEEDS ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_live && '--delivery-live' || '' }}
+
+  daily-nightly:
+    needs: ci-gate
+    if: github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.ci-gate.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    concurrency:
+      group: daily-nightly
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - name: Reconcile daily version PR and immutable Nightly archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NIGHTLY_RELEASE_TOKEN: ${{ secrets.NIGHTLY_RELEASE_TOKEN }}
+        run: |
+          gh auth setup-git
+          python3 scripts/daily-nightly.py --run-id "$GITHUB_RUN_ID"

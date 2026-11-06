@@ -1,8 +1,8 @@
 import { Link, Stack, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { Bot, Crown, LoaderCircle, MessageSquareOff, Star } from 'lucide-react-native'
+import { ArrowDown, Bot, Crown, LoaderCircle, MessageSquareOff, Star } from 'lucide-react-native'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { FlatList, Platform, Pressable, StyleSheet, View } from 'react-native'
+import { FlatList, Platform, Pressable, StyleSheet, View, type NativeScrollEvent } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
 import Animated, { useAnimatedStyle } from 'react-native-reanimated'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
@@ -37,6 +37,14 @@ import { fadeIn } from '@/lib/motion'
 type Entry = { key: string; message: ChatMessage; time?: string; grouped: boolean } | (Row & { attached?: boolean })
 
 const Fade = withUniwind(Animated.View)
+
+function awayFromLatest(event: NativeScrollEvent, inset: Pick<NativeScrollEvent['contentInset'], 'top' | 'bottom'>, ios: boolean) {
+  const { contentOffset, contentInset, contentSize, layoutMeasurement } = event
+  const padding = ios ? contentInset : inset
+  const range = Math.max(0, contentSize.height + padding.top + padding.bottom - layoutMeasurement.height)
+  const distance = contentOffset.y + (ios ? contentInset.top : 0)
+  return contentSize.height > 0 && layoutMeasurement.height > 0 && Math.min(Math.max(0, distance), range) > 64
+}
 
 /**
  * Questions sit right before the first message written after them, 新消息 above what the badge counted, tasks and changes right after the message that caused
@@ -124,9 +132,16 @@ export default function ChatScreen() {
   }, [awaiting, starting]))
   const keyboard = useReanimatedKeyboardAnimation()
   const list = useRef<FlatList<ReturnType<typeof entries>[number]>>(null)
+  const scrollInset = useRef({ id, top: 0, bottom: 0 })
+  if (scrollInset.current.id !== id) scrollInset.current = { id, top: 0, bottom: 0 }
+  const [scrollButton, setScrollButton] = useState({ id, visible: false })
+  const toLatest = () => {
+    if (scrollInset.current.id !== id) return
+    list.current?.scrollToOffset({ offset: ios ? -scrollInset.current.top : 0, animated: true })
+  }
   // Opening a chat with 新消息 brings it to the top of the screen, the unread under it.
   const unreadIndex = useRef(-1)
-  const toUnread = (index: number) => list.current?.scrollToIndex({ index, viewPosition: 1, animated: false })
+  const toUnread = (index: number) => { if (scrollInset.current.id === id) list.current?.scrollToIndex({ index, viewPosition: 1, animated: false }) }
   useEffect(() => {
     const index = unreadIndex.current
     if (index >= 0) requestAnimationFrame(() => toUnread(index))
@@ -152,8 +167,7 @@ export default function ChatScreen() {
     setDraft({ text: '', files: [] })
     // Held from the tap itself: the shared sending flag lands a frame or two after the draft clears.
     setLaunching(true)
-    // iOS makes room for the keyboard with an inset, so the newest message rests at a negative offset, not at 0.
-    list.current?.scrollToOffset({ offset: ios ? -Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) : 0, animated: true })
+    toLatest()
     workspace.actions.send(id, text.trim(), files).catch(() => { unsettled.current = { text: text.trim(), seen: sent(text.trim()) }; setDraft({ text, files }) }).finally(() => setLaunching(false))
   }
   const rows = chat ? entries(chat, extras, bot, offline) : []
@@ -187,17 +201,26 @@ export default function ChatScreen() {
     <ScreenFaces><View className="flex-1">
     {/* Always mounted, so the first message sent with the keyboard open lands in the keyboard-aware list. */}
     <FlatList
+      key={id}
       ref={list}
       data={rows}
       inverted
       keyExtractor={(row) => row.key}
       onScrollToIndexFailed={({ index, averageItemLength }) => {
+        if (scrollInset.current.id !== id) return
         list.current?.scrollToOffset({ offset: averageItemLength * index, animated: false })
         setTimeout(() => toUnread(index), 100)
       }}
+      onScroll={({ nativeEvent }) => {
+        if (scrollInset.current.id !== id) return
+        const visible = awayFromLatest(nativeEvent, scrollInset.current, ios)
+        setScrollButton((current) => current.id === id && current.visible === visible ? current : { id, visible })
+      }}
+      scrollEventThrottle={16}
       keyboardDismissMode="interactive"
       keyboardShouldPersistTaps="handled"
-      renderScrollComponent={(props) => <KeyboardChatScrollView {...props} inverted offset={insets.bottom} keyboardLiftBehavior="whenAtEnd" />}
+      renderScrollComponent={(props) => <KeyboardChatScrollView {...props} inverted offset={insets.bottom} keyboardLiftBehavior="whenAtEnd"
+        onContentInsetChange={(inset) => { if (scrollInset.current.id === id) scrollInset.current = { id, top: inset.top, bottom: inset.bottom } }} />}
       contentContainerClassName="w-full max-w-3xl self-center px-4 py-6"
       // The inverted list's footer is its top: the oldest message starts below the transparent bar.
       ListFooterComponent={<View style={{ height: header }} />}
@@ -228,6 +251,9 @@ export default function ChatScreen() {
     </View></ScreenFaces>
     <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
       <View style={{ paddingBottom: insets.bottom }}>
+        {scrollButton.id === id && scrollButton.visible ? <View pointerEvents="box-none" className="absolute -top-14 w-full max-w-3xl self-center items-end px-4">
+          <Button variant="outline" size="icon" className="rounded-full bg-card shadow-sm" accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
+        </View> : null}
         <OfflineBar chat className="mx-4 mb-2 self-center" />
         <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
           blocked={blocked} sending={launching || (chat?.sending ?? false)} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} tint={tint} />
