@@ -45,14 +45,12 @@ pub fn find_on_path(name: &OsStr) -> Option<PathBuf> {
     if direct.components().count() > 1 {
         return candidates(direct).into_iter().find(|path| runnable(path));
     }
-    std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths)
-                .filter(|directory| !directory.as_os_str().is_empty())
-                .flat_map(|directory| candidates(&directory.join(direct)))
-                .find(|path| runnable(path))
-        })
-        .flatten()
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .filter(|directory| !directory.as_os_str().is_empty())
+            .flat_map(|directory| candidates(&directory.join(direct)))
+            .find(|path| runnable(path))
+    })
 }
 
 /// Every file name that could be the program `base` names.

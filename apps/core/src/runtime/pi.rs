@@ -1506,9 +1506,8 @@ impl Executor for Pi {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
-    use super::super::manager_control::group_alive;
     use super::*;
     use crate::crypto::LocalIdentity;
     use crate::identity::{Genesis, Member, NetworkState};
@@ -1823,7 +1822,7 @@ mod tests {
         let pi = Pi::new(&dir);
         let file = dir.join("session.jsonl");
         std::fs::write(&file, "")?;
-        pi.keep("s-1", &file, &dir, 0)?;
+        pi.keep("s-1", &file, &dir, "")?;
         pi.record_reply("s-1", "attempt-a", "first prompt")?;
         let user = |id: &str, prompt: &str| json!({"type":"message","id":id,"message":{"role":"user","content":prompt}});
         let assistant = |id: &str, text: &str, stop: Value| json!({"type":"message","id":id,"message":{"role":"assistant","content":[{"type":"text","text":text}],"stopReason":stop}});
@@ -1858,7 +1857,7 @@ mod tests {
             user("user-b", "later prompt"),
             assistant("reply-b", "later result", json!("stop")),
         ])?;
-        pi.keep("s-1", &file, &dir, 0)?;
+        pi.keep("s-1", &file, &dir, "")?;
         assert_eq!(
             pi.probe_reply("s-1", None, "attempt-a").await?,
             Probe::Terminal {
@@ -2270,9 +2269,9 @@ mod tests {
         Ok(())
     }
 
-    async fn ended(group: u32) -> bool {
+    async fn ended(token: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while group_alive(group) {
+        while tree::token_is_running(token) {
             if Instant::now() > deadline {
                 return false;
             }
@@ -2298,7 +2297,7 @@ mod tests {
             reports.recv().await,
             Some(Report::Signal(Signal::TurnStarted { .. })) | None
         ) {}
-        let left = pi.pointer("s-1")?.context("pointer")?.group;
+        let left = pi.pointer("s-1")?.context("pointer")?.tree;
         let mut stranger = std::process::Command::new("/bin/sleep")
             .arg("30")
             .process_group(0)
@@ -2308,14 +2307,14 @@ mod tests {
         recorded.push_str(&format!("{} {}\n", stranger.id(), fake().display()));
         std::fs::write(&pidfile, recorded)?;
         let restarted = Pi::new(&dir);
-        assert!(ended(left).await, "the restart ended the pi it left");
+        assert!(ended(&left).await, "the restart ended the pi it left");
         assert!(!pidfile.exists());
         assert!(
             stranger.try_wait()?.is_none(),
             "a process the Node did not start is left alone"
         );
         let mut pointer = restarted.pointer("s-1")?.context("pointer")?;
-        pointer.group = stranger.id();
+        pointer.tree = stranger.id().to_string();
         config::private_write(
             &restarted.pointer_path("s-1")?,
             &serde_json::to_vec(&pointer)?,
@@ -2340,9 +2339,9 @@ mod tests {
         dispatch(&node, &network, &dir).await?;
         let running = work(&node, |state| state.handle().is_some()).await?;
         let session = running.state.thread().context("thread")?;
-        let group = node.pi.pointer(session)?.context("pointer")?.group;
+        let group = node.pi.pointer(session)?.context("pointer")?.tree;
         node.shutdown().await;
-        assert!(ended(group).await, "the shutdown ended the running pi");
+        assert!(ended(&group).await, "the shutdown ended the running pi");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -2396,7 +2395,7 @@ mod tests {
                 "instructions-write-error" => {
                     let file = dir.join("session.jsonl");
                     std::fs::write(&file, "")?;
-                    pi.keep("s-1", &file, &dir, 0)?;
+                    pi.keep("s-1", &file, &dir, "")?;
                     std::fs::create_dir(pi.dir.join("s-1.md"))?;
                     Some("s-1")
                 }

@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       source_sha: {type: string, required: true}
-      package_artifact: {type: string, required: true}
+      package_artifact: {type: string, default: ''}
 permissions:
   contents: read
 jobs:
@@ -30,6 +30,8 @@ jobs:
         with: {python-version: '3.12'}
       - name: Select this platform's Python
         run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        with: {arch: x64}
       - name: Confirm the host really is the MSVC target
         run: |
           rustc -vV
@@ -41,6 +43,7 @@ jobs:
         run: '"$PY" -B scripts/ci.py test --tier fast --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface-core vibeface-control vibeface'
 
   process:
+    if: inputs.package_artifact != ''
     name: windows packaged processes
     runs-on: windows-2025
     timeout-minutes: 60
@@ -74,7 +77,7 @@ jobs:
         run: |
           # scripts/verify-windows-node.py ships with the Windows runtime; without it this check cannot pass.
           [[ -f scripts/verify-windows-node.py ]] || { echo '::error::scripts/verify-windows-node.py is missing from this source; the Windows process verification cannot run.'; exit 1; }
-          "$PY" -B scripts/verify-windows-node.py --binary "$PACKAGE/vibeface.exe" --core-binary "$PACKAGE/vibeface-core.exe" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-windows-node
+          "$PY" -B scripts/verify-windows-node.py --package "$PACKAGE" --artifacts .artifacts/ci-windows-node
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ !cancelled() }}
         with:

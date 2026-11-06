@@ -1,3 +1,4 @@
+import { readPrivateControlJson } from '../../scripts/private-control.mjs';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
@@ -76,9 +77,7 @@ async function freePort(): Promise<number> {
 /** The private control API scripts/e2e-desktop.mjs publishes once the application window is up. */
 async function control(port: number) {
   const path = resolve(artifacts, `control/${port}.json`);
-  const stat = await lstat(path);
-  assert(stat.isFile() && !stat.isSymbolicLink() && (stat.mode & 0o077) === 0, 'Control material stays private');
-  const fields = record(JSON.parse(await readFile(path, 'utf8')));
+  const fields = record(await readPrivateControlJson(path, { root: resolve(artifacts, 'control'), maxBytes: 4096 }));
   const url = new URL(text(fields.url));
   const token = text(fields.token);
   assert(url.protocol === 'http:' && url.hostname === '127.0.0.1' && url.port && url.pathname === '/' && !url.search && !url.hash, 'Control stays on literal loopback');

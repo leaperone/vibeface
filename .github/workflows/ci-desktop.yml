@@ -6,7 +6,7 @@ on:
       source_sha: {type: string, required: true}
       runner: {type: string, required: true}
       target: {type: string, required: true}
-      package_artifact: {type: string, required: true}
+      package_artifact: {type: string, default: ''}
 permissions:
   contents: read
 jobs:
@@ -26,11 +26,50 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with: {python-version: '3.12'}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: inputs.package_artifact != ''
         with:
           name: ${{ inputs.package_artifact }}
           path: .artifacts/packages
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: inputs.package_artifact == ''
+        with:
+          name: crypto-web-${{ inputs.source_sha }}
+          path: apps/app/generated
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: inputs.package_artifact == ''
+        with:
+          name: web-${{ inputs.source_sha }}
+          path: apps/app/dist/client
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        if: inputs.package_artifact == ''
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        if: inputs.package_artifact == ''
+        with:
+          key: desktop-native-${{ inputs.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        if: runner.os == 'Windows'
+        with: {arch: x64}
       - name: Select this platform's Python
         run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
+      - name: Build this platform's native runtime
+        if: inputs.package_artifact == ''
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$TARGET"
+          if [[ "$TARGET" == *-windows-* ]]; then
+            "$PY" -B scripts/package-node-windows.py
+          else
+            bash scripts/package-node.sh --target "$TARGET"
+          fi
+      - name: Keep this platform's runtime independently reviewable
+        if: inputs.package_artifact == ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: desktop-runtime-${{ inputs.target }}-${{ inputs.source_sha }}
+          path: .artifacts/packages/*
+          if-no-files-found: error
       - name: Unpack the verified runtime for this platform
         id: runtime
         run: |
@@ -45,6 +84,13 @@ jobs:
             printf 'dir=%s\n' "$PWD/.artifacts/runtime/$name"
             printf 'archive=%s\n' "$PWD/${archives[0]}"
           } >> "$GITHUB_OUTPUT"
+      - name: Verify native Windows processes and private platform operations
+        if: runner.os == 'Windows'
+        env:
+          PACKAGE: ${{ steps.runtime.outputs.dir }}
+        run: |
+          node scripts/private-control.mjs --self-test
+          "$PY" -B scripts/verify-windows-node.py --package "$PACKAGE" --artifacts .artifacts/ci-windows-node
       - name: Build the desktop host from this source
         run: |
           pnpm install --frozen-lockfile
@@ -90,6 +136,7 @@ jobs:
           name: desktop-${{ inputs.target }}-${{ inputs.source_sha }}-${{ github.run_attempt }}
           path: |
             .artifacts/desktop/*
+            .artifacts/ci-windows-node
             .artifacts/e2e/desktop/*.log
             tests/e2e/.artifacts/desktop
             !tests/e2e/.artifacts/desktop/**/downloads/**

@@ -1334,10 +1334,14 @@ mod tests {
             SteerTrace::TargetUnseen
         );
     }
+    #[cfg(unix)]
     use crate::providers::{AppServerMode, Local, Provider, ProviderEnv};
+    #[cfg(unix)]
     use futures_util::{SinkExt as _, StreamExt as _};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     async fn lines(path: &Path, count: usize) -> Vec<String> {
         for _ in 0..100 {
             let text = std::fs::read_to_string(path).unwrap_or_default();
@@ -1350,9 +1354,10 @@ mod tests {
         panic!("App Server fixture did not start {count} times");
     }
 
-    async fn ended(group: i32) -> bool {
+    #[cfg(unix)]
+    async fn ended(group: u32) -> bool {
         for _ in 0..100 {
-            if !group_alive(group) {
+            if !tree::root_is_running(group) {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1360,6 +1365,7 @@ mod tests {
         false
     }
 
+    #[cfg(unix)]
     fn artifacts(name: &str) -> Result<PathBuf> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
@@ -1369,6 +1375,7 @@ mod tests {
     }
 
     /// Unix socket paths stay short, so fixture sockets live under `/tmp`.
+    #[cfg(unix)]
     fn sockets() -> Result<PathBuf> {
         let dir = PathBuf::from(format!(
             "/tmp/vf-app-{}",
@@ -1378,6 +1385,7 @@ mod tests {
         Ok(dir)
     }
 
+    #[cfg(unix)]
     fn recording_codex(dir: &Path) -> Result<(PathBuf, PathBuf)> {
         let (program, out) = (dir.join("fake-codex"), dir.join("ran"));
         std::fs::write(
@@ -1391,6 +1399,7 @@ mod tests {
         Ok((program, out))
     }
 
+    #[cfg(unix)]
     fn system_app_server(
         socket: &Path,
         user_agent: &'static str,
@@ -1402,39 +1411,41 @@ mod tests {
             while let Ok((stream, _)) = listener.accept().await {
                 let turn = turn.clone();
                 connections.spawn(async move {
-                    let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
-                        return;
+                let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                while let Some(Ok(message)) = server.next().await {
+                    let Ok(request) = serde_json::from_slice::<Value>(&message.into_data())
+                    else {
+                        continue;
                     };
-                    while let Some(Ok(message)) = server.next().await {
-                        let Ok(request) = serde_json::from_slice::<Value>(&message.into_data())
-                        else {
-                            continue;
+                    if request["method"] == "initialize" {
+                        let reply =
+                            json!({"id":request["id"],"result":{"userAgent":user_agent}});
+                        let _ = server.send(reply.to_string().into()).await;
+                    } else if request["method"] == "thread/read" && let Some(turn) = &turn {
+                        let turn = turn.lock().unwrap().clone();
+                        let reply = if turn.is_null() {
+                            json!({"id":request["id"],"error":{"code":-32000,"message":"fixture unavailable"}})
+                        } else {
+                            json!({"id":request["id"],"result":{"thread":{"turns":[turn]}}})
                         };
-                        if request["method"] == "initialize" {
-                            let reply =
-                                json!({"id":request["id"],"result":{"userAgent":user_agent}});
-                            let _ = server.send(reply.to_string().into()).await;
-                        } else if request["method"] == "thread/read" && let Some(turn) = &turn {
-                            let turn = turn.lock().unwrap().clone();
-                            let reply = if turn.is_null() {
-                                json!({"id":request["id"],"error":{"code":-32000,"message":"fixture unavailable"}})
-                            } else {
-                                json!({"id":request["id"],"result":{"thread":{"turns":[turn]}}})
-                            };
-                            let _ = server.send(reply.to_string().into()).await;
-                        }
+                        let _ = server.send(reply.to_string().into()).await;
                     }
-                });
+                }
+            });
             }
         })
     }
 
+    #[cfg(unix)]
     fn stale_socket(path: &Path) -> Result<()> {
         drop(std::os::unix::net::UnixListener::bind(path)?);
         Ok(())
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn manual_manager_confirmation_releases_codex_hold_but_refuses_a_live_turn() -> Result<()>
     {
         for completed in [true, false] {
@@ -1492,6 +1503,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     async fn link_becomes(server: &CodexServer, wanted: impl Fn(&Link) -> bool) -> Link {
         for _ in 0..200 {
             let link = server.link().await;
@@ -1504,6 +1516,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn new_private_configuration_does_not_block_a_deferred_system_or_off_target() -> Result<()>
     {
         let dir = artifacts("codex-config-retarget")?;
@@ -1548,6 +1561,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn new_private_configuration_reloads_the_same_launch_after_active_leases_end()
     -> Result<()> {
         let dir = artifacts("codex-config-reload")?;
@@ -1573,7 +1587,7 @@ mod tests {
         let server = CodexServer::open(target.clone(), &LocalIdentity::generate(), &dir, events)?;
         server.start();
         let first = lines(&out, 1).await;
-        let pid: i32 = first[0].parse()?;
+        let pid: u32 = first[0].parse()?;
         let lease = server.lease("manager:config-fixture".into(), &target)?;
         server.configuration_changed();
         for next in [
@@ -1589,7 +1603,7 @@ mod tests {
         }
         server.retarget(target.clone());
         assert!(server.configuration_pending(&target));
-        assert!(group_alive(pid));
+        assert!(tree::root_is_running(pid));
         assert!(
             server
                 .lease("manager:stale-fixture".into(), &target)
@@ -1613,6 +1627,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn the_app_server_runs_with_only_codex_variables_and_restarts_on_a_new_launch()
     -> Result<()> {
         let dir = artifacts("codex-launch")?;
@@ -1665,7 +1680,7 @@ mod tests {
         bot.bind_turn("fixture-bot")?;
         assert!(bot.target() == &expected);
         assert_eq!(bot.client_id(), "fixture-bot");
-        assert!(group_alive(pid.parse()?));
+        assert!(tree::root_is_running(pid.parse()?));
         assert!(server.inner.target.lock().unwrap().pending.is_some());
         assert!(
             server
@@ -1677,7 +1692,7 @@ mod tests {
         drop(bot);
         server.inner.release("manager:fixture-bot");
         assert!(
-            group_alive(pid.parse()?),
+            tree::root_is_running(pid.parse()?),
             "the dispatched work still uses the old launch"
         );
         assert!(server.inner.target.lock().unwrap().pending.is_some());
@@ -1688,7 +1703,7 @@ mod tests {
 
         local.switches.execution.clear();
         server.retarget(local.codex_target(false));
-        let second_group: i32 = second[1].split_once(' ').unwrap().0.parse()?;
+        let second_group: u32 = second[1].split_once(' ').unwrap().0.parse()?;
         assert!(
             ended(second_group).await,
             "turning execution off stops the App Server"
@@ -1707,6 +1722,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn discovery_skips_stale_sockets_and_names_a_failed_handshake() -> Result<()> {
         let dir = sockets()?;
         let (missing, stale, live, mute) = (
@@ -1749,6 +1765,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn system_mode_never_starts_or_stops_the_app_server_and_follows_its_restart() -> Result<()>
     {
         let dir = artifacts("codex-system")?;
@@ -1806,9 +1823,9 @@ mod tests {
         std::fs::remove_file(&control)?;
         std::os::unix::fs::symlink(&second, &control)?;
         link_becomes(&server, |link| {
-            matches!(link, Link::Connected { user_agent, .. } if user_agent == "codex/second")
-        })
-        .await;
+        matches!(link, Link::Connected { user_agent, .. } if user_agent == "codex/second")
+    })
+    .await;
         assert!(matches!(server.test().await, Link::Connected { socket, .. } if socket == control));
 
         server.retarget(CodexTarget::Off);
@@ -1830,6 +1847,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn without_a_system_app_server_the_link_says_not_found() -> Result<()> {
         let dir = artifacts("codex-none")?;
         let sockets = sockets()?;

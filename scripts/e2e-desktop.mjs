@@ -5,10 +5,11 @@ import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, unlink } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
+import { ensurePrivateDirectory, resolveBoundedPath, writePrivateControlFile } from './private-control.mjs';
 
 const run = promisify(execFile);
 const port = Number(process.argv[2]);
@@ -20,6 +21,7 @@ const windows = process.platform === 'win32';
 const executable = windows ? application : join(application, 'Contents/MacOS/Vibeface');
 const resources = windows ? join(application, '..', 'resources') : join(application, 'Contents/Resources');
 const root = resolve(repository, '.artifacts/e2e/desktop');
+const controlRoot = resolveBoundedPath(root, 'control');
 // A personal directory really does carry spaces and characters outside ASCII.
 const profile = join(root, 'profiles', `测试 配置 ${port}`);
 let child;
@@ -137,7 +139,7 @@ async function inspect() {
   };
 }
 
-await mkdir(join(root, 'control'), { recursive: true, mode: 0o700 });
+await ensurePrivateDirectory(controlRoot, { root });
 const token = randomBytes(32).toString('hex');
 const control = createServer(async (request, response) => {
   const authorization = request.headers.authorization;
@@ -174,7 +176,7 @@ const control = createServer(async (request, response) => {
     changing = false;
   }
 });
-const controlPath = join(root, `control/${port}.json`);
+const controlPath = resolveBoundedPath(controlRoot, `${port}.json`);
 
 async function shutdown() {
   if (stopping) return;
@@ -200,6 +202,5 @@ try {
   process.exit(1);
 }
 // The control file is published only once the window is up, so its presence means the application is ready.
-const temporary = `${controlPath}.${process.pid}.tmp`;
-await writeFile(temporary, JSON.stringify({ url: `http://127.0.0.1:${address.port}`, token }), { mode: 0o600, flag: 'wx' });
-await rename(temporary, controlPath);
+await writePrivateControlFile(controlPath, JSON.stringify({ url: `http://127.0.0.1:${address.port}`, token }),
+  { root: controlRoot, maxBytes: 2048 });
