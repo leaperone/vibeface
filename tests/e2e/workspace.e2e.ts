@@ -7,7 +7,7 @@ test('keeps personal Tasks, deferred inputs and directed Channel results in thei
   await browser.setViewport({ width: 1440, height: 1000 });
   await app.open(workspace.source.url);
   await screen.getByRole('button', '新建我的网络').click();
-  await screen.getByLabel('这台电脑叫什么？').fill('Workspace E2E Node');
+  await screen.getByLabel('这个节点叫什么？').fill('Workspace E2E Node');
   await screen.getByRole('button', '下一步').click();
   await expect(screen.getByRole('heading', '设置恢复密码')).toBeVisible();
   await screen.getByLabel(/^恢复密码/).fill(secrets.get('recoveryPassword'));

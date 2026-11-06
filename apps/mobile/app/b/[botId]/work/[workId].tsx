@@ -26,6 +26,7 @@ import type { Attachment } from '@/data/types'
 import { ErrorText } from '@/components/action'
 
 const tone = (state: string): Tone => state === 'failed' ? 'danger' : state === 'completed' ? 'success' : ['awaiting_confirmation', 'stop_timed_out'].includes(state) ? 'warning' : 'neutral'
+type ComposerDraft = { text: string; files: Attachment[]; intent: InputIntent; workId: string; conversationId: string }
 
 /** One task of a bot's chat, as the web's task panel: progress, result, stop and the details behind it. */
 export default function TaskDetailRoute() {
@@ -45,6 +46,11 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
   const [intent, setIntent] = useState<InputIntent>('continue')
   const [files, setFiles] = useState<Attachment[]>([])
   const [sendError, setSendError] = useState('')
+  const conversationId = bot?.conversation_id ?? ''
+  const draftRef = useRef<ComposerDraft>({ text, files, intent, workId, conversationId })
+  if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.intent !== intent || draftRef.current.workId !== workId || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, intent, workId, conversationId }
+  const draft = draftRef.current
+  const savingDrafts = useRef(new Set<ComposerDraft>())
   const routeActive = useRef(false)
   const latest = useRef(shared)
   latest.current = shared
@@ -169,9 +175,12 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
     </Details>
     {shared.pendingMessages.filter((item) => item.target.kind === 'work' && item.target.work_id === workId).map((item) => <InputStatus key={item.message_id} pending={item} />)}
     <Composer value={text} onChange={setText} files={files} onFiles={setFiles} blocked={inputBlocked ? '这个工作当前不能接收补充。选择「新任务」继续。' : shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={`补充给 ${work.title || '这个工作'}`} sendLabel={intent === "defer" ? "保存为稍后处理" : intent === "new_task" ? "发送为新任务" : "补充这个工作"} target={<InputOptions label={`补充给 · ${work.title || "这个工作"}`} options={[{ key: workId, label: work.title || "这个工作", target: { kind: "work", work_id: workId } }]} selected={workId} onSelect={() => {}} intent={intent} onIntent={setIntent} pending={shared.pendingMessages.filter((item) => item.target.kind === "work" && item.target.work_id === workId)} />} onSend={() => {
+      const submittedDraft = draft
+      if (savingDrafts.current.has(submittedDraft)) return
+      savingDrafts.current.add(submittedDraft)
       const submitted = text, selectedFiles = files
       setSendError('')
-      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target: { kind: 'work', work_id: workId }, intent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !shared.isCurrent()) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') router.push(`/task/${saved.target.task_id}`) } }).then((saved) => { if (saved) { setText((current) => current === submitted ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch((cause) => setSendError(messageOf(cause)))
+      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target: { kind: 'work', work_id: workId }, intent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !shared.isCurrent()) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') router.push(`/task/${saved.target.task_id}`) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setText((current) => current === submitted ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch((cause) => setSendError(messageOf(cause))).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}>{sendError ? <ErrorText error={sendError} /> : null}</Composer>
   </KeyboardAwareScrollView>
 }

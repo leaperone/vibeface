@@ -24,6 +24,7 @@ import { PromptInput } from "@/features/chat/elements/prompt-input"
 import { InputQueue, TargetContextButton, WorkspaceInputStatus } from "./workspace-chat"
 
 const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
+type ComposerDraft = { text: string; files: File[]; intent: InputIntent; workId: string; conversationId: string }
 
 // The route change unmounts the panel, so focus would otherwise drop to <body>. Module scope keeps the ref stable across renders.
 function holdFocus(node: HTMLElement | null) {
@@ -96,6 +97,10 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const [intent, setIntent] = useState<InputIntent>('continue')
   const [files, setFiles] = useState<File[]>([])
   const [sendError, setSendError] = useState<unknown>(null)
+  const draftRef = useRef<ComposerDraft>({ text: input, files, intent, workId, conversationId: conversationId ?? '' })
+  if (draftRef.current.text !== input || draftRef.current.files !== files || draftRef.current.intent !== intent || draftRef.current.workId !== workId || draftRef.current.conversationId !== (conversationId ?? '')) draftRef.current = { text: input, files, intent, workId, conversationId: conversationId ?? '' }
+  const draft = draftRef.current
+  const savingDrafts = useRef(new Set<ComposerDraft>())
   // Its device cannot say whether it finished, so the person settles it here; nothing is re-run.
   const check = work && state === "awaiting_confirmation" ? workChecks([work], workspace.nodes).find((item): item is WorkCheck => item.kind === "work") : undefined
   const settle = (choice: "completed" | "interrupted") => async () => { if (!check) return; await workspace.resolveCheck(check, choice, ""); toast(choice === "completed" ? "已记为做完" : "已记为没做完", { tone: "success" }) }
@@ -235,9 +240,12 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       {workspace.pendingMessages.filter((item) => item.target.kind === 'work' && item.target.work_id === workId).map((item) => <WorkspaceInputStatus key={item.message_id} pending={item} />)}
     </div>}
     {work ? <div className="shrink-0 border-t p-3"><PromptInput value={input} onChange={setInput} files={files} onFiles={setFiles} hint="" reason={inputBlocked ? "这个工作当前不能接收补充。选择「新任务」继续。" : workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages || inputBlocked} busy={false} label={`补充给 ${work.title || '这个工作'}`} sendLabel={intent === "defer" ? "保存为稍后处理" : intent === "new_task" ? "发送为新任务" : "补充这个工作"} target={<><span className="text-meta text-muted-foreground">补充给 · {work.title || '这个工作'}</span><NativeSelect size="sm" aria-label="发送方式" value={intent} onChange={(event) => { const value = event.currentTarget.value; if (value === "continue" || value === "new_task" || value === "defer") setIntent(value) }}><NativeSelectOption value="continue" disabled={!canContinue}>补充这个工作</NativeSelectOption><NativeSelectOption value="new_task">新任务</NativeSelectOption><NativeSelectOption value="defer" disabled={!canContinue}>稍后处理</NativeSelectOption></NativeSelect><TargetContextButton target={{ kind: "work", work_id: workId }} conversationId={work.conversation_id} /><InputQueue target={{ kind: "work", work_id: workId }} /></>} onSubmit={() => {
+      const submittedDraft = draft
+      if (savingDrafts.current.has(submittedDraft)) return
+      savingDrafts.current.add(submittedDraft)
       const text = input, selectedFiles = files
       setSendError(null)
-      void workspace.sendMessage(text, selectedFiles, undefined, { target: { kind: 'work', work_id: workId }, intent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !workspace.isCurrent()) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: saved.target.task_id } }) } }).then((saved) => { if (saved) { setInput((current) => current === text ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch(setSendError)
+      void workspace.sendMessage(text, selectedFiles, undefined, { target: { kind: 'work', work_id: workId }, intent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !workspace.isCurrent()) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: saved.target.task_id } }) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setInput((current) => current === text ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}><InlineError error={sendError} /></PromptInput></div> : null}
   </aside>
   </div>

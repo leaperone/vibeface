@@ -40,6 +40,7 @@ const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'runnin
 const failureReason = (raw: string) => taskError(raw).split('\n').at(-1) ?? ''
 // The owner wrote the reply but it has not synced here yet; its streamed text stands in until it lands.
 const streamingStates = [...busyStates, 'publishing']
+type ComposerDraft = { text: string; files: File[]; intent: InputIntent; target: string; conversationId: string }
 
 function NoBot() {
   const { bots } = useWorkspace()
@@ -68,6 +69,10 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const dark = useDark()
   const tint = bot ? botTint(faceOf(bot.bot_id, bot.avatar).hue, dark) : undefined
   const text = drafts.get(conversationId) ?? ''
+  const draftRef = useRef<ComposerDraft>({ text, files, intent, target: selectedTarget, conversationId })
+  if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.intent !== intent || draftRef.current.target !== selectedTarget || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, intent, target: selectedTarget, conversationId }
+  const draft = draftRef.current
+  const savingDrafts = useRef(new Set<ComposerDraft>())
   const jobs = data?.scheduler?.jobs ?? []
   const unanswered = data?.scheduler?.unanswered ?? []
   const activeJobs = jobs.filter((job) => busyStates.includes(job.state))
@@ -308,9 +313,12 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         onFiles={setFiles}
         onSubmit={() => {
           if (sendDisabled || !text.trim() && !files.length) return
+          const submittedDraft = draft
+          if (savingDrafts.current.has(submittedDraft)) return
+          savingDrafts.current.add(submittedDraft)
           setSendError(null)
           const submittedFiles = files
-          workspace.sendMessage(text, submittedFiles, undefined, { target: inputTarget, intent, onSaved: (input) => { if (!workspace.isCurrent() || latest.current.conversationId !== conversationId || latest.current.view !== "chat") return; if (intent === "new_task" && (input.target.kind === "task" || input.target.kind === "channel_task")) void navigate({ to: "/tasks/$taskId", params: { taskId: input.target.task_id } }) } }).then((sent) => { if (sent && workspace.isCurrent()) { clearSentDraft(conversationId, text); setFiles((current) => current === submittedFiles ? [] : current) } }).catch(setSendError)
+          workspace.sendMessage(text, submittedFiles, undefined, { target: inputTarget, intent, onSaved: (input) => { if (!workspace.isCurrent() || latest.current.conversationId !== conversationId || latest.current.view !== "chat") return; if (intent === "new_task" && (input.target.kind === "task" || input.target.kind === "channel_task")) void navigate({ to: "/tasks/$taskId", params: { taskId: input.target.task_id } }) } }).then((sent) => { if (sent && workspace.isCurrent()) { if (latest.current.conversationId !== conversationId || draftRef.current === submittedDraft) clearSentDraft(conversationId, text); if (draftRef.current === submittedDraft) setFiles((current) => current === submittedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
         }}
       >
         <InlineError error={sendError} className="basis-full" />

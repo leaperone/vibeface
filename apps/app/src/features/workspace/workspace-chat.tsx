@@ -28,6 +28,7 @@ const receiptLabels: Record<InputReceipt['stage'], string> = {
   entry_accepted: '连接的设备已接收', owner_accepted: '执行设备已接纳', submitting: '提交已登记，等待执行服务确认',
   provider_accepted: '执行服务已接受输入', associated: '已确认回合归属', refused: '已拒绝', unknown: '补充是否进入当前工作尚未确认',
 }
+type ComposerDraft = { text: string; files: File[]; intent: InputIntent; target: string; conversationId: string }
 
 function sameTarget(left: InputTarget, right: InputTarget) {
   if ((left.kind === 'task' || left.kind === 'channel_task') && (right.kind === 'task' || right.kind === 'channel_task')) return left.task_id === right.task_id
@@ -167,6 +168,11 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
   const storage = storageOf(webPlatform.storage)
   const draftKey = networkKey(`draft:${channelId ? `channel:${channelId}` : `task:${scopeTaskId}`}`, ready?.principal.network_id ?? '')
   const [text, setText] = useState(() => { const saved = storage.readStorage<unknown>(draftKey, ''); return typeof saved === 'string' ? saved : '' })
+  const targetKey = inputTargetKey(target)
+  const draftRef = useRef<ComposerDraft>({ text, files, intent, target: targetKey, conversationId })
+  if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.intent !== intent || draftRef.current.target !== targetKey || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, intent, target: targetKey, conversationId }
+  const draft = draftRef.current
+  const savingDrafts = useRef(new Set<ComposerDraft>())
   const latest = useRef(workspace)
   latest.current = workspace
   const filter = channelId ? { channel_id: channelId } : { task_id: scopeTaskId }
@@ -220,12 +226,15 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
       </div>
     </div>} onStop={workspace.writable && task && !['completed', 'cancelled', 'deferred'].includes(task.state) ? () => { void (onStop ? onStop() : workspace.stopInputTarget({ target, expected_revision: task.revision })).catch(setError) } : undefined} onSubmit={() => {
       if (!text.trim() && !files.length) return
+      const submittedDraft = draft
+      if (savingDrafts.current.has(submittedDraft)) return
+      savingDrafts.current.add(submittedDraft)
       const submitted = text
       const selectedFiles = files
       setError(null)
       void workspace.sendMessage(submitted, selectedFiles, undefined, { target, intent, conversation_id: conversationId, ...((expectedRevision ?? task?.revision) !== undefined ? { expected_revision: expectedRevision ?? task?.revision } : {}), onSaved: (input) => { if (!routeActive.current || !workspace.isCurrent()) return; onSaved?.(input); if (!channelId && (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id !== scopeTaskId) void navigate({ to: '/tasks/$taskId', params: { taskId: input.target.task_id } }) } }).then((saved) => {
-        if (saved && latest.current.isCurrent()) { setText((current) => { if (current !== submitted) return current; storage.writeStorage(draftKey, ''); return '' }); setFiles((current) => current === selectedFiles ? [] : current); setIntent('continue'); void refresh().catch(setError) }
-      }).catch(setError)
+        if (saved && latest.current.isCurrent()) { if (draftRef.current === submittedDraft) { setText((current) => { if (current !== submitted) return current; storage.writeStorage(draftKey, ''); return '' }); setFiles((current) => current === selectedFiles ? [] : current); setIntent('continue') } void refresh().catch(setError) }
+      }).catch(setError).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}><InlineError error={error} action={{ label: '重新读取', onClick: () => void refresh().catch(setError) }} /><p className="text-meta text-muted-foreground">{history ? `已加载最近 ${history.events.length} 条${history.coverage.truncated ? '，更早的记录未加载' : ''}。` : '尚未读取历史。'}执行服务是否接收、输入归入哪个回合，请查看每条输入的状态。</p></PromptInput>
   </section>
 }

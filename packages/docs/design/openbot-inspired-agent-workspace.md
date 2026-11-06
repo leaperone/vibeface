@@ -28,7 +28,7 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 | `Assignment` | 固定任务 revision、Bot、执行 Node、资源目录和因果 basis。执行 Node 要求目录为实际 canonical 目录，拒绝符号链接别名。接受、采用、完成分别记录，旧 revision 的结果不能证明新请求已完成。 |
 | `InputPosted` | 本人签名绑定目标、意图、目标内 sequence、预期 revision、正文、附件和汇报选项。相同 message ID 只允许回读原意图。 |
 | `open_works` | `Store::open_works(network, scope)` 按 SQL 找出存在 dispatch 且没有结束记录、结果为 `unverified`，或仍待本人看的失败工作；后者是会话里最近结束的失败或被拒工作，之后没有更晚结束的工作、Bot 没有对它做出后续回复（它的结果报告轮的回复，或对失败之后本人消息的回复；派发它的那一轮的回复不算），也没有本人在待处理关掉它（`NotificationAcked`，`client_id = "inbox"`）。本机被拒的派发（未接收）同样列出，直到本人关掉、Bot 对它的报告轮写出已完成的回复，或在没有报告轮时（派发轮内直接得知被拒，或关掉了结果汇报），派发它的那一轮之后本人发的消息有了已完成的回复。已完成的工作不在此列表。 |
-| `ConversationPayload` | 客户端快照包含 `conversation`、`messages`、`works`、`scheduler`、`checks`、`local_node`、`changes`、`overwritten`、`bot_settings`、`questions`、`sessions`、`sent`。工作区从这些字段建立链接，不另建任务事实。 |
+| `ConversationPayload` | 客户端快照包含 `conversation`、`messages`、`works`、`scheduler`、`checks`、`local_node`、`changes`、`overwritten`、`bot_settings`、`questions`、`sessions`、`sent`。该快照继续提供 Work 汇总和链接。业务 Task、频道、Assignment 和输入队列从同一签名 DAG 中的 `WorkspaceCommanded`、`InputPosted` 等事件投影，经 `workspace_state` 和 `workspace_history` 读取，不另存 transcript。 |
 | `scheduler_jobs` | job 主键语义为 `(conversation_id, trigger)`。`trigger` 可为 `message:<id>`、`work:<id>`、`task:<id>`、`assignment:<id>`、`bot_message:<id>` 或 `schedule:<id>:<slot>`。job 还保存 `kind`、顺序、`basis` 版本向量、`reply_to`、固定 `message_id` 和状态。 |
 | `scheduler_sessions` | 本机 Provider resume 指针，含 `native_id`、`native_token`、`covers`、`owner_epoch`、`sdk_config`、`permission_version`、`active` 和下一序号。它不是完整 transcript，也不是同步到 DAG 的上下文。 |
 | `ContextCheckpoint` | DAG 事件，含 `covers`、`summary`、`recent_user_requests`、`open_work`、`decisions`。它压缩提示预算，不删除旧事件，不等于 Provider 的 KV memory。 |

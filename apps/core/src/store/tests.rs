@@ -12553,7 +12553,8 @@ fn workspace_signed_commands_inputs_and_task_history_are_scoped_and_idempotent()
             (Some("history-channel"), None, &works[0].work_id),
             (None, Some("t2"), &works[1].work_id),
         ] {
-            let (history, truncated) = origin.workspace_history(&net.network, channel, task, 100)?;
+            let (history, truncated) =
+                origin.workspace_history(&net.network, channel, task, 100)?;
             assert!(!truncated);
             let facts: Vec<_> = history
                 .iter()

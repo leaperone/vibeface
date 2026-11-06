@@ -35,6 +35,7 @@ const receiptLabels: Record<InputReceipt['stage'], string> = {
   associated: '已确认回合归属', refused: '已拒绝', unknown: '补充是否进入当前工作尚未确认',
 }
 const deliveryLabels: Record<PendingMessage['delivery'], string> = { saved: '本地已保存', uploading: '本地已保存，附件准备中', submitting: '正在发送给连接的设备', accepted: '连接的设备已接收', unknown: '是否送达尚未确认' }
+type ComposerDraft = { text: string; files: Attachment[]; intent: InputIntent; target: string; conversationId: string }
 
 export function ScopeSources({ context }: { context: ContextProjection }) {
   const kinds: Record<ContextProjection['sources'][number]['kind'], string> = { trigger: '本轮交代', message: '共享消息', work: '工作结果', dispatch: '工作指派', checkpoint: '历史摘要', handoff: '任务交接', memory: '持久记忆', question: '已知问题', attachment: '附件' }
@@ -145,7 +146,7 @@ function sameTarget(left: InputTarget, right: InputTarget) {
 export function InputLocation({ target, conversationId }: { target: InputTarget; conversationId: string }) {
   const shared = useLive()
   const bot = shared?.bots.find((item) => item.conversation_id === conversationId)
-  const href = target.kind === 'task' || target.kind === 'channel_task' ? `/task/${target.task_id}` : target.kind === 'channel_member' ? `/channel/${target.channel_id}` : target.kind === 'work' && bot ? `/b/${bot.bot_id}/work/${target.work_id}` : bot ? `/b/${bot.bot_id}` : null
+  const href = target.kind === 'task' || target.kind === 'channel_task' ? `/task/${target.task_id}` : target.kind === 'channel_member' ? `/channel/${target.channel_id}` : target.kind === 'work' && bot ? `/b/${bot.bot_id}/work/${target.work_id}` : bot ? `/b/${bot.bot_id}${target.kind === 'routine' ? `?routine=${encodeURIComponent(target.trigger)}` : ''}` : null
   return href ? <Link href={href} asChild><Button variant="ghost" className="self-start"><Text>{target.kind === 'task' || target.kind === 'channel_task' ? '打开所属任务' : target.kind === 'work' ? '打开所属工作' : target.kind === 'channel_member' ? '打开所属频道' : '打开所属 Bot'}</Text></Button></Link> : null
 }
 
@@ -242,6 +243,8 @@ export function ScopedWorkspaceScreen({ taskId, channelId }: { taskId?: string; 
   const bot = shared?.bots.find((item) => task ? item.bot_id === task.owner_bot : pendingTask ? item.conversation_id === pendingTask.conversation_id : item.bot_id === (recipient || (selected.startsWith('member:') ? selected.slice(7) : channel?.coordinator_bot)))
   const draftKey = networkKey(`draft:${channelId ? `channel:${channelId}` : `task:${taskId}`}`, ready?.principal.network_id ?? '')
   const [text, setText] = useState(() => { const saved = storage.readStorage<unknown>(draftKey, ''); return typeof saved === 'string' ? saved : '' })
+  const draftRef = useRef<ComposerDraft | null>(null)
+  const savingDrafts = useRef(new Set<ComposerDraft>())
   const changeText = (value: string) => { setText(value); storage.writeStorage(draftKey, value) }
   const read = async () => {
     const live = latest.current
@@ -254,6 +257,9 @@ export function ScopedWorkspaceScreen({ taskId, channelId }: { taskId?: string; 
   useEffect(() => { let active = true; const refresh = () => { if (active) void read().catch((cause) => { if (active) setError(messageOf(cause)) }) }; refresh(); const timer = setInterval(refresh, 3000); return () => { active = false; clearInterval(timer) } }, [taskId, channelId, shared?.generation])
   if (!shared || !bot || taskId && !task && !pendingTask || channelId && !channel) return <View className="flex-1"><EmptyState icon={ListChecks} title={error || (shared?.workspaceState ? '尚未读到这个任务、频道或 Bot' : '正在读取')} className="flex-1 justify-center" action={<Button variant="outline" onPress={() => void read().catch((cause) => setError(messageOf(cause)))}><Text>重新读取</Text></Button>} /></View>
   const target: InputTarget = task ? task.channel_id ? { kind: 'channel_task', channel_id: task.channel_id, task_id: task.task_id, bot_id: task.owner_bot } : { kind: 'task', task_id: task.task_id } : taskId && pendingTask ? pendingTask.target : selectedTaskId && channelId ? { kind: 'channel_task', channel_id: channelId, task_id: selectedTaskId, bot_id: bot.bot_id } : { kind: 'channel_member', channel_id: channelId ?? '', bot_id: bot.bot_id }
+  const targetKey = inputTargetKey(target), conversationId = bot.conversation_id
+  if (!draftRef.current || draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.intent !== intent || draftRef.current.target !== targetKey || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, intent, target: targetKey, conversationId }
+  const draft = draftRef.current
   const expectedRevision = task?.revision ?? pendingTask?.expected_revision
   const label = `${bot.name} · ${task?.title ?? (selectedTaskId ? '已保存的任务' : '新频道任务')}`
   const pending = shared.pendingMessages.filter((item) => channelId ? (item.target.kind === 'channel_task' || item.target.kind === 'channel_member') && item.target.channel_id === channelId : item.target.kind === 'task' && item.target.task_id === taskId || item.target.kind === 'channel_task' && item.target.task_id === taskId)
@@ -287,9 +293,12 @@ export function ScopedWorkspaceScreen({ taskId, channelId }: { taskId?: string; 
       {error || actionError ? <ErrorText error={error || actionError} /> : null}
     </KeyboardAwareScrollView>
     <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}><View style={{ paddingBottom: insets.bottom }}><Composer value={text} onChange={changeText} files={files} onFiles={setFiles} blocked={shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={`发给 ${label}`} sendLabel={intent === 'defer' ? '保存为稍后处理' : intent === 'new_task' ? '发送为新任务' : active ? '补充当前工作' : '发送'} target={<InputOptions label={label} options={options} selected={selected || (task ? `task:${task.task_id}` : taskId ? `task:${taskId}` : `member:${bot.bot_id}`)} onSelect={(option) => { selectionRevision.current++; setSelected(option.key); setSavedInput(null); if (option.target.kind === 'channel_task' || option.target.kind === 'channel_member') { setRecipient(option.target.bot_id); storage.writeStorage(selectionKey, { bot_id: option.target.bot_id, ...(option.target.kind === 'channel_task' ? { task_id: option.target.task_id } : {}) }); if (option.target.kind === 'channel_task') void shared.readWorkspaceState({ task_id: option.target.task_id }).catch((cause) => setError(messageOf(cause))) } }} intent={intent} onIntent={setIntent} pending={pending} />} onStop={task && !['completed', 'cancelled', 'deferred'].includes(task.state) ? () => void shared.stopInputTarget({ target, expected_revision: task.revision }).catch((cause) => setError(messageOf(cause))) : undefined} onSend={() => {
+      const submittedDraft = draft
+      if (savingDrafts.current.has(submittedDraft)) return
+      savingDrafts.current.add(submittedDraft)
       const submitted = text, selectedFiles = files
       setError('')
-      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target, intent, conversation_id: bot.conversation_id, ...(expectedRevision !== undefined ? { expected_revision: expectedRevision } : {}), onSaved: (input) => { if (savedSelection !== selectionRevision.current || !shared.isCurrent()) return; if (channelId && input.target.kind === 'channel_task' && input.target.channel_id === channelId) { setSavedInput(input); setSelected(`task:${input.target.task_id}`); setRecipient(input.target.bot_id); storage.writeStorage(selectionKey, { bot_id: input.target.bot_id, task_id: input.target.task_id }) } else if (routeActive.current && !channelId && (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id !== taskId) router.push(`/task/${input.target.task_id}`) } }).then((saved) => { if (saved && shared.isCurrent()) { setText((current) => { if (current !== submitted) return current; storage.writeStorage(draftKey, ''); return '' }); setFiles((current) => current === selectedFiles ? [] : current); setIntent('continue'); void read().catch((cause) => setError(messageOf(cause))) } }).catch((cause) => setError(messageOf(cause)))
+      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target, intent, conversation_id: bot.conversation_id, ...(expectedRevision !== undefined ? { expected_revision: expectedRevision } : {}), onSaved: (input) => { if (savedSelection !== selectionRevision.current || !shared.isCurrent()) return; if (channelId && input.target.kind === 'channel_task' && input.target.channel_id === channelId) { setSavedInput(input); setSelected(`task:${input.target.task_id}`); setRecipient(input.target.bot_id); storage.writeStorage(selectionKey, { bot_id: input.target.bot_id, task_id: input.target.task_id }) } else if (routeActive.current && !channelId && (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id !== taskId) router.push(`/task/${input.target.task_id}`) } }).then((saved) => { if (saved && shared.isCurrent()) { if (draftRef.current === submittedDraft) { setText((current) => { if (current !== submitted) return current; storage.writeStorage(draftKey, ''); return '' }); setFiles((current) => current === selectedFiles ? [] : current); setIntent('continue') } void read().catch((cause) => setError(messageOf(cause))) } }).catch((cause) => setError(messageOf(cause))).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}>{error ? <ErrorText error={error} /> : null}</Composer></View></KeyboardStickyView>
   </View>
 }

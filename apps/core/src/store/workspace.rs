@@ -3013,7 +3013,22 @@ impl Store {
                             }
                         }
                 }
-                body => body.work_id().is_some_and(|id| work_ids.contains(id)),
+                body => {
+                    if let Some(id) = body.work_id()
+                        && self
+                            .work(network, id)?
+                            .is_some_and(|work| work.conversation_id == event.scope_id)
+                    {
+                        work_ids.contains(id)
+                            || self
+                                .work_input_target(network, &event.scope_id, id)?
+                                .as_ref()
+                                .and_then(target_task)
+                                .is_some_and(task_matches)
+                    } else {
+                        false
+                    }
+                }
             };
             if matches {
                 let speaker = history_speaker(&self.connection, network, &graph, &event)?;
@@ -3672,9 +3687,14 @@ impl Store {
         command: WorkspaceCommand,
         at: i64,
     ) -> Result<WorkspaceCommandReceipt> {
-        if let WorkspaceCommand::AssignmentProgress { execution, .. } = &command {
+        if let WorkspaceCommand::AssignmentProgress {
+            execution,
+            evidence_event,
+            ..
+        } = &command
+        {
             ensure!(
-                execution.is_none(),
+                execution.is_none() && evidence_event.is_none(),
                 "only Node lifecycle records execution evidence"
             );
         }
