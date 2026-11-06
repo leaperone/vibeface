@@ -17,12 +17,30 @@ export type OwnedExit = { code: number | null; signal: NodeJS.Signals | null }
 /** How long a graceful stdin EOF shutdown is awaited before the owned handle is killed. */
 const QUIT_GRACE_MS = 20_000
 const REPLACE_GRACE_MS = 5_000
-const POLL_MS = 50
+const SIGTERM_GRACE_MS = 2_000
+const SIGKILL_GRACE_MS = 2_000
+
+type LifecycleTiming = {
+  quitGraceMs: number
+  replaceGraceMs: number
+  sigtermGraceMs: number
+  sigkillGraceMs: number
+}
+
+const DEFAULT_TIMING: LifecycleTiming = {
+  quitGraceMs: QUIT_GRACE_MS,
+  replaceGraceMs: REPLACE_GRACE_MS,
+  sigtermGraceMs: SIGTERM_GRACE_MS,
+  sigkillGraceMs: SIGKILL_GRACE_MS,
+}
 
 export class CoreLifecycle {
   private ownership: Ownership = { kind: 'idle' }
   private child: ChildProcess | null = null
   private readonly exitHandlers = new Set<(exit: OwnedExit) => void>()
+  private stopping: Promise<void> | null = null
+
+  constructor(private readonly timing: Partial<LifecycleTiming> = {}) {}
 
   state(): Ownership {
     return this.ownership
@@ -81,8 +99,53 @@ export class CoreLifecycle {
     for (const handler of this.exitHandlers) handler(exit)
   }
 
-  /** Close stdin, wait for Core's own shutdown, and only then kill this exact child handle. */
-  async stopOwned(reason: 'quit' | 'replace'): Promise<void> {
+  private grace(reason: 'quit' | 'replace'): number {
+    return reason === 'quit'
+      ? (this.timing.quitGraceMs ?? DEFAULT_TIMING.quitGraceMs)
+      : (this.timing.replaceGraceMs ?? DEFAULT_TIMING.replaceGraceMs)
+  }
+
+  private signalGrace(signal: 'SIGTERM' | 'SIGKILL'): number {
+    return signal === 'SIGTERM'
+      ? (this.timing.sigtermGraceMs ?? DEFAULT_TIMING.sigtermGraceMs)
+      : (this.timing.sigkillGraceMs ?? DEFAULT_TIMING.sigkillGraceMs)
+  }
+
+  private exited(child: ChildProcess): boolean {
+    return this.child !== child || child.exitCode !== null || child.signalCode !== null
+  }
+
+  private sendSignal(child: ChildProcess, signal: 'SIGTERM' | 'SIGKILL'): void {
+    if (this.exited(child)) return
+    try {
+      child.kill(signal)
+    } catch {
+      /* the process can already be gone */
+    }
+  }
+
+  private async waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+    if (this.exited(child)) return true
+    return await new Promise<boolean>((resolve) => {
+      let done = false
+      let timer: NodeJS.Timeout | null = null
+      const finish = (): void => {
+        if (done) return
+        done = true
+        if (timer) clearTimeout(timer)
+        child.off('exit', onExit)
+        child.off('close', onClose)
+        resolve(this.exited(child))
+      }
+      const onExit = (): void => finish()
+      const onClose = (): void => finish()
+      timer = setTimeout(finish, timeoutMs)
+      child.once('exit', onExit)
+      child.once('close', onClose)
+    })
+  }
+
+  private async stopOwnedOnce(reason: 'quit' | 'replace'): Promise<void> {
     const child = this.child
     if (!child || this.ownership.kind !== 'owned') return
     try {
@@ -90,17 +153,29 @@ export class CoreLifecycle {
     } catch {
       /* already closed */
     }
-    const deadline = Date.now() + (reason === 'quit' ? QUIT_GRACE_MS : REPLACE_GRACE_MS)
-    while (Date.now() < deadline && child.exitCode === null && child.signalCode === null) {
-      await new Promise((resolve) => setTimeout(resolve, POLL_MS))
-    }
-    if (child.exitCode === null && child.signalCode === null) {
-      try {
-        child.kill('SIGTERM')
-      } catch {
-        /* the handle is gone */
-      }
-    }
-    this.finish(child, { code: child.exitCode, signal: child.signalCode })
+
+    // Stage 1: EOF graceful shutdown.
+    if (await this.waitForExit(child, this.grace(reason))) return
+
+    // Stage 2: SIGTERM, then wait for a confirmed exit.
+    this.sendSignal(child, 'SIGTERM')
+    if (await this.waitForExit(child, this.signalGrace('SIGTERM'))) return
+
+    // Stage 3: final SIGKILL, then wait for a confirmed exit/close.
+    this.sendSignal(child, 'SIGKILL')
+    if (await this.waitForExit(child, this.signalGrace('SIGKILL'))) return
+
+    // If exit cannot be confirmed, keep ownership so callers never treat a live child as stopped.
+    throw new Error('无法确认本机 Core 已退出；保留 owned 状态以避免误报已停止。')
+  }
+
+  /** Close stdin, wait for Core's own shutdown, and only then kill this exact child handle. */
+  async stopOwned(reason: 'quit' | 'replace'): Promise<void> {
+    if (this.stopping) return this.stopping
+    const running = this.stopOwnedOnce(reason)
+    this.stopping = running.finally(() => {
+      if (this.stopping === running) this.stopping = null
+    })
+    return this.stopping
   }
 }

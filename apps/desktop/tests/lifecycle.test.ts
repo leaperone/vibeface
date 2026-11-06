@@ -1,5 +1,6 @@
+import type { ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -15,6 +16,23 @@ const settled = async (check: () => boolean, timeoutMs = 5000): Promise<void> =>
   throw new Error('the owned child never reached the expected state')
 }
 
+const markerPath = (dataDir: string): string => join(dataDir, 'node.running')
+
+const runningPid = async (dataDir: string): Promise<number> => {
+  const raw = await readFile(markerPath(dataDir), 'utf8')
+  return Number(raw.trim())
+}
+
+const pidAlive = (pid: number): boolean => {
+  if (!Number.isFinite(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
 describe('CoreLifecycle with a real child process', () => {
   let dataDir = ''
   let lifecycle = new CoreLifecycle()
@@ -22,33 +40,43 @@ describe('CoreLifecycle with a real child process', () => {
   beforeEach(async () => {
     dataDir = await mkdtemp(join(tmpdir(), 'vibeface-owned-'))
     lifecycle = new CoreLifecycle()
+    delete process.env['FIXTURE_CRASH_AFTER_MS']
+    delete process.env['FIXTURE_IGNORE_PARENT_EOF']
+    delete process.env['FIXTURE_IGNORE_SIGTERM']
+    delete process.env['FIXTURE_TERM_DELAY_MS']
   })
 
   afterEach(async () => {
-    await lifecycle.stopOwned('quit')
+    delete process.env['FIXTURE_CRASH_AFTER_MS']
+    delete process.env['FIXTURE_IGNORE_PARENT_EOF']
+    delete process.env['FIXTURE_IGNORE_SIGTERM']
+    delete process.env['FIXTURE_TERM_DELAY_MS']
+    await lifecycle.stopOwned('quit').catch(() => {
+      /* tests that force unknown outcomes clean up the child explicitly */
+    })
     await rm(dataDir, { recursive: true, force: true })
   })
 
   it('starts a child that only runs with the parent-stdin flag', async () => {
     lifecycle.startOwned(serviceFixture(dataDir), dataDir)
     expect(lifecycle.state().kind).toBe('owned')
-    await settled(() => existsSync(join(dataDir, 'node.running')))
+    await settled(() => existsSync(markerPath(dataDir)))
   })
 
   it('closing stdin shuts the child down and releases ownership', async () => {
     lifecycle.startOwned(serviceFixture(dataDir), dataDir)
-    await settled(() => existsSync(join(dataDir, 'node.running')))
+    await settled(() => existsSync(markerPath(dataDir)))
     await lifecycle.stopOwned('quit')
     expect(lifecycle.state().kind).toBe('idle')
-    expect(existsSync(join(dataDir, 'node.running'))).toBe(false)
+    expect(existsSync(markerPath(dataDir))).toBe(false)
   })
 
   it('can start again after a clean stop', async () => {
     lifecycle.startOwned(serviceFixture(dataDir), dataDir)
-    await settled(() => existsSync(join(dataDir, 'node.running')))
+    await settled(() => existsSync(markerPath(dataDir)))
     await lifecycle.stopOwned('quit')
     lifecycle.startOwned(serviceFixture(dataDir), dataDir)
-    await settled(() => existsSync(join(dataDir, 'node.running')))
+    await settled(() => existsSync(markerPath(dataDir)))
     expect(lifecycle.state().kind).toBe('owned')
   })
 
@@ -80,5 +108,64 @@ describe('CoreLifecycle with a real child process', () => {
     expect(lifecycle.state()).toEqual({ kind: 'attached', dataDir })
     await lifecycle.stopOwned('quit')
     expect(lifecycle.state().kind).toBe('attached')
+  })
+
+  it('waits for a confirmed exit before clearing owned state during fallback stop', async () => {
+    lifecycle =
+      process.platform === 'win32'
+        ? new CoreLifecycle({ replaceGraceMs: 120, sigtermGraceMs: 900, sigkillGraceMs: 300 })
+        : new CoreLifecycle({ replaceGraceMs: 120, sigtermGraceMs: 200, sigkillGraceMs: 300 })
+
+    process.env['FIXTURE_IGNORE_PARENT_EOF'] = '1'
+    if (process.platform === 'win32') process.env['FIXTURE_TERM_DELAY_MS'] = '500'
+    else process.env['FIXTURE_IGNORE_SIGTERM'] = '1'
+
+    lifecycle.startOwned(serviceFixture(dataDir), dataDir)
+    await settled(() => existsSync(markerPath(dataDir)))
+    const pid = await runningPid(dataDir)
+
+    const stopping = lifecycle.stopOwned('replace')
+    await new Promise((resolve) => setTimeout(resolve, 180))
+
+    expect(lifecycle.state().kind).toBe('owned')
+    expect(pidAlive(pid)).toBe(true)
+
+    await stopping
+    expect(lifecycle.state().kind).toBe('idle')
+    expect(pidAlive(pid)).toBe(false)
+  })
+
+  it('retains owned state and errors when exit cannot be confirmed', async () => {
+    lifecycle = new CoreLifecycle({ replaceGraceMs: 80, sigtermGraceMs: 80, sigkillGraceMs: 80 })
+    process.env['FIXTURE_IGNORE_PARENT_EOF'] = '1'
+    if (process.platform !== 'win32') process.env['FIXTURE_IGNORE_SIGTERM'] = '1'
+    else process.env['FIXTURE_TERM_DELAY_MS'] = '1000'
+
+    lifecycle.startOwned(serviceFixture(dataDir), dataDir)
+    await settled(() => existsSync(markerPath(dataDir)))
+
+    const holder = lifecycle as unknown as { child: ChildProcess | null }
+    const child = holder.child
+    expect(child).not.toBeNull()
+    if (!child) return
+
+    const realKill = child.kill.bind(child)
+    ;(child as ChildProcess & { kill: (signal?: NodeJS.Signals | number) => boolean }).kill = () => false
+    try {
+      await expect(lifecycle.stopOwned('replace')).rejects.toThrow(/无法确认本机 Core 已退出/)
+      expect(lifecycle.state().kind).toBe('owned')
+    } finally {
+      ;(child as ChildProcess & { kill: (signal?: NodeJS.Signals | number) => boolean }).kill = realKill
+      realKill('SIGKILL')
+      await settled(() => lifecycle.state().kind === 'idle')
+    }
+  })
+
+  it('treats parallel stop requests as idempotent', async () => {
+    lifecycle = new CoreLifecycle({ replaceGraceMs: 120, sigtermGraceMs: 120, sigkillGraceMs: 120 })
+    lifecycle.startOwned(serviceFixture(dataDir), dataDir)
+    await settled(() => existsSync(markerPath(dataDir)))
+    await Promise.all([lifecycle.stopOwned('replace'), lifecycle.stopOwned('replace')])
+    expect(lifecycle.state().kind).toBe('idle')
   })
 })

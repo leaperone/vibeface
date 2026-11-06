@@ -23,8 +23,15 @@ if (!dataDir || !existsSync(dataDir)) {
 const marker = join(dataDir, 'node.running')
 const requested = process.env['FIXTURE_CRASH_AFTER_MS']
 const crashAfter = requested === undefined || requested === '' ? null : Number(requested)
+const ignoreParentEof = process.env['FIXTURE_IGNORE_PARENT_EOF'] === '1'
+const ignoreSigterm = process.env['FIXTURE_IGNORE_SIGTERM'] === '1' && process.platform !== 'win32'
+const termDelayRaw = process.env['FIXTURE_TERM_DELAY_MS']
+const termDelayMs = termDelayRaw === undefined || termDelayRaw === '' ? 0 : Number(termDelayRaw)
+let exiting = false
 
 function stop(code) {
+  if (exiting) return
+  exiting = true
   rmSync(marker, { force: true })
   process.exit(code)
 }
@@ -36,6 +43,20 @@ if (crashAfter !== null && Number.isFinite(crashAfter)) {
 }
 
 stdin.resume()
-stdin.on('end', () => stop(0))
-stdin.on('close', () => stop(0))
+if (!ignoreParentEof) {
+  stdin.on('end', () => stop(0))
+  stdin.on('close', () => stop(0))
+}
+if (ignoreSigterm) {
+  process.on('SIGTERM', () => {})
+} else {
+  process.on('SIGTERM', () => {
+    if (Number.isFinite(termDelayMs) && termDelayMs > 0) {
+      setTimeout(() => stop(0), termDelayMs)
+      return
+    }
+    stop(0)
+  })
+}
+process.on('SIGINT', () => stop(0))
 setInterval(() => {}, 1 << 30)

@@ -8,6 +8,7 @@ import {
   type LauncherStatus,
   type PreferenceKey,
 } from '../shared/contract.js'
+import { ActivationQueue, type JoinActivation } from './activation-queue.js'
 import { parseArgs } from './cli.js'
 import { deepLinkFromArgv, isLoopbackOrigin, parseDeepLink, type DeepLink } from './deeplink.js'
 import { isTrustedLauncherCall, readBoolean, readExternalUrl, readNoArguments, readString } from './ipc-guard.js'
@@ -186,6 +187,12 @@ async function handleJoin(link: DeepLink): Promise<void> {
   }
 }
 
+function canHandleLocally(link: JoinActivation): boolean {
+  if (link.origin !== null && !isLoopbackOrigin(link.origin)) return true
+  const state = coreSession?.state()
+  return state?.kind === 'owned' || state?.kind === 'attached'
+}
+
 function trusted(event: IpcMainInvokeEvent): void {
   const frame = event.senderFrame
   let frameUrl: string | null = null
@@ -298,15 +305,33 @@ async function start(): Promise<void> {
     return
   }
 
+  const activations = new ActivationQueue(async (link) => {
+    if (!canHandleLocally(link)) {
+      showLauncher()
+      return 'defer'
+    }
+    await handleJoin(link)
+    return 'handled'
+  })
+  activations.enqueue(deepLinkFromArgv(process.argv.slice(1)))
+
   app.on('second-instance', (_event, argv) => {
-    showLauncher()
     const passed = Array.isArray(argv) ? argv.filter((value): value is string => typeof value === 'string') : []
-    void handleJoin(deepLinkFromArgv(passed))
+    const parsed = deepLinkFromArgv(passed)
+    if (parsed.kind === 'join') {
+      activations.enqueue(parsed)
+      void activations.flush()
+      return
+    }
+    if (activations.isReady()) showLauncher()
   })
 
   app.on('open-url', (event, url) => {
     event.preventDefault()
-    void handleJoin(parseDeepLink(url))
+    const parsed = parseDeepLink(url)
+    if (parsed.kind !== 'join') return
+    activations.enqueue(parsed)
+    void activations.flush()
   })
 
   await app.whenReady()
@@ -317,7 +342,14 @@ async function start(): Promise<void> {
 
   coreSession = new CoreSession(
     { runtime: runtimeState, control: controlProgram, service: serviceProgram },
-    { profileDir, attachOnly: args.attachOnly, onChange: broadcast }
+    {
+      profileDir,
+      attachOnly: args.attachOnly,
+      onChange: () => {
+        broadcast()
+        void activations.flush()
+      },
+    }
   )
 
   applyApplicationMenu({ showLauncher, openBusiness: openBusinessSafely, quit })
@@ -353,7 +385,8 @@ async function start(): Promise<void> {
     })
   }
 
-  await handleJoin(deepLinkFromArgv(process.argv.slice(1)))
+  activations.setReady()
+  await activations.flush()
 }
 
 void start().catch((error: unknown) => {

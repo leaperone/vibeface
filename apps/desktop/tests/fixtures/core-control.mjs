@@ -11,12 +11,31 @@ import { stdin, stdout } from 'node:process'
 
 const LISTEN = process.env['FIXTURE_LISTEN'] ?? '127.0.0.1:4790'
 const LOCAL_LISTEN = process.env['FIXTURE_LOCAL_LISTEN'] ?? '127.0.0.1:4791'
+const forcedExitCodeRaw = process.env['FIXTURE_CONTROL_EXIT_CODE']
+const forcedExitCode =
+  forcedExitCodeRaw === undefined || forcedExitCodeRaw === '' ? null : Number.parseInt(forcedExitCodeRaw, 10)
+const forcedSignal = process.env['FIXTURE_CONTROL_EXIT_SIGNAL'] ?? null
 
 const deviceId = (dataDir) => createHash('sha256').update(dataDir).digest('hex')
 
-function reply(value) {
-  stdout.write(`${JSON.stringify(value)}\n`)
+function finish() {
+  if (forcedSignal) {
+    try {
+      process.kill(process.pid, forcedSignal)
+      return
+    } catch {
+      process.exit(1)
+    }
+  }
+  if (forcedExitCode !== null && Number.isFinite(forcedExitCode)) {
+    process.exit(forcedExitCode)
+    return
+  }
   process.exit(0)
+}
+
+function reply(value) {
+  stdout.write(`${JSON.stringify(value)}\n`, () => finish())
 }
 
 const chunks = []

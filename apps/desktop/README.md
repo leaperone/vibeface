@@ -23,9 +23,14 @@ Electron 宿主：一个受信任的本机启动器，加上一个只加载 Core
 `OwnedChild` 与 `Attached` 是两种不同的类型，而不是 pid 加布尔值。
 
 - 自己启动的 Core 带 `--desktop-parent-stdin`，父进程持有它的 stdin。退出或崩溃产生 EOF，Core 正常关闭；
-  只有超时后才对**这个**子进程句柄做一次有界 kill。
+  若 EOF 超时，会按 `SIGTERM -> SIGKILL` 分阶段等待确认退出；只有确认退出才释放 owned 状态。
 - 仅连接的服务永远不会被停止，退出 Vibeface 不影响它。
 - 启动前先 `inspect`；目录上已有运行中的 Core 时只提示改用仅连接，不接管、不清理任何已有数据。
+
+## 邀请激活时序
+
+`open-url`、`second-instance` 和初始 `argv` 只接受解析后的 `join` 邀请，先在内存队列里去重并限长缓存。
+队列在 `app.whenReady()` 与 `coreSession.restore()` 完成后统一消费；若当时还没连上本机 Core，邀请会保留并在会话变化后重试，不写入设置文件。
 
 ## 命令
 

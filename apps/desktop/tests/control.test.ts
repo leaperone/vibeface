@@ -98,4 +98,24 @@ describe('runControl against a protocol fixture', () => {
       runControl({ command: join(dataDir, 'not-a-program'), args: ['--control'] }, { command: 'inspect', data_dir: dataDir })
     ).rejects.toThrow()
   })
+
+  it('rejects a nominal JSON response when the control process exits non-zero', async () => {
+    process.env['FIXTURE_CONTROL_EXIT_CODE'] = '1'
+    try {
+      await expect(runControl(CONTROL_FIXTURE, { command: 'inspect', data_dir: dataDir })).rejects.toThrow(
+        /exited with code 1/
+      )
+    } finally {
+      delete process.env['FIXTURE_CONTROL_EXIT_CODE']
+    }
+  })
+
+  it('rejects a nominal JSON response when the control process exits by signal', async () => {
+    process.env['FIXTURE_CONTROL_EXIT_SIGNAL'] = 'SIGTERM'
+    try {
+      await expect(runControl(CONTROL_FIXTURE, { command: 'inspect', data_dir: dataDir })).rejects.toThrow(/exited with/)
+    } finally {
+      delete process.env['FIXTURE_CONTROL_EXIT_SIGNAL']
+    }
+  })
 })
