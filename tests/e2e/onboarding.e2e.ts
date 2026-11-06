@@ -162,12 +162,12 @@ test('creates a persistent Bot without a model and shows triage budget state', a
 
   const decisionDb = new DatabaseSync(join(node.directory, 'node.sqlite3'));
   try {
-    const identity = decisionDb.prepare('SELECT network_id, conversation_id FROM bots WHERE name=?').get('E2E Bot');
-    assert(typeof identity?.network_id === 'string' && typeof identity.conversation_id === 'string');
+    const identity = decisionDb.prepare('SELECT network_id, conversation_id, bot_id FROM bots WHERE name=?').get('E2E Bot');
+    assert(typeof identity?.network_id === 'string' && typeof identity.conversation_id === 'string' && typeof identity.bot_id === 'string');
     const insertQuestion = decisionDb.prepare('INSERT INTO questions(network_id,question_id,conversation_id,rank,author,created_at_ms,node,session_id,body) VALUES(?,?,?,?,?,?,?,?,?)');
     const readAnswer = decisionDb.prepare('SELECT text FROM messages WHERE network_id=? AND answers=?');
     const seed = (id: string, choices: string[]) => {
-      const body = { type: 'question_asked', question_id: id, severity: 'attention', text: '报告用哪种格式交付？\nMarkdown 可继续编辑，PDF 保留排版。\n对方尚未指定格式，需要你决定。', choices: choices.map(label => ({ label })), about: { node: node.peer, agent: 'codex', session_id: id, cwd: 'workspace', summary: '' } };
+      const body = { type: 'question_asked', question_id: id, target: { kind: 'bot_main', bot_id: identity.bot_id }, attention: { kind: 'question', device_id: node.peer }, severity: 'attention', text: '报告用哪种格式交付？\nMarkdown 可继续编辑，PDF 保留排版。\n对方尚未指定格式，需要你决定。', choices: choices.map(label => ({ label })), about: { node: node.peer, agent: 'codex', session_id: id, cwd: 'workspace', summary: '' } };
       insertQuestion.run(identity.network_id, id, identity.conversation_id, id, node.peer, Date.now(), node.peer, id, JSON.stringify(body));
     };
     const three = ['导出 Markdown，保留可编辑内容', '导出 PDF，保留当前排版', '同时导出两种格式'];

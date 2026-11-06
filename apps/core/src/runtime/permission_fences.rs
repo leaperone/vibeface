@@ -43,11 +43,12 @@ impl Runtime {
         if !roots_narrowed && !manager_disabled && execution.is_empty() {
             return Ok(());
         }
-        self.local_permission_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
-                epoch.checked_add(1)
-            })
-            .map_err(|_| anyhow::anyhow!("local permission epoch overflow"))?;
+        let epoch = self
+            .local_permission_epoch
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .context("local permission epoch overflow")?;
+        self.local_permission_epoch.store(epoch, Ordering::Release);
         let management_revoked = roots_narrowed || manager_disabled;
         if management_revoked {
             // Every management prompt captured the Node's roots, so it retains a removed grant.
@@ -322,6 +323,33 @@ mod tests {
             assert!(error.to_string().contains("actual canonical directories"));
             assert_eq!(signed_roots[0], alias.to_string_lossy());
         }
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permission_epoch_overflow_does_not_wrap_or_commit_revocation() -> Result<()> {
+        let (node, admin, directory) = node().await?;
+        let (_, _, _, cancel) = active_turn(&node, &admin, &directory).await?;
+        let previous = node.settings_snapshot();
+        let retained = directory.join("retained");
+        std::fs::create_dir(&retained)?;
+        let mut next = previous.clone();
+        next.roots = vec![retained];
+        node.local_permission_epoch
+            .store(u64::MAX, Ordering::Release);
+        let error = node
+            .configure_node(next, &admin.device_id()?, None)
+            .await
+            .expect_err("revocation cannot wrap the permission epoch");
+        assert!(format!("{error:#}").contains("local permission epoch overflow"));
+        assert_eq!(
+            node.local_permission_epoch.load(Ordering::Acquire),
+            u64::MAX
+        );
+        assert_eq!(node.settings_snapshot().roots, previous.roots);
+        assert!(!*cancel.borrow());
+        drop(node);
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }
