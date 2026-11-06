@@ -81,14 +81,12 @@ async fn main() -> Result<()> {
     runtime.config.web_enabled &= !args.no_web;
     let runtime = Arc::new(runtime);
     runtime.start().await?;
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut rejoin = false;
     let result = tokio::select! {
         result = vibeface_core::api::serve(runtime.clone(), app_dir) => result,
         result = vibeface_core::maintenance::serve(runtime.clone(), data_dir.clone()) => result,
         _ = runtime.rejoin_requested() => { rejoin = true; Ok(()) }
-        _ = terminate.recv() => Ok(()),
-        _ = tokio::signal::ctrl_c() => Ok(()),
+        stop = vibeface_bridge::platform::stop::requested() => stop.map(drop).map_err(Into::into),
     };
     runtime.shutdown().await;
     if rejoin {

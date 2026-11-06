@@ -2,11 +2,11 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
-    os::fd::{AsRawFd, FromRawFd},
     path::{Path, PathBuf},
     process::Stdio,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use vibeface_bridge::platform::privatefs;
 use vibeface_delivery::{ProofInput, ProofProfile, verify_relation};
 use zeroize::Zeroizing;
 
@@ -26,35 +26,37 @@ impl std::fmt::Display for Busy {
 impl std::error::Error for Busy {}
 
 fn process_lock(receipt: &Path) -> Result<File> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let directory = receipt
         .parent()
         .context("proof receipt has no private directory")?;
     let metadata = std::fs::symlink_metadata(directory)?;
     ensure!(
-        metadata.is_dir()
-            && !metadata.file_type().is_symlink()
-            && metadata.permissions().mode() & 0o077 == 0,
-        "proof receipt directory must be private"
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "the proof receipt directory must not be a link"
     );
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(directory.join("prover.lock"))?;
+    privatefs::ensure_private(directory, "the proof receipt directory")?;
+    let path = directory.join("prover.lock");
+    let file = privatefs::open_or_create(&path)?;
     ensure!(
-        file.metadata()?.is_file() && file.metadata()?.permissions().mode() & 0o077 == 0,
+        file.metadata()?.is_file(),
         "proof lock must be a private regular file"
     );
-    let duplicate = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-    ensure!(
-        duplicate >= 0,
-        "proof lock descriptor could not be reserved"
-    );
-    let file = unsafe { File::from_raw_fd(duplicate) };
+    privatefs::ensure_private(&path, "the proof lock")?;
+    // The prover inherits this descriptor, so it is moved above the standard streams: a
+    // prover started with fewer than three open would otherwise be handed the lock as its
+    // own standard input.
+    #[cfg(unix)]
+    let file = {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        // SAFETY: the descriptor is open and fcntl only duplicates it.
+        let duplicate = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        ensure!(
+            duplicate >= 0,
+            "proof lock descriptor could not be reserved"
+        );
+        // SAFETY: the duplicate is a fresh descriptor this File now owns alone.
+        unsafe { File::from_raw_fd(duplicate) }
+    };
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => Err(Busy.into()),
@@ -62,10 +64,15 @@ fn process_lock(receipt: &Path) -> Result<File> {
     }
 }
 
+/// Hands the prover the open lock so the trusted host and its local descendants keep holding it
+/// if this Node is killed.
+#[cfg(unix)]
 fn inherit_lock(command: &mut tokio::process::Command, lock: &File) {
+    use std::os::fd::AsRawFd as _;
     let fd = lock.as_raw_fd();
     command.env("VIBEFACE_DELIVERY_PROOF_LOCK_FD", fd.to_string());
-    // The trusted host and its local descendants retain ownership if this Node is killed.
+    // SAFETY: the closure only calls fcntl on a descriptor this process owns, which is
+    // async-signal-safe and allocates nothing.
     unsafe {
         command.pre_exec(move || {
             let flags = libc::fcntl(fd, libc::F_GETFD);
@@ -239,9 +246,20 @@ impl Drop for ProcessGroup {
         unsafe {
             libc::kill(-(self.0 as i32), libc::SIGKILL);
         }
+        // No prover runs anywhere else: `command` refuses a family that cannot carry the Linux
+        // cgroup memory limit paid proving is authorized against.
+        #[cfg(windows)]
+        let _ = self.0;
     }
 }
 fn command(config: &ProofConfig, lock: &File) -> Result<tokio::process::Command> {
+    // `check_memory_limit` refuses to authorize paid proving without a Linux cgroup memory
+    // limit, so no prover is ever started anywhere else. Saying so here keeps the cgroup
+    // membership and the inherited lock below on the one family that has them.
+    ensure!(
+        cfg!(target_os = "linux"),
+        "paid proving requires a Linux cgroup memory limit"
+    );
     let mut command = tokio::process::Command::new(&config.program);
     command
         .env_clear()
@@ -288,8 +306,10 @@ fn command(config: &ProofConfig, lock: &File) -> Result<tokio::process::Command>
     #[cfg(unix)]
     {
         command.process_group(0);
+        inherit_lock(&mut command, lock);
     }
-    inherit_lock(&mut command, lock);
+    #[cfg(windows)]
+    let _ = lock;
     Ok(command)
 }
 async fn bounded_run(

@@ -88,6 +88,19 @@ impl Endpoint {
         &self.display
     }
 
+    /// How a program the Node starts is told to listen here. Unix spells a socket path as a
+    /// `unix://` URL; Windows names the pipe, which is the only form a pipe has.
+    pub fn listen_argument(&self) -> String {
+        #[cfg(unix)]
+        {
+            format!("unix://{}", self.display.display())
+        }
+        #[cfg(windows)]
+        {
+            self.name.clone()
+        }
+    }
+
     /// Refuses an endpoint another account could read, replace, or have put there.
     ///
     /// Unix checks the socket and the private directory holding it, because the socket is a
@@ -206,6 +219,38 @@ impl Listener {
         }
     }
 
+    /// Claims `endpoint` for a Node that is starting, clearing only what an earlier run left
+    /// behind. A holder that still answers is refused rather than displaced.
+    pub async fn claim(endpoint: &Endpoint) -> Result<Self> {
+        #[cfg(unix)]
+        match std::fs::symlink_metadata(endpoint.path()) {
+            Ok(metadata) => {
+                use std::os::unix::fs::FileTypeExt as _;
+                ensure!(
+                    metadata.file_type().is_socket(),
+                    "the local endpoint {endpoint} is occupied by another file"
+                );
+                ensure!(
+                    tokio::net::UnixStream::connect(endpoint.path())
+                        .await
+                        .is_err(),
+                    "the local endpoint {endpoint} is already active"
+                );
+                // A socket entry outlives the process that made it, so an earlier run's is
+                // removed now that nothing answers on it.
+                std::fs::remove_file(endpoint.path())?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        #[cfg(windows)]
+        ensure!(
+            !endpoint.is_held(),
+            "the local endpoint {endpoint} is already active"
+        );
+        Self::bind(endpoint).await
+    }
+
     /// Waits for the next connection from this account.
     pub async fn accept(&mut self) -> Result<Stream> {
         #[cfg(unix)]
@@ -261,6 +306,12 @@ pub struct Stream {
     inner: tokio::net::UnixStream,
     #[cfg(windows)]
     inner: PipeSide,
+}
+
+impl std::fmt::Debug for Stream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a local connection of this account")
+    }
 }
 
 impl Stream {

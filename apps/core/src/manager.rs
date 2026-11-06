@@ -1013,11 +1013,7 @@ pub(crate) fn provider_environment_keys(env: &BTreeMap<String, String>) -> Resul
 
 pub(crate) fn read_codex_config(home: &Path) -> Result<Option<String>> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(home.join("config.toml"))
+    let file = match vibeface_bridge::platform::privatefs::open_no_follow(&home.join("config.toml"))
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

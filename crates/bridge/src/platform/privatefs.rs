@@ -258,14 +258,15 @@ pub fn append_or_create(path: &Path) -> io::Result<File> {
 }
 
 /// Opens an existing file for reading without following a link at the final component, so a
-/// link planted in place of a private file cannot redirect the read.
+/// link planted in place of a private file cannot redirect the read, and without waiting on
+/// something that is not a file, so a pipe left in its place cannot hold the Node up.
 pub fn open_no_follow(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
     }
     #[cfg(windows)]

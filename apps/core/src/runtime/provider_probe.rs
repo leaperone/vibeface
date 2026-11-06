@@ -16,10 +16,11 @@ use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::{
-    process::{Child, ChildStderr, Command},
+    process::{Child, ChildStderr},
     task::JoinHandle,
 };
 use vibeface_bridge::agent::{SdkCatalog, SdkProviderAuthentication, SdkProviderObservation};
+use vibeface_bridge::platform::tree;
 
 const OUTPUT_LIMIT: u64 = 64 * 1024;
 const PROBE_LIMIT: Duration = Duration::from_secs(5);
@@ -292,9 +293,12 @@ fn cursor_catalog(observation: &SdkProviderObservation) -> ModelCatalog {
     }
 }
 
+/// Names a probe's process tree in this account's job object namespace.
+const PROBE_TREE_KEY: &str = "provider-probe";
+
 struct ProbeChild {
     child: Child,
-    group: i32,
+    tree: tree::Tree,
 }
 
 fn stderr_task(stderr: Option<ChildStderr>) -> Option<JoinHandle<ScrubbedStderrTail>> {
@@ -336,9 +340,7 @@ fn issue_with_evidence(
 impl Drop for ProbeChild {
     fn drop(&mut self) {
         // A cancelled probe must also stop helpers the CLI started.
-        unsafe {
-            libc::kill(-self.group, libc::SIGKILL);
-        }
+        self.tree.kill();
     }
 }
 
@@ -347,7 +349,7 @@ fn spawn_probe(
     fallback: &std::path::Path,
     args: &[&str],
 ) -> Result<ProbeChild, ProbeIssue> {
-    let mut command = Command::new(&input.bin);
+    let mut command = std::process::Command::new(&input.bin);
     for (name, _) in std::env::vars_os() {
         let text = name.to_string_lossy();
         if text.starts_with("VIBEFACE_")
@@ -367,22 +369,18 @@ fn spawn_probe(
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true);
-    let child = command.spawn().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
+        .stderr(Stdio::piped());
+    let (tree, child) = tree::Tree::spawn(command, PROBE_TREE_KEY, true).map_err(|error| {
+        let missing = error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        if missing {
             ProbeIssue::new(ProbeStage::Install, ProbeCode::NotInstalled)
         } else {
             ProbeIssue::new(ProbeStage::Launch, ProbeCode::LaunchFailed)
         }
     })?;
-    let group = child
-        .id()
-        .and_then(|id| i32::try_from(id).ok())
-        .filter(|id| *id > 1)
-        .ok_or_else(|| ProbeIssue::new(ProbeStage::Launch, ProbeCode::LaunchFailed))?;
-    Ok(ProbeChild { child, group })
+    Ok(ProbeChild { child, tree })
 }
 
 async fn claude_authentication(

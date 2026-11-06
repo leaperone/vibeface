@@ -7,6 +7,7 @@
 //! pipes, and job objects. Nothing here degrades to a permissive variant when the strict one is
 //! unavailable: a location or object that cannot carry the guarantee is refused.
 
+pub mod account;
 pub mod clock;
 pub mod ipc;
 pub mod privatefs;

@@ -8,14 +8,19 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
     sync::Notify,
+};
+use vibeface_bridge::platform::{
+    ipc::{Endpoint, Listener, Stream},
+    privatefs,
 };
 use zeroize::Zeroizing;
 
 const PROTOCOL: u32 = 1;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_NAME: &str = "maintenance.sock";
+/// Names the maintenance endpoint in the message a person reads.
+const LABEL: &str = "the maintenance socket";
 
 #[derive(Debug)]
 pub struct Busy(pub String);
@@ -195,7 +200,7 @@ pub struct PeerHealth {
 #[must_use]
 pub struct Lease {
     pub health: Health,
-    _stream: UnixStream,
+    _stream: Stream,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -248,11 +253,11 @@ struct Response {
     join: Option<crate::client::NodeJoin>,
 }
 
-async fn read_packet<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result<T> {
+async fn read_packet<T: for<'de> Deserialize<'de>>(stream: &mut Stream) -> Result<T> {
     read_packet_timeout(stream, REQUEST_TIMEOUT).await
 }
 async fn read_packet_timeout<T: for<'de> Deserialize<'de>>(
-    stream: &mut UnixStream,
+    stream: &mut Stream,
     timeout: Duration,
 ) -> Result<T> {
     tokio::time::timeout(timeout, async {
@@ -276,7 +281,7 @@ async fn read_packet_timeout<T: for<'de> Deserialize<'de>>(
     .await
     .context("maintenance socket timed out")?
 }
-async fn write_packet<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
+async fn write_packet<T: Serialize>(stream: &mut Stream, value: &T) -> Result<()> {
     let mut bytes = Zeroizing::new(serde_json::to_vec(value)?);
     bytes.push(b'\n');
     tokio::time::timeout(REQUEST_TIMEOUT, stream.write_all(&bytes))
@@ -284,27 +289,37 @@ async fn write_packet<T: Serialize>(stream: &mut UnixStream, value: &T) -> Resul
         .context("maintenance socket timed out")??;
     Ok(())
 }
-pub fn socket_path(data_dir: &Path) -> Result<PathBuf> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+/// The maintenance endpoint of the Node whose data directory this is.
+fn endpoint(data_dir: &Path) -> Result<Endpoint> {
     let device_id = crate::config::identity(data_dir)?.device_id()?;
-    let socket_dir = PathBuf::from("/tmp").join(format!("vibeface-{}", &device_id[..32]));
-    match std::fs::create_dir(&socket_dir) {
+    let socket_dir = vibeface_bridge::platform::ipc::runtime_dir(&device_id[..32])?;
+    match privatefs::create_dir(&socket_dir) {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) => {}
+        Err(error) => return Err(error),
     }
     let metadata = std::fs::symlink_metadata(&socket_dir)?;
     ensure!(
-        metadata.is_dir()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == std::fs::metadata(data_dir)?.uid(),
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "the private maintenance socket directory must not be a link"
+    );
+    ensure!(
+        privatefs::same_owner(&socket_dir, data_dir)?,
         "private maintenance socket directory has unexpected ownership"
     );
-    std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))?;
-    Ok(socket_dir.join(SOCKET_NAME))
+    privatefs::restrict_dir(&socket_dir)?;
+    Endpoint::in_private_dir(&socket_dir, SOCKET_NAME)
 }
 
-async fn request(data_dir: &Path, command: Command) -> Result<(UnixStream, Response)> {
+/// Where the CLI reaches this Node's maintenance endpoint, as a person sees it.
+pub fn socket_path(data_dir: &Path) -> Result<PathBuf> {
+    Ok(endpoint(data_dir)?.path().to_owned())
+}
+
+async fn request(data_dir: &Path, command: Command) -> Result<(Stream, Response)> {
     let response_timeout = if matches!(&command, Command::DeliveryKeyOperation { .. }) {
         Duration::from_secs(
             crate::delivery::proof::INFO_TIMEOUT_SECS
@@ -315,10 +330,12 @@ async fn request(data_dir: &Path, command: Command) -> Result<(UnixStream, Respo
     } else {
         REQUEST_TIMEOUT
     };
-    let mut stream =
-        tokio::time::timeout(REQUEST_TIMEOUT, UnixStream::connect(socket_path(data_dir)?))
-            .await
-            .context("maintenance connection timed out")??;
+    let endpoint = endpoint(data_dir)?;
+    endpoint.ensure_private(LABEL)?;
+    let mut stream = tokio::time::timeout(REQUEST_TIMEOUT, Stream::connect(&endpoint))
+        .await
+        .context("maintenance connection timed out")??;
+    stream.require_current_account(LABEL)?;
     write_packet(
         &mut stream,
         &Request {
@@ -448,23 +465,9 @@ pub async fn delivery_key_operation(
 }
 
 pub async fn serve(runtime: Arc<Runtime>, data_dir: PathBuf) -> Result<()> {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    let socket = socket_path(&data_dir)?;
-    if let Ok(metadata) = std::fs::symlink_metadata(&socket) {
-        ensure!(
-            metadata.file_type().is_socket(),
-            "maintenance socket path is occupied by another file"
-        );
-        ensure!(
-            UnixStream::connect(&socket).await.is_err(),
-            "maintenance socket is already active"
-        );
-        std::fs::remove_file(&socket)?;
-    }
-    let listener = UnixListener::bind(&socket)?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    let mut listener = Listener::claim(&endpoint(&data_dir)?).await?;
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = listener.accept().await?;
         let runtime = runtime.clone();
         let pending = data_dir.join("update-pending.json");
         tokio::spawn(async move {
@@ -474,11 +477,11 @@ pub async fn serve(runtime: Arc<Runtime>, data_dir: PathBuf) -> Result<()> {
         });
     }
 }
-async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: UnixStream) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
+async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream) -> Result<()> {
+    stream.require_current_account(LABEL)?;
     ensure!(
-        stream.peer_cred()?.uid() == std::fs::metadata(&runtime.data_dir)?.uid(),
-        "maintenance socket requires its local owner"
+        privatefs::owner_of(&runtime.data_dir)? == privatefs::current_account()?,
+        "the maintenance socket requires the owner of the data directory"
     );
     let request: Request = read_packet(&mut stream).await?;
     ensure!(
