@@ -8,7 +8,7 @@ export const joinCopy = {
   showCode: '正在生成安全码…',
   compareCode: (admin?: string) => `两边的安全码一致，就在${admin ? `「${admin}」` : '那边'}上点允许`,
   linkSource: (from = '已有设备') => `链接来自${from}上的“添加设备”`,
-  byLink: '用加入链接',
+  byLink: '使用加入链接',
   scan: '扫码加入',
   paste: '或粘贴加入链接',
   pasteFirst: '粘贴加入链接',
@@ -19,8 +19,8 @@ export const joinCopy = {
   deviceName: '这台设备的名字',
   join: '加入',
   joining: '加入中',
-  noComputer: '还没有电脑？',
-  installFirst: '先在电脑上安装 Vibeface',
+  noComputer: '还没有运行中的节点？',
+  installFirst: '在电脑或服务器上安装并启动 Vibeface 节点',
   installGuide: 'https://github.com/leaperone/vibeface/blob/main/packages/docs/install.md',
 }
 
@@ -33,16 +33,16 @@ export const nodeJoinCopy = {
   expired: '这条加入链接已过期。在管理设备上点“添加设备”重新生成，再粘贴新链接。',
   failed: '没能加入。检查网络后再点“加入”，会接着上次的请求，不会重复提交。',
   /** The page lost the computer's answer; the join may still be running there. */
-  unreachable: '连不上这台电脑上的 Vibeface。加入可能还在进行：确认它在运行后再点“加入”，会接着上次的请求，不会重复提交。',
+  unreachable: '连不上这个 Vibeface 节点。加入可能还在进行：确认它在运行后再点“加入”，会接着上次的请求，不会重复提交。',
 }
 const nodeJoinReasons: [string, string][] = [
   ['already been used', nodeJoinCopy.used],
   ['expired', nodeJoinCopy.expired],
-  ['Rejected', '管理设备拒绝了这次加入。确认是自己的电脑后，在管理设备上重新生成链接再试。'],
+  ['Rejected', '管理设备拒绝了这次加入。确认是自己的节点后，在管理设备上重新生成链接再试。'],
   ['Withdrawn', '这次加入已撤回。在管理设备上重新生成链接再试。'],
   ['approval timed out', '等了很久也没有批准。在管理设备上重新生成链接再试。'],
-  ['already belongs to a personal network', '这台电脑已经在一个网络里了，不用再加入。'],
-  ['another join is already running', '这台电脑正在用终端命令加入。等它结束后再试。'],
+  ['already belongs to a personal network', '这个节点已经在一个网络里了，不用再加入。'],
+  ['another join is already running', '这个节点正在用终端命令加入。等它结束后再试。'],
   ['another join is in progress', '这条链接上次用的是另一个名字。改回上次的名字再加入，会接着等批准。'],
   ['invite link', '这不是有效的加入链接。到管理设备的“添加设备”重新复制。'],
   ['Vibeface ticket', '这不是有效的加入链接。到管理设备的“添加设备”重新复制。'],
@@ -59,7 +59,7 @@ export const startCopy = {
 
 /** The computer this device reaches its network through does not answer; `name`: that computer as the person named it. */
 export const offlineCopy = {
-  title: (name: string) => `连不上${name || '你的电脑'}`,
+  title: (name: string) => `连不上${name || '你的节点'}`,
   hint: '确认它开着',
   retry: '重试',
   retryConnect: '重试连接',
@@ -67,7 +67,7 @@ export const offlineCopy = {
 
 /** 手动填写地址, under 详细信息: a device ID pins which computer answers there. */
 export const manualCopy = {
-  optional: '这台电脑可不填',
+  optional: '当前节点可不填',
   where: '在我的设备 → 那台设备 → 详细信息里复制',
 }
 
@@ -76,13 +76,14 @@ export const manualCopy = {
  * running or not; both ways show without opening the raw link.
  */
 export const addDeviceCopy = {
-  phone: '手机',
-  computer: '电脑',
+  client: '客户端',
+  clientHint: '手机 App／浏览器',
+  node: '节点',
   copyCommand: '复制命令',
-  openThere: '在那台电脑的 Vibeface 网页选“加入已有网络”，粘贴',
-  installThere: '那台电脑要先装好 Vibeface',
+  openThere: '在新节点的 Vibeface 网页选“加入已有网络”，粘贴',
+  installThere: '先在电脑或服务器上安装并启动 Vibeface 节点',
   installHow: '怎么装',
-  orCommand: '或在那台电脑的终端运行',
+  orCommand: '或在新节点所在的电脑或服务器上运行命令',
   /** The browser could not write to the clipboard; the text below opens selected instead. */
   copyFailed: '没能复制，手动选中下面的内容',
   compare: '新设备出现安全码后，回这里比对',
@@ -136,21 +137,21 @@ export function whenText(at: number, now = Date.now()) {
 }
 
 export const recoveryCopy = {
-  scope: '找回后，对话会从你的其他电脑同步过来',
+  scope: '找回后，对话会从你的其他节点同步过来',
   whichLost: '哪台设备丢了？',
   delay: '默认 2 天后生效，管理设备可确认立即生效，也可拦下',
   cancelLate: '如果已经提交，取消不会撤回。',
-  connectTo: '连接到哪台电脑',
+  connectTo: '连接到哪个节点',
   manual: '手动填写',
   byPhone: '在手机上完成找回',
   qr: '找回二维码',
   scanHint: '在手机 App 的“用恢复文件找回”里扫码',
-  unreachable: '手机连不到这台电脑，先连同一个 Wi-Fi 再看',
-  scan: '扫电脑上的找回二维码',
+  unreachable: '手机连不到这个节点，先连同一个 Wi-Fi 再看',
+  scan: '扫节点网页上的找回二维码',
   paste: '或粘贴找回链接',
   pasteLabel: '找回链接',
-  notRecoveryLink: '这不是找回链接，到电脑网页的设置 → 找回 → 在手机上完成找回里复制',
-  target: '要连的电脑',
+  notRecoveryLink: '这不是找回链接，到节点网页的设置 → 找回 → 在手机上完成找回里复制',
+  target: '要连的节点',
   replaceHint: '要用现在的恢复文件和它的密码，换后旧文件作废',
   replaced: '已换密码，旧恢复文件已失效',
   waiting: '找回等待生效',
@@ -221,7 +222,7 @@ export const deviceCopy = {
   /** An offline computer reports nothing, so no bot there is unknown rather than none. */
   botState: (bot: 'ready' | 'unverified' | 'starting' | 'needs_setup' | null | undefined, online: boolean | undefined) => bot ?? (online === false ? 'unknown' as const : 'none' as const),
   /** This computer has a provider installed but no use of any turned on, as a computer that just joined starts. */
-  aiOff: '这台电脑的 AI 还没开',
+  aiOff: '这个节点的 AI 还没开',
   /** Ends on what removal cannot do: whatever already reached that device stays there. */
   removeNotice: (bot: boolean) => `${['移除后它无法再连接，要再用需重新加入', bot ? '上面的 Bot 会停止' : null, '对话记录会保留'].filter(Boolean).join('，')}。它已经拿到的内容删不掉。`,
   /**

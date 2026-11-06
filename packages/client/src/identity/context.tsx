@@ -342,7 +342,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         : expected
       verified = verifyAuthentication(authValue, own(), trust)
       const pinnedNetwork = load(`network-for.${active.entry.device_id}`)
-      if (pinnedNetwork && pinnedNetwork !== verified.principal.network_id) throw new Error('这台电脑属于另一组设备。确认连的是自己的设备。')
+      if (pinnedNetwork && pinnedNetwork !== verified.principal.network_id) throw new Error('这个节点属于另一组设备。确认连的是自己的设备。')
     } catch (cause) { throw new AuthenticationError(messageOf(cause)) }
     if (session.current !== active) throw changed()
     const { principal, view } = verified
@@ -468,7 +468,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       const own = candidate.device_id === target.entry.device_id
       try {
         active = await open(candidate, true, list.length === 1 ? 10000 : candidate.kind === 'lan' ? LAN_MS : 5000)
-        if (own && active.info.network_id && active.info.network_id !== target.networkId) throw new AuthenticationError('这台电脑已属于另一组设备。')
+        if (own && active.info.network_id && active.info.network_id !== target.networkId) throw new AuthenticationError('这个节点已属于另一组设备。')
         const auth = record(await callSession(active, 'authenticate', { network_id: target.networkId }))
         if (own && removed(auth, active, target.networkId)) return true
         if (auth.principal === null && (auth.revoked === true || own)) throw new AuthenticationError(auth.revoked === true ? removedText(self) : `${self}已不在我的设备里。`)
@@ -555,7 +555,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const auth = record(await scoped(active)('authenticate', { network_id: pinned ?? '' }))
     if (removed(auth, active, typeof pinned === 'string' ? pinned : '')) return true
     if (auth.principal === null) {
-      setError(auth.revoked === true ? removedText(self) : auth.initialized === false ? '这台电脑还没设置。到它的本机页面完成设置。' : notJoined(self))
+      setError(auth.revoked === true ? removedText(self) : auth.initialized === false ? '这个节点还没设置。到它的本机页面完成设置。' : notJoined(self))
       return false
     }
     await authenticate(auth, active)
@@ -571,7 +571,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   async function rejoin(entry = removedFrom) {
     // Without a local session yet, open one first; the launched page carries on with the rejoin.
     if (entry?.kind !== 'local' && localSetup?.kind === 'initialized' && localSetup.removed) return openLocalAccess(true)
-    if (entry?.kind !== 'local') throw new Error('这里不是本机页面。在这台电脑上打开它，再重新加入。')
+    if (entry?.kind !== 'local') throw new Error('这里不是本机页面。在运行这个节点的电脑或服务器上打开它，再重新加入。')
     try { await callSession(await open(entry, true), 'rejoin') }
     catch (cause) { resetConnection(); setPhase('removed'); throw cause }
     resetConnection(); setPhase('restarting')
@@ -585,12 +585,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       try { setup = await discoverLocalSetup(new AbortController().signal) } catch { setup = null }
     }
     if (version !== generation.current) throw changed()
-    if (setup?.kind !== 'uninitialized') { setPhase('removed'); throw new Error('这台电脑还没重新开始。刷新页面看看，或用下面的命令。') }
+    if (setup?.kind !== 'uninitialized') { setPhase('removed'); throw new Error('这个节点还没重新开始。刷新页面看看，或用下面的命令。') }
     setLocalSetup(setup); setRejoined(true); setPhase('disconnected')
   }
   /** Joins this computer, not this browser, with an invite; the Node runs the join and shows the short code. */
   async function joinThisComputer(linkText: string, nameValue: string): Promise<'joined' | 'cancelled'> {
-    if (localSetup?.kind !== 'uninitialized') throw new Error('这台电脑已经设置过。')
+    if (localSetup?.kind !== 'uninitialized') throw new Error('这个节点已经设置过。')
     const name = deviceName(nameValue)
     const found = joinTicket(linkText)
     const origin = found?.origin ?? page?.origin
@@ -617,7 +617,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         if (reply.status === 'cancelled') return 'cancelled'
         if (reply.status === 'failed') throw new Error(nodeJoinFailure(typeof reply.reason === 'string' ? reply.reason : ''))
         if (reply.status === 'joined') break
-        if (reply.status !== 'waiting' && reply.status !== 'confirming') throw new Error('这台电脑返回了未知的加入状态。')
+        if (reply.status !== 'waiting' && reply.status !== 'confirming') throw new Error('这个节点返回了未知的加入状态。')
         setNodeJoining({ status: reply.status, code: typeof reply.code === 'string' ? reply.code : undefined, admin: typeof reply.admin === 'string' ? reply.admin : undefined })
         await new Promise(resolve => setTimeout(resolve, 2000))
       }
@@ -724,7 +724,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const connection = managing(), request = scoped()
     const member = directory?.members.find(item => item.device_id === deviceId)
     if (!member) throw new Error('找不到这个设备。刷新后重试。')
-    if (deviceId === own().deviceId || deviceId === connection.entry.device_id) throw new Error(`不能移除${self}或当前连接的电脑。`)
+    if (deviceId === own().deviceId || deviceId === connection.entry.device_id) throw new Error(`不能移除${self}或当前连接的节点。`)
     // A Node's log counts up to the head this entry holds, along that branch if it forked.
     let cutoff = 0, cutoffHash: string | null = null
     if (member.kind === 'node') {
@@ -953,7 +953,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         catch (cause) { if (last || cause instanceof AuthenticationError) { link.secret = ''; throw cause } }
         if (active) break
       }
-      if (!active) throw new Error('连不上这台电脑。')
+      if (!active) throw new Error('连不上这个节点。')
       // A browser removed from this network joins again as a new device; its old key stays revoked.
       if (record(await scoped(active)('authenticate')).revoked === true) {
         const fresh = publicIdentity(await replaceClient())
@@ -1022,11 +1022,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     disconnect()
   }, [disconnect])
   async function createLocalNetwork(nameValue: string, password: string, nodeName?: string) {
-    if (localSetup?.kind !== 'uninitialized') throw new Error('这台电脑已经设置过。改用加入链接或恢复文件。')
+    if (localSetup?.kind !== 'uninitialized') throw new Error('这个节点已经设置过。改用加入链接或恢复文件。')
     const name = deviceName(nameValue)
     const { capability } = localSetup
     const active = await open(localSetup.entry)
-    if (active.info.initialized) throw new Error('这台电脑已经设置过。改用加入链接或恢复文件。')
+    if (active.info.initialized) throw new Error('这个节点已经设置过。改用加入链接或恢复文件。')
     if (!password) throw new Error('还没设置恢复密码。')
     const root = Identity.generate()
     let recovery: Uint8Array, genesis: Record<string, unknown>, networkId: string
@@ -1054,7 +1054,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     sensitive.current = flow; setReview({ kind: 'bootstrap', networkId })
   }
   async function openLocalAccess(thenRejoin = false) {
-    if (localSetup?.kind !== 'initialized') throw new Error('本机页面还没准备好。在这台电脑上打开它再试。')
+    if (localSetup?.kind !== 'initialized') throw new Error('本机页面还没准备好。在运行这个节点的电脑或服务器上打开它再试。')
     // A member browser reconnects as itself; the launcher would start a separate local session on another origin.
     // A removed browser would only be refused again, so it takes the local session.
     const computer = localSetup.entry
@@ -1062,7 +1062,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const version = generation.current, controller = new AbortController(); connecting.current = controller
     const setup = await discoverLocalSetup(controller.signal)
     if (version !== generation.current) throw changed()
-    if (setup?.kind !== 'initialized' || setup.entry.device_id !== localSetup.entry.device_id) throw new Error('本机页面对应的电脑已变化。刷新页面再试。')
+    if (setup?.kind !== 'initialized' || setup.entry.device_id !== localSetup.entry.device_id) throw new Error('本机页面对应的节点已变化。刷新页面再试。')
     setLocalSetup(setup)
     launchLocal(setup, thenRejoin)
   }
@@ -1070,7 +1070,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     if (!setup.local_launch) throw new Error('本机免确认打开已关闭。改用加入链接或恢复文件。')
     const url = new URL(setup.local_launch.url)
     url.hash = new URLSearchParams({ local: setup.local_launch.token, node: setup.local_launch.device_id, ...thenRejoin ? { rejoin: '1' } : {} }).toString()
-    if (!page) throw new Error('这里打不开本机页面。到这台电脑上打开。')
+    if (!page) throw new Error('这里打不开本机页面。到运行这个节点的电脑或服务器上打开。')
     page.open(url.href)
   }
   function setKept(next: KeptRecovery | null) {
@@ -1114,7 +1114,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       const me = own().deviceId
       const fresh = !active.info.initialized
       const capability = fresh && localSetup?.kind === 'uninitialized' && entryKey(localSetup.entry) === entryKey(active.entry) ? localSetup.capability : ''
-      if (fresh && !capability) throw new Error('恢复到新电脑需要在那台电脑的本机页面进行。')
+      if (fresh && !capability) throw new Error('恢复到新节点需要在它的本机页面进行。')
       const { genesis } = opened.material
       let state: unknown = { genesis, checkpoints: opened.material.checkpoints, events: opened.material.events }
       let heads: unknown = {}
@@ -1140,7 +1140,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       const members = view.members.filter(member => !revoked.has(member.device_id) && member.device_id !== me)
       // A computer already in some network must be one of this network's own; a link could name anyone's.
       if (!members.some(member => member.device_id === active.entry.device_id)) {
-        if (!fresh) throw new Error('这台电脑不在你的网络里。换一台你自己的电脑，再扫它网页上的找回二维码。')
+        if (!fresh) throw new Error('这个节点不在你的网络里。换一个你自己的节点，再扫它网页上的找回二维码。')
         members.push({ device_id: active.entry.device_id, kind: 'node', name: active.info.name, manage: false })
       }
       const newManager: Member = { device_id: me, kind: 'client', name, manage: true }
@@ -1156,7 +1156,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
               if (!original || original.kind !== member.kind || original.name !== member.name || member.kind === 'node' && member.manage) throw new Error('设备列表变了。重新打开恢复文件。')
               return member
             })
-            if (!selected.some(member => member.device_id === active.entry.device_id) || new Set(selected.map(member => member.device_id)).size !== selected.length) throw new Error('要保留正在连接的这台电脑。')
+            if (!selected.some(member => member.device_id === active.entry.device_id) || new Set(selected.map(member => member.device_id)).size !== selected.length) throw new Error('要保留正在连接的这个节点。')
             selected.push(newManager)
             const next = Identity.generate()
             let verified: ReturnType<typeof verifyState> | null = null

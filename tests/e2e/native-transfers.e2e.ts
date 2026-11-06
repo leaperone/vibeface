@@ -114,16 +114,20 @@ function providerInspection(value: Record<string, unknown>) {
     assert(saved.reasoning_effort === null || typeof saved.reasoning_effort === 'string');
     manager = { provider: text(saved.provider), model: saved.model, reasoning_effort: saved.reasoning_effort };
   }
-  assert(typeof value.checked === 'boolean' && Array.isArray(value.jobs));
+  assert(value.checked_at_ms === null || typeof value.checked_at_ms === 'number' && Number.isSafeInteger(value.checked_at_ms) && value.checked_at_ms >= 0);
+  assert(Array.isArray(value.jobs));
   assert(typeof value.running_invocations === 'number' && Number.isSafeInteger(value.running_invocations) && value.running_invocations >= 0);
   assert(typeof value.queued_invocations === 'number' && Number.isSafeInteger(value.queued_invocations) && value.queued_invocations >= 0);
   assert(Array.isArray(value.roles) && value.roles.every(role => role === 'agent' || role === 'execution'));
   assert(typeof value.execution_model === 'string');
   assert(typeof value.login_count === 'number' && Number.isSafeInteger(value.login_count) && value.login_count >= 0);
+  const link = text(value.app_server_link_state);
+  assert(['connected', 'starting', 'off', 'not_found', 'handshake_failed', 'launch_failed'].includes(link));
   const setup = record(value.setup);
   return { manager, roles: value.roles, execution_model: value.execution_model, login_count: value.login_count,
     setup: { directory: text(setup.directory), command: text(setup.command) },
-    readiness: text(value.readiness), authentication: text(value.authentication), catalog: text(value.catalog), checked: value.checked,
+    app_server_link_state: link, readiness: text(value.readiness), authentication: text(value.authentication), catalog: text(value.catalog),
+    checked_at_ms: value.checked_at_ms, checked: value.checked_at_ms !== null,
     jobs: value.jobs.map((item: unknown) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state) }; }),
     running_invocations: value.running_invocations, queued_invocations: value.queued_invocations };
 }
@@ -135,7 +139,7 @@ test('provider settings and queued cancellation work in the installed native app
   assert(simulator && appPath && binary && crypto && source && /^[a-f0-9]{40}$/.test(source), 'Provider acceptance pins its source and actual artifacts');
   const publicPath = resolve(root, '.artifacts/native/public');
   await mkdir(publicPath, { recursive: true, mode: 0o700 });
-  for (const name of ['provider.json', 'provider-navigation.json', 'provider-initial.png', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png']) {
+  for (const name of ['provider.json', 'provider-navigation.json', 'provider-probe.json', 'provider-initial.png', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png', 'terminology-device-kinds.png']) {
     await unlink(join(publicPath, name)).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
   const wasm = crypto.replace(/\.js$/, '_bg.wasm');
@@ -160,6 +164,7 @@ test('provider settings and queued cancellation work in the installed native app
   expect(await bundleManifest(installedPath)).toEqual(built);
   await device.clearKeychain();
   await app.open();
+  await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
   const run = process.env.GITHUB_RUN_ID, attempt = process.env.GITHUB_RUN_ATTEMPT;
   if (run !== undefined || attempt !== undefined) {
     assert(run && attempt && /^[0-9]+$/.test(run) && /^[0-9]+$/.test(attempt));
@@ -183,6 +188,23 @@ test('provider settings and queued cancellation work in the installed native app
   await expect(screen.getByLabel(`安全码 ${code.split('').join(' ')}`)).toBeVisible();
   await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
   await expect(screen.getByRole('link', '设置', { exact: true })).toBeVisible({ timeout: 30000 });
+  const openLink = async (url: string) => {
+    await device.openLink(url);
+    const consent = screen.getByRole('alert', /Open in.*Vibeface/);
+    if (await consent.isVisible()) await consent.getByRole('button', 'Open', { exact: true }).click();
+  };
+  await openLink('vibeface://add-device');
+  await expect(screen.getByText('添加设备', { exact: true }).first()).toBeVisible();
+  const clientKind = screen.getByRole('button', '客户端', { exact: true });
+  const nodeKind = screen.getByRole('button', '节点', { exact: true });
+  await expect(clientKind).toBeVisible({ timeout: 30000 });
+  await expect(screen.getByText('手机 App／浏览器', { exact: true })).toBeVisible();
+  await nodeKind.click();
+  await expect(screen.getByText('在新节点的 Vibeface 网页选“加入已有网络”，粘贴', { exact: true })).toBeVisible();
+  await copyFile(await app.screenshot('terminology-device-kinds'), join(publicPath, 'terminology-device-kinds.png'));
+  await clientKind.click();
+  await expect(screen.getByText('手机 App／浏览器', { exact: true })).toBeVisible();
+  await screen.getByRole('button', '关闭', { exact: true }).click();
   const navigation = async (stage: 'settings' | 'device') => {
     const present: Record<string, boolean | null> = {};
     for (const [key, locator] of Object.entries({
@@ -208,6 +230,7 @@ test('provider settings and queued cancellation work in the installed native app
       await screen.scrollUntilVisible(computer, { direction: 'down' });
       await computer.click();
     } else await device.back();
+    await expect(screen.getByText('节点', { exact: true })).toBeVisible({ timeout: 30000 });
     await expect(screen.getByText('当前连接', { exact: true })).toBeVisible();
     await navigation('device');
     const details = screen.getByRole('button', '详细信息', { exact: true });
@@ -220,14 +243,28 @@ test('provider settings and queued cancellation work in the installed native app
     await link.click();
   };
   const inspect = async () => providerInspection(await network.call({ op: 'native_provider_inspect' }));
-  const probe = () => screen.getByRole('button', '检查可用性', { exact: true }).first().click();
+  const probeButton = screen.getByRole('button', 'Codex 检查可用性', { exact: true });
   const codexRow = () => screen.getByRole('button', /^Codex，/);
+  const probe = async () => {
+    await expect.poll(async () => (await inspect()).app_server_link_state, { timeout: 30000 }).toBe('connected');
+    await expect(codexRow()).toHaveAccessibleName(/^Codex，(?:运行 Bot，)?执行任务，(?:未验证，可尝试|需设置|可用)$/, { timeout: 30000 });
+    await expect(probeButton).toBeEnabled({ timeout: 30000 });
+    const before = (await inspect()).checked_at_ms;
+    await probeButton.click();
+    await expect.poll(async () => {
+      const checked = (await inspect()).checked_at_ms;
+      return checked !== null && checked !== before;
+    }).toBe(true);
+    await expect(probeButton).toBeEnabled({ timeout: 30000 });
+  };
   const botDetails = screen.getByRole('button', '运行 Bot', { exact: true });
   const executionDetails = screen.getByRole('button', '执行任务', { exact: true });
   const modelButton = () => screen.getByRole('button', /^设备默认模型，/);
   const select = async (name: string) => {
+    await screen.scrollUntilVisible(codexRow(), { direction: 'up' });
     await screen.scrollUntilVisible(modelButton(), { direction: 'down' });
     await modelButton().click();
+    await screen.scrollUntilVisible(screen.getByRole('button', '其他…', { exact: true }), { direction: 'down' });
     await screen.getByRole('radio', name, { exact: true }).click();
   };
   const save = async (model: string, effort: string | null) => {
@@ -238,8 +275,10 @@ test('provider settings and queued cancellation work in the installed native app
   };
   const executionButton = () => screen.getByRole('button', /^执行任务默认模型，/);
   const selectExecution = async (name: string) => {
+    await screen.scrollUntilVisible(codexRow(), { direction: 'up' });
     await screen.scrollUntilVisible(executionButton(), { direction: 'down' });
     await executionButton().click();
+    await screen.scrollUntilVisible(screen.getByRole('button', '其他…', { exact: true }), { direction: 'down' });
     await screen.getByRole('radio', name, { exact: true }).click();
   };
   const saveExecution = async (model: string) => {
@@ -247,10 +286,11 @@ test('provider settings and queued cancellation work in the installed native app
     await screen.scrollUntilVisible(button, { direction: 'down' });
     await button.click();
     await expect.poll(async () => (await inspect()).execution_model, { timeout: 15000 }).toBe(model);
+    await screen.scrollUntilVisible(executionDetails, { direction: 'up' });
   };
   const screenshot = async (name: string) => { await copyFile(await app.screenshot(name), join(publicPath, `${name}.png`)); };
   await openSettings('home');
-  const initialProvider = screen.getByRole('button', 'Codex，尚未确认', { exact: true });
+  const initialProvider = screen.getByRole('button', 'Codex，未验证，可尝试', { exact: true });
   await expect(initialProvider).toBeVisible();
   await expect(screen.getByText('尚未主动检查', { exact: true }).first()).toBeVisible();
   expect((await inspect()).checked).toBe(false);
@@ -263,8 +303,16 @@ test('provider settings and queued cancellation work in the installed native app
   await expect.poll(async () => (await inspect()).roles, { timeout: 15000 }).toEqual(['execution']);
   expect((await inspect()).manager).toBeNull();
   await probe();
+  const firstProbe = await inspect();
+  await writeFile(join(publicPath, 'provider-probe.json'), `${JSON.stringify({
+    link: firstProbe.app_server_link_state,
+    readiness: ['ready', 'starting', 'needs_setup', 'unverified'].includes(firstProbe.readiness) ? firstProbe.readiness : 'unknown',
+    authentication: ['unverified', 'authenticated', 'not_required', 'sign_in_required'].includes(firstProbe.authentication) ? firstProbe.authentication : 'unknown',
+    catalog: ['available', 'unavailable'].includes(firstProbe.catalog) ? firstProbe.catalog : 'unknown',
+    checked: firstProbe.checked,
+  })}\n`, { mode: 0o600 });
   await expect(codexRow()).toHaveAccessibleName('Codex，执行任务，需设置');
-  expect((await inspect()).authentication).toBe('sign_in_required');
+  expect(firstProbe.authentication).toBe('sign_in_required');
   const setup = (await inspect()).setup;
   await expect(screen.getByText(setup.command, { exact: true })).toBeVisible();
   await screen.getByRole('button', '复制Codex 私有目录认证命令', { exact: true }).click();
@@ -362,7 +410,7 @@ test('provider settings and queued cancellation work in the installed native app
   await screen.getByRole('button', 'high', { exact: true }).click();
   await save('native-selectable', 'high');
   await network.call({ op: 'native_provider_stage', stage: 'catalog_unknown' });
-  await screen.scrollUntilVisible(screen.getByRole('button', '检查可用性', { exact: true }).first(), { direction: 'up' });
+  await screen.scrollUntilVisible(codexRow(), { direction: 'up' });
   await probe();
   await expect(screen.getByText('模型列表暂不可用，可继续手填。已保存的模型保持不变。', { exact: true })).toBeVisible();
   expect((await inspect()).manager).toEqual({ provider: 'codex', model: 'native-selectable', reasoning_effort: 'high' });
@@ -375,11 +423,13 @@ test('provider settings and queued cancellation work in the installed native app
   await save('native-custom-model', 'high');
   await screenshot('provider-typed');
   await network.call({ op: 'native_provider_stage', stage: 'ready' });
-  await screen.scrollUntilVisible(screen.getByRole('button', '检查可用性', { exact: true }).first(), { direction: 'up' });
+  await screen.scrollUntilVisible(codexRow(), { direction: 'up' });
   await probe();
+  await expect.poll(async () => (await inspect()).catalog).toBe('available');
   await screen.scrollUntilVisible(typed, { direction: 'down' });
+  await expect(screen.getByRole('button', '从列表选', { exact: true }).first()).toBeVisible({ timeout: 30000 });
   await typed.fill(' native-controlled ');
-  await expect(typed).toHaveValue(' native-controlled ');
+  // iOS snapshots trim outer whitespace; verify model matching and saved state below.
   await device.dismissKeyboard();
   await expect(screen.getByRole('button', 'high', { exact: true })).toBeHidden();
   await save('native-controlled', null);
@@ -389,7 +439,7 @@ test('provider settings and queued cancellation work in the installed native app
   const queue = await network.call({ op: 'native_provider_queue' });
   await assert.rejects(network.call({ op: 'native_provider_queue' }));
   const botId = text(queue.bot_id), runningTrigger = text(queue.running_trigger), queuedTrigger = text(queue.queued_trigger);
-  await device.openLink(`vibeface://b/${botId}`);
+  await openLink(`vibeface://b/${botId}`);
   const cancel = screen.getByRole('button', '取消排队', { exact: true });
   await screen.scrollUntilVisible(cancel, { direction: 'up', timeout: 30000 });
   await cancel.click();
@@ -401,8 +451,8 @@ test('provider settings and queued cancellation work in the installed native app
   const after = await inspect();
   expect(after.running_invocations).toBe(1);
   expect(after.queued_invocations).toBe(0);
-  await device.openLink('vibeface://settings');
-  await device.openLink(`vibeface://b/${botId}`);
+  await openLink('vibeface://settings');
+  await openLink(`vibeface://b/${botId}`);
   await expect(screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/)).toBeVisible();
   const reopened = await inspect();
   expect(reopened.jobs).toEqual(after.jobs);
@@ -421,7 +471,8 @@ test('provider settings and queued cancellation work in the installed native app
     javascript: Object.fromEntries(javascript.map(name => [name, built[name]])), native: Object.fromEntries(native.map(name => [name, built[name]])),
     node_sha256: hashes.node, crypto_js_sha256: hashes.crypto_js, crypto_wasm_sha256: hashes.crypto_wasm,
     web_manifest_sha256: digest(web),
-    real_pairing: true, installed_bundle_matches: true, known_sign_in_required: true, saved_model_high: true,
+    real_pairing: true, installed_bundle_matches: true, mobile_welcome: true, node_client_categories: true,
+    node_detail_label: true, known_sign_in_required: true, saved_model_high: true,
     provider_controlled_cleared_effort: true, unavailable_catalog_preserved_model_high: true, typed_model_saved: true,
     execution_only_catalog_select: true, execution_only_custom_and_default: true,
     default_collapsed_role_groups: true, role_drafts_survived_collapse: true,

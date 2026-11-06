@@ -34,7 +34,7 @@ type ConnectOptions = {
   timeoutMs?: number
 }
 /** A computer that does not answer at its address: off, or on another network. */
-export const unreachableText = '连不上这台电脑。确认它开着，并且和这里网络互通。'
+export const unreachableText = '连不上这个节点。确认它正在运行，并且和这里网络互通。'
 
 export type Transport = ReturnType<typeof createTransport>
 /** What the Noise session runs over: binary frames each way; a text frame from the far side is a refusal. */
@@ -160,7 +160,7 @@ async function lanCarrier(dial: LanDial, deviceId: string, addrs: string[], sign
     stream = opened
     if (frames.closed()) opened.close()
     return opened
-  }, () => { throw new Error('在局域网里连不上这台电脑。') })
+  }, () => { throw new Error('在局域网里连不上这个节点。') })
   let opened: LanStream
   try { opened = await Promise.race([dialing, frames.failed]) }
   catch (error) { frames.close(error as Error); throw error }
@@ -235,7 +235,7 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
       return lanCarrier(dialLan, target, entry.addrs, signal, onClose, timeoutMs)
     }
     const endpoint = validEndpoint(entry.address)
-    if (entry.kind === 'local' && endpoint !== page()?.origin) throw new Error('本机会话只能连接这台电脑。')
+    if (entry.kind === 'local' && endpoint !== page()?.origin) throw new Error('本机会话只能连接这个节点。')
     const url = new URL(entry.kind === 'local' ? '/api/local/ws' : '/api/client', endpoint)
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
     return socketCarrier(url.href, entry.kind === 'local' ? null : JSON.stringify({ type: 'connect', target }), signal, onClose, timeoutMs)

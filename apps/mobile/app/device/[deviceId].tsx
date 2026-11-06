@@ -39,6 +39,7 @@ export default function DeviceDetail() {
       <View className="min-w-0 flex-1 gap-1">
         <DeviceTitle deviceId={member.device_id} name={member.name} editable={device.ready?.principal.can_manage === true} />
         <View className="flex-row flex-wrap items-center gap-2">
+          <View className={tag}><Text className="text-meta text-muted-foreground">{member.kind === 'node' ? '节点' : '客户端'}</Text></View>
           {member.online !== undefined ? <Online online={member.online} /> : null}
           {member.current || member.entry ? <View className={tag}><Text className="text-meta text-muted-foreground">{member.current ? self : '当前连接'}</Text></View> : null}
           {member.current && entryName ? <View className={tag} accessibilityLabel={`连在「${entryName}」上`}><Icon as={Laptop} className="size-3.5 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{entryName}</Text></View> : null}

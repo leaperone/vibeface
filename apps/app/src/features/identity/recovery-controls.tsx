@@ -313,7 +313,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         void run(async () => {
           let work: Promise<void>
           try {
-            if (!field(form, 'address').trim() || !field(form, 'device_id').trim()) throw new Error(`还没填要连的电脑。在“${target ? recoveryCopy.connectTo : recoveryCopy.manual}”里填好。`)
+            if (!field(form, 'address').trim() || !field(form, 'device_id').trim()) throw new Error(`还没填要连的节点。在“${target ? recoveryCopy.connectTo : recoveryCopy.manual}”里填好。`)
             work = device.beginRecovery({ file: fileOf(form), password: field(form, 'password'), name: field(form, 'name'), entry: parseEntry({ address: field(form, 'address'), device_id: field(form, 'device_id') }) })
           }
           finally { clearPasswords(form) }
@@ -324,7 +324,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         <Label label="恢复密码"><PasswordInput name="password" autoComplete="off" required /></Label>
         <Label label="这个浏览器叫什么？"><Input name="name" required maxLength={128} defaultValue={defaultBrowserName()} /></Label>
         {/* With no address yet, opening this computer's own page fills it in; typing it is the fallback. */}
-        {target ? null : <p className="flex items-center gap-2 text-meta text-muted-foreground"><Laptop aria-hidden="true" className="size-4 shrink-0" />在要连的电脑上打开本机页面再找回</p>}
+        {target ? null : <p className="flex items-center gap-2 text-meta text-muted-foreground"><Laptop aria-hidden="true" className="size-4 shrink-0" />打开要连的节点的本机页面再找回</p>}
         <Details label={target ? recoveryCopy.connectTo : recoveryCopy.manual}>
           <Label label="访问地址"><Input type="url" name="address" required defaultValue={target ? entryAddress(target) : ''} /></Label>
           <Label label="设备编号"><Input className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" defaultValue={target?.device_id || ''} autoComplete="off" spellCheck={false} /></Label>
