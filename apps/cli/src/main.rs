@@ -35,7 +35,7 @@ const MAX_LOG_RECORD: usize = 8 * 1024;
     version,
     about = "Personal device network for local coding agents.",
     long_about = "Your coding agents, connected across your own devices.\n\nRun without a command to start this Node in the foreground.\nUse tui to observe it without starting or stopping anything.",
-    after_help = "Examples:\n  vibeface                         Start this Node\n  vibeface tui                     Watch your personal network\n  vibeface status --json            Inspect from a script\n  vibeface access                   Get the browser URL\n\nUse vibeface <command> --help for command options.",
+    after_help = "Examples:\n  Start this Node\n    vibeface\n\n  Watch your personal network\n    vibeface tui\n\n  Inspect from a script\n    vibeface status --json\n\n  Get the browser URL\n    vibeface access\n\nUse vibeface <command> --help for command options.",
     styles = terminal::help_styles(),
     args_conflicts_with_subcommands = true
 )]
