@@ -1,14 +1,16 @@
 {
   "name": "vibeface-mobile",
   "private": true,
-  "main": "expo-router/entry",
+  "main": "./index.ts",
   "scripts": {
     "start": "expo start",
     "ios": "expo run:ios",
     "android": "expo run:android",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:polyfills": "node scripts/check-polyfills.mjs"
   },
   "dependencies": {
+    "@bacons/text-decoder": "0.0.0",
     "@expo-google-fonts/geist": "^0.4.2",
     "@expo-google-fonts/geist-mono": "^0.4.3",
     "@rn-primitives/slot": "^1.5.2",

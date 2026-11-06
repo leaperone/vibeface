@@ -1,3 +1,4 @@
+import '@bacons/text-decoder/install'
 import 'react-native-url-polyfill/auto'
 import { CryptoDigestAlgorithm, digest, getRandomValues, randomUUID } from 'expo-crypto'
 
