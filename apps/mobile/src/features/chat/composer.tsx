@@ -18,7 +18,6 @@ type Props = {
   onFiles: (files: Attachment[]) => void
   /** Why sending is off, in place of the placeholder, or under the box while it holds a draft; null when it is allowed. */
   blocked: string | null
-  /** A message is on its way: the button rests, and nothing below the box appears and shifts it. */
   sending: boolean
   onSend: () => void
   /** Present while a reply runs and can be cancelled: the send button becomes stop. */
@@ -48,7 +47,6 @@ export function Composer({ chrome, value, onChange, files, onFiles, blocked, sen
     {drafting && onStop ? <Button instant size="icon" variant="outline" className="rounded-full shadow-none" accessibilityLabel="停止" onPress={onStop}>
       <Icon as={Square} className="fill-foreground" />
     </Button> : null}
-    {/* Idle, the disabled default button rests muted; ready, it takes the bot's tint. */}
     <Button instant size="icon" variant={stop ? 'outline' : 'default'} className="rounded-full shadow-none" style={armed && tint ? { backgroundColor: tint.fill } : undefined} accessibilityLabel={stop ? '停止' : sending ? '发送中' : '发送'} disabled={!stop && !canSend}
       onPress={stop ?? (sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() })}>
       {stop ? <Icon as={Square} className="fill-foreground" /> : sending ? <Icon as={LoaderCircle} /> : <Icon as={ArrowUp} color={armed ? tint?.ink : undefined} />}

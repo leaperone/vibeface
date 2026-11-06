@@ -554,14 +554,14 @@ test("workspace preserves bot and message requests while routing native decision
         return native
       }
       mobile()
-      const platform = { OS: 'android' }, insets = { bottom: 0 }, keyboard = { height: { value: 0 }, progress: { value: 0 } }, dockHeight = { value: 60 }
-      let initialHeight = 0, emptyPadding = () => ({ paddingBottom: 0 })
+      const platform = { OS: 'android' }, insets = { bottom: 0 }, keyboard = { height: { value: 0 }, progress: { value: 0 } }
+      let dockHeight: { value: number } | undefined, emptyPadding = () => ({ paddingBottom: 0 })
       const chat = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
         'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: botA.bot_id }) },
         'expo-router/react-navigation': { useHeaderHeight: () => platform.OS === 'ios' ? 96 : 0 },
         'react-native': { Platform: platform, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
         'react-native-keyboard-controller': { KeyboardChatScrollView: 'KeyboardChatScrollView', KeyboardStickyView: 'KeyboardStickyView', useReanimatedKeyboardAnimation: () => keyboard },
-        'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: typeof emptyPadding) => { emptyPadding = read; return read() }, useSharedValue: (initial: number) => { initialHeight = initial; return dockHeight } },
+        'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: typeof emptyPadding) => { emptyPadding = read; return read() }, useSharedValue: (initial: number) => dockHeight ??= { value: initial } },
         'react-native-safe-area-context': { useSafeAreaInsets: () => insets, useSafeAreaFrame: () => ({ width: 390 }) },
         'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
         '@/data/context': { useWorkspace: () => native }, '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
@@ -662,7 +662,7 @@ test("workspace preserves bot and message requests while routing native decision
         assert.match(String(android.find(({ type }) => type === 'FlatList')?.props.contentContainerClassName), /py-6/)
         platform.OS = 'ios'; insets.bottom = 34
         const ios = chat.render('default'), flat = ios.find(({ type }) => type === 'FlatList')
-        assert.equal(initialHeight, 94, 'the initial dock includes its 52pt row, 8pt gap, and safe area')
+        assert.ok(dockHeight)
         assert.equal(JSON.stringify(ios.find(({ type }) => type === 'KeyboardStickyView')?.props.style), JSON.stringify({ position: 'absolute', bottom: 0, left: 0, right: 0 }))
         assert.equal(ios.find(({ type }) => type === 'KeyboardStickyView')?.props.pointerEvents, 'box-none')
         const renderScroll = flat?.props.renderScrollComponent
@@ -673,7 +673,36 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(scroll?.props.keyboardLiftBehavior, 'whenAtEnd')
         const measure = ios.find(({ type, props }) => type === 'View' && typeof props.onLayout === 'function')?.props.onLayout
         assert.ok(typeof measure === 'function')
+        const controller = '../../../../../apps/mobile/node_modules/react-native-keyboard-controller/src/components/KeyboardChatScrollView/'
+        const helpers = componentHarness(controller + 'useChatKeyboard/helpers.ts', {})
+        const scrollOffset = { value: 0 }, contentOffsetY = { value: 0 }, keyboardPadding = { value: 0 }
+        let reactPadding = () => {}
+        const padding = componentHarness(controller + 'useExtraContentPadding/index.ts', {
+          'react-native': { Platform: platform }, '../../../architecture': { IS_FABRIC: true },
+          '../../../reanimated': { useAnimatedReaction(read: () => number, react: (current: number, previous: number | null) => void) {
+            let previous: number | null = null
+            reactPadding = () => { const current = read(); react(current, previous); previous = current }
+            reactPadding()
+          } },
+          '../../utils/safeScrollTo': { safeScrollTo() { assert.fail('iOS Fabric must update the inset and offset together') } },
+          '../useChatKeyboard/helpers': helpers.module,
+        })
+        padding.render('useExtraContentPadding', {
+          scrollViewRef: {}, extraContentPadding: dockHeight, keyboardPadding, blankSpace: { value: 0 },
+          scroll: scrollOffset, contentOffsetY, layout: { value: { height: 844 } }, size: { value: { height: 2000 } },
+          inverted: true, keyboardLiftBehavior: scroll?.props.keyboardLiftBehavior, freeze: { value: false },
+        })
         measure({ nativeEvent: { layout: { height: 94 } } })
+        reactPadding()
+        assert.equal(contentOffsetY.value, -94, 'the installed hook reserves the complete dock on its first measurement')
+        scrollOffset.value = contentOffsetY.value
+        measure({ nativeEvent: { layout: { height: 94 } } }); reactPadding()
+        assert.equal(contentOffsetY.value, -94, 'the same measurement must not add a second inset correction')
+        measure({ nativeEvent: { layout: { height: 190 } } }); reactPadding()
+        assert.equal(contentOffsetY.value, -190, 'dock growth preserves the latest edge including the initial inset')
+        scrollOffset.value = contentOffsetY.value
+        measure({ nativeEvent: { layout: { height: 94 } } }); reactPadding()
+        assert.equal(contentOffsetY.value, -94, 'dock shrink preserves the latest edge')
         assert.equal(emptyPadding().paddingBottom, 94)
         keyboard.height.value = -168; keyboard.progress.value = 0.5
         assert.equal(emptyPadding().paddingBottom, 245, 'safe area compensation follows keyboard progress')
@@ -682,7 +711,10 @@ test("workspace preserves bot and message requests while routing native decision
         const offsets: number[] = [], ref = flat?.props.ref
         assert.ok(ref && typeof ref === 'object' && 'current' in ref)
         ref.current = { scrollToOffset: ({ offset }: { offset: number }) => offsets.push(offset) }
+        scrollOffset.value = 400; keyboardPadding.value = 302
         measure({ nativeEvent: { layout: { height: 190 } } })
+        reactPadding()
+        assert.equal(contentOffsetY.value, -94, 'the installed hook issues no offset change while reading older messages')
         assert.equal(dockHeight.value, 190, 'attachment and notice growth use the measured complete dock')
         assert.equal(emptyPadding().paddingBottom, 492)
         assert.deepEqual(offsets, [], 'dock growth cannot itself force an old-message reader to the latest message')

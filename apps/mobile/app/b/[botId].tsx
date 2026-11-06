@@ -134,7 +134,7 @@ export default function ChatScreen() {
     return () => clearInterval(timer)
   }, [awaiting, starting]))
   const keyboard = useReanimatedKeyboardAnimation()
-  const dockHeight = useSharedValue(insets.bottom + 60)
+  const dockHeight = useSharedValue(0)
   const list = useRef<FlatList<ReturnType<typeof entries>[number]>>(null)
   const scrollInset = useRef({ id, top: 0, bottom: 0 })
   if (scrollInset.current.id !== id) scrollInset.current = { id, top: 0, bottom: 0 }
