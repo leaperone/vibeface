@@ -302,7 +302,6 @@ def mobile_provenance(apk):
 
 
 def verify_public(app, destination):
-    """Download a public release and verify its complete assets and embedded identity."""
     expected = identity(app)
     tag = expected['tag']
     view = json.loads(run('gh', 'release', 'view', tag, '--repo', 'leaperone/vibeface', '--json', 'isDraft,assets'))

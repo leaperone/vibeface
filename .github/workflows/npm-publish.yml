@@ -54,7 +54,9 @@ jobs:
           git merge-base --is-ancestor "$source_commit" origin/main
           run_id="$(gh run list --workflow release.yml --commit "$source_commit" --limit 100 --json databaseId,headBranch,status,conclusion --jq '.[] | select(.headBranch == env.RELEASE_TAG and .status == "completed" and .conclusion == "success") | .databaseId' | head -n 1)"
           [[ "$run_id" =~ ^[0-9]+$ ]]
-          gh run download "$run_id" --name "npm-package-$source_commit" --dir .artifacts/npm
+          run_attempt="$(gh api "repos/$GH_REPO/actions/runs/$run_id" --jq .run_attempt)"
+          [[ "$run_attempt" =~ ^[1-9][0-9]*$ ]]
+          gh run download "$run_id" --name "npm-package-$source_commit-$run_attempt" --dir .artifacts/npm
           node scripts/package-npm.mjs --verify ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#cli-v}.tgz" --source-commit "$source_commit"
       - name: Validate npm publication without registry writes
         if: ${{ !inputs.publish }}
