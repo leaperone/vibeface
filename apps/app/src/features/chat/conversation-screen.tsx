@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import { ArrowDown, ArrowRightLeft, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Hourglass, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, RotateCw, Send, Unplug, WifiOff } from 'lucide-react'
-import { ActionCard, EmptyState, InlineError, PrimaryMark } from '@/components/app/kit'
+import { ActionCard, Details, EmptyState, InlineError, PrimaryMark } from '@/components/app/kit'
 import { BotFace, botMood, botTint, useDark } from '@/components/app/bot-face'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
 import { Button } from '@/components/ui/button'
@@ -146,7 +146,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
       for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
     } else if (!folded.hidden.has(message.message_id)) entries.push({ ...pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message, message.message_id === newest?.message_id ? retry : undefined), detail })
     const recordedJob = jobs.find((job) => job.reply_message_id === message.message_id || !job.reply_message_id && job.message_id === message.message_id)
-    if (recordedJob?.runtime) entries.push({ key: `runtime:${recordedJob.trigger}`, node: <p className="text-meta text-muted-foreground">{runtimeLabel(recordedJob.runtime)}</p> })
+    if (recordedJob?.runtime) entries.push({ key: `runtime:${recordedJob.trigger}`, node: <Details label="运行信息">{runtimeLabel(recordedJob.runtime)}</Details> })
     if (message.status === 'failed' && !recordedJob?.pending_check && (!recordedJob || !canRetryJob(recordedJob))) entries.push({ key: `query:${message.message_id}`, node: <ActionButton variant="ghost" action={() => workspace.refresh()}>再查一次</ActionButton> })
     if (recordedJob?.state === 'reconciling' || recordedJob?.pending_check) entries.push({ key: `reconcile:${recordedJob.trigger}`, node: <ActionCard icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>}><p className="text-meta text-muted-foreground">设备正在查询上次回复，系统不会自动重发。</p></ActionCard> })
     entries.push(...announced.get(message.message_id) ?? [])
@@ -179,7 +179,8 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const here = workspace.nodes.find((node) => node.device_id === data?.local_node)
   const ownerAway = Boolean(owner && here && (botReadiness(here) === 'ready' || botReadiness(here) === 'unverified') && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
   const lastUnanswered = data?.messages.filter((message) => unanswered.includes(message.message_id)).at(-1)
-  const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
+  const activeReply = activeJobs.find((job) => job.state === 'cancelling') ?? activeJobs.find((job) => job.state === 'running') ?? activeJobs.find((job) => job.state === 'claimed') ?? activeJobs[0]
+  const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.trigger === activeReply?.trigger && item.status)?.status
   // The owner holds the reply's state; when it does not answer, a waiting message shows that state as unknown.
   const remote = data?.scheduler?.remote
   if (remote && !remote.reachable && !ownerAway && newest?.role === 'user') entries.push({ key: 'owner-unknown', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground"><Unplug aria-hidden="true" className="size-4 shrink-0" />{nodeName(remote.owner, lookup)} 连不上，回复情况未知</p> })
@@ -187,8 +188,15 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const toAnswer = questions.filter((question) => awaitsAnswer(question, workspace.answered, folded.answers))
   const asked = toAnswer[0]
   const stopping = activeJobs.some((job) => job.state === 'cancelling')
-  if (botBusy && !live.length && !asked) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground">{stopping ? <><CircleStop aria-hidden="true" className="size-4" />正在停止…</>
-    : <>{bot ? <BotFace bot={bot} mood={workspace.connectionOnline ? 'thinking' : 'asleep'} size={24} /> : null}{status ? progressLabel(status) : '思考中'}</>}</p> })
+  const activity = !workspace.connectionOnline || remote?.reachable === false ? '暂时收不到最新进展，显示最近记录'
+    : stopping ? '正在确认停止回复'
+    : activeReply?.state === 'pending_delivery' ? '等待设备接收'
+    : activeReply?.state === 'queued' ? '等待处理'
+    : activeReply?.state === 'claimed' ? '正在准备'
+    : activeReply?.state === 'steering' ? '正在加入本轮'
+    : status ? progressLabel(status) : '正在处理你的要求'
+  if (botBusy && !live.length && !asked) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground">{stopping ? <CircleStop aria-hidden="true" className="size-4 shrink-0" />
+    : bot ? <BotFace bot={bot} mood={workspace.connectionOnline && remote?.reachable !== false ? 'thinking' : 'asleep'} size={24} /> : null}{activity}</p> })
   entries.push(...waiting)
   // The replies and questions this chat's badge counted when it came on screen start under 新消息.
   const unread = firstUnread(timeline, workspace.fresh, (aside) => 'waiting' in aside && aside.waiting === true && workspace.fresh.has(aside.key))
@@ -211,7 +219,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const notice = !workspace.connectionOnline ? ''
     : workspace.readOnlyNotice ? workspace.readOnlyNotice
     : workspace.writeNotice ? '同步中，稍后可发送'
-    : ''
+    : targetBusy && !sendDisabled ? '可以继续补充要求，处理状态会显示在消息下方。' : ''
   // Questions sit where they were asked, so an older one scrolls away; the pill above the composer brings back the first still open.
   const waitingTarget = asked ? `question-${asked.question_id}` : cards.length ? 'chat-waiting' : null
   const waitingCount = toAnswer.length + cards.length
@@ -263,6 +271,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
             <h2 className="text-heading font-semibold">{bot.name}</h2>
             {workspace.primary === bot.conversation_id ? <PrimaryMark labeled /> : null}
           </div>
+          {!needsSetup ? <p className="text-sm leading-relaxed text-muted-foreground">说说你想完成的事，也可以随时补充要求。</p> : null}
           {starting ? <p role="status" className="flex items-center gap-1.5 text-muted-foreground"><LoaderCircle aria-hidden="true" className={`size-4 shrink-0 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />Bot 正在启动</p>
             : needsSetup ? <>
             <p className="flex items-center gap-1.5 text-muted-foreground"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
@@ -275,13 +284,16 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         </div> : workspace.synced ? <NoBot /> : null}
       />
       {bot && inputTarget ? <PromptInput
-        above={!workspace.connectionOnline ? <p role="status" className="flex h-8 items-center gap-1.5 rounded-full border bg-card ps-2.5 pe-1 text-meta font-medium shadow-sm max-md:h-11">
-          <WifiOff aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />连不上{ready ? nodeName(ready.entry.device_id, lookup) : '设备'}
-          <Button type="button" variant="ghost" size="sm" className="h-7 rounded-full max-md:h-9" onClick={retryNow}><RotateCw aria-hidden="true" />重试连接</Button>
-        </p> : waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft active:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out max-md:h-11 max-md:ps-3"
+        above={<div className="flex max-w-full flex-col items-start gap-2">
+          {!workspace.connectionOnline ? <p role="status" className="flex min-h-8 max-w-full flex-wrap items-center gap-1.5 rounded-xl border bg-card ps-2.5 pe-1 text-meta font-medium max-md:min-h-11">
+          <WifiOff aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="min-w-0 break-words">连不上{ready ? nodeName(ready.entry.device_id, lookup) : '设备'}</span>
+          <Button type="button" variant="ghost" size="sm" className="h-7 shrink-0 rounded-full max-md:h-9" onClick={retryNow}><RotateCw aria-hidden="true" />重试连接</Button>
+        </p> : null}
+        {waitingTarget && (targetHidden || !workspace.connectionOnline) ? <button type="button" className="flex min-h-8 max-w-full items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium transition-colors hover:bg-warning-soft active:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out motion-reduce:animate-none max-md:min-h-11 max-md:ps-3"
           onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
-          <terms.inbox.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
+          <terms.inbox.icon aria-hidden="true" className="size-4 shrink-0 text-warning" /><span className="min-w-0 break-words">{!workspace.connectionOnline ? '最近记录 · ' : ''}{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}</span><ArrowDown aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
         </button> : null}
+        </div>}
         tint={tint}
         value={text}
         hint={notice}
@@ -326,7 +338,7 @@ function useOffscreen(id: string | null, revision: number) {
 
 type TaskRow = { id: string; state: string; device: string; summary: string; agent: ProviderId | null; trigger: string; work: WorkRecord; joined?: string }
 
-/** Running tasks get a full card; finished ones shrink to one line that still opens the details. */
+/** The current progress stays beside its request; finished work keeps its result and a link to details. */
 /** `away`: its device is offline, so it waits for that device rather than spinning. */
 function TaskCard({ task, botId, device, here, open, live, away }: { task: TaskRow; botId: string; device: string; here: boolean; open: boolean; live: boolean; away: boolean }) {
   const failed = task.state === 'failed' || task.state === 'rejected' || task.state === 'dispatch_rejected'
@@ -341,7 +353,7 @@ function TaskCard({ task, botId, device, here, open, live, away }: { task: TaskR
     <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} label={taskLabel(task.state)} agent={task.agent} quiet={task.state === 'completed' || failed && Boolean(result)} /></span>{result ? <span className={`block break-words ${failed ? 'text-danger' : ''}`}>{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
   </Link></div>
-  return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 interactive-row rounded-xl border bg-card shadow-xs px-4 py-2">
+  return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-12 items-start gap-2 rounded-lg px-2 py-2 transition-colors hover:bg-muted/60 hover:text-foreground active:bg-muted">
     {task.state === 'waiting' ? <terms.approval.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : stale ? <CircleQuestionMark aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
       : away ? <WifiOff aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
@@ -349,7 +361,7 @@ function TaskCard({ task, botId, device, here, open, live, away }: { task: TaskR
       : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className="size-5 shrink-0 animate-spin text-info" /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
     <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} label={stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)} agent={task.agent} className="text-meta" /></span>
       {task.joined ? <span className="flex min-w-0 items-center gap-1 text-meta text-muted-foreground"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">补充到「{task.joined}」</span></span>
-        : taskActive(task.state) && !stale && task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
+        : taskActive(task.state) && task.summary ? <span className="line-clamp-2 whitespace-pre-wrap break-words text-meta text-muted-foreground">{stale ? '最近进展：' : ''}{task.summary}</span> : null}</span>
     <ChevronRight aria-label="详情" className="size-4 shrink-0 text-muted-foreground" />
   </Link></div>
 }
