@@ -118,37 +118,52 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     await browser.mouse.move(viewport.x, viewport.y);
     await browser.mouse.wheel(0, -40);
     await expect(screen.getByRole('button', '回到最新消息')).toBeVisible();
-    const readingTop = await browser.evaluate(() => document.querySelector('[data-message-id="history-user-10"]')?.getBoundingClientRect().top ?? null);
+    const readingPosition = () => browser.evaluate(async () => {
+      const item = document.querySelector('[data-message-id="history-user-10"]');
+      const viewport = document.querySelector('[data-slot="message-scroller-viewport"]');
+      if (!item || !(viewport instanceof HTMLElement)) throw new Error('The reading anchor and viewport exist');
+      const read = () => ({ top: item.getBoundingClientRect().top, scrollTop: viewport.scrollTop, scrollHeight: viewport.scrollHeight, height: viewport.clientHeight, animating: viewport.hasAttribute('data-autoscrolling') });
+      let previous = read(), stable = 0;
+      for (let frame = 0; frame < 120; frame++) {
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+        const current = read();
+        stable = !current.animating && Math.abs(current.top - previous.top) < 0.1 && Math.abs(current.scrollTop - previous.scrollTop) < 0.1 && current.scrollHeight === previous.scrollHeight && current.height === previous.height ? stable + 1 : 0;
+        if (stable >= 3) return current;
+        previous = current;
+      }
+      throw new Error(`Chat reading position did not settle: ${JSON.stringify(previous)}`);
+    });
+    const before = await readingPosition();
     const completed = { type: 'work_finished', work_id: 'chat-confidence-scrolling', outcome: 'completed', result_text: '核对完成', failure_reason: null };
     db.prepare('UPDATE works SET finish=?,finish_rank=? WHERE network_id=? AND work_id=?').run(JSON.stringify(completed), '999', network, 'chat-confidence-scrolling');
     db.prepare('UPDATE works SET progress=?,progress_rank=? WHERE network_id=? AND work_id=?').run(JSON.stringify({ type: 'work_progress', work_id: work, phase: 'running', summary: `${summary}\n已收到新的资料。` }), '1000', network, work);
     await browser.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await expect(browser.locator('[data-message-id="task-group:message:scroll-request"] a[aria-label="即将完成的任务 · 已完成 · 查看任务"]')).toBeAttached();
     assert.equal(await browser.evaluate(() => document.querySelector('[data-message-id="task-group:message:report"] details')?.hasAttribute('open') ?? null), true, 'progress updates preserve the expanded group');
-    const afterTop = await browser.evaluate(() => document.querySelector('[data-message-id="history-user-10"]')?.getBoundingClientRect().top ?? null);
-    assert(readingTop !== null && afterTop !== null && Math.abs(afterTop - readingTop) < 3, 'completion preserves the message being read');
+    const after = await readingPosition();
+    assert(Math.abs(after.top - before.top) < 3, `completion preserves the message being read: ${JSON.stringify({ before, after })}`);
 
     await screen.getByRole('link', '我的设备', { exact: true }).click();
     await expect(tasksButton()).toHaveCount(0);
-    await screen.getByRole('link', '运营助手', { exact: true }).click();
+    await screen.getByRole('link', /^运营助手(?:\s|$)/).click();
     await tasksButton().click();
     await browser.back();
     await expect(browser).toHaveURL(`${node.url}/devices`);
     await expect(screen.getByRole('dialog', '任务记录')).toHaveCount(0);
     await expect(tasksButton()).toHaveCount(0);
-    await screen.getByRole('link', '运营助手', { exact: true }).click();
+    await screen.getByRole('link', /^运营助手(?:\s|$)/).click();
     await screen.getByRole('button', '新 Bot', { exact: true }).click();
     await screen.getByLabel('名称', { exact: true }).fill('另一个助手');
-    await screen.getByRole('button', '完成', { exact: true }).click();
+    await screen.getByRole('button', '创建', { exact: true }).click();
     await expect(browser).not.toHaveURL(new RegExp(`/b/${bot}$`));
-    await screen.getByRole('link', '运营助手', { exact: true }).click();
+    await screen.getByRole('link', /^运营助手(?:\s|$)/).click();
     await tasksButton().click();
     await browser.back();
     await expect(screen.getByRole('dialog', '任务记录')).toHaveCount(0);
     await tasksButton().click();
     await expect(screen.getByRole('dialog', '任务记录').getByText('还没有任务', { exact: true })).toBeVisible();
     await browser.keyboard.press('Escape');
-    await screen.getByRole('link', '运营助手', { exact: true }).click();
+    await screen.getByRole('link', /^运营助手(?:\s|$)/).click();
 
     await browser.goto(`${node.url}/b/${bot}/work/${work}`);
     const desktopTask = screen.getByRole('complementary', '任务详情');
@@ -161,7 +176,7 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     await app.screenshot('chat-confidence-progress-desktop');
 
     const finish = { type: 'work_finished', work_id: work, outcome: 'unverified', result_text: '', failure_reason: '这次的结果无法确认。' };
-    db.prepare('UPDATE works SET finish=?,finish_rank=? WHERE network_id=? AND work_id=?').run(JSON.stringify(finish), '4', network, work);
+    db.prepare('UPDATE works SET finish=?,finish_rank=? WHERE network_id=? AND work_id=?').run(JSON.stringify(finish), '1001', network, work);
     await browser.setViewport({ width: 390, height: 844 });
     await browser.goto(`${node.url}/b/${bot}`);
     await tasksButton().click();
@@ -177,7 +192,8 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     assert(sheetGeometry.content <= sheetGeometry.width && sheetGeometry.pageContent <= sheetGeometry.page, 'phone task history must not scroll horizontally');
     await app.screenshot('chat-confidence-history-phone');
     await history.getByRole('link', /^整理本月运营情况 /).click();
-    const task = screen.getByRole('dialog');
+    await expect(screen.getByRole('dialog', '任务记录')).not.toBeVisible();
+    const task = screen.getByRole('dialog', '整理本月运营情况');
     await expect(task.getByRole('heading', '还不知道做完没有')).toBeVisible();
     await expect(task.getByRole('button', '先查结果', { exact: true })).toBeVisible();
     await expect(task.getByRole('button', '做完了', { exact: true })).not.toBeVisible();
