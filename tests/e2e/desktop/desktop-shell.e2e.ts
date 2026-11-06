@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { expect } from 'e2e';
-import { evaluate, screenshot, test, type Inspection, type Page } from './desktop';
+import { evaluate, screenshot, test, type Inspection, type Page } from '../desktop';
 
 const ELECTRON_VERSION = '45.2.3';
 const CORE_ORIGIN = 'http://127.0.0.1:4791';

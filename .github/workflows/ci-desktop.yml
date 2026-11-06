@@ -47,9 +47,8 @@ jobs:
         with:
           key: desktop-native-${{ inputs.target }}
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
-      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+      - uses: ./.github/actions/msvc-environment
         if: runner.os == 'Windows'
-        with: {arch: x64}
       - name: Select this platform's Python
         run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
       - name: Build this platform's native runtime

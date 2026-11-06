@@ -384,3 +384,37 @@ fn widely_readable(path: &Path) -> Result<PathBuf> {
         Ok(shared)
     }
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn codex_uses_a_native_unix_socket_instead_of_an_invented_pipe_url() -> Result<()> {
+    use std::io::{Read as _, Write as _};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let key = uuid::Uuid::new_v4().simple().to_string();
+    let directory = ipc::runtime_dir(&key[..12])?;
+    privatefs::create_dir(&directory)?;
+    let endpoint = ipc::Endpoint::codex_in_private_dir(&directory)?;
+    assert_eq!(
+        endpoint.listen_argument()?,
+        format!("unix://{}", endpoint.path().display())
+    );
+    let native = uds_windows::UnixListener::bind(endpoint.path())?;
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let (mut stream, _) = native.accept()?;
+        let mut request = [0; 4];
+        stream.read_exact(&mut request)?;
+        assert_eq!(&request, b"ping");
+        stream.write_all(b"pong")
+    });
+    let mut client = ipc::Stream::connect(&endpoint).await?;
+    client.require_current_account("the native Codex socket")?;
+    client.write_all(b"ping").await?;
+    client.flush().await?;
+    let mut response = [0; 4];
+    client.read_exact(&mut response).await?;
+    assert_eq!(&response, b"pong");
+    drop(client);
+    server.join().expect("native socket fixture thread")?;
+    std::fs::remove_dir_all(directory)?;
+    Ok(())
+}

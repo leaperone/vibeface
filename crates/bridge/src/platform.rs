@@ -17,6 +17,8 @@ pub mod stop;
 pub mod tree;
 
 #[cfg(windows)]
+pub mod codex_socket;
+#[cfg(windows)]
 mod winjob;
 #[cfg(windows)]
 mod winsec;

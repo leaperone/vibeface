@@ -395,6 +395,8 @@ jobs:
         run: bash scripts/import-mac-identity.sh
       - name: Select this platform's Python
         run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/msvc-environment
+        if: runner.os == 'Windows'
       - name: Build native release package
         run: |
           [[ "$(rustc -vV | sed -n 's/^host: //p')" == "$PACKAGE_TARGET" ]]

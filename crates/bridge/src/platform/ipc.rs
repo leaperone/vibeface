@@ -20,7 +20,14 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub struct Endpoint {
     display: PathBuf,
     #[cfg(windows)]
-    name: String,
+    address: WindowsAddress,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WindowsAddress {
+    Pipe(String),
+    CodexSocket,
 }
 
 impl Endpoint {
@@ -51,7 +58,7 @@ impl Endpoint {
             let name = format!(r"\\.\pipe\{scope}-{name}-{account}");
             Ok(Self {
                 display: PathBuf::from(&name),
-                name,
+                address: WindowsAddress::Pipe(name),
             })
         }
     }
@@ -72,13 +79,22 @@ impl Endpoint {
         #[cfg(windows)]
         {
             let name = path.to_string_lossy().into_owned();
-            ensure!(
-                name.starts_with(r"\\.\pipe\") && !name[r"\\.\pipe\".len()..].contains('\\'),
-                "a local endpoint must be a named pipe on this machine: {name}"
-            );
+            let address = if name.starts_with(r"\\.\pipe\") {
+                ensure!(
+                    !name[r"\\.\pipe\".len()..].contains('\\'),
+                    "a pipe must be on this machine"
+                );
+                WindowsAddress::Pipe(name)
+            } else {
+                ensure!(
+                    path.is_absolute() && !name.starts_with(r"\\"),
+                    "a Codex socket must be an absolute local path"
+                );
+                WindowsAddress::CodexSocket
+            };
             Ok(Self {
                 display: path.to_owned(),
-                name,
+                address,
             })
         }
     }
@@ -88,16 +104,27 @@ impl Endpoint {
         &self.display
     }
 
-    /// How a program the Node starts is told to listen here. Unix spells a socket path as a
-    /// `unix://` URL; Windows names the pipe, which is the only form a pipe has.
-    pub fn listen_argument(&self) -> String {
-        #[cfg(unix)]
-        {
-            format!("unix://{}", self.display.display())
-        }
+    /// Codex's documented Unix WebSocket endpoint, including Windows AF_UNIX.
+    pub fn codex_in_private_dir(dir: &Path) -> Result<Self> {
+        Self::from_path(&dir.join("codex.sock"))
+    }
+
+    pub fn listen_argument(&self) -> Result<String> {
         #[cfg(windows)]
-        {
-            self.name.clone()
+        ensure!(
+            matches!(self.address, WindowsAddress::CodexSocket),
+            "Codex does not accept a named pipe as a listen URL"
+        );
+        Ok(format!("unix://{}", self.display.display()))
+    }
+
+    #[cfg(windows)]
+    fn pipe_name(&self) -> Result<&str> {
+        match &self.address {
+            WindowsAddress::Pipe(name) => Ok(name),
+            WindowsAddress::CodexSocket => {
+                bail!("the Node's control listener requires a named pipe")
+            }
         }
     }
 
@@ -145,12 +172,28 @@ impl Endpoint {
         }
         #[cfg(windows)]
         {
-            let account = super::winsec::current_user()?.fingerprint();
-            ensure!(
-                self.name.ends_with(&format!("-{account}")),
-                "{label} is not in this account's part of the local pipe namespace"
-            );
-            Ok(())
+            match &self.address {
+                WindowsAddress::Pipe(name) => {
+                    let account = super::winsec::current_user()?.fingerprint();
+                    ensure!(
+                        name.ends_with(&format!("-{account}")),
+                        "{label} is not in this account's pipe namespace"
+                    );
+                    Ok(())
+                }
+                WindowsAddress::CodexSocket => {
+                    let parent = self
+                        .display
+                        .parent()
+                        .context("Codex socket has no parent")?;
+                    let metadata = std::fs::symlink_metadata(parent)?;
+                    ensure!(
+                        metadata.is_dir() && !metadata.file_type().is_symlink(),
+                        "Codex socket parent must be a regular directory"
+                    );
+                    super::privatefs::ensure_private(parent, label)
+                }
+            }
         }
     }
 
@@ -163,7 +206,10 @@ impl Endpoint {
         }
         #[cfg(windows)]
         {
-            super::winsec::pipe_name_exists(&self.name)
+            match &self.address {
+                WindowsAddress::Pipe(name) => super::winsec::pipe_name_exists(name),
+                WindowsAddress::CodexSocket => self.display.exists(),
+            }
         }
     }
 }
@@ -285,7 +331,7 @@ fn create_pipe_instance(
     // SAFETY: the attributes and the descriptor they point at outlive this call.
     let server = unsafe {
         options.create_with_security_attributes_raw(
-            &endpoint.name,
+            endpoint.pipe_name()?,
             (&raw mut attributes).cast::<std::ffi::c_void>(),
         )
     }
@@ -297,6 +343,7 @@ fn create_pipe_instance(
 enum PipeSide {
     Server(tokio::net::windows::named_pipe::NamedPipeServer),
     Client(tokio::net::windows::named_pipe::NamedPipeClient),
+    Codex(super::codex_socket::Stream),
 }
 
 /// One local connection. Reads and writes like any byte stream, and can prove which account is
@@ -332,10 +379,18 @@ impl Stream {
         }
         #[cfg(windows)]
         {
+            if matches!(endpoint.address, WindowsAddress::CodexSocket) {
+                endpoint.ensure_private("the Codex socket")?;
+                return Ok(Self {
+                    inner: PipeSide::Codex(
+                        super::codex_socket::Stream::connect(endpoint.path()).await?,
+                    ),
+                });
+            }
             let client = tokio::net::windows::named_pipe::ClientOptions::new()
                 .read(true)
                 .write(true)
-                .open(&endpoint.name)?;
+                .open(endpoint.pipe_name()?)?;
             let stream = Self {
                 inner: PipeSide::Client(client),
             };
@@ -361,6 +416,7 @@ impl Stream {
                     super::winsec::pipe_client_is_current_user(server).map_err(Into::into)
                 }
                 PipeSide::Client(_) => self.endpoint_is_private(),
+                PipeSide::Codex(socket) => Ok(socket.require_current_account().is_ok()),
             }
         }
     }
@@ -372,6 +428,7 @@ impl Stream {
         let handle = match &self.inner {
             PipeSide::Server(server) => server.as_raw_handle(),
             PipeSide::Client(client) => client.as_raw_handle(),
+            PipeSide::Codex(socket) => return Ok(socket.require_current_account().is_ok()),
         };
         super::winsec::handle_is_private(handle.cast()).map_err(Into::into)
     }
@@ -402,6 +459,7 @@ impl AsyncRead for Stream {
             match &mut self.get_mut().inner {
                 PipeSide::Server(server) => Pin::new(server).poll_read(context, buffer),
                 PipeSide::Client(client) => Pin::new(client).poll_read(context, buffer),
+                PipeSide::Codex(socket) => Pin::new(socket).poll_read(context, buffer),
             }
         }
     }
@@ -422,6 +480,7 @@ impl AsyncWrite for Stream {
             match &mut self.get_mut().inner {
                 PipeSide::Server(server) => Pin::new(server).poll_write(context, bytes),
                 PipeSide::Client(client) => Pin::new(client).poll_write(context, bytes),
+                PipeSide::Codex(socket) => Pin::new(socket).poll_write(context, bytes),
             }
         }
     }
@@ -439,6 +498,7 @@ impl AsyncWrite for Stream {
             match &mut self.get_mut().inner {
                 PipeSide::Server(server) => Pin::new(server).poll_flush(context),
                 PipeSide::Client(client) => Pin::new(client).poll_flush(context),
+                PipeSide::Codex(socket) => Pin::new(socket).poll_flush(context),
             }
         }
     }
@@ -456,6 +516,7 @@ impl AsyncWrite for Stream {
             match &mut self.get_mut().inner {
                 PipeSide::Server(server) => Pin::new(server).poll_shutdown(context),
                 PipeSide::Client(client) => Pin::new(client).poll_shutdown(context),
+                PipeSide::Codex(socket) => Pin::new(socket).poll_shutdown(context),
             }
         }
     }
@@ -532,27 +593,18 @@ impl Alias {
         }
         #[cfg(windows)]
         {
-            if let Ok(name) = path.to_string_lossy().parse::<AliasTarget>() {
-                return Ok(name.0);
+            if path.to_string_lossy().starts_with(r"\\.\pipe\")
+                || path
+                    .extension()
+                    .is_none_or(|extension| extension != "endpoint")
+            {
+                return Endpoint::from_path(path);
             }
             let bytes = super::privatefs::read_private_bounded(path, 4096, "App Server link")
                 .context("read the App Server link this Node published")?;
             let text = String::from_utf8(bytes).context("App Server link must be UTF-8")?;
             Endpoint::from_path(Path::new(text.trim()))
         }
-    }
-}
-
-/// A path that already names a pipe needs no pointer file behind it.
-#[cfg(windows)]
-struct AliasTarget(Endpoint);
-
-#[cfg(windows)]
-impl std::str::FromStr for AliasTarget {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        Endpoint::from_path(Path::new(value)).map(Self)
     }
 }
 

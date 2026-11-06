@@ -648,15 +648,11 @@ impl Inner {
     }
 
     fn spawn(&self, launch: &CodexLaunch) -> Result<tokio::process::Child> {
-        ensure!(
-            !self.spawn_endpoint.is_held(),
-            "the private Codex endpoint is already in use"
-        );
         let mut command = std::process::Command::new(&launch.bin);
         command
             .envs(&launch.env)
             .args(["app-server", "--listen"])
-            .arg(self.spawn_endpoint.listen_argument())
+            .arg(self.spawn_endpoint.listen_argument()?)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
@@ -868,8 +864,12 @@ impl CodexServer {
                 leases: BTreeSet::new(),
             }),
             changed: tokio::sync::Notify::new(),
-            spawn_endpoint: Endpoint::in_private_dir(&directory, "codex.sock")?,
-            agent_alias: Alias::new(directory.join("app-server.sock")),
+            spawn_endpoint: Endpoint::codex_in_private_dir(&directory)?,
+            agent_alias: Alias::new(directory.join(if cfg!(windows) {
+                "app-server.endpoint"
+            } else {
+                "app-server.sock"
+            })),
             pidfile: data_dir.join("codex-app-server.pid"),
             link: std::sync::Mutex::new(Link::Starting),
             tree: std::sync::Mutex::new(None),

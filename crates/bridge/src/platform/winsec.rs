@@ -974,3 +974,55 @@ fn mount_point_buffer(target: &Path) -> io::Result<Vec<u8>> {
     }
     Ok(buffer)
 }
+
+/// Authenticate the process attached to an AF_UNIX socket before sending protocol data.
+pub fn require_socket_peer(socket: std::os::windows::io::RawSocket) -> io::Result<()> {
+    use windows_sys::Win32::{
+        Networking::WinSock::{SIO_AF_UNIX_GETPEERPID, SOCKET_ERROR, WSAGetLastError, WSAIoctl},
+        System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    let mut pid = 0_u32;
+    let mut returned = 0_u32;
+    // SAFETY: socket remains open; the output points to one initialized PID-sized buffer.
+    if unsafe {
+        WSAIoctl(
+            socket as _,
+            SIO_AF_UNIX_GETPEERPID,
+            std::ptr::null(),
+            0,
+            (&mut pid as *mut u32).cast(),
+            std::mem::size_of_val(&pid) as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+            None,
+        )
+    } == SOCKET_ERROR
+    {
+        // SAFETY: WSAGetLastError reads this thread's most recent socket error.
+        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+    }
+    if pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Codex socket has no verifiable peer",
+        ));
+    }
+    // SAFETY: the kernel supplied the PID of this live socket's peer.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let process = OwnedHandle(process);
+    let mut token = std::ptr::null_mut();
+    // SAFETY: the process handle is owned above and the token output is writable.
+    if unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if token_user(OwnedHandle(token).0)? != current_user()? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Codex socket belongs to another account",
+        ));
+    }
+    Ok(())
+}

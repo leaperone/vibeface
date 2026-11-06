@@ -23,8 +23,12 @@ libc = "0.2"
 
 # The owner-only access control lists, named pipes, and job objects behind `platform`.
 [target.'cfg(windows)'.dependencies]
+async-io = "2.6"
+tokio-util = { version = "0.7", features = ["compat"] }
+uds_windows = "1.1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",

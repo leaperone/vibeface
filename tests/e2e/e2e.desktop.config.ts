@@ -10,7 +10,7 @@ assert(process.env.VIBEFACE_E2E_DESKTOP_RUNTIME, 'Name the verified runtime the 
 // windows it already opened over the application's own DevTools endpoint, so nothing here is a
 // browser beside the application.
 export default {
-  tests: ['desktop-shell.e2e.ts'],
+  tests: ['desktop/*.e2e.ts'],
   targets: [{ name: 'vibeface-desktop', platform: process.platform === 'win32' ? 'windows' : 'macos' }],
   workers: 1,
   retries: 0,

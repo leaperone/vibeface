@@ -30,8 +30,7 @@ jobs:
         with: {python-version: '3.12'}
       - name: Select this platform's Python
         run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
-      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
-        with: {arch: x64}
+      - uses: ./.github/actions/msvc-environment
       - name: Confirm the host really is the MSVC target
         run: |
           rustc -vV
