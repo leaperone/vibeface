@@ -31,7 +31,10 @@ function holdFocus(node: HTMLElement | null) {
   if (!node) return
   const opener = node.ownerDocument.activeElement
   node.focus({ preventScroll: true })
-  return () => { if (opener instanceof HTMLElement && opener.isConnected) opener.focus({ preventScroll: true }) }
+  return () => {
+    const target = opener instanceof HTMLElement && opener !== node.ownerDocument.body && opener.isConnected ? opener : node.ownerDocument.getElementById("main")
+    target?.focus({ preventScroll: true })
+  }
 }
 
 // Below lg the panel covers the chat, so it is a modal; beside the chat it is not. Same query as the lg: classes.
