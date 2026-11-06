@@ -1,0 +1,432 @@
+//! A local endpoint only the account running this process can connect to.
+//!
+//! Unix uses a `0o600` socket inside a `0o700` directory and reads the credentials of every
+//! peer. Windows uses a named pipe whose protected access control list names the token user,
+//! claims the first instance of the name so no other process can squat it, and reads the
+//! account behind every client by impersonating it. Neither family listens on a network
+//! socket, so nothing here is reachable from another machine or another account.
+
+use anyhow::{Context, Result, bail, ensure};
+use std::{
+    path::{Path, PathBuf},
+    pin::Pin,
+    task::{Context as TaskContext, Poll},
+};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+/// Where a local endpoint lives. The displayed path is what `vibeface status` reports and what
+/// the CLI passes back to the Node, so it round-trips through [`Endpoint::from_path`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    display: PathBuf,
+    #[cfg(windows)]
+    name: String,
+}
+
+impl Endpoint {
+    /// An endpoint named `name` belonging to the private directory `dir`.
+    ///
+    /// Unix places the socket inside `dir`. Windows has one machine-wide pipe namespace, so the
+    /// name of `dir` and a fingerprint of this account are folded into the pipe name; two
+    /// accounts on one machine therefore never collide and never squat each other.
+    pub fn in_private_dir(dir: &Path, name: &str) -> Result<Self> {
+        ensure!(
+            !name.is_empty() && !name.contains(['\\', '/', ':']),
+            "a local endpoint name must be a plain file name"
+        );
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                display: dir.join(name),
+            })
+        }
+        #[cfg(windows)]
+        {
+            let scope = dir
+                .file_name()
+                .context("a local endpoint needs a named private directory")?
+                .to_string_lossy()
+                .into_owned();
+            let account = super::winsec::current_user()?.fingerprint();
+            let name = format!(r"\\.\pipe\{scope}-{name}-{account}");
+            Ok(Self {
+                display: PathBuf::from(&name),
+                name,
+            })
+        }
+    }
+
+    /// Reads back an endpoint the Node reported earlier.
+    pub fn from_path(path: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            ensure!(
+                path.is_absolute(),
+                "a local endpoint path must be absolute: {}",
+                path.display()
+            );
+            Ok(Self {
+                display: path.to_owned(),
+            })
+        }
+        #[cfg(windows)]
+        {
+            let name = path.to_string_lossy().into_owned();
+            ensure!(
+                name.starts_with(r"\\.\pipe\") && !name[r"\\.\pipe\".len()..].contains('\\'),
+                "a local endpoint must be a named pipe on this machine: {name}"
+            );
+            Ok(Self {
+                display: path.to_owned(),
+                name,
+            })
+        }
+    }
+
+    /// The path a person sees and the CLI carries.
+    pub fn path(&self) -> &Path {
+        &self.display
+    }
+
+    /// Whether something already holds this endpoint. A `true` answer does not prove the holder
+    /// is this Node, which is why [`Stream::connect`] still checks the owner.
+    pub fn is_held(&self) -> bool {
+        #[cfg(unix)]
+        {
+            std::fs::symlink_metadata(&self.display).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            super::winsec::pipe_name_exists(&self.name)
+        }
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.display.to_string_lossy())
+    }
+}
+
+/// Accepts current-user-only local connections.
+pub struct Listener {
+    #[cfg(unix)]
+    inner: tokio::net::UnixListener,
+    #[cfg(windows)]
+    pending: tokio::net::windows::named_pipe::NamedPipeServer,
+    #[cfg(windows)]
+    endpoint: Endpoint,
+}
+
+impl Listener {
+    /// Claims `endpoint`. Fails when another process already holds it, so a second Node never
+    /// quietly takes over the first one's control surface.
+    pub async fn bind(endpoint: &Endpoint) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            let inner = tokio::net::UnixListener::bind(endpoint.path())
+                .with_context(|| format!("claim the local endpoint {endpoint}"))?;
+            super::privatefs::restrict_file(endpoint.path())?;
+            Ok(Self { inner })
+        }
+        #[cfg(windows)]
+        {
+            let pending = create_pipe_instance(endpoint, true)?;
+            Ok(Self {
+                pending,
+                endpoint: endpoint.clone(),
+            })
+        }
+    }
+
+    /// Waits for the next connection from this account.
+    pub async fn accept(&mut self) -> Result<Stream> {
+        #[cfg(unix)]
+        {
+            let (stream, _) = self.inner.accept().await?;
+            Ok(Stream { inner: stream })
+        }
+        #[cfg(windows)]
+        {
+            self.pending.connect().await?;
+            // The next instance is created before this one is handed out so the endpoint is
+            // never momentarily absent from the namespace.
+            let next = create_pipe_instance(&self.endpoint, false)?;
+            Ok(Stream {
+                inner: PipeSide::Server(std::mem::replace(&mut self.pending, next)),
+            })
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_pipe_instance(
+    endpoint: &Endpoint,
+    first: bool,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    let owner_only = super::winsec::OwnerOnly::new(false)?;
+    let mut attributes = owner_only.attributes();
+    let mut options = tokio::net::windows::named_pipe::ServerOptions::new();
+    options
+        .first_pipe_instance(first)
+        .reject_remote_clients(true);
+    // SAFETY: the attributes and the descriptor they point at outlive this call.
+    let server = unsafe {
+        options.create_with_security_attributes_raw(
+            &endpoint.name,
+            (&raw mut attributes).cast::<std::ffi::c_void>(),
+        )
+    }
+    .with_context(|| format!("claim the local endpoint {endpoint}"))?;
+    Ok(server)
+}
+
+#[cfg(windows)]
+enum PipeSide {
+    Server(tokio::net::windows::named_pipe::NamedPipeServer),
+    Client(tokio::net::windows::named_pipe::NamedPipeClient),
+}
+
+/// One local connection. Reads and writes like any byte stream, and can prove which account is
+/// on the other end.
+pub struct Stream {
+    #[cfg(unix)]
+    inner: tokio::net::UnixStream,
+    #[cfg(windows)]
+    inner: PipeSide,
+}
+
+impl Stream {
+    /// Connects to `endpoint` and refuses an endpoint this account does not own, so a squatter
+    /// cannot collect a request meant for the Node.
+    pub async fn connect(endpoint: &Endpoint) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            // The directory and socket checks happen in the caller, which knows what the
+            // endpoint is for and what to say when it is wrong.
+            let inner = tokio::net::UnixStream::connect(endpoint.path()).await?;
+            let stream = Self { inner };
+            ensure!(
+                stream.peer_is_current_account()?,
+                "the local endpoint {endpoint} belongs to another account"
+            );
+            Ok(stream)
+        }
+        #[cfg(windows)]
+        {
+            let client = tokio::net::windows::named_pipe::ClientOptions::new()
+                .read(true)
+                .write(true)
+                .open(&endpoint.name)?;
+            let stream = Self {
+                inner: PipeSide::Client(client),
+            };
+            ensure!(
+                stream.endpoint_is_private()?,
+                "the local endpoint {endpoint} belongs to another account"
+            );
+            Ok(stream)
+        }
+    }
+
+    /// Whether the process on the other end runs as this account.
+    pub fn peer_is_current_account(&self) -> Result<bool> {
+        #[cfg(unix)]
+        {
+            // SAFETY: geteuid reads the calling process and touches no memory.
+            Ok(self.inner.peer_cred()?.uid() == unsafe { libc::geteuid() })
+        }
+        #[cfg(windows)]
+        {
+            match &self.inner {
+                PipeSide::Server(server) => {
+                    super::winsec::pipe_client_is_current_user(server).map_err(Into::into)
+                }
+                PipeSide::Client(_) => self.endpoint_is_private(),
+            }
+        }
+    }
+
+    /// Whether the endpoint itself is reachable only by this account.
+    #[cfg(windows)]
+    fn endpoint_is_private(&self) -> Result<bool> {
+        use std::os::windows::io::AsRawHandle as _;
+        let handle = match &self.inner {
+            PipeSide::Server(server) => server.as_raw_handle(),
+            PipeSide::Client(client) => client.as_raw_handle(),
+        };
+        super::winsec::handle_is_private(handle.cast()).map_err(Into::into)
+    }
+
+    /// Refuses the connection unless the peer runs as this account.
+    pub fn require_current_account(&self, label: &str) -> Result<()> {
+        ensure!(
+            self.peer_is_current_account()
+                .with_context(|| format!("read the account behind {label}"))?,
+            "{label} requires its local owner"
+        );
+        Ok(())
+    }
+}
+
+impl AsyncRead for Stream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        #[cfg(unix)]
+        {
+            Pin::new(&mut self.get_mut().inner).poll_read(context, buffer)
+        }
+        #[cfg(windows)]
+        {
+            match &mut self.get_mut().inner {
+                PipeSide::Server(server) => Pin::new(server).poll_read(context, buffer),
+                PipeSide::Client(client) => Pin::new(client).poll_read(context, buffer),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for Stream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        #[cfg(unix)]
+        {
+            Pin::new(&mut self.get_mut().inner).poll_write(context, bytes)
+        }
+        #[cfg(windows)]
+        {
+            match &mut self.get_mut().inner {
+                PipeSide::Server(server) => Pin::new(server).poll_write(context, bytes),
+                PipeSide::Client(client) => Pin::new(client).poll_write(context, bytes),
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        #[cfg(unix)]
+        {
+            Pin::new(&mut self.get_mut().inner).poll_flush(context)
+        }
+        #[cfg(windows)]
+        {
+            match &mut self.get_mut().inner {
+                PipeSide::Server(server) => Pin::new(server).poll_flush(context),
+                PipeSide::Client(client) => Pin::new(client).poll_flush(context),
+            }
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        #[cfg(unix)]
+        {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+        }
+        #[cfg(windows)]
+        {
+            match &mut self.get_mut().inner {
+                PipeSide::Server(server) => Pin::new(server).poll_shutdown(context),
+                PipeSide::Client(client) => Pin::new(client).poll_shutdown(context),
+            }
+        }
+    }
+}
+
+/// A stable name a long-lived program keeps in its environment while the Node moves the
+/// endpoint behind it, used for the coordination Agent's App Server link.
+pub struct Alias {
+    path: PathBuf,
+}
+
+impl Alias {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Points the alias at `endpoint` without a moment where it points nowhere.
+    ///
+    /// Unix replaces a symbolic link. Windows writes the endpoint name into a private pointer
+    /// file, because a named pipe has no directory entry to link to.
+    pub fn point_at(&self, endpoint: &Endpoint) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let next = self.path.with_extension("next");
+            let _ = std::fs::remove_file(&next);
+            std::os::unix::fs::symlink(endpoint.path(), &next)?;
+            std::fs::rename(&next, &self.path)?;
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            super::privatefs::write_atomic(&self.path, endpoint.to_string().as_bytes())
+        }
+    }
+
+    pub fn clear(&self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+
+    /// The endpoint a program reached through `path`, which may be an alias or an endpoint.
+    pub fn resolve(path: &Path) -> Result<Endpoint> {
+        #[cfg(unix)]
+        {
+            // The kernel follows the link, so the alias is usable as the endpoint itself.
+            Endpoint::from_path(path)
+        }
+        #[cfg(windows)]
+        {
+            if let Ok(name) = path.to_string_lossy().parse::<AliasTarget>() {
+                return Ok(name.0);
+            }
+            let bytes = super::privatefs::read_private_bounded(path, 4096, "App Server link")
+                .context("read the App Server link this Node published")?;
+            let text = String::from_utf8(bytes).context("App Server link must be UTF-8")?;
+            Endpoint::from_path(Path::new(text.trim()))
+        }
+    }
+}
+
+/// A path that already names a pipe needs no pointer file behind it.
+#[cfg(windows)]
+struct AliasTarget(Endpoint);
+
+#[cfg(windows)]
+impl std::str::FromStr for AliasTarget {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Endpoint::from_path(Path::new(value)).map(Self)
+    }
+}
+
+/// The private per-device directory the local endpoints and their aliases live in.
+pub fn runtime_dir(key: &str) -> Result<PathBuf> {
+    ensure!(
+        !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric()),
+        "a runtime directory key must be alphanumeric"
+    );
+    #[cfg(unix)]
+    let base = PathBuf::from("/tmp");
+    #[cfg(windows)]
+    let base = std::env::temp_dir();
+    let directory = base.join(format!("vibeface-{key}"));
+    if directory.as_os_str().is_empty() {
+        bail!("this account has no usable temporary directory");
+    }
+    Ok(directory)
+}

@@ -6603,6 +6603,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "futures-util",
+ "libc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -6610,6 +6611,7 @@ dependencies = [
  "tokio-tungstenite 0.28.0",
  "tracing",
  "vibeface-protocol",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
