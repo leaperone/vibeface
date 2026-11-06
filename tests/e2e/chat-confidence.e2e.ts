@@ -28,9 +28,10 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     const { network_id: network, conversation_id: conversation, bot_id: bot } = identity;
     const work = 'chat-confidence-work';
     const summary = '已汇总现有记录。\n正在检查退款是否单独统计。\n详细资料保留在这里，不需要默认展开。';
-    const message = db.prepare('INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,attachments) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)');
+    const target = { kind: 'bot_main', bot_id: bot };
+    const message = db.prepare('INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,attachments,target,answers) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
     let rank = 0;
-    const addMessage = (id: string, text: string, replyTo?: string) => message.run(network, conversation, id, `fixture-${id}`, String(++rank).padStart(20, '0'), node.peer, replyTo ? 'assistant' : 'user', text, Date.now() - 60000 + rank, replyTo ?? null, replyTo ? 'completed' : null, '[]');
+    const addMessage = (id: string, text: string, replyTo?: string, answers?: string) => message.run(network, conversation, id, `fixture-${id}`, String(++rank).padStart(20, '0'), node.peer, replyTo ? 'assistant' : 'user', text, Date.now() - 60000 + rank, replyTo ?? null, replyTo ? 'completed' : null, '[]', JSON.stringify(target), answers ?? null);
     for (const [id, text] of [['report', '请整理本月运营情况'], ['scroll-request', '核对即将完成的记录'], ['compact-request', '保留已完成任务入口']]) {
       addMessage(id, text);
       addMessage(`${id}-reply`, `已收到，${text}`, id);
@@ -47,16 +48,20 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     };
     addWork(work, 'message:report', '整理本月运营情况');
     addWork('chat-confidence-sibling', 'message:report', '同次请求的已完成任务', 'completed');
-    addWork('chat-confidence-child', `task:${work}`, '嵌套任务', 'completed');
+    addWork('chat-confidence-child', `work:${work}`, '嵌套任务', 'completed');
     addWork('chat-confidence-approval', 'message:report', '等待允许的任务', undefined, 'approval-session');
     addWork('chat-confidence-unknown', 'message:report', '结果未知的任务', 'unverified');
     addWork('chat-confidence-scrolling', 'message:scroll-request', '即将完成的任务');
     addWork('chat-confidence-compact', 'message:compact-request', '完成行不重复的标题', 'completed');
-    for (let index = 1; index <= 12; index++) addWork(`chat-confidence-orphan-${index}`, `message:missing-${index}`, `历史任务 ${index}`, 'completed');
-    const question = { type: 'question_asked', question_id: 'report-scope', target: { kind: 'bot_main', bot_id: bot }, attention: { kind: 'question', device_id: null }, severity: 'attention', text: '退款需要单独统计吗？\n选择后会按这个口径整理。', choices: [{ label: '单独统计' }, { label: '合并统计' }], about: { node: node.peer, agent: null, session_id: 'report', cwd: 'workspace', summary: '' } };
+    const question = { type: 'question_asked', question_id: 'report-scope', target, attention: { kind: 'question', device_id: null }, severity: 'attention', text: '退款需要单独统计吗？\n选择后会按这个口径整理。', choices: [{ label: '单独统计' }, { label: '合并统计' }], about: { node: node.peer, agent: null, session_id: 'report', cwd: 'workspace', summary: '' } };
     db.prepare('INSERT INTO questions(network_id,question_id,conversation_id,rank,author,created_at_ms,node,session_id,body) VALUES(?,?,?,?,?,?,?,?,?)').run(network, question.question_id, conversation, '3', node.peer, Date.now(), node.peer, 'report', JSON.stringify(question));
     const approval = { ...question, question_id: 'report-approval', attention: { kind: 'approval', device_id: node.peer }, text: '允许写入运营汇总吗？', choices: [{ label: '允许' }, { label: '拒绝' }], about: { ...question.about, agent: 'codex', session_id: 'approval-session', request_id: 'fixture-request' } };
     db.prepare('INSERT INTO questions(network_id,question_id,conversation_id,rank,author,created_at_ms,node,session_id,request_id,body) VALUES(?,?,?,?,?,?,?,?,?,?)').run(network, approval.question_id, conversation, '4', node.peer, Date.now() + 1, node.peer, 'approval-session', 'fixture-request', JSON.stringify(approval));
+    const historyQuestion = { ...question, question_id: 'history-origin', severity: 'info', text: '历史交代已确认', choices: [], about: { ...question.about, session_id: 'history-origin' } };
+    db.prepare('INSERT INTO questions(network_id,question_id,conversation_id,rank,author,created_at_ms,node,session_id,body) VALUES(?,?,?,?,?,?,?,?,?)').run(network, historyQuestion.question_id, conversation, '0', node.peer, Date.now() - 120000, node.peer, historyQuestion.about.session_id, JSON.stringify(historyQuestion));
+    const historyAnswer = `a-${historyQuestion.question_id}`;
+    addMessage(historyAnswer, '已确认', undefined, historyQuestion.question_id);
+    for (let index = 1; index <= 12; index++) addWork(`chat-confidence-orphan-${index}`, `message:${historyAnswer}`, `历史任务 ${index}`, 'completed');
     await browser.reload();
     await expect(screen.getByRole('heading', '退款需要单独统计吗？')).toBeVisible();
     await expect(screen.getByText('选择后会按这个口径整理。', { exact: true })).toBeVisible();
@@ -71,7 +76,8 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     const groupLabel = '4 个任务 · 1 进行中 · 2 待处理';
     const order = await browser.evaluate(() => [...document.querySelectorAll('[data-message-id]')].map(item => item.getAttribute('data-message-id')));
     assert(order.indexOf('report') < order.indexOf('task-group:message:report') && order.indexOf('task-group:message:report') < order.indexOf('report-reply'), 'tasks stay between the originating request and its reply');
-    assert(order.includes(`task-group:task:${work}`), 'nested triggers resolve to the visible request');
+    assert(order.includes(`task-group:work:${work}`), 'nested triggers resolve to the visible request');
+    assert(!order.includes(historyAnswer), 'an answered Main input stays folded into its question');
     await expect(chat.getByRole('link', /^历史任务 /)).toHaveCount(0);
     const compact = browser.locator('[data-message-id="task-group:message:compact-request"]');
     await compact.scrollIntoView();
