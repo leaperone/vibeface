@@ -1042,8 +1042,8 @@ impl ProviderEnv {
     }
 
     pub fn save(&self, dir: &Path) -> Result<()> {
-        crate::config::private_write(&dir.join(ENV_FILE), &serde_json::to_vec(self)?)?;
         self.hide_values();
+        crate::config::private_write(&dir.join(ENV_FILE), &serde_json::to_vec(self)?)?;
         Ok(())
     }
 
@@ -1090,7 +1090,7 @@ impl ProviderEnv {
     }
 }
 
-fn validate(provider: Provider, name: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_env_name(name: &str) -> Result<()> {
     ensure!(
         !name.is_empty()
             && name.len() <= 256
@@ -1099,6 +1099,11 @@ fn validate(provider: Provider, name: &str, value: &str) -> Result<()> {
             }),
         "variable names use letters, digits and underscores"
     );
+    Ok(())
+}
+
+fn validate(provider: Provider, name: &str, value: &str) -> Result<()> {
+    validate_env_name(name)?;
     ensure!(
         !name.starts_with("VIBEFACE_")
             && !provider
@@ -1236,15 +1241,8 @@ impl ProviderRoots {
         env
     }
 
-    pub fn apply(
-        &self,
-        local: &mut Local,
-        codex_agent: bool,
-        host: &crate::discovery::Host,
-    ) -> Result<()> {
-        if local.launches(Provider::Codex) && local.switches.app_server_used(codex_agent) {
-            self.seed_codex_config(host)?;
-        }
+    /// Applies private roots without reading personal provider configuration.
+    pub fn apply(&self, local: &mut Local) -> Result<()> {
         for provider in Provider::ALL {
             local.env.apply(
                 provider,
@@ -1259,10 +1257,10 @@ impl ProviderRoots {
 
     /// A new private home inherits only safe model/provider settings, never the user's auth
     /// or session store. An existing private configuration always wins.
-    pub fn seed_codex_config(&self, host: &crate::discovery::Host) -> Result<bool> {
+    pub fn prepare_codex_config(&self, host: &crate::discovery::Host) -> Result<Option<String>> {
         let target = self.codex_home.join("config.toml");
         match std::fs::symlink_metadata(&target) {
-            Ok(_) => return Ok(false),
+            Ok(_) => return Ok(None),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => anyhow::bail!("could not inspect private Codex configuration"),
         }
@@ -1271,22 +1269,30 @@ impl ProviderRoots {
             .clone()
             .or_else(|| host.home.as_ref().map(|home| home.join(".codex")))
         else {
-            return Ok(false);
+            return Ok(None);
         };
-        let Some(source) = crate::manager::read_codex_config(&home)? else {
-            return Ok(false);
+        let Some(source) = crate::manager::read_codex_config(&home)
+            .map_err(|_| crate::discovery::LocalSourceError)?
+        else {
+            return Ok(None);
         };
-        let projected = crate::manager::codex_config_projection(&source)?;
+        let projected = crate::manager::codex_config_projection(&source)
+            .map_err(|_| crate::discovery::LocalSourceError)?;
         if projected.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
-        let bytes = toml::to_string(&projected)
-            .map_err(|_| anyhow::anyhow!("could not prepare private Codex configuration"))?;
+        toml::to_string(&projected)
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("could not prepare private Codex configuration"))
+    }
+
+    pub fn publish_codex_config(&self, source: &str) -> Result<bool> {
+        let target = self.codex_home.join("config.toml");
         crate::config::private_dir(&self.codex_home)?;
         let temp = self
             .codex_home
             .join(format!(".config-{}.toml", uuid::Uuid::new_v4()));
-        crate::config::private_write(&temp, bytes.as_bytes())
+        crate::config::private_write(&temp, source.as_bytes())
             .map_err(|_| anyhow::anyhow!("could not prepare private Codex configuration"))?;
         // A hard link publishes complete contents without replacing a concurrent creator.
         let created = match std::fs::hard_link(&temp, &target) {
@@ -1754,7 +1760,10 @@ trust_level = "trusted"
                     let host = &host;
                     scope.spawn(move || {
                         barrier.wait();
-                        roots.seed_codex_config(host)
+                        match roots.prepare_codex_config(host)? {
+                            Some(projected) => roots.publish_codex_config(&projected),
+                            None => Ok(false),
+                        }
                     })
                 })
                 .collect::<Vec<_>>()
@@ -1800,7 +1809,7 @@ requires_openai_auth = false
             env: ProviderEnv::default(),
         };
         local.switches.execution.insert(Provider::Codex);
-        roots.apply(&mut local, false, &host)?;
+        roots.apply(&mut local)?;
         let CodexTarget::Spawn(launch) = local.codex_target(false) else {
             unreachable!()
         };
@@ -1818,13 +1827,18 @@ requires_openai_auth = false
             source.join("config.toml"),
             "invalid = [ SYNTHETIC_INLINE_SECRET",
         )?;
-        assert!(!roots.seed_codex_config(&host)?);
+        assert!(roots.prepare_codex_config(&host)?.is_none());
         assert_eq!(std::fs::read(&target)?, bytes);
         let fallback_roots = ProviderRoots::new(&dir.join("fallback-node"));
-        assert!(fallback_roots.seed_codex_config(&crate::discovery::Host {
-            home: host.home.clone(),
-            ..Default::default()
-        })?);
+        let projected = fallback_roots
+            .prepare_codex_config(&crate::discovery::Host {
+                home: host.home.clone(),
+                ..Default::default()
+            })?
+            .context("safe fallback configuration")?;
+        assert!(!fallback_roots.codex_home.join("config.toml").exists());
+        assert!(fallback_roots.publish_codex_config(&projected)?);
+        assert!(!fallback_roots.publish_codex_config(&projected)?);
         assert!(
             std::fs::read_to_string(fallback_roots.codex_home.join("config.toml"))?
                 .contains("wrong-source")
@@ -1834,7 +1848,7 @@ requires_openai_auth = false
     }
 
     #[test]
-    fn invalid_global_codex_config_blocks_only_enabled_private_codex() -> Result<()> {
+    fn invalid_global_codex_config_is_read_only_by_explicit_preparation() -> Result<()> {
         let dir =
             std::env::temp_dir().join(format!("vibeface-codex-enable-{}", uuid::Uuid::new_v4()));
         let source = dir.join("global");
@@ -1848,19 +1862,11 @@ requires_openai_auth = false
             std::fs::write(source.join("config.toml"), config)?;
             let roots = ProviderRoots::new(&dir.join(index.to_string()));
             let mut local = Local { switches: Providers::default(), bins: BTreeMap::new(), env: ProviderEnv::default() };
-            local.switches.execution.insert(Provider::Cursor);
-            roots.apply(&mut local, false, &host)?;
-            assert!(!roots.codex_home.join("config.toml").exists());
             local.switches.execution.insert(Provider::Codex);
-            local.switches.codex_app_server = AppServer { mode: AppServerMode::System, socket: Some(dir.join("system.sock")) };
-            roots.apply(&mut local, false, &host)?;
-            roots.apply(&mut local, true, &host)?;
+            roots.apply(&mut local)?;
             assert!(!roots.codex_home.join("config.toml").exists());
-            local.switches.codex_app_server.mode = AppServerMode::Spawn;
-            let error = roots.apply(&mut local, false, &host).unwrap_err();
+            let error = roots.prepare_codex_config(&host).unwrap_err();
             assert!(!format!("{error:#}").contains("SYNTHETIC_INLINE_SECRET"));
-            local.switches.execution.remove(&Provider::Codex);
-            assert!(roots.apply(&mut local, true, &host).is_err());
             assert!(!roots.codex_home.join("config.toml").exists());
         }
         std::fs::remove_dir_all(dir)?;
@@ -1919,7 +1925,7 @@ requires_openai_auth = false
             Provider::Opencode,
             BTreeMap::from([("ANTHROPIC_API_KEY".into(), Some("fixture-auth".into()))]),
         )?;
-        roots.apply(&mut local, false, &crate::discovery::Host::default())?;
+        roots.apply(&mut local)?;
         local.env.save(&dir)?;
         let loaded = ProviderEnv::load(&dir)?;
         for provider in Provider::ALL {

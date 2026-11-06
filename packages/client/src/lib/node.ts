@@ -52,6 +52,11 @@ export type ProviderIssue = { code: 'bin_missing'; path: string } | { code: 'env
 export type AppServerLink = { state: 'off' } | { state: 'starting' } | { state: 'connected'; socket: string; user_agent: string }
   | { state: 'not_found'; candidates: string[] } | { state: 'handshake_failed'; socket: string; reason: string } | { state: 'launch_failed'; reason: string }
 export type AppServerMode = 'system' | 'spawn'
+/** A private settings edit on the connected computer; local completion never enables a use. */
+export type ProviderChange = {
+  provider: ProviderId; bot?: boolean; execution?: boolean; execution_model?: string; bin?: string
+  env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null }; connect_local?: boolean
+}
 /** `socket` is required when enabling a system App Server connection. */
 export type AppServer = { mode: AppServerMode; socket: string | null; link: AppServerLink }
 export type ProviderObservation = {
@@ -217,14 +222,13 @@ export type Availability = Exclude<ProviderStatus['state'], 'off'> | 'missing'
 export function summaryReadiness(item: Pick<ProviderStatus, 'roles' | 'readiness' | 'execution_readiness'>): ProviderReadiness {
   return item.roles.includes('execution') && !item.roles.includes('agent') ? item.execution_readiness : item.readiness
 }
-export function availability(item: Pick<ProviderStatus, 'state' | 'installed' | 'env'> | Pick<ProviderStatus, 'installed' | 'roles' | 'readiness' | 'execution_readiness'>): Availability {
-  if ('roles' in item) return item.installed ? summaryReadiness(item).state : 'missing'
-  if ('state' in item) {
-    if (item.state !== 'off') return item.state
-    if (!item.installed) return 'missing'
-    if (item.env.some((row) => row.required && !row.set && !row.inherited)) return 'needs_setup'
-    return 'unverified'
-  }
+export function availability(item: Pick<ProviderStatus, 'app_server' | 'state' | 'installed' | 'env'> | Pick<ProviderStatus, 'app_server' | 'installed' | 'roles' | 'readiness' | 'execution_readiness'>): Availability {
+  const launches = item.app_server?.mode !== 'system'
+  if ('roles' in item) return !launches || item.installed ? summaryReadiness(item).state : 'missing'
+  if (item.state !== 'off') return item.state
+  if (!launches) return 'unverified'
+  if (!item.installed) return 'missing'
+  if (item.env.some((row) => row.required && !row.set && !row.inherited)) return 'needs_setup'
   return 'unverified'
 }
 
