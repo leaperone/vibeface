@@ -744,6 +744,7 @@ def self_test():
     native = (root / ".github/workflows/ci-native.yml").read_text()
     package = (root / ".github/workflows/ci-package.yml").read_text()
     assert "actions/download-artifact@" not in native and "--native-output" in native
+    assert "shared-key: package-${{ inputs.target }}-package" in native
     assert "--native-input" in package and "--producer-attempt" in package
     assert "artifact-ids: ${{ inputs.crypto_artifact_id }}" in package and "artifact-ids: ${{ inputs.web_artifact_id }}" in package
     assert "macos-process" in package
