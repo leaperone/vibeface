@@ -1,11 +1,16 @@
-import type { ChildProcess } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CoreLifecycle, type OwnedExit } from '../src/main/lifecycle.js'
 import { serviceFixture } from './fixtures.js'
+
+vi.mock('node:child_process', async (original) => {
+  const actual = await original<typeof import('node:child_process')>()
+  return { ...actual, spawn: vi.fn(actual.spawn) }
+})
 
 const settled = async (check: () => boolean, timeoutMs = 5000): Promise<void> => {
   const deadline = Date.now() + timeoutMs
@@ -38,6 +43,7 @@ describe('CoreLifecycle with a real child process', () => {
   let lifecycle = new CoreLifecycle()
 
   beforeEach(async () => {
+    vi.mocked(spawn).mockClear()
     dataDir = await mkdtemp(join(tmpdir(), 'vibeface-owned-'))
     lifecycle = new CoreLifecycle()
     delete process.env['FIXTURE_CRASH_AFTER_MS']
@@ -54,6 +60,14 @@ describe('CoreLifecycle with a real child process', () => {
     await lifecycle.stopOwned('quit').catch(() => {
       /* tests that force unknown outcomes clean up the child explicitly */
     })
+    for (const call of vi.mocked(spawn).mock.results) {
+      if (call.type !== 'return') continue
+      const child = call.value
+      if (child.pid && pidAlive(child.pid)) {
+        child.kill('SIGKILL')
+        await settled(() => !child.pid || !pidAlive(child.pid))
+      }
+    }
     await rm(dataDir, { recursive: true, force: true })
   })
 
@@ -78,6 +92,32 @@ describe('CoreLifecycle with a real child process', () => {
     lifecycle.startOwned(serviceFixture(dataDir), dataDir)
     await settled(() => existsSync(markerPath(dataDir)))
     expect(lifecycle.state().kind).toBe('owned')
+  })
+
+  it('can stop a second owned process after restarting it', async () => {
+    lifecycle.startOwned(serviceFixture(dataDir), dataDir)
+    await settled(() => existsSync(markerPath(dataDir)))
+    await lifecycle.stopOwned('quit')
+    lifecycle.startOwned(serviceFixture(dataDir), dataDir)
+    await settled(() => existsSync(markerPath(dataDir)))
+    const secondPid = await runningPid(dataDir)
+    await lifecycle.stopOwned('quit')
+    expect(lifecycle.state().kind).toBe('idle')
+    expect(pidAlive(secondPid)).toBe(false)
+  })
+
+  it('keeps a running child owned when a process operation reports an error', async () => {
+    lifecycle.startOwned(serviceFixture(dataDir), dataDir)
+    await settled(() => existsSync(markerPath(dataDir)))
+    const call = vi.mocked(spawn).mock.results.at(-1)
+    if (!call || call.type !== 'return') throw new Error('expected a real spawned child')
+    const child = call.value
+    const pid = await runningPid(dataDir)
+    child.emit('error', new Error('fixture signal delivery failed'))
+    expect(lifecycle.state().kind).toBe('owned')
+    expect(pidAlive(pid)).toBe(true)
+    await lifecycle.stopOwned('quit')
+    expect(pidAlive(pid)).toBe(false)
   })
 
   it('reports a crashing child and drops back to idle', async () => {

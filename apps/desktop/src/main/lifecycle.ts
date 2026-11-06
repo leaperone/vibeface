@@ -83,7 +83,8 @@ export class CoreLifecycle {
       /* the child closing first is reported through 'exit' */
     })
     child.on('error', () => {
-      this.finish(child, { code: null, signal: null })
+      // A spawn failure has no process. An error delivering a signal to a live child is not exit.
+      if (child.pid === undefined) this.finish(child, { code: null, signal: null })
     })
     child.on('exit', (code, signal) => {
       this.finish(child, { code, signal })
@@ -173,9 +174,11 @@ export class CoreLifecycle {
   async stopOwned(reason: 'quit' | 'replace'): Promise<void> {
     if (this.stopping) return this.stopping
     const running = this.stopOwnedOnce(reason)
-    this.stopping = running.finally(() => {
+    this.stopping = running
+    try {
+      await running
+    } finally {
       if (this.stopping === running) this.stopping = null
-    })
-    return this.stopping
+    }
   }
 }
