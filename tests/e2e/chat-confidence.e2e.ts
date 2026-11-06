@@ -61,6 +61,22 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     await expect(task.getByRole('button', '没做完', { exact: true })).toBeVisible();
     const geometry = await browser.evaluate(() => ({ width: document.documentElement.clientWidth, content: document.documentElement.scrollWidth }));
     assert(geometry.content <= geometry.width, 'phone layout must not scroll horizontally');
+    const blockedReason = '这个工作当前不能接收补充。选择「新任务」继续。';
+    const blockedHint = task.getByText(blockedReason, { exact: true });
+    await expect(blockedHint).toBeVisible();
+    const hintBounds = await blockedHint.boundingBox();
+    assert(hintBounds, 'The blocked input reason renders');
+    assert(hintBounds.x >= 0 && hintBounds.y >= 0 && hintBounds.x + hintBounds.width <= 390 && hintBounds.y + hintBounds.height <= 844, 'The full blocked input reason fits the phone viewport');
+    const hintId = await blockedHint.getAttribute('id');
+    assert(hintId, 'The blocked input reason has an accessible description ID');
+    const blockedComposer = task.getByRole('textbox', '补充给 整理本月运营情况');
+    await expect(blockedComposer).toHaveAttribute('placeholder', '发消息');
+    await expect(blockedComposer).toHaveAttribute('aria-describedby', hintId);
+    const description = await browser.evaluate(id => {
+      const hint = document.getElementById(id);
+      return { text: hint?.textContent ?? null, label: hint?.closest('form')?.querySelector('textarea')?.getAttribute('aria-label') ?? null, count: [...document.querySelectorAll('[id]')].filter(element => element.id === id).length };
+    }, hintId);
+    assert.deepEqual(description, { text: blockedReason, label: '补充给 整理本月运营情况', count: 1 });
     await app.screenshot('chat-confidence-unknown-phone');
   } finally { db.close(); }
 });

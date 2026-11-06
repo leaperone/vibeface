@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type ChangeEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
+import { useId, useLayoutEffect, useRef, useState, type ChangeEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
 import { ArrowUpIcon, CircleAlertIcon, PaperclipIcon, SquareIcon, XIcon } from 'lucide-react'
 import { Spinner } from '@/components/ui/spinner'
 import { cn } from '@/lib/utils'
@@ -32,7 +32,6 @@ export function PromptInput({
 }: {
   value: string
   hint: string
-  /** Why it cannot send; a disabled box shows it in place of its placeholder, or under the box while it holds a draft. */
   reason: string
   disabled: boolean
   busy: boolean
@@ -53,6 +52,7 @@ export function PromptInput({
   const formRef = useRef<HTMLFormElement>(null)
   const pickerRef = useRef<HTMLInputElement>(null)
   const textRef = useRef<HTMLTextAreaElement>(null)
+  const hintId = useId()
   // One line until the text is focused, so the transcript keeps the screen; it grows while writing.
   const [open, setOpen] = useState(false)
   // Buttons keep the focus on the text, so a tap acts instead of collapsing the box under the finger.
@@ -63,7 +63,7 @@ export function PromptInput({
   const unfit = files.find(unfits)
   const sendable = !disabled && !busy && drafting && !unfit
   const limit = `${attachmentLimit / 2 ** 20} MiB`
-  const note = hint || (disabled && value ? reason : '')
+  const note = disabled && reason ? reason : hint
   // The box sizes itself to the text (field-sizing), already at its new height when this runs; CSS cannot ease
   // between two content heights, so the change is replayed from the height last shown. It lets go once there, so a
   // resized window still fits the text.
@@ -102,9 +102,9 @@ export function PromptInput({
             required={!files.length}
             maxLength={100000}
             value={value}
-            placeholder={disabled && reason ? reason : files.length ? '给附件写句说明' : '发消息'}
+            placeholder={files.length ? '给附件写句说明' : '发消息'}
             aria-label={label}
-            aria-describedby={note ? 'manager-hint' : undefined}
+            aria-describedby={note ? hintId : undefined}
             title="Enter 发送，Shift+Enter 换行"
             rows={1}
             className={cn('px-4 transition-[height,color,background-color,border-color,box-shadow] duration-200', open ? 'basis-auto min-h-24 max-h-[min(20rem,calc(var(--app-height,100dvh)*0.45))] overflow-y-auto py-3' : 'h-13 min-h-13 overflow-hidden py-3.5 md:h-12 md:min-h-12 md:py-3')}
@@ -155,7 +155,7 @@ export function PromptInput({
       </div>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-2 text-meta text-muted-foreground empty:hidden">
         {unfit ? <p role="alert" className="flex basis-full items-center gap-1.5 text-danger"><CircleAlertIcon aria-hidden="true" className="size-4 shrink-0" />{unfit.size ? `附件超过 ${limit}` : '附件是空文件'}，移除后再发送</p> : null}
-        {note ? <p id="manager-hint">{note}</p> : null}
+        {note ? <p id={hintId}>{note}</p> : null}
         {children}
       </div>
     </form>

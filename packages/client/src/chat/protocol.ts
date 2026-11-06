@@ -73,7 +73,6 @@ export function reachDevice(nodes: NodeInfo[], reach: BotReach): string | undefi
 }
 /** A device that exists but is not ready yet may become ready on its own; with none, setting one up rereads it. */
 export const awaitsDevice = (reach: BotReach) => reach === 'starting' || reach === 'offline' || reach === 'needs_setup'
-/** Why the box cannot send yet, short enough to stand in for its placeholder. */
 export function composerHint(input: Omit<SendGate, 'busy'> & { bot: BotReach }): string {
   if (!input.hasConversation) return ''
   if (input.bot === 'starting') return 'Bot 正在启动'
