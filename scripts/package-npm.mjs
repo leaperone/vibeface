@@ -9,9 +9,14 @@ import { fileURLToPath } from 'node:url';
 import { gunzipSync, gzipSync } from 'node:zlib';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
-const targets = ['aarch64-apple-darwin', 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-gnu'];
-const required = ['FILES.sha256', 'vibeface', 'vibeface-core', 'BUILD-INFO.json', 'README.md', 'RUNTIME-REQUIREMENTS.md',
-  'scripts/install-node-service.sh', 'docs/node.md', 'docs/releasing.md',
+const targets = ['aarch64-apple-darwin', 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-gnu',
+  'x86_64-pc-windows-msvc'];
+const windowsTargets = new Set(['x86_64-pc-windows-msvc']);
+const programSuffix = target => (windowsTargets.has(target) ? '.exe' : '');
+const programs = target => [`vibeface${programSuffix(target)}`, `vibeface-core${programSuffix(target)}`];
+const requiredFiles = target => ['FILES.sha256', ...programs(target), 'BUILD-INFO.json', 'README.md',
+  'RUNTIME-REQUIREMENTS.md',
+  `scripts/install-node-service.${windowsTargets.has(target) ? 'ps1' : 'sh'}`, 'docs/node.md', 'docs/releasing.md',
   'web/_shell.html', 'web/index.html', 'web/_redirects', 'web/_headers', 'web/.vibeface-build.json',
   'web/vibeface_secure.js', 'web/vibeface_secure_bg.wasm'];
 const run = (program, args, options = {}) => execFileSync(program, args, {
@@ -74,9 +79,9 @@ function unpack(archive, destination, root) {
 }
 
 function nativePackage(directory, version, target, sourceCommit) {
-  for (const entry of required) {
-    const file = fs.lstatSync(path.join(directory, entry));
-    assert(file.isFile() && file.size > 0, `missing package file: ${entry}`);
+  for (const entry of requiredFiles(target)) {
+    const file = fs.lstatSync(path.join(directory, entry), { throwIfNoEntry: false });
+    assert(file?.isFile() && file.size > 0, `missing package file: ${entry}`);
   }
   const info = JSON.parse(fs.readFileSync(path.join(directory, 'BUILD-INFO.json'), 'utf8'));
   assert.deepEqual(Object.keys(info).sort(), ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch',
@@ -101,7 +106,7 @@ function nativePackage(directory, version, target, sourceCommit) {
   }
   const actual = fs.readdirSync(directory, { recursive: true }).filter(name => name !== 'FILES.sha256' && fs.lstatSync(path.join(directory, name)).isFile()).sort();
   assert.deepEqual([...checked].sort(), actual, 'file checksum coverage mismatch');
-  for (const binary of ['vibeface', 'vibeface-core']) {
+  for (const binary of programs(target)) {
     const executable = path.join(directory, binary);
     assert(fs.statSync(executable).mode & 0o111, `${binary} must be executable`);
   }
@@ -137,7 +142,8 @@ function pack(input, output, version, sourceCommit) {
   nightly(version);
   assert(/^[0-9a-f]{40}$/.test(sourceCommit), 'a full source commit is required');
   const names = targets.map(target => `vibeface-${version}-${target}.tar.gz`);
-  assert.deepEqual(fs.readdirSync(input).sort(), names.flatMap(name => [name, `${name}.sha256`]).sort(), 'expected exactly three native archives and three checksums');
+  assert.deepEqual(fs.readdirSync(input).sort(), names.flatMap(name => [name, `${name}.sha256`]).sort(),
+    `expected exactly ${targets.length} native archives and ${targets.length} checksums`);
   fs.mkdirSync(output, { recursive: true });
   assert(!fs.existsSync(path.join(output, `leaperone-vibeface-${version}.tgz`)), 'npm artifact already exists; use a fresh output directory');
   const scratch = fs.mkdtempSync(path.join(output, '.npm-stage-'));
@@ -186,7 +192,8 @@ async function selfTest() {
       const name = `vibeface-${version}-${target}`;
       const archive = path.join(input, `${name}.tar.gz`);
       const directory = path.join(scratch, 'source', name);
-      const entries = required.filter(entry => entry !== 'FILES.sha256');
+      const entries = fs.readdirSync(directory, { recursive: true })
+        .filter(entry => entry !== 'FILES.sha256' && fs.lstatSync(path.join(directory, entry)).isFile()).sort();
       fs.writeFileSync(path.join(directory, 'FILES.sha256'), entries.map(entry => `${hash(path.join(directory, entry))}  ${entry}\n`).join(''));
       run('tar', ['-czf', archive, '-C', path.join(scratch, 'source'), name], { env: { ...process.env, COPYFILE_DISABLE: '1' } });
       fs.writeFileSync(`${archive}.sha256`, `${hash(archive)}  ${name}.tar.gz\n`);
@@ -194,15 +201,16 @@ async function selfTest() {
     for (const target of targets) {
       const directory = path.join(scratch, 'source', `vibeface-${version}-${target}`);
       sources.set(target, directory);
-      for (const entry of required) {
+      for (const entry of requiredFiles(target)) {
         fs.mkdirSync(path.dirname(path.join(directory, entry)), { recursive: true });
         fs.writeFileSync(path.join(directory, entry), 'fixture\n');
       }
       fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ version, target, source_commit: commit, update_protocol: 1, core_version: version, core_source_commit: commit, app_version: version, app_source_commit: commit, data_epoch: 1 }));
       fs.writeFileSync(path.join(directory, 'web/vibeface_secure_bg.wasm'), Buffer.from([0, 97, 115, 109]));
-      fs.writeFileSync(path.join(directory, 'vibeface'), '#!/usr/bin/env node\nif (process.env.VIBEFACE_PACK_ASSERT_NO_EXEC) process.exit(99);\nif (process.argv[2] === "--version") console.log(`vibeface ${process.env.VIBEFACE_FIXTURE_VERSION}`);\nelse if (process.argv[2] === "exit") process.exit(23);\nelse if (process.argv[2] === "wait") { process.on("SIGTERM", () => process.exit(42)); console.log("ready"); setInterval(() => {}, 1000); }\nelse console.log(JSON.stringify(process.argv.slice(2)));\n');
-      fs.writeFileSync(path.join(directory, 'vibeface-core'), '#!/usr/bin/env node\nif (process.env.VIBEFACE_PACK_ASSERT_NO_EXEC) process.exit(99);\nif (process.argv[2] === "--version") console.log(`vibeface-core ${process.env.VIBEFACE_FIXTURE_VERSION}`);\nelse console.log(JSON.stringify(process.argv.slice(2)));\n');
-      for (const binary of ['vibeface', 'vibeface-core']) fs.chmodSync(path.join(directory, binary), 0o755);
+      const [cli, core] = programs(target);
+      fs.writeFileSync(path.join(directory, cli), '#!/usr/bin/env node\nif (process.env.VIBEFACE_PACK_ASSERT_NO_EXEC) process.exit(99);\nif (process.argv[2] === "--version") console.log(`vibeface ${process.env.VIBEFACE_FIXTURE_VERSION}`);\nelse if (process.argv[2] === "exit") process.exit(23);\nelse if (process.argv[2] === "wait") { process.on("SIGTERM", () => process.exit(42)); console.log("ready"); setInterval(() => {}, 1000); }\nelse console.log(JSON.stringify(process.argv.slice(2)));\n');
+      fs.writeFileSync(path.join(directory, core), '#!/usr/bin/env node\nif (process.env.VIBEFACE_PACK_ASSERT_NO_EXEC) process.exit(99);\nif (process.argv[2] === "--version") console.log(`vibeface-core ${process.env.VIBEFACE_FIXTURE_VERSION}`);\nelse console.log(JSON.stringify(process.argv.slice(2)));\n');
+      for (const binary of programs(target)) fs.chmodSync(path.join(directory, binary), 0o755);
       repack(target);
     }
     process.env.VIBEFACE_FIXTURE_VERSION = version;
@@ -284,12 +292,25 @@ async function selfTest() {
     fs.writeFileSync(otherManifest, otherOriginal);
     repack(other);
     assert.equal(path.basename(pack(input, path.join(scratch, 'cohort-restored'), version, commit)), `leaperone-vibeface-${version}.tgz`);
+    // The Windows vendor carries .exe basenames and the PowerShell service installer, nothing else.
+    const windows = 'x86_64-pc-windows-msvc';
+    const windowsSource = sources.get(windows);
+    for (const [from, to, expected] of [
+      ['vibeface.exe', 'vibeface', /missing package file: vibeface.exe/],
+      ['scripts/install-node-service.ps1', 'scripts/install-node-service.sh', /missing package file: scripts\/install-node-service.ps1/],
+    ]) {
+      fs.renameSync(path.join(windowsSource, from), path.join(windowsSource, to));
+      repack(windows);
+      assert.throws(() => pack(input, path.join(scratch, `windows-${path.basename(to)}`), version, commit), expected);
+      fs.renameSync(path.join(windowsSource, to), path.join(windowsSource, from));
+      repack(windows);
+    }
     fs.symlinkSync('/tmp/vibeface-outside-package', path.join(sources.get(target), 'link'));
     repack(target);
     assert.throws(() => pack(input, path.join(scratch, 'unsafe-archive'), version, commit), /links or special files/);
     assert.throws(() => nightly('1.2.3'), /Nightly versions/);
     assert.throws(() => nightly('1.2.3-nightly.20260229.1'), /invalid Nightly date/);
-    console.log('npm self-test passed: complete epoch-1 packages, one cohort version and source across all three targets, old-epoch rejection, global install without scripts, arguments, exit status, signals, checksums, source identity, protocol and unsafe archive rejection.');
+    console.log(`npm self-test passed: complete epoch-1 packages, one cohort version and source across all ${targets.length} targets including Windows .exe vendors, old-epoch rejection, global install without scripts, arguments, exit status, signals, checksums, source identity, protocol and unsafe archive rejection.`);
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }

@@ -10,7 +10,7 @@ vibeface --version
 vibeface
 ```
 
-Supports macOS Apple Silicon and Linux x64/ARM64 with glibc. The package contains the native Rust programs, embedded Web client and service scripts. Installation does not download executable code from another host, run a postinstall script, initialize node data or start a service.
+Supports macOS Apple Silicon, Windows x64 and Linux x64/ARM64 with glibc. The package contains the native Rust programs, embedded Web client and service scripts for every supported platform; Windows uses the `.exe` programs and the PowerShell service installer, and needs neither WSL nor administrator rights. Installation does not download executable code from another host, run a postinstall script, initialize node data or start a service.
 
 Open a separate terminal and run `vibeface tui` to watch Node and peer status. This read-only monitor leaves the Node running when you quit with q. Pass `tui --data-dir <PATH>` to observe another data directory. Use `vibeface status --json` for scripts.
 
