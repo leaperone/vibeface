@@ -31,7 +31,7 @@ Inspect refreshes every three seconds with at most one request in flight. A pend
 
 ## Presentation and terminal safety
 
-The interface uses the terminal's default background and foreground, a cyan accent, yellow warnings, bold headings, and a visible selection marker. Color never carries state alone. `NO_COLOR` removes style colors and emphasis. No fonts, terminal profile, title, palette, mouse handling, clipboard, or external URLs are changed. There is no startup animation, spinner, or simulated activity.
+The interface uses the terminal's default background and foreground, a cyan brand accent, bold headings and warnings, and a visible selection marker. Selected device text keeps the default foreground so it remains readable on light and dark backgrounds. Color never carries state alone. `NO_COLOR` removes style colors and emphasis. No fonts, terminal profile, title, palette, mouse handling, clipboard, or external URLs are changed. There is no startup animation, spinner, or simulated activity.
 
 Display text escapes C0, C1, ESC, DEL, and bidirectional control characters. Ratatui's grapheme and cell-width APIs preserve CJK, combining characters, and emoji in shortening and wrapping. Raw JSON and redirected output are not rewritten. TUI does not read logs, access capabilities, wallet passphrases, relay credentials, or model keys.
 

@@ -366,7 +366,7 @@ impl Palette {
                     .add_modifier(Modifier::BOLD),
                 strong: Style::default().add_modifier(Modifier::BOLD),
                 secondary: Style::default().add_modifier(Modifier::DIM),
-                attention: Style::default().fg(Color::Yellow),
+                attention: Style::default().add_modifier(Modifier::BOLD),
             }
         } else {
             Self {
@@ -583,7 +583,7 @@ fn draw_network(frame: &mut Frame<'_>, area: Rect, app: &mut App, palette: Palet
     frame.render_stateful_widget(
         List::new(items)
             .highlight_symbol("> ")
-            .highlight_style(palette.accent),
+            .highlight_style(palette.strong.remove_modifier(Modifier::DIM)),
         list,
         &mut app.list,
     );
