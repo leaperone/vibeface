@@ -239,12 +239,16 @@ def input_files(directory):
 
 def write_input(directory, archive, component, target, source):
     manifest = dict(version=1, component=component, target=target, origin=source, files=input_files(directory))
+    for metadata in manifest["files"].values():
+        metadata["mode"] = 0o755 if metadata["mode"] & 0o111 else 0o644
     (directory / "manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n")
     archive.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "w:gz", format=tarfile.USTAR_FORMAT) as output:
         for path in sorted(directory.rglob("*")):
             if path.is_file():
-                info = output.gettarinfo(str(path), arcname=path.relative_to(directory).as_posix())
+                name = path.relative_to(directory).as_posix()
+                info = output.gettarinfo(str(path), arcname=name)
+                info.mode = 0o644 if name == "manifest.json" else manifest["files"][name]["mode"]
                 info.uid = info.gid = info.mtime = 0
                 info.uname = info.gname = ""
                 with path.open("rb") as data:
@@ -454,7 +458,12 @@ def self_test():
             pass
         else:
             raise AssertionError("mid-build source change was accepted")
-    input_self_test(scratch)
+    for mask in (0o022, 0o077):
+        previous_mask = os.umask(mask)
+        try:
+            input_self_test(scratch)
+        finally:
+            os.umask(previous_mask)
     print("Build input self-test passed")
 
 
@@ -535,10 +544,15 @@ def input_self_test(scratch):
             with zipfile.ZipFile(app, "w") as packed:
                 packed.writestr("Vibeface.app/Vibeface", b"public app fixture")
             ios = build.parent / "ios.tar.gz"
+            source_files = {component: input_files(repo / path) for component, path in OUTPUTS.items()}
             pack_ios(repo, app, archive, ios)
+            assert source_files == {component: input_files(repo / path) for component, path in OUTPUTS.items()}
             os.environ.update(GITHUB_JOB="ios-accept", GITHUB_RUN_ATTEMPT="2")
             restored_ios = build.parent / "ios-restored"
             restore_input(repo, ios, restored_ios, "ios", "aarch64-apple-ios-sim", 1)
+            assert (restored_ios / "manifest.json").stat().st_mode & 0o777 == 0o644
+            assert (restored_ios / "host/manifest.json").stat().st_mode & 0o777 == 0o644
+            assert (restored_ios / "web/vibeface_secure.js").stat().st_mode & 0o777 == 0o644
             for path in OUTPUTS.values():
                 shutil.rmtree(repo / path)
             install_ios(repo, restored_ios, 1)
