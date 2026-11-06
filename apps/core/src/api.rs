@@ -387,7 +387,8 @@ async fn check_boundary(
 ) -> ApiResult<()> {
     // Bootstrap resources carry their own signatures and are public by design: any origin may
     // read the catalogue, and grants are requested and registered by Nodes, not browsers.
-    let bootstrap_path = path == BOOTSTRAP_CATALOG || path == BOOTSTRAP_GRANT || path == RELAY_GRANT;
+    let bootstrap_path =
+        path == BOOTSTRAP_CATALOG || path == BOOTSTRAP_GRANT || path == RELAY_GRANT;
     let site = if bootstrap_path {
         host_site(&app.sites, headers)?
     } else if path == "/api/client" && *method == Method::GET {
@@ -536,10 +537,13 @@ fn client_ip(request: &Request) -> IpAddr {
 }
 
 /// Reads a bootstrap body within the contract's size limit.
-async fn small_json<T: serde::de::DeserializeOwned>(request: Request, limit: usize) -> ApiResult<T> {
+async fn small_json<T: serde::de::DeserializeOwned>(
+    request: Request,
+    limit: usize,
+) -> ApiResult<T> {
     let bytes = axum::body::to_bytes(request.into_body(), limit)
-    .await
-    .map_err(|_| ApiError::bad("request body exceeds the bootstrap limit"))?;
+        .await
+        .map_err(|_| ApiError::bad("request body exceeds the bootstrap limit"))?;
     serde_json::from_slice(&bytes).map_err(ApiError::bad)
 }
 

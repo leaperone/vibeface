@@ -137,7 +137,7 @@ function PublicBootstrapSettingsForm() {
     <SettingsRow
       icon={Globe}
       label="公共发现"
-      description="局域网优先；仍连不上时，可按默认或自定义来源自动尝试目录里的网关入口。"
+      description="优先通过局域网连接。连不上时，自动向默认或自定义服务查找其他连接方式。"
     >
       <Switch accessibilityLabel="公共发现" value={enabled} onValueChange={(on) => { setApplyError(null); setPublicBootstrapMode(on ? { kind: 'default' } : { kind: 'off' }) }} />
     </SettingsRow>
@@ -149,7 +149,7 @@ function PublicBootstrapSettingsForm() {
         className="font-mono"
         value={issuerDraft}
         onChangeText={(t) => setIssuerDraft(t.trim().toLowerCase())}
-        placeholder="64 位十六进制签发者"
+        placeholder="服务校验码，64 位字母或数字"
         accessibilityLabel="公共发现签发者编号"
         autoCapitalize="none"
         autoCorrect={false}
@@ -175,7 +175,7 @@ function PublicBootstrapSettingsForm() {
             return
           }
           if (!issuerHexPattern.test(issuer)) {
-            setApplyError('请填写有效的 64 位十六进制签发者编号')
+            setApplyError('请填写服务提供的 64 位校验码，只能包含 0–9 和 a–f')
             return
           }
           const https_base = parseCustomHttpsBaseInput(base)

@@ -197,10 +197,18 @@ struct Init {
     #[arg(long, value_name = "URL", requires = "bootstrap")]
     bootstrap_https: Option<String>,
     /// Gateway URL a discovery-only entry lists; pair each with --catalog-relay.
-    #[arg(long = "catalog-gateway", value_name = "URL", requires = "public_entry")]
+    #[arg(
+        long = "catalog-gateway",
+        value_name = "URL",
+        requires = "public_entry"
+    )]
     catalog_gateways: Vec<String>,
     /// Relay URL paired with the --catalog-gateway given in the same position.
-    #[arg(long = "catalog-relay", value_name = "URL", requires = "catalog_gateways")]
+    #[arg(
+        long = "catalog-relay",
+        value_name = "URL",
+        requires = "catalog_gateways"
+    )]
     catalog_relays: Vec<String>,
     /// Lifetime of the relay grants a discovery entry issues.
     #[arg(long, value_name = "MINUTES", requires = "catalog_gateways")]

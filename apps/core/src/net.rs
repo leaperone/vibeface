@@ -118,7 +118,9 @@ pub enum RelayServiceMode {
 pub enum RelayAdmission {
     #[default]
     OperatorToken,
-    Grants { issuer: String },
+    Grants {
+        issuer: String,
+    },
 }
 
 impl RelayAdmission {
@@ -918,10 +920,16 @@ mod tests {
         let mut forward = discovery.clone();
         forward.relay_mode = RelayServiceMode::Forward;
         forward.relay_url = Some("https://relay.example".into());
-        assert!(forward.validate().is_err(), "catalogues belong to discovery-only entries");
+        assert!(
+            forward.validate().is_err(),
+            "catalogues belong to discovery-only entries"
+        );
         let mut public = discovery.clone();
         public.bootstrap = bootstrap::Bootstrap::Public;
-        assert!(public.validate().is_err(), "a discovery entry does not bootstrap itself");
+        assert!(
+            public.validate().is_err(),
+            "a discovery entry does not bootstrap itself"
+        );
         let entry = NetworkConfig {
             relay_listen: Some("127.0.0.1:3340".parse()?),
             relay_url: Some("https://app.example".into()),
@@ -939,7 +947,10 @@ mod tests {
         let mut no_relay = entry.clone();
         no_relay.relay_listen = None;
         no_relay.relay_url = None;
-        assert!(no_relay.validate().is_err(), "grants need a relay to admit to");
+        assert!(
+            no_relay.validate().is_err(),
+            "grants need a relay to admit to"
+        );
         assert_eq!(
             serde_json::to_value(&RelayAdmission::default())?,
             serde_json::json!({"policy":"operator-token"})
@@ -960,26 +971,27 @@ mod tests {
         ]);
         assert_eq!(
             merged,
-            vec![
-                (url, Some("grant".into())),
-                (other, Some("token".into()))
-            ]
+            vec![(url, Some("grant".into())), (other, Some("token".into()))]
         );
         Ok(())
     }
 
     /// Admits only the one token the test hands out.
     #[derive(Debug)]
-    struct TokenOnly(String);
+    struct TokenOnly {
+        token: String,
+        attempts: tokio::sync::mpsc::UnboundedSender<bool>,
+    }
     impl iroh_relay::server::AccessControl for TokenOnly {
         async fn on_connect(
             &self,
             request: &iroh_relay::server::ClientRequest,
         ) -> iroh_relay::server::Access {
-            if request
+            let allowed = request
                 .auth_token()
-                .is_some_and(|token| same_token(&token, &self.0))
-            {
+                .is_some_and(|token| same_token(&token, &self.token));
+            let _ = self.attempts.send(allowed);
+            if allowed {
                 iroh_relay::server::Access::Allow
             } else {
                 iroh_relay::server::Access::Deny {
@@ -993,8 +1005,15 @@ mod tests {
     /// checked against a real relay that admits only that credential.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bare_copy_of_an_authenticated_relay_does_not_strip_its_token() -> Result<()> {
+        use iroh::Watcher as _;
+
         let token = crate::crypto::random_hex(32);
-        let relay = spawn_relay("127.0.0.1:0".parse()?, Arc::new(TokenOnly(token.clone()))).await?;
+        let (attempts, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let policy = TokenOnly {
+            token: token.clone(),
+            attempts,
+        };
+        let relay = spawn_relay("127.0.0.1:0".parse()?, Arc::new(policy)).await?;
         let url = format!(
             "http://{}",
             relay.http_addr().context("relay listener missing")?
@@ -1013,13 +1032,21 @@ mod tests {
         )
         .await?;
         let expected = relay_url(&url)?;
+        let mut status = net.endpoint.home_relay_status();
         tokio::time::timeout(Duration::from_secs(15), async {
-            while !net.addr().relay_urls().any(|known| *known == expected) {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            loop {
+                if status
+                    .get()
+                    .iter()
+                    .any(|relay| relay.url() == &expected && relay.is_connected())
+                {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                status.updated().await.context("endpoint closed")?;
             }
         })
         .await
-        .context("the relay never admitted the endpoint with its credential")?;
+        .context("the relay never admitted the endpoint with its credential")??;
         let bare = Net::bind(
             &crate::crypto::LocalIdentity::generate().secret_key_hex,
             &config,
@@ -1027,10 +1054,24 @@ mod tests {
             vec![],
         )
         .await?;
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(allowed) = received.recv().await {
+                if !allowed {
+                    return Ok::<(), anyhow::Error>(());
+                }
+            }
+            Err(anyhow!("relay closed before rejecting the bare endpoint"))
+        })
+        .await
+        .context("the bare endpoint never attempted relay admission")??;
         assert!(
-            !bare.addr().relay_urls().any(|known| *known == expected),
-            "a bare configuration is not admitted, so the token was what got the first one in"
+            !bare
+                .endpoint
+                .home_relay_status()
+                .get()
+                .iter()
+                .any(|relay| relay.is_connected()),
+            "the bare endpoint was rejected while the authenticated endpoint connected"
         );
         net.close().await;
         bare.close().await;

@@ -502,7 +502,10 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
         options.grant_ttl_minutes.is_none() || catalog.is_some(),
         "--grant-ttl-minutes belongs to a published catalogue"
     );
-    let relay_admission = match options.relay_admission.unwrap_or(RelayAdmissionMode::OperatorToken) {
+    let relay_admission = match options
+        .relay_admission
+        .unwrap_or(RelayAdmissionMode::OperatorToken)
+    {
         RelayAdmissionMode::OperatorToken => {
             ensure!(
                 options.grant_issuer.is_none(),
@@ -852,13 +855,21 @@ mod tests {
             Bootstrap::Public
         );
         assert_eq!(
-            resolve_bootstrap(Some(custom), Some("http://127.0.0.1:4800/bootstrap"), false, false).unwrap(),
+            resolve_bootstrap(
+                Some(custom),
+                Some("http://127.0.0.1:4800/bootstrap"),
+                false,
+                false
+            )
+            .unwrap(),
             Bootstrap::Custom {
                 discovery: custom.into(),
                 https: Some("http://127.0.0.1:4800/bootstrap".into())
             }
         );
-        assert!(resolve_bootstrap(Some("public"), Some("https://x.example"), false, false).is_err());
+        assert!(
+            resolve_bootstrap(Some("public"), Some("https://x.example"), false, false).is_err()
+        );
         assert!(resolve_bootstrap(Some("https://not-a-discovery"), None, false, false).is_err());
         let dir = temp_dir("bootstrap-default");
         let options: InitOptions = serde_json::from_value(json!({
@@ -915,7 +926,12 @@ mod tests {
             "relay_admission": "grants",
         }))
         .unwrap();
-        assert!(initialize_from_options(missing).unwrap_err().to_string().contains("grant-issuer"));
+        assert!(
+            initialize_from_options(missing)
+                .unwrap_err()
+                .to_string()
+                .contains("grant-issuer")
+        );
     }
 
     #[test]

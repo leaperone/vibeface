@@ -35,7 +35,7 @@ async function stopFixture() {
   });
 }
 async function startFixture(kind) {
-  assert(kind === 'single' || kind === 'delivery', 'Unknown fixture kind');
+  assert(['single', 'delivery', 'bootstrap', 'bootstrap-http'].includes(kind), 'Unknown fixture kind');
   await stopFixture();
   const args = [resolve(repository, 'scripts/verify-node.py'), '--e2e-fixture', '--binary', binary,
     '--artifacts', root, '--fixture-port', String(port), '--fixture-kind', kind];
@@ -88,7 +88,7 @@ const control = createServer(async (request, response) => {
     let result;
     if (value.op === 'reset') result = await startFixture(value.kind);
     else if (value.op === 'stop') { await stopFixture(); result = { stopped: true }; }
-    else if (value.op === 'restart' || value.op === 'inspect') result = await command(value);
+    else if (['restart', 'inspect', 'bootstrap_info', 'bootstrap_pairing', 'bootstrap_approve'].includes(value.op)) result = await command(value);
     else throw new Error('Unknown fixture operation');
     response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(result));
   } catch {

@@ -86,12 +86,16 @@ pub(super) fn validate_server(value: &str) -> Result<()> {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
     Register {},
-    Lookup { device_id: EndpointId },
+    Lookup {
+        device_id: EndpointId,
+    },
     Probe {},
     /// The signed service catalogue, when this service publishes one.
     Catalog {},
     /// A relay grant for the connecting device, which the QUIC handshake proved.
-    Grant { relay_url: String },
+    Grant {
+        relay_url: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -443,8 +447,12 @@ impl Discovery {
                                 let _guard = guard;
                                 write(&mut send, &Reply::Registered { address }, MAX_REPLY).await?;
                                 while let Some((device_id, address)) = incoming.recv().await {
-                                    write(&mut send, &Reply::Notice { device_id, address }, MAX_REPLY)
-                                        .await?;
+                                    write(
+                                        &mut send,
+                                        &Reply::Notice { device_id, address },
+                                        MAX_REPLY,
+                                    )
+                                    .await?;
                                 }
                                 Ok::<_, anyhow::Error>(())
                             });
@@ -571,10 +579,7 @@ async fn register(
                         write(&mut send, &Request::Probe {}, MAX_REQUEST).await?;
                         send.finish()?;
                         ensure!(
-                            matches!(
-                                read::<Reply>(&mut recv, MAX_REPLY).await?,
-                                Reply::Probed {}
-                            ),
+                            matches!(read::<Reply>(&mut recv, MAX_REPLY).await?, Reply::Probed {}),
                             "invalid discovery probe reply"
                         );
                         peer.close(0u32.into(), b"discovery probe finished");

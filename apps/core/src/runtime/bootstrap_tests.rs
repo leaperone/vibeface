@@ -180,7 +180,12 @@ impl Runtime {
             .network
             .relay_listen
             .context("this Node runs no relay")?;
-        let relay = self.relay.lock().await.take().context("relay not running")?;
+        let relay = self
+            .relay
+            .lock()
+            .await
+            .take()
+            .context("relay not running")?;
         relay
             .shutdown()
             .await
@@ -272,7 +277,11 @@ async fn a_fresh_node_is_admitted_over_udp_and_relays_through_the_public_entry()
     let infra = Infra::start(bootstrap::DEFAULT_GRANT_TTL_MS).await?;
     let (node, dir) = fresh_node(infra.source(true)).await?;
     let admitted = wait_admitted(&node, Duration::from_secs(40)).await?;
-    assert_eq!(admitted.via, Transport::Udp, "UDP is the first path when it answers");
+    assert_eq!(
+        admitted.via,
+        Transport::Udp,
+        "UDP is the first path when it answers"
+    );
     assert_eq!(admitted.gateway_url, infra.gateway_url);
     assert_eq!(admitted.relay_url, infra.relay_url);
     assert_eq!(
@@ -295,7 +304,11 @@ async fn a_fresh_node_is_admitted_over_udp_and_relays_through_the_public_entry()
         .grant_admission()
         .context("the entry admits by grants")?
         .admitted_until(&node.net()?.endpoint.id());
-    assert_eq!(registered, Some(admitted.grant_until_ms), "the entry learnt the grant");
+    assert_eq!(
+        registered,
+        Some(admitted.grant_until_ms),
+        "the entry learnt the grant"
+    );
     stop_node(node, dir).await;
     infra.stop().await;
     Ok(())
@@ -428,8 +441,14 @@ async fn a_catalogue_from_another_issuer_never_admits() -> Result<()> {
         "a catalogue signed by another key is not trusted"
     );
     match node.bootstrap_state().context("bootstrap is on")? {
-        BootstrapState::Seeking { reason: Some(reason), .. } => {
-            assert!(reason.contains("issuer") || reason.contains("catalogue"), "{reason}");
+        BootstrapState::Seeking {
+            reason: Some(reason),
+            ..
+        } => {
+            assert!(
+                reason.contains("issuer") || reason.contains("catalogue"),
+                "{reason}"
+            );
         }
         other => panic!("unexpected bootstrap state: {other:?}"),
     }
@@ -462,7 +481,9 @@ async fn bootstrap_http_serves_signed_resources_within_the_contract_limits() -> 
     let catalog = signed.open(&infra.issuer, now_ms())?;
     assert_eq!(catalog.entries[0].gateway_url, infra.gateway_url);
     assert!(
-        signed.open(&LocalIdentity::generate().device_id()?, now_ms()).is_err(),
+        signed
+            .open(&LocalIdentity::generate().device_id()?, now_ms())
+            .is_err(),
         "the catalogue is bound to its issuer"
     );
     let device = LocalIdentity::generate();
@@ -486,7 +507,9 @@ async fn bootstrap_http_serves_signed_resources_within_the_contract_limits() -> 
     )?;
     assert_eq!(grant.device_id, device.device_id()?);
     let mut forged = request.clone();
-    forged.signature = bootstrap::SignedRequest::sign(&LocalIdentity::generate(), &infra.relay_url, now_ms())?.signature;
+    forged.signature =
+        bootstrap::SignedRequest::sign(&LocalIdentity::generate(), &infra.relay_url, now_ms())?
+            .signature;
     let refused = http
         .post(format!("{}/grant", infra.https))
         .json(&forged)
@@ -507,7 +530,10 @@ async fn bootstrap_http_serves_signed_resources_within_the_contract_limits() -> 
     let oversized = http
         .post(format!("{}/grant", infra.https))
         .header("content-type", "application/json")
-        .body(format!("{{\"payload\":\"{}\",\"signature\":\"\"}}", "x".repeat(2000)))
+        .body(format!(
+            "{{\"payload\":\"{}\",\"signature\":\"\"}}",
+            "x".repeat(2000)
+        ))
         .send()
         .await?;
     assert_eq!(oversized.status(), reqwest::StatusCode::BAD_REQUEST);
@@ -516,7 +542,11 @@ async fn bootstrap_http_serves_signed_resources_within_the_contract_limits() -> 
         .json(&serde_json::json!({"grant": token}))
         .send()
         .await?;
-    assert_eq!(registered.status(), reqwest::StatusCode::OK, "the entry accepts its issuer's grants");
+    assert_eq!(
+        registered.status(),
+        reqwest::StatusCode::OK,
+        "the entry accepts its issuer's grants"
+    );
     let foreign = http
         .post(format!("{}/api/relay/grant", infra.gateway_url))
         .json(&serde_json::json!({"grant": "bm90LWEtZ3JhbnQ.00"}))

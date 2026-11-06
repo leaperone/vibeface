@@ -760,15 +760,12 @@ impl Runtime {
         if self.config.network.bootstrap.is_off() {
             return None;
         }
-        Some(
-            self.net
-                .get()
-                .map(|net| net.bootstrap().state())
-                .unwrap_or(crate::net::bootstrap::BootstrapState::Seeking {
-                    since_ms: now_ms(),
-                    reason: None,
-                }),
-        )
+        Some(self.net.get().map(|net| net.bootstrap().state()).unwrap_or(
+            crate::net::bootstrap::BootstrapState::Seeking {
+                since_ms: now_ms(),
+                reason: None,
+            },
+        ))
     }
     /// Whether this Node answers bootstrap HTTP: the catalogue and grants of a discovery entry,
     /// or grant registrations of a public entry's relay.

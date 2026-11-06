@@ -606,7 +606,13 @@ impl Issuer {
 
     /// A grant for `device`, whose key the caller has already proven, to use `relay_url` from
     /// `ip`. Budgets count per device and per source address.
-    pub fn grant(&self, device: &str, relay_url: &str, ip: IpAddr, now_ms: i64) -> Result<SignedGrant> {
+    pub fn grant(
+        &self,
+        device: &str,
+        relay_url: &str,
+        ip: IpAddr,
+        now_ms: i64,
+    ) -> Result<SignedGrant> {
         vibeface_secure::validate_device_id(device)?;
         let relay = origin(relay_url)?;
         ensure!(
@@ -632,7 +638,12 @@ impl Issuer {
     }
 
     /// The HTTPS path: the request itself proves the device.
-    pub fn grant_signed(&self, request: &SignedRequest, ip: IpAddr, now_ms: i64) -> Result<SignedGrant> {
+    pub fn grant_signed(
+        &self,
+        request: &SignedRequest,
+        ip: IpAddr,
+        now_ms: i64,
+    ) -> Result<SignedGrant> {
         let request = request.open(now_ms)?;
         self.grant(&request.device_id, &request.relay_url, ip, now_ms)
     }
@@ -818,7 +829,10 @@ fn http_client(loopback: bool) -> Result<reqwest::Client> {
     builder.build().context("bootstrap HTTP client")
 }
 
-async fn limited_body(response: reqwest::Response, limit: usize) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+async fn limited_body(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<(reqwest::StatusCode, Vec<u8>)> {
     let status = response.status();
     ensure!(
         response
@@ -887,7 +901,10 @@ impl Https {
 async fn register(gateway_url: &str, token: &str) -> Result<()> {
     let loopback = reqwest::Url::parse(gateway_url).is_ok_and(|url| is_loopback_host(&url));
     let response = http_client(loopback)?
-        .post(format!("{}/api/relay/grant", gateway_url.trim_end_matches('/')))
+        .post(format!(
+            "{}/api/relay/grant",
+            gateway_url.trim_end_matches('/')
+        ))
         .json(&serde_json::json!({ "grant": token }))
         .send()
         .await?;
@@ -1157,7 +1174,12 @@ impl Worker {
         }
     }
 
-    fn report(&self, reason: String, current: Option<&Credential>, trouble_since: &mut Option<i64>) {
+    fn report(
+        &self,
+        reason: String,
+        current: Option<&Credential>,
+        trouble_since: &mut Option<i64>,
+    ) {
         let since_ms = *trouble_since.get_or_insert_with(now_ms);
         tracing::warn!(event = "bootstrap.pending", %reason, "public bootstrap is pending");
         let state = match current {
@@ -1259,17 +1281,22 @@ impl Worker {
         let mut failures = Vec::new();
         for entry in entries {
             match self.request_grant(entry).await {
-                Ok(credential) => match register(&credential.gateway_url, &credential.token).await {
-                    Ok(()) => {
-                        self.install(&credential).await;
-                        return Ok(credential);
+                Ok(credential) => {
+                    match register(&credential.gateway_url, &credential.token).await {
+                        Ok(()) => {
+                            self.install(&credential).await;
+                            return Ok(credential);
+                        }
+                        Err(error) => failures.push(format!("{}: {error:#}", entry.gateway_url)),
                     }
-                    Err(error) => failures.push(format!("{}: {error:#}", entry.gateway_url)),
-                },
+                }
                 Err(error) => failures.push(format!("{}: {error:#}", entry.relay_url)),
             }
         }
-        bail!("no catalogue entry registered access: {}", failures.join("; "))
+        bail!(
+            "no catalogue entry registered access: {}",
+            failures.join("; ")
+        )
     }
 
     /// Puts the granted relay into the endpoint's relay map, replacing any bare copy.
@@ -1310,7 +1337,8 @@ mod tests {
     #[test]
     fn public_defaults_come_from_the_shared_file() -> Result<()> {
         let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/public-bootstrap.json"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../config/public-bootstrap.json"),
         )?)?;
         let defaults = PublicDefaults::load()?;
         assert_eq!(defaults.issuer, file["issuer"].as_str().unwrap());
@@ -1342,7 +1370,10 @@ mod tests {
         };
         let source = custom.source()?.unwrap();
         assert_eq!(source.issuer, id);
-        assert_eq!(source.https.as_deref(), Some("https://disc.example/bootstrap"));
+        assert_eq!(
+            source.https.as_deref(),
+            Some("https://disc.example/bootstrap")
+        );
         for https in [
             "http://disc.example/bootstrap",
             "https://user:pw@disc.example/bootstrap",
@@ -1380,8 +1411,14 @@ mod tests {
 
     #[test]
     fn origins_are_normalized_and_bounded() {
-        assert_eq!(origin("https://App.Example:443/").unwrap(), "https://app.example");
-        assert_eq!(origin("http://127.0.0.1:3340").unwrap(), "http://127.0.0.1:3340");
+        assert_eq!(
+            origin("https://App.Example:443/").unwrap(),
+            "https://app.example"
+        );
+        assert_eq!(
+            origin("http://127.0.0.1:3340").unwrap(),
+            "http://127.0.0.1:3340"
+        );
         for bad in [
             "http://app.example",
             "https://app.example/path",
@@ -1400,22 +1437,35 @@ mod tests {
     #[test]
     fn catalogues_open_only_when_current_and_signed_by_the_pinned_issuer() -> Result<()> {
         let identity = LocalIdentity::generate();
-        let issuer = Issuer::new(identity.clone(), config("https://relay.example", "https://app.example"))?;
+        let issuer = Issuer::new(
+            identity.clone(),
+            config("https://relay.example", "https://app.example"),
+        )?;
         let now = now_ms();
         let signed = issuer.catalog(now)?;
         let catalog = signed.open(&identity.device_id()?, now)?;
         assert_eq!(catalog.entries.len(), 1);
         assert_eq!(catalog.entries[0].relay_url, "https://relay.example");
-        assert_eq!(issuer.catalog(now + 1000)?, signed, "the cache serves a young catalogue");
+        assert_eq!(
+            issuer.catalog(now + 1000)?,
+            signed,
+            "the cache serves a young catalogue"
+        );
         assert_ne!(issuer.catalog(now + CATALOG_RESIGN_MS + 1)?, signed);
         let other = LocalIdentity::generate().device_id()?;
         assert!(signed.open(&other, now).is_err(), "another pinned issuer");
-        assert!(signed.open(&identity.device_id()?, now + CATALOG_TTL_MS + 1).is_err(), "expired");
+        assert!(
+            signed
+                .open(&identity.device_id()?, now + CATALOG_TTL_MS + 1)
+                .is_err(),
+            "expired"
+        );
         let mut tampered = signed.clone();
         tampered.payload = tampered.payload.replace("relay.example", "evil.example");
         assert!(tampered.open(&identity.device_id()?, now).is_err());
         let mut forged = signed.clone();
-        forged.signature = LocalIdentity::generate().sign_payload(CATALOG_DOMAIN, forged.payload.as_bytes())?;
+        forged.signature =
+            LocalIdentity::generate().sign_payload(CATALOG_DOMAIN, forged.payload.as_bytes())?;
         assert!(forged.open(&identity.device_id()?, now).is_err());
         let claims = Catalog {
             version: 1,
@@ -1429,7 +1479,10 @@ mod tests {
             signature: identity.sign_payload(CATALOG_DOMAIN, payload.as_bytes())?,
             payload,
         };
-        assert!(relabelled.open(&identity.device_id()?, now).is_err(), "payload naming another issuer");
+        assert!(
+            relabelled.open(&identity.device_id()?, now).is_err(),
+            "payload naming another issuer"
+        );
         let mut many = config("https://relay.example", "https://app.example");
         many.entries = (0..5)
             .map(|i| CatalogEntry {
@@ -1438,7 +1491,13 @@ mod tests {
             })
             .collect();
         assert!(Issuer::new(identity.clone(), many).is_err());
-        assert!(Issuer::new(identity.clone(), config("http://relay.example", "https://app.example")).is_err());
+        assert!(
+            Issuer::new(
+                identity.clone(),
+                config("http://relay.example", "https://app.example")
+            )
+            .is_err()
+        );
         let huge = SignedCatalog {
             payload: "x".repeat(MAX_SIGNED_CATALOG_BYTES),
             signature: "0".repeat(128),
@@ -1450,7 +1509,10 @@ mod tests {
     #[test]
     fn grants_bind_issuer_device_relay_and_time() -> Result<()> {
         let identity = LocalIdentity::generate();
-        let issuer = Issuer::new(identity.clone(), config("https://relay.example", "https://app.example"))?;
+        let issuer = Issuer::new(
+            identity.clone(),
+            config("https://relay.example", "https://app.example"),
+        )?;
         let device = LocalIdentity::generate().device_id()?;
         let endpoint = endpoint_id(&device)?;
         let relay: RelayUrl = "https://relay.example".parse().unwrap();
@@ -1460,22 +1522,45 @@ mod tests {
         let grant = signed.verify(&identity.device_id()?, &endpoint, &relay, now)?;
         assert_eq!(grant.device_id, device);
         assert_eq!(grant.relay_url, "https://relay.example");
-        assert_eq!(grant.expires_at_ms - grant.issued_at_ms, DEFAULT_GRANT_TTL_MS);
+        assert_eq!(
+            grant.expires_at_ms - grant.issued_at_ms,
+            DEFAULT_GRANT_TTL_MS
+        );
         let reparsed = SignedGrant::parse(signed.as_str())?;
         assert_eq!(reparsed, signed);
         assert!(
             signed
-                .verify(&LocalIdentity::generate().device_id()?, &endpoint, &relay, now)
+                .verify(
+                    &LocalIdentity::generate().device_id()?,
+                    &endpoint,
+                    &relay,
+                    now
+                )
                 .is_err(),
             "another issuer"
         );
         let stranger = endpoint_id(&LocalIdentity::generate().device_id()?)?;
-        assert!(signed.verify(&identity.device_id()?, &stranger, &relay, now).is_err(), "another device");
-        let elsewhere: RelayUrl = "https://other.example".parse().unwrap();
-        assert!(signed.verify(&identity.device_id()?, &endpoint, &elsewhere, now).is_err(), "another relay");
         assert!(
             signed
-                .verify(&identity.device_id()?, &endpoint, &relay, now + DEFAULT_GRANT_TTL_MS)
+                .verify(&identity.device_id()?, &stranger, &relay, now)
+                .is_err(),
+            "another device"
+        );
+        let elsewhere: RelayUrl = "https://other.example".parse().unwrap();
+        assert!(
+            signed
+                .verify(&identity.device_id()?, &endpoint, &elsewhere, now)
+                .is_err(),
+            "another relay"
+        );
+        assert!(
+            signed
+                .verify(
+                    &identity.device_id()?,
+                    &endpoint,
+                    &relay,
+                    now + DEFAULT_GRANT_TTL_MS
+                )
                 .is_err(),
             "expired"
         );
@@ -1488,8 +1573,16 @@ mod tests {
         let (claims, signature) = signed.as_str().split_once('.').unwrap();
         let mut forged = serde_json::from_slice::<Grant>(&URL_SAFE_NO_PAD.decode(claims)?)?;
         forged.expires_at_ms += 60_000;
-        let forged = format!("{}.{signature}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&forged)?));
-        assert!(SignedGrant::parse(&forged)?.verify(&identity.device_id()?, &endpoint, &relay, now).is_err(), "tampered");
+        let forged = format!(
+            "{}.{signature}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&forged)?)
+        );
+        assert!(
+            SignedGrant::parse(&forged)?
+                .verify(&identity.device_id()?, &endpoint, &relay, now)
+                .is_err(),
+            "tampered"
+        );
         let mut long = serde_json::from_slice::<Grant>(&URL_SAFE_NO_PAD.decode(claims)?)?;
         long.expires_at_ms = long.issued_at_ms + MAX_GRANT_TTL_MS + 1;
         let long_claims = serde_json::to_vec(&long)?;
@@ -1499,30 +1592,59 @@ mod tests {
             identity.sign_payload(GRANT_DOMAIN, &long_claims)?
         );
         assert!(
-            SignedGrant::parse(&long_token)?.verify(&identity.device_id()?, &endpoint, &relay, now).is_err(),
+            SignedGrant::parse(&long_token)?
+                .verify(&identity.device_id()?, &endpoint, &relay, now)
+                .is_err(),
             "a lifetime beyond an hour fails even with a valid signature"
         );
         let unencodable = format!("!.{}", "0".repeat(128));
         let oversized = "a".repeat(MAX_GRANT_BYTES + 1);
-        for malformed in ["", "abc", "abc.def", unencodable.as_str(), oversized.as_str()] {
+        for malformed in [
+            "",
+            "abc",
+            "abc.def",
+            unencodable.as_str(),
+            oversized.as_str(),
+        ] {
             assert!(SignedGrant::parse(malformed).is_err(), "{malformed}");
         }
-        assert!(issuer.grant(&device, "https://other.example", ip(), now).is_err(), "relay outside the catalogue");
-        assert!(issuer.grant("not-a-device", "https://relay.example", ip(), now).is_err());
+        assert!(
+            issuer
+                .grant(&device, "https://other.example", ip(), now)
+                .is_err(),
+            "relay outside the catalogue"
+        );
+        assert!(
+            issuer
+                .grant("not-a-device", "https://relay.example", ip(), now)
+                .is_err()
+        );
         Ok(())
     }
 
     #[test]
     fn issuer_budgets_are_per_device_and_per_address_and_bounded() -> Result<()> {
         let identity = LocalIdentity::generate();
-        let issuer = Issuer::new(identity, config("https://relay.example", "https://app.example"))?;
+        let issuer = Issuer::new(
+            identity,
+            config("https://relay.example", "https://app.example"),
+        )?;
         let now = now_ms();
         let device = LocalIdentity::generate().device_id()?;
         for _ in 0..DEVICE_GRANTS_PER_WINDOW {
             issuer.grant(&device, "https://relay.example", ip(), now)?;
         }
-        assert!(issuer.grant(&device, "https://relay.example", ip(), now).is_err());
-        issuer.grant(&device, "https://relay.example", ip(), now + BUDGET_WINDOW_MS)?;
+        assert!(
+            issuer
+                .grant(&device, "https://relay.example", ip(), now)
+                .is_err()
+        );
+        issuer.grant(
+            &device,
+            "https://relay.example",
+            ip(),
+            now + BUDGET_WINDOW_MS,
+        )?;
         let other: IpAddr = "198.51.100.9".parse()?;
         for _ in 0..IP_GRANTS_PER_WINDOW {
             let device = LocalIdentity::generate().device_id()?;
@@ -1530,7 +1652,12 @@ mod tests {
         }
         assert!(
             issuer
-                .grant(&LocalIdentity::generate().device_id()?, "https://relay.example", other, now)
+                .grant(
+                    &LocalIdentity::generate().device_id()?,
+                    "https://relay.example",
+                    other,
+                    now
+                )
                 .is_err()
         );
         let mut budget = Budget::default();
@@ -1538,7 +1665,10 @@ mod tests {
             let address = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000u32 + i as u32));
             budget.admit(&format!("{i:064x}"), address, now)?;
         }
-        assert!(budget.admit("ff".repeat(32).as_str(), ip(), now).is_err(), "a full table refuses");
+        assert!(
+            budget.admit("ff".repeat(32).as_str(), ip(), now).is_err(),
+            "a full table refuses"
+        );
         budget.admit("ff".repeat(32).as_str(), ip(), now + BUDGET_WINDOW_MS)?;
         Ok(())
     }
@@ -1555,14 +1685,18 @@ mod tests {
         tampered.payload = tampered.payload.replace("relay.example", "other.example");
         assert!(tampered.open(now).is_err());
         let mut forged = request.clone();
-        forged.signature = LocalIdentity::generate().sign_payload(REQUEST_DOMAIN, forged.payload.as_bytes())?;
+        forged.signature =
+            LocalIdentity::generate().sign_payload(REQUEST_DOMAIN, forged.payload.as_bytes())?;
         assert!(forged.open(now).is_err());
         let huge = SignedRequest {
             payload: "x".repeat(MAX_REQUEST_BYTES + 1),
             signature: "0".repeat(128),
         };
         assert!(huge.open(now).is_err());
-        let issuer = Issuer::new(LocalIdentity::generate(), config("https://relay.example", "https://app.example"))?;
+        let issuer = Issuer::new(
+            LocalIdentity::generate(),
+            config("https://relay.example", "https://app.example"),
+        )?;
         let grant = issuer.grant_signed(&request, ip(), now)?;
         assert_eq!(grant.claims()?.device_id, identity.device_id()?);
         Ok(())
@@ -1582,11 +1716,25 @@ mod tests {
         assert!(!admission.admits(&endpoint, None, now));
         let first = issuer.grant(&node.device_id()?, "http://127.0.0.1:3340", ip(), now)?;
         assert!(admission.admits(&endpoint, Some(first.as_str()), now));
-        assert!(admission.admits(&endpoint, None, now + 4000), "a verified connect is remembered");
-        assert!(!admission.admits(&endpoint, Some(first.as_str()), now + 5000), "expired token, nothing registered");
+        assert!(
+            admission.admits(&endpoint, None, now + 4000),
+            "a verified connect is remembered"
+        );
+        assert!(
+            !admission.admits(&endpoint, Some(first.as_str()), now + 5000),
+            "expired token, nothing registered"
+        );
         let stranger = endpoint_id(&LocalIdentity::generate().device_id()?)?;
-        assert!(!admission.admits(&stranger, Some(first.as_str()), now), "a grant does not admit another device");
-        let renewed = issuer.grant(&node.device_id()?, "http://127.0.0.1:3340", ip(), now + 3000)?;
+        assert!(
+            !admission.admits(&stranger, Some(first.as_str()), now),
+            "a grant does not admit another device"
+        );
+        let renewed = issuer.grant(
+            &node.device_id()?,
+            "http://127.0.0.1:3340",
+            ip(),
+            now + 3000,
+        )?;
         let registered = admission.register(renewed.as_str(), now + 3000)?;
         assert_eq!(registered.expires_at_ms, now + 8000);
         assert_eq!(admission.admitted_until(&endpoint), Some(now + 8000));
@@ -1595,13 +1743,25 @@ mod tests {
             "a reconnect with the stale token gets in on the registered renewal"
         );
         assert!(!admission.admits(&endpoint, Some(first.as_str()), now + 8000));
-        assert!(admission.register(renewed.as_str(), now + 9000).is_err(), "an expired grant cannot be registered");
-        let wrong_issuer = Issuer::new(LocalIdentity::generate(), config("http://127.0.0.1:3340", "http://127.0.0.1:4790"))?;
+        assert!(
+            admission.register(renewed.as_str(), now + 9000).is_err(),
+            "an expired grant cannot be registered"
+        );
+        let wrong_issuer = Issuer::new(
+            LocalIdentity::generate(),
+            config("http://127.0.0.1:3340", "http://127.0.0.1:4790"),
+        )?;
         let foreign = wrong_issuer.grant(&node.device_id()?, "http://127.0.0.1:3340", ip(), now)?;
         assert!(admission.register(foreign.as_str(), now).is_err());
         assert!(!admission.admits(&endpoint, Some(foreign.as_str()), now + 8001));
-        let elsewhere = GrantAdmission::new(discovery.device_id()?, "http://127.0.0.1:9999".parse().unwrap())?;
-        assert!(!elsewhere.admits(&endpoint, Some(renewed.as_str()), now + 3000), "another relay's audience");
+        let elsewhere = GrantAdmission::new(
+            discovery.device_id()?,
+            "http://127.0.0.1:9999".parse().unwrap(),
+        )?;
+        assert!(
+            !elsewhere.admits(&endpoint, Some(renewed.as_str()), now + 3000),
+            "another relay's audience"
+        );
         admission.forget_all();
         assert!(!admission.admits(&endpoint, None, now + 3000));
         Ok(())
@@ -1656,7 +1816,10 @@ mod tests {
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["state"], "admitted");
         assert_eq!(json["gateway_url"], "https://app.example");
-        assert_eq!(serde_json::from_value::<BootstrapState>(json).unwrap(), state);
+        assert_eq!(
+            serde_json::from_value::<BootstrapState>(json).unwrap(),
+            state
+        );
     }
 
     #[test]
@@ -1670,7 +1833,10 @@ mod tests {
         let now = fixture["now_ms"].as_i64().expect("fixture time");
         let catalog = signed.open(issuer, now)?;
         assert_eq!(catalog.entries.len(), 1);
-        assert_eq!(catalog.entries[0].gateway_url, "https://gateway.fixture.test");
+        assert_eq!(
+            catalog.entries[0].gateway_url,
+            "https://gateway.fixture.test"
+        );
         assert_eq!(catalog.entries[0].relay_url, "https://relay.fixture.test");
         Ok(())
     }

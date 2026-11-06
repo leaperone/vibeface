@@ -7684,6 +7684,59 @@ def delivery_paid_run(options, configuration, deployment):
     return report
 
 
+class BootstrapSite:
+    """Serves the entry UI and Discovery on one origin, with its own client socket unavailable."""
+    def __init__(self, port, entry, discovery):
+        site = self
+        self.catalog_reads = 0
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                path = urllib.parse.urlsplit(self.path).path
+                if path == "/api/client":
+                    self.send_error(503, "fixture direct gateway is unavailable")
+                    return
+                if path.startswith("/bootstrap/"):
+                    upstream = discovery.url
+                    if path == "/bootstrap/catalog":
+                        site.catalog_reads += 1
+                else:
+                    upstream = entry.url
+                try:
+                    try:
+                        response = opener.open(upstream + self.path, timeout=15)
+                    except urllib.error.HTTPError as error:
+                        response = error
+                    with response:
+                        body = response.read(4 * 1024 * 1024 + 1)
+                        require(len(body) <= 4 * 1024 * 1024, "fixture proxy response is bounded")
+                        self.send_response(response.status)
+                        for name in ("Content-Type", "Content-Security-Policy", "Cache-Control", "X-Vibeface-Source"):
+                            value = response.headers.get(name)
+                            if value:
+                                self.send_header(name, value)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                except (OSError, ValueError):
+                    self.send_error(502)
+
+            def log_message(self, *_):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        require(not self.thread.is_alive(), "bootstrap site stops its own thread")
+
+
 def e2e_fixture(options):
     program = shutil.which(str(options.binary)) if len(options.binary.parts) == 1 else str(options.binary)
     require(program is not None, "the isolated e2e Node binary exists on PATH or at its explicit path")
@@ -7703,9 +7756,12 @@ def e2e_fixture(options):
     native_ready = False
     native_provider = None
     native_queue = None
+    bootstrap_site = None
+    bootstrap_invitation = None
+    bootstrap_kind = options.fixture_kind in ("bootstrap", "bootstrap-http")
 
     def details():
-        return {"run": str(run), "nodes": {
+        return {"run": str(run), "site": bootstrap_site.url if bootstrap_site else None, "nodes": {
             role: {"url": node.url, "peer": node.device_id, "directory": str(node.directory)}
             for role, node in nodes.items()
         }}
@@ -7716,7 +7772,45 @@ def e2e_fixture(options):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
-        for role in (["source", "receiver", "provider"] if relay else ["source"]):
+        if bootstrap_kind:
+            site_url = f"http://127.0.0.1:{options.fixture_port}"
+            relay_port, entry_port, discovery_port = available_port(), available_port(), available_port()
+            gateway_url = f"http://127.0.0.1:{entry_port}"
+            relay_url = f"http://127.0.0.1:{relay_port}"
+            discovery = Node(run, "discovery", binary, workspace, helper, init_args=[
+                "--public-entry", "--relay-mode", "discovery-only", "--no-web",
+                "--relay-listen", f"127.0.0.1:{discovery_port}",
+                "--catalog-gateway", gateway_url, "--catalog-relay", relay_url])
+            nodes["discovery"] = discovery
+            entry = Node(run, "entry", binary, workspace, helper, port=entry_port, init_args=[
+                "--public-entry", "--public-url", gateway_url,
+                "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url,
+                "--relay-admission", "grants", "--grant-issuer", discovery.device_id,
+                "--allowed-origin", site_url])
+            nodes["entry"] = entry
+            udp_port = available_port() if options.fixture_kind == "bootstrap-http" else discovery_port
+            member = Node(run, "member", binary, workspace, helper, init_args=[
+                "--root", str(workspace), "--bootstrap", f"vibeface://{discovery.device_id}@127.0.0.1:{udp_port}",
+                "--bootstrap-https", discovery.url + "/bootstrap"])
+            nodes["member"] = member
+            require(not (member.directory / "entry-token").exists(), "public bootstrap member has no operator credential")
+            discovery.start(no_web=True)
+            entry.start()
+            member.start()
+            def admitted():
+                status = node_status(member).get("bootstrap") or {}
+                return status if status.get("state") == "admitted" else None
+            state = wait_for("fresh member registers a public Relay lease", admitted)
+            require(state["gateway_url"] == gateway_url and state["relay_url"] == relay_url,
+                    "bootstrap selects the paired gateway and Relay")
+            if options.fixture_kind == "bootstrap-http":
+                require(state["via"] == "https", "UDP-unreachable fixture admits over HTTP")
+            member.bootstrap()
+            member.client.rpc("create_bot", bot_id="bootstrap-fixture-bot", conversation_id="bootstrap-fixture-chat",
+                              name="Bootstrap fixture assistant", instructions="Controlled fixture; no provider enabled")
+            bootstrap_invitation = member.client.invite(discovery_only=True).split("#", 1)[1]
+            bootstrap_site = BootstrapSite(options.fixture_port, entry, discovery)
+        for role in ([] if bootstrap_kind else ["source", "receiver", "provider"] if relay else ["source"]):
             args = delivery_entry_args() if role == "provider" else []
             node = Node(run, role, binary, workspace, helper, init_args=args,
                         port=options.fixture_port if role == "source" else None)
@@ -7747,6 +7841,35 @@ def e2e_fixture(options):
                               "pkarr_reads": relay.reads if relay else 0,
                               "pkarr_writes": relay.writes if relay else 0,
                               "chain_rpc_calls": rpc.calls if rpc else 0}
+                elif op == "bootstrap_info":
+                    require(bootstrap_kind, "bootstrap info belongs to its controlled fixture")
+                    result = {**details(), "invitation": bootstrap_invitation,
+                              "issuer": nodes["discovery"].device_id,
+                              "bootstrap": node_status(nodes["member"])["bootstrap"],
+                              "member_has_operator_token": (nodes["member"].directory / "entry-token").exists(),
+                              "catalog_reads": bootstrap_site.catalog_reads}
+                elif op == "bootstrap_pairing":
+                    require(bootstrap_kind, "bootstrap pairing belongs to its controlled fixture")
+                    owner = nodes["member"].client
+                    def revealed_bootstrap():
+                        pending = next((item for item in owner.call("join_status")["requests"]
+                                        if item["name"] == "Bootstrap browser" and item["kind"] == "client"
+                                        and item["status"] in ("pending", "confirming")), None)
+                        if pending and pending["status"] == "pending":
+                            owner.start_approval(pending["join_id"])
+                            return None
+                        return pending if pending and pending.get("joiner_nonce") else None
+                    pending = wait_for("browser reveals its real bootstrap pairing nonce", revealed_bootstrap, timeout=20)
+                    result = {"peer": pending["device_id"], "code": owner.command("short_code", request=pending)}
+                elif op == "bootstrap_approve":
+                    require(bootstrap_kind, "bootstrap approval belongs to its controlled fixture")
+                    owner = nodes["member"].client
+                    pending = owner.pending_join(request["peer"])
+                    require(pending and pending["name"] == "Bootstrap browser" and pending.get("joiner_nonce")
+                            and request["code"] == owner.command("short_code", request=pending),
+                            "browser and manager display the same actual safety code")
+                    owner.grant(pending)
+                    result = {"approved": True}
                 elif op == "native_setup":
                     require(relay is not None and not native_ready, "native setup initializes only its own fresh delivery fixture")
                     for role in ("source", "receiver"):
@@ -7874,7 +7997,8 @@ def e2e_fixture(options):
                 print(json.dumps({"ok": False, "error": type(error).__name__}), flush=True)
     finally:
         cleanup_failed = False
-        actions = [action for node in reversed(list(nodes.values())) for action in (node.client.close, node.stop)]
+        actions = ([bootstrap_site.close] if bootstrap_site else [])
+        actions += [action for node in reversed(list(nodes.values())) for action in (node.client.close, node.stop)]
         actions += ([relay.close] if relay else []) + ([rpc.close] if rpc else []) + [lambda: stop_fixture_processes(run)]
         for action in actions:
             try:
@@ -7919,7 +8043,7 @@ if __name__ == "__main__":
         parser.add_argument("--delivery-config", type=Path)
         parser.add_argument("--delivery-ui-control", type=Path)
         parser.add_argument("--delivery-ui-timeout-ms", type=int, default=43_200_000)
-        parser.add_argument("--fixture-kind", choices=("single", "delivery"), default="single", help=argparse.SUPPRESS)
+        parser.add_argument("--fixture-kind", choices=("single", "delivery", "bootstrap", "bootstrap-http"), default="single", help=argparse.SUPPRESS)
         parser.add_argument("--fixture-port", type=int, help=argparse.SUPPRESS)
         parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()
