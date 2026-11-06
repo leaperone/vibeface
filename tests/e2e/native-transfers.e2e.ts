@@ -195,7 +195,7 @@ test('provider settings and queued cancellation work in the installed native app
     if (await consent.isVisible()) await consent.getByRole('button', 'Open', { exact: true }).click();
     await expect(destination).toBeVisible();
   };
-  await openLink('vibeface://add-device', screen.getByRole('button', '关闭', { exact: true, visible: true }));
+  await openLink('vibeface://add-device', screen.getByText('添加设备', { exact: true, visible: true }).first());
   await expect(screen.getByText('添加设备', { exact: true }).first()).toBeVisible();
   const clientKind = screen.getByRole('button', '客户端', { exact: true });
   const nodeKind = screen.getByRole('button', '节点', { exact: true });
