@@ -30,8 +30,8 @@ function github(endpoint, key) {
 }
 
 function resolveArtifact({ tag, sha, runId, artifactId, workflowRef }, api = github, now = Date.now()) {
-  assert(tag.startsWith('cli-v'), 'CLI tag is required');
-  nightly(tag.slice(5));
+  assert(/^v(0|[1-9][0-9]*)\./.test(tag), 'product v tag is required');
+  nightly(tag.slice(1));
   assert(/^[a-f0-9]{40}$/.test(sha), 'full source SHA is required');
   assert(/^[1-9]\d*$/.test(runId), 'current workflow run id is required');
   assert.equal(workflowRef, `${repository}/.github/workflows/${artifactId ? 'release.yml' : 'npm-publish.yml'}@refs/tags/${tag}`,
@@ -127,7 +127,7 @@ async function publishOnce(version, integrity, { read = readRegistry, publish, p
 
 async function selfTest() {
   const sha = 'a'.repeat(40), version = '0.0.1-nightly.20261106.1', newer = '0.0.1-nightly.20261106.2';
-  const tag = `cli-v${version}`, integrity = 'sha512-fixture';
+  const tag = `v${version}`, integrity = 'sha512-fixture';
   const run = { id: 7, head_sha: sha, head_branch: tag, path: workflow, run_attempt: 2, event: 'push',
     repository: { full_name: repository }, head_repository: { full_name: repository }, status: 'in_progress', conclusion: null };
   const artifact = { id: 11, name: `npm-package-${sha}-1`, expired: false, expires_at: '2099-01-01T00:00:00Z',
@@ -205,8 +205,8 @@ try {
     assert.equal(process.env.GITHUB_REPOSITORY, repository, 'publication only accepts the upstream repository');
     const tag = process.env.RELEASE_TAG ?? '';
     assert.equal(process.env.GITHUB_REF, `refs/tags/${tag}`, 'workflow ref must match the release tag');
-    assert(tag.startsWith('cli-v'), 'CLI tag is required');
-    const version = tag.slice(5);
+    assert(/^v(0|[1-9][0-9]*)\./.test(tag), 'product v tag is required');
+    const version = tag.slice(1);
     nightly(version);
     if (command === 'artifact') {
       const result = resolveArtifact({ tag, sha: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID,

@@ -20,7 +20,8 @@ REPO = 'leaperone/vibeface'
 CI = '.github/workflows/ci.yml'
 RELEASE = '.github/workflows/release.yml'
 PATHS = ('apps/www/package.json', 'apps/app/package.json', 'apps/core/Cargo.toml',
-         'apps/cli/Cargo.toml', 'Cargo.lock', 'apps/cli/release-lock.json', 'apps/mobile/app.json')
+         'apps/cli/Cargo.toml', 'Cargo.lock', 'apps/mobile/app.json')
+PRODUCT_APPS = ('app', 'core', 'cli', 'mobile')
 BOT = '41898282+github-actions[bot]@users.noreply.github.com'
 require = release.require
 
@@ -128,13 +129,33 @@ def versions_at(commit):
 def plan_versions(day, base, tags):
     datetime.datetime.strptime(day, '%Y%m%d')
     values = versions_at(base)
-    for app, current in values.items():
-        baseline = current.split('-', 1)[0]
-        prefix = f'{baseline}-nightly.{day}.'
-        existing = [current] + [tag[len(app) + 2:] for tag in tags if tag.startswith(app + '-v')]
-        sequences = [int(value[len(prefix):]) for value in existing
-                     if value.startswith(prefix) and re.fullmatch(r'[1-9][0-9]*', value[len(prefix):])]
-        values[app] = prefix + str(max(sequences, default=0) + 1)
+    baseline = values['cli'].split('-', 1)[0]
+    product_prefix = f'{baseline}-nightly.{day}.'
+    existing_product = []
+    product_tag_re = re.compile(r'^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:nightly|rc)\.|$)')
+    for tag in tags:
+        if product_tag_re.match(tag):
+            existing_product.append(tag[1:])
+        else:
+            for app in PRODUCT_APPS:
+                p = app + '-v'
+                if tag.startswith(p):
+                    existing_product.append(tag[len(p):])
+                    break
+    existing_product.append(values['cli'])
+    sequences = [int(value[len(product_prefix):]) for value in existing_product
+                 if value.startswith(product_prefix) and re.fullmatch(r'[1-9][0-9]*', value[len(product_prefix):])]
+    product_ver = product_prefix + str(max(sequences, default=0) + 1)
+    for app in PRODUCT_APPS:
+        values[app] = product_ver
+    app = 'www'
+    current = values[app]
+    www_baseline = current.split('-', 1)[0]
+    www_prefix = f'{www_baseline}-nightly.{day}.'
+    www_existing = [current] + [tag[len('www-v'):] for tag in tags if tag.startswith('www-v')]
+    www_sequences = [int(value[len(www_prefix):]) for value in www_existing
+                     if value.startswith(www_prefix) and re.fullmatch(r'[1-9][0-9]*', value[len(www_prefix):])]
+    values[app] = www_prefix + str(max(www_sequences, default=0) + 1)
     expo = json.loads(blob(base, 'apps/mobile/app.json'))['expo']
     code = expo['android']['versionCode']
     require(type(code) is int and 0 < code < 2100000000, 'Android versionCode cannot be incremented')
@@ -144,6 +165,9 @@ def plan_versions(day, base, tags):
 def generated(plan):
     old = versions_at(plan.base)
     require(set(plan.versions) == set(release.APPS), 'daily plan must contain all five apps')
+    product_ver = plan.versions['cli']
+    for app in PRODUCT_APPS:
+        require(plan.versions[app] == product_ver, 'product apps must share one canonical version')
     for app, value in plan.versions.items():
         release.version(value)
         prefix = old[app].split('-', 1)[0] + '-nightly.' + plan.day + '.'
@@ -169,11 +193,6 @@ def generated(plan):
             found.add(app)
     require(found == {'core', 'cli'}, 'Cargo.lock is missing local packages')
     result['Cargo.lock'] = '[[package]]'.join(blocks)
-    lock_path = 'apps/cli/release-lock.json'
-    lock = json.loads(result[lock_path])
-    require(set(lock) == {'core', 'app'} and all(set(pin) == {'tag'} for pin in lock.values()), 'unsupported CLI lock')
-    for app in ('core', 'app'):
-        result[lock_path] = json_value(result[lock_path], (app, 'tag'), f'{app}-v{plan.versions[app]}')
     mobile_path = 'apps/mobile/app.json'
     expo = json.loads(result[mobile_path])['expo']
     require(expo['version'] == plan.versions['mobile'].split('-', 1)[0], 'mobile marketing version mismatch')
@@ -393,8 +412,17 @@ def release_state(tag):
     return api('releases/tags/' + tag, missing=True)
 
 
+def release_dispatch_tag(app):
+    """Resolve workflow dispatch tag: product uses v<version>, www uses www-v<version>, mobile unchanged."""
+    if app == 'product':
+        return 'v' + release.read_version('cli')
+    if app == 'www':
+        return 'www-v' + release.read_version('www')
+    return release.identity(app)['tag']
+
+
 def start_release(app, source):
-    tag = release.identity(app)['tag']
+    tag = release_dispatch_tag(app)
     ensure_tag(tag, source)
     state = release_state(tag)
     runs = matching_runs(RELEASE, source, tag, {'push', 'workflow_dispatch'})
@@ -409,19 +437,29 @@ def start_release(app, source):
 
 def recover_publisher(app, run, source):
     artifacts = pages(f'actions/runs/{run["id"]}/artifacts', 'artifacts')
-    expected = {'static-release'} if app in ('www', 'app') else {f'release-android-{source}'} if app == 'mobile' else {'native-' + target for target in release.TARGETS}
+    if app in ('www', 'app'):
+        expected = {'static-release'}
+    elif app == 'mobile':
+        expected = {f'release-android-{source}'}
+    else:
+        expected = {'native-' + target for target in release.TARGETS}
     available = [artifact['name'] for artifact in artifacts if not artifact['expired'] and artifact['size_in_bytes'] > 0]
     require(all(available.count(name) == 1 for name in expected), 'original complete release artifact is unavailable; refusing a rebuild')
     jobs = pages(f'actions/runs/{run["id"]}/jobs?filter=latest', 'jobs')
     failed = [job for job in jobs if job['conclusion'] not in ('success', 'skipped')]
-    publisher = 'publish-static' if app in ('www', 'app') else 'publish-android' if app == 'mobile' else 'publish-native'
+    if app in ('www', 'app'):
+        publisher = 'publish-static'
+    elif app == 'mobile':
+        publisher = 'publish-android'
+    else:
+        publisher = 'publish-native'
     require(failed and all(job['status'] == 'completed' and job['name'].split(' / ')[-1] == publisher for job in failed),
             'failure includes a build job; only an original-artifact publisher may be recovered')
     return rerun(run, True)
 
 
 def finish_release(app, source, deadline):
-    tag = release.identity(app)['tag']
+    tag = release_dispatch_tag(app)
     restored = set()
     while time.monotonic() < deadline:
         require(tag_sha(tag) == source, 'release tag changed source')
@@ -430,9 +468,9 @@ def finish_release(app, source, deadline):
         active = [run for run in runs if run['status'] != 'completed']
         if not active:
             if state and not state['draft']:
-                if app == 'cli':
+                if app == 'product':
                     require(runs and all(run['conclusion'] == 'success' for run in runs),
-                            'CLI release workflow did not succeed; reconcile npm and rerun failed jobs in the original run')
+                            'product release workflow did not succeed; reconcile npm and rerun failed jobs in the original run')
                 with tempfile.TemporaryDirectory(dir=scratch(), prefix='public-') as temporary:
                     release.verify_public(app, Path(temporary) / 'assets')
                 return [dict(id=run['id'], url=run['html_url'], conclusion=run['conclusion']) for run in runs]
@@ -448,33 +486,23 @@ def finish_release(app, source, deadline):
 
 def publish_daily(source, deadline):
     receipt = {}; started = []; errors = []
-    for app in ('www', 'app', 'core', 'mobile'):
+    for app in ('product', 'www', 'mobile'):
         started.append(app)
         try:
             start_release(app, source)
         except Exception as error:
             errors.append(f'{app}: {error}')
             break
-    for app in ('core', 'app'):
-        if app in started:
-            try:
-                receipt[app] = finish_release(app, source, deadline)
-            except Exception as error:
-                errors.append(f'{app}: {error}')
-    if not errors and {'core', 'app'} <= set(receipt):
-        started.append('cli')
-        try:
-            start_release('cli', source)
-        except Exception as error:
-            errors.append(f'cli: {error}')
-    for app in started:
-        if app not in ('core', 'app'):
+    if not errors:
+        for app in ('product', 'www', 'mobile'):
+            if app not in started:
+                continue
             try:
                 receipt[app] = finish_release(app, source, deadline)
             except Exception as error:
                 errors.append(f'{app}: {error}')
     for app in started:
-        tag = release.identity(app)['tag']
+        tag = release_dispatch_tag(app)
         runs = matching_runs(RELEASE, source, tag, {'push', 'workflow_dispatch'})
         while any(run['status'] != 'completed' for run in runs) and time.monotonic() < deadline:
             time.sleep(15)
@@ -506,12 +534,12 @@ def run_daily(run_id):
         previous = release.ROOT
         release.ROOT = clean
         try:
-            require(versions_at(source) == plan.versions and json.loads((clean / 'apps/cli/release-lock.json').read_text()) == {
-                app: {'tag': f'{app}-v{plan.versions[app]}'} for app in ('core', 'app')}, 'landed daily versions or CLI pins changed')
-            for app in release.APPS:
-                environment = {key: value for key, value in os.environ.items()
-                               if key not in ('GITHUB_EVENT_NAME', 'GITHUB_REF', 'NIGHTLY_RELEASE_TOKEN')}
-                subprocess.run(['python3', str(clean / 'scripts/release.py'), 'plan', '--tag', release.identity(app)['tag'], '--require-main'],
+            require(versions_at(source) == plan.versions, 'landed daily versions changed')
+            environment = {key: value for key, value in os.environ.items()
+                           if key not in ('GITHUB_EVENT_NAME', 'GITHUB_REF', 'NIGHTLY_RELEASE_TOKEN')}
+            for tag in ('v' + plan.versions['cli'], 'www-v' + plan.versions['www'],
+                        'mobile-v' + plan.versions['mobile']):
+                subprocess.run(['python3', str(clean / 'scripts/release.py'), 'plan', '--tag', tag, '--require-main'],
                                cwd=clean, env=environment, check=True)
             releases = publish_daily(source, deadline)
         finally:
@@ -544,20 +572,33 @@ def self_test():
                 if app == 'mobile':
                     value = {'expo': {'version': '0.0.1', 'ios': {'buildNumber': '99'},
                         'android': {'package': 'one.leaper.vibeface', 'versionCode': 250001},
-                        'extra': {'releaseVersion': '0.0.1-nightly.20261105.1'}}}
+                        'extra': {'releaseVersion': '0.0.1-nightly.20261105.2'}}}
                 (directory / ('app.json' if app == 'mobile' else 'package.json')).write_text(json.dumps(value, indent=2) + '\n')
-        (root / 'apps/cli/release-lock.json').write_text(json.dumps({app: {'tag': f'{app}-v0.0.1-nightly.20261105.2'} for app in ('core', 'app')}, indent=2) + '\n')
         (root / 'Cargo.toml').write_text('[workspace]\nmembers = ["apps/core", "apps/cli"]\nresolver = "2"\n')
         (root / 'Cargo.lock').write_text('version = 3\n\n[[package]]\nname = "vibeface"\nversion = "0.0.1-nightly.20261105.2"\n\n[[package]]\nname = "vibeface-core"\nversion = "0.0.1-nightly.20261105.2"\n')
         git('init', '--initial-branch=main', root=root)
         git('add', '.', root=root)
         git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', 'fixture', root=root)
-        with patch(f'{__name__}.ROOT', root), patch('release.ROOT', root), patch(f'{__name__}.time.sleep'):
+        real_check_output = subprocess.check_output
+
+        def metadata_cargo_stub(cmd, cwd=None, **kwargs):
+            if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == 'cargo' and cmd[1] == 'metadata':
+                work = Path(cwd)
+                cli = re.search(r'version = "([^"]+)"', (work / 'apps/cli/Cargo.toml').read_text())[1]
+                core = re.search(r'version = "([^"]+)"', (work / 'apps/core/Cargo.toml').read_text())[1]
+                return json.dumps({'packages': [{'name': 'vibeface', 'version': cli},
+                                                {'name': 'vibeface-core', 'version': core}]}).encode()
+            return real_check_output(cmd, cwd=cwd, **kwargs)
+
+        with patch(f'{__name__}.ROOT', root), patch('release.ROOT', root), patch(f'{__name__}.time.sleep'), \
+                patch('subprocess.check_output', side_effect=metadata_cargo_stub):
             base = git('rev-parse', 'HEAD')
             plan = plan_versions('20261106', base, ['core-v0.0.1-nightly.20261106.7'])
             assert plan.versions['core'] == '0.0.1-nightly.20261106.8'
+            assert plan.versions['app'] == plan.versions['cli'] == plan.versions['core']
             assert plan.versions['www'] == '0.0.1-nightly.20261106.1'
             assert plan_versions('20261105', base, []).versions['core'].endswith('.3')
+            assert plan_versions('20261106', base, ['v0.0.1-nightly.20261106.9']).versions['cli'].endswith('.10')
             contents = generated(plan)
             assert json.loads(contents['apps/mobile/app.json'])['expo']['ios']['buildNumber'] == '99'
             assert contents['Cargo.lock'].count(b'[[package]]') == 2
@@ -580,7 +621,7 @@ def self_test():
                 ('apps/app/package.json', contents['apps/app/package.json'].replace(b'"private": true', b'"private": false')),
                 ('Cargo.lock', contents['Cargo.lock'] + b'\n[[package]]\nname = "unexpected"\nversion = "1.0.0"\n'),
                 ('apps/core/Cargo.toml', contents['apps/core/Cargo.toml'] + b'\n[dependencies]\nserde = "1"\n'),
-                ('apps/cli/release-lock.json', contents['apps/cli/release-lock.json'].replace(b'core-v', b'app-v')),
+                ('apps/cli/Cargo.toml', contents['apps/cli/Cargo.toml'].replace(b'0.0.1-nightly.20261106.8', b'0.0.1-nightly.20261106.9')),
                 ('apps/mobile/app.json', contents['apps/mobile/app.json'].replace(b'250002', b'1')),
                 ('extra.txt', b'not a version file\n'),
             ):
@@ -637,7 +678,9 @@ def self_test():
                     assert ensure_landed(plan.day, 'nightly-owner') == (plan, merged, 17)
                 rejected(lambda: validate_pr(dict(pr, user=dict(login='outsider')), plan, head, 'nightly-owner'), 'identity')
             next_day = plan_versions('20261107', merged, [])
-            assert all('-nightly.20261107.1' in value for value in next_day.versions.values())
+            pv = next_day.versions['cli']
+            assert all(next_day.versions[a] == pv for a in PRODUCT_APPS)
+            assert '-nightly.20261107.1' in next_day.versions['www']
             assert next_day.android_code == plan.android_code + 1
 
             good = dict(id=1, run_attempt=1, head_sha=merged, head_branch='main', event='push', path=CI,
@@ -663,7 +706,7 @@ def self_test():
                 assert writes == ['actions/runs/1/rerun']
 
             writes = []; remote = {'tag': None, 'runs': [], 'public': False}
-            tag = 'app-v' + plan.versions['app']
+            tag = 'v' + plan.versions['cli']
 
             def release_api(path, method='GET', data=None, **kwargs):
                 if method != 'GET':
@@ -682,15 +725,15 @@ def self_test():
 
             with patch(f'{__name__}.api', side_effect=release_api), \
                     patch(f'{__name__}.matching_runs', side_effect=lambda *args: remote['runs']), \
-                    patch('release.identity', return_value=dict(tag=tag)):
+                    patch(f'{__name__}.release_dispatch_tag', return_value=tag):
                 ensure_tag(tag, merged); ensure_tag(tag, merged)
                 assert len(writes) == 1
-                assert start_release('app', merged) and len(writes) == 2
-                assert start_release('app', merged) and len(writes) == 2
+                assert start_release('product', merged) and len(writes) == 2
+                assert start_release('product', merged) and len(writes) == 2
                 remote['public'] = True; remote['runs'] = []
-                assert start_release('app', merged) == [] and len(writes) == 2
+                assert start_release('product', merged) == [] and len(writes) == 2
                 remote['tag'] = 'b' * 40
-                rejected(lambda: start_release('app', merged), 'different SHA')
+                rejected(lambda: start_release('product', merged), 'different SHA')
                 assert len(writes) == 2
             attempts = {'value': dict(good, conclusion='failure')}; writes = []
 
@@ -712,18 +755,19 @@ def self_test():
                 assert len(writes) == 1
 
             with patch(f'{__name__}.tag_sha', return_value=merged), patch(f'{__name__}.release_state', return_value=dict(draft=False)), \
-                    patch('release.verify_public') as verified, patch(f'{__name__}.recover_publisher') as no_retry:
+                    patch('release.verify_public') as verified, patch(f'{__name__}.recover_publisher') as no_retry, \
+                    patch(f'{__name__}.release_dispatch_tag', return_value='v' + plan.versions['cli']):
                 for runs in ([], [dict(good, conclusion='failure')]):
                     with patch(f'{__name__}.matching_runs', return_value=runs):
-                        rejected(lambda: finish_release('cli', merged, time.monotonic() + 1), 'reconcile npm')
+                        rejected(lambda: finish_release('product', merged, time.monotonic() + 1), 'reconcile npm')
                 verified.assert_not_called()
                 no_retry.assert_not_called()
                 with patch(f'{__name__}.matching_runs', side_effect=[[dict(good, status='in_progress', conclusion=None)], [dict(good, run_attempt=2)]]), \
                         patch(f'{__name__}.time.sleep'):
-                    assert finish_release('cli', merged, time.monotonic() + 1)[0]['conclusion'] == 'success'
+                    assert finish_release('product', merged, time.monotonic() + 1)[0]['conclusion'] == 'success'
                 verified.assert_called_once()
 
-            for blocked in ('core', 'app', None):
+            for blocked in ('product', 'www', None):
                 operations = []
                 def finish(app, *args):
                     operations.append(('verified', app))
@@ -733,21 +777,24 @@ def self_test():
                         patch(f'{__name__}.finish_release', side_effect=finish), patch(f'{__name__}.matching_runs', return_value=[]):
                     if blocked:
                         rejected(lambda: publish_daily(merged, 1), 'not public')
-                        assert ('started', 'cli') not in operations
                     else:
-                        assert set(publish_daily(merged, 1)) == set(release.APPS)
-                        assert operations.index(('started', 'cli')) > operations.index(('verified', 'core'))
-                        assert operations.index(('started', 'cli')) > operations.index(('verified', 'app'))
+                        assert set(publish_daily(merged, 1)) == {'product', 'www', 'mobile'}
             observed = []
             def drain(*args):
-                observed.append(args[2])
-                return [dict(good, status='in_progress', conclusion=None)] if len(observed) == 1 else [good]
+                tag = args[2]
+                observed.append(tag)
+                n = sum(1 for t in observed if t == tag)
+                return [dict(good, status='in_progress', conclusion=None)] if n == 1 else [good]
             with patch(f'{__name__}.start_release'), patch(f'{__name__}.finish_release', side_effect=ValueError('component failed')), \
                     patch(f'{__name__}.matching_runs', side_effect=drain), patch(f'{__name__}.time.monotonic', return_value=0):
                 rejected(lambda: publish_daily(merged, 1), 'component failed')
-                assert len(observed) == 5 and observed[0] == observed[1]
-                assert all(any(tag.startswith(app + '-v') for tag in observed) for app in ('www', 'app', 'core', 'mobile'))
-                assert not any(tag.startswith('cli-v') for tag in observed)
+                assert len(observed) == 6
+                assert observed[0] == observed[1] and observed[2] == observed[3] and observed[4] == observed[5]
+                tags3 = {observed[0], observed[2], observed[4]}
+                assert len(tags3) == 3
+                assert any(t.startswith('v') and t[1] in '0123456789' for t in tags3)
+                assert any(t.startswith('www-v') for t in tags3)
+                assert any(t.startswith('mobile-v') for t in tags3)
 
             environment = dict(GITHUB_REPOSITORY=REPO, GITHUB_EVENT_NAME='schedule', GITHUB_REF='refs/heads/main',
                                GITHUB_RUN_ID='42', GITHUB_SHA=merged, NIGHTLY_RELEASE_TOKEN='fixture-only', GH_TOKEN='fixture-only')

@@ -46,7 +46,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          [[ "$RELEASE_TAG" =~ ^cli-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-nightly\.[0-9]{8}\.[1-9][0-9]*$ ]]
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-nightly\.[0-9]{8}\.[1-9][0-9]*$ ]]
           [[ "$GITHUB_REF" == "refs/tags/$RELEASE_TAG" ]]
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -78,12 +78,12 @@ jobs:
       - name: Verify the package against its source
         env:
           RELEASE_TAG: ${{ inputs.tag }}
-        run: node scripts/package-npm.mjs --verify ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#cli-v}.tgz" --source-commit "$GITHUB_SHA"
+        run: node scripts/package-npm.mjs --verify ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#v}.tgz" --source-commit "$GITHUB_SHA"
       - name: Validate npm publication without registry writes
         if: ${{ !inputs.publish }}
         env:
           RELEASE_TAG: ${{ inputs.tag }}
-        run: npm publish ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#cli-v}.tgz" --tag nightly --access public --dry-run --ignore-scripts --registry=https://registry.npmjs.org/
+        run: npm publish ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#v}.tgz" --tag nightly --access public --dry-run --ignore-scripts --registry=https://registry.npmjs.org/
       - name: Publish once using OIDC and reconcile the registry
         if: ${{ inputs.publish }}
         env:
