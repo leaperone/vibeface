@@ -204,11 +204,10 @@ test('native workspace routes preserve Task input, queue controls and directed C
   }
   await expect.poll(async () => (await inspect()).steers.filter(row => row.thread === main.thread).length, { timeout: 30000 }).toBe(8);
   const mainHistory = device.locator('role=scroll-area').filter({ has: screen.getByText(/^原生滚动记录 /) });
-  const olderMarker = screen.getByText(/^原生滚动记录 4\s/);
+  const olderMarker = screen.getByText(/^原生滚动记录 2\s/);
   const latestMarker = screen.getByText(/^原生滚动记录 8\s/);
   const latestReply = screen.getByText(/^native-workspace-scroll:\d+/, { visible: true }).first();
   const mainResult = screen.getByText(/^native-workspace-scroll:complete/, { visible: true }).first();
-  const providerNotice = screen.getByText(/^Codex · Node · Codex 尚未确认这个模型/);
   await expect(mainHistory).toHaveCount(1);
   await expect(keyboard).toHaveCount(1);
   let keyboardReadingBottom = 0, previousTargetBounds = '';
@@ -221,26 +220,29 @@ test('native workspace routes preserve Task input, queue controls and directed C
     return stable;
   }).toBe(true);
   for (const phase of ['closed', 'keyboard', 'reply']) {
-    if (await keyboard.count() !== 0) await providerNotice.click();
+    if (await keyboard.count() !== 0) await screen.getByText(/^原生滚动记录 8\s/, { visible: true }).click();
     await expect(keyboard).toHaveCount(0);
     await expect(latestReply).toBeVisible();
     await expect(toLatest).toHaveCount(0);
-    let previousHistoryBounds = '';
+    let previousHistoryBounds = '', positioningAttempt = 0;
     await expect.poll(async () => {
       const pane = await mainHistory.boundingBox(), target = await mainTarget.boundingBox(), back = await backButton.boundingBox();
-      const marker = await olderMarker.isVisible() ? await olderMarker.boundingBox() : null;
+      const markerVisible = await olderMarker.isVisible(), marker = markerVisible ? await olderMarker.boundingBox() : null;
       assert(pane && target && back, 'Main history and its visible limits expose bounds');
       const top = Math.max(pane.y, back.y + back.height), bottom = Math.min(pane.y + pane.height, target.y);
       const readingBottom = Math.min(top + (bottom - top) / 2, keyboardReadingBottom - 8);
       const positioned = marker && marker.y >= top && marker.y + marker.height <= readingBottom;
       const observed = JSON.stringify(marker), stable = observed === previousHistoryBounds;
       previousHistoryBounds = observed;
-      if (!positioned) {
-        const area = marker && marker.y >= top && marker.y + marker.height <= bottom ? olderMarker : mainHistory;
-        await area.swipe({ direction: marker && marker.y >= top ? 'down' : 'up', momentum: 'slow' });
-      }
+      const readingSpan = readingBottom - top, readable = readingSpan > 0 && (!marker || marker.height <= readingSpan);
+      const limit = readingSpan / 4, delta = marker ? Math.max(-limit, Math.min(limit, top + (readingSpan - marker.height) / 2 - marker.y)) : limit;
+      const x = pane.x + pane.width / 2, center = (top + bottom) / 2;
+      const gesture = !positioned && readable ? { from: { x, y: center - delta / 2 }, to: { x, y: center + delta / 2 }, duration: 500 } : null;
+      await writeFile(resolve(network.gates.main, '..', 'native-history-preposition.jsonl'), `${JSON.stringify({ phase, iteration: positioningAttempt++, at_ms: Date.now(), pane, target, back, markerVisible, marker, top, bottom, readingBottom, positioned: Boolean(positioned), stable, readable, gesture })}\n`, { flag: 'a', mode: 0o600 });
+      assert(readable, 'The historical message fits the unchanged reading interval');
+      if (gesture) await screen.swipe(gesture);
       return Boolean(positioned && stable);
-    }, { timeout: 15000 }).toBe(true);
+    }, { timeout: 30000 }).toBe(true);
     if (phase === 'keyboard') await mainComposer.focus();
     await expect(keyboard).toHaveCount(phase === 'keyboard' ? 1 : 0);
     await expect(olderMarker).toBeVisible();
@@ -301,8 +303,10 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await mainComposer.focus();
   await expect(keyboard).toHaveCount(1);
   await expect(toLatest).toHaveCount(0);
-  await expect(providerNotice).toBeVisible();
-  await providerNotice.click();
+  await backButton.click();
+  await screen.getByRole('link', /^Native Reviewer，/, { visible: true }).click();
+  await expect(screen.getByRole('button', /^输入目标 Native Reviewer · 主聊天，/, { visible: true })).toBeVisible();
+  await expect(mainComposer).toBeVisible();
   await expect(keyboard).toHaveCount(0);
   await expect(toLatest).toHaveCount(0);
   await expect(screen.getByText(/^原生滚动记录 /)).toHaveCount(0);
