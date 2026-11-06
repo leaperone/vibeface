@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Land one mechanical daily version PR, then reconcile five immutable Nightlies."""
+"""Land one mechanical daily version PR, then reconcile the product and www Nightlies."""
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,7 +21,10 @@ CI = '.github/workflows/ci.yml'
 RELEASE = '.github/workflows/release.yml'
 PATHS = ('apps/www/package.json', 'apps/app/package.json', 'apps/core/Cargo.toml',
          'apps/cli/Cargo.toml', 'Cargo.lock', 'apps/mobile/app.json')
-PRODUCT_APPS = ('app', 'core', 'cli', 'mobile')
+PRODUCT_APPS = release.PRODUCT_APPS
+RELEASES = release.RELEASES
+PRODUCER = 'collect'
+PUBLISHERS = ('publish', 'npm')
 BOT = '41898282+github-actions[bot]@users.noreply.github.com'
 require = release.require
 
@@ -126,36 +129,34 @@ def versions_at(commit):
     return values
 
 
+def declared_versions(tags):
+    """Versions already claimed by real release tags, per release group."""
+    values = {group: [] for group in RELEASES}
+    for tag in tags:
+        try:
+            group, value, _ = release.parse_tag(tag)
+        except ValueError:
+            continue
+        values[group].append(value)
+    return values
+
+
+def next_sequence(prefix, claimed):
+    sequences = [int(value[len(prefix):]) for value in claimed
+                 if value.startswith(prefix) and re.fullmatch(r'[1-9][0-9]*', value[len(prefix):])]
+    return prefix + str(max(sequences, default=0) + 1)
+
+
 def plan_versions(day, base, tags):
     datetime.datetime.strptime(day, '%Y%m%d')
     values = versions_at(base)
-    baseline = values['cli'].split('-', 1)[0]
-    product_prefix = f'{baseline}-nightly.{day}.'
-    existing_product = []
-    product_tag_re = re.compile(r'^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:nightly|rc)\.|$)')
-    for tag in tags:
-        if product_tag_re.match(tag):
-            existing_product.append(tag[1:])
-        else:
-            for app in PRODUCT_APPS:
-                p = app + '-v'
-                if tag.startswith(p):
-                    existing_product.append(tag[len(p):])
-                    break
-    existing_product.append(values['cli'])
-    sequences = [int(value[len(product_prefix):]) for value in existing_product
-                 if value.startswith(product_prefix) and re.fullmatch(r'[1-9][0-9]*', value[len(product_prefix):])]
-    product_ver = product_prefix + str(max(sequences, default=0) + 1)
+    claimed = declared_versions(tags)
+    product_prefix = values['cli'].split('-', 1)[0] + f'-nightly.{day}.'
+    product_ver = next_sequence(product_prefix, claimed['product'] + [values[app] for app in PRODUCT_APPS])
+    www_prefix = values['www'].split('-', 1)[0] + f'-nightly.{day}.'
+    values['www'] = next_sequence(www_prefix, claimed['www'] + [values['www']])
     for app in PRODUCT_APPS:
         values[app] = product_ver
-    app = 'www'
-    current = values[app]
-    www_baseline = current.split('-', 1)[0]
-    www_prefix = f'{www_baseline}-nightly.{day}.'
-    www_existing = [current] + [tag[len('www-v'):] for tag in tags if tag.startswith('www-v')]
-    www_sequences = [int(value[len(www_prefix):]) for value in www_existing
-                     if value.startswith(www_prefix) and re.fullmatch(r'[1-9][0-9]*', value[len(www_prefix):])]
-    values[app] = www_prefix + str(max(www_sequences, default=0) + 1)
     expo = json.loads(blob(base, 'apps/mobile/app.json'))['expo']
     code = expo['android']['versionCode']
     require(type(code) is int and 0 < code < 2100000000, 'Android versionCode cannot be incremented')
@@ -413,12 +414,11 @@ def release_state(tag):
 
 
 def release_dispatch_tag(app):
-    """Resolve workflow dispatch tag: product uses v<version>, www uses www-v<version>, mobile unchanged."""
+    """Daily Nightly publishes exactly two groups: product v<version> and www www-v<version>."""
+    require(app in RELEASES, 'daily Nightly publishes only the product and www release groups')
     if app == 'product':
-        return 'v' + release.read_version('cli')
-    if app == 'www':
-        return 'www-v' + release.read_version('www')
-    return release.identity(app)['tag']
+        return release.release_tag_for('product', release.require_product_version_alignment())
+    return release.release_tag_for('www', release.read_version('www'))
 
 
 def start_release(app, source):
@@ -430,31 +430,47 @@ def start_release(app, source):
         return runs
     if not runs:
         require(state is None, 'draft release has no original run; original bytes cannot be recovered')
-        runs = reconcile_write(lambda: api('actions/workflows/release.yml/dispatches', 'POST', dict(ref=tag, inputs=dict(tag=tag))),
+        # The release workflow only builds unless publish is requested explicitly.
+        inputs = dict(app=app, tag=tag, publish='true')
+        runs = reconcile_write(lambda: api('actions/workflows/release.yml/dispatches', 'POST', dict(ref=tag, inputs=inputs)),
                                lambda: matching_runs(RELEASE, source, tag, {'push', 'workflow_dispatch'}), bool, 'release workflow dispatch')
     return runs
 
 
+def job_leaf(job):
+    return job['name'].split(' / ')[-1]
+
+
+def original_artifacts(app, run, source):
+    """Immutable artifact IDs the publisher jobs must reuse instead of rebuilding."""
+    prefixes = [f'{app}-release-{source}-']
+    if app == 'product':
+        prefixes.append(f'npm-package-{source}-')
+    available = [artifact for artifact in pages(f'actions/runs/{run["id"]}/artifacts', 'artifacts')
+                 if not artifact['expired'] and artifact['size_in_bytes'] > 0
+                 and (artifact.get('workflow_run') or {}).get('id') == run['id']
+                 and (artifact.get('workflow_run') or {}).get('head_sha') == source]
+    identifiers = {}
+    for prefix in prefixes:
+        matches = [artifact for artifact in available
+                   if re.fullmatch(re.escape(prefix) + r'[1-9][0-9]*', artifact['name'])
+                   and int(artifact['name'][len(prefix):]) <= run['run_attempt']]
+        require(len(matches) == 1 and type(matches[0]['id']) is int and matches[0]['id'] > 0,
+                'original complete release artifact is unavailable; refusing a rebuild')
+        identifiers[prefix] = matches[0]['id']
+    return identifiers
+
+
 def recover_publisher(app, run, source):
-    artifacts = pages(f'actions/runs/{run["id"]}/artifacts', 'artifacts')
-    if app in ('www', 'app'):
-        expected = {'static-release'}
-    elif app == 'mobile':
-        expected = {f'release-android-{source}'}
-    else:
-        expected = {'native-' + target for target in release.TARGETS}
-    available = [artifact['name'] for artifact in artifacts if not artifact['expired'] and artifact['size_in_bytes'] > 0]
-    require(all(available.count(name) == 1 for name in expected), 'original complete release artifact is unavailable; refusing a rebuild')
+    require(app in RELEASES, 'only the product and www release groups can be recovered')
     jobs = pages(f'actions/runs/{run["id"]}/jobs?filter=latest', 'jobs')
+    producers = [job for job in jobs if job_leaf(job) == PRODUCER]
+    require(len(producers) == 1 and producers[0]['conclusion'] == 'success',
+            'the complete release artifact producer did not succeed; refusing a publisher recovery')
     failed = [job for job in jobs if job['conclusion'] not in ('success', 'skipped')]
-    if app in ('www', 'app'):
-        publisher = 'publish-static'
-    elif app == 'mobile':
-        publisher = 'publish-android'
-    else:
-        publisher = 'publish-native'
-    require(failed and all(job['status'] == 'completed' and job['name'].split(' / ')[-1] == publisher for job in failed),
-            'failure includes a build job; only an original-artifact publisher may be recovered')
+    require(failed and all(job['status'] == 'completed' and job_leaf(job) in PUBLISHERS for job in failed),
+            'failure includes a producer job; only an original-artifact publisher may be recovered')
+    original_artifacts(app, run, source)
     return rerun(run, True)
 
 
@@ -467,17 +483,15 @@ def finish_release(app, source, deadline):
         state = release_state(tag)
         active = [run for run in runs if run['status'] != 'completed']
         if not active:
-            if state and not state['draft']:
-                if app == 'product':
-                    require(runs and all(run['conclusion'] == 'success' for run in runs),
-                            'product release workflow did not succeed; reconcile npm and rerun failed jobs in the original run')
+            require(runs, 'release has no original workflow run')
+            require(len(runs) == 1, 'multiple release runs for one tag; reconcile original artifacts manually')
+            run = runs[0]
+            # A public Release with a failed npm job is not a success; it is a recoverable publisher failure.
+            if state and not state['draft'] and run['conclusion'] == 'success':
                 with tempfile.TemporaryDirectory(dir=scratch(), prefix='public-') as temporary:
                     release.verify_public(app, Path(temporary) / 'assets')
-                return [dict(id=run['id'], url=run['html_url'], conclusion=run['conclusion']) for run in runs]
-            require(runs, 'release has no original workflow run')
-            require(len(runs) == 1, 'multiple unsuccessful release runs; reconcile original artifacts manually')
-            run = runs[0]
-            require(run['conclusion'] != 'success' and run['id'] not in restored, 'release is not public after original workflow completion')
+                return [dict(id=run['id'], url=run['html_url'], conclusion=run['conclusion'])]
+            require(run['id'] not in restored, 'release is not complete after original workflow completion')
             restored.add(run['id'])
             recover_publisher(app, run, source)
         time.sleep(15)
@@ -486,7 +500,7 @@ def finish_release(app, source, deadline):
 
 def publish_daily(source, deadline):
     receipt = {}; started = []; errors = []
-    for app in ('product', 'www', 'mobile'):
+    for app in RELEASES:
         started.append(app)
         try:
             start_release(app, source)
@@ -494,7 +508,7 @@ def publish_daily(source, deadline):
             errors.append(f'{app}: {error}')
             break
     if not errors:
-        for app in ('product', 'www', 'mobile'):
+        for app in RELEASES:
             if app not in started:
                 continue
             try:
@@ -537,9 +551,9 @@ def run_daily(run_id):
             require(versions_at(source) == plan.versions, 'landed daily versions changed')
             environment = {key: value for key, value in os.environ.items()
                            if key not in ('GITHUB_EVENT_NAME', 'GITHUB_REF', 'NIGHTLY_RELEASE_TOKEN')}
-            for tag in ('v' + plan.versions['cli'], 'www-v' + plan.versions['www'],
-                        'mobile-v' + plan.versions['mobile']):
-                subprocess.run(['python3', str(clean / 'scripts/release.py'), 'plan', '--tag', tag, '--require-main'],
+            for app in RELEASES:
+                tag = release.release_tag_for(app, plan.versions['cli' if app == 'product' else 'www'])
+                subprocess.run(['python3', str(clean / 'scripts/release.py'), 'plan', '--app', app, '--tag', tag, '--require-main'],
                                cwd=clean, env=environment, check=True)
             releases = publish_daily(source, deadline)
         finally:
@@ -592,13 +606,18 @@ def self_test():
 
         with patch(f'{__name__}.ROOT', root), patch('release.ROOT', root), patch(f'{__name__}.time.sleep'), \
                 patch('subprocess.check_output', side_effect=metadata_cargo_stub):
+            assert RELEASES == ('product', 'www') and PRODUCT_APPS == ('app', 'core', 'cli', 'mobile')
             base = git('rev-parse', 'HEAD')
-            plan = plan_versions('20261106', base, ['core-v0.0.1-nightly.20261106.7'])
+            # Legacy component tags no longer claim a sequence; only real v/www-v tags and the current cohort do.
+            plan = plan_versions('20261106', base, ['v0.0.1-nightly.20261106.7', 'core-v0.0.1-nightly.20261106.9',
+                                                    'mobile-v0.0.1-nightly.20261106.9', 'cli-v0.0.1-nightly.20261106.9'])
             assert plan.versions['core'] == '0.0.1-nightly.20261106.8'
-            assert plan.versions['app'] == plan.versions['cli'] == plan.versions['core']
+            assert all(plan.versions[app] == plan.versions['cli'] for app in PRODUCT_APPS)
             assert plan.versions['www'] == '0.0.1-nightly.20261106.1'
             assert plan_versions('20261105', base, []).versions['core'].endswith('.3')
             assert plan_versions('20261106', base, ['v0.0.1-nightly.20261106.9']).versions['cli'].endswith('.10')
+            assert plan_versions('20261106', base, ['www-v0.0.1-nightly.20261106.4']).versions['www'].endswith('.5')
+            assert plan_versions('20261106', base, ['www-v0.0.1-nightly.20261106.4']).versions['cli'].endswith('.1')
             contents = generated(plan)
             assert json.loads(contents['apps/mobile/app.json'])['expo']['ios']['buildNumber'] == '99'
             assert contents['Cargo.lock'].count(b'[[package]]') == 2
@@ -628,6 +647,12 @@ def self_test():
                 bad = commit_files({path: content})
                 rejected(lambda: verify_tree(plan, bad), 'mechanical')
                 git('checkout', '--detach', '-q', base)
+            # An old per-app operation is refused outright instead of being reinterpreted as a new cohort.
+            stale = commit_files({'apps/mobile/app.json': contents['apps/mobile/app.json'].replace(
+                b'"releaseVersion": "0.0.1-nightly.20261106.8"', b'"releaseVersion": "0.0.1-nightly.20261106.9"')})
+            rejected(lambda: verify_tree(plan, stale), 'mechanical')
+            rejected(lambda: verify_tree(recovered_plan(plan.day, stale), stale), 'canonical version')
+            git('checkout', '--detach', '-q', base)
             head = commit_files({})
             git('checkout', '--detach', '-q', base)
             (root / 'business.txt').write_text('main advanced independently\n')
@@ -705,6 +730,14 @@ def self_test():
                 assert wait_main_ci(merged, time.monotonic() + 1)['run_attempt'] == 2
                 assert writes == ['actions/runs/1/rerun']
 
+            assert release_dispatch_tag('product') == 'v0.0.1-nightly.20261105.2'
+            assert release_dispatch_tag('www') == 'www-v0.0.1'
+            for group in ('mobile', 'app', 'core', 'cli'):
+                rejected(lambda: release_dispatch_tag(group), 'product and www release groups')
+            git('checkout', '--detach', '-q', stale)
+            rejected(lambda: release_dispatch_tag('product'), 'must equal CLI version')
+            git('checkout', '--detach', '-q', advanced)
+
             writes = []; remote = {'tag': None, 'runs': [], 'public': False}
             tag = 'v' + plan.versions['cli']
 
@@ -714,6 +747,8 @@ def self_test():
                     if path == 'git/refs':
                         remote['tag'] = data['sha']
                     elif path.endswith('/dispatches'):
+                        # A real daily release must request publication, not a build-only dry run.
+                        assert data == dict(ref=tag, inputs=dict(app='product', tag=tag, publish='true'))
                         remote['runs'] = [dict(good, head_branch=tag, event='workflow_dispatch', path=RELEASE)]
                     else:
                         raise AssertionError('unexpected write')
@@ -744,57 +779,109 @@ def self_test():
                     raise ValueError('rerun response lost')
                 return attempts['value']
 
-            def recovery_pages(path, key):
-                return [dict(name='static-release', expired=False, size_in_bytes=100)] if key == 'artifacts' else [dict(name='publish-static', status='completed', conclusion='failure')]
+            produced = dict(workflow_run=dict(id=1, head_sha=merged), expired=False, size_in_bytes=100)
+            remote_state = {
+                'artifacts': [dict(produced, id=51, name=f'product-release-{merged}-1'),
+                              dict(produced, id=52, name=f'npm-package-{merged}-1')],
+                'jobs': [dict(name='collect', status='completed', conclusion='success'),
+                         dict(name='publish', status='completed', conclusion='success'),
+                         dict(name='npm / npm', status='completed', conclusion='failure')],
+            }
 
+            def recovery_pages(path, key):
+                return list(remote_state['artifacts' if key == 'artifacts' else 'jobs'])
+
+            failing = dict(good, conclusion='failure')
             with patch(f'{__name__}.api', side_effect=recovery_api), patch(f'{__name__}.pages', side_effect=recovery_pages):
-                assert recover_publisher('app', dict(good, conclusion='failure'), merged)['run_attempt'] == 2
+                # A public product Release whose npm job failed is recovered from the original immutable artifacts.
+                assert original_artifacts('product', failing, merged) == {
+                    f'product-release-{merged}-': 51, f'npm-package-{merged}-': 52}
+                assert recover_publisher('product', failing, merged)['run_attempt'] == 2
                 assert writes == ['actions/runs/1/rerun-failed-jobs']
-                with patch(f'{__name__}.pages', return_value=[]):
-                    rejected(lambda: recover_publisher('app', good, merged), 'artifact is unavailable')
+                for artifacts in ([], [dict(produced, id=51, name=f'product-release-{merged}-1')],
+                                  [dict(produced, id=51, name=f'product-release-{merged}-1'),
+                                   dict(produced, id=52, name=f'npm-package-{merged}-2')],
+                                  [dict(produced, id=51, name=f'product-release-{merged}-1'),
+                                   dict(produced, id=52, name=f'npm-package-{merged}-1', expired=True)],
+                                  [dict(produced, id=51, name=f'product-release-{merged}-1'),
+                                   dict(produced, id=52, name=f'npm-package-{merged}-1', workflow_run=dict(id=9, head_sha=merged))],
+                                  [dict(produced, id=51, name=f'product-release-{merged}-1'),
+                                   dict(produced, id=52, name=f'npm-package-{merged}-1', workflow_run=dict(id=1, head_sha='b' * 40))]):
+                    with patch.dict(remote_state, {'artifacts': artifacts}):
+                        rejected(lambda: recover_publisher('product', failing, merged), 'refusing a rebuild')
+                for jobs in ([dict(name='collect', status='completed', conclusion='success'),
+                              dict(name='compose-macos', status='completed', conclusion='failure')],
+                             [dict(name='collect', status='completed', conclusion='success'),
+                              dict(name='npm / npm', status='in_progress', conclusion=None)],
+                             [dict(name='collect', status='completed', conclusion='success'),
+                              dict(name='publish', status='completed', conclusion='success')]):
+                    with patch.dict(remote_state, {'jobs': jobs}):
+                        rejected(lambda: recover_publisher('product', failing, merged), 'only an original-artifact publisher')
+                for jobs in ([dict(name='collect', status='completed', conclusion='failure'),
+                              dict(name='publish', status='completed', conclusion='failure')],
+                             [dict(name='publish', status='completed', conclusion='failure')]):
+                    with patch.dict(remote_state, {'jobs': jobs}):
+                        rejected(lambda: recover_publisher('product', failing, merged), 'producer did not succeed')
+                rejected(lambda: recover_publisher('mobile', failing, merged), 'product and www')
                 assert len(writes) == 1
 
             with patch(f'{__name__}.tag_sha', return_value=merged), patch(f'{__name__}.release_state', return_value=dict(draft=False)), \
                     patch('release.verify_public') as verified, patch(f'{__name__}.recover_publisher') as no_retry, \
                     patch(f'{__name__}.release_dispatch_tag', return_value='v' + plan.versions['cli']):
-                for runs in ([], [dict(good, conclusion='failure')]):
-                    with patch(f'{__name__}.matching_runs', return_value=runs):
-                        rejected(lambda: finish_release('product', merged, time.monotonic() + 1), 'reconcile npm')
+                with patch(f'{__name__}.matching_runs', return_value=[]):
+                    rejected(lambda: finish_release('product', merged, time.monotonic() + 1), 'no original workflow run')
                 verified.assert_not_called()
                 no_retry.assert_not_called()
+                # A failed npm job keeps the product outcome red even though the Release is already public.
+                with patch(f'{__name__}.matching_runs', return_value=[failing]), patch(f'{__name__}.time.sleep'):
+                    rejected(lambda: finish_release('product', merged, time.monotonic() + 1), 'not complete')
+                assert no_retry.call_count == 1
+                verified.assert_not_called()
                 with patch(f'{__name__}.matching_runs', side_effect=[[dict(good, status='in_progress', conclusion=None)], [dict(good, run_attempt=2)]]), \
                         patch(f'{__name__}.time.sleep'):
                     assert finish_release('product', merged, time.monotonic() + 1)[0]['conclusion'] == 'success'
                 verified.assert_called_once()
 
+            with patch(f'{__name__}.tag_sha', return_value=merged), patch(f'{__name__}.release_state', return_value=None), \
+                    patch('release.verify_public') as verified, patch(f'{__name__}.recover_publisher') as no_retry, \
+                    patch(f'{__name__}.release_dispatch_tag', return_value='v' + plan.versions['cli']), \
+                    patch(f'{__name__}.matching_runs', return_value=[failing]), patch(f'{__name__}.time.sleep'):
+                rejected(lambda: finish_release('product', merged, time.monotonic() + 1), 'not complete')
+                verified.assert_not_called()
+                assert no_retry.call_count == 1
+
             for blocked in ('product', 'www', None):
                 operations = []
                 def finish(app, *args):
                     operations.append(('verified', app))
-                    require(app != blocked, 'component is not public or verified')
+                    require(app != blocked, 'release group is not public or verified')
                     return []
                 with patch(f'{__name__}.start_release', side_effect=lambda app, *args: operations.append(('started', app))), \
                         patch(f'{__name__}.finish_release', side_effect=finish), patch(f'{__name__}.matching_runs', return_value=[]):
                     if blocked:
                         rejected(lambda: publish_daily(merged, 1), 'not public')
+                        # www is independent: the other group is still started and reconciled.
+                        assert [app for operation, app in operations if operation == 'started'] == list(RELEASES)
+                        assert {app for operation, app in operations if operation == 'verified'} == set(RELEASES)
                     else:
-                        assert set(publish_daily(merged, 1)) == {'product', 'www', 'mobile'}
+                        assert set(publish_daily(merged, 1)) == {'product', 'www'}
+                        assert operations[:2] == [('started', 'product'), ('started', 'www')]
             observed = []
             def drain(*args):
                 tag = args[2]
                 observed.append(tag)
                 n = sum(1 for t in observed if t == tag)
                 return [dict(good, status='in_progress', conclusion=None)] if n == 1 else [good]
-            with patch(f'{__name__}.start_release'), patch(f'{__name__}.finish_release', side_effect=ValueError('component failed')), \
+            with patch(f'{__name__}.start_release'), patch(f'{__name__}.finish_release', side_effect=ValueError('release group failed')), \
                     patch(f'{__name__}.matching_runs', side_effect=drain), patch(f'{__name__}.time.monotonic', return_value=0):
-                rejected(lambda: publish_daily(merged, 1), 'component failed')
-                assert len(observed) == 6
-                assert observed[0] == observed[1] and observed[2] == observed[3] and observed[4] == observed[5]
-                tags3 = {observed[0], observed[2], observed[4]}
-                assert len(tags3) == 3
-                assert any(t.startswith('v') and t[1] in '0123456789' for t in tags3)
-                assert any(t.startswith('www-v') for t in tags3)
-                assert any(t.startswith('mobile-v') for t in tags3)
+                rejected(lambda: publish_daily(merged, 1), 'release group failed')
+                assert len(observed) == 4
+                assert observed[0] == observed[1] and observed[2] == observed[3]
+                groups = {observed[0], observed[2]}
+                assert len(groups) == 2
+                assert any(t.startswith('v') and t[1] in '0123456789' for t in groups)
+                assert any(t.startswith('www-v') for t in groups)
+                assert not any(t.startswith('mobile-v') or t.startswith('app-v') or t.startswith('core-v') for t in groups)
 
             environment = dict(GITHUB_REPOSITORY=REPO, GITHUB_EVENT_NAME='schedule', GITHUB_REF='refs/heads/main',
                                GITHUB_RUN_ID='42', GITHUB_SHA=merged, NIGHTLY_RELEASE_TOKEN='fixture-only', GH_TOKEN='fixture-only')
@@ -815,11 +902,9 @@ def self_test():
     workflow = (ROOT / CI).read_text()
     assert "cron: '23 3 * * *'" in workflow and 'group: daily-nightly\n      cancel-in-progress: false' in workflow
     assert "if: github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.ci-gate.result == 'success'" in workflow
-    static = (ROOT / RELEASE).read_text()
-    android = (ROOT / '.github/workflows/release-apps.yml').read_text()
-    assert 'needs: [identity, publish-static]' in static and 'name: static-release' in static
-    assert android.index('python3 scripts/release.py manifest mobile') < android.index('actions/upload-artifact@')
-    assert 'needs: build-android' in android and 'path: .artifacts/android/*' in android
+    npm = (ROOT / '.github/workflows/npm-publish.yml').read_text()
+    assert 'id-token: write' in npm and 'environment: npm-release' in npm and 'default: false' in npm
+    assert 'NPM_TOKEN' not in npm and 'secrets.' not in npm
     print('daily Nightly real-Git, identity, reconciliation and original-artifact self-tests passed')
 
 

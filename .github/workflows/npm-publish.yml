@@ -7,7 +7,7 @@ on:
         type: string
         required: true
       artifact_id:
-        description: Immutable npm artifact from the successful publish-native job
+        description: Immutable npm artifact from the successful collect job
         type: string
         required: true
       publish:
@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing Nightly tag whose release npm artifact will be used
+        description: Existing product Nightly tag whose release npm artifact will be used
         type: string
         required: true
       publish:
