@@ -62,9 +62,9 @@ jobs:
         run: |
           "$PACKAGE/vibeface$EXE" --help
           "$PACKAGE/vibeface-core$EXE" --version
-          # The Windows process, private IPC, service and provider checks run in the Windows native
-          # workflow with the Windows verifier; this verifier covers the POSIX platforms.
-          if [[ -z "$EXE" ]]; then
+          if [[ -n "$EXE" ]]; then
+            "$PY" -B scripts/verify-windows-node.py --package "$PACKAGE" --artifacts .artifacts/release-smoke
+          else
             "$PY" -B scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/release-smoke --web-only
           fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

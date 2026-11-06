@@ -13,12 +13,12 @@ Core、CLI、Web App 和 Mobile 共享一个版本、一个 `v<version>` Tag 与
 
 | 发布组 | Tag | 交付物 |
 | --- | --- | --- |
-| product | `v<version>` | 三个平台的完整电脑包与 Core、Web App 归档、Android APK，以及各自校验信息 |
+| product | `v<version>` | 四个平台的完整 CLI/Core 包、macOS 与 Windows 桌面安装包、Web App 归档、Android APK，以及各自校验信息 |
 | www | `www-v<version>` | 静态官网与文档归档 |
 
 首个正式版为 `0.0.1`。Nightly 使用 `0.0.1-nightly.YYYYMMDD.N`，日期取 UTC 准备日期，序号按发布组递增。Mobile 的 `expo.version` 保持 `0.0.1`，Android versionCode 独立递增。当前 Mobile 发行目标是 Android APK，不代表 TestFlight、App Store 或 OTA 交付。
 
-身份检查后，Web、macOS 原生程序、Linux x64 原生程序、Linux ARM64 原生程序和 Android 同时构建。原生任务一次编译本平台 CLI 与 Core。每个平台的组包只等自己的原生输入和 Web，不等待其他平台，也不读取另一个公开 Release。
+身份检查后，Web、macOS 原生程序、Windows 原生程序、Linux x64 原生程序、Linux ARM64 原生程序和 Android 同时构建。原生任务一次编译本平台 CLI 与 Core。每个平台的组包只等自己的原生输入和 Web，不等待其他平台，也不读取另一个公开 Release。
 
 流水线按不可变 artifact ID 传递输入，核对源码、版本、目标平台、完整文件集合及 SHA-256。所有目标通过后汇总 17 个载荷文件与一个 `release.json`，由唯一发布任务上传、回读验证，再公开 Release。缺失、错源、损坏或失败目标都会阻止公开。
 
@@ -42,13 +42,14 @@ Core、CLI、Web App 和 Mobile 共享一个版本、一个 `v<version>` Tag 与
 
 ## 可下载的包
 
-每个平台的 Actions artifact 包含 `vibeface-<version>-<target>.tar.gz` 和同名 `.sha256`。`main` 的核心检查按需生成 Linux x64 包；扩展检查在三种架构的原生 runner 构建，解包后分别启动网页进程。多 Node、单 Node 调度、跨设备协作和公共入口的多进程验收只在 Linux x64 运行一次，聊天 Agent 与写入保护验收只在 macOS ARM64 运行一次，都不调用模型。
+每个平台的 Actions artifact 包含 `vibeface-<version>-<target>.tar.gz` 和同名 `.sha256`。`main` 的核心检查按需生成 Linux x64 包；扩展检查在四个目标的原生 runner 构建，解包后分别启动网页进程。多 Node、单 Node 调度、跨设备协作和公共入口的多进程验收只在 Linux x64 运行一次，聊天 Agent 与写入保护验收只在 macOS ARM64 运行一次，都不调用模型。
 
 | 平台 | Rust target | 构建和验收环境 |
 | --- | --- | --- |
 | Linux x64 | `x86_64-unknown-linux-gnu` | Ubuntu 24.04 |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` | Ubuntu 24.04 ARM64 |
 | macOS Apple Silicon | `aarch64-apple-darwin` | macOS 15 ARM64 |
+| Windows x64 | `x86_64-pc-windows-msvc` | Windows 2025，MSVC |
 
 Linux 包依赖 glibc，未在旧版发行版验收。扩展检查和产品 Tag 产出的 macOS 包，`vibeface` 与 `vibeface-core` 程序使用 Developer ID 签名，启用 hardened runtime，identifier 为 `cn.leaperone.vibeface`，并通过 Apple notarization。应用防火墙保持默认的“自动允许下载的已签名软件”设置时据此放行，安装和更新后不再询问是否接受传入连接。`main` 的核心检查不生成 macOS 包。本地运行 `scripts/package-node.sh` 时，只有设置 `VIBEFACE_CODESIGN_IDENTITY` 才签名；同时设置 `VIBEFACE_NOTARY_KEY`、`VIBEFACE_NOTARY_KEY_ID` 和 `VIBEFACE_NOTARY_ISSUER` 才提交 notarization，三者须同时设置，状态不是 `Accepted` 时打包失败。裸 Mach-O 无法 staple；带隔离属性的文件首次运行时由 Gatekeeper 在线核对公证记录。Apple 接受公证后，在线记录可能数分钟后才能查到，CI 因此按退避间隔重试 Gatekeeper 评估，最长约 14 分钟，只接受 `source=Notarized Developer ID`。产品发布入口验证签名和公证 `Accepted`，Gatekeeper 在线验收另行记录。
 
@@ -122,7 +123,7 @@ pnpm --filter vibeface-www run check:static
 
 数字不带前导零，日期必须有效。Tag 一经创建不可移动、删除重用或覆盖，不创建可变 `nightly` Tag，不追加 build metadata。
 
-1. 在同一 PR 更新四个产品版本及必要的 Cargo.lock，完成检查并按授权合并。
+1. 在同一 PR 更新所有产品组件版本及必要的 Cargo.lock，完成检查并按授权合并。
 2. 核对该完整提交的 main push CI success，再创建并推送 `v<version>`。一个产品 Tag 构建全部产品目标。
 3. 核对流水线全部生产者、组包和完整汇总成功，确认唯一 publisher 公开 Release。
 4. 下载并验证完整清单、包内来源、SHA-256 和实际运行结果。npm 与部署分别核对。
@@ -177,13 +178,13 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 ## npm Nightly 制品与发布
 
-npm 包名为 `@leaperone/vibeface`，已公开首版 `0.0.1-nightly.20261106.1`。Nightly 使用同名不可变版本和 `nightly` dist-tag。模板 `apps/cli/npm/package.json` 保持 private；打包脚本验证三个原生包后，为发布制品写入真实版本并移除 private 限制。
+npm 包名为 `@leaperone/vibeface`，已公开首版 `0.0.1-nightly.20261106.1`。Nightly 使用同名不可变版本和 `nightly` dist-tag。模板 `apps/cli/npm/package.json` 保持 private；打包脚本验证四个原生包后，为发布制品写入真实版本并移除 private 限制。
 
-`scripts/package-npm.mjs` 接收三个平台的完整 `.tar.gz` 与同名 SHA256，要求三个平台的 CLI 版本、CLI 源码、锁定组件身份及包协议一致，平台字段分别匹配各自 target。它拒绝危险路径、链接、特殊文件、校验错配和缺失资源，把完整包放入 `vendor/<target>`，再生成一个含全部平台的 `.tgz`。只有一个 npm 发布身份和一次发布操作，代价是下载包含其他平台的程序。没有 postinstall、运行期下载或新增 npm 依赖。
+`scripts/package-npm.mjs` 接收四个平台的完整 `.tar.gz` 与同名 SHA256，要求四个平台的 CLI 版本、CLI 源码、锁定组件身份及包协议一致，平台字段分别匹配各自 target。它拒绝危险路径、链接、特殊文件、校验错配和缺失资源，把完整包放入 `vendor/<target>`，再生成一个含全部平台的 `.tgz`。只有一个 npm 发布身份和一次发布操作，代价是下载包含其他平台的程序。没有 postinstall、运行期下载或新增 npm 依赖。
 
-定时和手动扩展 CI 生成 `npm-package-<SHA>` artifact。产品 Nightly 汇总生成 `npm-package-<SHA>-<producer_attempt>`，由 `collect` 输出不可变 artifact ID。npm job 使用该 id 下载，失败后单独重跑仍使用原 producer 的制品，不按当前 run attempt 拼接名称。两种 artifact 都包含 `.tgz` 和记录源码 SHA、SHA256、npm integrity 的 JSON。CI 在三个原生平台上以 `--ignore-scripts` 全局安装到隔离 prefix，然后验证版本，并以 `--web-only` 验证启动和随包网页，不重复完整多节点验收。Stable 和 rc 延续现有 GitHub 发布流程，不生成 npm 包。
+定时和手动扩展 CI 生成 `npm-package-<SHA>` artifact。产品 Nightly 汇总生成 `npm-package-<SHA>-<producer_attempt>`，由 `collect` 输出不可变 artifact ID。npm job 使用该 id 下载，失败后单独重跑仍使用原 producer 的制品，不按当前 run attempt 拼接名称。两种 artifact 都包含 `.tgz` 和记录源码 SHA、SHA256、npm integrity 的 JSON。CI 在四个原生平台上以 `--ignore-scripts` 全局安装到隔离 prefix，然后验证版本；POSIX 平台另以 `--web-only` 验证启动和随包网页，不重复完整多节点验收。Stable 和 rc 延续现有 GitHub 发布流程，不生成 npm 包。
 
-本地检查与打包命令如下。输入目录只能包含对应版本的三个包与三个 checksum，默认输出 `.artifacts/npm`，已有同名制品会被保留并报错：
+本地检查与打包命令如下。输入目录只能包含对应版本的四个包与四个 checksum，默认输出 `.artifacts/npm`，已有同名制品会被保留并报错：
 
 ```sh
 node scripts/package-npm.mjs --self-test
@@ -214,3 +215,12 @@ gh workflow run npm-publish.yml --repo leaperone/vibeface --ref v<version> \
 需要手动公开发布时，把 `publish` 设为 true。若原发布 run 的 npm job 失败，优先对账后使用 `gh run rerun <run-id> --failed`，复用原 artifact id；不要重建归档。每日协调器不会自动重试 npm 失败。
 
 发布器先读取公开 registry，只把 HTTP 404 当作包不存在，传输失败、其他 HTTP 错误和无效响应都停止发布。已有目标版本的 integrity 必须相同，且 `nightly` 等于目标或更高时直接成功，不降级。已有版本但 `nightly` 缺失或较旧时停止并要求对账，不自动修改 dist-tag。仅目标版本不存在且比当前 Nightly 更新时执行一次 `npm publish --provenance`。随后最多进行 40 次只读查询，等待 registry 确认 integrity 和渠道；包括发布响应丢失的情况，也不自动重发。未核实公开结果始终失败。公开版本不能覆盖，不能通过复用 tag 更换内容。
+
+
+## 桌面与 Windows 签名
+
+每个平台的桌面任务只等待自身完整运行包。macOS 生成 DMG 和 ZIP，Windows 生成当前用户安装的 NSIS EXE 和 ZIP。每组制品携带 SHA256 与来源收据，记录 Electron 版本、产品版本、源码和内置运行包摘要。打包后再次核对运行包的 `FILES.sha256`，禁止 Electron 重新签名或改写已经封存的 CLI 与 Core。
+
+Windows 签名使用可选仓库 secrets `WINDOWS_CERTIFICATE_PFX_BASE64` 和 `WINDOWS_CERTIFICATE_PASSWORD`，证书密码可以为空。可通过 `WINDOWS_CERTIFICATE_SUBJECT` 和 `WINDOWS_CERTIFICATE_THUMBPRINT` 约束签名身份。配置证书后，原生任务先使用现有 Windows SDK 的 signtool 签名和添加时间戳，再封存程序；桌面任务签名应用与安装器，并在 Windows 上验证 Authenticode、时间戳和配置的身份。
+
+没有 Windows 证书时，Nightly 和 RC 可以生成标注为未签名开发预览的桌面包。Stable 产品在身份检查阶段拒绝缺少证书的构建。脚本不会购买证书、修改信任配置或把未签名包声明为已签名。

@@ -42,3 +42,6 @@ Windows 移植包含当前用户隔离的私有 IPC、文件权限、数据锁�
 实现按 Windows 运行时、桌面宿主、构建与交付三个边界分工，主 Agent 负责接口、集成和最终验收。开发分支使用已注册的 CI 手动入口运行真实 Windows/MSVC 与 macOS 构建；本机跨目标类型检查不代表 Windows 编译、链接或运行已通过。
 
 验收覆盖当前用户权限与私有通道、已有/自有进程的启停与异常恢复、服务及更新、实际桌面窗口、包内来源与摘要。Provider 使用受控夹具。开发预览与实际发布的签名状态分别记录，不把无签名预览、普通浏览器页面或 pending CI 报告成原生正式交付。
+
+
+Windows 的维护通道与 Codex App Server 使用不同接口。维护通道是带当前 SID DACL 的命名管道；Codex 使用官方 `unix://PATH`，底层为 Windows AF_UNIX。连接前核对私有父目录和内核报告的对端进程账户。App Server 的路径指针使用 `.endpoint`，不把指针文件当作 socket，也不向上游传入未定义的命名管道 URL。
