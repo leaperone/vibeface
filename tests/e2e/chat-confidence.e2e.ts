@@ -7,7 +7,7 @@ import { expect, secrets } from 'e2e';
 test('chat keeps decisions and task records readable on desktop and phone', async ({ app, node, screen, browser }) => {
   await app.open(node.url);
   await screen.getByRole('button', '新建我的网络').click();
-  await screen.getByLabel('这台电脑叫什么？').fill('交互验收设备');
+  await screen.getByLabel('这个节点叫什么？').fill('交互验收设备');
   await screen.getByRole('button', '下一步').click();
   await screen.getByLabel(/^恢复密码/).fill(secrets.get('recoveryPassword'));
   await screen.getByRole('button', '下一步').click();
