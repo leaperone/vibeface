@@ -2609,6 +2609,115 @@ test('native chat folds runtime diagnostics and retains result checks without pr
   } finally { extras.close(); details.close() }
 })
 
+test('native composer adds photos and files without replacing current attachments or drafts', async (t) => {
+  type Attachment = import('../../../../../apps/mobile/src/data/types.ts').Attachment
+  type NativeButton = { text: string; onPress?: () => void; style?: string }
+  for (const os of ['ios', 'android']) await t.test(os, async () => {
+    const original = { uri: 'file:///report.pdf', name: 'report.pdf', size: 20, mimeType: 'application/pdf' }
+    const current = { uri: 'file:///current.txt', name: 'current.txt', size: null, mimeType: null }
+    const cache = new Map([
+      ['file:///cache/original.heic', { name: 'original.heic', size: 30, type: 'image/heic' }],
+      ['file:///cache/transparent.png', { name: 'transparent.png', size: 40, type: 'image/png' }],
+      ['file:///cache/photo.jpg', { name: 'photo.jpg', size: 50, type: 'image/jpeg' }],
+    ])
+    let files: Attachment[] = [original], updates = 0, renders = 0, usedCallback = 0
+    let photos = pendingResult(), documents = pendingResult(), selected: (() => void) | undefined
+    const photoCalls: unknown[] = [], fileCalls: unknown[] = []
+    const alerts: { title: string; message?: string; buttons?: NativeButton[] }[] = []
+    let sheet: { options: string[]; cancelButtonIndex: number } | undefined, sheetSelect: ((index: number) => void) | undefined
+    const app = componentHarness('../../../../../apps/mobile/src/features/chat/composer.tsx', {
+      'react-native': {
+        Platform: { OS: os }, TextInput: 'TextInput', View: 'View',
+        ActionSheetIOS: { showActionSheetWithOptions(options: typeof sheet, select: typeof sheetSelect) { sheet = options; sheetSelect = select } },
+        Alert: { alert(title: string, message?: string, buttons?: NativeButton[]) { alerts.push({ title, message, buttons }) } },
+      },
+      'expo-image-picker': {
+        UIImagePickerPreferredAssetRepresentationMode: { Current: 'current' },
+        launchImageLibraryAsync(options: unknown) { photoCalls.push(options); return photos.promise },
+      },
+      'expo-document-picker': { getDocumentAsync(options: unknown) { fileCalls.push(options); return documents.promise } },
+      'expo-file-system': { File: class {
+        readonly name: string; readonly size: number; readonly type: string
+        constructor(uri: string) {
+          const file = cache.get(uri)
+          assert.ok(file)
+          this.name = file.name; this.size = file.size; this.type = file.type
+        }
+      } },
+    })
+    const render = () => {
+      const callback = ++renders
+      return app.render('Composer', {
+        chrome: { kind: 'solid' }, value: '保留草稿', onChange() {}, files,
+        onFiles(next: Attachment[]) { usedCallback = callback; updates++; files = next }, blocked: null, sending: false, onSend() {},
+      })
+    }
+    const choose = (index: number) => {
+      const attach = render().find(({ props }) => String(props.accessibilityLabel).startsWith('添加附件'))?.props.onPress
+      assert.equal(typeof attach, 'function')
+      if (typeof attach === 'function') attach()
+      if (os === 'ios') {
+        assert.deepEqual(JSON.parse(JSON.stringify(sheet)), { options: ['照片图库', '文件', '取消'], cancelButtonIndex: 2 })
+        selected = () => sheetSelect?.(index)
+      } else {
+        const menu = alerts.at(-1)
+        assert.ok(menu)
+        assert.equal(menu?.title, '添加附件')
+        assert.deepEqual(Array.from(menu.buttons ?? [], ({ text }) => text), ['照片图库', '文件', '取消'])
+        selected = menu.buttons?.[index]?.onPress
+      }
+      selected?.()
+    }
+    const snapshot = () => JSON.parse(JSON.stringify(files))
+    try {
+      choose(0)
+      selected?.()
+      assert.equal(photoCalls.length, 1, 'only one picker can run at once')
+      assert.equal(fileCalls.length, 0)
+      assert.deepEqual(JSON.parse(JSON.stringify(photoCalls[0])), { mediaTypes: ['images'], allowsMultipleSelection: true, quality: 1, preferredAssetRepresentationMode: 'current' })
+      files = [current]; render()
+      photos.resolve({ canceled: false, assets: [
+        { uri: 'file:///cache/original.heic', fileName: null },
+        { uri: 'file:///cache/transparent.png' },
+        { uri: 'file:///cache/photo.jpg', fileName: 'holiday.jpg', fileSize: 50, mimeType: 'image/jpeg' },
+      ] })
+      await settleComponent()
+      assert.equal(usedCallback, renders, 'completion uses the current draft setter')
+      assert.deepEqual(snapshot(), [current,
+        { uri: 'file:///cache/original.heic', name: 'original.heic', size: 30, mimeType: 'image/heic' },
+        { uri: 'file:///cache/transparent.png', name: 'transparent.png', size: 40, mimeType: 'image/png' },
+        { uri: 'file:///cache/photo.jpg', name: 'holiday.jpg', size: 50, mimeType: 'image/jpeg' },
+      ])
+      assert.equal(render().find(({ type }) => type === 'TextInput')?.props.value, '保留草稿')
+      const selectedFiles = snapshot()
+      photos = pendingResult(); choose(0); photos.resolve({ canceled: true, assets: null }); await settleComponent()
+      choose(2)
+      assert.equal(updates, 1, 'picker cancellation and menu cancellation leave the draft alone')
+      assert.deepEqual(snapshot(), selectedFiles)
+      photos = pendingResult(); choose(0); photos.reject(new Error('无法读取所选照片')); await settleComponent()
+      assert.equal(alerts.at(-1)?.title, '未能添加附件')
+      assert.equal(alerts.at(-1)?.message, '无法读取所选照片')
+      assert.deepEqual(snapshot(), selectedFiles)
+      choose(1)
+      assert.equal(fileCalls.length, 1, 'an error releases the picker for another attempt')
+      assert.deepEqual(JSON.parse(JSON.stringify(fileCalls[0])), { multiple: true, copyToCacheDirectory: true })
+      documents.resolve({ canceled: false, assets: [
+        { uri: 'file:///report.pdf', name: 'report.pdf', size: 20, mimeType: 'application/pdf' },
+        { uri: 'file:///notes.txt', name: 'notes.txt' },
+      ] })
+      await settleComponent()
+      assert.deepEqual(snapshot(), [...selectedFiles, original, { uri: 'file:///notes.txt', name: 'notes.txt', size: null, mimeType: null }])
+      documents = pendingResult(); choose(1); documents.resolve({ canceled: true, assets: null }); await settleComponent()
+      assert.equal(updates, 2)
+      const remove = render().find(({ props }) => props.accessibilityLabel === '移除 transparent.png')?.props.onPress
+      assert.equal(typeof remove, 'function')
+      if (typeof remove === 'function') remove()
+      assert.equal(files.some(({ name }) => name === 'transparent.png'), false)
+      assert.equal(files.some(({ name }) => name === 'holiday.jpg'), true)
+    } finally { app.close() }
+  })
+})
+
 test('native composer shows one actionable blocker while preserving send gates on iOS and Android', () => {
   for (const os of ['ios', 'android']) {
     let retried = 0
