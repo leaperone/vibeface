@@ -138,7 +138,7 @@ python3 scripts/verify-node.py --delivery-ui-selfcheck \
   --binary /usr/bin/true --artifacts .artifacts/paid-ui-selfcheck
 ```
 
-深链接验收先等待系统确认或明确的目标界面；出现确认时只点击一次 Open，再要求目标界面可见。验收保留真实安装、配对和系统弹窗操作，不增加测试重试或固定延迟。公开失败诊断只增加预热回退布尔值，以及固定控件是否被报告的 true/null 标记，不上传原始 driver 日志。
+深链接验收先等待系统确认或明确的目标界面；出现确认时只点击一次 Open，再要求目标界面可见。验收保留真实安装、配对和系统弹窗操作，不增加测试重试或固定延迟。公开失败诊断限于预热回退、固定控件是否被报告的 true/null 标记和安装异常白名单，不上传原始 driver 日志。
 
 ## 重跑 iOS Provider 验收
 
@@ -178,7 +178,7 @@ pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^receives a ch
 
 ## 验证原生 Provider 设置和队列取消
 
-手动运行 `.github/workflows/mobile.yml` 时，现有 iOS job 在当前 checkout 构建 Simulator App、宿主 Node、Web 和 WASM，然后运行一个 Provider 原生用例。Android job 仍只构建 APK。iOS job 核对实际 arm64 宿主与 App，选择可用 iOS runtime，创建专属 iPhone 17 simulator 并等待它启动。缺少 runtime、启动失败或 driver 不可用都会使验收失败，构建成功不能代替 UI 结果。
+手动运行 `.github/workflows/mobile.yml` 时，`ios-build` 在当前 checkout 构建 Simulator App、宿主 Node、Web 和 WASM，`ios-accept` 恢复同源输入后运行一个 Provider 原生用例。Android job 仍只构建 APK。`ios-accept` 核对实际 arm64 宿主与 App，选择可用 iOS runtime，创建专属 iPhone 17 simulator 并等待它启动。缺少 runtime、启动失败或 driver 不可用都会使验收失败，构建成功不能代替 UI 结果。
 
 宿主构建前还要求 HEAD 等于本次提交，且 `git status --porcelain --untracked-files=normal` 为空。DerivedData 和 Simulator zip 位于已忽略的 `.artifacts/native/`，不会干扰这个检查。Expo prebuild 改变源码时必须先解决，不能继续把脏源码产物记为当前提交。
 
@@ -203,6 +203,8 @@ native config 默认关闭 trace 和整段 video。原始日志、自动失败�
 `provider-initial.png` 是唯一的配对前诊断图。它只在本次 CI 新建的专属 simulator 上，重新安装、清除钥匙串并启动 App 后主动拍摄，且早于首次 `secrets.get` 和邀请输入。用例核对 simulator 文件、实际 UUID、Booted 状态以及包含当前 run ID 和 attempt 的专属名称。此时 App 尚未接收邀请、登录命令或凭证，也没有旧应用数据；初始图只用于查看路由、系统弹窗和空表单。`terminology-device-kinds.png` 在配对后的“添加设备”面板记录节点与客户端分类，其他三张图在配对后的设置页保存。诊断图不代表配对或表单验收通过。导航诊断仅记录固定阶段和已知界面的布尔状态，不输出界面文本、加入链接、命令或剪贴板内容。CI 按固定键与布尔类型校验后，将该诊断并入公开的 `provider.json`，不上传原始页面树或测试日志。最终收据只有在一个目标测试真实通过、fixture 退出、专属 simulator 删除和私有状态清理后才标为 `passed`。
 
 失败收据与 stdout 保留固定阶段、报告是否可读，以及从实际 e2e report 提取的受限错误码、固定 `engine_reason` 和 `engine_timeout_kind`、已知 API 名和两个验收文件的行号。`completed_poll_samples` 只来自唯一合法的既有 expect 采样事件；零表示没有记录完成的采样，字段缺失不补零。错误 message、stack、locator label、值和原始报告不会导出。
+
+安装异常还会沿最多八层运行时 cause 记录 `driver_errors`。它只保留 `COMMAND_FAILED`、固定的 simctl 操作或 `unknown`、已知启动或传输原因，以及有界整数形式的超时预算、退出码和启动次数。命令、参数、路径和进程 stdout/stderr 不会导出。诊断写入失败也继续抛出原始安装异常，不增加安装或重试，不改变最终判定。
 
 已有失败语义快照通过文件与元数据校验时，`failure_screen` 只记录欢迎、已填入链接、邀请输入、设备名输入、加入按钮及已知无效或失效提示是否被报告。`true` 是正向出现，`null` 是未知，不能当作控件不存在。快照采集为 best effort，可能缺失或裁剪；没有截断标记也不证明树完整，不能从语义文本恢复原生控件类型或输入读回值。该投影不新增 UI 读取，也不改变原 fill、用例或清理的成败。报告尚未生成时仍保留失败阶段，完整私有日志随后按原清理规则删除。
 

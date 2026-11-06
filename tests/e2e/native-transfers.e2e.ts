@@ -158,7 +158,34 @@ test('provider settings and queued cancellation work in the installed native app
   await assert.rejects(network.call({ op: 'native_provider_setup' }));
   await assert.rejects(network.call({ op: 'native_provider_stage', stage: 'invalid' }));
   await assert.rejects(network.call({ op: 'native_provider_stage', stage: 'ready', role: 'source' }));
-  await device.installApp(undefined, { reinstall: true });
+  try {
+    await device.installApp(undefined, { reinstall: true });
+  } catch (cause) {
+    const failures: Record<string, string | number>[] = [];
+    for (let error: unknown = cause, depth = 0; error instanceof Error && depth < 8; error = error.cause, depth++) {
+      if (!('code' in error) || error.code !== 'COMMAND_FAILED' || !('details' in error)
+        || error.details === null || typeof error.details !== 'object' || Array.isArray(error.details)) continue;
+      const details = record(error.details);
+      const failure: Record<string, string | number> = { code: 'COMMAND_FAILED', operation: 'unknown' };
+      const args = details.args;
+      if (typeof details.cmd === 'string' && details.cmd.split('/').at(-1) === 'xcrun' && Array.isArray(args) && args[0] === 'simctl') {
+        if (args[1] === 'install' || args[1] === 'uninstall' || args[1] === 'bootstatus') failure.operation = `simctl-${args[1]}`;
+        else if (args[1] === 'list' && args[2] === 'devices') failure.operation = 'simctl-list-devices';
+      }
+      if (details.kind === 'daemon_startup_failed') failure.kind = details.kind;
+      if (details.reason === 'startup-exited' || details.reason === 'startup-stalled' || details.reason === 'startup-ceiling'
+        || details.reason === 'daemon_transport_timeout') failure.reason = details.reason;
+      const limits: Record<string, [number, number]> = { timeoutMs: [1, 1800000], startupTimeoutMs: [1, 1800000], exitCode: [0, 255], startupAttempts: [1, 2] };
+      for (const [key, [minimum, maximum]] of Object.entries(limits)) {
+        const value = details[key];
+        if (typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum && value <= maximum) failure[key] = value;
+      }
+      failures.push(failure);
+    }
+    await writeFile(join(publicPath, 'provider.json'), `${JSON.stringify({ source_commit: source, status: 'failed', driver_errors: failures })}\n`, { mode: 0o600 })
+      .catch(() => { process.stderr.write('Native driver failure diagnostic could not be recorded\n'); });
+    throw cause;
+  }
   const installedPath = (await execute('xcrun', ['simctl', 'get_app_container', simulator, 'one.leaper.vibeface', 'app'])).stdout.trim();
   assert(installedPath.startsWith('/') && installedPath.toLowerCase().includes(simulator.toLowerCase()), 'Inspect only the assigned simulator installed bundle');
   expect(await bundleManifest(installedPath)).toEqual(built);
