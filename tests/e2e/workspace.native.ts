@@ -316,9 +316,9 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await expect(builderButton).toHaveCount(1);
   await builderButton.click();
   await expect(builderButton).toBeSelected();
-  await textbox('任务名称').fill('原生导航检查');
   await textbox('交代内容').fill(JSON.stringify({ phase1: true, label: 'native-workspace-task', gate: network.gates.taskA }), { timeout: 30000 });
-  await device.dismissKeyboard();
+  await textbox('任务名称').fill('原生导航检查');
+  await textbox('任务名称').press('Enter');
   await expect(keyboard).toHaveCount(0);
   const createTask = screen.getByRole('button', '创建并发送', { exact: true, visible: true });
   await screen.scrollUntilVisible(createTask, { direction: 'down' });
@@ -443,9 +443,9 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await screen.getByRole('link', '消息', { exact: true }).click();
   await screen.getByRole('link', '管理频道', { exact: true }).click();
   await screen.getByRole('link', '新频道', { exact: true }).click();
-  await textbox('频道名称').fill('原生协作频道');
   await textbox('频道目标').fill('手机定向交给本人 Reviewer', { timeout: 30000 });
-  await device.dismissKeyboard();
+  await textbox('频道名称').fill('原生协作频道');
+  await textbox('频道名称').press('Enter');
   await expect(keyboard).toHaveCount(0);
   await screen.getByRole('checkbox', 'Native Builder', { exact: true, visible: true }).check();
   await screen.getByRole('checkbox', 'Native Reviewer', { exact: true, visible: true }).check();
