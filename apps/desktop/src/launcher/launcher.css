@@ -98,6 +98,7 @@ html {
 body {
   margin: 0;
   padding: 20px 20px 24px;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -287,6 +288,10 @@ main {
   user-select: text;
 }
 
+.card > p:empty {
+  display: none;
+}
+
 /* Controls -------------------------------------------------------------- */
 
 .actions {
@@ -360,6 +365,10 @@ button.ghost:hover:not(:disabled),
 }
 
 .settings summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
   padding: 12px 20px;
   font-size: var(--text-meta);
   line-height: var(--text-meta-leading);
@@ -367,6 +376,27 @@ button.ghost:hover:not(:disabled),
   color: var(--muted-foreground);
   cursor: default;
   border-radius: 14px;
+}
+
+.settings summary::-webkit-details-marker {
+  display: none;
+}
+
+/* The disclosure arrow is drawn so it turns with the panel instead of using the UA glyph. */
+.settings summary::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  rotate: -45deg;
+  translate: 1px -1px;
+  transition: rotate var(--duration) var(--ease-out);
+}
+
+.settings[open] summary::before {
+  rotate: 45deg;
+  translate: 0 -2px;
 }
 
 .settings[open] summary {

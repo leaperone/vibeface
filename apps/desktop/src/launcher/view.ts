@@ -34,7 +34,7 @@ const action = (id: ActionId, label: string, primary = false, disabled = false):
   disabled,
 })
 
-const choose = (label = '选择数据目录…') => action('choose', label)
+const choose = (label = '选择数据目录…', primary = false) => action('choose', label, primary)
 const recheck = () => action('recheck', '重新检查')
 
 export function describe(status: LauncherStatus): View {
@@ -66,7 +66,7 @@ export function describe(status: LauncherStatus): View {
           '数据目录保存这台设备的身份、配置和本机记录。可以选择已有目录连接正在运行的 Core，也可以选择一个空目录由 Vibeface 初始化。',
         facts: [],
         failure: null,
-        actions: [choose()],
+        actions: [choose('选择数据目录…', true)],
         scope,
       }
 

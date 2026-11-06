@@ -26,9 +26,9 @@ export function openExternally(rawUrl: string): void {
 export function createLauncherWindow(mainDir: string): BrowserWindow {
   const window = new BrowserWindow({
     width: 560,
-    height: 660,
-    minWidth: 480,
-    minHeight: 560,
+    height: 600,
+    minWidth: 460,
+    minHeight: 420,
     show: false,
     title: `${PRODUCT_NAME} 启动器`,
     webPreferences: {

@@ -32,7 +32,7 @@ const profilePath = element('profile-dir', HTMLElement)
 const corePath = element('core-path', HTMLElement)
 const version = element('version', HTMLElement)
 const forget = element('forget', HTMLButtonElement)
-const releases = element('releases', HTMLAnchorElement)
+const releases = element('releases', HTMLButtonElement)
 
 let working = false
 let lastHeadline = ''
@@ -130,10 +130,7 @@ autoOpen.addEventListener('change', () => {
 
 forget.addEventListener('click', () => run(() => api.forgetDataDir()))
 
-releases.addEventListener('click', (event) => {
-  event.preventDefault()
-  void api.openExternal(RELEASES)
-})
+releases.addEventListener('click', () => void api.openExternal(RELEASES))
 
 api.onStatus(paint)
 run(() => api.getStatus())
