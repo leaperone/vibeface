@@ -891,13 +891,13 @@ fn native_start_reservations_cover_initial_resume_and_reject_cancelled_work() ->
             })?;
             assert!(
                 store
-                    .reserve_work_native_submission(&net.network, &spec, &spec.cwd)
+                    .reserve_work_native_submission(&net.network, &spec, &spec.cwd, None)
                     .is_err()
             );
             assert!(!store.work_native_submission_reserved(&spec.work_id)?);
         } else {
-            assert!(store.reserve_work_native_submission(&net.network, &spec, &spec.cwd)?);
-            assert!(!store.reserve_work_native_submission(&net.network, &spec, &spec.cwd)?);
+            assert!(store.reserve_work_native_submission(&net.network, &spec, &spec.cwd, None)?);
+            assert!(!store.reserve_work_native_submission(&net.network, &spec, &spec.cwd, None)?);
             assert!(store.work_native_submission_reserved(&spec.work_id)?);
             let record = store.work_record(&spec.work_id)?.context("work")?;
             assert!(matches!(
@@ -2402,6 +2402,235 @@ fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
             "{trigger}: {error}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn a_signed_main_input_authorizes_bot_lifecycle_locally_and_on_replicas() -> Result<()> {
+    let (net, mut origin) = workspace_fixture()?;
+    let input = workspace_input_fixture(
+        &net,
+        &mut origin,
+        "main-profile",
+        None,
+        crate::workspace::InputIntent::Continue,
+        3,
+    )?;
+    let trigger = message_trigger(&input.input.message_id);
+    origin.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        "rename-main",
+        rename("Nova"),
+        Provider::Codex,
+        4,
+    )?;
+    let (created, new) = origin.create_bot_in_turn(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        "create-main",
+        ("Typed child", "follow the signed Main input", None),
+        5,
+    )?;
+    assert!(new);
+    let (_, deleted) = origin.delete_bot_in_turn(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &created.conversation_id,
+        6,
+    )?;
+    assert!(deleted.is_some());
+    assert_eq!(origin.bots(&net.network)?[0].name, "Nova");
+    assert_eq!(origin.bot_changes(&net.network, "c")?.len(), 1);
+    let mut replica = store(&net)?;
+    let events = origin.events_from(&net.network, &net.a.device_id()?, 1, 100)?;
+    assert_eq!(
+        replica.ingest_events(&net.network, &events)?.statuses,
+        vec![IngestStatus::Accepted; events.len()]
+    );
+    assert_eq!(replica.bots(&net.network)?[0].name, "Nova");
+    assert_eq!(replica.bot_changes(&net.network, "c")?.len(), 1);
+    assert_eq!(
+        replica
+            .conversation(&net.network, &created.conversation_id)?
+            .and_then(|conversation| conversation.owner),
+        Some(net.a.device_id()?)
+    );
+    assert!(replica.bot_deleted(&net.network, &created.conversation_id)?);
+    Ok(())
+}
+
+#[test]
+fn typed_bot_changes_reject_task_answers_forged_causes_and_indirect_sources() -> Result<()> {
+    use crate::workspace::InputIntent;
+    let (net, mut origin) = workspace_fixture()?;
+    workspace_command_fixture(
+        &net,
+        &mut origin,
+        "create-task",
+        workspace_task_command("task-source", None),
+        3,
+    )?;
+    let main = workspace_input_fixture(
+        &net,
+        &mut origin,
+        "main-source",
+        None,
+        InputIntent::Continue,
+        4,
+    )?;
+    let task = workspace_input_fixture(
+        &net,
+        &mut origin,
+        "task-input",
+        Some("task-source"),
+        InputIntent::Continue,
+        5,
+    )?;
+    let answer = origin.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        net.a.fixture_admin().attest(
+            &net.network,
+            "c",
+            EventBody::MessagePosted {
+                message_id: "a-q-source".into(),
+                role: Role::User,
+                text: "answer only".into(),
+                attachments: vec![],
+                report_results: Some(true),
+                in_reply_to: None,
+                status: None,
+                answers: Some("q-source".into()),
+                attestation: None,
+                failure: None,
+            },
+        )?,
+        vec![],
+        6,
+    )?;
+    let indirect = origin.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        bot_reply("after-main", "main-source"),
+        vec![],
+        7,
+    )?;
+    second_bot(&mut origin, &net, "Other")?;
+    let mut target = store(&net)?;
+    let events = origin.events_from(&net.network, &net.a.device_id()?, 1, 100)?;
+    assert_eq!(
+        target.ingest_events(&net.network, &events)?.statuses,
+        vec![IngestStatus::Accepted; events.len()]
+    );
+    let change = |conversation: &str, message: &str, deps: Vec<String>| {
+        net.b.sign_event(Event {
+            version: WIRE_VERSION,
+            network_id: net.network.clone(),
+            author: net.b.device_id()?,
+            seq: 1,
+            prev: None,
+            deps,
+            scope_id: "c".into(),
+            created_at_ms: 8,
+            body: EventBody::BotChanged {
+                change_id: "typed-change".into(),
+                cause: Some(Cause {
+                    conversation_id: conversation.into(),
+                    message_id: message.into(),
+                }),
+                change: BotChange::Profile {
+                    name: Some(Edit {
+                        before: "Workspace Bot".into(),
+                        after: "Nova".into(),
+                    }),
+                    instructions: None,
+                    model: None,
+                    skills: None,
+                    avatar: None,
+                    reasoning_effort: None,
+                },
+            },
+            blobs: vec![],
+        })
+    };
+    for (conversation, message, deps) in [
+        ("c", "task-input", vec![task.source_event]),
+        ("c", "a-q-source", vec![answer.hash]),
+        ("c", "wrong-input", vec![main.source_event.clone()]),
+        ("other", "main-source", vec![main.source_event.clone()]),
+        ("c", "main-source", vec![indirect.hash]),
+        ("c", "main-source", vec![]),
+    ] {
+        assert!(
+            matches!(&target.ingest_events(&net.network, &[change(conversation, message, deps)?])?.statuses[0],
+                IngestStatus::Rejected(error) if error.contains("user's own signed message")),
+            "{conversation}/{message}"
+        );
+        assert_eq!(
+            target
+                .bot_for_conversation(&net.network, "c")?
+                .context("source Bot")?
+                .name,
+            "Workspace Bot"
+        );
+        assert!(target.bot_changes(&net.network, "c")?.is_empty());
+    }
+    let hijack = net.b.sign_event(Event {
+        version: WIRE_VERSION,
+        network_id: net.network.clone(),
+        author: net.b.device_id()?,
+        seq: 1,
+        prev: None,
+        deps: vec![main.source_event.clone()],
+        scope_id: "d".into(),
+        created_at_ms: 8,
+        body: EventBody::ConversationOwner {
+            scheduler_node: net.b.device_id()?,
+            epoch: 1,
+            attestation: None,
+            cause: Some(Cause {
+                conversation_id: "c".into(),
+                message_id: "main-source".into(),
+            }),
+        },
+        blobs: vec![],
+    })?;
+    assert!(
+        matches!(&target.ingest_events(&net.network, &[hijack])?.statuses[0],
+            IngestStatus::Rejected(error) if error.contains("a created bot's first owner follows its creation"))
+    );
+    assert_eq!(
+        target
+            .conversation(&net.network, "d")?
+            .and_then(|conversation| conversation.owner),
+        Some(net.a.device_id()?)
+    );
+    assert_eq!(
+        target
+            .ingest_events(
+                &net.network,
+                &[change("c", "main-source", vec![main.source_event])?],
+            )?
+            .statuses,
+        vec![IngestStatus::Accepted]
+    );
+    assert_eq!(
+        target
+            .bot_for_conversation(&net.network, "c")?
+            .context("source Bot")?
+            .name,
+        "Nova"
+    );
+    assert_eq!(target.bot_changes(&net.network, "c")?.len(), 1);
     Ok(())
 }
 
@@ -13439,6 +13668,20 @@ fn workspace_new_revision_replaces_only_a_proven_never_started_assignment() -> R
         original.assignment_id,
         "a projection change alone does not prove the old job stopped"
     );
+    origin.admit_workspace_input(&net.network, &net.a.device_id()?, "revised")?;
+    let revised_job = origin
+        .scheduler_job("c", &message_trigger("revised"))?
+        .context("queued revised job")?;
+    assert!(
+        workspace::workspace_assignment_for_job_from(
+            &origin.connection,
+            &net.network,
+            &net.a.device_id()?,
+            &revised_job
+        )?
+        .is_none(),
+        "a new revision waits for a proven replacement instead of borrowing unstarted work"
+    );
     let stopped = origin
         .request_manager_cancel(&net.a, &net.network, "c", &message_trigger("original"))?
         .context("queued original job")?;
@@ -13460,6 +13703,10 @@ fn workspace_new_revision_replaces_only_a_proven_never_started_assignment() -> R
     assert_eq!(revised.started_revision, 2);
     assert_eq!(revised.trigger_message_id.as_deref(), Some("revised"));
     assert_eq!(
+        origin.scheduler_work_trigger(&net.network, &net.a.device_id()?, &revised_job)?,
+        format!("assignment:{}", revised.assignment_id)
+    );
+    assert_eq!(
         origin.scheduler_work_trigger(&net.network, &net.a.device_id()?, &original_job)?,
         original_work_trigger,
         "an old job keeps its original assignment after a replacement"
@@ -13478,6 +13725,95 @@ fn workspace_new_revision_replaces_only_a_proven_never_started_assignment() -> R
             .state,
         AssignmentState::Stopped
     );
+    let (net, mut uncertain) = workspace_fixture()?;
+    workspace_command_fixture(
+        &net,
+        &mut uncertain,
+        "create",
+        workspace_task_command("task", None),
+        3,
+    )?;
+    workspace_input_fixture(
+        &net,
+        &mut uncertain,
+        "inflight",
+        Some("task"),
+        InputIntent::Continue,
+        4,
+    )?;
+    let inflight = uncertain
+        .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 5)?
+        .unwrap();
+    let job = uncertain
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "inflight-revision")?
+        .unwrap()
+        .job;
+    let attempt = job.state.attempt().unwrap().id.clone();
+    uncertain.mark_started("c", &job.trigger, &attempt)?;
+    uncertain.update_turn_runtime(
+        "c",
+        &job.trigger,
+        &attempt,
+        vibeface_bridge::failure::ProviderStage::TurnStart,
+        crate::scheduling::TurnExecution::Unknown,
+    )?;
+    uncertain.started_workspace_assignment(&net.a, &net.network, &job, 6)?;
+    assert_eq!(
+        uncertain
+            .workspace_assignment(&net.network, &inflight.assignment_id)?
+            .unwrap()
+            .state,
+        AssignmentState::Proposed
+    );
+    workspace_command_fixture(
+        &net,
+        &mut uncertain,
+        "revision",
+        WorkspaceCommand::ReviseTask {
+            task_id: "task".into(),
+            expected_revision: 1,
+            request: "revision two".into(),
+            expected_result: "r2 result".into(),
+            dependencies: vec![],
+        },
+        7,
+    )?;
+    workspace_input_fixture(
+        &net,
+        &mut uncertain,
+        "inflight-revised",
+        Some("task"),
+        InputIntent::Continue,
+        8,
+    )?;
+    uncertain.admit_workspace_input(&net.network, &net.a.device_id()?, "inflight-revised")?;
+    let revised_job = uncertain
+        .scheduler_job("c", &message_trigger("inflight-revised"))?
+        .unwrap();
+    assert_eq!(
+        workspace::workspace_assignment_for_job_from(
+            &uncertain.connection,
+            &net.network,
+            &net.a.device_id()?,
+            &revised_job
+        )?
+        .unwrap()
+        .assignment_id,
+        inflight.assignment_id,
+        "an in-flight unknown start cannot become a never-started replacement"
+    );
+    assert_eq!(
+        uncertain
+            .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 9)?
+            .unwrap()
+            .assignment_id,
+        inflight.assignment_id
+    );
+    assert!(!workspace::task_execution_allowed_from(
+        &uncertain.connection,
+        &net.network,
+        "task"
+    )?);
     Ok(())
 }
 
@@ -13552,7 +13888,7 @@ fn workspace_native_start_and_steering_recheck_current_assignment_authority() ->
         for work in [&active, &waiting] {
             origin.accept_work_fixture(&net.a, &net.network, work.clone(), 7)?;
         }
-        assert!(origin.reserve_work_native_submission(&net.network, &active, &active.cwd)?);
+        assert!(origin.reserve_work_native_submission(&net.network, &active, &active.cwd, None)?);
         origin.apply_work_signal(
             &net.a,
             &net.network,
@@ -13598,7 +13934,7 @@ fn workspace_native_start_and_steering_recheck_current_assignment_authority() ->
         )?;
         assert!(
             origin
-                .reserve_work_native_submission(&net.network, &waiting, &waiting.cwd)
+                .reserve_work_native_submission(&net.network, &waiting, &waiting.cwd, None)
                 .is_err()
         );
         assert!(!origin.work_native_submission_reserved(&waiting.work_id)?);
@@ -13650,7 +13986,7 @@ fn workspace_native_start_and_steering_recheck_current_assignment_authority() ->
         )?);
         assert!(
             origin
-                .reserve_work_native_submission(&net.network, &waiting, &waiting.cwd)
+                .reserve_work_native_submission(&net.network, &waiting, &waiting.cwd, None)
                 .is_err(),
             "free resources do not restore the old revision's authority"
         );
@@ -14018,7 +14354,7 @@ fn a_reserved_native_input_is_consumed_once_and_a_held_stop_prevents_the_first_w
             thread: None,
         };
         origin.accept_work_fixture(&net.a, &net.network, spec.clone(), 3)?;
-        assert!(origin.reserve_work_native_submission(&net.network, &spec, &spec.cwd)?);
+        assert!(origin.reserve_work_native_submission(&net.network, &spec, &spec.cwd, None)?);
         origin.apply_work_signal(
             &net.a,
             &net.network,
@@ -14811,16 +15147,57 @@ fn workspace_task_answer_keeps_the_assignment_from_the_signed_question_basis() -
         9,
     )?;
     origin.settle_workspace_assignment(&net.a, &net.network, &completed, 10)?;
+    assert_eq!(
+        origin
+            .workspace_assignment(&net.network, &first.assignment_id)?
+            .unwrap()
+            .state,
+        AssignmentState::Adopted,
+        "the accepted answer still needs its own result before the allocation can finish"
+    );
+    let cancelled = origin
+        .request_manager_cancel(&net.a, &net.network, "c", &wrong.trigger)?
+        .context("unstarted wrong-session answer")?;
+    assert!(matches!(
+        cancelled.state,
+        JobState::Cancelled { attempt: None, .. }
+    ));
+    let answering = origin
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "question-basis")?
+        .context("original answer turn")?
+        .job;
+    assert_eq!(answering.trigger, answer.trigger);
+    let answer_attempt = answering.state.attempt().unwrap().id.clone();
+    origin.mark_started("c", &answering.trigger, &answer_attempt)?;
+    origin.update_turn_runtime(
+        "c",
+        &answering.trigger,
+        &answer_attempt,
+        vibeface_bridge::failure::ProviderStage::Run,
+        TurnExecution::Started,
+    )?;
+    origin.started_workspace_assignment(&net.a, &net.network, &answering, 12)?;
+    let answered = origin.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &answering.trigger,
+        &answer_attempt,
+        JobOutcome::Completed,
+        "answered the original question",
+        13,
+    )?;
+    origin.settle_workspace_assignment(&net.a, &net.network, &answered, 14)?;
     workspace_input_fixture(
         &net,
         &mut origin,
         "new-request",
         Some("task"),
         InputIntent::Continue,
-        11,
+        15,
     )?;
     let later = origin
-        .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 12)?
+        .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 16)?
         .context("later assignment")?;
     assert_ne!(later.assignment_id, first.assignment_id);
     assert_eq!(
@@ -15293,9 +15670,14 @@ fn two_accepted_ordinary_works_compete_for_one_native_reservation() -> Result<()
                 .context("projection")?;
             assert!(projection.thread_id.is_none() && projection.turn_id.is_none());
         }
-        assert!(origin.reserve_work_native_submission(&net.network, &winner, &waiting.cwd)?);
+        assert!(origin.reserve_work_native_submission(
+            &net.network,
+            &winner,
+            &waiting.cwd,
+            None
+        )?);
         let blocked = origin
-            .reserve_work_native_submission(&net.network, &waiting, &waiting.cwd)
+            .reserve_work_native_submission(&net.network, &waiting, &waiting.cwd, None)
             .expect_err("one reservation owns this root");
         assert_eq!(
             blocked
@@ -15342,7 +15724,7 @@ fn two_accepted_ordinary_works_compete_for_one_native_reservation() -> Result<()
         )?;
         assert!(
             origin
-                .reserve_work_native_submission(&net.network, &waiting, &waiting.cwd)
+                .reserve_work_native_submission(&net.network, &waiting, &waiting.cwd, None)
                 .is_err()
         );
         assert!(!origin.work_native_submission_reserved(&waiting.work_id)?);
@@ -15358,7 +15740,12 @@ fn two_accepted_ordinary_works_compete_for_one_native_reservation() -> Result<()
             },
             6,
         )?;
-        assert!(origin.reserve_work_native_submission(&net.network, &waiting, &waiting.cwd)?);
+        assert!(origin.reserve_work_native_submission(
+            &net.network,
+            &waiting,
+            &waiting.cwd,
+            None
+        )?);
     }
     Ok(())
 }
@@ -15444,8 +15831,8 @@ fn assignment_works_reserve_overlapping_directories_individually() -> Result<()>
     for work in [&winner, &waiting, &separate] {
         origin.accept_work_fixture(&net.a, &net.network, work.clone(), 8)?;
     }
-    assert!(origin.reserve_work_native_submission(&net.network, &winner, &winner.cwd)?);
-    assert!(origin.reserve_work_native_submission(&net.network, &separate, &separate.cwd)?);
+    assert!(origin.reserve_work_native_submission(&net.network, &winner, &winner.cwd, None)?);
+    assert!(origin.reserve_work_native_submission(&net.network, &separate, &separate.cwd, None)?);
     for running in [false, true] {
         if running {
             origin.apply_work_signal(
@@ -15473,7 +15860,7 @@ fn assignment_works_reserve_overlapping_directories_individually() -> Result<()>
             )?;
         }
         let blocked = origin
-            .reserve_work_native_submission(&net.network, &waiting, &waiting.cwd)
+            .reserve_work_native_submission(&net.network, &waiting, &waiting.cwd, None)
             .expect_err("one assignment still serializes overlapping work");
         assert_eq!(
             blocked
@@ -15502,6 +15889,887 @@ fn assignment_works_reserve_overlapping_directories_individually() -> Result<()>
         },
         11,
     )?;
-    assert!(origin.reserve_work_native_submission(&net.network, &waiting, &waiting.cwd)?);
+    assert!(origin.reserve_work_native_submission(&net.network, &waiting, &waiting.cwd, None)?);
+    Ok(())
+}
+
+#[test]
+fn codex_shared_reservations_require_a_verified_turn_and_the_same_work_scope() -> Result<()> {
+    use crate::work::NativeExecution;
+    for scenario in [
+        "same",
+        "hint",
+        "missing-id",
+        "turn",
+        "thread",
+        "unknown",
+        "stopped",
+        "scope",
+    ] {
+        let net = net()?;
+        let mut origin = store(&net)?;
+        conversation(&mut origin, &net)?;
+        say(&mut origin, &net, "source", true)?;
+        let local = net.a.device_id()?;
+        let make = |call_ref: &str| WorkSpec {
+            work_id: WorkSpec::id("c", "message:source", call_ref),
+            conversation: "c".into(),
+            trigger: "message:source".into(),
+            target: local.clone(),
+            dispatcher: local.clone(),
+            call_ref: call_ref.into(),
+            kind: WorkKind::Agent(Provider::Codex),
+            model: None,
+            resolved: ResolvedModel {
+                provider: Provider::Codex,
+                model: None,
+            },
+            cwd: "/shared".into(),
+            title: "work".into(),
+            prompt: "p".into(),
+            continues: None,
+            parent: None,
+            thread: Some("native".into()),
+        };
+        let first = make("first");
+        origin.accept_work_fixture(&net.a, &net.network, first.clone(), 3)?;
+        assert!(origin.reserve_work_native_submission(&net.network, &first, &first.cwd, None)?);
+        origin.apply_work_signal(
+            &net.a,
+            &net.network,
+            &first.work_id,
+            Signal::TurnStarted {
+                turn_id: "turn".into(),
+                epoch: 1,
+            },
+            4,
+        )?;
+        if scenario == "unknown" {
+            origin.apply_work_signal(
+                &net.a,
+                &net.network,
+                &first.work_id,
+                Signal::Disconnected,
+                5,
+            )?;
+        }
+        if scenario == "stopped" {
+            origin.save_stop_request(&crate::work::StopRequest {
+                work_id: first.work_id.clone(),
+                conversation: "c".into(),
+                target: local.clone(),
+                requested_at_ms: 5,
+                deadline_ms: 6,
+                timed_out: false,
+            })?;
+        }
+        let mut second = make("second");
+        if scenario == "scope" {
+            second.parent = Some("another-task".into());
+        }
+        if scenario == "thread" {
+            second.thread = Some("another-thread".into());
+        }
+        origin.accept_work_fixture(&net.a, &net.network, second.clone(), 6)?;
+        let execution = NativeExecution {
+            thread_id: second.thread.clone().unwrap(),
+            turn_id: if scenario == "turn" {
+                "another-turn"
+            } else {
+                "turn"
+            }
+            .into(),
+            work_ids: if scenario == "missing-id" {
+                vec![]
+            } else {
+                vec![first.work_id.clone()]
+            },
+        };
+        let reserved = origin.reserve_work_native_submission(
+            &net.network,
+            &second,
+            &second.cwd,
+            (scenario != "hint").then_some(&execution),
+        );
+        if scenario != "same" {
+            assert_eq!(
+                reserved
+                    .expect_err(scenario)
+                    .downcast_ref::<ExecFailure>()
+                    .context("typed conflict")?
+                    .kind,
+                FailureKind::WriterBusy,
+                "{scenario}"
+            );
+            assert!(
+                !origin.work_native_submission_reserved(&second.work_id)?,
+                "{scenario}"
+            );
+            continue;
+        }
+        assert!(reserved?);
+        assert!(!origin.reserve_work_native_submission(
+            &net.network,
+            &second,
+            &second.cwd,
+            Some(&execution)
+        )?);
+        assert!(origin.work_native_write_allowed(&net.network, &first.work_id)?);
+        assert!(origin.work_native_write_allowed(&net.network, &second.work_id)?);
+        origin.apply_work_signal(
+            &net.a,
+            &net.network,
+            &second.work_id,
+            Signal::TurnStarted {
+                turn_id: "turn".into(),
+                epoch: 1,
+            },
+            7,
+        )?;
+        origin.apply_work_signal(
+            &net.a,
+            &net.network,
+            &second.work_id,
+            Signal::Disconnected,
+            8,
+        )?;
+        let third = make("third");
+        origin.accept_work_fixture(&net.a, &net.network, third.clone(), 9)?;
+        let blocked = origin
+            .reserve_work_native_submission(&net.network, &third, &third.cwd, Some(&execution))
+            .expect_err("an unknown Work keeps its directory even with a shared-turn permit");
+        assert_eq!(
+            blocked
+                .downcast_ref::<ExecFailure>()
+                .context("typed conflict")?
+                .kind,
+            FailureKind::WriterBusy
+        );
+        assert!(!origin.work_native_submission_reserved(&third.work_id)?);
+        assert!(origin.work_native_submission_reserved(&second.work_id)?);
+        origin.apply_work_signal(
+            &net.a,
+            &net.network,
+            &second.work_id,
+            Signal::Probed(crate::work::Probe::Running {
+                turn_id: "turn".into(),
+                epoch: 1,
+            }),
+            10,
+        )?;
+        assert!(matches!(
+            origin
+                .work_record(&second.work_id)?
+                .context("readback restored Work")?
+                .state,
+            crate::work::WorkState::Running { .. }
+        ));
+        assert!(origin.reserve_work_native_submission(
+            &net.network,
+            &third,
+            &third.cwd,
+            Some(&execution)
+        )?);
+        let first_projection = origin
+            .work(&net.network, &first.work_id)?
+            .context("first projection")?;
+        let mut other_assignment = origin
+            .work(&net.network, &second.work_id)?
+            .context("second projection")?;
+        other_assignment.trigger = "assignment:other".into();
+        assert!(!origin.work_shares_native_execution(
+            &net.network,
+            &first_projection,
+            &other_assignment
+        )?);
+    }
+    Ok(())
+}
+
+fn workspace_signed_input_fixture(
+    net: &Net,
+    origin: &mut Store,
+    author: &LocalIdentity,
+    input: crate::workspace::InputRequest,
+    at: i64,
+) -> Result<crate::workspace::WorkspaceInput> {
+    let signed = net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::InputPosted {
+            message_id: input.message_id.clone(),
+            target: input.route.target.clone(),
+            intent: input.route.intent,
+            sequence: input.route.sequence,
+            expected_revision: input.route.expected_revision,
+            text: input.text.clone(),
+            attachments: input.attachments.clone(),
+            report_results: input.report_results,
+            attestation: None,
+        },
+    )?;
+    origin.post_workspace_input(
+        author,
+        &net.network,
+        input,
+        signed.attestation().cloned().context("input signature")?,
+        at,
+    )
+}
+
+fn workspace_started_job_fixture(net: &Net, origin: &mut Store, at: i64) -> Result<SchedulerJob> {
+    let job = origin
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "task-lifecycle")?
+        .context("claimable workspace job")?
+        .job;
+    let attempt = job.state.attempt().context("attempt")?.id.clone();
+    origin.mark_started("c", &job.trigger, &attempt)?;
+    origin.update_turn_runtime(
+        "c",
+        &job.trigger,
+        &attempt,
+        vibeface_bridge::failure::ProviderStage::Run,
+        crate::scheduling::TurnExecution::Started,
+    )?;
+    origin.started_workspace_assignment(&net.a, &net.network, &job, at)?;
+    origin
+        .scheduler_job("c", &job.trigger)?
+        .context("started job")
+}
+
+#[test]
+fn workspace_assignment_waits_for_native_work_and_the_last_real_summary() -> Result<()> {
+    use crate::workspace::*;
+    for (main_cause, work_first, reports, revise, answer_last) in [
+        (false, false, true, false, false),
+        (false, true, true, false, false),
+        (true, false, true, false, false),
+        (true, true, true, false, false),
+        (false, false, false, false, false),
+        (false, true, false, false, false),
+        (true, false, false, false, false),
+        (true, true, false, false, false),
+        (false, false, true, true, false),
+        (false, false, true, false, true),
+    ] {
+        let case = format!(
+            "main_cause={main_cause} work_first={work_first} reports={reports} revise={revise} answer_last={answer_last}"
+        );
+        eprintln!("lifecycle case {case}");
+        (|| -> Result<()> {
+        let (net, mut origin) = workspace_fixture()?;
+        let local = net.a.device_id()?;
+        if !main_cause {
+            workspace_command_fixture(
+                &net,
+                &mut origin,
+                "create",
+                workspace_task_command("task", None),
+                3,
+            )?;
+        }
+        let request = workspace_signed_input_fixture(
+            &net,
+            &mut origin,
+            &net.a,
+            InputRequest {
+                message_id: "request".into(),
+                route: InputRoute {
+                    target: if main_cause {
+                        InputTarget::BotMain {
+                            bot_id: "bot".into(),
+                        }
+                    } else {
+                        InputTarget::Task {
+                            task_id: "task".into(),
+                        }
+                    },
+                    intent: InputIntent::Continue,
+                    sequence: 4,
+                    expected_revision: (!main_cause).then_some(1),
+                },
+                text: "perform the task".into(),
+                attachments: vec![],
+                report_results: Some(reports),
+            },
+            4,
+        )?;
+        origin.admit_workspace_input(&net.network, &local, "request")?;
+        let assignment = if main_cause {
+            let coordinator = workspace_started_job_fixture(&net, &mut origin, 5)?;
+            let mut task = workspace_task_command("task", None);
+            if let WorkspaceCommand::CreateTask { source_events, .. } = &mut task {
+                source_events.push(request.source_event.clone());
+            }
+            origin.workspace_agent_command(
+                &net.a,
+                &net.network,
+                &coordinator,
+                "create-child",
+                task,
+                6,
+            )?;
+            origin.workspace_agent_command(
+                &net.a,
+                &net.network,
+                &coordinator,
+                "assign-child",
+                WorkspaceCommand::AssignTask {
+                    task_id: "task".into(),
+                    expected_revision: 1,
+                    assignment_id: "child-assignment".into(),
+                    bot_id: "bot".into(),
+                    execution_node: local.clone(),
+                    bot_owner_epoch: 1,
+                    channel_owner_epoch: None,
+                    work_id: None,
+                    resource_roots: vec!["/workspace".into()],
+                    automatic: true,
+                },
+                7,
+            )?;
+            let ended = origin.finish_job(
+                &net.a,
+                &net.network,
+                "c",
+                &coordinator.trigger,
+                &coordinator.state.attempt().unwrap().id,
+                JobOutcome::Completed,
+                "delegated the child",
+                8,
+            )?;
+            origin.settle_workspace_assignment(&net.a, &net.network, &ended, 8)?;
+            origin
+                .workspace_assignment(&net.network, "child-assignment")?
+                .unwrap()
+        } else {
+            origin
+                .ensure_workspace_assignment(
+                    &net.a,
+                    &net.network,
+                    "task",
+                    &["/workspace".into()],
+                    5,
+                )?
+                .unwrap()
+        };
+        let manager = workspace_started_job_fixture(&net, &mut origin, 9)?;
+        assert_eq!(
+            manager.scope,
+            SessionScope::WorkspaceTask {
+                task_id: "task".into()
+            }
+        );
+        let work = WorkSpec {
+            work_id: WorkSpec::id(
+                "c",
+                &format!("assignment:{}", assignment.assignment_id),
+                "native",
+            ),
+            conversation: "c".into(),
+            trigger: origin.scheduler_work_trigger(&net.network, &local, &manager)?,
+            target: local.clone(),
+            dispatcher: local.clone(),
+            call_ref: "native".into(),
+            kind: WorkKind::Agent(Provider::Codex),
+            model: None,
+            resolved: ResolvedModel {
+                provider: Provider::Codex,
+                model: None,
+            },
+            cwd: "/workspace".into(),
+            title: "native task".into(),
+            prompt: "perform the task".into(),
+            continues: None,
+            parent: None,
+            thread: None,
+        };
+        origin.accept_work_fixture(&net.a, &net.network, work.clone(), 10)?;
+        assert!(origin.reserve_work_native_submission(&net.network, &work, &work.cwd, None)?);
+        origin.apply_work_signal(
+            &net.a,
+            &net.network,
+            &work.work_id,
+            Signal::ThreadCreated("native-thread".into()),
+            11,
+        )?;
+        origin.begin_reserved_work_native_input(&net.network, &work, "native-thread", &work.cwd)?;
+        origin.apply_work_signal(
+            &net.a,
+            &net.network,
+            &work.work_id,
+            Signal::TurnStarted {
+                turn_id: "native-turn".into(),
+                epoch: 1,
+            },
+            12,
+        )?;
+        let finish_native = |origin: &mut Store,
+                             uncertain: bool|
+         -> Result<Option<crate::scheduling::AdmissionReceipt>> {
+            let terminal = if uncertain {
+                Signal::Probed(crate::work::Probe::Terminal {
+                    turn_id: "native-turn".into(),
+                    status: vibeface_bridge::turn::TurnStatus::Completed,
+                    text: "native result".into(),
+                    error: None,
+                })
+            } else {
+                Signal::TurnCompleted {
+                    turn_id: "native-turn".into(),
+                    status: vibeface_bridge::turn::TurnStatus::Completed,
+                    text: "native result".into(),
+                    error: None,
+                }
+            };
+            Ok(origin
+                .apply_work_signal(&net.a, &net.network, &work.work_id, terminal, 20)?
+                .1)
+        };
+        if work_first {
+            assert_eq!(finish_native(&mut origin, false)?.is_some(), reports);
+            assert!(
+                origin
+                    .claim_next_fixture(&net.a, &net.network, "c", "boot", "task-lifecycle")?
+                    .is_none()
+            );
+        }
+        let parent = origin.finish_job(
+            &net.a,
+            &net.network,
+            "c",
+            &manager.trigger,
+            &manager.state.attempt().unwrap().id,
+            JobOutcome::Completed,
+            "work dispatched",
+            13,
+        )?;
+        origin.settle_workspace_assignment(&net.a, &net.network, &parent, 14)?;
+        let mut earlier = vec![parent];
+        if !work_first || reports {
+            assert_eq!(
+                origin
+                    .workspace_assignment(&net.network, &assignment.assignment_id)?
+                    .unwrap()
+                    .state,
+                AssignmentState::Adopted
+            );
+            assert_eq!(
+                origin.workspace_task(&net.network, "task")?.unwrap().state,
+                TaskState::Running
+            );
+        }
+        if !work_first {
+            assert!(
+                origin
+                    .raw_work_steer_target(&net.network, &local, "c", &work.work_id)?
+                    .is_some()
+            );
+            workspace_input_fixture(
+                &net,
+                &mut origin,
+                "followup",
+                Some("task"),
+                InputIntent::Continue,
+                15,
+            )?;
+            origin.admit_workspace_input(&net.network, &local, "followup")?;
+            let queued = origin
+                .scheduler_job("c", &message_trigger("followup"))?
+                .unwrap();
+            assert_eq!(
+                workspace::workspace_assignment_for_job_from(
+                    &origin.connection,
+                    &net.network,
+                    &local,
+                    &queued
+                )?
+                .unwrap()
+                .assignment_id,
+                assignment.assignment_id
+            );
+            let followup = workspace_started_job_fixture(&net, &mut origin, 16)?;
+            assert_eq!(followup.trigger, message_trigger("followup"));
+            let ended = origin.finish_job(
+                &net.a,
+                &net.network,
+                "c",
+                &followup.trigger,
+                &followup.state.attempt().unwrap().id,
+                JobOutcome::Completed,
+                "followup recorded",
+                17,
+            )?;
+            origin.settle_workspace_assignment(&net.a, &net.network, &ended, 18)?;
+            earlier.push(ended);
+            let uncertain = !main_cause && reports && !revise;
+            if uncertain {
+                origin.apply_work_signal(
+                    &net.a,
+                    &net.network,
+                    &work.work_id,
+                    Signal::Disconnected,
+                    18,
+                )?;
+                origin.apply_work_signal(
+                    &net.a,
+                    &net.network,
+                    &work.work_id,
+                    Signal::Probed(crate::work::Probe::Missing),
+                    19,
+                )?;
+                origin.settle_workspace_assignment(&net.a, &net.network, &earlier[0], 19)?;
+                assert!(
+                    origin
+                        .raw_work_steer_target(&net.network, &local, "c", &work.work_id)?
+                        .is_none()
+                );
+                assert_eq!(
+                    origin
+                        .workspace_assignment(&net.network, &assignment.assignment_id)?
+                        .unwrap()
+                        .state,
+                    AssignmentState::Adopted
+                );
+                assert!(
+                    !origin
+                        .workspace_resource_conflicts(
+                            &net.network,
+                            &local,
+                            &["/workspace".into()],
+                            None
+                        )?
+                        .is_empty()
+                );
+            }
+            assert_eq!(finish_native(&mut origin, uncertain)?.is_some(), reports);
+        }
+        if reports {
+            for job in &earlier {
+                origin.settle_workspace_assignment(&net.a, &net.network, job, 21)?;
+            }
+            assert_eq!(
+                origin
+                    .workspace_assignment(&net.network, &assignment.assignment_id)?
+                    .unwrap()
+                    .state,
+                AssignmentState::Adopted
+            );
+            let result = workspace_started_job_fixture(&net, &mut origin, 22)?;
+            assert_eq!(result.kind, TriggerKind::WorkResult);
+            assert_eq!(
+                result.reply_to,
+                if main_cause {
+                    assignment.assignment_id.clone()
+                } else {
+                    "request".into()
+                }
+            );
+            if answer_last {
+                let mut asked = question(&origin, &net, "c", "q-final", "fixture-result-session")?;
+                if let EventBody::QuestionAsked { target, .. } = &mut asked {
+                    *target = Some(InputTarget::Task { task_id: "task".into() });
+                }
+                origin.append_event(&net.a, &net.network, "c", asked, vec![], 23)?;
+                origin.accept_answer(&net.a, &net.network, "q-final", "approved",
+                    Some(answer_signature(&net, "c", "q-final", "approved")?), 24)?;
+            }
+            if revise {
+                workspace_command_fixture(
+                    &net,
+                    &mut origin,
+                    "revise",
+                    WorkspaceCommand::ReviseTask {
+                        task_id: "task".into(),
+                        expected_revision: 1,
+                        request: "revision two".into(),
+                        expected_result: "revision two result".into(),
+                        dependencies: vec![],
+                    },
+                    23,
+                )?;
+                workspace_input_fixture(
+                    &net,
+                    &mut origin,
+                    "revision-two",
+                    Some("task"),
+                    InputIntent::Continue,
+                    24,
+                )?;
+                origin.admit_workspace_input(&net.network, &local, "revision-two")?;
+            }
+            let summarized = origin.finish_job(
+                &net.a,
+                &net.network,
+                "c",
+                &result.trigger,
+                &result.state.attempt().unwrap().id,
+                JobOutcome::Completed,
+                "actual final summary",
+                25,
+            )?;
+            for job in &earlier {
+                origin.settle_workspace_assignment(&net.a, &net.network, job, 26)?;
+            }
+            assert_eq!(
+                origin
+                    .workspace_assignment(&net.network, &assignment.assignment_id)?
+                    .unwrap()
+                    .state,
+                AssignmentState::Adopted,
+                "an older completed reply cannot steal the final settlement"
+            );
+            let final_job = if answer_last {
+                origin.settle_workspace_assignment(&net.a, &net.network, &summarized, 27)?;
+                assert_eq!(origin.workspace_assignment(&net.network, &assignment.assignment_id)?.unwrap().state, AssignmentState::Adopted);
+                let answer = workspace_started_job_fixture(&net, &mut origin, 28)?;
+                assert_eq!(answer.kind, TriggerKind::Answer);
+                let answered = origin.finish_job(&net.a, &net.network, "c", &answer.trigger,
+                    &answer.state.attempt().unwrap().id, JobOutcome::Completed, "answer final summary", 29)?;
+                origin.settle_workspace_assignment(&net.a, &net.network, &summarized, 30)?;
+                assert_eq!(origin.workspace_assignment(&net.network, &assignment.assignment_id)?.unwrap().state, AssignmentState::Adopted);
+                answered
+            } else {
+                summarized
+            };
+            origin.settle_workspace_assignment(&net.a, &net.network, &final_job, 31)?;
+            let final_assignment = origin
+                .workspace_assignment(&net.network, &assignment.assignment_id)?
+                .unwrap();
+            if revise {
+                assert_eq!(final_assignment.adopted_revision, Some(1));
+                assert!(final_assignment.completed_revision.is_none());
+                assert_eq!(
+                    origin.workspace_task(&net.network, "task")?.unwrap().state,
+                    TaskState::UpdatePending
+                );
+                assert!(
+                    origin
+                        .claim_next_fixture(&net.a, &net.network, "c", "boot", "task-lifecycle")?
+                        .is_none()
+                );
+                return Ok(());
+            }
+            assert_eq!(
+                final_assignment.result.as_deref(),
+                Some(if answer_last { "answer final summary" } else { "actual final summary" })
+            );
+            assert_eq!(
+                origin
+                    .message(&net.network, "c", &final_job.message_id)?
+                    .unwrap()
+                    .target,
+                Some(InputTarget::Task {
+                    task_id: "task".into()
+                })
+            );
+        } else {
+            assert!(
+                origin
+                    .scheduler_job("c", &work_trigger(&work.work_id))?
+                    .is_none()
+            );
+            for job in origin.scheduler_jobs_all()? {
+                origin.settle_workspace_assignment(&net.a, &net.network, &job, 28)?;
+            }
+        }
+        let final_assignment = origin
+            .workspace_assignment(&net.network, &assignment.assignment_id)?
+            .unwrap();
+        assert_eq!(final_assignment.state, AssignmentState::Completed);
+        assert_eq!(final_assignment.completed_revision, Some(1));
+        assert_eq!(
+            origin.workspace_task(&net.network, "task")?.unwrap().state,
+            TaskState::Completed
+        );
+        let mut replica = store(&net)?;
+        sync(&origin, &mut replica, &net)?;
+        assert_eq!(replica.workspace_assignment(&net.network, &assignment.assignment_id)?.unwrap(), final_assignment);
+        let private_binding: bool = replica.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM identity_meta WHERE key LIKE 'workspace-input-assignment:%')", [], |row| row.get(0))?;
+        assert!(!private_binding, "shared terminal proofs do not require the owner's private binding");
+        Ok(())
+        })().with_context(|| case)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn an_owner_freezes_a_partial_dag_followup_to_its_first_assignment() -> Result<()> {
+    use crate::workspace::*;
+    let (net, mut origin) = workspace_fixture()?;
+    let local = net.a.device_id()?;
+    workspace_command_fixture(
+        &net,
+        &mut origin,
+        "create",
+        workspace_task_command("task", None),
+        3,
+    )?;
+    let mut entry = store(&net)?;
+    sync(&origin, &mut entry, &net)?;
+    workspace_input_fixture(
+        &net,
+        &mut origin,
+        "original",
+        Some("task"),
+        InputIntent::Continue,
+        4,
+    )?;
+    let first = origin
+        .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 5)?
+        .unwrap();
+    let manager = workspace_started_job_fixture(&net, &mut origin, 6)?;
+    assert!(
+        entry
+            .workspace_assignment(&net.network, &first.assignment_id)?
+            .is_none()
+    );
+    workspace_signed_input_fixture(
+        &net,
+        &mut entry,
+        &net.b,
+        InputRequest {
+            message_id: "partial-followup".into(),
+            route: InputRoute {
+                target: InputTarget::Task {
+                    task_id: "task".into(),
+                },
+                intent: InputIntent::Continue,
+                sequence: 7,
+                expected_revision: Some(1),
+            },
+            text: "continue this task".into(),
+            attachments: vec![],
+            report_results: Some(true),
+        },
+        7,
+    )?;
+    sync(&entry, &mut origin, &net)?;
+    origin
+        .admit_delivery(
+            &local,
+            &net.network,
+            "c",
+            &message_trigger("partial-followup"),
+        )?
+        .context("owner admission")?;
+    let followup = origin
+        .scheduler_job("c", &message_trigger("partial-followup"))?
+        .unwrap();
+    assert_eq!(
+        workspace::workspace_assignment_for_job_from(
+            &origin.connection,
+            &net.network,
+            &local,
+            &followup
+        )?
+        .unwrap()
+        .assignment_id,
+        first.assignment_id
+    );
+    let ended = origin.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &manager.trigger,
+        &manager.state.attempt().unwrap().id,
+        JobOutcome::Completed,
+        "first turn ended",
+        8,
+    )?;
+    origin.settle_workspace_assignment(&net.a, &net.network, &ended, 9)?;
+    assert_eq!(
+        origin
+            .workspace_assignment(&net.network, &first.assignment_id)?
+            .unwrap()
+            .state,
+        AssignmentState::Adopted
+    );
+    let proof = origin
+        .message(&net.network, "c", &ended.message_id)?
+        .unwrap()
+        .event_hash;
+    origin.apply_workspace_command(
+        &net.a,
+        &net.network,
+        "stop-first",
+        WorkspaceCommand::AssignmentProgress {
+            execution: None,
+            assignment_id: first.assignment_id.clone(),
+            revision: 1,
+            state: AssignmentState::Stopped,
+            input_event: None,
+            evidence_event: Some(proof.clone()),
+            result: Some("stopped".into()),
+        },
+        None,
+        None,
+        None,
+        10,
+    )?;
+    workspace_input_fixture(
+        &net,
+        &mut origin,
+        "replacement",
+        Some("task"),
+        InputIntent::Continue,
+        11,
+    )?;
+    let replacement = origin
+        .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 12)?
+        .unwrap();
+    assert_ne!(replacement.assignment_id, first.assignment_id);
+    let before = origin.version_vector(&net.network)?;
+    let rejected = origin
+        .apply_workspace_command(
+            &net.a,
+            &net.network,
+            "borrow-old-reply",
+            WorkspaceCommand::AssignmentProgress {
+                execution: None,
+                assignment_id: replacement.assignment_id.clone(),
+                revision: 1,
+                state: AssignmentState::Accepted,
+                input_event: None,
+                evidence_event: Some(proof),
+                result: None,
+            },
+            None,
+            None,
+            None,
+            13,
+        )
+        .expect_err("the old allocation's reply cannot prove acceptance of its replacement");
+    assert!(format!("{rejected:#}").contains("assignment reply is outside this task revision"));
+    assert_eq!(origin.version_vector(&net.network)?, before);
+    assert_eq!(
+        replacement.trigger_message_id.as_deref(),
+        Some("replacement")
+    );
+    origin
+        .admit_delivery(
+            &local,
+            &net.network,
+            "c",
+            &message_trigger("partial-followup"),
+        )?
+        .context("duplicate admission")?;
+    let fixed = workspace::workspace_assignment_for_job_from(
+        &origin.connection,
+        &net.network,
+        &local,
+        &followup,
+    )?
+    .unwrap();
+    assert_eq!(fixed.assignment_id, first.assignment_id);
+    assert_eq!(fixed.state, AssignmentState::Stopped);
+    assert!(!workspace::assignment_work_allowed_from(
+        &origin.connection,
+        &net.network,
+        &fixed.assignment_id,
+        &local,
+        "c"
+    )?);
     Ok(())
 }

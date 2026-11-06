@@ -4379,8 +4379,14 @@ def acceptance(options):
             view = at_c.rpc("conversation", conversation_id=conversation)
             job = next((row for row in view["scheduler"]["jobs"] if row["trigger"] == held["trigger"]), None)
             remote = view["scheduler"]["remote"]
+            scope_jobs = remote.get("scope_jobs")
             return view if job and job["state"] == state and job.get("source_node") == a.device_id \
-                and set(remote) == {"owner", "reachable", "context", "memory_staged_count", "memory_conflicts"} \
+                and set(remote) == {"owner", "reachable", "context", "scope_jobs", "memory_staged_count", "memory_conflicts"} \
+                and isinstance(scope_jobs, list) \
+                and all(isinstance(row, dict) and row.get("conversation_id") == conversation
+                        and row.get("source_node") == a.device_id and row.get("scope") == {"kind": "main"}
+                        for row in scope_jobs) \
+                and any(row.get("trigger") == held["trigger"] and row.get("state") == state for row in scope_jobs) \
                 and remote["owner"] == a.device_id and remote["reachable"] is True else None
         view = wait_for("C shows A's running reply", lambda: owner_job("running"), timeout=60)
         remote = view["scheduler"]["remote"]
@@ -8301,7 +8307,13 @@ def e2e_fixture(options):
                                         "turn_id": row["message"]["params"]["turnId"]}
                                        for row in fixture_records(run, "codex-rpc.jsonl")
                                        if row["message"].get("method") == "turn/interrupt"],
+                        "inputs": [{"message_id": row["input"]["message_id"], "conversation_id": row["conversation_id"],
+                                    "target": row["input"]["target"], "text": row["input"]["text"],
+                                    "deferred": row["deferred"], "cancelled": row["cancelled"]}
+                                   for row in nodes["source"].client.rpc("workspace_state")["inputs"]],
                     }
+                    require(len(json.dumps({"ok": True, "result": result}).encode()) <= 65536,
+                            "workspace inspection returns one bounded public JSON event")
                 elif op == "workspace_native_setup":
                     require(set(request) == {"op", "invitation_file"} and workspace_gates and not native_ready,
                             "native workspace setup initializes only its own fresh workspace fixture")

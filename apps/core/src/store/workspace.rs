@@ -47,6 +47,13 @@ struct InputControlState {
     attachments: Option<Vec<Attachment>>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct InputAssignmentBinding {
+    source_event: String,
+    assignment_id: String,
+    assignment_event: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AssignmentStopProof {
     event_hash: String,
@@ -1274,6 +1281,127 @@ fn direct_parent(event: &Event, hash: &str) -> bool {
     event.prev.as_deref() == Some(hash) || event.deps.iter().any(|parent| parent == hash)
 }
 
+fn assignment_reply_source_matches_from(
+    connection: &Connection,
+    network: &str,
+    assignment: &Assignment,
+    revision: u64,
+    input: &str,
+    proof: &Event,
+) -> Result<bool> {
+    let known = ancestors(connection, network, proof)?;
+    let at_reply = graph_at(connection, network, Some(&known))?;
+    let Some(task) = at_reply.tasks.get(&assignment.task_id) else {
+        return Ok(false);
+    };
+    if task.current_assignment.as_deref() != Some(assignment.assignment_id.as_str())
+        || task.owner_bot != assignment.bot_id
+        || bot_scope(connection, network, &assignment.bot_id)? != proof.scope_id
+        || !at_reply
+            .assignments
+            .get(&assignment.assignment_id)
+            .is_some_and(|original| {
+                original.event_hash == assignment.event_hash
+                    && original.execution_node == assignment.execution_node
+                    && original.bot_id == assignment.bot_id
+            })
+    {
+        return Ok(false);
+    }
+    let submitted = assignment
+        .submitted_result
+        .as_ref()
+        .is_some_and(|submitted| submitted.revision == revision);
+    if input == assignment.assignment_id {
+        return Ok(revision == assignment.started_revision || submitted);
+    }
+    if let Some(source) = workspace_input_from(connection, network, input)? {
+        return Ok(source.conversation_id == proof.scope_id
+            && target_task(&source.input.route.target) == Some(assignment.task_id.as_str())
+            && (source.input.route.expected_revision == Some(revision) || submitted)
+            && known.get(&source.source_event).is_some_and(|event| {
+                matches!(
+                    &event.body,
+                    EventBody::InputPosted {
+                        attestation: Some(_),
+                        ..
+                    }
+                )
+            }));
+    }
+    let Some(answer) = super::message_from(connection, network, &proof.scope_id, input)?
+        .filter(|answer| answer.role == Role::User)
+    else {
+        return Ok(false);
+    };
+    let Some(question) = answer.answers.as_deref() else {
+        return Ok(false);
+    };
+    if !known.get(&answer.event_hash).is_some_and(|event| {
+        matches!(&event.body, EventBody::MessagePosted { role: Role::User, answers: Some(id), attestation: Some(_), .. } if id == question)
+    }) {
+        return Ok(false);
+    }
+    let Some(asked) = super::event_about_from(
+        connection,
+        network,
+        &proof.scope_id,
+        "question_asked",
+        question,
+    )?
+    else {
+        return Ok(false);
+    };
+    let EventBody::QuestionAsked {
+        target: Some(target),
+        about,
+        ..
+    } = &asked.event.body
+    else {
+        return Ok(false);
+    };
+    if !known.contains_key(&asked.hash)
+        || asked.event.author != assignment.execution_node
+        || about.node != assignment.execution_node
+        || target_task(target) != Some(assignment.task_id.as_str())
+    {
+        return Ok(false);
+    }
+    let question_known = ancestors(connection, network, &asked.event)?;
+    let at_question = graph_at(connection, network, Some(&question_known))?;
+    let Some(question_task) = at_question.tasks.get(&assignment.task_id) else {
+        return Ok(false);
+    };
+    if let InputTarget::ChannelTask {
+        channel_id, bot_id, ..
+    } = target
+        && (question_task.channel_id.as_ref() != Some(channel_id)
+            || question_task.owner_bot != *bot_id)
+    {
+        return Ok(false);
+    }
+    let Some(original) = question_task
+        .current_assignment
+        .as_ref()
+        .and_then(|id| at_question.assignments.get(id))
+    else {
+        return Ok(false);
+    };
+    Ok(original.assignment_id == assignment.assignment_id
+        && original.event_hash == assignment.event_hash
+        && original.execution_node == assignment.execution_node
+        && original.bot_id == assignment.bot_id
+        && matches!(
+            original.state,
+            AssignmentState::Accepted | AssignmentState::Adopted
+        )
+        && (original
+            .adopted_revision
+            .unwrap_or(original.started_revision)
+            == revision
+            || submitted))
+}
+
 pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Event) -> Result<()> {
     if !matches!(
         event.body,
@@ -1500,27 +1628,10 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                                 },
                                 "assignment reply is not proven ended"
                             );
-                            let task_scope = bot_scope(connection, network, &assignment.bot_id)?;
-                            let source_matches = if input == assignment_id {
-                                proof.scope_id == task_scope
-                            } else {
-                                workspace_input_from(connection, network, input)?.is_some_and(
-                                    |source| {
-                                        target_task(&source.input.route.target)
-                                            == Some(assignment.task_id.as_str())
-                                            && source.conversation_id == proof.scope_id
-                                            && assignment.trigger_message_id.as_deref()
-                                                == Some(source.input.message_id.as_str())
-                                    },
-                                )
-                            };
-                            let revision_matches = *revision == assignment.started_revision
-                                || assignment
-                                    .submitted_result
-                                    .as_ref()
-                                    .is_some_and(|submitted| submitted.revision == *revision);
                             ensure!(
-                                source_matches && revision_matches,
+                                assignment_reply_source_matches_from(
+                                    connection, network, assignment, *revision, input, proof,
+                                )?,
                                 "assignment reply is outside this task revision"
                             );
                         }
@@ -2022,6 +2133,10 @@ fn resource_conflicts_from(
         ResourceQuery::Assignment(work) => work,
         ResourceQuery::Work(work) => Some(work),
     };
+    let requesting_work = except_work
+        .map(|id| super::reduce::work_from(connection, network, id))
+        .transpose()?
+        .flatten();
     let mut conflicts = BTreeSet::new();
     for assignment in graph.assignments.values().filter(|assignment| {
         assignment.execution_node == node
@@ -2101,17 +2216,21 @@ fn resource_conflicts_from(
                     valid_roots(std::slice::from_ref(&cwd))?;
                     cwd
                 }
-                None => work.cwd,
+                None => work.cwd.clone(),
             };
             if roots.iter().any(|root| overlap(root, &occupied)) {
+                if matches!(query, ResourceQuery::Work(_))
+                    && let Some(requesting) = &requesting_work
+                    && super::scheduler::work_shares_native_execution_from(
+                        connection, network, requesting, &work,
+                    )?
+                {
+                    continue;
+                }
                 conflicts.insert(format!("work:{}", work.work_id));
             }
         }
     }
-    let requesting_work = except_work
-        .map(|id| super::reduce::work_from(connection, network, id))
-        .transpose()?
-        .flatten();
     let mut statement=connection.prepare("SELECT conversation_id,scope,trigger FROM scheduler_jobs WHERE state IN ('claimed','running','cancelling','reconciling')")?;
     let sessions = statement
         .query_map([], |row| {
@@ -3076,11 +3195,12 @@ impl Store {
                 return Ok(Some(existing));
             }
         }
-        let used_inputs: BTreeSet<_> = Graph::read(&self.connection, network)?
+        let graph = Graph::read(&self.connection, network)?;
+        let used_inputs: BTreeSet<_> = graph
             .assignments
-            .into_values()
+            .values()
             .filter(|assignment| assignment.task_id == task_id)
-            .filter_map(|assignment| assignment.trigger_message_id)
+            .filter_map(|assignment| assignment.trigger_message_id.clone())
             .collect();
         let mut inputs = self.workspace_queue(network)?;
         inputs.retain(|input| {
@@ -3092,6 +3212,12 @@ impl Store {
         });
         let mut eligible = Vec::new();
         for input in inputs {
+            let original =
+                workspace_input_from(&self.connection, network, &input.input.message_id)?
+                    .context("task input is missing")?;
+            if assignment_for_input_from(&self.connection, network, &original, &graph)?.is_some() {
+                continue;
+            }
             let job = self.scheduler_job(
                 &input.conversation_id,
                 &crate::scheduling::message_trigger(&input.input.message_id),
@@ -3186,7 +3312,6 @@ impl Store {
             return Ok(());
         };
         let local = identity.device_id()?;
-        let assignment_id = job.trigger.strip_prefix("assignment:");
         let Some(mut assignment) =
             workspace_assignment_for_job_from(&self.connection, network, &local, job)?
         else {
@@ -3199,18 +3324,12 @@ impl Store {
             return Ok(());
         }
         let id = assignment.assignment_id.clone();
-        let (initial_revision, adoption_source) = if assignment_id.is_some() {
-            (assignment.started_revision, assignment.event_hash.clone())
-        } else {
-            let Some(source) = self
-                .workspace_input(network, &job.reply_to)?
-                .filter(|input| {
-                    target_task(&input.input.route.target) == Some(task_id.as_str())
-                        && assignment.source_event.as_ref() == Some(&input.source_event)
-                })
-            else {
-                return Ok(());
-            };
+        let (initial_revision, adoption_source) = if let Some(source) = self
+            .workspace_input(network, &job.reply_to)?
+            .filter(|input| {
+                input.conversation_id == job.conversation_id
+                    && target_task(&input.input.route.target) == Some(task_id.as_str())
+            }) {
             (
                 source
                     .input
@@ -3219,6 +3338,8 @@ impl Store {
                     .context("task input lacks revision")?,
                 source.source_event,
             )
+        } else {
+            (assignment.started_revision, assignment.event_hash.clone())
         };
         let revision = assignment
             .submitted_result
@@ -3314,7 +3435,23 @@ impl Store {
             return Ok(());
         }
         if let Some(reply) = terminal {
-            let state = if reply.status == Some(ReplyStatus::Completed) {
+            let Some(task) = self.workspace_task(network, &task_id)? else {
+                return Ok(());
+            };
+            if task.current_assignment.as_deref() != Some(id.as_str())
+                || super::scheduler::workspace_assignment_followups_pending_from(
+                    &self.connection,
+                    network,
+                    &local,
+                    &assignment,
+                    job,
+                )?
+            {
+                return Ok(());
+            }
+            let state = if reply.status == Some(ReplyStatus::Completed)
+                && task.action == TaskAction::Continue
+            {
                 AssignmentState::Completed
             } else {
                 AssignmentState::Stopped
@@ -4402,6 +4539,202 @@ impl Store {
     }
 }
 
+fn input_requires_new_assignment_from(
+    connection: &Connection,
+    network: &str,
+    input: &WorkspaceInput,
+    assignment: &Assignment,
+) -> Result<bool> {
+    if !(assignment.state == AssignmentState::Proposed
+        && assignment.accepted_revision.is_none()
+        && assignment.adopted_revision.is_none()
+        && input
+            .input
+            .route
+            .expected_revision
+            .is_some_and(|revision| revision > assignment.started_revision))
+    {
+        return Ok(false);
+    }
+    let scope = SessionScope::WorkspaceTask {
+        task_id: assignment.task_id.clone(),
+    }
+    .storage_key();
+    let direct = format!("assignment:{}", assignment.assignment_id);
+    let source = assignment
+        .trigger_message_id
+        .as_ref()
+        .map(|input| crate::scheduling::message_trigger(input))
+        .unwrap_or_else(|| direct.clone());
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM scheduler_jobs AS job
+            WHERE conversation_id=?1 AND scope=?2 AND trigger IN (?3,?4)
+              AND state IN ('queued','cancelled') AND attempt_id IS NULL AND tool_calls=0
+              AND (runtime IS NULL OR json_extract(runtime,'$.execution')='not_started')
+              AND NOT EXISTS(SELECT 1 FROM pending_checks AS pending
+                  WHERE pending.conversation_id=job.conversation_id AND pending.trigger=job.trigger)
+         )",
+        params![
+            bot_scope(connection, network, &assignment.bot_id)?,
+            scope,
+            direct,
+            source
+        ],
+        |row| row.get(0),
+    )?)
+}
+
+fn assignment_for_input_from(
+    connection: &Connection,
+    network: &str,
+    input: &WorkspaceInput,
+    graph: &Graph,
+) -> Result<Option<Assignment>> {
+    let Some(task_id) = target_task(&input.input.route.target) else {
+        return Ok(None);
+    };
+    let binding: Option<String> = connection
+        .query_row(
+            "SELECT value FROM identity_meta WHERE key=?",
+            [format!(
+                "workspace-input-assignment:{network}:{}",
+                input.input.message_id
+            )],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(binding) = binding {
+        let binding: InputAssignmentBinding = serde_json::from_str(&binding)?;
+        ensure!(
+            binding.source_event == input.source_event,
+            "input assignment source changed"
+        );
+        return Ok(graph
+            .assignments
+            .get(&binding.assignment_id)
+            .filter(|assignment| {
+                assignment.event_hash == binding.assignment_event && assignment.task_id == task_id
+            })
+            .cloned());
+    }
+    let source = log::event_from(connection, network, &input.source_event)?
+        .context("task input source is missing")?;
+    let known = ancestors(connection, network, &source)?;
+    let at_input = graph_at(connection, network, Some(&known))?;
+    if let Some(task) = at_input.tasks.get(task_id) {
+        if input.input.route.expected_revision != Some(task.revision) {
+            return Ok(None);
+        }
+        if let InputTarget::ChannelTask {
+            channel_id, bot_id, ..
+        } = &input.input.route.target
+            && (task.channel_id.as_ref() != Some(channel_id) || task.owner_bot != *bot_id)
+        {
+            return Ok(None);
+        }
+        if let Some(original) = task
+            .current_assignment
+            .as_ref()
+            .and_then(|id| at_input.assignments.get(id))
+            .filter(|assignment| {
+                !matches!(
+                    assignment.state,
+                    AssignmentState::Completed | AssignmentState::Stopped
+                )
+            })
+            && !input_requires_new_assignment_from(connection, network, input, original)?
+        {
+            return Ok(graph
+                .assignments
+                .get(&original.assignment_id)
+                .filter(|assignment| {
+                    assignment.event_hash == original.event_hash
+                        && assignment.bot_id == original.bot_id
+                        && assignment.execution_node == original.execution_node
+                })
+                .cloned());
+        }
+    }
+    let mut found = None;
+    for assignment in graph.assignments.values().filter(|assignment| {
+        assignment.task_id == task_id
+            && assignment.trigger_message_id.as_deref() == Some(input.input.message_id.as_str())
+            && assignment.source_event.as_ref() == Some(&input.source_event)
+            && Some(assignment.started_revision) == input.input.route.expected_revision
+    }) {
+        ensure!(found.is_none(), "input has multiple original assignments");
+        found = Some(assignment.clone());
+    }
+    Ok(found)
+}
+
+pub(crate) fn freeze_workspace_input_assignment_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    message_id: &str,
+) -> Result<()> {
+    let Some(input) = workspace_input_from(connection, network, message_id)? else {
+        return Ok(());
+    };
+    let Some(task_id) = target_task(&input.input.route.target) else {
+        return Ok(());
+    };
+    ensure!(
+        input.conversation_id == conversation,
+        "input conversation mismatch"
+    );
+    let key = format!("workspace-input-assignment:{network}:{message_id}");
+    let existing: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM identity_meta WHERE key=?)",
+        [&key],
+        |row| row.get(0),
+    )?;
+    if existing {
+        return Ok(());
+    }
+    let graph = Graph::read(connection, network)?;
+    let original = assignment_for_input_from(connection, network, &input, &graph)?;
+    let current = graph
+        .tasks
+        .get(task_id)
+        .filter(|task| input.input.route.expected_revision == Some(task.revision))
+        .and_then(|task| task.current_assignment.as_ref())
+        .and_then(|id| graph.assignments.get(id))
+        .filter(|assignment| {
+            !matches!(
+                assignment.state,
+                AssignmentState::Completed | AssignmentState::Stopped
+            )
+        });
+    let current = match current {
+        Some(current)
+            if input_requires_new_assignment_from(connection, network, &input, current)? =>
+        {
+            None
+        }
+        current => current,
+    };
+    let Some(assignment) = original.as_ref().or(current) else {
+        return Ok(());
+    };
+    ensure!(
+        bot_scope(connection, network, &assignment.bot_id)? == conversation,
+        "input assignment belongs to another Bot"
+    );
+    let binding = InputAssignmentBinding {
+        source_event: input.source_event,
+        assignment_id: assignment.assignment_id.clone(),
+        assignment_event: assignment.event_hash.clone(),
+    };
+    connection.execute(
+        "INSERT INTO identity_meta(key,value) VALUES(?,?)",
+        params![key, serde_json::to_string(&binding)?],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn workspace_assignment_for_job_from(
     connection: &Connection,
     network: &str,
@@ -4562,20 +4895,17 @@ pub(crate) fn workspace_assignment_for_job_from(
     {
         return Ok(None);
     }
-    let mut found = None;
-    for assignment in graph.assignments.values().filter(|assignment| {
-        assignment.task_id == task_id
-            && assignment.execution_node == local
-            && assignment.trigger_message_id.as_deref() == Some(job.reply_to.as_str())
-            && assignment.source_event.as_ref() == Some(&input.source_event)
-            && Some(assignment.started_revision) == input.input.route.expected_revision
-    }) {
-        if bot_scope(connection, network, &assignment.bot_id)? == job.conversation_id {
-            ensure!(found.is_none(), "job has multiple original assignments");
-            found = Some(assignment.clone());
-        }
+    let source = log::event_from(connection, network, &input.source_event)?
+        .context("task input source is missing")?;
+    if job.basis.get(&source.author).copied().unwrap_or(0) < source.seq {
+        return Ok(None);
     }
-    Ok(found)
+    let assignment = assignment_for_input_from(connection, network, &input, &graph)?;
+    Ok(assignment.filter(|assignment| {
+        assignment.execution_node == local
+            && bot_scope(connection, network, &assignment.bot_id)
+                .is_ok_and(|scope| scope == job.conversation_id)
+    }))
 }
 
 pub(crate) fn assignment_resources_available_from(

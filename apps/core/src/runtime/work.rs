@@ -595,6 +595,32 @@ impl Runtime {
             record.conversation == scope && on_app_server(&record),
             "work belongs to another conversation"
         );
+        let execution = self
+            .store
+            .lock()
+            .await
+            .work_native_execution(network, work_id)?;
+        if let Some(execution) = execution {
+            let matches = match &report {
+                StartReport::Thread { thread_id } => thread_id == &execution.thread_id,
+                StartReport::Turn { turn_id } => {
+                    turn_id == &execution.turn_id
+                        && record.state.thread() == Some(execution.thread_id.as_str())
+                }
+                _ => true,
+            };
+            if !matches {
+                self.signal_work(
+                    network,
+                    work_id,
+                    Signal::SubmissionUnverified(
+                        "native send report differs from its reserved turn".into(),
+                    ),
+                )
+                .await?;
+                bail!("native send report differs from its reserved turn; delivery is unknown");
+            }
+        }
         let mut record = record;
         match report {
             StartReport::Thread { thread_id } => {
@@ -737,6 +763,30 @@ impl Runtime {
             state if state.thread().is_none() => return Ok(()),
             _ => self.work_executor(&record)?.probe(&record).await,
         };
+        let execution = self
+            .store
+            .lock()
+            .await
+            .work_native_execution(network, work_id)?;
+        if let Some(execution) = execution {
+            let turn = match &probe {
+                Ok(Probe::Running { turn_id, .. } | Probe::Terminal { turn_id, .. }) => {
+                    Some(turn_id)
+                }
+                _ => None,
+            };
+            if turn.is_some_and(|turn| turn != &execution.turn_id) {
+                self.signal_work(
+                    network,
+                    work_id,
+                    Signal::SubmissionUnverified(
+                        "native readback differs from its reserved turn".into(),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
         match probe {
             Ok(Probe::NotStarted | Probe::Missing)
                 if !over && matches!(record.state, WorkState::Starting { .. }) =>

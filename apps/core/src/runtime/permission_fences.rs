@@ -290,7 +290,7 @@ mod tests {
         store.accept_work_fixture(&node.identity, network, spec.clone(), now_ms())?;
         let actual_cwd = cwd.canonicalize()?;
         let actual_cwd = actual_cwd.to_str().context("fixture cwd")?;
-        store.reserve_work_native_submission(network, &spec, actual_cwd)?;
+        store.reserve_work_native_submission(network, &spec, actual_cwd, None)?;
         store.begin_reserved_work_native_input(network, &spec, &target.thread_id, actual_cwd)?;
         store.apply_work_signal(
             &node.identity,

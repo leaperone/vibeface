@@ -1280,6 +1280,34 @@ impl Runtime {
                 == request.permission_epoch,
             "the request's captured permissions were revoked"
         );
+        let active_group = |store: &crate::store::Store| -> Result<Vec<crate::work::WorkRecord>> {
+            let mut active: Vec<_> = store
+                .work_records_on_thread(&request.session_id)?
+                .into_iter()
+                .filter(|record| !record.state.finished())
+                .collect();
+            active.sort_by(|left, right| left.work_id.cmp(&right.work_id));
+            ensure!(!active.is_empty(), "the request has no active work");
+            if active.len() > 1 {
+                ensure!(
+                    request.provider == Provider::Codex,
+                    "the request has multiple native executions"
+                );
+                let first = store
+                    .work(&control.network, &active[0].work_id)?
+                    .context("the request's work is missing")?;
+                for record in active.iter().skip(1) {
+                    let work = store
+                        .work(&control.network, &record.work_id)?
+                        .context("the request's work is missing")?;
+                    ensure!(
+                        store.work_shares_native_execution(&control.network, &first, &work)?,
+                        "the request spans different native executions or work scopes"
+                    );
+                }
+            }
+            Ok(active)
+        };
         let (manager_attempt, managed, runs) = {
             let store = self.store.lock().await;
             let manager: Option<String> = store.connection.query_row(
@@ -1306,20 +1334,17 @@ impl Runtime {
         if runs.is_empty() {
             return Ok(Vec::new());
         }
-        let active: Vec<_> = runs
-            .iter()
-            .filter(|record| !record.state.finished())
-            .collect();
-        ensure!(
-            active.len() == 1,
-            "the request no longer identifies one active work"
-        );
-        let work_id = active[0].work_id.clone();
+        let active = {
+            let store = self.store.lock().await;
+            active_group(&store)?
+        };
+        let work_ids: Vec<_> = active.iter().map(|record| record.work_id.clone()).collect();
+        let work_id = &work_ids[0];
         let mut leases = Vec::new();
         let parent = {
             let store = self.store.lock().await;
             let work = store
-                .work(&control.network, &work_id)?
+                .work(&control.network, work_id)?
                 .context("the request's work is missing")?;
             if let Some(parent) = &work.parent {
                 let parent = store
@@ -1351,15 +1376,17 @@ impl Runtime {
                 None
             }
         };
-        // Match manager tools' order so a parent cancellation cannot deadlock a child input.
+        // Parent first, then stable Work order, matching cancellation's lock order.
         if let Some((_, attempt, provider)) = &parent {
             leases.push(self.manager_input_lease(attempt, *provider).await?);
         }
-        let input = self.work_input_lock(&work_id).await.read_owned().await;
+        for id in &work_ids {
+            leases.push(self.work_input_lock(id).await.read_owned().await);
+        }
         let cwd = {
             let store = self.store.lock().await;
             let work = store
-                .work(&control.network, &work_id)?
+                .work(&control.network, work_id)?
                 .context("the request's work is missing")?;
             Self::validate_work_assignment_roots(&store, &control.network, &work.trigger)?;
             work.cwd
@@ -1367,77 +1394,104 @@ impl Runtime {
         let actual_cwd = self
             .work_native_directory(request.provider, Some(&request.session_id), &cwd)
             .await?;
+        let execution = if work_ids.len() > 1 {
+            Some(
+                self.codex_native_execution(&control.network, &request.session_id, &actual_cwd)
+                    .await?
+                    .context("the request's shared native turn is no longer active")?,
+            )
+        } else {
+            None
+        };
         let store = self.store.lock().await;
         store.authorize_node(&control.network, &request.node)?;
-        let runs = store.work_records_on_thread(&request.session_id)?;
-        let active: Vec<_> = runs
-            .iter()
-            .filter(|record| !record.state.finished())
-            .collect();
+        let active = active_group(&store)?;
         ensure!(
-            active.len() == 1 && active[0].work_id == work_id,
-            "the request's active work changed before delivery"
+            active
+                .iter()
+                .map(|record| &record.work_id)
+                .eq(work_ids.iter()),
+            "the request's active works changed before delivery"
         );
-        let record = active[0];
-        ensure!(
-            record.kind == crate::model::WorkKind::Agent(request.provider)
-                && !store
-                    .stop_requests()?
-                    .iter()
-                    .any(|stop| stop.work_id == work_id)
-                && !store.peer_cancelled(&control.network, &record.conversation, &work_id)?,
-            "the request's work was stopped or changed provider"
-        );
-        ensure!(
-            store.work_native_write_allowed(&control.network, &work_id)?,
-            "the request's work has no current authority for native submission"
-        );
-        if let Some(handle) = record.state.handle() {
+        if let Some(execution) = &execution {
             ensure!(
-                request.turn_id.is_empty() || handle.turn_id == request.turn_id,
-                "the request belongs to another work turn"
+                (request.turn_id.is_empty() || request.turn_id == execution.turn_id)
+                    && work_ids.iter().any(|id| execution.work_ids.contains(id)),
+                "the request does not identify the shared native turn"
             );
         }
-        let work = store
-            .work(&control.network, &work_id)?
-            .context("the request's work is missing")?;
-        ensure!(
-            work.target_node == request.node
-                && work.outcome.is_none()
-                && work.parent.as_ref() == parent.as_ref().map(|(id, _, _)| id)
-                && self
-                    .providers()
-                    .switches
-                    .execution
-                    .contains(&request.provider)
-                && self
-                    .local_permission_epoch
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    == request.permission_epoch,
-            "the request's execution permission was revoked"
-        );
-        Self::validate_work_assignment_roots(&store, &control.network, &work.trigger)?;
-        ensure!(
-            store.work_native_directory_matches_reservation(
-                &control.network,
-                &work,
-                actual_cwd
-                    .to_str()
-                    .context("native work directory is not UTF-8")?,
-            )?,
-            "the request's native directory differs from the reserved work"
-        );
-        if parent.is_none() {
-            let owner = store
-                .conversation(&control.network, &record.conversation)?
-                .context("work conversation missing")?;
+        let stops = store.stop_requests()?;
+        for record in &active {
+            let work_id = &record.work_id;
             ensure!(
-                owner.owner.as_deref() == Some(work.dispatcher.as_str())
-                    && request.owner_epoch == Some(owner.owner_epoch),
-                "the request's work owner is no longer valid"
+                record.kind == crate::model::WorkKind::Agent(request.provider)
+                    && !stops.iter().any(|stop| &stop.work_id == work_id)
+                    && !store.peer_cancelled(&control.network, &record.conversation, work_id)?,
+                "the request's work was stopped or changed provider"
             );
+            ensure!(
+                store.work_native_write_allowed(&control.network, work_id)?,
+                "the request's work has no current authority for native submission"
+            );
+            if let Some(handle) = record.state.handle() {
+                ensure!(
+                    (request.turn_id.is_empty() || handle.turn_id == request.turn_id)
+                        && execution
+                            .as_ref()
+                            .is_none_or(|execution| handle.thread_id == execution.thread_id
+                                && handle.turn_id == execution.turn_id),
+                    "the request belongs to another work turn"
+                );
+            } else if let Some(execution) = &execution {
+                ensure!(
+                    store
+                        .work_native_execution(&control.network, work_id)?
+                        .is_some_and(|reserved| reserved.thread_id == execution.thread_id
+                            && reserved.turn_id == execution.turn_id),
+                    "the request's work has no shared native turn permit"
+                );
+            }
+            let work = store
+                .work(&control.network, work_id)?
+                .context("the request's work is missing")?;
+            ensure!(
+                work.target_node == request.node
+                    && work.outcome.is_none()
+                    && work.parent.as_ref() == parent.as_ref().map(|(id, _, _)| id)
+                    && self
+                        .providers()
+                        .switches
+                        .execution
+                        .contains(&request.provider)
+                    && self
+                        .local_permission_epoch
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == request.permission_epoch,
+                "the request's execution permission was revoked"
+            );
+            Self::validate_work_assignment_roots(&store, &control.network, &work.trigger)?;
+            ensure!(
+                (work.cwd.is_empty() || PathBuf::from(&work.cwd).canonicalize()? == actual_cwd)
+                    && store.work_native_directory_matches_reservation(
+                        &control.network,
+                        &work,
+                        actual_cwd
+                            .to_str()
+                            .context("native work directory is not UTF-8")?
+                    )?,
+                "the request's native directory differs from the reserved work"
+            );
+            if parent.is_none() {
+                let owner = store
+                    .conversation(&control.network, &record.conversation)?
+                    .context("work conversation missing")?;
+                ensure!(
+                    owner.owner.as_deref() == Some(work.dispatcher.as_str())
+                        && request.owner_epoch == Some(owner.owner_epoch),
+                    "the request's work owner is no longer valid"
+                );
+            }
         }
-        leases.push(input);
         Ok(leases)
     }
 
@@ -4474,6 +4528,9 @@ pub(super) mod tests {
         use futures_util::SinkExt as _;
         for (change, deny) in [
             ("standalone", false),
+            ("shared", false),
+            ("shared-stopped", false),
+            ("shared-scope", false),
             ("assigned", false),
             ("pause", false),
             ("pause", true),
@@ -4505,6 +4562,8 @@ pub(super) mod tests {
                 let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
                 let native_directory = Arc::new(std::sync::Mutex::new(directory.display().to_string()));
                 let served_directory = native_directory.clone();
+                let native_work_ids = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+                let served_work_ids = native_work_ids.clone();
                 socket_task = Some(tokio::spawn(async move {
                     loop {
                         let message = read(&mut socket).await;
@@ -4514,7 +4573,7 @@ pub(super) mod tests {
                             let result = match message["method"].as_str() {
                                 Some("thread/read" | "thread/resume") => {
                                     json!({"thread":{"id":"t-1","cwd":lock(&served_directory).clone(),
-                                    "turns":[{"id":"u-1","status":"inProgress","items":[]}]}})
+                                    "turns":[{"id":"u-1","status":"inProgress","items":lock(&served_work_ids).iter().map(|id| json!({"type":"userMessage","clientId":id})).collect::<Vec<_>>()}]}})
                                 }
                                 _ => json!({}),
                             };
@@ -4532,7 +4591,7 @@ pub(super) mod tests {
                         }
                     }
                 }));
-                let trigger = if change == "standalone" {
+                let trigger = if change == "standalone" || change.starts_with("shared") {
                     main_input_fact(&node, &admin, "c", "held-work-origin").await?
                 } else {
                     human_workspace_command(
@@ -4639,9 +4698,22 @@ pub(super) mod tests {
                     },
                 )
                 .await?;
+                lock(&native_work_ids).push(work_id.clone());
+                let mut group_ids = vec![work_id.clone()];
+                if change.starts_with("shared") {
+                    let mut second = spec.clone();
+                    second.call_ref = "held-second".into();
+                    second.work_id = crate::work::WorkSpec::id("c", &second.trigger, &second.call_ref);
+                    if change == "shared-scope" { second.parent = Some("another-task".into()); }
+                    node.store.lock().await.accept_work_fixture(&node.identity, &network, second.clone(), now_ms())?;
+                    if change != "shared-scope" { drop(node.work_start_lease(&network, &second, Some("t-1")).await?); }
+                    node.signal_work(&network, &second.work_id, crate::work::Signal::TurnStarted { turn_id:"u-1".into(), epoch:node.codex.epoch() }).await?;
+                    lock(&native_work_ids).push(second.work_id.clone());
+                    group_ids.push(second.work_id);
+                }
                 {
                     let store = node.store.lock().await;
-                    assert!(store.work_native_write_allowed(&network, &work_id)?);
+                    assert_eq!(store.work_native_write_allowed(&network, &work_id)?, change != "shared-scope");
                     assert!(
                         store
                             .work(&network, &work_id)?
@@ -4659,7 +4731,7 @@ pub(super) mod tests {
                     if deny { "拒绝" } else { "允许本次" },
                 )
                 .await?;
-                if matches!(change, "standalone" | "assigned") {
+                if matches!(change, "standalone" | "assigned" | "shared") {
                     let attempt = {
                         let mut store = node.store.lock().await;
                         let TriageAdmission::Claimed(attempt) =
@@ -4672,13 +4744,10 @@ pub(super) mod tests {
                     let leases = node
                         .answer_permission_lease(attempt.answer().context("control")?)
                         .await?;
-                    assert!(
-                        node.work_input_lock(&work_id)
-                            .await
-                            .try_write_owned()
-                            .is_err(),
-                        "the returned approval lease retains the Work input read lock"
-                    );
+                    for id in &group_ids {
+                        assert!(node.work_input_lock(id).await.try_write_owned().is_err(),
+                            "the approval lease retains every shared Work input read lock");
+                    }
                     drop(leases);
                     node.store.lock().await.finish_triage(
                         attempt,
@@ -4703,7 +4772,13 @@ pub(super) mod tests {
                         json!({"decision":"accept"})
                     );
                 } else {
-                    if matches!(change, "retarget" | "native-cwd") {
+                    if change == "shared-stopped" {
+                        node.store.lock().await.save_stop_request(&crate::work::StopRequest {
+                            work_id:group_ids[1].clone(), conversation:"c".into(), target:node.identity.device_id()?,
+                            requested_at_ms:now_ms(), deadline_ms:now_ms()+1000, timed_out:false,
+                        })?;
+                    } else if change == "shared-scope" {
+                    } else if matches!(change, "retarget" | "native-cwd") {
                         let replacement = root.join("other");
                         std::fs::create_dir(&replacement)?;
                         if change == "retarget" {
@@ -4744,10 +4819,8 @@ pub(super) mod tests {
                         if !matches!(change, "retarget" | "native-cwd") {
                             assert!(!store.work_native_write_allowed(&network, &work_id)?);
                         }
-                        assert!(
-                            store.stop_requests()?.is_empty(),
-                            "the source command precedes asynchronous native cancellation"
-                        );
+                        assert_eq!(store.stop_requests()?.is_empty(), change != "shared-stopped",
+                            "only the shared-stop fixture has sent a stop request");
                         assert!(
                             !store
                                 .work_record(&work_id)?
@@ -4770,6 +4843,7 @@ pub(super) mod tests {
                             .await
                             .expect_err("an obsolete assignment cannot approve its Work");
                         let reason = match change {
+                            "shared-stopped" | "shared-scope" => "different native executions or work scopes",
                             "retarget" => "assignment resource roots",
                             "native-cwd" => "native directory differs from the reserved work",
                             _ => "current authority",
@@ -7556,7 +7630,13 @@ pub(super) mod tests {
                                 turns.insert(thread.into(), turn.clone());
                                 json!({"turn":turn})
                             }
-                            Some("thread/read" | "thread/resume") => json!({"thread":{"id":thread,"cwd":native_dirs.get(thread),"source":"cli","status":{"type":"idle"},"turns":turns.get(thread).cloned().into_iter().collect::<Vec<_>>()}}),
+                            Some("turn/steer") => {
+                                let turn = turns.get_mut(thread).unwrap();
+                                assert_eq!(request["params"]["expectedTurnId"], turn["id"]);
+                                turn["items"].as_array_mut().unwrap().push(json!({"type":"userMessage","clientId":request["params"]["clientUserMessageId"]}));
+                                json!({"turnId":turn["id"]})
+                            }
+                            Some("thread/read" | "thread/resume") => json!({"thread":{"id":thread,"cwd":native_dirs.get(thread),"source":"cli","status":{"type":if turns.contains_key(thread) {"active"} else {"idle"}},"turns":turns.get(thread).cloned().into_iter().collect::<Vec<_>>()}}),
                             _ => json!({}),
                         }
                         };
@@ -7591,10 +7671,19 @@ pub(super) mod tests {
                 assert_eq!(json!(work.resolved), expected);
                 original.push((args, first["work_id"].clone(), expected));
             }
+            let supplement = json!({"agent":"codex","thread":"t-explicit","prompt":"same turn supplement","call_ref":"supplement"});
+            let second = node.tool(access.clone(), "dispatch_work", supplement.clone()).await?;
+            let second_id = second["work_id"].as_str().context("supplement work")?;
+            assert_eq!(node.store.lock().await.work_native_execution(&network, second_id)?.context("native permit")?.turn_id, "turn-t-explicit");
+            assert_ne!(second["work_id"], original[0].1);
+            assert_eq!(node.store.lock().await.work_record(second_id)?.context("supplement")?.state.handle().context("supplement handle")?.turn_id, "turn-t-explicit");
+            node.bind_work(&network, "c", second_id, vibeface_bridge::codex::StartReport::Turn { turn_id:"another-turn".into() }).await.expect_err("a mismatched report must remain unknown");
+            assert!(matches!(node.store.lock().await.work_record(second_id)?.context("supplement")?.state, crate::work::WorkState::Unverified { .. }));
+            original.push((supplement, second["work_id"].clone(), json!({"provider":"codex","model":null})));
             for (thread, reason) in [("missing", "was not returned"), ("sub", "parent thread lead")] {
                 let failure = node.tool(access.clone(), "dispatch_work", json!({"thread":thread,"prompt":"p","call_ref":thread})).await.expect_err("invalid native thread must not create work");
                 assert!(failure.to_string().contains(reason), "{failure:#}");
-                assert_eq!(node.store.lock().await.work_records()?.len(), 4);
+                assert_eq!(node.store.lock().await.work_records()?.len(), 5);
             }
             node.signal_work(&network, original[0].1.as_str().context("work id")?, crate::work::Signal::TurnCompleted { turn_id: "turn-t-explicit".into(), status: vibeface_bridge::turn::TurnStatus::Completed, text: "done".into(), error: None }).await?;
             node.signal_work(&network, original[1].1.as_str().context("work id")?, crate::work::Signal::Disconnected).await?;
@@ -7608,6 +7697,7 @@ pub(super) mod tests {
             }
             let before = requests.lock().unwrap().clone();
             assert_eq!(before.iter().filter(|request| request["method"] == "turn/start").count(), 4);
+            assert_eq!(before.iter().filter(|request| request["method"] == "turn/steer").count(), 1);
             for (args, work_id, expected) in &original {
                 for (tool, input) in [("dispatch_work", args.clone()), ("tool_call", json!({"tool":"dispatch_work","arguments":args,"call_ref":args["call_ref"]}))] {
                     let retried = node.tool(access.clone(), tool, input).await?;
@@ -7637,8 +7727,8 @@ pub(super) mod tests {
                 assert_eq!(retried["may_send"], false);
             }
             let store = node.store.lock().await;
-            assert_eq!(store.work_records()?.len(), 4);
-            assert_eq!(store.context(&network, "c", None)?.events.iter().filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. })).count(), 4);
+            assert_eq!(store.work_records()?.len(), 5);
+            assert_eq!(store.context(&network, "c", None)?.events.iter().filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. })).count(), 5);
             drop(store);
             node.finish_manager_attempt(&attempt).await;
             Ok::<_, anyhow::Error>(())

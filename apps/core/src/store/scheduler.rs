@@ -1000,6 +1000,116 @@ fn steer_target(
     )
 }
 
+fn native_reservation_from(
+    connection: &Connection,
+    network: &str,
+    work: &WorkProjection,
+) -> Result<Option<Value>> {
+    let encoded: Option<String> = connection
+        .query_row(
+            "SELECT value FROM identity_meta WHERE key=?",
+            [format!("work-native-submission:{}", work.work_id)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let reservation: Value = serde_json::from_str(&encoded)?;
+    ensure!(
+        reservation["network_id"] == network
+            && reservation["work_id"] == work.work_id
+            && reservation["conversation_id"] == work.conversation_id,
+        "native reservation belongs to another work scope"
+    );
+    Ok(Some(reservation))
+}
+
+fn reserved_execution(reservation: &Value) -> Result<Option<crate::work::NativeExecution>> {
+    reservation
+        .get("native_execution")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(Into::into)
+}
+
+pub(super) fn work_shares_native_execution_from(
+    connection: &Connection,
+    network: &str,
+    left: &WorkProjection,
+    right: &WorkProjection,
+) -> Result<bool> {
+    if left.kind != WorkKind::Agent(Provider::Codex)
+        || right.kind != left.kind
+        || left.target_node != right.target_node
+        || left.dispatcher != right.dispatcher
+        || left.conversation_id != right.conversation_id
+        || left.parent != right.parent
+    {
+        return Ok(false);
+    }
+    if left.trigger.starts_with("assignment:") || right.trigger.starts_with("assignment:") {
+        if left.trigger != right.trigger {
+            return Ok(false);
+        }
+    } else if trigger_scope_from(connection, network, &left.conversation_id, &left.trigger)?
+        != trigger_scope_from(connection, network, &right.conversation_id, &right.trigger)?
+    {
+        return Ok(false);
+    }
+    for work in [left, right] {
+        if matches!(work.state, WorkStatus::Finished | WorkStatus::Interrupting | WorkStatus::Unverified)
+            || !connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_runs WHERE work_id=?1 AND conversation_id=?2 AND state IN ('accepted','starting','running'))",
+                params![work.work_id, work.conversation_id], |row| row.get::<_, bool>(0))?
+            || !work_native_authority_allowed_from(connection, network, work)?
+            || connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_stops WHERE work_id=?)",
+                [&work.work_id],
+                |row| row.get::<_, bool>(0),
+            )?
+            || super::admission::peer_cancelled_from(
+                connection,
+                network,
+                &work.conversation_id,
+                &work.work_id,
+            )?
+        {
+            return Ok(false);
+        }
+    }
+    let (Some(left_reservation), Some(right_reservation)) = (
+        native_reservation_from(connection, network, left)?,
+        native_reservation_from(connection, network, right)?,
+    ) else {
+        return Ok(false);
+    };
+    if left_reservation["native_cwd"] != right_reservation["native_cwd"] {
+        return Ok(false);
+    }
+    let left_execution = reserved_execution(&left_reservation)?;
+    let right_execution = reserved_execution(&right_reservation)?;
+    let Some(execution) = left_execution.as_ref().or(right_execution.as_ref()) else {
+        return Ok(false);
+    };
+    let member = |work: &WorkProjection,
+                  reserved: Option<&crate::work::NativeExecution>|
+     -> Result<bool> {
+        match reserved {
+            Some(reserved) => Ok(reserved.thread_id == execution.thread_id && reserved.turn_id == execution.turn_id),
+            None => Ok(work.state == WorkStatus::Running
+                && work.thread_id.as_ref() == Some(&execution.thread_id)
+                && work.turn_id.as_ref() == Some(&execution.turn_id)
+                && execution.work_ids.contains(&work.work_id)
+                && connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM work_runs WHERE work_id=?1 AND conversation_id=?2 AND state='running' AND thread_id=?3 AND turn_id=?4)",
+                    params![work.work_id, work.conversation_id, execution.thread_id, execution.turn_id], |row| row.get::<_, bool>(0))?),
+        }
+    };
+    Ok(member(left, left_execution.as_ref())? && member(right, right_execution.as_ref())?)
+}
+
 fn work_native_write_allowed_from(
     connection: &Connection,
     network: &str,
@@ -1535,6 +1645,14 @@ fn admit_ended_from(
     if let Some(job) = load_job(connection, conversation, trigger)? {
         return Ok(job.receipt(network));
     }
+    if kind == TriggerKind::Human && declined.is_none() {
+        super::workspace::freeze_workspace_input_assignment_from(
+            connection,
+            network,
+            conversation,
+            reply_to,
+        )?;
+    }
     let scope = if let Some(route) =
         super::workspace::input_route_from(connection, network, conversation, reply_to)?
     {
@@ -1784,6 +1902,29 @@ fn stage_memory_from(
 }
 
 impl Store {
+    pub(crate) fn work_native_execution(
+        &self,
+        network: &str,
+        work_id: &str,
+    ) -> Result<Option<crate::work::NativeExecution>> {
+        let work = super::reduce::work_from(&self.connection, network, work_id)?
+            .context("accepted work scope missing")?;
+        native_reservation_from(&self.connection, network, &work)?
+            .as_ref()
+            .map(reserved_execution)
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub(crate) fn work_shares_native_execution(
+        &self,
+        network: &str,
+        left: &WorkProjection,
+        right: &WorkProjection,
+    ) -> Result<bool> {
+        work_shares_native_execution_from(&self.connection, network, left, right)
+    }
+
     pub(crate) fn work_native_submission_reserved(&self, work_id: &str) -> Result<bool> {
         Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM identity_meta WHERE key=?)",
@@ -1821,7 +1962,16 @@ impl Store {
         network: &str,
         work: &crate::work::WorkSpec,
         actual_cwd: &str,
+        execution: Option<&crate::work::NativeExecution>,
     ) -> Result<bool> {
+        if let Some(execution) = execution {
+            ensure!(
+                work.kind == WorkKind::Agent(Provider::Codex)
+                    && work.thread.as_deref() == Some(execution.thread_id.as_str())
+                    && !execution.turn_id.is_empty(),
+                "native execution permit differs from the work"
+            );
+        }
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1841,13 +1991,6 @@ impl Store {
             work_native_authority_allowed_from(&tx, network, &registered)?,
             "work has no active authority for native submission"
         );
-        if !super::workspace::work_resources_available_from(&tx, network, &registered)? {
-            return Err(ExecFailure::new(
-                FailureKind::WriterBusy,
-                "resource_conflict: work resources are reserved by another active execution",
-            )
-            .into());
-        }
         let allowed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM work_runs WHERE work_id=?1 AND conversation_id=?2 AND (state='accepted' OR (state='starting' AND ?3 IS NOT NULL AND thread_id=?3 AND turn_id IS NULL)) AND NOT EXISTS(SELECT 1 FROM work_stops WHERE work_id=?1))",params![work.work_id,work.conversation,work.thread],|row|row.get(0))?;
         ensure!(
             allowed
@@ -1860,10 +2003,21 @@ impl Store {
             "work no longer permits its first native submission"
         );
         let value = json!({"network_id":network,"work_id":work.work_id,"conversation_id":work.conversation,"spec_digest":crate::crypto::digest(&serde_json::to_vec(work)?),"native_cwd":actual_cwd,"reserved_at_ms":crate::runtime::now_ms()});
+        let mut value = value;
+        if let Some(execution) = execution {
+            value["native_execution"] = serde_json::to_value(execution)?;
+        }
         tx.execute(
             "INSERT INTO identity_meta(key,value) VALUES(?,?)",
             params![key, serde_json::to_string(&value)?],
         )?;
+        if !super::workspace::work_resources_available_from(&tx, network, &registered)? {
+            return Err(ExecFailure::new(
+                FailureKind::WriterBusy,
+                "resource_conflict: work resources are reserved by another active execution",
+            )
+            .into());
+        }
         tx.commit()?;
         Ok(true)
     }
@@ -3091,17 +3245,28 @@ fn cause_from(
         .map(|dispatch| (dispatch.spec.conversation, dispatch.spec.trigger)))
 }
 
-/// The fixed reply anchor a result follows, even when another Node ran the work.
-fn origin_message(
+struct ReportOrigin {
+    reply_to: String,
+    report_results: bool,
+}
+
+fn report_origin_from(
     connection: &Connection,
     network: &str,
     conversation: &str,
     trigger: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<ReportOrigin>> {
     let mut trigger = trigger.to_owned();
     for _ in 0..64 {
         match trigger.split_once(':') {
-            Some(("message" | "bot_message", message)) => return Ok(Some(message.into())),
+            Some(("message" | "bot_message", message)) => {
+                return Ok(Some(ReportOrigin {
+                    reply_to: message.into(),
+                    report_results: message_from(connection, network, conversation, message)?
+                        .and_then(|message| message.report_results)
+                        .unwrap_or(true),
+                }));
+            }
             Some(("work" | "task", work_id)) => match cause_from(connection, network, work_id)? {
                 Some((_, cause)) => trigger = cause,
                 None => return Ok(None),
@@ -3143,13 +3308,14 @@ fn origin_message(
                                 message_id,
                                 target,
                                 expected_revision,
+                                report_results,
                                 attestation: Some(_),
                                 ..
                             },
                         ) if input == message_id => {
                             let same_task = matches!(target,crate::workspace::InputTarget::Task {ref task_id}|crate::workspace::InputTarget::ChannelTask {ref task_id,..} if *task_id==assignment.task_id);
-                            Some(
-                                if same_task
+                            Some(ReportOrigin {
+                                reply_to: if same_task
                                     && expected_revision == Some(assignment.started_revision)
                                     && source.scope_id == conversation
                                 {
@@ -3157,7 +3323,8 @@ fn origin_message(
                                 } else {
                                     assignment.assignment_id
                                 },
-                            )
+                                report_results: report_results.unwrap_or(true),
+                            })
                         }
                         (
                             Some(input),
@@ -3166,9 +3333,13 @@ fn origin_message(
                                 role: Role::User,
                                 answers: None,
                                 attestation: Some(_),
+                                report_results,
                                 ..
                             },
-                        ) if input == message_id => Some(assignment.assignment_id),
+                        ) if input == message_id => Some(ReportOrigin {
+                            reply_to: assignment.assignment_id,
+                            report_results: report_results.unwrap_or(true),
+                        }),
                         (
                             None,
                             EventBody::WorkspaceCommanded {
@@ -3176,16 +3347,183 @@ fn origin_message(
                                     crate::workspace::WorkspaceCommand::CreateTask { task_id, .. },
                                 ..
                             },
-                        ) if task_id == assignment.task_id => Some(assignment.assignment_id),
+                        ) if task_id == assignment.task_id => Some(ReportOrigin {
+                            reply_to: assignment.assignment_id,
+                            report_results: true,
+                        }),
                         _ => None,
                     },
                 );
             }
-            Some(("schedule", _)) => return Ok(Some(trigger)),
+            Some(("schedule", _)) => {
+                return Ok(Some(ReportOrigin {
+                    reply_to: trigger,
+                    report_results: true,
+                }));
+            }
             _ => return Ok(None),
         }
     }
     Ok(None)
+}
+
+pub(crate) fn workspace_assignment_followups_pending_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    assignment: &crate::workspace::Assignment,
+    job: &SchedulerJob,
+) -> Result<bool> {
+    let mut jobs = Vec::new();
+    for other in query_jobs(
+        connection,
+        "conversation_id=? AND scope=?",
+        params![job.conversation_id, job.scope.storage_key()],
+    )? {
+        if !super::workspace::workspace_assignment_for_job_from(connection, network, local, &other)?
+            .is_some_and(|source| source.assignment_id == assignment.assignment_id)
+        {
+            continue;
+        }
+        if let JobState::Steered { outcome, .. } = &other.state {
+            if *outcome == SteerOutcome::Unknown {
+                return Ok(true);
+            }
+            continue;
+        }
+        if !other.state.terminal() || other.pending_check {
+            return Ok(true);
+        }
+        let Some(reply) = message_from(
+            connection,
+            network,
+            &other.conversation_id,
+            &other.message_id,
+        )?
+        .filter(|reply| {
+            reply.role == Role::Assistant
+                && reply.author == local
+                && reply.in_reply_to.as_deref() == Some(other.reply_to.as_str())
+                && (matches!(
+                    reply.status,
+                    Some(ReplyStatus::Completed | ReplyStatus::Stopped)
+                ) || (reply.status == Some(ReplyStatus::Failed)
+                    && other
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.execution != TurnExecution::Unknown)
+                    && !matches!(
+                        reply.failure,
+                        Some(FailureKind::Unknown | FailureKind::Lost | FailureKind::Restarted)
+                    )))
+        }) else {
+            return Ok(true);
+        };
+        let Some(event) = log::event_from(connection, network, &reply.event_hash)?
+            .filter(|event| event.author == local && event.scope_id == other.conversation_id)
+        else {
+            return Ok(true);
+        };
+        jobs.push((other, event.seq));
+    }
+    let initial = job.trigger == format!("assignment:{}", assignment.assignment_id)
+        || assignment
+            .trigger_message_id
+            .as_deref()
+            .is_some_and(|message| job.trigger == message_trigger(message));
+    let Some((_, reply_seq)) = jobs.iter().find(|(other, _)| other.trigger == job.trigger) else {
+        return Ok(true);
+    };
+    // An input and its reports may share a queue position; the local reply sequence is strict.
+    if jobs.iter().any(|(other, seq)| {
+        other.trigger != job.trigger
+            && (seq > reply_seq || (initial && other.kind == TriggerKind::WorkResult))
+    }) {
+        return Ok(true);
+    }
+    let source_matches = |conversation: &str, dispatcher: &str, trigger: &str| -> Result<bool> {
+        if conversation != job.conversation_id || dispatcher != local {
+            return Ok(false);
+        }
+        let (reply_to, kind) = match trigger.split_once(':') {
+            Some(("assignment", id)) => (id.to_owned(), TriggerKind::WorkspaceTask),
+            Some(("message", id)) => {
+                let Some(message) = message_from(connection, network, conversation, id)?
+                    .filter(|message| message.role == Role::User)
+                else {
+                    return Ok(false);
+                };
+                (
+                    id.to_owned(),
+                    if message.answers.is_some() {
+                        TriggerKind::Answer
+                    } else {
+                        TriggerKind::Human
+                    },
+                )
+            }
+            _ => return Ok(false),
+        };
+        let mut source =
+            load_job(connection, conversation, trigger)?.unwrap_or_else(|| job.clone());
+        source.trigger = trigger.to_owned();
+        source.reply_to = reply_to;
+        source.kind = kind;
+        Ok(super::workspace::workspace_assignment_for_job_from(
+            connection, network, local, &source,
+        )?
+        .is_some_and(|source| source.assignment_id == assignment.assignment_id))
+    };
+    let report_pending = |work_id: &str| -> Result<bool> {
+        let trigger = work_trigger(work_id);
+        let Some(origin) = report_origin_from(connection, network, &job.conversation_id, &trigger)?
+        else {
+            return Ok(true);
+        };
+        Ok(origin.report_results
+            && !jobs.iter().any(|(other, _)| {
+                other.kind == TriggerKind::WorkResult && other.trigger == trigger
+            }))
+    };
+    let mut finished = Vec::new();
+    for work in super::reduce::works_from(connection, network, &job.conversation_id)? {
+        if !source_matches(&work.conversation_id, &work.dispatcher, &work.trigger)? {
+            continue;
+        }
+        if matches!(work.outcome, None | Some(WorkOutcome::Unverified))
+            || report_pending(&work.work_id)?
+        {
+            return Ok(true);
+        }
+        finished.push(work.work_id);
+    }
+    let mut statement = connection.prepare(
+        "SELECT work_id FROM work_dispatches WHERE json_extract(spec,'$.conversation')=? AND json_extract(spec,'$.dispatcher')=?",
+    )?;
+    let dispatches = statement
+        .query_map(params![job.conversation_id, local], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in dispatches {
+        if finished.contains(&id) {
+            continue;
+        }
+        let dispatch = super::work::dispatch_from(connection, &id)?.context("dispatch missing")?;
+        if !source_matches(
+            &dispatch.spec.conversation,
+            &dispatch.spec.dispatcher,
+            &dispatch.spec.trigger,
+        )? {
+            continue;
+        }
+        if !matches!(dispatch.state, crate::work::DispatchState::Rejected { .. })
+            || report_pending(&id)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Admits the work's report turn for the message the chain started from, unless the user
@@ -3197,13 +3535,10 @@ fn admit_report_from(
     work_id: &str,
 ) -> Result<Option<AdmissionReceipt>> {
     let trigger = work_trigger(work_id);
-    let Some(reply_to) = origin_message(connection, network, conversation, &trigger)? else {
+    let Some(origin) = report_origin_from(connection, network, conversation, &trigger)? else {
         return Ok(None);
     };
-    let report = message_from(connection, network, conversation, &reply_to)?
-        .and_then(|message| message.report_results)
-        .unwrap_or(true);
-    if !report {
+    if !origin.report_results {
         return Ok(None);
     }
     admit_from(
@@ -3212,7 +3547,7 @@ fn admit_report_from(
         conversation,
         &trigger,
         TriggerKind::WorkResult,
-        &reply_to,
+        &origin.reply_to,
     )
     .map(Some)
 }

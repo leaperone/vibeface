@@ -1222,6 +1222,9 @@ pub struct Outgoing {
     pub thread_id: String,
     pub text: String,
     pub client_id: String,
+    /// A Node-verified shared execution may only steer this turn.
+    #[serde(default)]
+    pub expected_turn_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -1229,7 +1232,7 @@ pub struct Outgoing {
     /// Local image paths, or `data:`/`http(s):` URLs.
     #[serde(default)]
     pub images: Vec<String>,
-    /// Never steer: always a new turn (dispatched work).
+    /// Start a new turn when no expected-turn permit is present.
     #[serde(default)]
     pub start_only: bool,
     /// Run the new turn with full access and no approvals (dispatched work).
@@ -1315,8 +1318,22 @@ impl DirectSession {
                 Err(error) => return rejected(error),
             }
         };
+        let report_turn = |turn_id: String| {
+            if outgoing
+                .expected_turn_id
+                .as_ref()
+                .is_some_and(|expected| *expected != turn_id)
+            {
+                StartReport::Unknown {
+                    reason: "the message is on a different turn from its native execution permit"
+                        .into(),
+                }
+            } else {
+                StartReport::Turn { turn_id }
+            }
+        };
         if let Some(turn_id) = delivered(&resumed["thread"], &outgoing.client_id) {
-            return StartReport::Turn { turn_id };
+            return report_turn(turn_id);
         }
         let active = (!outgoing.start_only && resumed["thread"]["status"]["type"] == "active")
             .then(|| {
@@ -1329,6 +1346,23 @@ impl DirectSession {
                 })
             })
             .flatten();
+        let active = if let Some(expected) = &outgoing.expected_turn_id {
+            let present = resumed["thread"]["turns"].as_array().is_some_and(|turns| {
+                turns.iter().any(|turn| {
+                    turn["id"].as_str() == Some(expected.as_str())
+                        && turn_snapshot(turn).status == Some(TurnStatus::InProgress)
+                })
+            });
+            if !present {
+                return StartReport::Rejected(ExecFailure::new(
+                    FailureKind::WriterBusy,
+                    "the reserved native turn is no longer active",
+                ));
+            }
+            Some(expected.clone())
+        } else {
+            active
+        };
         let mut steered = None;
         if let Some(turn) = &active {
             match self
@@ -1339,8 +1373,7 @@ impl DirectSession {
                 )
                 .await
             {
-                // Refused (the turn just ended): nothing was sent, so a new turn is safe.
-                Err(error) if !error.uncertain => {}
+                Err(error) if !error.uncertain && outgoing.expected_turn_id.is_none() => {}
                 result => steered = Some(result),
             }
         }
@@ -1374,15 +1407,15 @@ impl DirectSession {
             .read_back(&outgoing.thread_id, &outgoing.client_id)
             .await
         {
-            Ok(Some(turn_id)) => StartReport::Turn { turn_id },
+            Ok(Some(turn_id)) => report_turn(turn_id),
             Ok(None) => match sent {
-                Some(turn_id) => StartReport::Turn { turn_id },
+                Some(turn_id) => report_turn(turn_id),
                 None => StartReport::Unknown {
                     reason: "the message is not in the thread yet".into(),
                 },
             },
             Err(error) => match sent {
-                Some(turn_id) => StartReport::Turn { turn_id },
+                Some(turn_id) => report_turn(turn_id),
                 None => StartReport::Unknown {
                     reason: error.message,
                 },
@@ -1854,7 +1887,7 @@ mod tests {
                 }
                 sent
             });
-            let outgoing = Outgoing { thread_id: "t".into(), text: "use plan B".into(), client_id: "d1".into(), ..Default::default() };
+            let outgoing = Outgoing { thread_id: "t".into(), text: "use plan B".into(), client_id: "d1".into(), expected_turn_id:Some("r1".into()), ..Default::default() };
             for _ in 0..2 {
                 let mut session = DirectSession::connect(&socket).await.unwrap();
                 assert_eq!(session.send(&outgoing).await, StartReport::Turn { turn_id: "r1".into() });
@@ -1863,6 +1896,51 @@ mod tests {
             assert_eq!(server.await.unwrap(), 1, "a repeated send only reads back");
             std::fs::remove_file(socket).unwrap();
         }).await.expect("send must finish");
+    }
+
+    #[tokio::test]
+    async fn a_shared_turn_permit_never_starts_a_replacement_turn() {
+        timeout(Duration::from_secs(5), async {
+            for scenario in ["stale", "rejected", "lost", "wrong-turn"] {
+                let socket = std::env::temp_dir().join(format!("vibeface-permit-{scenario}-{}-{}.sock", std::process::id(), now_ms()));
+                let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let mut methods = Vec::new();
+                    while let Some(Ok(Message::Text(text))) = server.next().await {
+                        let request: Value = serde_json::from_str(&text).unwrap();
+                        let Some(method) = request["method"].as_str() else { continue; };
+                        if request.get("id").is_none() { continue; }
+                        methods.push(method.to_owned());
+                        let result = match method {
+                            "thread/resume" => json!({"thread":{"id":"t","status":{"type":"active"},"turns":[{
+                                "id":if matches!(scenario,"stale"|"wrong-turn") {"r2"} else {"r1"},"status":"inProgress",
+                                "items":if scenario == "wrong-turn" { json!([{"type":"userMessage","clientId":"d1"}]) } else { json!([]) }
+                            }]}}),
+                            "turn/steer" => {
+                                assert_eq!(request["params"]["expectedTurnId"], "r1");
+                                if scenario == "lost" { server.close(None).await.unwrap(); break; }
+                                server.send(Message::Text(json!({"id":request["id"],"error":{"code":-32600,"message":"turn already ended"}}).to_string().into())).await.unwrap();
+                                continue;
+                            }
+                            "turn/start" => panic!("a shared permit must never start a turn"),
+                            _ => json!({}),
+                        };
+                        server.send(Message::Text(json!({"id":request["id"],"result":result}).to_string().into())).await.unwrap();
+                    }
+                    methods
+                });
+                let mut session = DirectSession::connect(&socket).await.unwrap();
+                let report = session.send(&Outgoing { thread_id:"t".into(), text:"supplement".into(), client_id:"d1".into(), expected_turn_id:Some("r1".into()), ..Default::default() }).await;
+                assert!(if matches!(scenario,"lost"|"wrong-turn") { matches!(report,StartReport::Unknown { .. }) } else { matches!(report,StartReport::Rejected(_)) }, "{scenario}: {report:?}");
+                session.close().await;
+                let methods = server.await.unwrap();
+                assert_eq!(methods.iter().filter(|method| method.as_str()=="turn/steer").count(), usize::from(matches!(scenario,"rejected"|"lost")));
+                assert!(!methods.iter().any(|method| method=="turn/start"));
+                std::fs::remove_file(socket).unwrap();
+            }
+        }).await.expect("shared permit checks must finish");
     }
 
     #[tokio::test]

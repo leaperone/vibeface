@@ -80,6 +80,76 @@ impl Runtime {
         )
     }
 
+    pub(super) async fn codex_native_execution(
+        &self,
+        network: &str,
+        thread: &str,
+        actual_cwd: &Path,
+    ) -> Result<Option<crate::work::NativeExecution>> {
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.codex.client().request(
+                "thread/read",
+                json!({"threadId":thread,"includeTurns":true}),
+            ),
+        )
+        .await
+        .context("native execution query timed out")??;
+        let native = &reply["thread"];
+        let Some(turns) = native["turns"].as_array() else {
+            return Ok(None);
+        };
+        ensure!(
+            native["id"].as_str() == Some(thread),
+            "native execution query returned another thread"
+        );
+        ensure!(
+            PathBuf::from(
+                native["cwd"]
+                    .as_str()
+                    .context("native session has no verified directory")?
+            )
+            .canonicalize()?
+                == actual_cwd,
+            "native session directory changed before submission"
+        );
+        let active: Vec<_> = turns
+            .iter()
+            .filter(|turn| turn["status"] == "inProgress")
+            .collect();
+        ensure!(
+            active.len() <= 1,
+            "native execution has ambiguous active turns"
+        );
+        let Some(turn) = active.first() else {
+            return Ok(None);
+        };
+        let turn_id = turn["id"]
+            .as_str()
+            .context("native execution has no turn ID")?;
+        vibeface_protocol::validate_id(turn_id).map_err(anyhow::Error::msg)?;
+        let mut work_ids = Vec::new();
+        let store = self.store.lock().await;
+        for item in turn["items"]
+            .as_array()
+            .context("native execution query returned no items")?
+        {
+            if item["type"] == "userMessage"
+                && let Some(id) = item["clientId"].as_str()
+                && store.work(network, id)?.is_some()
+            {
+                work_ids.push(id.to_owned());
+            }
+        }
+        work_ids.sort();
+        work_ids.dedup();
+        Ok(Some(crate::work::NativeExecution {
+            thread_id: thread.into(),
+            turn_id: turn_id.into(),
+            work_ids,
+        }))
+    }
+
     pub(super) async fn work_start_lease(
         &self,
         network: &str,
@@ -183,6 +253,17 @@ impl Runtime {
                 &work.cwd,
             )
             .await?;
+        let execution = if work.resolved.provider == Provider::Codex {
+            match work.thread.as_deref() {
+                Some(thread) => {
+                    self.codex_native_execution(network, thread, &actual_cwd)
+                        .await?
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let mut store = self.store.lock().await;
         store.authorize_node(network, &local)?;
         ensure!(
@@ -211,6 +292,7 @@ impl Runtime {
                 actual_cwd
                     .to_str()
                     .context("native work directory is not UTF-8")?,
+                execution.as_ref(),
             )?,
             "work native submission was already reserved; query the original work"
         );

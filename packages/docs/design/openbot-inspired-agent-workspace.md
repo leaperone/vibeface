@@ -39,6 +39,8 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 
 `scheduler_jobs` 当前状态是 `queued`、`claimed`、`running`、`cancelling`、`reconciling`、`completed`、`failed`、`cancelled`、`interrupted`、`steering`、`steered`。active job 按 `SessionScope` 隔离，同一 scope 不并行启动新轮；不同 scope 仍受 Node 的 `machine_slots`、Bot 的 `task_limit` 和 Provider instance 串行门约束。
 
+管理回合结束不等于 Assignment 完成。它派生的 Work、未知结果和必要汇报仍未结清时，Assignment 保持有效。关闭结果汇报只省略汇报回合，仍须等待真实 Work 结束。同一 Assignment 的后续输入保留原归属，替换 Assignment 不能重新授权旧输入。最终回复使用共享因果证据核验来源与 revision，其他 Node 不依赖执行设备的私有绑定验证完成记录。
+
 ## 目标信息架构
 
 ### 总览和任务详情

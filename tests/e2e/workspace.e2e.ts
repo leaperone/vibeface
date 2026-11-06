@@ -205,6 +205,13 @@ test('keeps personal Tasks, deferred inputs and directed Channel results in thei
   expect(stopped.interrupts).toEqual([{ thread_id: taskB.thread_id, turn_id: taskBTurn }]);
   expect(stopped.turns.find(row => row.turn_id === mainTurn)?.state).toBe('inProgress');
   expect(stopped.turns.find(row => row.turn_id === taskATurn)?.state).toBe('completed');
+  await browser.reload();
+  await expect(browser).toHaveURL(taskBUrl);
+  await expect(narrowComposer).toHaveValue('停止后仍保留的草稿');
+  const restored = await workspace.inspect();
+  expect(restored.invocations).toEqual(stopped.invocations);
+  expect(restored.steers).toEqual(stopped.steers);
+  expect(restored.interrupts).toEqual(stopped.interrupts);
   await browser.goto(taskAUrl);
   await expect(taskChat).toContainText(supplements[0]);
   await expect(taskChat).not.toContainText('workspace-task-b-only');

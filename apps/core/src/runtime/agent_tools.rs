@@ -1164,8 +1164,18 @@ impl Runtime {
                 .context("work not found on this device")?,
             false => record,
         };
+        let expected_turn_id = if may_send {
+            self.store
+                .lock()
+                .await
+                .work_native_execution(network, &record.work_id)?
+                .map(|execution| execution.turn_id)
+        } else {
+            None
+        };
         Ok(
             json!({"work_id":record.work_id,"call_ref":call_ref,"state":record.state,
+            "expected_turn_id":expected_turn_id,
             "may_send":may_send,"send_by_ms":record.send_by_ms,"cwd":spec.cwd,"thread_id":thread,
             "model":spec.model,"resolved":spec.resolved}),
         )

@@ -400,6 +400,9 @@ fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Res
         if parent.scope_id == cause.conversation_id
             && matches!(&parent.body, EventBody::MessagePosted {
                 message_id, role: Role::User, answers: None, attestation: Some(_), ..
+            } | EventBody::InputPosted {
+                message_id, target: crate::workspace::InputTarget::BotMain { .. },
+                attestation: Some(_), ..
             } if *message_id == cause.message_id)
         {
             return Ok(());
