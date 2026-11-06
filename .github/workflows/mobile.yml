@@ -187,7 +187,7 @@ jobs:
         run: |
           umask 077
           python3 - <<'PY'
-          import json, os, pathlib, re, shutil, subprocess
+          import hashlib, json, os, pathlib, re, shutil, stat, subprocess
           root = pathlib.Path(".artifacts/native")
           public = root / "public"
           public.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -287,6 +287,64 @@ jobs:
                                   if len(polls) == 1 and type(polls[0].get("count")) is int and polls[0]["count"] >= 0:
                                       failure["completed_poll_samples"] = polls[0]["count"]
                                   failures.append(failure)
+                          source = result.get("source")
+                          if result.get("selected") is True and isinstance(source, dict) and source.get("file") == "native-transfers.e2e.ts" and attempt.get("status") == "failed":
+                              screen = {"status": "unavailable", "reason": "missing_screen_id"}
+                              descriptors = []
+                              try:
+                                  evidence = attempt.get("failure")
+                                  assert isinstance(evidence, dict)
+                                  screen_id = evidence.get("screen")
+                                  assert isinstance(screen_id, str) and screen_id
+                                  screen["reason"] = "invalid_metadata"
+                                  artifacts = attempt.get("artifacts")
+                                  assert isinstance(artifacts, list)
+                                  matches = [item for item in artifacts if isinstance(item, dict) and item.get("id") == screen_id]
+                                  assert len(matches) == 1
+                                  artifact = matches[0]
+                                  assert artifact.get("kind") == "log" and artifact.get("mediaType") == "text/plain" and artifact.get("redaction") == "complete"
+                                  assert artifact.get("url") is None and artifact.get("ref") is None
+                                  size, digest, name = artifact.get("size"), artifact.get("sha256"), artifact.get("path")
+                                  assert type(size) is int and 0 <= size <= 262144 and isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest)
+                                  screen["reason"] = "unsafe_path"
+                                  assert isinstance(name, str) and name and "\\" not in name and "\0" not in name and "trash" not in name.lower()
+                                  parts = name.split("/")
+                                  assert len(parts) <= 16 and all(part not in {"", ".", ".."} for part in parts) and not re.match(r"[A-Za-z]:", name)
+                                  assert len(parts) >= 3 and re.fullmatch(r"attempt-[1-9][0-9]*", parts[-2]) and parts[-1] == "screen-at-failure.txt"
+                                  screen["reason"] = "file_unavailable"
+                                  descriptor = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+                                  descriptors.append(descriptor)
+                                  for part in (*runner_root.parts, "e2e", "results", *parts[:-1]):
+                                      descriptor = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+                                      descriptors.append(descriptor)
+                                  descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+                                  descriptors.append(descriptor)
+                                  metadata = os.fstat(descriptor)
+                                  screen["reason"] = "metadata_mismatch"
+                                  assert stat.S_ISREG(metadata.st_mode) and metadata.st_size == size
+                                  content = os.read(descriptor, 262145)
+                                  assert len(content) == size and hashlib.sha256(content).hexdigest() == digest
+                                  screen["reason"] = "invalid_encoding"
+                                  listing = content.decode("utf-8")
+                                  controls = {}
+                                  for key, role, label in (
+                                      ("welcome", None, "连接你的网络"), ("ready", None, "已填入加入链接"),
+                                      ("invitation", "textbox", "加入链接"), ("device_name", "textbox", "这台设备的名字"),
+                                      ("join", "button", "加入"), ("invalid_link", None, "这不是有效的加入链接"),
+                                      ("spent_link", None, "这条加入链接已用过或已过期。在已有设备上点“添加设备”重新生成。"),
+                                  ):
+                                      prefix = r"^\s*#\S+ " + (re.escape(role) + " " if role else r"(?:[a-z-]+ )?")
+                                      quoted = re.escape(json.dumps(label, ensure_ascii=False))
+                                      pattern = prefix + (quoted[:-1] + r'(?=["\s,，])' if role == "textbox" else quoted + r"(?:\s|$)")
+                                      controls[key] = True if re.search(pattern, listing, re.MULTILINE) else None
+                                  markers = {"[observation truncated at the resolved observation byte limit]", "[observation truncated: the engine stopped listing nodes at its limit]"}
+                                  screen = {"status": "captured", "controls_reported": controls, "truncation_marker_reported": any(line in markers for line in listing.splitlines())}
+                              except (AssertionError, OSError, ValueError, TypeError):
+                                  pass
+                              finally:
+                                  for descriptor in reversed(descriptors):
+                                      os.close(descriptor)
+                              diagnostics["failure_screen"] = screen
                   for failure in failures:
                       if failure and failure not in diagnostics["failures"] and len(diagnostics["failures"]) < 16:
                           diagnostics["failures"].append(failure)
