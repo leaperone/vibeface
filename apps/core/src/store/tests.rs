@@ -1180,9 +1180,13 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
             .is_none()
     );
     assert!(store.scheduler_job("c", &message_trigger("m4"))?.is_none());
-    let JobState::Steering { into, .. } = store.scheduler_job("c", &m3)?.context("job")?.state
+    let JobState::Steering {
+        into,
+        receipt: None,
+        ..
+    } = store.scheduler_job("c", &m3)?.context("job")?.state
     else {
-        bail!("m3 is no longer steering");
+        bail!("m3 is no longer an unacknowledged steer");
     };
     let stopped = store
         .request_manager_cancel(&net.a, &net.network, "c", &m3)?
@@ -1200,6 +1204,7 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
         store.scheduler_job("c", &m3)?.context("job")?.state,
         unknown
     );
+    assert!(!store.steering_jobs()?.iter().any(|job| job.trigger == m3));
     Ok(())
 }
 
@@ -1258,17 +1263,18 @@ fn a_steer_target_waiting_for_reconciliation_is_not_treated_as_active() -> Resul
         "a reconciliating host no longer guarantees a running target turn"
     );
 
-    let settled = store
+    let stopped = store
         .request_manager_cancel(&net.a, &net.network, "c", &m2)?
         .context("steering message")?;
     assert_eq!(
-        settled.state,
+        stopped.state,
         JobState::Steered {
             into,
             receipt: None,
             outcome: SteerOutcome::Unknown
         }
     );
+    assert!(!store.steering_jobs()?.iter().any(|job| job.trigger == m2));
     Ok(())
 }
 
@@ -16093,9 +16099,12 @@ fn workspace_signed_input_fixture(
     input: crate::workspace::InputRequest,
     at: i64,
 ) -> Result<crate::workspace::WorkspaceInput> {
+    let conversation = origin
+        .resolve_input_target(&net.network, &input.route.target)?
+        .conversation_id;
     let signed = net.a.fixture_admin().attest(
         &net.network,
-        "c",
+        &conversation,
         EventBody::InputPosted {
             message_id: input.message_id.clone(),
             target: input.route.target.clone(),
@@ -16771,5 +16780,673 @@ fn an_owner_freezes_a_partial_dag_followup_to_its_first_assignment() -> Result<(
         &local,
         "c"
     )?);
+    Ok(())
+}
+
+#[test]
+fn resource_waiting_inputs_keep_their_ids_and_share_the_first_assignment() -> Result<()> {
+    use crate::scheduling::{QueueHoldReason, TurnExecution};
+    use crate::workspace::*;
+    let (net, mut origin) = workspace_fixture()?;
+    let local = net.a.device_id()?;
+    second_bot(&mut origin, &net, "Waiting Bot")?;
+    workspace_input_fixture(&net, &mut origin, "writer", None, InputIntent::Continue, 3)?;
+    let writer = WorkSpec {
+        work_id: WorkSpec::id("c", &message_trigger("writer"), "writer"),
+        conversation: "c".into(),
+        trigger: message_trigger("writer"),
+        target: local.clone(),
+        dispatcher: local.clone(),
+        call_ref: "writer".into(),
+        kind: WorkKind::Agent(Provider::Codex),
+        model: None,
+        resolved: ResolvedModel {
+            provider: Provider::Codex,
+            model: None,
+        },
+        cwd: "/workspace/shared".into(),
+        title: "existing writer".into(),
+        prompt: "existing writer".into(),
+        continues: None,
+        parent: None,
+        thread: None,
+    };
+    origin.accept_work_fixture(&net.a, &net.network, writer.clone(), 4)?;
+    origin.apply_work_signal(
+        &net.a,
+        &net.network,
+        &writer.work_id,
+        Signal::ThreadCreated("writer-thread".into()),
+        5,
+    )?;
+    origin.apply_work_signal(
+        &net.a,
+        &net.network,
+        &writer.work_id,
+        Signal::TurnStarted {
+            turn_id: "writer-turn".into(),
+            epoch: 1,
+        },
+        6,
+    )?;
+    let mut task = workspace_task_command("waiting", None);
+    if let WorkspaceCommand::CreateTask { owner_bot, .. } = &mut task {
+        *owner_bot = "bot-d".into();
+    }
+    workspace_command_fixture(&net, &mut origin, "create-waiting", task, 7)?;
+    let roots = vec!["/workspace/shared/sub".into()];
+    for index in 0..crate::scheduling::MAX_PENDING_JOBS {
+        let source = format!("inbox-fill-{index}");
+        super::scheduler::admit_from(
+            &origin.connection,
+            &net.network,
+            "d",
+            &message_trigger(&source),
+            TriggerKind::Human,
+            &source,
+        )?;
+    }
+    workspace_signed_input_fixture(
+        &net,
+        &mut origin,
+        &net.a,
+        InputRequest {
+            message_id: "full-refused".into(),
+            route: InputRoute {
+                target: InputTarget::Task {
+                    task_id: "waiting".into(),
+                },
+                intent: InputIntent::Continue,
+                sequence: 8,
+                expected_revision: Some(1),
+            },
+            text: "full inbox".into(),
+            attachments: vec![],
+            report_results: Some(true),
+        },
+        8,
+    )?;
+    assert!(
+        origin
+            .ensure_workspace_assignment(&net.a, &net.network, "waiting", &roots, 9)?
+            .is_none()
+    );
+    let error = origin
+        .admit_workspace_input(&net.network, &local, "full-refused")
+        .expect_err("an occupied workspace does not bypass the admission capacity gate");
+    assert!(error.to_string().contains("scheduler inbox is full"));
+    assert!(
+        origin
+            .scheduler_job("d", &message_trigger("full-refused"))?
+            .is_none()
+    );
+    let waiting: bool = origin.connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM identity_meta WHERE key=?)",
+        [format!(
+            "workspace-input-assignment:{}:full-refused",
+            net.network
+        )],
+        |row| row.get(0),
+    )?;
+    assert!(
+        !waiting,
+        "a failed admission cannot leave a Waiting binding"
+    );
+    origin.refuse_workspace_input(&net.network, "full-refused", &error.to_string())?;
+    assert_eq!(origin.connection.execute(
+        "DELETE FROM scheduler_jobs WHERE conversation_id='d' AND trigger LIKE 'message:inbox-fill-%' AND state='queued' AND attempt_id IS NULL AND runtime IS NULL",
+        [],
+    )?, crate::scheduling::MAX_PENDING_JOBS);
+    for (index, message_id) in ["m1", "m2", "refused"].into_iter().enumerate() {
+        workspace_signed_input_fixture(
+            &net,
+            &mut origin,
+            &net.a,
+            InputRequest {
+                message_id: message_id.into(),
+                route: InputRoute {
+                    target: InputTarget::Task {
+                        task_id: "waiting".into(),
+                    },
+                    intent: InputIntent::Continue,
+                    sequence: 9 + index as u64,
+                    expected_revision: Some(1),
+                },
+                text: message_id.into(),
+                attachments: vec![],
+                report_results: Some(true),
+            },
+            9 + index as i64,
+        )?;
+        if message_id == "refused" {
+            origin.refuse_workspace_input(&net.network, message_id, "historical refusal")?;
+        } else {
+            assert!(
+                origin
+                    .ensure_workspace_assignment(&net.a, &net.network, "waiting", &roots, 11)?
+                    .is_none()
+            );
+            let receipt = origin.admit_workspace_input(&net.network, &local, message_id)?;
+            assert_eq!(receipt.state, "queued");
+            assert!(
+                origin
+                    .ensure_workspace_assignment(&net.a, &net.network, "waiting", &roots, 12)?
+                    .is_none()
+            );
+            let job = origin
+                .scheduler_job("d", &message_trigger(message_id))?
+                .unwrap();
+            assert_eq!(job.state, JobState::Queued);
+            assert!(job.runtime.is_none() && !job.tool_calls && !job.pending_check);
+            assert!(
+                workspace::workspace_assignment_for_job_from(
+                    &origin.connection,
+                    &net.network,
+                    &local,
+                    &job
+                )?
+                .is_none()
+            );
+            assert_eq!(
+                origin
+                    .input_receipt(&net.network, &local, message_id)?
+                    .unwrap()["stage"],
+                "owner_accepted"
+            );
+            assert_eq!(
+                origin.scheduler_job_hold(
+                    &net.network,
+                    &local,
+                    &job,
+                    Provider::Codex,
+                    &crate::config::SchedulingLimits::default()
+                )?,
+                Some(if message_id == "m1" {
+                    QueueHoldReason::ResourceConflict
+                } else {
+                    QueueHoldReason::EarlierInput
+                })
+            );
+        }
+    }
+    assert!(
+        origin
+            .claim_next_fixture(&net.a, &net.network, "d", "boot", "resource-wait")?
+            .is_none()
+    );
+    assert!(
+        origin
+            .ensure_workspace_assignment(
+                &net.a,
+                &net.network,
+                "waiting",
+                &["/workspace/../invalid".into()],
+                12
+            )
+            .is_err()
+    );
+    assert!(
+        origin
+            .ensure_workspace_assignment(&net.b, &net.network, "waiting", &roots, 12)
+            .is_err()
+    );
+    assert!(
+        workspace_command_fixture(
+            &net,
+            &mut origin,
+            "explicit-busy",
+            WorkspaceCommand::AssignTask {
+                task_id: "waiting".into(),
+                expected_revision: 1,
+                assignment_id: "explicit-busy".into(),
+                bot_id: "bot-d".into(),
+                execution_node: local.clone(),
+                bot_owner_epoch: 1,
+                channel_owner_epoch: None,
+                work_id: None,
+                resource_roots: roots.clone(),
+                automatic: false,
+            },
+            12
+        )
+        .is_err()
+    );
+    origin.apply_work_signal(
+        &net.a,
+        &net.network,
+        &writer.work_id,
+        Signal::Disconnected,
+        13,
+    )?;
+    assert!(
+        origin
+            .ensure_workspace_assignment(&net.a, &net.network, "waiting", &roots, 14)?
+            .is_none(),
+        "unknown execution retains its resource"
+    );
+    origin.apply_work_signal(
+        &net.a,
+        &net.network,
+        &writer.work_id,
+        Signal::Probed(crate::work::Probe::Terminal {
+            turn_id: "writer-turn".into(),
+            status: vibeface_bridge::turn::TurnStatus::Completed,
+            text: "writer done".into(),
+            error: None,
+        }),
+        15,
+    )?;
+    let assignment = origin
+        .ensure_workspace_assignment(&net.a, &net.network, "waiting", &roots, 16)?
+        .context("released assignment")?;
+    assert_eq!(assignment.started_revision, 1);
+    for message_id in ["m1", "m2"] {
+        let job = origin
+            .scheduler_job("d", &message_trigger(message_id))?
+            .unwrap();
+        assert_eq!(
+            workspace::workspace_assignment_for_job_from(
+                &origin.connection,
+                &net.network,
+                &local,
+                &job
+            )?
+            .unwrap()
+            .assignment_id,
+            assignment.assignment_id
+        );
+        let binding: String = origin.connection.query_row(
+            "SELECT value FROM identity_meta WHERE key=?",
+            [format!(
+                "workspace-input-assignment:{}:{message_id}",
+                net.network
+            )],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&binding)?["state"],
+            "bound"
+        );
+    }
+    let mut original_jobs = Vec::new();
+    for (index, expected) in ["m1", "m2"].into_iter().enumerate() {
+        let job = origin
+            .claim_next_fixture(&net.a, &net.network, "d", "boot", "resource-wait")?
+            .context("claim released input")?
+            .job;
+        assert_eq!(job.reply_to, expected);
+        let attempt = job.state.attempt().unwrap().id.clone();
+        origin.mark_started("d", &job.trigger, &attempt)?;
+        origin.update_turn_runtime(
+            "d",
+            &job.trigger,
+            &attempt,
+            vibeface_bridge::failure::ProviderStage::Run,
+            TurnExecution::Started,
+        )?;
+        origin.started_workspace_assignment(&net.a, &net.network, &job, 17 + index as i64)?;
+        let ended = origin.finish_job(
+            &net.a,
+            &net.network,
+            "d",
+            &job.trigger,
+            &attempt,
+            JobOutcome::Completed,
+            expected,
+            20 + index as i64,
+        )?;
+        origin.settle_workspace_assignment(&net.a, &net.network, &ended, 22 + index as i64)?;
+        assert_eq!(
+            origin
+                .workspace_assignment(&net.network, &assignment.assignment_id)?
+                .unwrap()
+                .state,
+            if index == 0 {
+                AssignmentState::Adopted
+            } else {
+                AssignmentState::Completed
+            }
+        );
+        assert_eq!(
+            origin
+                .admit_workspace_input(&net.network, &local, expected)?
+                .state,
+            "completed"
+        );
+        original_jobs.push(ended);
+    }
+    assert!(
+        origin
+            .claim_next_fixture(&net.a, &net.network, "d", "boot", "resource-wait")?
+            .is_none()
+    );
+    assert!(matches!(
+        origin
+            .scheduler_job("d", &message_trigger("refused"))?
+            .unwrap()
+            .state,
+        JobState::Cancelled { attempt: None, .. }
+    ));
+    assert_eq!(
+        origin
+            .input_receipt(&net.network, &local, "refused")?
+            .unwrap()["reason"],
+        "historical refusal"
+    );
+    assert!(matches!(
+        origin
+            .scheduler_job("d", &message_trigger("full-refused"))?
+            .unwrap()
+            .state,
+        JobState::Cancelled { attempt: None, .. }
+    ));
+    let waiting: bool = origin.connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM identity_meta WHERE key=?)",
+        [format!(
+            "workspace-input-assignment:{}:full-refused",
+            net.network
+        )],
+        |row| row.get(0),
+    )?;
+    assert!(
+        !waiting,
+        "the capacity refusal is never absorbed by a later assignment"
+    );
+    workspace_signed_input_fixture(
+        &net,
+        &mut origin,
+        &net.a,
+        InputRequest {
+            message_id: "replacement".into(),
+            route: InputRoute {
+                target: InputTarget::Task {
+                    task_id: "waiting".into(),
+                },
+                intent: InputIntent::Continue,
+                sequence: 24,
+                expected_revision: Some(1),
+            },
+            text: "replacement".into(),
+            attachments: vec![],
+            report_results: Some(true),
+        },
+        24,
+    )?;
+    let replacement = origin
+        .ensure_workspace_assignment(&net.a, &net.network, "waiting", &roots, 25)?
+        .unwrap();
+    assert_ne!(replacement.assignment_id, assignment.assignment_id);
+    for job in original_jobs {
+        assert_eq!(
+            workspace::workspace_assignment_for_job_from(
+                &origin.connection,
+                &net.network,
+                &local,
+                &job
+            )?
+            .unwrap()
+            .assignment_id,
+            assignment.assignment_id,
+            "bound inputs never borrow the replacement"
+        );
+        let replies: u64 = origin.connection.query_row("SELECT COUNT(*) FROM messages WHERE network_id=? AND conversation_id='d' AND in_reply_to=? AND role='assistant'", params![net.network, job.reply_to], |row| row.get(0))?;
+        assert_eq!(replies, 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn waiting_inputs_do_not_borrow_a_replacement_after_the_owner_returns() -> Result<()> {
+    use crate::workspace::*;
+    for assigned_by_b in [false, true] {
+        let (net, mut a) = workspace_fixture()?;
+        let local = net.a.device_id()?;
+        workspace_command_fixture(
+            &net,
+            &mut a,
+            "create",
+            workspace_task_command("task", None),
+            3,
+        )?;
+        for (at, message_id) in [(4, "waiting-first"), (5, "waiting-second")] {
+            workspace_input_fixture(
+                &net,
+                &mut a,
+                message_id,
+                Some("task"),
+                InputIntent::Continue,
+                at,
+            )?;
+            assert_eq!(
+                a.admit_workspace_input(&net.network, &local, message_id)?
+                    .state,
+                "queued"
+            );
+        }
+        let transfer = net.a.fixture_admin().attest(
+            &net.network,
+            "c",
+            EventBody::ConversationOwner {
+                scheduler_node: net.b.device_id()?,
+                epoch: 2,
+                attestation: None,
+                cause: None,
+            },
+        )?;
+        a.append_event(&net.a, &net.network, "c", transfer, vec![], 6)?;
+        let mut b = store(&net)?;
+        sync(&a, &mut b, &net)?;
+        let first = if assigned_by_b {
+            let first = b
+                .ensure_workspace_assignment(&net.b, &net.network, "task", &[], 7)?
+                .unwrap();
+            let job = b
+                .claim_next_fixture(&net.b, &net.network, "c", "boot-b", "owner-wait")?
+                .unwrap()
+                .job;
+            let attempt = job.state.attempt().unwrap().id.clone();
+            b.mark_started("c", &job.trigger, &attempt)?;
+            let ended = b.finish_job(
+                &net.b,
+                &net.network,
+                "c",
+                &job.trigger,
+                &attempt,
+                JobOutcome::Completed,
+                "owner B finished",
+                8,
+            )?;
+            b.settle_workspace_assignment(&net.b, &net.network, &ended, 9)?;
+            assert_eq!(
+                b.workspace_assignment(&net.network, &first.assignment_id)?
+                    .unwrap()
+                    .state,
+                AssignmentState::Completed
+            );
+            Some(first)
+        } else {
+            None
+        };
+        sync(&b, &mut a, &net)?;
+        let transfer = net.a.fixture_admin().attest(
+            &net.network,
+            "c",
+            EventBody::ConversationOwner {
+                scheduler_node: local.clone(),
+                epoch: 3,
+                attestation: None,
+                cause: None,
+            },
+        )?;
+        a.append_event(&net.a, &net.network, "c", transfer, vec![], 10)?;
+        let execution_head: Option<String> = if assigned_by_b {
+            a.connection.query_row(
+                "SELECT hash FROM events WHERE network_id=? AND scope_id=? AND author=? AND effective=1 ORDER BY seq DESC LIMIT 1",
+                params![net.network, WORKSPACE_SCOPE, net.b.device_id()?],
+                |row| row.get(0),
+            ).optional()?
+        } else {
+            None
+        };
+        let replacement_input = workspace_input_fixture(
+            &net,
+            &mut a,
+            "replacement",
+            Some("task"),
+            InputIntent::Continue,
+            11,
+        )?;
+        if let Some(head) = execution_head {
+            let source =
+                log::event_from(&a.connection, &net.network, &replacement_input.source_event)?
+                    .unwrap();
+            assert!(
+                source.deps.contains(&head),
+                "a new input must causally know the remote assignment's terminal progress"
+            );
+        }
+        let replacement = a
+            .ensure_workspace_assignment(&net.a, &net.network, "task", &[], 12)?
+            .unwrap();
+        if let Some(first) = &first {
+            assert_ne!(replacement.assignment_id, first.assignment_id);
+        }
+        assert_eq!(
+            replacement.trigger_message_id.as_deref(),
+            Some("replacement")
+        );
+        for message_id in ["waiting-first", "waiting-second"] {
+            let binding: String = a.connection.query_row(
+                "SELECT value FROM identity_meta WHERE key=?",
+                [format!(
+                    "workspace-input-assignment:{}:{message_id}",
+                    net.network
+                )],
+                |row| row.get(0),
+            )?;
+            let binding: serde_json::Value = serde_json::from_str(&binding)?;
+            if let Some(first) = &first {
+                assert_eq!(binding["state"], "bound");
+                assert_eq!(binding["assignment_id"], first.assignment_id);
+            } else {
+                assert_eq!(binding["state"], "waiting");
+                assert_eq!(binding["owner_epoch"], 1);
+            }
+            let job = a.scheduler_job("c", &message_trigger(message_id))?.unwrap();
+            assert_eq!(job.state, JobState::Queued);
+            assert!(job.runtime.is_none());
+            assert!(
+                workspace::workspace_assignment_for_job_from(
+                    &a.connection,
+                    &net.network,
+                    &local,
+                    &job
+                )?
+                .is_none()
+            );
+            assert_eq!(
+                a.scheduler_job_hold(
+                    &net.network,
+                    &local,
+                    &job,
+                    Provider::Codex,
+                    &crate::config::SchedulingLimits::default()
+                )?,
+                Some(if message_id == "waiting-first" {
+                    crate::scheduling::QueueHoldReason::PendingCheck
+                } else {
+                    crate::scheduling::QueueHoldReason::EarlierInput
+                })
+            );
+        }
+        let replacement_job = a
+            .claim_next_fixture(
+                &net.a,
+                &net.network,
+                "c",
+                "boot-a",
+                "owner-return-replacement",
+            )?
+            .context("old waiting inputs must not block the current assignment")?
+            .job;
+        assert_eq!(replacement_job.reply_to, "replacement");
+        assert_eq!(
+            workspace::workspace_assignment_for_job_from(
+                &a.connection,
+                &net.network,
+                &local,
+                &replacement_job,
+            )?
+            .unwrap()
+            .assignment_id,
+            replacement.assignment_id
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn an_owner_rechecks_new_input_revisions_without_rewriting_existing_receipts() -> Result<()> {
+    use crate::workspace::*;
+    let (net, mut origin) = workspace_fixture()?;
+    let local = net.a.device_id()?;
+    workspace_command_fixture(
+        &net,
+        &mut origin,
+        "create",
+        workspace_task_command("task", None),
+        3,
+    )?;
+    for (at, message_id) in [(4, "accepted"), (5, "stale")] {
+        workspace_input_fixture(
+            &net,
+            &mut origin,
+            message_id,
+            Some("task"),
+            InputIntent::Continue,
+            at,
+        )?;
+    }
+    let receipt = origin.admit_workspace_input(&net.network, &local, "accepted")?;
+    let accepted = origin
+        .scheduler_job("c", &message_trigger("accepted"))?
+        .unwrap();
+    workspace_command_fixture(
+        &net,
+        &mut origin,
+        "revise",
+        WorkspaceCommand::ReviseTask {
+            task_id: "task".into(),
+            expected_revision: 1,
+            request: "new revision".into(),
+            expected_result: "new result".into(),
+            dependencies: vec![],
+        },
+        6,
+    )?;
+    assert_eq!(
+        origin.admit_workspace_input(&net.network, &local, "accepted")?,
+        receipt
+    );
+    assert_eq!(
+        origin
+            .scheduler_job("c", &message_trigger("accepted"))?
+            .unwrap(),
+        accepted
+    );
+    let error = origin
+        .admit_workspace_input(&net.network, &local, "stale")
+        .expect_err("a newly admitted input cannot use an obsolete task revision");
+    assert!(error.to_string().contains("input task revision changed"));
+    assert!(
+        origin
+            .scheduler_job("c", &message_trigger("stale"))?
+            .is_none()
+    );
+    assert!(
+        origin
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "stale-revision")?
+            .is_none()
+    );
     Ok(())
 }

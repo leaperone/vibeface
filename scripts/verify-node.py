@@ -8307,11 +8307,12 @@ def e2e_fixture(options):
                                         "turn_id": row["message"]["params"]["turnId"]}
                                        for row in fixture_records(run, "codex-rpc.jsonl")
                                        if row["message"].get("method") == "turn/interrupt"],
-                        "inputs": [{"message_id": row["input"]["message_id"], "conversation_id": row["conversation_id"],
-                                    "target": row["input"]["target"], "text": row["input"]["text"],
-                                    "deferred": row["deferred"], "cancelled": row["cancelled"]}
-                                   for row in nodes["source"].client.rpc("workspace_state")["inputs"]],
                     }
+                    if native_ready:
+                        result["inputs"] = [{"message_id": row["input"]["message_id"], "conversation_id": row["conversation_id"],
+                                             "target": row["input"]["target"], "text": row["input"]["text"],
+                                             "deferred": row["deferred"], "cancelled": row["cancelled"]}
+                                            for row in nodes["source"].client.rpc("workspace_state")["inputs"]]
                     require(len(json.dumps({"ok": True, "result": result}).encode()) <= 65536,
                             "workspace inspection returns one bounded public JSON event")
                 elif op == "workspace_native_setup":

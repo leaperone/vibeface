@@ -302,8 +302,8 @@ pub enum SteerOutcome {
     Answered,
     /// The message is in a turn that stopped, failed or was interrupted.
     Unfinished,
-    /// The thread could not be read, or still showed the turn running, in time; whether it
-    /// joined is unknown. Stopping the message after its reply ended also ends it here.
+    /// The original thread could not prove the input's outcome, still showed its turn running
+    /// past the readback window, or the user stopped an unacknowledged input after its host ended.
     Unknown,
 }
 

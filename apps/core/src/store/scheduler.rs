@@ -672,6 +672,8 @@ fn job_hold_from(
     }
     let key = job.session_key();
     let session = load_scoped_session(connection, &key)?;
+    let fixed_assignment =
+        super::workspace::workspace_assignment_for_job_from(connection, network, local, job)?;
     for earlier in queued_jobs(connection, &job.conversation_id)? {
         if earlier.scope == job.scope
             && earlier.sequence < job.sequence
@@ -685,6 +687,14 @@ fn job_hold_from(
             && input.input.route.intent == crate::workspace::InputIntent::Continue
             && input.input.report_results != Some(false)
         {
+            if let Some(assignment) = &fixed_assignment
+                && !super::workspace::workspace_assignment_for_job_from(
+                    connection, network, local, &earlier,
+                )?
+                .is_some_and(|earlier| earlier.assignment_id == assignment.assignment_id)
+            {
+                continue;
+            }
             return Ok(Some(QueueHoldReason::EarlierInput));
         }
     }
@@ -692,13 +702,25 @@ fn job_hold_from(
         if !super::workspace::task_execution_allowed_from(connection, network, task_id)? {
             return Ok(Some(QueueHoldReason::PendingCheck));
         }
-        if let Some(assignment) =
-            super::workspace::workspace_assignment_for_job_from(connection, network, local, job)?
-            && !super::workspace::assignment_resources_available_from(
-                connection,
-                network,
-                &assignment,
-            )?
+        let Some(assignment) = fixed_assignment else {
+            return Ok(Some(
+                if super::workspace::workspace_input_resources_blocked_from(
+                    connection, network, local, job,
+                )? {
+                    QueueHoldReason::ResourceConflict
+                } else {
+                    QueueHoldReason::PendingCheck
+                },
+            ));
+        };
+        if super::workspace::workspace_task_from(connection, network, task_id)?
+            .and_then(|task| task.current_assignment)
+            .as_deref()
+            != Some(assignment.assignment_id.as_str())
+        {
+            return Ok(Some(QueueHoldReason::PendingCheck));
+        }
+        if !super::workspace::assignment_resources_available_from(connection, network, &assignment)?
         {
             return Ok(Some(QueueHoldReason::ResourceConflict));
         }
@@ -1471,6 +1493,15 @@ pub(crate) fn admit_workspace_input_from(
         "input conversation mismatch"
     );
     let trigger = message_trigger(message_id);
+    if resolved.owner_node == local {
+        if let Some(job) = load_job(connection, &input.conversation_id, &trigger)? {
+            return Ok(job.receipt(network));
+        }
+        ensure!(
+            resolved.task_revision == input.input.route.expected_revision,
+            "input task revision changed"
+        );
+    }
     if input.deferred || input.cancelled {
         return Ok(AdmissionReceipt {
             network_id: network.into(),
@@ -1574,6 +1605,7 @@ pub(crate) fn admit_assignment_from(
         owner.owner.as_deref() == Some(local) && owner.owner_epoch == assignment.bot_owner_epoch,
         "assignment owner permission is stale"
     );
+    super::workspace::bind_waiting_workspace_inputs_from(connection, network, assignment)?;
     if let Some(source) = &assignment.trigger_message_id
         && let Some(route) =
             super::workspace::input_route_from(connection, network, conversation, source)?
@@ -1645,14 +1677,6 @@ fn admit_ended_from(
     if let Some(job) = load_job(connection, conversation, trigger)? {
         return Ok(job.receipt(network));
     }
-    if kind == TriggerKind::Human && declined.is_none() {
-        super::workspace::freeze_workspace_input_assignment_from(
-            connection,
-            network,
-            conversation,
-            reply_to,
-        )?;
-    }
     let scope = if let Some(route) =
         super::workspace::input_route_from(connection, network, conversation, reply_to)?
     {
@@ -1687,6 +1711,15 @@ fn admit_ended_from(
         ended.is_some() || queued_jobs(connection, conversation)?.len() < MAX_PENDING_JOBS,
         "scheduler inbox is full; trigger was not admitted"
     );
+    if kind == TriggerKind::Human && ended.is_none() {
+        super::workspace::freeze_workspace_input_assignment_from(
+            connection,
+            network,
+            conversation,
+            reply_to,
+            None,
+        )?;
+    }
     let job = SchedulerJob {
         conversation_id: conversation.into(),
         scope,
@@ -5109,15 +5142,14 @@ impl Store {
             .filter(|host| steer_host_may_still_consume(&host.state))
             {
                 Some(host) => job = host,
-                // The reply it went into already ended: there is nothing left to stop, and the
-                // message is never sent again.
-                None => {
+                None if receipt.is_none() => {
                     job.state = JobState::Steered {
                         into,
                         receipt,
                         outcome: SteerOutcome::Unknown,
-                    }
+                    };
                 }
+                None => {}
             }
         }
         let mut session = load_job_session(&tx, &job)?;

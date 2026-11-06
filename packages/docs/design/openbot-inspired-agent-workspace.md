@@ -67,6 +67,8 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 
 快照未提供执行顺序字段时，UI 只能显示观察到的调用状态，不能称为实际排队顺序。`queued`、`cancelling` 和已写回复但尚待同步的 `publishing` 使用各自的状态文案。历史调用与等待执行的调用分开，不能统一标为正在运行。
 
+自动分配遇到临时目录占用时，已接纳的输入保留原 ID 排队，并显示资源等待。资源释放后再固定 Assignment 和执行，不把临时占用保存成永久拒绝。等待中的输入保留 Task revision 和原 owner epoch；已绑定的输入不能借后续 Assignment 执行。Unknown 仍保留资源，不能为解除等待而自动释放。
+
 `message_bot` 是 Bot 间消息，显示发送方、接收方、正文、hops 和投递状态。`dispatch_work` 是在某个 Node 上执行的工作，显示 dispatcher、target、work ID、结果和回执。两者可以关联，但不能互换。Bot 消息没有工作结果，工作派发也不等于聊天消息。
 
 `workspace_history` 按 Task 或 Channel 过滤共享记录，发言身份由已验证事件确定。Main 不接纳其他 scope 的消息、问题或调度进度。来源不明的 Bot 消息保留省略数量，不能默认归入 Main。手机与网页使用同一已认证投影。
@@ -78,6 +80,8 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 `input_receipt` 区分入口保存、owner 接纳、提交中、Provider 接受、实际回合归属、拒绝和未知。Provider 接受不表示模型已读。附件保留完整引用与内容，同目标不得越过尚未准备好的附件。不同目标的投递和旧输入回读独立推进。
 
 稍后队列的编辑、释放、取消和移动通过 `ControlInput`，以 `control_event` 做 CAS。owner 重新核验尚未开始，不能仅凭客户端的 deferred 标记编辑已提交输入。明确启动前失败可由本人用新的签名 Release 重试，必须绑定最新 control_event，并由 Node 证明原 job 为 NotStarted、没有工具调用、未决检查或在途 outbox。任务 Assignment 同时引用原失败与未启动证据，保留原输入和旧失败历史，重试回复有独立稳定身份。取消、Unknown、已经开始或 revision 改变均不能复活。未知写入只查询原 ID，不换 ID 重发。停止使用独立控制路径，保留未发送草稿和焦点。
+
+停止时，已获 Provider 接受回执的补充仍核对原 thread 和 turn；宿主结束本身不能替代逐条输入结果。没有接受回执且宿主已结束的取消输入保持 Unknown，迟到的未到达结果不能把它重新入队。两条路径均不重新发送原输入。
 
 ## 未知结果和用户动作
 

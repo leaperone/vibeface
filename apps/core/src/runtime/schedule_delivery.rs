@@ -890,7 +890,21 @@ impl Runtime {
                         now_ms(),
                     )?;
                 }
-                store.admit_workspace_input(network, &local, &message_id)
+                let receipt = store.admit_workspace_input(network, &local, &message_id)?;
+                if receipt.state == "queued"
+                    && let Some(task_id) = &resolved.task_id
+                    && resolved.owner_node == local
+                    && let Err(error) = store.ensure_workspace_assignment(
+                        &self.identity,
+                        network,
+                        task_id,
+                        &roots,
+                        now_ms(),
+                    )
+                {
+                    tracing::debug!(%error, "accepted task input waits for assignment recovery");
+                }
+                Ok(receipt)
             })();
             let receipt = match admission {
                 Ok(receipt) => receipt,
@@ -1440,6 +1454,244 @@ mod tests {
                 outcome: SteerOutcome::Unfinished,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn stopped_workspace_inputs_read_back_their_original_turn_without_resending() -> Result<()>
+    {
+        use crate::{
+            model::EventBody,
+            runtime::triage::tests::{bot, node, scripted_app_server},
+            scheduling::{SessionScope, message_trigger},
+            workspace::{
+                AssignmentState, InputIntent, InputRequest, InputRoute, InputTarget, TaskAction,
+                WORKSPACE_SCOPE, WorkspaceCommand,
+            },
+        };
+        for native_has_inputs in [true, false] {
+            let (node, admin, directory) = node().await?;
+            let socket = node
+                .providers()
+                .switches
+                .codex_app_server
+                .socket
+                .context("fixture socket")?;
+            let result = async {
+                bot(&node, &admin, "c", "Workspace", &[]).await?;
+                let network = node.store.lock().await.network()?.context("network")?;
+                let local = node.identity.device_id()?;
+                let roots = vec![directory.canonicalize()?.display().to_string()];
+                let command = |store: &mut Store, id: &str, command: WorkspaceCommand| -> Result<()> {
+                    let signed = admin.attest(&network, WORKSPACE_SCOPE, EventBody::WorkspaceCommanded {
+                        command_id:id.into(), command:command.clone(), attestation:None, acting_assignment:None, cause:None,
+                    })?;
+                    store.apply_workspace_command(&node.identity, &network, id, command,
+                        signed.attestation().cloned(), None, None, now_ms())?;
+                    Ok(())
+                };
+                let input = |store: &mut Store, id: &str, sequence: u64| -> Result<crate::workspace::WorkspaceInput> {
+                    let request = InputRequest {
+                        message_id:id.into(), route:InputRoute { target:InputTarget::Task { task_id:"task".into() },
+                            intent:InputIntent::Continue, sequence, expected_revision:Some(1) },
+                        text:id.into(), attachments:vec![], report_results:Some(true),
+                    };
+                    let signed = admin.attest(&network, "c", EventBody::InputPosted {
+                        message_id:request.message_id.clone(), target:request.route.target.clone(), intent:request.route.intent,
+                        sequence, expected_revision:Some(1), text:request.text.clone(), attachments:vec![], report_results:Some(true), attestation:None,
+                    })?;
+                    store.post_workspace_input(&node.identity, &network, request,
+                        signed.attestation().cloned().context("input signature")?, now_ms())
+                };
+                let assignment = {
+                    let mut store = node.store.lock().await;
+                    let bot_id = store.bot_for_conversation(&network, "c")?.context("bot")?.bot_id;
+                    command(&mut store, "create", WorkspaceCommand::CreateTask {
+                        task_id:"task".into(), channel_id:None, parent_task_id:None, owner_bot:bot_id,
+                        title:"task".into(), request:"perform task".into(), expected_result:"result".into(),
+                        source_events:vec![], dependencies:vec![], reply_only:false,
+                    })?;
+                    let first = input(&mut store, "original", 1)?;
+                    let assignment = store.ensure_workspace_assignment(&node.identity, &network, "task", &roots, now_ms())?.context("assignment")?;
+                    let host = store.claim_next_fixture(&node.identity, &network, "c", "boot", "fixture")?.context("host")?.job;
+                    assert_eq!(host.scope, SessionScope::WorkspaceTask { task_id:"task".into() });
+                    let attempt = host.state.attempt().context("attempt")?.id.clone();
+                    store.mark_started("c", &host.trigger, &attempt)?;
+                    store.record_manager_turn(&attempt, "system", "thread", Some("turn"), &Default::default())?;
+                    for (id, state, input_event) in [
+                        ("accept", AssignmentState::Accepted, None),
+                        ("adopt", AssignmentState::Adopted, Some(first.source_event)),
+                    ] {
+                        store.apply_workspace_command(&node.identity, &network, id, WorkspaceCommand::AssignmentProgress {
+                            assignment_id:assignment.assignment_id.clone(), revision:1, state, input_event,
+                            execution:None, evidence_event:None, result:None,
+                        }, None, None, None, now_ms())?;
+                    }
+                    for (id, sequence) in [("second", 2), ("third", 3)] {
+                        input(&mut store, id, sequence)?;
+                        let admitted = store.admit_workspace_input(&network, &local, id)?;
+                        assert_eq!(admitted.state, "queued");
+                        assert_eq!(store.scheduler_job("c", &message_trigger(id))?.context("owner-admitted input")?.scope,
+                            SessionScope::WorkspaceTask { task_id:"task".into() });
+                        let candidate = store.steer_candidates(&network, &local, "boot")?.into_iter()
+                            .find(|candidate| candidate.message_id == id).context("steer candidate")?;
+                        assert!(store.begin_steer(&network, &local, "boot", ("c", &candidate.trigger), &candidate.into, Some(&candidate.source_event.hash))?);
+                        store.record_steer_submission("c", &candidate.trigger, &candidate.into, Some(Some("turn".into())))?;
+                    }
+                    command(&mut store, "stop", WorkspaceCommand::ControlTask { task_id:"task".into(), expected_revision:1, action:TaskAction::Stop })?;
+                    store.request_manager_cancel(&node.identity, &network, "c", &host.trigger)?;
+                    store.finish_job(&node.identity, &network, "c", &host.trigger, &attempt,
+                        JobOutcome::Cancelled("native turn interrupted".into()), "", now_ms())?;
+                    assert!(!store.steer_host_active("c", &attempt)?);
+                    assignment.assignment_id
+                };
+                for _ in 0..2 { node.reconcile_workspace_jobs(&network).await?; }
+                let pending = node.store.lock().await.steering_jobs()?;
+                assert_eq!(pending.len(), 2, "Stop keeps both receipts eligible for native readback");
+                for job in &pending {
+                    assert!(matches!(&job.state, JobState::Steering { into, receipt:Some(receipt), .. }
+                        if into.thread_id=="thread" && into.turn_id=="turn" && receipt.actual_turn_id.as_deref()==Some("turn")));
+                }
+                let mut requests = scripted_app_server(&node, move |request| {
+                    if request["method"] == "thread/read" {
+                        assert_eq!(request["params"]["threadId"], "thread");
+                        assert_eq!(request["params"]["includeTurns"], true);
+                        let items = if native_has_inputs { vec![json!({"type":"userMessage","clientId":"second"}), json!({"type":"userMessage","clientId":"third"})] } else { vec![] };
+                        json!({"result":{"thread":{"id":"thread","turns":[{"id":"turn","status":"interrupted","items":items}]}}})
+                    } else {
+                        assert!(!request["method"].as_str().is_some_and(|method| method.starts_with("turn/")), "readback must not send or interrupt again");
+                        json!({"result":{}})
+                    }
+                })?;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while node.codex.status().await["connection"]["state"] != "connected" {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }).await?;
+                node.steer_messages(&network).await?;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if node.store.lock().await.steering_jobs()?.is_empty() { break Ok::<_, anyhow::Error>(()); }
+                        tokio::task::yield_now().await;
+                    }
+                }).await??;
+                let expected = if native_has_inputs { SteerOutcome::Unfinished } else { SteerOutcome::Unknown };
+                {
+                    let store = node.store.lock().await;
+                    for id in ["second", "third"] {
+                        assert!(matches!(store.scheduler_job("c", &message_trigger(id))?.context("settled input")?.state,
+                            JobState::Steered { outcome, receipt:Some(receipt), .. } if outcome == expected && receipt.actual_turn_id.as_deref()==Some("turn")));
+                    }
+                    assert!(store.steer_candidates(&network, &local, "boot")?.is_empty());
+                    if !native_has_inputs {
+                        assert!(store.workspace_resource_conflicts(&network, &local, &roots, None)?.contains(&assignment),
+                            "unknown native input keeps the Assignment's resources reserved");
+                    }
+                }
+                node.reconcile_workspace_jobs(&network).await?;
+                node.steer_messages(&network).await?;
+                let mut reads = 0;
+                while let Ok(request) = requests.try_recv() {
+                    if request["method"] == "thread/read" { reads += 1; }
+                    assert!(!request["method"].as_str().is_some_and(|method| method.starts_with("turn/")));
+                }
+                assert_eq!(reads, 2, "each original input is read once and never resubmitted");
+                if !native_has_inputs {
+                    assert!(node.store.lock().await.workspace_resource_conflicts(&network, &local, &roots, None)?.contains(&assignment),
+                        "later Stop reconciliation cannot release unknown input resources");
+                }
+                Ok::<_, anyhow::Error>(())
+            }.await;
+            node.shutdown().await;
+            let _ = std::fs::remove_file(socket);
+            drop(node);
+            std::fs::remove_dir_all(directory)?;
+            result?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stopping_an_unacknowledged_main_input_never_requeues_after_native_not_arrived()
+    -> Result<()> {
+        use crate::{
+            model::{EventBody, Role},
+            runtime::triage::tests::{bot, node, scripted_app_server, start_reply},
+            scheduling::{SessionScope, message_trigger},
+        };
+        let (node, admin, directory) = node().await?;
+        let socket = node
+            .providers()
+            .switches
+            .codex_app_server
+            .socket
+            .context("fixture socket")?;
+        let result = async {
+            bot(&node, &admin, "c", "Main", &[]).await?;
+            let network = node.store.lock().await.network()?.context("network")?;
+            let local = node.identity.device_id()?;
+            let (host_trigger, attempt) = start_reply(&node, &admin, "original").await?;
+            let trigger = message_trigger("unacknowledged");
+            let pending = {
+                let mut store = node.store.lock().await;
+                store.record_manager_turn(&attempt, "system", "thread", Some("turn"), &Default::default())?;
+                let signed = admin.attest(&network, "c", EventBody::MessagePosted {
+                    message_id:"unacknowledged".into(), role:Role::User, text:"supplement".into(), attachments:vec![],
+                    report_results:Some(true), in_reply_to:None, status:None, answers:None, attestation:None, failure:None,
+                })?;
+                store.accept_message(&node.identity, &network, "c", "unacknowledged", "supplement", vec![], true,
+                    signed.attestation().cloned().context("input signature")?, now_ms())?;
+                let candidate = store.steer_candidates(&network, &local, "boot")?.into_iter()
+                    .find(|candidate| candidate.message_id=="unacknowledged").context("Main steer candidate")?;
+                assert_eq!(candidate.scope, SessionScope::Main);
+                assert!(store.begin_steer(&network, &local, "boot", ("c", &trigger), &candidate.into, Some(&candidate.source_event.hash))?);
+                store.record_steer_submission("c", &trigger, &candidate.into, None)?;
+                let pending = store.scheduler_job("c", &trigger)?.context("pending input")?;
+                assert!(matches!(pending.state, JobState::Steering { receipt:None, uncertain:true, .. }));
+                store.finish_job(&node.identity, &network, "c", &host_trigger, &attempt, JobOutcome::Completed, "done", now_ms())?;
+                assert!(!store.steer_host_active("c", &attempt)?);
+                pending
+            };
+            node.cancel_manager(&Access { network_id:network.clone(), human:true, conversation_id:Some("c".into()), manager:None },
+                &json!({"conversation_id":"c","trigger":trigger})).await?;
+            let mut requests = scripted_app_server(&node, |request| {
+                if request["method"] == "thread/read" {
+                    assert_eq!(request["params"]["threadId"], "thread");
+                    assert_eq!(request["params"]["includeTurns"], true);
+                    json!({"result":{"thread":{"id":"thread","turns":[{"id":"turn","status":"completed","items":[]}]}}})
+                } else {
+                    assert!(!request["method"].as_str().is_some_and(|method| method.starts_with("turn/")), "a stopped Main input cannot write natively");
+                    json!({"result":{}})
+                }
+            })?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while node.codex.status().await["connection"]["state"] != "connected" {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await?;
+            node.settle_steer(&network, &pending).await?;
+            node.steer_messages(&network).await?;
+            {
+                let mut store = node.store.lock().await;
+                assert!(matches!(store.scheduler_job("c", &trigger)?.context("stopped input")?.state,
+                    JobState::Steered { outcome:SteerOutcome::Unknown, receipt:None, .. }));
+                assert!(store.steering_jobs()?.is_empty());
+                assert!(store.steer_candidates(&network, &local, "boot")?.is_empty());
+                assert!(store.claim_next_fixture(&node.identity, &network, "c", "boot", "cfg")?.is_none(),
+                    "late NotArrived cannot make a stopped Main input claimable");
+            }
+            let mut reads = 0;
+            while let Ok(request) = requests.try_recv() {
+                if request["method"] == "thread/read" { reads += 1; }
+                assert!(!request["method"].as_str().is_some_and(|method| method.starts_with("turn/")));
+            }
+            assert_eq!(reads, 1, "only the reader captured before Stop checks the original turn");
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        node.shutdown().await;
+        let _ = std::fs::remove_file(socket);
+        drop(node);
+        std::fs::remove_dir_all(directory)?;
+        result
     }
 
     #[test]
