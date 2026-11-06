@@ -250,6 +250,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
     await expect(latestReply).not.toBeVisible();
     await expect(toLatest).toBeEnabled();
     let previousReadingBounds = '';
+    // Each read captures a fresh device snapshot, so stability needs two complete samples.
     await expect.poll(async () => {
       const button = await toLatest.boundingBox(), marker = await olderMarker.boundingBox(), pane = await mainHistory.boundingBox();
       const target = await mainTarget.boundingBox(), back = await backButton.boundingBox();
@@ -259,7 +260,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
       const observed = JSON.stringify([button, marker, target, keyboardTop]), stable = observed === previousReadingBounds;
       previousReadingBounds = observed;
       return stable && marker.y >= top && marker.y + marker.height <= bottom && button.x >= pane.x && button.x + button.width <= pane.x + pane.width && button.y >= top && button.y + button.height <= bottom;
-    }).toBe(true);
+    }, { timeout: 30000 }).toBe(true);
     if (phase === 'reply') {
       const beforeReply = await olderMarker.boundingBox();
       assert(beforeReply, 'The same historical message is measured before the reply');
@@ -288,7 +289,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
       const observed = JSON.stringify([marker, target, keyboardTop]), stable = observed === previousLatestBounds;
       previousLatestBounds = observed;
       return stable && marker.y >= Math.max(pane.y, back.y + back.height) && marker.y + marker.height <= Math.min(pane.y + pane.height, target.y, keyboardTop);
-    }).toBe(true);
+    }, { timeout: 30000 }).toBe(true);
     await expect(toLatest).toHaveCount(0);
   }
   await expect(mainComposer).toHaveValue('');
