@@ -236,6 +236,7 @@ export default function ChatScreen() {
       ref={list}
       data={rows}
       inverted
+      maintainVisibleContentPosition={scrollButton.id === id && scrollButton.visible ? { minIndexForVisible: 0 } : undefined}
       keyExtractor={(row) => row.key}
       onScrollToIndexFailed={({ index, averageItemLength }) => {
         if (scrollInset.current.id !== id) return
