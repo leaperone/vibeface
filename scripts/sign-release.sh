@@ -28,10 +28,16 @@ identities="$(security find-identity -v -p codesigning "$keychain" | grep '"Deve
 identity="$(awk '{print $2}' <<< "$identities")"
 team="$(sed -n 's/.*(\([A-Z0-9]\{10\}\))"$/\1/p' <<< "$identities")"
 [[ "$identity" =~ ^[0-9A-F]{40}$ && -n "$team" ]] || { echo '::error::Could not resolve the signing identity or team.'; exit 1; }
-if [[ "$1" == core ]]; then binary="$2/vibeface-core"; else binary="$2/vibeface"; fi
+[[ "$1" == product ]] || { echo 'Expected the product native programs.' >&2; exit 1; }
+binaries=("$2/vibeface" "$2/vibeface-core")
 trap 'security delete-keychain "$keychain"; rm -f "$RUNNER_TEMP/vibeface-notary.p8"' EXIT
-codesign --force --options runtime --timestamp --identifier cn.leaperone.vibeface --sign "$identity" "$binary"
-codesign --verify --strict "$binary"
-ditto -c -k --keepParent "$binary" "$RUNNER_TEMP/native.zip"
+notary_inputs="$RUNNER_TEMP/vibeface-notary-product"
+mkdir "$notary_inputs"
+for binary in "${binaries[@]}"; do
+  codesign --force --options runtime --timestamp --identifier cn.leaperone.vibeface --sign "$identity" "$binary"
+  codesign --verify --strict "$binary"
+  cp "$binary" "$notary_inputs/"
+done
+ditto -c -k --keepParent "$notary_inputs" "$RUNNER_TEMP/native.zip"
 xcrun notarytool submit "$RUNNER_TEMP/native.zip" --key "$RUNNER_TEMP/vibeface-notary.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notary-result.json"
 python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["status"] == "Accepted"' "$RUNNER_TEMP/notary-result.json"
