@@ -23,7 +23,13 @@ APPS = ('www', 'app', 'core', 'cli', 'mobile')
 PRODUCT_APPS = ('app', 'core', 'cli', 'mobile')
 RELEASES = ('product', 'www')
 COMPONENTS = ('app', 'core', 'www')
-TARGETS = ('aarch64-apple-darwin', 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-gnu')
+TARGETS = ('aarch64-apple-darwin', 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-gnu',
+           'x86_64-pc-windows-msvc')
+WINDOWS_TARGETS = ('x86_64-pc-windows-msvc',)
+DESKTOP_TARGETS = ('aarch64-apple-darwin', 'x86_64-pc-windows-msvc')
+DESKTOP_INSTALLERS = {'aarch64-apple-darwin': 'dmg', 'x86_64-pc-windows-msvc': 'exe'}
+ELECTRON_VERSION = '45.2.3'
+SIGNING_STATES = ('developer-id-notarized', 'authenticode', 'unsigned-development-preview')
 VERSION = r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(nightly)\.([0-9]{8})\.([1-9][0-9]*)|-(rc)\.([1-9][0-9]*))?'
 COMMIT = r'[a-f0-9]{40}'
 MAX_ARCHIVE = 384 * 1024 * 1024
@@ -39,6 +45,20 @@ def require(condition, message):
 
 def run(*args, cwd=None):
     return subprocess.check_output(args, cwd=cwd or ROOT, text=True).strip()
+
+
+def program_suffix(target):
+    return '.exe' if target in WINDOWS_TARGETS else ''
+
+
+def program_names(target):
+    return tuple(name + program_suffix(target) for name in ('vibeface', 'vibeface-core'))
+
+
+def service_installer(target):
+    """The user service installer shipped inside a bundle for this platform."""
+    return ROOT / 'scripts' / ('install-node-service.ps1' if target in WINDOWS_TARGETS
+                               else 'install-node-service.sh')
 
 
 def version(value):
@@ -205,7 +225,8 @@ def verify_component(directory, app, expected=None):
     else:
         require(info['target'] is None, 'static component must not specify a native target')
     if app in ('app', 'www'):
-        require(not any(p.name in ('vibeface', 'vibeface-core') for p in directory.rglob('*')), 'static component must not include native programs')
+        programs = {name for target in TARGETS for name in program_names(target)}
+        require(not any(p.name in programs for p in directory.rglob('*')), 'static component must not include native programs')
     if expected:
         require(all(info[k] == v for k, v in expected.items()), 'component pin mismatch')
     require(info['files'] == files(directory, ('COMPONENT-INFO.json',)), 'component content changed')
@@ -218,6 +239,7 @@ def pack_component(app, source, output, target=None):
     if app == 'core':
         require(target in TARGETS and source.is_file(), 'core requires a target binary')
         require(run(str(source.resolve()), '--version') == 'vibeface-core ' + info['version'], 'core binary version mismatch')
+        require(source.name == program_names(target)[1], 'core binary name must match its platform')
     else:
         require(app in ('app', 'www') and source.is_dir(), 'expected static app directory')
     name = f'vibeface-{app}-{info["version"]}' + (f'-{target}' if target else '')
@@ -225,7 +247,7 @@ def pack_component(app, source, output, target=None):
     with tempfile.TemporaryDirectory(dir=output, prefix='.component-') as tmp:
         directory = Path(tmp) / name; directory.mkdir()
         if app == 'core':
-            shutil.copy2(source, directory / 'vibeface-core')
+            shutil.copy2(source, directory / program_names(target)[1])
         else:
             shutil.copytree(source, directory / ('web' if app == 'app' else 'site'))
         info.update(schema=SCHEMA_VERSION, target=target, files=files(directory))
@@ -324,7 +346,7 @@ def native_receipt(native_dir, target, product_version, source_commit):
     require(info['version'] == product_version, 'native receipt version mismatch')
     require(isinstance(info['source_commit'], str) and re.fullmatch(COMMIT, info['source_commit']), 'invalid native source commit')
     require(info['source_commit'] == source_commit, 'native staging source must match this checkout')
-    require(set(info['files']) == {'vibeface', 'vibeface-core'}, 'native receipt must list vibeface and vibeface-core')
+    require(set(info['files']) == set(program_names(target)), 'native receipt must list vibeface and vibeface-core')
     require(files(native_dir, ('NATIVE-INFO.json',)) == info['files'], 'native staging content changed or has extra files')
     return info
 
@@ -333,7 +355,7 @@ def stage_native(target, binary_directory, output):
     require(target in TARGETS, 'unsupported platform')
     binary_directory = binary_directory.resolve()
     require(binary_directory.is_dir(), 'native input must be a directory')
-    binaries = [binary_directory / name for name in ('vibeface', 'vibeface-core')]
+    binaries = [binary_directory / name for name in program_names(target)]
     for binary in binaries:
         require(binary.is_file() and not binary.is_symlink(), 'native directory must contain vibeface and vibeface-core')
     product_version = identity('product')['version']
@@ -367,17 +389,20 @@ def compose_offline(target, native_dir, app_archive, output):
         unpacked_app = unpack(app_archive, tmp / 'app-unpack')
         verify_component(unpacked_app, 'app', dict(version=product_version, tag=product['tag'], target=None,
                                                    source_commit=source_commit, channel=product['channel']))
-        cli_src = native_dir / 'vibeface'
-        core_src = native_dir / 'vibeface-core'
-        require(digest(cli_src) == receipt['files']['vibeface'] and digest(core_src) == receipt['files']['vibeface-core'],
+        cli_name, core_name = program_names(target)
+        cli_src = native_dir / cli_name
+        core_src = native_dir / core_name
+        require(digest(cli_src) == receipt['files'][cli_name] and digest(core_src) == receipt['files'][core_name],
                 'native binaries do not match the staging receipt')
         directory = tmp / f'vibeface-{product_version}-{target}'
         directory.mkdir()
-        shutil.copy2(cli_src, directory / 'vibeface')
-        shutil.copy2(core_src, directory / 'vibeface-core')
+        shutil.copy2(cli_src, directory / cli_name)
+        shutil.copy2(core_src, directory / core_name)
         shutil.copytree(unpacked_app / 'web', directory / 'web')
         (directory / 'scripts').mkdir()
-        shutil.copy2(ROOT / 'scripts/install-node-service.sh', directory / 'scripts/install-node-service.sh')
+        installer = service_installer(target)
+        require(installer.is_file(), f'missing user service installer for {target}: scripts/{installer.name}')
+        shutil.copy2(installer, directory / 'scripts' / installer.name)
         shutil.copy2(ROOT / 'README.md', directory / 'README.md')
         (directory / 'docs').mkdir()
         for name in ('node.md', 'releasing.md'):
@@ -389,7 +414,7 @@ def compose_offline(target, native_dir, app_archive, output):
         public_archive(directory, bundle)
         core_only = tmp / f'vibeface-core-{product_version}-{target}'
         core_only.mkdir()
-        shutil.copy2(core_src, core_only / 'vibeface-core')
+        shutil.copy2(core_src, core_only / core_name)
         core_info = dict(component_identity('core'), schema=SCHEMA_VERSION, target=target,
                          data_epoch=control_constant('DATA_EPOCH'), files=files(core_only))
         write_json(core_only / 'COMPONENT-INFO.json', core_info)
@@ -418,6 +443,61 @@ def mobile_provenance(apk):
                 applicationId=package, versionCode=int(code), versionName=marketing)
 
 
+def desktop_basename(version_value, target):
+    return f'vibeface-desktop-{version_value}-{target}'
+
+
+def desktop_payload_names(version_value, target):
+    base = desktop_basename(version_value, target)
+    return (f'{base}.{DESKTOP_INSTALLERS[target]}', f'{base}.zip')
+
+
+def desktop_asset_names(version_value, target):
+    names = {f'{desktop_basename(version_value, target)}.provenance.json'}
+    for name in desktop_payload_names(version_value, target):
+        names |= {name, name + '.sha256'}
+    return names
+
+
+def verify_desktop_receipt(directory, target, pins, runtime_digest=None):
+    """Read a desktop provenance receipt and bind it to its payloads, cohort and bundled runtime."""
+    require(target in DESKTOP_TARGETS, 'unsupported desktop target')
+    version_value = pins['version']
+    path = directory / f'{desktop_basename(version_value, target)}.provenance.json'
+    require(path.is_file(), 'missing desktop provenance receipt')
+    info = json.loads(path.read_text())
+    require(set(info) == {'schema', 'app', 'target', 'version', 'tag', 'channel', 'source_commit',
+                          'electron', 'signed', 'signing', 'runtime', 'artifacts'},
+            'unsupported desktop receipt fields')
+    require(type(info['schema']) is int and info['schema'] == SCHEMA_VERSION, 'invalid desktop receipt schema')
+    require(info['app'] == 'desktop' and info['target'] == target, 'desktop receipt is not this platform')
+    require(all(info[key] == value for key, value in pins.items()), 'desktop receipt cohort mismatch')
+    require(re.fullmatch(COMMIT, info['source_commit']), 'invalid desktop source commit')
+    require(info['electron'] == ELECTRON_VERSION, 'desktop receipt must name the pinned Electron version')
+    require(type(info['signed']) is bool and info['signing'] in SIGNING_STATES, 'invalid desktop signing status')
+    require(info['signed'] == (info['signing'] != 'unsigned-development-preview'),
+            'desktop signing status and signed flag disagree')
+    # Nothing unsigned may reach a stable distribution; Nightly previews must say so plainly.
+    require(info['signed'] or pins['channel'] != 'stable', 'stable desktop distribution requires a signed application')
+    expected_signing = 'developer-id-notarized' if target == 'aarch64-apple-darwin' else 'authenticode'
+    require(not info['signed'] or info['signing'] == expected_signing, 'desktop signing kind does not match its platform')
+    require(set(info['runtime']) == {'archive', 'sha256'}, 'unsupported desktop runtime reference')
+    require(info['runtime']['archive'] == f'vibeface-{version_value}-{target}.tar.gz',
+            'desktop runtime must be this platform CLI bundle')
+    require(isinstance(info['runtime']['sha256'], str) and re.fullmatch(r'[a-f0-9]{64}', info['runtime']['sha256']),
+            'invalid desktop runtime digest')
+    if runtime_digest:
+        require(info['runtime']['sha256'] == runtime_digest, 'desktop runtime differs from the released CLI bundle')
+    payloads = desktop_payload_names(version_value, target)
+    require(set(info['artifacts']) == set(payloads), 'desktop receipt must cover exactly its two payloads')
+    for name in payloads:
+        payload = directory / name
+        require(payload.is_file() and not payload.is_symlink(), 'missing regular desktop payload')
+        require(digest(payload) == info['artifacts'][name], 'desktop payload digest mismatch')
+        verify_checksum_file(directory, name)
+    return info
+
+
 def apk_asset_names(version_value):
     name = f'vibeface-{version_value}-android.apk'
     return {name, name + '.sha256', name + '.provenance.json'}
@@ -443,6 +523,8 @@ def product_asset_names(version_value):
     names = app_asset_names(version_value) | apk_asset_names(version_value) | {'release.json'}
     for target in TARGETS:
         names |= native_asset_names(version_value, target)
+    for target in DESKTOP_TARGETS:
+        names |= desktop_asset_names(version_value, target)
     return names
 
 
@@ -479,14 +561,18 @@ def verify_product_release(directory, expected):
             verify_build_info(build)
             require(build['version'] == product_version and build['source_commit'] == source_commit
                     and build['target'] == target, 'CLI bundle version, source or target mismatch')
-            for name in ('vibeface', 'vibeface-core'):
+            for name in program_names(target):
                 program = bundle / name
                 require(program.is_file() and not program.is_symlink(), 'CLI bundle must contain both native programs')
             require((bundle / 'web').is_dir(), 'CLI bundle must contain the Web App')
+            require((bundle / 'web/vibeface_secure.js').is_file() and (bundle / 'web/vibeface_secure_bg.wasm').is_file(),
+                    'CLI bundle must contain the browser cryptography SDK')
             content = files(bundle, ('FILES.sha256',))
             require((bundle / 'FILES.sha256').read_text() == ''.join(f'{value}  {name}\n' for name, value in content.items()),
                     'CLI bundled content changed')
             verify_component(unpack(directory / core_name, tmp / f'core-{index}'), 'core', dict(pins, target=target))
+            if target in DESKTOP_TARGETS:
+                verify_desktop_receipt(directory, target, pins, digest(directory / bundle_name))
         apk = directory / f'vibeface-{product_version}-android.apk'
         verify_checksum_file(directory, apk.name)
         provenance = json.loads((directory / (apk.name + '.provenance.json')).read_text())
@@ -594,14 +680,19 @@ def assemble_product(input_root, output):
     expected = identity('product')
     product_version = expected['version']
     pins = {key: expected[key] for key in ('app', 'version', 'tag', 'source_commit', 'channel')}
-    require({p.name for p in input_root.iterdir()} == {'app', 'native', 'mobile'},
-            'input-root must contain exactly app, native and mobile')
+    require({p.name for p in input_root.iterdir()} == {'app', 'native', 'mobile', 'desktop'},
+            'input-root must contain exactly app, native, mobile and desktop')
     native_root = input_root / 'native'
+    desktop_root = input_root / 'desktop'
     require({p.name for p in native_root.iterdir()} == set(TARGETS), 'native must contain one directory per target')
+    require({p.name for p in desktop_root.iterdir()} == set(DESKTOP_TARGETS),
+            'desktop must contain one directory per desktop target')
     producers = [(input_root / 'app', app_asset_names(product_version)),
                  (input_root / 'mobile', apk_asset_names(product_version))]
     for target in TARGETS:
         producers.append((native_root / target, native_asset_names(product_version, target)))
+    for target in DESKTOP_TARGETS:
+        producers.append((desktop_root / target, desktop_asset_names(product_version, target)))
     seen = {}
     for directory, payload in producers:
         producer_manifest(directory, pins)
@@ -702,8 +793,19 @@ def self_test():
 
     scratch = ROOT / '.artifacts/release-tests'
     scratch.mkdir(parents=True, exist_ok=True)
+    # The per-platform user service installers are repository files; the real compose job proves they
+    # exist, so the self-test composes against fixtures instead of the checkout's scripts directory.
+    installers = scratch / 'service-installers'
+    installers.mkdir(exist_ok=True)
+    for installer_name in ('install-node-service.sh', 'install-node-service.ps1'):
+        (installers / installer_name).write_text('# service installer fixture\n')
+
+    def fixture_installer(target):
+        return installers / ('install-node-service.ps1' if target in WINDOWS_TARGETS else 'install-node-service.sh')
+
     with tempfile.TemporaryDirectory(dir=scratch) as tmp, \
-            patch(f'{__name__}.run', side_effect=boundary), patch(f'{__name__}.shutil.which', return_value='aapt'):
+            patch(f'{__name__}.run', side_effect=boundary), patch(f'{__name__}.shutil.which', return_value='aapt'), \
+            patch(f'{__name__}.service_installer', side_effect=fixture_installer):
         tmp = Path(tmp)
 
         def repoint(path, **changes):
@@ -746,35 +848,43 @@ def self_test():
         (web_source / 'assets').mkdir(parents=True)
         (web_source / 'index.html').write_text('<!doctype html>app fixture')
         (web_source / 'assets/app.js').write_text('export const fixture = true;\n')
+        (web_source / 'vibeface_secure.js').write_text('export const secure = true;\n')
+        (web_source / 'vibeface_secure_bg.wasm').write_bytes(b'\x00asm\x01\x00\x00\x00')
         accepts(lambda: pack_component('app', web_source, app_dir))
         app_archive = app_dir / f'vibeface-app-{product_version}.tar.gz'
         require(json.loads((app_dir / 'release.json').read_text())['app'] == 'product',
                 'the App producer stages the product release')
 
-        # Native staging: real executable fixtures reporting the cohort version.
-        native_bin = tmp / 'native-bin'
-        wrong_bin = tmp / 'wrong-bin'
-        for directory, reported in ((native_bin, product_version), (wrong_bin, '9.9.9')):
-            directory.mkdir()
-            for name in ('vibeface', 'vibeface-core'):
+        # Native staging: real executable fixtures reporting the cohort version, per platform basename.
+        def native_programs(directory, target, reported=product_version):
+            directory.mkdir(parents=True, exist_ok=True)
+            for name in program_names(target):
                 binary = directory / name
-                binary.write_text(f'#!/bin/sh\necho "{name} {reported}"\n')
+                binary.write_text(f'#!/bin/sh\necho "{name.removesuffix(".exe")} {reported}"\n')
                 binary.chmod(0o755)
+            return directory
+
+        native_bin = {target: native_programs(tmp / f'native-bin-{target}', target) for target in TARGETS}
+        wrong_bin = native_programs(tmp / 'wrong-bin', TARGETS[0], '9.9.9')
         for target in TARGETS:
-            receipt = accepts(lambda target=target: stage_native(target, native_bin, tmp / f'stage-{target}'))
+            receipt = accepts(lambda target=target: stage_native(target, native_bin[target], tmp / f'stage-{target}'))
             require(receipt['target'] == target and receipt['source_commit'] == source
                     and receipt['version'] == product_version, 'native receipt identity')
             require(type(receipt['schema']) is int and type(receipt['data_epoch']) is int, 'native receipt integer types')
             require({p.name for p in (tmp / f'stage-{target}').iterdir()}
-                    == {'vibeface', 'vibeface-core', 'NATIVE-INFO.json'}, 'native staging holds exactly three files')
+                    == {*program_names(target), 'NATIVE-INFO.json'}, 'native staging holds exactly three files')
+        require(program_names('x86_64-pc-windows-msvc') == ('vibeface.exe', 'vibeface-core.exe'),
+                'Windows bundles keep .exe basenames')
         rejects('native programs of another version', lambda: stage_native(TARGETS[0], wrong_bin, tmp / 'stage-wrong'))
-        rejects('unknown native target', lambda: stage_native('mips-unknown', native_bin, tmp / 'stage-mips'))
+        rejects('unknown native target', lambda: stage_native('mips-unknown', native_bin[TARGETS[0]], tmp / 'stage-mips'))
+        rejects('Unix basenames staged as the Windows platform',
+                lambda: stage_native('x86_64-pc-windows-msvc', native_bin[TARGETS[0]], tmp / 'stage-unix-as-windows'))
         incomplete_bin = tmp / 'incomplete-bin'
         incomplete_bin.mkdir()
-        shutil.copy2(native_bin / 'vibeface', incomplete_bin / 'vibeface')
+        shutil.copy2(native_bin[TARGETS[0]] / 'vibeface', incomplete_bin / 'vibeface')
         rejects('native input without Core', lambda: stage_native(TARGETS[0], incomplete_bin, tmp / 'stage-incomplete'))
         rejects('restaging over an existing staging directory',
-                lambda: stage_native(TARGETS[0], native_bin, tmp / f'stage-{TARGETS[0]}'), 'must be empty')
+                lambda: stage_native(TARGETS[0], native_bin[TARGETS[0]], tmp / f'stage-{TARGETS[0]}'), 'must be empty')
 
         def staged_copy(label, mutate):
             destination = tmp / f'stage-{label}'
@@ -791,6 +901,92 @@ def self_test():
             require({p.name for p in (collected / 'native' / target).iterdir()}
                     == native_asset_names(product_version, target) | {'release.json'}, 'compose output set')
         bundle_name = f'vibeface-{product_version}-{TARGETS[0]}.tar.gz'
+
+        # Desktop producers: installer and archive payloads bound to this platform's released runtime.
+        def stage_desktop(destination, target, **changes):
+            destination.mkdir(parents=True, exist_ok=True)
+            runtime = collected / 'native' / target / f'vibeface-{product_version}-{target}.tar.gz'
+            artifacts = {}
+            for name in desktop_payload_names(product_version, target):
+                payload = destination / name
+                payload.write_bytes(f'{name} fixture payload'.encode())
+                payload.with_name(name + '.sha256').write_text(f'{digest(payload)}  {name}\n')
+                artifacts[name] = digest(payload)
+            receipt = dict(schema=SCHEMA_VERSION, app='desktop', target=target, version=product_version,
+                           tag=product_tag, channel=channel, source_commit=source, electron=ELECTRON_VERSION,
+                           signed=target == 'aarch64-apple-darwin',
+                           signing='developer-id-notarized' if target == 'aarch64-apple-darwin'
+                           else 'unsigned-development-preview',
+                           runtime={'archive': runtime.name, 'sha256': digest(runtime)}, artifacts=artifacts)
+            receipt.update(changes)
+            write_json(destination / f'{desktop_basename(product_version, target)}.provenance.json', receipt)
+            return destination
+
+        desktop_pins = dict(version=product_version, tag=product_tag, source_commit=source, channel=channel)
+        for target in DESKTOP_TARGETS:
+            produced = stage_desktop(collected / 'desktop' / target, target)
+            runtime_digest = digest(collected / 'native' / target / f'vibeface-{product_version}-{target}.tar.gz')
+            info = accepts(lambda produced=produced, target=target, runtime_digest=runtime_digest:
+                           verify_desktop_receipt(produced, target, desktop_pins, runtime_digest))
+            require(info['electron'] == ELECTRON_VERSION and len(info['artifacts']) == 2, 'desktop receipt payloads')
+            accepts(lambda produced=produced: manifest('product', produced))
+            require({p.name for p in produced.iterdir()}
+                    == desktop_asset_names(product_version, target) | {'release.json'}, 'desktop producer output set')
+        require(set(desktop_payload_names(product_version, 'x86_64-pc-windows-msvc'))
+                == {f'vibeface-desktop-{product_version}-x86_64-pc-windows-msvc.exe',
+                    f'vibeface-desktop-{product_version}-x86_64-pc-windows-msvc.zip'},
+                'Windows desktop ships a per-user installer and an archive')
+
+        def desktop_variant(label, target, **changes):
+            return stage_desktop(tmp / f'desktop-{label}', target, **changes)
+
+        mac_target, windows_target = DESKTOP_TARGETS
+        mac_runtime = digest(collected / 'native' / mac_target / f'vibeface-{product_version}-{mac_target}.tar.gz')
+        rejects('an unsigned desktop payload for a stable channel',
+                lambda: verify_desktop_receipt(
+                    desktop_variant('stable-unsigned', windows_target, channel='stable'), windows_target,
+                    dict(desktop_pins, channel='stable')),
+                'stable desktop distribution requires a signed application')
+        rejects('a desktop receipt claiming another Electron version',
+                lambda: verify_desktop_receipt(desktop_variant('other-electron', mac_target, electron='34.5.8'),
+                                               mac_target, desktop_pins),
+                'pinned Electron version')
+        rejects('a signed flag without a signing kind',
+                lambda: verify_desktop_receipt(
+                    desktop_variant('claimed-signed', windows_target, signed=True), windows_target, desktop_pins),
+                'signing status and signed flag disagree')
+        rejects('Authenticode claimed for the macOS application',
+                lambda: verify_desktop_receipt(
+                    desktop_variant('wrong-kind', mac_target, signing='authenticode'), mac_target, desktop_pins),
+                'signing kind does not match')
+        rejects('a desktop build from another commit',
+                lambda: verify_desktop_receipt(desktop_variant('other-commit', mac_target, source_commit=foreign),
+                                               mac_target, desktop_pins),
+                'cohort mismatch')
+        rejects('a desktop bundle built on a foreign runtime',
+                lambda: verify_desktop_receipt(
+                    desktop_variant('foreign-runtime', mac_target,
+                                    runtime={'archive': f'vibeface-{product_version}-{mac_target}.tar.gz',
+                                             'sha256': '0' * 64}),
+                    mac_target, desktop_pins, mac_runtime),
+                'differs from the released CLI bundle')
+        rejects('a desktop receipt naming another platform runtime',
+                lambda: verify_desktop_receipt(
+                    desktop_variant('other-runtime', mac_target,
+                                    runtime={'archive': f'vibeface-{product_version}-{windows_target}.tar.gz',
+                                             'sha256': mac_runtime}),
+                    mac_target, desktop_pins),
+                'must be this platform CLI bundle')
+        def changed_payload():
+            produced = desktop_variant('changed-payload', mac_target)
+            (produced / f'{desktop_basename(product_version, mac_target)}.dmg').write_bytes(b'changed')
+            return verify_desktop_receipt(produced, mac_target, desktop_pins)
+
+        rejects('a changed desktop payload', changed_payload, 'desktop payload digest mismatch')
+        rejects('an extra desktop receipt field',
+                lambda: verify_desktop_receipt(desktop_variant('extra-field', mac_target, legacy=True),
+                                               mac_target, desktop_pins),
+                'unsupported desktop receipt fields')
 
         def set_receipt(destination, **changes):
             repoint(destination / 'NATIVE-INFO.json', **changes)
@@ -860,8 +1056,8 @@ def self_test():
         assembled = tmp / 'assembled'
         info = accepts(lambda: assemble_product(collected, assembled))
         require({p.name for p in assembled.iterdir()} == product_asset_names(product_version), 'assembled asset set')
-        require(len(info['assets']) == 17 and len(product_asset_names(product_version)) == 18,
-                'the product publishes exactly 17 payloads plus its manifest')
+        require(len(info['assets']) == 31 and len(product_asset_names(product_version)) == 32,
+                'the product publishes exactly 31 payloads plus its manifest')
         rejects('assembling into a populated output', lambda: assemble_product(collected, assembled))
 
         def assemble(label, mutate):
@@ -884,7 +1080,15 @@ def self_test():
                                  lambda d: (d / 'app' / f'vibeface-app-{product_version}.tar.gz.sha256').unlink()))
         rejects('extra file in a producer directory',
                 lambda: assemble('extra-file', lambda d: (d / 'mobile/notes.txt').write_text('extra')))
-        rejects('extra producer directory', lambda: assemble('extra-producer', lambda d: (d / 'desktop').mkdir()))
+        rejects('extra producer directory', lambda: assemble('extra-producer', lambda d: (d / 'extras').mkdir()))
+        rejects('missing desktop producer',
+                lambda: assemble('missing-desktop', lambda d: shutil.rmtree(d / f'desktop/{DESKTOP_TARGETS[1]}')))
+        rejects('desktop producer for an unreleased platform',
+                lambda: assemble('other-desktop', lambda d: (d / f'desktop/{TARGETS[1]}').mkdir()))
+        rejects('desktop payload swapped between platforms',
+                lambda: assemble('swapped-desktop', lambda d: shutil.copy2(
+                    d / f'desktop/{DESKTOP_TARGETS[0]}/{desktop_basename(product_version, DESKTOP_TARGETS[0])}.zip',
+                    d / f'desktop/{DESKTOP_TARGETS[1]}/{desktop_basename(product_version, DESKTOP_TARGETS[1])}.zip')))
         rejects('corrupt staged archive',
                 lambda: assemble('corrupt', lambda d: (d / 'native' / TARGETS[0] / bundle_name).write_bytes(b'corrupt')))
         rejects('native payload of another target',
@@ -1007,6 +1211,13 @@ def self_test():
             write_json(path, json.loads(path.read_text()) | {'sourceCommit': foreign})
             manifest('product', directory)
 
+        def forge_desktop_runtime(directory):
+            """A desktop installer rebuilt on a runtime that this release never published."""
+            path = directory / f'{desktop_basename(product_version, DESKTOP_TARGETS[0])}.provenance.json'
+            receipt = json.loads(path.read_text())
+            write_json(path, receipt | {'runtime': dict(receipt['runtime'], sha256='0' * 64)})
+            manifest('product', directory)
+
         for label, mutate in (
                 ('short', lambda d: (d / f'vibeface-core-{product_version}-{TARGETS[0]}.tar.gz').unlink()),
                 ('extra', lambda d: (d / 'extra.txt').write_text('x')),
@@ -1014,6 +1225,9 @@ def self_test():
                 ('corrupt', lambda d: (d / f'vibeface-app-{product_version}.tar.gz').write_bytes(b'corrupt')),
                 ('foreign App component', swap_in_foreign_app),
                 ('forged APK provenance', forge_apk_provenance),
+                ('forged desktop runtime receipt', forge_desktop_runtime),
+                ('desktop set missing its installer',
+                 lambda d: (d / f'{desktop_basename(product_version, DESKTOP_TARGETS[1])}.exe').unlink()),
         ):
             blocked, calls = remote(), []
             rejects(f'publishing a {label} product set',
@@ -1057,6 +1271,9 @@ def self_test():
         rejects('a public set with forged APK provenance',
                 lambda: verify_published(staged_release('public-apk', forge_apk_provenance), label='forged-apk'),
                 'APK provenance mismatch')
+        rejects('a public desktop installer built on an unpublished runtime',
+                lambda: verify_published(staged_release('public-desktop', forge_desktop_runtime), label='desktop-runtime'),
+                'differs from the released CLI bundle')
         rejects('a public manifest with a corrupt checksum',
                 lambda: verify_published(staged_release('public-corrupt', lambda d: repoint(
                     d / 'release.json',
@@ -1107,6 +1324,10 @@ def main():
     p.add_argument('--app-archive', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     sub.add_parser('seal-bundle').add_argument('directory', type=Path)
+    p = sub.add_parser('verify-desktop')
+    p.add_argument('--target', required=True, choices=DESKTOP_TARGETS)
+    p.add_argument('--runtime-archive', type=Path)
+    p.add_argument('directory', type=Path)
     p = sub.add_parser('manifest')
     p.add_argument('app', choices=RELEASES)
     p.add_argument('directory', type=Path)
@@ -1135,6 +1356,11 @@ def main():
         compose_offline(args.target, args.native_dir, args.app_archive, args.output)
     elif args.command == 'seal-bundle':
         seal_bundle(args.directory)
+    elif args.command == 'verify-desktop':
+        product = identity('product')
+        pins = {key: product[key] for key in ('version', 'tag', 'source_commit', 'channel')}
+        runtime = digest(args.runtime_archive) if args.runtime_archive else None
+        print(json.dumps(verify_desktop_receipt(args.directory, args.target, pins, runtime)))
     elif args.command == 'manifest':
         manifest(args.app, args.directory)
     elif args.command == 'assemble-product':
