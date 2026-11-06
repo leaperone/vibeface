@@ -1454,7 +1454,10 @@ mod tests {
     fn client_ip_ignores_forwarded_headers_and_non_loopback_spoofing() {
         let loopback: IpAddr = "127.0.0.1".parse().unwrap();
         let r = request_from_peer(loopback, |headers| {
-            headers.insert("x-forwarded-for", "203.0.113.1, 198.51.100.2".parse().unwrap());
+            headers.insert(
+                "x-forwarded-for",
+                "203.0.113.1, 198.51.100.2".parse().unwrap(),
+            );
         });
         assert_eq!(client_ip(&r), loopback);
         let public: IpAddr = "198.51.100.9".parse().unwrap();

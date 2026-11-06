@@ -721,7 +721,10 @@ impl GrantAdmission {
         if admitted.len() >= MAX_ADMITTED {
             admitted.retain(|_, until| *until > now_ms);
         }
-        ensure!(admitted.len() < MAX_ADMITTED, "relay admission table is full");
+        ensure!(
+            admitted.len() < MAX_ADMITTED,
+            "relay admission table is full"
+        );
         admitted.insert(device, until_ms);
         Ok(())
     }
@@ -1823,7 +1826,12 @@ mod tests {
         }
         let replacement = endpoint_id(&LocalIdentity::generate().device_id()?)?;
         let later = now + 2000;
-        let token = issuer.grant(&device_id(&replacement), "https://relay.example", ip(), later)?;
+        let token = issuer.grant(
+            &device_id(&replacement),
+            "https://relay.example",
+            ip(),
+            later,
+        )?;
         let grant = admission.register(token.as_str(), later)?;
         assert_eq!(admission.admitted.lock().unwrap().len(), 1);
         assert!(admission.admitted_until(&first).is_none());
