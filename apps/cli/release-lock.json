@@ -1,8 +1,8 @@
 {
   "core": {
-    "tag": "core-v0.0.1-nightly.20261105.2"
+    "tag": "core-v0.0.1-nightly.20261106.1"
   },
   "app": {
-    "tag": "app-v0.0.1-nightly.20261105.2"
+    "tag": "app-v0.0.1-nightly.20261106.1"
   }
 }
