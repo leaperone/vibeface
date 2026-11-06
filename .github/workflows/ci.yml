@@ -95,7 +95,7 @@ jobs:
           python3 scripts/install-delivery-toolchain.py --self-test
           python3 scripts/run-delivery-live.py --self-test
           python3 scripts/daily-nightly.py --self-test
-          python3 scripts/release.py --self-test
+          python3 scripts/release.py self-test
           python3 scripts/package-node-windows.py --self-test
           python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/release.py", "scripts/package-node-windows.py", "scripts/check-release-workflow.py", "scripts/daily-nightly.py")]'
           bash -n install.sh
