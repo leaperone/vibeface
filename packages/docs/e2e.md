@@ -207,11 +207,13 @@ pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' \
 
 队列场景通过真实 Node API 准备一条运行中消息和一条排队消息。原生 UI 取消排队后，再通过原生“停止”结束运行中的消息并释放槽位。独立读取确认运行中的消息调用过一次，被取消的消息始终没有调用，离开再进入聊天后计数保持不变。受控 fixture 不调用真实模型，也不代替手机保存、取消或停止。
 
-native config 默认关闭 trace 和整段 video。原始日志、自动失败截图、e2e report、邀请、恢复文件、Node 数据与 driver 状态都属于私有材料，不能递归上传 `.artifacts/native/`。CI 只上传固定的 `provider.json`、`provider-initial.png`、`provider-selectable.png`、`provider-controlled.png` 和 `provider-typed.png`。
+native config 默认关闭 trace 和整段 video。原始日志、自动失败截图、e2e report、邀请、恢复文件、Node 数据与 driver 状态都属于私有材料，不能递归上传 `.artifacts/native/`。CI 只上传固定的 `provider.json`、`provider-probe.json`、`provider-initial.png`、`provider-selectable.png`、`provider-controlled.png`、`provider-typed.png` 和 `terminology-device-kinds.png`。`provider-probe.json` 只记录首轮检查的 `link`、`readiness`、`authentication`、`catalog` 和 `checked` 五个固定状态字段。
 
-`provider-initial.png` 是唯一的配对前诊断图。它只在本次 CI 新建的专属 simulator 上，重新安装、清除钥匙串并启动 App 后主动拍摄，且早于首次 `secrets.get` 和邀请输入。用例核对 simulator 文件、实际 UUID、Booted 状态以及包含当前 run ID 和 attempt 的专属名称。此时 App 尚未接收邀请、登录命令或凭证，也没有旧应用数据；初始图只用于查看路由、系统弹窗和空表单。其他三张图仍只在配对后的设置页保存。诊断图不代表配对或表单验收通过。 导航诊断仅记录固定阶段和已知界面的布尔状态，不输出界面文本、加入链接、命令或剪贴板内容。 CI 按固定键与布尔类型校验后，将该诊断并入公开的 `provider.json`，不上传原始页面树或测试日志。最终收据只有在一个目标测试真实通过、fixture 退出、专属 simulator 删除和私有状态清理后才标为 `passed`。
+`provider-initial.png` 是唯一的配对前诊断图。它只在本次 CI 新建的专属 simulator 上，重新安装、清除钥匙串并启动 App 后主动拍摄，且早于首次 `secrets.get` 和邀请输入。用例核对 simulator 文件、实际 UUID、Booted 状态以及包含当前 run ID 和 attempt 的专属名称。此时 App 尚未接收邀请、登录命令或凭证，也没有旧应用数据；初始图只用于查看路由、系统弹窗和空表单。`terminology-device-kinds.png` 在配对后的“添加设备”面板记录节点与客户端分类，其他三张图在配对后的设置页保存。诊断图不代表配对或表单验收通过。导航诊断仅记录固定阶段和已知界面的布尔状态，不输出界面文本、加入链接、命令或剪贴板内容。CI 按固定键与布尔类型校验后，将该诊断并入公开的 `provider.json`，不上传原始页面树或测试日志。最终收据只有在一个目标测试真实通过、fixture 退出、专属 simulator 删除和私有状态清理后才标为 `passed`。
 
-失败收据与 stdout 只保留固定阶段、报告是否可读，以及从实际 e2e report 提取的受限错误码、已知 API 名和两个验收文件的行号。错误 message、stack、locator label、值和原始报告不会导出。报告尚未生成时仍保留失败阶段，完整私有日志随后按原清理规则删除。
+失败收据与 stdout 保留固定阶段、报告是否可读，以及从实际 e2e report 提取的受限错误码、固定 `engine_reason` 和 `engine_timeout_kind`、已知 API 名和两个验收文件的行号。`completed_poll_samples` 只来自唯一合法的既有 expect 采样事件；零表示没有记录完成的采样，字段缺失不补零。错误 message、stack、locator label、值和原始报告不会导出。
+
+已有失败语义快照通过文件与元数据校验时，`failure_screen` 只记录欢迎、已填入链接、邀请输入、设备名输入、加入按钮及已知无效或失效提示是否被报告。`true` 是正向出现，`null` 是未知，不能当作控件不存在。快照采集为 best effort，可能缺失或裁剪；没有截断标记也不证明树完整，不能从语义文本恢复原生控件类型或输入读回值。该投影不新增 UI 读取，也不改变原 fill、用例或清理的成败。报告尚未生成时仍保留失败阶段，完整私有日志随后按原清理规则删除。
 
 本地用例产生的 `ui_passed` 仅表示 UI 步骤已完成；本地操作者仍须关闭并删除本人创建的专属 simulator，并核对 fixture 清理结果。这个入口覆盖 iOS Simulator 与受控 Provider，不代表 Android UI、iPhone 真机、真实登录或真实模型已经验收。
 

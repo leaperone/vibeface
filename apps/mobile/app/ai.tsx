@@ -48,8 +48,8 @@ function issueText(provider: ProviderId, issue: ProviderIssue): string {
     case 'env_missing': return `缺少 ${keyName(issue.name)}`
     case 'launch_failed': return `${name} 没能启动`
     case 'config_invalid': return `${name} 的配置文件读不了`
-    case 'app_server_not_found': return '没找到这台电脑上运行的 Codex'
-    case 'app_server_unreachable': return '连不上这台电脑上的 Codex'
+    case 'app_server_not_found': return '没找到这个节点上运行的 Codex'
+    case 'app_server_unreachable': return '连不上这个节点上的 Codex'
   }
 }
 
@@ -137,12 +137,12 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
     <View className="gap-1 px-4 pb-3">
       {'issue' in readiness ? <Text className="text-meta text-muted-foreground">{probeIssueText(item.provider, readiness.issue)}</Text> : null}
       {item.setup && (assistant || execution) && ['needs_setup', 'unverified'].includes(readiness.state) ? <View className="gap-2">
-        <Text className="text-meta text-muted-foreground">在运行 AI 的电脑上执行以下命令，为独立目录登录或配置，再点“检查可用性”。不会复制已有登录信息。</Text>
+        <Text className="text-meta text-muted-foreground">在运行该节点的电脑或服务器上执行以下命令，为独立目录登录或配置，再点“检查可用性”。不会复制已有登录信息。</Text>
         <Text selectable className="font-mono text-meta text-muted-foreground">{item.setup.directory}</Text>
         <CopyableId value={item.setup.command} label={`${name} 私有目录认证命令`} />
       </View> : null}
       <Text className="text-meta text-muted-foreground">{item.probe.checked_at_ms === null ? '尚未主动检查' : `检查于 ${new Date(item.probe.checked_at_ms).toLocaleString()}`}</Text>
-      <Button variant="ghost" className="self-start" disabled={busy !== ''} onPress={() => void probe()}><Icon as={busy === `${item.provider}:probe` ? LoaderCircle : PlugZap} /><Text>检查可用性</Text></Button>
+      <Button variant="ghost" className="self-start" accessibilityLabel={`${name} 检查可用性`} disabled={busy !== ''} onPress={() => void probe()}><Icon as={busy === `${item.provider}:probe` ? LoaderCircle : PlugZap} /><Text>检查可用性</Text></Button>
       {manager && item.probe.catalog.state === 'available' && item.probe.catalog.coverage === 'partial' ? <Text className="text-meta text-muted-foreground">模型列表可能不完整，可手填其他模型。</Text> : null}
       {manager && item.probe.catalog.state === 'unavailable' ? <Text className="text-meta text-muted-foreground">模型列表暂不可用，可继续手填。已保存的模型保持不变。</Text> : null}
     </View>
@@ -241,7 +241,7 @@ function AppServerSettings({ server, working, save, test }: { server: AppServer;
     {draft.mode === 'system' ? <Input accessibilityLabel="App Server socket 的绝对路径" placeholder="App Server socket 的绝对路径" autoCapitalize="none" autoCorrect={false}
       className="font-mono" value={draft.socket} editable={!working} onChangeText={(socket) => { setDraft({ ...draft, socket }); setInvalid(false) }} /> : null}
     {draft.mode === 'system' ? <Text className="text-meta text-muted-foreground">共享所选外部 App Server 的会话，不隔离该服务的数据。</Text> : null}
-    {invalid ? <Text role="alert" className="text-meta text-warning">填写运行 Codex 的电脑上的绝对路径。</Text> : null}
+    {invalid ? <Text role="alert" className="text-meta text-warning">填写运行该节点的电脑或服务器上的绝对路径。</Text> : null}
     <View className="flex-row flex-wrap items-center gap-2">
       {dirty ? <Button variant="outline" disabled={working} onPress={saveConnection}><Text>保存</Text></Button> : null}
       <Button variant="ghost" disabled={working || testing || dirty || server.link.state === 'off'} onPress={async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }}>
@@ -382,7 +382,7 @@ function Variables({ item, required, working, change }: { item: ProviderStatus; 
         <Icon as={Plus} /><Text>添加</Text>
       </Button>
     </View>
-    <Text className="text-meta text-muted-foreground">只存在这台电脑上，保存后看不到原值</Text>
+    <Text className="text-meta text-muted-foreground">只保存在这个节点上，保存后看不到原值</Text>
     {item.app_server?.mode === 'system' ? <Text className="text-meta text-muted-foreground">用已在运行的 Codex 时，这些变量不生效</Text> : null}
   </Field>
 }

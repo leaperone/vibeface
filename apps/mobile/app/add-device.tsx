@@ -16,7 +16,7 @@ import { JoinRequests, useOpenJoins, type Added } from '@/features/devices/join-
 import { QrCode } from '@/features/devices/qr-code'
 import { useRun } from '@/lib/use-run'
 
-const kinds = [{ value: 'phone', label: addDeviceCopy.phone, icon: Smartphone }, { value: 'computer', label: addDeviceCopy.computer, icon: Laptop }] as const
+const kinds = [{ value: 'phone', label: addDeviceCopy.client, icon: Smartphone }, { value: 'computer', label: addDeviceCopy.node, icon: Laptop }] as const
 type Kind = (typeof kinds)[number]['value']
 
 /** "添加设备": one single-use link the new device opens (a QR for phones, its own Vibeface page for computers), then both sides compare the safety code. */
@@ -81,6 +81,7 @@ export default function AddDevice() {
     {result && !used ? <View className="gap-4">
       <Segmented options={kinds} value={kind} onChange={(next) => { setKind(next); setCopied(null) }} />
       {kind === 'phone' ? <>
+        <Text className="text-meta text-muted-foreground">{addDeviceCopy.clientHint}</Text>
         <QrCode value={result.qr} label={result.publicEntry ? '用手机相机扫码打开' : '用手机 App 扫码'} />
         <View className="flex-row flex-wrap justify-center gap-2">
           {copyLink}
@@ -93,7 +94,7 @@ export default function AddDevice() {
           <Button variant="ghost" size="icon" accessibilityLabel="分享链接" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}><Icon as={Share2} /></Button>
         </View>
         <View className="flex-row items-center gap-3"><Step n={2} /><Icon as={Laptop} className="size-4 text-muted-foreground" /><Text className="shrink">{addDeviceCopy.openThere}</Text></View>
-        <Details label="安装电脑">
+        <Details label="安装节点">
           <Pressable accessibilityRole="link" onPress={() => void openURL(joinCopy.installGuide).catch(() => {})} className="min-h-11 flex-row flex-wrap items-center gap-1.5">
             <Icon as={Download} className="size-4 text-muted-foreground" />
             <Text className="text-meta text-muted-foreground">{addDeviceCopy.installThere}</Text>

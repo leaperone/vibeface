@@ -12246,7 +12246,24 @@ fn workspace_input_fixture(
 fn workspace_signed_commands_inputs_and_task_history_are_scoped_and_idempotent() -> Result<()> {
     use crate::workspace::*;
     let (net, mut origin) = workspace_fixture()?;
-    let command = workspace_task_command("t1", None);
+    workspace_command_fixture(
+        &net,
+        &mut origin,
+        "history-channel",
+        WorkspaceCommand::CreateChannel {
+            channel_id: "history-channel".into(),
+            title: "History".into(),
+            purpose: "Keep task work in its channel".into(),
+            members: vec!["bot".into()],
+            coordinator_bot: "bot".into(),
+            coordinator_node: net.a.device_id()?,
+        },
+        3,
+    )?;
+    let mut command = workspace_task_command("t1", None);
+    if let WorkspaceCommand::CreateTask { channel_id, .. } = &mut command {
+        *channel_id = Some("history-channel".into());
+    }
     let created = workspace_command_fixture(&net, &mut origin, "create-t1", command.clone(), 3)?;
     let duplicate = workspace_command_fixture(&net, &mut origin, "create-t1", command, 4)?;
     assert!(duplicate.duplicate);
@@ -12446,6 +12463,145 @@ fn workspace_signed_commands_inputs_and_task_history_are_scoped_and_idempotent()
         origin
             .workspace_task(&net.network, "forged-task")?
             .is_none()
+    );
+    let mut history_task = workspace_task_command("history-task", None);
+    if let WorkspaceCommand::CreateTask { channel_id, .. } = &mut history_task {
+        *channel_id = Some("history-channel".into());
+    }
+    workspace_command_fixture(&net, &mut origin, "create-history-task", history_task, 15)?;
+    workspace_input_fixture(
+        &net,
+        &mut origin,
+        "history-input",
+        Some("history-task"),
+        InputIntent::Continue,
+        16,
+    )?;
+    let assignment = origin
+        .ensure_workspace_assignment(&net.a, &net.network, "history-task", &[], 17)?
+        .context("automatic assignment")?;
+    assert!(assignment.work_id.is_none());
+    let manager = workspace_started_job_fixture(&net, &mut origin, 18)?;
+    let mut works = Vec::new();
+    for (trigger, call_ref) in [
+        (
+            origin.scheduler_work_trigger(&net.network, &net.a.device_id()?, &manager)?,
+            "task-work",
+        ),
+        (message_trigger("m2"), "other-task-work"),
+        (message_trigger("main"), "main-work"),
+    ] {
+        let work = WorkSpec {
+            work_id: WorkSpec::id("c", &trigger, call_ref),
+            conversation: "c".into(),
+            trigger,
+            target: net.a.device_id()?,
+            dispatcher: net.a.device_id()?,
+            call_ref: call_ref.into(),
+            kind: WorkKind::Agent(Provider::Codex),
+            model: None,
+            resolved: ResolvedModel {
+                provider: Provider::Codex,
+                model: None,
+            },
+            cwd: "/workspace/history".into(),
+            title: call_ref.into(),
+            prompt: "report this work".into(),
+            continues: None,
+            parent: None,
+            thread: None,
+        };
+        origin.accept_work_fixture(&net.a, &net.network, work.clone(), 19)?;
+        origin.apply_work_signal(
+            &net.a,
+            &net.network,
+            &work.work_id,
+            Signal::ThreadCreated(format!("{call_ref}-thread")),
+            20,
+        )?;
+        origin.apply_work_signal(
+            &net.a,
+            &net.network,
+            &work.work_id,
+            Signal::TurnStarted {
+                turn_id: format!("{call_ref}-turn"),
+                epoch: 1,
+            },
+            21,
+        )?;
+        works.push(work);
+    }
+    for ended in [false, true] {
+        if ended {
+            for work in &works {
+                origin.apply_work_signal(
+                    &net.a,
+                    &net.network,
+                    &work.work_id,
+                    Signal::TurnCompleted {
+                        turn_id: format!("{}-turn", work.call_ref),
+                        status: vibeface_bridge::turn::TurnStatus::Completed,
+                        text: format!("{} result", work.call_ref),
+                        error: None,
+                    },
+                    22,
+                )?;
+            }
+        }
+        for (channel, task, expected_work) in [
+            (None, Some("history-task"), &works[0].work_id),
+            (Some("history-channel"), None, &works[0].work_id),
+            (None, Some("t2"), &works[1].work_id),
+        ] {
+            let (history, truncated) = origin.workspace_history(&net.network, channel, task, 100)?;
+            assert!(!truncated);
+            let facts: Vec<_> = history
+                .iter()
+                .filter(|event| event.body.work_id().is_some())
+                .collect();
+            assert_eq!(
+                facts
+                    .iter()
+                    .filter_map(|event| event.body.work_id())
+                    .collect::<std::collections::BTreeSet<_>>(),
+                std::collections::BTreeSet::from([expected_work.as_str()])
+            );
+            let mut kinds: Vec<_> = facts.iter().map(|event| event.kind.as_str()).collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            assert_eq!(
+                kinds,
+                if ended {
+                    vec!["work_dispatched", "work_finished", "work_progress"]
+                } else {
+                    vec!["work_dispatched", "work_progress"]
+                }
+            );
+        }
+        let (main_history, _) = origin.main_history_page(
+            &net.network,
+            "c",
+            &origin.version_vector(&net.network)?,
+            None,
+            super::HistoryFilter {
+                kinds: &[],
+                author: None,
+                keyword: None,
+            },
+            100,
+        )?;
+        assert_eq!(
+            main_history
+                .iter()
+                .filter_map(|event| event.event.body.work_id())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([works[2].work_id.as_str()])
+        );
+    }
+    assert!(
+        origin
+            .workspace_history(&net.b.fixture_network_id()?, None, Some("t1"), 100)
+            .is_err()
     );
     let mut replica = store(&net)?;
     sync(&origin, &mut replica, &net)?;
@@ -16645,6 +16801,108 @@ fn workspace_assignment_waits_for_native_work_and_the_last_real_summary() -> Res
             );
             let followup = workspace_started_job_fixture(&net, &mut origin, 16)?;
             assert_eq!(followup.trigger, message_trigger("followup"));
+            let old_reply = origin
+                .message(&net.network, "c", &manager.message_id)?
+                .context("completed dispatch reply")?;
+            let recorded = origin.version_vector(&net.network)?;
+            let refused = origin
+                .workspace_agent_command(
+                    &net.a,
+                    &net.network,
+                    &followup,
+                    "borrow-old-reply",
+                    WorkspaceCommand::AssignmentProgress {
+                        execution: None,
+                        assignment_id: assignment.assignment_id.clone(),
+                        revision: 1,
+                        state: AssignmentState::Completed,
+                        input_event: None,
+                        evidence_event: Some(old_reply.event_hash),
+                        result: Some("ended before the native work".into()),
+                    },
+                    16,
+                )
+                .unwrap_err();
+            assert!(
+                refused
+                    .to_string()
+                    .contains("only Node lifecycle records execution evidence")
+            );
+            assert_eq!(origin.version_vector(&net.network)?, recorded);
+            origin.workspace_agent_command(
+                &net.a,
+                &net.network,
+                &followup,
+                "confirm-adoption",
+                WorkspaceCommand::AssignmentProgress {
+                    execution: None,
+                    assignment_id: assignment.assignment_id.clone(),
+                    revision: 1,
+                    state: AssignmentState::Adopted,
+                    input_event: Some(assignment.event_hash.clone()),
+                    evidence_event: None,
+                    result: None,
+                },
+                16,
+            )?;
+            origin.workspace_agent_command(
+                &net.a,
+                &net.network,
+                &followup,
+                "submit-result",
+                WorkspaceCommand::AssignmentProgress {
+                    execution: None,
+                    assignment_id: assignment.assignment_id.clone(),
+                    revision: 1,
+                    state: AssignmentState::Completed,
+                    input_event: None,
+                    evidence_event: None,
+                    result: Some("submitted final result".into()),
+                },
+                16,
+            )?;
+            let pending = origin
+                .workspace_assignment(&net.network, &assignment.assignment_id)?
+                .unwrap();
+            assert_eq!(pending.state, AssignmentState::Adopted);
+            assert_eq!(
+                pending.submitted_result.as_ref().unwrap().text,
+                "submitted final result"
+            );
+            assert!(pending.result.is_none());
+            assert_eq!(
+                origin.workspace_task(&net.network, "task")?.unwrap().state,
+                TaskState::Running
+            );
+            assert_eq!(
+                origin.work(&net.network, &work.work_id)?.unwrap().state,
+                WorkStatus::Running
+            );
+            assert!(matches!(
+                origin.scheduler_job("c", &followup.trigger)?.unwrap().state,
+                JobState::Running { .. }
+            ));
+            assert!(
+                origin
+                    .workspace_resource_conflicts(
+                        &net.network,
+                        &local,
+                        &["/workspace".into()],
+                        None,
+                    )?
+                    .contains(&assignment.assignment_id)
+            );
+            let mut pending_replica = store(&net)?;
+            sync(&origin, &mut pending_replica, &net)?;
+            assert_eq!(
+                pending_replica.workspace_assignment(&net.network, &assignment.assignment_id)?.unwrap(),
+                pending
+            );
+            assert_eq!(
+                pending_replica.workspace_task(&net.network, "task")?.unwrap().state,
+                TaskState::Running
+            );
+            assert!(pending_replica.scheduler_jobs_all()?.is_empty());
             let ended = origin.finish_job(
                 &net.a,
                 &net.network,
@@ -16807,7 +17065,13 @@ fn workspace_assignment_waits_for_native_work_and_the_last_real_summary() -> Res
             }
             assert_eq!(
                 final_assignment.result.as_deref(),
-                Some(if answer_last { "answer final summary" } else { "actual final summary" })
+                Some(if !work_first {
+                    "submitted final result"
+                } else if answer_last {
+                    "answer final summary"
+                } else {
+                    "actual final summary"
+                })
             );
             assert_eq!(
                 origin

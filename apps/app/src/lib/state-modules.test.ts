@@ -138,7 +138,7 @@ test('the app dials only the Nodes it sees on its LAN, and an unseen one only wh
 })
 
 test('backend English and gateway refusal codes reach the page as plain Chinese', () => {
-  assert.equal(humanError('unknown member', 'target_not_member'), '那台电脑不在我的设备里，访问地址不会转发给它。')
+  assert.equal(humanError('unknown member', 'target_not_member'), '那个节点不在我的设备里，访问地址不会转发给它。')
   assert.match(humanError('conversation not found'), /还没有这个对话/)
   assert.match(failureText('missing_key'), /缺少密钥.*设备 → Bot 与任务/)
   assert.match(failureText('execution_disabled'), /没开执行任务.*设备 → Bot 与任务/)
@@ -153,7 +153,7 @@ test('backend English and gateway refusal codes reach the page as plain Chinese'
   assert.equal(humanError('the App Server socket must be an absolute path'), '连接路径要是绝对路径。')
   assert.match(humanError('set an explicit absolute CODEX_HOME before starting a managed App Server'), /Codex 目录/)
   assert.match(humanError("this computer's Codex folder has no sessions folder yet"), /先用 Codex 跑一次对话/)
-  assert.match(humanError('no Codex folder found on this computer', 'codex_missing'), /没找到这台电脑上的 Codex 目录/)
+  assert.match(humanError('no Codex folder found on this computer', 'codex_missing'), /没找到这个节点上的 Codex 目录/)
   assert.equal(humanError('something nobody mapped'), '这次操作没有成功。再试一次。')
   assert.equal(humanError('something nobody mapped', undefined, '读取最新内容'), '读取最新内容没有成功。再试一次。')
   assert.equal(rawError(new Error('conversation not found')), 'conversation not found')

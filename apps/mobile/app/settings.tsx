@@ -156,7 +156,7 @@ function MemberRow({ member }: { member: Member }) {
   // The name wraps in full so the inline marks are never cut off with it. As in the web's device list, the bot mark leads to the computer whose detail holds Bot 与任务.
   return <SettingsRow href={`/device/${member.device_id}`} icon={deviceIcon(member)}
     label={<>{member.name}{member.admin ? mark(Crown, '管理设备') : null}{member.kind === 'node' && member.bot ? mark(Bot, '能运行 Bot') : null}</>}
-    description={member.current ? self : member.entry ? '当前连接' : undefined}>
+    description={[member.kind === 'node' ? '节点' : '客户端', member.current ? self : member.entry ? '当前连接' : null].filter(Boolean).join(' · ')}>
     {member.online !== undefined ? <Online online={member.online} /> : null}
   </SettingsRow>
 }

@@ -97,11 +97,11 @@ test('a session handoff reminder points at its Bot and keeps its text', () => {
   if (item?.kind === 'session') assert.deepEqual([item.bot.bot_id, item.notification.text], ['b', 'tests fail'])
 })
 
-test('a phone asking to join reads as a phone, and only a computer has an online state', () => {
+test('a phone asking to join reads as a phone, and only a node has an online state', () => {
   assert.equal(formName[deviceForm('client', join('pending').name)], '手机')
   assert.equal(formName[deviceForm('client', 'Chrome')], '浏览器')
   assert.equal(formName[deviceForm('client', '我的 iPad')], '平板')
-  assert.equal(formName[deviceForm('node', '我的手机')], '电脑')
+  assert.equal(formName[deviceForm('node', '我的手机')], '节点')
   assert.equal(deviceOnline('client', undefined, false, true), undefined, 'no device knows whether a browser on another connection is open')
   assert.equal(deviceOnline('client', undefined, false, true, true), true, 'the browser in hand is online while connected')
   assert.equal(deviceOnline('client', undefined, false, false, true), false)

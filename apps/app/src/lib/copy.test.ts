@@ -8,7 +8,7 @@ import ts from "typescript"
 // Copy rules from packages/docs/design/web-ux.md: jargon may only appear inside a folded <Details> or <SettingsDisclosure>.
 const folded = ["Details", "SettingsDisclosure"]
 const banned = [
-  "节点", "Node", "Gateway", "网关", "入口", "Relay", "中继", "同步角色", "调度", "Peer ID", "设备编号", "设备密钥", "公钥", "私钥", "Noise", "握手",
+  "Node", "Gateway", "网关", "入口", "Relay", "中继", "同步角色", "调度", "Peer ID", "设备编号", "设备密钥", "公钥", "私钥", "Noise", "握手",
   "capability", "凭证", "签名", "成员目录", "授权记录", "个人网络", "恢复包", "口令", "管理 Agent", "协调 Agent", "原生工作", "原生会话",
   "Agent 任务", "Provider", "SDK", "sidecar", "待核对", "核对", "复查", "本人", "证据", "轮次", "投递", "localhost", "JSON", "十六进制", "epoch", "角色",
   "密文", "链上", "收据", "意图", "对账", "证明", "落盘", "债权", "SHA-256", "Groth16", "窗口", "工作台",
@@ -59,8 +59,9 @@ function sources(dir: string): string[] {
 }
 
 test("copy check flags jargon outside Details only", () => {
-  assert.equal(violations(`const a = <p>连接节点</p>`).length, 1)
-  assert.equal(violations(`const a = <Details><p>节点</p></Details>`).length, 0)
+  assert.equal(violations(`const a = <p>节点与客户端</p>`).length, 0)
+  assert.equal(violations(`const a = <p>通过中继连接节点</p>`).length, 1)
+  assert.equal(violations(`const a = <Details><p>中继</p></Details>`).length, 0)
   assert.equal(violations(`const a = <p>安全码一致</p>`).length, 0)
   assert.equal(violations(`throw new Error("请填写本人证据")`).length, 1)
   assert.equal(violations(`rpc("node_settings")`).length, 0)
