@@ -3689,9 +3689,9 @@ def acceptance(options):
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "coverage": "four real Node processes over iroh with a member relay; WASM browser client; fixture SDK",
               "not_checked": ["real NAT and public ingress (disjoint loopback IP families require the relay)",
-                              "attachment resume: no product path writes attachments yet; the Rust test "
-                              "member_nodes_sync_ranges_and_attachments_without_jobs_and_refuse_outsiders resumes 3 MiB",
-                              "non-member endpoints refused by sync and RPC (same Rust test)",
+                              "attachment resume is not covered here; --phase4 checks 64 MiB upload, restart and resume",
+                              "non-member endpoints refused by sync and RPC are covered by Rust test "
+                              "member_nodes_sync_ranges_and_attachments_without_jobs_and_refuse_outsiders",
                               "rendered browser UI", "provider models"]}
 
     def passed(name, **evidence):
@@ -7849,9 +7849,10 @@ def e2e_fixture(options):
                     result = {"manager": {key: manager[key] for key in ("provider", "model", "reasoning_effort")} if manager is not None else None,
                               "roles": provider["roles"], "execution_model": provider["execution_model"], "setup": provider["setup"],
                               "login_count": len(fixture_records(run, "native-provider-login.jsonl")),
+                              "app_server_link_state": provider["app_server"]["link"]["state"],
                               "readiness": provider["readiness"]["state"], "catalog": provider["probe"]["catalog"]["state"],
                               "authentication": provider["probe"]["authentication"],
-                              "checked": provider["probe"]["checked_at_ms"] is not None,
+                              "checked_at_ms": provider["probe"]["checked_at_ms"],
                               "jobs": [{"trigger": row["trigger"], "state": row["state"]} for row in jobs
                                        if row["trigger"] in (native_queue["running_trigger"], native_queue["queued_trigger"])],
                               "running_invocations": sum(row["trigger"] == native_queue["running_trigger"] for row in calls),

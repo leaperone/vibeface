@@ -176,6 +176,13 @@ fn queued_jobs(connection: &Connection, conversation: &str) -> Result<Vec<Schedu
     )
 }
 
+fn steer_host_may_still_consume(state: &JobState) -> bool {
+    matches!(
+        state,
+        JobState::Claimed { .. } | JobState::Running { .. } | JobState::Cancelling { .. }
+    )
+}
+
 fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
     let attempt = job.state.attempt();
     let failure = match &job.state {
@@ -2951,7 +2958,7 @@ impl Store {
                 params![conversation, into.attempt_id],
             )?
             .pop()
-            .filter(|host| !host.state.terminal())
+            .filter(|host| steer_host_may_still_consume(&host.state))
             {
                 Some(host) => job = host,
                 // The reply it went into already ended: there is nothing left to stop, and the
@@ -3433,7 +3440,7 @@ impl Store {
         Ok(())
     }
 
-    /// Whether the reply attempt a message was steered into is still claimed or running.
+    /// Whether the reply attempt a message was steered into can still consume steered input.
     pub fn steer_host_active(&self, conversation: &str, attempt_id: &str) -> Result<bool> {
         Ok(query_jobs(
             &self.connection,
@@ -3441,7 +3448,7 @@ impl Store {
             params![conversation, attempt_id],
         )?
         .iter()
-        .any(|job| !job.state.terminal()))
+        .any(|job| steer_host_may_still_consume(&job.state)))
     }
 
     pub fn steering_jobs(&self) -> Result<Vec<SchedulerJob>> {

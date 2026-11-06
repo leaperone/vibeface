@@ -12,6 +12,8 @@ vibeface
 
 Supports macOS Apple Silicon and Linux x64/ARM64 with glibc. The package contains the native Rust programs, embedded Web client and service scripts. Installation does not download executable code from another host, run a postinstall script, initialize node data or start a service.
 
+Open a separate terminal and run `vibeface tui` to watch Node and peer status. This read-only monitor leaves the Node running when you quit with q. Pass `tui --data-dir <PATH>` to observe another data directory. Use `vibeface status --json` for scripts.
+
 After initialization, stop the foreground node before `vibeface service install`. When migrating a service, wait for idle and stop it through the previous installation first. Installation refuses an active updater, a data directory still locked by a running node, or a pending update. It holds the shared update lock until service installation finishes. If `update-pending.json` exists, run `update apply` through the previous managed installation to recover before migrating. Use a persistent global npm installation for a background service. Keep Node.js and this npm installation available; do not bind a service to a temporary `npx` cache.
 
 npm owns updates for this installation. The Rust self-updater is disabled. Before upgrading a background node, wait for active operations to finish and resolve unknown results, then stop its service:

@@ -363,6 +363,7 @@ struct TargetState {
     current: CodexTarget,
     applied: Option<CodexTarget>,
     pending: Option<CodexTarget>,
+    configuration_reload_pending: bool,
     leases: BTreeSet<String>,
 }
 
@@ -568,6 +569,7 @@ impl Inner {
         ensure!(
             &target.current == expected
                 && target.pending.is_none()
+                && !target.configuration_reload_pending
                 && target
                     .applied
                     .as_ref()
@@ -587,6 +589,9 @@ impl Inner {
             && target.leases.is_empty()
             && let Some(pending) = target.pending.take()
         {
+            if !matches!(pending, CodexTarget::Spawn(_)) {
+                target.configuration_reload_pending = false;
+            }
             target.current = pending;
             self.set_link(Link::Starting);
             self.changed.notify_one();
@@ -702,6 +707,26 @@ impl Inner {
     /// Runs the Node's own App Server once. `true` when a new target ended it; its turns are
     /// settled by probes on the next App Server, as after a crash.
     async fn run_spawned(&self, launch: &CodexLaunch) -> bool {
+        if self
+            .target
+            .lock()
+            .expect("target lock")
+            .configuration_reload_pending
+        {
+            self.point(None);
+            let disconnected = tokio::time::timeout(READY_WAIT, async {
+                while self.client.status().await["connection"]["state"] == "connected" {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            if disconnected.is_err() {
+                self.set_link(Link::LaunchFailed {
+                    reason: "could not reconnect Codex after its configuration changed".into(),
+                });
+                return false;
+            }
+        }
         self.point(Some(self.spawn_socket.clone()));
         let mut child = match self.spawn(launch) {
             Ok(child) => child,
@@ -713,7 +738,11 @@ impl Inner {
                 return false;
             }
         };
-        self.target.lock().expect("target lock").applied = Some(CodexTarget::Spawn(launch.clone()));
+        {
+            let mut target = self.target.lock().expect("target lock");
+            target.applied = Some(CodexTarget::Spawn(launch.clone()));
+            target.configuration_reload_pending = false;
+        }
         self.set_link(Link::Starting);
         let limit = tokio::time::sleep(START_LIMIT);
         tokio::pin!(limit);
@@ -858,6 +887,7 @@ impl CodexServer {
                 current: target,
                 applied,
                 pending: None,
+                configuration_reload_pending: false,
                 leases: BTreeSet::new(),
             }),
             changed: tokio::sync::Notify::new(),
@@ -924,7 +954,7 @@ impl CodexServer {
     /// Switches after active turns end. The system App Server is always left running.
     pub(crate) fn retarget(&self, target: CodexTarget) {
         let mut state = self.inner.target.lock().expect("target lock");
-        if state.current == target {
+        if state.current == target && !state.configuration_reload_pending {
             state.pending = None;
             return;
         }
@@ -932,10 +962,21 @@ impl CodexServer {
             state.pending = Some(target);
             return;
         }
+        if !matches!(target, CodexTarget::Spawn(_)) {
+            state.configuration_reload_pending = false;
+        }
         state.current = target;
         state.pending = None;
         self.inner.set_link(Link::Starting);
         self.inner.changed.notify_one();
+    }
+
+    pub(crate) fn configuration_changed(&self) {
+        self.inner
+            .target
+            .lock()
+            .expect("target lock")
+            .configuration_reload_pending = true;
     }
 
     pub(crate) fn lease(&self, id: String, expected: &CodexTarget) -> Result<CodexLease> {
@@ -960,6 +1001,7 @@ impl CodexServer {
         let target = self.inner.target.lock().expect("target lock");
         target.current != *expected
             || target.pending.is_some()
+            || target.configuration_reload_pending
             || target
                 .applied
                 .as_ref()
@@ -1087,6 +1129,7 @@ fn account_authentication(account: &Value) -> Authentication {
         account["requiresOpenaiAuth"].as_bool(),
         account.get("account"),
     ) {
+        (Some(false), _) => Authentication::NotRequired,
         (Some(true), Some(Value::Null)) => Authentication::SignInRequired,
         (Some(true), Some(value)) if value["type"] == "chatgpt" => Authentication::Authenticated,
         _ => Authentication::Unverified,
@@ -1237,7 +1280,11 @@ mod tests {
             account_authentication(
                 &json!({"requiresOpenaiAuth":false,"account":{"type":"apiKey"}})
             ),
-            Authentication::Unverified
+            Authentication::NotRequired
+        );
+        assert_eq!(
+            account_authentication(&json!({"requiresOpenaiAuth":false,"account":null})),
+            Authentication::NotRequired
         );
         assert_eq!(
             account_authentication(&json!({})),
@@ -1475,6 +1522,115 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("App Server link stayed {:?}", server.link().await);
+    }
+
+    #[tokio::test]
+    async fn new_private_configuration_does_not_block_a_deferred_system_or_off_target() -> Result<()>
+    {
+        let dir = artifacts("codex-config-retarget")?;
+        let (program, ran) = recording_codex(&dir)?;
+        let target = CodexTarget::Spawn(CodexLaunch {
+            bin: program,
+            env: BTreeMap::new(),
+        });
+        let mut outcomes = Vec::new();
+        for next in [
+            CodexTarget::System(dir.join("system.sock")),
+            CodexTarget::Off,
+        ] {
+            let (events, _) = mpsc::unbounded_channel();
+            let server =
+                CodexServer::open(target.clone(), &LocalIdentity::generate(), &dir, events)?;
+            let mut lease = server.lease("manager:config-fixture".into(), &target)?;
+            server.configuration_changed();
+            server.retarget(next.clone());
+            lease.retain_until_read_back();
+            drop(lease);
+            assert!(server.inner.target.lock().unwrap().current == target);
+            assert!(server.configuration_pending(&next));
+            assert!(server.lease("manager:new-fixture".into(), &next).is_err());
+            server.release_manager("config-fixture");
+            outcomes.push((
+                next.server(),
+                server.configuration_pending(&next),
+                server.lease("manager:new-fixture".into(), &next).is_ok(),
+            ));
+            server.stop().await;
+            std::fs::remove_dir_all(server.socket().parent().unwrap())?;
+        }
+        assert!(!ran.exists());
+        std::fs::remove_dir_all(dir)?;
+        assert_eq!(
+            outcomes,
+            [("system".into(), false, true), ("off".into(), false, false)],
+            "applied non-Spawn targets finish configuration work; only system accepts turns"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_private_configuration_reloads_the_same_launch_after_active_leases_end()
+    -> Result<()> {
+        let dir = artifacts("codex-config-reload")?;
+        let out = dir.join("starts");
+        let fixture = dir.join("fake-codex");
+        std::fs::write(
+            &fixture,
+            "#!/bin/sh\necho \"$$\" >> \"$FIXTURE_OUT\"\nexec sleep 60\n",
+        )?;
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700))?;
+        let mut local = Local {
+            switches: Default::default(),
+            bins: [(Provider::Codex, fixture)].into(),
+            env: Default::default(),
+        };
+        local.env.apply(
+            Provider::Codex,
+            [("FIXTURE_OUT".into(), Some(out.display().to_string()))].into(),
+        )?;
+        local.switches.execution.insert(Provider::Codex);
+        let target = local.codex_target(false);
+        let (events, _) = mpsc::unbounded_channel();
+        let server = CodexServer::open(target.clone(), &LocalIdentity::generate(), &dir, events)?;
+        server.start();
+        let first = lines(&out, 1).await;
+        let pid: i32 = first[0].parse()?;
+        let lease = server.lease("manager:config-fixture".into(), &target)?;
+        server.configuration_changed();
+        for next in [
+            CodexTarget::System(dir.join("system.sock")),
+            CodexTarget::Off,
+        ] {
+            server.retarget(next);
+            server.retarget(target.clone());
+            assert!(
+                server.configuration_pending(&target),
+                "cancelling a deferred target still reloads the new private configuration"
+            );
+        }
+        server.retarget(target.clone());
+        assert!(server.configuration_pending(&target));
+        assert!(group_alive(pid));
+        assert!(
+            server
+                .lease("manager:stale-fixture".into(), &target)
+                .is_err()
+        );
+        drop(lease);
+        let second = lines(&out, 2).await;
+        assert_ne!(second[0], second[1]);
+        assert!(ended(pid).await);
+        server.retarget(target);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            lines(&out, 2).await.len(),
+            2,
+            "an unchanged request does not reload again"
+        );
+        server.stop().await;
+        std::fs::remove_dir_all(server.socket().parent().unwrap())?;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[tokio::test]

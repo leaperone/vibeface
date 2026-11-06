@@ -52,14 +52,19 @@ export type ProviderIssue = { code: 'bin_missing'; path: string } | { code: 'env
 export type AppServerLink = { state: 'off' } | { state: 'starting' } | { state: 'connected'; socket: string; user_agent: string }
   | { state: 'not_found'; candidates: string[] } | { state: 'handshake_failed'; socket: string; reason: string } | { state: 'launch_failed'; reason: string }
 export type AppServerMode = 'system' | 'spawn'
+/** A private settings edit on the connected computer; local completion never enables a use. */
+export type ProviderChange = {
+  provider: ProviderId; bot?: boolean; execution?: boolean; execution_model?: string; bin?: string
+  env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null }; connect_local?: boolean
+}
 /** `socket` is required when enabling a system App Server connection. */
 export type AppServer = { mode: AppServerMode; socket: string | null; link: AppServerLink }
 export type ProviderObservation = {
   status: 'confirmed' | 'rejected' | 'unknown'
-  evidence: 'binary_discovery' | 'launch_prerequisites' | 'app_server_handshake' | 'app_server_starting' | 'app_server_unavailable' | 'managed_launch_failed' | 'configuration_invalid' | 'authentication_not_observed' | 'model_catalog_not_observed' | 'readiness_not_observed' | 'prerequisites_rejected'
+  evidence: 'binary_discovery' | 'launch_prerequisites' | 'app_server_handshake' | 'app_server_starting' | 'app_server_unavailable' | 'managed_launch_failed' | 'configuration_invalid' | 'authentication_not_observed' | 'model_catalog_not_observed' | 'readiness_not_observed' | 'prerequisites_rejected' | 'provider_probe'
 }
 export type ProviderObservations = Record<'installed' | 'launchable' | 'authenticated' | 'model_known' | 'ready', ProviderObservation>
-export const providerObservationLabels: Record<string, string> = { installed: '程序安装', launchable: '程序启动', authenticated: '登录状态', model_known: '模型可用性', ready: '完整可用性' }
+export const providerObservationLabels: Record<string, string> = { installed: '程序安装', launchable: '程序启动', authenticated: '认证状态', model_known: '模型可用性', ready: '完整可用性' }
 export const providerObservationStates: Record<ProviderObservation['status'], string> = { confirmed: '已确认', rejected: '未满足', unknown: '未验证' }
 /**
  * One local provider of the connected Node. `roles` is what it runs now: `agent` while the bot
@@ -115,7 +120,7 @@ export function parseEntry(value: unknown): ConnectionEntry {
   }
   const address = validEndpoint(text(v.address))
   if (v.local !== true) return { kind: 'gateway', address, device_id }
-  if (address !== (globalThis as { location?: { origin: string } }).location?.origin) throw new Error('本机打开时只能连这台电脑。')
+  if (address !== (globalThis as { location?: { origin: string } }).location?.origin) throw new Error('本机打开时只能连这个节点。')
   return { kind: 'local', address, device_id }
 }
 export const entryJson = (entry: ConnectionEntry) => entry.kind === 'lan' ? { device_id: entry.device_id, addrs: entry.addrs }
@@ -187,7 +192,7 @@ export function parseLocalSetup(value: unknown, origin: string): LocalSetup {
     setup = { kind: 'initialized', entry, removed: boolean(v.removed) }
     if (v.local_launch !== undefined) {
       const launch = record(v.local_launch), url = new URL(text(launch.url)), device_id = validTarget(launch.device_id), token = text(launch.token)
-      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.pathname !== '/' || url.search || url.hash || device_id !== entry.device_id || !/^[a-f0-9]{64}$/.test(token)) throw new Error('本机链接和这台电脑对不上。')
+      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.pathname !== '/' || url.search || url.hash || device_id !== entry.device_id || !/^[a-f0-9]{64}$/.test(token)) throw new Error('本机链接和这个节点对不上。')
       setup.local_launch = { url: url.origin, device_id, token }
     }
   }
@@ -217,14 +222,13 @@ export type Availability = Exclude<ProviderStatus['state'], 'off'> | 'missing'
 export function summaryReadiness(item: Pick<ProviderStatus, 'roles' | 'readiness' | 'execution_readiness'>): ProviderReadiness {
   return item.roles.includes('execution') && !item.roles.includes('agent') ? item.execution_readiness : item.readiness
 }
-export function availability(item: Pick<ProviderStatus, 'state' | 'installed' | 'env'> | Pick<ProviderStatus, 'installed' | 'roles' | 'readiness' | 'execution_readiness'>): Availability {
-  if ('roles' in item) return item.installed ? summaryReadiness(item).state : 'missing'
-  if ('state' in item) {
-    if (item.state !== 'off') return item.state
-    if (!item.installed) return 'missing'
-    if (item.env.some((row) => row.required && !row.set && !row.inherited)) return 'needs_setup'
-    return 'unverified'
-  }
+export function availability(item: Pick<ProviderStatus, 'app_server' | 'state' | 'installed' | 'env'> | Pick<ProviderStatus, 'app_server' | 'installed' | 'roles' | 'readiness' | 'execution_readiness'>): Availability {
+  const launches = item.app_server?.mode !== 'system'
+  if ('roles' in item) return !launches || item.installed ? summaryReadiness(item).state : 'missing'
+  if (item.state !== 'off') return item.state
+  if (!launches) return 'unverified'
+  if (!item.installed) return 'missing'
+  if (item.env.some((row) => row.required && !row.set && !row.inherited)) return 'needs_setup'
   return 'unverified'
 }
 
@@ -256,7 +260,7 @@ export const providerIds: readonly ProviderId[] = ['codex', 'cursor', 'claude', 
 export const asProvider = (value: unknown): ProviderId | null => providerIds.includes(value as ProviderId) ? value as ProviderId : null
 const providerRoles: ProviderRole[] = ['agent', 'execution']
 const providerStates: ProviderStatus['state'][] = ['ready', 'unverified', 'needs_setup', 'starting', 'off']
-const observationEvidence: ProviderObservation['evidence'][] = ['binary_discovery', 'launch_prerequisites', 'app_server_handshake', 'app_server_starting', 'app_server_unavailable', 'managed_launch_failed', 'configuration_invalid', 'authentication_not_observed', 'model_catalog_not_observed', 'readiness_not_observed', 'prerequisites_rejected']
+const observationEvidence: ProviderObservation['evidence'][] = ['binary_discovery', 'launch_prerequisites', 'app_server_handshake', 'app_server_starting', 'app_server_unavailable', 'managed_launch_failed', 'configuration_invalid', 'authentication_not_observed', 'model_catalog_not_observed', 'readiness_not_observed', 'prerequisites_rejected', 'provider_probe']
 function oneOf<T extends string>(value: unknown, options: readonly T[]): T {
   if (!options.includes(value as T)) throw new Error('AI 状态格式不对。')
   return value as T
@@ -324,9 +328,9 @@ export function probeIssueText(provider: ProviderId, issue: ProbeIssue): string 
   const name = providerNames[provider]
   const messages: Record<ProbeCode, string> = {
     not_installed: `找不到 ${name} 程序，请在运行设备安装或检查路径`, config_invalid: `${name} 配置无法读取，请检查运行设备上的配置`,
-    missing_credential: `${name} 缺少登录信息，请在运行设备设置`, launch_unverified: `${name} 尚未检查启动，请检查可用性`,
-    launch_failed: `${name} 没能启动，请在运行设备检查程序`, sign_in_required: `${name} 需要登录，请在运行设备完成登录`,
-    authentication_unverified: `${name} 登录尚未确认，可发送消息或先检查可用性`, catalog_unavailable: `${name} 模型列表暂不可用，可继续手填模型`,
+    missing_credential: `${name} 缺少认证信息，请在运行设备设置`, launch_unverified: `${name} 尚未检查启动，请检查可用性`,
+    launch_failed: `${name} 没能启动，请在运行设备检查程序`, sign_in_required: `${name} 需要完成认证，请在运行设备登录或配置 API 密钥`,
+    authentication_unverified: `${name} 认证状态尚未确认，可发送消息或先检查可用性`, catalog_unavailable: `${name} 模型列表暂不可用，可继续手填模型`,
     model_unverified: `${name} 尚未确认这个模型，可发送消息或先检查可用性`, model_unavailable: `${name} 无法使用所选模型，请检查模型设置`,
   }
   return messages[issue.code]

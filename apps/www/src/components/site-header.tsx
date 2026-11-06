@@ -2,10 +2,10 @@ import { Link, useRouterState } from '@tanstack/react-router'
 import { ThemeToggle } from '@/components/theme-toggle'
 
 const NAV = [
-  { label: '文档', kind: 'route' as const, to: '/docs/$' as const, splat: 'overview' },
-  { label: '下载', kind: 'href' as const, href: '/download' },
-  { label: '社区', kind: 'href' as const, href: '/community' },
-  { label: '安全', kind: 'href' as const, href: '/security' },
+  { label: 'Docs', kind: 'route' as const, to: '/docs/$' as const, splat: 'overview' },
+  { label: 'Download', kind: 'href' as const, href: '/download' },
+  { label: 'Community', kind: 'href' as const, href: '/community' },
+  { label: 'Security', kind: 'href' as const, href: '/security' },
 ]
 
 function navActive(pathname: string, item: (typeof NAV)[number]) {
@@ -19,12 +19,12 @@ export function SiteHeader() {
   const pathname = useRouterState({ select: (s) => s.location.pathname })
 
   return (
-    <header className="site-header">
-      <Link className="brand" to="/" aria-label="Vibeface 首页">
+    <header className="site-header" lang="en">
+      <Link className="brand" to="/" aria-label="Vibeface home">
         <img className="brand-mark" src="/logo.svg" width="28" height="28" alt="" />
         <span>Vibeface</span>
       </Link>
-      <nav aria-label="主导航">
+      <nav aria-label="Primary navigation">
         {NAV.map((item) => {
           const active = navActive(pathname, item)
           const className = active ? 'is-active' : undefined

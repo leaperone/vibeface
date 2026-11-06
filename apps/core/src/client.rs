@@ -1536,8 +1536,6 @@ struct PendingJoin {
     pinned: Option<(String, String, String)>,
 }
 
-/// The joining Node's side of `vibeface/join/1`, through the ticket's addresses. The relay
-/// admits a non-member holding the invite's derived token.
 struct JoinLink {
     net: Arc<Net>,
     entry: String,
@@ -1547,20 +1545,31 @@ impl JoinLink {
     async fn open(node: &Runtime, ticket: &Ticket) -> Result<Self> {
         let entry = ticket.entry_id();
         let token = net::relay_token(&ticket.invite_hash());
-        let relays = ticket
-            .entry
-            .relay_url
+        let mut relays = node
+            .config
+            .network
+            .relays
             .iter()
-            .map(|url| {
-                let url = net::relay_url(url)?;
-                // A public entry's relay knows no invites; it admits its operator token.
-                let token = match (&node.config.network.entry, &node.entry_token) {
-                    (Some(entry), Some(own)) if net::relay_url(&entry.relay)? == url => own.clone(),
-                    _ => token.clone(),
-                };
-                Ok((url, Some(token)))
-            })
+            .map(|url| Ok((net::relay_url(url)?, None)))
             .collect::<Result<Vec<_>>>()?;
+        if node.config.network.n0_relays {
+            relays.extend(
+                iroh::defaults::prod::default_relay_map()
+                    .urls::<Vec<_>>()
+                    .into_iter()
+                    .map(|url| (url, None)),
+            );
+        }
+        if let Some(url) = &ticket.entry.relay_url {
+            let url = net::relay_url(url)?;
+            relays.retain(|(known, _)| *known != url);
+            relays.push((url, Some(token)));
+        }
+        if let (Some(entry), Some(token)) = (&node.config.network.entry, &node.entry_token) {
+            let url = net::relay_url(&entry.relay)?;
+            relays.retain(|(known, _)| *known != url);
+            relays.push((url, Some(token.clone())));
+        }
         let mut addrs: Vec<TransportAddr> = relays
             .iter()
             .map(|(url, _)| TransportAddr::Relay(url.clone()))
@@ -2086,6 +2095,286 @@ mod tests {
             [addr("127.0.0.1:9")],
             "Nodes on one machine still join over loopback"
         );
+    }
+
+    #[tokio::test]
+    async fn node_joins_reuse_the_configured_private_relay() -> Result<()> {
+        use crate::config::{self, Config};
+        use iroh::protocol::{AcceptError, ProtocolHandler, Router};
+        use iroh_relay::server::{Access, AccessControl, ClientRequest};
+        use vibeface_secure::join::INVITE_DOMAIN;
+
+        const OPERATOR_TOKEN: &str =
+            "1111111111111111111111111111111111111111111111111111111111111111";
+        const WRONG_TOKEN: &str =
+            "2222222222222222222222222222222222222222222222222222222222222222";
+
+        #[derive(Default)]
+        struct PrivateRelay {
+            attempts: std::sync::Mutex<Vec<(iroh::EndpointId, Option<String>)>>,
+            without_token: std::sync::Mutex<Option<iroh::EndpointId>>,
+        }
+        impl std::fmt::Debug for PrivateRelay {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("PrivateRelay")
+            }
+        }
+        impl AccessControl for PrivateRelay {
+            async fn on_connect(&self, request: &ClientRequest) -> Access {
+                let token = request.auth_token();
+                self.attempts
+                    .lock()
+                    .expect("relay attempts")
+                    .push((request.endpoint_id(), token.clone()));
+                let invite_token = net::relay_token(&vibeface_secure::join::invite_hash(&[7; 32]));
+                let allowed = match token {
+                    Some(token) => {
+                        net::same_token(&token, OPERATOR_TOKEN)
+                            || net::same_token(&token, &invite_token)
+                    }
+                    None => {
+                        *self.without_token.lock().expect("relay allowance")
+                            == Some(request.endpoint_id())
+                    }
+                };
+                if allowed {
+                    Access::Allow
+                } else {
+                    Access::Deny { reason: None }
+                }
+            }
+        }
+
+        struct JoinServer(Arc<Runtime>);
+        impl std::fmt::Debug for JoinServer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("JoinServer")
+            }
+        }
+        impl ProtocolHandler for JoinServer {
+            async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+                let remote = net::device_id(&connection.remote_id());
+                serve_join(self.0.clone(), connection, remote)
+                    .await
+                    .map_err(|error| {
+                        AcceptError::from_err(std::io::Error::other(error.to_string()))
+                    })
+            }
+        }
+
+        async fn node(dir: &Path, network: NetworkConfig, token: &str) -> Result<Arc<Runtime>> {
+            config::private_dir(dir)?;
+            let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
+            configuration.network = network;
+            configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
+            configuration.save(dir)?;
+            config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
+            config::private_write(
+                &dir.join("identity.json"),
+                &serde_json::to_vec(&LocalIdentity::generate())?,
+            )?;
+            config::private_write(&dir.join(net::ENTRY_TOKEN_FILE), token.as_bytes())?;
+            Ok(Arc::new(Runtime::open(dir).await?))
+        }
+
+        async fn check(
+            node: &Runtime,
+            ticket: &Ticket,
+            access: &PrivateRelay,
+            expected_token: Option<&str>,
+        ) -> Result<()> {
+            let link = JoinLink::open(node, ticket).await?;
+            let result = async {
+                assert_eq!(
+                    link.call("join_check", json!({"secret":hex::encode(ticket.secret)}))
+                        .await?,
+                    json!({"invite":"open"})
+                );
+                assert_eq!(
+                    link.net.path_kind(&ticket.entry_id()),
+                    Some(net::PathKind::Relay)
+                );
+                assert_eq!(
+                    link.call("join_check", json!({"secret":hex::encode([8; 32])}))
+                        .await?,
+                    json!({"invite":"expired"})
+                );
+                assert_eq!(
+                    link.call("rpc", json!({"method":"nodes"}))
+                        .await
+                        .expect_err("a relay credential grants no RPC permission")
+                        .to_string(),
+                    "a join connection only joins"
+                );
+                assert!(!node.has_membership().await?);
+                let own = net::endpoint_id(&node.identity.device_id()?)?;
+                let attempts = access.attempts.lock().expect("relay attempts");
+                let mut own_attempts = attempts.iter().filter(|(id, _)| *id == own).peekable();
+                assert!(own_attempts.peek().is_some(), "the relay saw the joiner");
+                assert!(
+                    own_attempts.all(|(_, token)| token.as_deref() == expected_token),
+                    "each relay receives only its own credential"
+                );
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            link.net.close().await;
+            result
+        }
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("private-relay-join-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let access = Arc::new(PrivateRelay::default());
+        let relay = net::spawn_relay("127.0.0.1:0".parse()?, access.clone()).await?;
+        let relay_url = format!(
+            "http://{}",
+            relay.http_addr().context("relay listener missing")?
+        );
+        let network = |bind| NetworkConfig {
+            bind: Some(bind),
+            entry: Some(net::PublicEntry {
+                url: relay_url.clone(),
+                relay: relay_url.clone(),
+            }),
+            ..Default::default()
+        };
+        let target = node(
+            &dir.join("target"),
+            network("[::1]:0".parse()?),
+            OPERATOR_TOKEN,
+        )
+        .await?;
+        let joining = node(
+            &dir.join("joining"),
+            network("127.0.0.1:0".parse()?),
+            OPERATOR_TOKEN,
+        )
+        .await?;
+        let target_id = target.identity.device_id()?;
+        target
+            .install_membership(
+                target
+                    .identity
+                    .sign_network_fixture(1, vec![target_id.clone()])?,
+            )
+            .await?;
+        let admin = target.identity.fixture_admin();
+        let ticket = Ticket::new(&target_id, [7; 32])?;
+        let mut record = InviteRecord {
+            network_id: target.identity.fixture_network_id()?,
+            invite_hash: ticket.invite_hash(),
+            issuer: admin.device_id()?,
+            expires_at_ms: crate::runtime::now_ms() + 60_000,
+            signature: String::new(),
+        };
+        record.signature = admin.sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;
+        target
+            .store
+            .lock()
+            .await
+            .register_invite(&record, &record.issuer)?;
+        let target_net = Arc::new(
+            Net::bind(
+                &target.identity.secret_key_hex,
+                &target.config.network,
+                0,
+                vec![(net::relay_url(&relay_url)?, Some(OPERATOR_TOKEN.into()))],
+            )
+            .await?,
+        );
+        let router = Router::builder(target_net.endpoint.clone())
+            .accept(net::JOIN, JoinServer(target.clone()))
+            .spawn();
+        let result = async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while target_net.addr().relay_urls().next().is_none() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .context("the target did not connect to the private relay")?;
+            check(&joining, &ticket, &access, Some(OPERATOR_TOKEN)).await?;
+            let stale_relay = "http://127.0.0.1:9";
+            let invite_token = net::relay_token(&ticket.invite_hash());
+            for (name, ticket_relay, entry_relay, token, expected_token) in [
+                (
+                    "stale-ticket",
+                    Some(stale_relay),
+                    Some(relay_url.as_str()),
+                    OPERATOR_TOKEN,
+                    Some(OPERATOR_TOKEN),
+                ),
+                (
+                    "matching-relays",
+                    Some(relay_url.as_str()),
+                    Some(relay_url.as_str()),
+                    OPERATOR_TOKEN,
+                    Some(OPERATOR_TOKEN),
+                ),
+                (
+                    "unrelated-entry",
+                    Some(relay_url.as_str()),
+                    Some(stale_relay),
+                    WRONG_TOKEN,
+                    Some(invite_token.as_str()),
+                ),
+                ("configured-relay", None, None, OPERATOR_TOKEN, None),
+            ] {
+                let configuration = NetworkConfig {
+                    bind: Some("127.0.0.1:0".parse()?),
+                    relays: vec![relay_url.clone()],
+                    entry: entry_relay.map(|relay| net::PublicEntry {
+                        url: relay.into(),
+                        relay: relay.into(),
+                    }),
+                    ..Default::default()
+                };
+                let joining = node(&dir.join(name), configuration, token).await?;
+                if entry_relay.is_none() {
+                    *access.without_token.lock().expect("relay allowance") =
+                        Some(net::endpoint_id(&joining.identity.device_id()?)?);
+                }
+                let mut routed = ticket.clone();
+                routed.entry.relay_url = ticket_relay.map(str::to_owned);
+                check(&joining, &routed, &access, expected_token)
+                    .await
+                    .with_context(|| format!("relay case {name}"))?;
+            }
+            let denied = node(
+                &dir.join("wrong-operator-token"),
+                network("127.0.0.1:0".parse()?),
+                WRONG_TOKEN,
+            )
+            .await?;
+            let link = JoinLink::open(&denied, &ticket).await?;
+            let denied_result = link
+                .call("join_check", json!({"secret":hex::encode(ticket.secret)}))
+                .await;
+            link.net.close().await;
+            assert!(net::Unanswered::is(
+                &denied_result.expect_err("the relay must reject an invalid operator token")
+            ));
+            let denied_id = net::endpoint_id(&denied.identity.device_id()?)?;
+            assert!(
+                access
+                    .attempts
+                    .lock()
+                    .expect("relay attempts")
+                    .iter()
+                    .any(|(id, token)| *id == denied_id && token.as_deref() == Some(WRONG_TOKEN)),
+                "the relay received and refused the invalid operator token"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        router.shutdown().await?;
+        target_net.close().await;
+        relay.shutdown().await?;
+        drop((target, joining));
+        std::fs::remove_dir_all(dir)?;
+        result
     }
 
     /// The payload of the next push this client receives.
@@ -2665,7 +2954,7 @@ mod tests {
             node_codex_home.join("config.toml"),
             "model_provider='fixture'\n[model_providers.fixture]\nenv_key='FIXTURE_PROVIDER_KEY'\n",
         )?;
-        let set_codex = json!({"provider":"codex","bot":true,"bin":"/fixture/codex",
+        let set_codex = json!({"provider":"codex","connect_local":true,"bot":true,"bin":"/fixture/codex",
             "env":{"FIXTURE_CODEX_KEY":codex_key,"CODEX_HOME":user_codex_home}});
         let mut member = session(&client)?;
         assert!(
@@ -2725,10 +3014,26 @@ mod tests {
             &node,
             &mut owner,
             "configure_provider",
-            json!({"provider":"cursor","env":{"CURSOR_API_KEY":cursor_key}}),
+            json!({"provider":"cursor","connect_local":true,"env":{"CURSOR_API_KEY":cursor_key}}),
         )
         .await?;
         let read = dispatch(&node, &mut owner, "node_settings", json!({})).await?;
+        let private_env = std::fs::read(dir.join(crate::providers::ENV_FILE))?;
+        let private_env_modified =
+            std::fs::metadata(dir.join(crate::providers::ENV_FILE))?.modified()?;
+        let repeated = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","connect_local":true}),
+        )
+        .await?;
+        assert_eq!(repeated["providers"][1]["roles"], json!([]));
+        assert!(std::fs::read(dir.join(crate::providers::ENV_FILE))? == private_env);
+        assert_eq!(
+            std::fs::metadata(dir.join(crate::providers::ENV_FILE))?.modified()?,
+            private_env_modified
+        );
         for reply in [&saved, &cursor, &read] {
             let text = reply.to_string();
             assert!(

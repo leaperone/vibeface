@@ -48,8 +48,8 @@ export function inboxItems({ device, workspace }: InboxSource): InboxItem[] {
   const write = workspace.writeState
   if (device.pendingRecovery) items.push({ key: `recovery:${device.pendingRecovery.checkpoint}`, kind: "recovery", title: recoveryCopy.pending })
   if (device.rotateHint) items.push({ key: "rotate", kind: "rotate", title: "换个恢复密码" })
-  if (write.state === "read_only") items.push({ key: "write:read_only", kind: "write", write: "read_only", title: "这台电脑暂时只读" })
-  if (write.state === "forked") items.push({ key: "write:forked", kind: "write", write: "forked", title: "这台电脑的数据被复制过" })
+  if (write.state === "read_only") items.push({ key: "write:read_only", kind: "write", write: "read_only", title: "这个节点暂时只读" })
+  if (write.state === "forked") items.push({ key: "write:forked", kind: "write", write: "forked", title: "这个节点的数据被复制过" })
   else if (write.conflicts.length) items.push({ key: "write:conflicts", kind: "write", write: "conflicts", title: "有设备的数据被复制过" })
   for (const question of openQuestions(workspace.questions)) items.push({
     key: `question:${question.question_id}`, kind: "question", question, title: question.text, meta: question.bot?.name, done: question.question_id in workspace.answered,

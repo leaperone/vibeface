@@ -1,14 +1,14 @@
 import { Link, Stack, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { Bot, Crown, LoaderCircle, MessageSquareOff, Star } from 'lucide-react-native'
+import { ArrowDown, Bot, Crown, LoaderCircle, MessageSquareOff, Star } from 'lucide-react-native'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { FlatList, Platform, Pressable, StyleSheet, View } from 'react-native'
+import { FlatList, Platform, Pressable, StyleSheet, View, type NativeScrollEvent } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
-import Animated, { useAnimatedStyle } from 'react-native-reanimated'
+import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanimated'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
-import { useUniwind, withUniwind } from 'uniwind'
+import { useCSSVariable, useUniwind, withUniwind } from 'uniwind'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
-import { awaitsDevice, botReach, botCanSend, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, composerHint, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
@@ -26,6 +26,7 @@ import { useLive } from '@/data/live'
 import type { Attachment, ChatMessage, Conversation } from '@/data/types'
 import type { Question } from '@vibeface/client/workspace/types.ts'
 import { Composer } from '@/features/chat/composer'
+import { useChatChrome } from '@/features/chat/chrome'
 import { Message } from '@/features/chat/message'
 import { QuestionCard } from '@/features/chat/question-card'
 import { useChatExtras, type Row } from '@/features/chat/work'
@@ -37,6 +38,14 @@ import { fadeIn } from '@/lib/motion'
 type Entry = { key: string; message: ChatMessage; time?: string; grouped: boolean } | (Row & { attached?: boolean })
 
 const Fade = withUniwind(Animated.View)
+
+function awayFromLatest(event: NativeScrollEvent, inset: Pick<NativeScrollEvent['contentInset'], 'top' | 'bottom'>, ios: boolean) {
+  const { contentOffset, contentInset, contentSize, layoutMeasurement } = event
+  const padding = ios ? contentInset : inset
+  const range = Math.max(0, contentSize.height + padding.top + padding.bottom - layoutMeasurement.height)
+  const distance = contentOffset.y + (ios ? contentInset.top : 0)
+  return contentSize.height > 0 && layoutMeasurement.height > 0 && Math.min(Math.max(0, distance), range) > 64
+}
 
 /**
  * Questions sit right before the first message written after them, 新消息 above what the badge counted, tasks and changes right after the message that caused
@@ -91,6 +100,8 @@ export default function ChatScreen() {
   const wide = useWide()
   const titleWidth = ios ? (wide ? frame - 320 : frame) - 120 : undefined
   const { theme } = useUniwind()
+  const chrome = useChatChrome()
+  const background = useCSSVariable('--background')
   const bot = workspace.bots.find((item) => item.bot_id === botId)
   const id = bot?.conversation_id
   const chat = id ? workspace.conversations[id] : undefined
@@ -123,10 +134,18 @@ export default function ChatScreen() {
     return () => clearInterval(timer)
   }, [awaiting, starting]))
   const keyboard = useReanimatedKeyboardAnimation()
+  const dockHeight = useSharedValue(0)
   const list = useRef<FlatList<ReturnType<typeof entries>[number]>>(null)
+  const scrollInset = useRef({ id, top: 0, bottom: 0 })
+  if (scrollInset.current.id !== id) scrollInset.current = { id, top: 0, bottom: 0 }
+  const [scrollButton, setScrollButton] = useState({ id, visible: false })
+  const toLatest = () => {
+    if (scrollInset.current.id !== id) return
+    list.current?.scrollToOffset({ offset: ios ? -scrollInset.current.top : 0, animated: true })
+  }
   // Opening a chat with 新消息 brings it to the top of the screen, the unread under it.
   const unreadIndex = useRef(-1)
-  const toUnread = (index: number) => list.current?.scrollToIndex({ index, viewPosition: 1, animated: false })
+  const toUnread = (index: number) => { if (scrollInset.current.id === id) list.current?.scrollToIndex({ index, viewPosition: 1, animated: false }) }
   useEffect(() => {
     const index = unreadIndex.current
     if (index >= 0) requestAnimationFrame(() => toUnread(index))
@@ -142,7 +161,9 @@ export default function ChatScreen() {
     unsettled.current = null
   }, [landed])
   // The empty state stays centred in the space above the composer instead of riding up with the list.
-  const above = useAnimatedStyle(() => ({ paddingBottom: Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) }))
+  const above = useAnimatedStyle(() => ({ paddingBottom: ios
+    ? dockHeight.value + Math.max(0, Math.abs(keyboard.height.value) - insets.bottom * keyboard.progress.value)
+    : Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) }))
 
   if (!bot || !id) return <EmptyState icon={Bot} title={botCopy.notFound} className="flex-1 justify-center" />
   const offline = unreachable(device.link)
@@ -152,11 +173,11 @@ export default function ChatScreen() {
     setDraft({ text: '', files: [] })
     // Held from the tap itself: the shared sending flag lands a frame or two after the draft clears.
     setLaunching(true)
-    // iOS makes room for the keyboard with an inset, so the newest message rests at a negative offset, not at 0.
-    list.current?.scrollToOffset({ offset: ios ? -Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) : 0, animated: true })
+    toLatest()
     workspace.actions.send(id, text.trim(), files).catch(() => { unsettled.current = { text: text.trim(), seen: sent(text.trim()) }; setDraft({ text, files }) }).finally(() => setLaunching(false))
   }
   const rows = chat ? entries(chat, extras, bot, offline) : []
+  const setupBlocked = !offline && blocked === composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) && (reach === 'needs_setup' || reach === 'none' || reach === 'offline')
   // 重试 on the newest reply once it failed or was stopped, as on the web.
   const newest = chat?.messages.at(-1)
   const asked = newest && ['failed', 'stopped'].includes(newest.status ?? '') ? newest.in_reply_to : undefined
@@ -166,39 +187,52 @@ export default function ChatScreen() {
   const mood = offline ? 'asleep' : botMood(bot, workspace, live)
   // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
   const tint = botTint(faceOf(bot.bot_id, bot.avatar).hue, theme === 'dark')
+  const title = <Link href={`/b/${bot.bot_id}/about`} asChild>
+    <Pressable accessibilityRole="link" accessibilityLabel={[bot.name, workspace.primary === bot.conversation_id ? '主 Bot' : '', 'Bot 信息'].filter(Boolean).join('，')}
+      className={ios ? 'min-h-11 shrink flex-row items-center gap-1.5 rounded-full px-2.5 active:bg-muted/50' : '-mx-2 min-h-11 shrink flex-row items-center gap-2 self-start rounded-lg px-2 active:bg-muted'} style={{ maxWidth: titleWidth }}>
+      <BotFace bot={bot} mood={mood} size={ios ? 24 : 28} />
+      <Text numberOfLines={1} className="shrink font-semibold">{bot.name}</Text>
+      {workspace.primary === bot.conversation_id ? <Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
+    </Pressable>
+  </Link>
   // No background here: the screen paints it, and a painted view would come first natively and hide the list from scrollEdgeEffects.
   return <View className="flex-1">
     <Stack.Screen options={{
       title: bot.name,
       // iOS 26 measures the edge blur on the un-inverted list and covers every message once the chat outgrows the screen.
       scrollEdgeEffects: { top: 'hidden', bottom: 'hidden', left: 'hidden', right: 'hidden' },
-      // With the edge effects off, the bar keeps its own blur so messages scrolled under it stay behind frosted glass.
       headerTransparent: ios,
-      // Follows the app's own appearance setting, which the system material does not see.
-      headerBlurEffect: theme === 'dark' ? 'systemChromeMaterialDark' : 'systemChromeMaterialLight',
-      headerTitle: () => <ScreenFaces><Link href={`/b/${bot.bot_id}/about`} asChild>
-        <Pressable accessibilityRole="link" accessibilityLabel={[bot.name, workspace.primary === bot.conversation_id ? '主 Bot' : '', 'Bot 信息'].filter(Boolean).join('，')} className="-mx-2 min-h-11 shrink flex-row items-center gap-2 self-start rounded-lg px-2 active:bg-muted" style={{ maxWidth: titleWidth }}>
-          <BotFace bot={bot} mood={mood} size={28} />
-          <Text numberOfLines={1} className="shrink font-semibold">{bot.name}</Text>
-          {workspace.primary === bot.conversation_id ? <Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
-        </Pressable>
-      </Link></ScreenFaces>,
+      ...ios ? {
+        headerBlurEffect: chrome.kind === 'glass' ? chrome.colorScheme === 'dark' ? 'systemUltraThinMaterialDark' : 'systemUltraThinMaterialLight' : 'none',
+        headerStyle: { backgroundColor: chrome.kind === 'glass' ? 'transparent' : typeof background === 'string' ? background : undefined },
+      } : {},
+      headerTitle: () => <ScreenFaces>{title}</ScreenFaces>,
     }} />
     <ScreenFaces><View className="flex-1">
     {/* Always mounted, so the first message sent with the keyboard open lands in the keyboard-aware list. */}
     <FlatList
+      key={id}
       ref={list}
       data={rows}
       inverted
       keyExtractor={(row) => row.key}
       onScrollToIndexFailed={({ index, averageItemLength }) => {
+        if (scrollInset.current.id !== id) return
         list.current?.scrollToOffset({ offset: averageItemLength * index, animated: false })
         setTimeout(() => toUnread(index), 100)
       }}
+      onScroll={({ nativeEvent }) => {
+        if (scrollInset.current.id !== id) return
+        const visible = awayFromLatest(nativeEvent, scrollInset.current, ios)
+        setScrollButton((current) => current.id === id && current.visible === visible ? current : { id, visible })
+      }}
+      scrollEventThrottle={16}
       keyboardDismissMode="interactive"
       keyboardShouldPersistTaps="handled"
-      renderScrollComponent={(props) => <KeyboardChatScrollView {...props} inverted offset={insets.bottom} keyboardLiftBehavior="whenAtEnd" />}
-      contentContainerClassName="w-full max-w-3xl self-center px-4 py-6"
+      renderScrollComponent={(props) => <KeyboardChatScrollView {...props} inverted offset={insets.bottom} keyboardLiftBehavior="whenAtEnd"
+        extraContentPadding={ios ? dockHeight : undefined}
+        onContentInsetChange={(inset) => { if (scrollInset.current.id === id) scrollInset.current = { id, top: inset.top, bottom: inset.bottom } }} />}
+      contentContainerClassName={ios ? 'w-full max-w-3xl self-center px-4 pt-2 pb-4' : 'w-full max-w-3xl self-center px-4 py-6'}
       // The inverted list's footer is its top: the oldest message starts below the transparent bar.
       ListFooterComponent={<View style={{ height: header }} />}
       // Inverted, so the leading item is the lower one: a card caused by the message above it stays close to it.
@@ -226,11 +260,19 @@ export default function ChatScreen() {
     </Animated.View>}
     <RecoveryAlert top={header} />
     </View></ScreenFaces>
-    <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
-      <View style={{ paddingBottom: insets.bottom }}>
-        <OfflineBar chat className="mx-4 mb-2 self-center" />
-        <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
-          blocked={blocked} sending={launching || (chat?.sending ?? false)} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} tint={tint} />
+    <KeyboardStickyView pointerEvents={ios ? 'box-none' : undefined} style={ios ? { position: 'absolute', bottom: 0, left: 0, right: 0 } : undefined} offset={{ closed: 0, opened: insets.bottom }}>
+      <View pointerEvents={ios ? 'box-none' : undefined} style={{ paddingBottom: insets.bottom }} onLayout={ios ? (event) => { dockHeight.value = event.nativeEvent.layout.height } : undefined}>
+        {scrollButton.id === id && scrollButton.visible ? <View pointerEvents="box-none" className={ios ? 'absolute -top-13 w-full max-w-3xl self-center items-end px-4' : 'absolute -top-14 w-full max-w-3xl self-center items-end px-4'}>
+          <Button variant="outline" size="icon" className="rounded-full bg-card shadow-sm" accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
+        </View> : null}
+        <Composer chrome={chrome} value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
+          blocked={blocked} sending={launching || (chat?.sending ?? false)} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} tint={tint}>
+          {offline ? <OfflineBar chat className="self-center" /> : setupBlocked && rows.length ? <View role="status" className="flex-row flex-wrap items-center gap-x-2 px-2">
+            <Text className="text-meta text-muted-foreground">{blocked}</Text>
+            {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild><Button variant="ghost" size="sm"><Text>{reach === 'offline' ? '查看设备' : '去设置'}</Text></Button></Link>
+              : <Text className="text-meta text-muted-foreground">{setUpOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))}</Text>}
+          </View> : null}
+        </Composer>
       </View>
     </KeyboardStickyView>
   </View>

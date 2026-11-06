@@ -32,8 +32,8 @@ import { isSessionNotification } from "./types.ts"
 
 const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
   aligning: "正在和你的其他设备同步，稍后就能发送。",
-  read_only: "这台电脑暂时只读。去待处理确认一下就能发送。",
-  forked: "这台电脑的数据被复制过，已暂停发送。去待处理看看。",
+  read_only: "这个节点暂时只读。去待处理确认一下就能发送。",
+  forked: "这个节点的数据被复制过，已暂停发送。去待处理看看。",
 }
 
 type InterruptedReply = { trigger: string; conversation_id: string; after?: string; text: string }
@@ -139,7 +139,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     requireCurrent()
     if (!joined) throw new Error("本机管理不能发送。用加入链接加入后再操作。")
     if (!booted) throw new Error("本地记录还没读完，先暂停发送。")
-    if (readConnection.current !== connection) throw new Error("正在补读这台电脑的记录，已暂停写入。")
+    if (readConnection.current !== connection) throw new Error("正在补读这个节点的记录，已暂停写入。")
     if (writeState.state !== "writable") throw new Error(writeNotices[writeState.state])
   }
   const scoped = (key: string) => networkKey(`${key}.${clientId}`, networkId)
@@ -652,7 +652,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   /** `sent`: files already on the Node, which a retry sends again without uploading. */
   const sendMessage = (input: string, files: AttachmentFile[] = [], sent: Attachment[] = []) => withMutation(`message:${activeId.current}`, async () => {
     if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("还没选 Bot。先选一个。")
-    if (botReach(nodesRef.current) === "needs_setup") throw new Error("运行 Bot 的设备需设置。先检查 AI 服务登录和模型。")
+    if (botReach(nodesRef.current) === "needs_setup") throw new Error("运行 Bot 的设备需设置。先检查 AI 服务认证和模型。")
     setMessageBusy(true)
     try { return await submitMessage(input, files, sent) } finally { if (current()) setMessageBusy(false) }
   })
@@ -691,12 +691,12 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
     joined, synced,
     writable: joined && booted && current() && readConnection.current === connection && writeState.state === "writable",
-    writeNotice: readConnection.current !== connection ? "正在补读这台电脑的记录，已暂停写入。" : "",
+    writeNotice: readConnection.current !== connection ? "正在补读这个节点的记录，已暂停写入。" : "",
     writeState, readOnlyNotice: writeState.state === "writable" ? "" : writeNotices[writeState.state],
     diagnostics: (sinceMs: number) => { requireCurrent(); return connection.request("diagnostics", { since_ms: sinceMs }) },
     logs: async (filter: LogFilter) => { requireCurrent(); return parseLogs(await connection.request("logs", filter)) },
     confirmWritable: async () => { requireCurrent(); setWriteState(parseWriteStatus(await connection.request("confirm_writable"))); scheduleRefresh() },
-    syncText: !data ? "发一条消息开始对话。" : "已加载这台电脑上的记录。",
+    syncText: !data ? "发一条消息开始对话。" : "已加载这个节点上的记录。",
     refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton, ignoreNotifications, markNotificationsRead,
     ackNotification,
     selectBot,
@@ -831,13 +831,13 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     }),
     takeOver: () => withMutation(`owner:${activeId.current}`, async () => {
       const id = activeId.current, context = requireBotContext(id)
-      if (!context.conversation) throw new Error("这台电脑上还没有这个对话，可能还在同步。")
+      if (!context.conversation) throw new Error("这个节点上还没有这个对话，可能还在同步。")
       const scheduler = context.local_node, epoch = context.conversation.owner_epoch + 1
       const attestation = await attest(id, { type: "conversation_owner", scheduler_node: scheduler, epoch })
       try { await signedWrite("owner", `${id}:${epoch}`, "set_owner", { conversation_id: id, scheduler_node: scheduler, epoch, attestation }) }
       catch (caught) { requireControlRefresh(caught); throw caught }
       requireCurrent()
-      setNoticeText(`已换到 ${nodes.find((node) => node.device_id === scheduler)?.name || "另一台电脑"}`)
+      setNoticeText(`已换到 ${nodes.find((node) => node.device_id === scheduler)?.name || "另一个节点"}`)
       if (activeId.current === id) await refreshRef.current()
     }),
     /** Closes a failed task in 待处理 on every device; a retry of the same close writes nothing more. */

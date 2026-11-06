@@ -88,7 +88,7 @@ export function PromptInput({
       }}
     >
       <div className="relative">
-        <div data-toast-above="" className="absolute start-0 bottom-full flex pb-2 empty:hidden">{above}</div>
+        <div data-toast-above="" className="absolute start-0 bottom-full flex max-w-[calc(100%-3.5rem)] pb-2 empty:hidden">{above}</div>
         <InputGroup className="rounded-2xl bg-card shadow-sm dark:bg-card has-[[data-slot=input-group-control]:focus-visible]:ring-2">
           <InputGroupTextarea
             ref={textRef}

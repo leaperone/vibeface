@@ -23,12 +23,12 @@
       },
       "infoPlist": {
         "NSCameraUsageDescription": "扫描加入二维码",
-        "NSLocalNetworkUsageDescription": "用于在局域网内直接连接你自己的电脑。",
+        "NSLocalNetworkUsageDescription": "用于发现并直接连接局域网内你自己的 Vibeface 节点。",
         "NSBonjourServices": [
           "_vibeface._udp"
         ]
       },
-      "buildNumber": "1"
+      "buildNumber": "3"
     },
     "android": {
       "package": "one.leaper.vibeface",
@@ -43,7 +43,7 @@
         "android.permission.ACCESS_WIFI_STATE",
         "android.permission.CHANGE_WIFI_MULTICAST_STATE"
       ],
-      "versionCode": 249601
+      "versionCode": 250003
     },
     "plugins": [
       "expo-router",
@@ -117,7 +117,7 @@
       ]
     ],
     "extra": {
-      "releaseVersion": "0.0.1"
+      "releaseVersion": "0.0.1-nightly.20261106.2"
     }
   }
 }

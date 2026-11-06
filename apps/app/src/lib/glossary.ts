@@ -7,7 +7,7 @@ import {
 /** One icon and one word per concept, see packages/docs/design/web-ux.md. */
 export const terms = {
   myDevices: { label: "我的设备", icon: MonitorSmartphone },
-  thisComputer: { label: "这台电脑", icon: Laptop },
+  thisComputer: { label: "这个节点", icon: Laptop },
   browser: { label: "浏览器", icon: AppWindow },
   phone: { label: "手机", icon: Smartphone },
   address: { label: "访问地址", icon: Globe },

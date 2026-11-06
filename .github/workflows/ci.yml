@@ -13,16 +13,29 @@ on:
         description: 'Run genuine local paid delivery proofs and settlement in the bounded Linux sandbox'
         type: boolean
         default: false
+      delivery_small:
+        description: 'Run only the bounded 4 KiB proof, settlement and exposed-key experiments'
+        type: boolean
+        default: false
+      delivery_small_resume_run:
+        description: 'Optional explicit same-source small-experiment run ID to reuse verified public parts'
+        type: string
+        default: ''
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.delivery_small && 'delivery-small' || format('{0}-{1}-{2}', github.event_name, github.ref, (github.event_name == 'workflow_dispatch' || github.run_attempt > 1) && github.run_id || '') }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == 1 }}
 
 permissions:
   contents: read
 
 jobs:
   plan:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.delivery_small) }}
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
     outputs:
       plan: ${{ steps.select.outputs.plan }}
       web: ${{ steps.select.outputs.web }}
@@ -46,6 +59,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Select checks from the complete change and event
         id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci.py plan --github-output "$GITHUB_OUTPUT"
 
   quick-check:
@@ -75,7 +90,8 @@ jobs:
           python3 scripts/check-delivery.py --self-test
           python3 scripts/install-delivery-toolchain.py --self-test
           python3 scripts/run-delivery-live.py --self-test
-          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")]'
+          python3 scripts/daily-nightly.py --self-test
+          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/release.py", "scripts/daily-nightly.py")]'
           bash -n install.sh
           bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
           shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
@@ -86,6 +102,7 @@ jobs:
           node --check apps/cli/npm/bin/vibeface.mjs
           node --check scripts/package-npm.mjs
           node scripts/package-npm.mjs --self-test
+          node scripts/publish-npm.mjs --self-test
       - run: cargo fmt --all -- --check
 
   www:
@@ -187,21 +204,13 @@ jobs:
           retention-days: 14
 
   rust-check:
-    needs: [plan, quick-check, crypto-web, web]
+    needs: [plan, quick-check]
     if: needs.plan.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: crypto-web-${{ github.sha }}
-          path: apps/app/generated
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: web-${{ github.sha }}
-          path: apps/app/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
@@ -216,7 +225,7 @@ jobs:
         run: python3 scripts/ci.py check --plan-env CI_PLAN --msrv "$MSRV"
 
   rust-fast:
-    needs: [plan, crypto-web, web]
+    needs: plan
     if: needs.plan.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     env:
@@ -228,14 +237,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: crypto-web-${{ github.sha }}
-          path: apps/app/generated
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: web-${{ github.sha }}
-          path: apps/app/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -247,7 +248,7 @@ jobs:
         run: /usr/bin/time -v python3 scripts/ci.py test --tier fast --plan-env CI_PLAN
 
   rust-slow:
-    needs: [plan, crypto-web, web]
+    needs: plan
     if: needs.plan.outputs.slow == 'true'
     runs-on: ubuntu-24.04
     env:
@@ -259,14 +260,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: crypto-web-${{ github.sha }}
-          path: apps/app/generated
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: web-${{ github.sha }}
-          path: apps/app/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -623,14 +616,114 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/vibeface-signing.keychain-db" 2> /dev/null || true
           rm -f "$RUNNER_TEMP/vibeface-notary.p8" "$RUNNER_TEMP/vibeface-signing.p12"
 
+  delivery-small-prepare:
+    if: github.event_name == 'workflow_dispatch' && inputs.delivery_small
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      matrix: ${{ steps.run.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Require a single explicit experiment mode
+        env:
+          DELIVERY_LIVE: ${{ inputs.delivery_live }}
+        run: test "$DELIVERY_LIVE" = false
+      - name: Rebuild the canonical profile and verify two actual fixture replays
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESUME_RUN: ${{ inputs.delivery_small_resume_run }}
+        run: |
+          args=(--sandbox --prove-small prepare)
+          if [[ -n "$RESUME_RUN" ]]; then args+=(--resume-run "$RESUME_RUN"); fi
+          python3 scripts/check-delivery.py "${args[@]}"
+      - name: Preserve validated public preparation evidence
+        if: ${{ always() && steps.run.outputs.public-directory != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: delivery-small-prepare-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.run.outputs.public-directory }}
+          if-no-files-found: error
+          retention-days: 14
+
+  delivery-small-proofs:
+    needs: delivery-small-prepare
+    if: github.event_name == 'workflow_dispatch' && inputs.delivery_small
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.delivery-small-prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Prove the selected relation or independently verify its saved part
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORK_ITEM: ${{ matrix.item }}
+          RESUME_RUN: ${{ inputs.delivery_small_resume_run }}
+        run: |
+          args=(--sandbox --prove-small "$WORK_ITEM")
+          if [[ -n "$RESUME_RUN" ]]; then args+=(--resume-run "$RESUME_RUN"); fi
+          python3 scripts/check-delivery.py "${args[@]}"
+      - name: Preserve independently verified public part or unqualified diagnostic
+        if: ${{ always() && steps.run.outputs.public-directory != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: delivery-small-${{ matrix.item }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.run.outputs.public-directory }}
+          if-no-files-found: error
+          retention-days: 14
+
+  delivery-small-accept:
+    needs: [delivery-small-prepare, delivery-small-proofs]
+    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.delivery_small && needs.delivery-small-prepare.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Require all four qualified parts before the original money and recovery checks
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESUME_RUN: ${{ inputs.delivery_small_resume_run }}
+        run: |
+          args=(--sandbox --prove-small accept)
+          if [[ -n "$RESUME_RUN" ]]; then args+=(--resume-run "$RESUME_RUN"); fi
+          python3 scripts/check-delivery.py "${args[@]}"
+      - name: Preserve independently verified final public evidence
+        if: ${{ always() && steps.run.outputs.public-directory != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: delivery-small-accept-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.run.outputs.public-directory }}
+          if-no-files-found: error
+          retention-days: 14
+
   delivery-android:
-    if: github.event_name == 'workflow_dispatch' && inputs.delivery_live
+    if: github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small
     uses: ./.github/workflows/mobile.yml
     with:
       android_only: true
 
   delivery-live:
-    if: github.event_name == 'workflow_dispatch' && inputs.delivery_live
+    if: github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small
     needs: [plan, package, crypto-web, web, delivery-android]
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -827,15 +920,42 @@ jobs:
 
   ci-gate:
     name: ci-gate
-    if: always()
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.delivery_small) }}
     needs: [plan, quick-check, crypto-web, web, www, rust-check, rust-fast, rust-slow, delivery, delivery-live, package, npm-package, npm-smoke]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Require every check selected for this commit and scenario
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
         run: python3 scripts/ci.py gate --needs-env CI_NEEDS ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_live && '--delivery-live' || '' }}
 
+  daily-nightly:
+    needs: ci-gate
+    if: github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.ci-gate.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    concurrency:
+      group: daily-nightly
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - name: Reconcile daily version PR and immutable Nightly archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NIGHTLY_RELEASE_TOKEN: ${{ secrets.NIGHTLY_RELEASE_TOKEN }}
+        run: |
+          gh auth setup-git
+          python3 scripts/daily-nightly.py --run-id "$GITHUB_RUN_ID"

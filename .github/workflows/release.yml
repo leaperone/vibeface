@@ -20,6 +20,7 @@ jobs:
       app: ${{ steps.plan.outputs.app }}
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
+      source_sha: ${{ steps.plan.outputs.source_commit }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -34,8 +35,6 @@ jobs:
     needs: identity
     if: needs.identity.outputs.app == 'app' || needs.identity.outputs.app == 'www'
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -69,6 +68,25 @@ jobs:
             source_dir=apps/www/dist/client
           fi
           python3 scripts/release.py component "$APP" --input "$source_dir" --output .artifacts/release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: static-release
+          path: .artifacts/release/*
+          if-no-files-found: error
+  publish-static:
+    needs: [identity, static]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.identity.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: static-release
+          path: .artifacts/release
       - name: Publish verified component
         env:
           GH_TOKEN: ${{ github.token }}
@@ -145,6 +163,8 @@ jobs:
   publish-native:
     needs: [identity, native]
     runs-on: ubuntu-24.04
+    outputs:
+      npm_artifact_id: ${{ steps.npm-artifact.outputs.artifact-id }}
     permissions:
       contents: write
     steps:
@@ -163,9 +183,10 @@ jobs:
         if: needs.identity.outputs.app == 'cli' && contains(needs.identity.outputs.version, '-nightly.')
         run: node scripts/package-npm.mjs --input .artifacts/release --source-commit "$(git rev-parse HEAD)"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        id: npm-artifact
         if: needs.identity.outputs.app == 'cli' && contains(needs.identity.outputs.version, '-nightly.')
         with:
-          name: npm-package-${{ github.sha }}
+          name: npm-package-${{ github.sha }}-${{ github.run_attempt }}
           path: .artifacts/npm/*
           if-no-files-found: error
       - name: Seal and publish complete release
@@ -175,6 +196,18 @@ jobs:
         run: |
           python3 scripts/release.py manifest "$APP" .artifacts/release
           python3 scripts/release.py publish "$APP" .artifacts/release
+  npm:
+    needs: [identity, publish-native]
+    if: needs.publish-native.result == 'success' && needs.identity.outputs.app == 'cli' && contains(needs.identity.outputs.version, '-nightly.')
+    uses: ./.github/workflows/npm-publish.yml
+    with:
+      tag: ${{ needs.identity.outputs.tag }}
+      artifact_id: ${{ needs.publish-native.outputs.npm_artifact_id }}
+      publish: true
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
   mobile:
     needs: identity
     if: needs.identity.outputs.app == 'mobile'
@@ -186,7 +219,15 @@ jobs:
     permissions:
       contents: write
   deploy-www:
-    needs: [identity, static]
+    needs: [identity, publish-static]
     if: needs.identity.outputs.app == 'www' && !contains(needs.identity.outputs.version, '-')
     uses: ./.github/workflows/deploy-www.yml
+    secrets: inherit
+  deploy-app:
+    needs: [identity, publish-static]
+    if: needs.identity.outputs.app == 'app' && !contains(needs.identity.outputs.version, '-')
+    uses: ./.github/workflows/deploy-app.yml
+    with:
+      tag: ${{ needs.identity.outputs.tag }}
+      source_sha: ${{ needs.identity.outputs.source_sha }}
     secrets: inherit

@@ -138,7 +138,7 @@ test('the app dials only the Nodes it sees on its LAN, and an unseen one only wh
 })
 
 test('backend English and gateway refusal codes reach the page as plain Chinese', () => {
-  assert.equal(humanError('unknown member', 'target_not_member'), '那台电脑不在我的设备里，访问地址不会转发给它。')
+  assert.equal(humanError('unknown member', 'target_not_member'), '那个节点不在我的设备里，访问地址不会转发给它。')
   assert.match(humanError('conversation not found'), /还没有这个对话/)
   assert.match(failureText('missing_key'), /缺少密钥.*设备 → Bot 与任务/)
   assert.match(failureText('execution_disabled'), /没开执行任务.*设备 → Bot 与任务/)
@@ -146,6 +146,7 @@ test('backend English and gateway refusal codes reach the page as plain Chinese'
   assert.equal(failureText('unknown'), '', 'an unknown kind is worded by its caller')
   for (const kind of failureKinds) if (kind !== 'unknown') assert.match(failureText(kind), /[一-鿿]/, kind)
   assert.match(humanError('client response timed out; outcome may be unknown'), /结果未知/)
+  assert.equal(humanError('could not read local AI service settings; retry or configure the service manually'), '读取这台电脑的 AI 服务设置失败。重试或手动设置。')
   assert.equal(humanError('已断开设备连接。'), '已断开设备连接。')
   assert.match(humanError('peer did not answer in time'), /另一台设备没有回应/)
   assert.match(humanError('Codex rejected request: {"code":-32600,"message":"no rollout found for thread id 01a15c84"}'), /新对话还没准备好/)
@@ -153,7 +154,7 @@ test('backend English and gateway refusal codes reach the page as plain Chinese'
   assert.equal(humanError('the App Server socket must be an absolute path'), '连接路径要是绝对路径。')
   assert.match(humanError('set an explicit absolute CODEX_HOME before starting a managed App Server'), /Codex 目录/)
   assert.match(humanError("this computer's Codex folder has no sessions folder yet"), /先用 Codex 跑一次对话/)
-  assert.match(humanError('no Codex folder found on this computer', 'codex_missing'), /没找到这台电脑上的 Codex 目录/)
+  assert.match(humanError('no Codex folder found on this computer', 'codex_missing'), /没找到这个节点上的 Codex 目录/)
   assert.equal(humanError('something nobody mapped'), '这次操作没有成功。再试一次。')
   assert.equal(humanError('something nobody mapped', undefined, '读取最新内容'), '读取最新内容没有成功。再试一次。')
   assert.equal(rawError(new Error('conversation not found')), 'conversation not found')

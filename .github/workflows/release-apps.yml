@@ -11,7 +11,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   VERSION: ${{ inputs.version }}
@@ -51,22 +51,28 @@ jobs:
           mkdir -p .artifacts/android
           cp apps/mobile/android/app/build/outputs/apk/release/app-release.apk ".artifacts/android/vibeface-${VERSION#v}-android.apk"
           (cd .artifacts/android && shasum -a 256 "vibeface-${VERSION#v}-android.apk" > "vibeface-${VERSION#v}-android.apk.sha256")
-          python3 - <<'PY'
-          import hashlib, json, os
-          name = f"vibeface-{os.environ['VERSION'].removeprefix('v')}-android.apk"
-          path = f".artifacts/android/{name}"
-          json.dump({'version': os.environ['VERSION'].removeprefix('v'), 'sourceCommit': os.environ['GITHUB_SHA'], 'sha256': hashlib.sha256(open(path, 'rb').read()).hexdigest()}, open(f'{path}.provenance.json', 'w'), indent=2)
-          open(f'{path}.provenance.json', 'a').write('\n')
-          PY
+          python3 scripts/release.py mobile-provenance ".artifacts/android/vibeface-${VERSION#v}-android.apk"
+          python3 scripts/release.py manifest mobile .artifacts/android
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-android-${{ github.sha }}
-          path: .artifacts/android/vibeface-*
+          path: .artifacts/android/*
           if-no-files-found: error
 
+  publish-android:
+    needs: build-android
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: "${{ inputs.tag }}", persist-credentials: false}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-android-${{ github.sha }}
+          path: .artifacts/android
       - name: Publish verified mobile preview
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 scripts/release.py manifest mobile .artifacts/android
           python3 scripts/release.py publish mobile .artifacts/android

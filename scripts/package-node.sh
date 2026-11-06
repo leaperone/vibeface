@@ -127,9 +127,11 @@ cat > "$package/RUNTIME-REQUIREMENTS.md" <<'REQUIREMENTS'
 The archive contains the CLI, Core, and static browser application. Install the provider tools separately before enabling the bot.
 
 - Codex bots and native App Server access need the `codex` CLI and its authenticated account.
-- Cursor scheduling needs the official Cursor SDK bridge executable and CURSOR_API_KEY in the service environment.
+- Cursor scheduling needs the official Cursor SDK bridge executable and a CURSOR_API_KEY.
 
-Use absolute provider paths in `config.json` when running a background service. No credentials or provider runtimes are included.
+The device page's automatic connection finds common program installations and completes missing declared authentication variables from the Node environment or a bounded interactive login shell. Existing private settings and enabled uses are preserved. You can still choose an absolute program path in advanced settings.
+
+Codex keeps its own private home; personal OAuth logins and GUI credentials are not copied. Use the private login command shown in device settings when authentication is required. Cursor uses an API key, not the desktop application's login. No credentials or provider runtimes are included.
 REQUIREMENTS
 PACKAGE_TARGET="$target" python3 "$repo/scripts/release.py" seal-bundle "$package"
 python3 - "$output/$name.tar.gz" "$package" "$name" <<'PY'

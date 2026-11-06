@@ -23,10 +23,13 @@ pub struct Update {
 enum Action {
     /// Select a release channel and install or remove the automatic update timer.
     Configure {
+        /// Release channel to follow.
         #[arg(long, value_enum)]
         channel: Channel,
+        /// Enable or disable automatic updates.
         #[arg(long, action = clap::ArgAction::Set)]
         automatic: bool,
+        /// Root of the managed Vibeface installation.
         #[arg(long)]
         install_root: PathBuf,
         #[command(flatten)]
@@ -48,6 +51,7 @@ enum Action {
 
 #[derive(Args)]
 struct Data {
+    /// Node data directory.
     #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = absolute_path, default_value_os_t = default_data_dir())]
     data_dir: PathBuf,
 }

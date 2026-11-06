@@ -863,7 +863,7 @@ mod tests {
                 error.downcast_ref::<std::io::Error>().is_none(),
                 "{error:#}"
             );
-            crate::runtime::Runtime::open(&dir).await.unwrap();
+            crate::runtime::Runtime::reopen(&dir).await.unwrap();
         }
         let nonempty = root.join("nonempty");
         fs::create_dir(&nonempty).unwrap();

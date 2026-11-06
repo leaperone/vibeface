@@ -160,10 +160,12 @@ function JoinForm() {
     <Button disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? joinCopy.joining : joinCopy.join}</Text></Button>
   </View>
   return <View className="gap-4">
+    <Text role="heading" className="text-heading font-semibold">连接你的网络</Text>
     <Text className="text-meta text-muted-foreground">{joinCopy.linkSource()}</Text>
     <ErrorText error={failure} />
     <Button onPress={() => setScanning(true)}><Icon as={Camera} /><Text>{joinCopy.scan}</Text></Button>
     <View className="gap-2">
+      <Text className="text-meta font-medium text-muted-foreground">{joinCopy.byLink}</Text>
       <Textarea accessibilityLabel="加入链接" placeholder={joinCopy.paste} autoCapitalize="none" autoCorrect={false} numberOfLines={4}
         className="min-h-20 font-mono text-meta" value={invitation} onChangeText={edit} />
       {invalid ? <ErrorText error={joinCopy.notLink} /> : null}

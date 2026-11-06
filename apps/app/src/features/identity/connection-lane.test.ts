@@ -495,7 +495,7 @@ test('local launch metadata rejects an unrelated node, unsafe address, or malfor
     try {
       app.render(); await settle()
       assert.equal(app.render().localSetup, null)
-      assert.match(app.render().error, /本机链接和这台电脑对不上/)
+      assert.match(app.render().error, /本机链接和这个节点对不上/)
       assert.equal(app.sockets.length, 0)
       assert.equal(app.navigations.length, 0)
     } finally { app.close() }

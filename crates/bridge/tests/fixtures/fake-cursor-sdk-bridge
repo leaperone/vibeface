@@ -35,6 +35,7 @@ runs = {}
 store_log = os.environ.get("FAKE_BRIDGE_STORE_LOG")
 send_log = os.environ.get("FAKE_BRIDGE_SEND_LOG")
 gate_dir = os.environ.get("FAKE_BRIDGE_GATE_DIR")
+request_log = os.environ.get("FAKE_BRIDGE_REQUEST_LOG")
 delay_ms = int(os.environ.get("FAKE_BRIDGE_DELAY_MS", "0"))
 callback_token = None
 
@@ -103,6 +104,50 @@ class Bridge(BaseHTTPRequestHandler):
         if self.headers.get("Authorization") != f"Bearer {token}":
             return self.answer(401, b"{}")
         method = self.path.rsplit("/", 1)[-1]
+        if request_log:
+            with open(request_log, "a") as log:
+                log.write(method + "\n")
+        if method in ("Me", "ListModels"):
+            if self.path != "/sdk.v1.SdkCursorService/" + method or json.loads(request or b"{}") != {}:
+                return self.answer(400, b'{"message":"metadata request must be empty"}')
+        if method == "Me":
+            ready = os.environ.get("FAKE_BRIDGE_ME_READY")
+            release = os.environ.get("FAKE_BRIDGE_ME_RELEASE")
+            if ready:
+                with open(ready, "w") as marker:
+                    marker.write("ready")
+            if release:
+                while not os.path.exists(release):
+                    time.sleep(0.01)
+            mode = os.environ.get("FAKE_BRIDGE_ME", "ok")
+            if mode == "401":
+                return self.answer(401, b'{"message":"unauthorized"}')
+            if mode == "403":
+                return self.answer(403, b'{"message":"forbidden"}')
+            if mode == "timeout":
+                time.sleep(10)
+            if mode == "malformed":
+                return self.answer(200, b'{"user":"not-an-object"}')
+            if mode == "oversize":
+                return self.answer(200, b'{"user":{"profile":"' + b"x" * 65536 + b'"}}')
+            return self.answer(200, b'{"user":{"userEmail":"private@example.invalid"}}')
+        if method == "ListModels":
+            mode = os.environ.get("FAKE_BRIDGE_MODELS", "ok")
+            if mode == "401":
+                return self.answer(401, b'{"message":"unauthorized"}')
+            if mode == "403":
+                return self.answer(403, b'{"message":"forbidden"}')
+            if mode == "500":
+                return self.answer(500, b'{"message":"catalog unavailable"}')
+            if mode == "timeout":
+                time.sleep(10)
+            if mode == "malformed":
+                return self.answer(200, b'{"items":[{"id":"composer-2","displayName":42}]}')
+            if mode == "id_only":
+                return self.answer(200, b'{"items":[{"id":"composer-2"}]}')
+            if mode == "oversize":
+                return self.answer(200, b'{"items":[{"id":"composer-2","displayName":"' + b"x" * 65536 + b'"}]}')
+            return self.answer(200, b'{"items":[{"id":"composer-2","displayName":"Composer 2"}]}')
         if method == "Send":
             message = json.loads(request[5:])
             agent, run = message["agentId"], "run-" + uuid.uuid4().hex
@@ -191,6 +236,8 @@ class Bridge(BaseHTTPRequestHandler):
 server = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
 server.daemon_threads = True
 time.sleep(int(os.environ.get("FAKE_BRIDGE_STARTUP_MS", "0")) / 1000)
+if os.environ.get("FAKE_BRIDGE_EXIT_BEFORE_READY"):
+    sys.exit(7)
 discovery = {"schemaVersion": 1, "transport": "tcp", "protocol": "connect",
              "url": f"http://127.0.0.1:{server.server_address[1]}", "authTokenFile": token_file}
 print("cursor-sdk-bridge ready " + json.dumps(discovery), file=sys.stderr, flush=True)

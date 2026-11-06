@@ -96,7 +96,7 @@ export function isLoopback(address: string) {
 
 /** Short display name for an access address. */
 export function addressName(address: string) {
-  if (isLoopback(address)) return "这台电脑"
+  if (isLoopback(address)) return "这个节点"
   try { return new URL(address).hostname } catch { return address }
 }
 
@@ -114,7 +114,7 @@ export function entryLabel(input: { joined: boolean; directory: Pick<MembershipV
 export type DeviceForm = "computer" | "tablet" | "phone" | "browser"
 export const deviceForm = (kind: "node" | "client", name: string): DeviceForm =>
   kind === "node" ? "computer" : /ipad|tablet|平板/i.test(name) ? "tablet" : /iphone|android|phone|手机/i.test(name) ? "phone" : "browser"
-export const formName: Record<DeviceForm, string> = { computer: "电脑", tablet: "平板", phone: "手机", browser: "浏览器" }
+export const formName: Record<DeviceForm, string> = { computer: "节点", tablet: "平板", phone: "手机", browser: "浏览器" }
 
 /**
  * A computer's reachability as the Node reports it; `entry` marks the computer this device connects through, online

@@ -28,7 +28,7 @@ Vibeface 的完整 Rust 包包含 CLI `vibeface`、后台 Core `vibeface-core` �
 
 ## npm Nightly
 
-Node.js 22+ 可通过 npm 安装 Nightly。npm 包尚未公开发布，首次发布后使用：
+Node.js 22+ 可通过已公开的 npm 包安装 Nightly：
 
 ```sh
 npm install -g @leaperone/vibeface@nightly
@@ -36,7 +36,7 @@ vibeface --version
 vibeface
 ```
 
-一个 npm 包包含三个平台的 CLI、Core 和 `web/` 资源，按本机平台启动 Rust CLI。无需安装期脚本、二次下载、Rust 编译器或构建工具。npm 不创建身份、配置 Provider、启动服务或开启自动更新。发布前从手动扩展 CI 的 `npm-package-<SHA>` artifact 下载 `.tgz`，可用 `npm install --global --prefix /absolute/isolated/prefix --ignore-scripts /absolute/path/leaperone-vibeface-<version>.tgz` 隔离安装。
+一个 npm 包包含三个平台的 CLI、Core 和 `web/` 资源，按本机平台启动 Rust CLI。无需安装期脚本、二次下载、Rust 编译器或构建工具。npm 不创建身份、配置 Provider、启动服务或开启自动更新。CLI Nightly 的 GitHub Release 发布成功后自动通过 OIDC 发布同一份 npm 包，流程与权限要求见 [npm Nightly 制品与发布](releasing.md#npm-nightly-制品与发布)。也可从扩展 CI 的 `npm-package-<SHA>` artifact 下载 `.tgz`，使用 `npm install --global --prefix /absolute/isolated/prefix --ignore-scripts /absolute/path/leaperone-vibeface-<version>.tgz` 隔离安装。
 
 初始化后，下面的 `service` 命令也适用于全局 npm 安装。服务绑定 npm 包中固定的原生程序路径；不要把后台服务绑定到临时 `npx` 缓存，也不要在服务仍运行时移除或覆盖 npm 安装。迁移服务前先从原安装入口确认空闲并停止服务；npm 服务安装拒绝运行中的 updater、仍被运行中节点锁定或存在未完成更新记录的数据目录，通过后才移除同一目录绑定的旧受管更新定时器。安装期间持续持有同一更新锁，避免旧 updater 并发改写状态。存在 `update-pending.json` 时，先使用原受管安装的 `update apply` 恢复，再迁移服务。
 
@@ -110,9 +110,9 @@ vibeface
 
 数据目录默认为 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定，见[部署配置](deployment.md)。首次仅在空目录或不存在的目录中创建本机身份与配置，监听 `127.0.0.1:4790`，不开放局域网，不允许执行目录，不启用管理 Agent，不配置 relay 或公共入口。已有配置按原身份启动；损坏、非空未初始化或符号链接目录不会被重置。启动不自动输出配对秘密。
 
-保持进程运行，在本机可信浏览器打开 `http://localhost:4790`。首屏选**新建我的网络**，填写这台电脑的名称及恢复包口令（浏览器名称自动生成），下载并确认保存加密恢复包后创建个人网络，不需要复制终端邀请。已有网络的节点会尝试核验当前浏览器；新浏览器可使用本机自动访问，永久成员授权仍需原有成员邀请或恢复包。使用恢复包时，本机入口和初始化授权自动选取。
+保持进程运行，在本机可信浏览器打开 `http://localhost:4790`。首屏选**新建我的网络**，填写这个节点的名称及恢复包口令（浏览器名称自动生成），下载并确认保存加密恢复包后创建个人网络，不需要复制终端邀请。已有网络的节点会尝试核验当前浏览器；新浏览器可使用本机自动访问，永久成员授权仍需原有成员邀请或恢复包。使用恢复包时，本机入口和初始化授权自动选取。
 
-另一台节点加入已有个人网络时，不要在它的本机网页上建网。在管理设备的**添加设备**里选**电脑**，生成加入链接，然后任选一种方式：在新节点的本机网页上选**加入已有网络**并粘贴链接；或者在新节点的终端执行 `vibeface join '<加入链接>' --name '<设备显示名称>'`。两种方式都不用停止 Node：Node 正在运行时，命令交给它加入。数据目录为空或不存在时，`join` 先按直接启动的默认配置初始化；要预设执行目录或 relay，可先运行 `vibeface init`。网页或终端显示 6 位安全码，在管理设备上核对一致后点**一致，允许**。中断后用同一链接和目录重试，沿用原请求。见 [添加自己的设备](node.md#添加自己的设备)。`vibeface access` 保留为本机网页的备用入口。
+另一个节点加入已有个人网络时，不要在它的本机网页上建网。在管理设备的**添加设备**里选**节点**，生成加入链接，然后任选一种方式：在新节点的本机网页上选**加入已有网络**并粘贴链接；或者在新节点的终端执行 `vibeface join '<加入链接>' --name '<设备显示名称>'`。两种方式都不用停止 Node：Node 正在运行时，命令交给它加入。数据目录为空或不存在时，`join` 先按直接启动的默认配置初始化；要预设执行目录或 relay，可先运行 `vibeface init`。网页或终端显示 6 位安全码，在管理设备上核对一致后点**一致，允许**。中断后用同一链接和目录重试，沿用原请求。见 [添加自己的设备](node.md#添加自己的设备)。`vibeface access` 保留为本机网页的备用入口。
 
 使用签名管理身份或可信本机会话进入工作区后，在**设置**中选择管理 Agent、模型和允许 Agent 访问的项目目录。默认 Agent 工作目录在首次保存时自动创建，无需编辑配置文件或重启 Node。编码执行和管理 Agent 仍需事先安装并登录对应 Provider，角色授权也必须满足要求。见 [配置管理 Agent](node.md#配置管理-agent)。
 

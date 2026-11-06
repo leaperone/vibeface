@@ -10,7 +10,7 @@ import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, modelTyped, parseAppServerLink, parseNodeSettings, parseProvider, probeIssueText, effortOptions, type ModelChoice, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, parseProvider, probeIssueText, effortOptions, type ModelChoice, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderChange, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/packages/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
@@ -162,7 +162,7 @@ function openProvider(provider: ProviderId) {
   target?.focus({ preventScroll: true })
 }
 
-type Change = { provider: ProviderId; bot?: boolean; execution?: boolean; execution_model?: string; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
+type Change = ProviderChange
 type Failure = { at: ProviderId | "roots" | null; cause: unknown }
 
 /**
@@ -170,13 +170,16 @@ type Failure = { at: ProviderId | "roots" | null; cause: unknown }
  * Codex executes tasks, each provider's program and variables, and the folders it may use. Every
  * change saves right away. Variable values are write-only; the device only says which are set.
  */
-export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean; onBot?(on: boolean): void }) {
+export function AiSettings({ onboarding = false, compact = false, targetName, onBot }: { onboarding?: boolean; compact?: boolean; targetName?: string; onBot?(on: boolean): void }) {
   const { ready } = useDevice()
   const workspace = useWorkspace()
   const [response, setResponse] = useState<NodeSettingsResponse | null>(null)
   const [busy, setBusy] = useState("")
   const [error, setError] = useState<Failure | null>(null)
   const sequence = useRef(0)
+  const connecting = useRef(false)
+  const [localResult, setLocalResult] = useState("")
+  const [needsRead, setNeedsRead] = useState(false)
 
   async function call(key: string, at: Failure["at"], method: string, params?: Change | NodeSettings) {
     if (!ready?.isCurrent()) return false
@@ -186,6 +189,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
       const parsed = parseNodeSettings(await connection.request(method, params))
       if (owner !== sequence.current || !connection.isCurrent()) return false
       setResponse(parsed)
+      setNeedsRead(false)
       return true
     } catch (cause) {
       if (owner === sequence.current && connection.isCurrent()) setError({ at, cause })
@@ -197,20 +201,24 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   const load = () => call("load", null, "node_settings")
   /** After a write that failed, possibly after the device applied it: read the state again instead of resending; the error stays shown. */
   async function reconcile() {
-    if (!ready?.isCurrent()) return
+    if (!ready?.isCurrent()) return false
     const connection = ready, owner = sequence.current
     try {
       const parsed = parseNodeSettings(await connection.request("node_settings"))
-      if (owner === sequence.current && connection.isCurrent()) setResponse(parsed)
+      if (owner !== sequence.current || !connection.isCurrent()) return false
+      setResponse(parsed)
+      setNeedsRead(false)
+      return true
     } catch { /* the shown error already says what failed */ }
+    return false
   }
-  useEffect(() => { setResponse(null); void load(); return () => { sequence.current += 1 } }, [ready])
+  useEffect(() => { setResponse(null); setLocalResult(""); setNeedsRead(false); void load(); return () => { sequence.current += 1 } }, [ready])
   // A provider gets installed outside this page, so coming back to the page reads the device again.
   useEffect(() => {
-    const back = () => void reconcile()
+    const back = () => { if (!busy) void reconcile() }
     window.addEventListener("focus", back)
     return () => window.removeEventListener("focus", back)
-  }, [ready])
+  }, [ready, busy])
   async function test(): Promise<AppServerLink | null> {
     if (!ready?.isCurrent()) return null
     try {
@@ -236,6 +244,40 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
     } catch (cause) { if (owner === sequence.current && connection.isCurrent()) setError({ at: provider, cause }) }
     finally { if (owner === sequence.current) setBusy("") }
   }
+  async function connectLocal() {
+    if (!ready?.isCurrent() || busy || connecting.current || needsRead) return
+    const connection = ready, owner = ++sequence.current
+    connecting.current = true
+    setBusy("connect_local"); setError(null); setLocalResult("")
+    const failures: string[] = []
+    let reconciled = true
+    try {
+      for (const provider of ["codex", "cursor"] as const) {
+        if (owner !== sequence.current || !connection.isCurrent()) return
+        try {
+          const parsed = parseNodeSettings(await connection.request("configure_provider", { provider, connect_local: true }))
+          if (owner !== sequence.current || !connection.isCurrent()) return
+          setResponse(parsed)
+          reconciled = true
+        } catch (cause) {
+          if (owner !== sequence.current || !connection.isCurrent()) return
+          failures.push(`${providerNames[provider]}：${messageOf(cause, "自动接入")}`)
+          // The write may have reached the computer. Read it before allowing another attempt.
+          reconciled = await reconcile()
+        }
+      }
+      if (owner !== sequence.current || !connection.isCurrent()) return
+      setLocalResult(failures.length ? "部分服务未完成，检查下方结果后重试。" : "检测已完成，接入结果见下方。")
+      setNeedsRead(!reconciled)
+      if (failures.length) setError({ at: null, cause: new Error(failures.join("\n")) })
+      if (workspace.isCurrent()) await workspace.refresh()
+    } catch (cause) {
+      if (owner === sequence.current && connection.isCurrent()) setError({ at: null, cause })
+    } finally {
+      connecting.current = false
+      if (owner === sequence.current) setBusy("")
+    }
+  }
   const starting = response?.providers.some((item) => item.state === "starting")
   const botOn = response?.providers.some((item) => item.roles.includes("agent")) ?? false
   useEffect(() => { onBot?.(botOn) }, [botOn])
@@ -244,19 +286,32 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   const folders = response?.settings.roots.join("\n")
   useEffect(() => { if (folders !== undefined && workspace.isCurrent()) void workspace.refresh().catch(() => {}) }, [botState, folders])
   useEffect(() => {
-    if (!starting) return
+    if (!starting || busy) return
     const timer = setTimeout(() => void load(), 2000)
     return () => clearTimeout(timer)
-  }, [response])
+  }, [response, busy])
 
   if (!response) return error ? <InlineError error={error.cause} action={{ label: "重试", onClick: () => void load() }} /> : <div className="grid gap-2"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
   const { roots, manager } = response.settings
-  const { shown, folded } = providerGroups(response.providers)
-  const card = (item: ProviderStatus) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy} models={item.probe.catalog.state === "available" ? item.probe.catalog.models : null} probe={() => probe(item.provider)}
+  const groups = providerGroups(response.providers)
+  const shown = compact ? response.providers.filter((item) => item.provider === "codex" || item.provider === "cursor" || item.roles.length > 0) : groups.shown
+  const folded = response.providers.filter((item) => !shown.includes(item))
+  const card = (item: ProviderStatus) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} compact={compact} busy={busy} models={item.probe.catalog.state === "available" ? item.probe.catalog.models : null} probe={() => probe(item.provider)}
     error={error?.at === item.provider ? error.cause : null} test={test} reconcile={reconcile}
     change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
     saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />
   return <div className="grid gap-6">
+    <div className="grid min-w-0 gap-2 px-1">
+      <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
+        <div className="grid min-w-0 flex-1 basis-44 gap-1">
+          <h3 className="text-heading font-semibold">AI 服务</h3>
+          <p className="text-meta text-muted-foreground [overflow-wrap:anywhere]">{targetName ? `在「${targetName}」上检测 Codex 和 Cursor` : "检测这台电脑的 Codex 和 Cursor"}</p>
+        </div>
+        <Button type="button" variant={compact ? "default" : "outline"} className="min-h-11" disabled={busy !== "" || needsRead} aria-busy={busy === "connect_local" || undefined} onClick={() => void connectLocal()}><BusyIcon busy={busy === "connect_local"} icon={PlugZap} />自动接入</Button>
+      </div>
+      <p role="status" aria-live="polite" aria-atomic="true" className="text-meta text-muted-foreground">{busy === "connect_local" ? "正在检测并补齐设置" : localResult || "保留已保存的设置和用途"}</p>
+      {error?.at === null ? <InlineError error={error.cause} action={needsRead ? { label: "重新读取", onClick: () => void load() } : undefined} /> : null}
+    </div>
     <div className="grid gap-2">
     <ul className="flex flex-wrap gap-x-4 gap-y-1 px-1 text-meta text-muted-foreground" aria-label="两种用法">
       {(["bot", "execution"] as const).map((role) => { const { label, note, icon: RoleIcon } = roles[role]; return <li key={role} className="flex items-center gap-1.5 whitespace-nowrap">
@@ -268,14 +323,14 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
       {folded.length ? <li><details className="details" open={!shown.length || undefined}>
         <summary className="flex min-h-11 items-center gap-1 px-4 text-meta text-muted-foreground hover:text-foreground">
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 transition-transform duration-200" />
-          <span className="min-w-0 truncate">未安装 · {folded.map((item) => providerNames[item.provider]).join("、")}</span>
+          <span className="min-w-0 truncate">{compact ? `其他 AI 服务 · ${folded.length}` : `未安装 · ${folded.map((item) => providerNames[item.provider]).join("、")}`}</span>
         </summary>
         <ul className="divide-y border-t">{folded.map(card)}</ul>
       </details></li> : null}
     </ul>
     </div>
-    {onboarding && !botOn ? <BotHint /> : <Folders later={onboarding} roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
-    {error && (error.at === "roots" || error.at === null) ? <InlineError error={error.cause} /> : null}
+    {onboarding && !botOn ? <BotHint /> : compact ? <Details label="项目文件夹"><Folders later={false} roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} /></Details> : <Folders later={onboarding} roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
+    {error?.at === "roots" ? <InlineError error={error.cause} /> : null}
   </div>
 }
 
@@ -303,9 +358,9 @@ function RoleToggle({ role, name, pressed, busy, disabled, onClick }: { role: ke
   </Button>
 }
 
-function ProviderCard({ item, response, onboarding, busy, models, error, change, saveBot, test, reconcile, probe }: {
-  item: ProviderStatus; response: NodeSettingsResponse; onboarding: boolean; busy: string; models: ModelChoice[] | null; error: unknown
-  change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>; reconcile(): Promise<void>; probe(): Promise<void>
+function ProviderCard({ item, response, onboarding, compact = false, busy, models, error, change, saveBot, test, reconcile, probe }: {
+  item: ProviderStatus; response: NodeSettingsResponse; onboarding: boolean; compact?: boolean; busy: string; models: ModelChoice[] | null; error: unknown
+  change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>; reconcile(): Promise<boolean>; probe(): Promise<void>
 }) {
   const name = providerNames[item.provider], Icon = providerIcons[item.provider]
   const display = response.display_paths
@@ -323,8 +378,10 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
   const [newValue, setNewValue] = useState("")
   const [bin, setBin] = useState(item.bin)
   useEffect(() => setBin(item.bin), [item.bin])
-  const working = busy.startsWith(`${item.provider}:`)
-  const issue = item.state === "needs_setup" ? item.issues[0] : undefined
+  const working = busy !== ""
+  const launches = item.app_server?.mode !== "system"
+  const missingKey = compact && launches ? item.env.find((row) => row.required && !row.set && !row.inherited) : undefined
+  const issue: ProviderIssue | undefined = item.state === "needs_setup" ? item.issues[0] : compact && launches && !item.installed ? { code: "bin_missing", path: item.bin } : missingKey ? { code: "env_missing", name: missingKey.name } : undefined
   const server = item.app_server
   // The use last asked for: when the device found no Codex folder, the folder typed in turns it on in the same write.
   const [asked, setAsked] = useState<"bot" | "execution" | null>(null)
@@ -352,6 +409,14 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
   // The keys a provider needs show by default; the rest of its variables wait under 高级.
   const keys = env.filter((row) => row.required), others = env.filter((row) => !row.required)
   const advancedIssue = Boolean(issue && issue.code !== "env_missing")
+  const checkRecord = <Details label="检查记录">
+    <p>{item.probe.checked_at_ms === null ? "尚未主动检查" : `检查于 ${new Date(item.probe.checked_at_ms).toLocaleString()}`}</p>
+    {manager && item.probe.catalog.state === "available" && item.probe.catalog.coverage === "partial" ? <p>模型列表可能不完整，可手填其他模型。</p> : null}
+    {manager && item.probe.catalog.state === "unavailable" ? <p>模型列表暂不可用，可继续手填。已保存的模型保持不变。</p> : null}
+  </Details>
+  const checkButton = <Button type="button" variant="ghost" size="sm" className="min-h-11" aria-label={compact ? `${name} 检查可用性` : undefined} disabled={busy !== ""} onClick={() => void probe()}>
+    <BusyIcon busy={busy === `${item.provider}:probe`} icon={RotateCw} />{compact ? "检查" : "检查可用性"}
+  </Button>
 
   // `friendly`: a key the provider needs, named after its service in the default view; any other variable shows as it is named.
   const envRow = (row: (typeof env)[number], friendly: boolean) => {
@@ -381,20 +446,28 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
             </li>
   }
   return <li>
-    <div className="flex min-h-14 items-center gap-3 px-4 py-2">
+    <div className="flex min-h-14 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3">
       <Icon aria-hidden="true" className={cn("size-5 shrink-0", usable === "missing" ? "text-muted-foreground/60" : "text-muted-foreground")} />
       <div className="grid min-w-0 flex-1">
         <span className={cn("truncate font-medium", usable === "missing" && "text-muted-foreground")}>{name}</span>
         <span className={cn("flex min-w-0 items-center gap-1 text-meta", toneText[state.tone])}>
-          <state.icon aria-hidden="true" className={cn("size-3.5 shrink-0", usable === "starting" && "animate-spin")} /><span className="truncate">{state.label}</span>
+          <state.icon aria-hidden="true" className={cn("size-3.5 shrink-0", usable === "starting" && "animate-spin")} /><span className="truncate">{compact && usable === "unverified" ? "未验证" : state.label}</span>
         </span>
       </div>
-      <div className="flex shrink-0 gap-2">
+      <div className="flex shrink-0 flex-wrap gap-2 max-sm:basis-full max-sm:ps-8">
         {botable ? <RoleToggle role="bot" name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
           onClick={() => bot ? void change("bot", { bot: false }) : turnOn("bot")} /> : null}
         {executable ? <RoleToggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
           onClick={() => execution ? void change("execution", { execution: false }) : turnOn("execution")} /> : null}
       </div>
+    {compact ? <div className="flex basis-full items-center gap-3 ps-8"><div className="grid min-w-0 flex-1 gap-1">
+      <dl className="flex flex-wrap gap-x-4 gap-y-1 text-meta text-muted-foreground">
+        <div className="flex gap-1"><dt>程序</dt><dd>{!launches ? "外部服务" : item.installed ? "已找到" : "未找到"}</dd></div>
+        <div className="flex gap-1"><dt>认证</dt><dd>{missingKey ? "需填写密钥" : { authenticated: "已认证", not_required: "无需登录", sign_in_required: "需登录", unverified: "未验证" }[item.probe.authentication]}</dd></div>
+        <div className="flex gap-1"><dt>模型</dt><dd>{providerObservationStates[item.observed.model_known.status]}</dd></div>
+      </dl>
+      <p className="text-meta text-muted-foreground">{item.state === "starting" ? "等待当前任务结束或服务启动" : item.app_server?.mode === "system" ? "沿用已选的连接方式" : !item.roles.length ? "尚未启用用途" : item.roles.map((role) => role === "agent" ? "运行 Bot" : "执行任务").join("、")}</p>
+    </div>{checkButton}</div> : null}
     </div>
     {notFound ? <div className="grid gap-2 px-4 sm:ps-12 pb-2 text-meta">
       <span role="status" className="flex min-w-0 items-center gap-1.5 text-warning"><Unplug aria-hidden="true" className="size-4 shrink-0" />没找到这台电脑上的 Codex</span>
@@ -412,28 +485,25 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
         : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={issue.code === "bin_missing" ? install[item.provider] : guide[item.provider]} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
         : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={() => openProvider(item.provider)}>去设置</button>}
     </p> : null}
-    <div className="grid gap-1 px-4 pb-3 sm:ps-12">
-      {'issue' in readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, readiness.issue)}</p> : null}
-      {item.setup && (bot || execution) && ["needs_setup", "unverified"].includes(readiness.state) ? <div className="grid gap-2 text-meta">
-        <p>在运行 AI 的电脑上执行以下命令，为独立目录登录或配置，再点“检查可用性”。不会复制已有登录信息。</p>
+    <div className="grid gap-1 px-4 pb-3 empty:hidden sm:ps-12">
+      {!compact && 'issue' in readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, readiness.issue)}</p> : null}
+      {item.setup && (compact ? item.probe.authentication === "sign_in_required" : (bot || execution) && ["needs_setup", "unverified"].includes(readiness.state)) ? <Details label="登录方式" open={!compact || undefined}>
+        <p>需要登录时，在运行 AI 的电脑上执行以下命令，再点“检查可用性”。使用独立登录，不复制个人会话。</p>
         <FolderPath path={item.setup.directory} shown={display[item.setup.directory]} />
         <div className="flex min-w-0 gap-2">
-          <Input readOnly aria-label={`${name} 私有目录登录命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />
-          <Button type="button" variant="outline" onClick={() => { if (item.setup) void navigator.clipboard.writeText(item.setup.command).then(() => toast("已复制登录命令", { tone: "success" }), () => toast("请选中命令后复制", { tone: "warning" })) }}><Copy aria-hidden="true" />复制命令</Button>
+          <Input readOnly aria-label={`${name} 私有目录认证命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />
+          <Button type="button" variant="outline" onClick={() => { if (item.setup) void navigator.clipboard.writeText(item.setup.command).then(() => toast("已复制认证命令", { tone: "success" }), () => toast("请选中命令后复制", { tone: "warning" })) }}><Copy aria-hidden="true" />复制命令</Button>
         </div>
-      </div> : null}
-      <div className="flex flex-wrap items-center gap-2 text-meta text-muted-foreground">
-        <span>{item.probe.checked_at_ms === null ? "尚未主动检查" : `检查于 ${new Date(item.probe.checked_at_ms).toLocaleString()}`}</span>
-        <Button type="button" variant="ghost" size="sm" disabled={busy !== ""} onClick={() => void probe()}><BusyIcon busy={busy === `${item.provider}:probe`} icon={RotateCw} />检查可用性</Button>
-      </div>
-      {manager && item.probe.catalog.state === "available" && item.probe.catalog.coverage === "partial" ? <p className="text-meta text-muted-foreground">模型列表可能不完整，可手填其他模型。</p> : null}
-      {manager && item.probe.catalog.state === "unavailable" ? <p className="text-meta text-muted-foreground">模型列表暂不可用，可继续手填。已保存的模型保持不变。</p> : null}
+      </Details> : null}
+      {!compact ? <div className="flex flex-wrap items-center gap-2 text-meta text-muted-foreground">{checkButton}</div> : null}
+      {!compact ? checkRecord : null}
     </div>
     {onboarding ? null : <details id={`provider-${item.provider}`} className="details">
       <summary className="-mt-2 flex min-h-11 w-fit items-center gap-1 px-4 sm:ps-12 text-meta text-muted-foreground hover:text-foreground">
         <ChevronRight aria-hidden="true" className="size-4 transition-transform duration-200" />设置
       </summary>
       <div className="grid gap-4 px-4 sm:ps-12 pt-1 pb-4">
+        {compact ? checkRecord : null}
         <Details label="能力验证">
           <p>程序和密钥已配置，不代表登录或模型已经验证。未验证时可以尝试运行。</p>
           {item.observed ? <ul className="grid gap-1">{Object.entries(item.observed).map(([key, observation]) => <li key={key}>{providerObservationLabels[key]} · {providerObservationStates[observation.status]}</li>)}</ul> : <p>验证记录未提供。</p>}
