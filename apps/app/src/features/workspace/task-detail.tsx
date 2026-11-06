@@ -245,7 +245,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       savingDrafts.current.add(submittedDraft)
       const text = input, selectedFiles = files
       setSendError(null)
-      void workspace.sendMessage(text, selectedFiles, undefined, { target: { kind: 'work', work_id: workId }, intent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !workspace.isCurrent()) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: saved.target.task_id } }) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setInput((current) => current === text ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
+      void workspace.sendMessage(text, selectedFiles, undefined, { target: { kind: 'work', work_id: workId }, intent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !workspace.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: saved.target.task_id } }) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setInput((current) => current === text ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}><InlineError error={sendError} /></PromptInput></div> : null}
   </aside>
   </div>

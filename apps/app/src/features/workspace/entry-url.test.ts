@@ -840,8 +840,9 @@ test("workspace preserves bot and message requests while routing native decision
       }
       mobile()
       let routine: string | undefined
+      const nativeNavigations: string[] = []
       const chat = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
-        'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: botA.bot_id, routine }) },
+        'expo-router': { Stack: { Screen: 'Screen' }, router: { push: (target: string) => { nativeNavigations.push(target) } }, useLocalSearchParams: () => ({ botId: botA.bot_id, routine }) },
         '@vibeface/client/lib/node.ts': { messageOf },
         '@/platform': { mobilePlatform: { storage: browser.localStorage } },
         'expo-router/react-navigation': { useHeaderHeight: () => 0 },
@@ -984,6 +985,11 @@ test("workspace preserves bot and message requests while routing native decision
         chat.render('default'); chat.render('default')
         sendDraft(); sendDraft(); await settleComponent()
         assert.equal(mainSaves.length, optionStart + 3, 'changing only target saves a distinct input with the same text and attachment')
+        const selectTarget = chat.render('default').find(({ type }) => type === 'InputOptions')?.props.onSelect
+        assert.ok(typeof selectTarget === 'function')
+        selectTarget({ key: 'main', label: '主聊天', target: { kind: 'bot_main', bot_id: botA.bot_id } })
+        sendDraft(); sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, optionStart + 4, 'changing only target with an unchanged intent preserves a separate input identity')
         changeIntent('defer'); chat.render('default')
         changingOptions.resolve(new Uint8Array([13, 14, 15]).buffer)
         await Promise.all(mainSaves.slice(optionStart)); await settleComponent(); mobile()
@@ -992,16 +998,37 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(storedDraft(), '切换目标和发送方式仍是独立输入')
         assert.equal(chat.render('default').find(({ type }) => type === 'InputOptions')?.props.intent, 'defer', 'earlier completion cannot reset the current send intent')
         const optionMainTarget = { kind: 'bot_main', bot_id: botA.bot_id }, optionRoutineTarget = { kind: 'routine', bot_id: botA.bot_id, trigger: routine }
-        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionMainTarget, 'defer'], [optionRoutineTarget, 'continue']].map(value => JSON.stringify(value)).sort())
+        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionMainTarget, 'defer'], [optionRoutineTarget, 'continue'], [optionMainTarget, 'continue']].map(value => JSON.stringify(value)).sort())
         sendDraft(); await mainSaves.at(-1); await settleComponent(); mobile()
-        assert.equal(mainSaves.length, optionStart + 4)
+        assert.equal(mainSaves.length, optionStart + 5)
         assert.equal(composer()?.value, '')
         assert.equal(storedDraft(), '', 'the matching target and intent still clear after durable acceptance')
-        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionMainTarget, 'defer'], [optionRoutineTarget, 'continue'], [optionRoutineTarget, 'defer']].map(value => JSON.stringify(value)).sort())
-        assert.equal(new Set(messages.slice(optionMessages).map(message => message.message_id)).size, 4)
+        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionMainTarget, 'defer'], [optionRoutineTarget, 'continue'], [optionMainTarget, 'continue'], [optionMainTarget, 'defer']].map(value => JSON.stringify(value)).sort())
+        assert.equal(new Set(messages.slice(optionMessages).map(message => message.message_id)).size, 5)
         routine = undefined
         chat.render('default'); chat.render('default')
         mainActions.send = originalMainSend
+        for (const change of ['text', 'intent', 'unchanged']) {
+          const actions = mobile().actions, original = actions.send, accepted = deferred(), before = nativeNavigations.length
+          let saving = Promise.resolve()
+          actions.send = (_id, text, _files, options) => {
+            assert.ok(options)
+            saving = accepted.promise.then(() => { options.onSaved?.({ message_id: 'native-saved', conversation_id: 'chat', target: { kind: 'task', task_id: 'native-created-task' }, intent: 'continue', expected_revision: 1, sequence: 1, text, attachments: [], created_at_ms: 1, delivery: 'saved' }) })
+            return saving
+          }
+          try {
+            const onIntent = chat.render('default').find(({ type }) => type === 'InputOptions')?.props.onIntent
+            assert.ok(typeof onIntent === 'function'); onIntent('new_task')
+            composer()?.onChange?.(`手机新任务 ${change}`); sendDraft()
+            if (change === 'text') composer()?.onChange?.('手机仍在编辑')
+            if (change === 'intent') onIntent('continue')
+            chat.render('default')
+            accepted.resolve(undefined); await saving; await settleComponent()
+            assert.equal(nativeNavigations.length, before + (change === 'unchanged' ? 1 : 0), 'native Main only navigates for its unchanged submitted draft')
+            assert.equal(composer()?.value, change === 'unchanged' ? '' : change === 'text' ? '手机仍在编辑' : `手机新任务 ${change}`)
+            if (change === 'unchanged') assert.equal(nativeNavigations.at(-1), '/task/native-created-task')
+          } finally { actions.send = original }
+        }
 
         await render().refresh()
         assert.deepEqual(acknowledgements.slice(ackBefore), ['native-a'])
@@ -1816,6 +1843,8 @@ test('composers save each pending draft once and let edited drafts save independ
     { name: 'web Work', path: './task-detail.tsx', component: 'TaskDetail', native: false, privateExport: '', props: { botId: 'bot', workId: 'work' } },
     { name: 'native Scoped', path: '../../../../../apps/mobile/src/features/workspace/workspace.tsx', component: 'ScopedWorkspaceScreen', native: true, privateExport: '', props: { channelId: 'channel' } },
     { name: 'native Work', path: '../../../../../apps/mobile/app/b/[botId]/work/[workId].tsx', component: 'TaskDetail', native: true, privateExport: 'TaskDetail', props: { botId: 'bot', workId: 'work' } },
+    { name: 'web Scoped Task', path: './workspace-chat.tsx', component: 'ScopedConversation', native: false, privateExport: 'ScopedConversation', props: { target: { kind: 'task', task_id: 'task' }, conversationId: 'chat', label: '项目 Bot' } },
+    { name: 'native Scoped Task', path: '../../../../../apps/mobile/src/features/workspace/workspace.tsx', component: 'ScopedWorkspaceScreen', native: true, privateExport: '', props: { taskId: 'task' } },
   ]
   for (const example of cases) await t.test(example.name, async () => {
     type ReadableFile = { name: string; arrayBuffer: () => Promise<ArrayBuffer> }
@@ -1823,9 +1852,10 @@ test('composers save each pending draft once and let edited drafts save independ
     const read = async (name: string) => { const held = reads.get(name); assert.ok(held); const buffer = await held.promise; assert.ok(buffer instanceof ArrayBuffer); return buffer }
     const attempts: { text: string; files: string[]; target: InputTarget; intent: string | undefined }[] = []
     const saved: { text: string; attachments: { name: string; bytes: number[] }[] }[] = [], saves: Promise<boolean>[] = []
+    const navigations: unknown[] = []
     const domain: WorkspaceDomainState = {
       channels: [{ channel_id: 'channel', title: '频道', purpose: '', members: ['bot'], coordinator_bot: 'bot', coordinator_node: 'worker', revision: 1, owner_epoch: 1, event_hash: 'channel-event', created_at_ms: 1 }],
-      tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false },
+      tasks: [{ task_id: 'task', root_task_id: 'task', owner_bot: 'bot', title: '任务', request: '交代', expected_result: '结果', source_events: [], dependencies: [], reply_only: false, revision: 1, action: 'continue', request_event: 'request', event_hash: 'task-event', created_at_ms: 1, updated_at_ms: 1, state: 'running' }], assignments: [], inputs: [], coverage: { limit: 128, truncated: false },
     }
     const shared = {
       ...parityShared(), data: parseConversation({ ...context, works: [parityWork()] }), workspaceState: domain,
@@ -1834,7 +1864,12 @@ test('composers save each pending draft once and let edited drafts save independ
       readWorkspaceState: async () => domain, readWorkspaceHistory: async () => ({ events: [], coverage: { limit: 128, truncated: false, scope: 'channel' } }),
       sendMessage: (text: string, files: ReadableFile[], _sent: unknown, options: InputOptions) => {
         attempts.push({ text, files: files.map((file) => file.name), target: options.target, intent: options.intent })
-        const save = Promise.all(files.map(async (file) => ({ name: file.name, bytes: Array.from(new Uint8Array(await file.arrayBuffer())) }))).then((attachments) => { saved.push({ text, attachments }); return true })
+        const taskId = `created-task-${attempts.length}`
+        const save = Promise.all(files.map(async (file) => ({ name: file.name, bytes: Array.from(new Uint8Array(await file.arrayBuffer())) }))).then((attachments) => {
+          saved.push({ text, attachments })
+          if (options.intent === 'new_task') options.onSaved?.({ message_id: `input-${taskId}`, conversation_id: 'chat', target: { kind: 'task', task_id: taskId }, intent: 'continue', expected_revision: 1, sequence: attempts.length, text, attachments: [], created_at_ms: 1, delivery: 'saved' })
+          return true
+        })
         saves.push(save)
         return save
       },
@@ -1848,7 +1883,8 @@ test('composers save each pending draft once and let edited drafts save independ
       '@vibeface/client/chat/protocol.ts': { inputTargetKey, awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters },
       '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) },
       '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
-      'expo-router': { Stack: { Screen: 'Screen' }, router: { push() {} }, useRouter: () => ({ push() {}, back() {} }) },
+      '@tanstack/react-router': { useNavigate: () => (target: unknown) => { navigations.push(target) } },
+      'expo-router': { Stack: { Screen: 'Screen' }, router: { push: (target: unknown) => { navigations.push(target) } }, useRouter: () => ({ push: (target: unknown) => { navigations.push(target) }, back() {} }) },
       'expo-file-system': { File: class { uri: string; constructor(uri: string) { this.uri = uri } arrayBuffer() { return read(this.uri.split('/').at(-1) ?? '') } } },
       'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) },
       '@/lib/use-run': { useRun: () => ({ busy: null, error: '', run: async (_key: string, action: () => Promise<void>) => action() }) },
@@ -1888,7 +1924,7 @@ test('composers save each pending draft once and let edited drafts save independ
       assert.deepEqual(saved, [
         { text: '第一份草稿', attachments: [{ name: 'first.txt', bytes: [1, 2, 3] }] }, { text: '第二份草稿', attachments: [{ name: 'later.txt', bytes: [4, 5, 6] }] }, { text: '第二份草稿', attachments: [{ name: 'later.txt', bytes: [4, 5, 6] }] },
       ])
-      const target = example.name === 'web Main' ? { kind: 'bot_main', bot_id: 'bot' } : example.component.includes('Scoped') ? { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' } : { kind: 'work', work_id: 'work' }
+      const target = example.name.endsWith('Task') ? { kind: 'task', task_id: 'task' } : example.name === 'web Main' ? { kind: 'bot_main', bot_id: 'bot' } : example.component.includes('Scoped') ? { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' } : { kind: 'work', work_id: 'work' }
       assert.deepEqual(JSON.parse(JSON.stringify(attempts.map((item) => item.target))), [target, target, target])
       const failed = pendingResult(); reads.set('retry.txt', failed)
       composer().onChange?.('原样重试'); const retryFiles = attach('retry.txt'); submit()
@@ -1899,6 +1935,21 @@ test('composers save each pending draft once and let edited drafts save independ
       retry.resolve(new Uint8Array([7, 8, 9]).buffer); await saves[4]; await settleComponent()
       assert.equal(composer().value, '')
       assert.deepEqual(saved.at(-1), { text: '原样重试', attachments: [{ name: 'retry.txt', bytes: [7, 8, 9] }] })
+      if (!example.name.endsWith('Scoped')) for (const change of ['text', 'intent', 'unchanged']) {
+        const before = navigations.length, taskId: string = `created-task-${attempts.length + 1}`, name = `navigate-${change}.txt`
+        const held = pendingResult(); reads.set(name, held)
+        changeIntent(example.native ? 'new_task' : { currentTarget: { value: 'new_task' } })
+        composer().onChange?.(`新任务 ${change}`); attach(name); submit()
+        if (change === 'text') composer().onChange?.('当前正在编辑的正文')
+        if (change === 'intent') changeIntent(example.native ? 'continue' : { currentTarget: { value: 'continue' } })
+        render()
+        held.resolve(new Uint8Array([10, 11, 12]).buffer); await saves.at(-1); await settleComponent()
+        assert.equal(navigations.length, before + (change === 'unchanged' ? 1 : 0), 'only the unchanged submitted draft can navigate after local acceptance')
+        if (change === 'unchanged') {
+          assert.deepEqual(JSON.parse(JSON.stringify(navigations.at(-1))), example.native ? `/task/${taskId}` : { to: '/tasks/$taskId', params: { taskId } })
+          assert.equal(composer().value, '')
+        } else assert.equal(composer().value, change === 'text' ? '当前正在编辑的正文' : `新任务 ${change}`, 'late navigation cannot discard the active draft')
+      }
     } finally {
       for (const held of reads.values()) held.resolve(new ArrayBuffer(0))
       await Promise.allSettled(saves)

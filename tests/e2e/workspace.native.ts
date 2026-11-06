@@ -248,6 +248,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
       expect(await network.call({ op: 'workspace_release', gate: 'main' })).toEqual({ released: 'main' });
       await expect.poll(async () => (await inspect()).turns.find(row => row.thread === main.thread)?.state, { timeout: 30000 }).toBe('completed');
       await expect(screen.getByRole('button', '停止', { exact: true, visible: true })).toHaveCount(0);
+      await expect(screen.getByRole('button', '发送', { exact: true, visible: true })).toBeVisible({ timeout: 30000 });
       await expect(olderMarker).toBeVisible();
       await expect.poll(async () => {
         const afterReply = await olderMarker.boundingBox();
