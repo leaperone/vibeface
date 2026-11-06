@@ -424,15 +424,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_codex_sub_agent_thread_is_refused_before_anything_is_registered() -> Result<()> {
-        let dir =
-            std::path::PathBuf::from(format!("/tmp/vf-cli-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir)?;
-        let socket = dir.join("app.sock");
-        let listener = tokio::net::UnixListener::bind(&socket)?;
+        let dir = vibeface_bridge::platform::ipc::runtime_dir(
+            &uuid::Uuid::new_v4().simple().to_string(),
+        )?;
+        vibeface_bridge::platform::privatefs::create_dir(&dir)?;
+        let socket = vibeface_bridge::platform::ipc::Endpoint::in_private_dir(&dir, "app.sock")?;
+        let mut listener = vibeface_bridge::platform::ipc::Listener::bind(&socket).await?;
         let methods = Arc::new(Mutex::new(vec![]));
         let seen = methods.clone();
         tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok(stream) = listener.accept().await {
                 let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
                     continue;
                 };
@@ -467,10 +468,9 @@ mod tests {
             track,
             |_, _| async { Ok(json!({})) },
             |_| async { Ok(Some("codex".to_owned())) },
-            Some(&socket),
+            Some(socket.path()),
         )
         .await;
-        std::fs::remove_dir_all(&dir)?;
         let refused = refused.expect_err("Codex takes no direct input on a sub-agent");
         assert!(
             refused.to_string().contains("parent thread lead"),

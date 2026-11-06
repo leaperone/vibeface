@@ -7,13 +7,13 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{path::Path, time::Duration};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use vibeface_bridge::platform::ipc::{Endpoint, Stream};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const PROTOCOL: u32 = 1;
+/// Names the maintenance endpoint in the message a person reads.
+const LABEL: &str = "the maintenance socket";
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_PACKET: usize = 4 * 1024;
 const DELIVERY_INFO_TIMEOUT_SECS: u64 = 30;
@@ -131,57 +131,15 @@ pub struct MaintenanceResponse {
     pub join: Option<Value>,
 }
 
-/// A successful Acquire response plus the still-open Unix stream. Dropping it releases the
-/// server-side maintenance gate.
+/// A successful Acquire response plus the still-open owner-only stream. Dropping it releases
+/// the server-side maintenance gate.
 #[must_use]
 pub struct Lease {
     pub health: Value,
-    _stream: UnixStream,
+    _stream: Stream,
 }
 
-fn validate_socket(socket: &Path) -> Result<()> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-    ensure!(
-        socket.is_absolute(),
-        "maintenance socket path must be absolute"
-    );
-    let parent = socket
-        .parent()
-        .context("maintenance socket has no parent")?;
-    let parent_metadata = match std::fs::symlink_metadata(parent) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    ensure!(
-        parent_metadata.is_dir()
-            && !parent_metadata.file_type().is_symlink()
-            && parent_metadata.uid() == unsafe { libc::geteuid() }
-            && parent_metadata.permissions().mode() & 0o077 == 0,
-        "maintenance socket parent is not a private directory owned by this user"
-    );
-    let socket_metadata = match std::fs::symlink_metadata(socket) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    ensure!(
-        !socket_metadata.file_type().is_symlink(),
-        "maintenance socket must not be a symlink"
-    );
-    ensure!(
-        socket_metadata.file_type().is_socket(),
-        "maintenance socket path is occupied by another file"
-    );
-    ensure!(
-        socket_metadata.uid() == parent_metadata.uid()
-            && socket_metadata.permissions().mode() & 0o077 == 0,
-        "maintenance socket has unexpected ownership or permissions"
-    );
-    Ok(())
-}
-
-async fn read_response(stream: &mut UnixStream, timeout: Duration) -> Result<MaintenanceResponse> {
+async fn read_response(stream: &mut Stream, timeout: Duration) -> Result<MaintenanceResponse> {
     let mut packet = Zeroizing::new(Vec::new());
     tokio::time::timeout(timeout, async {
         let mut chunk = Zeroizing::new([0_u8; 256]);
@@ -212,7 +170,7 @@ async fn read_response(stream: &mut UnixStream, timeout: Duration) -> Result<Mai
     .context("maintenance socket timed out")?
 }
 
-async fn write_request(stream: &mut UnixStream, command: MaintenanceCommand) -> Result<()> {
+async fn write_request(stream: &mut Stream, command: MaintenanceCommand) -> Result<()> {
     let request = MaintenanceRequest {
         protocol: PROTOCOL,
         command,
@@ -232,21 +190,18 @@ async fn write_request(stream: &mut UnixStream, command: MaintenanceCommand) -> 
 async fn exchange(
     socket: &Path,
     command: MaintenanceCommand,
-) -> Result<(UnixStream, MaintenanceResponse)> {
-    validate_socket(socket)?;
+) -> Result<(Stream, MaintenanceResponse)> {
+    let endpoint = Endpoint::from_path(socket)?;
+    endpoint.ensure_private(LABEL)?;
     let timeout = if matches!(&command, MaintenanceCommand::DeliveryKeyOperation { .. }) {
         DELIVERY_KEY_OPERATION_TIMEOUT
     } else {
         REQUEST_TIMEOUT
     };
-    let mut stream = tokio::time::timeout(REQUEST_TIMEOUT, UnixStream::connect(socket))
+    let mut stream = tokio::time::timeout(REQUEST_TIMEOUT, Stream::connect(&endpoint))
         .await
         .context("maintenance connection timed out")??;
-    let expected_uid = unsafe { libc::geteuid() };
-    ensure!(
-        stream.peer_cred()?.uid() == expected_uid,
-        "maintenance socket requires its local owner"
-    );
+    stream.require_current_account(LABEL)?;
     write_request(&mut stream, command).await?;
     let response = read_response(&mut stream, timeout).await?;
     match response.status {
@@ -292,12 +247,11 @@ pub async fn acquire(socket: &Path) -> Result<Lease> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        net::UnixListener,
         sync::oneshot,
     };
+    use vibeface_bridge::platform::{ipc, ipc::Listener, privatefs};
 
     #[tokio::test]
     async fn request_refuses_acquire_without_dropping_a_lease() {
@@ -314,16 +268,14 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_keeps_the_server_stream_until_drop() -> Result<()> {
-        let directory = Path::new("/tmp").join(format!("vf-m-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&directory)?;
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-        let socket = directory.join("maintenance.sock");
-        let listener = UnixListener::bind(&socket)?;
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+        let directory = ipc::runtime_dir(&uuid::Uuid::new_v4().simple().to_string())?;
+        privatefs::create_dir(&directory)?;
+        let endpoint = Endpoint::in_private_dir(&directory, "maintenance.sock")?;
+        let mut listener = Listener::bind(&endpoint).await?;
         let (ready_tx, ready_rx) = oneshot::channel();
         let (closed_tx, mut closed_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
+            let mut stream = listener.accept().await?;
             let mut request = Vec::new();
             loop {
                 let mut byte = [0_u8; 1];
@@ -349,7 +301,7 @@ mod tests {
             let _ = closed_tx.send(());
             Ok::<_, anyhow::Error>(request)
         });
-        let lease = acquire(&socket).await?;
+        let lease = acquire(endpoint.path()).await?;
         assert_eq!(lease.health["device_id"], "device");
         ready_rx.await?;
         assert!(

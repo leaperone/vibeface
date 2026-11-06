@@ -88,6 +88,59 @@ impl Endpoint {
         &self.display
     }
 
+    /// Refuses an endpoint another account could read, replace, or have put there.
+    ///
+    /// Unix checks the socket and the private directory holding it, because the socket is a
+    /// directory entry another account could swap. Windows has no such entry: the name belongs
+    /// to this account's part of the machine-wide pipe namespace, and the access control list on
+    /// the pipe object itself is checked when [`Stream::connect`] opens it, which is the moment
+    /// a request would otherwise reach the wrong process.
+    pub fn ensure_private(&self, label: &str) -> Result<()> {
+        #[cfg(unix)]
+        {
+            ensure!(self.display.is_absolute(), "{label} path must be absolute");
+            let parent = self
+                .display
+                .parent()
+                .context("a local endpoint has no parent directory")?;
+            let Ok(parent_metadata) = std::fs::symlink_metadata(parent) else {
+                // Nothing is listening yet; the caller reports that as a stopped Node.
+                return Ok(());
+            };
+            ensure!(
+                parent_metadata.is_dir() && !parent_metadata.file_type().is_symlink(),
+                "{label} is not inside a directory"
+            );
+            super::privatefs::ensure_private(parent, &format!("the directory holding {label}"))?;
+            let Ok(metadata) = std::fs::symlink_metadata(&self.display) else {
+                return Ok(());
+            };
+            use std::os::unix::fs::FileTypeExt as _;
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "{label} must not be a symbolic link"
+            );
+            ensure!(
+                metadata.file_type().is_socket(),
+                "{label} is occupied by another file"
+            );
+            ensure!(
+                super::privatefs::same_owner(&self.display, parent)?,
+                "{label} has unexpected ownership"
+            );
+            super::privatefs::ensure_private(&self.display, label)
+        }
+        #[cfg(windows)]
+        {
+            let account = super::winsec::current_user()?.fingerprint();
+            ensure!(
+                self.name.ends_with(&format!("-{account}")),
+                "{label} is not in this account's part of the local pipe namespace"
+            );
+            Ok(())
+        }
+    }
+
     /// Whether something already holds this endpoint. A `true` answer does not prove the holder
     /// is this Node, which is why [`Stream::connect`] still checks the owner.
     pub fn is_held(&self) -> bool {
