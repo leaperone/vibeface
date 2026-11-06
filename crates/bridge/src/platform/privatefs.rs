@@ -5,6 +5,9 @@
 //! protected access control list whose only entry names the token user. Neither family has a
 //! permissive fallback: a location that cannot carry the guarantee, such as a volume without
 //! access control, is refused rather than accepted.
+//!
+//! Every open here refuses a link at the final component, so a link planted in place of a
+//! private file cannot redirect a read or a write to somewhere this account does not control.
 
 use anyhow::{Context, Result, bail, ensure};
 use std::{
@@ -166,6 +169,7 @@ pub fn create_new(path: &Path) -> io::Result<File> {
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
     }
     #[cfg(windows)]
@@ -185,6 +189,7 @@ pub fn create_or_truncate(path: &Path) -> io::Result<File> {
             .create(true)
             .truncate(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
     }
     #[cfg(windows)]
@@ -204,11 +209,51 @@ pub fn open_or_create(path: &Path) -> io::Result<File> {
             .write(true)
             .create(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
     }
     #[cfg(windows)]
     {
         super::winsec::create_private_file(path, super::winsec::Disposition::Keep)
+    }
+}
+
+/// What the filesystem calls this very file, which a copy or a restore from a backup does not
+/// carry over. Unix uses the inode number, Windows the volume and file identifier.
+pub fn file_identity(path: &Path) -> io::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(std::fs::metadata(path)?.ino().to_string())
+    }
+    #[cfg(windows)]
+    {
+        super::winsec::file_identity(path)
+    }
+}
+
+/// Opens a private file that every write extends, creating it when absent. The log does this so
+/// a rotated file keeps what it already holds.
+pub fn append_or_create(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(windows)]
+    {
+        // Give the file its owner-only access control list when it is absent, then reopen it in
+        // append mode so each write lands at the end even while another writer holds it.
+        drop(super::winsec::create_private_file(
+            path,
+            super::winsec::Disposition::Keep,
+        )?);
+        std::fs::OpenOptions::new().append(true).open(path)
     }
 }
 

@@ -8,7 +8,6 @@ use std::{
     collections::{HashMap, VecDeque},
     fs,
     io::{BufRead, Write},
-    os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -178,11 +177,7 @@ fn path(dir: &Path, index: usize) -> PathBuf {
 }
 
 fn open(path: &Path) -> std::io::Result<fs::File> {
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
+    vibeface_bridge::platform::privatefs::append_or_create(path)
 }
 
 struct Rotating {

@@ -4,10 +4,11 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
+use vibeface_bridge::platform::privatefs;
 use vibeface_delivery::hash;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,15 +65,10 @@ fn private_directory(path: &Path) -> Result<()> {
     crate::config::private_dir(path)
 }
 fn open_file(path: &Path, write: bool, create: bool) -> Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(write)
-        .create(create)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW);
-    let file = options.open(path)?;
+    let file = match (write, create) {
+        (true, true) => privatefs::open_or_create(path)?,
+        (true, false) | (false, _) => privatefs::open_no_follow(path)?,
+    };
     ensure!(
         file.metadata()?.is_file(),
         "service object is not a regular file"

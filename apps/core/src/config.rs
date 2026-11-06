@@ -6,6 +6,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
 };
+use vibeface_bridge::platform::privatefs;
 
 /// Bumped whenever stored data stops being readable by the previous build.
 pub use vibeface_control::DATA_EPOCH;
@@ -320,31 +321,10 @@ pub fn http_origin(value: &str) -> Result<reqwest::Url> {
 }
 pub fn private_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    privatefs::restrict_dir(path)
 }
 pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(temp, path)?;
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
-    Ok(())
+    privatefs::write_atomic(path, bytes)
 }
 pub fn identity(dir: &Path) -> Result<LocalIdentity> {
     serde_json::from_slice(
@@ -353,14 +333,7 @@ pub fn identity(dir: &Path) -> Result<LocalIdentity> {
     .context("invalid local identity")
 }
 pub fn lock_data_dir(dir: &Path) -> Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let lock = options.open(dir.join("node.lock"))?;
+    let lock = privatefs::open_or_create(&dir.join("node.lock"))?;
     lock.try_lock().context(
         "stop the Node using this data directory before changing its local pairing state",
     )?;

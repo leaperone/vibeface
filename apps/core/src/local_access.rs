@@ -63,14 +63,7 @@ impl LocalAccess {
             metadata.is_dir() && !metadata.file_type().is_symlink(),
             "local access requires a private data directory"
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            ensure!(
-                metadata.permissions().mode() & 0o077 == 0,
-                "local access directory must be private"
-            );
-        }
+        vibeface_bridge::platform::privatefs::ensure_private(dir, "the local access directory")?;
         let (changes, _) = watch::channel(0);
         let sessions = match std::fs::read(dir.join(SESSIONS_FILE)) {
             Ok(bytes) => serde_json::from_slice::<HashMap<String, LocalSession>>(&bytes)

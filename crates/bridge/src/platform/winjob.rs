@@ -266,6 +266,22 @@ impl std::str::FromStr for Record {
     }
 }
 
+/// Whether `process` is still running. A process this account cannot open reads as running,
+/// because the caller uses the answer to decide whether to refuse rather than to end anything.
+pub fn process_is_running(process: u32) -> bool {
+    use windows_sys::Win32::{Foundation::STATUS_PENDING, System::Threading::GetExitCodeProcess};
+    let Ok(handle) = open_for_query(process) else {
+        return io::Error::last_os_error().raw_os_error()
+            != Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32);
+    };
+    let mut status = 0_u32;
+    // SAFETY: the handle is open and the status is a live local.
+    if unsafe { GetExitCodeProcess(handle.0, &mut status) } == 0 {
+        return true;
+    }
+    status == STATUS_PENDING as u32
+}
+
 fn open_for_query(process: u32) -> Result<Owned> {
     // SAFETY: the call only looks up a process id and reports failure through the return value.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process) };

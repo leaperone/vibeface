@@ -15,12 +15,13 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    fs::{self, OpenOptions},
-    io::{Read, Write},
+    fs,
+    io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
 };
+use vibeface_bridge::platform::{clock, privatefs, program};
 
 pub const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4790);
 
@@ -215,14 +216,7 @@ async fn access(data_dir: &Path) -> Result<Value> {
             metadata.is_file() && !metadata.file_type().is_symlink(),
             "local launcher credential must be a private regular file"
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            ensure!(
-                metadata.permissions().mode() & 0o077 == 0,
-                "local launcher credential must be private"
-            );
-        }
+        privatefs::ensure_private(&path, "the local launcher credential")?;
         let launcher: Launcher = serde_json::from_slice(&read_bounded(&path, 4096)?)?;
         let mut url = config::http_origin(&launcher.origin)?;
         ensure!(
@@ -550,20 +544,7 @@ fn check_ports(
 }
 
 fn create_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path).context("create new private node file")?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    if let Some(parent) = path.parent() {
-        fs::File::open(parent)?.sync_all()?;
-    }
-    Ok(())
+    privatefs::create_durable(path, bytes).context("create new private node file")
 }
 
 pub fn restart_fresh(dir: &Path) -> Result<()> {
@@ -580,11 +561,11 @@ pub fn restart_fresh(dir: &Path) -> Result<()> {
             "removed Node data could not be set aside"
         ),
     }
-    use std::os::unix::process::CommandExt;
-    let error = std::process::Command::new(std::env::current_exe()?)
-        .args(std::env::args_os().skip(1))
-        .exec();
-    Err(error).context("restart the Node")
+    Err(program::become_program(
+        &std::env::current_exe()?,
+        std::env::args_os().skip(1),
+    ))
+    .context("restart the Node")
 }
 
 fn start_over(dir: &Path) -> Result<PathBuf> {
@@ -599,7 +580,7 @@ fn start_over(dir: &Path) -> Result<PathBuf> {
         .file_name()
         .context("data directory has no name")?
         .to_string_lossy();
-    let stamp = local_time_stamp();
+    let stamp = clock::local_stamp();
     let archive = dir.with_file_name(format!("{name}-removed-{stamp}"));
     let fresh = dir.with_file_name(format!(".{name}-fresh-{stamp}"));
     ensure!(
@@ -617,22 +598,6 @@ fn start_over(dir: &Path) -> Result<PathBuf> {
         return Err(error.into());
     }
     Ok(archive)
-}
-
-fn local_time_stamp() -> String {
-    let mut buffer = [0u8; 32];
-    let written = unsafe {
-        let now = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&now, &mut tm);
-        libc::strftime(
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            c"%Y%m%d-%H%M%S".as_ptr(),
-            &tm,
-        )
-    };
-    String::from_utf8_lossy(&buffer[..written]).into_owned()
 }
 
 #[cfg(test)]

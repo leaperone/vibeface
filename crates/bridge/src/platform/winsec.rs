@@ -698,6 +698,25 @@ fn from_handle(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<Fil
     Ok(unsafe { File::from_raw_handle(handle.cast()) })
 }
 
+/// The volume and file identifier Windows keeps for this file, which a copy or a restore from a
+/// backup does not carry over.
+pub fn file_identity(path: &Path) -> io::Result<String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let file = File::open(path)?;
+    // SAFETY: the handle is open and the information buffer is a live local.
+    let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    // SAFETY: as above.
+    if unsafe { GetFileInformationByHandle(as_handle(&file), &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(format!(
+        "{:x}:{:x}{:08x}",
+        information.dwVolumeSerialNumber, information.nFileIndexHigh, information.nFileIndexLow
+    ))
+}
+
 fn refuse_reparse_point(file: &File) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,

@@ -17,6 +17,9 @@ const GRACE: Duration = Duration::from_secs(3);
 pub struct Tree {
     /// The record a journal stores so a later run can find the same tree.
     token: String,
+    /// The process at the root of the tree, reported where a coordinator records which process
+    /// it started. Only ever compared or asked about, never signalled on its own.
+    root: u32,
     #[cfg(unix)]
     group: i32,
     #[cfg(windows)]
@@ -45,6 +48,7 @@ impl Tree {
             Ok((
                 Self {
                     token: group.to_string(),
+                    root: group as u32,
                     group,
                 },
                 child,
@@ -72,6 +76,7 @@ impl Tree {
                 Ok(token) => Ok((
                     Self {
                         token,
+                        root: id,
                         job: Some(job),
                     },
                     child,
@@ -90,6 +95,11 @@ impl Tree {
     /// the same tree after a crash.
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// The process at the root of the tree.
+    pub fn root(&self) -> u32 {
+        self.root
     }
 
     /// Whether any member of the tree is still running.
@@ -117,6 +127,21 @@ impl Tree {
         {
             if let Some(job) = self.job.take() {
                 job.terminate();
+            }
+        }
+    }
+
+    /// Asks the tree to stop and returns at once, for a caller that awaits the root itself and
+    /// ends what is left with [`Tree::kill`].
+    pub fn ask_to_stop(&self) {
+        #[cfg(unix)]
+        {
+            signal_group(self.group, libc::SIGTERM);
+        }
+        #[cfg(windows)]
+        {
+            if let Some(job) = self.job.as_ref() {
+                job.request_stop();
             }
         }
     }
@@ -236,6 +261,7 @@ impl Leftover {
         {
             let mut tree = Tree {
                 token: self.group.to_string(),
+                root: self.group as u32,
                 group: self.group,
             };
             tree.stop();
@@ -261,6 +287,28 @@ fn signal_group(group: i32, signal: i32) -> bool {
     }
     // SAFETY: kill(2) with a negative pid signals one process group and touches no memory.
     unsafe { libc::kill(-group, signal) == 0 }
+}
+
+/// Whether the process the scheduler recorded as the root of a coordination tree could still be
+/// running. Nothing is signalled or ended here.
+///
+/// The answer leans towards "still running": a reused identifier, or a process this account may
+/// not query, reads as alive. Every caller uses this to decide whether to refuse an action, so
+/// leaning that way keeps a stale record from closing out work that is still going.
+pub fn root_is_running(process: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(group) = libc::pid_t::try_from(process) else {
+            return false;
+        };
+        // SAFETY: kill with signal 0 performs only the existence and permission check.
+        let result = unsafe { libc::kill(-group, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(windows)]
+    {
+        super::winjob::process_is_running(process)
+    }
 }
 
 /// Whether a tree recorded under `token` could still be running, used where the Node only needs

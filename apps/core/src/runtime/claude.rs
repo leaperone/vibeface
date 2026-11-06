@@ -17,8 +17,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use vibeface_bridge::failure::ProviderStage;
+use vibeface_bridge::platform::tree;
 use vibeface_bridge::{
     agent::{self, AgentResult},
     failure::{ExecFailure, FailureKind},
@@ -34,12 +35,18 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(10);
 /// Seeds of the IDs a work's session and user message get from the work ID.
 const SESSION_SEED: &str = "claude-session:";
 const MESSAGE_SEED: &str = "claude-user:";
+/// Names a turn's process tree in this account's job object namespace.
+const TREE_KEY: &str = "claude-turn";
 
-/// The process groups of running agent processes, by the program each one runs. The pidfile
+/// The process trees of running agent processes, by the program each one runs. The pidfile
 /// lists them, so a Node that could not end them ends them when it starts again.
+///
+/// A tree is keyed by the record the platform needs to find it again, not by a bare process
+/// identifier, so a tree whose identifier the operating system has since handed to something
+/// else is never acted on.
 pub struct Processes {
     pidfile: PathBuf,
-    running: std::sync::Mutex<BTreeMap<u32, PathBuf>>,
+    running: std::sync::Mutex<BTreeMap<String, PathBuf>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -107,28 +114,49 @@ impl Processes {
         .await;
     }
 
-    pub(super) fn track(&self, group: u32, bin: &Path) -> Result<()> {
+    pub(super) fn track(&self, token: &str, bin: &Path) -> Result<()> {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
-        running.insert(group, bin.to_owned());
-        self.save(&running)
-            .context("record the agent process group")
+        running.insert(token.to_owned(), bin.to_owned());
+        self.save(&running).context("record the agent process tree")
     }
 
-    pub(super) fn forget(&self, group: u32) {
+    pub(super) fn forget(&self, token: &str) {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
-        if running.remove(&group).is_some() {
+        if running.remove(token).is_some() {
             let _ = self.save(&running);
         }
     }
 
-    pub(super) fn tracked(&self, group: u32) -> bool {
+    pub(super) fn tracked(&self, token: &str) -> bool {
         self.running
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(&group)
+            .contains_key(token)
     }
 
-    fn save(&self, running: &BTreeMap<u32, PathBuf>) -> Result<()> {
+    /// Ends a tree this Node run recorded, once the programs still in it are the ones it
+    /// started. A tree that is gone, or whose identifier now belongs to something else, is
+    /// left alone.
+    pub(super) fn stop_tracked(&self, token: &str) {
+        let bin = self
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(token)
+            .cloned();
+        let Some(bin) = bin else {
+            return;
+        };
+        if let Err(error) = tree::stop_recorded(token, |member| tree::names_program(member, &bin)) {
+            tracing::warn!(
+                event = "claude.tree_left_alone",
+                %error,
+                "the interrupted Claude Code tree was left alone"
+            );
+        }
+    }
+
+    fn save(&self, running: &BTreeMap<String, PathBuf>) -> Result<()> {
         if running.is_empty() {
             return match std::fs::remove_file(&self.pidfile) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
@@ -137,7 +165,7 @@ impl Processes {
         }
         let lines: String = running
             .iter()
-            .map(|(group, bin)| format!("{group} {}\n", bin.display()))
+            .map(|(token, bin)| format!("{token} {}\n", bin.display()))
             .collect();
         config::private_write(&self.pidfile, lines.as_bytes())
     }
@@ -504,7 +532,7 @@ struct Launch<'a> {
 /// A running `claude -p`: its pipes and process group.
 struct Process {
     child: Child,
-    group: u32,
+    tree: tree::Tree,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     lines: Lines<BufReader<ChildStdout>>,
     /// The end of what it wrote to stderr, once it closed it.
@@ -513,7 +541,7 @@ struct Process {
 
 impl Launch<'_> {
     fn spawn(&self) -> Result<Process, ExecFailure> {
-        let mut command = Command::new(self.bin);
+        let mut command = std::process::Command::new(self.bin);
         command
             .args(["-p", "--input-format", "stream-json", "--output-format"])
             .args([
@@ -552,22 +580,20 @@ impl Launch<'_> {
             .current_dir(self.cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .process_group(0)
-            .kill_on_drop(true);
-        let mut child = command.spawn().map_err(|error| {
-            let kind = match error.kind() {
-                std::io::ErrorKind::NotFound => FailureKind::MissingBinary,
+            .stderr(std::process::Stdio::piped());
+        let (tree, mut child) = tree::Tree::spawn(command, TREE_KEY, true).map_err(|error| {
+            let kind = match error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind)
+            {
+                Some(std::io::ErrorKind::NotFound) => FailureKind::MissingBinary,
                 _ => FailureKind::Unknown,
             };
-            ExecFailure::new(kind, format!("could not start Claude Code: {error}"))
+            ExecFailure::new(kind, format!("could not start Claude Code: {error:#}"))
         })?;
-        let (Some(group), Some(stdin), Some(stdout), Some(stderr)) = (
-            child.id(),
-            child.stdin.take(),
-            child.stdout.take(),
-            child.stderr.take(),
-        ) else {
+        let (Some(stdin), Some(stdout), Some(stderr)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
             return Err(ExecFailure::new(
                 FailureKind::Lost,
                 "Claude Code exited as it started",
@@ -585,7 +611,7 @@ impl Launch<'_> {
         });
         Ok(Process {
             child,
-            group,
+            tree,
             stdin: Arc::new(Mutex::new(Some(stdin))),
             lines: BufReader::new(stdout).lines(),
             stderr: Some(stderr),
@@ -628,15 +654,15 @@ impl Process {
         })
         .await
         .unwrap_or(false);
-        agent::terminate_process_group(&mut self.child, self.group).await || ended
+        agent::terminate_process_tree(&mut self.child, &mut self.tree).await || ended
     }
 
-    /// Closes its input, so it exits once its turn is done, and ends its group.
+    /// Closes its input, so it exits once its turn is done, and ends its tree.
     async fn end(&mut self, processes: &Processes) {
         self.stdin.lock().await.take();
         let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
-        if agent::terminate_process_group(&mut self.child, self.group).await {
-            processes.forget(self.group);
+        if agent::terminate_process_tree(&mut self.child, &mut self.tree).await {
+            processes.forget(self.tree.token());
         }
     }
 
@@ -786,9 +812,9 @@ where
         .map_err(|failure| error(ManagerFailure::Failed, native, failure))?;
     let sent = async {
         stage.enter(ProviderStage::Record);
-        processes.track(process.group, bin)?;
+        processes.track(process.tree.token(), bin)?;
         if let Some(started) = &config.process_started {
-            started(process.group).await?;
+            started(process.tree.root()).await?;
         }
         stage.enter(ProviderStage::TurnStart);
         *start.lock().unwrap() = manager::StartEvidence::Unknown;
@@ -937,7 +963,9 @@ impl Drop for Claim<'_> {
 struct Live {
     session: String,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
-    group: u32,
+    /// The record its process tree is journalled under, so an interrupt that outlives its
+    /// grace period ends that very tree and nothing else.
+    tree: String,
     interrupted: Arc<AtomicBool>,
 }
 
@@ -1065,14 +1093,14 @@ async fn follow(
     }
     process.stdin.lock().await.take();
     let _ = tokio::time::timeout(Duration::from_secs(5), process.child.wait()).await;
-    let stopped = agent::terminate_process_group(&mut process.child, process.group).await;
+    let stopped = agent::terminate_process_tree(&mut process.child, &mut process.tree).await;
     let Some(node) = node.upgrade() else {
         return;
     };
     // From here a probe reads the finished transcript.
     node.claude.live().remove(&work_id);
     if stopped {
-        node.claude.processes.forget(process.group);
+        node.claude.processes.forget(process.tree.token());
     }
     let signals = match turn.ending {
         Some(ending) => vec![Signal::Probed(ending.probe(message))],
@@ -1189,7 +1217,7 @@ impl Executor for Claude {
                 Err(failure) => return reject(failure),
             };
             let sent = async {
-                self.processes.track(process.group, &bin)?;
+                self.processes.track(process.tree.token(), &bin)?;
                 send(&process.stdin, &user_frame(&work.prompt, &message)).await
             }
             .await;
@@ -1206,7 +1234,7 @@ impl Executor for Claude {
                 Live {
                     session: session.clone(),
                     stdin: process.stdin.clone(),
-                    group: process.group,
+                    tree: process.tree.token().to_owned(),
                     interrupted: interrupted.clone(),
                 },
             );
@@ -1255,22 +1283,26 @@ impl Executor for Claude {
 
     fn interrupt<'a>(&'a self, work: &'a WorkRecord) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let (stdin, group, interrupted) = self
+            let (stdin, tree, interrupted) = self
                 .live()
                 .get(&work.work_id)
-                .map(|live| (live.stdin.clone(), live.group, live.interrupted.clone()))
+                .map(|live| {
+                    (
+                        live.stdin.clone(),
+                        live.tree.clone(),
+                        live.interrupted.clone(),
+                    )
+                })
                 .context("this work's Claude Code process is not running")?;
             interrupted.store(true, Ordering::Relaxed);
             send(&stdin, &interrupt_frame()).await?;
-            // A turn that outlives the interrupt ends with its process group.
+            // A turn that outlives the interrupt ends with its process tree.
             let processes = self.processes.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(INTERRUPT_GRACE).await;
-                if processes.tracked(group) {
-                    // SAFETY: kill(2) with a negative pid signals one process group and touches
-                    // no memory; the group is still recorded, so its ID was not reused.
-                    unsafe { libc::kill(-(group as i32), libc::SIGKILL) };
-                }
+                tokio::task::spawn_blocking(move || processes.stop_tracked(&tree))
+                    .await
+                    .ok();
             });
             Ok(())
         })

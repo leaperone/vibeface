@@ -14,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use vibeface_bridge::platform::privatefs;
 
 pub(crate) mod bot_settings;
 pub(crate) mod bots;
@@ -169,7 +170,6 @@ pub(crate) fn version(rank: &str) -> String {
 }
 
 pub(crate) fn private_file_connection(path: &Path) -> Result<Connection> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -179,36 +179,32 @@ pub(crate) fn private_file_connection(path: &Path) -> Result<Connection> {
     }
     let metadata = std::fs::symlink_metadata(parent)?;
     ensure!(
-        metadata.is_dir()
-            && !metadata.file_type().is_symlink()
-            && metadata.permissions().mode() & 0o077 == 0,
-        "database directory must be private and not a symlink"
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "database directory must not be a link"
     );
+    privatefs::ensure_private(parent, "the database directory")?;
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
+            privatefs::is_plain_file(&metadata),
             "database must be a regular file"
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
+            privatefs::create_new(path)?;
         }
         Err(error) => return Err(error.into()),
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    privatefs::restrict_file(path)?;
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut name = path.as_os_str().to_owned();
         name.push(suffix);
+        let name = PathBuf::from(name);
         match std::fs::symlink_metadata(&name) {
             Ok(metadata) => {
                 ensure!(
-                    metadata.is_file() && !metadata.file_type().is_symlink(),
+                    privatefs::is_plain_file(&metadata),
                     "database sidecar must be a regular file"
                 );
-                std::fs::set_permissions(&name, std::fs::Permissions::from_mode(0o600))?;
+                privatefs::restrict_file(&name)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -284,7 +280,7 @@ impl Store {
         let path = path.as_ref();
         let metadata = std::fs::symlink_metadata(path)?;
         ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
+            privatefs::is_plain_file(&metadata),
             "database must be a regular file"
         );
         let connection = Connection::open_with_flags(
@@ -684,17 +680,8 @@ impl Store {
         let parent = path.parent().context("blob path")?;
         std::fs::create_dir_all(parent)?;
         let temporary = parent.join(format!(".{}.{}", expected.hash, uuid::Uuid::new_v4()));
-        {
-            use std::{io::Write, os::unix::fs::OpenOptionsExt};
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temporary)?;
-            file.write_all(content)?;
-            file.sync_all()?;
-        }
-        std::fs::rename(&temporary, &path)?;
+        privatefs::create_durable(&temporary, content)?;
+        privatefs::durable_rename(&temporary, &path)?;
         Ok(())
     }
 
@@ -800,15 +787,17 @@ impl Store {
     /// This database file as the filesystem knows it: inode and creation time. Copying the data
     /// directory or restoring it from a backup writes a new file, so the values change.
     fn file_identity(&self) -> Option<String> {
-        use std::os::unix::fs::MetadataExt as _;
-        let metadata =
-            std::fs::metadata(self.connection.path().filter(|path| !path.is_empty())?).ok()?;
-        let born = metadata
+        let path = self.connection.path().filter(|path| !path.is_empty())?;
+        let born = std::fs::metadata(path)
+            .ok()?
             .created()
             .ok()
             .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |at| at.as_nanos());
-        Some(format!("{}:{born}", metadata.ino()))
+        Some(format!(
+            "{}:{born}",
+            privatefs::file_identity(Path::new(path)).ok()?
+        ))
     }
     /// Whether this Node last wrote from this very file, so it holds everything it wrote.
     pub fn wrote_from_this_file(&self) -> Result<bool> {

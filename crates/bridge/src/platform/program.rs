@@ -56,7 +56,7 @@ pub fn find_on_path(name: &OsStr) -> Option<PathBuf> {
 }
 
 /// Every file name that could be the program `base` names.
-fn candidates(base: &Path) -> Vec<PathBuf> {
+pub fn candidates(base: &Path) -> Vec<PathBuf> {
     #[cfg(unix)]
     {
         vec![base.to_owned()]
@@ -75,7 +75,8 @@ fn candidates(base: &Path) -> Vec<PathBuf> {
     }
 }
 
-fn runnable(path: &Path) -> bool {
+/// Whether `path` names a program this account can start.
+pub fn runnable(path: &Path) -> bool {
     super::privatefs::is_executable(path)
 }
 
