@@ -138,6 +138,8 @@ python3 scripts/verify-node.py --delivery-ui-selfcheck \
   --binary /usr/bin/true --artifacts .artifacts/paid-ui-selfcheck
 ```
 
+深链接验收先等待系统确认或明确的目标界面；出现确认时只点击一次 Open，再要求目标界面可见。验收保留真实安装、配对和系统弹窗操作，不增加测试重试或固定延迟。公开失败诊断只增加预热回退布尔值，以及固定控件是否被报告的 true/null 标记，不上传原始 driver 日志。
+
 ## 重跑 iOS Provider 验收
 
 `mobile.yml` 将构建和验收分成 `ios-build`、`ios-accept`。前者只上传白名单中的 App ZIP、host CLI/Core、Web/WASM 与来源清单，邀请、Node 数据和 driver 状态在后者创建。恢复后核对摘要、执行位、签名、entitlements 和实际安装的 bundle 字节，再执行原来的真实配对与 Provider 测试。构建成功不代表 UI 通过。

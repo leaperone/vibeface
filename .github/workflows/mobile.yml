@@ -259,6 +259,9 @@ jobs:
           stage = stage_path.read_text().strip() if stage_path.exists() else "not_started"
           stages = {"host-source", "host-build", "simulator-create", "typecheck", "selection", "ui-run"}
           diagnostics = {"stage": stage if stage in stages else "not_started", "report": "missing", "failures": []}
+          ui_log = root / "private/ui.log"
+          if ui_log.exists():
+              diagnostics["runner_prepare_fallback_reported"] = "automation runner not prepared" in ui_log.read_text(errors="replace")
           navigation_path = public / "provider-navigation.json"
           if navigation_path.exists():
               try:
@@ -391,6 +394,7 @@ jobs:
                                       ("welcome", None, "连接你的网络"), ("ready", None, "已填入加入链接"),
                                       ("invitation", "textbox", "加入链接"), ("device_name", "textbox", "这台设备的名字"),
                                       ("join", "button", "加入"), ("invalid_link", None, "这不是有效的加入链接"),
+                                      ("add_device", None, "添加设备"), ("open_button", "button", "Open"), ("cancel_button", "button", "Cancel"),
                                       ("spent_link", None, "这条加入链接已用过或已过期。在已有设备上点“添加设备”重新生成。"),
                                   ):
                                       prefix = r"^\s*#\S+ " + (re.escape(role) + " " if role else r"(?:[a-z-]+ )?")

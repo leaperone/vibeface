@@ -9,7 +9,7 @@ import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 import { test as base } from '@e2e-dev/mobile';
-import { expect, secrets } from 'e2e';
+import { expect, secrets, type Locator } from 'e2e';
 
 const root = resolve(import.meta.dirname, '../..');
 const execute = promisify(execFile);
@@ -188,12 +188,14 @@ test('provider settings and queued cancellation work in the installed native app
   await expect(screen.getByLabel(`安全码 ${code.split('').join(' ')}`)).toBeVisible();
   await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
   await expect(screen.getByRole('link', '设置', { exact: true })).toBeVisible({ timeout: 30000 });
-  const openLink = async (url: string) => {
+  const openLink = async (url: string, destination: Locator) => {
     await device.openLink(url);
-    const consent = screen.getByRole('alert', /Open in.*Vibeface/);
+    const consent = screen.getByRole('alert', /Open in.*Vibeface/, { visible: true });
+    await expect(consent.or(destination).first()).toBeVisible();
     if (await consent.isVisible()) await consent.getByRole('button', 'Open', { exact: true }).click();
+    await expect(destination).toBeVisible();
   };
-  await openLink('vibeface://add-device');
+  await openLink('vibeface://add-device', screen.getByRole('button', '关闭', { exact: true, visible: true }));
   await expect(screen.getByText('添加设备', { exact: true }).first()).toBeVisible();
   const clientKind = screen.getByRole('button', '客户端', { exact: true });
   const nodeKind = screen.getByRole('button', '节点', { exact: true });
@@ -439,7 +441,8 @@ test('provider settings and queued cancellation work in the installed native app
   const queue = await network.call({ op: 'native_provider_queue' });
   await assert.rejects(network.call({ op: 'native_provider_queue' }));
   const botId = text(queue.bot_id), runningTrigger = text(queue.running_trigger), queuedTrigger = text(queue.queued_trigger);
-  await openLink(`vibeface://b/${botId}`);
+  const composer = screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/, { visible: true });
+  await openLink(`vibeface://b/${botId}`, composer);
   const cancel = screen.getByRole('button', '取消排队', { exact: true });
   await screen.scrollUntilVisible(cancel, { direction: 'up', timeout: 30000 });
   await cancel.click();
@@ -451,8 +454,8 @@ test('provider settings and queued cancellation work in the installed native app
   const after = await inspect();
   expect(after.running_invocations).toBe(1);
   expect(after.queued_invocations).toBe(0);
-  await openLink('vibeface://settings');
-  await openLink(`vibeface://b/${botId}`);
+  await openLink('vibeface://settings', screen.getByText('我的设备', { exact: true, visible: true }));
+  await openLink(`vibeface://b/${botId}`, composer);
   await expect(screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/)).toBeVisible();
   const reopened = await inspect();
   expect(reopened.jobs).toEqual(after.jobs);
