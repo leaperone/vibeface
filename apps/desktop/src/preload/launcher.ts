@@ -1,29 +1,30 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
+import { IPC, type LauncherApi, type LauncherStatus, type PreferenceKey } from '../shared/contract.js'
 
-export type LauncherApi = {
-  pickDataDir(): Promise<string | null>
-  probeInspect(dataDir: string): Promise<unknown>
-  attach(dataDir: string): Promise<void>
-  startOwned(dataDir: string): Promise<void>
-  stopOwned(): Promise<void>
-  getAccessUrl(): Promise<string | null>
-  openExternal(url: string): Promise<void>
-  onStatus(handler: (state: unknown) => void): () => void
-}
-
+/**
+ * The only privileged bridge in the app, and only the trusted launcher window loads it.
+ * Each method is a fixed channel with fixed arity, so the renderer can never name a
+ * channel, a path outside the directory picker, or a program to run. The main process
+ * re-checks the sender and every payload before it reaches Core.
+ */
 const api: LauncherApi = {
-  pickDataDir: () => ipcRenderer.invoke<string | null>('launcher:pick-data-dir'),
-  probeInspect: (dataDir) => ipcRenderer.invoke<unknown>('launcher:probe-inspect', dataDir),
-  attach: (dataDir) => ipcRenderer.invoke<void>('launcher:attach', dataDir),
-  startOwned: (dataDir) => ipcRenderer.invoke<void>('launcher:start-owned', dataDir),
-  stopOwned: () => ipcRenderer.invoke<void>('launcher:stop-owned'),
-  getAccessUrl: () => ipcRenderer.invoke<string | null>('launcher:get-access-url'),
-  openExternal: (url) => ipcRenderer.invoke<void>('shell:open-external', url),
-  onStatus: (handler) => {
-    const channel = 'launcher:status'
-    const wrapped = (_: unknown, payload: unknown) => handler(payload)
-    ipcRenderer.on(channel, wrapped)
-    return () => ipcRenderer.removeListener(channel, wrapped)
+  getStatus: () => ipcRenderer.invoke(IPC.getStatus),
+  chooseDataDir: () => ipcRenderer.invoke(IPC.chooseDataDir),
+  useDataDir: (dataDir: string) => ipcRenderer.invoke(IPC.useDataDir, String(dataDir)),
+  forgetDataDir: () => ipcRenderer.invoke(IPC.forgetDataDir),
+  startOwned: () => ipcRenderer.invoke(IPC.startOwned),
+  attachExisting: () => ipcRenderer.invoke(IPC.attachExisting),
+  stopOwned: () => ipcRenderer.invoke(IPC.stopOwned),
+  openBusiness: () => ipcRenderer.invoke(IPC.openBusiness),
+  setPreference: (key: PreferenceKey, value: boolean) =>
+    ipcRenderer.invoke(IPC.setPreference, String(key), Boolean(value)),
+  openExternal: (url: string) => ipcRenderer.invoke(IPC.openExternal, String(url)),
+  onStatus: (handler: (status: LauncherStatus) => void) => {
+    const listener = (_event: IpcRendererEvent, status: LauncherStatus) => handler(status)
+    ipcRenderer.on(IPC.status, listener)
+    return () => {
+      ipcRenderer.removeListener(IPC.status, listener)
+    }
   },
 }
 

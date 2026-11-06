@@ -1,46 +1,67 @@
-/** Strict parsing for invite / join deeplinks — no arbitrary protocols or file URIs. */
+/**
+ * Only an invite is accepted from the outside world. A deeplink or a second instance can
+ * never carry a data directory, a runtime path or an executable: this parser returns the
+ * ticket and, at most, the entry origin the invite was published at.
+ *
+ * Shapes, matching `@vibeface/client`'s `joinTicket`: `vibeface1…` alone,
+ * `https://<entry>/join#vibeface1…`, or either inside `vibeface://join?link=…`.
+ */
 
-export type ParsedDeepLink =
-  | { kind: 'join'; link: string }
-  | { kind: 'none' }
-  | { kind: 'invalid'; reason: string }
+export type DeepLink =
+  | { kind: 'join'; ticket: string; origin: string | null }
+  | { kind: 'ignored' }
 
-const JOIN_PATH = '/join'
+const TICKET = /^vibeface1[0-9a-z]+$/
+const MAX_LINK = 4096
 
-function hasVibefaceInviteHash(hash: string): boolean {
-  return hash.startsWith('#vibeface1')
+function joinOrigin(url: URL): string | null {
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
+  if (url.pathname.replace(/\/+$/, '') !== '/join') return null
+  return url.origin
 }
 
-/** `vibeface://join?link=...` — link must be non-empty after trim. */
-function parseVibeface(url: URL): ParsedDeepLink {
-  if (url.protocol !== 'vibeface:') return { kind: 'invalid', reason: 'unsupported protocol' }
-  const host = url.hostname.toLowerCase()
-  if (host !== 'join') return { kind: 'invalid', reason: 'vibeface host must be join' }
-  const link = url.searchParams.get('link')?.trim() ?? ''
-  if (!link) return { kind: 'invalid', reason: 'join link missing' }
-  return { kind: 'join', link }
-}
-
-/** `http(s)://host/join#vibeface1...` */
-function parseWebJoin(url: URL): ParsedDeepLink {
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') return { kind: 'none' }
-  if (!url.pathname.replace(/\/$/, '').endsWith(JOIN_PATH)) return { kind: 'none' }
-  if (!hasVibefaceInviteHash(url.hash)) return { kind: 'none' }
-  return { kind: 'join', link: url.toString() }
-}
-
-export function parseDeepLink(raw: string): ParsedDeepLink {
-  const trimmed = raw.trim()
-  if (!trimmed) return { kind: 'none' }
-  if (trimmed.startsWith('file:')) return { kind: 'invalid', reason: 'file URLs are not allowed' }
+function fromUrl(raw: string, allowWrapper: boolean): DeepLink {
   let url: URL
   try {
-    url = new URL(trimmed)
+    url = new URL(raw)
   } catch {
-    return { kind: 'invalid', reason: 'invalid URL' }
+    return { kind: 'ignored' }
   }
-  if (url.protocol === 'vibeface:') return parseVibeface(url)
-  const web = parseWebJoin(url)
-  if (web.kind !== 'none') return web
-  return { kind: 'none' }
+  if (url.protocol === 'vibeface:') {
+    if (!allowWrapper || url.host !== 'join') return { kind: 'ignored' }
+    const inner = url.searchParams.get('link')?.trim() ?? ''
+    return inner ? parseDeepLink(inner, false) : { kind: 'ignored' }
+  }
+  const origin = joinOrigin(url)
+  if (origin === null) return { kind: 'ignored' }
+  const ticket = url.hash.slice(1)
+  return TICKET.test(ticket) ? { kind: 'join', ticket, origin } : { kind: 'ignored' }
+}
+
+export function parseDeepLink(raw: string, allowWrapper = true): DeepLink {
+  const input = raw.trim()
+  if (!input || input.length > MAX_LINK) return { kind: 'ignored' }
+  if (TICKET.test(input)) return { kind: 'join', ticket: input, origin: null }
+  return fromUrl(input, allowWrapper)
+}
+
+/** Pick the one invite out of a process argv or a second-instance argv. */
+export function deepLinkFromArgv(argv: readonly string[]): DeepLink {
+  for (const argument of argv) {
+    if (typeof argument !== 'string') continue
+    if (argument.startsWith('-')) continue
+    const parsed = parseDeepLink(argument)
+    if (parsed.kind === 'join') return parsed
+  }
+  return { kind: 'ignored' }
+}
+
+/** An invite published at this machine's own Core opens in the desktop window. */
+export function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const host = new URL(origin).hostname.replace(/^\[/, '').replace(/\]$/, '').toLowerCase()
+    return host === 'localhost' || host === '::1' || /^127\.\d+\.\d+\.\d+$/.test(host)
+  } catch {
+    return false
+  }
 }

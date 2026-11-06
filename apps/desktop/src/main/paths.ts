@@ -1,36 +1,55 @@
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { app } from 'electron'
+import type { CoreProgram } from './control-client.js'
+import type { RuntimeState } from '../shared/contract.js'
 
-/** Directory containing vibeface-core, vibeface CLI, web/, etc. */
+/**
+ * A packaged app only ever runs the runtime sealed into its own resources. Development
+ * overrides and test fixtures exist solely for an unpackaged build, so a signed install can
+ * never be pointed at another executable through the environment or a deeplink.
+ */
 export function runtimeRoot(): string {
-  const override = process.env.VIBEFACE_DESKTOP_RUNTIME?.trim()
-  if (override && existsSync(override)) return override
-  if (app.isPackaged && process.resourcesPath) {
-    const packaged = join(process.resourcesPath, 'runtime')
-    if (existsSync(packaged)) return packaged
-  }
-  const devCandidates = [
-    join(process.cwd(), 'fixtures', 'runtime'),
-    join(process.cwd(), 'apps', 'desktop', 'fixtures', 'runtime'),
-  ]
-  for (const path of devCandidates) {
-    if (existsSync(path)) return path
-  }
+  if (app.isPackaged) return join(process.resourcesPath, 'runtime')
+  const override = process.env['VIBEFACE_DESKTOP_RUNTIME']?.trim()
   if (override) return override
-  throw new Error(
-    'set VIBEFACE_DESKTOP_RUNTIME to a directory with vibeface-core and web/, or add apps/desktop/fixtures/runtime'
-  )
+  return join(app.getAppPath(), 'fixtures', 'runtime')
 }
 
 export function coreBinary(): string {
-  const fromEnv = process.env.VIBEFACE_DESKTOP_CORE?.trim()
-  if (fromEnv && existsSync(fromEnv)) return fromEnv
-  const root = runtimeRoot()
-  const base = process.platform === 'win32' ? 'vibeface-core.exe' : 'vibeface-core'
-  return join(root, base)
+  return join(runtimeRoot(), process.platform === 'win32' ? 'vibeface-core.exe' : 'vibeface-core')
 }
 
-export function webRoot(): string {
-  return join(runtimeRoot(), 'web')
+export function cliBinary(): string {
+  return join(runtimeRoot(), process.platform === 'win32' ? 'vibeface.exe' : 'vibeface')
+}
+
+export function runtimeState(): RuntimeState {
+  const corePath = coreBinary()
+  if (existsSync(corePath)) return { kind: 'ready', corePath }
+  return {
+    kind: 'missing',
+    corePath,
+    detail: app.isPackaged
+      ? '这个安装包缺少捆绑的 Core 程序，请重新安装 Vibeface 桌面版。'
+      : '未打包运行时请把 VIBEFACE_DESKTOP_RUNTIME 指向解包后的 CLI 目录。',
+  }
+}
+
+/** One bounded control request: the fixed Core program plus `--control`, nothing caller supplied. */
+export function controlProgram(): CoreProgram {
+  if (!app.isPackaged) {
+    const fake = process.env['VIBEFACE_DESKTOP_FAKE_CONTROL']?.trim()
+    if (fake) return { command: fake, args: ['--control'] }
+  }
+  return { command: coreBinary(), args: ['--control'] }
+}
+
+/** The long-lived owned Core: the fixed program and its own data directory, nothing else. */
+export function serviceProgram(dataDir: string): CoreProgram {
+  if (!app.isPackaged) {
+    const fake = process.env['VIBEFACE_DESKTOP_FAKE_CORE']?.trim()
+    if (fake) return { command: fake, args: ['--data-dir', dataDir] }
+  }
+  return { command: coreBinary(), args: ['--data-dir', dataDir] }
 }

@@ -8,19 +8,6 @@ import { indexedOutbox } from './indexed-outbox'
 import { localPage } from './local-page'
 import { joinTabs } from './tabs'
 
-declare global {
-  interface VibefaceDesktopPreload {
-    notify(payload: { title: string; body: string; tag?: string }): Promise<void>
-    requestShow(): Promise<void>
-    onShow(handler: () => void): () => void
-    onDeepLink(handler: (link: string) => void): () => void
-  }
-  interface Window {
-    /** Narrow Electron preload API when running inside vibeface-desktop business window */
-    vibefaceDesktop?: VibefaceDesktopPreload
-  }
-}
-
 const secure: SecureApi = wasm
 const lostKeyMessage = lostKeyText('这个浏览器')
 const hex = (bytes: ArrayBuffer) => [...new Uint8Array(bytes)].map(value => value.toString(16).padStart(2, '0')).join('')
@@ -89,13 +76,6 @@ const notifier: Notifier = {
   async permission() { return 'Notification' in globalThis ? Notification.permission : 'unsupported' },
   async request() { return 'Notification' in globalThis ? Notification.requestPermission() : 'unsupported' },
   show({ title, body, tag }, open) {
-    const bridge = typeof window !== 'undefined' ? window.vibefaceDesktop : undefined
-    if (bridge) {
-      void bridge.notify({ title, body, tag }).catch(() => {})
-      void bridge.requestShow().catch(() => { window.focus(); open() })
-      const off = bridge.onShow(() => { window.focus(); open(); off() })
-      return
-    }
     const popup = new Notification(title, { body, tag })
     popup.onclick = () => { window.focus(); open(); popup.close() }
   },

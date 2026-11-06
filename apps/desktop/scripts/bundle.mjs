@@ -1,47 +1,67 @@
 #!/usr/bin/env node
+/**
+ * Produces exactly what the delivery build packages:
+ *   dist/main/index.cjs       compiled main process (CommonJS, electron external)
+ *   dist/preload/launcher.cjs trusted launcher preload (CommonJS, electron external)
+ *   dist/launcher/**          launcher renderer: index.html, launcher.js, launcher.css
+ * Nothing else is written under dist/.
+ */
 import * as esbuild from 'esbuild'
-import { mkdirSync } from 'node:fs'
+import { cp, mkdir, rm } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const root = dirname(fileURLToPath(import.meta.url))
-const desktopRoot = join(root, '..')
+const desktopRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+const dist = join(desktopRoot, 'dist')
 
-const distMain = join(desktopRoot, 'dist/main')
-const distPreload = join(desktopRoot, 'dist/preload')
-mkdirSync(distMain, { recursive: true })
-mkdirSync(distPreload, { recursive: true })
+await rm(dist, { recursive: true, force: true })
+await mkdir(dist, { recursive: true })
 
-const common = {
+const shared = {
   bundle: true,
-  platform: 'node',
-  target: 'node20',
   sourcemap: true,
   logLevel: 'info',
+  legalComments: 'none',
+}
+
+const node = {
+  ...shared,
+  platform: 'node',
+  target: 'node22',
+  format: 'cjs',
+  external: ['electron'],
+  // The tray mark travels inside the compiled main so a packaged app needs no loose asset.
+  loader: { '.png': 'dataurl' },
 }
 
 await esbuild.build({
-  ...common,
+  ...node,
   entryPoints: [join(desktopRoot, 'src/main/index.ts')],
-  outfile: join(distMain, 'index.cjs'),
-  format: 'cjs',
-  external: ['electron'],
+  outfile: join(dist, 'main/index.cjs'),
 })
 
 await esbuild.build({
-  ...common,
+  ...node,
   entryPoints: [join(desktopRoot, 'src/preload/launcher.ts')],
-  outfile: join(distPreload, 'launcher.cjs'),
-  format: 'cjs',
-  external: ['electron'],
+  outfile: join(dist, 'preload/launcher.cjs'),
 })
 
 await esbuild.build({
-  ...common,
-  entryPoints: [join(desktopRoot, 'src/preload/business.ts')],
-  outfile: join(distPreload, 'business.cjs'),
-  format: 'cjs',
-  external: ['electron'],
+  ...shared,
+  entryPoints: [join(desktopRoot, 'src/launcher/main.ts')],
+  outfile: join(dist, 'launcher/launcher.js'),
+  platform: 'browser',
+  target: 'chrome140',
+  format: 'iife',
 })
 
-console.log('desktop bundle: dist/main/index.cjs, dist/preload/*.cjs')
+await esbuild.build({
+  ...shared,
+  entryPoints: [join(desktopRoot, 'src/launcher/launcher.css')],
+  outfile: join(dist, 'launcher/launcher.css'),
+  target: 'chrome140',
+})
+
+await cp(join(desktopRoot, 'src/launcher/index.html'), join(dist, 'launcher/index.html'))
+
+console.log('desktop build: dist/main/index.cjs, dist/preload/launcher.cjs, dist/launcher/index.html')

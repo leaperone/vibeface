@@ -1,31 +1,84 @@
-import { describe, expect, it, beforeAll, afterAll } from 'vitest'
+import { existsSync } from 'node:fs'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { runControl } from '../src/main/control-client.js'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { CoreLifecycle, type OwnedExit } from '../src/main/lifecycle.js'
+import { serviceFixture } from './fixtures.js'
 
-describe('CoreLifecycle + fake core', () => {
-  beforeAll(() => {
-    process.env.VIBEFACE_DESKTOP_FAKE_CONTROL = join(import.meta.dirname, 'fake-core.mjs')
-    process.env.VIBEFACE_DESKTOP_FAKE_INSPECT_JSON = JSON.stringify({
-      status: 'running',
-      device_id: 'aa',
-      local_listen: '127.0.0.1:4791',
-    })
+const settled = async (check: () => boolean, timeoutMs = 5000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (check()) return
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  throw new Error('the owned child never reached the expected state')
+}
+
+describe('CoreLifecycle with a real child process', () => {
+  let dataDir = ''
+  let lifecycle = new CoreLifecycle()
+
+  beforeEach(async () => {
+    dataDir = await mkdtemp(join(tmpdir(), 'vibeface-owned-'))
+    lifecycle = new CoreLifecycle()
   })
-  afterAll(() => {
-    delete process.env.VIBEFACE_DESKTOP_FAKE_CONTROL
-    delete process.env.VIBEFACE_DESKTOP_FAKE_INSPECT_JSON
+
+  afterEach(async () => {
+    await lifecycle.stopOwned('quit')
+    await rm(dataDir, { recursive: true, force: true })
   })
-  it('inspect and access use fixed bundled binary path', async () => {
-    const inspect = await runControl('/nonexistent/vibeface-core', {
-      command: 'inspect',
-      data_dir: '/tmp/fake-data',
-    })
-    expect((inspect as { local_listen?: string }).local_listen).toBe('127.0.0.1:4791')
-    const access = await runControl('/nonexistent/vibeface-core', {
-      command: 'access',
-      data_dir: '/tmp/fake-data',
-      json: false,
-    })
-    expect((access as { url?: string }).url).toBeDefined()
+
+  it('starts a child that only runs with the parent-stdin flag', async () => {
+    lifecycle.startOwned(serviceFixture(dataDir), dataDir)
+    expect(lifecycle.state().kind).toBe('owned')
+    await settled(() => existsSync(join(dataDir, 'node.running')))
+  })
+
+  it('closing stdin shuts the child down and releases ownership', async () => {
+    lifecycle.startOwned(serviceFixture(dataDir), dataDir)
+    await settled(() => existsSync(join(dataDir, 'node.running')))
+    await lifecycle.stopOwned('quit')
+    expect(lifecycle.state().kind).toBe('idle')
+    expect(existsSync(join(dataDir, 'node.running'))).toBe(false)
+  })
+
+  it('can start again after a clean stop', async () => {
+    lifecycle.startOwned(serviceFixture(dataDir), dataDir)
+    await settled(() => existsSync(join(dataDir, 'node.running')))
+    await lifecycle.stopOwned('quit')
+    lifecycle.startOwned(serviceFixture(dataDir), dataDir)
+    await settled(() => existsSync(join(dataDir, 'node.running')))
+    expect(lifecycle.state().kind).toBe('owned')
+  })
+
+  it('reports a crashing child and drops back to idle', async () => {
+    const exits: OwnedExit[] = []
+    lifecycle.onOwnedExit((exit) => exits.push(exit))
+    process.env['FIXTURE_CRASH_AFTER_MS'] = '0'
+    try {
+      lifecycle.startOwned(serviceFixture(dataDir), dataDir)
+      await settled(() => lifecycle.state().kind === 'idle')
+    } finally {
+      delete process.env['FIXTURE_CRASH_AFTER_MS']
+    }
+    expect(exits.at(-1)?.code).toBe(3)
+  })
+
+  it('refuses a second owned child while one runs', async () => {
+    lifecycle.startOwned(serviceFixture(dataDir), dataDir)
+    expect(() => lifecycle.startOwned(serviceFixture(dataDir), dataDir)).toThrow(/already runs/)
+  })
+
+  it('refuses to attach while it owns a child, so ownership never changes silently', async () => {
+    lifecycle.startOwned(serviceFixture(dataDir), dataDir)
+    expect(() => lifecycle.attach(dataDir)).toThrow(/stop the Core/)
+  })
+
+  it('attaching spawns nothing and stopping an attachment is a no-op', async () => {
+    lifecycle.attach(dataDir)
+    expect(lifecycle.state()).toEqual({ kind: 'attached', dataDir })
+    await lifecycle.stopOwned('quit')
+    expect(lifecycle.state().kind).toBe('attached')
   })
 })
