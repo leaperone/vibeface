@@ -864,6 +864,41 @@ test("workspace preserves bot and message requests while routing native decision
         'uniwind': { useCSSVariable: () => ['white', 'black'] }, '@/lib/layout': { useWide: () => false }, 'react-native': { Platform: { OS: 'ios' }, View: 'View' },
       })
       try {
+        const originalMessages = conversationMessages, originalScheduler = scheduler
+        const input = { message_id: 'host-input', event_hash: 'host-input-event', role: 'user', text: '主输入', created_at_ms: 1 }
+        const followup = { message_id: 'steered-input', event_hash: 'steered-input-event', role: 'user', text: '补充输入', created_at_ms: 2 }
+        const reply = { message_id: 'host-reply', event_hash: 'host-reply-event', role: 'assistant', text: '共同回复', in_reply_to: input.message_id, status: 'completed', created_at_ms: 3 }
+        try {
+          for (const outcome of ['answered', 'unfinished', 'unknown']) {
+            conversationMessages = { chat: [input, followup] }
+            const host = { scope: { kind: 'main' }, trigger: 'message:host-input', state: 'running', message_id: input.message_id, reply_message_id: reply.message_id }
+            scheduler = { scope_jobs: [], unanswered: [], capabilities: { cancel: true, streaming: true, steer: true }, jobs: [
+              host,
+              { scope: { kind: 'main' }, trigger: 'message:steered-input', state: 'steered', outcome, message_id: followup.message_id, reply_message_id: 'unused-steered-reply' },
+            ] }
+            await render().refresh()
+            assert.equal(mobile().conversations.chat.replying, true, 'the host turn still runs after accepting a supplement')
+            assert.equal(mobile().conversations.chat.stoppable, true)
+            host.state = 'completed'
+            await render().refresh()
+            assert.equal(mobile().conversations.chat.replying, true, 'a completed host keeps its activity until its reply syncs')
+            conversationMessages.chat.push(reply)
+            await render().refresh()
+            const completed = mobile().conversations.chat
+            assert.equal(completed.messages.some((message) => message.message_id === reply.message_id), true)
+            assert.equal(completed.replying, false, `a ${outcome} supplement never waits for an independent reply`)
+            assert.equal(completed.stoppable, false)
+          }
+          conversationMessages = { chat: [input] }
+          for (const state of ['publishing', 'completed', 'failed', 'interrupted', 'cancelled', 'rejected', 'reconciling']) {
+            scheduler = { scope_jobs: [], unanswered: [], jobs: [{ scope: { kind: 'main' }, trigger: 'message:host-input', state, message_id: input.message_id, reply_message_id: reply.message_id }] }
+            await render().refresh()
+            assert.equal(mobile().conversations.chat.replying, !['cancelled', 'rejected', 'reconciling'].includes(state), `${state} waits only when the job produces its own reply`)
+          }
+        } finally {
+          conversationMessages = originalMessages; scheduler = originalScheduler
+          await render().refresh(); mobile()
+        }
         const tree = layout.render('default')
         const screens = tree.find(({ type }) => typeof type === 'function' && type.name === 'Screens')
         assert.ok(screens && typeof screens.type === 'function')

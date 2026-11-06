@@ -206,12 +206,24 @@ test('native workspace routes preserve Task input, queue controls and directed C
   const mainHistory = device.locator('role=scroll-area').filter({ has: screen.getByText(/^原生滚动记录 /) });
   const olderMarker = screen.getByText(/^原生滚动记录 4\s/);
   const latestMarker = screen.getByText(/^原生滚动记录 8\s/);
+  const latestReply = screen.getByText(/^native-workspace-scroll:\d+/, { visible: true }).first();
   const mainResult = screen.getByText(/^native-workspace-scroll:complete/, { visible: true }).first();
+  const providerNotice = screen.getByText(/^Codex · Node · Codex 尚未确认这个模型/);
   await expect(mainHistory).toHaveCount(1);
+  await expect(keyboard).toHaveCount(1);
+  let keyboardReadingBottom = 0, previousTargetBounds = '';
+  await expect.poll(async () => {
+    const target = await mainTarget.boundingBox();
+    assert(target, 'The open keyboard exposes the history reading boundary');
+    const observed = JSON.stringify(target), stable = observed === previousTargetBounds;
+    previousTargetBounds = observed;
+    keyboardReadingBottom = target.y;
+    return stable;
+  }).toBe(true);
   for (const phase of ['closed', 'keyboard', 'reply']) {
-    await device.dismissKeyboard();
+    if (await keyboard.count() !== 0) await providerNotice.click();
     await expect(keyboard).toHaveCount(0);
-    await expect(latestMarker).toBeVisible();
+    await expect(latestReply).toBeVisible();
     await expect(toLatest).toHaveCount(0);
     let previousHistoryBounds = '';
     await expect.poll(async () => {
@@ -219,16 +231,21 @@ test('native workspace routes preserve Task input, queue controls and directed C
       const marker = await olderMarker.isVisible() ? await olderMarker.boundingBox() : null;
       assert(pane && target && back, 'Main history and its visible limits expose bounds');
       const top = Math.max(pane.y, back.y + back.height), bottom = Math.min(pane.y + pane.height, target.y);
-      const positioned = marker && marker.y >= top && marker.y + marker.height <= top + (bottom - top) / 2;
+      const readingBottom = Math.min(top + (bottom - top) / 2, keyboardReadingBottom - 8);
+      const positioned = marker && marker.y >= top && marker.y + marker.height <= readingBottom;
       const observed = JSON.stringify(marker), stable = observed === previousHistoryBounds;
       previousHistoryBounds = observed;
-      if (!positioned) await mainHistory.swipe({ direction: marker && marker.y >= top ? 'down' : 'up', momentum: 'slow' });
+      if (!positioned) {
+        const area = marker && marker.y >= top && marker.y + marker.height <= bottom ? olderMarker : mainHistory;
+        await area.swipe({ direction: marker && marker.y >= top ? 'down' : 'up', momentum: 'slow' });
+      }
       return Boolean(positioned && stable);
     }, { timeout: 15000 }).toBe(true);
     if (phase === 'keyboard') await mainComposer.focus();
     await expect(keyboard).toHaveCount(phase === 'keyboard' ? 1 : 0);
     await expect(olderMarker).toBeVisible();
     await expect(latestMarker).not.toBeVisible();
+    await expect(latestReply).not.toBeVisible();
     await expect(toLatest).toBeEnabled();
     let previousReadingBounds = '';
     await expect.poll(async () => {
@@ -259,7 +276,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
     }
     await app.screenshot(`workspace-native-scroll-${phase === 'reply' ? 'new-reply-history' : phase === 'keyboard' ? 'history-keyboard' : 'history'}`);
     await toLatest.click();
-    const newest = phase === 'reply' ? mainResult : latestMarker;
+    const newest = phase === 'reply' ? mainResult : latestReply;
     await expect(newest).toBeVisible();
     let previousLatestBounds = '';
     await expect.poll(async () => {
@@ -284,7 +301,8 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await mainComposer.focus();
   await expect(keyboard).toHaveCount(1);
   await expect(toLatest).toHaveCount(0);
-  await device.dismissKeyboard();
+  await expect(providerNotice).toBeVisible();
+  await providerNotice.click();
   await expect(keyboard).toHaveCount(0);
   await expect(toLatest).toHaveCount(0);
   await expect(screen.getByText(/^原生滚动记录 /)).toHaveCount(0);

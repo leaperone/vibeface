@@ -162,7 +162,7 @@ function Live({ children }: { children: ReactNode }) {
       // A finished job whose reply has not synced yet still counts, so the activity row hands over to the reply instead of
       // vanishing a frame early; its trigger being shown, even still sending, means the newer reply is on its way, not paged out.
       replying: Boolean(live) || !handedOver && jobs.some((job) => busyStates.includes(job.state) && !(job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))
-        || job.reply_message_id && job.message_id
+        || ['publishing', 'completed', 'failed', 'interrupted'].includes(job.state) && job.reply_message_id && job.message_id
         && !data.messages.some((message) => message.message_id === job.reply_message_id) && messages.some((message) => message.message_id === job.message_id)),
       status: jobs.some((job) => job.state === 'cancelling') ? '正在停止…' : shared.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status ?? null,
       stoppable: Boolean(stopJob && shared.writable),
