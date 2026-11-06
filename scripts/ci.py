@@ -257,7 +257,7 @@ def release_metadata(ref_type, ref_name):
         date = match[2]
         datetime.date(int(date[:4]), int(date[4:6]), int(date[6:]))
     if ref_type == "tag":
-        if ref_name != f"cli-v{version}":
+        if ref_name != f"v{version}":
             raise ValueError("Release tag must exactly match the Cargo version")
         git("merge-base", "--is-ancestor", "HEAD", "origin/main")
     return {"version": version, "msrv": package["rust_version"], "channel": channel, "prerelease": channel != "stable"}
@@ -411,6 +411,7 @@ def run_check(packages, msrv=None):
 
 def self_test():
     from unittest.mock import patch
+    subprocess.run(["python3", str(Path(__file__).resolve().parent / "check-release-workflow.py"), "--self-test"], check=True)
     web = make_plan(["apps/app/src/routes/index.tsx"])
     assert web["rust_packages"] == [] and web["test_tiers"] == []
     assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
@@ -613,9 +614,9 @@ def self_test():
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
             with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)), patch(f"{__name__}.git") as ancestor:
                 assert release_metadata("branch", "")["channel"] == channel
-                assert release_metadata("tag", f"cli-v{version}")["prerelease"] == (channel != "stable")
+                assert release_metadata("tag", f"v{version}")["prerelease"] == (channel != "stable")
                 ancestor.assert_called_once_with("merge-base", "--is-ancestor", "HEAD", "origin/main")
-                expect_failure(lambda: release_metadata("tag", "cli-v0.0.0"))
+                expect_failure(lambda: release_metadata("tag", "v0.0.0"))
         for version in ("01.2.3", "1.2.3-nightly.20260229.1", "1.2.3-nightly.20261019.0", "1.2.3+build"):
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
             with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)):
@@ -796,7 +797,7 @@ def release_privacy_test(root, scratch):
 
     with tempfile.TemporaryDirectory(prefix="release-", dir=scratch) as directory:
         repo = Path(directory)
-        for name in ("scripts/release.py", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/app/package.json", "scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/control/src/lib.rs", "README.md"):
+        for name in ("scripts/release.py", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/app/package.json", "apps/mobile/app.json", "scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/control/src/lib.rs", "README.md"):
             target = repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(root / name, target)

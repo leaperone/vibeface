@@ -102,8 +102,8 @@ select_release() {
     END {
       for (i in tags) {
         tag=tags[i]; if (draft[i]!="false" || pre[i]!=(channel=="nightly" ? "true" : "false")) continue
-        if (substr(tag,1,5)!="cli-v") continue
-        n=split(substr(tag,6),part,"-"); if (n!=(channel=="nightly" ? 2 : 1)) continue
+        if (substr(tag,1,1)!="v") continue
+        n=split(substr(tag,2),part,"-"); if (n!=(channel=="nightly" ? 2 : 1)) continue
         if (split(part[1],base,".")!=3 || !number(base[1]) || !number(base[2]) || !number(base[3])) continue
         day=0; build=0
         if (channel=="nightly") {
@@ -174,15 +174,8 @@ verify_package() {
   json_fields "$package/BUILD-INFO.json" build > "$scratch/build-fields" || fail 'invalid BUILD-INFO.json'
   awk -F '\t' -v version="$version" -v target="$target" -v commit="$commit" '
     { info[$2]=$3 }
-    END { exit !(NR==9 && info["version"]==version && info["target"]==target && info["source_commit"]==commit && info["update_protocol"]=="1" && info["data_epoch"]=="1" && info["core_version"]!="" && info["app_version"]!="" && info["core_source_commit"] ~ /^[a-f0-9]+$/ && length(info["core_source_commit"])==40 && info["app_source_commit"] ~ /^[a-f0-9]+$/ && length(info["app_source_commit"])==40) }
+    END { exit !(NR==9 && info["version"]==version && info["target"]==target && info["source_commit"]==commit && info["update_protocol"]=="1" && info["data_epoch"]=="1" && info["core_version"]==version && info["app_version"]==version && info["core_source_commit"]==commit && info["app_source_commit"]==commit) }
   ' "$scratch/build-fields" || fail 'BUILD-INFO does not match the release, platform, source commit, or data epoch'
-  local channel=stable prerelease=false component_version field
-  if [[ $version == *-nightly.* ]]; then channel=nightly; prerelease=true; fi
-  for field in core_version app_version; do
-    component_version=$(awk -F '\t' -v field="$field" '$2==field {print $3}' "$scratch/build-fields")
-    printf '0\ttag_name\tcli-v%s\n0\tdraft\tfalse\n0\tprerelease\t%s\n' "$component_version" "$prerelease" > "$scratch/component-fields"
-    [[ $(select_release "$scratch/component-fields" "$channel") == "cli-v$component_version" ]] || fail 'component version does not match the release channel'
-  done
   [[ -x "$package/vibeface" && -x "$package/vibeface-core" ]] || fail 'packaged CLI and Core binaries must be executable'
   [[ $("$package/vibeface" --version) == "vibeface $version" ]] || fail 'packaged CLI version does not match the release'
   local core_version
@@ -250,7 +243,7 @@ install_release() (
     if [[ $channel == stable ]]; then fail 'no published Stable release; use --channel nightly explicitly to install a preview'; fi
     fail 'no published Nightly release'
   fi
-  version=${tag#cli-v}
+  version=${tag#v}
   package="vibeface-$version-$target"
   archive="$package.tar.gz"
   fetch "https://api.github.com/repos/leaperone/vibeface/commits/$tag" "$scratch/commit.json" 4194304
@@ -338,21 +331,24 @@ MOCK
   export PATH="$fixture/bin:$PATH"
   cat > "$fixture/releases.json" <<'JSON'
 [
- {"tag_name":"cli-v0.0.1-nightly.20261017.2","draft":false,"prerelease":true,"body":"quoted \"tag_name\": \"cli-v999.0.0\""},
- {"tag_name":"cli-v1.9.0","draft":false,"prerelease":false},
- {"tag_name":"cli-v0.0.1-nightly.20261017.10","draft":false,"prerelease":true},
- {"tag_name":"cli-v1.10.0","draft":false,"prerelease":false},
- {"tag_name":"cli-v999.0.0-rc.1","draft":false,"prerelease":true},
- {"tag_name":"cli-v999.0.0","draft":true,"prerelease":false},
- {"tag_name":"cli-v0.0.1-nightly.20260229.1","draft":false,"prerelease":true},
- {"tag_name":"cli-v01.2.3","draft":false,"prerelease":false},
- {"tag_name":"cli-v18446744073709551616.0.0","draft":false,"prerelease":false},
- {"tag_name":"cli-v0.0.1-nightly.20261017.18446744073709551616","draft":false,"prerelease":true}
+ {"tag_name":"v0.0.1-nightly.20261017.2","draft":false,"prerelease":true,"body":"quoted \"tag_name\": \"v999.0.0\""},
+ {"tag_name":"cli-v999.0.0","draft":false,"prerelease":false},
+ {"tag_name":"www-v999.0.0-nightly.20261017.99","draft":false,"prerelease":true},
+ {"tag_name":"mobile-v999.0.0-nightly.20261017.99","draft":false,"prerelease":true},
+ {"tag_name":"v1.9.0","draft":false,"prerelease":false},
+ {"tag_name":"v0.0.1-nightly.20261017.10","draft":false,"prerelease":true},
+ {"tag_name":"v1.10.0","draft":false,"prerelease":false},
+ {"tag_name":"v999.0.0-rc.1","draft":false,"prerelease":true},
+ {"tag_name":"v999.0.0","draft":true,"prerelease":false},
+ {"tag_name":"v0.0.1-nightly.20260229.1","draft":false,"prerelease":true},
+ {"tag_name":"v01.2.3","draft":false,"prerelease":false},
+ {"tag_name":"v18446744073709551616.0.0","draft":false,"prerelease":false},
+ {"tag_name":"v0.0.1-nightly.20261017.18446744073709551616","draft":false,"prerelease":true}
 ]
 JSON
   json_fields "$fixture/releases.json" releases > "$fixture/fields"
-  [[ $(select_release "$fixture/fields" stable) == cli-v1.10.0 ]] || fail 'self-test: Stable numeric sorting or channel isolation'
-  [[ $(select_release "$fixture/fields" nightly) == cli-v0.0.1-nightly.20261017.10 ]] || fail 'self-test: Nightly numeric sorting or channel isolation'
+  [[ $(select_release "$fixture/fields" stable) == v1.10.0 ]] || fail 'self-test: Stable numeric sorting or channel isolation'
+  [[ $(select_release "$fixture/fields" nightly) == v0.0.1-nightly.20261017.10 ]] || fail 'self-test: Nightly numeric sorting or channel isolation'
   version=0.0.1-nightly.20261017.10
   target=x86_64-unknown-linux-gnu
   package="vibeface-$version-$target"
@@ -364,7 +360,7 @@ JSON
     mkdir -p "$fixture/source/$package/$(dirname "$entry")"
     printf 'test fixture\n' > "$fixture/source/$package/$entry"
   done
-  printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"%s","app_source_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\n' \
+  printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"%s","app_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n' \
     "$version" "$target" "$version" "$version" > "$fixture/source/$package/BUILD-INFO.json"
   printf '#!/bin/sh\nprintf "vibeface %s\\n"\n' "$version" > "$fixture/source/$package/vibeface"
   printf '#!/bin/sh\nprintf "vibeface-core %s\\n"\n' "$version" > "$fixture/source/$package/vibeface-core"
@@ -396,7 +392,7 @@ JSON
     target="$platform"
     package="vibeface-$version-$target"
     if [[ $old_package != "$package" ]]; then mv "$fixture/source/$old_package" "$fixture/source/$package"; fi
-    printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"%s","app_source_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\n' \
+    printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"%s","app_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n' \
       "$version" "$target" "$version" "$version" > "$fixture/source/$package/BUILD-INFO.json"
     case "$target" in
       aarch64-apple-darwin) printf 'Darwin\n' > "$fixture/os"; printf 'arm64\n' > "$fixture/arch" ;;
@@ -462,7 +458,14 @@ JSON
   mkdir "$case_dir"
   sed 's/"app_version":"[^"]*"/"app_version":"0.0.1"/' "$fixture/supported-build" > "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
-  expect_failure nightly 'component version does not match the release channel'
+  expect_failure nightly 'BUILD-INFO does not match'
+  for identity_field in core_source_commit app_source_commit; do
+    case_dir="$test_dir/foreign-$identity_field"
+    mkdir "$case_dir"
+    sed "s/\"$identity_field\":\"[^\"]*\"/\"$identity_field\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"/" "$fixture/supported-build" > "$fixture/source/$package/BUILD-INFO.json"
+    repack_fixture
+    expect_failure nightly 'BUILD-INFO does not match'
+  done
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   case_dir="$test_dir/unknown-build-field"
   mkdir "$case_dir"
@@ -472,7 +475,7 @@ JSON
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   case_dir="$test_dir/manifest"
   mkdir "$case_dir"
-  printf '{"version":"wrong","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"%s","app_source_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\n' "$target" "$version" "$version" > "$fixture/source/$package/BUILD-INFO.json"
+  printf '{"version":"wrong","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"%s","app_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n' "$target" "$version" "$version" > "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
   expect_failure nightly 'BUILD-INFO does not match'
   case_dir="$test_dir/bin-conflict"
@@ -482,16 +485,16 @@ JSON
   [[ $(cat "$case_dir/bin/vibeface") == 'preserve me' ]] || fail 'self-test: bin conflict changed'
   case_dir="$test_dir/no-stable"
   mkdir "$case_dir"
-  printf '[{"tag_name":"cli-v%s","draft":false,"prerelease":true}]\n' "$version" > "$fixture/releases.json"
+  printf '[{"tag_name":"v%s","draft":false,"prerelease":true}]\n' "$version" > "$fixture/releases.json"
   expect_failure stable 'no published Stable release'
   [[ ! -e "$case_dir/root" ]] || fail 'self-test: no Stable release created installation directories'
   # Page-local indexes must not overwrite earlier candidates.
   json_fields "$fixture/releases.json" releases 1 > "$fixture/fields"
-  printf '[{"tag_name":"cli-v0.0.1-nightly.20261017.2","draft":false,"prerelease":true}]\n' > "$fixture/page2.json"
+  printf '[{"tag_name":"v0.0.1-nightly.20261017.2","draft":false,"prerelease":true}]\n' > "$fixture/page2.json"
   json_fields "$fixture/page2.json" releases 2 >> "$fixture/fields"
-  [[ $(select_release "$fixture/fields" nightly) == "cli-v$version" ]] || fail 'self-test: pagination changed version selection'
+  [[ $(select_release "$fixture/fields" nightly) == "v$version" ]] || fail 'self-test: pagination changed version selection'
   json_fields "$fixture/page2.json" releases 2 > "$fixture/compact-fields"
-  awk 'BEGIN { print "["; print "{"; print "\"tag_name\":\"cli-v0.0.1-nightly.20261017.2\","; print "\"draft\":false,"; print "\"prerelease\":true,"; printf "\"body\":\""; for (i=0;i<10000;i++) printf "ignored "; print "\""; print "}"; print "]" }' > "$fixture/pretty.json"
+  awk 'BEGIN { print "["; print "{"; print "\"tag_name\":\"v0.0.1-nightly.20261017.2\","; print "\"draft\":false,"; print "\"prerelease\":true,"; printf "\"body\":\""; for (i=0;i<10000;i++) printf "ignored "; print "\""; print "}"; print "]" }' > "$fixture/pretty.json"
   json_fields "$fixture/pretty.json" releases 2 > "$fixture/pretty-fields"
   cmp "$fixture/compact-fields" "$fixture/pretty-fields" || fail 'self-test: pretty JSON changed release fields'
   case_dir="$test_dir/http-failure"
