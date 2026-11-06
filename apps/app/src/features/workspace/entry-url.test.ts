@@ -831,8 +831,9 @@ test("workspace preserves bot and message requests while routing native decision
       type NativeWorkspace = import('../../../../../apps/mobile/src/data/types.ts').Workspace
       const mainSaves: ReturnType<NativeWorkspace['actions']['send']>[] = []
       let native: NativeWorkspace
-      const mobile = () => {
+      const mobile = (liveProgress?: typeof shared.liveProgress) => {
         shared = render()
+        if (liveProgress) shared = { ...shared, liveProgress }
         const value = bridge.render('Live').find(({ type }) => type === 'NativeWorkspace')?.props.value
         assert.ok(value && typeof value === 'object')
         native = value as NativeWorkspace
@@ -879,6 +880,8 @@ test("workspace preserves bot and message requests while routing native decision
             await render().refresh()
             assert.equal(mobile().conversations.chat.replying, true, 'the host turn still runs after accepting a supplement')
             assert.equal(mobile().conversations.chat.stoppable, true)
+            const streaming = mobile([{ kind: 'manager', key: 'host-progress', conversation_id: 'chat', trigger: host.trigger, source_node: 'gateway', text: '部分回复', sequence: 1, items: [], needsRefresh: false }]).conversations.chat.messages.find((message) => message.state === 'streaming')
+            assert.equal(streaming?.in_reply_to, input.message_id, 'the streamed reply retains its host input after a supplement')
             host.state = 'completed'
             await render().refresh()
             assert.equal(mobile().conversations.chat.replying, true, 'a completed host keeps its activity until its reply syncs')

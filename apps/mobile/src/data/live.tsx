@@ -141,9 +141,7 @@ function Live({ children }: { children: ReactNode }) {
     const handedOver = streamed.some((progress) => landed(progress.text))
     const live = streamed.find((progress) => !landed(progress.text)
       && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))))
-    // The user message it answers, as the final reply's in_reply_to names it, so the two share a row: the one still
-    // sending, or else the latest in the history.
-    const liveTrigger = live && (sending ? pending.at(-1)?.message_id : data.messages.findLast((message) => message.role === 'user')?.message_id)
+    const liveTrigger = live && (jobs.find((job) => job.trigger === live.trigger)?.message_id ?? (sending ? pending.at(-1)?.message_id : data.messages.findLast((message) => message.role === 'user')?.message_id))
     const timeline = chatTimeline(data.messages, data.questions, new Set(jobs.filter((job) => job.state === 'steered').map((job) => job.message_id)))
     // An answer is a user message, shown inside its question instead of as a bubble, as on the web.
     const folded = foldAnswers(data.messages, data.questions)
