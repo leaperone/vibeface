@@ -19,8 +19,8 @@ import tempfile
 sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parent.parent
-APPS = ('www', 'app', 'core', 'cli', 'mobile')
-PRODUCT_APPS = ('app', 'core', 'cli', 'mobile')
+APPS = ('www', 'app', 'core', 'cli', 'mobile', 'desktop')
+PRODUCT_APPS = ('app', 'core', 'cli', 'mobile', 'desktop')
 RELEASES = ('product', 'www')
 COMPONENTS = ('app', 'core', 'www')
 TARGETS = ('aarch64-apple-darwin', 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-gnu',
@@ -116,7 +116,7 @@ def identity(release_app, root=None):
     root = root or ROOT
     require(release_app in RELEASES, 'release app must be product or www')
     if release_app == 'product':
-        value = require_version_cohort(('core', 'app', 'mobile'), root)
+        value = require_version_cohort(PRODUCT_APPS, root)
     else:
         value = read_version('www', root)
     return {'app': release_app, 'version': value, 'tag': release_tag_for(release_app, value),
@@ -813,6 +813,14 @@ def self_test():
 
         # Identity: one public product identity, one independent portal identity.
         product = accepts(lambda: identity('product'))
+        original_read_version = read_version
+
+        def changed_desktop_version(app, root=None):
+            return '9.9.9' if app == 'desktop' else original_read_version(app, root)
+
+        with patch(f'{__name__}.read_version', side_effect=changed_desktop_version):
+            rejects('a desktop version outside the product cohort', lambda: identity('product'),
+                    'desktop version must equal')
         portal = accepts(lambda: identity('www'))
         require(product['tag'] == product_tag and product['source_commit'] == source, 'product identity')
         require(portal['tag'] == www_tag and portal['app'] == 'www', 'independent portal identity')

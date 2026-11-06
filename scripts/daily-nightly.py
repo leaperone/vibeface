@@ -22,7 +22,7 @@ REPO = 'leaperone/vibeface'
 CI = '.github/workflows/ci.yml'
 RELEASE = '.github/workflows/release.yml'
 PATHS = ('apps/www/package.json', 'apps/app/package.json', 'apps/core/Cargo.toml',
-         'apps/cli/Cargo.toml', 'Cargo.lock', 'apps/mobile/app.json')
+         'apps/cli/Cargo.toml', 'Cargo.lock', 'apps/mobile/app.json', 'apps/desktop/package.json')
 PRODUCT_APPS = release.PRODUCT_APPS
 RELEASES = release.RELEASES
 PRODUCER = 'collect'
@@ -167,7 +167,7 @@ def plan_versions(day, base, tags):
 
 def generated(plan):
     old = versions_at(plan.base)
-    require(set(plan.versions) == set(release.APPS), 'daily plan must contain all five apps')
+    require(set(plan.versions) == set(release.APPS), 'daily plan must contain all release applications')
     product_ver = plan.versions['cli']
     for app in PRODUCT_APPS:
         require(plan.versions[app] == product_ver, 'product apps must share one canonical version')
@@ -178,7 +178,7 @@ def generated(plan):
         if old[app].startswith(prefix):
             require(int(value[len(prefix):]) > int(old[app][len(prefix):]), 'daily version did not advance')
     result = {path: blob(plan.base, path).decode() for path in PATHS}
-    for app in ('www', 'app'):
+    for app in ('www', 'app', 'desktop'):
         path = f'apps/{app}/package.json'
         result[path] = json_value(result[path], ('version',), plan.versions[app])
     for app in ('core', 'cli'):
@@ -614,7 +614,7 @@ def self_test():
 
         with patch(f'{__name__}.ROOT', root), patch('release.ROOT', root), patch(f'{__name__}.time.sleep'), \
                 patch('subprocess.check_output', side_effect=metadata_cargo_stub):
-            assert RELEASES == ('product', 'www') and PRODUCT_APPS == ('app', 'core', 'cli', 'mobile')
+            assert RELEASES == ('product', 'www') and PRODUCT_APPS == ('app', 'core', 'cli', 'mobile', 'desktop')
             base = git('rev-parse', 'HEAD')
             # Legacy component tags no longer claim a sequence; only real v/www-v tags and the current cohort do.
             plan = plan_versions('20261106', base, ['v0.0.1-nightly.20261106.7', 'core-v0.0.1-nightly.20261106.9',
@@ -628,6 +628,7 @@ def self_test():
             assert plan_versions('20261106', base, ['www-v0.0.1-nightly.20261106.4']).versions['cli'].endswith('.1')
             contents = generated(plan)
             assert json.loads(contents['apps/mobile/app.json'])['expo']['ios']['buildNumber'] == '99'
+            assert json.loads(contents['apps/desktop/package.json'])['version'] == plan.versions['cli']
             assert contents['Cargo.lock'].count(b'[[package]]') == 2
 
             def commit_files(changes):
@@ -646,6 +647,7 @@ def self_test():
             metadata(root, plan)
             for path, content in (
                 ('apps/app/package.json', contents['apps/app/package.json'].replace(b'"private": true', b'"private": false')),
+                ('apps/desktop/package.json', contents['apps/desktop/package.json'].replace(b'"private": true', b'"private": false')),
                 ('Cargo.lock', contents['Cargo.lock'] + b'\n[[package]]\nname = "unexpected"\nversion = "1.0.0"\n'),
                 ('apps/core/Cargo.toml', contents['apps/core/Cargo.toml'] + b'\n[dependencies]\nserde = "1"\n'),
                 ('apps/cli/Cargo.toml', contents['apps/cli/Cargo.toml'].replace(b'0.0.1-nightly.20261106.8', b'0.0.1-nightly.20261106.9')),
