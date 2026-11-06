@@ -1,4 +1,4 @@
-use crate::terminal::{NodeStatus, RunState, age, safe_text, shorten, use_color};
+use crate::terminal::{NodeStatus, RunState, age, safe_text, shorten, use_emphasis};
 use anyhow::{Context, Result, bail, ensure};
 use crossterm::{
     cursor::{Hide, Show},
@@ -11,7 +11,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Margin, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{List, ListItem, ListState, Paragraph, Wrap},
 };
@@ -293,7 +293,7 @@ pub async fn run(data_dir: PathBuf) -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut events = EventStream::new();
     let mut app = App::new();
-    let palette = Palette::new(use_color());
+    let palette = Palette::new(use_emphasis());
     let mut reading = Box::pin(inspect(core.clone(), data_dir.clone()));
     let mut reading_active = true;
     let mut refresh = tokio::time::interval(REFRESH_INTERVAL);
@@ -351,30 +351,17 @@ pub async fn run(data_dir: PathBuf) -> Result<()> {
 
 #[derive(Clone, Copy)]
 struct Palette {
-    accent: Style,
     strong: Style,
-    secondary: Style,
-    attention: Style,
 }
 
 impl Palette {
-    fn new(color: bool) -> Self {
-        if color {
-            Self {
-                accent: Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-                strong: Style::default().add_modifier(Modifier::BOLD),
-                secondary: Style::default().add_modifier(Modifier::DIM),
-                attention: Style::default().add_modifier(Modifier::BOLD),
-            }
-        } else {
-            Self {
-                accent: Style::default(),
-                strong: Style::default(),
-                secondary: Style::default(),
-                attention: Style::default(),
-            }
+    fn new(emphasis: bool) -> Self {
+        Self {
+            strong: if emphasis {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
         }
     }
 }
@@ -407,16 +394,12 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, refreshing: bool, palette: Palette
             height: 1,
             ..header
         });
-    frame.render_widget(Paragraph::new("vibeface").style(palette.accent), brand);
+    frame.render_widget(Paragraph::new("vibeface").style(palette.strong), brand);
     let stale = matches!(app.reading, Reading::Failed { .. });
     frame.render_widget(
         Paragraph::new(app.reading.state_label())
             .right_aligned()
-            .style(if stale {
-                palette.attention
-            } else {
-                palette.strong
-            }),
+            .style(palette.strong),
         state,
     );
     if let Some(snapshot) = app.reading.snapshot() {
@@ -424,8 +407,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, refreshing: bool, palette: Palette
             Paragraph::new(format!(
                 "This node · {}",
                 shorten(&snapshot.node.device_id, 16)
-            ))
-            .style(palette.secondary),
+            )),
             Rect {
                 y: header.y + 1,
                 height: 1,
@@ -445,7 +427,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, refreshing: bool, palette: Palette
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(section_title, palette.strong),
-            Line::styled("─".repeat(section.width as usize), palette.secondary),
+            Line::raw("─".repeat(section.width as usize)),
         ]),
         section,
     );
@@ -465,7 +447,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, refreshing: bool, palette: Palette
         ]);
         render_scrolled(frame, content, help, &mut app.help_scroll);
     } else if app.view == View::Details {
-        let text = details(app, palette);
+        let text = details(app);
         render_scrolled(frame, content, text, &mut app.detail_scroll);
     } else if app.reading.snapshot().is_some() {
         let wide = content.width >= 84 && content.height >= 12;
@@ -497,7 +479,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, refreshing: bool, palette: Palette
     if let Some(error) = app.reading.error() {
         update_lines.push(Line::styled(
             "Refresh failed. Data is not current.",
-            palette.attention,
+            palette.strong,
         ));
         update_lines.push(Line::raw(safe_text(error)));
     }
@@ -508,15 +490,12 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, refreshing: bool, palette: Palette
         } else {
             "Updated"
         };
-        update_lines.push(Line::styled(
-            format!(
-                "{prefix} {age} ago{}",
-                if refreshing { " · refreshing" } else { "" }
-            ),
-            palette.secondary,
-        ));
+        update_lines.push(Line::raw(format!(
+            "{prefix} {age} ago{}",
+            if refreshing { " · refreshing" } else { "" }
+        )));
     } else if refreshing {
-        update_lines.push(Line::styled("Reading status…", palette.secondary));
+        update_lines.push(Line::raw("Reading status…"));
     }
     frame.render_widget(Paragraph::new(update_lines), update);
     let keys_text = if app.help {
@@ -536,7 +515,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, refreshing: bool, palette: Palette
     } else {
         "j/k select   Enter details   r refresh   ? help   q quit"
     };
-    frame.render_widget(Paragraph::new(keys_text).style(palette.secondary), keys);
+    frame.render_widget(Paragraph::new(keys_text), keys);
 }
 
 fn draw_network(frame: &mut Frame<'_>, area: Rect, app: &mut App, palette: Palette) {
@@ -551,10 +530,7 @@ fn draw_network(frame: &mut Frame<'_>, area: Rect, app: &mut App, palette: Palet
         Constraint::Length(if compact { 1 } else { 2 }),
     ])
     .areas(area);
-    frame.render_widget(
-        Paragraph::new("Personal network").style(palette.secondary),
-        heading,
-    );
+    frame.render_widget(Paragraph::new("Personal network"), heading);
     let width = list.width.saturating_sub(2) as usize;
     let mut items = vec![network_item(
         "This node",
@@ -583,7 +559,7 @@ fn draw_network(frame: &mut Frame<'_>, area: Rect, app: &mut App, palette: Palet
     frame.render_stateful_widget(
         List::new(items)
             .highlight_symbol("> ")
-            .highlight_style(palette.strong.remove_modifier(Modifier::DIM)),
+            .highlight_style(palette.strong),
         list,
         &mut app.list,
     );
@@ -595,10 +571,7 @@ fn draw_network(frame: &mut Frame<'_>, area: Rect, app: &mut App, palette: Palet
         ""
     };
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(node.peer_summary(), palette.secondary),
-            Line::raw(note),
-        ]),
+        Paragraph::new(vec![Line::raw(node.peer_summary()), Line::raw(note)]),
         summary,
     );
 }
@@ -618,14 +591,14 @@ fn network_item(
             Span::styled(format!("{name}{}  ", " ".repeat(padding)), palette.strong),
             Span::raw(state.to_owned()),
         ]),
-        Line::styled(shorten(description, width), palette.secondary),
+        Line::raw(shorten(description, width)),
     ])
 }
 
-fn details(app: &App, palette: Palette) -> Text<'static> {
+fn details(app: &App) -> Text<'static> {
     let mut lines = Vec::new();
     let mut field = |label: &str, value: &str| {
-        lines.push(Line::styled(label.to_owned(), palette.secondary));
+        lines.push(Line::raw(label.to_owned()));
         lines.push(Line::raw(safe_text(value)));
         lines.push(Line::raw(""));
     };
@@ -731,14 +704,11 @@ fn compact_details(app: &App, width: u16, palette: Palette) -> Text<'static> {
     let mut lines = vec![Line::styled(heading, palette.strong), Line::raw("")];
     for (label, value) in fields {
         lines.push(Line::from(vec![
-            Span::styled(format!("{label:<8} "), palette.secondary),
+            Span::raw(format!("{label:<8} ")),
             Span::raw(shorten(&value, width.saturating_sub(9).into())),
         ]));
     }
-    lines.extend([
-        Line::raw(""),
-        Line::styled("Enter full details", palette.secondary),
-    ]);
+    lines.extend([Line::raw(""), Line::raw("Enter full details")]);
     Text::from(lines)
 }
 
@@ -781,6 +751,26 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    #[ignore = "requires a PTY"]
+    fn terminal_guard_restores_after_panic() {
+        assert!(io::stdin().is_terminal() && io::stdout().is_terminal());
+        let panic = std::panic::catch_unwind(|| {
+            let _guard = TerminalGuard::enter().unwrap();
+            assert!(crossterm::terminal::is_raw_mode_enabled().unwrap());
+            panic!("intentional TerminalGuard panic");
+        });
+        assert_eq!(
+            panic.unwrap_err().downcast_ref::<&str>(),
+            Some(&"intentional TerminalGuard panic")
+        );
+        assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
+        println!("PANIC_RESTORED_PRESS_ENTER");
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        assert_eq!(input, "\n");
     }
 
     #[test]

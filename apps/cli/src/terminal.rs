@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use clap::builder::styling::{AnsiColor, Effects, Styles};
+use clap::builder::styling::Styles;
 use crossterm::style::Stylize;
 use ratatui::{style::Style, text::Span};
 use serde::Deserialize;
@@ -11,14 +11,15 @@ use std::{
 };
 
 pub fn help_styles() -> Styles {
+    let strong = clap::builder::styling::Style::new().bold();
     Styles::styled()
-        .header(AnsiColor::Cyan.on_default() | Effects::BOLD)
-        .usage(AnsiColor::Cyan.on_default() | Effects::BOLD)
-        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .header(strong)
+        .usage(strong)
+        .literal(strong)
         .placeholder(clap::builder::styling::Style::new())
 }
 
-pub fn use_color() -> bool {
+pub fn use_emphasis() -> bool {
     std::env::var_os("NO_COLOR").is_none() && std::env::var("TERM").is_ok_and(|term| term != "dumb")
 }
 
@@ -217,11 +218,11 @@ pub fn print_status(node: &NodeStatus) -> io::Result<()> {
     let mut out = io::stdout().lock();
     let width = crossterm::terminal::size().map_or(80, |(width, _)| width.max(16));
     writeln!(out)?;
-    if use_color() {
+    if use_emphasis() {
         writeln!(
             out,
             "  {}  {}",
-            "vibeface".cyan().bold(),
+            "vibeface".bold(),
             node.status.label().bold()
         )?;
     } else {
