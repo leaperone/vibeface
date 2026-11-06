@@ -22,7 +22,7 @@ assert(inside && !inside.startsWith('..') && !inside.startsWith('/'), 'Native in
 
 export default {
   tests: ['native-transfers.e2e.ts'],
-  targets: [{ name: 'vdp-ios', engine: mobile({ platform: 'ios', device: simulator, session: 'vdp-native-acceptance' }),
+  targets: [{ name: 'vdp-ios', engine: mobile({ platform: 'ios', device: simulator, session: 'vdp-native-acceptance', transition: 1000 }),
     app: { appPath: resolve(app), bundleId: 'one.leaper.vibeface' } }],
   workers: 1,
   retries: 0,

@@ -235,7 +235,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
       const observed = JSON.stringify(marker), stable = observed === previousHistoryBounds;
       previousHistoryBounds = observed;
       const readingSpan = readingBottom - top, readable = readingSpan > 0 && (!marker || marker.height <= readingSpan);
-      const limit = readingSpan / 4, delta = marker ? Math.max(-limit, Math.min(limit, top + (readingSpan - marker.height) / 2 - marker.y)) : limit;
+      const limit = readingSpan / 4, delta = marker ? Math.max(-limit, Math.min(limit, top + (readingSpan - marker.height) / 2 - marker.y)) : (bottom - top) / 2;
       const x = pane.x + pane.width / 2, center = (top + bottom) / 2;
       const gesture = !positioned && readable ? { from: { x, y: center - delta / 2 }, to: { x, y: center + delta / 2 }, duration: 500 } : null;
       await writeFile(resolve(network.gates.main, '..', 'native-history-preposition.jsonl'), `${JSON.stringify({ phase, iteration: positioningAttempt++, at_ms: Date.now(), pane, target, back, markerVisible, marker, top, bottom, readingBottom, positioned: Boolean(positioned), stable, readable, gesture })}\n`, { flag: 'a', mode: 0o600 });

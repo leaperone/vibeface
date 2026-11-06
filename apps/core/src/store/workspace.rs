@@ -1255,7 +1255,17 @@ pub(crate) fn apply_projection(
         );
         graph.record(hash, event, rank, basis)?;
     }
-    graph.save(connection, network)
+    graph.save(connection, network)?;
+    if let EventBody::WorkspaceCommanded {
+        command: WorkspaceCommand::AssignTask { assignment_id, .. },
+        ..
+    } = &event.body
+        && let Some(assignment) = graph.assignments.get(assignment_id)
+    {
+        let scope = bot_scope(connection, network, &assignment.bot_id)?;
+        refresh_reply_targets(connection, network, &scope, assignment_id)?;
+    }
+    Ok(())
 }
 
 fn bot_scope(connection: &Connection, network: &str, bot_id: &str) -> Result<String> {
@@ -3072,19 +3082,71 @@ pub(crate) fn refresh_reply_targets(
     connection: &Connection,
     network: &str,
     conversation: &str,
+    message_id: &str,
 ) -> Result<()> {
-    connection.execute("UPDATE messages AS answer SET target=(SELECT json_extract(question.body,'$.target') FROM questions AS question WHERE question.network_id=answer.network_id AND question.conversation_id=answer.conversation_id AND question.question_id=answer.answers) WHERE answer.network_id=? AND answer.conversation_id=? AND answer.role='user' AND answer.answers IS NOT NULL AND EXISTS(SELECT 1 FROM questions AS question WHERE question.network_id=answer.network_id AND question.conversation_id=answer.conversation_id AND question.question_id=answer.answers AND json_type(question.body,'$.target')='object')",params![network,conversation])?;
-    connection.execute("UPDATE messages AS reply SET target=(SELECT input.target FROM messages AS input WHERE input.network_id=reply.network_id AND input.conversation_id=reply.conversation_id AND input.message_id=reply.in_reply_to) WHERE reply.network_id=? AND reply.conversation_id=? AND reply.role='assistant' AND EXISTS(SELECT 1 FROM messages AS input WHERE input.network_id=reply.network_id AND input.conversation_id=reply.conversation_id AND input.message_id=reply.in_reply_to AND input.target IS NOT NULL)",params![network,conversation])?;
-    connection.execute("UPDATE messages AS reply SET target=(SELECT input.target FROM messages AS input WHERE input.network_id=reply.network_id AND input.conversation_id=reply.conversation_id AND input.steered_into=reply.message_id AND input.target IS NOT NULL ORDER BY input.rank LIMIT 1) WHERE reply.network_id=? AND reply.conversation_id=? AND reply.role='assistant' AND reply.target IS NULL AND EXISTS(SELECT 1 FROM messages AS input WHERE input.network_id=reply.network_id AND input.conversation_id=reply.conversation_id AND input.steered_into=reply.message_id AND input.target IS NOT NULL)",params![network,conversation])?;
-    let graph = Graph::read(connection, network)?;
-    for assignment in graph.assignments.values() {
-        if bot_scope(connection, network, &assignment.bot_id)? != conversation {
-            continue;
+    connection.execute(
+        "UPDATE messages AS answer SET target=(SELECT json_extract(question.body,'$.target') FROM questions AS question WHERE question.network_id=answer.network_id AND question.conversation_id=answer.conversation_id AND question.question_id=answer.answers AND json_type(question.body,'$.target')='object') WHERE answer.network_id=? AND answer.conversation_id=? AND answer.message_id=? AND answer.role='user' AND answer.answers IS NOT NULL",
+        params![network, conversation, message_id],
+    )?;
+    let mut changed = BTreeSet::from([message_id.to_owned()]);
+    while let Some(message_id) = changed.pop_first() {
+        let replies: Vec<String> = connection.prepare(
+            "SELECT message_id FROM messages WHERE network_id=?1 AND conversation_id=?2 AND in_reply_to=?3 AND role='assistant' UNION SELECT message_id FROM messages WHERE network_id=?1 AND conversation_id=?2 AND message_id=?3 AND role='assistant' UNION SELECT steered_into FROM messages WHERE network_id=?1 AND conversation_id=?2 AND message_id=?3 AND steered_into IS NOT NULL",
+        )?.query_map(params![network, conversation, message_id], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        for reply in replies {
+            if refresh_reply_target(connection, network, conversation, &reply)? {
+                changed.insert(reply);
+            }
         }
-        let target = InputTarget::Task {
-            task_id: assignment.task_id.clone(),
-        };
-        connection.execute("UPDATE messages SET target=? WHERE network_id=? AND conversation_id=? AND in_reply_to=? AND author=? AND role='assistant'", params![serde_json::to_string(&target)?, network, conversation, assignment.assignment_id, assignment.execution_node])?;
+    }
+    Ok(())
+}
+
+fn refresh_reply_target(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    message_id: &str,
+) -> Result<bool> {
+    let Some((author, in_reply_to, previous)) = connection.query_row(
+        "SELECT author,in_reply_to,target FROM messages WHERE network_id=? AND conversation_id=? AND message_id=? AND role='assistant'",
+        params![network, conversation, message_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?)),
+    ).optional()? else { return Ok(false) };
+    let mut target: Option<String> = connection.query_row(
+        "SELECT COALESCE((SELECT target FROM messages WHERE network_id=?1 AND conversation_id=?2 AND message_id=?4),(SELECT target FROM messages WHERE network_id=?1 AND conversation_id=?2 AND steered_into=?3 AND role='user' AND target IS NOT NULL ORDER BY rank LIMIT 1))",
+        params![network, conversation, message_id, in_reply_to],
+        |row| row.get(0),
+    )?;
+    if let Some(in_reply_to) = in_reply_to
+        && let Some(assignment) = workspace_assignment_from(connection, network, &in_reply_to)?
+        && assignment.execution_node == author
+        && bot_scope(connection, network, &assignment.bot_id)? == conversation
+    {
+        target = Some(serde_json::to_string(&InputTarget::Task {
+            task_id: assignment.task_id,
+        })?);
+    }
+    if target == previous {
+        return Ok(false);
+    }
+    connection.execute(
+        "UPDATE messages SET target=? WHERE network_id=? AND conversation_id=? AND message_id=?",
+        params![target, network, conversation, message_id],
+    )?;
+    Ok(true)
+}
+
+pub(crate) fn refresh_question_targets(
+    connection: &Connection,
+    network: &str,
+    question_id: &str,
+) -> Result<()> {
+    let answers: Vec<(String, String)> = connection.prepare(
+        "SELECT conversation_id,message_id FROM messages WHERE network_id=? AND answers=? AND role='user'",
+    )?.query_map(params![network, question_id], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    for (conversation, message_id) in answers {
+        refresh_reply_targets(connection, network, &conversation, &message_id)?;
     }
     Ok(())
 }
@@ -4362,9 +4424,17 @@ pub(crate) fn workspace_assignment_from(
     network: &str,
     assignment_id: &str,
 ) -> Result<Option<Assignment>> {
-    Ok(Graph::read(connection, network)?
-        .assignments
-        .remove(assignment_id))
+    let encoded: Option<String> = connection
+        .query_row(
+            "SELECT json_extract(state, '$.assignments.' || json_quote(?2)) FROM workspace_projection WHERE network_id=?1",
+            params![network, assignment_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    encoded
+        .map(|encoded| serde_json::from_str(&encoded).map_err(Into::into))
+        .transpose()
 }
 
 pub(crate) fn assignment_admission_allowed_from(

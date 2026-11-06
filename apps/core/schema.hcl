@@ -285,6 +285,14 @@ table "messages" {
   index "messages_answers" {
     columns = [column.network_id, column.answers]
   }
+  index "messages_replies" {
+    columns = [column.network_id, column.conversation_id, column.in_reply_to]
+    where   = "in_reply_to IS NOT NULL"
+  }
+  index "messages_steered" {
+    columns = [column.network_id, column.conversation_id, column.steered_into, column.rank]
+    where   = "steered_into IS NOT NULL AND role = 'user' AND target IS NOT NULL"
+  }
 }
 table "bots" {
   schema = schema.main

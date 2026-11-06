@@ -5327,6 +5327,13 @@ fn append_100k_stays_flat() -> Result<()> {
     }
     let last = batch(&mut store, 99_000)?;
     eprintln!("first 1000: {first:?}, last 1000: {last:?}");
+    let written: u64 = store.connection.query_row(
+        "SELECT count(*) FROM messages WHERE network_id=? AND conversation_id='c'",
+        [&net.network],
+        |row| row.get(0),
+    )?;
+    assert_eq!(written, 100_000);
+    eprintln!("stored messages: {written}");
     std::fs::remove_dir_all(&dir)?;
     assert!(last < first * 3, "append cost grew: {first:?} -> {last:?}");
     Ok(())
@@ -6624,6 +6631,292 @@ fn a_question_target_is_shared_and_does_not_turn_unknown_into_main() -> Result<(
             1
         );
     }
+    Ok(())
+}
+
+#[test]
+fn reply_targets_follow_winning_rows_and_ranked_steers_in_any_order() -> Result<()> {
+    use crate::workspace::{InputIntent, InputTarget, WorkspaceCommand};
+    for order in permutations(3) {
+        let (net, mut origin) = workspace_fixture()?;
+        workspace_command_fixture(
+            &net,
+            &mut origin,
+            "task",
+            workspace_task_command("task", None),
+            3,
+        )?;
+        workspace_command_fixture(
+            &net,
+            &mut origin,
+            "assign",
+            WorkspaceCommand::AssignTask {
+                task_id: "task".into(),
+                expected_revision: 1,
+                assignment_id: "assignment.with.dots".into(),
+                bot_id: "bot".into(),
+                execution_node: net.a.device_id()?,
+                bot_owner_epoch: 1,
+                channel_owner_epoch: None,
+                work_id: None,
+                resource_roots: vec![],
+                automatic: false,
+            },
+            4,
+        )?;
+        let [early, late, direct] =
+            ["early", "late", "direct"].map(|id| InputTarget::Task { task_id: id.into() });
+        let apply =
+            |scope: &str, body: EventBody, rank: u64, author: &LocalIdentity| -> Result<()> {
+                let hash = format!("{rank:064x}");
+                reduce::apply(
+                    &origin.connection,
+                    &net.network,
+                    &hash,
+                    &Event {
+                        version: WIRE_VERSION,
+                        network_id: net.network.clone(),
+                        author: author.device_id()?,
+                        seq: 1,
+                        prev: None,
+                        deps: vec![],
+                        scope_id: scope.into(),
+                        created_at_ms: rank as i64,
+                        body,
+                        blobs: vec![],
+                    },
+                    rank as i64,
+                    &super::rank(1000 + rank, rank as i64, &hash),
+                    false,
+                )
+            };
+        let question_body = |id: &str, target: Option<InputTarget>| -> Result<EventBody> {
+            let mut body = question(&origin, &net, "c", id, "session")?;
+            if let EventBody::QuestionAsked {
+                target: current, ..
+            } = &mut body
+            {
+                *current = target;
+            }
+            Ok(body)
+        };
+        let answer = |id: &str| -> Result<EventBody> {
+            let mut body = user(&net, &format!("a-{id}"), "answer");
+            if let EventBody::MessagePosted {
+                answers,
+                attestation,
+                ..
+            } = &mut body
+            {
+                *answers = Some(id.into());
+                *attestation = None;
+            }
+            net.a.fixture_admin().attest(&net.network, "c", body)
+        };
+        let target =
+            |id: &str| workspace::message_target_from(&origin.connection, &net.network, "c", id);
+        for piece in &order {
+            match piece {
+                0 | 1 => {
+                    let (id, value, rank) = if *piece == 0 {
+                        ("q-early", &early, 10)
+                    } else {
+                        ("q-late", &late, 20)
+                    };
+                    apply("c", question_body(id, Some(value.clone()))?, rank, &net.a)?;
+                    apply("c", answer(id)?, rank + 20, &net.a)?;
+                    apply(
+                        "c",
+                        EventBody::MessageSteered {
+                            message_id: format!("a-{id}"),
+                            reply: "reply".into(),
+                        },
+                        rank + 100,
+                        &net.a,
+                    )?;
+                }
+                2 => {
+                    apply("c", bot_reply("reply", "a-q-direct"), 80, &net.a)?;
+                    apply("c", bot_reply("chain", "reply"), 90, &net.a)?;
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(target("reply")?, Some(early.clone()), "{order:?}");
+        assert_eq!(target("chain")?, Some(early.clone()), "{order:?}");
+        apply("c", answer("q-direct")?, 50, &net.a)?;
+        assert_eq!(target("reply")?, Some(early.clone()));
+        apply(
+            "c",
+            question_body("q-direct", Some(direct.clone()))?,
+            60,
+            &net.a,
+        )?;
+        assert_eq!(target("reply")?, Some(direct.clone()));
+        assert_eq!(target("chain")?, Some(direct.clone()));
+        apply(
+            "c",
+            question_body("q-direct", Some(late.clone()))?,
+            70,
+            &net.a,
+        )?;
+        apply("c", bot_reply("reply", "a-q-late"), 85, &net.b)?;
+        assert_eq!(
+            target("reply")?,
+            Some(direct.clone()),
+            "losing events keep the winning row"
+        );
+        apply(
+            "other",
+            question_body("q-direct", Some(direct.clone()))?,
+            55,
+            &net.a,
+        )?;
+        assert_eq!(
+            target("a-q-direct")?,
+            None,
+            "a question cannot cross conversation boundaries"
+        );
+        assert_eq!(target("reply")?, Some(early.clone()));
+        apply("c", bot_reply("a-q-early", "a-q-late"), 25, &net.a)?;
+        assert_eq!(target("reply")?, Some(late.clone()));
+        let input = |id: &str| -> Result<EventBody> {
+            net.a.fixture_admin().attest(
+                &net.network,
+                "c",
+                EventBody::InputPosted {
+                    message_id: id.into(),
+                    target: direct.clone(),
+                    intent: InputIntent::Continue,
+                    sequence: 1,
+                    expected_revision: None,
+                    text: "input".into(),
+                    attachments: vec![],
+                    report_results: Some(true),
+                    attestation: None,
+                },
+            )
+        };
+        apply("c", input("a-q-early")?, 24, &net.a)?;
+        let row: (String, Option<String>, Option<String>, Option<String>) = origin.connection.query_row(
+            "SELECT role,answers,in_reply_to,steered_into FROM messages WHERE network_id=? AND conversation_id='c' AND message_id='a-q-early'",
+            [&net.network], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(row, ("user".into(), None, None, Some("reply".into())));
+        assert_eq!(target("reply")?, Some(direct.clone()));
+        assert_eq!(target("chain")?, Some(direct.clone()));
+        apply("c", input("assignment.with.dots")?, 140, &net.a)?;
+        apply(
+            "c",
+            bot_reply("assigned", "assignment.with.dots"),
+            150,
+            &net.a,
+        )?;
+        apply(
+            "c",
+            bot_reply("other-author", "assignment.with.dots"),
+            151,
+            &net.b,
+        )?;
+        apply(
+            "other",
+            bot_reply("other-scope", "assignment.with.dots"),
+            152,
+            &net.a,
+        )?;
+        assert_eq!(
+            target("assigned")?,
+            Some(InputTarget::Task {
+                task_id: "task".into()
+            })
+        );
+        assert_eq!(target("other-author")?, Some(direct));
+        assert_eq!(
+            workspace::message_target_from(
+                &origin.connection,
+                &net.network,
+                "other",
+                "other-scope"
+            )?,
+            None
+        );
+        assert_eq!(
+            workspace::workspace_assignment_from(
+                &origin.connection,
+                "other-network",
+                "assignment.with.dots"
+            )?,
+            None
+        );
+        assert_eq!(
+            workspace::workspace_assignment_from(&origin.connection, &net.network, "assignment")?,
+            None,
+            "an assignment ID is an exact JSON object key"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn reply_target_refresh_visits_only_related_mixed_history() -> Result<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let net = net()?;
+    let store = store(&net)?;
+    let target = serde_json::to_string(&crate::workspace::InputTarget::Task {
+        task_id: "task".into(),
+    })?;
+    store.connection.execute(
+        "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,attachments,target) VALUES(?,'c','input','input','0','author','user','input',0,'[]',?)",
+        params![net.network, target],
+    )?;
+    store.connection.execute(
+        "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,attachments,in_reply_to) VALUES(?,'c','reply','reply','1','author','assistant','reply',0,'[]','input')",
+        [&net.network],
+    )?;
+    let mut steps = Vec::new();
+    for history in [0, 2000] {
+        for i in 0..history {
+            store.connection.execute(
+                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,attachments,in_reply_to,steered_into,target) VALUES(?1,'c',?2,?2,?2,'author',CASE WHEN ?3%2=0 THEN 'user' ELSE 'assistant' END,'unrelated',0,'[]',?2,?2,?4)",
+                params![net.network, format!("unrelated-{i}"), i, target],
+            )?;
+        }
+        store.connection.execute(
+            "UPDATE messages SET target=NULL WHERE network_id=? AND message_id='reply'",
+            [&net.network],
+        )?;
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = count.clone();
+        store.connection.progress_handler(
+            1,
+            Some(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        );
+        let result =
+            workspace::refresh_reply_targets(&store.connection, &net.network, "c", "input");
+        store.connection.progress_handler(0, None::<fn() -> bool>);
+        result?;
+        steps.push(count.load(Ordering::Relaxed));
+        assert_eq!(
+            store
+                .message(&net.network, "c", "reply")?
+                .context("reply")?
+                .target,
+            Some(crate::workspace::InputTarget::Task {
+                task_id: "task".into()
+            })
+        );
+    }
+    assert!(
+        steps[1] < steps[0] * 2,
+        "unrelated mixed history increased projection work: {steps:?}"
+    );
+    eprintln!("reply target SQLite VM steps with 0/2000 unrelated mixed messages: {steps:?}");
     Ok(())
 }
 
