@@ -11,7 +11,7 @@ use std::{
 pub use vibeface_control::DATA_EPOCH;
 /// SHA-256 of the Core and delivery initial SQL schemas.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
-    "5b00ddf4d8207f94b2d674984b4a2e798816aebedabf959b6db016f751bc393d";
+    "a854af1e33092a6f80232b013cb3585b4959ad59b012e0cc11401bf1511569fe";
 /// Bumped whenever a release package stops being installable by the previous updater.
 pub use vibeface_control::UPDATE_PROTOCOL;
 pub fn data_epoch_marker() -> Vec<u8> {
