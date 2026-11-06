@@ -537,8 +537,19 @@ jobs:
             'runner_readiness_preflight_failed', 'runner_cache_uncertifiable', 'runner_process_dead',
             'runner_reported_failure', 'xcodebuild_exited_early', 'simulator_service_hub_unavailable',
             'simulator_set_destination_not_found', 'build_failed_unclassified',
+            'IOS_RUNNER_CONNECT_TIMEOUT', 'IOS_RUNNER_DEVICE_NOT_PROVISIONED', 'BOOT_COMMAND_FAILED',
             'startup-exited', 'startup-stalled', 'startup-ceiling'];
+          const execEvents = ['spawn_start', 'spawn', 'deadline', 'abort', 'error', 'exit', 'close', 'settled'];
+          const signals = ['SIGTERM', 'SIGKILL', 'SIGABRT', 'SIGSEGV', 'SIGBUS', 'SIGILL',
+            'SIGTRAP', 'SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGPIPE'];
+          const startupReasons = ['bundle_identifier_already_registered', 'signing_no_development_team',
+            'signing_provisioning_profile_missing', 'signing_unspecified', 'devtools_security_developer_mode_disabled',
+            'device_developer_mode_disabled', 'device_developer_disk_image_unavailable', 'build_failed_unclassified',
+            'simulator_service_hub_unavailable', 'simulator_set_destination_not_found'];
           const enumValue = (value, allowed, fallback = 'unknown') => allowed.includes(value) ? value : fallback;
+          const exitCode = value => value === undefined ? 'missing' : value === null ? null
+            : Number.isInteger(value) && value >= 0 && value <= 255 ? value : 'unknown';
+          const signal = value => value === undefined ? 'missing' : value === null ? null : enumValue(value, signals);
           const ms = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 3600000
             ? Math.round(value) : null;
           const numericFields = (value, keys) => Object.fromEntries(keys.map(key => [key, ms(value?.[key])]));
@@ -549,6 +560,7 @@ jobs:
             runner_error_code: enumValue(error?.details?.runnerErrorCode,
               ['RUNNER_BUSY', 'MAIN_THREAD_TIMEOUT', 'RUNNER_WEDGED', 'COMMAND_ALREADY_FINISHED', 'IOS_AX_SNAPSHOT_FAILED']),
             runner_connect_failure_reason: enumValue(error?.details?.runnerConnectFailureReason, reasons),
+            xcodebuild_exit_code: exitCode(error?.details?.xcodebuild?.exitCode),
             runner_phase: enumValue(error?.details?.phase, ['runner_session', 'runner_rebuild', 'runner_health']),
             startup_kind: enumValue(error?.details?.kind, ['daemon_startup_failed']),
             timeout_ms: ms(error?.details?.timeoutMs),
@@ -557,9 +569,19 @@ jobs:
               && error.details.startupAttempts >= 0 && error.details.startupAttempts <= 2 ? error.details.startupAttempts : null,
             cause: depth < 2 && error?.cause ? safeError(error.cause, depth + 1) : null,
           });
-          function safeEvent(value) {
+          function safeEvent(value, execIds) {
             const phase = value?.phase;
             const data = value?.data;
+            if (phase === 'exec_command' && data?.command === 'xcodebuild' && execEvents.includes(data.event)) {
+              const id = data.execId;
+              if (typeof id === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id)
+                && !execIds.has(id) && execIds.size < 128) execIds.set(id, execIds.size + 1);
+              return { phase, command: 'xcodebuild', event: data.event, exec_index: execIds.get(id) ?? null,
+                duration_ms: ms(value.durationMs), timeout_ms: ms(data.timeoutMs),
+                exit_code: exitCode(data.exitCode), signal: signal(data.signal),
+                settlement_reason: enumValue(data.reason, ['success', 'exit_failure', 'timeout', 'abort', 'spawn_error', 'stdin_error'],
+                  data.reason === undefined ? 'missing' : 'unknown') };
+            }
             if (phase === 'prepare_apple_runner') return { phase,
               event: enumValue(data?.event, ['readiness_start', 'runner_start', 'settled']),
               duration_ms: ms(value.durationMs), timeout_ms: ms(data?.timeoutMs), remaining_ms: ms(data?.remainingMs) };
@@ -584,12 +606,13 @@ jobs:
             if (statSync(path).size > 8388608) return { ...result, status: 'size_limit', capped: true };
             result.status = 'read';
             const lines = readFileSync(path, 'utf8').split('\n');
+            const execIds = new Map();
             result.capped = lines.length > 10000;
             for (const line of lines.slice(0, 10000)) {
               if (!line) continue;
               if (line.length > 131072) { result.malformed_lines++; continue; }
               let event;
-              try { event = safeEvent(JSON.parse(line)); }
+              try { event = safeEvent(JSON.parse(line), execIds); }
               catch { result.malformed_lines++; continue; }
               if (!event) continue;
               if (result.events.length >= 128) { result.capped = true; break; }
@@ -650,6 +673,27 @@ jobs:
             assert.equal(process.env.AGENT_DEVICE_STATE_DIR, state);
             mkdirSync(state, { recursive: true, mode: 0o700 });
           }
+          function startupProjection(error, AppError, classify) {
+            const stderr = error?.details?.xcodebuild?.stderr;
+            if (typeof stderr !== 'string') return { reason: 'unavailable', matched: null };
+            const details = { stderr };
+            for (const key of ['simulatorSetPath', 'simulatorUdid', 'xcodeVersion']) {
+              if (typeof error.details[key] === 'string') details[key] = error.details[key];
+            }
+            const result = classify(new AppError('COMMAND_FAILED', 'Runner did not accept connection (xcodebuild exited early)', details));
+            return { reason: enumValue(result?.reason, startupReasons),
+              matched: typeof result?.matched === 'boolean' ? result.matched : null };
+          }
+          async function startupClassification(error) {
+            if (typeof error?.details?.xcodebuild?.stderr !== 'string') return { reason: 'unavailable', matched: null };
+            try {
+              const sdk = dependency();
+              const { AppError } = await import(pathToFileURL(sdk.entry).href);
+              const { r: classify } = await import(pathToFileURL(join(dirname(sdk.entry), 'runner-error-classification.js')).href);
+              assert.equal(typeof classify, 'function');
+              return startupProjection(error, AppError, classify);
+            } catch { return { reason: 'unavailable', matched: null }; }
+          }
           async function stage(name, operation, project = () => null) {
             const started = performance.now();
             report[name].status = 'running';
@@ -662,6 +706,7 @@ jobs:
             } catch (error) {
               report[name].status = 'failed';
               report[name].error = safeError(error);
+              report[name].error.startup_classification = await startupClassification(error);
               return false;
             } finally {
               report[name].duration_ms = ms(performance.now() - started);
@@ -692,7 +737,70 @@ jobs:
               snapshotQuality: { state: 'healthy', backend: 'tree', reason: sentinel }, fallbackScreenshotPath: sentinel });
             assert.equal(snapshot.node_count, 1);
             assert.equal(snapshot.quality, 'healthy');
-            assert(!JSON.stringify({ event, error, prepared, snapshot }).includes(sentinel));
+            for (const reason of ['IOS_RUNNER_CONNECT_TIMEOUT', 'IOS_RUNNER_DEVICE_NOT_PROVISIONED', 'BOOT_COMMAND_FAILED']) {
+              assert.equal(safeError({ details: { reason } }).reason, reason);
+            }
+            for (const code of [0, 1, 65, 70, 255]) {
+              assert.equal(safeError({ details: { xcodebuild: { exitCode: code } } }).xcodebuild_exit_code, code);
+            }
+            for (const code of [-1, 256, 1.5, Infinity, NaN, '65', sentinel]) assert.equal(exitCode(code), 'unknown');
+            assert.equal(exitCode(undefined), 'missing');
+            assert.equal(exitCode(null), null);
+            assert.equal(signal(undefined), 'missing');
+            assert.equal(signal(null), null);
+            assert.equal(signal(sentinel), 'unknown');
+            for (const name of signals) assert.equal(signal(name), name);
+            const execIds = new Map();
+            const fixtureExecId = index => `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`;
+            const id = fixtureExecId(1);
+            const exec = (event, data = {}) => safeEvent({ phase: 'exec_command', durationMs: 7,
+              data: { command: 'xcodebuild', execId: id, event, args: [sentinel], stderr: sentinel, ...data } }, execIds);
+            for (const name of execEvents) assert.equal(exec(name).event, name);
+            const started = exec('spawn_start');
+            assert.equal(started.exec_index, 1);
+            assert(!JSON.stringify(started).includes(id));
+            assert.equal(started.exit_code, 'missing');
+            assert.equal(started.signal, 'missing');
+            const killed = exec('exit', { exitCode: null, signal: 'SIGKILL' });
+            const closed = exec('close', { exitCode: null, signal: 'SIGKILL' });
+            assert.equal(killed.exit_code, null);
+            assert.equal(killed.signal, 'SIGKILL');
+            assert.equal(closed.exec_index, killed.exec_index);
+            const finished = exec('settled', { exitCode: 1, signal: null, reason: 'success',
+              execId: fixtureExecId(2) });
+            assert.equal(finished.exec_index, 2);
+            assert.equal(finished.exit_code, 1);
+            assert.equal(finished.signal, null);
+            assert.equal(finished.settlement_reason, 'success');
+            assert.equal(exec('exit', { signal: sentinel }).signal, 'unknown');
+            assert.equal(exec(sentinel), null);
+            assert.equal(exec('exit', { command: 'swift' }), null);
+            assert.equal(exec('exit', { command: '/usr/bin/xcodebuild' }), null);
+            assert.equal(exec('exit', { execId: sentinel }).exec_index, null);
+            const groups = new Map();
+            for (let i = 1; i <= 129; i++) {
+              const projected = safeEvent({ phase: 'exec_command', data: { command: 'xcodebuild', event: 'spawn',
+                execId: fixtureExecId(i) } }, groups);
+              assert.equal(projected.exec_index, i <= 128 ? i : null);
+            }
+            assert.equal(groups.size, 128);
+            class FixtureError extends Error {
+              constructor(code, message, details) { super(message); this.code = code; this.details = details; }
+            }
+            let adapted;
+            const classified = startupProjection({ message: sentinel, details: { xcodebuild: { stderr: sentinel },
+              simulatorUdid: 'fixture-udid', simulatorSetPath: null, xcodeVersion: 26 } }, FixtureError, value => {
+              adapted = value;
+              return { reason: 'signing_no_development_team', matched: true, hint: sentinel, messageSuffix: sentinel };
+            });
+            assert.deepEqual(classified, { reason: 'signing_no_development_team', matched: true });
+            assert.equal(adapted.message, 'Runner did not accept connection (xcodebuild exited early)');
+            assert.deepEqual(adapted.details, { stderr: sentinel, simulatorUdid: 'fixture-udid' });
+            assert.deepEqual(startupProjection({}, FixtureError, () => { throw new Error(); }),
+              { reason: 'unavailable', matched: null });
+            assert.deepEqual(startupProjection({ details: { xcodebuild: { stderr: '' } } }, FixtureError,
+              () => ({ reason: sentinel, matched: sentinel })), { reason: 'unknown', matched: null });
+            assert(!JSON.stringify({ event, error, prepared, snapshot, started, killed, closed, finished, classified }).includes(sentinel));
           }
           const mode = process.argv[2];
           if (mode === 'self-check') { selfCheck(); process.exit(0); }
