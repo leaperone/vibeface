@@ -251,7 +251,7 @@ export default function ChatScreen() {
     </View></ScreenFaces>
     <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
       <View style={{ paddingBottom: insets.bottom }}>
-        {scrollButton.id === id && scrollButton.visible ? <View pointerEvents="box-none" className="absolute bottom-full mb-3 w-full max-w-3xl self-center items-end px-4">
+        {scrollButton.id === id && scrollButton.visible ? <View pointerEvents="box-none" className="absolute -top-14 w-full max-w-3xl self-center items-end px-4">
           <Button variant="outline" size="icon" className="rounded-full bg-card shadow-sm" accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
         </View> : null}
         <OfflineBar chat className="mx-4 mb-2 self-center" />
