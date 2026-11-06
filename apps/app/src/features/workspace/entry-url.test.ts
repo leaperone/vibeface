@@ -554,19 +554,22 @@ test("workspace preserves bot and message requests while routing native decision
         return native
       }
       mobile()
+      const platform = { OS: 'android' }, insets = { bottom: 0 }, keyboard = { height: { value: 0 }, progress: { value: 0 } }, dockHeight = { value: 60 }
+      let initialHeight = 0, emptyPadding = () => ({ paddingBottom: 0 })
       const chat = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
         'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: botA.bot_id }) },
-        'expo-router/react-navigation': { useHeaderHeight: () => 0 },
-        'react-native': { Platform: { OS: 'android' }, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
-        'react-native-keyboard-controller': { useReanimatedKeyboardAnimation: () => ({ height: { value: 0 } }) },
-        'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read() },
-        'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }), useSafeAreaFrame: () => ({ width: 390 }) },
-        'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme: 'light' }) },
+        'expo-router/react-navigation': { useHeaderHeight: () => platform.OS === 'ios' ? 96 : 0 },
+        'react-native': { Platform: platform, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
+        'react-native-keyboard-controller': { KeyboardChatScrollView: 'KeyboardChatScrollView', KeyboardStickyView: 'KeyboardStickyView', useReanimatedKeyboardAnimation: () => keyboard },
+        'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: typeof emptyPadding) => { emptyPadding = read; return read() }, useSharedValue: (initial: number) => { initialHeight = initial; return dockHeight } },
+        'react-native-safe-area-context': { useSafeAreaInsets: () => insets, useSafeAreaFrame: () => ({ width: 390 }) },
+        'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
         '@/data/context': { useWorkspace: () => native }, '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
         '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/home.ts': { unreachable },
         '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
         '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
         '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
+        '@/features/chat/chrome': { ChatMaterial: 'ChatMaterial', useChatChrome: () => ({ kind: 'solid' }) },
       }, { requestAnimationFrame: (run: () => void) => run(), setInterval: () => 1, clearInterval() {} })
       const stack = { Screen: 'Screen', Protected: 'Protected' }
       const layout = componentHarness('../../../../../apps/mobile/app/_layout.tsx', {
@@ -653,6 +656,43 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(shared.view, 'tasks', 'a completed read from a blurred chat cannot reactivate the chat view')
         assert.deepEqual(acknowledgements.slice(ackBefore), ['native-a'])
         conversationHold = null
+
+        const android = chat.render('default')
+        assert.equal(android.find(({ type }) => type === 'KeyboardStickyView')?.props.style, undefined)
+        assert.match(String(android.find(({ type }) => type === 'FlatList')?.props.contentContainerClassName), /py-6/)
+        platform.OS = 'ios'; insets.bottom = 34
+        const ios = chat.render('default'), flat = ios.find(({ type }) => type === 'FlatList')
+        assert.equal(initialHeight, 94, 'the initial dock includes its 52pt row, 8pt gap, and safe area')
+        assert.equal(JSON.stringify(ios.find(({ type }) => type === 'KeyboardStickyView')?.props.style), JSON.stringify({ position: 'absolute', bottom: 0, left: 0, right: 0 }))
+        assert.equal(ios.find(({ type }) => type === 'KeyboardStickyView')?.props.pointerEvents, 'box-none')
+        const renderScroll = flat?.props.renderScrollComponent
+        assert.ok(typeof renderScroll === 'function'); renderScroll({})
+        const scroll = ios.find(({ type }) => type === 'KeyboardChatScrollView')
+        assert.equal(scroll?.props.extraContentPadding, dockHeight)
+        assert.equal(scroll?.props.offset, 34)
+        assert.equal(scroll?.props.keyboardLiftBehavior, 'whenAtEnd')
+        const measure = ios.find(({ type, props }) => type === 'View' && typeof props.onLayout === 'function')?.props.onLayout
+        assert.ok(typeof measure === 'function')
+        measure({ nativeEvent: { layout: { height: 94 } } })
+        assert.equal(emptyPadding().paddingBottom, 94)
+        keyboard.height.value = -168; keyboard.progress.value = 0.5
+        assert.equal(emptyPadding().paddingBottom, 245, 'safe area compensation follows keyboard progress')
+        keyboard.height.value = -336; keyboard.progress.value = 1
+        assert.equal(844 - emptyPadding().paddingBottom, 448, 'the open keyboard and dock reserve H + K - S')
+        const offsets: number[] = [], ref = flat?.props.ref
+        assert.ok(ref && typeof ref === 'object' && 'current' in ref)
+        ref.current = { scrollToOffset: ({ offset }: { offset: number }) => offsets.push(offset) }
+        measure({ nativeEvent: { layout: { height: 190 } } })
+        assert.equal(dockHeight.value, 190, 'attachment and notice growth use the measured complete dock')
+        assert.equal(emptyPadding().paddingBottom, 492)
+        assert.deepEqual(offsets, [], 'dock growth cannot itself force an old-message reader to the latest message')
+        const insetChanged = scroll?.props.onContentInsetChange, scrolled = flat?.props.onScroll
+        assert.ok(typeof insetChanged === 'function' && typeof scrolled === 'function')
+        insetChanged({ top: 492, bottom: 96 })
+        scrolled({ nativeEvent: { contentOffset: { y: 0 }, contentInset: { top: 492, bottom: 96 }, contentSize: { height: 2000 }, layoutMeasurement: { height: 844 } } })
+        const jump = chat.render('default').find(({ props }) => props.accessibilityLabel === '回到底部')?.props.onPress
+        assert.ok(typeof jump === 'function'); jump()
+        assert.deepEqual(offsets, [-492], 'the inverted list jumps to the negative actual native top inset')
       } finally { chat.close(); layout.close(); bridge.close() }
     })
   } finally {
@@ -665,7 +705,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const focusEffects = new Map<number, { run: () => (() => void) | void; cleanup?: () => void }>()
   type Props = Record<string, unknown> & { name?: string; type?: string; role?: string; disabled?: boolean; value?: unknown; onChange?: (event: unknown) => void; onSubmit?: (event?: unknown) => void; onClick?: () => void; action?: () => Promise<unknown> }
   const elements: { type: unknown; props: Props }[] = [], afterRender: (() => void)[] = []
-  let cursor = 0, focused = true
+  let cursor = 0, focused = true, output: unknown
   function effect(run: () => (() => void) | void, dependencies: unknown[]) {
     const index = cursor++, previous = effects.get(index)
     if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) afterRender.push(() => {
@@ -725,13 +765,14 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       cursor = 0; elements.length = 0
       const component = module.exports[name]
       assert.ok(typeof component === 'function')
-      component(props)
+      output = component(props)
       afterRender.splice(0).forEach(run => run())
       return elements
     },
     focus() { if (!focused) { focused = true; for (const effect of focusEffects.values()) effect.cleanup = effect.run() ?? undefined } },
     blur() { if (focused) { focused = false; for (const effect of focusEffects.values()) { effect.cleanup?.(); effect.cleanup = undefined } } },
     close() { for (const effect of [...effects.values(), ...focusEffects.values()]) effect.cleanup?.() },
+    get output() { return output },
     module: module.exports,
   }
 }
@@ -784,6 +825,57 @@ const settleComponent = () => new Promise(setImmediate)
 
 const elementText = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(elementText).join('')
   : node && typeof node === 'object' && 'props' in node && node.props && typeof node.props === 'object' && 'children' in node.props ? elementText(node.props.children) : ''
+
+test('native chat glass follows accessibility events without replacing its input content', async () => {
+  const initial = pendingResult(), platform = { OS: 'ios' }
+  let theme = 'light', supported = true, liquid = true, removed = 0, reads = 0, change = (_enabled: boolean) => {}
+  const app = componentHarness('../../../../../apps/mobile/src/features/chat/chrome.tsx', {
+    'expo-glass-effect': { GlassView: 'GlassView', isGlassEffectAPIAvailable: () => supported, isLiquidGlassAvailable: () => liquid },
+    'react-native': { View: 'View', Platform: platform, AccessibilityInfo: {
+      isReduceTransparencyEnabled: () => { reads++; return initial.promise },
+      addEventListener: (name: string, listener: typeof change) => { assert.equal(name, 'reduceTransparencyChanged'); change = listener; return { remove() { removed++ } } },
+    } },
+    'uniwind': { useUniwind: () => ({ theme }), withUniwind: (component: unknown) => component },
+  })
+  const read = () => {
+    app.render('useChatChrome')
+    const chrome = app.output
+    assert.ok(chrome && typeof chrome === 'object' && 'kind' in chrome)
+    return chrome
+  }
+  const input = { type: 'TextInput', props: { value: '保留输入中的草稿', selection: { start: 2, end: 2 } } }
+  const material = (chrome: ReturnType<typeof read>) => {
+    const elements = app.render('ChatMaterial', { chrome, children: input })
+    const root = elements.at(-1)
+    assert.equal(root?.type, 'View')
+    assert.ok(Array.isArray(root?.props.children))
+    assert.equal(root.props.children[1], input, 'the same input stays in the same child slot beneath a fixed View')
+    return elements
+  }
+  try {
+    assert.equal(read().kind, 'solid', 'the first render waits for the accessibility setting')
+    change(false)
+    initial.resolve(true)
+    await settleComponent()
+    const glass = read()
+    assert.equal(glass.kind, 'glass', 'a late initial read cannot overwrite a newer settings event')
+    assert.equal(material(glass).find(({ type }) => type === 'GlassView')?.props.colorScheme, 'light')
+    theme = 'dark'
+    assert.equal(material(read()).find(({ type }) => type === 'GlassView')?.props.colorScheme, 'dark')
+    change(true)
+    const solid = read()
+    assert.equal(solid.kind, 'solid')
+    assert.equal(material(solid).some(({ type }) => type === 'GlassView'), false)
+    change(false); liquid = false
+    assert.equal(read().kind, 'solid', 'Liquid Glass availability is checked independently of the API')
+    assert.equal(removed, 1)
+    supported = false; liquid = true
+    assert.equal(read().kind, 'solid')
+    supported = true; platform.OS = 'android'
+    assert.equal(read().kind, 'solid')
+    assert.equal(reads, 1, 'unsupported platforms do not subscribe or read iOS accessibility settings')
+  } finally { app.close() }
+})
 
 test("automatic connection checks both services without changing uses and reads back unknown writes", async (t) => {
   for (const outcome of ['ready', 'first-failed', 'unreadable', 'connection-changed']) await t.test(outcome, async () => {
