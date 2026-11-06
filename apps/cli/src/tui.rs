@@ -478,7 +478,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, refreshing: bool, palette: Palette
     let mut update_lines = Vec::new();
     if let Some(error) = app.reading.error() {
         update_lines.push(Line::styled(
-            "Refresh failed. Data is not current.",
+            "Refresh failed. Press r.",
             palette.strong,
         ));
         update_lines.push(Line::raw(safe_text(error)));
