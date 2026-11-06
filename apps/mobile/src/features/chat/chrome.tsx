@@ -1,11 +1,9 @@
 import { GlassView, isGlassEffectAPIAvailable, isLiquidGlassAvailable } from 'expo-glass-effect'
 import { useEffect, useState } from 'react'
-import { AccessibilityInfo, Platform, View, type ViewProps } from 'react-native'
-import { useUniwind, withUniwind } from 'uniwind'
+import { AccessibilityInfo, Platform, StyleSheet, View, type ViewProps } from 'react-native'
+import { useUniwind } from 'uniwind'
 
 export type ChatChrome = { kind: 'glass'; colorScheme: 'light' | 'dark' } | { kind: 'solid' }
-
-const Glass = withUniwind(GlassView)
 
 export function useChatChrome(): ChatChrome {
   const { theme } = useUniwind()
@@ -27,8 +25,8 @@ export function useChatChrome(): ChatChrome {
 export function ChatMaterial({ chrome, radius = 26, children, ...props }: ViewProps & { chrome: ChatChrome; radius?: number }) {
   return <View {...props}>
     {chrome.kind === 'glass'
-      ? <Glass pointerEvents="none" glassEffectStyle="regular" colorScheme={chrome.colorScheme} className="absolute inset-0" style={{ borderRadius: radius }} />
-      : <View pointerEvents="none" className="absolute inset-0 border border-input bg-card" style={{ borderRadius: radius }} />}
+      ? <GlassView pointerEvents="none" glassEffectStyle="regular" colorScheme={chrome.colorScheme} style={[StyleSheet.absoluteFill, { borderRadius: radius }]} />
+      : <View pointerEvents="none" className="border border-input bg-card" style={[StyleSheet.absoluteFill, { borderRadius: radius }]} />}
     {children}
   </View>
 }

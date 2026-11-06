@@ -26,7 +26,7 @@ import { useLive } from '@/data/live'
 import type { Attachment, ChatMessage, Conversation } from '@/data/types'
 import type { Question } from '@vibeface/client/workspace/types.ts'
 import { Composer } from '@/features/chat/composer'
-import { ChatMaterial, useChatChrome } from '@/features/chat/chrome'
+import { useChatChrome } from '@/features/chat/chrome'
 import { Message } from '@/features/chat/message'
 import { QuestionCard } from '@/features/chat/question-card'
 import { useChatExtras, type Row } from '@/features/chat/work'
@@ -201,8 +201,11 @@ export default function ChatScreen() {
       // iOS 26 measures the edge blur on the un-inverted list and covers every message once the chat outgrows the screen.
       scrollEdgeEffects: { top: 'hidden', bottom: 'hidden', left: 'hidden', right: 'hidden' },
       headerTransparent: ios,
-      ...ios ? { headerBlurEffect: 'none', headerStyle: { backgroundColor: chrome.kind === 'glass' ? 'transparent' : typeof background === 'string' ? background : undefined } } : {},
-      headerTitle: () => <ScreenFaces>{ios ? <ChatMaterial chrome={chrome} radius={22} className="shrink self-start">{title}</ChatMaterial> : title}</ScreenFaces>,
+      ...ios ? {
+        headerBlurEffect: chrome.kind === 'glass' ? chrome.colorScheme === 'dark' ? 'systemUltraThinMaterialDark' : 'systemUltraThinMaterialLight' : 'none',
+        headerStyle: { backgroundColor: chrome.kind === 'glass' ? 'transparent' : typeof background === 'string' ? background : undefined },
+      } : {},
+      headerTitle: () => <ScreenFaces>{title}</ScreenFaces>,
     }} />
     <ScreenFaces><View className="flex-1">
     {/* Always mounted, so the first message sent with the keyboard open lands in the keyboard-aware list. */}

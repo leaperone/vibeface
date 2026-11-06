@@ -555,6 +555,7 @@ test("workspace preserves bot and message requests while routing native decision
       }
       mobile()
       const platform = { OS: 'android' }, insets = { bottom: 0 }, keyboard = { height: { value: 0 }, progress: { value: 0 } }
+      let glass = false, theme = 'light'
       let dockHeight: { value: number } | undefined, emptyPadding = () => ({ paddingBottom: 0 })
       const chat = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
         'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: botA.bot_id }) },
@@ -563,13 +564,13 @@ test("workspace preserves bot and message requests while routing native decision
         'react-native-keyboard-controller': { KeyboardChatScrollView: 'KeyboardChatScrollView', KeyboardStickyView: 'KeyboardStickyView', useReanimatedKeyboardAnimation: () => keyboard },
         'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: typeof emptyPadding) => { emptyPadding = read; return read() }, useSharedValue: (initial: number) => dockHeight ??= { value: initial } },
         'react-native-safe-area-context': { useSafeAreaInsets: () => insets, useSafeAreaFrame: () => ({ width: 390 }) },
-        'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
+        'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme }), useCSSVariable: () => theme === 'dark' ? 'black' : 'white' },
         '@/data/context': { useWorkspace: () => native }, '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
         '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/home.ts': { unreachable },
         '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
         '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
         '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
-        '@/features/chat/chrome': { ChatMaterial: 'ChatMaterial', useChatChrome: () => ({ kind: 'solid' }) },
+        '@/features/chat/chrome': { ChatMaterial: 'ChatMaterial', useChatChrome: () => glass ? { kind: 'glass', colorScheme: theme } : { kind: 'solid' } },
       }, { requestAnimationFrame: (run: () => void) => run(), setInterval: () => 1, clearInterval() {} })
       const stack = { Screen: 'Screen', Protected: 'Protected' }
       const layout = componentHarness('../../../../../apps/mobile/app/_layout.tsx', {
@@ -725,6 +726,19 @@ test("workspace preserves bot and message requests while routing native decision
         const jump = chat.render('default').find(({ props }) => props.accessibilityLabel === '回到底部')?.props.onPress
         assert.ok(typeof jump === 'function'); jump()
         assert.deepEqual(offsets, [-492], 'the inverted list jumps to the negative actual native top inset')
+        for (const [nextTheme, nextGlass, blur, background] of [
+          ['light', true, 'systemUltraThinMaterialLight', 'transparent'], ['dark', true, 'systemUltraThinMaterialDark', 'transparent'],
+          ['light', false, 'none', 'white'], ['dark', false, 'none', 'black'],
+        ] satisfies [string, boolean, string, string][]) {
+          theme = nextTheme; glass = nextGlass
+          const elements = chat.render('default'), options = elements.find(({ type }) => type === 'Screen')?.props.options
+          assert.ok(options && typeof options === 'object' && 'headerTransparent' in options && 'headerBlurEffect' in options && 'headerStyle' in options && 'headerTitle' in options)
+          assert.equal(options.headerTransparent, true)
+          assert.equal(options.headerBlurEffect, blur)
+          assert.equal(JSON.stringify(options.headerStyle), JSON.stringify({ backgroundColor: background }))
+          assert.ok(typeof options.headerTitle === 'function'); options.headerTitle()
+          assert.equal(elements.some(({ type }) => type === 'ChatMaterial'), false, 'the native bar owns the title material')
+        }
       } finally { chat.close(); layout.close(); bridge.close() }
     })
   } finally {
@@ -860,14 +874,15 @@ const elementText = (node: unknown): string => typeof node === 'string' ? node :
 
 test('native chat glass follows accessibility events without replacing its input content', async () => {
   const initial = pendingResult(), platform = { OS: 'ios' }
+  const absoluteFill = { position: 'absolute', top: 0, right: 0, bottom: 0, left: 0 }
   let theme = 'light', supported = true, liquid = true, removed = 0, reads = 0, change = (_enabled: boolean) => {}
   const app = componentHarness('../../../../../apps/mobile/src/features/chat/chrome.tsx', {
     'expo-glass-effect': { GlassView: 'GlassView', isGlassEffectAPIAvailable: () => supported, isLiquidGlassAvailable: () => liquid },
-    'react-native': { View: 'View', Platform: platform, AccessibilityInfo: {
+    'react-native': { View: 'View', Platform: platform, StyleSheet: { absoluteFill }, AccessibilityInfo: {
       isReduceTransparencyEnabled: () => { reads++; return initial.promise },
       addEventListener: (name: string, listener: typeof change) => { assert.equal(name, 'reduceTransparencyChanged'); change = listener; return { remove() { removed++ } } },
     } },
-    'uniwind': { useUniwind: () => ({ theme }), withUniwind: (component: unknown) => component },
+    'uniwind': { useUniwind: () => ({ theme }) },
   })
   const read = () => {
     app.render('useChatChrome')
@@ -882,6 +897,10 @@ test('native chat glass follows accessibility events without replacing its input
     assert.equal(root?.type, 'View')
     assert.ok(Array.isArray(root?.props.children))
     assert.equal(root.props.children[1], input, 'the same input stays in the same child slot beneath a fixed View')
+    const background = elements.find(({ props }) => props.pointerEvents === 'none')
+    assert.ok(background)
+    const style = background.props.style
+    assert.deepEqual(Object.assign({}, ...(Array.isArray(style) ? style : [style])), { ...absoluteFill, borderRadius: 26 }, 'both material backgrounds fill their native parent')
     return elements
   }
   try {
