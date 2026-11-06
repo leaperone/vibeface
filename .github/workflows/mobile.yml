@@ -217,6 +217,20 @@ jobs:
               result = {"code": code if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) else "UNCLASSIFIED_ERROR"}
               message = error.get("message")
               if code == "ENGINE_FAILURE" and isinstance(message, str):
+                  lowered = message.lower()
+                  result["engine_timeout_kind"] = next((kind for needle, kind in (
+                      ("timed out while reading snapshot viewport on the xctest main thread", "snapshot-viewport"),
+                      ("timed out while reading private ax viewport on the xctest main thread", "snapshot-private-ax"),
+                      ("timed out while processing tree snapshot on the xctest main thread", "snapshot-tree"),
+                      ("timed out while running query-sweep snapshot on the xctest main thread", "snapshot-query-sweep"),
+                      ("main thread execution timed out", "runner-main-thread"),
+                      ("daemon request timed out", "daemon-rpc"),
+                      ("runner connection deadline exceeded", "runner-connect"),
+                      ("runner command deadline exceeded", "runner-command"),
+                      ("timed out waiting for xctest runner over usbmux", "runner-usbmux"),
+                  ) if needle in lowered), "unknown")
+                  if "the xctest tree capture exceeded its " in lowered and "s time slice" in lowered:
+                      result["engine_timeout_kind"] = "snapshot-tree-slice"
                   result["engine_reason"] = next((reason for needle, reason in (
                       ("could not be masked", "secure-mask"),
                       ("no focused text input was available for typing", "text-input-not-focused"),
@@ -238,7 +252,7 @@ jobs:
                       ("timed out", "timeout"),
                       ("snapshot", "snapshot"),
                       ("screenshot", "screenshot"),
-                  ) if needle in message.lower()), "unknown")
+                  ) if needle in lowered), "unknown")
               source = error.get("source", source)
               if isinstance(source, dict) and source.get("file") in {"native-transfers.e2e.ts", "e2e.native.config.ts"}:
                   line = source.get("line")
@@ -265,7 +279,14 @@ jobs:
                   for result in run["results"]:
                       for attempt in result["attempts"]:
                           failures += [safe_error(error, result.get("source")) for error in [attempt.get("error"), *attempt.get("secondaryErrors", [])]]
-                          failures += [safe_error(step.get("error"), step.get("source"), step.get("api")) for step in attempt["steps"]]
+                          for step in attempt["steps"]:
+                              failure = safe_error(step.get("error"), step.get("source"), step.get("api"))
+                              if failure:
+                                  events = step.get("events")
+                                  polls = [event for event in events if isinstance(event, dict) and event.get("kind") == "poll" and event.get("name") == "expect"] if isinstance(events, list) else []
+                                  if len(polls) == 1 and type(polls[0].get("count")) is int and polls[0]["count"] >= 0:
+                                      failure["completed_poll_samples"] = polls[0]["count"]
+                                  failures.append(failure)
                   for failure in failures:
                       if failure and failure not in diagnostics["failures"] and len(diagnostics["failures"]) < 16:
                           diagnostics["failures"].append(failure)
