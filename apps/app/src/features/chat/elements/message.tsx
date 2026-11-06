@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { Bot, CalendarClock, ChevronDown, ChevronUp, CirclePause, CircleX, Clock, LoaderCircle, Merge, MonitorSmartphone, RotateCcw } from 'lucide-react'
+import { Bot, CalendarClock, ChevronDown, ChevronUp, CirclePause, CircleQuestionMark, CircleX, Clock, LoaderCircle, Merge, MonitorSmartphone, RotateCcw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useState } from 'react'
 import { Markdown, PlainText } from '@/components/app/markdown'
@@ -15,7 +15,7 @@ import type { SteerOutcome } from '@vibeface/client/workspace/types.ts'
 
 export type ChatMessage = TranscriptMessage & { state?: 'streaming' | 'interrupted' | 'sending' | 'queued' | 'merging' | 'merged'; merged?: SteerOutcome }
 
-const mergedLabels: Record<SteerOutcome, string> = { answered: '已补充给 Bot', unfinished: '补充后回复没完成', unknown: '不确定 Bot 看到了没有' }
+const mergedLabels: Record<SteerOutcome, string> = { answered: '已加入本轮', unfinished: '已加入本轮，回复未完成', unknown: '补充结果尚未确认' }
 
 /** A long message shows its first lines until expanded. */
 function isLong(text: string) {
@@ -44,7 +44,7 @@ export function FoldedText({ text }: { text: string }) {
  */
 /** `detail`: the device's own words for a failed reply, folded under its cause. */
 export function Message({ message, schedule, time: shown, retry, detail }: { message: ChatMessage; schedule?: string; time?: string; retry?: () => Promise<void>; detail?: string }) {
-  const { connectionOnline, data, selectedBot } = useWorkspace()
+  const { connectionOnline, data, selectedBot, refresh } = useWorkspace()
   const owner = data?.conversation?.owner
   const user = message.role === 'user'
   const when = message.created_at_ms ? new Date(message.created_at_ms) : null
@@ -59,9 +59,14 @@ export function Message({ message, schedule, time: shown, retry, detail }: { mes
   if (user) return <div className="flex min-w-0 flex-col items-end gap-1" data-message-id={messageKey(message)}>
     {message.text ? <div title={full} className="min-w-0 max-w-[85%] rounded-2xl rounded-br-md bg-secondary px-4 py-2 text-secondary-foreground ring-1 ring-border/60 [overflow-wrap:anywhere] sm:max-w-[75%] data-[sending]:opacity-70" data-sending={message.state === 'sending' || message.state === 'queued' || message.state === 'merging' || undefined}><span className="sr-only">你：</span><FoldedText text={message.text} /></div> : null}
     {message.attachments?.map((file) => <div key={file.hash} className="w-full min-w-0 max-w-[85%] sm:max-w-[75%]"><Artifact file={file} /></div>)}
-    {message.state === 'queued' ? <span className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Clock aria-hidden="true" className="size-3.5" />排队中</span>
-      : message.state === 'merging' ? <span className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Merge aria-hidden="true" className="size-3.5" />Bot 正在看这条补充</span>
-      : message.state === 'merged' ? <span className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Merge aria-hidden="true" className="size-3.5" />{mergedLabels[message.merged ?? 'answered']}</span> : time}
+    {message.state === 'sending' ? <span role="status" className="px-1 text-meta text-muted-foreground">正在确认送达</span>
+      : message.state === 'queued' ? <span role="status" className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Clock aria-hidden="true" className="size-3.5" />已排队</span>
+      : message.state === 'merging' ? <span role="status" className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Merge aria-hidden="true" className="size-3.5" />正在加入本轮</span>
+      : message.state === 'merged' && (!message.merged || message.merged === 'unknown') ? <div className="flex max-w-[85%] flex-wrap items-center justify-end gap-x-2 gap-y-1 text-meta sm:max-w-[75%]">
+        <span role="status" className="flex items-center gap-1 text-warning"><CircleQuestionMark aria-hidden="true" className="size-3.5 shrink-0" />{mergedLabels.unknown}</span>
+        <ActionButton variant="ghost" className="h-8 px-2 text-meta max-md:h-11" disabled={!connectionOnline} action={refresh}>再查一次</ActionButton>
+      </div>
+      : message.state === 'merged' ? <span role="status" className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Merge aria-hidden="true" className="size-3.5" />{mergedLabels[message.merged ?? 'unknown']}</span> : time}
   </div>
   if (message.role === 'bot') return <div className="flex min-w-0 flex-col items-start gap-1" data-message-id={messageKey(message)}>
     <span className="flex min-w-0 max-w-full items-center gap-1.5 text-meta text-muted-foreground">
