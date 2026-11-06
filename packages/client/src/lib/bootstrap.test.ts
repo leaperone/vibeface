@@ -282,6 +282,13 @@ test('readCachedCatalog re-verifies stored envelope and invokes verifier', () =>
   assert.equal(verifyCalls, 1)
 })
 
+test('unreadable bootstrap settings disable public requests', () => {
+  assert.deepEqual(getPublicBootstrapMode({
+    getItem() { throw new Error('storage denied') },
+    setItem() { throw new Error('storage denied') },
+  }), { kind: 'off' })
+})
+
 test('malformed custom storage fails closed without official catalogue fetch', async (t) => {
   const { defaults, secure, signCatalog } = createTestIssuer()
   const now = 1_700_000_000_000

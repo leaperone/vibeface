@@ -952,7 +952,7 @@ mod tests {
             "grants need a relay to admit to"
         );
         assert_eq!(
-            serde_json::to_value(&RelayAdmission::default())?,
+            serde_json::to_value(RelayAdmission::default())?,
             serde_json::json!({"policy":"operator-token"})
         );
         Ok(())

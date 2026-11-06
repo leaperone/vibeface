@@ -127,7 +127,7 @@ function parseMode(storage: BootstrapStorage | null): PublicBootstrapMode {
 
 /** Read-only; advanced UI may set keys via `setPublicBootstrapMode`. */
 export function getPublicBootstrapMode(storage: BootstrapStorage | null): PublicBootstrapMode {
-  return parseMode(storage)
+  try { return parseMode(storage) } catch { return { kind: 'off' } }
 }
 
 export function setPublicBootstrapMode(storage: BootstrapStorage, mode: PublicBootstrapMode): void {

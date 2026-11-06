@@ -10,7 +10,7 @@ use super::{RelayUrl, device_id, endpoint_id, relay_config, relay_url};
 use crate::crypto::LocalIdentity;
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use iroh::{Endpoint, EndpointId, Watcher as _, endpoint::RelayStatus};
+use iroh::{Endpoint, EndpointId, endpoint::RelayStatus};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -616,7 +616,7 @@ impl Issuer {
         vibeface_secure::validate_device_id(device)?;
         let relay = origin(relay_url)?;
         ensure!(
-            self.relays.iter().any(|known| *known == relay),
+            self.relays.contains(&relay),
             "the catalogue has no such relay"
         );
         self.budget
@@ -1089,7 +1089,6 @@ impl Worker {
         let mut catalog: Option<Catalog> = None;
         let mut current: Option<Credential> = None;
         let mut trouble_since: Option<i64> = None;
-        let mut last_renewal_ms = 0;
         let mut relay_status = self.endpoint.home_relay_status();
         while !self.endpoint.is_closed() {
             let now = now_ms();
@@ -1133,7 +1132,7 @@ impl Worker {
                 Ok(credential) => {
                     backoff = BACKOFF_MIN;
                     trouble_since = None;
-                    last_renewal_ms = now_ms();
+                    let last_renewal_ms = now_ms();
                     *self.credential.lock().expect("bootstrap credential") =
                         Some(credential.clone());
                     let admitted = credential.admitted();

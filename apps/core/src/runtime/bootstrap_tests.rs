@@ -13,7 +13,7 @@ use crate::{
     },
 };
 use anyhow::{Context as _, Result, anyhow, ensure};
-use iroh::{Watcher as _, endpoint::RelayStatus};
+use iroh::endpoint::RelayStatus;
 use std::{
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
