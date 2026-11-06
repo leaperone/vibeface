@@ -120,9 +120,17 @@ impl Runtime {
         if self
             .pending_provider_launches
             .load(std::sync::atomic::Ordering::SeqCst)
-            && !matches!(probe.launch, LaunchCheck::Failed { .. })
+            || provider.on_app_server()
+                && self.codex.configuration_pending(
+                    &local.codex_target(
+                        self.manager()
+                            .is_some_and(|manager| manager.provider.on_app_server()),
+                    ),
+                )
         {
-            probe.launch = LaunchCheck::Starting;
+            if !matches!(probe.launch, LaunchCheck::Failed { .. }) {
+                probe.launch = LaunchCheck::Starting;
+            }
             return probe;
         }
         if provider.on_app_server() {
@@ -729,12 +737,15 @@ mod tests {
         .await?;
         let save = node.config_save.lock().await;
         for key in ["fixture-new-key", "fixture-api-key"] {
-            node.write_providers(|target| {
-                target.local.env.apply(
-                    provider,
-                    BTreeMap::from([("CURSOR_API_KEY".into(), Some(key.into()))]),
-                )
-            })
+            node.write_providers(
+                |target| {
+                    target.local.env.apply(
+                        provider,
+                        BTreeMap::from([("CURSOR_API_KEY".into(), Some(key.into()))]),
+                    )
+                },
+                None,
+            )
             .await?;
         }
         drop(save);

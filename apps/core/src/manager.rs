@@ -1079,7 +1079,7 @@ fn codex_profile(config: &toml::Value) -> Result<Option<&toml::Value>> {
         .context("invalid Codex profile")
 }
 
-fn provider_keys_from_config(source: &str) -> Result<Vec<String>> {
+pub(crate) fn provider_keys_from_config(source: &str) -> Result<Vec<String>> {
     let config = codex_config(source)?;
     let profile = codex_profile(&config)?;
     let provider = profile

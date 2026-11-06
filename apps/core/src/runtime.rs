@@ -468,14 +468,6 @@ fn id(v: &Value, key: &str) -> Result<String> {
     Ok(s.into())
 }
 impl Runtime {
-    pub(crate) fn enforce_provider_roots(
-        &self,
-        local: &mut crate::providers::Local,
-        codex_agent: bool,
-    ) -> Result<()> {
-        ProviderRoots::new(&self.data_dir).apply(local, codex_agent, &self.host)
-    }
-
     pub async fn open(dir: &Path) -> Result<Self> {
         let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
         ensure!(
@@ -525,7 +517,69 @@ impl Runtime {
             .manager
             .as_ref()
             .is_some_and(|manager| manager.provider.on_app_server());
-        provider_roots.apply(&mut local, codex_agent, &host)?;
+        provider_roots.apply(&mut local)?;
+        let mut codex_config = if local.launches(Provider::Codex)
+            && local.switches.app_server_used(codex_agent)
+        {
+            match provider_roots.prepare_codex_config(&host) {
+                Ok(projected) => projected,
+                Err(error) if error.is::<crate::discovery::LocalSourceError>() => {
+                    tracing::warn!(
+                        event = "providers.local_source_failed",
+                        "could not read local AI service settings; configure the service manually"
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let mut completed_env = false;
+        for provider in [Provider::Codex, Provider::Cursor] {
+            let enabled = if provider == Provider::Codex {
+                local.switches.app_server_used(codex_agent)
+            } else {
+                config
+                    .manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.provider == provider)
+                    || local.switches.execution.contains(&provider)
+            };
+            if !enabled {
+                continue;
+            }
+            match crate::discovery::complete_local(
+                &mut local,
+                &crate::discovery::LocalConnect {
+                    provider,
+                    explicit_env_names: BTreeSet::new(),
+                },
+                codex_config.as_deref(),
+                &host,
+            )
+            .await
+            {
+                Ok(changed) => completed_env |= changed,
+                Err(error) if error.is::<crate::discovery::LocalSourceError>() => {
+                    if provider == Provider::Codex {
+                        codex_config = None;
+                    }
+                    tracing::warn!(
+                        event = "providers.local_source_failed",
+                        provider = provider.name(),
+                        "could not read local AI service settings; configure the service manually"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if completed_env {
+            local.env.save(dir)?;
+        }
+        if let Some(projected) = codex_config {
+            provider_roots.publish_codex_config(&projected)?;
+        }
         if !config.triage.scan_codex_sessions {
             config.triage.codex_sessions = Some(provider_roots.codex_sessions.clone());
         }

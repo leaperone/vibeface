@@ -332,16 +332,22 @@ mod tests {
         let (trigger, attempt, access, cancel) = active_turn(&node, &admin, &directory).await?;
         let epoch = node.local_permission_epoch.load(Ordering::Acquire);
         let save = node.config_save.lock().await;
-        node.write_providers(|target| {
-            target.manager.as_mut().context("manager")?.model = "next-model".into();
-            Ok(())
-        })
+        node.write_providers(
+            |target| {
+                target.manager.as_mut().context("manager")?.model = "next-model".into();
+                Ok(())
+            },
+            None,
+        )
         .await?;
         drop(node.manager_input_lease(&attempt, Provider::Codex).await?);
-        node.write_providers(|target| {
-            target.manager.as_mut().context("manager")?.provider = Provider::Pi;
-            Ok(())
-        })
+        node.write_providers(
+            |target| {
+                target.manager.as_mut().context("manager")?.provider = Provider::Pi;
+                Ok(())
+            },
+            None,
+        )
         .await?;
         drop(save);
         assert_eq!(node.local_permission_epoch.load(Ordering::Acquire), epoch);
@@ -471,19 +477,25 @@ mod tests {
         .await?;
         let other = running_work(&node, network, &pi_directory, "pi-work", Provider::Pi).await?;
         let save = node.config_save.lock().await;
-        node.write_providers(|target| {
-            target.local.switches.execution.remove(&Provider::Codex);
-            Ok(())
-        })
+        node.write_providers(
+            |target| {
+                target.local.switches.execution.remove(&Provider::Codex);
+                Ok(())
+            },
+            None,
+        )
         .await?;
         assert!(!*cancel.borrow());
         drop(node.manager_input_lease(&attempt, Provider::Codex).await?);
         assert!(node.work_input_lease(network, "c", &target).await.is_err());
         drop(node.work_input_lease(network, "c", &other).await?);
-        node.write_providers(|target| {
-            *target.manager = None;
-            Ok(())
-        })
+        node.write_providers(
+            |target| {
+                *target.manager = None;
+                Ok(())
+            },
+            None,
+        )
         .await?;
         drop(save);
         assert!(*cancel.borrow());

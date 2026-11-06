@@ -71,13 +71,30 @@ export function DevicesPage({ joins = true }: { joins?: boolean }) {
   const device = useDevice()
   const rows = useDeviceRows()
   const entryLabel = useEntryLabel()
+  const connected = rows.find((row) => row.entry && row.kind === "node")
+  const local = device.ready && isLoopback(entryAddress(device.ready.entry))
+  const canEdit = device.ready?.principal.can_manage || device.ready?.principal.source === "local_session"
   const [error, setError] = useState<unknown>(null)
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(setError) }, [device.ready])
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     {joins ? <JoinRequests /> : null}
     <InlineError error={error} action={{ label: "重试", onClick: () => { setError(null); device.refreshDirectory().catch(setError) } }} />
-    {!rows.length ? <div className="grid gap-2" aria-busy="true"><Skeleton className="h-14" /><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
-      : <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">{rows.map((row) => {
+    {connected ? <section className="grid min-w-0 gap-6" aria-label="当前连接的电脑">
+      <header className="flex min-w-0 flex-wrap items-center gap-3 px-1">
+        <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-muted"><terms.thisComputer.icon aria-hidden="true" className="size-5 text-muted-foreground" /></span>
+        <div className="grid min-w-0 flex-1 basis-32 gap-1">
+          <p className="text-meta text-muted-foreground">当前连接的电脑</p>
+          <h2 className="text-heading font-semibold [overflow-wrap:anywhere]">{connected.name}</h2>
+          <div className="flex flex-wrap items-center gap-2"><Tag>{entryLabel}</Tag>{connected.online !== undefined ? <Online online={connected.online} /> : null}</div>
+        </div>
+        <Button asChild variant="ghost" className="min-h-11 max-sm:size-11 max-sm:p-0"><Link to="/devices/$deviceId" params={{ deviceId: connected.id }} title="详细设置"><span className="max-sm:sr-only">详细设置</span><ChevronRight aria-hidden="true" /></Link></Button>
+      </header>
+      {canEdit ? <AiSettings key={connected.id} compact targetName={local ? undefined : connected.name} /> : <p className="px-1 text-meta text-muted-foreground">{editOnManager(rows.filter((row) => row.admin).map((row) => row.name))}</p>}
+    </section> : null}
+    {!rows.length ? device.directory ? <EmptyState icon={terms.myDevices.icon} title="还没有设备" /> : <div className="grid gap-2" aria-busy="true"><Skeleton className="h-14" /><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
+      : [{ title: "电脑", items: rows.filter((row) => row.kind === "node") }, { title: "手机与浏览器", items: rows.filter((row) => row.kind === "client") }].filter((group) => group.items.length).map((group) => <section key={group.title} className="grid gap-2">
+        <h2 className="px-1 text-meta font-medium text-muted-foreground">{group.title}</h2>
+        <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">{group.items.map((row) => {
         const Icon = deviceIcon(row)
         return <li key={row.id}><Link to="/devices/$deviceId" params={{ deviceId: row.id }} className="interactive-row flex min-h-14 items-center gap-3 px-4 py-2">
           <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
@@ -92,7 +109,7 @@ export function DevicesPage({ joins = true }: { joins?: boolean }) {
           {row.online !== undefined ? <Online online={row.online} compact /> : null}
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link></li>
-      })}</ul>}
+      })}</ul></section>)}
     <SoleBrowserManager rows={rows} />
     {device.ready && !device.ready.principal.can_manage && rows.length ? <p className="flex min-w-0 items-center gap-1.5 px-1 text-meta text-muted-foreground">
       <terms.admin.icon aria-hidden="true" className="size-4 shrink-0" /><span className="min-w-0 truncate">{addOnManager(rows.filter((row) => row.admin).map((row) => row.name))}</span>

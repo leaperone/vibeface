@@ -1335,6 +1335,124 @@ const pendingResult = () => {
 }
 const settleComponent = () => new Promise(setImmediate)
 
+const elementText = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(elementText).join('')
+  : node && typeof node === 'object' && 'props' in node && node.props && typeof node.props === 'object' && 'children' in node.props ? elementText(node.props.children) : ''
+
+test("automatic connection checks both services without changing uses and reads back unknown writes", async (t) => {
+  for (const outcome of ['ready', 'first-failed', 'unreadable', 'connection-changed']) await t.test(outcome, async () => {
+    const provider: ProviderStatus = {
+      provider: 'codex', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex', app_server: null,
+      execution_model: '', execution_readiness: { state: 'starting' }, setup: null, installed: true, home: null, sessions: null, env: [],
+      state: 'starting', issues: [], readiness: { state: 'starting' },
+      probe: { provider: 'codex', config_id: 'fixture', checked_at_ms: null, launch: { state: 'starting' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
+      observed: { installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'app_server_starting' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
+    }
+    const initial: NodeSettingsResponse = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: null }, providers: [provider], display_paths: {}, suggested_roots: [] }
+    const first = pendingResult(), readback = pendingResult()
+    let current = true, reads = 0
+    const calls: { method: string; params: unknown }[] = []
+    const connection = { isCurrent: () => current, request: async (method: string, params?: unknown) => {
+      calls.push({ method, params })
+      if (method === 'node_settings') return ++reads === 1 ? initial : readback.promise
+      if (calls.filter((call) => call.method === 'configure_provider').length === 1) return first.promise
+      if (outcome === 'unreadable') throw new Error('client response timed out; outcome may be unknown')
+      return initial
+    } }
+    const workspace = { isCurrent: () => current, refresh: async () => {} }
+    const timers = new Set<unknown>()
+    let focused = () => {}
+    const app = componentHarness('../devices/ai-settings.tsx', {
+      '@vibeface/client/lib/node.ts': nodeSettings,
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: connection }) },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace },
+      '@vibeface/client/identity/copy.ts': { deviceCopy },
+      '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
+      '@/lib/glossary': { terms: { bot: { icon: 'Bot' }, task: { icon: 'Tasks' } } },
+    }, {
+      window: { addEventListener(_event: string, callback: () => void) { focused = callback }, removeEventListener() { focused = () => {} } },
+      setTimeout(callback: () => void) { timers.add(callback); return callback }, clearTimeout(callback: unknown) { timers.delete(callback) },
+    })
+    const render = () => app.render('AiSettings', { compact: true, targetName: '远端工作机' })
+    try {
+      render(); await settleComponent()
+      let elements = render()
+      assert.ok(elements.some((element) => elementText(element).includes('在「远端工作机」上检测 Codex 和 Cursor')))
+      const connect = elements.find(({ type, props }) => type === 'Button' && elementText(props.children) === '自动接入')
+      assert.ok(connect?.props.onClick)
+      connect.props.onClick(); connect.props.onClick()
+      assert.equal(calls.filter((call) => call.method === 'configure_provider').length, 1, 'duplicate clicks do not submit again')
+      elements = render()
+      assert.equal(timers.size, 0, 'starting-state polling pauses while the connection write is pending')
+      focused()
+      assert.equal(calls.length, 2, 'a focus read cannot replace the active write sequence')
+      assert.equal(elements.find(({ type, props }) => type === 'Button' && elementText(props.children) === '自动接入')?.props['aria-busy'], true)
+      if (outcome === 'connection-changed') {
+        current = false
+        first.resolve({ ...initial, settings: { roots: ['/stale'], manager: null } })
+        await settleComponent()
+        assert.equal(calls.length, 2, 'a stale write cannot continue on a different connection')
+        assert.ok(!render().some(({ props }) => Array.isArray(props.roots) && props.roots.includes('/stale')))
+        return
+      }
+      if (outcome === 'ready') first.resolve(initial)
+      else {
+        first.reject(new Error('client response timed out; outcome may be unknown'))
+        await settleComponent()
+        assert.equal(calls.at(-1)?.method, 'node_settings')
+        assert.equal(calls.filter((call) => call.method === 'configure_provider').length, 1, 'the unknown write is read back before continuing')
+        if (outcome === 'unreadable') readback.reject(new Error('device read failed'))
+        else readback.resolve(initial)
+      }
+      await settleComponent(); await settleComponent()
+      const writes = calls.filter((call) => call.method === 'configure_provider').map((call) => JSON.parse(JSON.stringify(call.params)))
+      assert.deepEqual(writes, [{ provider: 'codex', connect_local: true }, { provider: 'cursor', connect_local: true }])
+      elements = render()
+      const button = elements.find(({ type, props }) => type === 'Button' && elementText(props.children) === '自动接入')
+      assert.equal(button?.props.disabled, outcome === 'unreadable', 'a failed read blocks another attempt until the settings can be read')
+      const result = elements.find(({ props }) => props.role === 'status')
+      assert.match(elementText(result), outcome === 'ready' ? /检测已完成/ : /部分服务未完成/)
+      if (outcome !== 'ready') assert.ok(elements.some(({ type }) => type === 'InlineError'), 'the first failure remains visible after the other service completes')
+    } finally { app.close() }
+  })
+})
+
+test("compact system provider cards use external service evidence without local prerequisites", async (t) => {
+  for (const mode of ['system', 'spawn'] satisfies NonNullable<ProviderStatus['app_server']>['mode'][]) for (const installed of [false, true]) for (const authentication of ['authenticated', 'unverified', 'sign_in_required'] satisfies ProviderStatus['probe']['authentication'][]) await t.test(`${mode} installed=${installed} ${authentication}`, () => {
+    const item: ProviderStatus = {
+      provider: 'codex', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex',
+      app_server: { mode, socket: '/fixture/codex.sock', link: { state: 'connected', socket: '/fixture/codex.sock', user_agent: 'fixture' } },
+      execution_model: '', execution_readiness: { state: 'ready' }, setup: null, installed, home: null, sessions: null,
+      env: [{ name: 'FIXTURE_KEY', set: false, inherited: false, required: true }], state: 'ready', issues: [], readiness: { state: 'ready' },
+      probe: { provider: 'codex', config_id: 'fixture', checked_at_ms: null, launch: { state: 'launchable' }, authentication, catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
+      observed: { installed: { status: 'rejected', evidence: 'binary_discovery' }, launchable: { status: 'confirmed', evidence: 'app_server_handshake' }, authenticated: { status: 'confirmed', evidence: 'provider_probe' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
+    }
+    const response: NodeSettingsResponse = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: null }, providers: [item], display_paths: {}, suggested_roots: [] }
+    const app = componentHarness('../devices/ai-settings.tsx', {
+      '@vibeface/client/lib/node.ts': nodeSettings,
+      '@vibeface/client/identity/copy.ts': { deviceCopy },
+      '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
+      '@/lib/glossary': { terms: { bot: { icon: 'Bot' }, task: { icon: 'Tasks' }, secret: { icon: 'Key' } } },
+    }, {}, 'ProviderCard')
+    try {
+      const elements = app.render('ProviderCard', { item, response, onboarding: false, compact: true, busy: '', models: null, error: '' })
+      const summary = elements.find(({ type, props }) => type === 'span' && props.className === 'truncate')
+      assert.equal(elementText(summary), mode === 'system' || installed ? '可用' : '未安装', 'the main state follows readiness for system services')
+      const evidence = elements.filter(({ type }) => type === 'dl').map(elementText).join('')
+      if (mode === 'system') {
+        assert.match(evidence, /程序外部服务/)
+        assert.ok(evidence.includes(`认证${{ authenticated: '已认证', unverified: '未验证', sign_in_required: '需登录' }[authentication]}`))
+        assert.equal(elements.filter(({ props }) => props.name === 'FIXTURE_KEY').length, 0, 'an external service never requests the private key')
+        assert.ok(!elements.some((element) => elementText(element).includes('找不到 Codex 程序')))
+      } else {
+        assert.ok(evidence.includes(`程序${installed ? '已找到' : '未找到'}`))
+        assert.match(evidence, /认证需填写密钥/)
+        assert.equal(elements.filter(({ props }) => props.name === 'FIXTURE_KEY').length, installed ? 1 : 0)
+        assert.equal(elements.some((element) => elementText(element).includes('找不到 Codex 程序')), !installed)
+      }
+    } finally { app.close() }
+  })
+})
+
 test("provider cards keep summary readiness, setup and execution details in their own roles", async (t) => {
   const ready: ProviderReadiness = { state: 'ready' }
   const signIn: ProviderReadiness = { state: 'needs_setup', issue: { stage: 'authentication', code: 'sign_in_required' } }

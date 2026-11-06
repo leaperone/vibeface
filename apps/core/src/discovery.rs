@@ -1,6 +1,6 @@
 //! Finds the paths this computer's providers need and writes them into the Node's own
 //! configuration once, where Settings shows them and the owner can change them. Nothing is
-//! guessed while running: a value is only filled in when it is missing for a use that is on.
+//! guessed while running: a value is filled only for an enabled use or explicit local connection.
 //! The paths stay in `config.json` and `provider-env.json`; they never reach shared records.
 use crate::{
     config::{Config, ManagerSettings},
@@ -14,6 +14,76 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
 };
+
+mod environment;
+
+pub(crate) struct LocalConnect {
+    pub provider: Provider,
+    pub explicit_env_names: BTreeSet<String>,
+}
+
+impl LocalConnect {
+    fn names(&self, local: &Local, codex_config: Option<&str>) -> Result<Vec<String>> {
+        if !local.launches(self.provider) {
+            return Ok(vec![]);
+        }
+        let keys = match (self.provider, codex_config) {
+            (Provider::Codex, Some(source)) => crate::manager::provider_keys_from_config(source),
+            _ => self.provider.key_variables(local.env.get(self.provider)),
+        };
+        Ok(keys
+            .map_err(|_| LocalSourceError)?
+            .into_iter()
+            .filter(|name| {
+                !local.env.get(self.provider).contains_key(name)
+                    && !self.explicit_env_names.contains(name)
+            })
+            .collect())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LocalSourceError;
+
+impl std::fmt::Display for LocalSourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "could not read local AI service settings; retry or configure the service manually",
+        )
+    }
+}
+
+impl std::error::Error for LocalSourceError {}
+
+pub(crate) async fn complete_local(
+    local: &mut Local,
+    connect: &LocalConnect,
+    codex_config: Option<&str>,
+    host: &Host,
+) -> Result<bool> {
+    if !local.launches(connect.provider) {
+        return Ok(false);
+    }
+    let names = connect.names(local, codex_config)?;
+    let values = environment::missing(&names, host).await?;
+    if values.is_empty() {
+        return Ok(false);
+    }
+    for value in values.values() {
+        crate::logging::add_credential(value);
+    }
+    let mut next = local.env.clone();
+    next.apply(
+        connect.provider,
+        values
+            .into_iter()
+            .map(|(name, value)| (name, Some(value)))
+            .collect(),
+    )
+    .map_err(|_| LocalSourceError)?;
+    local.env = next;
+    Ok(true)
+}
 
 pub const CODEX_HOME: &str = "CODEX_HOME";
 
@@ -40,6 +110,8 @@ pub struct Host {
     pub home: Option<PathBuf>,
     pub nvm_dir: Option<PathBuf>,
     pub path: Option<OsString>,
+    #[cfg(test)]
+    pub inherited_env: BTreeMap<String, String>,
 }
 
 impl Host {
@@ -59,6 +131,8 @@ impl Host {
             home: dir("HOME"),
             nvm_dir: dir("NVM_DIR"),
             path: std::env::var_os("PATH"),
+            #[cfg(test)]
+            inherited_env: BTreeMap::new(),
         }
     }
 
@@ -336,11 +410,11 @@ impl Paths {
     }
 }
 
-/// What this computer supplies for the uses that are on and miss a program path. `codex` also
-/// counts Codex as in use when it is about to be. External session scanning needs an explicit root.
-pub fn missing(target: &Target, codex: bool, host: &Host) -> Result<Paths> {
+/// What this computer supplies for enabled uses or an explicitly requested service.
+/// External session scanning needs an explicit root.
+pub fn missing(target: &Target, requested: Option<Provider>, host: &Host) -> Result<Paths> {
     let local = &*target.local;
-    let codex = codex
+    let codex = requested == Some(Provider::Codex)
         || local.switches.app_server_used(
             target
                 .manager
@@ -359,7 +433,11 @@ pub fn missing(target: &Target, codex: bool, host: &Host) -> Result<Paths> {
     for provider in Provider::ALL {
         let launches = match provider.on_app_server() {
             true => codex && spawn,
-            false => bot == Some(provider) || local.switches.execution.contains(&provider),
+            false => {
+                requested == Some(provider)
+                    || bot == Some(provider)
+                    || local.switches.execution.contains(&provider)
+            }
         };
         let bin = local.bin(provider);
         let provider_host = Host {
@@ -395,7 +473,7 @@ pub fn complete(config: &mut Config, env: &mut ProviderEnv, host: &Host) -> Resu
             manager: &mut config.manager,
             triage: &mut config.triage,
         },
-        false,
+        None,
         host,
     );
     if let Ok(filled) = &filled {
@@ -470,6 +548,225 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    fn environment_fixture(name: &str, script: &str) -> (PathBuf, Host, environment::Shell) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("local-environment-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let path = dir.join("zsh");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let host = Host {
+            home: Some(dir.clone()),
+            path: Some("/usr/bin:/bin".into()),
+            ..Default::default()
+        };
+        (
+            dir,
+            host,
+            environment::Shell {
+                path,
+                user: "fixture".into(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn local_environment_uses_only_required_names_and_inherited_values_win() -> Result<()> {
+        let (dir, host, shell) = environment_fixture(
+            "priority",
+            r#"
+printf 'startup noise\000ignored\n'
+. "$HOME/fixture-env"
+exec /bin/sh -c "$2"
+"#,
+        );
+        std::fs::write(
+            dir.join("fixture-env"),
+            "export FIRST_KEY='synthetic-shell-first'\nexport SECOND_KEY='synthetic-shell-second'\nexport OTHER_PROVIDER_KEY='synthetic-other'\n",
+        )?;
+        let names = vec!["FIRST_KEY".into(), "SECOND_KEY".into(), "ABSENT_KEY".into()];
+        let inherited = BTreeMap::from([
+            ("FIRST_KEY".into(), "synthetic-inherited".into()),
+            ("OTHER_PROVIDER_KEY".into(), "synthetic-other".into()),
+        ]);
+        let values = environment::missing_from(
+            &names,
+            &host,
+            &inherited,
+            Some(&shell),
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
+        assert!(
+            values
+                .get("FIRST_KEY")
+                .is_some_and(|value| value == "synthetic-inherited")
+        );
+        assert!(
+            values
+                .get("SECOND_KEY")
+                .is_some_and(|value| value == "synthetic-shell-second")
+        );
+        assert_eq!(values.len(), 2);
+        let missing_shell = environment::Shell {
+            path: dir.join("missing/zsh"),
+            user: "fixture".into(),
+        };
+        assert!(
+            environment::missing_from(
+                &names[..1],
+                &host,
+                &inherited,
+                Some(&missing_shell),
+                std::time::Duration::from_secs(2)
+            )
+            .await
+            .is_ok(),
+            "a complete inherited source never runs a shell"
+        );
+        assert!(
+            environment::missing_from(
+                &names,
+                &host,
+                &inherited,
+                Some(&missing_shell),
+                std::time::Duration::from_secs(2)
+            )
+            .await
+            .err()
+            .is_some_and(|error| error.is::<LocalSourceError>()),
+            "a missing supported shell is a source failure when there is a gap"
+        );
+        assert!(
+            environment::missing_from(
+                &names,
+                &host,
+                &BTreeMap::new(),
+                None,
+                std::time::Duration::from_secs(2)
+            )
+            .await?
+            .is_empty()
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_environment_failures_are_safe_bounded_and_stop_shell_helpers() -> Result<()> {
+        for (case, script) in [
+            ("frame", "printf 'synthetic-secret-output'; exit 0"),
+            ("exit", "printf 'synthetic-secret-output' >&2; exit 7"),
+            ("output", "head -c 400000 /dev/zero"),
+            (
+                "value",
+                "export FIXTURE_KEY=$(head -c 4097 /dev/zero | tr '\\000' x); exec /bin/sh -c \"$2\"",
+            ),
+            (
+                "timeout",
+                "(sleep 0.4; touch \"$HOME/helper-survived\") &\nwait",
+            ),
+        ] {
+            let (dir, host, shell) = environment_fixture(case, script);
+            let error = environment::missing_from(
+                &["FIXTURE_KEY".into()],
+                &host,
+                &BTreeMap::new(),
+                Some(&shell),
+                std::time::Duration::from_millis(150),
+            )
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected a safe source failure"))?;
+            assert!(error.is::<LocalSourceError>());
+            assert!(!format!("{error:#}").contains("synthetic-secret-output"));
+            if case == "timeout" {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                assert!(
+                    !dir.join("helper-survived").exists(),
+                    "the entire startup process group ends"
+                );
+            }
+            std::fs::remove_dir_all(dir)?;
+        }
+        let (dir, host, shell) = environment_fixture("invalid-name", "touch \"$HOME/ran\"");
+        assert!(
+            environment::missing_from(
+                &["KEY;touch bad".into()],
+                &host,
+                &BTreeMap::new(),
+                Some(&shell),
+                std::time::Duration::from_secs(1)
+            )
+            .await
+            .is_err()
+        );
+        assert!(!dir.join("ran").exists());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn local_completion_keeps_private_values_and_explicit_removals_per_provider() -> Result<()> {
+        let (dir, _, _) = environment_fixture("private", "exit 1");
+        let roots = crate::providers::ProviderRoots::new(&dir);
+        std::fs::create_dir_all(&roots.codex_home)?;
+        std::fs::write(
+            roots.codex_home.join("config.toml"),
+            "model_provider='selected'\n[model_providers.selected]\nenv_key='PRIVATE_KEY'\nenv_http_headers={a='REMOVED_KEY',b='MISSING_KEY'}\n[model_providers.other]\nenv_key='OTHER_KEY'\n",
+        )?;
+        let mut local = local();
+        roots.apply(&mut local)?;
+        local.env.apply(
+            Provider::Codex,
+            BTreeMap::from([("PRIVATE_KEY".into(), Some("synthetic-private".into()))]),
+        )?;
+        let connect = LocalConnect {
+            provider: Provider::Codex,
+            explicit_env_names: ["REMOVED_KEY".into()].into(),
+        };
+        assert_eq!(connect.names(&local, None)?, vec!["MISSING_KEY"]);
+        let cursor = LocalConnect {
+            provider: Provider::Cursor,
+            explicit_env_names: BTreeSet::new(),
+        };
+        assert_eq!(cursor.names(&local, None)?, vec!["CURSOR_API_KEY"]);
+        local.env.apply(
+            Provider::Cursor,
+            BTreeMap::from([("CURSOR_API_KEY".into(), Some("synthetic-private".into()))]),
+        )?;
+        assert!(cursor.names(&local, None)?.is_empty());
+        local.switches.codex_app_server.mode = AppServerMode::System;
+        assert!(connect.names(&local, None)?.is_empty());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn requested_local_service_is_discovered_without_enabling_a_use() -> Result<()> {
+        let (dir, host, _) = environment_fixture("disabled", "exit 1");
+        let bridge = dir.join(".local/bin/cursor-sdk-bridge");
+        program(&bridge);
+        let (mut local, mut manager, mut triage) = (local(), None, TriageConfig::default());
+        let found = missing(
+            &Target {
+                local: &mut local,
+                manager: &mut manager,
+                triage: &mut triage,
+            },
+            Some(Provider::Cursor),
+            &host,
+        )?;
+        assert_eq!(found.bins.get(&Provider::Cursor), Some(&bridge));
+        assert!(found.execution.is_empty());
+        assert!(manager.is_none() && local.switches.execution.is_empty());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     #[test]
     fn settings_show_home_paths_from_tilde_and_read_typed_tilde_as_home() {
         let host = Host {
@@ -523,12 +820,12 @@ mod tests {
             manager: &mut manager,
             triage: &mut triage,
         };
-        assert!(missing(&target, true, &host)?.is_empty());
+        assert!(missing(&target, Some(Provider::Codex), &host)?.is_empty());
         assert!(
-            missing(&target, false, &host)?.is_empty(),
+            missing(&target, None, &host)?.is_empty(),
             "nothing is looked up while Codex is not in use"
         );
-        assert!(missing(&target, true, &Host::default())?.is_empty());
+        assert!(missing(&target, Some(Provider::Codex), &Host::default())?.is_empty());
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -551,7 +848,7 @@ mod tests {
                 manager: &mut manager,
                 triage: &mut triage,
             },
-            true,
+            Some(Provider::Codex),
             &host,
         )?;
         assert_eq!(found.app_server, None);
@@ -567,7 +864,7 @@ mod tests {
                 manager: &mut manager,
                 triage: &mut triage,
             },
-            true,
+            Some(Provider::Codex),
             &host,
         )?;
         assert_eq!(found.app_server, None);
@@ -640,7 +937,7 @@ mod tests {
                 manager: &mut manager,
                 triage: &mut triage,
             },
-            false,
+            None,
             &host,
         )?;
         assert_eq!(found.bins, BTreeMap::from([(Provider::Cursor, bridge)]));
@@ -654,7 +951,7 @@ mod tests {
                     manager: &mut manager,
                     triage: &mut triage
                 },
-                false,
+                None,
                 &host,
             )?
             .is_empty(),

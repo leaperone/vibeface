@@ -2606,10 +2606,13 @@ impl Runtime {
             ),
             Some(_) => bail!("webhook_secret must be a string or null"),
         }
-        self.write_providers(|target| {
-            *target.triage = triage;
-            Ok(())
-        })
+        self.write_providers(
+            |target| {
+                *target.triage = triage;
+                Ok(())
+            },
+            None,
+        )
         .await?;
         match secret {
             Some(Value::Null) => match std::fs::remove_file(self.data_dir.join(WEBHOOK_KEY)) {
