@@ -189,6 +189,28 @@ struct Init {
     /// File containing the relay credential.
     #[arg(long, value_name = "PATH", requires = "entry")]
     relay_token_file: Option<PathBuf>,
+    /// Public bootstrap: `public` (default for a fresh Node), `off`, or a self-hosted
+    /// `vibeface://` discovery URL.
+    #[arg(long, value_name = "MODE|URL")]
+    bootstrap: Option<String>,
+    /// HTTPS bootstrap base of a self-hosted discovery service.
+    #[arg(long, value_name = "URL", requires = "bootstrap")]
+    bootstrap_https: Option<String>,
+    /// Gateway URL a discovery-only entry lists; pair each with --catalog-relay.
+    #[arg(long = "catalog-gateway", value_name = "URL", requires = "public_entry")]
+    catalog_gateways: Vec<String>,
+    /// Relay URL paired with the --catalog-gateway given in the same position.
+    #[arg(long = "catalog-relay", value_name = "URL", requires = "catalog_gateways")]
+    catalog_relays: Vec<String>,
+    /// Lifetime of the relay grants a discovery entry issues.
+    #[arg(long, value_name = "MINUTES", requires = "catalog_gateways")]
+    grant_ttl_minutes: Option<i64>,
+    /// How a public entry's relay admits Nodes.
+    #[arg(long, value_enum, requires = "public_entry")]
+    relay_admission: Option<RelayAdmission>,
+    /// Device ID of the discovery entry whose grants the relay admits.
+    #[arg(long, value_name = "DEVICE-ID", requires = "relay_admission")]
+    grant_issuer: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, ValueEnum)]
@@ -197,6 +219,13 @@ enum RelayServiceMode {
     #[default]
     Forward,
     DiscoveryOnly,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum RelayAdmission {
+    OperatorToken,
+    Grants,
 }
 
 #[derive(Args)]
@@ -612,6 +641,12 @@ async fn main() -> Result<()> {
             {
                 println!("Relay token: {path} (copy it to your Node and pass --relay-token-file)");
             }
+            match result["bootstrap"].as_str() {
+                Some("public") => println!("公共接入: 启用（--bootstrap off 可关闭）"),
+                Some("custom") => println!("公共接入: 自建 Discovery"),
+                Some("off") if result["public_entry"] != true => println!("公共接入: 关闭"),
+                _ => {}
+            }
             Ok(())
         }
         Some(Action::Status(options)) => status(options).await,
@@ -716,6 +751,11 @@ async fn status(options: Access) -> Result<()> {
         }
         if let Some(write_state) = result["write_state"].as_str() {
             println!("Writes: {write_state}");
+        }
+        if let Ok(bootstrap) =
+            serde_json::from_value::<terminal::BootstrapStatus>(result["bootstrap"].clone())
+        {
+            println!("Bootstrap: {}", bootstrap.summary());
         }
         if let Some(peers) = result["peers"].as_array() {
             let now = now_ms();

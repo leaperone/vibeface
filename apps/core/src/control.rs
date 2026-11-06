@@ -62,10 +62,59 @@ struct InitOptions {
     #[serde(default)]
     bins: Vec<(Provider, PathBuf)>,
     codex_socket: Option<PathBuf>,
+    /// `off`, `public`, or a `vibeface://` discovery URL of a private bootstrap source. A fresh
+    /// Node without a private entry defaults to `public`.
+    bootstrap: Option<String>,
+    /// HTTPS base of a private bootstrap source, for Nodes whose UDP is blocked.
+    bootstrap_https: Option<String>,
+    /// Paired with `catalog_relays`: the catalogue a discovery-only entry publishes.
+    #[serde(default)]
+    catalog_gateways: Vec<String>,
+    #[serde(default)]
+    catalog_relays: Vec<String>,
+    /// Grant lifetime the catalogue's issuer hands out, in minutes.
+    grant_ttl_minutes: Option<i64>,
+    /// How a public entry's relay admits Nodes.
+    relay_admission: Option<RelayAdmissionMode>,
+    /// The discovery entry whose grants a `grants` relay admits.
+    grant_issuer: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum RelayAdmissionMode {
+    OperatorToken,
+    Grants,
 }
 
 fn default_listen() -> SocketAddr {
     DEFAULT_LISTEN
+}
+
+/// The bootstrap a fresh Node gets: an explicit choice, else public unless this Node is
+/// infrastructure itself or already has a private entry.
+fn resolve_bootstrap(
+    choice: Option<&str>,
+    https: Option<&str>,
+    infrastructure: bool,
+    private_entry: bool,
+) -> Result<net::bootstrap::Bootstrap> {
+    use net::bootstrap::Bootstrap;
+    let bootstrap = match choice.map(str::trim) {
+        None if infrastructure || private_entry => Bootstrap::Off,
+        None | Some("public") => Bootstrap::Public,
+        Some("off") => Bootstrap::Off,
+        Some(discovery) => Bootstrap::Custom {
+            discovery: discovery.to_owned(),
+            https: https.map(str::to_owned),
+        },
+    };
+    ensure!(
+        https.is_none() || matches!(bootstrap, Bootstrap::Custom { .. }),
+        "--bootstrap-https belongs to a custom --bootstrap discovery URL"
+    );
+    bootstrap.validate()?;
+    Ok(bootstrap)
 }
 fn default_local_listen() -> SocketAddr {
     config::DEFAULT_LOCAL_LISTEN
@@ -164,6 +213,10 @@ pub async fn inspect(data_dir: &Path) -> Result<Value> {
         "web_enabled": health.as_ref().map_or(configuration.web_enabled, |health| health.web_enabled),
         "version": health.as_ref().ok().map(|health| &health.version),
         "write_state": health.as_ref().ok().and_then(|health| health.write_state),
+        "bootstrap": {
+            "mode": configuration.network.bootstrap.label(),
+            "status": health.as_ref().ok().and_then(|health| health.bootstrap.as_ref()),
+        },
         "peers": health.as_ref().ok().map(|health| &health.peers),
         "core_version": env!("CARGO_PKG_VERSION"),
         "error": error,
@@ -371,7 +424,8 @@ pub fn prepare_start(dir: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     if empty {
-        let configuration = Config::local(DEFAULT_LISTEN, vec![], false);
+        let mut configuration = Config::local(DEFAULT_LISTEN, vec![], false);
+        configuration.network.bootstrap = net::bootstrap::Bootstrap::Public;
         initialize(dir, configuration, None)?;
     }
     Ok(())
@@ -419,12 +473,65 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
         });
     }
     let relay_mode = options.relay_mode.unwrap_or_default();
+    ensure!(
+        options.catalog_gateways.len() == options.catalog_relays.len(),
+        "--catalog-gateway and --catalog-relay are given in pairs"
+    );
+    ensure!(
+        options.catalog_gateways.is_empty()
+            || (options.public_entry && relay_mode == RelayServiceMode::DiscoveryOnly),
+        "a catalogue is published by a discovery-only public entry"
+    );
+    let catalog = (!options.catalog_gateways.is_empty()).then(|| net::bootstrap::CatalogConfig {
+        entries: options
+            .catalog_gateways
+            .iter()
+            .zip(&options.catalog_relays)
+            .map(|(gateway_url, relay_url)| net::bootstrap::CatalogEntry {
+                gateway_url: gateway_url.clone(),
+                relay_url: relay_url.clone(),
+            })
+            .collect(),
+        grant_ttl_ms: options
+            .grant_ttl_minutes
+            .map_or(net::bootstrap::DEFAULT_GRANT_TTL_MS, |minutes| {
+                minutes.saturating_mul(60_000)
+            }),
+    });
+    ensure!(
+        options.grant_ttl_minutes.is_none() || catalog.is_some(),
+        "--grant-ttl-minutes belongs to a published catalogue"
+    );
+    let relay_admission = match options.relay_admission.unwrap_or(RelayAdmissionMode::OperatorToken) {
+        RelayAdmissionMode::OperatorToken => {
+            ensure!(
+                options.grant_issuer.is_none(),
+                "--grant-issuer belongs to --relay-admission grants"
+            );
+            net::RelayAdmission::OperatorToken
+        }
+        RelayAdmissionMode::Grants => net::RelayAdmission::Grants {
+            issuer: options
+                .grant_issuer
+                .clone()
+                .context("--relay-admission grants requires --grant-issuer")?,
+        },
+    };
+    let bootstrap = resolve_bootstrap(
+        options.bootstrap.as_deref(),
+        options.bootstrap_https.as_deref(),
+        options.public_entry,
+        options.entry.is_some(),
+    )?;
     configuration.network = NetworkConfig {
         relays: options.relays,
         discovery: options.discovery,
         relay_mode,
         relay_listen: options.relay_listen,
         relay_url: options.relay_url,
+        bootstrap,
+        relay_admission,
+        catalog,
         ..NetworkConfig::default()
     };
     configuration.public_entry = options.public_entry;
@@ -449,16 +556,24 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
             url,
         });
     }
+    let bootstrap_http = configuration.public_entry
+        && match relay_mode {
+            RelayServiceMode::DiscoveryOnly => configuration.network.catalog.is_some(),
+            RelayServiceMode::Forward => configuration.network.relay_admission.is_grants(),
+        };
     check_ports(
         configuration.listen,
         configuration.local_listen,
-        configuration.web_enabled,
+        configuration.web_enabled || bootstrap_http,
         configuration.public_entry,
     )?;
+    // A relay admitting by grants holds no operator token for anyone to copy.
+    let operator_relay = configuration.public_entry
+        && relay_mode == RelayServiceMode::Forward
+        && !configuration.network.relay_admission.is_grants();
     let entry_token = match options.relay_token_file {
         Some(path) => Some(net::read_token_file(&path)?),
-        None => (configuration.public_entry && relay_mode == RelayServiceMode::Forward)
-            .then(|| crypto::random_hex(32)),
+        None => operator_relay.then(|| crypto::random_hex(32)),
     };
     let mut provider_env = ProviderEnv::default();
     discovery::complete(
@@ -469,6 +584,7 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
     let public_entry = configuration.public_entry;
     let discovery_only = configuration.network.relay_mode == RelayServiceMode::DiscoveryOnly;
     let web_enabled = configuration.web_enabled;
+    let bootstrap = configuration.network.bootstrap.label();
     let open = if !public_entry
         && (configuration.listen.ip().is_loopback() || configuration.listen.ip().is_unspecified())
     {
@@ -488,8 +604,9 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
         "open": web_enabled.then_some(open),
         "discovery_only": discovery_only,
         "public_entry": public_entry,
+        "bootstrap": bootstrap,
         "device_id": device_id,
-        "relay_token_file": public_entry.then(|| options.data_dir.join(net::ENTRY_TOKEN_FILE)),
+        "relay_token_file": operator_relay.then(|| options.data_dir.join(net::ENTRY_TOKEN_FILE)),
     }))
 }
 
@@ -679,6 +796,13 @@ mod tests {
             model: None,
             bins: vec![],
             codex_socket: None,
+            bootstrap: Some("off".into()),
+            bootstrap_https: None,
+            catalog_gateways: vec![],
+            catalog_relays: vec![],
+            grant_ttl_minutes: None,
+            relay_admission: None,
+            grant_issuer: None,
         };
         assert!(initialize_from_options(options).is_err());
         assert_eq!(fs::read(dir.join("existing-data")).unwrap(), b"original");
@@ -699,6 +823,99 @@ mod tests {
         #[cfg(unix)]
         assert!(validate_data_dir(&link).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_nodes_bootstrap_publicly_unless_told_otherwise() {
+        use net::bootstrap::Bootstrap;
+        let custom = "vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@127.0.0.1:4792";
+        assert_eq!(
+            resolve_bootstrap(None, None, false, false).unwrap(),
+            Bootstrap::Public
+        );
+        assert_eq!(
+            resolve_bootstrap(None, None, true, false).unwrap(),
+            Bootstrap::Off,
+            "public entries are the infrastructure"
+        );
+        assert_eq!(
+            resolve_bootstrap(None, None, false, true).unwrap(),
+            Bootstrap::Off,
+            "a private entry is not silently paired with the public one"
+        );
+        assert_eq!(
+            resolve_bootstrap(Some("off"), None, false, false).unwrap(),
+            Bootstrap::Off
+        );
+        assert_eq!(
+            resolve_bootstrap(Some("public"), None, false, true).unwrap(),
+            Bootstrap::Public
+        );
+        assert_eq!(
+            resolve_bootstrap(Some(custom), Some("http://127.0.0.1:4800/bootstrap"), false, false).unwrap(),
+            Bootstrap::Custom {
+                discovery: custom.into(),
+                https: Some("http://127.0.0.1:4800/bootstrap".into())
+            }
+        );
+        assert!(resolve_bootstrap(Some("public"), Some("https://x.example"), false, false).is_err());
+        assert!(resolve_bootstrap(Some("https://not-a-discovery"), None, false, false).is_err());
+        let dir = temp_dir("bootstrap-default");
+        let options: InitOptions = serde_json::from_value(json!({
+            "data_dir": dir,
+            "no_web": true,
+            "listen": free_addr(),
+            "local_listen": free_addr(),
+        }))
+        .unwrap();
+        let result = initialize_from_options(options).unwrap();
+        assert_eq!(result["bootstrap"], "public");
+        assert_eq!(
+            Config::load(&dir).unwrap().network.bootstrap,
+            Bootstrap::Public
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn grant_admitting_entries_hold_no_operator_token() {
+        let dir = temp_dir("grants-entry");
+        let listen = free_addr();
+        let relay_listen = loop {
+            let candidate = free_addr();
+            if candidate != listen {
+                break candidate;
+            }
+        };
+        let options: InitOptions = serde_json::from_value(json!({
+            "data_dir": dir,
+            "no_web": true,
+            "listen": listen,
+            "public_url": "https://entry.example",
+            "public_entry": true,
+            "relay_listen": relay_listen,
+            "relay_url": "https://entry.example",
+            "relay_admission": "grants",
+            "grant_issuer": "82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235",
+        }))
+        .unwrap();
+        let result = initialize_from_options(options).unwrap();
+        assert_eq!(result["bootstrap"], "off");
+        assert!(result["relay_token_file"].is_null());
+        assert!(!dir.join(net::ENTRY_TOKEN_FILE).exists());
+        let saved = Config::load(&dir).unwrap();
+        assert!(saved.network.relay_admission.is_grants());
+        assert!(saved.network.bootstrap.is_off());
+        fs::remove_dir_all(dir).unwrap();
+        let missing: InitOptions = serde_json::from_value(json!({
+            "data_dir": temp_dir("grants-missing"),
+            "public_url": "https://entry.example",
+            "public_entry": true,
+            "relay_listen": "127.0.0.1:0",
+            "relay_admission": "grants",
+        }))
+        .unwrap();
+        assert!(initialize_from_options(missing).unwrap_err().to_string().contains("grant-issuer"));
     }
 
     #[test]
@@ -751,6 +968,13 @@ mod tests {
                 model: None,
                 bins: vec![],
                 codex_socket: socket.clone(),
+                bootstrap: Some("off".into()),
+                bootstrap_https: None,
+                catalog_gateways: vec![],
+                catalog_relays: vec![],
+                grant_ttl_minutes: None,
+                relay_admission: None,
+                grant_issuer: None,
             };
             initialize_from_options(options).unwrap();
             let saved = Config::load(&dir).unwrap().providers.codex_app_server;
@@ -813,6 +1037,13 @@ mod tests {
             model: None,
             bins: vec![],
             codex_socket: None,
+            bootstrap: Some("off".into()),
+            bootstrap_https: None,
+            catalog_gateways: vec![],
+            catalog_relays: vec![],
+            grant_ttl_minutes: None,
+            relay_admission: None,
+            grant_issuer: None,
         };
         let error = initialize_from_options(options).unwrap_err().to_string();
         assert!(!error.contains("secret"));
@@ -834,6 +1065,11 @@ mod tests {
             prepare_start(&dir).unwrap();
             assert_eq!(fs::read(dir.join("identity.json")).unwrap(), identity);
             assert_eq!(fs::read(dir.join("config.json")).unwrap(), config);
+            assert_eq!(
+                Config::load(&dir).unwrap().network.bootstrap,
+                net::bootstrap::Bootstrap::Public,
+                "a fresh direct start bootstraps from the public infrastructure"
+            );
             let runtime = crate::runtime::Runtime::open(&dir).await.unwrap();
             drop(runtime);
         }

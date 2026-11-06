@@ -221,12 +221,27 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
 ## 配置公共入口
 
-手机或另一台电脑要从外网打开网页，需要一个 HTTPS 入口。有两种做法：
+手机或另一台电脑要从外网打开网页，需要一个 HTTPS 入口。有三种做法：
 
-- **公共入口**：在有公网地址的机器上运行一个不加入个人网络的 `vibeface`，它默认只提供网页、relay 和密文转发，不保存个人网络的事件或附件。个人设备不需要入站端口。推荐用这种方式。
+- **官方公共入口（默认）**：新初始化的 Node 自动从 Vibeface 的公共发现服务取得官方公共入口的地址和一张绑定本设备的 relay 许可，不需要令牌或任何服务器。见下文 [自动接入官方公共入口](#自动接入官方公共入口)。
+- **自建公共入口**：在有公网地址的机器上运行一个不加入个人网络的 `vibeface`，它默认只提供网页、relay 和密文转发，不保存个人网络的事件或附件。个人设备不需要入站端口。
 - **成员 Gateway**：让公网机器上的 Node 作为普通成员加入个人网络，同时提供网页，见本节末尾。
 
-### 公共入口：Linux 服务器加 nginx
+### 自动接入官方公共入口
+
+`vibeface init` 和首次直接启动在空数据目录里写入 `"bootstrap": {"mode": "public"}`。Node 启动后在后台做三件事，本机网页、维护接口和局域网发现不等待它们：
+
+1. 向 `config/public-bootstrap.json` 里固定的发现服务（`discovery.vibeface.dev:4792`，UDP）索取**服务目录**；UDP 不通时改从 `https://app.vibeface.dev/bootstrap/catalog` 获取。目录由发现服务的设备密钥签名，列出成对的网页入口 `gateway_url` 和 relay `relay_url`，最多 4 对；签名、签发者、有效期或大小不符的目录一律丢弃。
+2. 按目录顺序向发现服务申请 **relay 许可**。许可绑定本设备的设备编号和那台 relay 的 origin，默认 30 分钟有效，最长 1 小时；UDP 路径由 QUIC TLS 证明设备，HTTPS 路径由设备私钥签名请求。许可在过半有效期时续签，续签结果同时登记到入口，所以 relay 重启后拿旧许可重连的设备仍被接纳，不会反复重连。
+3. 把许可交给 iroh 连接那台 relay，并把这台入口的 `gateway_url` 写进自己的签名地址记录，让其他设备和浏览器知道经哪个入口能找到它。
+
+`vibeface status` 的 `Bootstrap` 一行显示 `seeking`（还没拿到许可，附带最近一次失败原因）、`admitted`（已接入，附带入口地址）或 `degraded`（续签或登记失败，仍持有旧许可）。接入失败不影响本机使用和局域网内同步，只是外网设备暂时找不到它。
+
+目录只是地址提示：公共入口看不到对话内容，个人网络仍按邀请和成员目录授权。公共入口的 relay 只接纳持有效许可的设备，一台入口服务多个人的 Node，各人的网络互不相通。
+
+不想使用官方服务时，初始化加 `--bootstrap off`；指定了自建入口 `--entry` 时默认就是关闭，不会悄悄回退到官方服务。自建一套同样协议的发现服务和入口后，用 `--bootstrap 'vibeface://<发现服务设备编号>@<主机>:<UDP 端口>'` 指向它，可选 `--bootstrap-https https://<入口>/bootstrap` 作为 UDP 不通时的第二路径；自建来源永远不会回退到官方服务。已初始化的 Node 停掉后修改 `config.json` 里 `network.bootstrap`（`{"mode":"off"}`、`{"mode":"public"}` 或 `{"mode":"custom","discovery":"vibeface://…","https":"https://…/bootstrap"}`）再启动。
+
+### 自建公共入口：Linux 服务器加 nginx
 
 下面以一台 Linux 服务器为公共入口，域名为 `vb.example.com`。个人电脑运行加入个人网络的 Node。
 
@@ -310,6 +325,10 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
 已经初始化的 Node 要改用公共入口，停掉它，在 `config.json` 的 `network` 中加入 `"entry": {"url": "https://vb.example.com", "relay": "https://vb.example.com"}`，把令牌放到数据目录的 `entry-token`（权限 600），再启动。
 
+### 自建公共入口：按许可接纳设备
+
+不想分发运营者令牌时，可以让自建入口像官方入口一样，由一台发现服务签发目录和许可。入口初始化时改用 `--relay-admission grants --grant-issuer <发现服务设备编号>`，此时不生成 `entry-token`，relay 只接纳该发现服务签发、绑定到连接设备和本 relay origin 的许可，并在 `POST /api/relay/grant` 接受设备登记续签的许可。发现服务按 [运行不转发业务数据的公共发现服务](#运行不转发业务数据的公共发现服务) 初始化，加上 `--catalog-gateway https://vb.example.com --catalog-relay https://vb.example.com` 发布目录，nginx 把入口域名下的 `/bootstrap/` 转给发现服务的网页端口（`Host` 仍是入口域名，发现服务的 `--public-url` 也设为入口域名，并传递 `X-Real-IP` 以便按来源限流）。个人设备用 `--bootstrap 'vibeface://<发现服务设备编号>@discovery.example:4792' --bootstrap-https https://vb.example.com/bootstrap` 初始化即可，不需要令牌。
+
 ### 成员 Gateway
 
 公网机器上的 Node 也可以作为普通成员提供网页：
@@ -348,6 +367,12 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | `--relay-mode <MODE>` | `relay_mode` | 默认 `forward`；`discovery-only` 只提供连接协助，需要 `--public-entry` |
 | `--discovery <URL>` | `discovery` | 钉住身份的发现服务，格式为 `vibeface://<device-id>@<host>:<UDP-port>`，最多 4 个 |
 | `--relay-url <URL>` | `relay_url` | 其他 Node 访问本 relay 的 URL，必须明确提供其他 Node 可访问的 URL |
+| `--bootstrap <MODE\|URL>` | `bootstrap` | `public`（无 `--entry` 的新 Node 默认值）、`off`，或自建发现服务的 `vibeface://` 地址 |
+| `--bootstrap-https <URL>` | `bootstrap.https` | 自建发现服务的 HTTPS 接入基址，UDP 不通时使用 |
+| `--relay-admission <POLICY>` | `relay_admission` | 公共入口 relay 的接纳策略：`operator-token`（默认）或 `grants` |
+| `--grant-issuer <DEVICE-ID>` | `relay_admission.issuer` | `grants` 策略信任的发现服务设备编号 |
+| `--catalog-gateway <URL>`、`--catalog-relay <URL>` | `catalog.entries` | 仅发现服务：成对发布的网页入口和 relay，最多 4 对 |
+| `--grant-ttl-minutes <N>` | `catalog.grant_ttl_ms` | 仅发现服务：签发许可的有效期，默认 30 分钟，最长 60 分钟 |
 | 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
 | 无 | `n0_relays` | 同时使用 n0 公共 relay，默认关闭 |
 
@@ -425,29 +450,15 @@ vibeface wallet --data-dir /path/to/node-data backup /path/to/new-wallet-backup.
 
 ## 使用公共发现服务
 
-Vibeface 提供以下可选的公共发现服务，帮助不同用户各自网络中的 Node 查询已知设备的地址并尝试直连。它不会把个人网络合并，也不会授予成员权限；加入仍需邀请和批准。Node 不会默认连接这项服务。
+Vibeface 的公共发现服务帮助不同用户各自网络中的 Node 查询已知设备的地址并尝试直连，同时签发官方公共入口的服务目录和 relay 许可，见 [自动接入官方公共入口](#自动接入官方公共入口)。它不会把个人网络合并，也不会授予成员权限；加入仍需邀请和批准。它的设备编号、UDP 地址和 HTTPS 基址固定在仓库的 `config/public-bootstrap.json`，Core、网页和手机 App 都从这一个文件取值：
 
 ```text
 vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@discovery.vibeface.dev:4792
 ```
 
-首次初始化且数据目录为空或不存在时，可以显式选择它：
+新初始化的 Node 默认（`bootstrap` 为 `public`）就向它登记地址、索取目录和许可，不需要再传 `--discovery`。`--bootstrap off` 的 Node 不会连接它；之后要启用，停掉 Node，把 `config.json` 里 `network.bootstrap` 改为 `{"mode": "public"}` 再启动。只想用它查询地址、不接入官方公共入口的 Node，可以在 `--bootstrap off` 的同时显式传 `--discovery` 这个地址，或把它加入 `config.json` 的 `network.discovery` 数组后重启。不要为修改发现配置重新运行 `init`，也不需要重新创建个人网络。
 
-```sh
-vibeface init --discovery 'vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@discovery.vibeface.dev:4792'
-```
-
-已有节点先停止 Core，再把这个地址添加到数据目录 `config.json` 的 `network.discovery` 数组，保留其他配置。例如该字段的值为：
-
-```json
-[
-  "vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@discovery.vibeface.dev:4792"
-]
-```
-
-随后按原方式启动 Core。不要为修改发现配置重新运行 `init`，也不需要重新创建个人网络。
-
-服务使用 UDP 4792，通过地址中的设备编号核验身份，不经过 Cloudflare HTTP 代理。运营者能看到设备编号、UDP 地址和查询关系；地址登记只保存在内存中，不保存会话或附件。它不提供网页入口，不接受 `--relay` 或 `--entry` 的配置用途，也不转发业务数据。对称 NAT 或 UDP 被封锁时仍可能无法直连，需要另行配置普通中继。自建同类服务见下一节。
+服务使用 UDP 4792，通过地址中的设备编号核验身份，不经过 Cloudflare HTTP 代理；只有目录和许可的 HTTPS 第二路径经 `https://app.vibeface.dev/bootstrap/` 到达同一个实例。运营者能看到设备编号、UDP 地址、查询关系和许可申请；地址登记只保存在内存中，不保存会话或附件。它不提供网页入口，不接受 `--relay` 或 `--entry` 的配置用途，也不转发业务数据。对称 NAT 或 UDP 被封锁时仍可能无法直连，业务流量经许可的公共 relay 转发。自建同类服务见下一节。
 
 ## 运行不转发业务数据的公共发现服务
 
@@ -462,20 +473,23 @@ vibeface serve --data-dir /srv/vibeface-discovery
 
 `init` 输出发现服务的设备编号。UDP 4792 必须能从公网直接访问，不能用 HTTP 反向代理替代。监听地址的端口必须非零；使用 `0.0.0.0` 或 `[::]` 时同时尝试监听 IPv4 和 IPv6。此模式不使用 `--relay-url`，也不生成 `entry-token`。省略 `--no-web` 时仍提供静态网页，但不提供 `/api/client`、`/api/decision` 或建网入口。
 
+要让它同时为一台或多台公共入口签发目录和许可，初始化时成对传入 `--catalog-gateway <入口网页 URL>` 和 `--catalog-relay <入口 relay URL>`（最多 4 对，公网地址必须是 HTTPS），可选 `--grant-ttl-minutes` 调整许可有效期（默认 30，最长 60）。发布目录的发现服务在 `listen` 上提供 `GET /bootstrap/catalog` 和 `POST /bootstrap/grant`，即使 `--no-web`；把入口域名下的 `/bootstrap/` 反代到这个端口，`Host` 保持入口域名并把 `--public-url` 设为同一入口，传递 `X-Real-IP` 以按来源限流（每设备每分钟 6 张、每来源 IP 每分钟 30 张）。目录每 24 小时重签，Node 每 6 小时刷新；对应的公共入口用 `--relay-admission grants --grant-issuer <这台发现服务的设备编号>` 初始化。
+
 用户在自己的 Node 上明确配置这个发现服务的编号和公网地址：
 
 ```sh
 vibeface init --data-dir /absolute/personal-node \
-	--discovery 'vibeface://<发现服务设备编号>@discovery.example:4792'
+	--bootstrap 'vibeface://<发现服务设备编号>@discovery.example:4792' \
+	--bootstrap-https https://<入口域名>/bootstrap
 ```
 
-已有 Node 可在 `config.json` 的 `network.discovery` 数组里添加同一 URL 后重启。发现服务的编号通过 QUIC TLS 校验，域名解析结果不能冒充运营者。不要把这个地址传给 `--relay` 或 `--entry`，它没有业务转发能力。
+只做地址查询、不接入它发布的公共入口时，改传 `--bootstrap off --discovery 'vibeface://…'`；已有 Node 可在 `config.json` 的 `network.discovery` 数组里添加同一 URL 后重启。发现服务的编号通过 QUIC TLS 校验，域名解析结果不能冒充运营者。不要把这个地址传给 `--relay` 或 `--entry`，它没有业务转发能力。
 
 Node 用自身的业务 UDP 端口登记。发现服务只交换它从已认证连接上观察到的地址，并通知双方发起直连探测。服务端没有转发客户端数据报的实现，也不接受个人网络的业务 ALPN。加入设备仍需有效邀请，读取、同步和执行仍按原有成员权限校验。
 
-发现服务不会列出所有用户；知道设备编号的人可以查询它是否在线及其公网地址。运营者能看到设备编号、UDP 地址和查询关系。地址登记只保存在内存中，连接租约到期或断开后移除，不保存会话、附件、事件或个人网络。每个服务最多接纳 512 条控制连接，每个来源 IP 最多 8 条；单连接最多处理 60 个固定请求，租约为 60 秒，单帧最多 512 字节。连接通知队列和并发探测也有上限。
+发现服务不会列出所有用户；知道设备编号的人可以查询它是否在线及其公网地址。运营者能看到设备编号、UDP 地址、查询关系和许可申请。地址登记只保存在内存中，连接租约到期或断开后移除，不保存会话、附件、事件或个人网络。每个服务最多接纳 512 条控制连接，每个来源 IP 最多 8 条；单连接最多处理 60 个固定请求，租约为 60 秒，请求帧最多 1024 字节，应答帧最多容纳一份 4096 字节的签名目录。连接通知队列和并发探测也有上限。
 
-仅发现不保证所有 NAT 类型都能直连。对称 NAT、UDP 被封锁或双方没有可用直连路径时，仅发现会报告不可达。需要这类网络仍可自动连接时，用户可另行配置普通 `--relay`。Node 自动选择直连或普通 relay；发现节点始终不承载业务流量。本项目不默认连接任何官方发现服务。
+仅发现不保证所有 NAT 类型都能直连。对称 NAT、UDP 被封锁或双方没有可用直连路径时，仅发现会报告不可达。这类网络的业务流量经它目录里的公共入口 relay 转发，用户也可另行配置普通 `--relay`。Node 自动选择直连或 relay；发现节点始终不承载业务流量。新 Node 默认只连接 `config/public-bootstrap.json` 里固定的官方发现服务，`--bootstrap off` 后不连接任何发现服务。
 
 ## 多个访问地址
 

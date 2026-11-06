@@ -228,6 +228,15 @@ impl Config {
                     && self.roots.is_empty(),
                 "a public entry runs a relay and nothing else"
             );
+            ensure!(
+                self.network.bootstrap.is_off(),
+                "a public entry is the infrastructure Nodes bootstrap from and does not bootstrap"
+            );
+        } else {
+            ensure!(
+                !self.network.relay_admission.is_grants(),
+                "grant admission belongs to a public entry's relay"
+            );
         }
         self.triage.validate()?;
         self.providers.validate(

@@ -559,11 +559,12 @@ class Node:
         self.process = None
         self.log = None
         try:
-            result = subprocess.run(
-                [str(binary), "init", "--data-dir", str(self.directory),
-                 "--listen", f"127.0.0.1:{self.port}", "--local-listen", f"127.0.0.1:{self.local_port}",
-                 *(init_args if init_args is not None else ["--root", str(workspace)])],
-                capture_output=True, timeout=45)
+            arguments = [str(binary), "init", "--data-dir", str(self.directory),
+                         "--listen", f"127.0.0.1:{self.port}", "--local-listen", f"127.0.0.1:{self.local_port}",
+                         *(init_args if init_args is not None else ["--root", str(workspace)])]
+            if not any(arg == "--bootstrap" or arg.startswith("--bootstrap=") for arg in arguments):
+                arguments.extend(["--bootstrap", "off"])
+            result = subprocess.run(arguments, capture_output=True, timeout=45)
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{name}: CLI initialization timed out") from None
         require(result.returncode == 0, f"{name}: CLI initialization succeeds: {result.stderr.decode(errors='replace')[-300:]}")

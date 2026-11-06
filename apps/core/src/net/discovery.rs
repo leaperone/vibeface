@@ -1,4 +1,8 @@
-use super::{DIAL_TIMEOUT, DISCOVERY, endpoint_id};
+use super::{
+    DIAL_TIMEOUT, DISCOVERY,
+    bootstrap::{self, Issuer, SignedCatalog},
+    device_id, endpoint_id,
+};
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, TransportAddr,
@@ -16,7 +20,9 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
-const MAX_FRAME: usize = 512;
+/// A request names at most a relay origin; a reply may carry the signed catalogue.
+const MAX_REQUEST: usize = 1024;
+const MAX_REPLY: usize = bootstrap::MAX_SIGNED_CATALOG_BYTES + 512;
 const MAX_SESSIONS: usize = 512;
 const MAX_PER_IP: usize = 8;
 const MAX_REQUESTS: usize = 60;
@@ -24,15 +30,15 @@ const LEASE: Duration = Duration::from_secs(60);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const NOTICE_INTERVAL: Duration = Duration::from_millis(250);
 
-#[derive(Clone, Debug)]
-struct Server {
-    id: EndpointId,
-    host: String,
-    port: u16,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Server {
+    pub(super) id: EndpointId,
+    pub(super) host: String,
+    pub(super) port: u16,
 }
 
 impl Server {
-    fn parse(value: &str) -> Result<Self> {
+    pub(super) fn parse(value: &str) -> Result<Self> {
         let url = reqwest::Url::parse(value).context("invalid discovery server URL")?;
         ensure!(
             url.scheme() == "vibeface"
@@ -82,6 +88,10 @@ enum Request {
     Register {},
     Lookup { device_id: EndpointId },
     Probe {},
+    /// The signed service catalogue, when this service publishes one.
+    Catalog {},
+    /// A relay grant for the connecting device, which the QUIC handshake proved.
+    Grant { relay_url: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,6 +110,15 @@ enum Reply {
     },
     Missing {},
     Probed {},
+    Catalog {
+        catalog: SignedCatalog,
+    },
+    Granted {
+        grant: String,
+    },
+    Refused {
+        reason: String,
+    },
 }
 
 struct Registration {
@@ -155,11 +174,80 @@ struct Client {
     ready: Notify,
 }
 
+impl Client {
+    /// The registration connection, waiting up to `wait` for the next one to come up.
+    async fn connection_or_wait(&self, wait: Duration) -> Option<Connection> {
+        let ready = self.ready.notified();
+        if let Some(connection) = self
+            .connection
+            .lock()
+            .expect("discovery connection")
+            .clone()
+        {
+            return Some(connection);
+        }
+        let _ = tokio::time::timeout(wait, ready).await;
+        self.connection
+            .lock()
+            .expect("discovery connection")
+            .clone()
+    }
+}
+
+/// Catalogue and grant requests on the authenticated registration session with one server.
+#[derive(Clone)]
+pub(super) struct DiscoveryClient(Arc<Client>);
+
+impl std::fmt::Debug for DiscoveryClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DiscoveryClient")
+    }
+}
+
+impl DiscoveryClient {
+    async fn call(&self, request: &Request, wait: Duration) -> Result<Reply> {
+        let connection = self
+            .0
+            .connection_or_wait(wait)
+            .await
+            .context("discovery server is not connected")?;
+        tokio::time::timeout(CONTROL_TIMEOUT, async {
+            let (mut send, mut recv) = connection.open_bi().await?;
+            write(&mut send, request, MAX_REQUEST).await?;
+            send.finish()?;
+            read::<Reply>(&mut recv, MAX_REPLY).await
+        })
+        .await
+        .context("discovery request timed out")?
+    }
+
+    pub async fn catalog(&self, wait: Duration) -> Result<SignedCatalog> {
+        match self.call(&Request::Catalog {}, wait).await? {
+            Reply::Catalog { catalog } => Ok(catalog),
+            Reply::Refused { reason } => bail!("{reason}"),
+            _ => bail!("invalid discovery catalogue reply"),
+        }
+    }
+
+    pub async fn grant(&self, relay_url: &str, wait: Duration) -> Result<String> {
+        let request = Request::Grant {
+            relay_url: relay_url.to_owned(),
+        };
+        match self.call(&request, wait).await? {
+            Reply::Granted { grant } => Ok(grant),
+            Reply::Refused { reason } => bail!("{reason}"),
+            _ => bail!("invalid discovery grant reply"),
+        }
+    }
+}
+
 pub(super) struct Discovery {
     server: bool,
+    /// Signs the catalogue and grants when this service publishes a catalogue.
+    issuer: Option<Arc<Issuer>>,
     registry: Arc<Mutex<Registry>>,
     sessions: Semaphore,
-    clients: Vec<Arc<Client>>,
+    clients: Vec<(Server, Arc<Client>)>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -172,7 +260,12 @@ impl Drop for Discovery {
 }
 
 impl Discovery {
-    pub fn new(endpoint: &Endpoint, servers: &[String], server: bool) -> Result<Self> {
+    pub fn new(
+        endpoint: &Endpoint,
+        servers: &[String],
+        server: bool,
+        issuer: Option<Arc<Issuer>>,
+    ) -> Result<Self> {
         let mut clients = Vec::new();
         let mut tasks = Vec::new();
         let probes = Arc::new(Semaphore::new(8));
@@ -183,7 +276,7 @@ impl Discovery {
                 connection: Mutex::new(None),
                 ready: Notify::new(),
             });
-            clients.push(client.clone());
+            clients.push((server.clone(), client.clone()));
             let endpoint = endpoint.clone();
             let probes = probes.clone();
             let observations = observations.clone();
@@ -201,6 +294,7 @@ impl Discovery {
         }
         Ok(Self {
             server,
+            issuer,
             registry: Default::default(),
             sessions: Semaphore::new(MAX_SESSIONS),
             clients,
@@ -208,28 +302,23 @@ impl Discovery {
         })
     }
 
+    /// The session with the server `value` names, if this endpoint registers there.
+    pub fn client_for(&self, value: &str) -> Option<DiscoveryClient> {
+        let wanted = Server::parse(value).ok()?;
+        self.clients
+            .iter()
+            .find(|(server, _)| *server == wanted)
+            .map(|(_, client)| DiscoveryClient(client.clone()))
+    }
+
     pub async fn resolve(&self, device_id: EndpointId) -> Option<SocketAddr> {
-        let queries = self.clients.iter().map(|client| async move {
-            let ready = client.ready.notified();
-            let mut connection = client
-                .connection
-                .lock()
-                .expect("discovery connection")
-                .clone();
-            if connection.is_none() {
-                let _ = tokio::time::timeout(Duration::from_secs(1), ready).await;
-                connection = client
-                    .connection
-                    .lock()
-                    .expect("discovery connection")
-                    .clone();
-            }
-            let connection = connection?;
+        let queries = self.clients.iter().map(|(_, client)| async move {
+            let connection = client.connection_or_wait(Duration::from_secs(1)).await?;
             tokio::time::timeout(CONTROL_TIMEOUT, async {
                 let (mut send, mut recv) = connection.open_bi().await?;
-                write(&mut send, &Request::Lookup { device_id }).await?;
+                write(&mut send, &Request::Lookup { device_id }, MAX_REQUEST).await?;
                 send.finish()?;
-                match read::<Reply>(&mut recv).await? {
+                match read::<Reply>(&mut recv, MAX_REPLY).await? {
                     Reply::Peer {
                         device_id: found,
                         address,
@@ -279,12 +368,53 @@ impl Discovery {
                         streams = connection.accept_bi() => streams?,
                     };
                     let (mut send, mut recv) = streams;
-                    let request: Request = tokio::time::timeout(CONTROL_TIMEOUT, read(&mut recv))
-                        .await
-                        .context("discovery request timed out")??;
+                    let request: Request =
+                        tokio::time::timeout(CONTROL_TIMEOUT, read(&mut recv, MAX_REQUEST))
+                            .await
+                            .context("discovery request timed out")??;
                     match request {
                         Request::Probe {} => {
-                            write(&mut send, &Reply::Probed {}).await?;
+                            write(&mut send, &Reply::Probed {}, MAX_REPLY).await?;
+                            send.finish()?;
+                        }
+                        Request::Catalog {} if self.server => {
+                            let reply = match &self.issuer {
+                                Some(issuer) => match issuer.catalog(bootstrap::now_ms()) {
+                                    Ok(catalog) => Reply::Catalog { catalog },
+                                    Err(error) => Reply::Refused {
+                                        reason: error.to_string(),
+                                    },
+                                },
+                                None => Reply::Refused {
+                                    reason: "this discovery service publishes no catalogue".into(),
+                                },
+                            };
+                            write(&mut send, &reply, MAX_REPLY).await?;
+                            send.finish()?;
+                        }
+                        Request::Grant { relay_url } if self.server => {
+                            // The QUIC handshake proved the device; the source address is the
+                            // observed one.
+                            let device = device_id(&connection.remote_id());
+                            let reply = match &self.issuer {
+                                Some(issuer) => match issuer.grant(
+                                    &device,
+                                    &relay_url,
+                                    address.ip(),
+                                    bootstrap::now_ms(),
+                                ) {
+                                    Ok(grant) => Reply::Granted {
+                                        grant: grant.as_str().to_owned(),
+                                    },
+                                    Err(error) => Reply::Refused {
+                                        reason: error.to_string(),
+                                    },
+                                },
+                                None => Reply::Refused {
+                                    reason: "this discovery service issues no grants".into(),
+                                },
+                            };
+                            write(&mut send, &reply, MAX_REPLY).await?;
                             send.finish()?;
                         }
                         Request::Register {} if self.server && !registered => {
@@ -311,9 +441,10 @@ impl Discovery {
                             };
                             work.spawn(async move {
                                 let _guard = guard;
-                                write(&mut send, &Reply::Registered { address }).await?;
+                                write(&mut send, &Reply::Registered { address }, MAX_REPLY).await?;
                                 while let Some((device_id, address)) = incoming.recv().await {
-                                    write(&mut send, &Reply::Notice { device_id, address }).await?;
+                                    write(&mut send, &Reply::Notice { device_id, address }, MAX_REPLY)
+                                        .await?;
                                 }
                                 Ok::<_, anyhow::Error>(())
                             });
@@ -344,7 +475,7 @@ impl Discovery {
                                 Some(address) => Reply::Peer { device_id, address },
                                 None => Reply::Missing {},
                             };
-                            write(&mut send, &reply).await?;
+                            write(&mut send, &reply, MAX_REPLY).await?;
                             send.finish()?;
                         }
                         _ => bail!("this endpoint only accepts discovery probes"),
@@ -393,10 +524,10 @@ async fn register(
 ) -> Result<()> {
     let connection = server.connect(endpoint).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
-    write(&mut send, &Request::Register {}).await?;
+    write(&mut send, &Request::Register {}, MAX_REQUEST).await?;
     send.finish()?;
     let Reply::Registered { address } =
-        tokio::time::timeout(CONTROL_TIMEOUT, read(&mut recv)).await??
+        tokio::time::timeout(CONTROL_TIMEOUT, read(&mut recv, MAX_REPLY)).await??
     else {
         bail!("discovery server did not register this endpoint");
     };
@@ -416,7 +547,7 @@ async fn register(
         loop {
             let reply: Reply = tokio::select! {
                 _ = connection.closed() => break,
-                reply = read(&mut recv) => reply?,
+                reply = read(&mut recv, MAX_REPLY) => reply?,
             };
             let Reply::Notice { device_id, address } = reply else {
                 bail!("invalid discovery notification");
@@ -437,10 +568,13 @@ async fn register(
                             )
                             .await?;
                         let (mut send, mut recv) = peer.open_bi().await?;
-                        write(&mut send, &Request::Probe {}).await?;
+                        write(&mut send, &Request::Probe {}, MAX_REQUEST).await?;
                         send.finish()?;
                         ensure!(
-                            matches!(read::<Reply>(&mut recv).await?, Reply::Probed {}),
+                            matches!(
+                                read::<Reply>(&mut recv, MAX_REPLY).await?,
+                                Reply::Probed {}
+                            ),
                             "invalid discovery probe reply"
                         );
                         peer.close(0u32.into(), b"discovery probe finished");
@@ -468,19 +602,19 @@ async fn register(
     result
 }
 
-async fn read<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
+async fn read<T: DeserializeOwned>(recv: &mut RecvStream, limit: usize) -> Result<T> {
     let mut size = [0; 4];
     recv.read_exact(&mut size).await?;
     let size = u32::from_be_bytes(size) as usize;
-    ensure!(size <= MAX_FRAME, "discovery frame is too large");
+    ensure!(size <= limit, "discovery frame is too large");
     let mut bytes = vec![0; size];
     recv.read_exact(&mut bytes).await?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-async fn write<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {
+async fn write<T: Serialize>(send: &mut SendStream, value: &T, limit: usize) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
-    ensure!(bytes.len() <= MAX_FRAME, "discovery frame is too large");
+    ensure!(bytes.len() <= limit, "discovery frame is too large");
     send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
     send.write_all(&bytes).await?;
     Ok(())
@@ -668,7 +802,7 @@ mod tests {
         );
         let raw = a.endpoint.connect(service.addr(), DISCOVERY).await?;
         let (mut send, _recv) = raw.open_bi().await?;
-        send.write_all(&((MAX_FRAME + 1) as u32).to_be_bytes())
+        send.write_all(&((MAX_REQUEST + 1) as u32).to_be_bytes())
             .await?;
         send.finish()?;
         tokio::time::timeout(CONTROL_TIMEOUT, raw.closed()).await?;
