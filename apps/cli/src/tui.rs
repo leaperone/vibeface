@@ -395,7 +395,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, refreshing: bool, palette: Palette
             ..header
         });
     frame.render_widget(Paragraph::new("vibeface").style(palette.strong), brand);
-    let stale = matches!(app.reading, Reading::Failed { .. });
+    let stale = matches!(app.reading, Reading::Failed { .. }) && app.reading.snapshot().is_some();
     frame.render_widget(
         Paragraph::new(app.reading.state_label())
             .right_aligned()
@@ -476,7 +476,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, refreshing: bool, palette: Palette
         frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), content);
     }
     let mut update_lines = Vec::new();
-    if let Some(error) = app.reading.error() {
+    if let Some(error) = app.reading.error().filter(|_| stale) {
         update_lines.push(Line::styled("Refresh failed. Press r.", palette.strong));
         update_lines.push(Line::raw(safe_text(error)));
     }
@@ -501,6 +501,8 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, refreshing: bool, palette: Palette
         } else {
             "↑/↓ scroll   Esc back   ? close   q quit"
         }
+    } else if app.reading.snapshot().is_none() {
+        "r retry  ? help  q quit"
     } else if app.view == View::Details {
         if keys.width < 58 {
             "↑/↓ scroll  Esc back\nr refresh  ? help  q quit"
@@ -822,6 +824,10 @@ mod tests {
         app.finish_reading(Err(anyhow::anyhow!("first read failed")));
         assert!(app.reading.snapshot().is_none());
         assert_eq!(app.reading.state_label(), "UNAVAILABLE");
+        let unavailable = render(&mut app, 45, 24);
+        assert!(!unavailable.contains("last known result"));
+        assert_eq!(unavailable.matches("first read failed").count(), 1);
+        assert!(unavailable.contains("r retry"));
         app.finish_reading(Ok(node()));
         app.select(2);
         assert_eq!(app.selected_device.as_deref(), Some("peer-b"));
