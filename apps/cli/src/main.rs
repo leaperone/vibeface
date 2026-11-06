@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs::{self, OpenOptions},
-    io::{BufRead, Read, Seek, SeekFrom, Write},
+    io::{BufRead, IsTerminal, Read, Seek, SeekFrom, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
@@ -17,7 +17,9 @@ use vibeface_control::{
 };
 
 mod service;
+mod terminal;
 mod triage;
+mod tui;
 mod update;
 
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4790);
@@ -32,13 +34,19 @@ const MAX_LOG_RECORD: usize = 8 * 1024;
     name = "vibeface",
     version,
     about = "Personal device network for local coding agents.",
+    long_about = "Your coding agents, connected across your own devices.\n\nRun without a command to start this Node in the foreground.\nUse tui to observe it without starting or stopping anything.",
+    after_help = "Examples:\n  vibeface                         Start this Node\n  vibeface tui                     Watch your personal network\n  vibeface status --json            Inspect from a script\n  vibeface access                   Get the browser URL\n\nUse vibeface <command> --help for command options.",
+    styles = terminal::help_styles(),
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    /// Node data directory for foreground startup.
     #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = absolute_path)]
     data_dir: Option<PathBuf>,
+    /// Web app directory for foreground startup.
     #[arg(long, env = "VIBEFACE_APP_DIR", value_parser = absolute_path)]
     app_dir: Option<PathBuf>,
+    /// Start without the browser interface.
     #[arg(long)]
     no_web: bool,
     #[command(subcommand)]
@@ -47,89 +55,138 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Set up this Node and its network options.
     Init(Box<Init>),
+    /// Start this Node in the foreground.
     Serve(Serve),
+    /// Show this Node's status and known peers.
     Status(Access),
+    /// Watch Node and peer status in a read-only terminal interface.
+    Tui(Tui),
+    /// Get the browser URL or control local browser access.
     Access(LocalEntry),
+    /// Join your personal network with an invite link.
     Join(Join),
+    /// Manage this Node's delivery wallet.
     Wallet(WalletOptions),
+    /// Manage the installed user service.
     Service(crate::service::Service),
+    /// Check releases and manage the automatic update policy.
     Update(crate::update::Update),
+    /// Call a local tool with JSON arguments.
     Tool {
+        /// Tool name.
         name: String,
+        /// Tool arguments as JSON.
         #[arg(long)]
         json: String,
+        /// Stable reference for this tool call.
         #[arg(long)]
         call_ref: Option<String>,
     },
+    /// Read from a Codex App Server or send a coordinated turn.
     Codex {
+        /// Codex App Server socket path.
         #[arg(long, env = "VIBEFACE_CODEX_SOCKET")]
         socket: Option<PathBuf>,
         #[command(subcommand)]
         command: CodexCommand,
     },
+    /// Handle one provider hook event from standard input.
     Hook(Hook),
+    /// Install, inspect, or remove provider hooks.
     Hooks(Hooks),
+    /// Inspect or update the coordination queue.
     Triage(Triage),
+    /// List pending coordination requests.
     Requests(LocalNode),
+    /// Answer a coordination request.
     Respond {
+        /// Request to answer.
         request_id: String,
+        /// Response as JSON.
         result: String,
+        /// Target Node ID.
         #[arg(long)]
         node: Option<String>,
         #[command(flatten)]
         local: LocalNode,
     },
+    /// Append a structured log record.
     Log(LogRecord),
+    /// Read or follow structured Node logs.
     Logs(Logs),
 }
 
 #[derive(Args, Serialize)]
 struct Init {
+    /// Node data directory.
     #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
     data_dir: PathBuf,
+    /// Address for peer connections.
     #[arg(long, default_value_t = DEFAULT_LISTEN)]
     listen: SocketAddr,
+    /// Address for the local control API.
     #[arg(long, default_value_t = local_listen())]
     local_listen: SocketAddr,
+    /// Public browser entry URL.
     #[arg(long)]
     public_url: Option<String>,
+    /// Disable the browser interface.
     #[arg(long)]
     no_web: bool,
+    /// Allowed browser origin. Repeat for multiple origins.
     #[arg(long = "allowed-origin")]
     allowed_origins: Vec<String>,
+    /// Allowed workspace root. Repeat for multiple roots.
     #[arg(long = "root")]
     roots: Vec<PathBuf>,
+    /// Require confirmation for local browser access.
     #[arg(long)]
     no_local_auto_access: bool,
+    /// Allow unencrypted LAN access.
     #[arg(long)]
     allow_insecure_lan: bool,
+    /// Provider for the coordinating Agent.
     #[arg(long, value_enum, requires = "workspace")]
     manager: Option<triage::Provider>,
+    /// Workspace for the coordinating Agent.
     #[arg(long, requires = "manager")]
     workspace: Option<PathBuf>,
+    /// Model name for this provider.
     #[arg(long, requires = "manager")]
     model: Option<String>,
+    /// Provider executable override.
     #[arg(long = "bin", value_name = "PROVIDER=PATH", value_parser = provider_bin)]
     bins: Vec<(triage::Provider, PathBuf)>,
+    /// Codex App Server socket path.
     #[arg(long)]
     codex_socket: Option<PathBuf>,
+    /// Relay URL. Repeat for multiple relays.
     #[arg(long = "relay", value_name = "URL")]
     relays: Vec<String>,
+    /// Discovery URL. Repeat for multiple entries.
     #[arg(long = "discovery", value_name = "URL")]
     discovery: Vec<String>,
+    /// Relay service role.
     #[arg(long, value_enum, default_value = "forward")]
     relay_mode: RelayServiceMode,
+    /// Address for an embedded relay.
     #[arg(long, value_name = "ADDR")]
     relay_listen: Option<SocketAddr>,
+    /// Public URL for the embedded relay.
     #[arg(long, value_name = "URL", requires = "relay_listen")]
     relay_url: Option<String>,
+    /// Run a public entry without local workspace execution.
     #[arg(long, requires = "relay_listen", conflicts_with_all = ["manager", "roots", "entry"])]
     public_entry: bool,
+    /// Public entry URL for this Node.
     #[arg(long, value_name = "URL", requires = "relay_token_file")]
     entry: Option<String>,
+    /// Relay URL for the public entry.
     #[arg(long, value_name = "URL", requires = "entry")]
     entry_relay: Option<String>,
+    /// File containing the relay credential.
     #[arg(long, value_name = "PATH", requires = "entry")]
     relay_token_file: Option<PathBuf>,
 }
@@ -144,43 +201,61 @@ enum RelayServiceMode {
 
 #[derive(Args)]
 struct Serve {
+    /// Node data directory.
     #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
     data_dir: PathBuf,
+    /// Disable the browser interface.
     #[arg(long)]
     no_web: bool,
+    /// Web app directory.
     #[arg(long, env = "VIBEFACE_APP_DIR", value_parser = absolute_path)]
     app_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
 struct Access {
+    /// Initialized Node data directory.
     #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
     data_dir: PathBuf,
+    /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args)]
+struct Tui {
+    /// Initialized Node data directory to observe.
+    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
+    data_dir: PathBuf,
 }
 
 #[derive(Args)]
 struct LocalEntry {
     #[command(flatten)]
     access: Access,
+    /// Allow local browser access without confirmation.
     #[arg(long, conflicts_with = "disable")]
     enable: bool,
+    /// Require confirmation for local browser access.
     #[arg(long)]
     disable: bool,
 }
 
 #[derive(Args)]
 struct Join {
+    /// Invite link from a device in your personal network.
     link: String,
+    /// Node data directory.
     #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
     data_dir: PathBuf,
+    /// Name for this device in your network.
     #[arg(long)]
     name: String,
 }
 
 #[derive(Args)]
 struct WalletOptions {
+    /// Node data directory.
     #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
     data_dir: PathBuf,
     #[command(subcommand)]
@@ -189,101 +264,144 @@ struct WalletOptions {
 
 #[derive(Subcommand)]
 enum WalletAction {
+    /// Show wallet and receiving-key status.
     Status,
+    /// Create a wallet using a protected passphrase descriptor.
     Create {
+        /// Protected file descriptor containing the wallet passphrase.
         #[arg(long)]
         passphrase_fd: Option<i32>,
     },
+    /// Unlock the local wallet.
     Unlock {
+        /// Protected file descriptor containing the wallet passphrase.
         #[arg(long)]
         passphrase_fd: Option<i32>,
     },
+    /// Lock the local wallet.
     Lock,
+    /// Load delivery configuration from a file.
     Configure {
+        /// Delivery configuration file.
         file: PathBuf,
     },
+    /// Register a receiving key with an explicit intent and gas limit.
     RegisterKey {
+        /// Stable intent ID for this key operation.
         #[arg(long)]
         intent_id: String,
+        /// Maximum gas for this key operation.
         #[arg(long)]
         gas_cap: String,
     },
+    /// Rotate the receiving key.
     RotateKey {
+        /// Stable intent ID for this key operation.
         #[arg(long)]
         intent_id: String,
+        /// Maximum gas for this key operation.
         #[arg(long)]
         gas_cap: String,
     },
+    /// Revoke the receiving key.
     RevokeKey {
+        /// Stable intent ID for this key operation.
         #[arg(long)]
         intent_id: String,
+        /// Maximum gas for this key operation.
         #[arg(long)]
         gas_cap: String,
     },
+    /// Save an encrypted wallet backup.
     Backup {
+        /// Destination backup file.
         output: PathBuf,
     },
 }
 
 #[derive(Subcommand)]
 enum CodexCommand {
+    /// Call a read-only App Server method.
     Call {
+        /// App Server method name.
         method: String,
+        /// Method parameters as JSON.
         params: Option<String>,
     },
+    /// Send a turn through the coordinator.
     Send {
+        /// Thread ID.
         thread: String,
+        /// Turn text.
         text: String,
+        /// Stable turn ID.
         #[arg(long)]
         id: String,
+        /// Model name for this provider.
         #[arg(long)]
         model: Option<String>,
+        /// Provider reasoning effort.
         #[arg(long)]
         effort: Option<String>,
+        /// Image attachment. Repeat for multiple images.
         #[arg(long)]
         image: Vec<String>,
     },
+    /// Stream events for a thread.
     Watch {
+        /// Thread ID.
         thread: String,
     },
 }
 
 #[derive(Args)]
 struct LocalNode {
+    /// Node data directory.
     #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
     data_dir: PathBuf,
+    /// Local Node URL. Only loopback addresses are accepted.
     #[arg(long, env = "VIBEFACE_TRIAGE_URL")]
     node_url: Option<String>,
 }
 
 #[derive(Args)]
 struct Hook {
+    /// Provider that emitted this hook.
     #[arg(value_enum)]
     agent: triage::Provider,
     #[command(flatten)]
     local: LocalNode,
+    /// Send a synthetic hook event.
     #[arg(long)]
     test: bool,
+    /// Show the operation without applying it.
     #[arg(long)]
     dry_run: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum HooksAction {
+    /// Install provider hooks.
     Install,
+    /// Remove installed provider hooks.
     Uninstall,
+    /// Show provider hook configuration.
     Status,
+    /// Send a synthetic provider event.
     Test,
 }
 
 #[derive(Args)]
 struct Hooks {
+    /// Hook operation.
     #[arg(value_enum)]
     action: HooksAction,
     #[command(flatten)]
     local: LocalNode,
+    /// Provider configuration home directory.
     #[arg(long, value_parser = absolute_path)]
     home: Option<PathBuf>,
+    /// Show the operation without applying it.
     #[arg(long)]
     dry_run: bool,
 }
@@ -308,25 +426,36 @@ struct Triage {
 #[derive(Subcommand, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum TriageAction {
+    /// List coordination events.
     Events {
+        /// Return events after this Unix timestamp in milliseconds.
         #[arg(long)]
         since: Option<i64>,
     },
+    /// Raise an event or request a decision.
     Raise {
+        /// Stable coordination event ID.
         #[arg(long)]
         event_id: String,
+        /// Event severity.
         #[arg(long, value_parser = ["info", "attention", "urgent"])]
         severity: String,
+        /// Question shown to the user.
         #[arg(long)]
         question: String,
+        /// Stable decision request ID.
         #[arg(long)]
         request_id: Option<String>,
+        /// Kind of decision requested from the user.
         #[arg(long, value_enum)]
         attention_kind: Option<AttentionKind>,
+        /// Available answer. Repeat for multiple answers.
         #[arg(long = "choice")]
         choices: Vec<String>,
     },
+    /// Dismiss a coordination event.
     Dismiss {
+        /// Stable coordination event ID.
         #[arg(long)]
         event_id: String,
     },
@@ -371,16 +500,23 @@ impl std::str::FromStr for LogSource {
 
 #[derive(Args)]
 struct LogRecord {
+    /// Log severity.
     level: LogLevel,
+    /// Log message.
     message: String,
+    /// Conversation ID.
     #[arg(long, env = "VIBEFACE_NODE_CONVERSATION")]
     conversation: Option<String>,
+    /// Work ID.
     #[arg(long)]
     work: Option<String>,
+    /// Provider thread ID.
     #[arg(long)]
     thread: Option<String>,
+    /// Structured event name.
     #[arg(long)]
     event: Option<String>,
+    /// Log source.
     #[arg(long)]
     source: Option<LogSource>,
     #[command(flatten)]
@@ -389,24 +525,34 @@ struct LogRecord {
 
 #[derive(Args)]
 struct Logs {
+    /// Node data directory.
     #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
     data_dir: PathBuf,
+    /// Earliest timestamp or relative age, such as 10m.
     #[arg(long)]
     since: Option<String>,
+    /// Log severity.
     #[arg(long)]
     level: Option<LogLevel>,
+    /// Log source. Repeat to include multiple sources.
     #[arg(long)]
     source: Vec<LogSource>,
+    /// Conversation ID.
     #[arg(long)]
     conversation: Option<String>,
+    /// Work ID.
     #[arg(long)]
     work: Option<String>,
+    /// Keep records containing this text.
     #[arg(long)]
     grep: Option<String>,
+    /// Maximum number of records to show.
     #[arg(long, default_value_t = 200)]
     limit: usize,
+    /// Follow new complete records.
     #[arg(short, long)]
     follow: bool,
+    /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
 }
@@ -469,6 +615,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Action::Status(options)) => status(options).await,
+        Some(Action::Tui(options)) => tui::run(options.data_dir).await,
         Some(Action::Access(options)) => access(options).await,
         Some(Action::Join(options)) => join(options).await,
         Some(Action::Wallet(options)) => wallet(options).await,
@@ -548,6 +695,8 @@ async fn status(options: Access) -> Result<()> {
     result["cli_version"] = json!(env!("CARGO_PKG_VERSION"));
     if options.json {
         println!("{}", serde_json::to_string(&result)?);
+    } else if std::io::stdout().is_terminal() {
+        terminal::print_status(&terminal::NodeStatus::parse(result.clone())?)?;
     } else {
         println!(
             "Peer ID: {}\nStatus: {}\nListen: {}\nData: {}",
@@ -2020,6 +2169,30 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tui_is_explicit_read_only_and_help_describes_every_command() {
+        use clap::CommandFactory;
+        let options =
+            Cli::try_parse_from(["vibeface", "tui", "--data-dir", "/private/node"]).unwrap();
+        let Some(Action::Tui(options)) = options.command else {
+            panic!("expected tui")
+        };
+        assert_eq!(options.data_dir, Path::new("/private/node"));
+        assert!(Cli::try_parse_from(["vibeface", "tui", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["vibeface", "tui", "--data-dir", "relative"]).is_err());
+        let command = Cli::command();
+        for subcommand in command.get_subcommands() {
+            assert!(
+                subcommand.get_about().is_some(),
+                "{}",
+                subcommand.get_name()
+            );
+        }
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("Run without a command to start this Node"));
+        assert!(help.contains("vibeface status --json"));
+    }
 
     #[test]
     fn triage_attention_kind_parses_and_serializes_for_the_existing_request_boundary() {
