@@ -30,7 +30,7 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     const summary = '已汇总现有记录。\n正在检查退款是否单独统计。\n详细资料保留在这里，不需要默认展开。';
     const progress = { type: 'work_progress', work_id: work, phase: 'running', summary };
     db.prepare('INSERT INTO works(network_id,work_id,conversation_id,target_node,dispatch,dispatch_rank,progress,progress_rank) VALUES(?,?,?,?,?,?,?,?)').run(network, work, conversation, node.peer, JSON.stringify(dispatch), '1', JSON.stringify(progress), '2');
-    const question = { type: 'question_asked', question_id: 'report-scope', severity: 'attention', text: '退款需要单独统计吗？\n选择后会按这个口径整理。', choices: [{ label: '单独统计' }, { label: '合并统计' }], about: { node: node.peer, agent: null, session_id: 'report', cwd: 'workspace', summary: '' } };
+    const question = { type: 'question_asked', question_id: 'report-scope', target: { kind: 'bot_main', bot_id: bot }, attention: { kind: 'question', device_id: null }, severity: 'attention', text: '退款需要单独统计吗？\n选择后会按这个口径整理。', choices: [{ label: '单独统计' }, { label: '合并统计' }], about: { node: node.peer, agent: null, session_id: 'report', cwd: 'workspace', summary: '' } };
     db.prepare('INSERT INTO questions(network_id,question_id,conversation_id,rank,author,created_at_ms,node,session_id,body) VALUES(?,?,?,?,?,?,?,?,?)').run(network, question.question_id, conversation, '3', node.peer, Date.now(), node.peer, 'report', JSON.stringify(question));
     await browser.reload();
     await expect(screen.getByRole('heading', '退款需要单独统计吗？')).toBeVisible();
