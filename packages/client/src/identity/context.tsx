@@ -21,6 +21,7 @@ import {
   catalogConnectionEntries,
   createBootstrapPrefetch,
   getPublicBootstrapMode,
+  publicBootstrapDefaults,
   readCachedCatalog,
   setPublicBootstrapMode as persistPublicBootstrapMode,
   type PublicBootstrapMode,
@@ -446,7 +447,14 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   }
   function currentBootstrapCatalog(): VerifiedCatalog | null {
     if (publicBootstrap.kind === 'off') return null
-    return bootstrapCatalogRef.current ?? readCachedCatalog(platform.storage, publicBootstrap, platform.secure, Date.now())
+    const expected = publicBootstrap.kind === 'custom' ? publicBootstrap : publicBootstrapDefaults
+    const catalog = bootstrapCatalogRef.current
+    if (catalog && catalog.issuer === expected.issuer && catalog.defaults.https_base === expected.https_base && catalog.expires_at_ms > Date.now()) return catalog
+    return readCachedCatalog(platform.storage, publicBootstrap, platform.secure, Date.now())
+  }
+  async function refreshBootstrapCatalog() {
+    await bootstrap.refresh({ secure: platform.secure, storage: platform.storage })
+    bootstrapCatalogRef.current = bootstrap.snapshot()
   }
   const reconnectBootstrapAllowed = useMemo(() => {
     const allowed = new Set<string>()
@@ -467,39 +475,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     }
     return allowed
   }, [directory, load, entries])
-  const joinBootstrapAllowed = useMemo(() => {
-    let allowed: Set<string>
-    if (!directory) {
-      allowed = new Set<string>()
-      for (const saved of savedEntries()) {
-        const pinned = load(`network-for.${saved.device_id}`)
-        if (typeof pinned === 'string') {
-          try {
-            validTarget(pinned)
-            allowed.add(saved.device_id)
-          } catch { /* ignore */ }
-        }
-      }
-    } else {
-      const revoked = new Set(directory.revoked.map(item => item.device_id))
-      allowed = new Set(directory.members.filter(m => !revoked.has(m.device_id)).map(m => m.device_id))
-    }
-    if (joining) {
-      try {
-        validTarget(joining.entry.device_id)
-        allowed.add(joining.entry.device_id)
-      } catch { /* ignore */ }
-    }
-    return allowed
-  }, [directory, load, entries, joining])
   useEffect(() => {
     if (publicBootstrap.kind === 'off') {
       bootstrapCatalogRef.current = null
       return
     }
-    void bootstrap.refresh({ secure: platform.secure, storage: platform.storage }).then(() => {
-      bootstrapCatalogRef.current = bootstrap.snapshot()
-    })
+    void refreshBootstrapCatalog()
   }, [publicBootstrap, bootstrap, platform.secure, platform.storage])
   function mergeReconnectWays(base: ConnectionEntry[], target: Reconnect, allowed: ReadonlySet<string>): ConnectionEntry[] {
     const catalog = currentBootstrapCatalog()
@@ -605,6 +586,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         if (active && session.current === active) { generation.current += 1; session.current = null; active.channel.close() }
       }
     }
+    if (publicBootstrap.kind !== 'off') void refreshBootstrapCatalog()
     return false
   }
   async function open(parsed: ConnectionEntry, resuming = false, timeoutMs = 10000) {
@@ -1018,7 +1000,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       ...platform.lan && link.direct.length ? [{ kind: 'lan' as const, addrs: link.direct, device_id: link.entryId }] : [],
       ...addresses.map(address => ({ kind: 'gateway' as const, address, device_id: link.entryId })),
     ]
-    return mergeJoinWays(base, link.entryId, joinBootstrapAllowed)
+    return mergeJoinWays(base, link.entryId, new Set([link.entryId]))
   }
   /**
    * One question on a channel of its own, so the screen's connection stays as it is. The secret goes only to the
@@ -1054,11 +1036,26 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     // Joining opens a new connection, so the screen drops this failure as stale; keep it here.
     try {
       const ways = joinWays(link)
+      let refreshed = false
+      const refreshWays = async () => {
+        if (refreshed || publicBootstrap.kind === 'off') return
+        refreshed = true
+        const version = generation.current
+        await refreshBootstrapCatalog()
+        if (version !== generation.current) throw changed()
+        const seen = new Set(ways.map(entryKey))
+        ways.push(...joinWays(link).filter(way => !seen.has(entryKey(way))))
+      }
+      if (!ways.length) await refreshWays()
       let active: Session | null = null
       for (const [index, way] of ways.entries()) {
         const last = index === ways.length - 1
         try { active = await open(way, false, way.kind === 'lan' && !last ? LAN_MS : 10000) }
-        catch (cause) { if (last || cause instanceof AuthenticationError) { link.secret = ''; throw cause } }
+        catch (cause) {
+          if (cause instanceof AuthenticationError) { link.secret = ''; throw cause }
+          if (last) await refreshWays()
+          if (index === ways.length - 1) { link.secret = ''; throw cause }
+        }
         if (active) break
       }
       if (!active) throw new Error('连不上这个节点。')

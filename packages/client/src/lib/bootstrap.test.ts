@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs'
 import type { SecureApi } from '../secure-api.ts'
 import {
   catalogConnectionEntries,
+  createBootstrapPrefetch,
   fetchVerifiedCatalog,
   getPublicBootstrapMode,
   parseVerifiedCatalogPayload,
@@ -282,11 +283,17 @@ test('readCachedCatalog re-verifies stored envelope and invokes verifier', () =>
   assert.equal(verifyCalls, 1)
 })
 
-test('unreadable bootstrap settings disable public requests', () => {
-  assert.deepEqual(getPublicBootstrapMode({
+test('unreadable bootstrap settings keep background refresh offline', async (t) => {
+  const storage = {
     getItem() { throw new Error('storage denied') },
     setItem() { throw new Error('storage denied') },
-  }), { kind: 'off' })
+  }
+  assert.deepEqual(getPublicBootstrapMode(storage), { kind: 'off' })
+  const fetch = t.mock.method(globalThis, 'fetch', async () => { throw new Error('unexpected public request') })
+  const prefetch = createBootstrapPrefetch()
+  await prefetch.refresh({ storage, secure: { verify() { throw new Error('unexpected verification') } } })
+  assert.equal(prefetch.snapshot(), null)
+  assert.equal(fetch.mock.callCount(), 0)
 })
 
 test('malformed custom storage fails closed without official catalogue fetch', async (t) => {

@@ -500,7 +500,7 @@ export function createBootstrapPrefetch(): BootstrapPrefetch {
   return {
     snapshot: () => latest,
     async refresh(opts) {
-      const mode = parseMode(opts.storage)
+      const mode = getPublicBootstrapMode(opts.storage)
       if (mode.kind === 'off') {
         latest = null
         return
