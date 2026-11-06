@@ -90,6 +90,7 @@ jobs:
           name: desktop-${{ inputs.target }}-${{ inputs.source_sha }}-${{ github.run_attempt }}
           path: |
             .artifacts/desktop/*
+            .artifacts/e2e/desktop/*.log
             tests/e2e/.artifacts/desktop
             !tests/e2e/.artifacts/desktop/**/downloads/**
           if-no-files-found: error

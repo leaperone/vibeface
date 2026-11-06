@@ -109,6 +109,7 @@ jobs:
           node --check scripts/package-npm.mjs
           node --check scripts/build-desktop.mjs
           node --check scripts/verify-desktop.mjs
+          node --check scripts/e2e-desktop.mjs
           node --check apps/desktop/electron-builder.cjs
           node scripts/package-npm.mjs --self-test
           node scripts/publish-npm.mjs --self-test
