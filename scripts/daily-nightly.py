@@ -430,6 +430,9 @@ def finish_release(app, source, deadline):
         active = [run for run in runs if run['status'] != 'completed']
         if not active:
             if state and not state['draft']:
+                if app == 'cli':
+                    require(runs and all(run['conclusion'] == 'success' for run in runs),
+                            'CLI release workflow did not succeed; reconcile npm and rerun failed jobs in the original run')
                 with tempfile.TemporaryDirectory(dir=scratch(), prefix='public-') as temporary:
                     release.verify_public(app, Path(temporary) / 'assets')
                 return [dict(id=run['id'], url=run['html_url'], conclusion=run['conclusion']) for run in runs]
@@ -707,6 +710,18 @@ def self_test():
                 with patch(f'{__name__}.pages', return_value=[]):
                     rejected(lambda: recover_publisher('app', good, merged), 'artifact is unavailable')
                 assert len(writes) == 1
+
+            with patch(f'{__name__}.tag_sha', return_value=merged), patch(f'{__name__}.release_state', return_value=dict(draft=False)), \
+                    patch('release.verify_public') as verified, patch(f'{__name__}.recover_publisher') as no_retry:
+                for runs in ([], [dict(good, conclusion='failure')]):
+                    with patch(f'{__name__}.matching_runs', return_value=runs):
+                        rejected(lambda: finish_release('cli', merged, time.monotonic() + 1), 'reconcile npm')
+                verified.assert_not_called()
+                no_retry.assert_not_called()
+                with patch(f'{__name__}.matching_runs', side_effect=[[dict(good, status='in_progress', conclusion=None)], [dict(good, run_attempt=2)]]), \
+                        patch(f'{__name__}.time.sleep'):
+                    assert finish_release('cli', merged, time.monotonic() + 1)[0]['conclusion'] == 'success'
+                verified.assert_called_once()
 
             for blocked in ('core', 'app', None):
                 operations = []

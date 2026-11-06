@@ -33,8 +33,8 @@ command = "pnpm --filter vibeface-www run typecheck && pnpm --filter vibeface-ww
 
 [[domain_check]]
 name = "JavaScript syntax"
-trigger_paths = ["scripts/crypto-client.mjs", "apps/cli/npm/**", "scripts/package-npm.mjs"]
-command = "node --check scripts/crypto-client.mjs && node --check apps/cli/npm/bin/vibeface.mjs && node --check scripts/package-npm.mjs && node scripts/package-npm.mjs --self-test"
+trigger_paths = ["scripts/crypto-client.mjs", "apps/cli/npm/**", "scripts/package-npm.mjs", "scripts/publish-npm.mjs", ".github/workflows/npm-publish.yml", ".github/workflows/release.yml"]
+command = "node --check scripts/crypto-client.mjs && node --check apps/cli/npm/bin/vibeface.mjs && node --check scripts/package-npm.mjs && node --check scripts/publish-npm.mjs && node scripts/package-npm.mjs --self-test && node scripts/publish-npm.mjs --self-test"
 
 [[domain_check]]
 name = "Delivery scripts and workflow"
