@@ -15,34 +15,79 @@ pub enum Stop {
     Requested,
 }
 
+/// Everything that counts as being asked to stop, registered once.
+///
+/// A caller with a loop of its own holds one of these for its whole run, so an event that
+/// arrives between two turns of the loop is still delivered.
+#[cfg(unix)]
+pub struct Stops {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+#[cfg(windows)]
+pub struct Stops {
+    interrupt: tokio::signal::windows::CtrlC,
+    interrupt_break: tokio::signal::windows::CtrlBreak,
+    close: tokio::signal::windows::CtrlClose,
+    logoff: tokio::signal::windows::CtrlLogoff,
+    shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+impl Stops {
+    /// Registers interest in every stop the operating system can report.
+    pub fn listen() -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt())?,
+                terminate: signal(SignalKind::terminate())?,
+                hangup: signal(SignalKind::hangup())?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            use tokio::signal::windows::{
+                ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown,
+            };
+            Ok(Self {
+                interrupt: ctrl_c()?,
+                interrupt_break: ctrl_break()?,
+                close: ctrl_close()?,
+                logoff: ctrl_logoff()?,
+                shutdown: ctrl_shutdown()?,
+            })
+        }
+    }
+
+    /// Resolves once the operating system asks this process to stop.
+    pub async fn next(&mut self) -> Stop {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.interrupt.recv() => Stop::Interrupted,
+                _ = self.terminate.recv() => Stop::Requested,
+                _ = self.hangup.recv() => Stop::Requested,
+            }
+        }
+        #[cfg(windows)]
+        {
+            tokio::select! {
+                _ = self.interrupt.recv() => Stop::Interrupted,
+                _ = self.interrupt_break.recv() => Stop::Interrupted,
+                _ = self.close.recv() => Stop::Requested,
+                _ = self.logoff.recv() => Stop::Requested,
+                _ = self.shutdown.recv() => Stop::Requested,
+            }
+        }
+    }
+}
+
 /// Resolves once the operating system asks this process to stop.
 pub async fn requested() -> io::Result<Stop> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate = signal(SignalKind::terminate())?;
-        let mut hangup = signal(SignalKind::hangup())?;
-        Ok(tokio::select! {
-            _ = tokio::signal::ctrl_c() => Stop::Interrupted,
-            _ = terminate.recv() => Stop::Requested,
-            _ = hangup.recv() => Stop::Requested,
-        })
-    }
-    #[cfg(windows)]
-    {
-        use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_logoff, ctrl_shutdown};
-        let mut interrupt_break = ctrl_break()?;
-        let mut close = ctrl_close()?;
-        let mut logoff = ctrl_logoff()?;
-        let mut shutdown = ctrl_shutdown()?;
-        Ok(tokio::select! {
-            _ = tokio::signal::ctrl_c() => Stop::Interrupted,
-            _ = interrupt_break.recv() => Stop::Interrupted,
-            _ = close.recv() => Stop::Requested,
-            _ = logoff.recv() => Stop::Requested,
-            _ = shutdown.recv() => Stop::Requested,
-        })
-    }
+    Ok(Stops::listen()?.next().await)
 }
 
 /// Ends this process the way the operating system's own stop would have, so the shell that

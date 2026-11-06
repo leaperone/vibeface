@@ -4,13 +4,14 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     io::{BufRead, IsTerminal, Read, Seek, SeekFrom, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
 };
+use vibeface_bridge::platform::privatefs;
 use vibeface_control::{
     ControlRequest,
     maintenance::{self, MaintenanceCommand, SecretString, WalletCommand},
@@ -268,15 +269,17 @@ enum WalletAction {
     Status,
     /// Create a wallet using a protected passphrase descriptor.
     Create {
-        /// Protected file descriptor containing the wallet passphrase.
+        /// Protected channel holding the wallet passphrase: a file descriptor on Unix, a
+        /// handle value on Windows.
         #[arg(long)]
-        passphrase_fd: Option<i32>,
+        passphrase_fd: Option<i64>,
     },
     /// Unlock the local wallet.
     Unlock {
-        /// Protected file descriptor containing the wallet passphrase.
+        /// Protected channel holding the wallet passphrase: a file descriptor on Unix, a
+        /// handle value on Windows.
         #[arg(long)]
-        passphrase_fd: Option<i32>,
+        passphrase_fd: Option<i64>,
     },
     /// Lock the local wallet.
     Lock,
@@ -657,9 +660,11 @@ async fn main() -> Result<()> {
 }
 
 fn exec_core(args: &[&str]) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    let error = Command::new(core_binary()?).args(args).exec();
-    Err(error).context("exec vibeface-core")
+    Err(vibeface_bridge::platform::program::become_program(
+        &core_binary()?,
+        args,
+    ))
+    .context("run vibeface-core")
 }
 
 fn core_binary() -> Result<PathBuf> {
@@ -1082,29 +1087,48 @@ fn read_text_bounded(path: &Path, limit: u64) -> Result<Option<String>> {
     }
 }
 
-fn read_wallet_passphrase(fd: Option<i32>) -> Result<SecretString> {
-    use std::os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::fs::{FileTypeExt, MetadataExt},
-    };
+/// The value a caller would pass to `--passphrase-fd` to hand `file` over.
+#[cfg(test)]
+fn handed_over_reference(file: &fs::File) -> i64 {
+    #[cfg(unix)]
+    {
+        std::os::fd::AsRawFd::as_raw_fd(file) as i64
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::io::AsRawHandle::as_raw_handle(file) as i64
+    }
+}
+
+/// A file holding the same bytes as `path` that accounts other than this one can read.
+#[cfg(test)]
+fn widely_readable_file(path: &Path) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
+        Ok(path.to_owned())
+    }
+    #[cfg(windows)]
+    {
+        // Windows carries access in a list that only its own calls can widen, so a file every
+        // account on the machine may read is borrowed from the system instead.
+        let _ = path;
+        let root = std::env::var_os("SystemRoot").context("SystemRoot is required")?;
+        let shared = PathBuf::from(root).join("System32\\drivers\\etc\\hosts");
+        ensure!(shared.is_file(), "a widely readable file is required");
+        Ok(shared)
+    }
+}
+
+fn read_wallet_passphrase(handed_over: Option<i64>) -> Result<SecretString> {
+    use vibeface_bridge::platform::secret;
     use zeroize::Zeroizing;
     let mut bytes = Zeroizing::new(Vec::new());
-    if let Some(fd) = fd {
-        ensure!(fd >= 0, "wallet passphrase descriptor is invalid");
-        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-        ensure!(
-            duplicate >= 0,
-            "wallet passphrase descriptor cannot be read"
-        );
-        let file = unsafe { fs::File::from_raw_fd(duplicate) };
-        let metadata = file.metadata()?;
-        ensure!(
-            metadata.uid() == unsafe { libc::geteuid() }
-                && metadata.mode() & 0o077 == 0
-                && (metadata.is_file() || metadata.file_type().is_fifo()),
-            "wallet passphrase descriptor must be an owner-only regular file or pipe"
-        );
-        file.take(1026).read_to_end(&mut bytes)?;
+    if let Some(reference) = handed_over {
+        let channel = secret::handed_over(reference)
+            .context("read the wallet passphrase the caller handed over")?;
+        channel.take(1026).read_to_end(&mut bytes)?;
         if bytes.last() == Some(&b'\n') {
             bytes.pop();
         }
@@ -1112,54 +1136,20 @@ fn read_wallet_passphrase(fd: Option<i32>) -> Result<SecretString> {
             bytes.pop();
         }
     } else {
-        let mut terminal = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
+        let mut console = secret::Console::open()
             .context("wallet passphrase requires a terminal or --passphrase-fd")?;
-        let mut previous = std::mem::MaybeUninit::<libc::termios>::uninit();
-        ensure!(
-            unsafe { libc::tcgetattr(terminal.as_raw_fd(), previous.as_mut_ptr()) } == 0,
-            "wallet terminal settings are unavailable"
-        );
-        let previous = unsafe { previous.assume_init() };
-        let mut hidden = previous;
-        hidden.c_lflag &= !(libc::ECHO | libc::ECHONL);
-        ensure!(
-            unsafe { libc::tcsetattr(terminal.as_raw_fd(), libc::TCSAFLUSH, &hidden) } == 0,
-            "wallet terminal cannot disable echo"
-        );
-        struct RestoreEcho {
-            fd: i32,
-            previous: libc::termios,
-        }
-        impl Drop for RestoreEcho {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.previous);
-                }
-            }
-        }
-        let restore = RestoreEcho {
-            fd: terminal.as_raw_fd(),
-            previous,
-        };
-        terminal.write_all(b"Delivery wallet passphrase: ")?;
-        terminal.flush()?;
+        console.prompt("Delivery wallet passphrase: ")?;
         loop {
-            let mut byte = [0];
-            ensure!(
-                terminal.read(&mut byte)? == 1,
-                "wallet terminal closed before a passphrase was entered"
-            );
-            if matches!(byte[0], b'\n' | b'\r') {
+            let byte = console
+                .read_byte()?
+                .context("the terminal closed before a passphrase was entered")?;
+            if matches!(byte, b'\n' | b'\r') {
                 break;
             }
             ensure!(bytes.len() < 1024, "wallet passphrase exceeds its limit");
-            bytes.push(byte[0]);
+            bytes.push(byte);
         }
-        drop(restore);
-        terminal.write_all(b"\n")?;
+        console.prompt("\n")?;
     }
     ensure!(
         (12..=1024).contains(&bytes.len())
@@ -2077,41 +2067,25 @@ fn git(cwd: &str, args: &[&str]) -> Option<String> {
 }
 
 fn private_dir(path: &Path) -> Result<()> {
-    let created = if let Ok(metadata) = fs::symlink_metadata(path) {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
         ensure!(
             metadata.is_dir() && !metadata.file_type().is_symlink(),
             "private path is not a private directory"
         );
-        false
-    } else {
-        fs::create_dir_all(path)?;
-        true
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if created {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-        }
+        return Ok(());
     }
-    Ok(())
+    fs::create_dir_all(path)?;
+    privatefs::restrict_dir(path)
 }
 
 fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
+            privatefs::is_plain_file(&metadata),
             "private file path is not a regular file"
         );
     }
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
+    let mut file = privatefs::create_or_truncate(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
@@ -2270,29 +2244,21 @@ mod tests {
     }
 
     #[test]
-    fn wallet_passphrase_requires_a_protected_descriptor_and_cli_never_accepts_it_as_text()
+    fn wallet_passphrase_requires_a_protected_channel_and_cli_never_accepts_it_as_text()
     -> Result<()> {
-        use std::os::{
-            fd::AsRawFd,
-            unix::fs::{OpenOptionsExt, PermissionsExt},
-        };
         let dir =
             std::env::temp_dir().join(format!("vibeface-wallet-cli-{}", uuid::Uuid::new_v4()));
         private_dir(&dir)?;
         let path = dir.join("synthetic-passphrase");
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)?;
-        file.write_all(b"synthetic test passphrase\n")?;
-        drop(file);
-        let file = fs::File::open(&path)?;
-        read_wallet_passphrase(Some(file.as_raw_fd()))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
-        let file = fs::File::open(&path)?;
-        assert!(read_wallet_passphrase(Some(file.as_raw_fd())).is_err());
+        private_write(&path, b"synthetic test passphrase\n")?;
+        read_wallet_passphrase(Some(handed_over_reference(&fs::File::open(&path)?)))?;
+        let readable_by_anyone = widely_readable_file(&path)?;
+        assert!(
+            read_wallet_passphrase(Some(handed_over_reference(&fs::File::open(
+                readable_by_anyone
+            )?)))
+            .is_err()
+        );
         let data_dir = dir.to_string_lossy();
         assert!(
             Cli::try_parse_from([

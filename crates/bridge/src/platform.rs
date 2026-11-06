@@ -12,6 +12,7 @@ pub mod clock;
 pub mod ipc;
 pub mod privatefs;
 pub mod program;
+pub mod secret;
 pub mod stop;
 pub mod tree;
 

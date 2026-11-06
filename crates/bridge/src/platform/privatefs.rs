@@ -130,6 +130,22 @@ pub fn create_dir(path: &Path) -> Result<()> {
     }
 }
 
+/// Creates `path` as a directory of this account alone, refusing a path that already exists.
+///
+/// A caller that must know it is writing somewhere fresh, such as a backup, uses this instead
+/// of `create_dir`, which accepts a directory that is already there.
+pub fn create_dir_new(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::create_dir(path)?;
+        restrict_dir(path).map_err(io::Error::other)
+    }
+    #[cfg(windows)]
+    {
+        super::winsec::create_private_dir(path)
+    }
+}
+
 /// Restricts an existing directory to this account, dropping anything inherited from a
 /// permissive parent.
 pub fn restrict_dir(path: &Path) -> Result<()> {
@@ -416,6 +432,74 @@ pub fn link_dir(target: &Path, alias: &Path) -> Result<()> {
     {
         super::winsec::create_junction(target, alias).map_err(Into::into)
     }
+}
+
+/// Reproduces the link at `source` as `target`, without following it.
+///
+/// A copy of a directory of this account has to carry its links across without reading through
+/// them, so a link left behind by something else cannot pull the copy outside the directory.
+pub fn copy_link(source: &Path, target: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(std::fs::read_link(source)?, target)?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let pointed_at = read_dir_link(source).with_context(|| {
+            format!(
+                "copy the link at {}, which is not a directory link this account can reproduce",
+                source.display()
+            )
+        })?;
+        link_dir(&pointed_at, target)
+    }
+}
+
+/// Whether `alias` is a managed directory link rather than a real directory.
+pub fn is_dir_link(alias: &Path) -> Result<bool> {
+    Ok(std::fs::symlink_metadata(alias)?.file_type().is_symlink())
+}
+
+/// Points the managed activation link `alias` at `target`, replacing whatever it pointed at.
+///
+/// Neither family leaves a moment where the link is missing. Unix writes a new link beside it
+/// and renames it into place. Windows replaces the reparse record of the existing link in one
+/// call, and a path is resolved when it is opened, so a reader always sees one target or the
+/// other. Neither needs a privilege a normal account lacks.
+pub fn point_dir_link(target: &Path, alias: &Path) -> Result<()> {
+    ensure!(
+        target.is_absolute(),
+        "a managed directory link needs an absolute target"
+    );
+    let parent = alias
+        .parent()
+        .context("a managed directory link has no parent directory")?;
+    #[cfg(unix)]
+    {
+        let temporary = parent.join(format!(".{}-{}", name_of(alias)?, uuid()));
+        std::os::unix::fs::symlink(target, &temporary)?;
+        if let Err(error) = std::fs::rename(&temporary, alias) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+    }
+    #[cfg(windows)]
+    match is_dir_link(alias) {
+        Ok(true) => super::winsec::point_junction(target, alias)?,
+        Ok(false) => bail!("{} is not a managed directory link", alias.display()),
+        Err(_) => link_dir(target, alias)?,
+    }
+    sync_dir(parent)
+}
+
+/// The final component of `path`, as a name a temporary file can be built from.
+#[cfg(unix)]
+fn name_of(path: &Path) -> Result<std::borrow::Cow<'_, str>> {
+    Ok(path
+        .file_name()
+        .context("a managed path has no name")?
+        .to_string_lossy())
 }
 
 /// The directory `alias` points at, or an error when `alias` is not a link this module made.

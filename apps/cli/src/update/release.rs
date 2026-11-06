@@ -7,14 +7,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{BufRead, BufReader, Read},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use vibeface_bridge::platform::privatefs;
 use vibeface_control::{DATA_EPOCH, UPDATE_PROTOCOL};
 
 const API: &str = "https://api.github.com/repos/leaperone/vibeface";
@@ -23,6 +23,20 @@ const MAX_JSON: u64 = 4 * 1024 * 1024;
 const MAX_ARCHIVE: u64 = 128 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 512 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
+
+/// The programs a package carries, named the way this platform names a program.
+pub(crate) const PROGRAMS: [&str; 2] = if cfg!(windows) {
+    ["vibeface.exe", "vibeface-core.exe"]
+} else {
+    ["vibeface", "vibeface-core"]
+};
+
+/// The script a package carries for running the Node in the background of this account.
+pub(crate) const SERVICE_SCRIPT: &str = if cfg!(windows) {
+    "scripts/install-node-service.ps1"
+} else {
+    "scripts/install-node-service.sh"
+};
 
 #[derive(ValueEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -352,9 +366,9 @@ pub async fn stage(release: &Release, install_root: &Path) -> Result<PathBuf> {
         tokio::task::spawn_blocking(move || unpack(&archive_path, &unpack_root, &expected_name))
             .await??;
     let build = verify_build(&package, release)?;
-    verify_binary(&package.join("vibeface"), &release.version, "vibeface").await?;
+    verify_binary(&package.join(PROGRAMS[0]), &release.version, "vibeface").await?;
     verify_binary(
-        &package.join("vibeface-core"),
+        &package.join(PROGRAMS[1]),
         &Version::parse(&build.core_version)?,
         "vibeface-core",
     )
@@ -449,12 +463,7 @@ async fn download_archive(
             .is_none_or(|size| size == release.archive_size),
         "release archive length changed"
     );
-    let mut file = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .await?;
+    let mut file = tokio::fs::File::from_std(privatefs::create_new(path)?);
     let mut size = 0_u64;
     let mut digest = Sha256::new();
     while let Some(chunk) = response.chunk().await? {
@@ -478,12 +487,52 @@ async fn download_archive(
     Ok(())
 }
 
+/// Opens a package file so this account owns it and anything it shares the installation with
+/// can read it, and can run it when the package marked it as a program.
+///
+/// Unix carries the right to run in the file's own mode, so it is set here. Windows carries it
+/// in the name, which `manifest` checks, and carries access in the rules a new file inherits
+/// from the installation root, which `installed` requires to be a directory of this account.
+fn readable_file(path: &Path, executable: bool) -> Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        Ok(fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(if executable { 0o755 } else { 0o644 })
+            .open(path)?)
+    }
+    #[cfg(windows)]
+    {
+        let _ = executable;
+        Ok(fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?)
+    }
+}
+
+/// Gives a package directory the same access its files get.
+fn readable_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 struct Scratch(PathBuf);
 
 impl Scratch {
     fn create(parent: &Path) -> Result<Self> {
         let path = parent.join(format!(".staging-{}", uuid::Uuid::new_v4()));
-        fs::DirBuilder::new().mode(0o700).create(&path)?;
+        privatefs::create_dir(&path)?;
         Ok(Self(path))
     }
 }
@@ -544,23 +593,14 @@ fn unpack(archive: &Path, destination: &Path, root_name: &str) -> Result<PathBuf
         if kind == tar::EntryType::Directory {
             ensure!(size == 0, "package directory has content");
             fs::create_dir_all(&output)?;
-            fs::set_permissions(&output, fs::Permissions::from_mode(0o755))?;
+            readable_dir(&output)?;
         } else {
             ensure!(
                 relative.components().count() > 1,
                 "package root must be a directory"
             );
             fs::create_dir_all(output.parent().context("package entry has no parent")?)?;
-            let mode = if entry.header().mode()? & 0o111 != 0 {
-                0o755
-            } else {
-                0o644
-            };
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(mode)
-                .open(&output)?;
+            let mut file = readable_file(&output, entry.header().mode()? & 0o111 != 0)?;
             ensure!(
                 std::io::copy(&mut entry, &mut file)? == size,
                 "truncated package file"
@@ -679,11 +719,11 @@ fn verify_build(package: &Path, release: &Release) -> Result<BuildInfo> {
         "invalid component identity"
     );
     for file in [
-        "vibeface",
-        "vibeface-core",
+        PROGRAMS[0],
+        PROGRAMS[1],
         "README.md",
         "RUNTIME-REQUIREMENTS.md",
-        "scripts/install-node-service.sh",
+        SERVICE_SCRIPT,
         "docs/node.md",
         "docs/releasing.md",
     ] {
@@ -694,14 +734,10 @@ fn verify_build(package: &Path, release: &Release) -> Result<BuildInfo> {
             "package is missing required file {file}"
         );
     }
-    for binary in ["vibeface", "vibeface-core"] {
+    for binary in PROGRAMS {
         ensure!(
-            fs::symlink_metadata(package.join(binary))?
-                .permissions()
-                .mode()
-                & 0o111
-                != 0,
-            "package binary is not executable: {binary}"
+            privatefs::is_executable(&package.join(binary)),
+            "package binary is not a program this account can run: {binary}"
         );
     }
     let web = fs::symlink_metadata(package.join("web"))?;
@@ -791,7 +827,7 @@ fn tree(root: &Path) -> Result<BTreeMap<PathBuf, TreeEntry>> {
                 std::io::copy(&mut file, &mut digest)?;
                 TreeEntry::File {
                     size: metadata.len(),
-                    executable: metadata.permissions().mode() & 0o111 != 0,
+                    executable: privatefs::is_executable(&entry.path()),
                     sha256: digest.finalize().to_vec(),
                 }
             };
@@ -805,7 +841,19 @@ fn tree(root: &Path) -> Result<BTreeMap<PathBuf, TreeEntry>> {
 mod tests {
     use super::*;
     use flate2::{Compression, write::GzEncoder};
-    use std::os::unix::fs::symlink;
+
+    /// Marks `path` as a program this account can run, where that is something a file carries.
+    fn mark_runnable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Windows carries the right to run in the name, which the fixtures already use.
+        #[cfg(windows)]
+        let _ = path;
+        assert!(privatefs::is_executable(path));
+    }
 
     #[test]
     fn channels_accept_only_canonical_release_tags() {
@@ -1047,7 +1095,7 @@ mod tests {
             for file in [
                 "README.md",
                 "RUNTIME-REQUIREMENTS.md",
-                "scripts/install-node-service.sh",
+                SERVICE_SCRIPT,
                 "docs/node.md",
                 "docs/releasing.md",
             ] {
@@ -1060,20 +1108,19 @@ mod tests {
             )
             .unwrap();
             fs::write(
-                dir.join("vibeface"),
+                dir.join(PROGRAMS[0]),
                 b"#!/bin/sh\nprintf 'vibeface 0.0.2\\n'\n",
             )
             .unwrap();
             fs::write(
-                dir.join("vibeface-core"),
+                dir.join(PROGRAMS[1]),
                 b"#!/bin/sh\nprintf 'vibeface-core 0.0.2\n'\n",
             )
             .unwrap();
             fs::create_dir_all(dir.join("web")).unwrap();
             fs::write(dir.join("web/index.html"), b"web").unwrap();
-            fs::set_permissions(dir.join("vibeface"), fs::Permissions::from_mode(0o755)).unwrap();
-            fs::set_permissions(dir.join("vibeface-core"), fs::Permissions::from_mode(0o755))
-                .unwrap();
+            mark_runnable(&dir.join(PROGRAMS[0]));
+            mark_runnable(&dir.join(PROGRAMS[1]));
         }
         for dir in [&package, &copy] {
             let checksums = tree(dir)
@@ -1094,20 +1141,26 @@ mod tests {
             fs::write(dir.join("FILES.sha256"), checksums).unwrap();
         }
         let component_build = verify_build(&package, &release).unwrap();
-        verify_binary(&package.join("vibeface"), &release.version, "vibeface")
+        // A fixture program here is a shell script, which only Unix can run. Windows runs the
+        // real programs through `scripts/verify-windows-node.py` instead.
+        #[cfg(unix)]
+        {
+            verify_binary(&package.join(PROGRAMS[0]), &release.version, "vibeface")
+                .await
+                .unwrap();
+            verify_binary(
+                &package.join(PROGRAMS[1]),
+                &Version::parse(&component_build.core_version).unwrap(),
+                "vibeface-core",
+            )
             .await
             .unwrap();
-        verify_binary(
-            &package.join("vibeface-core"),
-            &Version::parse(&component_build.core_version).unwrap(),
-            "vibeface-core",
-        )
-        .await
-        .unwrap();
+        }
+        assert_eq!(component_build.core_version, "0.0.2");
         assert!(tree(&package).unwrap() == tree(&copy).unwrap());
         fs::write(copy.join("docs/node.md"), b"corrupt").unwrap();
         assert!(tree(&package).unwrap() != tree(&copy).unwrap());
-        symlink(package.join("README.md"), copy.join("unexpected-link")).unwrap();
+        privatefs::link_dir(&package.join("docs"), &copy.join("unexpected-link")).unwrap();
         assert!(tree(&copy).is_err());
         let mut undeclared_build = build.clone();
         undeclared_build
@@ -1142,7 +1195,7 @@ mod tests {
         }
         assert!(
             verify_binary(
-                &package.join("vibeface"),
+                &package.join(PROGRAMS[0]),
                 &Version::new(0, 0, 3),
                 "vibeface"
             )

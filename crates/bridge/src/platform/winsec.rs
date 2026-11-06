@@ -418,6 +418,65 @@ pub fn handle_is_private(handle: HANDLE) -> io::Result<bool> {
     ReadDescriptor::of_handle(handle)?.private_to(&user)
 }
 
+/// Opens the channel a caller handed over as a handle value, refusing one another account
+/// could read or write.
+///
+/// The handle is duplicated so it belongs to the returned `File` alone and is not inheritable,
+/// which keeps a program the Node starts from being handed the secret's channel. A disk file
+/// must carry an owner-only access control list. An unnamed pipe carries none, because no
+/// other process can open one: reaching it needs a handle this process was handed.
+pub fn handed_over(reference: usize) -> io::Result<File> {
+    use windows_sys::Win32::{
+        Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle},
+        Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType},
+        System::Threading::GetCurrentProcess,
+    };
+    let handed: HANDLE = reference as HANDLE;
+    let mut owned: HANDLE = std::ptr::null_mut();
+    // SAFETY: both process handles are pseudo handles for this process and the out parameter
+    // is a live local; failure is reported in the return value.
+    if unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handed,
+            GetCurrentProcess(),
+            &mut owned,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the handed-over channel cannot be read",
+        ));
+    }
+    let owned = OwnedHandle(owned);
+    // SAFETY: the handle was just duplicated successfully.
+    let kind = unsafe { GetFileType(owned.0) };
+    match kind {
+        FILE_TYPE_PIPE => {}
+        FILE_TYPE_DISK => {
+            if !handle_is_private(owned.0)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the handed-over channel must be an owner-only file or pipe",
+                ));
+            }
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the handed-over channel must be a file or a pipe",
+            ));
+        }
+    }
+    let handle = owned.0;
+    std::mem::forget(owned);
+    from_handle(handle)
+}
+
 /// Whether a named pipe already exists under `name`, whichever account created it.
 pub fn pipe_name_exists(name: &str) -> bool {
     use windows_sys::Win32::{
@@ -739,6 +798,19 @@ fn refuse_reparse_point(file: &File) -> io::Result<()> {
 /// Points `alias` at the directory `target` with a junction, which needs no privilege a normal
 /// account lacks, unlike a directory symbolic link.
 pub fn create_junction(target: &Path, alias: &Path) -> io::Result<()> {
+    std::fs::create_dir(alias)?;
+    let result = point_junction(target, alias);
+    if result.is_err() {
+        let _ = std::fs::remove_dir(alias);
+    }
+    result
+}
+
+/// Points the existing junction `alias` at `target`.
+///
+/// One call replaces the whole reparse record, and a path is resolved when it is opened, so a
+/// reader sees either the old target or the new one and never a junction with no target.
+pub fn point_junction(target: &Path, alias: &Path) -> io::Result<()> {
     use windows_sys::Win32::{
         Foundation::GENERIC_WRITE,
         Storage::FileSystem::{
@@ -747,8 +819,7 @@ pub fn create_junction(target: &Path, alias: &Path) -> io::Result<()> {
         },
         System::{IO::DeviceIoControl, Ioctl::FSCTL_SET_REPARSE_POINT},
     };
-    std::fs::create_dir(alias)?;
-    let result = (|| -> io::Result<()> {
+    {
         let name = wide(alias.as_os_str());
         // SAFETY: `name` is NUL-terminated; backup semantics open the directory itself.
         let handle = unsafe {
@@ -782,11 +853,7 @@ pub fn create_junction(target: &Path, alias: &Path) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
         Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_dir(alias);
     }
-    result
 }
 
 /// The directory a junction made by `create_junction` points at.
