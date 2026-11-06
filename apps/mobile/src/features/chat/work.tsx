@@ -4,7 +4,7 @@ import { useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { failureText, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
-import { botProviderNotice, canRetryJob, runtimeLabel } from '@vibeface/client/chat/protocol.ts'
+import { canRetryJob, runtimeLabel } from '@vibeface/client/chat/protocol.ts'
 import { providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
 import { changeTitle, firedAt, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { chatTaskState, interruptedCopy, nodeName, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
@@ -14,7 +14,7 @@ import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
 import type { AvatarEdit, BotChange, BotChangeRecord, ManagerJob, Overwritten, PendingCheck, ScheduleView, SkillSet, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
 import { ActionButton } from '@/components/action'
-import { ActionCard, providerIcons } from '@/components/kit'
+import { ActionCard, Details, providerIcons } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
 import { Text } from '@/components/ui/text'
@@ -66,7 +66,7 @@ export function useChatExtras(conversationId: string, botId: string, edit?: (tex
   })
   for (const job of jobs) {
     const at = job.reply_message_id && shown.has(job.reply_message_id) ? job.reply_message_id : job.message_id
-    if (job.runtime) add(at, { key: `runtime:${job.trigger}`, node: <Text className="text-meta text-muted-foreground">{runtimeLabel(job.runtime)}</Text> })
+    if (job.runtime) add(at, { key: `runtime:${job.trigger}`, node: <Details label="运行信息"><Text className="text-meta text-muted-foreground">{runtimeLabel(job.runtime)}</Text></Details> })
     if (job.state === 'reconciling' || job.pending_check) cards.push(<ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => shared.refresh()}>再查一次</ActionButton>}><Text className="text-meta text-muted-foreground">设备正在查询上次回复，系统不会自动重发。</Text></ActionCard>)
     const message = data.messages.find((message) => message.message_id === job.message_id && message.role === 'user')
     if (job.state === 'queued' && message) add(job.message_id, { key: `queued:${job.trigger}`, node: <View className="flex-row flex-wrap gap-2">
@@ -86,8 +86,6 @@ export function useChatExtras(conversationId: string, botId: string, edit?: (tex
   const first = changes.first.map(changeRow)
 
   if (shared.messagePending && !shared.messageBusy) cards.push(<PendingMessageCard key="undelivered" />)
-  const providerNotice = botProviderNotice(shared.nodes, data.conversation?.owner)
-  if (providerNotice) cards.push(<View key="provider" role="status"><Text className="text-meta text-muted-foreground">{providerNotice}</Text><ActionButton variant="ghost" action={() => shared.refresh()}>再查一次</ActionButton></View>)
   const owner = data.conversation?.owner
   const here = shared.nodes.find((node) => node.device_id === data.local_node)
   if (owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !shared.nodes.some((node) => node.device_id === owner && node.online && !node.revoked)) {
