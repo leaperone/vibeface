@@ -2275,11 +2275,12 @@ def self_test():
                 (generated / name).write_bytes(b"same-run-crypto")
                 (sample / "web" / name).write_bytes(b"same-run-crypto")
             info = {"version": "0.0.1", "target": "x86_64-unknown-linux-gnu", "source_commit": "1" * 40,
-                    "update_protocol": 1, "data_epoch": 1, "core_version": "0.0.1", "core_source_commit": "2" * 40,
-                    "app_version": "0.0.1", "app_source_commit": "3" * 40}
+                    "update_protocol": 1, "data_epoch": 1, "core_version": "0.0.1", "core_source_commit": "1" * 40,
+                    "app_version": "0.0.1", "app_source_commit": "1" * 40}
             (sample / "BUILD-INFO.json").write_text(json.dumps(info))
             checked_package(sample, "1" * 40)
-            for malformed in ({**info, "source_commit": "2" * 40}, {**info, "target": "another-target"}):
+            for malformed in ({**info, "source_commit": "2" * 40}, {**info, "target": "another-target"},
+                              {**info, "core_source_commit": "2" * 40}, {**info, "app_source_commit": "3" * 40}):
                 (sample / "BUILD-INFO.json").write_text(json.dumps(malformed))
                 try:
                     checked_package(sample, "1" * 40)

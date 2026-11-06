@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Exact existing stable app tag
+        description: Exact existing stable product tag
         required: true
         type: string
 
@@ -30,8 +30,8 @@ jobs:
           EXPECTED_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          [[ "$SOURCE_TAG" =~ ^app-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
-            echo 'An exact stable app tag is required' >&2; exit 1;
+          [[ "$SOURCE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo 'An exact stable product tag is required' >&2; exit 1;
           }
           test -n "$GH_TOKEN" || { echo 'VIBEFACE_RELEASE_DISPATCH_TOKEN is required' >&2; exit 1; }
           source_sha=$(gh api "repos/leaperone/vibeface/commits/$SOURCE_TAG" --jq .sha)

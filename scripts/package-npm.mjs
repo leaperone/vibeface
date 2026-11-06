@@ -83,8 +83,14 @@ function nativePackage(directory, version, target, sourceCommit) {
     'core_version', 'core_source_commit', 'app_version', 'app_source_commit'].sort(), 'unsupported build info fields');
   assert.deepEqual([info.version, info.target, info.source_commit, info.update_protocol, info.data_epoch],
     [version, target, sourceCommit, updateProtocol, dataEpoch], 'native package identity mismatch');
-  for (const field of ['core_version', 'app_version']) nightly(info[field]);
-  for (const field of ['core_source_commit', 'app_source_commit']) assert(/^[a-f0-9]{40}$/.test(info[field]), 'invalid component source');
+  for (const field of ['core_version', 'app_version']) {
+    nightly(info[field]);
+    assert.equal(info[field], version, 'component versions must equal the bundled product version');
+  }
+  for (const field of ['core_source_commit', 'app_source_commit']) {
+    assert(/^[a-f0-9]{40}$/.test(info[field]), 'invalid component source');
+    assert.equal(info[field], sourceCommit, 'component source commits must equal the bundled product source');
+  }
   const checked = new Set();
   for (const line of fs.readFileSync(path.join(directory, 'FILES.sha256'), 'utf8').trim().split('\n')) {
     const match = /^([a-f0-9]{64})  ([a-zA-Z0-9._/-]+)$/.exec(line);
@@ -100,7 +106,6 @@ function nativePackage(directory, version, target, sourceCommit) {
     assert(fs.statSync(executable).mode & 0o111, `${binary} must be executable`);
   }
   assert(fs.readFileSync(path.join(directory, 'web/vibeface_secure_bg.wasm')).subarray(0, 4).equals(Buffer.from([0, 97, 115, 109])), 'invalid WebAssembly module');
-  return JSON.stringify([info.data_epoch, info.core_version, info.core_source_commit, info.app_version, info.app_source_commit]);
 }
 
 function verifyReceipt(archive, version, sourceCommit) {
@@ -124,8 +129,7 @@ function verify(archive, version, sourceCommit, scratch) {
     fs.readFileSync(path.join(repo, 'apps/cli/npm/bin/vibeface.mjs'), 'utf8'), 'launcher does not match the source');
   assert.deepEqual(fs.readdirSync(path.join(directory, 'bin')), ['vibeface.mjs'], 'unexpected npm launcher file');
   assert.deepEqual(fs.readdirSync(path.join(directory, 'vendor')).sort(), [...targets].sort());
-  const epochs = targets.map(target => nativePackage(path.join(directory, 'vendor', target), version, target, sourceCommit));
-  assert.equal(new Set(epochs).size, 1, 'platform packages must use the same component versions, sources and data epoch');
+  for (const target of targets) nativePackage(path.join(directory, 'vendor', target), version, target, sourceCommit);
   return directory;
 }
 
@@ -145,17 +149,15 @@ function pack(input, output, version, sourceCommit) {
     fs.copyFileSync(path.join(repo, 'apps/cli/npm/README.md'), path.join(directory, 'README.md'));
     const metadata = JSON.parse(fs.readFileSync(path.join(repo, 'apps/cli/npm/package.json'), 'utf8'));
     fs.writeFileSync(path.join(directory, 'package.json'), `${JSON.stringify({ ...metadata, version, private: false }, null, 2)}\n`);
-    const epochs = new Set();
     for (const [index, target] of targets.entries()) {
       const archive = path.join(input, names[index]);
       const checksum = fs.readFileSync(`${archive}.sha256`, 'utf8').trim().split(/\s+/);
       assert(checksum.length === 2 && checksum[1] === names[index] && /^[a-fA-F0-9]{64}$/.test(checksum[0]), 'checksum must name the exact native archive');
       assert.equal(hash(archive), checksum[0].toLowerCase(), 'native archive SHA256 mismatch');
       const native = unpack(archive, path.join(scratch, target), names[index].slice(0, -7));
-      epochs.add(nativePackage(native, version, target, sourceCommit));
+      nativePackage(native, version, target, sourceCommit);
       fs.renameSync(native, path.join(directory, 'vendor', target));
     }
-    assert.equal(epochs.size, 1, 'platform packages must use the same component versions, sources and data epoch');
     const [result] = JSON.parse(run('npm', ['pack', '--json', '--ignore-scripts', '--pack-destination', scratch], { cwd: directory }));
     const staged = path.join(scratch, result.filename);
     verify(staged, version, sourceCommit, path.join(scratch, 'verify'));
@@ -250,10 +252,16 @@ async function selfTest() {
       fs.writeFileSync(manifest, JSON.stringify({ ...build, [field]: '0.0.1' }));
       repack(target);
       assert.throws(() => pack(input, path.join(scratch, `mixed-${field}`), version, commit), /Nightly versions/);
+      // A same-channel Nightly from another cohort is still a foreign component.
+      fs.writeFileSync(manifest, JSON.stringify({ ...build, [field]: '1.2.3-nightly.20261019.2' }));
+      repack(target);
+      assert.throws(() => pack(input, path.join(scratch, `cohort-${field}`), version, commit), /must equal the bundled product version/);
     }
-    fs.writeFileSync(manifest, JSON.stringify({ ...build, core_source_commit: 'c'.repeat(40) }));
-    repack(target);
-    assert.throws(() => pack(input, path.join(scratch, 'mixed-components'), version, commit), /same component versions, sources and data epoch/);
+    for (const field of ['core_source_commit', 'app_source_commit']) {
+      fs.writeFileSync(manifest, JSON.stringify({ ...build, [field]: 'c'.repeat(40) }));
+      repack(target);
+      assert.throws(() => pack(input, path.join(scratch, `foreign-${field}`), version, commit), /must equal the bundled product source/);
+    }
     for (const [platform, directory] of sources) {
       const info = JSON.parse(fs.readFileSync(path.join(directory, 'BUILD-INFO.json')));
       fs.writeFileSync(path.join(directory, 'BUILD-INFO.json'), JSON.stringify({ ...info, data_epoch: 2 }));
@@ -266,12 +274,22 @@ async function selfTest() {
       repack(platform);
     }
     fs.writeFileSync(manifest, original);
+    repack(target);
+    const other = targets[2];
+    const otherManifest = path.join(sources.get(other), 'BUILD-INFO.json');
+    const otherOriginal = fs.readFileSync(otherManifest);
+    fs.writeFileSync(otherManifest, JSON.stringify({ ...JSON.parse(otherOriginal), app_source_commit: 'd'.repeat(40) }));
+    repack(other);
+    assert.throws(() => pack(input, path.join(scratch, 'foreign-last-target'), version, commit), /must equal the bundled product source/);
+    fs.writeFileSync(otherManifest, otherOriginal);
+    repack(other);
+    assert.equal(path.basename(pack(input, path.join(scratch, 'cohort-restored'), version, commit)), `leaperone-vibeface-${version}.tgz`);
     fs.symlinkSync('/tmp/vibeface-outside-package', path.join(sources.get(target), 'link'));
     repack(target);
     assert.throws(() => pack(input, path.join(scratch, 'unsafe-archive'), version, commit), /links or special files/);
     assert.throws(() => nightly('1.2.3'), /Nightly versions/);
     assert.throws(() => nightly('1.2.3-nightly.20260229.1'), /invalid Nightly date/);
-    console.log('npm self-test passed: complete epoch-1 packages, old-epoch rejection, global install without scripts, arguments, exit status, signals, checksums, source identity, protocol and unsafe archive rejection.');
+    console.log('npm self-test passed: complete epoch-1 packages, one cohort version and source across all three targets, old-epoch rejection, global install without scripts, arguments, exit status, signals, checksums, source identity, protocol and unsafe archive rejection.');
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }

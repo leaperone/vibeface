@@ -6,6 +6,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 const repository = 'leaperone/vibeface';
 const workflow = '.github/workflows/release.yml';
+const producerJob = 'collect';
+const publisherJob = 'publish';
 const registry = 'https://registry.npmjs.org/';
 const packageName = '@leaperone/vibeface';
 
@@ -29,9 +31,17 @@ function github(endpoint, key) {
   return key ? value.flatMap(page => page[key]) : value;
 }
 
+function completedJob(api, runId, leaf, message) {
+  const jobs = api(`actions/runs/${runId}/jobs?filter=latest&per_page=100`, 'jobs')
+    .filter(job => typeof job.name === 'string' && job.name.split(' / ').pop() === leaf);
+  assert.equal(jobs.length, 1, `the release run must contain exactly one ${leaf} job`);
+  assert.equal(jobs[0].status, 'completed', message);
+  assert.equal(jobs[0].conclusion, 'success', message);
+}
+
 function resolveArtifact({ tag, sha, runId, artifactId, workflowRef }, api = github, now = Date.now()) {
-  assert(tag.startsWith('cli-v'), 'CLI tag is required');
-  nightly(tag.slice(5));
+  assert(/^v(0|[1-9][0-9]*)\./.test(tag), 'product v tag is required');
+  nightly(tag.slice(1));
   assert(/^[a-f0-9]{40}$/.test(sha), 'full source SHA is required');
   assert(/^[1-9]\d*$/.test(runId), 'current workflow run id is required');
   assert.equal(workflowRef, `${repository}/.github/workflows/${artifactId ? 'release.yml' : 'npm-publish.yml'}@refs/tags/${tag}`,
@@ -42,10 +52,11 @@ function resolveArtifact({ tag, sha, runId, artifactId, workflowRef }, api = git
     run = api(`actions/runs/${runId}`);
     assert.equal(String(run.id), runId, 'artifact must belong to the calling run');
   } else {
-    const runs = api(`actions/workflows/release.yml/runs?head_sha=${sha}&status=success&per_page=100`, 'workflow_runs')
+    // A manual recovery follows a published product whose npm job failed, so the run itself is red.
+    const runs = api(`actions/workflows/release.yml/runs?head_sha=${sha}&per_page=100`, 'workflow_runs')
       .filter(item => item.head_sha === sha && item.head_branch === tag && item.path === workflow
-        && item.status === 'completed' && item.conclusion === 'success');
-    assert.equal(runs.length, 1, 'manual publication needs one successful release run for the exact tag');
+        && item.status === 'completed');
+    assert.equal(runs.length, 1, 'manual publication needs one completed release run for the exact tag');
     [run] = runs;
   }
   assert(Number.isSafeInteger(run.id) && run.id > 0, 'invalid release run id');
@@ -56,6 +67,8 @@ function resolveArtifact({ tag, sha, runId, artifactId, workflowRef }, api = git
   assert.equal(run.head_branch, tag, 'release tag mismatch');
   assert(['push', 'workflow_dispatch'].includes(run.event), 'untrusted release event');
   assert(Number.isSafeInteger(run.run_attempt) && run.run_attempt > 0, 'invalid release run attempt');
+  completedJob(api, run.id, producerJob, 'the complete release artifact producer did not succeed');
+  completedJob(api, run.id, publisherJob, 'the product release must be published before npm');
   let artifact;
   if (artifactId) {
     artifact = api(`actions/artifacts/${artifactId}`);
@@ -127,28 +140,41 @@ async function publishOnce(version, integrity, { read = readRegistry, publish, p
 
 async function selfTest() {
   const sha = 'a'.repeat(40), version = '0.0.1-nightly.20261106.1', newer = '0.0.1-nightly.20261106.2';
-  const tag = `cli-v${version}`, integrity = 'sha512-fixture';
+  const tag = `v${version}`, integrity = 'sha512-fixture';
   const run = { id: 7, head_sha: sha, head_branch: tag, path: workflow, run_attempt: 2, event: 'push',
     repository: { full_name: repository }, head_repository: { full_name: repository }, status: 'in_progress', conclusion: null };
   const artifact = { id: 11, name: `npm-package-${sha}-1`, expired: false, expires_at: '2099-01-01T00:00:00Z',
     size_in_bytes: 100, workflow_run: { id: 7, head_sha: sha } };
   const context = { tag, sha, runId: '7', artifactId: '11', workflowRef: `${repository}/${workflow}@refs/tags/${tag}` };
   const manual = { ...context, artifactId: '', workflowRef: `${repository}/.github/workflows/npm-publish.yml@refs/tags/${tag}` };
-  const api = (endpoint, key) => key === 'workflow_runs' ? [{ ...run, status: 'completed', conclusion: 'success' }]
-    : key === 'artifacts' ? [artifact] : endpoint.includes('/artifacts/') ? artifact : run;
+  const jobs = [{ name: producerJob, status: 'completed', conclusion: 'success' },
+    { name: publisherJob, status: 'completed', conclusion: 'success' },
+    { name: 'npm / npm', status: 'completed', conclusion: 'failure' }];
+  const api = (endpoint, key) => key === 'workflow_runs' ? [{ ...run, status: 'completed', conclusion: 'failure' }]
+    : key === 'jobs' ? jobs : key === 'artifacts' ? [artifact] : endpoint.includes('/artifacts/') ? artifact : run;
   assert.deepEqual(resolveArtifact(context, api), { artifact_id: '11', run_id: '7' });
+  // A published product whose npm job failed is still recoverable by hand; it is never reported as green.
   assert.deepEqual(resolveArtifact(manual, api), { artifact_id: '11', run_id: '7' });
   assert.throws(() => resolveArtifact({ ...context, artifactId: '' }, api), /calling workflow mismatch/);
   for (const change of [{ workflow_run: { id: 8, head_sha: sha } }, { workflow_run: { id: 7, head_sha: 'b'.repeat(40) } },
     { name: `npm-package-${sha}-3` }, { name: `npm-package-${sha}-01` }, { expired: true }, { expires_at: '2000-01-01' }]) {
-    assert.throws(() => resolveArtifact(context, endpoint => endpoint.includes('/artifacts/') ? { ...artifact, ...change } : run));
+    assert.throws(() => resolveArtifact(context, (endpoint, key) => endpoint.includes('/artifacts/') ? { ...artifact, ...change } : api(endpoint, key)));
   }
   for (const change of [{ head_sha: 'b'.repeat(40) }, { head_branch: 'main' }, { path: '.github/workflows/ci.yml' }, { id: 8 }]) {
-    assert.throws(() => resolveArtifact(context, endpoint => endpoint.includes('/artifacts/') ? artifact : { ...run, ...change }));
+    assert.throws(() => resolveArtifact(context, (endpoint, key) => endpoint.includes('/artifacts/') ? artifact : key === 'jobs' ? jobs : { ...run, ...change }));
   }
-  assert.throws(() => resolveArtifact(manual, () => []), /one successful release run/);
+  const withJobs = replacement => (endpoint, key) => (key === 'jobs' ? replacement : api(endpoint, key));
+  assert.throws(() => resolveArtifact(context, withJobs([{ ...jobs[0], conclusion: 'failure' }, jobs[1]])), /producer did not succeed/);
+  assert.throws(() => resolveArtifact(context, withJobs([{ ...jobs[0], status: 'in_progress', conclusion: null }, jobs[1]])), /producer did not succeed/);
+  assert.throws(() => resolveArtifact(context, withJobs([jobs[0], { ...jobs[1], conclusion: 'failure' }])), /published before npm/);
+  assert.throws(() => resolveArtifact(context, withJobs([jobs[1]])), /exactly one collect job/);
+  assert.throws(() => resolveArtifact(context, withJobs([jobs[0], jobs[0], jobs[1]])), /exactly one collect job/);
+  assert.throws(() => resolveArtifact(context, withJobs([jobs[0], { name: 'publish-native', status: 'completed', conclusion: 'success' }])), /exactly one publish job/);
+  assert.throws(() => resolveArtifact(manual, () => []), /one completed release run/);
   assert.throws(() => resolveArtifact(manual, (endpoint, key) => key === 'workflow_runs'
-    ? [api(endpoint, key)[0], api(endpoint, key)[0]] : api(endpoint, key)), /one successful release run/);
+    ? [api(endpoint, key)[0], api(endpoint, key)[0]] : api(endpoint, key)), /one completed release run/);
+  assert.throws(() => resolveArtifact(manual, (endpoint, key) => key === 'workflow_runs'
+    ? [{ ...run, status: 'in_progress', conclusion: null }] : api(endpoint, key)), /one completed release run/);
   const packument = (latest = version, published = true) => ({
     versions: { ...(published ? { [version]: { dist: { integrity } } } : {}),
       ...(latest && latest !== version ? { [latest]: { dist: { integrity: 'sha512-other' } } } : {}) },
@@ -193,7 +219,7 @@ async function selfTest() {
     await assert.rejects(publishOnce(version, integrity, { read, publish }));
     assert.equal(writes, 2);
   }
-  console.log('npm publication self-test passed: exact source and artifact, original producer attempt reuse, registry integrity, monotonic Nightly, and publish-once reconciliation.');
+  console.log('npm publication self-test passed: successful collect producer and published product, exact source and artifact, original producer attempt reuse, honest npm failure recovery, registry integrity, monotonic Nightly, and publish-once reconciliation.');
 }
 
 try {
@@ -205,8 +231,8 @@ try {
     assert.equal(process.env.GITHUB_REPOSITORY, repository, 'publication only accepts the upstream repository');
     const tag = process.env.RELEASE_TAG ?? '';
     assert.equal(process.env.GITHUB_REF, `refs/tags/${tag}`, 'workflow ref must match the release tag');
-    assert(tag.startsWith('cli-v'), 'CLI tag is required');
-    const version = tag.slice(5);
+    assert(/^v(0|[1-9][0-9]*)\./.test(tag), 'product v tag is required');
+    const version = tag.slice(1);
     nightly(version);
     if (command === 'artifact') {
       const result = resolveArtifact({ tag, sha: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID,

@@ -36,7 +36,7 @@ vibeface --version
 vibeface
 ```
 
-一个 npm 包包含三个平台的 CLI、Core 和 `web/` 资源，按本机平台启动 Rust CLI。无需安装期脚本、二次下载、Rust 编译器或构建工具。npm 不创建身份、配置 Provider、启动服务或开启自动更新。CLI Nightly 的 GitHub Release 发布成功后自动通过 OIDC 发布同一份 npm 包，流程与权限要求见 [npm Nightly 制品与发布](releasing.md#npm-nightly-制品与发布)。也可从扩展 CI 的 `npm-package-<SHA>` artifact 下载 `.tgz`，使用 `npm install --global --prefix /absolute/isolated/prefix --ignore-scripts /absolute/path/leaperone-vibeface-<version>.tgz` 隔离安装。
+一个 npm 包包含三个平台的 CLI、Core 和 `web/` 资源，按本机平台启动 Rust CLI。无需安装期脚本、二次下载、Rust 编译器或构建工具。npm 不创建身份、配置 Provider、启动服务或开启自动更新。产品 Nightly 的 GitHub Release 发布成功后自动通过 OIDC 发布同一份 npm 包，流程与权限要求见 [npm Nightly 制品与发布](releasing.md#npm-nightly-制品与发布)。也可从扩展 CI 的 `npm-package-<SHA>` artifact 下载 `.tgz`，使用 `npm install --global --prefix /absolute/isolated/prefix --ignore-scripts /absolute/path/leaperone-vibeface-<version>.tgz` 隔离安装。
 
 初始化后，下面的 `service` 命令也适用于全局 npm 安装。服务绑定 npm 包中固定的原生程序路径；不要把后台服务绑定到临时 `npx` 缓存，也不要在服务仍运行时移除或覆盖 npm 安装。迁移服务前先从原安装入口确认空闲并停止服务；npm 服务安装拒绝运行中的 updater、仍被运行中节点锁定或存在未完成更新记录的数据目录，通过后才移除同一目录绑定的旧受管更新定时器。安装期间持续持有同一更新锁，避免旧 updater 并发改写状态。存在 `update-pending.json` 时，先使用原受管安装的 `update apply` 恢复，再迁移服务。
 
@@ -90,7 +90,7 @@ bash install.sh --channel nightly --install-root "$VIBEFACE_INSTALL_ROOT" --bin-
 
 它不创建节点数据、不创建个人网络、不启动后台服务、不安装 Provider，也不开启自动更新。安装后把明确指定的 `--bin-dir` 加入 PATH，或直接使用该目录下的 CLI。SHA256 与包同由 GitHub 提供，不能替代独立发布签名。
 
-已有 `current` 或同名 bin 文件时，安装器保留原文件并拒绝安装。受管安装通过 `update apply` 升级，不能绕过正在运行节点的维护检查。更新和服务管理需要完整包。
+已有 `current` 或同名 bin 文件时，安装器保留原文件并拒绝安装。 旧版 CLI 只识别 `cli-v`，首次切换统一产品 Tag 需要手动安装新版完整包。先确认旧任务与更新已结束，关闭旧自动更新并停止旧服务，再安装到新的安装目录与命令目录，由新入口注册服务。保留原数据目录；这次 Tag 调整不改变数据 epoch。新版本之后的更新器只跟踪 `v`，不会回退旧应用前缀。受管安装通过 `update apply` 升级，不能绕过正在运行节点的维护检查。更新和服务管理需要完整包。
 
 自定义位置需使用绝对路径，并保持安装根目录和 bin 目录为普通目录：
 

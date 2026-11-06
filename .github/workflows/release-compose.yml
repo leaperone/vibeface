@@ -1,0 +1,59 @@
+name: Release platform package
+on:
+  workflow_call:
+    inputs:
+      source_sha: {type: string, required: true}
+      runner: {type: string, required: true}
+      target: {type: string, required: true}
+      native_artifact_id: {type: string, required: true}
+      app_artifact_id: {type: string, required: true}
+    outputs:
+      artifact_id:
+        value: ${{ jobs.compose.outputs.artifact_id }}
+permissions:
+  contents: read
+jobs:
+  compose:
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ inputs.source_sha }}', persist-credentials: false}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.native_artifact_id }}
+          merge-multiple: true
+          path: .artifacts/native-input
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.app_artifact_id }}
+          merge-multiple: true
+          path: .artifacts/app-input
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '24'}
+      - name: Compose from this run's exact inputs
+        id: package
+        env:
+          TARGET: ${{ inputs.target }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          chmod +x .artifacts/native-input/vibeface .artifacts/native-input/vibeface-core
+          version=$(python3 -B scripts/release.py plan --app product | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+          python3 -B scripts/release.py compose --target "$TARGET" --native-dir .artifacts/native-input --app-archive ".artifacts/app-input/vibeface-app-$version.tar.gz" --output .artifacts/release
+          mkdir .artifacts/smoke
+          tar -xzf ".artifacts/release/vibeface-$version-$TARGET.tar.gz" -C .artifacts/smoke
+          echo "package=$PWD/.artifacts/smoke/vibeface-$version-$TARGET" >> "$GITHUB_OUTPUT"
+      - name: Verify the composed programs and Web resources
+        env:
+          PACKAGE: ${{ steps.package.outputs.package }}
+        run: |
+          "$PACKAGE/vibeface" --help
+          python3 -B scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/release-smoke --web-only
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        id: upload
+        with:
+          name: native-release-${{ inputs.target }}-${{ inputs.source_sha }}-${{ github.run_attempt }}
+          path: .artifacts/release/*
+          if-no-files-found: error
