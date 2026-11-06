@@ -566,6 +566,13 @@ def run_daily(run_id):
 def self_test():
     from unittest.mock import patch
 
+    with patch.dict(os.environ, {'GH_TOKEN': 'fixture-actions-token', 'NIGHTLY_RELEASE_TOKEN': 'fixture-pr-token'}):
+        with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, '{}', '')) as transport:
+            api('git/refs', 'POST', dict(ref='refs/tags/v0.0.1', sha='a' * 40))
+            assert transport.call_args.kwargs['env']['GH_TOKEN'] == 'fixture-actions-token'
+            api('pulls', 'POST', {}, pat=True)
+            assert transport.call_args.kwargs['env']['GH_TOKEN'] == 'fixture-pr-token'
+
     def rejected(call, message=None):
         try:
             call()
