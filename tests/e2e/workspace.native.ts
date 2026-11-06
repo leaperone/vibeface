@@ -20,7 +20,7 @@ function record(value: unknown): Record<string, unknown> {
 function text(value: unknown): string { assert(typeof value === 'string' && value.length > 0); return value; }
 function rows(value: unknown) { assert(Array.isArray(value)); return value.map(record); }
 type NativeWorkspace = {
-  gates: { taskA: string; channel: string };
+  gates: { main: string; taskA: string; channel: string };
   call(request: Record<string, unknown>): Promise<Record<string, unknown>>;
 };
 const test = base.extend<{ network: NativeWorkspace }>({
@@ -84,7 +84,7 @@ const test = base.extend<{ network: NativeWorkspace }>({
         return value;
       };
       await call({ op: 'workspace_native_setup', invitation_file: invitation });
-      await use({ gates: { taskA: gate('taskA'), channel: gate('channel') }, call });
+      await use({ gates: { main: gate('main'), taskA: gate('taskA'), channel: gate('channel') }, call });
     } finally {
       cancelPending();
       child.stdin.end();
@@ -184,6 +184,111 @@ test('native workspace routes preserve Task input, queue controls and directed C
     await backButton.click();
     await expect(screen.getByRole('link', '设置', { exact: true })).toBeVisible();
   }
+  await screen.getByRole('link', /^Native Builder，/, { visible: true }).click();
+  const mainComposer = textbox('给 Bot 发消息');
+  const mainTarget = screen.getByRole('button', /^输入目标 Native Builder · 主聊天，/, { visible: true });
+  const toLatest = screen.getByRole('button', '回到底部', { exact: true, visible: true });
+  await expect(mainComposer).toBeVisible();
+  await expect(toLatest).toHaveCount(0);
+  await mainComposer.focus();
+  await expect(keyboard).toHaveCount(1);
+  await expect(toLatest).toHaveCount(0);
+  await mainComposer.fill(JSON.stringify({ phase1: true, label: 'native-workspace-scroll', gate: network.gates.main }), { timeout: 30000 });
+  await screen.getByRole('button', '发送', { exact: true, visible: true }).click();
+  await expect(mainComposer).toHaveValue('');
+  const main = await invocation('native-workspace-scroll');
+  for (let index = 1; index <= 8; index++) {
+    await mainComposer.fill(`原生滚动记录 ${index}\n这条记录留在主聊天历史。\n第二行用于撑开手机列表。\n第三行保留独立消息边界。\n第四行确认输入仍然可读。`);
+    await screen.getByRole('button', '补充当前工作', { exact: true, visible: true }).click();
+    await expect(mainComposer).toHaveValue('');
+  }
+  await expect.poll(async () => (await inspect()).steers.filter(row => row.thread === main.thread).length, { timeout: 30000 }).toBe(8);
+  const mainHistory = device.locator('role=scroll-area').filter({ has: screen.getByText(/^原生滚动记录 /) });
+  const olderMarker = screen.getByText(/^原生滚动记录 4\s/);
+  const latestMarker = screen.getByText(/^原生滚动记录 8\s/);
+  const mainResult = screen.getByText(/^native-workspace-scroll:complete/, { visible: true }).first();
+  await expect(mainHistory).toHaveCount(1);
+  for (const phase of ['closed', 'keyboard', 'reply']) {
+    await device.dismissKeyboard();
+    await expect(keyboard).toHaveCount(0);
+    await expect(latestMarker).toBeVisible();
+    await expect(toLatest).toHaveCount(0);
+    let previousHistoryBounds = '';
+    await expect.poll(async () => {
+      const pane = await mainHistory.boundingBox(), target = await mainTarget.boundingBox(), back = await backButton.boundingBox();
+      const marker = await olderMarker.isVisible() ? await olderMarker.boundingBox() : null;
+      assert(pane && target && back, 'Main history and its visible limits expose bounds');
+      const top = Math.max(pane.y, back.y + back.height), bottom = Math.min(pane.y + pane.height, target.y);
+      const positioned = marker && marker.y >= top && marker.y + marker.height <= top + (bottom - top) / 2;
+      const observed = JSON.stringify(marker), stable = observed === previousHistoryBounds;
+      previousHistoryBounds = observed;
+      if (!positioned) await mainHistory.swipe({ direction: marker && marker.y >= top ? 'down' : 'up', momentum: 'slow' });
+      return Boolean(positioned && stable);
+    }, { timeout: 15000 }).toBe(true);
+    if (phase === 'keyboard') await mainComposer.focus();
+    await expect(keyboard).toHaveCount(phase === 'keyboard' ? 1 : 0);
+    await expect(olderMarker).toBeVisible();
+    await expect(latestMarker).not.toBeVisible();
+    await expect(toLatest).toBeEnabled();
+    let previousReadingBounds = '';
+    await expect.poll(async () => {
+      const button = await toLatest.boundingBox(), marker = await olderMarker.boundingBox(), pane = await mainHistory.boundingBox();
+      const target = await mainTarget.boundingBox(), back = await backButton.boundingBox();
+      const keyboardTop = await keyboard.count() === 0 ? Infinity : (await keyboard.boundingBox())?.y;
+      assert(button && marker && pane && target && back && keyboardTop !== undefined, 'History, return control and keyboard expose bounds');
+      const top = Math.max(pane.y, back.y + back.height), bottom = Math.min(pane.y + pane.height, target.y, keyboardTop);
+      const observed = JSON.stringify([button, marker, target, keyboardTop]), stable = observed === previousReadingBounds;
+      previousReadingBounds = observed;
+      return stable && marker.y >= top && marker.y + marker.height <= bottom && button.x >= pane.x && button.x + button.width <= pane.x + pane.width && button.y >= top && button.y + button.height <= bottom;
+    }).toBe(true);
+    if (phase === 'reply') {
+      const beforeReply = await olderMarker.boundingBox();
+      assert(beforeReply, 'The same historical message is measured before the reply');
+      await expect(screen.getByRole('button', '停止', { exact: true, visible: true })).toHaveCount(1);
+      expect(await network.call({ op: 'workspace_release', gate: 'main' })).toEqual({ released: 'main' });
+      await expect.poll(async () => (await inspect()).turns.find(row => row.thread === main.thread)?.state, { timeout: 30000 }).toBe('completed');
+      await expect(screen.getByRole('button', '停止', { exact: true, visible: true })).toHaveCount(0);
+      await expect(olderMarker).toBeVisible();
+      await expect.poll(async () => {
+        const afterReply = await olderMarker.boundingBox();
+        return afterReply !== null && Math.abs(afterReply.y - beforeReply.y) <= 1;
+      }).toBe(true);
+      await expect(toLatest).toBeVisible();
+      await expect(mainResult).not.toBeVisible();
+    }
+    await app.screenshot(`workspace-native-scroll-${phase === 'reply' ? 'new-reply-history' : phase === 'keyboard' ? 'history-keyboard' : 'history'}`);
+    await toLatest.click();
+    const newest = phase === 'reply' ? mainResult : latestMarker;
+    await expect(newest).toBeVisible();
+    let previousLatestBounds = '';
+    await expect.poll(async () => {
+      const marker = await newest.boundingBox(), pane = await mainHistory.boundingBox(), target = await mainTarget.boundingBox(), back = await backButton.boundingBox();
+      const keyboardTop = await keyboard.count() === 0 ? Infinity : (await keyboard.boundingBox())?.y;
+      assert(marker && pane && target && back && keyboardTop !== undefined, 'The latest message and its visible limits expose bounds');
+      const observed = JSON.stringify([marker, target, keyboardTop]), stable = observed === previousLatestBounds;
+      previousLatestBounds = observed;
+      return stable && marker.y >= Math.max(pane.y, back.y + back.height) && marker.y + marker.height <= Math.min(pane.y + pane.height, target.y, keyboardTop);
+    }).toBe(true);
+    await expect(toLatest).toHaveCount(0);
+  }
+  await expect(mainComposer).toHaveValue('');
+  await mainHistory.swipe({ direction: 'up', momentum: 'slow' });
+  await expect(toLatest).toBeVisible();
+  await expect(backButton).toHaveAccessibleName('消息');
+  await backButton.click();
+  await screen.getByRole('link', /^Native Reviewer，/, { visible: true }).click();
+  await expect(screen.getByRole('button', /^输入目标 Native Reviewer · 主聊天，/, { visible: true })).toBeVisible();
+  await expect(mainComposer).toBeVisible();
+  await expect(toLatest).toHaveCount(0);
+  await mainComposer.focus();
+  await expect(keyboard).toHaveCount(1);
+  await expect(toLatest).toHaveCount(0);
+  await device.dismissKeyboard();
+  await expect(keyboard).toHaveCount(0);
+  await expect(toLatest).toHaveCount(0);
+  await expect(screen.getByText(/^原生滚动记录 /)).toHaveCount(0);
+  await app.screenshot('workspace-native-scroll-short-chat');
+  await backButton.click();
   await screen.getByRole('link', '任务', { exact: true, visible: true }).first().click();
   const newTask = screen.getByRole('link', '新任务', { exact: true });
   await screen.scrollUntilVisible(newTask, { direction: 'down' });
@@ -375,5 +480,5 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await channelHistory.scrollUntilVisible(result, { direction: 'down' });
   await expect(result).toBeVisible();
   await app.screenshot('workspace-native-channel-directed');
-  await writeFile(resolve(artifacts, 'acceptance.json'), `${JSON.stringify({ ui_passed: true, source, simulator, installed_matches_build: true, task_inputs: 3, cancelled_input_invoked: false, directed_channel_result: true })}\n`, { mode: 0o600 });
+  await writeFile(resolve(artifacts, 'acceptance.json'), `${JSON.stringify({ ui_passed: true, source, simulator, installed_matches_build: true, task_inputs: 3, cancelled_input_invoked: false, directed_channel_result: true, scroll_short_chat_hidden: true, scroll_latest_hidden: true, scroll_history_to_latest: true, scroll_keyboard_clearance: true, scroll_new_reply_preserves_history: true, scroll_conversation_isolation: true })}\n`, { mode: 0o600 });
 });

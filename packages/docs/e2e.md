@@ -183,7 +183,7 @@ VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/apps/app/dist/client/vibeface_secure.j
 pnpm exec e2e run --config tests/e2e/e2e.workspace.native.config.ts workspace.native.ts:123 --retries 0 --video off
 ```
 
-用例核对已安装 App 与构建文件，通过邀请、安全码和管理授权加入，再从原生界面创建 Bot、Task 和频道，检查补充、Context、队列编辑取消及停止后的草稿。`acceptance.json` 只在全部界面步骤通过后写入，`cleanup.json` 只在受控 fixture 正常退出后写入。运行结束后，操作者还需停止并删除本任务的模拟器。模拟器通过不代表真机、Android 或真实模型验收。
+用例核对已安装 App 与构建文件，通过邀请、安全码和管理授权加入，再从原生界面创建 Bot。主聊天检查历史阅读、回到底部、键盘、新回复保留阅读位置及聊天切换，随后创建 Task 和频道，检查补充、Context、队列编辑取消及停止后的草稿。`acceptance.json` 只在全部界面步骤通过后写入，`cleanup.json` 只在受控 fixture 正常退出后写入。运行结束后，操作者还需停止并删除本任务的模拟器。模拟器通过不代表真机、Android 或真实模型验收。
 
 ## 验证原生 Provider 设置和队列取消
 
@@ -219,7 +219,7 @@ native config 默认关闭 trace 和整段 video。原始日志、自动失败�
 
 ## 验证原生聊天回到底部
 
-使用任务专属模拟器和对应源码的 App，在消息超过一屏的聊天中检查以下行为。
+上面的原生工作台用例使用现有受控 Provider 的 `main` 门建立长聊天，释放该门时收到真实 Node 写入的新回复。它在任务专属模拟器和对应源码的 App 中检查以下行为。
 
 - 位于最新消息处时没有回到底部按钮；上滑阅读历史后，输入框上方出现按钮。
 - 点击按钮后显示最新消息，按钮消失；键盘展开和收起时均成立。

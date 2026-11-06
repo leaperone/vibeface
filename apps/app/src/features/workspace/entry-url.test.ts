@@ -971,6 +971,36 @@ test("workspace preserves bot and message requests while routing native decision
         await mainSaves[4]; await settleComponent(); mobile()
         assert.equal(storedDraft(), '')
         assert.equal(messages.slice(sentBefore).filter((message) => message.text === '附件失败后可重发').length, 1)
+        const changingOptions = deferred(); fileReads.set('file:///options.txt', changingOptions)
+        const optionStart = mainSaves.length, optionMessages = messages.length
+        composer()?.onChange?.('切换目标和发送方式仍是独立输入')
+        const optionFiles = attach('file:///options.txt')
+        sendDraft(); await settleComponent()
+        const changeIntent = chat.render('default').find(({ type }) => type === 'InputOptions')?.props.onIntent
+        assert.ok(typeof changeIntent === 'function')
+        changeIntent('defer'); sendDraft(); sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, optionStart + 2, 'changing only intent saves a distinct input while unchanged repeated taps remain deduplicated')
+        routine = 'schedule:pending-draft'
+        chat.render('default'); chat.render('default')
+        sendDraft(); sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, optionStart + 3, 'changing only target saves a distinct input with the same text and attachment')
+        changeIntent('defer'); chat.render('default')
+        changingOptions.resolve(new Uint8Array([13, 14, 15]).buffer)
+        await Promise.all(mainSaves.slice(optionStart)); await settleComponent(); mobile()
+        assert.equal(composer()?.value, '切换目标和发送方式仍是独立输入')
+        assert.equal(composer()?.files, optionFiles, 'an earlier target or intent cannot clear the current attachment')
+        assert.equal(storedDraft(), '切换目标和发送方式仍是独立输入')
+        assert.equal(chat.render('default').find(({ type }) => type === 'InputOptions')?.props.intent, 'defer', 'earlier completion cannot reset the current send intent')
+        const optionMainTarget = { kind: 'bot_main', bot_id: botA.bot_id }, optionRoutineTarget = { kind: 'routine', bot_id: botA.bot_id, trigger: routine }
+        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionMainTarget, 'defer'], [optionRoutineTarget, 'continue']].map(value => JSON.stringify(value)).sort())
+        sendDraft(); await mainSaves.at(-1); await settleComponent(); mobile()
+        assert.equal(mainSaves.length, optionStart + 4)
+        assert.equal(composer()?.value, '')
+        assert.equal(storedDraft(), '', 'the matching target and intent still clear after durable acceptance')
+        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionMainTarget, 'defer'], [optionRoutineTarget, 'continue'], [optionRoutineTarget, 'defer']].map(value => JSON.stringify(value)).sort())
+        assert.equal(new Set(messages.slice(optionMessages).map(message => message.message_id)).size, 4)
+        routine = undefined
+        chat.render('default'); chat.render('default')
         mainActions.send = originalMainSend
 
         await render().refresh()

@@ -120,7 +120,9 @@ export default function ChatScreen() {
   const [sendError, setSendError] = useState('')
   useEffect(() => { setSelectedTarget(routine ? `routine:${routine}` : 'main'); setIntent('continue') }, [id, routine])
   const draft = (id && drafts[id]) || { text: '', files: [] }
-  const savingDrafts = useRef(new Set<typeof draft>())
+  const draftRef = useRef({ value: draft, intent, target: selectedTarget, conversationId: id })
+  if (draftRef.current.value !== draft || draftRef.current.intent !== intent || draftRef.current.target !== selectedTarget || draftRef.current.conversationId !== id) draftRef.current = { value: draft, intent, target: selectedTarget, conversationId: id }
+  const savingDrafts = useRef(new Set<typeof draftRef.current>())
   const setDraft = (next: Partial<typeof draft>) => { if (id) setDrafts((current) => {
     const present = current[id] ?? { text: '', files: [] }, changed = { ...present, ...next }
     if (changed.text === present.text && changed.files === present.files) return current
@@ -180,23 +182,23 @@ export default function ChatScreen() {
   const stopSharing = targetWork?.turn_id ? (chat?.works ?? []).filter((work) => !work.outcome && work.thread_id === targetWork.thread_id && work.turn_id === targetWork.turn_id) : []
   const pending = live?.pendingMessages.filter((item) => item.conversation_id === id && ['bot_main', 'work', 'routine'].includes(item.target.kind)) ?? []
   const send = () => {
-    const submittedDraft = draft
+    const submittedDraft = draftRef.current
     if (savingDrafts.current.has(submittedDraft)) return
     savingDrafts.current.add(submittedDraft)
-    const { text, files } = submittedDraft
+    const { text, files } = submittedDraft.value
     setSendError('')
     toLatest()
     workspace.actions.send(id, text.trim(), files, { target: targetOption.target, intent, conversation_id: id, onSaved: (input) => {
       if (!live?.isCurrent()) return
       setDrafts((current) => {
         const present = current[id]
-        if (present !== submittedDraft) return current
+        if (present !== submittedDraft.value || draftRef.current.conversationId === id && draftRef.current !== submittedDraft) return current
         const updated = { ...current, [id]: { text: '', files: [] } }
         draftStorage.writeStorage(draftKey, Object.fromEntries(Object.entries(updated).map(([key, value]) => [key, value.text])))
         return updated
       })
-      setIntent((current) => current === intent ? 'continue' : current)
-      if (!routeActive.current || !live?.isCurrent() || latestLive.current?.conversationId !== id) return; if (intent === "new_task" && (input.target.kind === "task" || input.target.kind === "channel_task")) router.push(`/task/${input.target.task_id}`) } }).catch((cause) => { setSendError(messageOf(cause)) }).finally(() => { savingDrafts.current.delete(submittedDraft) })
+      if (draftRef.current === submittedDraft) setIntent((current) => current === intent ? 'continue' : current)
+      if (!routeActive.current || !live?.isCurrent() || latestLive.current?.conversationId !== id || draftRef.current !== submittedDraft) return; if (intent === "new_task" && (input.target.kind === "task" || input.target.kind === "channel_task")) router.push(`/task/${input.target.task_id}`) } }).catch((cause) => { setSendError(messageOf(cause)) }).finally(() => { savingDrafts.current.delete(submittedDraft) })
   }
   const rows = chat ? entries(chat, extras, bot, offline) : []
   // 重试 on the newest reply once it failed or was stopped, as on the web.
