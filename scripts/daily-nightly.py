@@ -9,10 +9,12 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from urllib.parse import quote
 
+sys.dont_write_bytecode = True
 import release
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -416,9 +418,7 @@ def release_state(tag):
 def release_dispatch_tag(app):
     """Daily Nightly publishes exactly two groups: product v<version> and www www-v<version>."""
     require(app in RELEASES, 'daily Nightly publishes only the product and www release groups')
-    if app == 'product':
-        return release.release_tag_for('product', release.require_product_version_alignment())
-    return release.release_tag_for('www', release.read_version('www'))
+    return release.identity(app)['tag']
 
 
 def start_release(app, source):
@@ -551,6 +551,7 @@ def run_daily(run_id):
             require(versions_at(source) == plan.versions, 'landed daily versions changed')
             environment = {key: value for key, value in os.environ.items()
                            if key not in ('GITHUB_EVENT_NAME', 'GITHUB_REF', 'NIGHTLY_RELEASE_TOKEN')}
+            environment['PYTHONDONTWRITEBYTECODE'] = '1'
             for app in RELEASES:
                 tag = release.release_tag_for(app, plan.versions['cli' if app == 'product' else 'www'])
                 subprocess.run(['python3', str(clean / 'scripts/release.py'), 'plan', '--app', app, '--tag', tag, '--require-main'],
@@ -735,7 +736,7 @@ def self_test():
             for group in ('mobile', 'app', 'core', 'cli'):
                 rejected(lambda: release_dispatch_tag(group), 'product and www release groups')
             git('checkout', '--detach', '-q', stale)
-            rejected(lambda: release_dispatch_tag('product'), 'must equal CLI version')
+            rejected(lambda: release_dispatch_tag('product'), 'mobile version must equal')
             git('checkout', '--detach', '-q', advanced)
 
             writes = []; remote = {'tag': None, 'runs': [], 'public': False}

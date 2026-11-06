@@ -66,7 +66,7 @@ jobs:
           mkdir -p .artifacts/android
           cp apps/mobile/android/app/build/outputs/apk/release/app-release.apk ".artifacts/android/vibeface-${VERSION#v}-android.apk"
           (cd .artifacts/android && shasum -a 256 "vibeface-${VERSION#v}-android.apk" > "vibeface-${VERSION#v}-android.apk.sha256")
-          python3 scripts/release.py mobile-provenance ".artifacts/android/vibeface-${VERSION#v}-android.apk"
+          python3 -B scripts/release.py mobile-provenance ".artifacts/android/vibeface-${VERSION#v}-android.apk"
           python3 -B scripts/release.py manifest product .artifacts/android
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         id: upload

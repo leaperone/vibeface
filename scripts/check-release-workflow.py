@@ -58,6 +58,8 @@ def evaluate(expression, results, scope='product', publishing=True, cancelled=Fa
 
 def check(source, helpers):
     workflow = jobs(source)
+    require('release-${{ inputs.tag || github.ref_name }}-' in source,
+            'tag pushes and manual publication must share the same concurrency group')
     producers = ['static', 'native-macos', 'native-linux-x64', 'native-linux-arm64', 'android']
     for producer in producers:
         require(needs(workflow[producer]) == {'identity'}, producer + ' waits on an unrelated build')
@@ -92,8 +94,11 @@ def check(source, helpers):
     require(not evaluate(collect, good, cancelled=True), 'cancelled product must not be collected')
     portal = {name: ('success' if name in ('identity', 'static') else 'skipped') for name in collection_needs}
     require(evaluate(collect, portal, scope='www'), 'website must be independently releasable')
-    require(evaluate(publish, {}, publishing=True) and not evaluate(publish, {}, publishing=False),
+    require(evaluate(publish, {'collect': 'success'}, publishing=True)
+            and not evaluate(publish, {'collect': 'success'}, publishing=False),
             'build-only runs may publish publicly')
+    for failure in ('failure', 'cancelled', 'skipped'):
+        require(not evaluate(publish, {'collect': failure}), 'incomplete collection may publish publicly')
     return workflow
 
 
@@ -102,7 +107,8 @@ def self_test(source, helpers):
     broken = [
         source.replace('needs: [identity, static, native-macos]', 'needs: [identity, static, native-macos, native-linux-x64]'),
         source.replace("needs.android.result == 'success'", "True"),
-        source.replace("if: needs.identity.outputs.publish == 'true'", 'if: always()'),
+        source.replace("if: needs.identity.outputs.publish == 'true' && needs.collect.result == 'success'", 'if: always()'),
+        source.replace("&& needs.collect.result == 'success'", ''),
         source.replace('artifact-ids: ${{ needs.static.outputs.artifact_id }}', 'pattern: static-*'),
     ]
     for candidate in broken:
@@ -122,7 +128,8 @@ def main():
     directory = ROOT / '.github/workflows'
     source = (directory / 'release.yml').read_text()
     helpers = {name: (directory / name).read_text()
-               for name in ('release-native.yml', 'release-compose.yml', 'release-apps.yml')}
+               for name in ('release-native.yml', 'release-compose.yml', 'release-apps.yml',
+                            'npm-publish.yml', 'deploy-app.yml', 'deploy-www.yml')}
     self_test(source, helpers) if args.self_test else check(source, helpers)
     print('Release DAG passed: parallel producers, per-platform composition, exact artifacts and complete-only publication')
 

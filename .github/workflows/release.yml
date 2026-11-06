@@ -20,7 +20,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: release-${{ inputs.tag || github.ref }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
+  group: release-${{ inputs.tag || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
   cancel-in-progress: false
 jobs:
   identity:
@@ -55,7 +55,7 @@ jobs:
           if publish:
               if not tag or os.environ['GITHUB_REF'] != 'refs/tags/' + tag:
                   raise SystemExit('Publishing requires the exact existing tag as the workflow ref')
-              command += ['--require-main']
+              command += ['--require-main', '--publish']
           result = json.loads(subprocess.check_output(command, text=True))
           if result['source_commit'] != os.environ['GITHUB_SHA']:
               raise SystemExit('Build source differs from the workflow commit')
@@ -70,7 +70,10 @@ jobs:
                          run['conclusion'] == 'success' for run in runs):
                   raise SystemExit('The exact source must have a successful main push CI before publication')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              for key, value in result.items():
+              for key in ('app', 'version', 'tag', 'source_commit', 'channel'):
+                  value = result[key]
+                  if not isinstance(value, str) or '\n' in value or '\r' in value:
+                      raise SystemExit('Release outputs must be single-line identity strings')
                   output.write(f'{key}={value}\n')
               output.write('publish=' + str(publish).lower() + '\n')
           PY
@@ -122,7 +125,12 @@ jobs:
       source_sha: ${{ needs.identity.outputs.source_sha }}
       runner: macos-15
       target: aarch64-apple-darwin
-    secrets: inherit
+    secrets:
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
   native-linux-x64:
     needs: [identity]
     if: needs.identity.outputs.app == 'product'
@@ -191,6 +199,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {ref: '${{ needs.identity.outputs.source_sha }}', persist-credentials: false}
+      - name: Assert the collection source
+        env:
+          SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ needs.static.outputs.artifact_id }}
@@ -227,6 +239,7 @@ jobs:
           SCOPE: ${{ needs.identity.outputs.app }}
         run: |
           if [[ "$SCOPE" == product ]]; then
+            python3 -B scripts/check-android-manifest-tool.py
             python3 -B scripts/release.py assemble-product --input-root .artifacts/input --output .artifacts/release
           else
             mv .artifacts/input/app .artifacts/release
@@ -257,7 +270,7 @@ jobs:
           if-no-files-found: error
   publish:
     needs: [identity, collect]
-    if: needs.identity.outputs.publish == 'true'
+    if: needs.identity.outputs.publish == 'true' && needs.collect.result == 'success'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -275,7 +288,8 @@ jobs:
           SCOPE: ${{ needs.identity.outputs.app }}
           RELEASE_TAG: ${{ needs.identity.outputs.tag }}
         run: |
-          python3 -B scripts/release.py plan --app "$SCOPE" --tag "$RELEASE_TAG" --require-main
+          python3 -B scripts/release.py plan --app "$SCOPE" --tag "$RELEASE_TAG" --require-main --publish
+          if [[ "$SCOPE" == product ]]; then python3 -B scripts/check-android-manifest-tool.py; fi
           python3 -B scripts/release.py publish "$SCOPE" .artifacts/release
   npm:
     needs: [identity, collect, publish]

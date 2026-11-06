@@ -5,6 +5,12 @@ on:
       source_sha: {type: string, required: true}
       runner: {type: string, required: true}
       target: {type: string, required: true}
+    secrets:
+      MACOS_CERTIFICATE_P12_BASE64: {required: false}
+      MACOS_CERTIFICATE_PASSWORD: {required: false}
+      APPLE_API_KEY_P8_BASE64: {required: false}
+      APPLE_API_KEY_ID: {required: false}
+      APPLE_API_ISSUER_ID: {required: false}
     outputs:
       artifact_id:
         value: ${{ jobs.build.outputs.artifact_id }}
