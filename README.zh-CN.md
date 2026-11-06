@@ -41,7 +41,14 @@ Vibeface 负责协调工作。每台电脑上的 Agent、登录、模型服务�
 
 准备一台 Apple Silicon Mac、Linux x64 或 Linux ARM64（glibc）电脑，并在上面配置一个支持的 Agent。
 
-1. 从 [GitHub Releases](https://github.com/leaperone/vibeface/releases) 下载对应平台的完整包，按[安装说明](packages/docs/install.md)操作。
+1. 安装 Nightly。安装器自动选择并校验本机平台的完整包：
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash -s -- --channel nightly --install-root "$HOME/.local/share/vibeface" --bin-dir "$HOME/.local/bin"
+   export PATH="$HOME/.local/bin:$PATH"
+   vibeface --version
+   ```
+
 2. 启动 Node，也就是连接这台电脑的本机服务：
 
    ```sh
@@ -54,6 +61,8 @@ Vibeface 负责协调工作。每台电脑上的 Agent、登录、模型服务�
 6. 创建 Bot 并发送消息。需要操作项目时，在 AI 设置中启用任务执行，添加项目目录。
 
 数据目录默认为 `~/.vibeface`，首次运行只初始化不存在或为空的目录。完整步骤见[快速上手](packages/docs/quick-start.md)。
+
+将 `~/.local/bin` 加入 shell 配置，便于在新终端使用 `vibeface`。已有安装通过 `vibeface update` 更新，通过 `vibeface service` 管理后台服务，不重复运行安装器。更新配置和其他安装方式见[安装与更新](packages/docs/install.md)。
 
 ## 添加另一台设备
 

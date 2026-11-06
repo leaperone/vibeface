@@ -41,7 +41,14 @@ Vibeface coordinates the work. You provide the Agent, its login and model access
 
 You need an Apple Silicon Mac, Linux x64, or Linux ARM64 with glibc, plus a supported Agent set up on that computer.
 
-1. Download a complete package for your platform from [GitHub Releases](https://github.com/leaperone/vibeface/releases) and follow the [installation guide](packages/docs/install.md).
+1. Install Nightly. The installer selects and verifies the complete package for your platform:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash -s -- --channel nightly --install-root "$HOME/.local/share/vibeface" --bin-dir "$HOME/.local/bin"
+   export PATH="$HOME/.local/bin:$PATH"
+   vibeface --version
+   ```
+
 2. Run the Node, the service that connects this computer to Vibeface:
 
    ```sh
@@ -54,6 +61,8 @@ You need an Apple Silicon Mac, Linux x64, or Linux ARM64 with glibc, plus a supp
 6. Create a bot and send a message. To work on a project, enable task execution and add the project folder in the AI settings.
 
 The default data directory is `~/.vibeface`. The first run initializes only a missing or empty directory. See the [quick start](packages/docs/quick-start.md) for the full walkthrough.
+
+Add `~/.local/bin` to your shell configuration to use `vibeface` in new terminals. For an existing installation, use `vibeface update` for updates and `vibeface service` to manage the background service. Do not run the installer again. See [installation and updates](packages/docs/install.md) for update configuration and other installation options.
 
 ## Add another device
 
