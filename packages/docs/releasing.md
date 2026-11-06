@@ -23,6 +23,10 @@ description: 了解 Vibeface 的 CI、制品和 Nightly 发布流程。
 
 先完成独立分支、PR、相关测试并合并，再从已验证的提交创建具体 tag。例如 `git tag app-v0.0.1-nightly.20261101.1 <commit>`，随后 `git push origin app-v0.0.1-nightly.20261101.1`。若重跑，使用 `gh workflow run release.yml --ref <tag> -f tag=<tag>`。发布后核对 Actions 终态、release.json、实际下载摘要和平台运行结果。
 
+## 每日 Nightly 的发布约束
+
+每日 Nightly 覆盖 WWW、App、Core、CLI 和 Mobile，使用 UTC 日期及各应用独立的序号。Core 和 App 的公开制品验证成功后，CLI 才能组装。重跑先核对已有 tag、Release 和制品，不覆盖已发布内容。Nightly 不触发生产站点部署、npm 公开发布或 iOS 分发。
+
 `app` 的静态归档发布成功后，`deploy-app.yml` 使用 `VIBEFACE_RELEASE_DISPATCH_TOKEN` 向 `leaperone/leaperone-releases` 发送 `deploy-vibeface-app`，携带确切 tag 和源码 SHA。接收端校验 tag、main 祖先关系、release 清单和归档内容后部署到现有站点，并检查 `/`、`/connect`、`/join` 及首页引用的静态资源。源站首页必须与发布产物一致；公网入口和静态资源必须返回 200，页面须保留原启动脚本，静态资源须与产物一致。公网检查允许现有 Cloudflare 外部统计脚本，循环跳转使验收失败。派发成功仅表示接收了请求，仍须核对发布仓库的部署与冒烟结果。
 
 ## 可下载的包
