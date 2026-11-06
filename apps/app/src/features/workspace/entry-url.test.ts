@@ -750,7 +750,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const focusEffects = new Map<number, { run: () => (() => void) | void; cleanup?: () => void }>()
   type Props = Record<string, unknown> & { name?: string; type?: string; role?: string; disabled?: boolean; value?: unknown; onChange?: (event: unknown) => void; onSubmit?: (event?: unknown) => void; onClick?: () => void; action?: () => Promise<unknown> }
-  const elements: { type: unknown; props: Props }[] = [], afterRender: (() => void)[] = []
+  const elements: { type: unknown; props: Props; key?: string }[] = [], afterRender: (() => void)[] = []
   let cursor = 0, focused = true, output: unknown
   function effect(run: () => (() => void) | void, dependencies: unknown[]) {
     const index = cursor++, previous = effects.get(index)
@@ -782,7 +782,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     },
     useEffect: effect, useLayoutEffect: effect,
   }
-  const jsx = (type: unknown, props: Props) => { const element = { type, props }; elements.push(element); return element }
+  const jsx = (type: unknown, props: Props, key?: string) => { const element = key === undefined ? { type, props } : { type, props, key }; elements.push(element); return element }
   const ui = new Proxy({}, { get: (_target, name) => name === 'useAction' ? () => ({ busy: null, error: null, run() {}, clear() {} }) : String(name) })
   const module: { exports: Record<string, unknown> } = { exports: {} }
   const useFocusEffect = (run: () => (() => void) | void) => {
@@ -1275,6 +1275,11 @@ test('chat task groups stay at their originating message and orphan tasks remain
     assert.equal(componentText(renderComponent(finished)), '已完成 · 查看任务')
     const history = elements.find(({ type }) => typeof type === 'function' && type.name === 'TaskHistory')
     assert.equal(history, undefined, 'an inactive chat never mounts a history portal')
+    const active = harness.render({ active: true })
+    const historyKey = active.find(({ type }) => typeof type === 'function' && type.name === 'TaskHistory')?.key
+    const chatKey = active.find(({ type }) => type === 'Chat')?.key
+    assert.ok(historyKey && chatKey)
+    assert.notEqual(historyKey, chatKey, 'history and the retained chat are different siblings during reconciliation')
     shared.data = parseConversation({ ...context, messages: messages.slice(0, 1), works: shared.data.works })
     assert.equal(harness.chatEntries()[1].key, 'task-group:message:one', 'a reply arriving never moves the task group')
     shared.data = parseConversation({ ...context, messages, works: [complete('root'), complete('sibling'), complete('child', 'task:root'), complete('orphan', 'message:missing')] })
@@ -1291,7 +1296,7 @@ test('chat task history keeps completed and unknown records while counting only 
   shared.openWorks = shared.data.works.map((work) => ({ ...work, conversation_id: 'chat' }))
   const dependencies = {
     '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
-    '@vibeface/client/workspace/labels.ts': taskLabels, '@/lib/glossary': { terms: { approval: { icon: 'ApprovalIcon' } } }, 'react-dom': { flushSync: (run: () => void) => run() },
+    '@vibeface/client/workspace/labels.ts': taskLabels, '@/lib/glossary': { terms: { approval: { icon: 'ApprovalIcon' } } },
   }
   const app = componentHarness('../chat/conversation-screen.tsx', dependencies, {}, 'TaskHistory, TaskIcon')
   const harness = conversationHarness(() => shared)
@@ -1314,10 +1319,11 @@ test('chat task history keeps completed and unknown records while counting only 
     const trigger = render().find(({ type }) => type === 'Button')
     trigger?.props.onClick?.()
     assert.equal(render().find(({ type }) => type === 'Sheet')?.props.open, true)
+    const onCloseAutoFocus = render().find(({ type }) => type === 'SheetContent')?.props.onCloseAutoFocus as (event: { preventDefault(): void }) => void
     render().find(({ type }) => type === 'Link')?.props.onClick?.()
     assert.equal(render().find(({ type }) => type === 'Sheet')?.props.open, false, 'navigation closes the sheet first')
     let prevented = false
-    const closeFocus = () => (render().find(({ type }) => type === 'SheetContent')?.props.onCloseAutoFocus as (event: { preventDefault(): void }) => void)({ preventDefault() { prevented = true } })
+    const closeFocus = () => onCloseAutoFocus({ preventDefault() { prevented = true } })
     closeFocus()
     assert.equal(prevented, true, 'detail navigation owns focus after the sheet closes')
     render().find(({ type }) => type === 'Button')?.props.onClick?.()

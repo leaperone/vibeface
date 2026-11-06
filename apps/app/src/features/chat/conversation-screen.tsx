@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react'
-import { flushSync } from 'react-dom'
 import { Link } from '@tanstack/react-router'
 import { ArrowDown, ArrowRightLeft, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Hourglass, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, RotateCw, Send, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, Details, EmptyState, InlineError, PageActions, PrimaryMark } from '@/components/app/kit'
@@ -272,7 +271,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   }
 
   if (missing) return <section className="conversation-screen" aria-label="对话"><Chat key="missing" entries={[]} empty={<NoBot />} /></section>
-  const history = active && bot ? <TaskHistory key={conversationId} tasks={tasks} botId={bot.bot_id} name={bot.name} /> : null
+  const history = active && bot ? <TaskHistory key={`task-history:${conversationId}`} tasks={tasks} botId={bot.bot_id} name={bot.name} /> : null
   if (bot && !data) return <section className="conversation-screen" aria-label="对话">{history}<ChatSkeleton /></section>
 
   return (
@@ -393,7 +392,7 @@ function TaskHistory({ tasks, botId, name }: { tasks: TaskRow[]; botId: string; 
           {!workspace.data ? <p role="status" className="py-6 text-meta text-muted-foreground">正在读取任务记录</p> : tasks.length ? <ul className="divide-y">{tasks.map((task) => {
             const stale = taskStale(task.state, workspace.connectionOnline) || !workspace.connectionOnline && task.state === 'awaiting_children'
             const away = task.state === 'dispatch_waiting' && workspace.nodes.some((node) => node.device_id === task.device && !node.online)
-            return <li key={task.id}><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} onClick={() => { leaving.current = true; flushSync(() => setOpen(false)) }} className="-mx-2 flex min-h-11 min-w-0 items-start gap-2 rounded-lg px-2 py-3 hover:bg-muted/60 active:bg-muted">
+            return <li key={task.id}><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} onClick={() => { leaving.current = true; setOpen(false) }} className="-mx-2 flex min-h-11 min-w-0 items-start gap-2 rounded-lg px-2 py-3 hover:bg-muted/60 active:bg-muted">
               <TaskIcon state={task.state} stale={stale} away={away} />
               <span className="grid min-w-0 flex-1 gap-1"><span className="break-words font-medium">{task.work.title || '任务'}</span><span className="flex min-w-0 flex-wrap gap-x-1 text-meta text-muted-foreground"><span>{stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)}</span><span aria-hidden="true">·</span><span className="min-w-0 break-words">{nodeName(task.device, { nodes: workspace.nodes, directory })}</span></span></span>
               <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
