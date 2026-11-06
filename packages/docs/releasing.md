@@ -25,9 +25,21 @@ description: 了解 Vibeface 的 CI、制品和 Nightly 发布流程。
 
 ## 每日 Nightly 的发布约束
 
-每日 Nightly 覆盖 WWW、App、Core、CLI 和 Mobile，使用 UTC 日期及各应用独立的序号。Core 和 App 的公开制品验证成功后，CLI 才能组装。重跑先核对已有 tag、Release 和制品，不覆盖已发布内容。Nightly 不触发生产站点部署、npm 公开发布或 iOS 分发。
+每日 Nightly 的协调入口是 `ci.yml` 的 `daily-nightly` job。启用后，它只在 UTC 03:23 的 main 定时扩展检查及 `ci-gate` 成功后运行，手动 `workflow_dispatch` 和普通 main push 均不运行发布协调。即使业务源码没有变化，每天仍为 WWW、App、Core、CLI 和 Mobile 分配新 Nightly。
 
-`app` 的静态归档发布成功后，`deploy-app.yml` 使用 `VIBEFACE_RELEASE_DISPATCH_TOKEN` 向 `leaperone/leaperone-releases` 发送 `deploy-vibeface-app`，携带确切 tag 和源码 SHA。接收端校验 tag、main 祖先关系、release 清单和归档内容后部署到现有站点，并检查 `/`、`/connect`、`/join` 及首页引用的静态资源。源站首页必须与发布产物一致；公网入口和静态资源必须返回 200，页面须保留原启动脚本，静态资源须与产物一致。公网检查允许现有 Cloudflare 外部统计脚本，循环跳转使验收失败。派发成功仅表示接收了请求，仍须核对发布仓库的部署与冒烟结果。
+启用前须明确授权未来每日机械版本 PR 的自动 squash，并配置单仓库 fine-grained secret `NIGHTLY_RELEASE_TOKEN`，授予 Contents、Pull requests 和 Actions 所需读写权限。当前实现交付不代表该 secret 已配置或每日发布已启用；缺少它时 job 明确失败，不使用其他发布 token 替代，也不修改保护规则。PAT 本身没有路径级限制。受信协调脚本通过 PR 仓库、作者、base、head 和逐字节机械 tree 校验限制合并范围。普通 `GITHUB_TOKEN` 只在协调 job 申请必要的 Contents、Actions 写权限，负责版本分支、tag 和精确 dispatch；PAT 只用于创建与立即 squash 合并版本 PR，使真实 main push 正常触发 CI。
+
+`scripts/daily-nightly.py` 从原定时 run 的 `created_at` 恢复 UTC 日期，以 `bot/daily-nightly/YYYYMMDD` 查找所有状态的唯一版本 PR。它先复用原 PR 和已预留版本，再考虑分配。每应用按已提交基准、该日远端 tag 和 manifest 的最大序号加一。版本提交只改五应用版本、Cargo.lock 的两个本仓包版本、CLI 的 Core/App tag 锁和 Android `versionCode`。Mobile marketing version 和 iOS buildNumber 保持不变，Cargo 只运行 `metadata --locked --no-deps`，不重新解析依赖。
+
+协调器用固定 head 普通 squash，不使用 auto-merge 或 admin。原 PR head 必须等于从原 base 机械生成的完整 tree。若 main 已前进，真实 squash 提交也必须恰好等于在其实际 main 父提交上生成同批固定版本的 tree，否则停止。随后只接受真实合并 SHA 的 `ci.yml`、`event=push`、`head_branch=main` 和终态 success；缺失、pending、其他 SHA 或取消均不能放行。取消时只恢复原 run。相同日期重跑继续使用原 PR、版本和真实合并 SHA，不再递增。
+
+WWW、App、Core 和 Mobile 的精确 tag 发布可并行运行。Core 和 App 的公开制品下载验证成功后才启动 CLI。已有 tag 必须指向同一真实合并 SHA，tag 只创建、不移动。由 `GITHUB_TOKEN` 创建 tag 后显式 dispatch `release.yml`，不依赖 token push 自动触发。写入响应未知时先查询 PR、ref 或原 run 对账，不盲重试。已有公开且验证通过的 Release 直接复用。
+
+static 和 Android 构建先把完整待发布集合连同 `release.json` 保存为 Actions artifact，再由独立 publisher 发布。Core 和 CLI 保留原有 native artifact 与 publisher 分层。失败恢复只重跑原 run 的失败 publisher job，不重建归档；原 artifact 缺失、过期、构建失败或公开字节冲突时停止。所有已关联 runs 都要跟踪到终态，某应用失败不省略其他已启动 runs。最终下载五份公开 manifest，核对完整文件集合、大小、摘要、组件身份、CLI 构建锁，以及 APK 实际包名、marketing version、versionCode 和 provenance。Nightly 不触发生产站点部署、npm 公开发布或 iOS 分发。
+
+## Stable App 的站点部署
+
+仅 Stable `app-vX.Y.Z` 的静态归档发布成功后，`deploy-app.yml` 使用 `VIBEFACE_RELEASE_DISPATCH_TOKEN` 向 `leaperone/leaperone-releases` 发送 `deploy-vibeface-app`，携带确切 tag 和源码 SHA。接收端校验 tag、main 祖先关系、release 清单和归档内容后部署到现有站点，并检查 `/`、`/connect`、`/join` 及首页引用的静态资源。源站首页必须与发布产物一致；公网入口和静态资源必须返回 200，页面须保留原启动脚本，静态资源须与产物一致。公网检查允许现有 Cloudflare 外部统计脚本，循环跳转使验收失败。派发成功仅表示接收了请求，仍须核对发布仓库的部署与冒烟结果。
 
 ## 可下载的包
 

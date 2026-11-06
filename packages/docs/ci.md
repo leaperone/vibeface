@@ -153,6 +153,10 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 每日 UTC 03:23 定时和 Actions 中手动运行 `ci` 强制执行扩展检查，不受路径影响。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或三平台打包。开发分支 PR 不触发 `ci`。应用前缀 tag 由独立的 `release.yml` 路由，仅构建目标应用。`ci` 的手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
 
+每日 Nightly 接在同一 schedule run 的 `ci-gate` 后，不新增第二套定时全量 CI。`daily-nightly` 仅接受 main 的 schedule，使用固定 concurrency 且不取消进行中的协调。启用需要明确授权未来每日机械版本 PR 自动 squash，并配置专用单仓库 `NIGHTLY_RELEASE_TOKEN`；当前实现不代表凭证或自动发布已启用。该 PAT 需 Contents、Pull requests、Actions 所需权限，只处理版本 PR 创建和普通 squash；版本 branch、tag 与精确 workflow dispatch 使用 job 级 `GITHUB_TOKEN`。未配置时明确失败，不修改权限或保护规则。
+
+协调脚本先验证精确机械版本 diff 和 `cargo metadata --locked --no-deps`，合并后只接受真实 squash SHA 的 main push CI success，再启动现有应用 tag 构建。不会为版本分支再派发一轮全量检查，也不为合并 SHA 再跑扩展全量 CI。原 run 的 `created_at` 固定当日身份，重跑复用原 PR、版本、SHA 和留存制品。quick-check 与 preflight 注册 `python3 scripts/daily-nightly.py --self-test` 及 Python 语法检查，涵盖真实临时 Git、篡改 diff、依赖发布门、未知写入对账和原 artifact 恢复。具体发布顺序与停止条件见 [每日 Nightly 的发布约束](releasing.md#每日-nightly-的发布约束)。
+
 | 扩展检查 | 执行范围 |
 | --- | --- |
 | Rust 快、慢测试及 Clippy | 整个工作区；慢组为精确名称的 `SLOW_TESTS` |
