@@ -4,6 +4,10 @@ name: mobile
 on:
   workflow_dispatch:
     inputs:
+      runner_probe:
+        description: 'Run only the temporary iOS runner diagnosis'
+        type: boolean
+        default: false
       feedback:
         description: 'Replace older ordinary mobile feedback on this branch'
         type: boolean
@@ -18,8 +22,8 @@ on:
         default: false
 
 concurrency:
-  group: mobile-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.feedback && github.run_attempt == 1 && 'feedback' || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && inputs.feedback && github.run_attempt == 1 }}
+  group: mobile-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && !inputs.runner_probe && inputs.feedback && github.run_attempt == 1 && 'feedback' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && !inputs.runner_probe && inputs.feedback && github.run_attempt == 1 }}
 
 permissions:
   contents: read
@@ -31,7 +35,7 @@ jobs:
   android:
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
-    if: inputs.android_only || github.event_name == 'workflow_dispatch'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.runner_probe) && (inputs.android_only || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -82,7 +86,7 @@ jobs:
     outputs:
       artifact_id: ${{ steps.inputs.outputs.artifact-id }}
       producer_attempt: ${{ github.run_attempt }}
-    if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' }}
+    if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' && !inputs.runner_probe }}
     runs-on: macos-26
     timeout-minutes: 75
     steps:
@@ -149,7 +153,7 @@ jobs:
 
   ios-accept:
     needs: ios-build
-    if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' }}
+    if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' && !inputs.runner_probe }}
     runs-on: macos-26
     timeout-minutes: 30
     steps:
@@ -466,7 +470,7 @@ jobs:
           retention-days: 7
 
   mobile-gate:
-    if: always()
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.runner_probe) }}
     needs: [android, ios-build, ios-accept]
     runs-on: ubuntu-24.04
     steps:
@@ -477,3 +481,336 @@ jobs:
         env:
           MOBILE_NEEDS: ${{ toJSON(needs) }}
         run: python3 scripts/ci.py mobile-gate --needs-env MOBILE_NEEDS ${{ inputs.android_only && '--android-only' || '' }}
+
+  runner-probe:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_probe }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      AGENT_DEVICE_HOME: ${{ github.workspace }}/.artifacts/ios-runner-probe/private/agent-device
+      AGENT_DEVICE_STATE_DIR: ${{ github.workspace }}/.artifacts/ios-runner-probe/private/agent-device
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Prepare the private diagnostic collector
+        shell: bash
+        run: |
+          umask 077
+          mkdir -p .artifacts/ios-runner-probe/private
+          cat > .artifacts/ios-runner-probe/private/probe.mjs <<'NODE'
+          import assert from 'node:assert/strict';
+          import { spawnSync } from 'node:child_process';
+          import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+          import { createRequire, findPackageJSON } from 'node:module';
+          import { dirname, join, resolve } from 'node:path';
+          import { pathToFileURL } from 'node:url';
+
+          process.umask(0o077);
+          const root = resolve('.artifacts/ios-runner-probe');
+          const privateRoot = join(root, 'private');
+          const state = join(privateRoot, 'agent-device');
+          const home = state;
+          const reportPath = join(root, 'result.json');
+          const simulatorPath = join(privateRoot, 'simulator.txt');
+          const session = 'vdp-native-acceptance-0';
+          const stages = ['setup', 'prepare', 'open', 'system_snapshot'];
+          const timingKeys = ['adopt_detached_runner', 'cleanup_stale_xcodebuild', 'ensure_booted',
+            'verify_device_readiness', 'verify_host_dev_tools_security', 'cleanup_stale_bundles',
+            'ensure_xctestrun', 'allocate_port', 'prepare_xctestrun_env', 'launch_xcodebuild', 'build_xctestrun'];
+          const codes = ['INVALID_ARGS', 'DEVICE_NOT_FOUND', 'DEVICE_IN_USE', 'TOOL_MISSING',
+            'APP_NOT_INSTALLED', 'UNSUPPORTED_PLATFORM', 'UNSUPPORTED_OPERATION', 'NOT_IMPLEMENTED',
+            'COMMAND_FAILED', 'SESSION_NOT_FOUND', 'UNAUTHORIZED', 'AMBIGUOUS_MATCH', 'REPLAY_DIVERGENCE',
+            'REPAIR_SESSION_EXPIRED', 'REPAIR_COMMIT_FAILED', 'UNKNOWN', 'ERR_ASSERTION', 'PROBE_COMMAND_FAILED'];
+          const reasons = ['daemon_transport_timeout', 'daemon_request_timeout', 'request_canceled',
+            'prepare_deadline_expired', 'runner_start_budget_exhausted', 'runner_launch_budget_exhausted',
+            'runner_main_thread_timeout', 'runner_main_thread_wedged', 'runner_busy', 'runner_busy_refusal',
+            'runner_reply_lost', 'runner_connect_refused', 'runner_endpoint_probe_exhausted',
+            'runner_readiness_preflight_failed', 'runner_cache_uncertifiable', 'runner_process_dead',
+            'runner_reported_failure', 'xcodebuild_exited_early', 'simulator_service_hub_unavailable',
+            'simulator_set_destination_not_found', 'build_failed_unclassified',
+            'startup-exited', 'startup-stalled', 'startup-ceiling'];
+          const enumValue = (value, allowed, fallback = 'unknown') => allowed.includes(value) ? value : fallback;
+          const ms = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 3600000
+            ? Math.round(value) : null;
+          const numericFields = (value, keys) => Object.fromEntries(keys.map(key => [key, ms(value?.[key])]));
+          const safeError = (error, depth = 0) => ({
+            code: enumValue(error?.code, codes),
+            reason: enumValue(error?.details?.reason, reasons),
+            cause_reason: enumValue(error?.details?.causeReason, reasons),
+            runner_error_code: enumValue(error?.details?.runnerErrorCode,
+              ['RUNNER_BUSY', 'MAIN_THREAD_TIMEOUT', 'RUNNER_WEDGED', 'COMMAND_ALREADY_FINISHED', 'IOS_AX_SNAPSHOT_FAILED']),
+            runner_connect_failure_reason: enumValue(error?.details?.runnerConnectFailureReason, reasons),
+            runner_phase: enumValue(error?.details?.phase, ['runner_session', 'runner_rebuild', 'runner_health']),
+            startup_kind: enumValue(error?.details?.kind, ['daemon_startup_failed']),
+            timeout_ms: ms(error?.details?.timeoutMs),
+            startup_timeout_ms: ms(error?.details?.startupTimeoutMs),
+            startup_attempts: Number.isInteger(error?.details?.startupAttempts)
+              && error.details.startupAttempts >= 0 && error.details.startupAttempts <= 2 ? error.details.startupAttempts : null,
+            cause: depth < 2 && error?.cause ? safeError(error.cause, depth + 1) : null,
+          });
+          function safeEvent(value) {
+            const phase = value?.phase;
+            const data = value?.data;
+            if (phase === 'prepare_apple_runner') return { phase,
+              event: enumValue(data?.event, ['readiness_start', 'runner_start', 'settled']),
+              duration_ms: ms(value.durationMs), timeout_ms: ms(data?.timeoutMs), remaining_ms: ms(data?.remainingMs) };
+            if (timingKeys.slice(0, -1).some(key => phase === `ios_runner_startup_${key}`)) {
+              return { phase, duration_ms: ms(value.durationMs) };
+            }
+            if (phase === 'ios_runner_session_startup_timings') return { phase,
+              duration_ms: ms(value.durationMs), ready: typeof data?.ready === 'boolean' ? data.ready : null,
+              command: enumValue(data?.command, ['uptime', 'activate', 'snapshot']),
+              timings: numericFields(data?.timings, timingKeys) };
+            if (phase === 'apple_runner_prepare') return { phase,
+              cache: enumValue(data?.cache, ['exact', 'miss', 'external']),
+              artifact: enumValue(data?.artifact, ['valid', 'rebuilt']),
+              duration_ms: ms(value.durationMs),
+              timings: numericFields(data, ['buildMs', 'connectMs', 'healthCheckMs']) };
+            return null;
+          }
+          function diagnostics(stage) {
+            const path = join(state, 'sessions', session, 'requests', `probe-${stage}.ndjson`);
+            const result = { status: 'missing', malformed_lines: 0, capped: false, events: [] };
+            if (!existsSync(path)) return result;
+            if (statSync(path).size > 8388608) return { ...result, status: 'size_limit', capped: true };
+            result.status = 'read';
+            const lines = readFileSync(path, 'utf8').split('\n');
+            result.capped = lines.length > 10000;
+            for (const line of lines.slice(0, 10000)) {
+              if (!line) continue;
+              if (line.length > 131072) { result.malformed_lines++; continue; }
+              let event;
+              try { event = safeEvent(JSON.parse(line)); }
+              catch { result.malformed_lines++; continue; }
+              if (!event) continue;
+              if (result.events.length >= 128) { result.capped = true; break; }
+              result.events.push(event);
+            }
+            return result;
+          }
+          function safePrepare(value) {
+            return { action: enumValue(value?.action, ['ios-runner']), platform: enumValue(value?.platform, ['ios']),
+              kind: enumValue(value?.kind, ['simulator']), cache: enumValue(value?.cache, ['exact', 'miss', 'external']),
+              artifact: enumValue(value?.artifact, ['valid', 'rebuilt']),
+              timings: numericFields(value, ['durationMs', 'buildMs', 'connectMs', 'healthCheckMs']),
+              total_ms: ms(value?.timing?.totalMs),
+              additive_parts: numericFields(value?.timing?.additiveParts, ['buildMs', 'connectAfterBuildMs', 'healthCheckMs']) };
+          }
+          function safeSnapshot(value) {
+            return { node_count: Array.isArray(value?.nodes) && value.nodes.length <= 1000000 ? value.nodes.length : null,
+              quality: enumValue(value?.snapshotQuality?.state, ['healthy', 'recovered', 'sparse'],
+                value?.snapshotQuality === undefined ? 'absent' : 'unknown'),
+              backend: enumValue(value?.snapshotQuality?.backend, ['tree', 'queries', 'private-ax', 'android-helper']),
+              reason_code: enumValue(value?.snapshotQuality?.reasonCode, ['ax-rejected', 'sparse-tree', 'budget',
+                'no-nodes', 'capture-failed', 'presentation-failed', 'deferred', 'requested-backend']) };
+          }
+          const blank = () => ({ status: 'not_run', duration_ms: null, error: null, result: null, diagnostics: null });
+          const initial = () => ({ schema_version: 1, status: 'not_run', scope: 'sdk-availability-control',
+            source_sha: /^[a-f0-9]{40}$/.test(process.env.GITHUB_SHA ?? '') ? process.env.GITHUB_SHA : null,
+            sdk_version: '0.21.36', mobile_version: '0.12.4',
+            configuration: { runner: 'macos-26', device: 'iPhone 17', sdk_debug: true,
+              home_equals_state: true, session, mobile_wrapper_exercised: false,
+              state_environment: 'before-process-start', production_state_environment: 'after-mobile-static-import',
+              derived_override_set: false, prepare_timeout_override_set: false, snapshot_interactive_only: false },
+            environment: { host_arch: enumValue(process.arch, ['arm64', 'x64']), xcode_version: null,
+              xcode_build: null, simulator_sdk_version: null, simulator_runtime_version: null },
+            ...Object.fromEntries(stages.map(name => [name, blank()])),
+            cleanup: { daemon_stop: 'not_run', simulator_shutdown: 'not_run', simulator_delete: 'not_run', state_removed: false } });
+          let report;
+          function save() { writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 }); }
+          function raw(command, args, quiet = false) {
+            const stdout = quiet ? openSync(join(privateRoot, 'commands.stdout'), 'a', 0o600) : 'pipe';
+            try {
+              const result = spawnSync(command, args, { encoding: 'utf8', maxBuffer: 33554432,
+                stdio: ['ignore', stdout, 2] });
+              if (result.error || result.status !== 0) throw { code: 'PROBE_COMMAND_FAILED' };
+              return result.stdout ?? '';
+            } finally { if (quiet) closeSync(stdout); }
+          }
+          function dependency() {
+            const mobile = createRequire(resolve('package.json')).resolve('@e2e-dev/mobile');
+            const mobilePackage = JSON.parse(readFileSync(join(dirname(mobile), '..', 'package.json'), 'utf8'));
+            const path = findPackageJSON('agent-device', pathToFileURL(mobile));
+            const manifest = JSON.parse(readFileSync(path, 'utf8'));
+            assert.equal(mobilePackage.version, '0.12.4');
+            assert.equal(manifest.version, '0.21.36');
+            return { entry: resolve(dirname(path), manifest.exports['.'].import), cli: resolve(dirname(path), manifest.bin['agent-device']) };
+          }
+          function isolate() {
+            assert.equal(process.env.AGENT_DEVICE_HOME, home);
+            assert.equal(process.env.AGENT_DEVICE_STATE_DIR, state);
+            mkdirSync(state, { recursive: true, mode: 0o700 });
+          }
+          async function stage(name, operation, project = () => null) {
+            const started = performance.now();
+            report[name].status = 'running';
+            save();
+            try {
+              const value = await operation();
+              report[name].result = project(value);
+              report[name].status = 'passed';
+              return true;
+            } catch (error) {
+              report[name].status = 'failed';
+              report[name].error = safeError(error);
+              return false;
+            } finally {
+              report[name].duration_ms = ms(performance.now() - started);
+              try { report[name].diagnostics = diagnostics(name); }
+              catch { report[name].diagnostics = { status: 'unreadable', malformed_lines: 0, capped: false, events: [] }; }
+              save();
+            }
+          }
+          function selfCheck() {
+            const sentinel = 'PRIVATE_SENTINEL_/token/screen/argv';
+            assert.equal(ms(Infinity), null);
+            assert.equal(ms(-1), null);
+            assert.equal(ms('42'), null);
+            assert.equal(ms(3600001), null);
+            assert.equal(safeEvent({ phase: sentinel }), null);
+            const event = safeEvent({ phase: 'prepare_apple_runner', durationMs: 4, message: sentinel,
+              data: { event: sentinel, timeoutMs: 240000, remainingMs: -1, error: sentinel, argv: [sentinel] } });
+            assert.deepEqual(event, { phase: 'prepare_apple_runner', event: 'unknown', duration_ms: 4,
+              timeout_ms: 240000, remaining_ms: null });
+            const error = safeError({ code: sentinel, message: sentinel, details: { reason: sentinel,
+              runnerErrorCode: sentinel, timeoutMs: 42, stderr: sentinel }, cause: { code: 'COMMAND_FAILED',
+              details: { reason: 'daemon_request_timeout' }, message: sentinel } });
+            assert.equal(error.code, 'unknown');
+            assert.equal(error.cause.reason, 'daemon_request_timeout');
+            const prepared = safePrepare({ action: 'ios-runner', runner: { token: sentinel }, message: sentinel,
+              recoveryReason: sentinel, failureReason: sentinel, xctestrunPath: sentinel, durationMs: 8 });
+            const snapshot = safeSnapshot({ nodes: [{ label: sentinel, text: sentinel }],
+              snapshotQuality: { state: 'healthy', backend: 'tree', reason: sentinel }, fallbackScreenshotPath: sentinel });
+            assert.equal(snapshot.node_count, 1);
+            assert.equal(snapshot.quality, 'healthy');
+            assert(!JSON.stringify({ event, error, prepared, snapshot }).includes(sentinel));
+          }
+          const mode = process.argv[2];
+          if (mode === 'self-check') { selfCheck(); process.exit(0); }
+          mkdirSync(privateRoot, { recursive: true, mode: 0o700 });
+          if (mode === 'init') { report = initial(); save(); process.exit(0); }
+          report = JSON.parse(readFileSync(reportPath, 'utf8'));
+          isolate();
+          if (mode === 'run') {
+            let client;
+            let simulator;
+            const setup = await stage('setup', async () => {
+              assert.equal(process.platform, 'darwin');
+              assert.equal(process.arch, 'arm64');
+              assert(!process.env.AGENT_DEVICE_IOS_RUNNER_DERIVED_PATH);
+              assert(!process.env.AGENT_DEVICE_IOS_CLEAN_DERIVED);
+              const xcode = raw('xcodebuild', ['-version']).trim().match(/^Xcode (\d{1,3}(?:\.\d{1,3}){1,2})\s+Build version ([0-9]{1,3}[A-Z][0-9]{1,6}[a-z]?)$/);
+              assert(xcode);
+              report.environment.xcode_version = xcode[1];
+              report.environment.xcode_build = xcode[2];
+              const sdk = raw('xcrun', ['--sdk', 'iphonesimulator', '--show-sdk-version']).trim();
+              assert(/^\d{1,3}(?:\.\d{1,3}){1,2}$/.test(sdk));
+              report.environment.simulator_sdk_version = sdk;
+              const runtimes = JSON.parse(raw('xcrun', ['simctl', 'list', 'runtimes', '--json'])).runtimes
+                .filter(row => row.isAvailable && row.identifier.includes('.SimRuntime.iOS-'));
+              assert(runtimes.length > 0);
+              assert(runtimes.every(row => /^\d{1,3}(?:\.\d{1,3}){1,2}$/.test(row.version)));
+              const order = (a, b) => {
+                const left = a.version.split('.').map(Number), right = b.version.split('.').map(Number);
+                for (let i = 0; i < 3; i++) if ((right[i] ?? 0) !== (left[i] ?? 0)) return (right[i] ?? 0) - (left[i] ?? 0);
+                return 0;
+              };
+              const runtime = runtimes.sort(order)[0];
+              report.environment.simulator_runtime_version = runtime.version;
+              const types = JSON.parse(raw('xcrun', ['simctl', 'list', 'devicetypes', '--json'])).devicetypes;
+              const type = types.find(row => row.name === 'iPhone 17' && row.productFamily === 'iPhone');
+              assert(type);
+              const sdkPackage = dependency();
+              const { createAgentDeviceClient } = await import(pathToFileURL(sdkPackage.entry).href);
+              client = createAgentDeviceClient({ session, debug: true });
+              simulator = raw('xcrun', ['simctl', 'create', `ios-runner-probe-${process.pid}`, type.identifier, runtime.identifier]).trim();
+              assert(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(simulator));
+              writeFileSync(simulatorPath, simulator, { mode: 0o600 });
+              raw('xcrun', ['simctl', 'boot', simulator], true);
+              raw('xcrun', ['simctl', 'bootstatus', simulator, '-b'], true);
+            });
+            const where = { platform: 'ios', udid: simulator };
+            if (setup && await stage('prepare', () => client.command.prepare({ action: 'ios-runner', ...where,
+              requestId: 'probe-prepare' }), safePrepare)) {
+              if (await stage('open', () => client.apps.open({ app: 'com.apple.Preferences', relaunch: true,
+                ...where, requestId: 'probe-open' }))) {
+                await stage('system_snapshot', () => client.capture.snapshot({ interactiveOnly: false,
+                  requestId: 'probe-system_snapshot' }), value => {
+                  const result = safeSnapshot(value);
+                  report.system_snapshot.result = result;
+                  assert(result.node_count > 0 && result.quality !== 'sparse');
+                  return result;
+                });
+              }
+            }
+            report.status = stages.every(name => report[name].status === 'passed') ? 'passed' : 'failed';
+            save();
+            process.exitCode = report.status === 'passed' ? 0 : 1;
+          } else if (mode === 'cleanup') {
+            if (existsSync(join(state, 'daemon.json'))) {
+              try {
+                raw(process.execPath, [dependency().cli, 'daemon', 'stop', '--clean'], true);
+                assert(!existsSync(join(state, 'daemon.json')));
+                report.cleanup.daemon_stop = 'passed';
+              }
+              catch { report.cleanup.daemon_stop = 'failed'; }
+            } else report.cleanup.daemon_stop = 'absent';
+            if (existsSync(simulatorPath)) {
+              const simulator = readFileSync(simulatorPath, 'utf8').trim();
+              assert(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(simulator));
+              for (const [command, key] of [['shutdown', 'simulator_shutdown'], ['delete', 'simulator_delete']]) {
+                try { raw('xcrun', ['simctl', command, simulator], true); report.cleanup[key] = 'passed'; }
+                catch { report.cleanup[key] = 'failed'; }
+              }
+            } else {
+              report.cleanup.simulator_shutdown = 'absent';
+              report.cleanup.simulator_delete = 'absent';
+            }
+            if (report.cleanup.daemon_stop !== 'failed' && report.cleanup.simulator_delete !== 'failed') {
+              rmSync(state, { recursive: true, force: true });
+              report.cleanup.state_removed = !existsSync(state);
+            }
+            const clean = report.cleanup.daemon_stop !== 'failed' && report.cleanup.simulator_delete !== 'failed'
+              && report.cleanup.state_removed;
+            if (!clean || report.status !== 'passed') report.status = 'failed';
+            save();
+            process.exitCode = clean ? 0 : 1;
+          } else throw new Error('Unsupported probe operation');
+          NODE
+          node .artifacts/ios-runner-probe/private/probe.mjs init > .artifacts/ios-runner-probe/private/init.stdout 2> .artifacts/ios-runner-probe/private/init.stderr
+          node .artifacts/ios-runner-probe/private/probe.mjs self-check > .artifacts/ios-runner-probe/private/self-check.stdout 2> .artifacts/ios-runner-probe/private/self-check.stderr
+      - name: Install the frozen root dependencies
+        shell: bash
+        run: |
+          umask 077
+          pnpm install --frozen-lockfile --filter . > .artifacts/ios-runner-probe/private/install.stdout 2> .artifacts/ios-runner-probe/private/install.stderr
+      - name: Probe one cold runner and one Settings snapshot
+        shell: bash
+        run: |
+          umask 077
+          node .artifacts/ios-runner-probe/private/probe.mjs run > .artifacts/ios-runner-probe/private/driver.stdout 2> .artifacts/ios-runner-probe/private/driver.stderr
+      - name: Clean up the probe resources
+        if: always()
+        shell: bash
+        run: |
+          umask 077
+          if [ -f .artifacts/ios-runner-probe/private/probe.mjs ]; then
+            node .artifacts/ios-runner-probe/private/probe.mjs cleanup > .artifacts/ios-runner-probe/private/cleanup.stdout 2> .artifacts/ios-runner-probe/private/cleanup.stderr
+          fi
+      - name: Upload only the fixed diagnostic receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ios-runner-probe-${{ github.sha }}-${{ github.run_attempt }}
+          path: .artifacts/ios-runner-probe/result.json
+          if-no-files-found: error
+          retention-days: 7
