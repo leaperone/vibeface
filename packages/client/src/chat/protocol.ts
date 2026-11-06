@@ -6,8 +6,8 @@ import { asProvider, providerNames, probeIssueText } from '../lib/node.ts'
 import type { ManagerJob, ProviderStage, TurnRuntime, NodeInfo } from '../workspace/types.ts'
 import type { FailureKind } from '../lib/errors.ts'
 
-/** An empty chat's first messages: project questions for a bot with a folder, otherwise what any bot can do from chat. */
-export const starters = { project: ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？'], general: ['你能帮我做什么？', '每天早上 9 点提醒我', '记住：回复用中文'] }
+/** Start with the bot's role and the person's goal, including when it has a project folder. */
+export const starters = { project: ['按你的职责，你能帮我完成什么？', '先帮我理清目标和步骤', '开始前，需要我提供哪些信息？'], general: ['你能帮我完成什么？', '先帮我理清目标和步骤', '记住：回复用中文'] }
 
 type SendGate = {
   hasConversation: boolean

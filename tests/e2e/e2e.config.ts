@@ -6,12 +6,13 @@ const root = resolve(import.meta.dirname, '../..')
 const localArtifacts = resolve(import.meta.dirname, '.artifacts')
 process.env.PLAYWRIGHT_BROWSERS_PATH ??= resolve(localArtifacts, 'browsers');
 const { web } = await import('@e2e-dev/web');
+const browserEndpoint = process.env.VIBEFACE_E2E_BROWSER_ENDPOINT;
 
 export default {
   tests: ['*.e2e.ts'],
   targets: [{
     name: 'chromium',
-    engine: web(),
+    engine: web(browserEndpoint ? { connect: { cdpEndpoint: () => browserEndpoint } } : {}),
     app: {
       url: 'http://127.0.0.1:0',
       readyUrl: 'http://127.0.0.1:{port}/api/info',

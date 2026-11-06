@@ -12,7 +12,7 @@ import { workChecks, type WorkCheck } from "@vibeface/client/workspace/model.ts"
 import { BackOnline, confirmText } from "./task-activity"
 import { ActionButton } from "./present"
 import { QuestionCard } from "./question-card"
-import { agentLaneLabels, contextStages, fixOnDevice, fixOnDeviceLabel, nodeName, parseSummarySteps, progressLabel, promptSummary, queueHoldLabels, schedulerStatus, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, followUp, followUpCopy, type FollowUp, type SummaryStep } from "@vibeface/client/workspace/labels.ts"
+import { agentLaneLabels, contextStages, fixOnDevice, fixOnDeviceLabel, nodeName, parseSummarySteps, progressLabel, promptSummary, queueHoldLabels, schedulerStatus, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskProgress, taskStale, followUp, followUpCopy, type FollowUp, type SummaryStep } from "@vibeface/client/workspace/labels.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import { CopyDiagnostics } from "@/features/identity/device-controls"
@@ -56,6 +56,12 @@ function inertAround(keep: Element) {
  */
 export function TaskDetail({ botId, workId, from }: { botId: string; workId: string; from?: "inbox" | "tasks" }) {
   const workspace = useWorkspace()
+  const activeTask = useRef<{ botId: string; workId: string } | null>({ botId, workId })
+  activeTask.current = { botId, workId }
+  useEffect(() => {
+    activeTask.current = { botId, workId }
+    return () => { activeTask.current = null }
+  }, [botId, workId])
   const { directory } = useDevice()
   const action = useAction()
   const lookup = { nodes: workspace.nodes, directory }
@@ -72,10 +78,21 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const agent = work ? taskAgent(work) : null
   const AgentIcon = agent ? providerIcons[agent] : null
   const progress = workspace.liveProgress.find((item) => item.kind === "native" && item.work_id === workId && item.target_node === device)
+  const progressText = progress?.text?.trim() ?? ""
+  const stale = Boolean(state && taskStale(state, workspace.connectionOnline))
   const plan = parseSummarySteps(work?.summary ?? "")
+  const conciseProgress = plan ? plan.find((step) => step.state === "current")?.text ?? ""
+    : work ? taskProgress(work, workspace.liveProgress).trim().split(/\r?\n/).filter((line) => line.trim()).at(-1) ?? "" : ""
+  const progressStatus = progress?.status && progress.status !== "awaiting_input" ? progressLabel(progress.status) : ""
+  const progressHeadline = taskActive(state) ? conciseProgress || (progressStatus !== "进行中" ? progressStatus : "") : ""
+  const navigate = useNavigate()
+  const askBotCheck = async () => {
+    if (!work || !(await workspace.sendMessage(followUpCopy.check.ask(work.title || "这个任务")))) return
+    if (workspace.isCurrent() && activeTask.current?.botId === botId && activeTask.current.workId === workId) void navigate({ to: "/b/$botId", params: { botId } })
+  }
+  const canAskCheck = workspace.writable && workspace.connectionOnline && !workspace.incomplete && check?.reason !== "offline"
   // Any entry forwards the stop; an unreachable device gets it when it is back.
   const canStop = work && state !== "awaiting_confirmation" && !work.outcome && !work.stop && ["accepted", "running"].includes(work.state)
-  const navigate = useNavigate()
   const leave = from === "inbox" ? { to: "/inbox" as const } : from === "tasks" ? { to: "/tasks" as const } : { to: "/b/$botId" as const, params: { botId } }
   const close = () => void navigate(leave)
   const modal = !useSyncExternalStore(followWidth, () => window.matchMedia(WIDE).matches, () => true)
@@ -122,6 +139,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
         {device ? <span className="flex min-w-0 items-center gap-1.5"><Laptop aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">设备 </span><span className="truncate">{nodeName(device, lookup)}</span></span> : null}
         {work.cwd ? <span className="flex min-w-0 items-center gap-1.5" title={work.cwd}><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project} </span><span className="truncate">{projectName(work.cwd)}</span></span> : null}
       </p> : null}
+      {progressHeadline ? <p className="line-clamp-2 break-words text-meta text-muted-foreground">{stale ? '最近进展：' : ''}{progressHeadline}</p> : null}
       {work.kind === 'task' ? <Details label="协调回合">
         {coordination ? <>
           <p>{!workspace.connectionOnline || workspace.nodes.find((node) => node.device_id === device)?.online === false ? '当前状态未知，显示最近记录' : schedulerStatus(coordination.state).label}{coordination.lane ? ` · ${agentLaneLabels[coordination.lane]}` : ''}</p>
@@ -131,19 +149,22 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
         </> : <p>执行设备尚未提供这个任务的协调回合观察。</p>}
         <p className="text-meta text-muted-foreground">这里显示 Bot 的准备和排队情况，任务结果仍以上面的共享记录为准。</p>
       </Details> : null}
-      {progress?.status && taskActive(state) && progress.status !== "awaiting_input" && progressLabel(progress.status) !== "进行中" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
-      {plan ? <Details label={`最近步骤摘要 · ${plan.length}`} open={taskActive(state)}><SummarySteps steps={plan} /></Details> : !progress?.text && work.summary && taskActive(state) ? <p className="whitespace-pre-wrap break-words">{work.summary}</p> : null}
-      {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}
+      {plan ? <Details label={`最近步骤摘要 · ${plan.length}`} open={taskActive(state)}><SummarySteps steps={plan} /></Details> : null}
+      {taskActive(state) && (progressText || !plan && work.summary) ? <Details label="详细进展"><p className="max-h-[50dvh] overflow-auto whitespace-pre-wrap break-words text-meta">{progressText || work.summary || ""}</p></Details> : null}
       {asked.summary ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">交代的事</h3><p className="break-words">{asked.summary}</p></section> : null}
       {result && !taskActive(state) && !check ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">{failed || !work.result_text ? "原因" : "结果"}</h3>{!failed && work.result_text ? <Markdown text={result} /> : <p className={`whitespace-pre-wrap break-words ${failed ? "text-danger" : ""}`}>{result}</p>}</section> : null}
       {check ? <section className="grid gap-3 rounded-xl border border-warning-border bg-warning-soft p-3">
         <h3 className="flex items-center gap-2 font-medium"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0 text-warning" />还不知道做完没有</h3>
         <p className="text-meta text-muted-foreground">{confirmText(check, nodeName(device, lookup))}</p>
         {check.reason === "offline" ? <BackOnline device={nodeName(device, lookup)} /> : null}
-        <div className="flex flex-wrap justify-end gap-2">
-          <ActionButton disabled={!workspace.writable} action={settle("interrupted")}>没做完</ActionButton>
-          <ActionButton variant="default" disabled={!workspace.writable} action={settle("completed")}>做完了</ActionButton>
-        </div>
+        <ActionButton variant="default" className="w-fit justify-self-end" disabled={!canAskCheck || action.busy !== null} action={askBotCheck}><SearchCheck aria-hidden="true" />先查结果</ActionButton>
+        <Details label="我已自行核对">
+          <p className="text-meta text-muted-foreground">只记录你的核对结论，不会重新执行任务。</p>
+          <div className="flex flex-wrap justify-end gap-2">
+            <ActionButton disabled={!workspace.writable} action={settle("interrupted")}>没做完</ActionButton>
+            <ActionButton variant="default" disabled={!workspace.writable} action={settle("completed")}>做完了</ActionButton>
+          </div>
+        </Details>
       </section> : null}
       {sharing.length && stop ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">会一起停止</h3>
         <ul className="grid gap-1">{sharing.map((item) => <li key={item.work_id} className="flex min-w-0 items-center gap-2"><Link2 aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="truncate">{item.title || "任务"}</span></li>)}</ul></section> : null}
@@ -156,12 +177,13 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
         </div> : <Button type="button" variant="outline" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => setConfirming(true)}><CircleStop aria-hidden="true" />{sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : "停止任务"}</Button>}
         <InlineError error={action.error} />
       </div> : null}
-      {failed || unknown || state === "interrupted" ? <div className="grid gap-2"><div className="flex flex-wrap gap-2">
+      {(!check && (failed || unknown || state === "interrupted")) ? <div className="grid gap-2"><div className="flex flex-wrap gap-2">
         {failed && device && fixOnDevice(work) ? <Button asChild variant="outline"><Link to="/devices/$deviceId" params={{ deviceId: device }}><Settings aria-hidden="true" />{fixOnDeviceLabel(nodeName(device, lookup))}</Link></Button> : null}
         {/* After a failure trying again is the next step; a task the person stopped only offers it. */}
-        <Button type="button" variant={state === "interrupted" ? "outline" : "default"} className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("retry", async () => {
-          if (await workspace.sendMessage(followUpCopy[next].ask(work.title || "这个任务"))) void navigate({ to: "/b/$botId", params: { botId } })
-        })}><BusyIcon busy={action.busy === "retry"} icon={followUpIcons[next]} />{followUpCopy[next].action}</Button>
+        <Button type="button" variant={state === "interrupted" ? "outline" : "default"} className="w-fit" disabled={!workspace.writable || workspace.incomplete || !workspace.connectionOnline || action.busy !== null} onClick={() => void action.run("retry", async () => {
+          if (next === "check") await askBotCheck()
+          else if (await workspace.sendMessage(followUpCopy[next].ask(work.title || "这个任务"))) void navigate({ to: "/b/$botId", params: { botId } })
+        })}><BusyIcon busy={action.busy === "retry"} icon={followUpIcons[next]} />{next === "check" ? "先查结果" : followUpCopy[next].action}</Button>
         </div><InlineError error={action.error} />
       </div> : null}
       <Details>
