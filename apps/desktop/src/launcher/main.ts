@@ -25,6 +25,7 @@ const card = element('card', HTMLElement)
 const headline = element('headline', HTMLHeadingElement)
 const explain = element('explain', HTMLParagraphElement)
 const facts = element('facts', HTMLDListElement)
+const diagnostics = element('diagnostics', HTMLDetailsElement)
 const failure = element('failure', HTMLParagraphElement)
 const actions = element('actions', HTMLDivElement)
 const autoOpen = element('auto-open', HTMLInputElement)
@@ -85,6 +86,7 @@ function paintActions(view: View): void {
 }
 
 function paintFacts(view: View): void {
+  diagnostics.hidden = view.facts.length === 0
   facts.replaceChildren()
   for (const [label, value] of view.facts) {
     const term = document.createElement('dt')

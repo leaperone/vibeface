@@ -39,14 +39,14 @@ const recheck = () => action('recheck', '重新检查')
 
 export function describe(status: LauncherStatus): View {
   const scope = status.attachOnly
-    ? '仅连接模式：这次运行不会启动或停止任何 Core。'
-    : '管理这台电脑上的 Core，并打开它提供的界面。'
+    ? '连接已有的 Vibeface，此入口不会管理其运行。'
+    : '在这台电脑上使用 Vibeface。'
 
   if (status.runtime.kind === 'missing') {
     return {
       tone: 'bad',
       indicator: '运行时缺失',
-      headline: '找不到捆绑的 Core 程序',
+      headline: 'Vibeface 程序不完整',
       explain: status.runtime.detail,
       facts: [['期望路径', status.runtime.corePath]],
       failure: null,
@@ -61,9 +61,9 @@ export function describe(status: LauncherStatus): View {
       return {
         tone: 'idle',
         indicator: '未选择目录',
-        headline: '选择 Core 数据目录',
+        headline: '开始使用 Vibeface',
         explain:
-          '数据目录保存这台设备的身份、配置和本机记录。可以选择已有目录连接正在运行的 Core，也可以选择一个空目录由 Vibeface 初始化。',
+          '选择保存身份、配置和记录的位置。已有 Vibeface 时，选择它正在使用的位置即可连接。',
         facts: [],
         failure: null,
         actions: [choose('选择数据目录…', true)],
@@ -74,14 +74,14 @@ export function describe(status: LauncherStatus): View {
       return {
         tone: 'idle',
         indicator: '尚未初始化',
-        headline: '这个目录还没有 Core 数据',
+        headline: '这个位置还没有配置 Vibeface',
         explain: status.attachOnly
-          ? '仅连接模式不会初始化目录。请选择一个已经在运行 Core 的数据目录。'
-          : '启动时会在这里创建身份与配置，默认网页入口 127.0.0.1:4790，本机会话入口 127.0.0.1:4791。目录中已有的文件不会被改动。',
+          ? '请选择正在运行的 Vibeface 所使用的数据位置。'
+          : '启动会在此位置建立这台电脑的身份与配置，后续设置在 Vibeface 界面完成。',
         facts: [['数据目录', core.dataDir]],
         failure: null,
         actions: status.attachOnly
-          ? [choose('换一个目录'), action('attach', '仅连接已运行的 Core')]
+          ? [choose('换一个目录'), action('attach', '连接已有 Vibeface')]
           : [action('start', '初始化并启动', true), choose('换一个目录')],
         scope,
       }
@@ -90,18 +90,18 @@ export function describe(status: LauncherStatus): View {
       return {
         tone: 'idle',
         indicator: '未运行',
-        headline: 'Core 未在运行',
+        headline: 'Vibeface 尚未启动',
         explain: status.attachOnly
-          ? '仅连接模式不会启动 Core。等这台电脑上的服务启动后再点重新检查。'
-          : '可以由 Vibeface 启动并托管这个 Core；退出 Vibeface 时它会一起正常停止。也可以在别处启动服务后仅连接。',
+          ? '等待这台电脑上的 Vibeface 启动后，再点重新检查。'
+          : '在这台电脑上启动后，即可进入 Vibeface 界面。',
         facts: [
           ['数据目录', core.dataDir],
           ...(core.deviceId ? ([['设备 ID', core.deviceId]] as Array<[string, string]>) : []),
         ],
         failure: null,
         actions: status.attachOnly
-          ? [action('attach', '仅连接已运行的 Core', true), recheck(), choose('换一个目录')]
-          : [action('start', '启动本机 Core', true), action('attach', '仅连接已运行的 Core'), choose('换一个目录')],
+          ? [action('attach', '连接已有 Vibeface', true), recheck(), choose('换一个目录')]
+          : [action('start', '启动 Vibeface', true), action('attach', '连接已有 Vibeface'), choose('换一个目录')],
         scope,
       }
 
@@ -109,30 +109,30 @@ export function describe(status: LauncherStatus): View {
       return {
         tone: 'busy',
         indicator: '正在启动',
-        headline: '正在启动本机 Core',
+        headline: '正在启动 Vibeface',
         explain:
           core.attempts > 0
-            ? `已经向 Core 确认 ${core.attempts} 次运行状态，等它报告就绪后会自动打开界面。`
-            : '已经启动子进程，正在等待它报告运行状态。',
+            ? `已检查 ${core.attempts} 次，仍在等待启动完成。`
+            : '正在等待这台电脑就绪。',
         facts: [['数据目录', core.dataDir]],
         failure: null,
-        actions: [action('open', '打开 Vibeface 窗口', true, true), action('stop', '停止本机 Core', false, true)],
+        actions: [action('open', '打开 Vibeface', true, true), action('stop', '停止在这台电脑运行', false, true)],
         scope,
       }
 
     case 'owned':
       return {
         tone: 'live',
-        indicator: '本机托管',
-        headline: 'Core 正在由 Vibeface 运行',
-        explain: '退出 Vibeface 会一并正常停止这个 Core。关闭窗口只会收起界面，进程继续运行。',
+        indicator: '已启动',
+        headline: 'Vibeface 正在这台电脑运行',
+        explain: '关闭窗口后会在后台继续运行，选择退出时才会停止。',
         facts: [
           ['数据目录', core.dataDir],
           ['设备 ID', core.deviceId],
           ['本机入口', core.origin],
         ],
         failure: null,
-        actions: [action('open', '打开 Vibeface 窗口', true), action('stop', '停止本机 Core'), recheck()],
+        actions: [action('open', '打开 Vibeface', true), action('stop', '停止在这台电脑运行'), recheck()],
         scope,
       }
 
@@ -140,15 +140,15 @@ export function describe(status: LauncherStatus): View {
       return {
         tone: 'live',
         indicator: '已连接',
-        headline: '已连接到这台电脑上的 Core',
-        explain: '这个 Core 不是由 Vibeface 启动的，退出 Vibeface 不会影响它。',
+        headline: '已连接正在运行的 Vibeface',
+        explain: '运行不受此窗口控制，退出 App 后也会保持运行。',
         facts: [
           ['数据目录', core.dataDir],
           ['设备 ID', core.deviceId],
           ['本机入口', core.origin],
         ],
         failure: null,
-        actions: [action('open', '打开 Vibeface 窗口', true), recheck(), choose('换一个目录')],
+        actions: [action('open', '打开 Vibeface', true), recheck(), choose('换一个目录')],
         scope,
       }
 
@@ -157,7 +157,7 @@ export function describe(status: LauncherStatus): View {
         tone: 'bad',
         indicator: '出错',
         headline: '上一步没有完成',
-        explain: '下面是 Core 返回的原因。数据目录和已有服务都没有被改动。',
+        explain: '可以重新检查当前状态，或调整设置后重试。',
         facts: core.dataDir ? [['数据目录', core.dataDir]] : [],
         failure: core.message,
         actions: [recheck(), choose('换一个目录')],

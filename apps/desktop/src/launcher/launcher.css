@@ -464,3 +464,7 @@ input[type='checkbox'][role='switch']:checked::after {
     transition-duration: 1ms !important;
   }
 }
+
+.diagnostics { margin-top: 1.25rem; color: var(--muted-foreground); }
+.diagnostics summary { cursor: pointer; font-size: 0.8rem; }
+.diagnostics summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 4px; }

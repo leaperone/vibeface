@@ -24,7 +24,7 @@ describe('launcher view', () => {
   it('offers initialization for an empty directory and says what will be created', () => {
     const view = toView(status({ kind: 'uninitialized', dataDir: '/tmp/node' }))
     expect(view.actions[0]?.id).toBe('start')
-    expect(view.explain).toContain('127.0.0.1:4791')
+    expect(view.explain).toContain('身份与配置')
   })
 
   it('offers both starting and connecting when a directory is idle', () => {
@@ -43,14 +43,14 @@ describe('launcher view', () => {
     const attached: CoreState = { ...owned, kind: 'attached' }
     expect(ids(owned)).toContain('stop')
     expect(ids(attached)).not.toContain('stop')
-    expect(toView(status(attached)).explain).toContain('不是由 Vibeface 启动')
+    expect(toView(status(attached)).explain).toContain('退出 App 后也会保持运行')
   })
 
-  it('shows Core’s own failure text and never claims the data changed', () => {
+  it('shows the failure and asks to check the current state', () => {
     const view = toView(status({ kind: 'failed', dataDir: '/tmp/node', message: '端口 4790 被占用，可用 --listen 更换' }))
     expect(view.tone).toBe('bad')
     expect(view.failure).toBe('端口 4790 被占用，可用 --listen 更换')
-    expect(view.explain).toContain('没有被改动')
+    expect(view.explain).toBe('可以重新检查当前状态，或调整设置后重试。')
   })
 
   it('hides every start action in a connection-only run', () => {
