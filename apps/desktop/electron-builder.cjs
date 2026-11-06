@@ -32,6 +32,7 @@ const artifactName = `vibeface-desktop-\${version}-${target}.\${ext}`;
 module.exports = {
   appId: 'one.leaper.vibeface.desktop',
   productName: 'Vibeface',
+  protocols: [{ name: 'Vibeface', schemes: ['vibeface'] }],
   copyright: 'LEAPER ONE',
   electronVersion: ELECTRON_VERSION,
   directories: { output, buildResources: path.join(desktop, 'build') },

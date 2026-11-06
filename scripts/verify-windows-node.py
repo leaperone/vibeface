@@ -161,11 +161,13 @@ time.sleep(900)
         self.source.write_text(self.SOURCE, encoding="utf-8")
         self.program = directory / "codex.cmd"
         self.program.write_text(
-            f'@echo off\r\nchcp 65001 >nul\r\n"{sys.executable}" "{self.source}" %*\r\n', encoding="utf-8"
+            '@echo off\r\n"%VIBEFACE_FAKE_PROVIDER_PYTHON%" "%~dp0fake_provider.py" %*\r\n',
+            encoding="ascii",
         )
 
     def environment(self, base):
-        return {**base, "VIBEFACE_FAKE_PROVIDER_MARKS": str(self.marks)}
+        return {**base, "VIBEFACE_FAKE_PROVIDER_MARKS": str(self.marks),
+                "VIBEFACE_FAKE_PROVIDER_PYTHON": sys.executable}
 
     def pids(self):
         found = {}

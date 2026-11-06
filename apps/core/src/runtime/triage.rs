@@ -2013,7 +2013,7 @@ fn rollouts(root: &Path, since_ms: i64) -> Vec<PathBuf> {
     found
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(super) mod tests {
     use super::*;
     use crate::{
@@ -2039,12 +2039,18 @@ pub(super) mod tests {
         config::private_dir(&dir)?;
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
         // A unix socket path must stay short; nothing listens unless a test binds it.
-        let socket = format!(
+        #[cfg(unix)]
+        let socket = PathBuf::from(format!(
             "/tmp/vf-{}.sock",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
-        );
+        ));
+        #[cfg(windows)]
+        let socket =
+            vibeface_bridge::platform::ipc::Endpoint::in_private_dir(&dir, "fixture.sock")?
+                .path()
+                .to_owned();
         configuration.providers.codex_app_server.mode = crate::providers::AppServerMode::System;
-        configuration.providers.codex_app_server.socket = Some(socket.into());
+        configuration.providers.codex_app_server.socket = Some(socket);
         configuration.providers.execution = [crate::providers::Provider::Codex].into();
         configuration.network = network;
         configuration.save(&dir)?;
@@ -2071,7 +2077,7 @@ pub(super) mod tests {
     fn with_agent(node: &Runtime) {
         node.settings.lock().unwrap().manager = Some(crate::config::ManagerSettings {
             provider: crate::providers::Provider::Codex,
-            workspace: "/tmp".into(),
+            workspace: std::env::temp_dir(),
             model: "fixture".into(),
             reasoning_effort: None,
             backup: Default::default(),
@@ -2150,7 +2156,7 @@ pub(super) mod tests {
         Ok(node.post_answer(&network, question, text, None).await?.0)
     }
 
-    type Server = tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>;
+    type Server = tokio_tungstenite::WebSocketStream<vibeface_bridge::platform::ipc::Stream>;
 
     fn named_socket(node: &Runtime) -> PathBuf {
         node.providers()
@@ -2177,8 +2183,11 @@ pub(super) mod tests {
 
     async fn app_server(node: &Runtime) -> Result<(Server, ServerRequest)> {
         use futures_util::SinkExt as _;
-        let listener = tokio::net::UnixListener::bind(named_socket(node))?;
-        let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+        let mut listener = vibeface_bridge::platform::ipc::Listener::bind(
+            &vibeface_bridge::platform::ipc::Endpoint::from_path(&named_socket(node))?,
+        )
+        .await?;
+        let stream = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
         let mut server = tokio_tungstenite::accept_async(stream).await?;
         let initialize = read(&mut server).await;
         let ready = json!({"id":initialize["id"],"result":{"userAgent":"codex/fixture"}});
@@ -2212,20 +2221,25 @@ pub(super) mod tests {
         Ok(())
     }
 
-    fn answering_app_server(node: &Runtime) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
-        scripted_app_server(node, |_| json!({"result":{}}))
+    async fn answering_app_server(
+        node: &Runtime,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
+        scripted_app_server(node, |_| json!({"result":{}})).await
     }
 
     /// An App Server fixture: `answer` gives each request's reply, `{"result":…}` or `{"error":…}`.
-    fn scripted_app_server(
+    async fn scripted_app_server(
         node: &Runtime,
         mut answer: impl FnMut(&Value) -> Value + Send + 'static,
     ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
         use futures_util::{SinkExt as _, StreamExt as _};
-        let listener = tokio::net::UnixListener::bind(named_socket(node))?;
+        let mut listener = vibeface_bridge::platform::ipc::Listener::bind(
+            &vibeface_bridge::platform::ipc::Endpoint::from_path(&named_socket(node))?,
+        )
+        .await?;
         let (sent, received) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
-            let Ok((stream, _)) = listener.accept().await else {
+            let Ok(stream) = listener.accept().await else {
                 return;
             };
             let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
@@ -2263,7 +2277,7 @@ pub(super) mod tests {
         let result = async {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
-            let mut requests = answering_app_server(&node)?;
+            let mut requests = answering_app_server(&node).await?;
             while node.codex.status().await["connection"]["state"] != "connected" {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -2439,7 +2453,8 @@ pub(super) mod tests {
                     }
                     Some("thread/read") => json!({"result":{"thread":{"turns":[]}}}),
                     _ => json!({"result":{}}),
-                })?;
+                })
+                .await?;
             connected(&node).await;
             let network = node.network_id().await?;
             let local = node.identity.device_id()?;
@@ -2560,7 +2575,8 @@ pub(super) mod tests {
                     Some("thread/read") => json!({"result":{"thread":{"turns":[
                         {"id":"u-1","status":"completed","items":[]}]}}}),
                     _ => json!({"result":{}}),
-                })?;
+                })
+                .await?;
             connected(&node).await;
             let network = node.network_id().await?;
             running_work(&node, "w-missed").await?;
@@ -2608,7 +2624,8 @@ pub(super) mod tests {
                     Some("thread/read") => json!({"result":{"thread":{"turns":[
                         {"id":"u-1","status":"inProgress","items":[]}]}}}),
                     _ => json!({"result":{}}),
-                })?;
+                })
+                .await?;
             connected(&node).await;
             let network = node.network_id().await?;
             running_work(&node, "w-held").await?;
@@ -2704,7 +2721,7 @@ pub(super) mod tests {
             }
             let network = b.network_id().await?;
             bot(&b, &admin, "c", "前端", &[]).await?;
-            let mut requests = answering_app_server(&b)?;
+            let mut requests = answering_app_server(&b).await?;
             connected(&b).await;
             running_work(&b, "w-far").await?;
 
@@ -3971,7 +3988,8 @@ pub(super) mod tests {
                     Some("thread/read") => json!({"result":{"thread":{"turns":[
                     {"id":"turn","status":"completed","items":[]}]}}}),
                     _ => json!({"result":{}}),
-                })?;
+                })
+                .await?;
             tokio::time::timeout(Duration::from_secs(5), connected(&node)).await?;
             let network = node.network_id().await?;
             assert_eq!(node.codex.server(), "system");
@@ -4570,10 +4588,13 @@ pub(super) mod tests {
         response: CoordinationReply,
     ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
         use futures_util::{SinkExt as _, StreamExt as _};
-        let listener = tokio::net::UnixListener::bind(named_socket(node))?;
+        let mut listener = vibeface_bridge::platform::ipc::Listener::bind(
+            &vibeface_bridge::platform::ipc::Endpoint::from_path(&named_socket(node))?,
+        )
+        .await?;
         let (sent, received) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok(stream) = listener.accept().await {
                 let sent = sent.clone();
                 tokio::spawn(async move {
                     let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
@@ -5827,11 +5848,14 @@ pub(super) mod tests {
         let (node, admin, dir) = node().await?;
         let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
         let turns = Arc::new(std::sync::Mutex::new(BTreeMap::<String, Value>::new()));
-        let listener = tokio::net::UnixListener::bind(named_socket(&node))?;
+        let mut listener = vibeface_bridge::platform::ipc::Listener::bind(
+            &vibeface_bridge::platform::ipc::Endpoint::from_path(&named_socket(&node))?,
+        )
+        .await?;
         let seen = requests.clone();
         let server = tokio::spawn(async move {
             let mut sessions = tokio::task::JoinSet::new();
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok(stream) = listener.accept().await {
                 let seen = seen.clone();
                 let turns = turns.clone();
                 sessions.spawn(async move {
