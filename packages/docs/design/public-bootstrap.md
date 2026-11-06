@@ -25,7 +25,7 @@ Catalog {
 }
 ```
 
-每个入口与对应 Relay 成对发布，不能把不同服务的网关和 Relay 任意组合。目录最多包含四项，整个签名响应最多 4096 字节，公共地址使用 HTTPS，回环 HTTP 仅用于明确的本机夹具。拒绝凭证、查询、fragment、超长地址、过期数据和错误签名。
+每个入口与对应 Relay 成对发布，不能把不同服务的网关和 Relay 任意组合。目录最多包含四项，有效期最多七天，整个签名响应最多 4096 字节，每个 origin 最多 256 字节。公共地址使用 HTTPS，回环 HTTP 仅用于明确的本机夹具。拒绝凭证、查询、fragment、未知字段、超长地址、过期数据和错误签名。
 
 Discovery 的 UDP 协议增加目录查询和接入许可请求。HTTPS 对应 `GET /bootstrap/catalog` 和 `POST /bootstrap/grant`。HTTPS 接口由同一个 Discovery 实例提供，可通过现有公网入口反代；网页代码、连接网关和 Relay 可以使用同一域名。
 

@@ -2,9 +2,18 @@ import assert from 'node:assert/strict';
 import { lstat, readFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import { test as base } from '@e2e-dev/web';
+import publicBootstrap from '../../config/public-bootstrap.json' with { type: 'json' };
 
 const root = resolve(import.meta.dirname, '../..');
 const artifacts = resolve(root, '.artifacts/e2e');
+base.beforeEach(async ({ browser }) => {
+  await browser.route(`${publicBootstrap.https_base}/**`, route => route.abort());
+  await browser.addInitScript(() => {
+    if (location.protocol !== 'http:' && location.protocol !== 'https:') return;
+    const key = 'vibeface.bootstrap-public-mode';
+    if (localStorage.getItem(key) === null) localStorage.setItem(key, 'off');
+  });
+});
 export type NodeInfo = { url: string; peer: string; directory: string };
 type Role = 'source' | 'receiver' | 'provider';
 type Control = (request: Record<string, unknown>) => Promise<unknown>;
