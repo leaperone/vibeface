@@ -28,7 +28,7 @@
           "_vibeface._udp"
         ]
       },
-      "buildNumber": "2"
+      "buildNumber": "3"
     },
     "android": {
       "package": "one.leaper.vibeface",
@@ -43,7 +43,7 @@
         "android.permission.ACCESS_WIFI_STATE",
         "android.permission.CHANGE_WIFI_MULTICAST_STATE"
       ],
-      "versionCode": 250002
+      "versionCode": 250003
     },
     "plugins": [
       "expo-router",
@@ -117,7 +117,7 @@
       ]
     ],
     "extra": {
-      "releaseVersion": "0.0.1-nightly.20261106.1"
+      "releaseVersion": "0.0.1-nightly.20261106.2"
     }
   }
 }
