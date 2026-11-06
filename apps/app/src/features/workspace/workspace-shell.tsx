@@ -214,7 +214,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
         {/* Kept laid out while hidden so the chat keeps its scroll position across pages. */}
         <div className={cn("flex min-h-0 min-w-0 flex-1", !chatRoute && "invisible absolute inset-x-0 top-14 bottom-0")} inert={!chatRoute} aria-hidden={!chatRoute || undefined}>
-          <div className="conversation-view"><ConversationScreen missing={missingBot} /></div>
+          <div className="conversation-view"><ConversationScreen missing={missingBot} active={/^\/b\/[^/]+\/?$/.test(pathname) && !missingBot} /></div>
           {chatRoute ? children : null}
         </div>
         {chatRoute ? null : <div className="workspace-screen">{children}</div>}
