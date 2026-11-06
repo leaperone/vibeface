@@ -31,7 +31,7 @@ description: 按应用 tag 发布 Vibeface 到 Stable、RC 或 Nightly，并核�
 
 协调器从原 run.created_at 固定 UTC 日期，先恢复 `bot/daily-nightly/YYYYMMDD` 的唯一 PR、版本和真实 squash SHA。即使业务源码未变化，每日仍递增五应用 Nightly，保留 marketing version、iOS buildNumber 和依赖解析结果。版本 PR 只允许机械版本字段、两个 Cargo.lock 本仓包版本、CLI 组件 tag 和 Android versionCode。PAT 只用于 PR 创建与普通立即 squash；PAT 没有路径级权限，限制由受信脚本的完整 tree、仓库、作者、base、head 校验执行。普通 GITHUB_TOKEN 处理分支、只创建的 tag 和精确 dispatch。
 
-合并后仅实际 SHA 的 main push CI success 放行。Core/App 公开下载验证后才发 CLI；Nightly 不发站、不公开 npm、不做 iOS。失败或响应未知先对账，只从原 run 完整 artifact 重跑失败 publisher，不能重建后覆盖。artifact 丢失、过期或存在字节冲突时停止。重跑原 schedule run 即可恢复原日任务，不另建版本 PR，不重新分配同日版本。不要在人工发版会话中无授权调用此自动协调入口。
+合并后仅实际 SHA 的 main push CI success 放行。Core/App 公开下载验证后才发 CLI；CLI Nightly 自动发布 npm，Nightly 不发站、不做 iOS。失败或响应未知先对账，只从原 run 完整 artifact 重跑失败 publisher，不能重建后覆盖。npm 失败使每日协调器失败，不自动重试；对账后重跑原 release run 的失败 job，复用原 npm artifact id。artifact 丢失、过期或存在字节冲突时停止。重跑原 schedule run 即可恢复原日任务，不另建版本 PR，不重新分配同日版本。不要在人工发版会话中无授权调用此自动协调入口。
 
 ## 准备并验证版本
 
@@ -85,7 +85,7 @@ App 的公网入口是 `https://app.vibeface.dev`。Stable App tag 的归档发�
 
 www Stable 还要跟踪 `leaperone/leaperone-releases` 的 `deploy-vibeface-www.yml`。该 workflow 的标题包含 `src=<SOURCE_SHA>`，用它匹配源码；其 `headSha` 属于部署仓库，不能拿来与 Vibeface 源码比较。确认下游部署成功后再检查 `www.vibeface.dev` 的实际页面。源码仓库 dispatch 成功不代表网站已经上线。
 
-npm 使用 [npm-publish.yml](../../../.github/workflows/npm-publish.yml)，当前仅支持 CLI Nightly。它不随 tag 自动公开发布：先验证同 tag 产物并 dry run，只有授权包含 npm 发布时才执行 publish。不要索取聊天凭证。
+npm 使用 [npm-publish.yml](../../../.github/workflows/npm-publish.yml)，当前仅支持 CLI Nightly。`release.yml` 在 `publish-native` 成功后自动调用它，以原 immutable artifact id 验证源码与包，再通过 OIDC 公开发布。npm trust 须分别允许调用方 `release.yml` 与手动入口 `npm-publish.yml`，均绑定 `npm-release` environment。手动入口默认 dry run，实际发布须显式 `publish=true`，不得配置长期 npm token 或索取聊天凭证。配置命令和 registry 对账规则见 [发布说明](../../../packages/docs/releasing.md#npm-nightly-制品与发布)；仓库改动不代表远端 trust 已生效或真实 OIDC 发布已验收。
 
 Mobile 的 TestFlight、App Store、OTA 和真机安装不由当前 tag 流程完成。按用户明确指定的平台另行处理，不能把 Android APK 或 CI 成功报告成 iOS 已交付。
 

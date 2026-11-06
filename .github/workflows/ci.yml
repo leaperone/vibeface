@@ -102,6 +102,7 @@ jobs:
           node --check apps/cli/npm/bin/vibeface.mjs
           node --check scripts/package-npm.mjs
           node scripts/package-npm.mjs --self-test
+          node scripts/publish-npm.mjs --self-test
       - run: cargo fmt --all -- --check
 
   www:
