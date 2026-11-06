@@ -130,6 +130,8 @@ pub struct AgentEvent {
     pub session_id: String,
     /// The turn's ID. Claude Code has none: `tx:<transcript bytes>`, and for a permission request
     /// also a hash of the tool and its input.
+    /// App Server requests use `request:<id>` for deduplication; their verified
+    /// `HeldRequest.session_turn` carries the real native turn.
     pub turn_id: String,
     pub cwd: String,
     pub repo: Option<String>,

@@ -2244,13 +2244,22 @@ impl Store {
         job: &SchedulerJob,
         thread: &str,
     ) -> Result<bool> {
-        match self.native_input_target(network, &job.conversation_id, thread, "")? {
-            Some(crate::workspace::InputTarget::Work { work_id }) => {
-                self.scheduler_work_in_scope(network, job, &work_id)
-            }
-            Some(target) => Ok(target_scope(&target) == job.scope),
-            None => Ok(job.scope == SessionScope::Main),
+        let targets = self.native_input_targets(network, &job.conversation_id, thread, "")?;
+        if targets.is_empty() {
+            return Ok(job.scope == SessionScope::Main);
         }
+        for target in targets {
+            let in_scope = match target {
+                crate::workspace::InputTarget::Work { work_id } => {
+                    self.scheduler_work_in_scope(network, job, &work_id)?
+                }
+                target => target_scope(&target) == job.scope,
+            };
+            if !in_scope {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn scheduler_scope_events(

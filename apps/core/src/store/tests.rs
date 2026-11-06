@@ -6096,9 +6096,43 @@ fn main_projection_excludes_task_channel_and_unknown_replies() -> Result<()> {
             },
             12,
         )?;
+        assert_eq!(
+            origin.native_input_target(
+                &net.network,
+                "c",
+                "main-native-thread",
+                &format!("main-native-turn-{index}")
+            )?,
+            Some(InputTarget::Work {
+                work_id: work.work_id.clone()
+            })
+        );
+        if index == 0 {
+            let mut own_job = main_job.clone();
+            own_job.scope = SessionScope::Task {
+                work_id: work.work_id,
+            };
+            assert!(origin.scheduler_native_in_scope(
+                &net.network,
+                &own_job,
+                "main-native-thread"
+            )?);
+        }
     }
     assert!(origin.scheduler_native_in_scope(&net.network, &main_job, "main-native-thread")?);
     assert!(!origin.scheduler_native_in_scope(&net.network, &task_job, "main-native-thread")?);
+    let mut own_job = main_job.clone();
+    own_job.scope = SessionScope::Task {
+        work_id: "main-native-work-0".into(),
+    };
+    assert!(!origin.scheduler_native_in_scope(&net.network, &own_job, "main-native-thread")?);
+    assert!(
+        origin
+            .native_input_target(&net.network, "c", "main-native-thread", "")
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting input targets")
+    );
     let conflicting = WorkSpec {
         work_id: "conflicting-native-work".into(),
         trigger: "message:m1".into(),
@@ -6268,6 +6302,218 @@ fn main_projection_excludes_task_channel_and_unknown_replies() -> Result<()> {
         replica.scheduler_jobs("c")?.is_empty(),
         "sync never schedules a private input"
     );
+    Ok(())
+}
+
+#[test]
+fn native_targets_require_one_exact_work_or_one_shared_task_target() -> Result<()> {
+    use crate::workspace::{InputIntent, InputTarget, WorkspaceCommand};
+    for case in ["main", "lineage", "task", "channel", "unknown", "foreign"] {
+        let (net, mut origin) = workspace_fixture()?;
+        let local = net.a.device_id()?;
+        let scoped = matches!(case, "task" | "channel");
+        if case == "channel" {
+            workspace_command_fixture(
+                &net,
+                &mut origin,
+                "channel",
+                WorkspaceCommand::CreateChannel {
+                    channel_id: "native-channel".into(),
+                    title: "native channel".into(),
+                    purpose: "shared native target".into(),
+                    members: vec!["bot".into()],
+                    coordinator_bot: "bot".into(),
+                    coordinator_node: local.clone(),
+                },
+                3,
+            )?;
+        }
+        if scoped {
+            let mut command = workspace_task_command("native-task", None);
+            if case == "channel"
+                && let WorkspaceCommand::CreateTask { channel_id, .. } = &mut command
+            {
+                *channel_id = Some("native-channel".into());
+            }
+            workspace_command_fixture(&net, &mut origin, "task", command, 4)?;
+        }
+        let expected = match case {
+            "task" => InputTarget::Task {
+                task_id: "native-task".into(),
+            },
+            "channel" => InputTarget::ChannelTask {
+                channel_id: "native-channel".into(),
+                task_id: "native-task".into(),
+                bot_id: "bot".into(),
+            },
+            _ => InputTarget::Work {
+                work_id: "native-first".into(),
+            },
+        };
+        let input = net.a.fixture_admin().attest(
+            &net.network,
+            "c",
+            EventBody::InputPosted {
+                message_id: "native-source".into(),
+                target: if scoped {
+                    expected.clone()
+                } else {
+                    InputTarget::BotMain {
+                        bot_id: "bot".into(),
+                    }
+                },
+                intent: InputIntent::Continue,
+                sequence: 1,
+                expected_revision: scoped.then_some(1),
+                text: "native source".into(),
+                attachments: vec![],
+                report_results: Some(true),
+                attestation: None,
+            },
+        )?;
+        origin.append_event(&net.a, &net.network, "c", input, vec![], 5)?;
+        super::scheduler::admit_from(
+            &origin.connection,
+            &net.network,
+            "c",
+            "message:native-source",
+            TriggerKind::Human,
+            "native-source",
+        )?;
+        let source_job = origin
+            .scheduler_job("c", "message:native-source")?
+            .context("native source job")?;
+        let add = |store: &mut Store, id: &str, conversation: &str, trigger: &str| -> Result<()> {
+            store.accept_work_fixture(
+                &net.a,
+                &net.network,
+                WorkSpec {
+                    work_id: id.into(),
+                    conversation: conversation.into(),
+                    trigger: trigger.into(),
+                    target: local.clone(),
+                    dispatcher: local.clone(),
+                    call_ref: id.into(),
+                    kind: WorkKind::Agent(Provider::Codex),
+                    model: None,
+                    resolved: ResolvedModel {
+                        provider: Provider::Codex,
+                        model: None,
+                    },
+                    cwd: "/workspace/native".into(),
+                    title: id.into(),
+                    prompt: id.into(),
+                    continues: None,
+                    parent: None,
+                    thread: Some("exact-native-thread".into()),
+                },
+                6,
+            )?;
+            store.apply_work_signal(
+                &net.a,
+                &net.network,
+                id,
+                Signal::TurnStarted {
+                    turn_id: "exact-native-turn".into(),
+                    epoch: 1,
+                },
+                7,
+            )?;
+            assert_eq!(
+                store
+                    .work_record(id)?
+                    .context("registered native work")?
+                    .state
+                    .handle()
+                    .map(|handle| handle.turn_id.as_str()),
+                Some("exact-native-turn")
+            );
+            Ok(())
+        };
+        add(&mut origin, "native-first", "c", "message:native-source")?;
+        assert_eq!(
+            origin.native_input_target(
+                &net.network,
+                "c",
+                "exact-native-thread",
+                "exact-native-turn"
+            )?,
+            Some(expected.clone()),
+            "{case}: the single genuine binding is visible"
+        );
+        assert_eq!(
+            origin.native_input_target(&net.network, "c", "exact-native-thread", "wrong-turn")?,
+            None,
+            "{case}: an unknown turn never borrows Main"
+        );
+        if case == "foreign" {
+            second_bot(&mut origin, &net, "Foreign")?;
+        }
+        add(
+            &mut origin,
+            "native-second",
+            if case == "foreign" { "d" } else { "c" },
+            if case == "lineage" {
+                "task:native-first"
+            } else if case == "unknown" {
+                "message:missing"
+            } else {
+                "message:native-source"
+            },
+        )?;
+        let target = origin.native_input_target(
+            &net.network,
+            "c",
+            "exact-native-thread",
+            "exact-native-turn",
+        );
+        if scoped || case == "lineage" {
+            assert_eq!(
+                target?,
+                Some(expected),
+                "{case}: only the same exact Task target converges"
+            );
+            assert!(origin.scheduler_native_in_scope(
+                &net.network,
+                &source_job,
+                "exact-native-thread"
+            )?);
+            if case == "lineage" {
+                let mut own_job = source_job.clone();
+                own_job.scope = SessionScope::Task {
+                    work_id: "native-first".into(),
+                };
+                assert!(origin.scheduler_native_in_scope(
+                    &net.network,
+                    &own_job,
+                    "exact-native-thread"
+                )?);
+                assert!(!super::scope_projection::work_is_main_from(
+                    &origin.connection,
+                    &net.network,
+                    "c",
+                    "native-second"
+                )?);
+            }
+        } else {
+            let error = target.unwrap_err().to_string();
+            assert!(
+                error.contains(match case {
+                    "unknown" => "unknown input target",
+                    "foreign" => "another conversation",
+                    _ => "conflicting input targets",
+                }),
+                "{case}: {error}"
+            );
+            let in_scope =
+                origin.scheduler_native_in_scope(&net.network, &source_job, "exact-native-thread");
+            if case == "main" {
+                assert!(in_scope?);
+            } else {
+                assert!(in_scope.is_err(), "{case}: invalid bindings stay rejected");
+            }
+        }
+    }
     Ok(())
 }
 

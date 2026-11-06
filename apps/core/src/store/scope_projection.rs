@@ -411,6 +411,24 @@ impl Store {
         thread: &str,
         turn: &str,
     ) -> Result<Option<InputTarget>> {
+        let mut target = None;
+        for candidate in self.native_input_targets(network, conversation, thread, turn)? {
+            ensure!(
+                target.as_ref().is_none_or(|target| target == &candidate),
+                "native session has conflicting input targets"
+            );
+            target.get_or_insert(candidate);
+        }
+        Ok(target)
+    }
+
+    pub(super) fn native_input_targets(
+        &self,
+        network: &str,
+        conversation: &str,
+        thread: &str,
+        turn: &str,
+    ) -> Result<Vec<InputTarget>> {
         let foreign: bool = self.connection.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM scheduler_sessions WHERE native_id=?1 AND conversation_id<>?2
@@ -504,49 +522,51 @@ impl Store {
         for work_id in work_ids {
             candidates.push(InputTarget::Work { work_id });
         }
-        let mut target = None;
+        let mut targets = Vec::new();
         let mut scope = None;
         for candidate in candidates {
-            let (candidate, main_work) = match candidate {
+            let candidate = match candidate {
                 InputTarget::Work { work_id } => match target_from(
                     &self.connection,
                     network,
                     conversation,
                     Source::Work(work_id.clone()),
                 )? {
-                    Destination::Scoped(target) => (target, false),
-                    Destination::Main(_) => (InputTarget::Work { work_id }, true),
+                    Destination::Scoped(target) => target,
+                    Destination::Main(_) => InputTarget::Work { work_id },
                     Destination::Unknown => bail!("native work has an unknown input target"),
                 },
-                candidate => (candidate, false),
+                candidate => candidate,
             };
-            let candidate_scope = if main_work {
-                SessionScope::Main
-            } else {
-                match &candidate {
-                    InputTarget::BotMain { .. } | InputTarget::ChannelMember { .. } => {
-                        SessionScope::Main
+            let candidate_scope = match &candidate {
+                InputTarget::BotMain { .. } | InputTarget::ChannelMember { .. } => {
+                    SessionScope::Main
+                }
+                InputTarget::Task { task_id } | InputTarget::ChannelTask { task_id, .. } => {
+                    SessionScope::WorkspaceTask {
+                        task_id: task_id.clone(),
                     }
-                    InputTarget::Task { task_id } | InputTarget::ChannelTask { task_id, .. } => {
-                        SessionScope::WorkspaceTask {
-                            task_id: task_id.clone(),
+                }
+                InputTarget::Work { work_id } => {
+                    if work_is_main_from(&self.connection, network, conversation, work_id)? {
+                        SessionScope::Main
+                    } else {
+                        SessionScope::Task {
+                            work_id: work_id.clone(),
                         }
                     }
-                    InputTarget::Work { work_id } => SessionScope::Task {
-                        work_id: work_id.clone(),
-                    },
-                    InputTarget::Routine { trigger, .. } => SessionScope::Routine {
-                        trigger: trigger.clone(),
-                    },
                 }
+                InputTarget::Routine { trigger, .. } => SessionScope::Routine {
+                    trigger: trigger.clone(),
+                },
             };
             ensure!(
                 scope.as_ref().is_none_or(|scope| scope == &candidate_scope),
                 "native session has conflicting scope bindings"
             );
             scope = Some(candidate_scope);
-            target.get_or_insert(candidate);
+            targets.push(candidate);
         }
-        Ok(target)
+        Ok(targets)
     }
 }

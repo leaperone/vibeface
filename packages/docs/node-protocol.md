@@ -240,6 +240,8 @@ Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, 
 
 本人普通输入使用 `InputPosted`。`message` 请求必需携带 `target`、`intent`、目标内 `sequence`，Task 修改还核验 `expected_revision`。实际提交目标为 Bot Main、稳定业务 Task、已登记 Work、Routine 或频道 Task。界面的频道成员目标先由客户端创建并绑定稳定 Task，再以 channel_task 提交；message 不直接接受 channel_member。签名覆盖目标、意图、顺序、revision、正文、完整附件和汇报选项。审批回答仍使用绑定原 `question_id` 的签名 `MessagePosted`，不能由普通输入冒充。
 
+连接身份绑定或会话权限检查失败仍返回 RPC 错误。进入 `message` 处理后的未保存拒绝返回 `{accepted:false, code:"input_not_saved", stored:false, message_id, reason}`。同一消息 ID 已有内容冲突时返回 `code:"input_conflict"` 和 `stored:true`，保留原记录。`accepted:true` 表示输入已保存，执行阶段仍以 `receipt` 为准。
+
 `workspace_command` 持久化频道、任务、Assignment 和队列控制命令。相同 command ID 回读原结果，改变内容须换 ID。 ControlInput 在追加前明确因 CAS 或资格校验被拒绝时，返回 `{accepted:false, code:"workspace_command_not_saved", stored:false, command_id, reason}`。该证据只表示这次控制命令未保存，不授予重发输入的权限。客户端绑定确切控制 ID 后重新查询原输入；IO、提交或转发结果不明时保留原控制身份继续对账。`workspace_state` 与 `workspace_history` 是有界共享投影，保留截断说明和已核验发言身份。`scope_context` 返回确切目标的本机编译来源与省略数量，`input_receipt` 返回该消息的逐阶段证据。Main 快照只包含 Main 消息和私有 job 投影；`scope_jobs` 另供明确目标选择，不携带原始提示、错误正文或私密会话内容。 `input_receipt.control_event` 是确切输入控制事件的哈希，不可达时为 null。`retry_safe=true` 必须带有效控制引用，未知结果始终为 false。
 
 调度 job 以 `(conversation_id, trigger)` 为键，`trigger` 为 `message:<message_id>`、`work:<work_id>`、`task:<work_id>`、`assignment:<assignment_id>`、`schedule:<schedule_id>:<slot_ms>` 或 `bot_message:<message_id>`，重试和同步都不会产生第二个 job。`message` 返回 `accepted`、`state`、`trigger`、`message_id` 和 `receipt`：
@@ -349,7 +351,7 @@ Event {
 | `work_progress` | `work_id`、`phase`、`summary`、`thread_id?`、`turn_id?` | 目标 Node |
 | `work_finished` | `work_id`、`outcome`、`result_text`、`failure_reason?`、`failure?`、`attestation?` | 目标 Node，本人结清时由入口写 |
 | `notification_acked` | `notification_id`、`client_id`、`attestation` | 入口 Node |
-| `question_asked` | `question_id`、`severity`、`text`、`choices: [{label}]`、`about {node, agent, session_id, cwd, summary, request_id?}`、`attention {kind, device_id}`（必填） | 提问的 Node；写在拥有该会话的 Bot 会话 |
+| `question_asked` | `question_id`、`target?`、`severity`、`text`、`choices: [{label, action?}]`、`about {node, agent, session_id, cwd, summary, request_id?}`、`attention {kind, device_id}`（必填） | 提问的 Node；写在拥有该会话的 Bot 会话；原生审批动作仅为 `allow_once` 或 `deny` |
 | `question_closed` | `question_id`、`reason`（`request_lost`） | 提问且挂着该请求的 Node，写在提问所在会话；其他作者的关闭不计入。已有回答时回答为准，与到达顺序无关；关闭后回答被拒绝 |
 | `session_attributed` | `node`、`agent`、`session_id`、`cwd`、`summary` | 运行该会话的 Node，写在接手 Bot 的会话；rank 最大者为准 |
 | `session_muted` | `node`、`session_id` | 运行该会话的 Node，写在当前接手 Bot 的会话：不再关注，新的 `session_attributed` 撤销 |

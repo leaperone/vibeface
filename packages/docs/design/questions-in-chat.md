@@ -129,7 +129,7 @@ Agent 侧（CLI → `/api/triage`）：
 用户侧 RPC：
 
 - `questions`：全网未回答问题，含所属会话与 Bot 名。
-- `answer { question_id, text, attestation }`：写回答消息。会话问题按普通消息准入或转交调度 Node；同一问题已有不同回答时返回已有回答，`status = "already_answered"`。
+- `answer { question_id, text, attestation }`：写回答消息。普通问题按原目标准入 Answer 轮或转交调度 Node；挂起的原生请求走独立控制队列，基础审批不新建普通 Answer 轮。同一问题已有不同回答时返回已有回答，`status = "already_answered"`。
 - `conversation` 快照新增 `questions`（含回答）和 `sessions`（归给本 Bot 的外来会话 `{node, agent, session_id, cwd, summary, muted, created_at_ms}`）。
 - `bots` 返回 `primary`，即主 Bot 的会话 ID，没有 Bot 时为 `null`。
 - `set_primary_bot { conversation_id, attestation }`：本人选定主 Bot，签名事件体为 `{"type":"primary_bot_set", conversation_id}`，scope 为 `bots`。

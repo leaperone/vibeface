@@ -1585,7 +1585,7 @@ impl Runtime {
                     .status
                     .as_ref()
                     .map_or("completed", |status| status.as_str());
-                let event = AgentEvent {
+                let mut event = AgentEvent {
                     source: triage::Source::AppServer,
                     agent: Provider::Codex,
                     event: triage::Kind::TurnEnd,
@@ -1599,6 +1599,33 @@ impl Runtime {
                 };
                 let node = self.clone();
                 tokio::spawn(async move {
+                    // Another CLI connection may have created the thread before this observer joined.
+                    if event.cwd.is_empty()
+                        && node.manager().is_some()
+                        && let Ok(Ok(reply)) = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            node.codex.client().request(
+                                "thread/read",
+                                json!({"threadId":event.session_id,"includeTurns":false}),
+                            ),
+                        )
+                        .await
+                        && reply["thread"]["id"].as_str() == Some(event.session_id.as_str())
+                    {
+                        if !triage::interactive_codex(&reply["thread"]["source"], None) {
+                            let mut background = lock(&node.triage.background);
+                            if background.len() > 1024 {
+                                background.clear();
+                            }
+                            background.insert(event.session_id.clone());
+                        }
+                        if let Some(cwd) = reply["thread"]["cwd"]
+                            .as_str()
+                            .filter(|cwd| !cwd.is_empty() && cwd.len() <= 4096)
+                        {
+                            event.cwd = cwd.into();
+                        }
+                    }
                     if let Err(error) = node.ingest_agent_event(event).await {
                         tracing::debug!(%error, "App Server turn was not triaged");
                     }
@@ -2221,14 +2248,32 @@ impl Runtime {
                     .context("no bot owns this session")?,
             };
             if event.node == self.identity.device_id()?
-                && let EventBody::QuestionAsked { target, .. } = &mut question
+                && let EventBody::QuestionAsked { target, about, .. } = &mut question
             {
-                *target = store.native_input_target(
-                    network,
-                    &owner,
-                    &event.session_id,
-                    &event.turn_id,
-                )?;
+                let native_turn = if matches!(&event.source, triage::Source::AppServer)
+                    && event.request_id.is_some()
+                {
+                    event.request_id.as_deref().and_then(|id| {
+                        lock(&self.triage.requests)
+                            .get(id)
+                            .filter(|request| {
+                                request.request_id == id
+                                    && about.request_id.as_deref() == Some(id)
+                                    && request.provider == event.agent
+                                    && request.session_id == event.session_id
+                                    && !request.session_turn.is_empty()
+                                    && matches!(&request.reply, Reply::AppServer { .. })
+                            })
+                            .map(|request| request.session_turn.clone())
+                    })
+                } else {
+                    Some(event.turn_id.clone())
+                };
+                *target = if let Some(native_turn) = native_turn {
+                    store.native_input_target(network, &owner, &event.session_id, &native_turn)?
+                } else {
+                    None
+                };
             }
             let (asked, written) =
                 store.ask(&self.identity, network, &owner, question, now_ms())?;
@@ -4306,6 +4351,186 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn native_request_questions_use_the_real_work_turn_without_merging_requests() -> Result<()>
+    {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "Native target", &[]).await?;
+            running_work(&node, &admin, "native-target-work").await?;
+            let network = node.network_id().await?;
+            for item in ["first", "second"] {
+                node.on_codex_request(&handed(
+                    71,
+                    "item/commandExecution/requestApproval",
+                    json!({"threadId":"t-9","turnId":"u-1","itemId":item,"command":"fixture"}),
+                ))
+                .await;
+            }
+            let events = node.triage_command(json!({"action":"events"})).await?["events"]
+                .as_array()
+                .context("native events")?
+                .clone();
+            assert_eq!(events.len(), 2);
+            assert_ne!(events[0]["event_id"], events[1]["event_id"]);
+            assert_ne!(events[0]["request_id"], events[1]["request_id"]);
+            let mut questions = Vec::new();
+            for event in events {
+                assert_eq!(
+                    event["turn_id"],
+                    format!("request:{}", event["request_id"].as_str().context("request ID")?),
+                    "the event keeps its per-request deduplication key"
+                );
+                let raised = node
+                    .triage_command(json!({"action":"raise","event_id":event["event_id"],
+                        "severity":"urgent","question":"allow fixture?","request_id":event["request_id"]}))
+                    .await?;
+                let card = node.store.lock().await.question(
+                    &network,
+                    raised["question_id"].as_str().context("native question")?,
+                )?.context("saved native question")?;
+                assert_eq!(card["target"], json!({"kind":"work","work_id":"native-target-work"}));
+                assert_eq!(card["about"]["request_id"], event["request_id"]);
+                questions.push(card["question_id"].clone());
+            }
+            assert_ne!(questions[0], questions[1], "two items in one turn ask independently");
+            assert_eq!(unanswered(&node).await?.len(), 2);
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn native_question_targets_require_matching_held_sources_and_keep_hook_turns()
+    -> Result<()> {
+        for case in [
+            "missing-held",
+            "missing-event-request",
+            "missing-about-request",
+            "wrong-held-id",
+            "wrong-event-request",
+            "wrong-about-request",
+            "provider",
+            "thread",
+            "node",
+            "missing-turn",
+            "unknown-turn",
+            "transport",
+            "hook",
+            "held-hook",
+        ] {
+            let (node, admin, dir) = node().await?;
+            let result = async {
+                with_agent(&node);
+                bot(&node, &admin, "c", "Native source", &[]).await?;
+                running_work(&node, &admin, "native-source-work").await?;
+                let network = node.network_id().await?;
+                node.on_codex_request(&handed(
+                    72,
+                    "item/commandExecution/requestApproval",
+                    json!({"threadId":"t-9","turnId":"u-1","itemId":"source","command":"fixture"}),
+                ))
+                .await;
+                let mut event: AgentEvent = serde_json::from_value(
+                    node.triage_command(json!({"action":"events"})).await?["events"][0].clone(),
+                )?;
+                let id = event.request_id.clone().context("held request")?;
+                let mut about = subject(&event, Some(id.clone()));
+                {
+                    let mut requests = lock(&node.triage.requests);
+                    let request = requests.get_mut(&id).context("saved request")?;
+                    match case {
+                        "missing-event-request" => event.request_id = None,
+                        "missing-about-request" => about.request_id = None,
+                        "wrong-held-id" => request.request_id = "another-request".into(),
+                        "wrong-event-request" => event.request_id = Some("another-request".into()),
+                        "wrong-about-request" => about.request_id = Some("another-request".into()),
+                        "provider" => request.provider = Provider::Claude,
+                        "thread" => request.session_id = "another-thread".into(),
+                        "node" => event.node = LocalIdentity::generate().device_id()?,
+                        "missing-turn" => request.session_turn.clear(),
+                        "unknown-turn" => request.session_turn = "unknown-turn".into(),
+                        "transport" => {
+                            request.reply = Reply::Hook {
+                                answer: tokio::sync::watch::channel(None).0,
+                                waited: false,
+                            }
+                        }
+                        "hook" | "held-hook" => {
+                            event.source = triage::Source::Hook;
+                            event.turn_id = "u-1".into();
+                            request.session_turn = "not-the-hook-turn".into();
+                            if case == "hook" {
+                                event.request_id = None;
+                                about.request_id = None;
+                            } else {
+                                request.reply = Reply::Hook {
+                                    answer: tokio::sync::watch::channel(None).0,
+                                    waited: false,
+                                };
+                            }
+                        }
+                        _ => {}
+                    }
+                    if case == "missing-held" {
+                        requests.remove(&id);
+                    }
+                }
+                let question_id = format!("q-native-source-{case}");
+                let raised = node
+                    .raise(
+                        &network,
+                        &event,
+                        EventBody::QuestionAsked {
+                            question_id: question_id.clone(),
+                            target: None,
+                            attention: AttentionRequest {
+                                kind: AttentionKind::Question,
+                                device_id: Some(event.node.clone()),
+                            },
+                            severity: Severity::Attention,
+                            text: "fixture source?".into(),
+                            choices: vec![],
+                            about,
+                        },
+                    )
+                    .await;
+                if matches!(case, "hook" | "held-hook") {
+                    raised?;
+                    let card = node
+                        .store
+                        .lock()
+                        .await
+                        .question(&network, &question_id)?
+                        .context("hook question")?;
+                    assert_eq!(
+                        card["target"],
+                        json!({"kind":"work","work_id":"native-source-work"}),
+                        "{case}"
+                    );
+                } else if raised.is_ok() {
+                    let card = node
+                        .store
+                        .lock()
+                        .await
+                        .question(&network, &question_id)?
+                        .context("unscoped question")?;
+                    assert!(
+                        card["target"].is_null(),
+                        "{case}: mismatched evidence cannot borrow a Work or Main target"
+                    );
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            cleanup(node, dir).await?;
+            result.with_context(|| case)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_question_holds_the_request_until_it_is_answered() -> Result<()> {
         let (node, admin, dir) = node().await?;
         let result = async {
@@ -4591,7 +4816,7 @@ pub(super) mod tests {
                         }
                     }
                 }));
-                let trigger = if change == "standalone" || change.starts_with("shared") {
+                let trigger = if change == "standalone" {
                     main_input_fact(&node, &admin, "c", "held-work-origin").await?
                 } else {
                     human_workspace_command(
@@ -5585,6 +5810,93 @@ pub(super) mod tests {
         .await;
         cleanup(node, dir).await?;
         result
+    }
+
+    #[tokio::test]
+    async fn app_server_turns_recover_only_their_missing_thread_metadata() -> Result<()> {
+        for case in [
+            "missing-start",
+            "known",
+            "wrong-thread",
+            "missing-thread",
+            "missing-cwd",
+            "invalid-cwd",
+            "empty-cwd",
+            "oversized-cwd",
+            "failed-read",
+            "background",
+        ] {
+            let (node, admin, dir) = node().await?;
+            let result = async {
+                with_agent(&node);
+                bot(&node, &admin, "c", "Metadata", &[]).await?;
+                let mut queries = scripted_app_server(&node, move |request| {
+                    if request["method"] != "thread/read" {
+                        return json!({"result":{}});
+                    }
+                    let mut thread = json!({"id":"metadata-thread","cwd":"/native/project","source":"cli"});
+                    match case {
+                        "wrong-thread" => {
+                            thread["id"] = json!("another-thread");
+                            thread["source"] = json!({"subAgent":"review"});
+                        }
+                        "missing-thread" => thread = Value::Null,
+                        "missing-cwd" => { thread.as_object_mut().unwrap().remove("cwd"); }
+                        "invalid-cwd" => thread["cwd"] = json!(42),
+                        "empty-cwd" => thread["cwd"] = json!(""),
+                        "oversized-cwd" => thread["cwd"] = json!("x".repeat(4097)),
+                        "failed-read" => return json!({"error":{"code":-32000,"message":"unreadable"}}),
+                        "background" => thread["source"] = json!({"subAgent":"review"}),
+                        _ => {}
+                    }
+                    json!({"result":{"thread":thread}})
+                })?;
+                tokio::time::timeout(Duration::from_secs(5), connected(&node)).await?;
+                if case == "known" {
+                    node.triage_app_server(&json!({"method":"thread/started","params":{"thread":
+                        {"id":"metadata-thread","cwd":"/known/project","source":"cli"}}}));
+                }
+                node.triage_app_server(&json!({"method":"turn/completed","params":{
+                    "threadId":"metadata-thread","turn":{"id":"metadata-turn","status":"completed","items":[]}}}));
+                let queued = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if case == "background" && lock(&node.triage.background).contains("metadata-thread") {
+                            return Ok::<Option<AgentEvent>, anyhow::Error>(None);
+                        }
+                        if let Some(event) = node.store.lock().await.triage_events(None)?.into_iter().next() {
+                            return Ok(Some(event));
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }).await??;
+                if case == "background" {
+                    assert!(queued.is_none());
+                    assert_eq!(owner_of(&node, "metadata-thread").await?, None);
+                    assert_eq!(node.ingest_agent_event(turn("metadata-thread", "metadata-turn", "/native/project")).await?["status"], "foreign");
+                } else {
+                    let queued = queued.context("queued native event")?;
+                    assert_eq!(queued.cwd, match case { "missing-start" => "/native/project", "known" => "/known/project", _ => "" });
+                    assert_eq!(queued.session_id, "metadata-thread");
+                    assert_eq!(queued.turn_id, "metadata-turn");
+                    assert_eq!(queued.source, triage::Source::AppServer);
+                    assert_eq!(node.ingest_agent_event(turn("metadata-thread", "metadata-turn", "/native/project")).await?["status"], "duplicate");
+                    assert_eq!(node.store.lock().await.triage_events(None)?.len(), 1);
+                }
+                let queries: Vec<_> = std::iter::from_fn(|| queries.try_recv().ok()).collect();
+                let reads: Vec<_> = queries.iter().filter(|query| query["method"] == "thread/read").collect();
+                if case == "known" {
+                    assert!(reads.is_empty());
+                } else {
+                    assert_eq!(reads.len(), 1);
+                    assert_eq!(reads[0]["params"], json!({"threadId":"metadata-thread","includeTurns":false}));
+                }
+                assert!(!queries.iter().any(|query| query["method"].as_str().is_some_and(|method| method.starts_with("turn/"))));
+                Ok::<_, anyhow::Error>(())
+            }.await;
+            cleanup(node, dir).await?;
+            result.with_context(|| case)?;
+        }
+        Ok(())
     }
 
     pub(in crate::runtime) async fn start_reply(
