@@ -659,9 +659,7 @@ mod tests {
         let target = root.join("target");
         fs::create_dir(&target).unwrap();
         let link = root.join("link");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        #[cfg(unix)]
+        vibeface_bridge::platform::privatefs::link_dir(&target, &link).unwrap();
         assert!(validate_data_dir(&link).is_err());
         fs::remove_dir_all(root).unwrap();
     }

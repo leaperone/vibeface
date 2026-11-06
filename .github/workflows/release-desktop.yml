@@ -60,7 +60,7 @@ jobs:
         run: |
           version=$("$PY" -B scripts/release.py plan --app product | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["version"])')
           archive=".artifacts/native-release/vibeface-$version-$TARGET.tar.gz"
-          (cd .artifacts/native-release && shasum -a 256 -c "vibeface-$version-$TARGET.tar.gz.sha256")
+          "$PY" -B scripts/checksum.py ".artifacts/native-release/vibeface-$version-$TARGET.tar.gz.sha256"
           mkdir -p .artifacts/runtime
           tar -xzf "$archive" -C .artifacts/runtime
           {

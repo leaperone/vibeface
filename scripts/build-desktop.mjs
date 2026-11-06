@@ -172,7 +172,7 @@ function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   const builderCli = createRequire(path.join(desktop, 'package.json')).resolve('electron-builder/cli.js');
   run(process.execPath, [builderCli, '--config', path.join(desktop, 'electron-builder.cjs'),
     platform.flag, '--publish', 'never'], {
-    cwd: repo,
+    cwd: desktop,
     stdio: 'inherit',
     env: {
       ...process.env,

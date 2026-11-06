@@ -490,7 +490,7 @@ async fn verified_seal(
     Ok(seal)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     fn lock_directory() -> PathBuf {

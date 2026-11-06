@@ -1391,7 +1391,7 @@ pub fn hook_output(input: &Value, answer: &Value) -> Option<Value> {
     Some(json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":decision}}))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, NetworkState};

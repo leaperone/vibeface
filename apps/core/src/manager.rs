@@ -1221,6 +1221,7 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
+    use vibeface_bridge::platform::{ipc, privatefs};
 
     #[test]
     fn tool_guidance_discovers_targets_and_preserves_scoped_cli_references() {
@@ -1349,10 +1350,28 @@ mod tests {
         Ends(&'static str),
     }
 
+    fn fixture_endpoint() -> (ipc::Endpoint, PathBuf) {
+        let key = uuid::Uuid::new_v4().simple().to_string();
+        let directory = ipc::runtime_dir(&key[..12]).unwrap();
+        privatefs::create_dir(&directory).unwrap();
+        (
+            ipc::Endpoint::in_private_dir(&directory, "manager.sock").unwrap(),
+            directory,
+        )
+    }
+
     struct Fake {
         socket: PathBuf,
+        directory: PathBuf,
         requests: Arc<std::sync::Mutex<Vec<Value>>>,
         _server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            self._server.abort();
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
     }
 
     impl Fake {
@@ -1367,16 +1386,14 @@ mod tests {
         }
     }
 
-    fn fake_app_server(turn: Turn) -> Fake {
-        let socket = std::env::temp_dir().join(format!(
-            "vf-manager-{}.sock",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    async fn fake_app_server(turn: Turn) -> Fake {
+        let (endpoint, directory) = fixture_endpoint();
+        let socket = endpoint.path().to_owned();
+        let mut listener = ipc::Listener::bind(&endpoint).await.unwrap();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = requests.clone();
         let server = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok(stream) = listener.accept().await {
                 let seen = seen.clone();
                 tokio::spawn(async move {
                     let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -1442,6 +1459,7 @@ mod tests {
         });
         Fake {
             socket,
+            directory,
             requests,
             _server: server,
         }
@@ -1509,25 +1527,24 @@ mod tests {
 
     struct ConcurrentFake {
         socket: PathBuf,
+        directory: PathBuf,
         requests: Arc<std::sync::Mutex<Vec<Value>>>,
         gate: Arc<ConcurrentGate>,
         server: tokio::task::JoinHandle<()>,
     }
 
     impl ConcurrentFake {
-        fn new(expected: usize) -> Self {
-            let socket = std::env::temp_dir().join(format!(
-                "vf-manager-concurrent-{}.sock",
-                &uuid::Uuid::new_v4().simple().to_string()[..12]
-            ));
-            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        async fn new(expected: usize) -> Self {
+            let (endpoint, directory) = fixture_endpoint();
+            let socket = endpoint.path().to_owned();
+            let mut listener = ipc::Listener::bind(&endpoint).await.unwrap();
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let gate = ConcurrentGate::new(expected);
             let seen = requests.clone();
             let shared_gate = gate.clone();
             let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let server = tokio::spawn(async move {
-                while let Ok((stream, _)) = listener.accept().await {
+                while let Ok(stream) = listener.accept().await {
                     let seen = seen.clone();
                     let gate = shared_gate.clone();
                     let next = next.clone();
@@ -1644,6 +1661,7 @@ mod tests {
             });
             Self {
                 socket,
+                directory,
                 requests,
                 gate,
                 server,
@@ -1687,7 +1705,7 @@ mod tests {
     impl Drop for ConcurrentFake {
         fn drop(&mut self) {
             self.server.abort();
-            let _ = std::fs::remove_file(&self.socket);
+            let _ = std::fs::remove_dir_all(&self.directory);
         }
     }
 
@@ -1777,7 +1795,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_turn_runs_on_the_app_server_and_is_recorded_before_it_starts() {
-        let fake = fake_app_server(Turn::Answers);
+        let fake = fake_app_server(Turn::Answers).await;
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = recorded.clone();
         let config = ManagerConfig {
@@ -1853,7 +1871,7 @@ mod tests {
             (true, ManagerFailure::Cancelled),
             (false, ManagerFailure::Unknown),
         ] {
-            let fake = fake_app_server(Turn::Runs { confirm });
+            let fake = fake_app_server(Turn::Runs { confirm }).await;
             let config = codex(workspace(), fake.socket.clone());
             let (stop, cancel) = watch::channel(false);
             let stopper = tokio::spawn(async move {
@@ -1890,7 +1908,7 @@ mod tests {
             ("paused", ManagerFailure::Unknown),
             ("failed", ManagerFailure::Failed),
         ] {
-            let fake = fake_app_server(Turn::Ends(status));
+            let fake = fake_app_server(Turn::Ends(status)).await;
             let config = codex(workspace(), fake.socket.clone());
             let error = run_manager(
                 &config,
@@ -1917,7 +1935,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_thread_in_place_of_a_lost_one_gets_the_full_prompt() {
-        let fake = fake_app_server(Turn::Answers);
+        let fake = fake_app_server(Turn::Answers).await;
         let config = ManagerConfig {
             codex_turn: Some(CodexTurn {
                 client_id: "attempt-1".into(),
@@ -1947,7 +1965,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_turn_start_is_not_sent_again() {
-        let fake = fake_app_server(Turn::Drops);
+        let fake = fake_app_server(Turn::Drops).await;
         let config = codex(workspace(), fake.socket.clone());
         let error = run_manager(
             &config,
@@ -2009,7 +2027,7 @@ mod tests {
 
     #[tokio::test]
     async fn sixteen_codex_turns_overlap_and_keep_their_outputs() -> Result<()> {
-        let fake = ConcurrentFake::new(16);
+        let fake = ConcurrentFake::new(16).await;
         let prompts: Vec<_> = (0..16).map(|i| format!("marker-{i}")).collect();
         let tasks = concurrent_codex_turns(&fake, prompts.clone());
         tokio::time::timeout(Duration::from_secs(10), fake.wait_all())
@@ -2029,7 +2047,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_one_of_sixteen_codex_turns_leaves_the_others_running() -> Result<()> {
-        let fake = ConcurrentFake::new(16);
+        let fake = ConcurrentFake::new(16).await;
         let prompts: Vec<_> = (0..16).map(|i| format!("marker-{i}")).collect();
         let mut tasks = Vec::with_capacity(16);
         let mut stops = Vec::with_capacity(16);
@@ -2084,7 +2102,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_failed_codex_turn_does_not_stop_the_other_fifteen() -> Result<()> {
-        let fake = ConcurrentFake::new(16);
+        let fake = ConcurrentFake::new(16).await;
         let prompts: Vec<_> = (0..16)
             .map(|i| {
                 if i == 0 {

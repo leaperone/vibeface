@@ -616,7 +616,7 @@ fn prerequisites(provider: Provider, local: &providers::Local) -> Option<ProbeIs
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;

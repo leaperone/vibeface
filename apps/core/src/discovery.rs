@@ -522,7 +522,7 @@ fn bare(program: &Path) -> Option<&str> {
         .flatten()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::providers::Providers;

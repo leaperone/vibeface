@@ -106,6 +106,7 @@ jobs:
           python3 scripts/daily-nightly.py --self-test
           python3 scripts/release.py self-test
           python3 scripts/package-node-windows.py --self-test
+          python3 scripts/checksum.py --self-test
           python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/release.py", "scripts/package-node-windows.py", "scripts/check-release-workflow.py", "scripts/daily-nightly.py")]'
           bash -n install.sh
           bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/import-mac-identity.sh
@@ -421,7 +422,7 @@ jobs:
           [[ "${#archives[@]}" == 1 ]]
           archive="${archives[0]}"
           name="$(basename "$archive" .tar.gz)"
-          (cd .artifacts/packages && shasum -a 256 -c "$name.tar.gz.sha256")
+          "$PY" -B scripts/checksum.py ".artifacts/packages/$name.tar.gz.sha256"
           mkdir -p .artifacts/unpacked
           tar -xzf "$archive" -C .artifacts/unpacked
           package="$PWD/.artifacts/unpacked/$name"

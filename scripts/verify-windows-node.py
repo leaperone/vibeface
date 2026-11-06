@@ -9,6 +9,7 @@ called, no model key is read, and nothing outside the scratch directory is writt
 """
 
 import argparse
+import base64
 import ctypes
 import json
 import os
@@ -74,6 +75,12 @@ def free_port():
 def process_is_running(pid):
     """Whether a process this account may query is still running."""
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    kernel.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    kernel.GetExitCodeProcess.restype = ctypes.c_int
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
     handle = kernel.OpenProcess(0x1000, False, int(pid))
     if not handle:
         return False
@@ -87,24 +94,24 @@ def process_is_running(pid):
 
 
 def owner_only(path):
-    """Whether `path` grants access to this account alone, read from the access control list."""
-    listing = run(["icacls", str(path)]).stdout.decode("utf-8", errors="replace")
-    account = os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")
-    entries = []
-    for line in listing.splitlines():
-        line = line.strip()
-        if not line or line.startswith("Successfully processed"):
-            continue
-        body = line[len(str(path)):].strip() if line.startswith(str(path)) else line
-        found = re.match(r"^([^:]+):\(", body)
-        if found:
-            entries.append(found.group(1).strip())
-    require(entries, f"the access control list of {path} names at least one account")
-    for entry in entries:
-        require(
-            entry.lower() == account.lower() or entry.upper().endswith("\\SYSTEM"),
-            f"{path} grants access to {entry}, which is not this account",
-        )
+    """Read trustees as SIDs so account names and the Windows locale cannot change the check."""
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$sidType = [System.Security.Principal.SecurityIdentifier]
+$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$acl = Get-Acl -LiteralPath $env:VIBEFACE_ACL_FIXTURE
+$allow = @($acl.GetAccessRules($true, $true, $sidType) | Where-Object {
+    $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow
+} | ForEach-Object { $_.IdentityReference.Value })
+@{ owner = $acl.GetOwner($sidType).Value; current = $current; allow = $allow } | ConvertTo-Json -Compress
+"""
+    encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    result = run(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+                 env={**os.environ, 'VIBEFACE_ACL_FIXTURE': str(path)})
+    acl = json.loads(result.stdout.decode('utf-8-sig'))
+    require(acl['owner'] == acl['current'], 'the private path is owned by this Windows SID')
+    require(acl['allow'] and all(sid == acl['current'] for sid in acl['allow']),
+            'the private path grants access only to this Windows SID')
     return True
 
 
@@ -135,6 +142,8 @@ if os.environ.get("VIBEFACE_FAKE_PROVIDER_CHILD"):
     (marks / "child.pid").write_text(str(os.getpid()))
     time.sleep(900)
     sys.exit(0)
+if len(sys.argv) != 4 or sys.argv[1:3] != ["app-server", "--listen"] or not sys.argv[3].startswith("unix://"):
+    raise SystemExit("The fixture only accepts the documented Unix socket transport")
 (marks / "provider.pid").write_text(str(os.getpid()))
 (marks / "argv.json").write_text(repr(sys.argv[1:]))
 environment = {**os.environ, "VIBEFACE_FAKE_PROVIDER_CHILD": "1"}
@@ -152,7 +161,7 @@ time.sleep(900)
         self.source.write_text(self.SOURCE, encoding="utf-8")
         self.program = directory / "codex.cmd"
         self.program.write_text(
-            f'@echo off\r\n"{sys.executable}" "{self.source}" %*\r\n', encoding="ascii"
+            f'@echo off\r\nchcp 65001 >nul\r\n"{sys.executable}" "{self.source}" %*\r\n', encoding="utf-8"
         )
 
     def environment(self, base):

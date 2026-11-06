@@ -384,10 +384,26 @@ impl Stream {
                     ),
                 });
             }
-            let client = tokio::net::windows::named_pipe::ClientOptions::new()
-                .read(true)
-                .write(true)
-                .open(endpoint.pipe_name()?)?;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let client = loop {
+                match tokio::net::windows::named_pipe::ClientOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(endpoint.pipe_name()?)
+                {
+                    Ok(client) => break client,
+                    Err(error)
+                        if error.raw_os_error()
+                            == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32)
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        // Accept creates the next instance; concurrent callers wait without
+                        // blocking a runtime thread or replaying a protocol request.
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
             let stream = Self {
                 inner: PipeSide::Client(client),
             };

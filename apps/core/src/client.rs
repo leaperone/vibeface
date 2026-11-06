@@ -2753,7 +2753,7 @@ mod tests {
         assert!(Config::load(&dir)?.manager.is_none());
         let choose_cursor =
             json!({"provider":"cursor","bot":true,"bin":dir.join("missing-cursor-sdk")});
-        std::os::unix::fs::symlink(&project, &workspace)?;
+        vibeface_bridge::platform::privatefs::link_dir(&project, &workspace)?;
         assert!(
             dispatch(
                 &node,
@@ -2765,7 +2765,7 @@ mod tests {
             .is_err(),
             "the default workspace must be a real directory"
         );
-        std::fs::remove_file(&workspace)?;
+        vibeface_bridge::platform::privatefs::remove_dir_link(&workspace)?;
         let chosen = dispatch(
             &node,
             &mut manager_session,
@@ -3134,14 +3134,10 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 3 && logs.join("node.log").is_file());
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(dir.join(crate::providers::ENV_FILE))?
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+        vibeface_bridge::platform::privatefs::ensure_private(
+            &dir.join(crate::providers::ENV_FILE),
+            "the saved provider environment",
+        )?;
 
         for invalid in [
             json!({"provider":"unknown","execution":true}),

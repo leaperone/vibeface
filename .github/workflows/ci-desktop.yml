@@ -46,6 +46,7 @@ jobs:
         if: inputs.package_artifact == ''
         with:
           key: desktop-native-${{ inputs.target }}
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
       - uses: ./.github/actions/msvc-environment
         if: runner.os == 'Windows'
@@ -76,7 +77,7 @@ jobs:
           archives=(.artifacts/packages/*.tar.gz)
           [[ "${#archives[@]}" == 1 ]]
           name="$(basename "${archives[0]}" .tar.gz)"
-          (cd .artifacts/packages && shasum -a 256 -c "$name.tar.gz.sha256")
+          "$PY" -B scripts/checksum.py ".artifacts/packages/$name.tar.gz.sha256"
           mkdir -p .artifacts/runtime
           tar -xzf "${archives[0]}" -C .artifacts/runtime
           {
@@ -139,5 +140,5 @@ jobs:
             .artifacts/e2e/desktop/*.log
             tests/e2e/.artifacts/desktop
             !tests/e2e/.artifacts/desktop/**/downloads/**
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14

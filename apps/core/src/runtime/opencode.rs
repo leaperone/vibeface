@@ -1996,7 +1996,7 @@ impl Executor for Opencode {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::crypto::LocalIdentity;

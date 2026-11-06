@@ -59,7 +59,7 @@ module.exports = {
     signIgnore: ['Contents/Resources/runtime/'],
     identity: signed ? undefined : null,
     // Notarization uses the existing Developer ID and App Store Connect key, then staples the app.
-    notarize: signed ? { teamId: process.env.VIBEFACE_CODESIGN_TEAM } : false,
+    notarize: signed,
     extendInfo: { NSHighResolutionCapable: true, LSMinimumSystemVersion: '12.0.0' },
   },
   win: {
@@ -82,6 +82,5 @@ module.exports = {
     differentialPackage: false,
   },
   dmg: { artifactName, writeUpdateInfo: false },
-  zip: { artifactName },
 };
 

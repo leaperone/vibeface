@@ -942,7 +942,9 @@ impl Service {
 fn task_command_line(definition: &[u8]) -> Result<String> {
     let text = if definition.len() >= 2 && definition[..2] == [0xff, 0xfe] {
         let units: Vec<u16> = definition[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
         String::from_utf16(&units).context("the task scheduler printed an unreadable definition")?

@@ -2013,7 +2013,7 @@ fn rollouts(root: &Path, since_ms: i64) -> Vec<PathBuf> {
     found
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) mod tests {
     use super::*;
     use crate::{

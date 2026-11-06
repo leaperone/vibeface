@@ -60,7 +60,7 @@ foreach ($rule in $acl.Access) {
   $allowSids += $sid
   if ($trusted -notcontains $sid) { $badAllowSids += $sid }
 }
-@{ ownerSid = $ownerSid; allowSids = $allowSids; badAllowSids = $badAllowSids; inherited = $inherited } | ConvertTo-Json -Compress
+@{ ownerSid = $ownerSid; allowSids = $allowSids; badAllowSids = $badAllowSids; inherited = $inherited; protected = $acl.AreAccessRulesProtected } | ConvertTo-Json -Compress
 `;
 
 const WINDOWS_REPARSE_FLAG = `
@@ -82,7 +82,7 @@ export function resolveBoundedPath(root, candidate) {
 }
 
 async function powershellJson(script, ...args) {
-  const invocation = '$values = @(ConvertFrom-Json -InputObject $env:VIBEFACE_PRIVATE_CONTROL_ARGS)\n& {\n' + script + '\n} @values';
+  const invocation = '$ErrorActionPreference = "Stop"\n$values = @(ConvertFrom-Json -InputObject $env:VIBEFACE_PRIVATE_CONTROL_ARGS)\n& {\n' + script + '\n} @values';
   const result = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(invocation, 'utf16le').toString('base64')], {
     windowsHide: true,
     maxBuffer: 8 * 1024 * 1024,
@@ -127,7 +127,7 @@ async function verifyWindowsAcl(pathname) {
   const sid = await currentWindowsSid();
   const data = await powershellJson(WINDOWS_VERIFY_PRIVATE_ACL, pathname, sid);
   assert(data && data.ownerSid === sid, 'Control file owner must be the current Windows user SID');
-  assert(data.inherited === false, 'Control ACL inheritance is disabled');
+  assert(data.inherited === false && data.protected === true, 'Control ACL inheritance is disabled');
   assert(Array.isArray(data.allowSids) && data.allowSids.includes(sid), 'Control ACL must allow the current SID');
   assert(Array.isArray(data.badAllowSids) && data.badAllowSids.length === 0, 'Control ACL has unexpected allow entries');
 }

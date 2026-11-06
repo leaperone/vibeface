@@ -25,6 +25,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           key: ci-windows-native
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with: {python-version: '3.12'}
@@ -66,7 +67,7 @@ jobs:
           archives=(.artifacts/packages/*.tar.gz)
           [[ "${#archives[@]}" == 1 ]]
           name="$(basename "${archives[0]}" .tar.gz)"
-          (cd .artifacts/packages && shasum -a 256 -c "$name.tar.gz.sha256")
+          "$PY" -B scripts/checksum.py ".artifacts/packages/$name.tar.gz.sha256"
           mkdir -p .artifacts/unpacked
           tar -xzf "${archives[0]}" -C .artifacts/unpacked
           printf 'package=%s\n' "$PWD/.artifacts/unpacked/$name" >> "$GITHUB_OUTPUT"
