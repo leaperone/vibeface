@@ -9,6 +9,7 @@ keychain="$RUNNER_TEMP/vibeface-signing.keychain-db"
 keychain_password="$(openssl rand -hex 32)"
 echo "::add-mask::$keychain_password"
 umask 077
+trap 'security delete-keychain "$keychain" >/dev/null 2>&1 || true; rm -f "$RUNNER_TEMP/vibeface-signing.p12" "$RUNNER_TEMP/vibeface-notary.p8"' EXIT
 printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/vibeface-signing.p12"
 printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/vibeface-notary.p8"
 security create-keychain -p "$keychain_password" "$keychain"
@@ -28,10 +29,14 @@ identities="$(security find-identity -v -p codesigning "$keychain" | grep '"Deve
 identity="$(awk '{print $2}' <<< "$identities")"
 team="$(sed -n 's/.*(\([A-Z0-9]\{10\}\))"$/\1/p' <<< "$identities")"
 [[ "$identity" =~ ^[0-9A-F]{40}$ && -n "$team" ]] || { echo '::error::Could not resolve the signing identity or team.'; exit 1; }
-if [[ "$1" == core ]]; then binary="$2/vibeface-core"; else binary="$2/vibeface"; fi
-trap 'security delete-keychain "$keychain"; rm -f "$RUNNER_TEMP/vibeface-notary.p8"' EXIT
-codesign --force --options runtime --timestamp --identifier cn.leaperone.vibeface --sign "$identity" "$binary"
-codesign --verify --strict "$binary"
-ditto -c -k --keepParent "$binary" "$RUNNER_TEMP/native.zip"
+[[ "$1" == product ]] || { echo 'Expected the product native programs.' >&2; exit 1; }
+binaries=("$2/vibeface" "$2/vibeface-core")
+notary_inputs=$(mktemp -d "$RUNNER_TEMP/vibeface-notary-product.XXXXXX")
+for binary in "${binaries[@]}"; do
+  codesign --force --options runtime --timestamp --identifier cn.leaperone.vibeface --sign "$identity" "$binary"
+  codesign --verify --strict "$binary"
+  cp "$binary" "$notary_inputs/"
+done
+ditto -c -k --keepParent "$notary_inputs" "$RUNNER_TEMP/native.zip"
 xcrun notarytool submit "$RUNNER_TEMP/native.zip" --key "$RUNNER_TEMP/vibeface-notary.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notary-result.json"
 python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["status"] == "Accepted"' "$RUNNER_TEMP/notary-result.json"

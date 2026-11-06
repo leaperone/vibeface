@@ -105,8 +105,8 @@ pub async fn check(channel: Channel) -> Result<Option<Release>> {
 }
 
 fn channel_version(tag: &str, channel: Channel) -> Option<Version> {
-    let version = Version::parse(tag.strip_prefix("cli-v")?).ok()?;
-    if !version.build.is_empty() || format!("cli-v{version}") != tag {
+    let version = Version::parse(tag.strip_prefix("v")?).ok()?;
+    if !version.build.is_empty() || format!("v{version}") != tag {
         return None;
     }
     match channel {
@@ -613,12 +613,17 @@ impl BuildInfo {
         );
         let version = Version::parse(&self.version)?;
         for component in [&self.core_version, &self.app_version] {
-            let component = Version::parse(component)?;
             ensure!(
-                component.pre.as_str().split('.').next() == version.pre.as_str().split('.').next(),
-                "CLI, Core and App must use the same release channel"
+                Version::parse(component)? == version,
+                "CLI, Core and App must use one product version"
             );
         }
+        ensure!(
+            valid_commit(&self.source_commit)
+                && self.core_source_commit == self.source_commit
+                && self.app_source_commit == self.source_commit,
+            "CLI, Core and App must come from one source commit"
+        );
         Ok(())
     }
 }
@@ -805,28 +810,33 @@ mod tests {
     #[test]
     fn channels_accept_only_canonical_release_tags() {
         assert_eq!(
-            channel_version("cli-v1.2.3", Channel::Stable),
+            channel_version("v1.2.3", Channel::Stable),
             Some(Version::new(1, 2, 3))
         );
-        assert!(channel_version("cli-v1.2.3-nightly.20260228.1", Channel::Nightly).is_some());
-        assert!(channel_version("cli-v1.2.3-nightly.20240229.10", Channel::Nightly).is_some());
+        assert!(channel_version("v1.2.3-nightly.20260228.1", Channel::Nightly).is_some());
+        assert!(channel_version("v1.2.3-nightly.20240229.10", Channel::Nightly).is_some());
         for tag in [
             "1.2.3",
-            "cli-v01.2.3",
-            "cli-v1.2.3+build",
-            "cli-v1.2.3-rc.1",
-            "cli-v1.2.3-nightly.20260229.1",
-            "cli-v1.2.3-nightly.20261301.1",
-            "cli-v1.2.3-nightly.20260100.1",
-            "cli-v1.2.3-nightly.20260101.0",
-            "cli-v1.2.3-nightly.20260101.01",
-            "cli-v1.2.3-nightly.20260101.1.extra",
+            "cli-v1.2.3",
+            "core-v1.2.3",
+            "app-v1.2.3",
+            "mobile-v1.2.3",
+            "www-v1.2.3",
+            "v01.2.3",
+            "v1.2.3+build",
+            "v1.2.3-rc.1",
+            "v1.2.3-nightly.20260229.1",
+            "v1.2.3-nightly.20261301.1",
+            "v1.2.3-nightly.20260100.1",
+            "v1.2.3-nightly.20260101.0",
+            "v1.2.3-nightly.20260101.01",
+            "v1.2.3-nightly.20260101.1.extra",
         ] {
             assert!(channel_version(tag, Channel::Stable).is_none(), "{tag}");
             assert!(channel_version(tag, Channel::Nightly).is_none(), "{tag}");
         }
-        assert!(channel_version("cli-v1.2.3", Channel::Nightly).is_none());
-        assert!(channel_version("cli-v1.2.3-nightly.20260101.1", Channel::Stable).is_none());
+        assert!(channel_version("v1.2.3", Channel::Nightly).is_none());
+        assert!(channel_version("v1.2.3-nightly.20260101.1", Channel::Stable).is_none());
         assert!(
             Version::parse("1.2.3-nightly.20260102.1").unwrap()
                 > Version::parse("1.2.3-nightly.20260101.10").unwrap()
@@ -991,14 +1001,14 @@ mod tests {
         fs::create_dir(&copy).unwrap();
         let release = Release {
             version: Version::new(0, 0, 2),
-            tag: "cli-v0.0.2".to_owned(),
+            tag: "v0.0.2".to_owned(),
             target: host_target().unwrap().to_owned(),
             source_commit: "a".repeat(40),
             archive_url: String::new(),
             checksum_url: String::new(),
             archive_size: 1,
         };
-        let build = serde_json::json!({"version": release.version.to_string(), "target": release.target, "source_commit": release.source_commit, "update_protocol": UPDATE_PROTOCOL, "data_epoch": DATA_EPOCH, "core_version": "0.0.3", "core_source_commit": "b".repeat(40), "app_version": "0.0.1", "app_source_commit": "c".repeat(40)});
+        let build = serde_json::json!({"version": release.version.to_string(), "target": release.target, "source_commit": release.source_commit, "update_protocol": UPDATE_PROTOCOL, "data_epoch": DATA_EPOCH, "core_version": "0.0.2", "core_source_commit": "a".repeat(40), "app_version": "0.0.2", "app_source_commit": "a".repeat(40)});
         serde_json::from_value::<BuildInfo>(build.clone())
             .unwrap()
             .validate()
@@ -1006,6 +1016,26 @@ mod tests {
         for field in ["core_version", "app_version"] {
             let mut mixed = build.clone();
             mixed[field] = serde_json::json!("0.0.1-nightly.20261101.1");
+            assert!(
+                serde_json::from_value::<BuildInfo>(mixed)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        for field in ["core_version", "app_version"] {
+            let mut mixed = build.clone();
+            mixed[field] = serde_json::json!("0.0.3");
+            assert!(
+                serde_json::from_value::<BuildInfo>(mixed)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        for field in ["core_source_commit", "app_source_commit"] {
+            let mut mixed = build.clone();
+            mixed[field] = serde_json::json!("b".repeat(40));
             assert!(
                 serde_json::from_value::<BuildInfo>(mixed)
                     .unwrap()
@@ -1036,7 +1066,7 @@ mod tests {
             .unwrap();
             fs::write(
                 dir.join("vibeface-core"),
-                b"#!/bin/sh\nprintf 'vibeface-core 0.0.3\n'\n",
+                b"#!/bin/sh\nprintf 'vibeface-core 0.0.2\n'\n",
             )
             .unwrap();
             fs::create_dir_all(dir.join("web")).unwrap();
