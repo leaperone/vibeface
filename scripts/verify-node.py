@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run local Node process acceptance without making paid provider calls.
 
-The default run starts four Nodes over iroh (one runs the member relay, one
-reaches others only through it) and checks sync, signed entrances, forwarding
+The default run starts four member Nodes over iroh (one runs the member relay,
+one reaches others only through it) and an outside-network Node. It checks sync, signed entrances, forwarding
 through other Gateways, delivery to the scheduling Node without replay, a relay
 outage and an entrance switch. Host work uses bot turns on a controlled fixture App Server, never a model. All state and logs stay beneath
 --artifacts with private permissions. The script prints no credentials.
@@ -4362,7 +4362,7 @@ def acceptance(options):
     helper.chmod(0o600)
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
-              "coverage": "four real Node processes over iroh with a member relay; WASM browser client; fixture SDK",
+              "coverage": "five real Node processes over iroh (four members and one outsider) with a member relay; WASM browser client; fixture SDK",
               "not_checked": ["real NAT and public ingress (disjoint loopback IP families require the relay)",
                               "attachment resume is not covered here; --phase4 checks 64 MiB upload, restart and resume",
                               "non-member endpoints refused by sync and RPC are covered by Rust test "
@@ -5383,7 +5383,7 @@ def discovery_acceptance(options):
         nodes.append(d)
         require(not (d.directory / "entry-token").exists(), "discovery has no data-relay operator token")
         d.start()
-        require(b"<html" in d.client.request("/").lower(), "discovery defaults to serving its embedded webpage")
+        require(b"<html" in d.client.request("/").lower(), "discovery serves its configured Web page")
         for path in ("/api/client", "/api/decision", "/api/local/setup"):
             d.client.request(path, status=404)
         try:
