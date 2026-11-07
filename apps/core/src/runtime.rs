@@ -929,6 +929,12 @@ impl Runtime {
     pub(crate) async fn maintenance_idle(&self) -> Result<()> {
         self.store.lock().await.scheduler_maintenance_idle()
     }
+    pub(crate) fn spawn_background(
+        &self,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        self.background_tasks.spawn(task)
+    }
     pub async fn authorize_bearer(&self, token: &str) -> Option<Access> {
         self.agent_tokens.lock().await.get(token).cloned()
     }

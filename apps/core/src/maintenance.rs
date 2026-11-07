@@ -108,10 +108,7 @@ impl Gate {
         })
     }
     fn commit(&self, pending: &Path) -> Result<()> {
-        self.commit_with_sync(pending, |parent| {
-            std::fs::File::open(parent)?.sync_all()?;
-            Ok(())
-        })
+        self.commit_with_sync(pending, privatefs::sync_dir)
     }
     fn commit_with_sync(
         &self,
@@ -468,13 +465,13 @@ pub async fn serve(runtime: Arc<Runtime>, data_dir: PathBuf) -> Result<()> {
     let mut listener = Listener::claim(&endpoint(&data_dir)?).await?;
     loop {
         let stream = listener.accept().await?;
-        let runtime = runtime.clone();
+        let node = runtime.clone();
         let pending = data_dir.join("update-pending.json");
-        tokio::spawn(async move {
-            if let Err(error) = connection(runtime, pending, stream).await {
+        runtime.spawn_background(async move {
+            if let Err(error) = connection(node, pending, stream).await {
                 tracing::debug!(%error, "maintenance connection ended");
             }
-        });
+        })?;
     }
 }
 async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream) -> Result<()> {
@@ -643,6 +640,50 @@ mod tests {
         crypto::LocalIdentity,
     };
     use anyhow::bail;
+
+    #[tokio::test]
+    async fn shutdown_releases_a_maintenance_connection_with_its_client_still_open() -> Result<()> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("maintenance-shutdown-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let dir = dir.canonicalize()?;
+        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
+        let mut config = Config::local("127.0.0.1:4790".parse()?, vec![dir.clone()], false);
+        config.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
+        config.save(&dir)?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let retired = Arc::downgrade(&node);
+        let server = tokio::spawn(serve(node.clone(), dir.clone()));
+        let lease = async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while probe(&dir).await.is_err() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            acquire(&dir).await
+        }
+        .await;
+        server.abort();
+        let _ = server.await;
+        node.shutdown().await;
+        node.shutdown().await;
+        drop(node);
+        assert!(
+            retired.upgrade().is_none(),
+            "shutdown releases the server even while the maintenance client is open"
+        );
+        let result = lease.map(drop);
+        let device = config::identity(&dir)?.device_id()?;
+        remove_dir_if_exists(&vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?)?;
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
 
     fn remove_dir_if_exists(path: &Path) -> Result<()> {
         match std::fs::remove_dir_all(path) {

@@ -432,7 +432,7 @@ impl Runtime {
     fn close_when_removed(self: &Arc<Self>, connection: Connection, remote: String) {
         let node = Arc::downgrade(self);
         let mut membership = self.membership.subscribe();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             loop {
                 tokio::select! {
                     _ = connection.closed() => return,
@@ -445,7 +445,9 @@ impl Runtime {
                     }
                 }
             }
-        });
+        }) {
+            tracing::debug!(%error, "membership watcher skipped while the Node is shutting down");
+        }
     }
 
     /// A request to another member Node over `vibeface/rpc/1`.
