@@ -111,7 +111,7 @@ function Convert-RegisteredPath {
     if ($Value.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
         return '\\' + $Value.Substring(8)
     }
-    if ($Value.StartsWith('\\?\')) { return $Value.Substring(4) }
+    if ($Value -match '^\\\\\?\\[A-Za-z]:\\') { return $Value.Substring(4) }
     return $Value
 }
 
@@ -188,7 +188,7 @@ function Register-Definition {
     try {
         # The scheduler reads a definition as UTF-16, which is also what it writes.
         [System.IO.File]::WriteAllText($file, $Definition, [System.Text.Encoding]::Unicode)
-        $result = Invoke-Scheduler @('/Create', '/TN', $Name, '/XML', $file, '/F')
+        $result = Invoke-Scheduler -Arguments @('/Create', '/TN', $Name, '/XML', $file, '/F')
         if ($result.Code -ne 0) { Fail "could not register $Name`n$($result.Output)" }
     } finally {
         Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
@@ -206,7 +206,7 @@ function Test-TaskRunning {
 function Stop-Task {
     param([string] $Name)
     if (Test-TaskRunning -Name $Name) {
-        $result = Invoke-Scheduler @('/End', '/TN', $Name)
+        $result = Invoke-Scheduler -Arguments @('/End', '/TN', $Name)
         if ($result.Code -ne 0) { Fail "could not stop $Name`n$($result.Output)" }
     }
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
@@ -248,7 +248,7 @@ function Wait-NodeReleased {
 function Start-Task {
     param([string] $Name)
     if (Test-TaskRunning -Name $Name) { return }
-    $result = Invoke-Scheduler @('/Run', '/TN', $Name)
+    $result = Invoke-Scheduler -Arguments @('/Run', '/TN', $Name)
     if ($result.Code -ne 0) { Fail "could not start $Name`n$($result.Output)" }
 }
 
@@ -256,7 +256,7 @@ function Remove-Task {
     param([string] $Name)
     if ($null -eq (Get-RegisteredTask -Name $Name)) { return }
     Stop-Task -Name $Name
-    $result = Invoke-Scheduler @('/Delete', '/TN', $Name, '/F')
+    $result = Invoke-Scheduler -Arguments @('/Delete', '/TN', $Name, '/F')
     if ($result.Code -ne 0) { Fail "could not remove $Name`n$($result.Output)" }
     if ($null -ne (Get-RegisteredTask -Name $Name)) {
         Fail "task $Name is still registered after removal."
@@ -396,9 +396,9 @@ switch ($action) {
         Start-Task -Name $NodeTask
     }
     'status' {
-        $node = Invoke-Scheduler @('/Query', '/TN', $NodeTask, '/V', '/FO', 'LIST')
+        $node = Invoke-Scheduler -Arguments @('/Query', '/TN', $NodeTask, '/V', '/FO', 'LIST')
         $node.Output
-        $updater = Invoke-Scheduler @('/Query', '/TN', $UpdateTask, '/V', '/FO', 'LIST')
+        $updater = Invoke-Scheduler -Arguments @('/Query', '/TN', $UpdateTask, '/V', '/FO', 'LIST')
         if ($updater.Code -eq 0) { $updater.Output } else { 'Updater is not installed.' }
         exit $node.Code
     }

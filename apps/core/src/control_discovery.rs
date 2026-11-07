@@ -437,8 +437,17 @@ fn add_candidate(
 }
 
 fn owned_by_current_user(path: &Path) -> Result<bool> {
-    Ok(vibeface_bridge::platform::privatefs::owner_of(path)?
-        == vibeface_bridge::platform::privatefs::current_account()?)
+    // Windows can assign an elevated token's group as owner. The native private ACL check
+    // already proves that only the current user is granted access and the token holds the owner.
+    #[cfg(windows)]
+    {
+        vibeface_bridge::platform::privatefs::is_private(path)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(vibeface_bridge::platform::privatefs::owner_of(path)?
+            == vibeface_bridge::platform::privatefs::current_account()?)
+    }
 }
 
 #[cfg(test)]
@@ -465,6 +474,25 @@ mod tests {
         assert_eq!(fs::read(dir.join("config.json")).unwrap(), config);
         assert_eq!(fs::read(dir.join("identity.json")).unwrap(), identity);
         assert_eq!(fs::read(dir.join("data-epoch.json")).unwrap(), epoch);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn private_node_on_the_workspace_volume_is_visible_to_its_account() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(".artifacts")
+            .join(format!("vibeface-discovery-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("Node 数据");
+        super::super::control::prepare_start(&dir).unwrap();
+        assert!(vibeface_bridge::platform::privatefs::is_private(&dir).unwrap());
+        assert!(owned_by_current_user(&dir).unwrap());
+        let mut paths = BTreeMap::new();
+        paths.insert(fs::canonicalize(&dir).unwrap(), vec![Source::Remembered]);
+        let result = inspect_candidates(paths, Vec::new()).await.unwrap();
+        assert_eq!(result["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(result["nodes"][0]["status"], "stopped");
         fs::remove_dir_all(root).unwrap();
     }
 

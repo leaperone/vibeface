@@ -2,6 +2,7 @@ use crate::update;
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
 use serde::Deserialize;
+#[cfg(any(windows, test))]
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -154,10 +155,14 @@ fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Resul
 
 /// Windows canonical paths can carry a verbatim `\\?\` prefix that PowerShell 5 `-File` and Task
 /// Scheduler reject; spell them as ordinary DOS or UNC paths at the script boundary.
+#[cfg(any(windows, test))]
 fn strip_verbatim_windows_path(path: &str) -> Cow<'_, str> {
     if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
         Cow::Owned(format!(r"\\{rest}"))
-    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+    } else if let Some(rest) = path.strip_prefix(r"\\?\").filter(|value| {
+        let bytes = value.as_bytes();
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+    }) {
         Cow::Borrowed(rest)
     } else {
         Cow::Borrowed(path)
@@ -167,7 +172,10 @@ fn strip_verbatim_windows_path(path: &str) -> Cow<'_, str> {
 fn script_os_argument(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        PathBuf::from(strip_verbatim_windows_path(&path.to_string_lossy()))
+        match path.to_str() {
+            Some(path) => PathBuf::from(strip_verbatim_windows_path(path)),
+            None => path.to_path_buf(),
+        }
     }
     #[cfg(not(windows))]
     {
@@ -259,13 +267,16 @@ pub async fn run(options: Service) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use std::ffi::OsStr;
     use vibeface_bridge::platform::privatefs;
 
     #[test]
     fn strip_verbatim_windows_path_returns_dos_and_unc_spelling() {
         assert_eq!(
-            strip_verbatim_windows_path(r"\\?\D:\Vibeface\current\scripts\install-node-service.ps1"),
+            strip_verbatim_windows_path(
+                r"\\?\D:\Vibeface\current\scripts\install-node-service.ps1"
+            ),
             r"D:\Vibeface\current\scripts\install-node-service.ps1"
         );
         assert_eq!(
@@ -275,6 +286,10 @@ mod tests {
         assert_eq!(
             strip_verbatim_windows_path(r"D:\ordinary\path"),
             r"D:\ordinary\path"
+        );
+        assert_eq!(
+            strip_verbatim_windows_path(r"\\?\Volume{fixture}\path"),
+            r"\\?\Volume{fixture}\path"
         );
     }
 
@@ -328,17 +343,22 @@ mod tests {
         let data = root.join("data");
         std::fs::create_dir(&data).unwrap();
         let executable = package.join(PROGRAMS[0]);
-        let install = command(&root, &data, &executable, Action::Install).unwrap();
+        let install = command(
+            &root.canonicalize().unwrap(),
+            &data.canonicalize().unwrap(),
+            &executable.canonicalize().unwrap(),
+            Action::Install,
+        )
+        .unwrap();
         let args: Vec<_> = install
             .as_std()
             .get_args()
-            .skip(1)
             .map(|value| value.to_owned())
             .collect();
-        let verbatim = OsStr::new("data-dir");
+        let verbatim = OsStr::new("--data-dir");
         let position = args.iter().position(|value| value == verbatim).unwrap();
         assert!(!args[position + 1].to_string_lossy().starts_with(r"\\?\"));
-        let binary_flag = OsStr::new("binary");
+        let binary_flag = OsStr::new("--binary");
         let position = args.iter().position(|value| value == binary_flag).unwrap();
         assert!(!args[position + 1].to_string_lossy().starts_with(r"\\?\"));
         std::fs::remove_dir_all(root).unwrap();

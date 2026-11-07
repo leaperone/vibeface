@@ -164,7 +164,7 @@ test('local discovery chooses among healthy Nodes and explicitly starts a stoppe
   assert.equal(choice.selectedNode, null);
   assert.equal(choice.discovery.kind, 'ready');
   const healthy = choice.discovery.nodes.filter(node => node.kind === 'running');
-  assert.equal(healthy.length, 2, 'the chooser presents both healthy fixture Nodes exactly once');
+  assert.equal(healthy.length, 2, `the chooser presents both healthy fixture Nodes exactly once; warnings=${JSON.stringify(choice.discovery.warnings)}`);
   assert.deepEqual(new Set(healthy.map(node => node.deviceId)), new Set([first.deviceId, second.deviceId]));
   const chooser = windows(await desktop.inspect()).launcher;
   expect(await evaluate(chooser, 'document.querySelectorAll("#nodes li").length')).toBe(2);
@@ -218,7 +218,7 @@ test('one existing healthy Node is discovered and selected when the desktop open
   const fixture = await desktop.createFixture(true);
   const before = await desktop.snapshotNode(fixture.dataDir);
   const opened = await desktop.start();
-  assert.equal(opened.status.nodeMode, 'controller');
+  assert.equal(opened.status.nodeMode, 'controller', `automatic discovery warnings=${opened.status.discovery.kind === 'ready' ? JSON.stringify(opened.status.discovery.warnings) : opened.status.discovery.kind}`);
   assert.deepEqual(opened.status.selectedNode, { dataDir: fixture.dataDir, deviceId: fixture.deviceId });
   assert.equal(opened.status.core.kind, 'none');
   assert.deepEqual(opened.cores, [], 'automatic connection starts no App-owned Core');
