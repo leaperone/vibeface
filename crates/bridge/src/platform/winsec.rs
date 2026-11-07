@@ -690,11 +690,12 @@ mod handed_over_pipe_tests {
         Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
         Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES},
         Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, ReadFile, WriteFile,
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+            PIPE_ACCESS_INBOUND, ReadFile, WriteFile,
         },
         System::Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, CreatePipe, GetNamedPipeInfo, PIPE_ACCESS_DUPLEX,
-            PIPE_ACCESS_INBOUND, PIPE_READMODE_BYTE, PIPE_SERVER_END, PIPE_TYPE_BYTE, PIPE_WAIT,
+            ConnectNamedPipe, CreateNamedPipeW, CreatePipe, GetNamedPipeInfo, PIPE_READMODE_BYTE,
+            PIPE_SERVER_END, PIPE_TYPE_BYTE, PIPE_WAIT,
         },
     };
 
