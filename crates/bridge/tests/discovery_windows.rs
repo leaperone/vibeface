@@ -61,7 +61,13 @@ fn compile_fixture_core(root: &Path) -> PathBuf {
     )
     .expect("write the fixture core source");
     let executable = root.join("vibeface-core.exe");
-    let output = Command::new("rustc")
+    let mut compiler = Command::new("rustc");
+    if let Some(linker) = std::env::var_os("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER") {
+        let mut option = std::ffi::OsString::from("linker=");
+        option.push(linker);
+        compiler.arg("-C").arg(option);
+    }
+    let output = compiler
         .arg(&source)
         .arg("-o")
         .arg(&executable)
