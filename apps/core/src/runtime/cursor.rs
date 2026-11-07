@@ -1389,7 +1389,7 @@ mod tests {
             let persist_trigger = job.trigger.clone();
             let persist_attempt = attempt.clone();
             let (cancel, receiver) = tokio::sync::watch::channel(false);
-            let task = tokio::spawn(async move {
+            let mut task = tokio::spawn(async move {
                 crate::manager::run_manager(
                     &running_config,
                     "hang",

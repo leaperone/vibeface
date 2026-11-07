@@ -180,7 +180,7 @@ impl Infra {
         drop(entry);
         drop(discovery);
         for dir in dirs {
-            std::fs::remove_dir_all(dir)
+            std::fs::remove_dir_all(&dir)
                 .with_context(|| format!("remove bootstrap fixture {}", dir.display()))?;
         }
         Ok(())
