@@ -258,8 +258,9 @@ async function quit() {
   const owned = await cores(running.pid);
   assert(Number.isInteger(inspectorPort), 'the app-owned inspector is available for its explicit menu quit');
   let forced = false;
+  const actionKey = `__vibefaceE2EQuit_${randomBytes(12).toString('hex')}`;
   try {
-    const clicked = await inMain(`(() => {
+    const validated = await inMain(`(() => {
       const { Menu, BrowserWindow } = process.mainModule.require('electron');
       const menu = Menu.getApplicationMenu();
       if (!menu) throw new Error('application menu is unavailable');
@@ -272,14 +273,40 @@ async function quit() {
       }
       if (!quitItem || typeof quitItem.click !== 'function') throw new Error('the product quit menu item has no click handler');
       const focused = BrowserWindow.getFocusedWindow();
-      quitItem.click(null, focused, focused?.webContents);
-      return JSON.stringify({ pid: process.pid, label: quitItem.label });
+      globalThis[${JSON.stringify(actionKey)}] = () => quitItem.click(null, focused, focused?.webContents);
+      return JSON.stringify({ pid: process.pid, label: quitItem.label, handler: typeof quitItem.click });
     })()`);
-    assert.equal(typeof clicked, 'string');
-    const action = JSON.parse(clicked);
+    assert.equal(typeof validated, 'string');
+    const action = JSON.parse(validated);
     assert.equal(action.pid, running.pid, 'the product menu handler ran in the driver-owned app process');
     assert.equal(action.label, '退出 Vibeface', 'the real product quit menu item handled the request');
-    forced = !(await waitForExit(running, 30000));
+    assert.equal(action.handler, 'function', 'the receipt identifies the actual product menu click handler');
+
+    let scheduled;
+    let scheduleError;
+    try {
+      scheduled = await inMain(`(() => {
+      const click = globalThis[${JSON.stringify(actionKey)}];
+      if (typeof click !== 'function') throw new Error('validated product quit handler is unavailable');
+      setImmediate(() => {
+        delete globalThis[${JSON.stringify(actionKey)}];
+        click();
+      });
+      return JSON.stringify({ pid: process.pid, label: '退出 Vibeface', scheduled: true });
+      })()`);
+    } catch (error) { scheduleError = error; }
+    if (scheduled !== undefined) {
+      assert.equal(typeof scheduled, 'string');
+      const receipt = JSON.parse(scheduled);
+      assert.equal(receipt.pid, running.pid, 'the handler was scheduled in the driver-owned Electron process');
+      assert.equal(receipt.label, '退出 Vibeface');
+      assert.equal(receipt.scheduled, true);
+    }
+
+    const exited = await waitForExit(running, 30000);
+    const normalExit = exited && running.exitCode === 0 && running.signalCode === null;
+    if (scheduled === undefined && !normalExit) throw scheduleError ?? new Error('the app did not confirm its scheduled product quit');
+    forced = !normalExit;
   } catch (error) {
     forced = true;
     console.error(`The product quit menu did not complete normally: ${error instanceof Error ? error.message : String(error)}`);
