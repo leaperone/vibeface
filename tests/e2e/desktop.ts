@@ -17,12 +17,29 @@ export type Inspection = {
   profile: string;
   runtime: Record<string, unknown>;
   cores: number[];
+  status: LauncherStatus;
   pages: Page[];
+};
+export type FixtureNode = { dataDir: string; peerPort: number; localPort: number; deviceId: string; running: boolean };
+export type LauncherStatus = {
+  core: { kind: string; dataDir?: string; deviceId?: string; origin?: string };
+  nodeMode: string;
+  discovery: { kind: string; nodes: Array<{ kind: string; id?: string; deviceId?: string; dataDir?: string }> };
+  backgroundNode: { kind: string; nodeId?: string; dataDir?: string; health?: string };
 };
 export type Desktop = {
   inspect(): Promise<Inspection>;
-  quit(): Promise<{ pid: number; owned: number[]; surviving: number[] }>;
+  status(): Promise<LauncherStatus>;
+  invoke(method: string, ...args: unknown[]): Promise<LauncherStatus>;
+  quit(): Promise<{ pid: number | null; owned: number[]; surviving: number[]; forced: boolean }>;
+  closeWindows(): Promise<Array<{ url: string; visibility: string }>>;
   start(): Promise<Inspection>;
+  createFixture(start?: boolean): Promise<FixtureNode>;
+  startFixture(dataDir: string): Promise<Record<string, unknown>>;
+  stopFixture(dataDir: string): Promise<Record<string, unknown>>;
+  snapshotNode(dataDir: string): Promise<{ deviceId: string; status: string; version: string | null; coreVersion: string; values: Record<string, string | null> }>;
+  serviceStatus(deviceId: string): Promise<Record<string, unknown>>;
+  detachSourceRuntime(deviceId: string): Promise<Record<string, unknown>>;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -57,6 +74,7 @@ function inspection(value: unknown): Inspection {
     profile: text(fields.profile),
     runtime: record(fields.runtime),
     cores: identifiers(fields.cores),
+    status: record(fields.status) as LauncherStatus,
     pages: pages.map(page),
   };
 }
@@ -89,8 +107,9 @@ async function control(port: number) {
       body: JSON.stringify(request),
       signal: AbortSignal.timeout(120000),
     });
-    assert(response.ok, `The desktop control operation returned ${response.status}`);
-    return response.json();
+    const body: unknown = await response.json();
+    assert(response.ok, `The desktop control operation returned ${response.status}: ${isRecord(body) && typeof body.error === 'string' ? body.error : 'see driver log'}`);
+    return body;
   };
 }
 
@@ -172,11 +191,35 @@ export const test = base.extend<{ desktop: Desktop }>({
       assert(inside && !inside.startsWith('..') && !inside.startsWith('/'), 'The desktop profile stays in this task');
       await use({
         inspect: async () => inspection(await call({ op: 'inspect' })),
+        status: async () => record(await call({ op: 'status' })) as LauncherStatus,
+        invoke: async (method, ...args) => record(await call({ op: 'invoke', method, args })) as LauncherStatus,
         quit: async () => {
           const result = record(await call({ op: 'quit' }));
-          return { pid: identifier(result.pid), owned: identifiers(result.owned), surviving: identifiers(result.surviving) };
+          return { pid: result.pid === null ? null : identifier(result.pid), owned: identifiers(result.owned), surviving: identifiers(result.surviving), forced: result.forced === true };
+        },
+        closeWindows: async () => {
+          const value = await call({ op: 'close-windows' });
+          assert(Array.isArray(value));
+          return value as Array<{ url: string; visibility: string }>;
         },
         start: async () => inspection(await call({ op: 'start' })),
+        createFixture: async (start = true) => {
+          const value = record(await call({ op: 'create-fixture', start }));
+          assert(typeof value.dataDir === 'string' && typeof value.deviceId === 'string');
+          assert(typeof value.peerPort === 'number' && typeof value.localPort === 'number');
+          assert(typeof value.running === 'boolean');
+          return value as FixtureNode;
+        },
+        startFixture: async dataDir => record(await call({ op: 'start-fixture', dataDir })),
+        stopFixture: async dataDir => record(await call({ op: 'stop-fixture', dataDir })),
+        snapshotNode: async dataDir => {
+          const value = record(await call({ op: 'snapshot-node', dataDir }));
+          assert(typeof value.deviceId === 'string' && isRecord(value.values));
+          assert(typeof value.status === 'string' && (typeof value.version === 'string' || value.version === null) && typeof value.coreVersion === 'string');
+          return value as { deviceId: string; status: string; version: string | null; coreVersion: string; values: Record<string, string | null> };
+        },
+        serviceStatus: async deviceId => record(await call({ op: 'service-status', deviceId })),
+        detachSourceRuntime: async deviceId => record(await call({ op: 'detach-source-runtime', deviceId })),
       });
     } finally {
       await stop();
