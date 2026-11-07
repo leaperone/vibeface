@@ -311,7 +311,7 @@ test("conversation snapshots parse bot changes strictly", () => {
   const base = {
     conversation: { conversation_id: "chat", title: "t", owner: null, owner_epoch: 0 }, messages: [],
     works: [], deliveries: [], checks: [], local_node: "n", questions: [], sessions: [],
-    sent: [], overwritten: [],
+    sent: [], sent_coverage: { scope: 'main', omitted_unknown: 0 }, overwritten: [],
     bot_settings: {
       skills: [{ skill_id: "s", name: "发布", description: "发版步骤" }],
       schedules: [
@@ -359,7 +359,7 @@ test("conversation snapshots parse bot changes strictly", () => {
 test("a change another device replaced reads as one line and asks for it back the usual way", () => {
   const base = {
     conversation: { conversation_id: "chat", title: "t", owner: null, owner_epoch: 0 }, messages: [], works: [], deliveries: [], checks: [], local_node: "n",
-    questions: [], sessions: [], sent: [], changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } },
+    questions: [], sessions: [], sent: [], sent_coverage: { scope: 'main', omitted_unknown: 0 }, changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } },
   }
   assert.deepEqual(parseConversation(base, "chat").overwritten, [])
   const item = (value: Record<string, unknown>) => parseConversation({ ...base, overwritten: [{ change_id: "c1", by: "dev-b", ...value }] }, "chat").overwritten[0]!

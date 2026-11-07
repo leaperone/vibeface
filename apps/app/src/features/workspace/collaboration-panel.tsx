@@ -158,7 +158,7 @@ function SentMessage({ sent, botName, botId }: { sent: SentBotMessage; botName: 
 function CollaborationMessages({ data, botNames }: { data: ConversationPayload; botNames: Map<string, { bot_id: string; name: string }> }) {
   const incoming = data.messages.filter((message) => message.role === "bot" && message.sender)
   const sent = data.sent
-  if (!incoming.length && !sent.length) return null
+  if (!incoming.length && !sent.length && !data.sent_coverage.omitted_unknown) return null
   return <Section title="Bot 协作消息" count={incoming.length + sent.length}>
     <div className="grid gap-3">
       {incoming.map((message) => {
@@ -175,6 +175,7 @@ function CollaborationMessages({ data, botNames }: { data: ConversationPayload; 
       })}
     </div>
     <p className="px-1 text-meta text-muted-foreground">协作消息与任务分别记录，执行情况在任务详情中查看。</p>
+    {data.sent_coverage.omitted_unknown ? <p className="px-1 text-meta text-muted-foreground">另有 {data.sent_coverage.omitted_unknown} 条协作消息的归属尚未确认，未计入当前主聊天。</p> : null}
   </Section>
 }
 

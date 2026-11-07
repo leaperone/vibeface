@@ -1,4 +1,4 @@
-//! Incremental projections. Each event updates its rows once, as it is stored; every rule is
+//! Incremental projections. Each event updates its rows and their dependents; every rule is
 //! order-independent (first/last by rank, max epoch or version), so any arrival order converges.
 //! Bot settings, skills and schedules use rank. Memories permanently prefer signed user
 //! control and its stable counter; removals remain as tombstones.
@@ -34,7 +34,7 @@ fn text(value: impl serde::Serialize) -> Result<String> {
 }
 
 /// Every table `apply` writes. A rebuild clears exactly these; nothing else is derived from the log.
-pub(crate) const TABLES: [&str; 16] = [
+pub(crate) const TABLES: [&str; 17] = [
     "conversations",
     "messages",
     "bots",
@@ -51,6 +51,7 @@ pub(crate) const TABLES: [&str; 16] = [
     "notification_acks",
     "questions",
     "session_owners",
+    "workspace_projection",
 ];
 
 /// Who owns a session, in any order the records arrive: the latest attribution or mute by
@@ -126,6 +127,26 @@ pub(crate) fn apply(
                 params![network, scope, bot_id, name, instructions, project.as_ref().map(serde_json::to_string).transpose()?, hash, rank, cause.as_ref().map(serde_json::to_string).transpose()?],
             )?;
         }
+        EventBody::WorkspaceCommanded { .. } => {
+            super::workspace::apply_projection(connection, network, hash, event, rank)?
+        }
+        EventBody::InputPosted {
+            message_id,
+            target,
+            text: body,
+            attachments,
+            report_results,
+            ..
+        } => {
+            let changed = connection.execute(
+                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,report_results,attachments,target) VALUES(?,?,?,?,?,?,'user',?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,in_reply_to=excluded.in_reply_to,status=excluded.status,failure=excluded.failure,report_results=excluded.report_results,answers=excluded.answers,attachments=excluded.attachments,sender=excluded.sender,target=excluded.target WHERE excluded.rank<rank",
+                params![network,scope,message_id,hash,rank,event.body.attestation().expect("validated input signature").device_id,body,event.created_at_ms,report_results,serde_json::to_string(attachments)?,serde_json::to_string(target)?],
+            )?;
+            if changed != 0 {
+                super::workspace::refresh_reply_targets(connection, network, scope, message_id)?;
+            }
+            super::workspace::apply_projection(connection, network, hash, event, rank)?;
+        }
         EventBody::MessagePosted {
             message_id,
             role,
@@ -138,8 +159,8 @@ pub(crate) fn apply(
             attachments,
             ..
         } => {
-            connection.execute(
-                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,failure,report_results,answers,attachments) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,in_reply_to=excluded.in_reply_to,status=excluded.status,failure=excluded.failure,report_results=excluded.report_results,answers=excluded.answers,attachments=excluded.attachments WHERE excluded.rank<rank",
+            let changed = connection.execute(
+                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,failure,report_results,answers,attachments) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,in_reply_to=excluded.in_reply_to,status=excluded.status,failure=excluded.failure,report_results=excluded.report_results,answers=excluded.answers,attachments=excluded.attachments,sender=excluded.sender,target=excluded.target WHERE excluded.rank<rank",
                 params![
                     network,
                     scope,
@@ -158,6 +179,9 @@ pub(crate) fn apply(
                     serde_json::to_string(attachments)?
                 ],
             )?;
+            if changed != 0 {
+                super::workspace::refresh_reply_targets(connection, network, scope, message_id)?;
+            }
             if *role == Role::Assistant {
                 let kind = if *status == Some(ReplyStatus::Completed) {
                     "manager_response"
@@ -168,10 +192,19 @@ pub(crate) fn apply(
             }
         }
         EventBody::MessageSteered { message_id, reply } => {
+            let previous: Option<String> = connection.query_row(
+                "SELECT steered_into FROM messages WHERE network_id=? AND conversation_id=? AND message_id=? AND role='user'",
+                params![network, scope, message_id],
+                |row| row.get(0),
+            ).optional()?.flatten();
             connection.execute(
                 "UPDATE messages SET steered_into=? WHERE network_id=? AND conversation_id=? AND message_id=? AND role='user'",
                 params![reply, network, scope, message_id],
             )?;
+            super::workspace::refresh_reply_targets(connection, network, scope, message_id)?;
+            if let Some(previous) = previous.filter(|previous| previous != reply) {
+                super::workspace::refresh_reply_targets(connection, network, scope, &previous)?;
+            }
         }
         EventBody::WorkDispatched { work_id, .. } => {
             connection.execute(
@@ -259,10 +292,13 @@ pub(crate) fn apply(
             about,
             ..
         } => {
-            connection.execute(
+            let changed = connection.execute(
                 "INSERT INTO questions(network_id,question_id,conversation_id,rank,author,created_at_ms,node,session_id,request_id,body) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,question_id) DO UPDATE SET conversation_id=excluded.conversation_id,rank=excluded.rank,author=excluded.author,created_at_ms=excluded.created_at_ms,node=excluded.node,session_id=excluded.session_id,request_id=excluded.request_id,body=excluded.body WHERE excluded.rank<rank",
                 params![network, question_id, scope, rank, event.author, event.created_at_ms, about.node, about.session_id, about.request_id, serde_json::to_string(&event.body)?],
             )?;
+            if changed != 0 {
+                super::workspace::refresh_question_targets(connection, network, question_id)?;
+            }
             notify(connection, network, hash, scope, "question", question, rank)?;
         }
         // Follows the question in its author's log. Only the device that asked and held the

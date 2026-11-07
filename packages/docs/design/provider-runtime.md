@@ -15,6 +15,7 @@ Provider 的登录材料和原生会话保留在运行设备上。
 
 回合启动时固定 Provider、模型、推理档位和本地配置标识。
 配置变更只作用于后续回合。Provider 不支持的档位在发送前拒绝。
+撤销目录、执行用途、Bot 权限或网络成员资格时，先封存原回合的输入和工具准入，并持久化停止意向。取消未确认的回合保留待核对，不能当作未启动或自动重发。
 回合记录保存提交给 Provider 的配置，不把提交值当作 Provider 已确认的实际选择。
 Provider 没有确认实际模型或推理档位时，实际选择保持未知。
 日志与页面不得通过原始账户响应或环境变量展示凭证。
@@ -25,6 +26,12 @@ Provider 没有确认实际模型或推理档位时，实际选择保持未知�
 历史读取只返回当前聊天的有限分页，省略内容必须能够按稳定标识读回。
 Provider 能原生压缩时记录压缩状态，否则通过有界上下文交接建立新会话。
 恢复只读取原回合结果，不从历史重新生成工作。
+
+Main、稳定业务 Task、已登记 Work 和 Routine 分别解析到真实执行 scope。业务 Task 的 `task_id` 跨多轮保持不变，本机原生会话按 scope 隔离。共享 Task 历史、checkpoint、持久 Memory 与 Provider 私有 transcript 是不同的数据。Context 展示实际选入的来源、省略数量和逐条输入证据，不展示私密提示或完整原生 transcript。
+
+活动补充使用完整 `SteerInput`，包含正文和已验证的附件。Codex 使用 `turn/steer`，Claude 使用持续 stdin，pi 使用原生 steer，OpenCode 使用 steer delivery。Provider 接受与原生回合归属分别保存；缺少逐条消费证据时不显示已读。同目标保持顺序，不同目标的投递与旧输入回读分别推进。发送结果未知时只核对原消息编号。
+
+Cursor 的新版 TypeScript SDK 提供文本 `Run.steer`，当前官方独立 SDK Bridge 尚未暴露该方法。本地 Bridge 配置不能完成活动补充，不用第二次普通 Send、停止重开或强制覆盖冒充原生 steer。此能力仍未满足，不能将其他 Provider 的验收推广到 Cursor。
 
 ## 工具和重试
 

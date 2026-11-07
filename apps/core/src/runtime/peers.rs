@@ -5,6 +5,7 @@
 //! after a restart or from another Node replays no side effect.
 use super::*;
 use crate::net::{self, AddressRecord, Net, SignedAddress};
+use crate::store::admission::{PeerAdmission, PeerAdmissionState, PeerCommand, PeerEnvelope};
 use iroh::{
     endpoint::{Connection, ConnectionError},
     protocol::{AcceptError, ProtocolHandler, Router},
@@ -26,19 +27,27 @@ const JOIN_NOTICE_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 pub(super) struct PeerDeliveryLocks {
-    peers: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    targets: std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl PeerDeliveryLocks {
-    pub(super) async fn lock(&self, device_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let peer = {
-            let mut peers = self.peers.lock().expect("peer delivery locks");
-            peers
-                .entry(device_id.to_owned())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
-        peer.lock_owned().await
+    fn target(&self, target: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut targets = self.targets.lock().expect("peer delivery locks");
+        targets.retain(|_, target| target.strong_count() > 0);
+        if let Some(target) = targets.get(target).and_then(Weak::upgrade) {
+            return target;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        targets.insert(target.into(), Arc::downgrade(&lock));
+        lock
+    }
+
+    pub(super) async fn lock(&self, target: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        self.target(target).lock_owned().await
+    }
+
+    pub(super) fn try_lock(&self, target: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.target(target).try_lock_owned().ok()
     }
 }
 
@@ -511,7 +520,13 @@ impl Runtime {
         let kind = field(input, "type")?;
         let _work = (!matches!(
             kind,
-            "capabilities" | "progress_read" | "addresses" | "scheduler_jobs" | "join_changed"
+            "capabilities"
+                | "progress_read"
+                | "addresses"
+                | "scheduler_jobs"
+                | "join_changed"
+                | "input_receipt"
+                | "scope_context"
         ))
         .then(|| self.maintenance.enter())
         .transpose()?;
@@ -529,7 +544,12 @@ impl Runtime {
                     .await
             }
             "progress_read" => self.read_progress(network, origin, input).await,
-            "dispatch_work" => self.accept_remote_dispatch(network, origin, input).await,
+            "dispatch_work" | "interrupt_work" => {
+                self.accept_peer_command(network, origin, input).await
+            }
+            "input_receipt" => self.read_input_receipt(network, input).await,
+            "scope_context" => self.read_scope_context(network, input).await,
+            "workspace_command" => self.accept_workspace_command(network, input).await,
             "join_changed" => {
                 self.publish_reread(network);
                 Ok(json!({}))
@@ -539,21 +559,6 @@ impl Runtime {
             ),
             "approve_join" => {
                 crate::client::approve_join(self, field(input, "admin")?, &input["params"]).await
-            }
-            "interrupt_work" => {
-                let scope = field(input, "conversation_id")?;
-                let work_id = field(input, "work_id")?;
-                let record = self
-                    .store
-                    .lock()
-                    .await
-                    .work_record(work_id)?
-                    .context("work not found on this device")?;
-                ensure!(
-                    record.conversation == scope,
-                    "work belongs to another conversation"
-                );
-                self.interrupt_work(network, work_id).await
             }
             "codex_state" => {
                 ensure!(
@@ -832,6 +837,9 @@ impl Runtime {
                     };
                     if presence_changed {
                         node.publish_reread(&network);
+                    }
+                    if result.is_ok() {
+                        node.outbox_wakeup.notify_one();
                     }
                     if result.is_err() {
                         node.align(&network).await;
@@ -1733,114 +1741,226 @@ impl Runtime {
                 continue;
             };
             let network = &state.genesis.network_id;
-            let (outbox, works) =
-                tokio::join!(self.deliver_outbox(), self.deliver_work_requests(network));
+            let (outbox, works, commands) = tokio::join!(
+                self.deliver_outbox(),
+                self.deliver_work_requests(network),
+                self.drive_peer_commands(network)
+            );
+            if let Err(error) = commands {
+                tracing::debug!(%error, "peer command admission pending");
+            }
             if let Err(error) = outbox {
                 tracing::debug!(%error, "scheduler delivery pending");
             }
             if let Err(error) = works {
                 tracing::debug!(%error, "work requests wait for their devices");
             }
-            if let Err(error) = self.reconcile_works(network).await {
-                tracing::debug!(%error, "work reconciliation pending");
-            }
-            if let Err(error) = self.reconcile_checks(network).await {
-                tracing::debug!(%error, "pending check reconciliation pending");
+            if let Some(guard) = self.peer_delivery_locks.try_lock("reconcile_works") {
+                let (node, network) = (self.clone(), network.to_owned());
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    if let Err(error) = node.reconcile_works(&network).await {
+                        tracing::debug!(%error, "work reconciliation pending");
+                    }
+                    if let Err(error) = node.reconcile_checks(&network).await {
+                        tracing::debug!(%error, "pending check reconciliation pending");
+                    }
+                });
             }
         }
     }
 
-    /// Hands each waiting message or result to the conversation's current owner. The owner admits
-    /// by trigger, so a retry after an unknown outcome is harmless.
     async fn deliver_outbox(self: &Arc<Self>) -> Result<()> {
-        let Some(network) = self.store.lock().await.network()? else {
-            return Ok(());
+        let (network, lanes) = {
+            let store = self.store.lock().await;
+            let Some(network) = store.network()? else {
+                return Ok(());
+            };
+            let mut lanes: BTreeMap<String, Vec<_>> = BTreeMap::new();
+            for entry in store.scheduler_outbox()? {
+                let metadata = (|| -> Result<_> {
+                    let target = store.peer_delivery_target(
+                        &network,
+                        &entry.conversation_id,
+                        &entry.trigger,
+                    )?;
+                    let lane = serde_json::to_string(&(&network, &entry.conversation_id, target))?;
+                    let (_, sequence, _) =
+                        store.peer_source(&network, &entry.conversation_id, &entry.trigger)?;
+                    Ok((lane, sequence))
+                })();
+                match metadata {
+                    Ok((lane, sequence)) => {
+                        lanes.entry(lane).or_default().push((sequence, entry));
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, conversation_id = entry.conversation_id, trigger = entry.trigger, "delivery source pending")
+                    }
+                }
+            }
+            (network, lanes)
         };
-        let entries = self.store.lock().await.scheduler_outbox()?;
-        let mut owned = Vec::new();
-        for entry in entries {
-            let owner = self
-                .store
-                .lock()
-                .await
-                .conversation(&network, &entry.conversation_id)?
-                .and_then(|conversation| conversation.owner)
-                .context("conversation has no scheduling Node")?;
-            owned.push((owner, entry));
+        for (lane, mut entries) in lanes {
+            let Some(guard) = self
+                .peer_delivery_locks
+                .try_lock(&format!("outbound:{lane}"))
+            else {
+                continue;
+            };
+            entries.sort_by_key(|(sequence, _)| *sequence);
+            let (node, network) = (self.clone(), network.clone());
+            tokio::spawn(async move {
+                let _guard = guard;
+                let mut progressed = false;
+                for (_, entry) in entries {
+                    match node.deliver_outbox_entry(&network, &entry).await {
+                        Ok(attempted) => progressed |= attempted,
+                        Err(error) => {
+                            tracing::debug!(%error, "target delivery pending");
+                            break;
+                        }
+                    }
+                }
+                drop(_guard);
+                if progressed {
+                    node.outbox_wakeup.notify_one();
+                }
+            });
         }
-        let (local, network) = (&self.identity.device_id()?, &network);
-        each_device(owned, |owner, entry| async move {
-            let _peer_delivery = self.peer_delivery_locks.lock(&owner).await;
-            let now = now_ms();
-            if !self.store.lock().await.mailbox_before_attempt(
+        Ok(())
+    }
+
+    async fn deliver_outbox_entry(
+        self: &Arc<Self>,
+        network: &str,
+        entry: &crate::scheduling::OutboxEntry,
+    ) -> Result<bool> {
+        let command = {
+            let mut store = self.store.lock().await;
+            if !store.mailbox_before_attempt(
                 network,
                 &entry.conversation_id,
                 &entry.trigger,
-                now,
+                now_ms(),
             )? {
-                return Ok(());
+                ensure!(
+                    store.peer_delivery_saved(network, &entry.conversation_id, &entry.trigger)?,
+                    "target waits for earlier delivery reconciliation"
+                );
+                return Ok(false);
             }
-            let delivered = if owner == *local {
+            store.peer_delivery_command(network, &entry.conversation_id, &entry.trigger)?
+        };
+        let command_id = command.envelope.command_id.clone();
+        let local = self.identity.device_id()?;
+        let delivered = if command.target_node == local {
+            self.accept_peer_envelope(network, &local, command.envelope)
+                .await
+        } else {
+            self.peer_request(
+                network,
+                &command.target_node,
+                json!({"type":"deliver","command":command.envelope}),
+            )
+            .await
+        };
+        let receipt_matches = match &delivered {
+            Ok(reply) if reply["admission"]["state"] == "owner_accepted" => {
+                self.store.lock().await.peer_delivery_receipt_matches(
+                    network,
+                    &entry.conversation_id,
+                    &entry.trigger,
+                    reply["receipt"]["trigger"].as_str().unwrap_or_default(),
+                )
+            }
+            _ => Ok(true),
+        };
+        let delivered = delivered.and_then(|reply| {
+            ensure!(
+                reply["admission"]["command_id"] == command_id,
+                "delivery answer belongs to another command"
+            );
+            let state = reply["admission"]["state"]
+                .as_str()
+                .context("delivery answer had no admission state")?;
+            ensure!(
+                matches!(
+                    state,
+                    "saved" | "waiting_dependencies" | "owner_accepted" | "rejected"
+                ),
+                "invalid owner admission state"
+            );
+            if state == "owner_accepted" {
+                let receipt = &reply["receipt"];
+                ensure!(
+                    receipt["network_id"] == network
+                        && receipt["conversation_id"] == entry.conversation_id
+                        && receipt_matches?,
+                    "delivery answer had no matching owner receipt"
+                );
+            }
+            Ok(reply)
+        });
+        match delivered {
+            Ok(delivered) if delivered["admission"]["state"] == "owner_accepted" => {
+                self.store.lock().await.mailbox_delivered(
+                    network,
+                    &entry.conversation_id,
+                    &entry.trigger,
+                    now_ms(),
+                )?;
+                self.publish_changed(
+                    network,
+                    &entry.conversation_id,
+                    Changed::Job(&entry.trigger),
+                );
+                Ok(true)
+            }
+            Ok(delivered) => {
+                let state = delivered["admission"]["state"]
+                    .as_str()
+                    .context("delivery answer had no admission state")?;
+                let detail = delivered["rejected"].as_str().unwrap_or(state);
+                if state == "rejected" {
+                    self.store.lock().await.mailbox_rejected(
+                        network,
+                        &entry.conversation_id,
+                        &entry.trigger,
+                        detail,
+                        now_ms(),
+                    )?;
+                    return Ok(true);
+                }
+                self.store.lock().await.mailbox_failed(
+                    network,
+                    &entry.conversation_id,
+                    &entry.trigger,
+                    false,
+                    detail,
+                    now_ms(),
+                )?;
+                ensure!(
+                    matches!(state, "saved" | "waiting_dependencies"),
+                    "invalid owner admission state"
+                );
                 self.store
                     .lock()
                     .await
-                    .admit_delivery(local, network, &entry.conversation_id, &entry.trigger)
-                    .map(|receipt| json!({ "receipt": receipt }))
-            } else {
-                let request = json!({"type":"deliver","conversation_id":entry.conversation_id,
-                        "trigger":entry.trigger});
-                self.peer_request(network, &owner, request).await
-            };
-            match delivered {
-                Ok(delivered) => {
-                    if let Err(error) = (|| -> Result<()> {
-                        ensure!(
-                            delivered["receipt"].is_object(),
-                            "delivery answer had no receipt"
-                        );
-                        Ok(())
-                    })() {
-                        self.store.lock().await.mailbox_failed(
-                            network,
-                            &entry.conversation_id,
-                            &entry.trigger,
-                            false,
-                            &error.to_string(),
-                            now_ms(),
-                        )?;
-                        return Err(error);
-                    }
-                    let now = now_ms();
-                    self.store.lock().await.mailbox_delivered(
-                        network,
-                        &entry.conversation_id,
-                        &entry.trigger,
-                        now,
-                    )?;
-                    self.publish_changed(
-                        network,
-                        &entry.conversation_id,
-                        Changed::Job(&entry.trigger),
-                    );
-                    self.schedule_wakeup.notify_one();
-                    Ok(())
-                }
-                Err(error) => {
-                    let unknown = net::Unanswered::is(&error);
-                    self.store.lock().await.mailbox_failed(
-                        network,
-                        &entry.conversation_id,
-                        &entry.trigger,
-                        unknown,
-                        &error.to_string(),
-                        now_ms(),
-                    )?;
-                    Err(error)
-                }
+                    .mark_peer_saved(network, &command_id)?;
+                Ok(true)
             }
-        })
-        .await;
-        Ok(())
+            Err(error) => {
+                self.store.lock().await.mailbox_failed(
+                    network,
+                    &entry.conversation_id,
+                    &entry.trigger,
+                    net::Unanswered::is(&error),
+                    &error.to_string(),
+                    now_ms(),
+                )?;
+                Err(error)
+            }
+        }
     }
 
     async fn accept_delivery(
@@ -1849,26 +1969,162 @@ impl Runtime {
         origin: &str,
         input: &Value,
     ) -> Result<Value> {
-        let scope = id(input, "conversation_id")?;
-        let trigger = field(input, "trigger")?;
-        let local = self.identity.device_id()?;
-        let mut receipt = self
-            .store
-            .lock()
-            .await
-            .admit_delivery(&local, network, &scope, trigger)?;
-        if receipt.is_none() {
-            self.sync_peer(network, origin).await?;
-            receipt = self
-                .store
+        self.accept_peer_command(network, origin, input).await
+    }
+
+    async fn accept_peer_command(
+        self: &Arc<Self>,
+        network: &str,
+        origin: &str,
+        input: &Value,
+    ) -> Result<Value> {
+        let envelope: PeerEnvelope = serde_json::from_value(input["command"].clone())?;
+        ensure!(
+            matches!(
+                (field(input, "type")?, &envelope.payload),
+                ("deliver", PeerCommand::Deliver { .. })
+                    | ("dispatch_work", PeerCommand::Dispatch { .. })
+                    | ("interrupt_work", PeerCommand::Stop { .. })
+            ),
+            "RPC does not match its command"
+        );
+        self.accept_peer_envelope(network, origin, envelope).await
+    }
+
+    async fn accept_peer_envelope(
+        self: &Arc<Self>,
+        network: &str,
+        origin: &str,
+        envelope: PeerEnvelope,
+    ) -> Result<Value> {
+        envelope.validate(network, origin, &self.identity.device_id()?)?;
+        let admission =
+            self.store
                 .lock()
                 .await
-                .admit_delivery(&local, network, &scope, trigger)?;
+                .save_peer_command(network, origin, &envelope, now_ms())?;
+        self.drive_peer_commands(network).await?;
+        Ok(admission.reply())
+    }
+
+    async fn drive_peer_commands(self: &Arc<Self>, network: &str) -> Result<()> {
+        let pending = self.store.lock().await.pending_peer_commands(network)?;
+        let mut lanes = BTreeSet::new();
+        for command in pending {
+            lanes.insert(command.envelope.lane(network));
         }
-        let receipt = receipt.context("the message has not reached the scheduling Node yet")?;
-        self.schedule_wakeup.notify_one();
-        self.publish_changed(network, &scope, Changed::Job(trigger));
-        Ok(json!({"receipt":receipt}))
+        for lane in lanes {
+            let Some(guard) = self
+                .peer_delivery_locks
+                .try_lock(&format!("inbound:{lane}"))
+            else {
+                continue;
+            };
+            let (node, network) = (self.clone(), network.to_owned());
+            tokio::spawn(async move {
+                let _guard = guard;
+                let mut drained = false;
+                let mut progressed = false;
+                loop {
+                    let command = match node.store.lock().await.pending_peer_commands(&network) {
+                        Ok(pending) => pending
+                            .into_iter()
+                            .find(|command| command.envelope.lane(&network) == lane),
+                        Err(error) => {
+                            tracing::warn!(%error, "peer command scan pending");
+                            break;
+                        }
+                    };
+                    let Some(command) = command else {
+                        drained = true;
+                        break;
+                    };
+                    match node.process_peer_command(&network, &command).await {
+                        Ok(true) => progressed = true,
+                        Ok(false) => break,
+                        Err(error) => {
+                            tracing::warn!(%error, command_id = command.envelope.command_id, "peer command persistence pending");
+                            break;
+                        }
+                    }
+                }
+                drop(_guard);
+                if drained && progressed {
+                    node.outbox_wakeup.notify_one();
+                }
+            });
+        }
+        Ok(())
+    }
+
+    async fn process_peer_command(
+        self: &Arc<Self>,
+        network: &str,
+        command: &PeerAdmission,
+    ) -> Result<bool> {
+        let envelope = &command.envelope;
+        let result: Result<Option<Value>> = async {
+            {
+                let store = self.store.lock().await;
+                let local = self.identity.device_id()?;
+                store.authorize_node(network, &local)?;
+                if let Some(proof) = store.peer_owner_proof(network, &local, envelope)? {
+                    return Ok(Some(proof));
+                }
+                store.authorize_node(network, &command.origin)?;
+                if !store.peer_command_dependencies(network, envelope)? { return Ok(None); }
+            }
+            match &envelope.payload {
+                PeerCommand::Deliver { conversation_id, trigger } => {
+                    if let Some(("message", message_id)) = trigger.split_once(':')
+                        && let Some(receipt) = self.accept_held_answer_delivery(network, conversation_id, message_id).await? {
+                            return Ok(Some(json!({"receipt":receipt})));
+                        }
+                    let receipt = {
+                        let mut store = self.store.lock().await;
+                        store.authorize_node(network, &command.origin)?;
+                        if !store.peer_command_dependencies(network, envelope)? { return Ok(None); }
+                        store.admit_delivery(&self.identity.device_id()?, network, conversation_id, trigger)?
+                    };
+                    if let Some(receipt) = receipt {
+                        self.schedule_wakeup.notify_one();
+                        self.publish_changed(network, conversation_id, Changed::Job(trigger));
+                        Ok(Some(json!({"receipt":receipt})))
+                    } else { Ok(None) }
+                }
+                PeerCommand::Dispatch { spec } => {
+                    let admitted = self.accept_dispatch(network, spec.as_ref().clone(), &Value::Null).await?;
+                    Ok(Some(json!({"work_id":admitted.record.work_id,"state":admitted.record.state.name()})))
+                }
+                PeerCommand::Stop { conversation_id, work_id } => {
+                    let record = self.store.lock().await.work_record(work_id)?;
+                    let Some(record) = record else {
+                        return Ok(Some(json!({"work_id":work_id,"interrupt_requested":true,"confirmed":false,"waiting_for_start":true})));
+                    };
+                    ensure!(record.conversation == *conversation_id, "work belongs to another conversation");
+                    self.interrupt_work(network, work_id).await.map(Some)
+                }
+            }
+        }.await;
+        let (state, response) = match result {
+            Ok(Some(response)) => (PeerAdmissionState::OwnerAccepted, response),
+            Ok(None) => {
+                self.wake_sync(&command.origin);
+                (PeerAdmissionState::WaitingDependencies, json!({}))
+            }
+            Err(error) => (
+                PeerAdmissionState::Rejected,
+                json!({"rejected":error.to_string(),
+                "failure":error.downcast_ref::<vibeface_bridge::failure::ExecFailure>().map(|failure| failure.kind)}),
+            ),
+        };
+        self.store.lock().await.finish_peer_command(
+            network,
+            &envelope.command_id,
+            state,
+            response,
+        )?;
+        Ok(state != PeerAdmissionState::WaitingDependencies)
     }
 
     async fn serve_blobs(self: Arc<Self>, connection: Connection, network: String, remote: String) {
@@ -2081,31 +2337,6 @@ impl Runtime {
     }
 }
 
-/// Sends each device its requests in order, all devices at once. A device that does not answer
-/// keeps the rest of its requests for the next round, so it holds up nobody else's.
-pub(super) async fn each_device<T, F, Fut>(requests: Vec<(String, T)>, send: F)
-where
-    F: Fn(String, T) -> Fut,
-    Fut: Future<Output = Result<()>>,
-{
-    let mut queues: BTreeMap<String, Vec<T>> = BTreeMap::new();
-    for (device, request) in requests {
-        queues.entry(device).or_default().push(request);
-    }
-    let send = &send;
-    futures_util::future::join_all(queues.into_iter().map(|(device, requests)| async move {
-        for request in requests {
-            if let Err(error) = send(device.clone(), request).await {
-                tracing::debug!(%device, %error, "request waits for its device");
-                if net::Unanswered::is(&error) {
-                    break;
-                }
-            }
-        }
-    }))
-    .await;
-}
-
 /// Devices out of `view` by a manager's signed revocation in an epoch in effect, not only
 /// because a recovery left them out.
 fn signed_removals(state: &NetworkState, view: &AuthorizationView) -> Vec<String> {
@@ -2267,7 +2498,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn peer_delivery_locks_serialize_same_peer_and_allow_other_peers() -> Result<()> {
+    async fn peer_delivery_locks_serialize_same_target_and_allow_other_scopes() -> Result<()> {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let locks = Arc::new(PeerDeliveryLocks::default());
@@ -2281,7 +2512,7 @@ mod tests {
             let locks = locks.clone();
             let first_active = first_active.clone();
             async move {
-                let _guard = locks.lock("peer-a").await;
+                let _guard = locks.lock("peer-a:scope-a").await;
                 first_active.store(true, Ordering::SeqCst);
                 first_ready_tx.send(()).expect("first waiter");
                 release_first_rx.await.expect("first release");
@@ -2295,7 +2526,7 @@ mod tests {
             let first_active = first_active.clone();
             let same_peer_entered = same_peer_entered.clone();
             async move {
-                let _guard = locks.lock("peer-a").await;
+                let _guard = locks.lock("peer-a:scope-a").await;
                 assert!(!first_active.load(Ordering::SeqCst));
                 same_peer_entered.store(true, Ordering::SeqCst);
             }
@@ -2305,7 +2536,7 @@ mod tests {
             let first_active = first_active.clone();
             let other_peer_parallel = other_peer_parallel.clone();
             async move {
-                let _guard = locks.lock("peer-b").await;
+                let _guard = locks.lock("peer-a:scope-b").await;
                 other_peer_parallel.store(first_active.load(Ordering::SeqCst), Ordering::SeqCst);
             }
         });
@@ -2319,6 +2550,817 @@ mod tests {
         same_peer.await?;
         assert!(same_peer_entered.load(Ordering::SeqCst));
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_dependencies_do_not_block_another_scope_on_the_same_peer() -> Result<()> {
+        let (sender, owner) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let (sender_id, owner_id) = (sender.device_id()?, owner.device_id()?);
+        let state = sender.sign_network_fixture(1, vec![sender_id.clone(), owner_id.clone()])?;
+        let network = sender.fixture_network_id()?;
+        let (a, dir_a) = node(&sender).await?;
+        let (r, dir_r) = node(&owner).await?;
+        let result = async {
+            for node in [&a, &r] {
+                node.install_membership(state.clone()).await?;
+            }
+            {
+                let mut store = a.store.lock().await;
+                for scope in ["slow", "active"] {
+                    let grant = sender.owner_fixture(&network, scope, &owner_id)?;
+                    store.create_conversation(&sender, &network, scope, scope, grant, now_ms())?;
+                }
+            }
+            let initial = a
+                .store
+                .lock()
+                .await
+                .events_from(&network, &sender_id, 1, 10)?;
+            r.store.lock().await.ingest_events(&network, &initial)?;
+            a.store.lock().await.accept_message(
+                &sender,
+                &network,
+                "slow",
+                "slow-input",
+                "slow-input",
+                vec![],
+                true,
+                posted(&sender, &network, "slow", "slow-input")?
+                    .attestation()
+                    .cloned()
+                    .context("attestation")?,
+                now_ms(),
+            )?;
+            let active = r.store.lock().await.append_event(
+                &owner,
+                &network,
+                "active",
+                posted(&sender, &network, "active", "active-input")?,
+                vec![],
+                now_ms(),
+            )?;
+            a.store.lock().await.ingest_events(&network, &[active])?;
+            a.store.lock().await.accept_message(
+                &sender,
+                &network,
+                "active",
+                "active-input",
+                "active-input",
+                vec![],
+                true,
+                posted(&sender, &network, "active", "active-input")?
+                    .attestation()
+                    .cloned()
+                    .context("attestation")?,
+                now_ms(),
+            )?;
+            assert!(r.store.lock().await.scheduler_jobs("active")?.is_empty());
+            for (node, peer) in [(&a, &owner_id), (&r, &sender_id)] {
+                node.sync_peers
+                    .lock()
+                    .expect("sync peers")
+                    .entry(peer.clone())
+                    .or_default()
+                    .running = true;
+                node.start_network().await?;
+            }
+            a.net()?.learn(&r.net()?.addr()).await;
+            r.net()?.learn(&a.net()?.addr()).await;
+            let slow = a.store.lock().await.peer_delivery_command(
+                &network,
+                "slow",
+                "message:slow-input",
+            )?;
+            let receipt = a
+                .peer_request(
+                    &network,
+                    &owner_id,
+                    json!({"type":"deliver","command":slow.envelope}),
+                )
+                .await?;
+            assert!(matches!(
+                receipt["admission"]["state"].as_str(),
+                Some("saved" | "waiting_dependencies")
+            ));
+            assert!(
+                receipt.get("receipt").is_none(),
+                "saved ingress is not owner admission"
+            );
+            a.deliver_outbox().await?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while r
+                    .store
+                    .lock()
+                    .await
+                    .scheduler_job("active", "message:active-input")?
+                    .is_none()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                anyhow::Ok(())
+            })
+            .await
+            .context(
+                "the active scope is admitted while the same peer still lacks the slow source",
+            )??;
+            assert!(
+                r.store
+                    .lock()
+                    .await
+                    .message(&network, "slow", "slow-input")?
+                    .is_none()
+            );
+            assert!(r.store.lock().await.scheduler_jobs("slow")?.is_empty());
+            assert_ne!(
+                a.store
+                    .lock()
+                    .await
+                    .mailbox_for_test(&network, "slow", "message:slow-input")?
+                    .context("slow mailbox")?
+                    .state,
+                crate::store::mailbox::MailboxState::Delivered
+            );
+            let mut changed = slow.envelope.clone();
+            changed.revision = Some(2);
+            assert!(
+                a.peer_request(
+                    &network,
+                    &owner_id,
+                    json!({"type":"deliver","command":changed})
+                )
+                .await
+                .is_err(),
+                "the same command cannot change its intent"
+            );
+            let active = a.store.lock().await.peer_delivery_command(
+                &network,
+                "active",
+                "message:active-input",
+            )?;
+            let read = a
+                .peer_request(
+                    &network,
+                    &owner_id,
+                    json!({"type":"deliver","command":active.envelope}),
+                )
+                .await?;
+            assert_eq!(read["admission"]["state"], "owner_accepted");
+            assert_eq!(r.store.lock().await.scheduler_jobs("active")?.len(), 1);
+            anyhow::Ok(())
+        }
+        .await;
+        stop_nodes(vec![(a, dir_a), (r, dir_r)]).await?;
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_answers_route_to_the_original_request_node_and_never_become_jobs() -> Result<()> {
+        let (sender, request_node) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let (sender_id, request_node_id) = (sender.device_id()?, request_node.device_id()?);
+        let network = sender.fixture_network_id()?;
+        let state =
+            sender.sign_network_fixture(1, vec![sender_id.clone(), request_node_id.clone()])?;
+        let (a, dir_a) = node(&sender).await?;
+        let (r, dir_r) = node(&request_node).await?;
+        let result = async {
+            for node in [&a, &r] { node.install_membership(state.clone()).await?; }
+            {
+                let mut store = a.store.lock().await;
+                let grant = sender.owner_fixture(&network, "c", &sender_id)?;
+                store.create_conversation(&sender, &network, "c", "answer control", grant, now_ms())?;
+            }
+            let initial = a.store.lock().await.events_from(&network, &sender_id, 1, 10)?;
+            r.store.lock().await.ingest_events(&network, &initial)?;
+            r.store.lock().await.ask(&request_node, &network, "c", EventBody::QuestionAsked {
+                question_id: "q-held".into(), target: None, attention: AttentionRequest { kind: AttentionKind::Question, device_id: Some(request_node_id.clone()) },
+                severity: Severity::Attention, text: "Continue the held request?".into(), choices: vec![],
+                about: Subject { node: request_node_id.clone(), agent: Some(crate::providers::Provider::Codex), session_id: "original-session".into(),
+                    cwd: dir_r.display().to_string(), summary: "held request".into(), request_id: Some("original-request".into()) },
+            }, now_ms())?;
+            let question = r.store.lock().await.events_from(&network, &request_node_id, 1, 10)?;
+            a.store.lock().await.ingest_events(&network, &question)?;
+            let answer = sender.fixture_admin().attest(&network, "c", EventBody::MessagePosted {
+                message_id: "a-q-held".into(), role: Role::User, text: "continue".into(), attachments: vec![], report_results: Some(true),
+                in_reply_to: None, status: None, failure: None, answers: Some("q-held".into()), attestation: None,
+            })?;
+            a.store.lock().await.accept_answer(&sender, &network, "q-held", "continue", answer.attestation().cloned(), now_ms())?;
+            assert!(a.store.lock().await.scheduler_jobs("c")?.is_empty(), "the Bot owner does not schedule an Answer for a held request elsewhere");
+            let answer_events = a.store.lock().await.events_from(&network, &sender_id, 1, 20)?;
+            r.store.lock().await.ingest_events(&network, &answer_events)?;
+            assert!(r.store.lock().await.scheduler_jobs("c")?.is_empty());
+            assert!(r.store.lock().await.admit_delivery(&request_node_id, &network, "c", "message:a-q-held")?.is_none(),
+                "direct delivery waits for the live control receipt instead of creating a scheduler job");
+            let command = a.store.lock().await.peer_delivery_command(&network, "c", "message:a-q-held")?;
+            assert_eq!(command.target_node, request_node_id);
+            assert!(command.envelope.target.starts_with("held_request:"));
+            assert_eq!(command.envelope.owner_epoch, 0);
+            assert_eq!(command.envelope.causal_refs.len(), 2);
+            for node in [&a, &r] { node.start_network().await?; }
+            a.net()?.learn(&r.net()?.addr()).await;
+            r.net()?.learn(&a.net()?.addr()).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let answer = a.peer_request(&network, &request_node_id, json!({"type":"deliver","command":command.envelope})).await?;
+                    assert_ne!(answer["admission"]["state"], "owner_accepted", "a missing live transport is never accepted as an Answer job");
+                    if answer["admission"]["state"] == "rejected" { break; }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                anyhow::Ok(())
+            }).await.context("an answer for a request without a live transport fails explicitly")??;
+            assert!(r.store.lock().await.scheduler_jobs("c")?.is_empty());
+            assert!(r.store.lock().await.held_answer_receipt(&network, "c", "a-q-held")?.is_none());
+            anyhow::Ok(())
+        }.await;
+        stop_nodes(vec![(a, dir_a), (r, dir_r)]).await?;
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn synced_assignments_run_only_after_explicit_delivery_and_are_admitted_once()
+    -> Result<()> {
+        use crate::workspace::{WORKSPACE_SCOPE, WorkspaceCommand};
+        fn apply(
+            sender: &LocalIdentity,
+            store: &mut Store,
+            network: &str,
+            command_id: &str,
+            command: WorkspaceCommand,
+        ) -> Result<()> {
+            let signed = sender.fixture_admin().attest(
+                network,
+                WORKSPACE_SCOPE,
+                EventBody::WorkspaceCommanded {
+                    command_id: command_id.into(),
+                    command: command.clone(),
+                    acting_assignment: None,
+                    attestation: None,
+                    cause: None,
+                },
+            )?;
+            store.apply_workspace_command(
+                sender,
+                network,
+                command_id,
+                command,
+                signed.attestation().cloned(),
+                None,
+                None,
+                now_ms(),
+            )?;
+            Ok(())
+        }
+        let (sender, owner) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let (sender_id, owner_id) = (sender.device_id()?, owner.device_id()?);
+        let state = sender.sign_network_fixture(1, vec![sender_id.clone(), owner_id.clone()])?;
+        let network = sender.fixture_network_id()?;
+        let (a, dir_a) = node(&sender).await?;
+        let (r, dir_r) = node(&owner).await?;
+        let result = async {
+            for node in [&a, &r] {
+                node.install_membership(state.clone()).await?;
+            }
+            {
+                let mut store = a.store.lock().await;
+                let grant = sender.owner_fixture(&network, "c", &owner_id)?;
+                store.create_conversation(
+                    &sender,
+                    &network,
+                    "c",
+                    "assigned Bot",
+                    grant,
+                    now_ms(),
+                )?;
+                let bot = sender.fixture_admin().attest(
+                    &network,
+                    "c",
+                    EventBody::BotCreated {
+                        bot_id: "bot".into(),
+                        name: "assigned Bot".into(),
+                        instructions: "run the assigned task".into(),
+                        project: None,
+                        attestation: None,
+                        cause: None,
+                    },
+                )?;
+                store.append_event(&sender, &network, "c", bot, vec![], now_ms())?;
+                let epoch = store
+                    .conversation(&network, "c")?
+                    .context("Bot conversation")?
+                    .owner_epoch;
+                for (command_id, command) in [
+                    (
+                        "create-task",
+                        WorkspaceCommand::CreateTask {
+                            task_id: "task".into(),
+                            channel_id: None,
+                            parent_task_id: None,
+                            owner_bot: "bot".into(),
+                            title: "assigned task".into(),
+                            request: "perform the assigned task".into(),
+                            expected_result: "verified result".into(),
+                            source_events: vec![],
+                            dependencies: vec![],
+                            reply_only: false,
+                        },
+                    ),
+                    (
+                        "assign-task",
+                        WorkspaceCommand::AssignTask {
+                            task_id: "task".into(),
+                            expected_revision: 1,
+                            assignment_id: "assignment".into(),
+                            bot_id: "bot".into(),
+                            execution_node: owner_id.clone(),
+                            bot_owner_epoch: epoch,
+                            channel_owner_epoch: None,
+                            work_id: None,
+                            resource_roots: vec![],
+                            automatic: false,
+                        },
+                    ),
+                ] {
+                    apply(&sender, &mut store, &network, command_id, command)?;
+                }
+                assert!(
+                    store
+                        .scheduler_outbox()?
+                        .iter()
+                        .any(|entry| entry.trigger == "assignment:assignment")
+                );
+            }
+            let history = a
+                .store
+                .lock()
+                .await
+                .events_from(&network, &sender_id, 1, 20)?;
+            r.store.lock().await.ingest_events(&network, &history)?;
+            assert!(
+                r.store
+                    .lock()
+                    .await
+                    .workspace_assignment(&network, "assignment")?
+                    .is_some()
+            );
+            assert!(
+                r.store.lock().await.scheduler_jobs("c")?.is_empty(),
+                "sync stores assignment intent without scheduling it"
+            );
+            assert!(
+                r.store.lock().await.scheduler_outbox()?.is_empty(),
+                "sync never creates a new delivery"
+            );
+            let command = a.store.lock().await.peer_delivery_command(
+                &network,
+                "c",
+                "assignment:assignment",
+            )?;
+            assert_eq!(command.target_node, owner_id);
+            assert_eq!(command.envelope.target, "workspace_task:task");
+            assert_eq!(command.envelope.revision, Some(1));
+            assert!(!command.envelope.causal_refs.is_empty());
+            {
+                let mut store = r.store.lock().await;
+                store.save_peer_command(&network, &sender_id, &command.envelope, now_ms())?;
+                let receipt = store
+                    .admit_delivery(&owner_id, &network, "c", "assignment:assignment")?
+                    .context("owner persisted admission")?;
+                assert_eq!(receipt.trigger, "assignment:assignment");
+                assert_eq!(
+                    store.pending_peer_commands(&network)?[0].state,
+                    PeerAdmissionState::Saved
+                );
+            }
+            r.store.lock().await.apply_workspace_command(
+                &owner,
+                &network,
+                "accepted-for-work",
+                WorkspaceCommand::AssignmentProgress {
+                    execution: None,
+                    assignment_id: "assignment".into(),
+                    revision: 1,
+                    state: crate::workspace::AssignmentState::Accepted,
+                    input_event: None,
+                    evidence_event: None,
+                    result: None,
+                },
+                None,
+                None,
+                None,
+                now_ms(),
+            )?;
+            let execution = r
+                .store
+                .lock()
+                .await
+                .events_from(&network, &owner_id, 1, 20)?;
+            a.store.lock().await.ingest_events(&network, &execution)?;
+            a.settings.lock().unwrap().roots = vec![dir_a.clone()];
+            a.settings.lock().unwrap().manager = Some(config::ManagerSettings {
+                provider: crate::providers::Provider::Claude,
+                workspace: dir_a.clone(),
+                model: "test-model".into(),
+                reasoning_effort: None,
+                backup: Default::default(),
+            });
+            let work = crate::work::WorkRequest {
+                work_id: crate::work::WorkSpec::id("c", "assignment:assignment", "assigned-work"),
+                conversation: "c".into(),
+                trigger: "assignment:assignment".into(),
+                target: sender_id.clone(),
+                dispatcher: owner_id.clone(),
+                call_ref: "assigned-work".into(),
+                kind: crate::work::RequestedWorkKind::Task,
+                model: None,
+                cwd: dir_a.display().to_string(),
+                title: "assigned work".into(),
+                prompt: "perform assigned file work".into(),
+                continues: None,
+                parent: None,
+                thread: None,
+            };
+            let work_command = r
+                .store
+                .lock()
+                .await
+                .peer_dispatch_command(&network, &work)?
+                .envelope;
+            assert_eq!(work_command.revision, Some(1));
+            assert!(
+                work_command
+                    .causal_refs
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+            );
+            a.store
+                .lock()
+                .await
+                .save_peer_command(&network, &owner_id, &work_command, now_ms())?;
+            assert!(
+                a.accept_dispatch(&network, work.clone(), &Value::Null)
+                    .await?
+                    .created,
+                "a legitimate assignment can dispatch actual Work on another Node"
+            );
+            assert!(
+                !a.accept_dispatch(&network, work.clone(), &Value::Null)
+                    .await?
+                    .created
+            );
+            let mut outside = work.clone();
+            outside.call_ref = "outside-root".into();
+            outside.work_id =
+                crate::work::WorkSpec::id("c", "assignment:assignment", &outside.call_ref);
+            outside.cwd = dir_r.display().to_string();
+            assert!(
+                a.accept_dispatch(&network, outside, &Value::Null)
+                    .await
+                    .err()
+                    .is_some_and(|error| error.to_string().contains("outside configured roots")),
+                "assignment authority does not bypass target roots"
+            );
+            {
+                let mut store = a.store.lock().await;
+                apply(
+                    &sender,
+                    &mut store,
+                    &network,
+                    "revise-after-admission",
+                    WorkspaceCommand::ReviseTask {
+                        task_id: "task".into(),
+                        expected_revision: 1,
+                        request: "new revision after original admission".into(),
+                        expected_result: "new verified result".into(),
+                        dependencies: vec![],
+                    },
+                )?;
+                let changed_owner = sender.fixture_admin().attest(
+                    &network,
+                    "c",
+                    EventBody::ConversationOwner {
+                        scheduler_node: owner_id.clone(),
+                        epoch: command.envelope.owner_epoch + 1,
+                        attestation: None,
+                        cause: None,
+                    },
+                )?;
+                store.append_event(&sender, &network, "c", changed_owner, vec![], now_ms())?;
+            }
+            let changed = a
+                .store
+                .lock()
+                .await
+                .events_from(&network, &sender_id, 1, 30)?;
+            r.store.lock().await.ingest_events(&network, &changed)?;
+            {
+                let mut store = r.store.lock().await;
+                assert_eq!(
+                    store
+                        .workspace_task(&network, "task")?
+                        .context("revised task")?
+                        .revision,
+                    2
+                );
+                assert!(
+                    store
+                        .admit_delivery(&owner_id, &network, "c", "assignment:assignment")
+                        .is_err(),
+                    "a fresh stale assignment must fail its current fences"
+                );
+            }
+            assert!(
+                a.store
+                    .lock()
+                    .await
+                    .peer_owner_proof(&network, &sender_id, &work_command)?
+                    .is_some(),
+                "a later revision does not reinterpret the original admitted Work source frame"
+            );
+            assert_eq!(a.store.lock().await.work_records()?.len(), 1);
+            let reloaded = Store::open_readonly(dir_r.join("node.sqlite3"))?;
+            assert_eq!(
+                reloaded.pending_peer_commands(&network)?[0].state,
+                PeerAdmissionState::Saved,
+                "the owner job survived while its peer receipt was still unwritten"
+            );
+            assert_eq!(reloaded.scheduler_jobs("c")?.len(), 1);
+            drop(reloaded);
+            for node in [&a, &r] {
+                node.start_network().await?;
+            }
+            a.net()?.learn(&r.net()?.addr()).await;
+            r.net()?.learn(&a.net()?.addr()).await;
+            let saved = a
+                .peer_request(
+                    &network,
+                    &owner_id,
+                    json!({"type":"deliver","command":command.envelope}),
+                )
+                .await?;
+            assert!(matches!(
+                saved["admission"]["state"].as_str(),
+                Some("saved" | "owner_accepted")
+            ));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let read = a
+                        .peer_request(
+                            &network,
+                            &owner_id,
+                            json!({"type":"deliver","command":command.envelope}),
+                        )
+                        .await?;
+                    if read["admission"]["state"] == "owner_accepted" {
+                        assert_eq!(read["receipt"]["trigger"], "assignment:assignment");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                anyhow::Ok(())
+            })
+            .await
+            .context("explicit delivery admits the assignment")??;
+            r.store.lock().await.ingest_events(&network, &changed)?;
+            let jobs = r.store.lock().await.scheduler_jobs("c")?;
+            assert_eq!(
+                jobs.len(),
+                1,
+                "repeated delivery and historical sync do not duplicate execution"
+            );
+            assert_eq!(jobs[0].kind, crate::scheduling::TriggerKind::WorkspaceTask);
+            assert_eq!(
+                jobs[0].scope,
+                crate::scheduling::SessionScope::WorkspaceTask {
+                    task_id: "task".into()
+                }
+            );
+            assert!(jobs[0].runtime.is_none());
+            let mut changed_intent = command.envelope.clone();
+            changed_intent.revision = Some(2);
+            assert!(
+                a.peer_request(
+                    &network,
+                    &owner_id,
+                    json!({"type":"deliver","command":changed_intent})
+                )
+                .await
+                .is_err(),
+                "recovery cannot reinterpret the original command as the newer revision"
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        stop_nodes(vec![(a, dir_a), (r, dir_r)]).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn a_saved_cancel_prevents_a_delayed_dispatch_and_survives_reload() -> Result<()> {
+        use crate::work::{RequestedWorkKind, WorkRequest, WorkSpec};
+        let (sender, target) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let (sender_id, target_id) = (sender.device_id()?, target.device_id()?);
+        let state = sender.sign_network_fixture(1, vec![sender_id.clone(), target_id.clone()])?;
+        let network = sender.fixture_network_id()?;
+        let (node, dir) = node(&target).await?;
+        let result = async {
+            node.install_membership(state).await?;
+            node.settings.lock().unwrap().roots = vec![dir.clone()];
+            node.settings.lock().unwrap().manager = Some(config::ManagerSettings {
+                provider: crate::providers::Provider::Claude,
+                workspace: dir.clone(),
+                model: "test-model".into(),
+                reasoning_effort: None,
+                backup: Default::default(),
+            });
+            {
+                let mut store = node.store.lock().await;
+                let grant = sender.owner_fixture(&network, "c", &sender_id)?;
+                store.create_conversation(&sender, &network, "c", "Task", grant, now_ms())?;
+                store.append_event(
+                    &sender,
+                    &network,
+                    "c",
+                    posted(&sender, &network, "c", "m1")?,
+                    vec![],
+                    now_ms(),
+                )?;
+            }
+            let spec = WorkRequest {
+                work_id: WorkSpec::id("c", "message:m1", "delayed"),
+                conversation: "c".into(),
+                trigger: "message:m1".into(),
+                target: target_id,
+                dispatcher: sender_id.clone(),
+                call_ref: "delayed".into(),
+                kind: RequestedWorkKind::Task,
+                model: None,
+                cwd: dir.display().to_string(),
+                title: "delayed".into(),
+                prompt: "do not run".into(),
+                continues: None,
+                parent: None,
+                thread: None,
+            };
+            let dispatch = node
+                .store
+                .lock()
+                .await
+                .peer_dispatch_command(&network, &spec)?
+                .envelope;
+            let stop_payload = PeerCommand::Stop {
+                conversation_id: "c".into(),
+                work_id: spec.work_id.clone(),
+            };
+            let stop = PeerEnvelope {
+                command_id: stop_payload.id(&network),
+                payload: stop_payload,
+                ..dispatch.clone()
+            };
+            let guard = node.work_input_lock(&spec.work_id).await.read_owned().await;
+            let saved = tokio::time::timeout(
+                Duration::from_secs(1),
+                node.accept_peer_envelope(&network, &sender_id, stop.clone()),
+            )
+            .await
+            .context("saving a cancel does not wait for an in-flight Provider read guard")??;
+            assert_eq!(saved["admission"]["state"], "saved");
+            assert!(!saved["confirmed"].as_bool().unwrap_or(true));
+            assert!(
+                node.store
+                    .lock()
+                    .await
+                    .peer_cancelled(&network, "c", &spec.work_id)?
+            );
+            let reopened = Store::open_readonly(dir.join("node.sqlite3"))?;
+            assert!(
+                reopened.peer_cancelled(&network, "c", &spec.work_id)?,
+                "the durable intent is the dispatch fence"
+            );
+            drop((guard, reopened));
+            node.accept_peer_envelope(&network, &sender_id, dispatch.clone())
+                .await?;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let answer = node
+                        .accept_peer_envelope(&network, &sender_id, dispatch.clone())
+                        .await?;
+                    if answer["admission"]["state"] == "rejected" {
+                        assert!(
+                            answer["rejected"]
+                                .as_str()
+                                .is_some_and(|reason| reason.contains("cancelled"))
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                anyhow::Ok(())
+            })
+            .await
+            .context("delayed dispatch is rejected by the earlier cancel")??;
+            assert!(
+                node.store
+                    .lock()
+                    .await
+                    .work_record(&spec.work_id)?
+                    .is_none()
+            );
+            assert!(node.store.lock().await.scheduler_jobs("c")?.is_empty());
+            let mut allowed = spec.clone();
+            allowed.call_ref = "allowed".into();
+            allowed.work_id = WorkSpec::id("c", "message:m1", "allowed");
+            let allowed_command = node
+                .store
+                .lock()
+                .await
+                .peer_dispatch_command(&network, &allowed)?
+                .envelope;
+            node.store.lock().await.save_peer_command(
+                &network,
+                &sender_id,
+                &allowed_command,
+                now_ms(),
+            )?;
+            assert!(
+                node.accept_dispatch(&network, allowed.clone(), &Value::Null)
+                    .await?
+                    .created,
+                "a different uncancelled work remains admissible"
+            );
+            assert!(
+                node.store
+                    .lock()
+                    .await
+                    .work_record(&allowed.work_id)?
+                    .is_some()
+            );
+            let stop_payload = PeerCommand::Stop {
+                conversation_id: "c".into(),
+                work_id: allowed.work_id.clone(),
+            };
+            let held_stop = PeerEnvelope {
+                command_id: stop_payload.id(&network),
+                payload: stop_payload,
+                ..allowed_command.clone()
+            };
+            node.store.lock().await.save_peer_command(
+                &network,
+                &sender_id,
+                &held_stop,
+                now_ms(),
+            )?;
+            node.interrupt_work(&network, &allowed.work_id).await?;
+            let owner_change = sender.fixture_admin().attest(
+                &network,
+                "c",
+                EventBody::ConversationOwner {
+                    scheduler_node: sender_id.clone(),
+                    epoch: allowed_command.owner_epoch + 1,
+                    attestation: None,
+                    cause: None,
+                },
+            )?;
+            node.store.lock().await.append_event(
+                &target,
+                &network,
+                "c",
+                owner_change,
+                vec![],
+                now_ms(),
+            )?;
+            node.settings.lock().unwrap().manager = None;
+            for command_id in [&allowed_command.command_id, &held_stop.command_id] {
+                let pending = node
+                    .store
+                    .lock()
+                    .await
+                    .pending_peer_commands(&network)?
+                    .into_iter()
+                    .find(|pending| pending.envelope.command_id == *command_id)
+                    .context("unwritten peer receipt")?;
+                assert!(node.process_peer_command(&network, &pending).await?);
+                let proof = node
+                    .accept_peer_envelope(&network, &sender_id, pending.envelope)
+                    .await?;
+                assert_eq!(
+                    proof["admission"]["state"], "owner_accepted",
+                    "persisted Work and stop facts precede the newer epoch fence"
+                );
+            }
+            assert_eq!(node.store.lock().await.work_records()?.len(), 1);
+            assert_eq!(node.store.lock().await.scheduler_jobs("c")?.len(), 1);
+            assert!(
+                node.store
+                    .lock()
+                    .await
+                    .peer_cancelled(&network, "c", &spec.work_id)?,
+                "an accepted cancel does not revive the same Work after an epoch change"
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        drop(node);
+        let _ = std::fs::remove_dir_all(dir);
+        result
     }
 
     fn user(identity: &LocalIdentity, network: &str, id: &str) -> Result<Attestation> {
@@ -3607,7 +4649,12 @@ mod tests {
                 user(&ia, &network, "m4")?, now_ms())?;
             assert_eq!(b.store.lock().await.scheduler_outbox()?.len(), 1);
             b.deliver_outbox().await?;
-            assert!(b.store.lock().await.scheduler_outbox()?.is_empty());
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !b.store.lock().await.scheduler_outbox()?.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                anyhow::Ok(())
+            }).await.context("owner returns the stored delivery receipt")??;
             let trigger = crate::scheduling::message_trigger("m4");
             assert_eq!(
                 b.store
@@ -3619,8 +4666,9 @@ mod tests {
             );
             a.store.lock().await.scheduler_job("c", &trigger)?
                 .context("the owner admitted the delivered message")?;
+            let command = b.store.lock().await.peer_delivery_command(&network, "c", &trigger)?;
             let again = b.peer_request(&network, &ia.device_id()?,
-                json!({"type":"deliver","conversation_id":"c","trigger":trigger})).await?;
+                json!({"type":"deliver","command":command.envelope})).await?;
             assert_eq!(again["receipt"]["trigger"], trigger.as_str());
             assert_eq!(
                 a.store.lock().await.scheduler_jobs("c")?.iter().filter(|job| job.trigger == trigger).count(),

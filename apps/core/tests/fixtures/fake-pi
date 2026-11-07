@@ -4,7 +4,8 @@ file written the way pi writes it.
 
 PI_CODING_AGENT_SESSION_DIR holds the sessions. FAKE_PI_LOG gets one JSON line per start and
 per prompt. FAKE_PI_MODE picks "reply", "wait", "crash", "fail", "fail-key", "refuse",
-"refuse-model" or "prompt-lost". Standard library only.
+"refuse-model", "prompt-lost", "prompt-pending" or "retry-abort". Standard library only.
+FAKE_PI_STATE_GATE delays get_state until that file exists, while EOF still ends the process.
 """
 import json
 import os
@@ -17,9 +18,11 @@ import uuid
 MODE = os.environ.get("FAKE_PI_MODE", "reply")
 GATE_DIR = os.environ.get("FAKE_PI_GATE_DIR")
 GATE_RELEASE = os.environ.get("FAKE_PI_GATE_RELEASE")
+STATE_GATE = os.environ.get("FAKE_PI_STATE_GATE")
 out = threading.Lock()
 state = threading.Condition()
 steers, aborted, running = [], [False], [False]
+aborts = 0
 
 
 def log(record):
@@ -137,7 +140,7 @@ def turn(text):
         failed = reply("fixture failure", "error")
         failed["errorMessage"] = "No API key found for fake." if MODE == "fail-key" else "fixture failure"
         end(failed)
-    elif MODE == "wait":
+    elif MODE in ("wait", "retry-abort"):
         start("assistant")
         stream("Working")
         wait(lambda: steers or aborted[0])
@@ -173,11 +176,22 @@ def respond(command, data=None, error=None):
     emit(answer)
 
 
+def respond_state(command):
+    if STATE_GATE:
+        log({"state_waiting": session, "pid": os.getpid()})
+        while not os.path.exists(STATE_GATE):
+            time.sleep(0.01)
+    respond(command, {"sessionId": session, "sessionFile": path, "isStreaming": running[0]})
+
+
 for line in sys.stdin:
     command = json.loads(line)
     kind = command["type"]
     if kind == "get_state":
-        respond(command, {"sessionId": session, "sessionFile": path, "isStreaming": running[0]})
+        if STATE_GATE:
+            threading.Thread(target=respond_state, args=(command,), daemon=True).start()
+        else:
+            respond_state(command)
     elif kind == "get_entries":
         since, ids = command.get("since"), [entry["id"] for entry in entries]
         if since is not None and since not in ids:
@@ -195,16 +209,24 @@ for line in sys.stdin:
             continue
         if MODE == "prompt-lost":
             os._exit(1)
+        if MODE == "prompt-pending":
+            continue
         running[0] = True
         respond(command, {"disposition": "started"})
         threading.Thread(target=turn, args=(command["message"],), daemon=True).start()
     elif kind == "steer":
+        content = [{"type": "text", "text": command["message"]}] + command.get("images", [])
+        log({"steer": command["message"], "images": command.get("images", [])})
         with state:
-            steers.append(command["message"])
+            steers.append(content)
             state.notify_all()
         respond(command, {"disposition": "queued"})
     elif kind == "abort":
+        aborts += 1
         log({"abort": True, "session": session})
+        if MODE == "retry-abort" and aborts == 1:
+            respond(command)
+            continue
         with state:
             aborted[0] = True
             state.notify_all()

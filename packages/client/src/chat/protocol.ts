@@ -3,11 +3,17 @@ import { newId } from '../workspace/storage.ts'
 import type { MessageRequest, PendingMessage, TranscriptMessage } from './types.ts'
 import { failureText } from '../lib/errors.ts'
 import { providerNames } from '../lib/node.ts'
-import type { ManagerJob, ProviderStage, TurnRuntime, NodeInfo } from '../workspace/types.ts'
+import type { InputIntent, InputTarget, ManagerJob, ProviderStage, TurnRuntime, NodeInfo, WorkspaceCommand, WorkspaceInputBody } from '../workspace/types.ts'
 import type { FailureKind } from '../lib/errors.ts'
 
 /** Start with the bot's role and the person's goal, including when it has a project folder. */
 export const starters = { project: ['按你的职责，你能帮我完成什么？', '先帮我理清目标和步骤', '开始前，需要我提供哪些信息？'], general: ['你能帮我完成什么？', '先帮我理清目标和步骤', '记住：回复用中文'] }
+
+export function inputTaskCommand(input: { task_id: string; owner_bot: string; text: string; channel_id?: string; source_events?: readonly string[] }): Extract<WorkspaceCommand, { kind: 'create_task' }> {
+  const request = inputText(input.text.trim() || '附件输入', '任务交代', 65536)
+  return { kind: 'create_task', task_id: input.task_id, ...(input.channel_id === undefined ? {} : { channel_id: input.channel_id }), owner_bot: input.owner_bot, title: input.text.trim().slice(0, 80) || '附件任务', request,
+    expected_result: '按交代完成工作，并说明结果和未完成的部分。', source_events: [...(input.source_events ?? [])], dependencies: [], reply_only: false }
+}
 
 type SendGate = {
   hasConversation: boolean
@@ -51,7 +57,6 @@ export function reachDevice(nodes: NodeInfo[], reach: BotReach): string | undefi
 }
 /** A device that exists but is not ready yet may become ready on its own; with none, setting one up rereads it. */
 export const awaitsDevice = (reach: BotReach) => reach === 'starting' || reach === 'offline' || reach === 'needs_setup'
-/** Why the box cannot send yet, short enough to stand in for its placeholder. */
 export function composerHint(input: Omit<SendGate, 'busy'> & { bot: BotReach }): string {
   if (!input.hasConversation) return ''
   if (input.bot === 'starting') return 'Bot 正在启动'
@@ -64,25 +69,53 @@ export function composerHint(input: Omit<SendGate, 'busy'> & { bot: BotReach }):
 export function prepareSend(input: {
   conversationId: string
   text: string
-  pending: PendingMessage | null
+  target: InputTarget
+  sequence: number
+  pending?: PendingMessage | null
+  intent?: InputIntent
+  expected_revision?: number
   reportResults?: boolean
   /** It carries files, which are a message on their own. */
   files?: boolean
 }): { ok: true; pending: PendingMessage; body: MessageRequest } | { ok: false; error: string } {
+  if (!Number.isSafeInteger(input.sequence) || input.sequence < 1) return { ok: false, error: '输入顺序必须为正整数。' }
   let text: string
   try { text = input.files && !input.text.trim() ? '' : inputText(input.text, '消息内容', 65536) }
   catch (caught) { return { ok: false, error: caught instanceof Error ? caught.message : '消息内容无效。' } }
-  if (input.pending && (input.pending.text !== text || input.pending.conversation_id !== input.conversationId)) {
-    return { ok: false, error: '上一条消息还没确认送达，先处理它再发新的。' }
+  if (input.pending && (input.pending.text !== text || input.pending.conversation_id !== input.conversationId || inputTargetKey(input.pending.target) !== inputTargetKey(input.target))) {
+    return { ok: false, error: '重试必须保留原消息内容和目标。' }
   }
-  const pending = input.pending ?? {
+  const pending: PendingMessage = input.pending ?? {
     message_id: newId(), conversation_id: input.conversationId, text,
     report_results: input.reportResults ?? true,
+    target: input.target, intent: input.intent ?? 'continue', sequence: input.sequence,
+    ...(input.expected_revision === undefined ? {} : { expected_revision: input.expected_revision }),
+    created_at_ms: Date.now(), delivery: 'saved',
   }
   return { ok: true, pending, body: {
-    conversation_id: pending.conversation_id, message_id: pending.message_id, text: pending.text,
+    conversation_id: pending.conversation_id, message_id: pending.message_id, target: pending.target,
+    intent: pending.intent, sequence: pending.sequence,
+    ...(pending.expected_revision === undefined ? {} : { expected_revision: pending.expected_revision }),
+    text: pending.text, ...(pending.attachments?.length ? { attachments: pending.attachments } : {}),
     report_results: pending.report_results ?? true,
   } }
+}
+export function inputTargetKey(target: InputTarget): string {
+  switch (target.kind) {
+    case 'bot_main': return JSON.stringify([target.kind, target.bot_id])
+    case 'task': return JSON.stringify([target.kind, target.task_id])
+    case 'work': return JSON.stringify([target.kind, target.work_id])
+    case 'routine': return JSON.stringify([target.kind, target.bot_id, target.trigger])
+    case 'channel_member': return JSON.stringify([target.kind, target.channel_id, target.bot_id])
+    case 'channel_task': return JSON.stringify([target.kind, target.channel_id, target.task_id, target.bot_id])
+  }
+}
+export function inputEventBody(body: MessageRequest): WorkspaceInputBody {
+  return { type: 'input_posted', message_id: body.message_id, target: body.target, intent: body.intent, sequence: body.sequence,
+    ...(body.expected_revision === undefined ? {} : { expected_revision: body.expected_revision }), text: body.text,
+    ...(body.attachments?.length ? { attachments: body.attachments } : {}),
+    ...(body.report_results === undefined ? {} : { report_results: body.report_results }),
+  }
 }
 /** The Node admitted this exact message; a retry of the same message_id returns the same receipt. */
 export function isQueuedReceipt(value: unknown, pending: PendingMessage): boolean {

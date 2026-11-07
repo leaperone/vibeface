@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
     scheduling::{PendingCheck, TriggerKind},
+    store::scope_projection,
     work::DispatchState,
 };
 
@@ -35,6 +36,27 @@ fn artifact_page(hash: &str, bytes: &[u8], offset: u64, limit: u64) -> Result<Va
 }
 
 impl Runtime {
+    pub(super) async fn work_detail(&self, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(access.human, "work detail access requires the user");
+        let scope = id(input, "conversation_id")?;
+        let work_id = id(input, "work_id")?;
+        self.require_scope(access, &scope).await?;
+        let store = self.store.lock().await;
+        let work = store
+            .work(&access.network_id, &work_id)?
+            .context("work not found")?;
+        ensure!(
+            work.conversation_id == scope,
+            "work belongs to another conversation"
+        );
+        let target = store.work_input_target(&access.network_id, &scope, &work_id)?;
+        let sources = store.work_source_events(&access.network_id, &scope, &work_id)?;
+        let mut value = serde_json::to_value(&work)?;
+        value["target"] = json!(target);
+        value["source_events"] = json!(sources);
+        Ok(json!({"work":value,"coverage":{"source":"shared_history","complete":false}}))
+    }
+
     pub(super) async fn read_artifact(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(access.human, "artifact access requires the user");
         let scope = field(input, "conversation_id")?;
@@ -147,16 +169,17 @@ impl Runtime {
         self.require_scope(access, scope).await?;
         let network = &access.network_id;
         let (mut jobs, checks) = self.scheduler_snapshot_jobs(network, scope).await?;
+        let mut scope_jobs = self.scheduler_scope_jobs(network, scope).await?;
         let owner = self.merge_owner_jobs(network, scope, &mut jobs).await?;
         let local = self.identity.device_id()?;
         let store = self.store.lock().await;
-        let works = store.works(network, scope)?;
-        let task_jobs = task_observations(self, &store, network, scope, &checks)?;
-        let mut work_values = works
+        let works = main_works(&store, network, scope)?;
+        let task_jobs = task_observations(&store, scope)?;
+        let work_values = works
             .iter()
             .map(|work| work_view(work, &task_jobs))
             .collect::<Result<Vec<_>>>()?;
-        let checks = without_work_checks(checks, &works);
+        let checks = main_checks(&store, network, scope, checks, &works)?;
         let deliveries = deliveries(&store, network, scope)?;
         let conversation = store.conversation(network, scope)?;
         // Devices whose live progress this conversation shows: its owner and those running its open works.
@@ -177,11 +200,16 @@ impl Runtime {
             }
         }
         let bot = store.bot_for_conversation(network, scope)?;
-        let messages = store.messages(network, scope)?;
-        let changes = store.bot_changes(network, scope)?;
-        let overwritten = store.overwritten(network, scope)?;
-        let sent = store.sent_bot_messages(network, scope)?;
-        let questions = store.conversation_questions(network, scope)?;
+        let messages = store.main_messages(network, scope)?;
+        let changes = main_changes(&store, network, scope)?;
+        let change_ids: BTreeSet<_> = changes.iter().map(|change| &change.change_id).collect();
+        let overwritten: Vec<_> = store
+            .overwritten(network, scope)?
+            .into_iter()
+            .filter(|change| change_ids.contains(&change.change_id))
+            .collect();
+        let omitted_sent = store.sent_bot_messages(network, scope)?.len();
+        let questions = main_questions(&store, network, scope)?;
         let sessions = store.attributed_sessions(network, scope)?;
         let now = now_ms();
         let enabled = bot.as_ref().and_then(|bot| bot.skills.as_ref());
@@ -208,8 +236,6 @@ impl Runtime {
         let memory_conflicts = store.scheduler_memory_conflicts(scope)?;
         let unanswered = store.unanswered_messages(network, &local, scope)?;
         drop(store);
-        self.refresh_task_contexts(network, &mut work_values)
-            .await?;
         let local_context = self
             .scheduler_context_observation(
                 network,
@@ -224,6 +250,7 @@ impl Runtime {
             Some((remote, _)) => (remote, Value::Null),
             None => (Value::Null, self.scheduler_manager_metadata()),
         };
+        merge_scope_jobs(&mut scope_jobs, &remote);
         let context = if remote.is_null() {
             json!(local_context)
         } else {
@@ -245,7 +272,8 @@ impl Runtime {
             "deliveries":deliveries,
             "changes":changes,
             "overwritten":overwritten,
-            "sent":sent,
+            "sent":[],
+            "sent_coverage":{"scope":"main","omitted_unknown":omitted_sent},
             "questions":questions,
             "sessions":sessions,
             "bot_settings":{"skills":skills,"schedules":schedules,"memory":memory,
@@ -253,7 +281,7 @@ impl Runtime {
                 "memory_sync_conflicts":memory_sync_conflicts},
             "checks":checks,
             "local_node":local,
-            "scheduler":{"jobs":jobs,"unanswered":unanswered,"provider":metadata["provider"],"model":metadata["model"],
+            "scheduler":{"jobs":jobs,"scope_jobs":scope_jobs,"unanswered":unanswered,"provider":metadata["provider"],"model":metadata["model"],
                 "capabilities":metadata["capabilities"],"remote":remote,"context":context},
             "observation_targets":targets,
         }))
@@ -269,7 +297,9 @@ impl Runtime {
         change: &Value,
     ) -> Result<Option<Value>> {
         let scope = field(change, "conversation_id")?;
-        let (jobs, checks) = self.scheduler_snapshot_jobs(network, scope).await?;
+        let (mut jobs, checks) = self.scheduler_snapshot_jobs(network, scope).await?;
+        let mut scope_jobs = self.scheduler_scope_jobs(network, scope).await?;
+        let owner = self.merge_owner_jobs(network, scope, &mut jobs).await?;
         let context = self
             .scheduler_context_observation(
                 network,
@@ -288,7 +318,9 @@ impl Runtime {
             };
             let event: Event = serde_json::from_str(&event.canonical_body)?;
             match &event.body {
-                EventBody::MessagePosted { message_id: id, .. } => message_id = Some(id.clone()),
+                EventBody::MessagePosted { message_id: id, .. }
+                | EventBody::InputPosted { message_id: id, .. }
+                | EventBody::BotMessaged { message_id: id, .. } => message_id = Some(id.clone()),
                 EventBody::QuestionAsked { .. }
                 | EventBody::QuestionClosed { .. }
                 | EventBody::SessionAttributed { .. }
@@ -306,16 +338,26 @@ impl Runtime {
             return Ok(None);
         }
         let message = match message_id {
-            Some(id) => store.message(network, scope, &id)?,
+            Some(id)
+                if scope_projection::message_is_main_from(
+                    &store.connection,
+                    network,
+                    scope,
+                    &id,
+                )? =>
+            {
+                store.message(network, scope, &id)?
+            }
             None => None,
+            Some(_) => None,
         };
         let last_message = match message {
             Some(_) => store.last_messages(network)?.remove(scope),
             None => None,
         };
         let messages = message.map(|message| json!(message));
-        let works = store.works(network, scope)?;
-        let task_jobs = task_observations(self, &store, network, scope, &checks)?;
+        let works = main_works(&store, network, scope)?;
+        let task_jobs = task_observations(&store, scope)?;
         let changed: Vec<_> = works
             .iter()
             .filter(|work| work_id.as_deref() == Some(work.work_id.as_str()))
@@ -326,7 +368,15 @@ impl Runtime {
             .into_iter()
             .filter(|notification| notification.conversation_id == scope)
             .collect();
-        let mut value = json!({
+        let remote = owner.map(|(remote, _)| remote).unwrap_or(Value::Null);
+        merge_scope_jobs(&mut scope_jobs, &remote);
+        let context = if remote.is_null() {
+            json!(context)
+        } else {
+            remote["context"].clone()
+        };
+        let omitted_sent = store.sent_bot_messages(network, scope)?.len();
+        let value = json!({
             "type":"records",
             "conversation_id":scope,
             "messages":messages.into_iter().collect::<Vec<_>>(),
@@ -334,12 +384,14 @@ impl Runtime {
             "last_message":last_message,
             "busy":store.busy_conversations()?.remove(scope),
             "questions":store.conversation_questions(network, scope)?,
-            "sent":store.sent_bot_messages(network, scope)?,
+            "sent":[],
+            "sent_coverage":{"scope":"main","omitted_unknown":omitted_sent},
             "open_works":open_works(&store, network, Some(scope))?,
             "notifications":notifications,
             "deliveries":deliveries(&store, network, scope)?,
-            "checks":without_work_checks(checks, &works),
+            "checks":main_checks(&store, network, scope, checks, &works)?,
             "jobs":jobs,
+            "scope_jobs":scope_jobs,
             "context":context,
             "memory":memory_view(&store, network, scope)?,
             "memory_sync_conflicts":store.memory_sync_conflicts(network, scope)?,
@@ -348,45 +400,11 @@ impl Runtime {
             "unanswered":store.unanswered_messages(network, &self.identity.device_id()?, scope)?,
         });
         drop(store);
-        if let Some(works) = value["works"].as_array_mut() {
-            self.refresh_task_contexts(network, works).await?;
-        }
         Ok(Some(value))
     }
 }
 
-impl Runtime {
-    async fn refresh_task_contexts(&self, network: &str, works: &mut [Value]) -> Result<()> {
-        for work in works {
-            let Some(expected) = work["coordination_job"]["context"]["attempt_id"]
-                .as_str()
-                .map(str::to_owned)
-            else {
-                continue;
-            };
-            let key = crate::scheduling::SessionKey {
-                conversation_id: field(work, "conversation_id")?.into(),
-                scope: crate::scheduling::SessionScope::Task {
-                    work_id: field(work, "work_id")?.into(),
-                },
-            };
-            work["coordination_job"]["context"] = json!(
-                self.scheduler_context_observation(network, &key)
-                    .await?
-                    .filter(|context| context.attempt_id == expected)
-            );
-        }
-        Ok(())
-    }
-}
-
-fn task_observations(
-    runtime: &Runtime,
-    store: &Store,
-    network: &str,
-    scope: &str,
-    checks: &[PendingCheck],
-) -> Result<BTreeMap<String, Value>> {
+fn task_observations(store: &Store, scope: &str) -> Result<BTreeMap<String, Value>> {
     store
         .scheduler_jobs(scope)?
         .into_iter()
@@ -394,8 +412,101 @@ fn task_observations(
         .map(|job| {
             Ok((
                 job.reply_to.clone(),
-                runtime.scheduler_job_projection(store, network, &job, checks)?,
+                json!({
+                    "conversation_id":job.conversation_id,"trigger":job.trigger,
+                    "scope":job.session_scope(),"state":job.state.name(),
+                    "sequence":job.sequence,"reply_message_id":job.message_id,
+                }),
             ))
+        })
+        .collect()
+}
+
+fn merge_scope_jobs(jobs: &mut Vec<Value>, remote: &Value) {
+    if let Some(scope_jobs) = remote["scope_jobs"].as_array() {
+        for job in scope_jobs {
+            jobs.retain(|known| known["trigger"] != job["trigger"]);
+            jobs.push(job.clone());
+        }
+    }
+}
+
+fn main_works(store: &Store, network: &str, scope: &str) -> Result<Vec<WorkProjection>> {
+    store
+        .works(network, scope)?
+        .into_iter()
+        .filter_map(|work| {
+            match scope_projection::work_is_main_from(
+                &store.connection,
+                network,
+                scope,
+                &work.work_id,
+            ) {
+                Ok(true) => Some(Ok(work)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
+}
+
+fn main_changes(store: &Store, network: &str, scope: &str) -> Result<Vec<ChangeRecord>> {
+    store
+        .bot_changes(network, scope)?
+        .into_iter()
+        .filter_map(|change| {
+            let main = match &change.cause {
+                Some(cause) => scope_projection::message_is_main_from(
+                    &store.connection,
+                    network,
+                    &cause.conversation_id,
+                    &cause.message_id,
+                ),
+                None => Ok(false),
+            };
+            match main {
+                Ok(true) => Some(Ok(change)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
+}
+
+fn main_questions(store: &Store, network: &str, scope: &str) -> Result<Vec<Value>> {
+    let bot = store.bot_for_conversation(network, scope)?;
+    Ok(store
+        .conversation_questions(network, scope)?
+        .into_iter()
+        .filter(|question| {
+            question["target"]["kind"] == "bot_main"
+                && bot
+                    .as_ref()
+                    .is_some_and(|bot| question["target"]["bot_id"] == bot.bot_id)
+        })
+        .collect())
+}
+
+fn main_checks(
+    store: &Store,
+    network: &str,
+    scope: &str,
+    checks: Vec<PendingCheck>,
+    works: &[WorkProjection],
+) -> Result<Vec<PendingCheck>> {
+    without_work_checks(checks, works)
+        .into_iter()
+        .filter_map(|check| {
+            match scope_projection::trigger_is_main_from(
+                &store.connection,
+                network,
+                scope,
+                &check.trigger,
+            ) {
+                Ok(true) => Some(Ok(check)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
         })
         .collect()
 }
@@ -443,6 +554,9 @@ fn deliveries(store: &Store, network: &str, scope: &str) -> Result<Vec<Value>> {
             continue;
         }
         let spec = &dispatch.spec;
+        if !scope_projection::work_is_main_from(&store.connection, network, scope, &spec.work_id)? {
+            continue;
+        }
         deliveries.push(
             json!({"work_id":spec.work_id,"target_node":spec.target,"state":dispatch.state.name(),
             "kind":spec.kind,"title":spec.title,"cwd":spec.cwd,"reason":dispatch.state.reason(),
@@ -450,7 +564,14 @@ fn deliveries(store: &Store, network: &str, scope: &str) -> Result<Vec<Value>> {
         );
     }
     for stop in store.stop_requests()? {
-        if stop.conversation == scope {
+        if stop.conversation == scope
+            && scope_projection::work_is_main_from(
+                &store.connection,
+                network,
+                scope,
+                &stop.work_id,
+            )?
+        {
             deliveries.push(json!({"work_id":stop.work_id,"target_node":stop.target,
                 "state":if stop.timed_out {"stop_timed_out"} else {"stop_waiting"}}));
         }
@@ -464,17 +585,26 @@ pub(super) fn open_works(store: &Store, network: &str, scope: Option<&str>) -> R
     let mut works = store
         .open_works(network, scope)?
         .into_iter()
-        .map(|work| Ok(serde_json::to_value(work)?))
+        .map(|work| {
+            let target = store.work_input_target(network, &work.conversation_id, &work.work_id)?;
+            let mut value = serde_json::to_value(work)?;
+            if let Some(target) = target {
+                value["target"] = json!(target);
+            }
+            Ok(value)
+        })
         .collect::<Result<Vec<_>>>()?;
     for dispatch in store.open_dispatches(network, scope)? {
         let spec = &dispatch.spec;
-        works.push(
-            json!({"work_id":spec.work_id,"conversation_id":spec.conversation,
+        let mut value = json!({"work_id":spec.work_id,"conversation_id":spec.conversation,
             "target_node":spec.target,"trigger":spec.trigger,"dispatcher":spec.dispatcher,
             "kind":spec.kind,"cwd":spec.cwd,"title":spec.title,"prompt":spec.prompt,
             "call_ref":spec.call_ref,"state":dispatch.state.name(),"summary":"","outcome":null,
-            "result_text":"","failure_reason":dispatch.state.reason(),"failure":dispatch.state.failure()}),
-        );
+            "result_text":"","failure_reason":dispatch.state.reason(),"failure":dispatch.state.failure()});
+        if let Some(target) = store.work_input_target(network, &spec.conversation, &spec.work_id)? {
+            value["target"] = json!(target);
+        }
+        works.push(value);
     }
     Ok(works)
 }

@@ -145,7 +145,16 @@ function verifySignature(application, target, receipt) {
 function extract(archive, destination) {
   fs.mkdirSync(destination, { recursive: true });
   if (process.platform === 'linux') run('unzip', ['-q', archive, '-d', destination]);
-  else run('tar', ['-xf', archive, '-C', destination]);
+  else {
+    let tar = 'tar';
+    if (process.platform === 'win32') {
+      const systemRoot = process.env.SystemRoot;
+      assert(systemRoot && path.isAbsolute(systemRoot), 'Windows SystemRoot is required to locate native tar');
+      tar = path.join(systemRoot, 'System32', 'tar.exe');
+      assert(fs.statSync(tar).isFile(), 'Windows native tar is installed');
+    }
+    run(tar, ['-xf', archive, '-C', destination]);
+  }
   return destination;
 }
 

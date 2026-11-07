@@ -2,7 +2,7 @@ import { type MembershipView, type ProviderId } from "../lib/node.ts"
 import type { LiveProgress } from "../lib/progress.ts"
 import { confirmReason } from "./model.ts"
 import { awaitsAnswer, workApproval } from "./questions.ts"
-import type { AgentLane, ContextProjection, ManagerJob, MemoryEntry, NodeInfo, OpenWorkCard, OverviewBot, OverviewCoverage, OverviewJob, OverviewTask, PendingCheck, Question, QueueHoldReason, ResolvedModel, SessionHandoff, WorkCard, WorkRecord, WorkspaceActivity, WorkspaceActivityAttention, WorkspaceActivityFacts, WorkspaceActivityGroup, WorkspaceActivityJob, WorkspaceActivityView, WorkspaceOverview } from "./types.ts"
+import type { AgentLane, ContextProjection, InputReceipt, ManagerJob, MemoryEntry, NodeInfo, OpenWorkCard, OverviewBot, OverviewCoverage, OverviewJob, OverviewTask, PendingCheck, Question, QueueHoldReason, ResolvedModel, SessionHandoff, WorkCard, WorkRecord, WorkspaceActivity, WorkspaceActivityAttention, WorkspaceActivityFacts, WorkspaceActivityGroup, WorkspaceActivityJob, WorkspaceActivityView, WorkspaceOverview } from "./types.ts"
 
 export const contextStages = {
   compiled: { label: '已编译', detail: '内容已准备，尚未确认 AI 开始执行。', tone: 'info' },
@@ -33,15 +33,18 @@ export const queueHoldLabels: Record<QueueHoldReason, string> = {
   active_turn: '等待当前回合结束', steering_settlement: '等待补充消息结清', provider_serial: '等待 AI 空闲',
   task_limit: '等待 Bot 任务名额', machine_slot: '等待设备运行名额', pending_check: '等待确认上一轮结果',
   backend_config_pending: '等待当前 AI 回合结束后切换配置',
+  attachment_preparation: '正在准备附件', earlier_input: '等待此目标前面的输入先发送',
+  resource_conflict: '等待正在使用的工作目录释放',
 }
 export const agentLaneLabels: Record<AgentLane, string> = { main: '主对话', task: '独立任务', schedule_routine: '定时任务', bot_message: 'Bot 消息' }
+export const inputReceiptLabels: Record<InputReceipt['stage'], string> = { entry_accepted: '接收设备已保存', owner_accepted: '运行设备已接收', submitting: '正在提交给 AI', provider_accepted: 'AI 服务已接受', associated: '已确认实际回合', refused: '已拒绝', unknown: '结果未知' }
 
 const stateNames: Record<string, string> = {
   accepted: "已接收",
   pending_delivery: "等待设备接收",
   queued: "等待处理",
-  steering: "Bot 正在看这条补充",
-  steered: "已补充给 Bot",
+  steering: "补充已登记，等待确认",
+  steered: "补充已结算",
   claimed: "正在准备",
   running: "执行中",
   waiting: "需要你同意",
@@ -444,7 +447,7 @@ export function parseSummarySteps(summary: string): SummaryStep[] | null {
 const schedulerStates: Record<string, { label: string; group: "open" | "history" }> = {
   queued: { label: "排队中", group: "open" }, claimed: { label: "已领取", group: "open" }, running: { label: "执行中", group: "open" },
   steering: { label: "补充中", group: "open" }, cancelling: { label: "停止中", group: "open" }, publishing: { label: "回复同步中", group: "open" },
-  pending_delivery: { label: "等待设备接收", group: "open" }, reconciling: { label: "正在查询上次回复", group: "open" }, steered: { label: "已补充", group: "history" }, completed: { label: "已完成", group: "history" },
+  pending_delivery: { label: "等待设备接收", group: "open" }, reconciling: { label: "正在查询上次回复", group: "open" }, steered: { label: "补充已结算", group: "history" }, completed: { label: "已完成", group: "history" },
   failed: { label: "失败", group: "history" }, cancelled: { label: "已取消", group: "history" }, interrupted: { label: "已中断", group: "history" },
 }
 export const schedulerStatus = (state: string): { label: string; group: "open" | "history" | "unknown" } => schedulerStates[state] ?? { label: "状态未知", group: "unknown" }

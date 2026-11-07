@@ -1,5 +1,5 @@
 import type { TranscriptMessage } from '@vibeface/client/chat/types.ts'
-import type { AnswerResult, BotReadiness, BotRecord, Question, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { AnswerResult, BotReadiness, BotRecord, InputOptions, Question, WorkRecord } from '@vibeface/client/workspace/types.ts'
 
 export type { Question }
 
@@ -37,7 +37,6 @@ export type Conversation = {
   status: string | null
   stoppable: boolean
   blocked: string | null
-  sending: boolean
 }
 
 /** A file picked for the next message. */
@@ -66,7 +65,7 @@ export type WorkspaceActions = {
   cancelJoin(): void
   /** Loads the chat and keeps it live while on screen; reading it acknowledges its notifications. */
   open(conversationId: string): () => void
-  send(conversationId: string, text: string, attachments: Attachment[]): Promise<void>
+  send(conversationId: string, text: string, attachments: Attachment[], options?: InputOptions): Promise<void>
   stop(conversationId: string): Promise<void>
   answer(question: Question, text: string): Promise<AnswerResult>
   /** Takes this phone out of the network; coming back takes a join link. */

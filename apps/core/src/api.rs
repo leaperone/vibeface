@@ -879,13 +879,18 @@ async fn tool(
     }
 }
 
-async fn hooks(
-    State(app): State<App>,
-    Json(event): Json<crate::triage::AgentEvent>,
-) -> ApiResult<Json<Value>> {
+async fn hooks(State(app): State<App>, Json(mut input): Json<Value>) -> ApiResult<Json<Value>> {
+    let schema = input
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad("hook event must be an object"))?
+        .remove("_request")
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(ApiError::bad)?;
+    let event = serde_json::from_value(input).map_err(ApiError::bad)?;
     Ok(Json(
         app.node
-            .ingest_agent_event(event)
+            .ingest_hook_event(event, schema)
             .await
             .map_err(ApiError::bad)?,
     ))

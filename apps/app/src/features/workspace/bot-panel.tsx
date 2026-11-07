@@ -30,6 +30,8 @@ const GAP_MS = 4000
 // The one title button on screen; a schedule card in the chat opens its panel on that schedule.
 let showSchedule: ((id: string) => void) | null = null
 export const openSchedule = (id: string) => showSchedule?.(id)
+let showContext: (() => void) | null = null
+export const openBotContext = () => showContext?.()
 
 /** The chat route's title: the bot's avatar and name as one button that opens a view of the bot where its face can be picked, schedules paused, resumed or deleted and the bot itself deleted (packages/docs/design/bot-config.md section 5). */
 export function BotPanelButton() {
@@ -45,6 +47,7 @@ export function BotPanelButton() {
   const [confirming, setConfirming] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [contextOpen, setContextOpen] = useState(false)
+  useEffect(() => { showContext = () => { setContextOpen(true); setOpen(true) }; return () => { showContext = null } }, [])
   const [shownSchedule, setShownSchedule] = useState<string | null>(null)
   useEffect(() => { showSchedule = (id) => { order.current = []; setShownSchedule(id); setOpen(true) }; return () => { showSchedule = null } }, [])
   useEffect(() => { if (open && shownSchedule) requestAnimationFrame(() => document.getElementById(`schedule-${shownSchedule}`)?.scrollIntoView({ block: "center" })) }, [open, shownSchedule])

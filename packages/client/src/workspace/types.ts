@@ -1,7 +1,81 @@
 import type { ProviderId, ProviderReadiness } from "../lib/node.ts"
-import type { PendingMessage, TranscriptMessage } from "../chat/types.ts"
+import type { PendingMessage, ReplyStatus, TranscriptMessage } from "../chat/types.ts"
 import type { FailureKind } from "../lib/errors.ts"
 import type { Avatar } from "../avatar/face.ts"
+import type { Attachment } from "../chat/types.ts"
+
+export type InputTarget =
+  | { kind: 'bot_main'; bot_id: string }
+  | { kind: 'task'; task_id: string }
+  | { kind: 'work'; work_id: string }
+  | { kind: 'routine'; bot_id: string; trigger: string }
+  | { kind: 'channel_member'; channel_id: string; bot_id: string }
+  | { kind: 'channel_task'; channel_id: string; task_id: string; bot_id: string }
+export type InputIntent = 'continue' | 'new_task' | 'defer'
+export type InputOptions = { target: InputTarget; intent?: InputIntent; expected_revision?: number; conversation_id?: string; onSaved?: (input: PendingMessage) => void }
+export type SessionScope = { kind: 'main' } | { kind: 'workspace_task'; task_id: string } | { kind: 'task'; work_id: string } | { kind: 'routine'; trigger: string }
+export type InputReceipt = {
+  message_id: string; target: InputTarget
+  stage: 'entry_accepted' | 'owner_accepted' | 'submitting' | 'provider_accepted' | 'associated' | 'refused' | 'unknown'
+  actual_turn_id: string | null; reason: string | null; retry_safe: boolean; control_event: string | null
+}
+export type ScopeContext = { conversation_id: string; target: InputTarget } & (
+  | { available: true; context: ContextProjection; reason: null }
+  | { available: false; context: null; reason: string | null }
+)
+export type WorkspaceFilter = { channel_id?: string; task_id?: string; limit?: number }
+export type WorkspaceChannel = {
+  channel_id: string; title: string; purpose: string; members: string[]; coordinator_bot: string; coordinator_node: string
+  owner_epoch: number; revision: number; event_hash: string; created_at_ms: number
+}
+export type WorkspaceTaskAction = 'continue' | 'stop' | 'cancel' | 'defer'
+export type WorkspaceTask = {
+  task_id: string; channel_id?: string; root_task_id: string; parent_task_id?: string; owner_bot: string; title: string
+  request: string; expected_result: string; source_events: string[]; dependencies: string[]; reply_only: boolean; revision: number
+  action: WorkspaceTaskAction; request_event: string; event_hash: string; created_at_ms: number; updated_at_ms: number
+  state: 'not_started' | 'running' | 'waiting_dependencies' | 'waiting_user' | 'update_pending' | 'stop_pending' | 'needs_reconciliation' | 'completed' | 'cancelled' | 'deferred'
+  waiting_reason?: string; current_assignment?: string
+}
+export type WorkspaceAssignment = {
+  assignment_id: string; task_id: string; started_revision: number; bot_id: string; execution_node: string
+  bot_owner_epoch: number; channel_owner_epoch?: number; work_id?: string; basis: Record<string, number>; resource_roots: string[]; automatic: boolean
+  accepted_revision?: number; adopted_revision?: number; completed_revision?: number
+  trigger_message_id?: string; source_event?: string; submitted_result?: { revision: number; text: string; event_hash: string }
+  state: 'proposed' | 'accepted' | 'adopted' | 'completed' | 'stopped' | 'unknown'
+  result?: string; event_hash: string; created_at_ms: number
+}
+export type InputControlAction = { kind: 'release' } | { kind: 'cancel' } | { kind: 'edit'; text: string; attachments: Attachment[] } | { kind: 'move'; before_message_id?: string }
+export type QueuedInput = {
+  input: Omit<WorkspaceInputBody, 'type'>; conversation_id: string; source_event: string; control_event: string
+  effective_order: number; deferred: boolean; cancelled: boolean
+}
+export type WorkspaceCommand =
+  | { kind: 'create_channel'; channel_id: string; title: string; purpose: string; members: string[]; coordinator_bot: string; coordinator_node: string }
+  | { kind: 'configure_channel'; channel_id: string; expected_revision: number; title: string; purpose: string; members: string[]; coordinator_bot: string; coordinator_node: string; owner_epoch: number }
+  | { kind: 'post_channel_message'; channel_id: string; message_id: string; text: string; attachments: Attachment[]; recipient_bot?: string; task_id?: string; reply_to?: string }
+  | { kind: 'create_task'; task_id: string; channel_id?: string; parent_task_id?: string; owner_bot: string; title: string; request: string; expected_result: string; source_events: string[]; dependencies: string[]; reply_only: boolean }
+  | { kind: 'revise_task'; task_id: string; expected_revision: number; request: string; expected_result: string; dependencies: string[] }
+  | { kind: 'control_task'; task_id: string; expected_revision: number; action: WorkspaceTaskAction }
+  | { kind: 'assign_task'; task_id: string; expected_revision: number; assignment_id: string; bot_id: string; execution_node: string; bot_owner_epoch: number; channel_owner_epoch?: number; work_id?: string; resource_roots: string[]; automatic: boolean }
+  | { kind: 'assignment_progress'; assignment_id: string; revision: number; state: WorkspaceAssignment['state']; input_event?: string; evidence_event?: string; execution?: TurnRuntime['execution']; result?: string }
+  | { kind: 'control_input'; message_id: string; expected_event: string; action: InputControlAction }
+export type WorkspaceDomainState = { channels: WorkspaceChannel[]; tasks: WorkspaceTask[]; assignments: WorkspaceAssignment[]; inputs: QueuedInput[]; coverage: { limit: number; truncated: boolean } }
+export type WorkspaceCommandResult = Omit<WorkspaceDomainState, 'coverage'> & { command_id: string; event_hash: string; duplicate: boolean }
+export type WorkspaceCommandNotSaved = { accepted: false; code: 'workspace_command_not_saved'; stored: false; command_id: string; reason: string }
+export type WorkspaceInputBody = {
+  type: 'input_posted'; message_id: string; target: InputTarget; intent: InputIntent; sequence: number; expected_revision?: number
+  text: string; attachments?: Attachment[]; report_results?: boolean
+}
+export type WorkspaceHistoryBody =
+  | WorkspaceInputBody
+  | { type: 'workspace_commanded'; command_id: string; command: WorkspaceCommand }
+  | { type: 'message_posted'; message_id: string; role: string; text: string; attachments?: Attachment[]; in_reply_to?: string; status?: ReplyStatus; failure?: FailureKind }
+  | { type: 'work_finished'; work_id: string; outcome: WorkOutcome; result_text: string; failure_reason?: string; failure?: FailureKind }
+  | { type: 'work_dispatched'; work_id: string; title: string; prompt: string }
+  | { type: 'work_progress'; work_id: string; phase: WorkPhase; summary: string; thread_id?: string; turn_id?: string }
+export type WorkspaceSpeaker = { kind: 'human'; device_id: string } | { kind: 'bot'; bot_id: string } | { kind: 'node'; device_id: string }
+export type WorkspaceHistoryItem = { event_hash: string; created_at_ms: number; scope_id: string; kind: string; body: WorkspaceHistoryBody; speaker: WorkspaceSpeaker }
+export type WorkspaceHistory = { events: WorkspaceHistoryItem[]; coverage: { limit: number; truncated: boolean; scope: 'task' | 'channel' | 'workspace' } }
 
 export type NodeInfo = {
   device_id: string
@@ -26,6 +100,7 @@ export type WorkOutcome = "completed" | "failed" | "interrupted" | "rejected" | 
 export type ResolvedModel = { provider: ProviderId; model: string | null }
 type WorkFields = {
   work_id: string
+  target?: InputTarget
   trigger: string
   target_node: string
   cwd: string
@@ -59,14 +134,14 @@ type WorkFields = {
   turn_id?: string
   /** A stop sent while the device was unreachable: still retrying, or past its deadline. */
   stop?: StopState
-  coordination_job?: ManagerJob | null
+  coordination_job?: ScopeJob | null
 }
 export type WorkRecord = WorkFields & (
   | { state: WorkState; resolved: ResolvedModel }
   | { state: DispatchState; resolved?: never }
 )
 /** The fields a task card can read from either full work or an overview summary. */
-export type WorkCard = Pick<WorkRecord, "work_id" | "target_node" | "cwd" | "title" | "state" | "summary" | "outcome" | "failure_reason" | "failure" | "kind" | "dispatcher" | "call_ref" | "continues" | "parent" | "thread" | "thread_id" | "turn_id" | "phase" | "stop">
+export type WorkCard = Pick<WorkRecord, "work_id" | "target" | "target_node" | "cwd" | "title" | "state" | "summary" | "outcome" | "failure_reason" | "failure" | "kind" | "dispatcher" | "call_ref" | "continues" | "parent" | "thread" | "thread_id" | "turn_id" | "phase" | "stop">
 export type OpenWorkCard = WorkCard & { conversation_id: string }
 export const providerStages = ['validate', 'install', 'launch', 'authentication', 'model_list', 'session_start', 'turn_start', 'run', 'read_back', 'interrupt', 'compact', 'handoff', 'record'] as const
 export type ProviderStage = typeof providerStages[number]
@@ -78,6 +153,10 @@ export type TurnRuntime = {
 export type ManagerJob = {
   trigger: string
   state: string
+  scope: SessionScope
+  into?: { provider: ProviderId; attempt_id: string; thread_id: string; turn_id: string }
+  receipt?: { accepted_at_ms: number; actual_turn_id: string | null }
+  uncertain?: boolean
   context?: ContextProjection | null
   lane?: AgentLane
   hold_reason?: QueueHoldReason
@@ -93,9 +172,20 @@ export type ManagerJob = {
   /** The device that reported this observation. */
   source_node?: string
 }
+export type ScopeJob = {
+  conversation_id: string; trigger: string; scope: SessionScope; state: string; sequence: number
+  kind: 'human' | 'answer' | 'work_result' | 'agent_task' | 'workspace_task' | 'schedule' | 'bot_message'
+  lane: AgentLane; source_node: string; owner: string | null; message_id: string | null; reply_message_id: string
+  hold_reason?: QueueHoldReason
+}
 export type AgentLane = 'main' | 'task' | 'schedule_routine' | 'bot_message'
-export type QueueHoldReason = 'active_turn' | 'steering_settlement' | 'provider_serial' | 'task_limit' | 'machine_slot' | 'pending_check' | 'backend_config_pending'
+export type QueueHoldReason = 'active_turn' | 'steering_settlement' | 'provider_serial' | 'task_limit' | 'machine_slot' | 'pending_check' | 'backend_config_pending' | 'attachment_preparation' | 'earlier_input' | 'resource_conflict'
 export type ContextProjection = {
+  scope: SessionScope
+  sources: { kind: 'trigger' | 'message' | 'work' | 'dispatch' | 'checkpoint' | 'handoff' | 'memory' | 'question' | 'attachment'; event_id?: string; author?: string; seq?: number; reference?: string }[]
+  sources_omitted: number
+  inputs: { message_id: string; source_event: string; stage: InputReceipt['stage']; actual_turn_id: string | null; expected_turn_id: string; accepted_at_ms?: number }[]
+  inputs_omitted: number
   attempt_id: string
   provider: ProviderId
   stable_fingerprint: string
@@ -121,6 +211,7 @@ export type MemoryConflict = {
 export type SteerOutcome = 'answered' | 'unfinished' | 'unknown'
 export type SchedulerSnapshot = {
   jobs: ManagerJob[]
+  scope_jobs: ScopeJob[]
   context?: ContextProjection | null
   /** Messages a former scheduling device left unanswered; only listed on the device that schedules now. */
   unanswered: string[]
@@ -144,6 +235,8 @@ export type CoordinationCheck = {
 export type ConfirmReason = "offline" | "disconnected" | "unverified"
 /** A work no result has settled yet, from any conversation. */
 export type OpenWork = WorkRecord & { conversation_id: string }
+export type WorkDetailWork = Omit<OpenWork, 'target'> & { target: InputTarget | null; source_events: string[] }
+export type WorkDetail = { work: WorkDetailWork; coverage: { source: 'shared_history'; complete: false } }
 /** What one change touched, pushed by the Node so the page merges it without a reload. */
 export type ConversationRecords = {
   conversation_id: string
@@ -162,8 +255,10 @@ export type ConversationRecords = {
   deliveries: unknown[]
   checks: CoordinationCheck[]
   jobs: ManagerJob[]
+  scope_jobs: ScopeJob[]
   unanswered: string[]
   sent: SentBotMessage[]
+  sent_coverage: SentCoverage
   /** The conversation's works that want the person, as the Node lists them now; replaces its share of `open_works`. */
   open_works: OpenWork[]
 }
@@ -173,12 +268,13 @@ export type ConversationRecords = {
  * device or one disconnected Codex cannot report, settled one by one on a single card. `process`: a coordination process the person confirms stopped.
  */
 export type PendingCheck =
-  | { kind: "work"; check_id: string; detail: string; work_id: string; target_node: string; conversation_id: string; title: string; reason: ConfirmReason }
+  | { kind: "work"; check_id: string; detail: string; work_id: string; target?: InputTarget; target_node: string; conversation_id: string; title: string; reason: ConfirmReason }
   | { kind: "device"; check_id: string; detail: string; target_node: string; reason: "offline" | "disconnected"; works: Extract<PendingCheck, { kind: "work" }>[] }
   | { kind: "process"; check_id: string; detail: string }
-export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
+export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string; target?: InputTarget }
 export const sessionNotificationKind = "session_attributed"
 export const isSessionNotification = (item: Pick<NotificationRecord, "kind">) => item.kind === sessionNotificationKind
+export const isMainNotification = (item: Pick<NotificationRecord, 'target'>, botId: string | undefined) => botId !== undefined && item.target?.kind === 'bot_main' && item.target.bot_id === botId
 export type FieldEdit = { before: string; after: string }
 /** A bot's model on one provider; empty follows the device's default. */
 export type ModelEdit = FieldEdit & { provider: ProviderId }
@@ -239,6 +335,8 @@ export type ConversationPayload = {
   messages: TranscriptMessage[]
   works: WorkRecord[]
   scheduler: SchedulerSnapshot | null
+  /** Public job metadata for selecting a registered target; Main's timeline uses scheduler.jobs. */
+  scopeJobs: ScopeJob[]
   checks: CoordinationCheck[]
   local_node: string
   /** Oldest first. */
@@ -250,7 +348,9 @@ export type ConversationPayload = {
   sessions: SessionHandoff[]
   /** What this bot wrote to other bots; `to` is the receiver's conversation. */
   sent: SentBotMessage[]
+  sent_coverage: SentCoverage
 }
+export type SentCoverage = { scope: 'main'; omitted_unknown: number }
 export type SentBotMessage = { message_id: string; to: string; text: string; created_at_ms: number }
 /** "chat" while a conversation route is on screen; reading it acknowledges ordinary notifications. */
 export type WorkspaceView = "chat" | "tasks" | "other"
@@ -279,7 +379,7 @@ export type OverviewTaskKind = "work" | "check" | "dispatch"
 export type OverviewNavigation = { bot_id: string; conversation_id: string; work_id?: string }
 
 type OverviewTaskCommon = {
-  coordination_job?: ManagerJob | null
+  coordination_job?: ScopeJob | null
   item_id: string
   work_id: string | null
   conversation_id: string
@@ -320,7 +420,7 @@ export type OverviewQuestion = {
   bot: OverviewBot | null
   text: string
   severity: Severity
-  choices: { label: string }[]
+  choices: QuestionChoice[]
   request_id: string | null
   work_id: string | null
   about: QuestionSubject | null
@@ -431,7 +531,7 @@ export type PendingBot = CreateBotRequest & {
 export type Severity = "info" | "attention" | "urgent"
 /** The device, project and session a question is about. `agent` is null when the question is about the device's own settings. */
 export type QuestionSubject = { node: string; agent: ProviderId | null; session_id: string; cwd: string; summary: string; request_id?: string }
-type QuestionChoice = { label: string }
+export type QuestionChoice = { label: string; action?: 'allow_once' | 'deny' }
 type QuestionAnswer = { message_id: string; text: string; author: string; created_at_ms: number }
 /** Why the device that asked closed a question unanswered: the App Server request it held is gone. */
 export type CloseReason = "request_lost"
@@ -439,6 +539,7 @@ export type CloseReason = "request_lost"
 export type Question = {
   question_id: string
   conversation_id: string
+  target?: InputTarget
   bot: { bot_id: string; name: string } | null
   severity: Severity
   attention?: { kind: "question" | "approval" | "browser_takeover"; device_id: string | null }

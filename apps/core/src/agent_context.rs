@@ -97,6 +97,8 @@ pub struct DynamicContext {
     pub schema_version: u32,
     pub network_id: String,
     pub conversation_id: String,
+    pub scope: crate::scheduling::SessionScope,
+    pub task_context: Option<Value>,
     pub basis: VersionVector,
     pub trigger: DynamicTrigger,
     pub instructions: String,
@@ -291,7 +293,7 @@ impl DynamicContext {
             .collect();
         let mut data = json!({
             "network_id": self.network_id, "conversation_id": self.conversation_id,
-            "basis": self.basis, "bot": self.bot,
+            "basis": self.basis, "bot": self.bot, "scope":self.scope, "task":self.task_context,
             "conversation": {
                 "resumed_session": self.resumed_session, "checkpoint": self.checkpoint,
                 "messages": self.messages.entries, "earlier_messages_omitted": self.messages.omitted,
@@ -546,6 +548,8 @@ mod tests {
 
     fn dynamic() -> Result<DynamicContext> {
         let mut dynamic = DynamicContext {
+            scope: crate::scheduling::SessionScope::Main,
+            task_context: None,
             schema_version: SCHEMA_VERSION,
             network_id: "n".into(),
             conversation_id: "c".into(),

@@ -272,6 +272,10 @@ table "messages" {
     null = true
     type = text
   }
+  column "target" {
+    null = true
+    type = text
+  }
   primary_key {
     columns = [column.network_id, column.conversation_id, column.message_id]
   }
@@ -280,6 +284,14 @@ table "messages" {
   }
   index "messages_answers" {
     columns = [column.network_id, column.answers]
+  }
+  index "messages_replies" {
+    columns = [column.network_id, column.conversation_id, column.in_reply_to]
+    where   = "in_reply_to IS NOT NULL"
+  }
+  index "messages_steered" {
+    columns = [column.network_id, column.conversation_id, column.steered_into, column.rank]
+    where   = "steered_into IS NOT NULL AND role = 'user' AND target IS NOT NULL"
   }
 }
 table "bots" {
@@ -1073,6 +1085,11 @@ table "scheduler_sessions" {
 }
 table "scheduler_jobs" {
   schema = schema.main
+  column "scope" {
+    null = false
+    type = text
+    default = "main"
+  }
   column "conversation_id" {
     null = false
     type = text
@@ -1373,4 +1390,19 @@ table "work_stops" {
   }
 }
 schema "main" {
+}
+
+table "workspace_projection" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "state" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id]
+  }
 }

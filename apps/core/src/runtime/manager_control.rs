@@ -25,12 +25,12 @@ pub struct ManagerAccess {
 const OWNER_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) struct ActiveManager {
-    access: Access,
+    pub(super) access: Access,
     /// The provider the reply runs on, whatever the device switched to since.
-    provider: crate::providers::Provider,
-    token: String,
-    cancel: watch::Sender<bool>,
-    fenced: AtomicBool,
+    pub(super) provider: crate::providers::Provider,
+    pub(super) token: String,
+    pub(super) cancel: watch::Sender<bool>,
+    pub(super) fenced: AtomicBool,
     admission: Arc<RwLock<()>>,
 }
 
@@ -74,8 +74,13 @@ impl Runtime {
         attempt_id: &str,
         trigger: &str,
         provider: crate::providers::Provider,
+        captured_permission_epoch: u64,
     ) -> Result<watch::Receiver<bool>> {
         let mut controls = self.manager_controls.lock().await;
+        ensure!(
+            self.local_permission_epoch.load(Ordering::Acquire) == captured_permission_epoch,
+            "management permissions changed before this attempt registered"
+        );
         if let Some(active) = controls.get(attempt_id) {
             return Ok(active.cancel.subscribe());
         }
@@ -139,13 +144,87 @@ impl Runtime {
         Ok(receiver)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn register_manager_attempt_fixture(
+        &self,
+        token: String,
+        access: Access,
+        attempt_id: &str,
+        trigger: &str,
+        provider: crate::providers::Provider,
+    ) -> Result<watch::Receiver<bool>> {
+        self.register_manager_attempt(
+            token,
+            access,
+            attempt_id,
+            trigger,
+            provider,
+            self.local_permission_epoch.load(Ordering::Acquire),
+        )
+        .await
+    }
+
     /// The provider a reply of this process runs on.
+    #[cfg(test)]
     pub(super) async fn attempt_provider(
         &self,
         attempt_id: &str,
     ) -> Option<crate::providers::Provider> {
         let controls = self.manager_controls.lock().await;
         controls.get(attempt_id).map(|active| active.provider)
+    }
+
+    pub(crate) async fn manager_input_lease(
+        &self,
+        attempt_id: &str,
+        provider: crate::providers::Provider,
+    ) -> Result<OwnedRwLockReadGuard<()>> {
+        let active = self
+            .manager_controls
+            .lock()
+            .await
+            .get(attempt_id)
+            .cloned()
+            .context("management invocation is no longer active")?;
+        let guard = active.admission.clone().read_owned().await;
+        ensure!(
+            !active.fenced.load(Ordering::Acquire) && active.provider == provider,
+            "management input target is no longer valid"
+        );
+        let store = self.store.lock().await;
+        let local = self.identity.device_id()?;
+        Self::check_manager_permission(&store, &local, &active.access)?;
+        let manager = active
+            .access
+            .manager
+            .as_ref()
+            .context("manager metadata missing")?;
+        let scope = active
+            .access
+            .conversation_id
+            .as_deref()
+            .context("manager scope missing")?;
+        let job = store
+            .scheduler_job(scope, &manager.trigger)?
+            .context("manager job missing")?;
+        if let Some(assignment) = crate::store::workspace::workspace_assignment_for_job_from(
+            &store.connection,
+            &active.access.network_id,
+            &local,
+            &job,
+        )? && let Err(error) = Self::validate_assignment_roots(&assignment.resource_roots)
+        {
+            if !job.tool_calls
+                && !job.pending_check
+                && job.runtime.as_ref().is_some_and(|runtime| {
+                    runtime.execution == crate::scheduling::TurnExecution::NotStarted
+                })
+            {
+                return Err(crate::manager::ManagerError::not_started(error));
+            }
+            return Err(error);
+        }
+        Ok(guard)
     }
 
     pub async fn fence_manager_attempt(&self, attempt_id: &str) -> Result<()> {
@@ -696,5 +775,91 @@ pub(super) mod tests {
             },
             check,
         ))
+    }
+
+    #[tokio::test]
+    async fn an_approval_lease_cannot_borrow_a_replacement_assignment() -> Result<()> {
+        use crate::{
+            model::EventBody,
+            workspace::{AssignmentState, WorkspaceCommand},
+        };
+        let (node, admin, dir) = super::super::triage::tests::node().await?;
+        let result = async {
+            let root = dir.canonicalize()?;
+            let first_root = root.join("first");
+            let next_root = root.join("next");
+            std::fs::create_dir_all(&first_root)?;
+            std::fs::create_dir_all(&next_root)?;
+            {
+                let mut settings = node.settings.lock().unwrap();
+                settings.roots = vec![root.clone()];
+                settings.manager = Some(crate::config::ManagerSettings {
+                    provider: crate::providers::Provider::Codex,
+                    workspace: root,
+                    model: "fixture".into(),
+                    reasoning_effort: None,
+                    backup: Default::default(),
+                });
+            }
+            super::super::triage::tests::bot(&node, &admin, "c", "Task Bot", &[]).await?;
+            let network = node.store.lock().await.network()?.context("network")?;
+            let local = node.identity.device_id()?;
+            let command = |store: &mut crate::store::Store, id: &str, command: WorkspaceCommand| -> Result<_> {
+                let signed = admin.attest(&network, crate::workspace::WORKSPACE_SCOPE,
+                    EventBody::WorkspaceCommanded { command_id: id.into(), command: command.clone(),
+                        acting_assignment: None, attestation: None, cause: None })?;
+                store.apply_workspace_command(&node.identity, &network, id, command,
+                    signed.attestation().cloned(), None, None, now_ms())
+            };
+            let (job, first, attempt) = {
+                let mut store = node.store.lock().await;
+                command(&mut store, "create", serde_json::from_value(json!({
+                    "kind":"create_task","task_id":"lease-task","owner_bot":"c","title":"lease",
+                    "request":"lease","expected_result":"result","source_events":[],"dependencies":[],"reply_only":false
+                }))?)?;
+                let input = admin.attest(&network, "c", serde_json::from_value(json!({
+                    "type":"input_posted","message_id":"lease-input","target":{"kind":"task","task_id":"lease-task"},
+                    "intent":"continue","sequence":1,"expected_revision":1,"text":"run","report_results":true
+                }))?)?;
+                store.append_event(&node.identity, &network, "c", input, vec![], now_ms())?;
+                let first = store.ensure_workspace_assignment(&node.identity, &network, "lease-task",
+                    &[first_root.to_string_lossy().into_owned()], now_ms())?.context("first allocation")?;
+                let job = store.claim_next_fixture(&node.identity, &network, "c", &node.boot, "lease-fence")?.context("Task claim")?.job;
+                let attempt = job.state.attempt().context("attempt")?.id.clone();
+                store.mark_started("c", &job.trigger, &attempt)?;
+                store.started_workspace_assignment(&node.identity, &network, &job, now_ms())?;
+                (job, first, attempt)
+            };
+            let _cancel = node.register_manager_attempt_fixture("lease-token".into(), Access {
+                network_id: network.clone(), human: false, conversation_id: Some("c".into()), manager: None,
+            }, &attempt, &job.trigger, crate::providers::Provider::Codex).await?;
+            drop(node.manager_input_lease(&attempt, crate::providers::Provider::Codex).await?);
+            {
+                let mut store = node.store.lock().await;
+                let proof = store.append_event(&node.identity, &network, "c", serde_json::from_value(json!({
+                    "type":"message_posted","message_id":"shared-stop","role":"assistant","text":"stopped",
+                    "in_reply_to":"lease-input","status":"stopped"
+                }))?, vec![], now_ms())?;
+                store.apply_workspace_command(&node.identity, &network, "stop-first", WorkspaceCommand::AssignmentProgress {
+                    execution: None, assignment_id: first.assignment_id.clone(), revision: 1,
+                    state: AssignmentState::Stopped, input_event: None, evidence_event: Some(proof.hash), result: None,
+                }, None, None, None, now_ms())?;
+                command(&mut store, "replace", WorkspaceCommand::AssignTask {
+                    task_id: "lease-task".into(), expected_revision: 1, assignment_id: "lease-replacement".into(),
+                    bot_id: "c".into(), execution_node: local.clone(), bot_owner_epoch: first.bot_owner_epoch,
+                    channel_owner_epoch: None, work_id: None,
+                    resource_roots: vec![next_root.to_string_lossy().into_owned()], automatic: false,
+                })?;
+                assert!(crate::store::workspace::task_input_allowed_from(&store.connection, &network, "lease-task")?);
+                assert!(crate::store::workspace::assignment_resources_available_from(&store.connection, &network, &first)?);
+                assert!(matches!(store.scheduler_job("c", &job.trigger)?.unwrap().state, JobState::Running { .. }));
+            }
+            assert!(node.manager_input_lease(&attempt, crate::providers::Provider::Codex).await.is_err(),
+                "a colocated approval must reject the still-running old manager before native response");
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
     }
 }

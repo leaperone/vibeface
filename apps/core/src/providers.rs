@@ -599,7 +599,7 @@ impl ProviderDescriptor {
                 StablePromptPlacement::SessionInstructions,
                 SkillInjection::Plugin,
                 SandboxMode::ProviderControlled,
-                false,
+                true,
                 ConcurrencyMode::Serial,
                 CapabilitySupport::Unsupported,
                 TextStreamMode::Snapshot,
@@ -2155,33 +2155,43 @@ requires_openai_auth = false
     #[test]
     fn discovered_tools_keep_the_turn_and_token_effect_boundary() -> Result<()> {
         use crate::tools::{Effect, Tool};
-        let human = Tool::search(json!({"limit":30}), Some(TriggerKind::Human))?;
-        assert_eq!(human["tools"].as_array().map(Vec::len), Some(29));
-        assert_eq!(human["more"], false);
-        assert!(human["next"].is_null());
         for kind in [
             None,
+            Some(TriggerKind::Human),
             Some(TriggerKind::AgentTask),
             Some(TriggerKind::Schedule),
         ] {
-            let found = Tool::search(json!({"limit":30}), kind)?;
-            for row in found["tools"].as_array().unwrap() {
-                let tool = Tool::parse(row["name"].as_str().unwrap()).unwrap();
-                assert!(!matches!(tool, Tool::Search | Tool::Describe | Tool::Call));
-                assert!(kind.map_or(tool.effect() == Effect::Read, |kind| {
-                    tool.effect().offered(kind)
-                }));
+            let mut offset = 0;
+            let mut names = BTreeSet::new();
+            loop {
+                let found = Tool::search(json!({"limit":30,"offset":offset}), kind)?;
+                for row in found["tools"].as_array().unwrap() {
+                    let name = row["name"].as_str().unwrap();
+                    assert!(
+                        names.insert(name.to_owned()),
+                        "catalog pagination repeats {name}"
+                    );
+                    let tool = Tool::parse(name).unwrap();
+                    assert!(!matches!(tool, Tool::Search | Tool::Describe | Tool::Call));
+                    assert!(kind.map_or(tool.effect() == Effect::Read, |kind| {
+                        tool.effect().offered(kind)
+                    }));
+                }
+                if found["more"] == false {
+                    assert!(found["next"].is_null());
+                    break;
+                }
+                let next = found["next"].as_u64().context("next catalog page")?;
+                assert!(next > offset);
+                offset = next;
             }
-            assert!(Tool::describe(json!({"tool":"update_profile"}), kind).is_err());
+            assert!(names.contains("workspace_state"));
+            assert_eq!(names.contains("workspace_command"), kind.is_some());
+            assert_eq!(
+                Tool::describe(json!({"tool":"update_profile"}), kind).is_ok(),
+                kind == Some(TriggerKind::Human)
+            );
         }
-        let first = Tool::search(json!({"limit":1}), Some(TriggerKind::Human))?;
-        assert_eq!(first["tools"][0]["name"], "nodes");
-        assert_eq!(first["more"], true);
-        let second = Tool::search(
-            json!({"limit":1,"offset":first["next"]}),
-            Some(TriggerKind::Human),
-        )?;
-        assert_eq!(second["tools"][0]["name"], "context");
         let dispatch = Tool::search(json!({"query":"DISPATCH_WORK"}), Some(TriggerKind::Human))?;
         assert_eq!(dispatch["tools"].as_array().map(Vec::len), Some(1));
         assert_eq!(dispatch["tools"][0]["name"], "dispatch_work");

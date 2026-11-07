@@ -9,7 +9,7 @@ import { FileName } from './prompt-input'
 import type { Attachment } from '@vibeface/client/chat/types.ts'
 
 /** A file the user attached: read it here as text, or download it under its own name. */
-export function Artifact({ file: { hash, size, name } }: { file: Attachment }) {
+export function Artifact({ file: { hash, size, name }, conversationId }: { file: Attachment; conversationId?: string }) {
   const workspace = useWorkspace()
   const [content, setContent] = useState('')
   const [nextOffset, setNextOffset] = useState<number | null>(0)
@@ -24,7 +24,7 @@ export function Artifact({ file: { hash, size, name } }: { file: Attachment }) {
     inFlight.current = generation
     setReadingGeneration(generation)
     try {
-      const page = await workspace.readArtifact(hash, cursor.current)
+      const page = await workspace.readArtifact(hash, cursor.current, conversationId)
       if (!workspace.isCurrent()) return
       if (page.size !== size) throw new Error('产物大小与消息引用不符，已停止读取。')
       cursor.current = page.next_offset
@@ -47,7 +47,7 @@ export function Artifact({ file: { hash, size, name } }: { file: Attachment }) {
           const parts: Uint8Array<ArrayBuffer>[] = []
           let offset: number | null = 0
           while (offset !== null) {
-            const page = await workspace.readArtifactBytes(hash, offset)
+            const page = await workspace.readArtifactBytes(hash, offset, conversationId)
             if (!workspace.isCurrent()) return
             if (page.size !== size) throw new Error('产物大小与消息引用不符，已停止下载。')
             parts.push(page.bytes)

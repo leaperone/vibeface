@@ -10,8 +10,10 @@ import type { BotRecord, ConversationPayload, ManagerJob } from '@vibeface/clien
 import { Details, EmptyState, providerIcons, SettingsGroup, SettingsRow } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Text } from '@/components/ui/text'
+import { Input } from '@/components/ui/input'
 import { useLive } from '@/data/live'
 import { MemorySummary } from '@/features/chat/memory-summary'
+import { InputStatus, ScopeSources } from '@/features/workspace/workspace'
 
 /** Read the selected Bot's parsed shared snapshot without acknowledging its chat. */
 export default function BotContext() {
@@ -52,6 +54,8 @@ export default function BotContext() {
 
 function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: ConversationPayload; shared: NonNullable<ReturnType<typeof useLive>> }) {
   const nodes = shared.nodes
+  const [historyQuery, setHistoryQuery] = useState('')
+  const loadedMessages = historyQuery.trim() ? data.messages.filter((message) => message.text.toLocaleLowerCase().includes(historyQuery.trim().toLocaleLowerCase())) : data.messages.slice(-4)
   const remote = data.scheduler?.remote
   const owner = remote?.owner ?? data.conversation?.owner
   const scheduler = data.scheduler
@@ -68,6 +72,7 @@ function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: Conversat
   const botNames = new Map(shared.bots.map((item) => [item.conversation_id, item]))
   const incoming = data.messages.filter((message) => message.role === 'bot' && message.sender)
   return <>
+    <View className="gap-3 rounded-xl border border-border bg-card p-4"><Text role="heading" className="font-medium">本轮来源和补充归属</Text><Text className="text-meta text-muted-foreground">当前范围为 {bot.name} 的主聊天。任务、频道与例行任务使用各自的执行上下文。</Text><Text className="text-meta text-muted-foreground">已同步的消息和持久记忆，只有进入本轮来源记录才显示为引用。</Text>{!connected || remote?.reachable === false ? <Text role="status" className="text-meta text-warning">目标状态未知，显示最近的上下文记录。</Text> : null}{context ? <ScopeSources context={context} /> : <Text className="text-meta text-muted-foreground">本轮编译与省略记录尚未提供。</Text>}{shared.pendingMessages.filter((item) => item.target.kind === 'bot_main' && item.target.bot_id === bot.bot_id).map((item) => <View key={item.message_id} className="gap-2"><Text numberOfLines={2} className="text-meta">{item.text}</Text><InputStatus pending={item} /></View>)}{jobs.filter((job) => job.receipt).map((job) => <Text key={job.trigger} className="text-meta text-muted-foreground">补充 {job.message_id ?? job.trigger} · 执行服务已接受输入{job.receipt?.actual_turn_id ? ` · 实际回合 ${job.receipt.actual_turn_id}` : ' · 回合归属尚未确认'}</Text>)}</View>
     <SettingsGroup title="Bot 身份">
       <SettingsRow icon={Bot} label={bot.name} description="共享聊天身份" href={`/b/${bot.bot_id}`} />
       <SettingsRow icon={Laptop} label="负责设备" description={reach}><Text className="max-w-[50%] text-muted-foreground">{owner ? nodeName(owner, { nodes }) : '归属未知'}</Text></SettingsRow>
@@ -87,14 +92,14 @@ function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: Conversat
         <Text selectable className="font-mono text-meta">稳定指纹 {context.stable_fingerprint}</Text><Text selectable className="font-mono text-meta">本轮指纹 {context.dynamic_fingerprint}</Text>
       </Fold> : null}
     </SettingsGroup>
-    <SettingsGroup title="共享摘要">
+    <SettingsGroup title="共享摘要"><View className="gap-2 p-4"><Text nativeID="bot-history-search" className="text-meta">搜索这个 Bot 已加载的历史</Text><Input accessibilityLabel="搜索这个 Bot 已加载的历史" accessibilityLabelledBy="bot-history-search" value={historyQuery} onChangeText={setHistoryQuery} placeholder="输入关键词" /><Text className="text-meta text-muted-foreground">范围为 {bot.name} 当前已加载的 {data.messages.length} 条主聊天消息。</Text></View>
       <SettingsRow icon={MessagesSquare} label="消息" description={`${data.messages.length} 条已加载消息`} href={`/b/${bot.bot_id}`} />
       <SettingsRow icon={ListChecks} label="工作" description={`${data.works.length} 项已加载工作`} />
       {data.works.map((work) => {
         const state = shownState(work, nodes)
         return <SettingsRow key={work.work_id} icon={ListChecks} label={work.title || '任务'} description={taskStale(state, connected) ? staleTaskLabel : taskLabel(state)} href={`/b/${bot.bot_id}/work/${work.work_id}`} />
       })}
-      <Fold label="最近消息摘要">{data.messages.length ? data.messages.slice(-4).map((message) => <View key={message.message_id} className="gap-1"><Text className="text-meta font-medium">{message.sender?.name ?? (message.role === 'user' ? '你' : 'Bot')} · {formatWhen(message.created_at_ms)}</Text><Text selectable>{message.text}</Text></View>) : <Text className="text-muted-foreground">当前记录没有聊天消息</Text>}</Fold>
+      <Fold label="最近消息摘要">{loadedMessages.length ? loadedMessages.map((message) => <View key={message.message_id} className="gap-1"><Text className="text-meta font-medium">{message.sender?.name ?? (message.role === 'user' ? '你' : 'Bot')} · {formatWhen(message.created_at_ms)}</Text><Text selectable>{message.text}</Text></View>) : <Text className="text-muted-foreground">当前记录没有聊天消息</Text>}</Fold>
     </SettingsGroup>
     <SettingsGroup title="持久记忆和定时任务">
       <View className="p-4"><MemorySummary key={bot.conversation_id} settings={data.bot_settings} context={context} memory={shared} /></View>
@@ -128,6 +133,7 @@ function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: Conversat
         return <MessageRecord key={`received:${message.message_id}`} icon={MessagesSquare} label={`收到 ${sender?.name ?? '另一个 Bot'} 的消息`} text={message.text} time={message.created_at_ms} bot={target} />
       })}
       {data.sent.map((message) => <MessageRecord key={`sent:${message.message_id}`} icon={Send} label={`发给 ${botNames.get(message.to)?.name ?? '另一个 Bot'}`} text={message.text} time={message.created_at_ms} bot={botNames.get(message.to)} sent />)}
+      {data.sent_coverage.omitted_unknown ? <Text className="px-4 py-2 text-meta text-muted-foreground">另有 {data.sent_coverage.omitted_unknown} 条协作消息的归属尚未确认，未计入当前主聊天。</Text> : null}
       {!incoming.length && !data.sent.length ? <SettingsRow icon={MessagesSquare} label="当前记录没有 Bot 协作消息" /> : null}
     </SettingsGroup>
     <Text className="text-meta text-muted-foreground">这里显示当前已加载的记录，不包含完整 AI 会话或提示词。回答、停止和结算仍在原有对话与任务详情中进行。</Text>

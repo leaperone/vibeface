@@ -243,6 +243,7 @@ where
         thread_id: thread,
         text: args["prompt"].as_str().unwrap_or_default().into(),
         client_id: work_id.clone(),
+        expected_turn_id: tracked["expected_turn_id"].as_str().map(str::to_owned),
         model,
         effort: args["effort"].as_str().map(str::to_owned),
         images: serde_json::from_value(args["images"].clone()).unwrap_or_default(),

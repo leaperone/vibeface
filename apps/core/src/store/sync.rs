@@ -243,7 +243,7 @@ impl Store {
         Ok(false)
     }
 
-    /// The owner admits a user message or a work result another Node holds. Idempotent by
+    /// The target Node admits a message, assignment or result another Node holds. Idempotent by
     /// trigger, so a second delivery gets the original receipt. `None` means the triggering
     /// event has not been synced here yet.
     pub fn admit_delivery(
@@ -256,14 +256,66 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owner = super::conversation_from(&tx, network, conversation)?
+        let conversation_owner = super::conversation_from(&tx, network, conversation)?
             .context("conversation not found")?
             .owner;
+        let assignment = if let Some(("assignment", assignment_id)) = trigger.split_once(':') {
+            let Some(assignment) =
+                super::workspace::workspace_assignment_from(&tx, network, assignment_id)?
+            else {
+                return Ok(None);
+            };
+            ensure!(
+                super::bot_settings::find_bot(&tx, network, &assignment.bot_id)?.conversation_id
+                    == conversation,
+                "assignment belongs to another Bot conversation"
+            );
+            Some(assignment)
+        } else {
+            None
+        };
+        let typed_input = if let Some(("message", message_id)) = trigger.split_once(':') {
+            if message_from(&tx, network, conversation, message_id)?.is_none() {
+                return Ok(None);
+            }
+            super::workspace::input_route_from(&tx, network, conversation, message_id)?
+        } else {
+            None
+        };
+        let held_input = if let Some(("message", message_id)) = trigger.split_once(':') {
+            super::admission::held_answer_subject_from(&tx, network, conversation, message_id)?
+        } else {
+            None
+        };
+        let owner = if let Some(subject) = &held_input {
+            Some(subject.node.clone())
+        } else if let Some(assignment) = &assignment {
+            Some(assignment.execution_node.clone())
+        } else if let Some(route) = &typed_input {
+            let resolved =
+                super::workspace::resolve_input_target_from(&tx, network, &route.target)?;
+            ensure!(
+                resolved.conversation_id == conversation,
+                "input belongs to another Bot conversation"
+            );
+            Some(resolved.owner_node)
+        } else {
+            conversation_owner
+        };
+        super::authorize_node_from(&tx, network, local)?;
         ensure!(
             owner.as_deref() == Some(local),
             "this Node does not schedule the conversation"
         );
         let receipt = match trigger.split_once(':') {
+            Some(("assignment", _)) => {
+                let assignment = assignment.as_ref().expect("assignment trigger parsed");
+                ensure!(
+                    super::workspace::assignment_admission_allowed_from(&tx, network, assignment)?,
+                    "assignment authorization or revision is stale"
+                );
+                super::scheduler::admit_assignment_from(&tx, network, local, assignment)?
+            }
             Some(("message", message_id)) => {
                 let Some(message) = message_from(&tx, network, conversation, message_id)? else {
                     return Ok(None);
@@ -276,7 +328,22 @@ impl Store {
                     Some(_) => TriggerKind::Answer,
                     None => TriggerKind::Human,
                 };
-                admit_from(&tx, network, conversation, trigger, kind, message_id)?
+                if held_input.is_some() {
+                    let Some(receipt) = super::triage::held_answer_receipt_from(
+                        &tx,
+                        network,
+                        conversation,
+                        message_id,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    receipt
+                } else if typed_input.is_some() {
+                    super::scheduler::admit_workspace_input_from(&tx, network, local, message_id)?
+                } else {
+                    admit_from(&tx, network, conversation, trigger, kind, message_id)?
+                }
             }
             Some(("work", work_id)) => {
                 let outcome = super::reduce::works_from(&tx, network, conversation)?
@@ -312,7 +379,9 @@ impl Store {
                     message_id,
                 )?
             }
-            _ => anyhow::bail!("only user and bot messages and work results are delivered"),
+            _ => anyhow::bail!(
+                "only user and bot messages, assignments and work results are delivered"
+            ),
         };
         tx.commit()?;
         Ok(Some(receipt))

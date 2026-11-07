@@ -22,9 +22,10 @@ import { useWide } from '@/lib/layout'
 import { move } from '@/lib/motion'
 import { useRun } from '@/lib/use-run'
 import { QuestionCard } from '@/features/chat/question-card'
-import { ConfirmCard, PendingMessageCard } from '@/features/chat/work'
+import { ConfirmCard } from '@/features/chat/work'
 import { JoinRequests } from '@/features/devices/join-requests'
 import { RecoveryPendingCard, RotateHintCard } from '@/features/recovery/recovery'
+import { InputLocation, InputStatus, WorkspaceTaskRow } from '@/features/workspace/workspace'
 
 // An answered card leaves at once and what was below glides up into its space, so nothing passes over anything.
 const Group = withUniwind(Animated.View)
@@ -40,6 +41,9 @@ export default function Inbox() {
   const items = useInbox()
   const device = useDevice()
   const shared = useLive()
+  const decisions = (shared?.workspaceState?.tasks ?? []).filter((task) => task.state === 'waiting_user' || task.state === 'update_pending')
+  const confirmations = (shared?.workspaceState?.tasks ?? []).filter((task) => task.state === 'needs_reconciliation' || task.state === 'stop_pending')
+  const inputs = items.flatMap((item) => item.kind === 'undelivered' ? [item.message] : [])
   const { busy, error, status, run } = useRun()
   const wide = useWide()
   const bar = useHeaderHeight()
@@ -62,6 +66,9 @@ export default function Inbox() {
   const attention = items.filter((item): item is Extract<InboxItem, { kind: 'attention' }> => item.kind === 'attention')
   // Entering animations skip the first render: an inbox opened empty just shows it, one emptied by an answer fades it in.
   return <LayoutAnimationConfig skipEntering><KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-3 p-4 pb-10">
+    {decisions.length ? <View className="gap-3"><Text role="heading" className="text-heading font-semibold">需要决定</Text>{decisions.map((task) => <WorkspaceTaskRow key={task.task_id} task={task} />)}</View> : null}
+    {confirmations.length || inputs.length ? <View className="gap-3"><Text role="heading" className="text-heading font-semibold">待确认</Text>{confirmations.map((task) => <WorkspaceTaskRow key={task.task_id} task={task} />)}{inputs.map((input) => <View key={input.message_id} className="gap-2"><Text numberOfLines={2} className="text-meta">{input.text}</Text><InputLocation target={input.target} conversationId={input.conversation_id} /><InputStatus pending={input} /></View>)}</View> : null}
+    {attention.length ? <Text role="heading" className="mt-3 text-heading font-semibold">更新</Text> : null}
     {attention.length && shared ? <View className="flex-row flex-wrap justify-end gap-2">
       <Button variant="ghost" disabled={busy !== null} accessibilityLabel="忽略提醒" onPress={() => void run('ignore', async () => { shared.ignoreNotifications(attention.map((item) => item.notification.notification_id)) }, '已忽略提醒，仅此设备隐藏。')}><Icon as={EyeOff} /><Text>忽略提醒</Text></Button>
       <Button variant="outline" disabled={busy !== null} accessibilityLabel="全部已读" onPress={() => void run('read', async () => { await shared.markNotificationsRead(attention.map((item) => item.notification.notification_id)) }, '提醒已标记为已读。')}><Icon as={CheckCheck} /><Text>全部已读</Text></Button>
@@ -70,7 +77,7 @@ export default function Inbox() {
     {items.map((item) => item.kind === 'recovery' ? <RecoveryPendingCard key={item.key} />
       : item.kind === 'rotate' ? <RotateHintCard key={item.key} />
       : item.kind === 'confirm' ? <ConfirmCard key={item.key} check={item.check} />
-      : item.kind === 'undelivered' ? <PendingMessageCard key={item.key} />
+      : item.kind === 'undelivered' ? null
       : item.kind === 'failed' ? <FailedCard key={item.key} item={item} replace={wide} />
       : item.kind === 'write' || item.kind === 'attention' || item.kind === 'setup' ? <ItemRow key={item.key} item={item} href={rowHref(item, shared?.selectedBot?.bot_id, device.ready?.entry.device_id)} replace={wide} />
       : null)}
@@ -82,7 +89,7 @@ export default function Inbox() {
         </Pressable>
       </Link> : null}
       {questions.map((question) => <Animated.View key={question.question_id} layout={move}><QuestionCard question={question} /></Animated.View>)}
-    </Group>) : items.length ? null : <View style={{ minHeight: below, paddingTop: 24, justifyContent: 'center' }}>
+    </Group>) : items.length || decisions.length || confirmations.length || inputs.length ? null : <View style={{ minHeight: below, paddingTop: 24, justifyContent: 'center' }}>
       <EmptyState icon={InboxIcon} title="没有待处理" action={<Link href="/" dismissTo asChild><Button variant="outline" className="self-center"><Icon as={MessageCircle} /><Text>回到消息</Text></Button></Link>} />
     </View>}
   </KeyboardAwareScrollView></LayoutAnimationConfig>
@@ -90,7 +97,14 @@ export default function Inbox() {
 
 /** Where a row leads on the phone; the phone cannot settle a copied or read-only computer, so that row only says it. */
 function rowHref(item: Row, chat: string | undefined, entry: string | undefined): Href | null {
-  if (item.kind === 'attention') return `/b/${item.bot.bot_id}`
+  if (item.kind === 'attention') {
+    const target = item.notification.target
+    if (target?.kind === 'task' || target?.kind === 'channel_task') return `/task/${target.task_id}`
+    if (target?.kind === 'channel_member') return `/channel/${target.channel_id}`
+    if (target?.kind === 'work') return `/b/${item.bot.bot_id}/work/${target.work_id}`
+    if (target?.kind === 'routine') return `/b/${item.bot.bot_id}?routine=${encodeURIComponent(target.trigger)}`
+    return target?.kind === "bot_main" ? `/b/${item.bot.bot_id}` : null
+  }
   if (item.kind === 'undelivered') return chat ? `/b/${chat}` : null
   if (item.kind === 'setup') return !item.device || item.device === entry ? '/ai' : `/device/${item.device}`
   return null

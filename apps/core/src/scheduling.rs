@@ -6,6 +6,7 @@ use crate::{
     work::Signal,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use vibeface_bridge::failure::{ExecFailure, FailureKind, ProviderStage};
 
@@ -20,6 +21,7 @@ pub enum TriggerKind {
     WorkResult,
     /// A `task` work this Node accepted; its turn ends in `WorkFinished`, not a reply.
     AgentTask,
+    WorkspaceTask,
     /// A due time of a schedule of this conversation: a routine, or a reminder.
     Schedule,
     /// Another bot's message to this one.
@@ -40,7 +42,7 @@ impl TriggerKind {
     pub const fn lane(self) -> AgentLane {
         match self {
             Self::Human | Self::Answer | Self::WorkResult => AgentLane::Main,
-            Self::AgentTask => AgentLane::Task,
+            Self::AgentTask | Self::WorkspaceTask => AgentLane::Task,
             Self::Schedule => AgentLane::ScheduleRoutine,
             Self::BotMessage => AgentLane::BotMessage,
         }
@@ -52,6 +54,9 @@ impl TriggerKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueHoldReason {
+    AttachmentPreparation,
+    EarlierInput,
+    ResourceConflict,
     ActiveTurn,
     SteeringSettlement,
     ProviderSerial,
@@ -61,18 +66,27 @@ pub enum QueueHoldReason {
     BackendConfigPending,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionScope {
+    #[default]
     Main,
-    Task { work_id: String },
-    Routine { trigger: String },
+    WorkspaceTask {
+        task_id: String,
+    },
+    Task {
+        work_id: String,
+    },
+    Routine {
+        trigger: String,
+    },
 }
 
 impl SessionScope {
     pub fn storage_key(&self) -> String {
         match self {
             Self::Main => "main".into(),
+            Self::WorkspaceTask { task_id } => format!("workspace_task:{task_id}"),
             Self::Task { work_id } => format!("task:{work_id}"),
             Self::Routine { trigger } => format!("routine:{trigger}"),
         }
@@ -81,6 +95,12 @@ impl SessionScope {
     pub fn from_storage_key(key: &str) -> anyhow::Result<Self> {
         if key == "main" {
             return Ok(Self::Main);
+        }
+        if let Some(task_id) = key.strip_prefix("workspace_task:") {
+            vibeface_protocol::validate_id(task_id).map_err(anyhow::Error::msg)?;
+            return Ok(Self::WorkspaceTask {
+                task_id: task_id.into(),
+            });
         }
         if let Some(work_id) = key.strip_prefix("task:") {
             vibeface_protocol::validate_id(work_id).map_err(anyhow::Error::msg)?;
@@ -282,21 +302,29 @@ pub enum SteerOutcome {
     Answered,
     /// The message is in a turn that stopped, failed or was interrupted.
     Unfinished,
-    /// The thread could not be read, or still showed the turn running, in time; whether it
-    /// joined is unknown. Stopping the message after its reply ended also ends it here.
+    /// The original thread could not prove the input's outcome, still showed its turn running
+    /// past the readback window, or the user stopped an unacknowledged input after its host ended.
     Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SteerReceipt {
+    pub accepted_at_ms: i64,
+    pub actual_turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum JobState {
     Queued,
-    /// Sent, or about to be sent, as `turn/steer` into `into`. It is settled from the thread
-    /// once that reply's attempt ended, never sent again. After that, `unread_since_ms` is when
-    /// reading the thread first failed and `running_since_ms` when a read first still showed the
-    /// target turn running.
+    /// One registered native submission, with acceptance saved separately from its result.
+    /// An uncertain submission is read back; only explicit NotArrived permits requeue.
     Steering {
         into: SteerTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<SteerReceipt>,
+        #[serde(default)]
+        uncertain: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unread_since_ms: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -306,6 +334,8 @@ pub enum JobState {
     Steered {
         into: SteerTarget,
         outcome: SteerOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<SteerReceipt>,
     },
     Claimed {
         attempt: ManagerAttempt,
@@ -413,13 +443,13 @@ pub struct TurnRuntime {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchedulerJob {
     pub conversation_id: String,
+    pub scope: SessionScope,
     /// `message:<message_id>`, `work:<work_id>`, `task:<work_id>`,
     /// `bot_message:<message_id>` or `schedule:<schedule_id>:<slot_ms>`.
     pub trigger: String,
     pub kind: TriggerKind,
     pub sequence: u64,
-    /// The version vector the turn reads, taken again when it is claimed; later events are not
-    /// part of its prompt.
+    /// The fixed prompt basis. Accepted later inputs keep separate source and receipt records.
     pub basis: VersionVector,
     /// The user message this turn ultimately answers, an agent task's own work ID, a peer
     /// message, or a schedule run's trigger.
@@ -448,14 +478,16 @@ impl SchedulerJob {
     }
 
     pub fn session_scope(&self) -> SessionScope {
-        match self.kind {
-            TriggerKind::AgentTask => SessionScope::Task {
-                work_id: self.reply_to.clone(),
-            },
-            TriggerKind::Schedule => SessionScope::Routine {
-                trigger: self.trigger.clone(),
-            },
-            _ => SessionScope::Main,
+        self.scope.clone()
+    }
+
+    pub fn tool_kind(&self) -> TriggerKind {
+        match self.scope {
+            SessionScope::WorkspaceTask { .. } | SessionScope::Task { .. } => {
+                TriggerKind::AgentTask
+            }
+            SessionScope::Routine { .. } => TriggerKind::Schedule,
+            SessionScope::Main => self.kind,
         }
     }
 
@@ -468,7 +500,10 @@ impl SchedulerJob {
 
     pub fn priority(&self) -> (bool, u64, &str, &str) {
         (
-            !matches!(self.kind, TriggerKind::Human | TriggerKind::Answer),
+            !matches!(
+                self.kind,
+                TriggerKind::Human | TriggerKind::Answer | TriggerKind::WorkspaceTask
+            ),
             self.sequence,
             &self.conversation_id,
             &self.trigger,
@@ -517,9 +552,12 @@ impl OutboxEntry {
 #[derive(Debug, Clone)]
 pub struct SteerCandidate {
     pub conversation_id: String,
+    pub scope: SessionScope,
     pub trigger: String,
     pub message_id: String,
     pub text: String,
+    pub attachments: Vec<crate::model::Attachment>,
+    pub source_event: crate::model::HashedEvent,
     pub into: SteerTarget,
 }
 
@@ -605,11 +643,14 @@ pub enum ContextStage {
     Unknown,
 }
 
-/// Only digests, counts and lifecycle facts leave the local session. The prompt, native
-/// session identifiers and credentials remain private.
+/// Bounded source references and delivery facts without the prompt, transcript or credentials.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ContextProjection {
+    #[serde(default)]
+    pub network_id: String,
+    #[serde(default)]
+    pub scope: SessionScope,
     pub attempt_id: String,
     pub provider: Provider,
     pub stable_fingerprint: String,
@@ -622,6 +663,14 @@ pub struct ContextProjection {
     pub stage: ContextStage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_status: Option<SessionStatusProjection>,
+    #[serde(default)]
+    pub sources: Vec<Value>,
+    #[serde(default)]
+    pub sources_omitted: usize,
+    #[serde(default)]
+    pub inputs: Vec<Value>,
+    #[serde(default)]
+    pub inputs_omitted: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -750,6 +799,36 @@ impl PendingCheck {
 #[cfg(test)]
 mod lane_tests {
     use super::*;
+
+    #[test]
+    fn workspace_tasks_round_trip_without_aliasing_raw_work_or_other_scopes() -> anyhow::Result<()>
+    {
+        let scopes = [
+            SessionScope::Main,
+            SessionScope::WorkspaceTask {
+                task_id: "a".into(),
+            },
+            SessionScope::WorkspaceTask {
+                task_id: "b".into(),
+            },
+            SessionScope::Task {
+                work_id: "a".into(),
+            },
+            SessionScope::Routine {
+                trigger: schedule_trigger("schedule", 1),
+            },
+        ];
+        let keys = scopes
+            .iter()
+            .map(SessionScope::storage_key)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys.len(), 5);
+        for scope in scopes {
+            assert_eq!(SessionScope::from_storage_key(&scope.storage_key())?, scope);
+        }
+        assert!(SessionScope::from_storage_key("workspace_task:../a").is_err());
+        Ok(())
+    }
 
     #[test]
     fn trigger_kinds_have_stable_lanes() {

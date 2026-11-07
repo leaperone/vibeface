@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::path::Path;
 use vibeface_bridge::failure::{ExecFailure, ProviderStage};
 
-const JOB_COLUMNS: &str = "conversation_id,trigger,kind,sequence,basis,reply_to,message_id,state,attempt_id,attempt_boot,attempt_permission,detail,failure,runtime,tool_calls";
+const JOB_COLUMNS: &str = "conversation_id,trigger,kind,sequence,basis,reply_to,message_id,state,attempt_id,attempt_boot,attempt_permission,detail,failure,runtime,tool_calls,scope";
 
 type JobRow = (
     String,
@@ -26,6 +26,7 @@ type JobRow = (
     Option<String>,
     Option<String>,
     bool,
+    String,
     bool,
 );
 
@@ -46,6 +47,7 @@ fn job_from_row(row: JobRow) -> Result<SchedulerJob> {
         failure,
         runtime,
         tool_calls,
+        scope,
         pending_check,
     ) = row;
     let attempt = match (id, boot, permission) {
@@ -107,6 +109,7 @@ fn job_from_row(row: JobRow) -> Result<SchedulerJob> {
     };
     Ok(SchedulerJob {
         conversation_id,
+        scope: SessionScope::from_storage_key(&scope)?,
         trigger,
         kind: super::enum_from(&kind)?,
         sequence,
@@ -149,6 +152,7 @@ fn query_jobs(
                 r.get(13)?,
                 r.get(14)?,
                 r.get(15)?,
+                r.get(16)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<JobRow>>>()?;
@@ -168,12 +172,211 @@ fn load_job(
     .pop())
 }
 
+fn attachment_sources_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    hash: &str,
+) -> Result<Vec<HashedEvent>> {
+    let mut statement=connection.prepare("SELECT e.hash,e.envelope FROM events e JOIN event_blobs b ON b.network_id=e.network_id AND b.hash=e.hash WHERE e.network_id=? AND e.scope_id=? AND b.blob=? AND e.effective=1")?;
+    let rows = statement
+        .query_map(params![network, conversation, hash], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(hash, envelope)| {
+            let signed: SignedEvent = serde_json::from_str(&envelope)?;
+            Ok(HashedEvent {
+                hash,
+                event: serde_json::from_str(&signed.canonical_body)?,
+            })
+        })
+        .collect()
+}
+
 fn queued_jobs(connection: &Connection, conversation: &str) -> Result<Vec<SchedulerJob>> {
     query_jobs(
         connection,
         "conversation_id=? AND state='queued'",
         [conversation],
     )
+}
+
+pub(crate) fn workspace_input_editable_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    message_id: &str,
+) -> Result<bool> {
+    let Some(input) =
+        super::workspace::queued_workspace_input_from(connection, network, message_id)?
+    else {
+        return Ok(false);
+    };
+    if input.conversation_id != conversation || input.cancelled {
+        return Ok(false);
+    }
+    let unresolved:bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM scheduler_outbox WHERE conversation_id=?1 AND trigger=?2) OR EXISTS(SELECT 1 FROM pending_checks WHERE conversation_id=?1 AND trigger=?2)",
+        params![conversation,message_trigger(message_id)], |row| row.get(0),
+    )?;
+    if unresolved {
+        return Ok(false);
+    }
+    match load_job(connection, conversation, &message_trigger(message_id))? {
+        Some(job) => Ok(job.state == JobState::Queued && job.runtime.is_none() && !job.tool_calls),
+        None => {
+            let steered:bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE network_id=? AND conversation_id=? AND message_id=? AND steered_into IS NOT NULL)",params![network,conversation,message_id],|row|row.get(0))?;
+            Ok(!steered)
+        }
+    }
+}
+
+pub(crate) fn workspace_input_releasable_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    message_id: &str,
+) -> Result<bool> {
+    if workspace_input_editable_from(connection, network, conversation, message_id)? {
+        return Ok(true);
+    }
+    let Some(input) =
+        super::workspace::queued_workspace_input_from(connection, network, message_id)?
+    else {
+        return Ok(false);
+    };
+    if input.conversation_id != conversation || input.cancelled {
+        return Ok(false);
+    }
+    let blocked: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM scheduler_outbox WHERE conversation_id=?1 AND trigger=?2) OR EXISTS(SELECT 1 FROM pending_checks WHERE conversation_id=?1 AND trigger=?2) OR EXISTS(SELECT 1 FROM messages WHERE network_id=?3 AND conversation_id=?1 AND message_id=?4 AND steered_into IS NOT NULL)",
+        params![conversation, message_trigger(message_id), network, message_id],
+        |row| row.get(0),
+    )?;
+    if blocked
+        || !load_job(connection, conversation, &message_trigger(message_id))?
+            .is_some_and(|job| job.retryable())
+    {
+        return Ok(false);
+    }
+    let resolved = super::workspace::resolve_input_target_from(
+        connection,
+        network,
+        &input.input.route.target,
+    )?;
+    super::workspace::workspace_input_release_allowed_from(
+        connection,
+        network,
+        &resolved.owner_node,
+        message_id,
+    )
+}
+
+pub(crate) fn apply_workspace_input_control_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    message_id: &str,
+) -> Result<()> {
+    let input = super::workspace::queued_workspace_input_from(connection, network, message_id)?
+        .context("input not found")?;
+    let resolved = super::workspace::resolve_input_target_from(
+        connection,
+        network,
+        &input.input.route.target,
+    )?;
+    ensure!(
+        resolved.owner_node == local,
+        "only the input owner applies queue controls"
+    );
+    let release =
+        log::event_from(connection, network, &input.control_event)?.is_some_and(|event| {
+            matches!(event.body, EventBody::WorkspaceCommanded {
+            command: crate::workspace::WorkspaceCommand::ControlInput {
+                message_id: controlled,
+                action: crate::workspace::InputControl::Release,
+                ..
+            }, ..
+        } if controlled == message_id)
+        });
+    let release_key = format!("workspace-input-release:{}", input.control_event);
+    if release {
+        let applied: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM identity_meta WHERE key=?)",
+            [&release_key],
+            |row| row.get(0),
+        )?;
+        if applied {
+            return Ok(());
+        }
+    }
+    if let Some(mut job) = load_job(
+        connection,
+        &input.conversation_id,
+        &message_trigger(message_id),
+    )? {
+        if release && job.retryable() {
+            ensure!(
+                workspace_input_releasable_from(
+                    connection,
+                    network,
+                    &input.conversation_id,
+                    message_id,
+                )?,
+                "input is not safe to release"
+            );
+            job.state = JobState::Queued;
+            job.runtime = None;
+            job.pending_check = false;
+            job.basis = log::version_vector_from(connection, network)?;
+            job.message_id = format!(
+                "reply-{}",
+                crate::crypto::digest(&serde_json::to_vec(&(
+                    &input.conversation_id,
+                    &input.control_event,
+                ))?)
+            );
+        } else {
+            ensure!(
+                job.state == JobState::Queued && job.runtime.is_none() && !job.tool_calls,
+                "input has already started"
+            );
+        }
+        if input.cancelled {
+            job.state = JobState::Cancelled {
+                attempt: None,
+                evidence: "cancelled_before_delivery".into(),
+            };
+        }
+        job.sequence = input.effective_order;
+        save_job(connection, &job)?;
+    } else if !input.cancelled && !input.deferred {
+        admit_from(
+            connection,
+            network,
+            &input.conversation_id,
+            &message_trigger(message_id),
+            TriggerKind::Human,
+            message_id,
+        )?;
+    }
+    for mut job in queued_jobs(connection, &input.conversation_id)? {
+        if let Some(effective) =
+            super::workspace::queued_workspace_input_from(connection, network, &job.reply_to)?
+        {
+            job.sequence = effective.effective_order;
+            save_job(connection, &job)?;
+        }
+    }
+    if release {
+        connection.execute(
+            "INSERT INTO identity_meta(key,value) VALUES(?,?)",
+            params![release_key, message_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn steer_host_may_still_consume(state: &JobState) -> bool {
@@ -203,13 +406,13 @@ fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
     };
     connection.execute(
         &format!(
-            "INSERT INTO scheduler_jobs({JOB_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            "INSERT INTO scheduler_jobs({JOB_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(conversation_id,trigger) DO UPDATE SET
              kind=excluded.kind,sequence=excluded.sequence,basis=excluded.basis,
              reply_to=excluded.reply_to,message_id=excluded.message_id,state=excluded.state,
              attempt_id=excluded.attempt_id,attempt_boot=excluded.attempt_boot,
              attempt_permission=excluded.attempt_permission,detail=excluded.detail,
-             failure=excluded.failure,runtime=excluded.runtime,tool_calls=excluded.tool_calls"
+             failure=excluded.failure,runtime=excluded.runtime,tool_calls=excluded.tool_calls,scope=excluded.scope"
         ),
         params![
             job.conversation_id,
@@ -230,6 +433,7 @@ fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
                 .map(serde_json::to_string)
                 .transpose()?,
             job.tool_calls,
+            job.scope.storage_key(),
         ],
     )?;
     Ok(())
@@ -303,6 +507,7 @@ fn load_scoped_session(connection: &Connection, key: &SessionKey) -> Result<Sche
     .unwrap_or_else(|| SchedulerSession::in_scope(&key.conversation_id, key.scope.clone())))
 }
 
+#[cfg(test)]
 fn load_session(connection: &Connection, conversation: &str) -> Result<SchedulerSession> {
     load_scoped_session(
         connection,
@@ -352,8 +557,13 @@ fn save_session(connection: &Connection, session: &SchedulerSession) -> Result<(
     Ok(())
 }
 
-fn context_projection_from(session: &SchedulerSession) -> Option<ContextProjection> {
-    let mut context = session.shown.context.clone()?;
+fn context_projection_from(
+    connection: &Connection,
+    session: &SchedulerSession,
+) -> Result<Option<ContextProjection>> {
+    let Some(mut context) = session.shown.context.clone() else {
+        return Ok(None);
+    };
     let pending_generation = context
         .session_status
         .as_ref()
@@ -364,11 +574,93 @@ fn context_projection_from(session: &SchedulerSession) -> Option<ContextProjecti
             && !session.covers.is_empty(),
         pending_generation,
     });
-    Some(context)
+    context.scope = session.scope.clone();
+    context.inputs.clear();
+    let mut missing_sources = 0;
+    for job in query_jobs(
+        connection,
+        "conversation_id=? AND state IN ('steering','steered')",
+        [&session.conversation_id],
+    )? {
+        let (into, receipt, stage) = match &job.state {
+            JobState::Steering {
+                into,
+                receipt,
+                uncertain,
+                ..
+            } => (
+                into,
+                receipt,
+                if receipt.is_some() {
+                    "provider_accepted"
+                } else if *uncertain {
+                    "unknown"
+                } else {
+                    "submitting"
+                },
+            ),
+            JobState::Steered {
+                into,
+                receipt,
+                outcome,
+            } => (
+                into,
+                receipt,
+                if *outcome == SteerOutcome::Unknown
+                    || receipt
+                        .as_ref()
+                        .and_then(|receipt| receipt.actual_turn_id.as_ref())
+                        .is_none()
+                {
+                    "unknown"
+                } else {
+                    "associated"
+                },
+            ),
+            _ => continue,
+        };
+        if into.attempt_id != context.attempt_id {
+            continue;
+        }
+        let Some(source) = message_from(
+            connection,
+            &context.network_id,
+            &job.conversation_id,
+            &job.reply_to,
+        )?
+        .map(|message| message.event_hash) else {
+            missing_sources += 1;
+            continue;
+        };
+        let mut value = json!({"message_id":job.reply_to,"source_event":source,"stage":stage,
+            "expected_turn_id":into.turn_id,"actual_turn_id":receipt.as_ref().and_then(|receipt| receipt.actual_turn_id.clone())});
+        if let Some(receipt) = receipt {
+            value["accepted_at_ms"] = json!(receipt.accepted_at_ms);
+        }
+        context.inputs.push(value);
+    }
+    context.inputs_omitted = context.inputs.len().saturating_sub(64) + missing_sources;
+    context.inputs.truncate(64);
+    Ok(Some(context))
+}
+
+fn context_history_complete(context: Option<&ContextProjection>) -> bool {
+    context.is_none_or(|context| {
+        let coverage = &context.coverage;
+        coverage.messages_omitted == 0
+            && coverage.works_omitted == 0
+            && coverage.dispatches_omitted == 0
+            && coverage.questions_omitted == 0
+            && coverage.attachments_omitted == 0
+            && coverage.checkpoint_omitted == 0
+            && coverage.handoff_omitted == 0
+            && coverage.pending_checks_omitted == 0
+    })
 }
 
 fn job_hold_from(
     connection: &Connection,
+    blob_dir: &Path,
     network: &str,
     local: &str,
     job: &SchedulerJob,
@@ -380,6 +672,96 @@ fn job_hold_from(
     }
     let key = job.session_key();
     let session = load_scoped_session(connection, &key)?;
+    let fixed_assignment =
+        super::workspace::workspace_assignment_for_job_from(connection, network, local, job)?;
+    for earlier in queued_jobs(connection, &job.conversation_id)? {
+        if earlier.scope == job.scope
+            && earlier.sequence < job.sequence
+            && let Some(input) = super::workspace::queued_workspace_input_from(
+                connection,
+                network,
+                &earlier.reply_to,
+            )?
+            && !input.deferred
+            && !input.cancelled
+            && input.input.route.intent == crate::workspace::InputIntent::Continue
+            && input.input.report_results != Some(false)
+        {
+            if let Some(assignment) = &fixed_assignment
+                && !super::workspace::workspace_assignment_for_job_from(
+                    connection, network, local, &earlier,
+                )?
+                .is_some_and(|earlier| earlier.assignment_id == assignment.assignment_id)
+            {
+                continue;
+            }
+            return Ok(Some(QueueHoldReason::EarlierInput));
+        }
+    }
+    if let SessionScope::WorkspaceTask { task_id } = &job.scope {
+        if !super::workspace::task_execution_allowed_from(connection, network, task_id)? {
+            return Ok(Some(QueueHoldReason::PendingCheck));
+        }
+        let Some(assignment) = fixed_assignment else {
+            return Ok(Some(
+                if super::workspace::workspace_input_resources_blocked_from(
+                    connection, network, local, job,
+                )? {
+                    QueueHoldReason::ResourceConflict
+                } else {
+                    QueueHoldReason::PendingCheck
+                },
+            ));
+        };
+        if super::workspace::workspace_task_from(connection, network, task_id)?
+            .and_then(|task| task.current_assignment)
+            .as_deref()
+            != Some(assignment.assignment_id.as_str())
+        {
+            return Ok(Some(QueueHoldReason::PendingCheck));
+        }
+        if !super::workspace::assignment_resources_available_from(connection, network, &assignment)?
+        {
+            return Ok(Some(QueueHoldReason::ResourceConflict));
+        }
+    }
+    if let Some(input) =
+        super::workspace::queued_workspace_input_from(connection, network, &job.reply_to)?
+    {
+        if input.deferred || input.cancelled {
+            return Ok(Some(QueueHoldReason::SteeringSettlement));
+        }
+        if matches!(
+            input.input.route.target,
+            crate::workspace::InputTarget::Work { .. }
+                | crate::workspace::InputTarget::Routine { .. }
+        ) {
+            return Ok(Some(QueueHoldReason::ActiveTurn));
+        }
+        for attachment in &input.input.attachments {
+            if !log::blob_file_matches(
+                &log::blob_path(blob_dir, &attachment.hash),
+                &attachment.blob(),
+            ) {
+                return Ok(Some(QueueHoldReason::AttachmentPreparation));
+            }
+        }
+        if let SessionScope::WorkspaceTask { .. } = &job.scope {
+            let resolved = super::workspace::resolve_input_target_from(
+                connection,
+                network,
+                &input.input.route.target,
+            )?;
+            if let Some(id) = resolved.assignment_id
+                && let Some(assignment) =
+                    super::workspace::workspace_assignment_from(connection, network, &id)?
+                && input.input.route.expected_revision != Some(assignment.started_revision)
+                && input.input.route.expected_revision != assignment.adopted_revision
+            {
+                return Ok(Some(QueueHoldReason::PendingCheck));
+            }
+        }
+    }
     let checks = pending_checks_from(connection)?;
     let mut pending = Vec::with_capacity(checks.len());
     for check in &checks {
@@ -393,15 +775,15 @@ fn job_hold_from(
     if session.active.is_some() {
         return Ok(Some(QueueHoldReason::ActiveTurn));
     }
-    if matches!(key.scope, SessionScope::Main)
-        && conversation_from(connection, network, &job.conversation_id)?
-            .is_some_and(|conversation| conversation.owner.as_deref() == Some(local))
-        && !query_jobs(
+    if conversation_from(connection, network, &job.conversation_id)?
+        .is_some_and(|conversation| conversation.owner.as_deref() == Some(local))
+        && query_jobs(
             connection,
             "conversation_id=? AND state='steering'",
             [&job.conversation_id],
         )?
-        .is_empty()
+        .iter()
+        .any(|input| input.scope == key.scope)
     {
         return Ok(Some(QueueHoldReason::SteeringSettlement));
     }
@@ -422,18 +804,24 @@ fn job_hold_from(
     {
         return Ok(Some(QueueHoldReason::ProviderSerial));
     }
-    if job.kind == TriggerKind::AgentTask {
+    if job.kind == TriggerKind::AgentTask || matches!(job.scope, SessionScope::WorkspaceTask { .. })
+    {
         let active_tasks = active
             .iter()
             .filter(|session| {
                 session.conversation_id == key.conversation_id
-                    && matches!(session.scope, SessionScope::Task { .. })
+                    && matches!(
+                        session.scope,
+                        SessionScope::Task { .. } | SessionScope::WorkspaceTask { .. }
+                    )
             })
             .count();
         let pending_tasks = pending
             .iter()
             .filter(|job| {
-                job.conversation_id == key.conversation_id && job.kind == TriggerKind::AgentTask
+                job.conversation_id == key.conversation_id
+                    && (job.kind == TriggerKind::AgentTask
+                        || matches!(job.scope, SessionScope::WorkspaceTask { .. }))
             })
             .count();
         if active_tasks + pending_tasks >= limits.task_limit {
@@ -558,6 +946,26 @@ fn holds_turn(
     session: &SchedulerSession,
     job: &SchedulerJob,
 ) -> Result<bool> {
+    if let SessionScope::WorkspaceTask { task_id } = &job.scope {
+        let Some(assignment) =
+            super::workspace::workspace_assignment_for_job_from(connection, network, local, job)?
+        else {
+            return Ok(false);
+        };
+        if super::workspace::workspace_task_from(connection, network, task_id)?
+            .and_then(|task| task.current_assignment)
+            .as_deref()
+            != Some(assignment.assignment_id.as_str())
+            || !super::workspace::task_input_allowed_from(connection, network, task_id)?
+            || !super::workspace::assignment_resources_available_from(
+                connection,
+                network,
+                &assignment,
+            )?
+        {
+            return Ok(false);
+        }
+    }
     if job.kind == TriggerKind::AgentTask {
         return Ok(
             super::reduce::work_from(connection, network, &job.reply_to)?
@@ -571,15 +979,12 @@ fn holds_turn(
     )
 }
 
-/// The turn a user message may join: the session's running reply to a user message, started by
-/// this process and still held by this Node, on a turn of `provider`.
 fn steer_target(
     connection: &Connection,
     network: &str,
     local: &str,
     boot: &str,
     session: &SchedulerSession,
-    provider: Provider,
 ) -> Result<Option<SteerTarget>> {
     let Some(trigger) = &session.active else {
         return Ok(None);
@@ -590,11 +995,21 @@ fn steer_target(
     let JobState::Running { attempt } = &job.state else {
         return Ok(None);
     };
-    if job.kind != TriggerKind::Human
-        || attempt.boot != boot
+    if attempt.boot != boot
         || attempt.permission_version != session.permission_version
         || !holds_turn(connection, network, local, session, &job)?
     {
+        return Ok(None);
+    }
+    let Some(provider) = job
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.provider)
+        .or(session.provider)
+    else {
+        return Ok(None);
+    };
+    if !provider.supports_steer() {
         return Ok(None);
     }
     Ok(
@@ -607,23 +1022,398 @@ fn steer_target(
     )
 }
 
-/// The text of a queued user message that can join a running turn as is: no attachments, and
-/// results reported as usual.
-fn steerable_text(
+fn native_reservation_from(
+    connection: &Connection,
+    network: &str,
+    work: &WorkProjection,
+) -> Result<Option<Value>> {
+    let encoded: Option<String> = connection
+        .query_row(
+            "SELECT value FROM identity_meta WHERE key=?",
+            [format!("work-native-submission:{}", work.work_id)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let reservation: Value = serde_json::from_str(&encoded)?;
+    ensure!(
+        reservation["network_id"] == network
+            && reservation["work_id"] == work.work_id
+            && reservation["conversation_id"] == work.conversation_id,
+        "native reservation belongs to another work scope"
+    );
+    Ok(Some(reservation))
+}
+
+fn reserved_execution(reservation: &Value) -> Result<Option<crate::work::NativeExecution>> {
+    reservation
+        .get("native_execution")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(Into::into)
+}
+
+pub(super) fn work_shares_native_execution_from(
+    connection: &Connection,
+    network: &str,
+    left: &WorkProjection,
+    right: &WorkProjection,
+) -> Result<bool> {
+    if left.kind != WorkKind::Agent(Provider::Codex)
+        || right.kind != left.kind
+        || left.target_node != right.target_node
+        || left.dispatcher != right.dispatcher
+        || left.conversation_id != right.conversation_id
+        || left.parent != right.parent
+    {
+        return Ok(false);
+    }
+    if left.trigger.starts_with("assignment:") || right.trigger.starts_with("assignment:") {
+        if left.trigger != right.trigger {
+            return Ok(false);
+        }
+    } else if trigger_scope_from(connection, network, &left.conversation_id, &left.trigger)?
+        != trigger_scope_from(connection, network, &right.conversation_id, &right.trigger)?
+    {
+        return Ok(false);
+    }
+    for work in [left, right] {
+        if matches!(work.state, WorkStatus::Finished | WorkStatus::Interrupting | WorkStatus::Unverified)
+            || !connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_runs WHERE work_id=?1 AND conversation_id=?2 AND state IN ('accepted','starting','running'))",
+                params![work.work_id, work.conversation_id], |row| row.get::<_, bool>(0))?
+            || !work_native_authority_allowed_from(connection, network, work)?
+            || connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_stops WHERE work_id=?)",
+                [&work.work_id],
+                |row| row.get::<_, bool>(0),
+            )?
+            || super::admission::peer_cancelled_from(
+                connection,
+                network,
+                &work.conversation_id,
+                &work.work_id,
+            )?
+        {
+            return Ok(false);
+        }
+    }
+    let (Some(left_reservation), Some(right_reservation)) = (
+        native_reservation_from(connection, network, left)?,
+        native_reservation_from(connection, network, right)?,
+    ) else {
+        return Ok(false);
+    };
+    if left_reservation["native_cwd"] != right_reservation["native_cwd"] {
+        return Ok(false);
+    }
+    let left_execution = reserved_execution(&left_reservation)?;
+    let right_execution = reserved_execution(&right_reservation)?;
+    let Some(execution) = left_execution.as_ref().or(right_execution.as_ref()) else {
+        return Ok(false);
+    };
+    let member = |work: &WorkProjection,
+                  reserved: Option<&crate::work::NativeExecution>|
+     -> Result<bool> {
+        match reserved {
+            Some(reserved) => Ok(reserved.thread_id == execution.thread_id && reserved.turn_id == execution.turn_id),
+            None => Ok(work.state == WorkStatus::Running
+                && work.thread_id.as_ref() == Some(&execution.thread_id)
+                && work.turn_id.as_ref() == Some(&execution.turn_id)
+                && execution.work_ids.contains(&work.work_id)
+                && connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM work_runs WHERE work_id=?1 AND conversation_id=?2 AND state='running' AND thread_id=?3 AND turn_id=?4)",
+                    params![work.work_id, work.conversation_id, execution.thread_id, execution.turn_id], |row| row.get::<_, bool>(0))?),
+        }
+    };
+    Ok(member(left, left_execution.as_ref())? && member(right, right_execution.as_ref())?)
+}
+
+fn work_native_write_allowed_from(
+    connection: &Connection,
+    network: &str,
+    work: &WorkProjection,
+) -> Result<bool> {
+    let mut resources = work.clone();
+    let reservation: Option<String> = connection
+        .query_row(
+            "SELECT value FROM identity_meta WHERE key=?",
+            [format!("work-native-submission:{}", work.work_id)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(reservation) = reservation {
+        let reservation: Value = serde_json::from_str(&reservation)?;
+        if let Some(cwd) = reservation["native_cwd"].as_str() {
+            resources.cwd = cwd.to_owned();
+        }
+    }
+    if !super::workspace::work_resources_available_from(connection, network, &resources)? {
+        return Ok(false);
+    }
+    work_native_authority_allowed_from(connection, network, work)
+}
+
+fn work_native_authority_allowed_from(
+    connection: &Connection,
+    network: &str,
+    work: &WorkProjection,
+) -> Result<bool> {
+    if let Some(assignment) = work.trigger.strip_prefix("assignment:") {
+        return super::workspace::assignment_work_allowed_from(
+            connection,
+            network,
+            assignment,
+            &work.dispatcher,
+            &work.conversation_id,
+        );
+    }
+    if matches!(
+        trigger_scope_from(connection, network, &work.conversation_id, &work.trigger)?,
+        SessionScope::WorkspaceTask { .. }
+    ) {
+        return Ok(false);
+    }
+    if let Some(parent) = work.trigger.strip_prefix("task:") {
+        let active: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_runs WHERE work_id=?1 AND conversation_id=?2 AND kind='task' AND state IN ('accepted','starting','running') AND NOT EXISTS(SELECT 1 FROM work_stops WHERE work_id=?1))",
+            params![parent, work.conversation_id],
+            |row| row.get(0),
+        )?;
+        return Ok(active
+            && !super::admission::peer_cancelled_from(
+                connection,
+                network,
+                &work.conversation_id,
+                parent,
+            )?);
+    }
+    Ok(true)
+}
+
+fn raw_work_steer_target_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    conversation: &str,
+    work_id: &str,
+) -> Result<Option<SteerTarget>> {
+    let Some(work) = super::reduce::work_from(connection, network, work_id)? else {
+        return Ok(None);
+    };
+    if work.conversation_id != conversation
+        || work.target_node != local
+        || work.kind == WorkKind::Task
+        || work.outcome.is_some()
+        || !work.resolved.provider.supports_steer()
+        || !work_native_write_allowed_from(connection, network, &work)?
+    {
+        return Ok(None);
+    }
+    if super::admission::peer_cancelled_from(connection, network, conversation, work_id)? {
+        return Ok(None);
+    }
+    let turn: Option<(String, String)> = connection.query_row(
+        "SELECT thread_id,turn_id FROM work_runs WHERE work_id=? AND conversation_id=? AND state='running' AND NOT EXISTS(SELECT 1 FROM work_stops WHERE work_id=work_runs.work_id)",
+        params![work_id, conversation],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    Ok(turn.map(|(thread_id, turn_id)| SteerTarget {
+        provider: work.resolved.provider,
+        attempt_id: format!("work:{work_id}"),
+        thread_id,
+        turn_id,
+    }))
+}
+
+fn target_scope(target: &crate::workspace::InputTarget) -> SessionScope {
+    use crate::workspace::InputTarget;
+    match target {
+        InputTarget::Task { task_id } | InputTarget::ChannelTask { task_id, .. } => {
+            SessionScope::WorkspaceTask {
+                task_id: task_id.clone(),
+            }
+        }
+        InputTarget::Work { work_id } => SessionScope::Task {
+            work_id: work_id.clone(),
+        },
+        InputTarget::Routine { trigger, .. } => SessionScope::Routine {
+            trigger: trigger.clone(),
+        },
+        InputTarget::BotMain { .. } | InputTarget::ChannelMember { .. } => SessionScope::Main,
+    }
+}
+
+pub(super) fn trigger_scope_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    trigger: &str,
+) -> Result<SessionScope> {
+    if let Some(target) = super::scope_projection::trigger_input_target_from(
+        connection,
+        network,
+        conversation,
+        trigger,
+    )? {
+        return Ok(target_scope(&target));
+    }
+    ensure!(
+        super::scope_projection::trigger_is_main_from(connection, network, conversation, trigger)?,
+        "trigger target is unknown"
+    );
+    Ok(SessionScope::Main)
+}
+
+pub(super) fn event_in_session_scope_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    scope: &SessionScope,
+    event: &Event,
+) -> Result<bool> {
+    let event_scope = match &event.body {
+        EventBody::InputPosted { target, .. } => target_scope(target),
+        EventBody::MessagePosted { message_id, .. }
+        | EventBody::BotMessaged { message_id, .. }
+        | EventBody::MessageSteered { message_id, .. } => {
+            if let Some(target) = super::scope_projection::trigger_input_target_from(
+                connection,
+                network,
+                conversation,
+                &message_trigger(message_id),
+            )? {
+                target_scope(&target)
+            } else {
+                if !super::scope_projection::message_is_main_from(
+                    connection,
+                    network,
+                    conversation,
+                    message_id,
+                )? {
+                    return Ok(false);
+                }
+                SessionScope::Main
+            }
+        }
+        EventBody::WorkDispatched {
+            work_id, trigger, ..
+        } => {
+            if matches!(scope, SessionScope::Task { work_id: own } if own == work_id) {
+                return Ok(true);
+            }
+            trigger_scope_from(connection, network, conversation, trigger)?
+        }
+        EventBody::WorkProgress { work_id, .. } | EventBody::WorkFinished { work_id, .. } => {
+            if matches!(scope, SessionScope::Task { work_id: own } if own == work_id) {
+                return Ok(true);
+            }
+            match super::reduce::work_from(connection, network, work_id)? {
+                Some(work) => trigger_scope_from(connection, network, conversation, &work.trigger)?,
+                None => return Ok(false),
+            }
+        }
+        EventBody::ScheduleRunClaimed {
+            schedule_id,
+            slot_ms,
+            ..
+        } => SessionScope::Routine {
+            trigger: schedule_trigger(schedule_id, *slot_ms),
+        },
+        EventBody::QuestionAsked {
+            target: Some(target),
+            ..
+        } => target_scope(target),
+        EventBody::QuestionAsked { about, .. } => {
+            let scope:Option<String> = connection.query_row(
+                "SELECT scope FROM scheduler_sessions WHERE conversation_id=? AND native_id=? LIMIT 1",
+                params![conversation, about.session_id], |row| row.get(0),
+            ).optional()?;
+            match scope {
+                Some(scope) => SessionScope::from_storage_key(&scope)?,
+                None => return Ok(false),
+            }
+        }
+        EventBody::QuestionClosed { question_id, .. } => {
+            return match super::event_about_from(
+                connection,
+                network,
+                conversation,
+                "question_asked",
+                question_id,
+            )? {
+                Some(question) => event_in_session_scope_from(
+                    connection,
+                    network,
+                    conversation,
+                    scope,
+                    &question.event,
+                ),
+                None => Ok(false),
+            };
+        }
+        EventBody::WorkspaceCommanded { .. } => return Ok(false),
+        _ => SessionScope::Main,
+    };
+    Ok(&event_scope == scope)
+}
+
+fn steerable_message(
     connection: &Connection,
     network: &str,
     job: &SchedulerJob,
-) -> Result<Option<String>> {
+) -> Result<Option<(Message, HashedEvent)>> {
     if job.kind != TriggerKind::Human {
         return Ok(None);
     }
-    Ok(
-        message_from(connection, network, &job.conversation_id, &job.reply_to)?
-            .filter(|message| {
-                message.attachments.is_empty() && message.report_results != Some(false)
-            })
-            .map(|message| message.text),
-    )
+    let effective =
+        super::workspace::queued_workspace_input_from(connection, network, &job.reply_to)?;
+    if let Some(effective) = &effective {
+        let route = &effective.input.route;
+        if route.intent != crate::workspace::InputIntent::Continue
+            || effective.deferred
+            || effective.cancelled
+        {
+            return Ok(None);
+        }
+        let Ok(resolved) =
+            super::workspace::resolve_input_target_from(connection, network, &route.target)
+        else {
+            return Ok(None);
+        };
+        if let SessionScope::WorkspaceTask { task_id } = &job.scope
+            && !super::workspace::task_input_allowed_from(connection, network, task_id)?
+        {
+            return Ok(None);
+        }
+        if route.expected_revision.is_some() && route.expected_revision != resolved.task_revision {
+            return Ok(None);
+        }
+        if resolved.scope != job.scope || resolved.conversation_id != job.conversation_id {
+            return Ok(None);
+        }
+    }
+    let Some(mut message) = message_from(connection, network, &job.conversation_id, &job.reply_to)?
+        .filter(|message| message.report_results != Some(false))
+    else {
+        return Ok(None);
+    };
+    let mut source_hash = message.event_hash.clone();
+    if let Some(effective) = effective {
+        message.text = effective.input.text;
+        message.attachments = effective.input.attachments;
+        source_hash = effective.control_event;
+    }
+    let event =
+        log::event_from(connection, network, &source_hash)?.context("input event missing")?;
+    let source = HashedEvent {
+        hash: source_hash,
+        event,
+    };
+    Ok(Some((message, source)))
 }
 
 fn pending_conversations_from(connection: &Connection) -> Result<Vec<String>> {
@@ -684,6 +1474,196 @@ pub(crate) fn admit_from(
     )
 }
 
+pub(crate) fn admit_workspace_input_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    message_id: &str,
+) -> Result<AdmissionReceipt> {
+    authorize_node_from(connection, network, local)?;
+    let input = super::workspace::queued_workspace_input_from(connection, network, message_id)?
+        .context("input not found")?;
+    let resolved = super::workspace::resolve_input_target_from(
+        connection,
+        network,
+        &input.input.route.target,
+    )?;
+    ensure!(
+        resolved.conversation_id == input.conversation_id,
+        "input conversation mismatch"
+    );
+    let trigger = message_trigger(message_id);
+    if resolved.owner_node == local {
+        if let Some(job) = load_job(connection, &input.conversation_id, &trigger)? {
+            return Ok(job.receipt(network));
+        }
+        ensure!(
+            resolved.task_revision == input.input.route.expected_revision,
+            "input task revision changed"
+        );
+    }
+    if input.deferred || input.cancelled {
+        return Ok(AdmissionReceipt {
+            network_id: network.into(),
+            conversation_id: input.conversation_id,
+            trigger,
+            state: if input.cancelled {
+                "cancelled"
+            } else {
+                "deferred"
+            }
+            .into(),
+        });
+    }
+    if resolved.owner_node == local {
+        let refusal = match &input.input.route.target {
+            crate::workspace::InputTarget::Routine { .. } => {
+                let session = load_scoped_session(
+                    connection,
+                    &SessionKey {
+                        conversation_id: input.conversation_id.clone(),
+                        scope: resolved.scope.clone(),
+                    },
+                )?;
+                session
+                    .active
+                    .is_none()
+                    .then_some("routine_has_no_active_turn")
+            }
+            crate::workspace::InputTarget::Work { work_id } => {
+                let work = super::reduce::work_from(connection, network, work_id)?
+                    .context("work not found")?;
+                if work.outcome.is_some() {
+                    Some("work_has_no_active_turn")
+                } else if !work.resolved.provider.supports_steer() {
+                    Some("provider_has_no_native_input")
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(reason) = refusal {
+            return admit_ended_from(
+                connection,
+                network,
+                &input.conversation_id,
+                &trigger,
+                TriggerKind::Human,
+                message_id,
+                Some(reason),
+            );
+        }
+    }
+    if resolved.owner_node == local {
+        admit_from(
+            connection,
+            network,
+            &input.conversation_id,
+            &trigger,
+            TriggerKind::Human,
+            message_id,
+        )
+    } else {
+        queue_delivery_from(connection, network, &input.conversation_id, &trigger)
+    }
+}
+
+pub(crate) fn admit_assignment_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    assignment: &crate::workspace::Assignment,
+) -> Result<AdmissionReceipt> {
+    ensure!(
+        super::workspace::assignment_admission_allowed_from(connection, network, assignment)?,
+        "assignment admission is stale or revoked"
+    );
+    let bot = super::bot_settings::find_bot(connection, network, &assignment.bot_id)?;
+    let conversation = &bot.conversation_id;
+    let trigger = format!("assignment:{}", assignment.assignment_id);
+    if assignment.execution_node != local {
+        return queue_delivery_from(connection, network, conversation, &trigger);
+    }
+    let owner = conversation_from(connection, network, conversation)?
+        .context("assignment Bot conversation missing")?;
+    if let Some(work_id) = &assignment.work_id {
+        let work = super::reduce::work_from(connection, network, work_id)?
+            .context("assignment work missing")?;
+        ensure!(
+            work.target_node == local && work.conversation_id == *conversation,
+            "assignment work belongs to another target"
+        );
+        return Ok(AdmissionReceipt {
+            network_id: network.into(),
+            conversation_id: conversation.clone(),
+            trigger,
+            state: "attached".into(),
+        });
+    }
+    ensure!(
+        owner.owner.as_deref() == Some(local) && owner.owner_epoch == assignment.bot_owner_epoch,
+        "assignment owner permission is stale"
+    );
+    super::workspace::bind_waiting_workspace_inputs_from(connection, network, assignment)?;
+    if let Some(source) = &assignment.trigger_message_id
+        && let Some(route) =
+            super::workspace::input_route_from(connection, network, conversation, source)?
+        && route.expected_revision == Some(assignment.started_revision)
+        && target_scope(&route.target)
+            == (SessionScope::WorkspaceTask {
+                task_id: assignment.task_id.clone(),
+            })
+    {
+        return admit_from(
+            connection,
+            network,
+            conversation,
+            &message_trigger(source),
+            TriggerKind::Human,
+            source,
+        );
+    }
+    if let Some(job) = load_job(connection, conversation, &trigger)? {
+        return Ok(job.receipt(network));
+    }
+    let scope = SessionScope::WorkspaceTask {
+        task_id: assignment.task_id.clone(),
+    };
+    let mut session = load_scoped_session(
+        connection,
+        &SessionKey {
+            conversation_id: conversation.clone(),
+            scope: scope.clone(),
+        },
+    )?;
+    ensure!(
+        queued_jobs(connection, conversation)?.len() < MAX_PENDING_JOBS,
+        "scheduler inbox is full"
+    );
+    let job = SchedulerJob {
+        conversation_id: conversation.clone(),
+        scope,
+        trigger: trigger.clone(),
+        kind: TriggerKind::WorkspaceTask,
+        sequence: session.next_sequence,
+        basis: log::version_vector_from(connection, network)?,
+        reply_to: assignment.assignment_id.clone(),
+        message_id: reply_message_id(conversation, &trigger, assignment.bot_owner_epoch),
+        runtime: None,
+        pending_check: false,
+        tool_calls: false,
+        state: JobState::Queued,
+    };
+    session.next_sequence = session
+        .next_sequence
+        .checked_add(1)
+        .context("scheduler queue sequence overflow")?;
+    save_job(connection, &job)?;
+    save_session(connection, &session)?;
+    Ok(job.receipt(network))
+}
+
 /// `declined` records the trigger as already cancelled with that evidence, so it never runs here.
 fn admit_ended_from(
     connection: &Connection,
@@ -697,7 +1677,31 @@ fn admit_ended_from(
     if let Some(job) = load_job(connection, conversation, trigger)? {
         return Ok(job.receipt(network));
     }
-    let mut session = load_session(connection, conversation)?;
+    let scope = if let Some(route) =
+        super::workspace::input_route_from(connection, network, conversation, reply_to)?
+    {
+        super::workspace::resolve_input_target_from(connection, network, &route.target)?.scope
+    } else {
+        match kind {
+            TriggerKind::AgentTask => SessionScope::Task {
+                work_id: reply_to.into(),
+            },
+            TriggerKind::Schedule => SessionScope::Routine {
+                trigger: trigger.into(),
+            },
+            TriggerKind::WorkResult | TriggerKind::Answer => {
+                trigger_scope_from(connection, network, conversation, trigger)?
+            }
+            _ => SessionScope::Main,
+        }
+    };
+    let mut session = load_scoped_session(
+        connection,
+        &SessionKey {
+            conversation_id: conversation.into(),
+            scope: scope.clone(),
+        },
+    )?;
     // What reaches a deleted bot is recorded as cancelled, so a sender's retry reads it back.
     // An agent task waits for `claim_next`, which also ends its work.
     let deleted = kind != TriggerKind::AgentTask
@@ -707,11 +1711,22 @@ fn admit_ended_from(
         ended.is_some() || queued_jobs(connection, conversation)?.len() < MAX_PENDING_JOBS,
         "scheduler inbox is full; trigger was not admitted"
     );
+    if kind == TriggerKind::Human && ended.is_none() {
+        super::workspace::freeze_workspace_input_assignment_from(
+            connection,
+            network,
+            conversation,
+            reply_to,
+            None,
+        )?;
+    }
     let job = SchedulerJob {
         conversation_id: conversation.into(),
+        scope,
         trigger: trigger.into(),
         kind,
-        sequence: session.next_sequence,
+        sequence: super::workspace::queued_workspace_input_from(connection, network, reply_to)?
+            .map_or(session.next_sequence, |input| input.effective_order),
         basis: log::version_vector_from(connection, network)?,
         reply_to: reply_to.into(),
         message_id: reply_message_id(
@@ -920,6 +1935,814 @@ fn stage_memory_from(
 }
 
 impl Store {
+    pub(crate) fn work_native_execution(
+        &self,
+        network: &str,
+        work_id: &str,
+    ) -> Result<Option<crate::work::NativeExecution>> {
+        let work = super::reduce::work_from(&self.connection, network, work_id)?
+            .context("accepted work scope missing")?;
+        native_reservation_from(&self.connection, network, &work)?
+            .as_ref()
+            .map(reserved_execution)
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub(crate) fn work_shares_native_execution(
+        &self,
+        network: &str,
+        left: &WorkProjection,
+        right: &WorkProjection,
+    ) -> Result<bool> {
+        work_shares_native_execution_from(&self.connection, network, left, right)
+    }
+
+    pub(crate) fn work_native_submission_reserved(&self, work_id: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM identity_meta WHERE key=?)",
+            [format!("work-native-submission:{work_id}")],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn work_native_directory_matches_reservation(
+        &self,
+        network: &str,
+        work: &WorkProjection,
+        actual_cwd: &str,
+    ) -> Result<bool> {
+        let encoded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM identity_meta WHERE key=?",
+                [format!("work-native-submission:{}", work.work_id)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(encoded) = encoded else {
+            return Ok(false);
+        };
+        let reservation: Value = serde_json::from_str(&encoded)?;
+        Ok(reservation["network_id"] == network
+            && reservation["work_id"] == work.work_id
+            && reservation["conversation_id"] == work.conversation_id
+            && reservation["native_cwd"] == actual_cwd)
+    }
+
+    pub(crate) fn reserve_work_native_submission(
+        &mut self,
+        network: &str,
+        work: &crate::work::WorkSpec,
+        actual_cwd: &str,
+        execution: Option<&crate::work::NativeExecution>,
+    ) -> Result<bool> {
+        if let Some(execution) = execution {
+            ensure!(
+                work.kind == WorkKind::Agent(Provider::Codex)
+                    && work.thread.as_deref() == Some(execution.thread_id.as_str())
+                    && !execution.turn_id.is_empty(),
+                "native execution permit differs from the work"
+            );
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let key = format!("work-native-submission:{}", work.work_id);
+        let existing: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM identity_meta WHERE key=?)",
+            [&key],
+            |row| row.get(0),
+        )?;
+        if existing {
+            return Ok(false);
+        }
+        let mut registered = super::reduce::work_from(&tx, network, &work.work_id)?
+            .context("accepted work scope missing")?;
+        registered.cwd = actual_cwd.to_owned();
+        ensure!(
+            work_native_authority_allowed_from(&tx, network, &registered)?,
+            "work has no active authority for native submission"
+        );
+        let allowed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM work_runs WHERE work_id=?1 AND conversation_id=?2 AND (state='accepted' OR (state='starting' AND ?3 IS NOT NULL AND thread_id=?3 AND turn_id IS NULL)) AND NOT EXISTS(SELECT 1 FROM work_stops WHERE work_id=?1))",params![work.work_id,work.conversation,work.thread],|row|row.get(0))?;
+        ensure!(
+            allowed
+                && !super::admission::peer_cancelled_from(
+                    &tx,
+                    network,
+                    &work.conversation,
+                    &work.work_id
+                )?,
+            "work no longer permits its first native submission"
+        );
+        let value = json!({"network_id":network,"work_id":work.work_id,"conversation_id":work.conversation,"spec_digest":crate::crypto::digest(&serde_json::to_vec(work)?),"native_cwd":actual_cwd,"reserved_at_ms":crate::runtime::now_ms()});
+        let mut value = value;
+        if let Some(execution) = execution {
+            value["native_execution"] = serde_json::to_value(execution)?;
+        }
+        tx.execute(
+            "INSERT INTO identity_meta(key,value) VALUES(?,?)",
+            params![key, serde_json::to_string(&value)?],
+        )?;
+        if !super::workspace::work_resources_available_from(&tx, network, &registered)? {
+            return Err(ExecFailure::new(
+                FailureKind::WriterBusy,
+                "resource_conflict: work resources are reserved by another active execution",
+            )
+            .into());
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn begin_reserved_work_native_input(
+        &mut self,
+        network: &str,
+        work: &crate::work::WorkSpec,
+        thread: &str,
+        actual_cwd: &str,
+    ) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let key = format!("work-native-submission:{}", work.work_id);
+        let encoded: String = tx
+            .query_row(
+                "SELECT value FROM identity_meta WHERE key=?",
+                [&key],
+                |row| row.get(0),
+            )
+            .context("work native submission has not been reserved")?;
+        let mut reservation: Value = serde_json::from_str(&encoded)?;
+        ensure!(
+            reservation["network_id"] == network
+                && reservation["spec_digest"] == crate::crypto::digest(&serde_json::to_vec(work)?)
+                && reservation["native_cwd"] == actual_cwd,
+            "native input differs from the reserved work"
+        );
+        ensure!(
+            reservation.get("first_input_started_at_ms").is_none(),
+            "native input may already have been submitted; query the original work"
+        );
+        let allowed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_runs WHERE work_id=?1 AND conversation_id=?2 AND state='starting' AND thread_id=?3 AND turn_id IS NULL AND NOT EXISTS(SELECT 1 FROM work_stops WHERE work_id=?1))",
+            params![work.work_id, work.conversation, thread], |row| row.get(0),
+        )?;
+        let mut registered = super::reduce::work_from(&tx, network, &work.work_id)?
+            .context("accepted work scope missing")?;
+        registered.cwd = actual_cwd.to_owned();
+        ensure!(
+            allowed
+                && work_native_authority_allowed_from(&tx, network, &registered)?
+                && !super::admission::peer_cancelled_from(
+                    &tx,
+                    network,
+                    &work.conversation,
+                    &work.work_id
+                )?,
+            "work no longer permits its first native input"
+        );
+        if !super::workspace::work_resources_available_from(&tx, network, &registered)? {
+            return Err(ExecFailure::new(
+                FailureKind::WriterBusy,
+                "resource_conflict: work resources are reserved by another active execution",
+            )
+            .into());
+        }
+        reservation["first_input_started_at_ms"] = json!(crate::runtime::now_ms());
+        reservation["native_thread"] = json!(thread);
+        tx.execute(
+            "UPDATE identity_meta SET value=? WHERE key=?",
+            params![serde_json::to_string(&reservation)?, key],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn work_native_resources_available(
+        &self,
+        network: &str,
+        work_id: &str,
+        actual_cwd: &str,
+    ) -> Result<bool> {
+        let mut work = super::reduce::work_from(&self.connection, network, work_id)?
+            .context("accepted work scope missing")?;
+        work.cwd = actual_cwd.to_owned();
+        super::workspace::work_resources_available_from(&self.connection, network, &work)
+    }
+
+    pub(crate) fn work_native_write_allowed(&self, network: &str, work_id: &str) -> Result<bool> {
+        let work = super::reduce::work_from(&self.connection, network, work_id)?
+            .context("accepted work scope missing")?;
+        work_native_write_allowed_from(&self.connection, network, &work)
+    }
+
+    pub(crate) fn work_native_authority_allowed(
+        &self,
+        network: &str,
+        work_id: &str,
+    ) -> Result<bool> {
+        let work = super::reduce::work_from(&self.connection, network, work_id)?
+            .context("accepted work scope missing")?;
+        work_native_authority_allowed_from(&self.connection, network, &work)
+    }
+
+    pub(crate) fn scheduler_work_trigger(
+        &self,
+        network: &str,
+        local: &str,
+        job: &SchedulerJob,
+    ) -> Result<String> {
+        if matches!(job.scope, SessionScope::WorkspaceTask { .. }) {
+            let assignment = super::workspace::workspace_assignment_for_job_from(
+                &self.connection,
+                network,
+                local,
+                job,
+            )?
+            .context("task turn has no fixed assignment")?;
+            Ok(format!("assignment:{}", assignment.assignment_id))
+        } else {
+            Ok(job.trigger.clone())
+        }
+    }
+
+    pub(crate) fn input_attachment_events(
+        &self,
+        network: &str,
+        message_id: &str,
+    ) -> Result<Vec<HashedEvent>> {
+        let Some(input) = self.queued_workspace_input(network, message_id)? else {
+            return Ok(vec![]);
+        };
+        let mut events = Vec::new();
+        for attachment in &input.input.attachments {
+            let mut sources = attachment_sources_from(
+                &self.connection,
+                network,
+                &input.conversation_id,
+                &attachment.hash,
+            )?;
+            if sources.is_empty() {
+                sources = attachment_sources_from(
+                    &self.connection,
+                    network,
+                    crate::workspace::WORKSPACE_SCOPE,
+                    &attachment.hash,
+                )?;
+            }
+            if let Some(event) = sources.into_iter().next()
+                && !events
+                    .iter()
+                    .any(|source: &HashedEvent| source.hash == event.hash)
+            {
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+
+    pub(crate) fn scheduler_work_in_scope(
+        &self,
+        network: &str,
+        job: &SchedulerJob,
+        work_id: &str,
+    ) -> Result<bool> {
+        if matches!(&job.scope, SessionScope::Task { work_id:own } if own == work_id) {
+            return Ok(true);
+        }
+        if let SessionScope::WorkspaceTask { task_id } = &job.scope
+            && self
+                .workspace_task(network, task_id)?
+                .and_then(|task| task.current_assignment)
+                .map(|id| self.workspace_assignment(network, &id))
+                .transpose()?
+                .flatten()
+                .is_some_and(|assignment| assignment.work_id.as_deref() == Some(work_id))
+        {
+            return Ok(true);
+        }
+        let trigger = match super::reduce::work_from(&self.connection, network, work_id)? {
+            Some(work) if work.conversation_id == job.conversation_id => work.trigger,
+            Some(_) => return Ok(false),
+            None => match super::work::dispatch_from(&self.connection, work_id)? {
+                Some(dispatch) if dispatch.spec.conversation == job.conversation_id => {
+                    dispatch.spec.trigger
+                }
+                _ => return Ok(false),
+            },
+        };
+        Ok(
+            trigger_scope_from(&self.connection, network, &job.conversation_id, &trigger)?
+                == job.scope,
+        )
+    }
+
+    pub(crate) fn scheduler_native_in_scope(
+        &self,
+        network: &str,
+        job: &SchedulerJob,
+        thread: &str,
+    ) -> Result<bool> {
+        let targets = self.native_input_targets(network, &job.conversation_id, thread, "")?;
+        if targets.is_empty() {
+            return Ok(job.scope == SessionScope::Main);
+        }
+        for target in targets {
+            let in_scope = match target {
+                crate::workspace::InputTarget::Work { work_id } => {
+                    self.scheduler_work_in_scope(network, job, &work_id)?
+                }
+                target => target_scope(&target) == job.scope,
+            };
+            if !in_scope {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn scheduler_scope_events(
+        &self,
+        network: &str,
+        job: &SchedulerJob,
+        events: Vec<HashedEvent>,
+    ) -> Result<Vec<HashedEvent>> {
+        events
+            .into_iter()
+            .filter_map(|event| {
+                match event_in_session_scope_from(
+                    &self.connection,
+                    network,
+                    &job.conversation_id,
+                    &job.scope,
+                    &event.event,
+                ) {
+                    Ok(true) => Some(Ok(event)),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn main_event_allowed(
+        &self,
+        network: &str,
+        conversation: &str,
+        event: &HashedEvent,
+    ) -> Result<bool> {
+        event_in_session_scope_from(
+            &self.connection,
+            network,
+            conversation,
+            &SessionScope::Main,
+            &event.event,
+        )
+    }
+
+    pub(crate) fn main_history_page(
+        &self,
+        network: &str,
+        conversation: &str,
+        basis: &VersionVector,
+        at: Option<(&str, u64, bool)>,
+        filter: super::HistoryFilter<'_>,
+        limit: usize,
+    ) -> Result<(Vec<HashedEvent>, bool)> {
+        let after = at.is_some_and(|(_, _, after)| after);
+        let mut cursor = at.map(|(author, seq, _)| (author.to_owned(), seq));
+        let mut rows = Vec::new();
+        loop {
+            let (events, more) = self.search_history_page(
+                network,
+                conversation,
+                basis,
+                cursor
+                    .as_ref()
+                    .map(|(author, seq)| (author.as_str(), *seq, after)),
+                super::HistoryFilter {
+                    kinds: filter.kinds,
+                    author: filter.author,
+                    keyword: filter.keyword,
+                },
+                100,
+            )?;
+            let Some(last) = events.last() else {
+                return Ok((rows, false));
+            };
+            cursor = Some((last.event.author.clone(), last.event.seq));
+            for event in events {
+                if !self.main_event_allowed(network, conversation, &event)? {
+                    continue;
+                }
+                if rows.len() == limit {
+                    return Ok((rows, true));
+                }
+                rows.push(event);
+            }
+            if !more {
+                return Ok((rows, false));
+            }
+        }
+    }
+
+    pub(crate) fn scheduler_late_inputs(
+        &self,
+        network: &str,
+        job: &SchedulerJob,
+    ) -> Result<Vec<HashedEvent>> {
+        let Some(attempt) = job.state.attempt() else {
+            return Ok(vec![]);
+        };
+        let mut events = Vec::new();
+        for input in query_jobs(
+            &self.connection,
+            "conversation_id=? AND state IN ('steering','steered')",
+            [&job.conversation_id],
+        )? {
+            let accepted = match &input.state {
+                JobState::Steering {
+                    into,
+                    receipt: Some(_),
+                    ..
+                }
+                | JobState::Steered {
+                    into,
+                    receipt: Some(_),
+                    ..
+                } => into.attempt_id == attempt.id,
+                _ => false,
+            };
+            if accepted
+                && let Some(message) = message_from(
+                    &self.connection,
+                    network,
+                    &job.conversation_id,
+                    &input.reply_to,
+                )?
+                && let Some(event) =
+                    log::event_from(&self.connection, network, &message.event_hash)?
+            {
+                events.push(HashedEvent {
+                    hash: message.event_hash,
+                    event,
+                });
+            }
+        }
+        self.scheduler_scope_events(network, job, events)
+    }
+
+    pub(crate) fn scheduler_history_page(
+        &self,
+        network: &str,
+        job: &SchedulerJob,
+        at: Option<(&str, u64, bool)>,
+        filter: super::HistoryFilter<'_>,
+        limit: usize,
+    ) -> Result<(Vec<HashedEvent>, bool)> {
+        let late = self.scheduler_late_inputs(network, job)?;
+        let mut basis = job.basis.clone();
+        for event in &late {
+            let seq = basis.entry(event.event.author.clone()).or_default();
+            *seq = (*seq).max(event.event.seq);
+        }
+        let after = at.is_some_and(|(_, _, after)| after);
+        let mut cursor = at.map(|(author, seq, _)| (author.to_owned(), seq));
+        let mut result = Vec::new();
+        loop {
+            let (page, more) = self.search_history_page(
+                network,
+                &job.conversation_id,
+                &basis,
+                cursor
+                    .as_ref()
+                    .map(|(author, seq)| (author.as_str(), *seq, after)),
+                super::HistoryFilter {
+                    kinds: filter.kinds,
+                    author: filter.author,
+                    keyword: filter.keyword,
+                },
+                100,
+            )?;
+            let Some(last) = page.last() else {
+                return Ok((result, false));
+            };
+            cursor = Some((last.event.author.clone(), last.event.seq));
+            for event in self.scheduler_scope_events(network, job, page)? {
+                if event.event.seq > job.basis.get(&event.event.author).copied().unwrap_or(0)
+                    && !late.iter().any(|input| input.hash == event.hash)
+                {
+                    continue;
+                }
+                if result.len() == limit {
+                    return Ok((result, true));
+                }
+                result.push(event);
+            }
+            if !more {
+                return Ok((result, false));
+            }
+        }
+    }
+
+    pub(crate) fn scheduler_event_allowed(
+        &self,
+        network: &str,
+        job: &SchedulerJob,
+        event: &HashedEvent,
+    ) -> Result<bool> {
+        if !event_in_session_scope_from(
+            &self.connection,
+            network,
+            &job.conversation_id,
+            &job.scope,
+            &event.event,
+        )? {
+            return Ok(false);
+        }
+        Ok(
+            event.event.seq <= job.basis.get(&event.event.author).copied().unwrap_or(0)
+                || self
+                    .scheduler_late_inputs(network, job)?
+                    .iter()
+                    .any(|input| input.hash == event.hash),
+        )
+    }
+
+    pub(crate) fn main_blob_scope(
+        &self,
+        network: &str,
+        conversation: &str,
+        hash: &str,
+    ) -> Result<Option<String>> {
+        for event in attachment_sources_from(&self.connection, network, conversation, hash)? {
+            if self.main_event_allowed(network, conversation, &event)? {
+                return Ok(Some(conversation.into()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn scheduler_blob_scope(
+        &self,
+        network: &str,
+        job: &SchedulerJob,
+        hash: &str,
+    ) -> Result<Option<String>> {
+        for event in attachment_sources_from(&self.connection, network, &job.conversation_id, hash)?
+        {
+            if self.scheduler_event_allowed(network, job, &event)? {
+                return Ok(Some(job.conversation_id.clone()));
+            }
+        }
+        let Some(attempt) = job.state.attempt() else {
+            return Ok(None);
+        };
+        for input in query_jobs(
+            &self.connection,
+            "conversation_id=? AND state IN ('steering','steered')",
+            [&job.conversation_id],
+        )? {
+            let accepted = match &input.state {
+                JobState::Steering {
+                    into,
+                    receipt: Some(_),
+                    ..
+                }
+                | JobState::Steered {
+                    into,
+                    receipt: Some(_),
+                    ..
+                } => into.attempt_id == attempt.id,
+                _ => false,
+            };
+            if accepted
+                && let Some(effective) = self.queued_workspace_input(network, &input.reply_to)?
+                && effective
+                    .input
+                    .attachments
+                    .iter()
+                    .any(|attachment| attachment.hash == hash)
+                && self
+                    .referenced_size(network, crate::workspace::WORKSPACE_SCOPE, hash)
+                    .is_ok()
+            {
+                return Ok(Some(crate::workspace::WORKSPACE_SCOPE.into()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn admit_workspace_input(
+        &mut self,
+        network: &str,
+        local: &str,
+        message_id: &str,
+    ) -> Result<AdmissionReceipt> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let receipt = admit_workspace_input_from(&tx, network, local, message_id)?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    pub fn refuse_workspace_input(
+        &mut self,
+        network: &str,
+        message_id: &str,
+        reason: &str,
+    ) -> Result<AdmissionReceipt> {
+        let input = self
+            .workspace_input(network, message_id)?
+            .context("input not found")?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let receipt = admit_ended_from(
+            &tx,
+            network,
+            &input.conversation_id,
+            &message_trigger(message_id),
+            TriggerKind::Human,
+            message_id,
+            Some(reason),
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    pub fn workspace_input_editable(
+        &self,
+        network: &str,
+        conversation: &str,
+        message_id: &str,
+    ) -> Result<bool> {
+        workspace_input_editable_from(&self.connection, network, conversation, message_id)
+    }
+
+    pub(crate) fn workspace_task_input_allowed(
+        &self,
+        network: &str,
+        task_id: &str,
+    ) -> Result<bool> {
+        super::workspace::task_input_allowed_from(&self.connection, network, task_id)
+    }
+
+    pub fn apply_workspace_input_control(
+        &mut self,
+        network: &str,
+        local: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        apply_workspace_input_control_from(&tx, network, local, message_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn input_receipt(
+        &self,
+        network: &str,
+        local: &str,
+        message_id: &str,
+    ) -> Result<Option<Value>> {
+        let Some(input) = self.queued_workspace_input(network, message_id)? else {
+            return Ok(None);
+        };
+        let resolved = self.resolve_input_target(network, &input.input.route.target)?;
+        let job = load_job(
+            &self.connection,
+            &input.conversation_id,
+            &message_trigger(message_id),
+        )?;
+        let mut turn = None;
+        let mut reason = None;
+        let stage = match job.as_ref().map(|job| &job.state) {
+            None if input.cancelled => {
+                reason = Some("cancelled_before_delivery".into());
+                "refused"
+            }
+            None if input.deferred => {
+                reason = Some("deferred".to_owned());
+                "owner_accepted"
+            }
+            None => {
+                reason = Some(
+                    if resolved.owner_node == local {
+                        "awaiting_admission"
+                    } else {
+                        "awaiting_owner"
+                    }
+                    .to_owned(),
+                );
+                "entry_accepted"
+            }
+            Some(JobState::Queued | JobState::Claimed { .. }) => "owner_accepted",
+            Some(JobState::Steering {
+                receipt, uncertain, ..
+            }) => {
+                if let Some(receipt) = receipt {
+                    turn = receipt.actual_turn_id.clone();
+                    "provider_accepted"
+                } else {
+                    reason = Some("native_delivery_unconfirmed".into());
+                    if *uncertain { "unknown" } else { "submitting" }
+                }
+            }
+            Some(JobState::Steered {
+                outcome, receipt, ..
+            }) => {
+                turn = receipt
+                    .as_ref()
+                    .and_then(|receipt| receipt.actual_turn_id.clone());
+                if *outcome == SteerOutcome::Unknown || turn.is_none() {
+                    reason = Some("native_delivery_unconfirmed".into());
+                    "unknown"
+                } else {
+                    "associated"
+                }
+            }
+            Some(JobState::Cancelled {
+                attempt: None,
+                evidence,
+            }) => {
+                reason = Some(evidence.clone());
+                "refused"
+            }
+            Some(JobState::Failed { failure, .. })
+                if job.as_ref().is_some_and(|job| job.retryable()) =>
+            {
+                reason = Some(failure.detail.clone());
+                "refused"
+            }
+            Some(JobState::Completed { attempt }) => {
+                turn = manager_turn(&self.connection, &attempt.id)?.map(|(_, turn)| turn);
+                "associated"
+            }
+            Some(JobState::Running { attempt }) => {
+                turn = manager_turn(&self.connection, &attempt.id)?.map(|(_, turn)| turn);
+                if turn.is_some() {
+                    "provider_accepted"
+                } else {
+                    "owner_accepted"
+                }
+            }
+            Some(_) => {
+                reason = Some("execution_result_unconfirmed".into());
+                "unknown"
+            }
+        };
+        let retry_safe = resolved.owner_node == local
+            && workspace_input_releasable_from(
+                &self.connection,
+                network,
+                &input.conversation_id,
+                message_id,
+            )?;
+        Ok(Some(json!({
+            "message_id": message_id, "target":input.input.route.target,
+            "control_event":input.control_event,
+            "stage":stage,"actual_turn_id":turn,"reason":reason,"retry_safe":retry_safe,
+        })))
+    }
+
+    pub fn workspace_input_accepted(
+        &self,
+        network: &str,
+        conversation: &str,
+        message_id: &str,
+    ) -> Result<bool> {
+        ensure!(
+            self.workspace_input(network, message_id)?
+                .is_some_and(|input| input.conversation_id == conversation),
+            "input not found in conversation"
+        );
+        Ok(
+            load_job(&self.connection, conversation, &message_trigger(message_id))?.is_some_and(
+                |job| {
+                    matches!(
+                        job.state,
+                        JobState::Steering {
+                            receipt: Some(_),
+                            ..
+                        } | JobState::Steered {
+                            receipt: Some(_),
+                            ..
+                        } | JobState::Completed { .. }
+                    ) || matches!(job.state, JobState::Running { .. })
+                        && job
+                            .runtime
+                            .as_ref()
+                            .is_some_and(|runtime| runtime.execution == TurnExecution::Started)
+                },
+            ),
+        )
+    }
+
     pub(crate) fn staged_memory_call(
         &self,
         conversation: &str,
@@ -1168,6 +2991,7 @@ fn unanswered_from(
     let mut statement = connection.prepare(
         "SELECT m.message_id,m.answers FROM messages m
         WHERE m.network_id=?1 AND m.conversation_id=?2 AND m.role='user' AND m.steered_into IS NULL
+        AND (m.target IS NULL OR json_extract(m.target,'$.kind')='bot_main')
         AND NOT EXISTS(SELECT 1 FROM messages r WHERE r.network_id=?1 AND r.conversation_id=?2
             AND r.in_reply_to=m.message_id AND r.status='completed')
         AND NOT EXISTS(SELECT 1 FROM scheduler_jobs j WHERE j.conversation_id=?2
@@ -1463,22 +3287,285 @@ fn cause_from(
         .map(|dispatch| (dispatch.spec.conversation, dispatch.spec.trigger)))
 }
 
-/// The user message a trigger ultimately answers, followed through the dispatch chain, so any
-/// owner can report a result whose turn ran on another Node.
-fn origin_message(connection: &Connection, network: &str, trigger: &str) -> Result<Option<String>> {
+struct ReportOrigin {
+    reply_to: String,
+    report_results: bool,
+}
+
+fn report_origin_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    trigger: &str,
+) -> Result<Option<ReportOrigin>> {
     let mut trigger = trigger.to_owned();
     for _ in 0..64 {
         match trigger.split_once(':') {
-            Some(("message" | "bot_message", message)) => return Ok(Some(message.into())),
+            Some(("message" | "bot_message", message)) => {
+                return Ok(Some(ReportOrigin {
+                    reply_to: message.into(),
+                    report_results: message_from(connection, network, conversation, message)?
+                        .and_then(|message| message.report_results)
+                        .unwrap_or(true),
+                }));
+            }
             Some(("work" | "task", work_id)) => match cause_from(connection, network, work_id)? {
                 Some((_, cause)) => trigger = cause,
                 None => return Ok(None),
             },
-            Some(("schedule", _)) => return Ok(Some(trigger)),
+            Some(("assignment", id)) => {
+                let Some(assignment) =
+                    super::workspace::workspace_assignment_from(connection, network, id)?
+                else {
+                    return Ok(None);
+                };
+                let bot_scope: Option<String> = connection
+                    .query_row(
+                        "SELECT conversation_id FROM bots WHERE network_id=? AND bot_id=?",
+                        params![network, assignment.bot_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if bot_scope.as_deref() != Some(conversation) {
+                    return Ok(None);
+                }
+                let Some(source) = assignment.source_event.as_deref() else {
+                    return Ok(None);
+                };
+                let effective:bool=connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE network_id=? AND hash=? AND effective=1)",
+                    params![network,source], |row|row.get(0),
+                )?;
+                if !effective {
+                    return Ok(None);
+                }
+                let Some(source) = super::log::event_from(connection, network, source)? else {
+                    return Ok(None);
+                };
+                return Ok(
+                    match (assignment.trigger_message_id.as_deref(), source.body) {
+                        (
+                            Some(input),
+                            EventBody::InputPosted {
+                                message_id,
+                                target,
+                                expected_revision,
+                                report_results,
+                                attestation: Some(_),
+                                ..
+                            },
+                        ) if input == message_id => {
+                            let same_task = matches!(target,crate::workspace::InputTarget::Task {ref task_id}|crate::workspace::InputTarget::ChannelTask {ref task_id,..} if *task_id==assignment.task_id);
+                            Some(ReportOrigin {
+                                reply_to: if same_task
+                                    && expected_revision == Some(assignment.started_revision)
+                                    && source.scope_id == conversation
+                                {
+                                    message_id
+                                } else {
+                                    assignment.assignment_id
+                                },
+                                report_results: report_results.unwrap_or(true),
+                            })
+                        }
+                        (
+                            Some(input),
+                            EventBody::MessagePosted {
+                                message_id,
+                                role: Role::User,
+                                answers: None,
+                                attestation: Some(_),
+                                report_results,
+                                ..
+                            },
+                        ) if input == message_id => Some(ReportOrigin {
+                            reply_to: assignment.assignment_id,
+                            report_results: report_results.unwrap_or(true),
+                        }),
+                        (
+                            None,
+                            EventBody::WorkspaceCommanded {
+                                command:
+                                    crate::workspace::WorkspaceCommand::CreateTask { task_id, .. },
+                                ..
+                            },
+                        ) if task_id == assignment.task_id => Some(ReportOrigin {
+                            reply_to: assignment.assignment_id,
+                            report_results: true,
+                        }),
+                        _ => None,
+                    },
+                );
+            }
+            Some(("schedule", _)) => {
+                return Ok(Some(ReportOrigin {
+                    reply_to: trigger,
+                    report_results: true,
+                }));
+            }
             _ => return Ok(None),
         }
     }
     Ok(None)
+}
+
+pub(crate) fn workspace_assignment_followups_pending_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    assignment: &crate::workspace::Assignment,
+    job: &SchedulerJob,
+) -> Result<bool> {
+    let mut jobs = Vec::new();
+    for other in query_jobs(
+        connection,
+        "conversation_id=? AND scope=?",
+        params![job.conversation_id, job.scope.storage_key()],
+    )? {
+        if !super::workspace::workspace_assignment_for_job_from(connection, network, local, &other)?
+            .is_some_and(|source| source.assignment_id == assignment.assignment_id)
+        {
+            continue;
+        }
+        if let JobState::Steered { outcome, .. } = &other.state {
+            if *outcome == SteerOutcome::Unknown {
+                return Ok(true);
+            }
+            continue;
+        }
+        if !other.state.terminal() || other.pending_check {
+            return Ok(true);
+        }
+        let Some(reply) = message_from(
+            connection,
+            network,
+            &other.conversation_id,
+            &other.message_id,
+        )?
+        .filter(|reply| {
+            reply.role == Role::Assistant
+                && reply.author == local
+                && reply.in_reply_to.as_deref() == Some(other.reply_to.as_str())
+                && (matches!(
+                    reply.status,
+                    Some(ReplyStatus::Completed | ReplyStatus::Stopped)
+                ) || (reply.status == Some(ReplyStatus::Failed)
+                    && other
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.execution != TurnExecution::Unknown)
+                    && !matches!(
+                        reply.failure,
+                        Some(FailureKind::Unknown | FailureKind::Lost | FailureKind::Restarted)
+                    )))
+        }) else {
+            return Ok(true);
+        };
+        let Some(event) = log::event_from(connection, network, &reply.event_hash)?
+            .filter(|event| event.author == local && event.scope_id == other.conversation_id)
+        else {
+            return Ok(true);
+        };
+        jobs.push((other, event.seq));
+    }
+    let initial = job.trigger == format!("assignment:{}", assignment.assignment_id)
+        || assignment
+            .trigger_message_id
+            .as_deref()
+            .is_some_and(|message| job.trigger == message_trigger(message));
+    let Some((_, reply_seq)) = jobs.iter().find(|(other, _)| other.trigger == job.trigger) else {
+        return Ok(true);
+    };
+    // An input and its reports may share a queue position; the local reply sequence is strict.
+    if jobs.iter().any(|(other, seq)| {
+        other.trigger != job.trigger
+            && (seq > reply_seq || (initial && other.kind == TriggerKind::WorkResult))
+    }) {
+        return Ok(true);
+    }
+    let source_matches = |conversation: &str, dispatcher: &str, trigger: &str| -> Result<bool> {
+        if conversation != job.conversation_id || dispatcher != local {
+            return Ok(false);
+        }
+        let (reply_to, kind) = match trigger.split_once(':') {
+            Some(("assignment", id)) => (id.to_owned(), TriggerKind::WorkspaceTask),
+            Some(("message", id)) => {
+                let Some(message) = message_from(connection, network, conversation, id)?
+                    .filter(|message| message.role == Role::User)
+                else {
+                    return Ok(false);
+                };
+                (
+                    id.to_owned(),
+                    if message.answers.is_some() {
+                        TriggerKind::Answer
+                    } else {
+                        TriggerKind::Human
+                    },
+                )
+            }
+            _ => return Ok(false),
+        };
+        let mut source =
+            load_job(connection, conversation, trigger)?.unwrap_or_else(|| job.clone());
+        source.trigger = trigger.to_owned();
+        source.reply_to = reply_to;
+        source.kind = kind;
+        Ok(super::workspace::workspace_assignment_for_job_from(
+            connection, network, local, &source,
+        )?
+        .is_some_and(|source| source.assignment_id == assignment.assignment_id))
+    };
+    let report_pending = |work_id: &str| -> Result<bool> {
+        let trigger = work_trigger(work_id);
+        let Some(origin) = report_origin_from(connection, network, &job.conversation_id, &trigger)?
+        else {
+            return Ok(true);
+        };
+        Ok(origin.report_results
+            && !jobs.iter().any(|(other, _)| {
+                other.kind == TriggerKind::WorkResult && other.trigger == trigger
+            }))
+    };
+    let mut finished = Vec::new();
+    for work in super::reduce::works_from(connection, network, &job.conversation_id)? {
+        if !source_matches(&work.conversation_id, &work.dispatcher, &work.trigger)? {
+            continue;
+        }
+        if matches!(work.outcome, None | Some(WorkOutcome::Unverified))
+            || report_pending(&work.work_id)?
+        {
+            return Ok(true);
+        }
+        finished.push(work.work_id);
+    }
+    let mut statement = connection.prepare(
+        "SELECT work_id FROM work_dispatches WHERE json_extract(spec,'$.conversation')=? AND json_extract(spec,'$.dispatcher')=?",
+    )?;
+    let dispatches = statement
+        .query_map(params![job.conversation_id, local], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in dispatches {
+        if finished.contains(&id) {
+            continue;
+        }
+        let dispatch = super::work::dispatch_from(connection, &id)?.context("dispatch missing")?;
+        if !source_matches(
+            &dispatch.spec.conversation,
+            &dispatch.spec.dispatcher,
+            &dispatch.spec.trigger,
+        )? {
+            continue;
+        }
+        if !matches!(dispatch.state, crate::work::DispatchState::Rejected { .. })
+            || report_pending(&id)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Admits the work's report turn for the message the chain started from, unless the user
@@ -1490,13 +3577,10 @@ fn admit_report_from(
     work_id: &str,
 ) -> Result<Option<AdmissionReceipt>> {
     let trigger = work_trigger(work_id);
-    let Some(reply_to) = origin_message(connection, network, &trigger)? else {
+    let Some(origin) = report_origin_from(connection, network, conversation, &trigger)? else {
         return Ok(None);
     };
-    let report = message_from(connection, network, conversation, &reply_to)?
-        .and_then(|message| message.report_results)
-        .unwrap_or(true);
-    if !report {
+    if !origin.report_results {
         return Ok(None);
     }
     admit_from(
@@ -1505,7 +3589,7 @@ fn admit_report_from(
         conversation,
         &trigger,
         TriggerKind::WorkResult,
-        &reply_to,
+        &origin.reply_to,
     )
     .map(Some)
 }
@@ -1682,13 +3766,42 @@ fn end_job_from(
             at,
         )?
     {
-        let context = super::since_checkpoint_from(connection, network, &job.conversation_id)?;
-        let works = super::reduce::works_from(connection, network, &job.conversation_id)?;
+        let mut context = super::since_checkpoint_from(connection, network, &job.conversation_id)?;
+        context.events = context
+            .events
+            .into_iter()
+            .filter_map(|event| {
+                match event_in_session_scope_from(
+                    connection,
+                    network,
+                    &job.conversation_id,
+                    &SessionScope::Main,
+                    &event.event,
+                ) {
+                    Ok(true) => Some(Ok(event)),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<_>>()?;
+        let works = super::reduce::works_from(connection, network, &job.conversation_id)?
+            .into_iter()
+            .filter_map(|work| {
+                match trigger_scope_from(connection, network, &job.conversation_id, &work.trigger) {
+                    Ok(SessionScope::Main) => Some(Ok(work)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
         // A Node the conversation moved away from mid-turn leaves condensing to the new owner.
         let owned = conversation_from(connection, network, &job.conversation_id)?
             .and_then(|c| c.owner)
             == Some(identity.device_id()?);
-        if owned && let Some(checkpoint) = crate::scheduler::checkpoint(&context, &works) {
+        if owned
+            && job.scope == SessionScope::Main
+            && let Some(checkpoint) = crate::scheduler::checkpoint(&context, &works)
+        {
             log::append_from(
                 connection,
                 blob_dir,
@@ -1926,7 +4039,15 @@ impl Store {
         provider: Provider,
         limits: &crate::config::SchedulingLimits,
     ) -> Result<Option<QueueHoldReason>> {
-        job_hold_from(&self.connection, network, local, job, provider, limits)
+        job_hold_from(
+            &self.connection,
+            &self.blob_dir,
+            network,
+            local,
+            job,
+            provider,
+            limits,
+        )
     }
 
     #[cfg(test)]
@@ -1954,11 +4075,13 @@ impl Store {
         job: &SchedulerJob,
     ) -> Result<Option<ContextProjection>> {
         let session = load_job_session(&self.connection, job)?;
-        Ok(context_projection_from(&session).filter(|context| {
-            job.state
-                .attempt()
-                .is_some_and(|attempt| attempt.id == context.attempt_id)
-        }))
+        Ok(
+            context_projection_from(&self.connection, &session)?.filter(|context| {
+                job.state
+                    .attempt()
+                    .is_some_and(|attempt| attempt.id == context.attempt_id)
+            }),
+        )
     }
 
     pub(crate) fn scheduler_memory_staged_count(&self, conversation: &str) -> Result<usize> {
@@ -1997,17 +4120,17 @@ impl Store {
         conversation: &str,
     ) -> Result<Option<ContextProjection>> {
         let session = load_session(&self.connection, conversation)?;
-        Ok(context_projection_from(&session))
+        context_projection_from(&self.connection, &session)
     }
 
     pub(crate) fn scheduler_scoped_context_projection(
         &self,
         key: &SessionKey,
     ) -> Result<Option<ContextProjection>> {
-        Ok(context_projection_from(&load_scoped_session(
+        context_projection_from(
             &self.connection,
-            key,
-        )?))
+            &load_scoped_session(&self.connection, key)?,
+        )
     }
 
     pub(crate) fn scheduler_memory_conflicts(
@@ -2077,6 +4200,12 @@ impl Store {
                     && context.stage == ContextStage::Compiled
                 {
                     context.stage = ContextStage::Started;
+                }
+                if session.native_id.is_some()
+                    && session.provider != Some(Provider::Cursor)
+                    && context_history_complete(session.shown.context.as_ref())
+                {
+                    session.covers = job.basis.clone();
                 }
                 Ok(())
             },
@@ -2331,7 +4460,38 @@ impl Store {
                     )?;
                 }
             }
+            let scope_refusal = if matches!(job.scope, SessionScope::WorkspaceTask { .. }) {
+                if let Some(route) = super::workspace::input_route_from(
+                    &tx,
+                    network,
+                    &job.conversation_id,
+                    &job.reply_to,
+                )? {
+                    let resolved =
+                        super::workspace::resolve_input_target_from(&tx, network, &route.target)?;
+                    (route.expected_revision != resolved.task_revision)
+                        .then_some("task_input_revision_changed_before_start")
+                } else if let Some(id) = job.trigger.strip_prefix("assignment:") {
+                    match super::workspace::workspace_assignment_from(&tx, network, id)? {
+                        Some(assignment)
+                            if super::workspace::assignment_admission_allowed_from(
+                                &tx,
+                                network,
+                                &assignment,
+                            )? =>
+                        {
+                            None
+                        }
+                        _ => Some("assignment_changed_before_start"),
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let evidence = match job.kind {
+                _ if scope_refusal.is_some() => scope_refusal,
                 _ if deleted => Some(BOT_DELETED),
                 TriggerKind::Schedule if live_schedule(&tx, network, &job)?.is_none() => {
                     Some("定时任务已暂停或删除")
@@ -2361,6 +4521,18 @@ impl Store {
                 _ => None,
             };
             if let Some(evidence) = evidence {
+                if scope_refusal.is_some() {
+                    post_reply_from(
+                        &tx,
+                        &self.blob_dir,
+                        identity,
+                        network,
+                        &job,
+                        (ReplyStatus::Stopped, None),
+                        evidence.to_owned(),
+                        crate::runtime::now_ms(),
+                    )?;
+                }
                 job.state = JobState::Cancelled {
                     attempt: None,
                     evidence: evidence.into(),
@@ -2368,7 +4540,17 @@ impl Store {
                 save_job(&tx, &job)?;
                 continue;
             }
-            if job_hold_from(&tx, network, &local, &job, config.provider, limits)?.is_some() {
+            if job_hold_from(
+                &tx,
+                &self.blob_dir,
+                network,
+                &local,
+                &job,
+                config.provider,
+                limits,
+            )?
+            .is_some()
+            {
                 continue;
             }
             selected = Some(job);
@@ -2929,7 +5111,14 @@ impl Store {
             }
             session.native_id = Some(native_id.into());
             session.native_token = Some(token.into());
-            if sent {
+            if sent
+                && context_history_complete(session.shown.context.as_ref())
+                && (session.shown.context.is_none()
+                    || job
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.execution == TurnExecution::Started))
+            {
                 session.covers = job.basis.clone();
             }
             Ok(())
@@ -2950,8 +5139,9 @@ impl Store {
         let Some(mut job) = load_job(&tx, conversation, trigger)? else {
             return Ok(None);
         };
-        if let JobState::Steering { into, .. } = &job.state {
+        if let JobState::Steering { into, receipt, .. } = &job.state {
             let into = into.clone();
+            let receipt = receipt.clone();
             match query_jobs(
                 &tx,
                 "conversation_id=? AND attempt_id=?",
@@ -2961,14 +5151,14 @@ impl Store {
             .filter(|host| steer_host_may_still_consume(&host.state))
             {
                 Some(host) => job = host,
-                // The reply it went into already ended: there is nothing left to stop, and the
-                // message is never sent again.
-                None => {
+                None if receipt.is_none() => {
                     job.state = JobState::Steered {
                         into,
+                        receipt,
                         outcome: SteerOutcome::Unknown,
-                    }
+                    };
                 }
+                None => {}
             }
         }
         let mut session = load_job_session(&tx, &job)?;
@@ -3235,7 +5425,11 @@ impl Store {
             if session.active.as_deref() == Some(job.trigger.as_str())
                 && session.native_id.as_deref() == Some(thread_id)
             {
-                session.covers = job.basis;
+                if context_history_complete(
+                    shown.context.as_ref().or(session.shown.context.as_ref()),
+                ) {
+                    session.covers = job.basis;
+                }
                 let mut shown = shown.clone();
                 shown.staged_memories.extend(
                     session
@@ -3318,34 +5512,109 @@ impl Store {
             .optional()?)
     }
 
-    /// Queued user messages that may join the running reply of their conversation: plain text
-    /// while a reply to a user message runs on a turn of `provider` this Node holds.
     pub fn steer_candidates(
         &self,
         network: &str,
         local: &str,
         boot: &str,
-        provider: Provider,
     ) -> Result<Vec<SteerCandidate>> {
         let mut candidates = Vec::new();
         for session in query_sessions(&self.connection, "active IS NOT NULL", [])? {
-            if let Some(target) =
-                steer_target(&self.connection, network, local, boot, &session, provider)?
-            {
+            if let Some(target) = steer_target(&self.connection, network, local, boot, &session)? {
                 for job in queued_jobs(&self.connection, &session.conversation_id)? {
-                    if let Some(text) = steerable_text(&self.connection, network, &job)? {
+                    if job.scope != session.scope {
+                        continue;
+                    }
+                    if let Some((message, source_event)) =
+                        steerable_message(&self.connection, network, &job)?
+                    {
                         candidates.push(SteerCandidate {
                             conversation_id: job.conversation_id,
+                            scope: job.scope,
                             trigger: job.trigger,
                             message_id: job.reply_to,
-                            text,
+                            text: message.text,
+                            attachments: message.attachments,
+                            source_event,
                             into: target.clone(),
                         });
                     }
                 }
             }
         }
+        for job in query_jobs(&self.connection, "state='queued' AND kind='human'", [])? {
+            if candidates.iter().any(|candidate| {
+                candidate.conversation_id == job.conversation_id && candidate.trigger == job.trigger
+            }) {
+                continue;
+            }
+            let Some(route) = super::workspace::input_route_from(
+                &self.connection,
+                network,
+                &job.conversation_id,
+                &job.reply_to,
+            )?
+            else {
+                continue;
+            };
+            let Ok(resolved) = super::workspace::resolve_input_target_from(
+                &self.connection,
+                network,
+                &route.target,
+            ) else {
+                continue;
+            };
+            let work_id = match route.target {
+                crate::workspace::InputTarget::Work { work_id } => Some(work_id),
+                crate::workspace::InputTarget::Task { .. }
+                | crate::workspace::InputTarget::ChannelTask { .. } => resolved
+                    .assignment_id
+                    .as_ref()
+                    .map(|id| self.workspace_assignment(network, id))
+                    .transpose()?
+                    .flatten()
+                    .and_then(|assignment| assignment.work_id),
+                _ => None,
+            };
+            let Some(work_id) = work_id else {
+                continue;
+            };
+            let Some(into) = raw_work_steer_target_from(
+                &self.connection,
+                network,
+                local,
+                &job.conversation_id,
+                &work_id,
+            )?
+            else {
+                continue;
+            };
+            if let Some((message, source_event)) =
+                steerable_message(&self.connection, network, &job)?
+            {
+                candidates.push(SteerCandidate {
+                    conversation_id: job.conversation_id,
+                    scope: job.scope,
+                    trigger: job.trigger,
+                    message_id: job.reply_to,
+                    text: message.text,
+                    attachments: message.attachments,
+                    source_event,
+                    into,
+                });
+            }
+        }
         Ok(candidates)
+    }
+
+    pub(crate) fn raw_work_steer_target(
+        &self,
+        network: &str,
+        local: &str,
+        conversation: &str,
+        work_id: &str,
+    ) -> Result<Option<SteerTarget>> {
+        raw_work_steer_target_from(&self.connection, network, local, conversation, work_id)
     }
 
     /// Marks the message as being steered into `into` if that reply still runs here under the
@@ -3355,32 +5624,82 @@ impl Store {
         network: &str,
         local: &str,
         boot: &str,
-        conversation: &str,
-        trigger: &str,
+        job_key: (&str, &str),
         into: &SteerTarget,
+        expected_event: Option<&str>,
     ) -> Result<bool> {
+        let (conversation, trigger) = job_key;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let session = load_session(&tx, conversation)?;
         let Some(mut job) = load_job(&tx, conversation, trigger)? else {
             return Ok(false);
         };
+        let session = load_job_session(&tx, &job)?;
+        let target = if let Some(work_id) = into.attempt_id.strip_prefix("work:") {
+            raw_work_steer_target_from(&tx, network, local, conversation, work_id)?
+        } else {
+            steer_target(&tx, network, local, boot, &session)?
+        };
+        let message = steerable_message(&tx, network, &job)?;
         if job.state != JobState::Queued
-            || steerable_text(&tx, network, &job)?.is_none()
-            || steer_target(&tx, network, local, boot, &session, into.provider)?.as_ref()
-                != Some(into)
+            || message.as_ref().is_none_or(|(_, source)| {
+                expected_event.is_some_and(|expected| expected != source.hash)
+            })
+            || target.as_ref() != Some(into)
         {
             return Ok(false);
         }
         job.state = JobState::Steering {
             into: into.clone(),
+            receipt: None,
+            uncertain: false,
             unread_since_ms: None,
             running_since_ms: None,
         };
         save_job(&tx, &job)?;
         tx.commit()?;
         Ok(true)
+    }
+
+    pub fn record_steer_submission(
+        &mut self,
+        conversation: &str,
+        trigger: &str,
+        into: &SteerTarget,
+        accepted: Option<Option<String>>,
+    ) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut job) = load_job(&tx, conversation, trigger)? else {
+            return Ok(());
+        };
+        if let JobState::Steering {
+            into: current,
+            receipt,
+            uncertain,
+            ..
+        } = &mut job.state
+            && current == into
+        {
+            match accepted {
+                Some(turn_id) => {
+                    let receipt = receipt.get_or_insert(SteerReceipt {
+                        accepted_at_ms: crate::runtime::now_ms(),
+                        actual_turn_id: None,
+                    });
+                    if receipt.actual_turn_id.is_none() {
+                        receipt.actual_turn_id = turn_id;
+                    }
+                    *uncertain = false;
+                }
+                None => *uncertain = receipt.is_none(),
+            }
+            save_job(&tx, &job)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Moves a steering message on: back to the queue when nothing reached the turn, steered,
@@ -3392,7 +5711,7 @@ impl Store {
         network: &str,
         conversation: &str,
         trigger: &str,
-        next: JobState,
+        mut next: JobState,
     ) -> Result<()> {
         ensure!(
             matches!(
@@ -3408,9 +5727,53 @@ impl Store {
         if !matches!(job.state, JobState::Steering { .. }) {
             return Ok(());
         }
+        let JobState::Steering {
+            into: original,
+            receipt: existing,
+            ..
+        } = &job.state
+        else {
+            unreachable!()
+        };
+        if next == JobState::Queued && existing.is_some() {
+            next = JobState::Steered {
+                into: original.clone(),
+                receipt: existing.clone(),
+                outcome: SteerOutcome::Unknown,
+            };
+        }
+        match &mut next {
+            JobState::Steering {
+                receipt, uncertain, ..
+            } => {
+                if receipt.is_none() {
+                    *receipt = existing.clone();
+                }
+                if receipt.is_some() {
+                    *uncertain = false;
+                }
+            }
+            JobState::Steered { receipt, .. } if receipt.is_none() => *receipt = existing.clone(),
+            _ => {}
+        }
+        if next == JobState::Queued
+            && let Some(route) =
+                super::workspace::input_route_from(&tx, network, conversation, &job.reply_to)?
+            && matches!(
+                route.target,
+                crate::workspace::InputTarget::Work { .. }
+                    | crate::workspace::InputTarget::Routine { .. }
+            )
+        {
+            next = JobState::Cancelled {
+                attempt: None,
+                evidence: "target_ended_without_accepting_input".into(),
+            };
+        }
         if let JobState::Steered {
             into,
             outcome: SteerOutcome::Answered,
+            ..
         } = &next
         {
             let host = query_jobs(
@@ -3418,21 +5781,22 @@ impl Store {
                 "conversation_id=? AND attempt_id=?",
                 params![conversation, into.attempt_id],
             )?
-            .pop()
-            .context("steered reply missing")?;
-            log::append_from(
-                &tx,
-                &self.blob_dir,
-                identity,
-                network,
-                conversation,
-                EventBody::MessageSteered {
-                    message_id: job.reply_to.clone(),
-                    reply: host.message_id,
-                },
-                vec![],
-                crate::runtime::now_ms(),
-            )?;
+            .pop();
+            if let Some(host) = host {
+                log::append_from(
+                    &tx,
+                    &self.blob_dir,
+                    identity,
+                    network,
+                    conversation,
+                    EventBody::MessageSteered {
+                        message_id: job.reply_to.clone(),
+                        reply: host.message_id,
+                    },
+                    vec![],
+                    crate::runtime::now_ms(),
+                )?;
+            }
         }
         job.state = next;
         save_job(&tx, &job)?;
@@ -3442,6 +5806,12 @@ impl Store {
 
     /// Whether the reply attempt a message was steered into can still consume steered input.
     pub fn steer_host_active(&self, conversation: &str, attempt_id: &str) -> Result<bool> {
+        if let Some(work_id) = attempt_id.strip_prefix("work:") {
+            return Ok(self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_runs WHERE work_id=? AND conversation_id=? AND state IN ('running','interrupting'))",
+                params![work_id, conversation], |row| row.get(0),
+            )?);
+        }
         Ok(query_jobs(
             &self.connection,
             "conversation_id=? AND attempt_id=?",
