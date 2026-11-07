@@ -150,7 +150,7 @@ describe('CoreSession against protocol fixtures', () => {
     await session.useDataDir(dataDir)
     await session.startOwned()
     await session.businessTarget()
-    const settings = JSON.parse(await readFile(join(profileDir, 'desktop-settings.json'), 'utf8'))
+    const settings: unknown = JSON.parse(await readFile(join(profileDir, 'desktop-settings.json'), 'utf8'))
     expect(settings).toEqual({ lastDataDir: dataDir, preferences: { openBusinessOnConnect: true } })
   })
 

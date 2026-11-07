@@ -149,10 +149,9 @@ describe('CoreLifecycle with a real child process', () => {
   })
 
   it('waits for a confirmed exit before clearing owned state during fallback stop', async () => {
-    lifecycle = new CoreLifecycle({ replaceGraceMs: 120, sigtermGraceMs: 900, sigkillGraceMs: 300 })
+    lifecycle = new CoreLifecycle({ replaceGraceMs: 120, sigtermGraceMs: 200, sigkillGraceMs: 300 })
 
     process.env['FIXTURE_IGNORE_PARENT_EOF'] = '1'
-    process.env['FIXTURE_IGNORE_SIGTERM'] = '1'
 
     lifecycle.startOwned(serviceFixture(dataDir), dataDir)
     await settled(() => existsSync(markerPath(dataDir)))
@@ -161,29 +160,30 @@ describe('CoreLifecycle with a real child process', () => {
     if (!call || call.type !== 'return') throw new Error('expected a real spawned child')
     const child = call.value
     const realKill = child.kill.bind(child)
-    let requestedSignal: (() => void) | undefined
+    const kill = vi.spyOn(child, 'kill')
     const signalRequested = new Promise<void>((resolve) => {
-      requestedSignal = resolve
-    })
-    const kill = vi.spyOn(child, 'kill').mockImplementation((signal) => {
-      if (signal === 'SIGTERM') {
-        requestedSignal?.()
-        return true
-      }
-      return realKill(signal)
+      kill.mockImplementation((signal) => {
+        if (signal === 'SIGTERM') {
+          resolve()
+          return true
+        }
+        return realKill(signal)
+      })
     })
 
     const stopping = lifecycle.stopOwned('replace')
-    await signalRequested
-
-    expect(lifecycle.state().kind).toBe('owned')
-    expect(pidAlive(pid)).toBe(true)
-
-    kill.mockRestore()
-    realKill('SIGTERM')
-    await stopping
-    expect(lifecycle.state().kind).toBe('idle')
-    expect(pidAlive(pid)).toBe(false)
+    try {
+      await signalRequested
+      expect(lifecycle.state().kind).toBe('owned')
+      expect(pidAlive(pid)).toBe(true)
+      kill.mockRestore()
+      realKill('SIGTERM')
+      await stopping
+      expect(lifecycle.state().kind).toBe('idle')
+      expect(pidAlive(pid)).toBe(false)
+    } finally {
+      kill.mockRestore()
+    }
   })
 
   it('retains owned state and errors when exit cannot be confirmed', async () => {
