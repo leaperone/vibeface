@@ -235,14 +235,11 @@ pub mod maintenance;
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[tokio::test]
     async fn control_client_bounds_child_output_before_waiting_for_exit() -> Result<()> {
-        let path =
-            std::env::temp_dir().join(format!("vibeface-control-output-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&path, b"#!/bin/sh\nhead -c 1048577 /dev/zero\n")?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/control-oversized-output.sh");
         let error = request(
             &path,
             &ControlRequest::Inspect {
@@ -252,19 +249,13 @@ mod tests {
         .await
         .expect_err("oversized child output must be rejected");
         assert!(error.to_string().contains("stdout exceeds"), "{error:#}");
-        std::fs::remove_file(path)?;
         Ok(())
     }
 
     #[tokio::test]
     async fn control_client_rejects_ok_response_from_nonzero_child() -> Result<()> {
-        let path =
-            std::env::temp_dir().join(format!("vibeface-control-status-{}", uuid::Uuid::new_v4()));
-        std::fs::write(
-            &path,
-            b"#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"ok\":true,\"result\":{}}'\nexit 7\n",
-        )?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/control-nonzero-response.sh");
         let error = request(
             &path,
             &ControlRequest::Inspect {
@@ -277,7 +268,6 @@ mod tests {
             error.to_string().contains("core control process failed"),
             "{error:#}"
         );
-        std::fs::remove_file(path)?;
         Ok(())
     }
 

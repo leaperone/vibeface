@@ -234,7 +234,7 @@ jobs:
           PY
           printf '%s\n' ui-run > .artifacts/native/private/stage.txt
           set +e
-          pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' --action-timeout 240000 --trace off --video off --retries 0 > .artifacts/native/private/ui.log 2>&1
+          pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' --action-timeout 240000 --trace off --video off --retries 0 --reporter json > .artifacts/native/private/ui.json 2> .artifacts/native/private/ui.log
           result=$?
           set -e
           printf '%s\n' "$result" > .artifacts/native/private/ui-exit-code.txt
@@ -331,12 +331,13 @@ jobs:
 
           runner_root = pathlib.Path("tests/e2e/.artifacts/native")
           report_path = runner_root / "e2e/report.json"
+          canonical_report = report_path.exists()
           exit_path = root / "private/ui-exit-code.txt"
           if exit_path.exists():
               value = exit_path.read_text().strip()
               if re.fullmatch(r"[0-9]{1,3}", value) and int(value) <= 255:
                   diagnostics["runner_exit_code"] = int(value)
-          if not report_path.exists() and ui_log.exists():
+          if not canonical_report and ui_log.exists():
               logged = ui_log.read_text(errors="replace")
               for code in ("ENVIRONMENT_UNAVAILABLE", "ENGINE_FAILURE", "CONFIG_LOAD_FAILED", "INVALID_CONFIG", "SESSION_UNAVAILABLE", "SESSION_CONTRACT", "INTERNAL_ERROR"):
                   match = re.search(r"(?m)^" + code + r": ([^\n]*)", logged)
@@ -344,12 +345,14 @@ jobs:
                       diagnostics["failures"].append(safe_error({"code": code, "message": match[1]}))
                       break
 
+          if not canonical_report:
+              report_path = root / "private/ui.json"
           if report_path.exists():
               try:
                   run = json.loads(report_path.read_text())["run"]
-                  diagnostics["report"] = "present"
+                  diagnostics["report"] = "present" if canonical_report else "stdout_only"
                   summary = run["summary"]
-                  selected_passed = run["exitCode"] == 0 and not run["errors"] and summary["selected"] == summary["passed"] == 1 and all(
+                  selected_passed = canonical_report and run["exitCode"] == 0 and not run["errors"] and summary["selected"] == summary["passed"] == 1 and all(
                       summary[key] == 0 for key in ("failed", "skipped", "interrupted", "flaky"))
                   failures = [safe_error(error) for error in run["errors"]]
                   for result in run["results"]:
