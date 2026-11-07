@@ -239,12 +239,12 @@ impl Runtime {
             // re-signs the address record at once instead of at its next tick.
             let mut states = net.bootstrap().subscribe();
             let node = Arc::downgrade(self);
-            tokio::spawn(async move {
+            self.background_tasks.spawn(async move {
                 while states.changed().await.is_ok() {
                     let Some(node) = node.upgrade() else { break };
                     node.wake_sync_all();
                 }
-            });
+            })?;
         }
         let node = self.clone();
         self.background_tasks

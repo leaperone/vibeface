@@ -970,6 +970,9 @@ impl Runtime {
         self.delivery.shutdown().await;
         self.background_tasks.shutdown().await;
         self.stop_network().await;
+        if let Ok(net) = self.net() {
+            net.close().await;
+        }
         self.codex.stop().await;
         self.claude.stop().await;
         self.pi.stop().await;

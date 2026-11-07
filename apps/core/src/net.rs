@@ -760,6 +760,7 @@ impl Net {
     }
 
     pub async fn close(&self) {
+        self.bootstrap.shutdown().await;
         self.endpoint.close().await;
     }
 }
