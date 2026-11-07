@@ -377,7 +377,7 @@ impl Runtime {
 
     pub(crate) fn start_observation_worker(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(500));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -385,7 +385,9 @@ impl Runtime {
                 let Some(node) = weak.upgrade() else { break };
                 node.poll_observed_progress().await;
             }
-        });
+        }) {
+            tracing::debug!(%error, "observation worker skipped while the Node is shutting down");
+        }
     }
 
     async fn poll_observed_progress(self: &Arc<Self>) {

@@ -13,15 +13,18 @@ use futures_util::future::BoxFuture;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{oneshot, watch};
 use vibeface_bridge::agent::{self, AgentResult};
 use vibeface_bridge::failure::ProviderStage;
 use vibeface_bridge::failure::{ExecFailure, FailureKind};
+use vibeface_bridge::platform::tree;
 use vibeface_bridge::turn::TurnStatus;
 
 /// Process groups of the running pi processes, with the program each one runs.
 const PIDFILE: &str = "pi.pid";
+/// Names a session's process tree in this account's job object namespace.
+const TREE_KEY: &str = "pi-session";
 /// Set in every pi process the Node starts; the vibeface extension stays out of those.
 const RUN_ENV: &str = "VIBEFACE_PI_RUN";
 /// How long pi may take to start, or to answer a command.
@@ -95,9 +98,9 @@ struct Pointer {
     file: PathBuf,
     /// The directory pi runs the session in; a later work in the session runs there too.
     cwd: PathBuf,
-    /// The process group of the session's latest pi; while this Node run tracks it, the turn
+    /// The process tree of the session's latest pi; while this Node run tracks it, the turn
     /// may go on.
-    group: u32,
+    tree: String,
     /// The session's last entry before that prompt; `None` when it had none.
     after: Option<String>,
 }
@@ -138,7 +141,7 @@ struct Launch {
 
 struct Process {
     child: Child,
-    group: u32,
+    tree: tree::Tree,
     _tracked: Tracked,
     rpc: Arc<Rpc>,
     /// Everything pi writes but the responses.
@@ -466,12 +469,12 @@ async fn read_output(stdout: ChildStdout, rpc: Arc<Rpc>, events: mpsc::Unbounded
     *lock(&rpc.waiting) = None;
 }
 
-/// A pi process group recorded in the pidfile until its process is done.
-struct Tracked(Arc<Processes>, u32);
+/// A pi process tree recorded in the pidfile until its process is done.
+struct Tracked(Arc<Processes>, String);
 
 impl Drop for Tracked {
     fn drop(&mut self) {
-        self.0.forget(self.1);
+        self.0.forget(&self.1);
     }
 }
 
@@ -487,7 +490,7 @@ impl Process {
                 format!("{} is not a directory", launch.cwd.display()),
             ));
         }
-        let mut command = Command::new(&launch.bin);
+        let mut command = std::process::Command::new(&launch.bin);
         config::private_dir(sessions)
             .map_err(|error| ExecFailure::new(FailureKind::Rejected, error.to_string()))?;
         command
@@ -500,26 +503,24 @@ impl Process {
             .env(RUN_ENV, "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .kill_on_drop(true);
-        let mut child = command.spawn().map_err(|error| {
-            let kind = match error.kind() {
-                std::io::ErrorKind::NotFound => FailureKind::MissingBinary,
+            .stderr(Stdio::piped());
+        let (tree, mut child) = tree::Tree::spawn(command, TREE_KEY, true).map_err(|error| {
+            let kind = match error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind)
+            {
+                Some(std::io::ErrorKind::NotFound) => FailureKind::MissingBinary,
                 _ => FailureKind::Unknown,
             };
             ExecFailure::new(
                 kind,
-                format!("could not start pi at {}: {error}", launch.bin.display()),
+                format!("could not start pi at {}: {error:#}", launch.bin.display()),
             )
         })?;
-        let group = child
-            .id()
-            .ok_or_else(|| ExecFailure::new(FailureKind::Lost, "pi exited as it started"))?;
         processes
-            .track(group, &launch.bin)
+            .track(tree.token(), &launch.bin)
             .map_err(|error| ExecFailure::new(FailureKind::Unknown, format!("{error:#}")))?;
-        let tracked = Tracked(processes.clone(), group);
+        let tracked = Tracked(processes.clone(), tree.token().to_owned());
         let (Some(stdin), Some(stdout), Some(mut stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
@@ -543,7 +544,7 @@ impl Process {
         });
         Ok(Self {
             child,
-            group,
+            tree,
             _tracked: tracked,
             rpc,
             events,
@@ -552,7 +553,7 @@ impl Process {
     }
 
     /// Ends the process: closing its input shuts pi down, and one that does not exit in time is
-    /// killed with its group. Returns the end of its stderr.
+    /// ended with its tree. Returns the end of its stderr.
     async fn end(mut self) -> String {
         self.rpc.stdin.lock().await.take();
         let exited = matches!(
@@ -560,7 +561,7 @@ impl Process {
             Ok(Ok(_))
         );
         if !exited {
-            agent::terminate_process_group(&mut self.child, self.group).await;
+            agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
         }
         match tokio::time::timeout(Duration::from_secs(1), self.stderr).await {
             Ok(Ok(tail)) => tail,
@@ -835,7 +836,7 @@ impl Pi {
 
     /// Keeps where pi writes `session`, the directory it runs in and the session's last entry
     /// so far.
-    fn keep(&self, session: &str, file: &Path, cwd: &Path, group: u32) -> Result<Option<String>> {
+    fn keep(&self, session: &str, file: &Path, cwd: &Path, tree: &str) -> Result<Option<String>> {
         let after = entries(file)?
             .last()
             .and_then(|entry| entry["id"].as_str())
@@ -843,7 +844,7 @@ impl Pi {
         let pointer = Pointer {
             file: file.to_owned(),
             cwd: cwd.to_owned(),
-            group,
+            tree: tree.to_owned(),
             after: after.clone(),
         };
         config::private_dir(&self.dir)?;
@@ -903,7 +904,7 @@ impl Pi {
                 return Err(own(format!("pi opened session {}", state["sessionId"])));
             }
             let file = PathBuf::from(state["sessionFile"].as_str().unwrap_or_default());
-            self.keep(session, &file, &launch.cwd, process.group)
+            self.keep(session, &file, &launch.cwd, process.tree.token())
                 .map_err(|error| own(format!("keep where pi writes the session: {error:#}")))
         };
         let opened = tokio::select! {
@@ -1059,7 +1060,7 @@ impl Pi {
             ));
         }
         if let Some(started) = &config.process_started
-            && let Err(e) = started(process.group).await
+            && let Err(e) = started(process.tree.root()).await
         {
             process.end().await;
             return Err(error(
@@ -1418,7 +1419,7 @@ impl Executor for Pi {
                 let origin = match (work.thread.as_deref(), thread) {
                     (Some(session), _) => {
                         let Pointer {
-                            file, cwd, group, ..
+                            file, cwd, tree, ..
                         } = pointer(session, "the pi session of this thread is gone")?;
                         if !work.cwd.is_empty() && Path::new(&work.cwd) != cwd {
                             let failure = ExecFailure::new(
@@ -1432,11 +1433,11 @@ impl Executor for Pi {
                             return Err(failure.into());
                         }
                         ensure!(
-                            !self.processes.tracked(group),
+                            !self.processes.tracked(&tree),
                             "a pi started earlier still runs in this session"
                         );
                         // A restart before pi takes the prompt reads the session from here on.
-                        self.keep(session, &file, &cwd, group)?;
+                        self.keep(session, &file, &cwd, &tree)?;
                         Origin::Resume {
                             session: session.to_owned(),
                             file,
@@ -1570,7 +1571,7 @@ impl Executor for Pi {
                                 .position(|entry| is_message(entry, "user"))
                             {
                                 Some(at) => Some(start + at),
-                                None if self.processes.tracked(pointer.group) => {
+                                None if self.processes.tracked(&pointer.tree) => {
                                     bail!("pi may still take the prompt")
                                 }
                                 None => return Ok(Probe::NotStarted),
@@ -1584,7 +1585,7 @@ impl Executor for Pi {
                 return Ok(Probe::Missing);
             };
             let turn_id = entries[turn]["id"].as_str().unwrap_or_default().to_owned();
-            if self.processes.tracked(pointer.group) {
+            if self.processes.tracked(&pointer.tree) {
                 return Ok(Probe::Running { turn_id, epoch: 0 });
             }
             let last = run(&entries, turn)
@@ -1689,7 +1690,7 @@ impl Executor for Pi {
             }) else {
                 return Some(
                     if self.live_turn(&into.thread_id, &into.turn_id).is_some()
-                        || self.processes.tracked(pointer.group)
+                        || self.processes.tracked(&pointer.tree)
                     {
                         SteerTrace::Pending
                     } else {
@@ -1724,9 +1725,8 @@ impl Executor for Pi {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
-    use super::super::manager_control::group_alive;
     use super::*;
     use crate::crypto::LocalIdentity;
     use crate::identity::{Genesis, Member, NetworkState};
@@ -2071,7 +2071,7 @@ mod tests {
         let pi = Pi::new(&dir);
         let file = dir.join("session.jsonl");
         std::fs::write(&file, "")?;
-        pi.keep("s-1", &file, &dir, 0)?;
+        pi.keep("s-1", &file, &dir, "")?;
         pi.record_reply("s-1", "attempt-a", "first prompt")?;
         let user = |id: &str, prompt: &str| json!({"type":"message","id":id,"message":{"role":"user","content":prompt}});
         let assistant = |id: &str, text: &str, stop: Value| json!({"type":"message","id":id,"message":{"role":"assistant","content":[{"type":"text","text":text}],"stopReason":stop}});
@@ -2106,7 +2106,7 @@ mod tests {
             user("user-b", "later prompt"),
             assistant("reply-b", "later result", json!("stop")),
         ])?;
-        pi.keep("s-1", &file, &dir, 0)?;
+        pi.keep("s-1", &file, &dir, "")?;
         assert_eq!(
             pi.probe_reply("s-1", None, "attempt-a").await?,
             Probe::Terminal {
@@ -2501,7 +2501,7 @@ mod tests {
                 },
                 "{revoked}"
             );
-            assert!(ended(pid).await, "pi ended after {revoked}");
+            assert!(ended(&pid.to_string()).await, "pi ended after {revoked}");
             std::fs::remove_dir_all(&dir)?;
         }
         Ok(())
@@ -2530,7 +2530,10 @@ mod tests {
                 outcome: WorkOutcome::Rejected
             }
         );
-        assert!(ended(pid).await, "cancelling get_state ended pi");
+        assert!(
+            ended(&pid.to_string()).await,
+            "cancelling get_state ended pi"
+        );
         std::fs::write(dir.join("state-release"), "")?;
         assert!(prompts(&dir).is_empty());
         assert!(!lock(&node.pi.preparing).contains_key("w-1"));
@@ -2723,11 +2726,7 @@ mod tests {
         dispatch(&node, &network, &dir).await?;
         let running = work(&node, |state| state.handle().is_some()).await?;
         let handle = running.state.handle().context("native handle")?;
-        let group = node
-            .pi
-            .pointer(&handle.thread_id)?
-            .context("pointer")?
-            .group;
+        let group = node.pi.pointer(&handle.thread_id)?.context("pointer")?.tree;
         let aborts = || {
             log(&dir)
                 .iter()
@@ -2800,7 +2799,7 @@ mod tests {
                 error: None,
             }
         );
-        assert!(ended(group).await, "settled pi ended its process");
+        assert!(ended(&group).await, "settled pi ended its process");
         assert!(node.store.lock().await.stop_requests()?.is_empty());
         assert!(!lock(&node.pi.preparing).contains_key("w-1"));
         assert!(
@@ -2833,9 +2832,9 @@ mod tests {
         Ok(())
     }
 
-    async fn ended(group: u32) -> bool {
+    async fn ended(token: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while group_alive(group) {
+        while tree::token_is_running(token) {
             if Instant::now() > deadline {
                 return false;
             }
@@ -2852,7 +2851,7 @@ mod tests {
         dispatch(&node, &network, &dir).await?;
         let running = work(&node, |state| state.handle().is_some()).await?;
         let session = running.state.thread().context("thread")?;
-        let left = node.pi.pointer(session)?.context("pointer")?.group;
+        let left = node.pi.pointer(session)?.context("pointer")?.tree;
         let mut stranger = std::process::Command::new("/bin/sleep")
             .arg("30")
             .process_group(0)
@@ -2863,14 +2862,14 @@ mod tests {
         recorded.push_str(&format!("{} {}\n", stranger.id(), fake().display()));
         std::fs::write(&pidfile, recorded)?;
         let restarted = Pi::new(&data);
-        assert!(ended(left).await, "the restart ended the pi it left");
+        assert!(ended(&left).await, "the restart ended the pi it left");
         assert!(!pidfile.exists());
         assert!(
             stranger.try_wait()?.is_none(),
             "a process the Node did not start is left alone"
         );
         let mut pointer = restarted.pointer(session)?.context("pointer")?;
-        pointer.group = stranger.id();
+        pointer.tree = stranger.id().to_string();
         config::private_write(
             &restarted.pointer_path(session)?,
             &serde_json::to_vec(&pointer)?,
@@ -2893,9 +2892,9 @@ mod tests {
         dispatch(&node, &network, &dir).await?;
         let running = work(&node, |state| state.handle().is_some()).await?;
         let session = running.state.thread().context("thread")?;
-        let group = node.pi.pointer(session)?.context("pointer")?.group;
+        let group = node.pi.pointer(session)?.context("pointer")?.tree;
         node.shutdown().await;
-        assert!(ended(group).await, "the shutdown ended the running pi");
+        assert!(ended(&group).await, "the shutdown ended the running pi");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -2955,7 +2954,7 @@ mod tests {
                 "instructions-write-error" => {
                     let file = dir.join("session.jsonl");
                     std::fs::write(&file, "")?;
-                    pi.keep("s-1", &file, &dir, 0)?;
+                    pi.keep("s-1", &file, &dir, "")?;
                     std::fs::create_dir(pi.dir.join("s-1.md"))?;
                     Some("s-1")
                 }

@@ -961,7 +961,7 @@ pub async fn admit_once(identity: &LocalIdentity, source: &Source) -> Result<Cre
 pub struct Bootstrapper {
     state: watch::Receiver<BootstrapState>,
     credential: Arc<Mutex<Option<Credential>>>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for Bootstrapper {
@@ -972,7 +972,7 @@ impl std::fmt::Debug for Bootstrapper {
 
 impl Drop for Bootstrapper {
     fn drop(&mut self) {
-        if let Some(task) = &self.task {
+        if let Some(task) = self.task.get_mut().as_ref() {
             task.abort();
         }
     }
@@ -984,7 +984,7 @@ impl Bootstrapper {
         Self {
             state,
             credential: Arc::new(Mutex::new(None)),
-            task: None,
+            task: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -1017,8 +1017,20 @@ impl Bootstrapper {
         Ok(Self {
             state,
             credential,
-            task: Some(tokio::spawn(worker.run())),
+            task: tokio::sync::Mutex::new(Some(tokio::spawn(worker.run()))),
         })
+    }
+
+    /// Stops the client permanently and waits until its network work has exited.
+    pub async fn shutdown(&self) {
+        if let Some(task) = self.task.lock().await.take() {
+            task.abort();
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                tracing::warn!(event = "bootstrap.worker", %error, "bootstrap worker failed during shutdown");
+            }
+        }
     }
 
     pub fn state(&self) -> BootstrapState {

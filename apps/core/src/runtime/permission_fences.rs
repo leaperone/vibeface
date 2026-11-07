@@ -181,7 +181,8 @@ mod tests {
                 };
             }
             json!({"result":{}})
-        })?;
+        })
+        .await?;
         tokio::time::timeout(Duration::from_secs(5), async {
             while node.codex.status().await["connection"]["state"] != "connected" {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -264,7 +265,7 @@ mod tests {
             crate::config::private_write(
                 &directory.join(format!("{}.json", target.thread_id)),
                 &serde_json::to_vec(&json!({"file":transcript,"cwd":cwd.canonicalize()?,
-                    "group":0,"after":Value::Null}))?,
+                    "tree":"0","after":Value::Null}))?,
             )?;
         }
         let spec = WorkSpec {
@@ -316,7 +317,7 @@ mod tests {
         Runtime::validate_assignment_roots(&[actual.to_string_lossy().into_owned()])?;
         for name in ["first-alias", "second-alias"] {
             let alias = directory.join(name);
-            std::os::unix::fs::symlink(&actual, &alias)?;
+            vibeface_bridge::platform::privatefs::link_dir(&actual, &alias)?;
             let signed_roots = vec![alias.to_string_lossy().into_owned()];
             let error = Runtime::validate_assignment_roots(&signed_roots)
                 .expect_err("aliases cannot lock distinct physical resources");
@@ -411,7 +412,7 @@ mod tests {
         std::fs::create_dir(&retained)?;
         let retained = retained.canonicalize()?;
         let retained_alias = directory.join("retained-alias");
-        std::os::unix::fs::symlink(&retained, &retained_alias)?;
+        vibeface_bridge::platform::privatefs::link_dir(&retained, &retained_alias)?;
         let removed = directory.join("removed");
         std::fs::create_dir(&removed)?;
         let removed = removed.canonicalize()?;

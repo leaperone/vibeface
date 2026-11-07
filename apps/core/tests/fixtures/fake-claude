@@ -17,10 +17,32 @@ Every argument list and stdin frame is appended to `$FAKE_CLAUDE_LOG` as one JSO
 import json
 import os
 import re
-import select
+import queue
+import threading
 import sys
 import time
 import uuid
+
+INPUT = queue.Queue()
+INPUT_EOF = object()
+
+
+def collect_input():
+    for line in sys.stdin:
+        INPUT.put(line)
+    INPUT.put(INPUT_EOF)
+
+
+def input_lines():
+    while True:
+        line = INPUT.get()
+        if line is INPUT_EOF:
+            INPUT.put(INPUT_EOF)
+            return
+        yield line
+
+
+threading.Thread(target=collect_input, daemon=True).start()
 
 LOG = os.environ.get("FAKE_CLAUDE_LOG")
 GATE_DIR = os.environ.get("FAKE_CLAUDE_GATE_DIR")
@@ -116,10 +138,14 @@ def gated():
     os.makedirs(GATE_DIR, exist_ok=True)
     open(os.path.join(GATE_DIR, f"{session}.started"), "w").close()
     while not os.path.exists(GATE_RELEASE):
-        ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-        if not ready:
+        try:
+            line = INPUT.get(timeout=0.05)
+        except queue.Empty:
             continue
-        control = json.loads(sys.stdin.readline())
+        if line is INPUT_EOF:
+            INPUT.put(INPUT_EOF)
+            return True
+        control = json.loads(line)
         if control.get("type") == "user":
             accept_steer(control)
             continue
@@ -160,7 +186,7 @@ def turn(frame):
     if mode in ("hang", "steer", "steer-late", "steer-late-delayed"):
         steered = 0
         deferred = []
-        for line in sys.stdin:
+        for line in input_lines():
             control = json.loads(line)
             if control.get("type") == "user":
                 if mode in ("steer-late", "steer-late-delayed"):
@@ -202,7 +228,7 @@ def turn(frame):
     result("success", False, answer, "completed")
 
 
-for line in sys.stdin:
+for line in input_lines():
     frame = json.loads(line)
     log({"stdin": frame.get("type"), "uuid": frame.get("uuid"),
          "subtype": (frame.get("request") or {}).get("subtype")})

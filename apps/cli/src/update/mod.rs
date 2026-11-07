@@ -2,15 +2,16 @@ pub mod release;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Subcommand};
-use release::Channel;
+use release::{Channel, PROGRAMS, SERVICE_SCRIPT};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
 };
 use tokio::process::Command;
+use vibeface_bridge::platform::privatefs;
 use vibeface_control::{self, ControlRequest, maintenance};
 
 #[derive(Args)]
@@ -150,49 +151,16 @@ async fn inspect(data: &Path, core: &Path) -> Result<InspectResult> {
 
 fn private_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    privatefs::restrict_dir(path)
 }
 
 fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let parent = path.parent().context("private file has no parent")?;
-    private_dir(parent)?;
-    let temporary = parent.join(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .context("private file has no name")?
-            .to_string_lossy(),
-        uuid::Uuid::new_v4()
-    ));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&temporary, path)?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
+    private_dir(path.parent().context("private file has no parent")?)?;
+    privatefs::write_atomic(path, bytes)
 }
 
 pub(crate) fn lock_data_dir(data: &Path) -> Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(data.join("node.lock"))?;
+    let file = privatefs::open_or_create(&data.join("node.lock"))?;
     file.try_lock()
         .context("stop the Node using this data directory before updating")?;
     Ok(file)
@@ -240,7 +208,7 @@ pub fn npm_install_root(executable: &Path) -> Result<Option<PathBuf>> {
             && root.join("bin/vibeface.mjs").is_file()
             && executable
                 .file_name()
-                .is_some_and(|name| name == "vibeface"),
+                .is_some_and(|name| name == PROGRAMS[0]),
         "npm package does not match the native Vibeface program"
     );
     Ok(Some(root.to_path_buf()))
@@ -440,14 +408,7 @@ async fn maintenance_commit(data: &Path) -> Result<()> {
 }
 
 pub fn update_lock(data: &Path) -> Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(data.join("update.lock"))?;
+    let file = privatefs::open_or_create(&data.join("update.lock"))?;
     file.try_lock()
         .context("another updater is already running")?;
     Ok(file)
@@ -463,11 +424,7 @@ fn manifest(package: &Path) -> Result<Manifest> {
         serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
             .context("invalid package manifest")?;
     build.validate()?;
-    for file in [
-        "vibeface",
-        "vibeface-core",
-        "scripts/install-node-service.sh",
-    ] {
+    for file in [PROGRAMS[0], PROGRAMS[1], SERVICE_SCRIPT] {
         ensure!(
             fs::symlink_metadata(package.join(file))?
                 .file_type()
@@ -475,19 +432,12 @@ fn manifest(package: &Path) -> Result<Manifest> {
             "package is missing required file {file}"
         );
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        for binary in ["vibeface", "vibeface-core"] {
-            ensure!(
-                fs::symlink_metadata(package.join(binary))?
-                    .permissions()
-                    .mode()
-                    & 0o111
-                    != 0,
-                "package binary is not executable: {binary}"
-            );
-        }
+    for binary in PROGRAMS {
+        let path = package.join(binary);
+        ensure!(
+            privatefs::is_executable(&path),
+            "package binary is not a program this account can run: {binary}"
+        );
     }
     let web = fs::symlink_metadata(package.join("web"))?;
     ensure!(
@@ -507,8 +457,8 @@ fn installed(root: &Path) -> Result<PathBuf> {
     let root = fs::canonicalize(root)?;
     let current = root.join("current");
     ensure!(
-        fs::symlink_metadata(&current)?.is_symlink(),
-        "managed installation requires a current symlink"
+        privatefs::is_dir_link(&current)?,
+        "managed installation requires a current link"
     );
     let package = fs::canonicalize(current)?;
     ensure!(
@@ -520,16 +470,13 @@ fn installed(root: &Path) -> Result<PathBuf> {
 }
 
 async fn configure_timer(policy: &Policy, data: &Path) -> Result<()> {
-    let mut command = Command::new(
-        policy
-            .install_root
-            .join("current/scripts/install-node-service.sh"),
-    );
+    let current = policy.install_root.join("current");
+    let mut command = crate::service::service_script(&current.join(SERVICE_SCRIPT))?;
     if policy.automatic {
         command
             .arg("install-updater")
             .arg("--binary")
-            .arg(policy.install_root.join("current/vibeface"));
+            .arg(current.join(PROGRAMS[0]));
     } else {
         command.arg("uninstall-updater");
     }
@@ -539,8 +486,7 @@ async fn configure_timer(policy: &Policy, data: &Path) -> Result<()> {
 
 fn persist(path: &Path, value: &impl Serialize) -> Result<()> {
     private_write(path, &serde_json::to_vec_pretty(value)?)?;
-    File::open(path.parent().context("missing parent directory")?)?.sync_all()?;
-    Ok(())
+    privatefs::sync_dir(path.parent().context("missing parent directory")?)
 }
 
 fn switch(root: &Path, package: &Path) -> Result<()> {
@@ -551,14 +497,7 @@ fn switch(root: &Path, package: &Path) -> Result<()> {
         "package is outside installation"
     );
     manifest(&package)?;
-    let temporary = root.join(format!(".current-{}", uuid::Uuid::new_v4()));
-    std::os::unix::fs::symlink(&package, &temporary)?;
-    if let Err(error) = fs::rename(&temporary, root.join("current")) {
-        let _ = fs::remove_file(temporary);
-        return Err(error.into());
-    }
-    File::open(root)?.sync_all()?;
-    Ok(())
+    privatefs::point_dir_link(&package, &root.join("current"))
 }
 
 async fn activate(
@@ -681,7 +620,7 @@ async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
         .build()?;
     let mut last = String::new();
     for _ in 0..150 {
-        match inspect(data, &package.join("vibeface-core")).await {
+        match inspect(data, &package.join(PROGRAMS[1])).await {
             Ok(inspected) => {
                 let running_version = inspected
                     .core_version
@@ -780,34 +719,37 @@ async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
 }
 
 fn backup(source: &Path, destination: &Path) -> Result<()> {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    fs::create_dir(destination)?;
-    fs::set_permissions(destination, fs::Permissions::from_mode(0o700))?;
+    privatefs::create_dir_new(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let path = entry.path();
         let target = destination.join(entry.file_name());
         let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_socket() {
+        // A local endpoint of a running Node holds no data to copy. Only Unix gives one a
+        // directory entry; a Windows pipe has no name in the file system.
+        #[cfg(unix)]
+        if std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type()) {
             continue;
         }
         if metadata.is_symlink() {
-            std::os::unix::fs::symlink(fs::read_link(path)?, target)?;
+            privatefs::copy_link(&path, &target)?;
         } else if metadata.is_dir() {
             backup(&path, &target)?;
         } else {
             ensure!(
-                metadata.is_file(),
+                privatefs::is_plain_file(&metadata),
                 "unsupported data file: {}",
                 path.display()
             );
             fs::copy(&path, &target)?;
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
-            File::open(target)?.sync_all()?;
+            privatefs::restrict_file(&target)?;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(target)?
+                .sync_all()?;
         }
     }
-    File::open(destination)?.sync_all()?;
-    Ok(())
+    privatefs::sync_dir(destination)
 }
 
 async fn prepare_firewall(inspected: &InspectResult, root: &Path, candidate: &Path) -> Result<()> {
@@ -863,6 +805,24 @@ struct Service {
     domain: String,
     #[cfg(target_os = "macos")]
     plist: PathBuf,
+}
+
+/// The scheduled task this account runs the Node under on Windows.
+#[cfg(windows)]
+pub(crate) const TASK: &str = "\\Vibeface\\Node";
+
+/// The task scheduler of this installation of Windows.
+#[cfg(windows)]
+pub(crate) fn schtasks() -> Result<PathBuf> {
+    let root = std::env::var_os("SystemRoot")
+        .context("SystemRoot is required to reach the task scheduler")?;
+    let path = PathBuf::from(root).join("System32\\schtasks.exe");
+    ensure!(
+        path.is_file(),
+        "the task scheduler is required to manage this account's Node: {}",
+        path.display()
+    );
+    Ok(path)
 }
 
 trait ServiceControl {
@@ -949,9 +909,87 @@ impl Service {
             );
             Ok(Self {})
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        bail!("automatic updates require macOS launchd or Linux systemd user services")
+        #[cfg(windows)]
+        {
+            let output = Command::new(schtasks()?)
+                .args(["/Query", "/TN", TASK, "/XML", "ONE"])
+                .output()
+                .await?;
+            ensure!(
+                output.status.success(),
+                "installed node task of this account is required"
+            );
+            ensure!(
+                task_data_matches(&task_command_line(&output.stdout)?, data),
+                "installed node service uses a different data directory"
+            );
+            Ok(Self {})
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        bail!(
+            "automatic updates require macOS launchd, Linux systemd user services, or the Windows task scheduler"
+        )
     }
+}
+
+/// The whole command line a task definition runs, read out of the definition the task
+/// scheduler printed.
+///
+/// The scheduler prints a definition as XML, which it writes the same way whatever language
+/// Windows is displaying, unlike its readable listing.
+#[cfg(any(windows, test))]
+fn task_command_line(definition: &[u8]) -> Result<String> {
+    let text = if definition.len() >= 2 && definition[..2] == [0xff, 0xfe] {
+        let units: Vec<u16> = definition[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16(&units).context("the task scheduler printed an unreadable definition")?
+    } else {
+        String::from_utf8(definition.to_vec())
+            .context("the task scheduler printed an unreadable definition")?
+    };
+    let mut line = String::new();
+    for tag in ["Command", "Arguments"] {
+        if let Some(value) = between(&text, &format!("<{tag}>"), &format!("</{tag}>")) {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(&unescape(value));
+        }
+    }
+    ensure!(!line.is_empty(), "the installed node task runs no program");
+    Ok(line)
+}
+
+/// The text between the first `open` and the `close` that follows it.
+#[cfg(any(windows, test))]
+fn between<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let rest = &text[text.find(open)? + open.len()..];
+    Some(&rest[..rest.find(close)?])
+}
+
+/// XML text as the characters it stands for.
+#[cfg(any(windows, test))]
+fn unescape(text: &str) -> String {
+    text.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Whether `line` starts the Node on `data` and on nothing else.
+#[cfg(any(windows, test))]
+fn task_data_matches(line: &str, data: &Path) -> bool {
+    let quoted = format!("--data-dir \"{}\"", data.display());
+    line.matches("--data-dir").count() == 1
+        && line.ends_with(&quoted)
+        && line[..line.len() - quoted.len()]
+            .split_whitespace()
+            .any(|word| word == "serve")
 }
 
 impl ServiceControl for Service {
@@ -980,7 +1018,20 @@ impl ServiceControl for Service {
             )
             .await
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            // Ending a task that is not running is reported as a failure, so the state is read
+            // first and a Node that already stopped is left alone.
+            if task_is_running().await? {
+                checked(
+                    Command::new(schtasks()?).args(["/End", "/TN", TASK]),
+                    "stop node service",
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             bail!("unsupported service platform")
         }
@@ -1018,11 +1069,45 @@ impl ServiceControl for Service {
             )
             .await
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            if task_is_running().await? {
+                return Ok(());
+            }
+            checked(
+                Command::new(schtasks()?).args(["/Run", "/TN", TASK]),
+                "start node service",
+            )
+            .await
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             bail!("unsupported service platform")
         }
     }
+}
+
+/// Whether this account's Node task has a run in progress.
+#[cfg(windows)]
+async fn task_is_running() -> Result<bool> {
+    let root =
+        std::env::var_os("SystemRoot").context("SystemRoot is required to query the node task")?;
+    let shell = PathBuf::from(root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let output = Command::new(shell)
+        .args(["-NoProfile", "-NonInteractive", "-Command",
+            "$ErrorActionPreference='Stop'; $scheduler=New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); [int]$scheduler.GetFolder('\\').GetTask($env:VIBEFACE_NODE_TASK).State"])
+        .env("VIBEFACE_NODE_TASK", TASK)
+        .output().await?;
+    ensure!(
+        output.status.success(),
+        "could not query the installed node task of this account"
+    );
+    let state = String::from_utf8(output.stdout)?
+        .trim()
+        .parse::<u32>()
+        .context("invalid scheduled task state")?;
+    ensure!(state <= 4, "unknown scheduled task state");
+    Ok(state == 4)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1052,7 +1137,46 @@ async fn checked(command: &mut Command, action: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+
+    /// Marks `path` as a program this account can run, where that is something a file carries.
+    fn mark_runnable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Windows carries the right to run in the name, which the fixtures already use.
+        #[cfg(windows)]
+        let _ = path;
+        assert!(privatefs::is_executable(path));
+    }
+
+    /// Writes a fixture service script that records the arguments it was handed.
+    fn recording_service_script(package: &Path) -> PathBuf {
+        let script = package.join(SERVICE_SCRIPT);
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n").unwrap();
+            mark_runnable(&script);
+        }
+        #[cfg(windows)]
+        fs::write(
+            &script,
+            "$args | Set-Content -LiteralPath \"$PSCommandPath.args\"\r\n",
+        )
+        .unwrap();
+        script
+    }
+
+    /// What the script `recording_service_script` wrote was handed.
+    fn recorded_arguments(script: &Path) -> String {
+        let mut name = script.file_name().unwrap().to_owned();
+        name.push(".args");
+        fs::read_to_string(script.with_file_name(name))
+            .unwrap()
+            .replace("\r\n", "\n")
+    }
 
     #[test]
     fn device_id_journal_uses_only_the_current_field() -> Result<()> {
@@ -1065,12 +1189,20 @@ mod tests {
     }
 
     fn sandbox() -> PathBuf {
-        let directory =
-            PathBuf::from("/tmp").join(format!("vibeface-updater-{}", uuid::Uuid::new_v4()));
+        // Unix keeps the parent short because a local endpoint a test binds inside it has a
+        // length limit of its own.
+        #[cfg(unix)]
+        let parent = PathBuf::from("/tmp");
+        #[cfg(windows)]
+        let parent = std::env::temp_dir();
+        let directory = parent.join(format!("vibeface-updater-{}", uuid::Uuid::new_v4()));
         private_dir(&directory).unwrap();
         fs::canonicalize(directory).unwrap()
     }
 
+    // A fixture program here is a shell script, which only Unix can run. Windows runs the
+    // real programs through `scripts/verify-windows-node.py` instead.
+    #[cfg(unix)]
     #[tokio::test]
     async fn update_health_inspects_the_candidate_core() -> Result<()> {
         let root = sandbox();
@@ -1082,7 +1214,7 @@ mod tests {
             "maintenance_socket":root.join("socket"),"listen":"127.0.0.1:4790",
             "version":"9.0.0","core_version":"9.0.0"
         }});
-        let core = candidate.join("vibeface-core");
+        let core = candidate.join(PROGRAMS[1]);
         fs::write(
             &core,
             format!(
@@ -1091,7 +1223,7 @@ mod tests {
                 response
             ),
         )?;
-        fs::set_permissions(&core, fs::Permissions::from_mode(0o700))?;
+        mark_runnable(&core);
         let error = healthy(&data, &candidate, "expected").await.unwrap_err();
         assert!(marker.exists(), "health must execute the candidate Core");
         assert!(error.to_string().contains("unexpected version or identity"));
@@ -1102,21 +1234,13 @@ mod tests {
     fn package(root: &Path, version: &str) -> PathBuf {
         let directory = root.join("releases").join(version);
         fs::create_dir_all(directory.join("scripts")).unwrap();
-        fs::write(directory.join("vibeface"), b"binary").unwrap();
-        fs::write(directory.join("vibeface-core"), b"core").unwrap();
+        fs::write(directory.join(PROGRAMS[0]), b"binary").unwrap();
+        fs::write(directory.join(PROGRAMS[1]), b"core").unwrap();
         fs::create_dir(directory.join("web")).unwrap();
         fs::write(directory.join("web/index.html"), b"web").unwrap();
-        fs::write(directory.join("scripts/install-node-service.sh"), b"script").unwrap();
-        fs::set_permissions(
-            directory.join("vibeface"),
-            fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-        fs::set_permissions(
-            directory.join("vibeface-core"),
-            fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        fs::write(directory.join(SERVICE_SCRIPT), b"script").unwrap();
+        mark_runnable(&directory.join(PROGRAMS[0]));
+        mark_runnable(&directory.join(PROGRAMS[1]));
         fs::write(
             directory.join("BUILD-INFO.json"),
             serde_json::to_vec(&build_info(version)).unwrap(),
@@ -1127,7 +1251,7 @@ mod tests {
 
     fn build_info(version: &str) -> serde_json::Value {
         serde_json::json!({
-            "version": version, "target": "aarch64-apple-darwin", "source_commit": "a".repeat(40),
+            "version": version, "target": if cfg!(windows) { "x86_64-pc-windows-msvc" } else { "aarch64-apple-darwin" }, "source_commit": "a".repeat(40),
             "core_version": version, "core_source_commit": "a".repeat(40),
             "app_version": version, "app_source_commit": "a".repeat(40),
             "update_protocol": vibeface_control::UPDATE_PROTOCOL,
@@ -1142,13 +1266,8 @@ mod tests {
         private_dir(&data)?;
         fs::write(data.join("identity.json"), b"opaque identity fixture")?;
         let package = package(&root, "1.0.0");
-        std::os::unix::fs::symlink(&package, root.join("current"))?;
-        let installer = package.join("scripts/install-node-service.sh");
-        fs::write(
-            &installer,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n",
-        )?;
-        fs::set_permissions(&installer, fs::Permissions::from_mode(0o700))?;
+        privatefs::link_dir(&package, &root.join("current"))?;
+        let installer = recording_service_script(&package);
 
         assert!(
             run(Update {
@@ -1177,8 +1296,27 @@ mod tests {
             serde_json::json!({"channel":"nightly","automatic":false,"install_root":root})
         );
         assert_eq!(
-            fs::read_to_string(installer.with_extension("sh.args"))?,
+            recorded_arguments(&installer),
             format!("uninstall-updater\n--data-dir\n{}\n", data.display())
+        );
+        run(Update {
+            action: Action::Configure {
+                channel: Channel::Nightly,
+                automatic: true,
+                install_root: root.clone(),
+                data: Data {
+                    data_dir: data.clone(),
+                },
+            },
+        })
+        .await?;
+        assert_eq!(
+            recorded_arguments(&installer),
+            format!(
+                "install-updater\n--binary\n{}\n--data-dir\n{}\n",
+                root.join("current").join(PROGRAMS[0]).display(),
+                data.display()
+            )
         );
         run(Update {
             action: Action::Status(Data { data_dir: data }),
@@ -1192,9 +1330,14 @@ mod tests {
     fn npm_installation_requires_matching_package_metadata() {
         let root = sandbox();
         let original = package(&root, "1.2.3-nightly.20261019.1");
-        assert_eq!(npm_install_root(&original.join("vibeface")).unwrap(), None);
+        assert_eq!(npm_install_root(&original.join(PROGRAMS[0])).unwrap(), None);
         fs::create_dir_all(root.join("vendor")).unwrap();
-        let native = root.join("vendor/aarch64-apple-darwin");
+        let target = if cfg!(windows) {
+            "x86_64-pc-windows-msvc"
+        } else {
+            "aarch64-apple-darwin"
+        };
+        let native = root.join("vendor").join(target);
         fs::rename(original, &native).unwrap();
         fs::create_dir(root.join("bin")).unwrap();
         fs::write(root.join("bin/vibeface.mjs"), b"launcher").unwrap();
@@ -1204,7 +1347,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            npm_install_root(&native.join("vibeface")).unwrap(),
+            npm_install_root(&native.join(PROGRAMS[0])).unwrap(),
             Some(root.clone())
         );
         for metadata in [
@@ -1214,7 +1357,7 @@ mod tests {
             r#"{"name":"@leaperone/vibeface"}"#,
         ] {
             fs::write(root.join("package.json"), metadata).unwrap();
-            assert!(npm_install_root(&native.join("vibeface")).is_err());
+            assert!(npm_install_root(&native.join(PROGRAMS[0])).is_err());
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -1224,7 +1367,7 @@ mod tests {
         let root = sandbox();
         let old = package(&root, "1.0.0");
         let new = package(&root, "1.1.0");
-        std::os::unix::fs::symlink(&old, root.join("current")).unwrap();
+        privatefs::link_dir(&old, &root.join("current")).unwrap();
         assert_eq!(installed(&root).unwrap(), old);
         let data = root.join("data");
         fs::create_dir(&data).unwrap();
@@ -1240,7 +1383,7 @@ mod tests {
         assert_eq!(managed_install_root(&data).unwrap(), root);
         switch(&root, &new).unwrap();
         assert_eq!(installed(&root).unwrap(), new);
-        assert!(old.join("vibeface").is_file());
+        assert!(old.join(PROGRAMS[0]).is_file());
         let outside = sandbox();
         let escaped = package(&outside, "2.0.0");
         assert!(switch(&root, &escaped).is_err());
@@ -1276,9 +1419,10 @@ mod tests {
         fs::remove_dir_all(outside).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_backup_keeps_wal_and_links_without_following_them() {
-        use std::os::unix::net::UnixListener;
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
         let root = sandbox();
         let data = root.join("data");
         private_dir(&data).unwrap();
@@ -1307,6 +1451,91 @@ mod tests {
         );
         assert_eq!(fs::read(data.join("node.sqlite3")).unwrap(), b"db");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // Windows has no socket file to skip and no link a copy may follow except a directory
+    // link, so the same guarantees are checked against what it does have.
+    #[cfg(windows)]
+    #[test]
+    fn private_backup_keeps_wal_and_links_without_following_them() {
+        let root = sandbox();
+        let data = root.join("data");
+        private_dir(&data).unwrap();
+        fs::write(data.join("node.sqlite3"), b"db").unwrap();
+        fs::write(data.join("node.sqlite3-wal"), b"wal").unwrap();
+        let elsewhere = root.join("elsewhere");
+        private_dir(&elsewhere).unwrap();
+        fs::write(elsewhere.join("not-business-data"), b"outside").unwrap();
+        privatefs::link_dir(&elsewhere, &data.join("link")).unwrap();
+        let destination = root.join("backup");
+        backup(&data, &destination).unwrap();
+        assert_eq!(
+            fs::read(destination.join("node.sqlite3-wal")).unwrap(),
+            b"wal"
+        );
+        assert_eq!(
+            privatefs::read_dir_link(&destination.join("link")).unwrap(),
+            elsewhere
+        );
+        assert!(
+            !destination.join("link/not-business-data").is_file()
+                || privatefs::is_dir_link(&destination.join("link")).unwrap(),
+            "a copy must carry the link across instead of reading through it"
+        );
+        privatefs::ensure_private(&destination.join("node.sqlite3"), "the copied database")
+            .unwrap();
+        assert_eq!(fs::read(data.join("node.sqlite3")).unwrap(), b"db");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_definitions_match_only_the_managed_data_dir() {
+        let definition = |command: &str, arguments: &str| {
+            format!(
+                "<Task><Actions><Exec><Command>{command}</Command>\
+                 <Arguments>{arguments}</Arguments></Exec></Actions></Task>"
+            )
+        };
+        let data = Path::new("C:\\Users\\someone\\My Node");
+        let line = task_command_line(
+            definition(
+                "C:\\Program Files\\Vibeface\\vibeface.exe",
+                "serve --data-dir &quot;C:\\Users\\someone\\My Node&quot;",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(task_data_matches(&line, data));
+        assert!(!task_data_matches(&line, Path::new("C:\\Users\\someone")));
+        let twice = task_command_line(
+            definition(
+                "C:\\Program Files\\Vibeface\\vibeface.exe",
+                "serve --data-dir &quot;C:\\elsewhere&quot; --data-dir &quot;C:\\Users\\someone\\My Node&quot;",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(!task_data_matches(&twice, data));
+        let other_verb = task_command_line(
+            definition(
+                "C:\\Program Files\\Vibeface\\vibeface.exe",
+                "update apply --data-dir &quot;C:\\Users\\someone\\My Node&quot;",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(!task_data_matches(&other_verb, data));
+        let mut utf16: Vec<u8> = vec![0xff, 0xfe];
+        for unit in definition(
+            "vibeface.exe",
+            "serve --data-dir &quot;C:\\Users\\someone\\My Node&quot;",
+        )
+        .encode_utf16()
+        {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert!(task_data_matches(&task_command_line(&utf16).unwrap(), data));
+        assert!(task_command_line(b"<Task></Task>").is_err());
     }
 
     #[test]
@@ -1369,7 +1598,7 @@ mod tests {
                 "only a confirmed activation can open admission"
             );
             fs::remove_file(pending)?;
-            File::open(data)?.sync_all()?;
+            privatefs::sync_dir(data)?;
             Ok(())
         }
     }
@@ -1385,7 +1614,7 @@ mod tests {
         fs::write(data.join("node.sqlite3-wal"), b"uncheckpointed-events").unwrap();
         let previous = package(&root, "1.0.0");
         let candidate = package(&root, "1.1.0");
-        std::os::unix::fs::symlink(&previous, root.join("current")).unwrap();
+        privatefs::link_dir(&previous, &root.join("current")).unwrap();
         let journal = Journal {
             phase: Phase::Prepared,
             previous,

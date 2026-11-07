@@ -22,7 +22,7 @@ REPO = 'leaperone/vibeface'
 CI = '.github/workflows/ci.yml'
 RELEASE = '.github/workflows/release.yml'
 PATHS = ('apps/www/package.json', 'apps/app/package.json', 'apps/core/Cargo.toml',
-         'apps/cli/Cargo.toml', 'Cargo.lock', 'apps/mobile/app.json')
+         'apps/cli/Cargo.toml', 'Cargo.lock', 'apps/mobile/app.json', 'apps/desktop/package.json')
 PRODUCT_APPS = release.PRODUCT_APPS
 RELEASES = release.RELEASES
 PRODUCER = 'collect'
@@ -37,6 +37,7 @@ class DailyPlan:
     base: str
     versions: dict
     android_code: int
+    ios_build_number: str
 
     @property
     def branch(self):
@@ -149,6 +150,20 @@ def next_sequence(prefix, claimed):
     return prefix + str(max(sequences, default=0) + 1)
 
 
+def next_ios_build_number(value):
+    """Increment the last valid CFBundleVersion component without rollover."""
+    require(isinstance(value, str), 'iOS build number must be a string')
+    parts = value.split('.')
+    require(1 <= len(parts) <= 3 and re.fullmatch(r'[0-9]{1,4}', parts[0])
+            and int(parts[0]) > 0 and all(re.fullmatch(r'[0-9]{1,2}', part) for part in parts[1:]),
+            'iOS build number must be a valid Apple CFBundleVersion')
+    maximum = 9999 if len(parts) == 1 else 99
+    last = int(parts[-1])
+    require(last < maximum, 'iOS build number component cannot be incremented without rollover')
+    parts[-1] = str(last + 1)
+    return '.'.join(parts)
+
+
 def plan_versions(day, base, tags):
     datetime.datetime.strptime(day, '%Y%m%d')
     values = versions_at(base)
@@ -162,12 +177,13 @@ def plan_versions(day, base, tags):
     expo = json.loads(blob(base, 'apps/mobile/app.json'))['expo']
     code = expo['android']['versionCode']
     require(type(code) is int and 0 < code < 2100000000, 'Android versionCode cannot be incremented')
-    return DailyPlan(day, base, values, code + 1)
+    ios_build_number = next_ios_build_number(expo['ios']['buildNumber'])
+    return DailyPlan(day, base, values, code + 1, ios_build_number)
 
 
 def generated(plan):
     old = versions_at(plan.base)
-    require(set(plan.versions) == set(release.APPS), 'daily plan must contain all five apps')
+    require(set(plan.versions) == set(release.APPS), 'daily plan must contain all release applications')
     product_ver = plan.versions['cli']
     for app in PRODUCT_APPS:
         require(plan.versions[app] == product_ver, 'product apps must share one canonical version')
@@ -178,7 +194,7 @@ def generated(plan):
         if old[app].startswith(prefix):
             require(int(value[len(prefix):]) > int(old[app][len(prefix):]), 'daily version did not advance')
     result = {path: blob(plan.base, path).decode() for path in PATHS}
-    for app in ('www', 'app'):
+    for app in ('www', 'app', 'desktop'):
         path = f'apps/{app}/package.json'
         result[path] = json_value(result[path], ('version',), plan.versions[app])
     for app in ('core', 'cli'):
@@ -201,8 +217,11 @@ def generated(plan):
     require(expo['version'] == plan.versions['mobile'].split('-', 1)[0], 'mobile marketing version mismatch')
     require(type(plan.android_code) is int and plan.android_code == expo['android']['versionCode'] + 1
             and 0 < plan.android_code <= 2100000000, 'Android versionCode must advance exactly once')
+    require(plan.ios_build_number == next_ios_build_number(expo['ios']['buildNumber']),
+            'iOS build number must advance exactly once')
     result[mobile_path] = json_value(result[mobile_path], ('expo', 'extra', 'releaseVersion'), plan.versions['mobile'])
     result[mobile_path] = json_value(result[mobile_path], ('expo', 'android', 'versionCode'), plan.android_code)
+    result[mobile_path] = json_value(result[mobile_path], ('expo', 'ios', 'buildNumber'), plan.ios_build_number)
     return {path: text.encode() for path, text in result.items()}
 
 
@@ -210,7 +229,7 @@ def recovered_plan(day, head):
     parents = git('rev-list', '--parents', '-n', '1', head).split()
     require(len(parents) == 2, 'daily version head must be one ordinary commit')
     expo = json.loads(blob(head, 'apps/mobile/app.json'))['expo']
-    return DailyPlan(day, parents[1], versions_at(head), expo['android']['versionCode'])
+    return DailyPlan(day, parents[1], versions_at(head), expo['android']['versionCode'], expo['ios']['buildNumber'])
 
 
 def expected_tree(plan):
@@ -316,7 +335,7 @@ def merge_pr(pr, plan, head, login):
     git('merge-base', '--is-ancestor', source, 'origin/main')
     parents = git('rev-list', '--parents', '-n', '1', source).split()
     require(len(parents) == 2, 'daily squash merge must have one real main parent')
-    landed = DailyPlan(plan.day, parents[1], plan.versions, plan.android_code)
+    landed = DailyPlan(plan.day, parents[1], plan.versions, plan.android_code, plan.ios_build_number)
     require(git('rev-parse', source + '^{tree}') == expected_tree(landed),
             'actual main merge differs from exact mechanical versions on its real parent; retain original PR and stop')
     return source
@@ -592,7 +611,7 @@ def self_test():
             else:
                 value = {'version': '0.0.1'} if app == 'www' else {'version': '0.0.1-nightly.20261105.2', 'private': True}
                 if app == 'mobile':
-                    value = {'expo': {'version': '0.0.1', 'ios': {'buildNumber': '99'},
+                    value = {'expo': {'version': '0.0.1', 'ios': {'buildNumber': '3', 'supportsTablet': True},
                         'android': {'package': 'one.leaper.vibeface', 'versionCode': 250001},
                         'extra': {'releaseVersion': '0.0.1-nightly.20261105.2'}}}
                 (directory / ('app.json' if app == 'mobile' else 'package.json')).write_text(json.dumps(value, indent=2) + '\n')
@@ -614,7 +633,7 @@ def self_test():
 
         with patch(f'{__name__}.ROOT', root), patch('release.ROOT', root), patch(f'{__name__}.time.sleep'), \
                 patch('subprocess.check_output', side_effect=metadata_cargo_stub):
-            assert RELEASES == ('product', 'www') and PRODUCT_APPS == ('app', 'core', 'cli', 'mobile')
+            assert RELEASES == ('product', 'www') and PRODUCT_APPS == ('app', 'core', 'cli', 'mobile', 'desktop')
             base = git('rev-parse', 'HEAD')
             # Legacy component tags no longer claim a sequence; only real v/www-v tags and the current cohort do.
             plan = plan_versions('20261106', base, ['v0.0.1-nightly.20261106.7', 'core-v0.0.1-nightly.20261106.9',
@@ -622,12 +641,20 @@ def self_test():
             assert plan.versions['core'] == '0.0.1-nightly.20261106.8'
             assert all(plan.versions[app] == plan.versions['cli'] for app in PRODUCT_APPS)
             assert plan.versions['www'] == '0.0.1-nightly.20261106.1'
+            assert plan.ios_build_number == '4'
+            assert next_ios_build_number('3.1.9') == '3.1.10'
+            assert next_ios_build_number('3.01') == '3.2'
+            for invalid in ('', '0', '10000', '9999', '3.99', '3.1.99', '3.100', '3.1.100', '3.1.2.3'):
+                rejected(lambda invalid=invalid: next_ios_build_number(invalid))
             assert plan_versions('20261105', base, []).versions['core'].endswith('.3')
             assert plan_versions('20261106', base, ['v0.0.1-nightly.20261106.9']).versions['cli'].endswith('.10')
             assert plan_versions('20261106', base, ['www-v0.0.1-nightly.20261106.4']).versions['www'].endswith('.5')
             assert plan_versions('20261106', base, ['www-v0.0.1-nightly.20261106.4']).versions['cli'].endswith('.1')
             contents = generated(plan)
-            assert json.loads(contents['apps/mobile/app.json'])['expo']['ios']['buildNumber'] == '99'
+            mobile_generated = json.loads(contents['apps/mobile/app.json'])['expo']
+            assert mobile_generated['ios']['buildNumber'] == '4'
+            assert mobile_generated['ios']['supportsTablet'] is True
+            assert json.loads(contents['apps/desktop/package.json'])['version'] == plan.versions['cli']
             assert contents['Cargo.lock'].count(b'[[package]]') == 2
 
             def commit_files(changes):
@@ -646,10 +673,14 @@ def self_test():
             metadata(root, plan)
             for path, content in (
                 ('apps/app/package.json', contents['apps/app/package.json'].replace(b'"private": true', b'"private": false')),
+                ('apps/desktop/package.json', contents['apps/desktop/package.json'].replace(b'"private": true', b'"private": false')),
                 ('Cargo.lock', contents['Cargo.lock'] + b'\n[[package]]\nname = "unexpected"\nversion = "1.0.0"\n'),
                 ('apps/core/Cargo.toml', contents['apps/core/Cargo.toml'] + b'\n[dependencies]\nserde = "1"\n'),
                 ('apps/cli/Cargo.toml', contents['apps/cli/Cargo.toml'].replace(b'0.0.1-nightly.20261106.8', b'0.0.1-nightly.20261106.9')),
                 ('apps/mobile/app.json', contents['apps/mobile/app.json'].replace(b'250002', b'1')),
+                ('apps/mobile/app.json', contents['apps/mobile/app.json'].replace(b'"buildNumber": "4"', b'"buildNumber": "3"')),
+                ('apps/mobile/app.json', contents['apps/mobile/app.json'].replace(b'"buildNumber": "4"', b'"buildNumber": "5"')),
+                ('apps/mobile/app.json', contents['apps/mobile/app.json'].replace(b'"supportsTablet": true', b'"supportsTablet": false')),
                 ('extra.txt', b'not a version file\n'),
             ):
                 bad = commit_files({path: content})
@@ -667,7 +698,7 @@ def self_test():
             git('add', 'business.txt')
             git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', 'independent main change')
             advanced = git('rev-parse', 'HEAD')
-            landed = DailyPlan(plan.day, advanced, plan.versions, plan.android_code)
+            landed = DailyPlan(plan.day, advanced, plan.versions, plan.android_code, plan.ios_build_number)
             merged = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
                          'commit-tree', expected_tree(landed), '-p', advanced, '-m', 'actual squash fixture')
             assert merged != head
@@ -715,6 +746,7 @@ def self_test():
             assert all(next_day.versions[a] == pv for a in PRODUCT_APPS)
             assert '-nightly.20261107.1' in next_day.versions['www']
             assert next_day.android_code == plan.android_code + 1
+            assert next_day.ios_build_number == '5'
 
             good = dict(id=1, run_attempt=1, head_sha=merged, head_branch='main', event='push', path=CI,
                         repository=dict(full_name=REPO), head_repository=dict(full_name=REPO),

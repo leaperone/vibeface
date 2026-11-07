@@ -270,19 +270,22 @@ impl Host {
 }
 
 pub(crate) fn executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    vibeface_bridge::platform::privatefs::is_executable(path)
 }
 
 /// Whether `program` runs as configured: a path that is an executable file, or a bare name
 /// found on the Node's `PATH`.
 pub fn runnable(program: &Path, path: Option<&OsString>) -> bool {
+    use vibeface_bridge::platform::program;
     if program.components().count() != 1 || program.is_absolute() {
-        return executable_file(program);
+        return program::runnable(program);
     }
     path.is_some_and(|paths| {
-        std::env::split_paths(paths).any(|dir| executable_file(&dir.join(program)))
+        std::env::split_paths(paths).any(|dir| {
+            program::candidates(&dir.join(program))
+                .iter()
+                .any(|candidate| program::runnable(candidate))
+        })
     })
 }
 
@@ -519,7 +522,7 @@ fn bare(program: &Path) -> Option<&str> {
         .flatten()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::providers::Providers;

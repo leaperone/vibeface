@@ -13,6 +13,7 @@ use k256::ecdsa::SigningKey;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use vibeface_bridge::platform::privatefs;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const KEYSTORE_DOMAIN: &[u8] = b"vibeface-delivery-wallet-v1";
@@ -275,28 +276,7 @@ fn authenticated_metadata(address: Address) -> Vec<u8> {
 }
 
 fn read_keystore(path: &Path) -> Result<Keystore> {
-    use std::{
-        io::Read,
-        os::unix::fs::{MetadataExt, OpenOptionsExt},
-    };
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    ensure!(
-        metadata.is_file()
-            && metadata.len() <= MAX_KEYSTORE_BYTES
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0,
-        "delivery wallet must be an owner-only regular file"
-    );
-    let mut bytes = Vec::new();
-    file.take(MAX_KEYSTORE_BYTES + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_KEYSTORE_BYTES,
-        "delivery wallet file exceeds its limit"
-    );
+    let bytes = privatefs::read_private_bounded(path, MAX_KEYSTORE_BYTES, "the delivery wallet")?;
     let store: Keystore = serde_json::from_slice(&bytes)?;
     ensure!(
         store.format == "vibeface-delivery-wallet-v1"
@@ -318,21 +298,7 @@ fn read_keystore(path: &Path) -> Result<Keystore> {
 }
 
 fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::{io::Write, os::unix::fs::OpenOptionsExt};
-    let parent = path
-        .parent()
-        .context("delivery wallet has no parent directory")?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    let result = (|| {
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
+    let result = privatefs::create_durable(path, bytes);
     if result.is_err() {
         let _ = std::fs::remove_file(path);
     }

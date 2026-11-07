@@ -1,4 +1,7 @@
-use crate::failure::{ExecFailure, FailureKind, ProviderStage};
+use crate::{
+    failure::{ExecFailure, FailureKind, ProviderStage},
+    platform,
+};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -8,7 +11,6 @@ use std::{
     hash::{BuildHasher, RandomState},
     io::Write,
     net::IpAddr,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -19,7 +21,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
-    process::{Child, Command},
+    process::Child,
     sync::{Mutex, Notify, Semaphore, oneshot, watch},
     task::JoinHandle,
     time::Instant,
@@ -32,10 +34,13 @@ const MAX_PROMPT_BYTES: usize = 86_016;
 const AGENT_SERVICE: &str = "SdkAgentService";
 const CONTROL_SERVICE: &str = "SdkBridgeControlService";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const STARTUP_DIAGNOSTIC_BYTES: usize = 2_048;
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_METADATA_BYTES: usize = 65_536;
 const MAX_METADATA_MODELS: usize = 512;
+/// Names the job objects the Cursor SDK bridges of this account run in.
+const SDK_TREE_KEY: &str = "cursor-sdk";
 const OWNER_IDLE_RETIRE: Duration = Duration::from_secs(10 * 60);
 const PROVIDER_PROBE_OWNER: &str = "provider-probe";
 
@@ -187,23 +192,16 @@ fn provider_cancel_failure(native_terminal: Option<AgentFailure>) -> AgentFailur
     native_terminal.unwrap_or(AgentFailure::Unknown)
 }
 
-/// Reaps the local process group only; already accepted external work is unaffected.
-pub async fn terminate_process_group(child: &mut Child, group: u32) -> bool {
-    async fn signal(group: u32, signal: &str) -> Option<bool> {
-        Command::new("/bin/kill")
-            .arg(signal)
-            // procps kill parses a bare negative PID as an option; `--` makes it a group.
-            .arg("--")
-            .arg(format!("-{group}"))
-            .output()
-            .await
-            .ok()
-            .map(|output| output.status.success())
-    }
-    let _ = signal(group, "-TERM").await;
+/// Reaps this bridge's own process tree only; already accepted external work is unaffected.
+///
+/// `true` means nothing of the tree is left. A `false` answer keeps the tree recorded so a
+/// later attempt, or the next run of the Node, ends it rather than losing track of it.
+pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree::Tree) -> bool {
+    let token = tree.token().to_owned();
+    tree.stop();
     let reaped = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
     if !matches!(reaped, Ok(Ok(_))) {
-        let _ = signal(group, "-KILL").await;
+        tree.kill();
         if !matches!(
             tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
             Ok(Ok(_))
@@ -212,25 +210,19 @@ pub async fn terminate_process_group(child: &mut Child, group: u32) -> bool {
         }
     }
     for _ in 0..20 {
-        match signal(group, "-0").await {
-            Some(false) => return true,
-            None => return false,
-            Some(true) => {
-                let _ = signal(group, "-KILL").await;
+        // Windows Tree::kill drops its Job handle after terminating it. Query the recorded job
+        // by token so this checks the whole tree, including children of a `.cmd` launcher.
+        match platform::tree::Leftover::find(&token) {
+            Ok(None) => return true,
+            Ok(Some(_)) => {}
+            Err(error) => {
+                tracing::warn!(%error, "could not confirm Cursor SDK process-tree exit");
             }
         }
+        tree.kill();
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     false
-}
-
-fn signal_group_now(group: u32, signal: &str) -> bool {
-    std::process::Command::new("/bin/kill")
-        .args([signal, "--", &format!("-{group}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 /// The Node's resident Cursor SDK bridges. Each stable owner has one process group and store;
@@ -372,10 +364,15 @@ impl Drop for Abandon {
     }
 }
 
-/// Bridge process groups still running, mirrored to the pidfile for `kill_orphan`.
+/// Bridge process trees still running, mirrored to the pidfile for `kill_orphan`.
+///
+/// Each journal line carries the record the platform needs to find the same tree again plus the
+/// program it was started from. The record is what proves a leftover is still this Node's own
+/// bridge, so a process identifier the operating system has since handed to something else is
+/// never acted on.
 struct Processes {
     pidfile: Option<PathBuf>,
-    running: std::sync::Mutex<BTreeMap<u32, Tracked>>,
+    running: std::sync::Mutex<BTreeMap<String, Tracked>>,
 }
 
 struct Tracked {
@@ -385,20 +382,20 @@ struct Tracked {
 }
 
 impl Processes {
-    fn track(&self, group: u32, tracked: Tracked) -> Result<()> {
+    fn track(&self, token: String, tracked: Tracked) -> Result<()> {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
-        running.insert(group, tracked);
+        running.insert(token, tracked);
         self.save(&running)
-            .context("record the Cursor SDK bridge process group")
+            .context("record the Cursor SDK bridge process tree")
     }
 
-    fn forget(&self, group: u32) {
+    fn forget(&self, token: &str) {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
-        running.remove(&group);
+        running.remove(token);
         let _ = self.save(&running);
     }
 
-    fn save(&self, running: &BTreeMap<u32, Tracked>) -> std::io::Result<()> {
+    fn save(&self, running: &BTreeMap<String, Tracked>) -> std::io::Result<()> {
         let Some(pidfile) = &self.pidfile else {
             return Ok(());
         };
@@ -410,15 +407,9 @@ impl Processes {
         }
         let lines: String = running
             .iter()
-            .map(|(group, tracked)| format!("{group} {}\n", tracked.executable.display()))
+            .map(|(token, tracked)| format!("{token} {}\n", tracked.executable.display()))
             .collect();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(pidfile)?
-            .write_all(lines.as_bytes())
+        platform::privatefs::create_or_truncate(pidfile)?.write_all(lines.as_bytes())
     }
 }
 
@@ -583,35 +574,30 @@ impl SdkBridge {
         }
     }
 
-    /// Kills the bridge groups an earlier Node run recorded in `pidfile`, when the group leader
-    /// still runs the recorded program; a reused process id is left alone.
+    /// Ends the bridge trees an earlier Node run recorded in `pidfile`, but only those still
+    /// running the recorded program. A record whose identifier the operating system has since
+    /// handed to something else is left alone.
     pub fn kill_orphan(pidfile: &Path) {
         let Ok(recorded) = std::fs::read_to_string(pidfile) else {
             return;
         };
         for line in recorded.lines() {
-            let Some((group, executable)) = line.split_once(' ') else {
+            // A journal record never contains a space, so the rest of the line is the whole
+            // program path even when a directory in it has one.
+            let Some((token, executable)) = line.split_once(' ') else {
                 continue;
             };
-            let Some(group) = group.parse::<u32>().ok().filter(|group| *group > 1) else {
-                continue;
-            };
-            let command = std::process::Command::new("/bin/ps")
-                .args(["-o", "command=", "-p", &group.to_string()])
-                .output()
-                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-                .unwrap_or_default();
-            if executable.is_empty() || !command.contains(executable) {
+            if executable.is_empty() {
                 continue;
             }
-            if signal_group_now(group, "-TERM") {
-                for _ in 0..30 {
-                    if !signal_group_now(group, "-0") {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                signal_group_now(group, "-KILL");
+            let stopped =
+                platform::tree::stop_recorded(token, |member| member.contains(executable));
+            if let Err(error) = stopped {
+                tracing::debug!(
+                    event = "sdk.leftover_left_alone",
+                    %error,
+                    "a recorded Cursor SDK bridge was not ended"
+                );
             }
         }
         let _ = std::fs::remove_file(pidfile);
@@ -1088,7 +1074,7 @@ impl SdkBridge {
     ) -> Result<Arc<Live>> {
         let bridge_state_root = local_store_root.join("bridge-state");
         prepare_sdk_workspace(workspace, local_store_root, &bridge_state_root).await?;
-        let mut command = Command::new(executable);
+        let mut command = std::process::Command::new(executable);
         command
             .arg("--workspace")
             .arg(workspace)
@@ -1102,9 +1088,7 @@ impl SdkBridge {
             .current_dir(workspace)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
         for (key, _) in std::env::vars_os() {
             let name = key.to_string_lossy();
             if name.starts_with("VIBEFACE_")
@@ -1131,15 +1115,21 @@ impl SdkBridge {
             .env("CURSOR_API_KEY", api_key)
             .env("CURSOR_DATA_DIR", bridge_state_root.join("cursor-data"))
             .env("CURSOR_SDK_CLIENT_LANGUAGE", "rust");
-        let mut child = command.spawn().map_err(|error| {
-            let kind = if error.kind() == std::io::ErrorKind::NotFound {
-                FailureKind::MissingBinary
-            } else {
-                FailureKind::Unknown
-            };
-            ExecFailure::new(kind, format!("could not start cursor-sdk-bridge: {error}"))
-        })?;
+        let (tree, mut child) =
+            platform::tree::Tree::spawn(command, &format!("{SDK_TREE_KEY}-{key:016x}"), true)
+                .map_err(|error| {
+                    let kind = if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        FailureKind::MissingBinary
+                    } else {
+                        FailureKind::Unknown
+                    };
+                    ExecFailure::new(kind, format!("could not start cursor-sdk-bridge: {error}"))
+                })?;
         let group = child.id().context("Cursor SDK process has no group")?;
+        let token = tree.token().to_owned();
         let stdout = child
             .stdout
             .take()
@@ -1149,16 +1139,29 @@ impl SdkBridge {
             .take()
             .context("Cursor SDK stderr unavailable")?;
         let (ready_tx, ready_rx) = oneshot::channel();
+        let startup_diagnostics = Arc::new(std::sync::Mutex::new(String::new()));
+        let startup_secrets = std::iter::once(api_key)
+            .chain(env.values().map(String::as_str))
+            .chain(self.env.values().map(String::as_str))
+            .chain(std::iter::once(self.callback.auth_token.as_str()))
+            .filter(|secret| !secret.is_empty())
+            .map(str::to_owned)
+            .collect();
         let process = SdkProcess {
             child,
-            group: Some(group),
+            tree: Some(tree),
             stdout: tokio::spawn(drain(stdout)),
-            stderr: tokio::spawn(read_discovery(stderr, ready_tx)),
+            stderr: tokio::spawn(read_discovery(
+                stderr,
+                ready_tx,
+                startup_diagnostics.clone(),
+                startup_secrets,
+            )),
         };
         let kill = Arc::new(Notify::new());
         let (exited_tx, exited) = watch::channel(false);
         let tracked = self.processes.track(
-            group,
+            token,
             Tracked {
                 executable: executable.to_owned(),
                 kill: kill.clone(),
@@ -1176,10 +1179,19 @@ impl SdkBridge {
         let mut died = exited.clone();
         let (rpc, agents) = tokio::select! {
             ready = tokio::time::timeout(STARTUP_TIMEOUT, self.connect(ready_rx)) => ready.map_err(|_| {
+                let diagnostics = startup_diagnostics
+                    .lock()
+                    .map(|diagnostics| diagnostics.clone())
+                    .unwrap_or_default();
+                let diagnostics = if diagnostics.is_empty() {
+                    "no stderr output before discovery".to_owned()
+                } else {
+                    format!("stderr before discovery: {diagnostics}")
+                };
                 ExecFailure::new(
                     FailureKind::TimedOut,
                     format!(
-                        "Cursor SDK bridge did not start within {}s; the reply did not start",
+                        "Cursor SDK bridge did not start within {}s; the reply did not start ({diagnostics})",
                         STARTUP_TIMEOUT.as_secs()
                     ),
                 )
@@ -1210,20 +1222,16 @@ impl SdkBridge {
             .await
             .context("Cursor SDK stopped before discovery")??;
         let endpoint = discovery.endpoint()?;
-        let metadata = tokio::fs::symlink_metadata(&discovery.auth_token_file)
-            .await
-            .context("Cursor SDK token file unavailable")?;
-        ensure!(
-            metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && metadata.permissions().mode() & 0o777 == 0o600
-                && metadata.len() <= 4096,
-            "Cursor SDK token file must be a private 0600 file"
-        );
-        let bearer = tokio::fs::read_to_string(&discovery.auth_token_file)
-            .await
-            .map_err(|_| anyhow!("could not read Cursor SDK token file"))?;
-        let bearer = bearer.trim().to_owned();
+        let token_file = discovery.auth_token_file.clone();
+        let bearer = tokio::task::spawn_blocking(move || {
+            platform::privatefs::read_private_bounded(&token_file, 4096, "Cursor SDK token file")
+        })
+        .await?
+        .map_err(|error| anyhow!("could not read Cursor SDK token file: {error:#}"))?;
+        let bearer = String::from_utf8(bearer)
+            .context("Cursor SDK token file must be UTF-8")?
+            .trim()
+            .to_owned();
         ensure!(
             !bearer.is_empty() && bearer.len() <= 4096,
             "invalid Cursor SDK bridge authentication token"
@@ -1279,17 +1287,39 @@ async fn supervise(
     exited: watch::Sender<bool>,
     processes: Arc<Processes>,
 ) {
-    tokio::select! {
-        _ = &mut process.stdout => {}
-        _ = &mut process.stderr => {}
-        _ = process.child.wait() => {}
-        _ = kill.notified() => {}
+    enum JoinedIo {
+        Stdout,
+        Stderr,
+        Neither,
     }
-    if let Some(group) = process.group {
-        if terminate_process_group(&mut process.child, group).await {
-            process.group = None;
-        }
-        processes.forget(group);
+    let joined = tokio::select! {
+        _ = &mut process.stdout => JoinedIo::Stdout,
+        _ = &mut process.stderr => JoinedIo::Stderr,
+        _ = process.child.wait() => JoinedIo::Neither,
+        _ = kill.notified() => JoinedIo::Neither,
+    };
+    let token = process.tree.as_ref().map(|tree| tree.token().to_owned());
+    if let Some(mut tree) = process.tree.take()
+        && !terminate_process_tree(&mut process.child, &mut tree).await
+    {
+        // Something of the tree is left; keeping the handle lets the drop of the process
+        // end it rather than leaving it unowned.
+        process.tree = Some(tree);
+    }
+    // The process exit signal is also the bridge's teardown barrier. Reap the output tasks before
+    // publishing it so their pipe handles, along with the child and job handles below, cannot
+    // outlive SdkBridge::stop and race its owner removing the bridge state directory.
+    process.stdout.abort();
+    process.stderr.abort();
+    if !matches!(joined, JoinedIo::Stdout) {
+        let _ = (&mut process.stdout).await;
+    }
+    if !matches!(joined, JoinedIo::Stderr) {
+        let _ = (&mut process.stderr).await;
+    }
+    drop(process);
+    if let Some(token) = token {
+        processes.forget(&token);
     }
     let _ = exited.send(true);
 }
@@ -1310,15 +1340,17 @@ async fn prepare_sdk_workspace(
         "Cursor SDK workspace must be a real directory"
     );
     for directory in [local_store_root, bridge_state_root] {
-        tokio::fs::create_dir_all(directory)
-            .await
-            .context("create Cursor SDK workspace")?;
-        let metadata = tokio::fs::symlink_metadata(directory).await?;
-        ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "Cursor SDK workspace must be a real directory"
-        );
-        tokio::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).await?;
+        let directory = directory.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let metadata = std::fs::symlink_metadata(&directory).ok();
+            ensure!(
+                metadata
+                    .is_none_or(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink()),
+                "Cursor SDK workspace must be a real directory"
+            );
+            platform::privatefs::create_dir(&directory).context("create Cursor SDK workspace")
+        })
+        .await??;
     }
     Ok(())
 }
@@ -1639,7 +1671,7 @@ impl Discovery {
 
 struct SdkProcess {
     child: Child,
-    group: Option<u32>,
+    tree: Option<platform::tree::Tree>,
     stdout: JoinHandle<Result<()>>,
     stderr: JoinHandle<Result<()>>,
 }
@@ -1647,8 +1679,8 @@ impl Drop for SdkProcess {
     fn drop(&mut self) {
         self.stdout.abort();
         self.stderr.abort();
-        if let Some(group) = self.group.take() {
-            signal_group_now(group, "-KILL");
+        if let Some(mut tree) = self.tree.take() {
+            tree.kill();
         }
     }
 }
@@ -1656,6 +1688,8 @@ impl Drop for SdkProcess {
 async fn read_discovery(
     stderr: impl AsyncRead + Unpin,
     ready: oneshot::Sender<Result<Discovery>>,
+    diagnostics: Arc<std::sync::Mutex<String>>,
+    secrets: Vec<String>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stderr);
     loop {
@@ -1668,6 +1702,22 @@ async fn read_discovery(
                 .map_err(|_| anyhow!("Cursor SDK emitted invalid discovery JSON"));
             let _ = ready.send(discovery);
             return forward(reader).await;
+        }
+        let line = String::from_utf8_lossy(&line);
+        let secret_refs = secrets.iter().map(String::as_str).collect::<Vec<_>>();
+        let line = redact_text(line.into_owned(), &secret_refs);
+        if let Ok(mut diagnostics) = diagnostics.lock() {
+            let available = STARTUP_DIAGNOSTIC_BYTES.saturating_sub(diagnostics.len());
+            if available > 0 {
+                let line = format!("{}\n", line.trim_end());
+                let end = line
+                    .char_indices()
+                    .map(|(index, character)| index + character.len_utf8())
+                    .take_while(|end| *end <= available)
+                    .last()
+                    .unwrap_or(0);
+                diagnostics.push_str(&line[..end]);
+            }
         }
     }
 }

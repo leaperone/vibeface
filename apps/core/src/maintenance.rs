@@ -8,14 +8,19 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
     sync::Notify,
+};
+use vibeface_bridge::platform::{
+    ipc::{Endpoint, Listener, Stream},
+    privatefs,
 };
 use zeroize::Zeroizing;
 
 const PROTOCOL: u32 = 1;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_NAME: &str = "maintenance.sock";
+/// Names the maintenance endpoint in the message a person reads.
+const LABEL: &str = "the maintenance socket";
 
 #[derive(Debug)]
 pub struct Busy(pub String);
@@ -103,10 +108,7 @@ impl Gate {
         })
     }
     fn commit(&self, pending: &Path) -> Result<()> {
-        self.commit_with_sync(pending, |parent| {
-            std::fs::File::open(parent)?.sync_all()?;
-            Ok(())
-        })
+        self.commit_with_sync(pending, privatefs::sync_dir)
     }
     fn commit_with_sync(
         &self,
@@ -198,7 +200,7 @@ pub struct PeerHealth {
 #[must_use]
 pub struct Lease {
     pub health: Health,
-    _stream: UnixStream,
+    _stream: Stream,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -251,11 +253,11 @@ struct Response {
     join: Option<crate::client::NodeJoin>,
 }
 
-async fn read_packet<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result<T> {
+async fn read_packet<T: for<'de> Deserialize<'de>>(stream: &mut Stream) -> Result<T> {
     read_packet_timeout(stream, REQUEST_TIMEOUT).await
 }
 async fn read_packet_timeout<T: for<'de> Deserialize<'de>>(
-    stream: &mut UnixStream,
+    stream: &mut Stream,
     timeout: Duration,
 ) -> Result<T> {
     tokio::time::timeout(timeout, async {
@@ -279,7 +281,7 @@ async fn read_packet_timeout<T: for<'de> Deserialize<'de>>(
     .await
     .context("maintenance socket timed out")?
 }
-async fn write_packet<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
+async fn write_packet<T: Serialize>(stream: &mut Stream, value: &T) -> Result<()> {
     let mut bytes = Zeroizing::new(serde_json::to_vec(value)?);
     bytes.push(b'\n');
     tokio::time::timeout(REQUEST_TIMEOUT, stream.write_all(&bytes))
@@ -287,27 +289,37 @@ async fn write_packet<T: Serialize>(stream: &mut UnixStream, value: &T) -> Resul
         .context("maintenance socket timed out")??;
     Ok(())
 }
-pub fn socket_path(data_dir: &Path) -> Result<PathBuf> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+/// The maintenance endpoint of the Node whose data directory this is.
+fn endpoint(data_dir: &Path) -> Result<Endpoint> {
     let device_id = crate::config::identity(data_dir)?.device_id()?;
-    let socket_dir = PathBuf::from("/tmp").join(format!("vibeface-{}", &device_id[..32]));
-    match std::fs::create_dir(&socket_dir) {
+    let socket_dir = vibeface_bridge::platform::ipc::runtime_dir(&device_id[..32])?;
+    match privatefs::create_dir(&socket_dir) {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) => {}
+        Err(error) => return Err(error),
     }
     let metadata = std::fs::symlink_metadata(&socket_dir)?;
     ensure!(
-        metadata.is_dir()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == std::fs::metadata(data_dir)?.uid(),
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "the private maintenance socket directory must not be a link"
+    );
+    ensure!(
+        privatefs::same_owner(&socket_dir, data_dir)?,
         "private maintenance socket directory has unexpected ownership"
     );
-    std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))?;
-    Ok(socket_dir.join(SOCKET_NAME))
+    privatefs::restrict_dir(&socket_dir)?;
+    Endpoint::in_private_dir(&socket_dir, SOCKET_NAME)
 }
 
-async fn request(data_dir: &Path, command: Command) -> Result<(UnixStream, Response)> {
+/// Where the CLI reaches this Node's maintenance endpoint, as a person sees it.
+pub fn socket_path(data_dir: &Path) -> Result<PathBuf> {
+    Ok(endpoint(data_dir)?.path().to_owned())
+}
+
+async fn request(data_dir: &Path, command: Command) -> Result<(Stream, Response)> {
     let response_timeout = if matches!(&command, Command::DeliveryKeyOperation { .. }) {
         Duration::from_secs(
             crate::delivery::proof::INFO_TIMEOUT_SECS
@@ -318,10 +330,12 @@ async fn request(data_dir: &Path, command: Command) -> Result<(UnixStream, Respo
     } else {
         REQUEST_TIMEOUT
     };
-    let mut stream =
-        tokio::time::timeout(REQUEST_TIMEOUT, UnixStream::connect(socket_path(data_dir)?))
-            .await
-            .context("maintenance connection timed out")??;
+    let endpoint = endpoint(data_dir)?;
+    endpoint.ensure_private(LABEL)?;
+    let mut stream = tokio::time::timeout(REQUEST_TIMEOUT, Stream::connect(&endpoint))
+        .await
+        .context("maintenance connection timed out")??;
+    stream.require_current_account(LABEL)?;
     write_packet(
         &mut stream,
         &Request {
@@ -451,37 +465,23 @@ pub async fn delivery_key_operation(
 }
 
 pub async fn serve(runtime: Arc<Runtime>, data_dir: PathBuf) -> Result<()> {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    let socket = socket_path(&data_dir)?;
-    if let Ok(metadata) = std::fs::symlink_metadata(&socket) {
-        ensure!(
-            metadata.file_type().is_socket(),
-            "maintenance socket path is occupied by another file"
-        );
-        ensure!(
-            UnixStream::connect(&socket).await.is_err(),
-            "maintenance socket is already active"
-        );
-        std::fs::remove_file(&socket)?;
-    }
-    let listener = UnixListener::bind(&socket)?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    let mut listener = Listener::claim(&endpoint(&data_dir)?).await?;
     loop {
-        let (stream, _) = listener.accept().await?;
-        let runtime = runtime.clone();
+        let stream = listener.accept().await?;
+        let node = runtime.clone();
         let pending = data_dir.join("update-pending.json");
-        tokio::spawn(async move {
-            if let Err(error) = connection(runtime, pending, stream).await {
+        runtime.spawn_background(async move {
+            if let Err(error) = connection(node, pending, stream).await {
                 tracing::debug!(%error, "maintenance connection ended");
             }
-        });
+        })?;
     }
 }
-async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: UnixStream) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
+async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream) -> Result<()> {
+    stream.require_current_account(LABEL)?;
     ensure!(
-        stream.peer_cred()?.uid() == std::fs::metadata(&runtime.data_dir)?.uid(),
-        "maintenance socket requires its local owner"
+        privatefs::owner_of(&runtime.data_dir)? == privatefs::current_account()?,
+        "the maintenance socket requires the owner of the data directory"
     );
     let request: Request = read_packet(&mut stream).await?;
     ensure!(
@@ -645,6 +645,58 @@ mod tests {
     };
     use anyhow::bail;
 
+    #[tokio::test]
+    async fn shutdown_releases_a_maintenance_connection_with_its_client_still_open() -> Result<()> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("maintenance-shutdown-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let dir = dir.canonicalize()?;
+        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
+        let mut config = Config::local("127.0.0.1:4790".parse()?, vec![dir.clone()], false);
+        config.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
+        config.save(&dir)?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let retired = Arc::downgrade(&node);
+        let server = tokio::spawn(serve(node.clone(), dir.clone()));
+        let lease = async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while probe(&dir).await.is_err() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            acquire(&dir).await
+        }
+        .await;
+        server.abort();
+        let _ = server.await;
+        node.shutdown().await;
+        node.shutdown().await;
+        drop(node);
+        assert!(
+            retired.upgrade().is_none(),
+            "shutdown releases the server even while the maintenance client is open"
+        );
+        let result = lease.map(drop);
+        let device = config::identity(&dir)?.device_id()?;
+        remove_dir_if_exists(&vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?)?;
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    fn remove_dir_if_exists(path: &Path) -> Result<()> {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     #[test]
     fn device_id_health_uses_only_the_current_field() -> Result<()> {
         let wire = r#"{"device_id":"device","version":"version","web_enabled":true}"#;
@@ -712,14 +764,17 @@ mod tests {
         let node = Arc::new(Runtime::open(&dir).await?);
         let server = tokio::spawn(serve(node.clone(), dir.clone()));
         let result = async {
-            for _ in 0..100 {
-                if socket_path(&dir)?.exists() {
-                    break;
+            let health = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Ok(health) = probe(&dir).await {
+                        break health;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::task::yield_now().await;
-            }
+            })
+            .await
+            .context("the maintenance listener did not become ready")?;
             assert!(node.maintenance.enter().is_err());
-            let health = probe(&dir).await?;
             assert_eq!(health.device_id, node.identity.device_id()?);
             assert_eq!(health.version, env!("CARGO_PKG_VERSION"));
             for enabled in [false, true] {
@@ -791,11 +846,17 @@ mod tests {
         .await;
         server.abort();
         let _ = server.await;
+        node.shutdown().await;
         drop(node);
-        let socket = socket_path(&dir)?;
-        std::fs::remove_file(&socket)?;
-        std::fs::remove_dir_all(socket.parent().unwrap())?;
-        std::fs::remove_dir_all(&dir)?;
+        assert!(
+            !endpoint(&dir)?.is_held(),
+            "the stopped listener releases its endpoint"
+        );
+        let device = crate::config::identity(&dir)?.device_id()?;
+        remove_dir_if_exists(&vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?)
+            .with_context(|| format!("remove maintenance IPC directory for {device}"))?;
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("remove maintenance fixture directory {}", dir.display()))?;
         result
     }
 
@@ -844,12 +905,16 @@ mod tests {
             }
         };
         let result = async {
-            for _ in 0..100 {
-                if socket_path(&dir)?.exists() {
-                    break;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if probe(&dir).await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::task::yield_now().await;
-            }
+            })
+            .await
+            .context("the maintenance listener did not become ready")?;
             let first = link(7)?;
             assert_eq!(join(&dir, &first, "工作室 Mac").await?, NodeJoin::Waiting);
             committed().await;
@@ -888,11 +953,18 @@ mod tests {
         .await;
         server.abort();
         let _ = server.await;
+        let retired = Arc::downgrade(&node);
+        node.shutdown().await;
         drop(node);
-        let socket = socket_path(&dir)?;
-        let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
-        std::fs::remove_dir_all(&dir)?;
+        let device = crate::config::identity(&dir)?.device_id()?;
+        assert!(
+            retired.upgrade().is_none(),
+            "shutdown releases the pending local join task"
+        );
+        remove_dir_if_exists(&vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?)
+            .with_context(|| format!("remove maintenance IPC directory for {device}"))?;
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("remove maintenance fixture directory {}", dir.display()))?;
         result
     }
 }

@@ -1,42 +1,25 @@
 use super::{Host, LocalSourceError};
 use anyhow::Result;
 use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
-use tokio::{io::AsyncReadExt, process::Command};
+use tokio::io::AsyncReadExt;
+use vibeface_bridge::platform::tree;
 
 const OUTPUT_LIMIT: usize = 320 * 1024;
 const READ_LIMIT: Duration = Duration::from_secs(5);
+/// Names a login shell's process tree in this account's job object namespace.
+const SHELL_TREE_KEY: &str = "login-shell";
 
 pub(super) struct Shell {
     pub path: PathBuf,
     pub user: String,
 }
 
+#[cfg(unix)]
 fn registered_login_shell() -> Result<Option<Shell>> {
-    use std::{ffi::CStr, os::unix::ffi::OsStrExt};
-    let mut buffer = vec![0u8; 16 * 1024];
-    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut found = std::ptr::null_mut();
-    let status = unsafe {
-        libc::getpwuid_r(
-            libc::geteuid(),
-            &mut entry,
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            &mut found,
-        )
-    };
-    if status != 0 || found.is_null() {
-        return Err(LocalSourceError.into());
-    }
-    let path = unsafe { CStr::from_ptr(entry.pw_shell) }.to_bytes();
-    if path.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(Shell {
-        path: std::ffi::OsStr::from_bytes(path).into(),
-        user: unsafe { CStr::from_ptr(entry.pw_name) }
-            .to_string_lossy()
-            .into_owned(),
+    let shell = vibeface_bridge::platform::account::login_shell().map_err(|_| LocalSourceError)?;
+    Ok(shell.map(|shell| Shell {
+        path: shell.path,
+        user: shell.user,
     }))
 }
 
@@ -54,11 +37,26 @@ pub(super) async fn missing(names: &[String], host: &Host) -> Result<BTreeMap<St
             }
         }
     }
-    let shell = if !cfg!(test) && names.iter().any(|name| !inherited.contains_key(name)) {
+    let absent = || names.iter().any(|name| !inherited.contains_key(name));
+    // Windows keeps this account's variables in the registry, where the value a person set
+    // after the Node started is readable without running anything; a Unix login shell only
+    // reveals one by running its startup scripts.
+    #[cfg(windows)]
+    if !cfg!(test) && absent() {
+        let stored = vibeface_bridge::platform::account::stored(names)
+            .map_err(|_| anyhow::Error::from(LocalSourceError))?;
+        for (name, value) in stored {
+            inherited.entry(name).or_insert(value);
+        }
+    }
+    #[cfg(unix)]
+    let shell = if !cfg!(test) && absent() {
         registered_login_shell()?
     } else {
         None
     };
+    #[cfg(windows)]
+    let shell = None;
     missing_from(names, host, &inherited, shell.as_ref(), READ_LIMIT).await
 }
 
@@ -93,15 +91,13 @@ pub(super) async fn missing_from(
 
 struct ShellChild {
     child: tokio::process::Child,
-    group: i32,
+    tree: tree::Tree,
 }
 
 impl Drop for ShellChild {
     fn drop(&mut self) {
         // Startup scripts may leave helpers behind, including after a successful read.
-        unsafe {
-            libc::kill(-self.group, libc::SIGKILL);
-        }
+        self.tree.kill();
     }
 }
 
@@ -128,7 +124,8 @@ async fn read_shell(
         script.push_str(&format!("printf '%s\\0%s\\0' '{name}' \"${{{name}-}}\";\n"));
     }
     script.push_str(&format!("printf '%s\\0' '{marker}:end'"));
-    let child = Command::new(&shell.path)
+    let mut command = std::process::Command::new(&shell.path);
+    command
         .args(["-ilc", &script])
         .env_clear()
         .env("HOME", home)
@@ -145,17 +142,10 @@ async fn read_shell(
         .current_dir(home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| LocalSourceError)?;
-    let group = child
-        .id()
-        .and_then(|id| i32::try_from(id).ok())
-        .filter(|id| *id > 1)
-        .ok_or(LocalSourceError)?;
-    let mut process = ShellChild { child, group };
+        .stderr(Stdio::null());
+    let (tree, child) =
+        tree::Tree::spawn(command, SHELL_TREE_KEY, true).map_err(|_| LocalSourceError)?;
+    let mut process = ShellChild { child, tree };
     let stdout = process.child.stdout.take().ok_or(LocalSourceError)?;
     let mut bytes = Vec::new();
     let result = tokio::time::timeout(limit, async {
@@ -179,9 +169,7 @@ async fn read_shell(
     .await
     .map_err(|_| anyhow::Error::from(LocalSourceError))
     .and_then(|result| result);
-    unsafe {
-        libc::kill(-process.group, libc::SIGKILL);
-    }
+    process.tree.kill();
     let _ = tokio::time::timeout(Duration::from_millis(250), process.child.wait()).await;
     result
 }

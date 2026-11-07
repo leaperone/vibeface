@@ -13,6 +13,47 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+def startup_phase(name):
+    print("fake-cursor-sdk-bridge phase " + name, file=sys.stderr, flush=True)
+
+
+startup_phase("python-started")
+
+
+def append_observation(path, value):
+    """One record is one kernel append, including concurrent Windows fixture processes."""
+    if not path:
+        return
+    data = (value + "\n").encode("utf-8")
+    if os.name != "nt":
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            if os.write(descriptor, data) != len(data):
+                raise OSError("incomplete observation append")
+        finally:
+            os.close(descriptor)
+        return
+    import ctypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+    kernel.CreateFileW.restype = ctypes.c_void_p
+    kernel.WriteFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p]
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    # FILE_APPEND_DATA without FILE_WRITE_DATA makes the kernel select the end atomically.
+    handle = kernel.CreateFileW(path, 0x0004, 0x0007, None, 4, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        written = ctypes.c_ulong()
+        buffer = ctypes.create_string_buffer(data)
+        if not kernel.WriteFile(handle, buffer, len(data), ctypes.byref(written), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if written.value != len(data):
+            raise OSError("incomplete observation append")
+    finally:
+        kernel.CloseHandle(handle)
+
+
 def argument(name):
     return sys.argv[sys.argv.index(name) + 1]
 
@@ -22,15 +63,34 @@ if not os.environ.get("CURSOR_API_KEY") or os.environ.get("CURSOR_SDK_CLIENT_LAN
 local_store = json.loads(argument("--local-store"))
 if local_store.get("type") != "jsonl" or not os.path.isabs(local_store.get("rootDir", "")):
     sys.exit(4)
+startup_phase("arguments-validated")
 token = uuid.uuid4().hex
 token_file = os.path.join(argument("--state-root"), "fake-bridge-token")
 descriptor = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 os.write(descriptor, token.encode())
 os.close(descriptor)
 os.chmod(token_file, 0o600)
-if os.environ.get("FAKE_BRIDGE_LOG"):
-    with open(os.environ["FAKE_BRIDGE_LOG"], "a") as log:
-        log.write(f"{os.getpid()}\n")
+startup_phase("token-created")
+if os.name == "nt":
+    startup_phase("windows-acl-start")
+    import base64
+    import subprocess
+    acl_script = """
+$ErrorActionPreference = 'Stop'
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = New-Object System.Security.AccessControl.FileSecurity
+$acl.SetAccessRuleProtection($true, $false)
+$acl.SetOwner($sid)
+$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')
+$acl.SetAccessRule($rule)
+Set-Acl -LiteralPath $env:VIBEFACE_FAKE_TOKEN_FILE -AclObject $acl
+"""
+    subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                    base64.b64encode(acl_script.encode("utf-16le")).decode("ascii")],
+                   env={**os.environ, "VIBEFACE_FAKE_TOKEN_FILE": token_file},
+                   check=True, stdout=subprocess.DEVNULL)
+    startup_phase("windows-acl-complete")
+append_observation(os.environ.get("FAKE_BRIDGE_LOG"), str(os.getpid()))
 runs = {}
 store_log = os.environ.get("FAKE_BRIDGE_STORE_LOG")
 send_log = os.environ.get("FAKE_BRIDGE_SEND_LOG")
@@ -45,16 +105,14 @@ def record_store(body):
         return
     local = body.get("options", {}).get("local", {})
     store = local.get("store")
-    with open(store_log, "a") as log:
-        log.write(json.dumps(store, sort_keys=True) + "\n")
+    append_observation(store_log, json.dumps(store, sort_keys=True))
 
 
 def record_send(agent, text):
     if not send_log:
         return
-    with open(send_log, "a") as log:
-        log.write(json.dumps({"pid": os.getpid(), "agent": agent, "text": text,
-                              "callback": callback_token}) + "\n")
+    append_observation(send_log, json.dumps({"pid": os.getpid(), "agent": agent, "text": text,
+                                             "callback": callback_token}))
 
 
 def agent_file(agent):
@@ -105,8 +163,7 @@ class Bridge(BaseHTTPRequestHandler):
             return self.answer(401, b"{}")
         method = self.path.rsplit("/", 1)[-1]
         if request_log:
-            with open(request_log, "a") as log:
-                log.write(method + "\n")
+            append_observation(request_log, method)
         if method in ("Me", "ListModels"):
             if self.path != "/sdk.v1.SdkCursorService/" + method or json.loads(request or b"{}") != {}:
                 return self.answer(400, b'{"message":"metadata request must be empty"}')
@@ -234,6 +291,7 @@ class Bridge(BaseHTTPRequestHandler):
 
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
+startup_phase("server-bound")
 server.daemon_threads = True
 time.sleep(int(os.environ.get("FAKE_BRIDGE_STARTUP_MS", "0")) / 1000)
 if os.environ.get("FAKE_BRIDGE_EXIT_BEFORE_READY"):

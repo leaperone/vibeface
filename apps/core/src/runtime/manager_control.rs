@@ -553,7 +553,10 @@ impl Runtime {
             .is_some_and(|turn| !turn.server.is_empty())
         {
             ensure!(
-                !check.process_groups.iter().any(|group| group_alive(*group)),
+                !check
+                    .process_groups
+                    .iter()
+                    .any(|root| vibeface_bridge::platform::tree::root_is_running(*root)),
                 "仍有协调进程在运行，请先停止它再确认。"
             );
         }
@@ -726,17 +729,7 @@ impl Runtime {
     }
 }
 
-/// Signal 0 only asks whether the recorded group still exists; it never signals the processes.
-pub(super) fn group_alive(group: u32) -> bool {
-    let Ok(group) = libc::pid_t::try_from(group) else {
-        return false;
-    };
-    // SAFETY: kill with signal 0 performs only the existence and permission check.
-    let result = unsafe { libc::kill(-group, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) mod tests {
     use super::*;
 

@@ -1529,11 +1529,10 @@ mod tests {
             );
         }
         env.save(&dir)?;
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(dir.join(ENV_FILE))?.permissions().mode() & 0o777,
-            0o600
-        );
+        vibeface_bridge::platform::privatefs::ensure_private(
+            &dir.join(ENV_FILE),
+            "the saved provider environment",
+        )?;
         let loaded = ProviderEnv::load(&dir)?;
         assert!(!loaded.get(Provider::Cursor).contains_key("CPA_API_KEY"));
         assert!(!loaded.get(Provider::Codex).contains_key("CURSOR_API_KEY"));
@@ -1622,6 +1621,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn selected_codex_wrapper_launches_with_its_sibling_node() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
@@ -1701,6 +1701,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_codex_config_projects_selected_metadata_and_never_overwrites() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;

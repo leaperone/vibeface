@@ -11,6 +11,10 @@ on:
       APPLE_API_KEY_P8_BASE64: {required: false}
       APPLE_API_KEY_ID: {required: false}
       APPLE_API_ISSUER_ID: {required: false}
+      WINDOWS_CERTIFICATE_PFX_BASE64: {required: false}
+      WINDOWS_CERTIFICATE_PASSWORD: {required: false}
+      WINDOWS_CERTIFICATE_SUBJECT: {required: false}
+      WINDOWS_CERTIFICATE_THUMBPRINT: {required: false}
     outputs:
       artifact_id:
         value: ${{ jobs.build.outputs.artifact_id }}
@@ -19,6 +23,8 @@ permissions:
 jobs:
   build:
     runs-on: ${{ inputs.runner }}
+    defaults:
+      run: {shell: bash}
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -26,6 +32,12 @@ jobs:
         with: {ref: '${{ inputs.source_sha }}', persist-credentials: false}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ${{ runner.os == 'Windows' && 'windows-static-crt' || '' }}
+      - name: Select this platform's Python
+        run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/msvc-environment
+        if: runner.os == 'Windows'
       - name: Build both native programs
         env:
           TARGET: ${{ inputs.target }}
@@ -33,9 +45,13 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(rustc -vV | sed -n 's/^host: //p')" = "$TARGET"
-          CARGO_ENCODED_RUSTFLAGS="$(python3 scripts/release-rustflags.py)"
+          CARGO_ENCODED_RUSTFLAGS="$("$PY" -B scripts/release-rustflags.py)"
+          if [[ "$TARGET" == *-windows-msvc ]]; then CARGO_ENCODED_RUSTFLAGS+=$'\x1f-C\x1ftarget-feature=+crt-static'; fi
           export CARGO_ENCODED_RUSTFLAGS
           cargo build --release --locked -p vibeface -p vibeface-core --target "$TARGET"
+          if [[ "$TARGET" == *-windows-msvc ]]; then
+            "$PY" -B scripts/verify-windows-imports.py "target/$TARGET/release/vibeface.exe" "target/$TARGET/release/vibeface-core.exe"
+          fi
       - name: Sign and notarize both macOS programs
         if: runner.os == 'macOS'
         env:
@@ -46,10 +62,27 @@ jobs:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
         run: bash scripts/sign-release.sh product "target/$TARGET/release"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        if: runner.os == 'Windows'
+        with: {node-version: '24'}
+      - name: Sign and verify Windows programs before sealing
+        if: runner.os == 'Windows'
+        env:
+          TARGET: ${{ inputs.target }}
+          WIN_CSC_LINK: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          VIBEFACE_WINDOWS_EXPECTED_SUBJECT: ${{ secrets.WINDOWS_CERTIFICATE_SUBJECT }}
+          VIBEFACE_WINDOWS_EXPECTED_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+        run: |
+          if [[ -n "$WIN_CSC_LINK" ]]; then
+            node scripts/windows-signing.mjs sign "$PWD/target/$TARGET/release/vibeface.exe" "$PWD/target/$TARGET/release/vibeface-core.exe"
+          else
+            echo 'Windows native programs are an unsigned development preview'
+          fi
       - name: Bind native inputs to the source
         env:
           TARGET: ${{ inputs.target }}
-        run: python3 -B scripts/release.py stage-native --target "$TARGET" --input "target/$TARGET/release" --output .artifacts/native-input
+        run: '"$PY" -B scripts/release.py stage-native --target "$TARGET" --input "target/$TARGET/release" --output .artifacts/native-input'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         id: upload
         with:
