@@ -1412,8 +1412,36 @@ mod tests {
                 )
                 .await
             });
-            let observed = tokio::time::timeout(Duration::from_secs(5), started.notified()).await;
+            let observed = tokio::select! {
+                observed = tokio::time::timeout(Duration::from_secs(5), started.notified()) => observed,
+                result = &mut task => {
+                    match result {
+                        Ok(Ok(_)) => bail!("Cursor work completed before its native start callback"),
+                        Ok(Err(error)) => return Err(error).context("Cursor work ended before its native start callback"),
+                        Err(error) => return Err(error).context("Cursor work task ended before its native start callback"),
+                    }
+                }
+            };
             let pending = !task.is_finished();
+            if observed.is_err() {
+                let fake_send_seen = std::fs::read_to_string(dir.join("sends.log"))
+                    .is_ok_and(|log| log.lines().any(|line| line.contains("\"text\": \"hang\"")));
+                let session_saved = persisted.lock().unwrap().is_some();
+                let durable_run_recorded = node
+                    .store
+                    .lock()
+                    .await
+                    .manager_turn_record(&attempt)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.turn.is_some());
+                cancel.send(true)?;
+                let ended = task.await;
+                bail!(
+                    "native Cursor start callback deadline elapsed (fake Send seen: {fake_send_seen}; SDK session saved: {session_saved}; durable run recorded: {durable_run_recorded}; worker ended: {})",
+                    ended.is_ok()
+                );
+            }
             let captured = async {
                 let store = node.store.lock().await;
                 let early = store
