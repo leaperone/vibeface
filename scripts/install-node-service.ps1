@@ -204,8 +204,13 @@ function Start-Task {
 
 function Remove-Task {
     param([string] $Name)
-    Invoke-Scheduler @('/End', '/TN', $Name) | Out-Null
-    Invoke-Scheduler @('/Delete', '/TN', $Name, '/F') | Out-Null
+    if ($null -eq (Get-RegisteredTask -Name $Name)) { return }
+    Stop-Task -Name $Name
+    $result = Invoke-Scheduler @('/Delete', '/TN', $Name, '/F')
+    if ($result.Code -ne 0) { Fail "could not remove $Name`n$($result.Output)" }
+    if ($null -ne (Get-RegisteredTask -Name $Name)) {
+        Fail "task $Name is still registered after removal."
+    }
 }
 
 # A private log this account alone can read, for the updater's own output.

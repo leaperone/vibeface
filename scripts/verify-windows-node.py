@@ -12,8 +12,10 @@ import argparse
 import base64
 import ctypes
 import json
+import ntpath
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -23,6 +25,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 DATA_EPOCH = 1
@@ -575,6 +578,50 @@ class Node:
             raise StatusCommandFailure(result, self, diagnose_runtime=diagnose_runtime)
         return status
 
+    def core_process_identities(self):
+        """Read identities for this fixture's Core processes without logging raw process data."""
+        script = r"""
+$ErrorActionPreference = 'Stop'
+$image = [System.IO.Path]::GetFullPath($env:VIBEFACE_EXPECTED_CORE_IMAGE)
+$data = $env:VIBEFACE_EXPECTED_NODE_DATA
+$coreProcesses = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='vibeface-core.exe'" |
+    Where-Object {
+        $_.ExecutablePath -and
+        [String]::Equals([System.IO.Path]::GetFullPath($_.ExecutablePath), $image,
+            [StringComparison]::OrdinalIgnoreCase) -and
+        $_.CommandLine -and
+        $_.CommandLine.IndexOf($data, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    })
+Write-Output "count=$($coreProcesses.Count)"
+foreach ($process in $coreProcesses) {
+    Write-Output "identity=$([string]$process.ProcessId)|$([string]$process.CreationDate)"
+}
+"""
+        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        environment = {
+            **self.environment(),
+            "VIBEFACE_EXPECTED_CORE_IMAGE": str(self.core),
+            "VIBEFACE_EXPECTED_NODE_DATA": str(self.directory),
+        }
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                capture_output=True, timeout=15, env=environment,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        lines = result.stdout.decode("utf-8-sig", errors="replace").splitlines()
+        count_line = next((line for line in lines if line.startswith("count=")), None)
+        identities = tuple(line.removeprefix("identity=") for line in lines
+                           if line.startswith("identity="))
+        try:
+            count = int(count_line.split("=", 1)[1]) if count_line else -1
+        except ValueError:
+            return None
+        return identities if count == len(identities) else None
+
     def ask_to_stop(self):
         require(self.process is not None, "the node is running before it is asked to stop")
         pid = self.process.pid
@@ -668,6 +715,83 @@ def check_provider_tree_is_cleared(node):
     return pids
 
 
+def service_task_xml_encoding(data):
+    if data.startswith(b"\xff\xfe"):
+        return "utf-16-le-bom"
+    if data.startswith(b"\xfe\xff"):
+        return "utf-16-be-bom"
+    if data.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-bom"
+    if data.startswith(b"<\x00?\x00"):
+        return "utf-16-le"
+    if data.startswith(b"\x00<\x00?"):
+        return "utf-16-be"
+    declaration = data[:160].decode("ascii", errors="ignore").lower()
+    match = re.search(r"encoding=['\"]([^'\"]+)", declaration)
+    return match.group(1).lower() if match else "no-bom"
+
+
+def service_task_action_matches(data, binary, data_dir):
+    """Check the generated Exec action while returning only sanitized match facts."""
+    summary = {
+        "encoding": service_task_xml_encoding(data),
+        "xml_parse": False,
+        "action_count": 0,
+        "exec_action_count": 0,
+        "command_matches": False,
+        "arguments_match": False,
+        "working_directory_matches": False,
+    }
+    try:
+        document = ET.fromstring(data)
+    except (ET.ParseError, ValueError):
+        return summary
+    summary["xml_parse"] = True
+    namespace = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
+    action_container = document.find(f".//{namespace}Actions")
+    summary["action_count"] = len(action_container) if action_container is not None else 0
+    actions = document.findall(f".//{namespace}Actions/{namespace}Exec")
+    summary["exec_action_count"] = len(actions)
+    if summary["action_count"] != 1 or len(actions) != 1:
+        return summary
+    action = actions[0]
+    command = action.findtext(f"{namespace}Command") or ""
+    arguments = action.findtext(f"{namespace}Arguments") or ""
+    working_directory = action.findtext(f"{namespace}WorkingDirectory") or ""
+
+    def canonical(path):
+        if not path:
+            return None
+        try:
+            if os.name == "nt":
+                return ntpath.normcase(str(Path(path).resolve(strict=True)))
+            return ntpath.normcase(ntpath.normpath(path))
+        except (OSError, RuntimeError):
+            return None
+
+    def same_existing_path(actual, expected):
+        actual_path = canonical(actual)
+        expected_path = canonical(expected)
+        return actual_path is not None and actual_path == expected_path
+
+    try:
+        tokens = shlex.split(arguments, posix=False)
+    except ValueError:
+        tokens = []
+    data_argument = tokens[2].strip('"') if len(tokens) == 3 else ""
+    summary["command_matches"] = same_existing_path(command, str(binary))
+    summary["arguments_match"] = (
+        len(tokens) == 3
+        and tokens[0] == "serve"
+        and tokens[1] == "--data-dir"
+        and same_existing_path(data_argument, str(data_dir))
+    )
+    summary["working_directory_matches"] = (
+        same_existing_path(working_directory, ntpath.dirname(str(binary)))
+    )
+    return summary
+
+
 def check_service_scripts(package, node, skip_service):
     shell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
     require(shell.is_file(), "Windows PowerShell is available")
@@ -690,45 +814,102 @@ def check_service_scripts(package, node, skip_service):
 
     task_probe = r"""
 $ErrorActionPreference = 'Stop'
+function Read-TaskState($scheduler, [string] $name) {
+    try {
+        $null = $scheduler.GetFolder('\').GetTask($name)
+        return 'present'
+    } catch {
+        $failure = $_.Exception
+        while ($failure.InnerException) { $failure = $failure.InnerException }
+        if ($failure.HResult -eq -2147024894 -or $failure.HResult -eq -2147024893) {
+            return 'absent'
+        }
+        throw
+    }
+}
 try {
     $scheduler = New-Object -ComObject 'Schedule.Service'
     $scheduler.Connect()
-    $task = $scheduler.GetFolder('\').GetTask('\Vibeface\Node')
-    if (-not $task) { throw 'Task Scheduler returned no task object' }
-    'present'
+    $node = Read-TaskState $scheduler '\Vibeface\Node'
+    $updater = Read-TaskState $scheduler '\Vibeface\Update'
+    @{node=$node;updater=$updater} | ConvertTo-Json -Compress
 } catch {
     $failure = $_.Exception
     while ($failure.InnerException) { $failure = $failure.InnerException }
-    if ($failure.HResult -eq -2147024894 -or $failure.HResult -eq -2147024893) {
-        'absent'
-        exit 0
-    }
-    [Console]::Error.WriteLine("Could not safely inspect the existing task (HRESULT $($failure.HResult)).")
+    [Console]::Error.WriteLine("Could not safely inspect service task state (HRESULT $($failure.HResult)).")
     exit 1
 }
 """
     task_probe_encoded = base64.b64encode(task_probe.encode("utf-16le")).decode("ascii")
-    task_state = run([shell, "-NoProfile", "-NonInteractive", "-EncodedCommand", task_probe_encoded])
-    task_state_text = task_state.stdout.decode("utf-8-sig").strip().lower()
-    if task_state_text == "present":
-        raise IncompleteAcceptance("service task coverage incomplete; existing task preserved")
-    require(task_state_text == "absent", "existing service task state is unambiguous")
+
+    def service_task_states():
+        result = run([shell, "-NoProfile", "-NonInteractive", "-EncodedCommand", task_probe_encoded],
+                     check=False, timeout=60)
+        if result.returncode != 0:
+            return None
+        try:
+            states = json.loads(result.stdout.decode("utf-8-sig"))
+        except ValueError:
+            return None
+        if (not isinstance(states, dict)
+                or set(states) != {"node", "updater"}
+                or any(states[name] not in ("absent", "present") for name in states)):
+            return None
+        return states
+
+    absent_tasks = {"node": "absent", "updater": "absent"}
+    if service_task_states() != absent_tasks:
+        raise IncompleteAcceptance("service task coverage incomplete; existing task state preserved")
+
+    def tasks_are_absent():
+        states = service_task_states()
+        return states if states == absent_tasks else None
+
+    def registered_node_action():
+        result = run([
+            Path(os.environ["SystemRoot"]) / "System32/schtasks.exe",
+            "/Query", "/TN", "\\Vibeface\\Node", "/XML", "ONE",
+        ], check=False, timeout=60)
+        if result.returncode != 0:
+            summary = service_task_action_matches(b"", node.cli, node.directory)
+            summary["query_succeeded"] = False
+            summary["encoding"] = "unknown"
+            return summary
+        summary = service_task_action_matches(result.stdout, node.cli, node.directory)
+        summary["query_succeeded"] = True
+        return summary
 
     def service_call(*arguments, check=True):
         return run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                     "-File", service, *arguments], timeout=180, check=check)
+
+    def running_service_instance():
+        status = node.status()
+        if status.get("status") != "running" or status.get("device_id") != node.device_id:
+            return None
+        identities = node.core_process_identities()
+        if identities is None or len(identities) != 1:
+            return None
+        return identities[0], status["device_id"]
+
     try:
         require(node.status()["status"] == "stopped",
                 "service installation starts from a stopped fixture node")
         service_call("install", "--binary", package / "vibeface.exe",
                      "--data-dir", node.directory)
-        query = run([Path(os.environ["SystemRoot"]) / "System32/schtasks.exe",
-                     "/Query", "/TN", "\\Vibeface\\Node", "/XML", "ONE"], timeout=60)
-        definition = query.stdout.decode("utf-16", errors="replace")
-        if "<Task" not in definition:
-            definition = query.stdout.decode("utf-8", errors="replace")
-        require("serve" in definition and str(node.directory) in definition,
-                "the registered task starts this node on this data directory")
+        action = registered_node_action()
+        require(
+            action["query_succeeded"] and action["xml_parse"]
+            and action["action_count"] == 1 and action["exec_action_count"] == 1
+            and action["command_matches"]
+            and action["arguments_match"] and action["working_directory_matches"],
+            f"registered task action matches expected verb/path (encoding={action['encoding']}, "
+            f"query={action['query_succeeded']}, parse={action['xml_parse']}, "
+            f"actions={action['action_count']}, "
+            f"exec_actions={action['exec_action_count']}, command={action['command_matches']}, "
+            f"arguments={action['arguments_match']}, "
+            f"working_directory={action['working_directory_matches']})",
+        )
         other = node.directory.parent / "another node"
         other.mkdir(parents=True, exist_ok=True)
         for name in ("config.json", "identity.json"):
@@ -738,6 +919,25 @@ try {
                 "a service command naming another data directory is refused")
         wait_for("the scheduled task to start this node",
                  lambda: node.status() if node.status().get("status") == "running" else None)
+        before_restart = wait_for(
+            "the service Core process identity",
+            running_service_instance,
+        )
+        service_call("restart", "--data-dir", node.directory)
+
+        def restarted_service_instance():
+            current = running_service_instance()
+            return current if current and current[0] != before_restart[0] else None
+
+        after_restart = wait_for(
+            "the service restart to create a new Core process with the same device identity",
+            restarted_service_instance,
+        )
+        require(
+            after_restart[0] != before_restart[0]
+            and after_restart[1] == before_restart[1] == node.device_id,
+            "service restart changes process identity but preserves device identity",
+        )
         service_call("stop", "--data-dir", node.directory)
         wait_for("the scheduled task to stop this node",
                  lambda: node.status() if node.status().get("status") == "stopped" else None)
@@ -746,7 +946,14 @@ try {
                  lambda: node.status() if node.status().get("status") == "running" else None)
         checks["service_task"] = True
     finally:
-        service_call("uninstall", "--data-dir", node.directory, check=False)
+        cleanup = service_call("uninstall", "--data-dir", node.directory, check=False)
+        if cleanup.returncode != 0 and sys.exc_info()[0] is None:
+            raise AssertionError("service uninstall failed after lifecycle checks")
+    require(cleanup.returncode == 0, "service uninstall returned success")
+    wait_for("the node and updater tasks to be absent",
+             tasks_are_absent)
+    service_call("uninstall", "--data-dir", node.directory)
+    wait_for("repeated uninstall leaves both tasks absent", tasks_are_absent)
     wait_for("the scheduled task to leave the node stopped",
              lambda: node.status() if node.status().get("status") == "stopped" else None)
     return checks
