@@ -564,9 +564,16 @@ class Node:
 
     def status(self, diagnose_runtime=False):
         result = self.read_status()
-        if result.returncode != 0:
+        try:
+            status = json.loads(result.stdout)
+        except ValueError:
+            status = None
+        state = status.get("status") if isinstance(status, dict) else None
+        exit_codes = {"running": 0, "stopped": 1, "unavailable": 1}
+        if (not isinstance(state, str) or state not in exit_codes or result.returncode != exit_codes[state]
+                or diagnose_runtime and state != "running"):
             raise StatusCommandFailure(result, self, diagnose_runtime=diagnose_runtime)
-        return json.loads(result.stdout)
+        return status
 
     def ask_to_stop(self):
         require(self.process is not None, "the node is running before it is asked to stop")
