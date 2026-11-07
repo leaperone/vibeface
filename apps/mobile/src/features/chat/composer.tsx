@@ -1,8 +1,10 @@
 import * as DocumentPicker from 'expo-document-picker'
+import { File } from 'expo-file-system'
 import * as Haptics from 'expo-haptics'
+import * as ImagePicker from 'expo-image-picker'
 import { ArrowUp, LoaderCircle, Paperclip, Square, X } from 'lucide-react-native'
-import type { ReactNode } from 'react'
-import { Platform, Pressable, ScrollView, TextInput, View } from 'react-native'
+import { useRef, type ReactNode } from 'react'
+import { ActionSheetIOS, Alert, Platform, Pressable, ScrollView, TextInput, View } from 'react-native'
 import { Button } from '@/components/ui/button'
 import { caret } from '@/components/ui/input'
 import { Icon } from '@/components/ui/icon'
@@ -30,17 +32,51 @@ type Props = {
 
 export function Composer({ chrome, value, onChange, files, onFiles, blocked, sending, onSend, onStop, children, tint }: Props) {
   const ios = Platform.OS === 'ios'
+  const latest = useRef({ files, onFiles })
+  latest.current = { files, onFiles }
+  const picking = useRef(false)
   // While writing a follow-up, keep Send available and move Stop beside it.
   const drafting = value.trim().length > 0 || files.length > 0
   const stop = drafting ? undefined : onStop
   const canSend = !blocked && !sending && drafting
   const armed = canSend
-  const pick = async () => {
-    const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })
-    if (picked.canceled) return
-    onFiles([...files, ...picked.assets.map((asset) => ({ uri: asset.uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null }))])
+  const pick = async (source: 'photos' | 'files') => {
+    if (picking.current) return
+    picking.current = true
+    try {
+      let added: Attachment[]
+      if (source === 'photos') {
+        const picked = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], allowsMultipleSelection: true, quality: 1, preferredAssetRepresentationMode: ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Current })
+        if (picked.canceled) return
+        added = picked.assets.map((asset) => {
+          const file = new File(asset.uri)
+          return { uri: asset.uri, name: asset.fileName || file.name, size: asset.fileSize ?? file.size, mimeType: asset.mimeType || file.type || null }
+        })
+      } else {
+        const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })
+        if (picked.canceled) return
+        added = picked.assets.map((asset) => ({ uri: asset.uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null }))
+      }
+      latest.current.onFiles([...latest.current.files, ...added])
+    } catch (error) {
+      Alert.alert('未能添加附件', error instanceof Error ? error.message : '请重试，或选择其他文件。')
+    } finally {
+      picking.current = false
+    }
   }
-  const attach = <Button variant="ghost" size="icon" className={ios ? 'size-13 rounded-full' : 'rounded-full'} accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} onPress={pick}>
+  const choose = () => {
+    if (picking.current) return
+    if (ios) ActionSheetIOS.showActionSheetWithOptions({ options: ['照片图库', '文件', '取消'], cancelButtonIndex: 2 }, (index) => {
+      if (index === 0) void pick('photos')
+      if (index === 1) void pick('files')
+    })
+    else Alert.alert('添加附件', undefined, [
+      { text: '照片图库', onPress: () => void pick('photos') },
+      { text: '文件', onPress: () => void pick('files') },
+      { text: '取消', style: 'cancel' },
+    ])
+  }
+  const attach = <Button variant="ghost" size="icon" className={ios ? 'size-13 rounded-full' : 'rounded-full'} accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} onPress={choose}>
     <Icon as={Paperclip} className="text-muted-foreground" />
   </Button>
   const controls = <>
