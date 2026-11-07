@@ -207,6 +207,8 @@ pnpm exec e2e run --config tests/e2e/e2e.workspace.native.config.ts workspace.na
 
 本地运行使用上节的四个明确产物与 simulator 环境变量，并补充当前源码身份。仅选择 Provider 用例，不运行公益文件用例。
 
+使用 simslim 做键盘验收时保留 `siri` 分组。它包含听写和语音服务，关闭后可能干扰输入及可访问性快照。
+
 ```sh
 umask 077
 mkdir -p .artifacts/native/private
@@ -219,7 +221,7 @@ pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' \
 
 原生设备页的“Bot 与任务”进入真实 AI 设置页。fixture 只配置受控程序与连接模式，并关闭 Bot 和执行角色，真实返回 `manager=null`。用例先确认未启用的 Codex 尚未主动检查，再开启执行用途；依照 Node 的首次设置默认，这也开启 Bot，用例随后由原生界面关闭 Bot。启用和已有 manager 的 Node 启动都会主动检查，不能把这些结果称为未检查。用例在 execution-only 状态实际检查未登录提示，精确核对从界面复制的私有目录认证命令，由受限 fake CLI 完成一次合成登录，再主动检查并选择、手填和清空执行模型。之后开启 Bot，验证双角色草稿、独立保存、默认模型和 high。它还确认 Provider 控制强度时清除旧覆盖，包括带空白的手填已知模型，以及目录不可用时保留旧模型和强度。所有启用与保存均经已授权手机的正常接口执行。
 
-队列场景通过真实 Node API 准备一条运行中消息和一条排队消息。原生 UI 取消排队后，再通过原生“停止”结束运行中的消息并释放槽位。独立读取确认运行中的消息调用过一次，被取消的消息始终没有调用，离开再进入聊天后计数保持不变。受控 fixture 不调用真实模型，也不代替手机保存、取消或停止。
+队列场景通过真实 Node API 准备一条运行中消息和同一目标的一条 defer 输入。原生 UI 在“目标和队列”弹层取消稍后输入后，独立读取同一 message、target 的输入和 owner 回执，确认 cancelled=true、reason=cancelled_before_delivery，且运行中的消息仍在运行。随后通过原生“停止”结束运行中的消息。独立读取确认运行中的消息调用过一次，被取消的 defer 输入始终没有调用，离开再进入聊天后取消事实与计数保持不变。受控 fixture 不调用真实模型，也不代替手机保存设置、取消或停止。
 
 native config 默认关闭 trace 和整段 video。原始日志、自动失败截图、e2e report、邀请、恢复文件、Node 数据与 driver 状态都属于私有材料，不能递归上传 `.artifacts/native/`。CI 只上传固定的 `provider.json`、`provider-probe.json`、`provider-initial.png`、`provider-selectable.png`、`provider-controlled.png`、`provider-typed.png` 和 `terminology-device-kinds.png`。`provider-probe.json` 只记录首轮检查的 `link`、`readiness`、`authentication`、`catalog` 和 `checked` 五个固定状态字段。
 

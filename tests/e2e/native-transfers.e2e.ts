@@ -106,7 +106,32 @@ async function bundleManifest(directory: string): Promise<Record<string, string>
   return files;
 }
 
+function providerDeferredInput(value: unknown) {
+  if (value === null) return null;
+  const input = record(value), receipt = record(input.receipt);
+  assert.deepEqual(Object.keys(input).sort(), ['message_id', 'conversation_id', 'target', 'intent', 'deferred', 'cancelled', 'source_event', 'control_event', 'receipt'].sort());
+  assert(input.message_id === 'native-deferred' && input.conversation_id === 'native-provider' && input.intent === 'defer');
+  assert.deepEqual(input.target, { kind: 'bot_main', bot_id: 'native-provider' });
+  assert(typeof input.deferred === 'boolean' && typeof input.cancelled === 'boolean');
+  const sourceEvent = text(input.source_event), controlEvent = text(input.control_event);
+  assert(/^[0-9a-f]{64}$/.test(sourceEvent) && /^[0-9a-f]{64}$/.test(controlEvent));
+  assert.deepEqual(Object.keys(receipt).sort(), ['message_id', 'target', 'control_event', 'stage', 'reason', 'actual_turn_id', 'retry_safe'].sort());
+  assert(receipt.message_id === input.message_id && receipt.control_event === controlEvent);
+  assert.deepEqual(receipt.target, input.target);
+  const stage = text(receipt.stage);
+  assert(['entry_accepted', 'owner_accepted', 'submitting', 'provider_accepted', 'associated', 'refused', 'unknown'].includes(stage));
+  assert(receipt.reason === null || typeof receipt.reason === 'string');
+  assert(receipt.actual_turn_id === null || typeof receipt.actual_turn_id === 'string' && receipt.actual_turn_id.length > 0);
+  assert(typeof receipt.retry_safe === 'boolean' && (stage !== 'unknown' || receipt.retry_safe === false));
+  return { message_id: input.message_id, conversation_id: input.conversation_id,
+    target: { kind: 'bot_main', bot_id: 'native-provider' }, intent: input.intent,
+    deferred: input.deferred, cancelled: input.cancelled, source_event: sourceEvent, control_event: controlEvent,
+    receipt: { message_id: receipt.message_id, target: { kind: 'bot_main', bot_id: 'native-provider' }, control_event: controlEvent,
+      stage, reason: receipt.reason, actual_turn_id: receipt.actual_turn_id, retry_safe: receipt.retry_safe } };
+}
+
 function providerInspection(value: Record<string, unknown>) {
+  assert.deepEqual(Object.keys(value).sort(), ['manager', 'roles', 'execution_model', 'setup', 'login_count', 'app_server_link_state', 'readiness', 'catalog', 'authentication', 'checked_at_ms', 'jobs', 'deferred_input', 'running_invocations', 'deferred_invocations'].sort());
   let manager: { provider: string; model: string; reasoning_effort: string | null } | null = null;
   if (value.manager !== null) {
     const saved = record(value.manager);
@@ -117,7 +142,7 @@ function providerInspection(value: Record<string, unknown>) {
   assert(value.checked_at_ms === null || typeof value.checked_at_ms === 'number' && Number.isSafeInteger(value.checked_at_ms) && value.checked_at_ms >= 0);
   assert(Array.isArray(value.jobs));
   assert(typeof value.running_invocations === 'number' && Number.isSafeInteger(value.running_invocations) && value.running_invocations >= 0);
-  assert(typeof value.queued_invocations === 'number' && Number.isSafeInteger(value.queued_invocations) && value.queued_invocations >= 0);
+  assert(typeof value.deferred_invocations === 'number' && Number.isSafeInteger(value.deferred_invocations) && value.deferred_invocations >= 0);
   assert(Array.isArray(value.roles) && value.roles.every(role => role === 'agent' || role === 'execution'));
   assert(typeof value.execution_model === 'string');
   assert(typeof value.login_count === 'number' && Number.isSafeInteger(value.login_count) && value.login_count >= 0);
@@ -129,10 +154,11 @@ function providerInspection(value: Record<string, unknown>) {
     app_server_link_state: link, readiness: text(value.readiness), authentication: text(value.authentication), catalog: text(value.catalog),
     checked_at_ms: value.checked_at_ms, checked: value.checked_at_ms !== null,
     jobs: value.jobs.map((item: unknown) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state) }; }),
-    running_invocations: value.running_invocations, queued_invocations: value.queued_invocations };
+    deferred_input: providerDeferredInput(value.deferred_input),
+    running_invocations: value.running_invocations, deferred_invocations: value.deferred_invocations };
 }
 
-test('provider settings and queued cancellation work in the installed native app', { platforms: ['ios'], timeout: 600000 }, async ({ app, device, network, screen }) => {
+test('provider settings and deferred input cancellation work in the installed native app', { platforms: ['ios'], timeout: 600000 }, async ({ app, device, network, screen }) => {
   const simulator = process.env.VIBEFACE_E2E_SIMULATOR, appPath = process.env.VIBEFACE_E2E_IOS_APP;
   const source = process.env.VIBEFACE_E2E_SOURCE_COMMIT;
   const binary = process.env.VIBEFACE_E2E_BINARY, crypto = process.env.VIBEFACE_E2E_CRYPTO_MODULE;
@@ -471,27 +497,76 @@ test('provider settings and queued cancellation work in the installed native app
   await save('native-selectable', 'high');
   const queue = await network.call({ op: 'native_provider_queue' });
   await assert.rejects(network.call({ op: 'native_provider_queue' }));
-  const botId = text(queue.bot_id), runningTrigger = text(queue.running_trigger), queuedTrigger = text(queue.queued_trigger);
+  assert.deepEqual(Object.keys(queue).sort(), ['bot_id', 'conversation_id', 'target', 'running_trigger', 'deferred_message_id'].sort());
+  const botId = text(queue.bot_id), conversationId = text(queue.conversation_id);
+  const runningTrigger = text(queue.running_trigger), deferredMessageId = text(queue.deferred_message_id);
+  assert(botId === 'native-provider' && conversationId === 'native-provider'
+    && runningTrigger === 'message:native-running' && deferredMessageId === 'native-deferred');
+  const target = { kind: 'bot_main', bot_id: botId };
+  assert.deepEqual(queue.target, target);
+  const prepared = await inspect(), deferred = prepared.deferred_input;
+  assert(deferred, 'The fixture reads the real deferred input and its owner receipt');
+  expect(prepared.jobs).toEqual([{ trigger: runningTrigger, state: 'running' }]);
+  expect(prepared.running_invocations).toBe(1);
+  expect(prepared.deferred_invocations).toBe(0);
+  expect(deferred).toEqual({ message_id: deferredMessageId, conversation_id: conversationId, target, intent: 'defer',
+    deferred: true, cancelled: false, source_event: deferred.source_event, control_event: deferred.source_event,
+    receipt: { message_id: deferredMessageId, target, control_event: deferred.source_event,
+      stage: 'owner_accepted', reason: 'deferred', actual_turn_id: null, retry_safe: false } });
   const composer = screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/, { visible: true });
   await openLink(`vibeface://b/${botId}`, composer);
-  const cancel = screen.getByRole('button', '取消排队', { exact: true });
-  await screen.scrollUntilVisible(cancel, { direction: 'up', timeout: 30000 });
+  const targetSheet = screen.getByTestId('input-options-sheet', { visible: true });
+  await screen.getByRole('button', /^输入目标 Native Provider · 主聊天，/, { visible: true }).click();
+  await expect(targetSheet).toHaveCount(1);
+  const queued = targetSheet.getByText('稍后处理 1 条', { exact: true });
+  const cancel = targetSheet.getByRole('button', '取消稍后输入', { exact: true, visible: true });
+  const queueScroll = device.locator('role=scroll-area').filter({
+    has: screen.getByRole('button', '取消稍后输入', { exact: true }),
+  });
+  await expect(queueScroll).toHaveCount(1);
+  await queueScroll.scrollUntilVisible(queued, { direction: 'down' });
+  await expect(queued).toBeVisible();
+  await queueScroll.scrollUntilVisible(cancel, { direction: 'down' });
+  await expect(cancel).toHaveCount(1);
+  await expect(cancel).toBeEnabled();
+  let previousCancelBounds = '';
+  await expect.poll(async () => {
+    const bounds = await cancel.boundingBox(), pane = await queueScroll.boundingBox();
+    assert(bounds && pane, 'Deferred input Cancel and its scroll pane expose bounds');
+    const observed = JSON.stringify([bounds, pane]), stable = observed === previousCancelBounds;
+    previousCancelBounds = observed;
+    return stable && bounds.x >= pane.x && bounds.y >= pane.y && bounds.x + bounds.width <= pane.x + pane.width && bounds.y + bounds.height <= pane.y + pane.height;
+  }).toBe(true);
   await cancel.click();
-  await expect.poll(async () => (await inspect()).jobs.find(job => job.trigger === queuedTrigger)?.state, { timeout: 15000 }).toBe('cancelled');
-  expect((await inspect()).queued_invocations).toBe(0);
+  await expect.poll(async () => (await inspect()).deferred_input?.cancelled, { timeout: 15000 }).toBe(true);
+  const cancelled = await inspect(), cancelledInput = cancelled.deferred_input;
+  assert(cancelledInput);
+  expect(cancelledInput).toEqual({ ...deferred, cancelled: true, control_event: cancelledInput.control_event,
+    receipt: { ...deferred.receipt, control_event: cancelledInput.control_event, stage: 'refused', reason: 'cancelled_before_delivery' } });
+  expect(cancelledInput.control_event).not.toBe(deferred.control_event);
+  expect(cancelled.jobs).toEqual(prepared.jobs);
+  expect(cancelled.running_invocations).toBe(1);
+  expect(cancelled.deferred_invocations).toBe(0);
+  await expect(queued).toHaveCount(0);
+  await expect(cancel).toHaveCount(0);
+  await expect(targetSheet).toHaveCount(1);
+  await targetSheet.getByRole('button', '关闭目标和队列', { exact: true }).click();
+  await expect(targetSheet).toHaveCount(0);
   await screen.getByRole('button', '停止', { exact: true }).click();
   await expect.poll(async () => (await inspect()).jobs.find(job => job.trigger === runningTrigger)?.state, { timeout: 30000 }).toBe('cancelled');
   await expect(screen.getByRole('button', '停止', { exact: true })).toBeHidden();
   const after = await inspect();
+  expect(after.deferred_input).toEqual(cancelledInput);
   expect(after.running_invocations).toBe(1);
-  expect(after.queued_invocations).toBe(0);
+  expect(after.deferred_invocations).toBe(0);
   await openLink('vibeface://settings', screen.getByText('我的设备', { exact: true, visible: true }));
   await openLink(`vibeface://b/${botId}`, composer);
   await expect(screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/)).toBeVisible();
   const reopened = await inspect();
   expect(reopened.jobs).toEqual(after.jobs);
+  expect(reopened.deferred_input).toEqual(cancelledInput);
   expect(reopened.running_invocations).toBe(1);
-  expect(reopened.queued_invocations).toBe(0);
+  expect(reopened.deferred_invocations).toBe(0);
   expect(reopened.execution_model).toBe('');
   expect(reopened.login_count).toBe(1);
   expect(await bundleManifest(installedPath)).toEqual(built);
@@ -515,9 +590,9 @@ test('provider settings and queued cancellation work in the installed native app
     private_login_command_copied_exactly: true, controlled_bin_and_private_codex_home_verified: true,
     synthetic_login_count: reopened.login_count, native_authenticated_recheck: true, trimmed_controlled_cleared_effort: true,
     real_provider_model_calls: 0, not_checked: ['real Provider authentication', 'Claude-specific native login'],
-    running_trigger: runningTrigger, queued_trigger: queuedTrigger, jobs: reopened.jobs,
-    running_invocations: reopened.running_invocations, queued_invocations: reopened.queued_invocations,
-    native_cancelled_queue: true, native_stopped_running: true, reopened_without_execution: true }, null, 2)}\n`, { mode: 0o600 });
+    running_trigger: runningTrigger, deferred_message_id: deferredMessageId, deferred_input: reopened.deferred_input, jobs: reopened.jobs,
+    running_invocations: reopened.running_invocations, deferred_invocations: reopened.deferred_invocations,
+    native_cancelled_deferred_input: true, native_stopped_running: true, reopened_without_execution: true }, null, 2)}\n`, { mode: 0o600 });
 });
 
 test('receives a charity file through a real native pairing and verifies the saved bytes', { platforms: ['ios'], timeout: 240000 }, async ({ app, device, network, screen }) => {

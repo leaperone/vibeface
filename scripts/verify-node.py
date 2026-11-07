@@ -8569,6 +8569,32 @@ def e2e_fixture(options):
             for role, node in nodes.items()
         }, **({"gates": {name: str(path) for name, path in workspace_gates.items()}} if workspace_gates else {})}
 
+    def native_deferred_input(client):
+        if native_queue is None:
+            return None
+        rows = [row for row in client.rpc("workspace_state")["inputs"]
+                if row["input"]["message_id"] == native_queue["deferred_message_id"]]
+        require(len(rows) == 1, "the native deferred message has one real workspace input")
+        queued = rows[0]
+        saved = queued["input"]
+        require(queued["conversation_id"] == native_queue["conversation_id"]
+                and saved["target"] == native_queue["target"] and saved["intent"] == "defer",
+                "the native deferred input preserves its exact conversation, target and intent")
+        require(all(isinstance(queued[key], str) and re.fullmatch(r"[0-9a-f]{64}", queued[key])
+                    for key in ("source_event", "control_event"))
+                and type(queued["deferred"]) is bool and type(queued["cancelled"]) is bool,
+                "the native deferred input has exact control events and boolean state")
+        receipt = client.rpc("input_receipt", conversation_id=queued["conversation_id"],
+                             message_id=saved["message_id"], target=saved["target"])
+        require(receipt["message_id"] == saved["message_id"] and receipt["target"] == saved["target"]
+                and receipt["control_event"] == queued["control_event"],
+                "the owner receipt identifies the exact native deferred input and control event")
+        return {"message_id": saved["message_id"], "conversation_id": queued["conversation_id"],
+                "target": saved["target"], "intent": saved["intent"],
+                **{key: queued[key] for key in ("deferred", "cancelled", "source_event", "control_event")},
+                "receipt": {key: receipt[key] for key in
+                            ("message_id", "target", "control_event", "stage", "reason", "actual_turn_id", "retry_safe")}}
+
     def stop(*_):
         raise SystemExit(0)
 
@@ -8796,23 +8822,40 @@ def e2e_fixture(options):
                     require(manager is not None and manager["provider"] == "codex",
                             "the native UI must enable the controlled manager before queue preparation")
                     native_queue = {"bot_id": "native-provider", "conversation_id": "native-provider",
-                                    "running_trigger": "message:native-running", "queued_trigger": "message:native-queued"}
+                                    "target": {"kind": "bot_main", "bot_id": "native-provider"},
+                                    "running_trigger": "message:native-running", "deferred_message_id": "native-deferred"}
                     client.rpc("create_bot", bot_id=native_queue["bot_id"], conversation_id=native_queue["conversation_id"],
                                name="Native Provider", instructions="Controlled native acceptance", project=None)
-                    for label in ("native-running", "native-queued"):
+                    for label in ("native-running", native_queue["deferred_message_id"]):
                         directive = {"phase1": True, "label": label}
                         if label == "native-running":
                             directive["gate"] = str(run / "native-never-release")
                         receipt = client.rpc("message", conversation_id=native_queue["conversation_id"],
-                                             message_id=label, text=json.dumps(directive), report_results=False)
-                        require(receipt["trigger"] == "message:" + label, "native queue preserves the accepted trigger")
-                        wait_for("native message reaches its actual queue state", lambda:
-                            any(job["trigger"] == receipt["trigger"] and job["state"] == ("running" if label == "native-running" else "queued")
-                                for job in client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"]))
+                                             message_id=label, target=native_queue["target"],
+                                             intent="continue" if label == "native-running" else "defer",
+                                             text=json.dumps(directive), report_results=False)
+                        require(receipt["accepted"] is True and receipt["message_id"] == label
+                                and receipt["trigger"] == "message:" + label
+                                and receipt["receipt"]["network_id"] == client.network_id
+                                and receipt["receipt"]["conversation_id"] == native_queue["conversation_id"]
+                                and receipt["receipt"]["trigger"] == receipt["trigger"]
+                                and receipt["receipt"]["state"] == receipt["state"],
+                                "native messages preserve their exact accepted admission identity")
                         if label == "native-running":
+                            wait_for("native message reaches its actual running state", lambda:
+                                any(job["trigger"] == receipt["trigger"] and job["state"] == "running"
+                                    for job in client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"]))
                             wait_for("the native queue has one positive controlled invocation", lambda:
                                 len([row for row in fixture_records(run) if row["conversation_id"] == native_queue["conversation_id"]
                                      and row["trigger"] == native_queue["running_trigger"]]) == 1)
+                        else:
+                            require(receipt["state"] == "deferred", "the native second message is saved as a deferred input")
+                    deferred = native_deferred_input(client)
+                    require(deferred["deferred"] is True and deferred["cancelled"] is False
+                            and deferred["source_event"] == deferred["control_event"]
+                            and deferred["receipt"]["stage"] == "owner_accepted" and deferred["receipt"]["reason"] == "deferred"
+                            and deferred["receipt"]["actual_turn_id"] is None and deferred["receipt"]["retry_safe"] is False,
+                            "the real owner confirms its unsent native deferred input")
                     result = native_queue
                 elif op == "native_provider_inspect":
                     require(set(request) == {"op"} and native_provider, "native inspection reads only its controlled receiver")
@@ -8822,6 +8865,8 @@ def e2e_fixture(options):
                     manager = settings["settings"]["manager"]
                     jobs = client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"] if native_queue else []
                     calls = [row for row in fixture_records(run) if native_queue and row["conversation_id"] == native_queue["conversation_id"]]
+                    running_trigger = native_queue["running_trigger"] if native_queue else None
+                    deferred_trigger = "message:" + native_queue["deferred_message_id"] if native_queue else None
                     result = {"manager": {key: manager[key] for key in ("provider", "model", "reasoning_effort")} if manager is not None else None,
                               "roles": provider["roles"], "execution_model": provider["execution_model"], "setup": provider["setup"],
                               "login_count": len(fixture_records(run, "native-provider-login.jsonl")),
@@ -8830,9 +8875,10 @@ def e2e_fixture(options):
                               "authentication": provider["probe"]["authentication"],
                               "checked_at_ms": provider["probe"]["checked_at_ms"],
                               "jobs": [{"trigger": row["trigger"], "state": row["state"]} for row in jobs
-                                       if row["trigger"] in (native_queue["running_trigger"], native_queue["queued_trigger"])],
-                              "running_invocations": sum(row["trigger"] == native_queue["running_trigger"] for row in calls),
-                              "queued_invocations": sum(row["trigger"] == native_queue["queued_trigger"] for row in calls)}
+                                       if row["trigger"] in (running_trigger, deferred_trigger)],
+                              "deferred_input": native_deferred_input(client),
+                              "running_invocations": sum(row["trigger"] == running_trigger for row in calls),
+                              "deferred_invocations": sum(row["trigger"] == deferred_trigger for row in calls)}
                 elif op == "native_send":
                     require(native_ready, "native delivery is scoped to the initialized fixture")
                     intent = str(uuid.uuid4())
