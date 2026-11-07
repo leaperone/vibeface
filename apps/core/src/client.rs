@@ -3270,9 +3270,16 @@ mod tests {
         )
         .await?;
 
+        let retired_node = Arc::downgrade(&node);
         node.shutdown().await;
         drop(node);
-        let reopened = Runtime::reopen(&dir).await?;
+        ensure!(
+            retired_node.upgrade().is_none(),
+            "provider-key test Runtime remained alive after shutdown and drop"
+        );
+        let reopened = Runtime::reopen(&dir)
+            .await
+            .context("reopen provider-key test Node after dropping the prior Runtime")?;
         let providers = reopened.providers();
         assert!(reopened.manager().is_none());
         assert!(providers.switches.execution.is_empty());
@@ -3286,8 +3293,9 @@ mod tests {
         );
         reopened.shutdown().await;
         drop(reopened);
-        crate::logging::close_capture(&logs)?;
-        std::fs::remove_dir_all(dir)?;
+        crate::logging::close_capture(&logs).context("close provider-key test log handle")?;
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("remove provider-key test directory {}", dir.display()))?;
         Ok(())
     }
 

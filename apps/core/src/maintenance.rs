@@ -808,8 +808,10 @@ mod tests {
             "the stopped listener releases its endpoint"
         );
         let device = crate::config::identity(&dir)?.device_id()?;
-        remove_dir_if_exists(&vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?)?;
-        std::fs::remove_dir_all(&dir)?;
+        remove_dir_if_exists(&vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?)
+            .with_context(|| format!("remove maintenance IPC directory for {device}"))?;
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("remove maintenance fixture directory {}", dir.display()))?;
         result
     }
 
@@ -909,8 +911,10 @@ mod tests {
         node.shutdown().await;
         drop(node);
         let device = crate::config::identity(&dir)?.device_id()?;
-        remove_dir_if_exists(&vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?)?;
-        std::fs::remove_dir_all(&dir)?;
+        remove_dir_if_exists(&vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?)
+            .with_context(|| format!("remove maintenance IPC directory for {device}"))?;
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("remove maintenance fixture directory {}", dir.display()))?;
         result
     }
 }
