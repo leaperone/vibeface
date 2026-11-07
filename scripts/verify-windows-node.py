@@ -37,6 +37,15 @@ class IncompleteAcceptance(AssertionError):
     """The check preserved existing host state but could not cover a required scenario."""
 
 
+class FixtureProcessCheckError(AssertionError):
+    """A safe, categorized process identity failure without IDs or filesystem paths."""
+
+    def __init__(self, role, reason):
+        self.role = role
+        self.reason = reason
+        super().__init__(f"fake provider {role} identity check failed: {reason}")
+
+
 def require(condition, description):
     if not condition:
         raise AssertionError(description)
@@ -97,7 +106,7 @@ def process_is_running(pid):
         kernel.CloseHandle(ctypes.c_void_p(handle))
 
 
-def open_fixture_process(pid, created):
+def open_fixture_process(pid, created, expected_image):
     """Open and identity-check a fixture process, retaining its handle to pin its PID."""
     class FILETIME(ctypes.Structure):
         _fields_ = [("low", ctypes.c_ulong), ("high", ctypes.c_ulong)]
@@ -117,32 +126,43 @@ def open_fixture_process(pid, created):
     kernel.CloseHandle.argtypes = [ctypes.c_void_p]
     handle = kernel.OpenProcess(0x1000, False, int(pid))
     if not handle:
-        return None
+        return None, "open_failed"
     try:
         code = ctypes.c_ulong()
         times = [FILETIME() for _ in range(4)]
-        if (not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or
-                code.value != STILL_RUNNING or
-                not kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in times))):
+        if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
             kernel.CloseHandle(handle)
-            return None
+            return None, "exit_code_query_failed"
+        if code.value != STILL_RUNNING:
+            kernel.CloseHandle(handle)
+            return None, "process_not_running"
+        if not kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)):
+            kernel.CloseHandle(handle)
+            return None, "creation_time_query_failed"
         actual_created = (times[0].high << 32) | times[0].low
+        if actual_created != created:
+            kernel.CloseHandle(handle)
+            return None, "creation_time_mismatch"
         image = ctypes.create_unicode_buffer(32768)
         length = ctypes.c_ulong(len(image))
-        if (actual_created != created or
-                not kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(length)) or
-                os.path.normcase(os.path.abspath(image.value)) !=
-                os.path.normcase(os.path.abspath(sys.executable))):
+        if not kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(length)):
             kernel.CloseHandle(handle)
-            return None
-        return handle
+            return None, "image_query_failed"
+        try:
+            same_image = os.path.samefile(image.value, expected_image)
+        except OSError:
+            same_image = False
+        if not same_image:
+            kernel.CloseHandle(handle)
+            return None, "image_mismatch"
+        return handle, None
     except BaseException:
         kernel.CloseHandle(handle)
         raise
 
 
-def fixture_process_is_running(pid, created):
-    handle = open_fixture_process(pid, created)
+def fixture_process_is_running(pid, created, expected_image):
+    handle, _ = open_fixture_process(pid, created, expected_image)
     if handle is None:
         return False
     ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(ctypes.c_void_p(handle))
@@ -259,7 +279,7 @@ time.sleep(900)
         """Stop fixture processes only while a verified process handle pins their PIDs."""
         failed = False
         for pid, created in self.pids().values():
-            handle = open_fixture_process(pid, created)
+            handle, _ = open_fixture_process(pid, created, sys.executable)
             if not handle:
                 continue
             try:
@@ -435,13 +455,16 @@ def check_provider_tree_is_cleared(node):
         timeout=60,
     )
     for name, (pid, created) in pids.items():
-        require(fixture_process_is_running(pid, created),
-                f"the fake provider's {name} is running before the stop")
+        handle, identity_error = open_fixture_process(pid, created, sys.executable)
+        if handle is None:
+            raise FixtureProcessCheckError(name.removesuffix(".pid"), identity_error)
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(ctypes.c_void_p(handle))
     node.ask_to_stop()
     for name, (pid, created) in pids.items():
         wait_for(
             f"the fake provider's {name} to be cleared with the node",
-            lambda pid=pid, created=created: not fixture_process_is_running(pid, created),
+            lambda pid=pid, created=created:
+                not fixture_process_is_running(pid, created, sys.executable),
             timeout=30,
         )
     return pids
@@ -577,6 +600,10 @@ def main():
                 "status": "incomplete" if isinstance(error, IncompleteAcceptance) else "failed",
                 "error_type": type(error).__name__,
             }
+            if isinstance(error, FixtureProcessCheckError):
+                diagnostic["fixture_process_check"] = {
+                    "role": error.role, "result": error.reason,
+                }
             (options.artifacts / "windows-node-failure.json").write_text(
                 json.dumps(diagnostic, indent=2) + "\n", encoding="utf-8"
             )
