@@ -980,7 +980,17 @@ fn mount_point_buffer(target: &Path) -> io::Result<Vec<u8>> {
         path::{Component, Prefix},
     };
     use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
-    let encoded: Vec<u16> = target.as_os_str().encode_wide().collect();
+    let encoded: Vec<u16> = target
+        .as_os_str()
+        .encode_wide()
+        .map(|unit| {
+            if unit == u16::from(b'/') {
+                u16::from(b'\\')
+            } else {
+                unit
+            }
+        })
+        .collect();
     let mut substitute: Vec<u16> = r"\??\".encode_utf16().collect();
     match target.components().next() {
         Some(Component::Prefix(prefix)) => match prefix.kind() {

@@ -37,7 +37,7 @@ fn long_lived() -> Command {
         let mut command = Command::new("cmd");
         command.args([
             "/c",
-            "waitfor /t 120 vibeface-platform-test >nul 2>&1 || exit /b 0",
+            "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 120\"",
         ]);
         command
     }
@@ -62,10 +62,15 @@ fn echoing_program(directory: &Path, name: &str) -> PathBuf {
     {
         let path = directory.join(format!("{name}.cmd"));
         std::fs::write(
-            &path,
-            "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto done\r\necho %~1\r\nshift\r\ngoto loop\r\n:done\r\n",
+            directory.join("echo-arguments.py"),
+            "import sys\nfor argument in sys.argv[1:]: print(argument)\n",
         )
-        .expect("write the fixture program");
+        .expect("write the native argument parser fixture");
+        std::fs::write(
+            &path,
+            "@echo off\r\npython.exe \"%~dp0echo-arguments.py\" %*\r\n",
+        )
+        .expect("write the batch entry point used by Windows provider wrappers");
         path
     }
 }
@@ -217,7 +222,12 @@ async fn a_local_endpoint_admits_this_account_and_refuses_a_second_holder() -> R
 
     drop(served);
     drop(listener);
-    eventually("the endpoint to be released", || !endpoint.is_held());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while endpoint.is_held() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
 
     let (mut left, mut right) = ipc::pair().await?;
     left.write_all(b"paired\n").await?;

@@ -141,7 +141,7 @@ impl Tree {
         #[cfg(windows)]
         {
             if let Some(job) = self.job.as_ref() {
-                job.request_stop();
+                job.terminate();
             }
         }
     }
@@ -168,9 +168,8 @@ impl Tree {
             let Some(job) = self.job.take() else {
                 return;
             };
-            // A console program in its own group stops on a break event; one that ignores it is
-            // ended with the job when the grace period runs out.
-            job.request_stop();
+            // The job handle bounds termination to this tree; console events are not job-scoped.
+            job.terminate();
             for _ in 0..30 {
                 if job.member_count().unwrap_or(0) == 0 {
                     return;
@@ -268,7 +267,7 @@ impl Leftover {
         }
         #[cfg(windows)]
         {
-            self.job.request_stop();
+            self.job.terminate();
             for _ in 0..30 {
                 if self.job.member_count().unwrap_or(0) == 0 {
                     return;

@@ -211,16 +211,6 @@ impl Job {
             .collect()
     }
 
-    /// Asks every program in the job to stop. A program with no console to receive the request
-    /// keeps running and is ended by [`Job::terminate`] when its grace period runs out.
-    pub fn request_stop(&self) {
-        use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
-        for id in self.members().unwrap_or_default() {
-            // SAFETY: the call only sends a console event and touches no memory here.
-            unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, id) };
-        }
-    }
-
     /// Ends every program in the job at once.
     pub fn terminate(&self) {
         // SAFETY: the job handle is open; the exit code is arbitrary.

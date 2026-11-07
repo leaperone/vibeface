@@ -83,9 +83,12 @@ impl Endpoint {
                 ensure!(!suffix.contains('\\'), "a pipe must be on this machine");
                 WindowsAddress::Pipe(name)
             } else {
+                use std::path::{Component, Prefix};
+                let local_disk = matches!(path.components().next(), Some(Component::Prefix(prefix))
+                    if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)));
                 ensure!(
-                    path.is_absolute() && !name.starts_with(r"\\"),
-                    "a Codex socket must be an absolute local path"
+                    path.is_absolute() && local_disk,
+                    "a Codex socket must be an absolute local disk path"
                 );
                 WindowsAddress::CodexSocket
             };

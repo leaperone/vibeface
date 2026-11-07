@@ -2354,10 +2354,8 @@ mod tests {
 
     #[test]
     fn data_directory_defaults_to_home_unless_named() {
-        assert_eq!(
-            data_dir_or_home(Some(PathBuf::from("/arg"))).unwrap(),
-            Path::new("/arg")
-        );
+        let named = std::env::temp_dir().join("named-node");
+        assert_eq!(data_dir_or_home(Some(named.clone())).unwrap(), named);
         assert!(data_dir_or_home(Some(PathBuf::from("relative"))).is_err());
         assert!(data_dir_or_home(Some(PathBuf::new())).is_err());
     }
