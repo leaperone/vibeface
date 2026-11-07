@@ -3117,17 +3117,46 @@ mod tests {
             thread_id: None,
             fields: Default::default(),
         });
+
+        // The byte scan includes the live SQLite database, so release its Windows file locks
+        // while leaving the provider environment and logged key-containing event unchanged.
+        let retired_node = Arc::downgrade(&node);
+        node.shutdown().await;
+        drop(node);
+        ensure!(
+            retired_node.upgrade().is_none(),
+            "provider-key scan Runtime remained alive after shutdown and drop"
+        );
         let mut files = vec![dir.clone()];
         let mut checked = 0;
         while let Some(path) = files.pop() {
             if path.is_dir() {
-                files.extend(std::fs::read_dir(&path)?.map(|entry| entry.unwrap().path()));
+                let entries = std::fs::read_dir(&path).with_context(|| {
+                    format!(
+                        "list {} while checking provider-key persistence",
+                        path.display()
+                    )
+                })?;
+                for entry in entries {
+                    let entry = entry.with_context(|| {
+                        format!(
+                            "enumerate {} while checking provider-key persistence",
+                            path.display()
+                        )
+                    })?;
+                    files.push(entry.path());
+                }
                 continue;
             }
             if path.file_name() == Some(std::ffi::OsStr::new(crate::providers::ENV_FILE)) {
                 continue;
             }
-            let bytes = std::fs::read(&path)?;
+            let bytes = std::fs::read(&path).with_context(|| {
+                format!(
+                    "read {} while checking provider-key persistence",
+                    path.display()
+                )
+            })?;
             for key in [codex_key, cursor_key] {
                 assert!(
                     !bytes
@@ -3144,6 +3173,11 @@ mod tests {
             &dir.join(crate::providers::ENV_FILE),
             "the saved provider environment",
         )?;
+        let node = Arc::new(
+            Runtime::reopen(&dir)
+                .await
+                .context("reopen provider-key test Node after its persistence scan")?,
+        );
 
         for invalid in [
             json!({"provider":"unknown","execution":true}),
@@ -3294,6 +3328,7 @@ mod tests {
         reopened.shutdown().await;
         drop(reopened);
         crate::logging::close_capture(&logs).context("close provider-key test log handle")?;
+
         std::fs::remove_dir_all(&dir)
             .with_context(|| format!("remove provider-key test directory {}", dir.display()))?;
         Ok(())

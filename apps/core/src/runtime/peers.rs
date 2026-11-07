@@ -4071,11 +4071,11 @@ mod tests {
         let (l, dir_l) = node(&il).await?;
         let (c, dir_c) = node(&ic).await?;
         let scratch_dir = dir_l.with_extension("other-branch");
+        let mut other = crate::store::Store::open(scratch_dir.join("db.sqlite"))?;
         let result = async {
             for node in [&l, &c] {
                 node.install_membership(state.clone()).await?;
             }
-            let mut other = crate::store::Store::open(scratch_dir.join("db.sqlite"))?;
             other.install_trust_bundle(&network, &state)?;
             let long = MAX_FORK_PAGES * crate::store::MAX_PULL_EVENTS + 100;
             {
@@ -4128,9 +4128,48 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        remove_directory(&scratch_dir)?;
-        stop_nodes(vec![(l, dir_l), (c, dir_c)]).await?;
-        result
+        drop(other);
+        let mut cleanup_errors = Vec::new();
+        if let Err(error) = remove_directory(&scratch_dir)
+            .with_context(|| format!("remove fork branch fixture {}", scratch_dir.display()))
+        {
+            cleanup_errors.push(format!("{error:#}"));
+        }
+        let retired_l = Arc::downgrade(&l);
+        let retired_c = Arc::downgrade(&c);
+        l.shutdown().await;
+        c.shutdown().await;
+        drop(l);
+        drop(c);
+        if retired_l.upgrade().is_some() {
+            cleanup_errors
+                .push("first fork fixture Runtime still has a strong owner after shutdown".into());
+        } else if let Err(error) = std::fs::remove_dir_all(&dir_l)
+            .with_context(|| format!("remove first fork fixture directory {}", dir_l.display()))
+        {
+            cleanup_errors.push(format!("{error:#}"));
+        }
+        if retired_c.upgrade().is_some() {
+            cleanup_errors
+                .push("second fork fixture Runtime still has a strong owner after shutdown".into());
+        } else if let Err(error) = std::fs::remove_dir_all(&dir_c)
+            .with_context(|| format!("remove second fork fixture directory {}", dir_c.display()))
+        {
+            cleanup_errors.push(format!("{error:#}"));
+        }
+        let cleanup = if cleanup_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(cleanup_errors.join("; ")))
+        };
+        match (result, cleanup) {
+            (Err(body), Err(cleanup)) => {
+                Err(body.context(format!("cleanup also failed: {cleanup:#}")))
+            }
+            (Err(body), Ok(())) => Err(body),
+            (Ok(()), Err(cleanup)) => Err(cleanup),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     /// A round that leaves events waiting on other authors past the pending limit is followed
