@@ -58,7 +58,7 @@ fn checked(code: u32) -> io::Result<()> {
 
 /// An owned copy of a security identifier.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Sid(Vec<u8>);
+pub struct Sid(Vec<u32>);
 
 impl Sid {
     /// Copies the SID at `raw`, which must point at a valid SID owned by the caller.
@@ -71,10 +71,17 @@ impl Sid {
         if length == 0 {
             return Err(io::Error::last_os_error());
         }
-        let mut bytes = vec![0u8; length];
-        // SAFETY: `bytes` has exactly the length the SID reports.
-        unsafe { std::ptr::copy_nonoverlapping(raw.cast::<u8>(), bytes.as_mut_ptr(), length) };
-        Ok(Self(bytes))
+        if length % std::mem::size_of::<u32>() != 0 {
+            return Err(io::Error::other(
+                "security identifier has an invalid length",
+            ));
+        }
+        let mut words = vec![0_u32; length / std::mem::size_of::<u32>()];
+        // SAFETY: SID storage is DWORD-aligned and covers the exact byte length reported above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(raw.cast::<u8>(), words.as_mut_ptr().cast(), length)
+        };
+        Ok(Self(words))
     }
 
     pub fn as_psid(&self) -> PSID {
@@ -85,8 +92,8 @@ impl Sid {
     /// machine-wide named pipe namespace.
     pub fn fingerprint(&self) -> String {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in &self.0 {
-            hash ^= u64::from(*byte);
+        for byte in self.0.iter().flat_map(|word| word.to_le_bytes()) {
+            hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x1000_0000_01b3);
         }
         format!("{hash:016x}")
@@ -338,6 +345,23 @@ impl ReadDescriptor {
             // An absent list grants every account full access.
             return Ok(false);
         }
+        let mut controls = 0_u16;
+        let mut revision = 0_u32;
+        // SAFETY: the descriptor owns the backing memory and both outputs are writable locals.
+        if unsafe {
+            windows_sys::Win32::Security::GetSecurityDescriptorControl(
+                self.raw,
+                &mut controls,
+                &mut revision,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if controls & SE_DACL_PROTECTED == 0 {
+            return Ok(false);
+        }
+
         // SAFETY: the owner pointer belongs to the descriptor this value still owns.
         let owner = unsafe { Sid::copy_from(self.owner) }?;
         if owner != *user && !token_holds(&owner)? {
@@ -567,7 +591,7 @@ fn token_user(token: HANDLE) -> io::Result<Sid> {
     if needed == 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut buffer = vec![0u8; needed as usize];
+    let mut buffer = vec![0_usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
     // SAFETY: `buffer` holds the size the previous call asked for.
     if unsafe {
         GetTokenInformation(
@@ -581,7 +605,7 @@ fn token_user(token: HANDLE) -> io::Result<Sid> {
     {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: on success the buffer starts with a TOKEN_USER whose SID lives inside it.
+    // SAFETY: the usize allocation aligns TOKEN_USER and covers its reported size; its SID stays inside the live buffer.
     let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
     // SAFETY: the SID belongs to the buffer that is still alive here.
     unsafe { Sid::copy_from(user.User.Sid) }

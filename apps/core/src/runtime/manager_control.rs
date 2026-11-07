@@ -654,6 +654,7 @@ impl Runtime {
 pub(super) mod tests {
     use super::*;
 
+    #[cfg(unix)]
     pub(in crate::runtime) async fn pending_manager(
         node: &Runtime,
         admin: &crate::crypto::LocalIdentity,

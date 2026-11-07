@@ -66,6 +66,54 @@ function alive(pid) {
   }
 }
 
+/** Evaluate inside one of the app's existing windows; no second browser is created. */
+async function inPage(page, expression) {
+  const socket = new WebSocket(page.webSocketDebuggerUrl);
+  try {
+    return await new Promise((done, fail) => {
+      const limit = AbortSignal.timeout(30000);
+      limit.addEventListener('abort', () => fail(new Error('The application page did not answer')));
+      socket.addEventListener('error', () => fail(new Error('The application page could not be reached')));
+      socket.addEventListener('open', () => socket.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, returnByValue: true, awaitPromise: true } })));
+      socket.addEventListener('message', event => {
+        const message = JSON.parse(event.data);
+        if (message.id !== 1) return;
+        assert(!message.error && !message.result?.exceptionDetails, 'The application page rejected the operation');
+        done(message.result.result.value);
+      });
+    });
+  } finally {
+    socket.close();
+  }
+}
+
+async function enterBusiness() {
+  const deadline = Date.now() + 120000;
+  let clicked = false;
+  let last = '';
+  while (Date.now() < deadline) {
+    assert(child && child.exitCode === null, 'The application exited before startup completed');
+    const pages = await devtools('/json/list');
+    const launcher = pages.find(page => page.type === 'page' && page.url === 'vibeface-launcher://app/index.html');
+    if (launcher) {
+      last = await inPage(launcher, 'document.body.innerText');
+      const state = await inPage(launcher, 'typeof window.vibefaceLauncher === "object" ? window.vibefaceLauncher.getStatus().then(status => status.core.kind) : "loading"');
+      assert(state !== 'failed', `The launcher could not start its Core: ${last}`);
+      if (!clicked && ['none', 'uninitialized', 'offline'].includes(state)) {
+        clicked = await inPage(launcher, `(() => {
+          const start = document.querySelector('button[data-action="start"]');
+          if (!(start instanceof HTMLButtonElement) || start.disabled) return false;
+          start.click();
+          return true;
+        })()`);
+      }
+      if (state === 'owned' && pages.some(page => page.type === 'page' && page.url.startsWith('http://127.0.0.1:4791/')) && (await cores(child.pid)).length === 1) return;
+    }
+    await sleep(100);
+  }
+  throw new Error(`The desktop never reached its Core-served window: ${last}`);
+}
+
 async function start() {
   assert(!child || child.exitCode !== null, 'The desktop application is already running');
   await mkdir(profile, { recursive: true });
@@ -79,12 +127,12 @@ async function start() {
     assert(started.exitCode === null, `The desktop application exited ${started.exitCode} before opening a window`);
     try {
       await devtools('/json/version');
-      return;
+      break;
     } catch {
       await sleep(500);
     }
   }
-  throw new Error('The desktop application never exposed its window');
+  await enterBusiness();
 }
 
 /**

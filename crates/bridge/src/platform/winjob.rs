@@ -164,7 +164,7 @@ impl Job {
     /// The process ids still in the job.
     fn members(&self) -> Result<Vec<u32>> {
         let header = std::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
-        let mut buffer = vec![0u8; header + MAX_MEMBERS * std::mem::size_of::<usize>()];
+        let mut buffer = vec![0_usize; header.div_ceil(std::mem::size_of::<usize>()) + MAX_MEMBERS];
         let mut returned = 0u32;
         // SAFETY: the buffer is sized for the list header plus MAX_MEMBERS entries.
         if unsafe {
@@ -172,7 +172,7 @@ impl Job {
                 self.handle.0,
                 JobObjectBasicProcessIdList,
                 buffer.as_mut_ptr().cast(),
-                buffer.len() as u32,
+                std::mem::size_of_val(buffer.as_slice()) as u32,
                 &mut returned,
             )
         } == 0
@@ -183,17 +183,13 @@ impl Job {
                 return Err(error.into());
             }
         }
-        // SAFETY: the kernel filled the header; the entries follow it inside the same buffer.
+        // SAFETY: the usize allocation aligns this pointer-sized Windows structure; the kernel filled its complete header.
         let list = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
         let count = (list.NumberOfProcessIdsInList as usize).min(MAX_MEMBERS);
         let mut ids = Vec::with_capacity(count);
-        for index in 0..count {
-            let at = header - std::mem::size_of::<usize>() + index * std::mem::size_of::<usize>();
-            let bytes: [u8; std::mem::size_of::<usize>()] = buffer
-                [at..at + std::mem::size_of::<usize>()]
-                .try_into()
-                .expect("a pointer sized entry");
-            let id = usize::from_le_bytes(bytes);
+        let first = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList)
+            / std::mem::size_of::<usize>();
+        for id in buffer[first..first + count].iter().copied() {
             if let Ok(id) = u32::try_from(id) {
                 ids.push(id);
             }

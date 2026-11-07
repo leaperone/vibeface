@@ -12,7 +12,7 @@ def verify(checksum):
     if checksum.is_symlink() or not checksum.name.endswith('.sha256'):
         raise ValueError('Expected a regular .sha256 sidecar')
     text = checksum.read_bytes()
-    match = re.fullmatch(rb'([0-9a-f]{64})  ([A-Za-z0-9._-]+)\n', text)
+    match = re.fullmatch(rb'([0-9a-f]{64})  ([A-Za-z0-9._-]+)\r?\n', text)
     if match is None or match[2].decode() != checksum.name.removesuffix('.sha256'):
         raise ValueError('Checksum must name exactly its sibling payload')
     payload = checksum.with_name(match[2].decode())
@@ -31,6 +31,8 @@ def self_test():
         payload.write_bytes(b'abc')
         digest = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
         checksum.write_text(f'{digest}  {payload.name}\n')
+        verify(checksum)
+        checksum.write_bytes(f'{digest}  {payload.name}\r\n'.encode())
         verify(checksum)
         for body in (f'{digest}  ../escape\n', f'{digest}  other.tar.gz\n',
                      f'{"0" * 64}  {payload.name}\n', f'{digest}  {payload.name}\nextra\n'):

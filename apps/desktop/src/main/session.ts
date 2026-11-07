@@ -169,6 +169,9 @@ export class CoreSession {
   async startOwned(): Promise<void> {
     await this.guard(async () => {
       if (this.options.attachOnly) throw new Error('这次会话以仅连接模式启动，不会启动 Core。')
+      if (!this.dataDir()) {
+        await this.useDataDir(join(this.options.profileDir, 'node'))
+      }
       const dataDir = this.requireDataDir()
       if (this.lifecycle.state().kind === 'owned') throw new Error('这台电脑上的 Core 已经在运行。')
       if (initialized(dataDir)) {

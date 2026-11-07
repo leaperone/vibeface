@@ -48,6 +48,16 @@ describe('CoreSession against protocol fixtures', () => {
     expect(existsSync(join(dataDir, 'config.json'))).toBe(false)
   })
 
+  it('starts a new desktop in its own profile only when the user chooses to start', async () => {
+    await session.restore()
+    expect(session.state()).toEqual({ kind: 'none' })
+    expect(existsSync(join(profileDir, 'node'))).toBe(false)
+    await session.startOwned()
+    expect(session.state().kind).toBe('owned')
+    expect(session.dataDir()).toBe(join(profileDir, 'node'))
+    expect(existsSync(join(profileDir, 'node/config.json'))).toBe(true)
+  })
+
   it('initializes, starts and then serves the Core private origin', async () => {
     await session.useDataDir(dataDir)
     await session.startOwned()

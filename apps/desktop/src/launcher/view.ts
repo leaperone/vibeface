@@ -60,13 +60,17 @@ export function describe(status: LauncherStatus): View {
     case 'none':
       return {
         tone: 'idle',
-        indicator: '未选择目录',
+        indicator: '尚未开始',
         headline: '开始使用 Vibeface',
         explain:
-          '选择保存身份、配置和记录的位置。已有 Vibeface 时，选择它正在使用的位置即可连接。',
+          status.attachOnly
+            ? '选择已经在运行的 Vibeface 所使用的数据位置。'
+            : '开始后，身份和记录会保存在这台电脑的应用目录。已有数据时也可以选择原来的位置。',
         facts: [],
         failure: null,
-        actions: [choose('选择数据目录…', true)],
+        actions: status.attachOnly
+          ? [choose('选择数据目录…', true)]
+          : [action('start', '在这台电脑开始使用', true), choose('使用已有数据…')],
         scope,
       }
 

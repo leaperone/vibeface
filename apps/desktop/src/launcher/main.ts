@@ -76,6 +76,7 @@ function paintActions(view: View): void {
   for (const item of view.actions) {
     const button = document.createElement('button')
     button.type = 'button'
+    button.dataset['action'] = item.id
     button.textContent = item.label
     button.disabled = item.disabled
     button.dataset['locked'] = item.disabled ? 'true' : 'false'

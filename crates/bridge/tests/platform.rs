@@ -436,3 +436,16 @@ async fn two_programs_with_the_same_label_have_independent_trees() -> Result<()>
     );
     Ok(())
 }
+
+#[cfg(windows)]
+#[test]
+fn an_inherited_acl_is_not_a_protected_private_file() -> Result<()> {
+    let directory = scratch("acl-inheritance");
+    let file = directory.join("inherited");
+    std::fs::write(&file, b"fixture")?;
+    assert!(privatefs::ensure_private(&file, "the inherited fixture").is_err());
+    privatefs::restrict_file(&file)?;
+    privatefs::ensure_private(&file, "the protected fixture")?;
+    std::fs::remove_dir_all(directory)?;
+    Ok(())
+}

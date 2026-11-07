@@ -17,8 +17,8 @@ const ids = (core: CoreState, overrides?: Partial<LauncherStatus>) =>
   toView(status(core, overrides)).actions.map((action) => action.id)
 
 describe('launcher view', () => {
-  it('asks for a directory before anything else', () => {
-    expect(ids({ kind: 'none' })).toEqual(['choose'])
+  it('offers a local start and a separate existing-data choice', () => {
+    expect(ids({ kind: 'none' })).toEqual(['start', 'choose'])
   })
 
   it('offers initialization for an empty directory and says what will be created', () => {
@@ -54,6 +54,7 @@ describe('launcher view', () => {
   })
 
   it('hides every start action in a connection-only run', () => {
+    expect(ids({ kind: 'none' }, { attachOnly: true })).toEqual(['choose'])
     expect(ids({ kind: 'offline', dataDir: '/tmp/node', deviceId: null }, { attachOnly: true })).not.toContain('start')
     expect(ids({ kind: 'uninitialized', dataDir: '/tmp/node' }, { attachOnly: true })).not.toContain('start')
   })

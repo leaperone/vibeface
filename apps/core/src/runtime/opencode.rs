@@ -976,7 +976,7 @@ impl Opencode {
 
     /// Whether no run or queued input remains in a reply's session; a running turn is aborted. Runs
     /// end with their serve, and the Node stops the serve of an earlier run when it opens.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn run_ended(&self, session: &str) -> bool {
         let ended = async {
             let Some(conn) = self.running().await else {
