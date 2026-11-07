@@ -51,9 +51,12 @@
 | `discovery` | `--discovery URL` | 最多 4 个 `vibeface://<device-id>@<host>:<UDP-port>`，显式钉住发现服务身份 |
 | `relay_url` | `--relay-url URL` | 其他 Node 访问本 relay 的 URL，明确提供其他 Node 可访问的 URL |
 | `entry` | `--entry URL`、`--entry-relay URL` | 公共入口 `{ url, relay }`；`relay` 默认等于 `url`，即反向代理把 `/relay` 转给入口的 relay |
+| `bootstrap` | `--bootstrap MODE\|URL`、`--bootstrap-https URL` | `{"mode":"off"}`、`{"mode":"public"}` 或 `{"mode":"custom","discovery":"vibeface://…","https":"https://…/bootstrap"}`；`init` 和首次直接启动在没有 `--entry` 的新 Node 上写 `public`，公共入口恒为 `off`，见[公共接入](#公共接入) |
+| `relay_admission` | `--relay-admission POLICY`、`--grant-issuer DEVICE-ID` | 公共入口 relay 的接纳策略：`{"policy":"operator-token"}` 默认，或 `{"policy":"grants","issuer":"<发现服务设备编号>"}` |
+| `catalog` | `--catalog-gateway URL`、`--catalog-relay URL`、`--grant-ttl-minutes N` | 仅 `discovery-only`：`{"entries":[{"gateway_url","relay_url"}…],"grant_ttl_ms"}`，1 到 4 对，许可有效期默认 1 800 000 毫秒、最长 3 600 000 |
 | `pkarr` | 无 | 默认全部关闭的免费 pkarr 发现配置，见[免费节点发现](#免费节点发现) |
 
-配置了 `network.bind` 时关闭 iroh 的端口映射，不发布未配置的路由器地址。`public_entry=true` 要求 `relay_listen`，且不能同时有 `entry`、`manager` 或 `roots`。`discovery-only` 还要求非零 UDP 端口，不能配置 `bind`、`relays`、`n0_relays`、`relay_url` 或其他发现服务。
+配置了 `network.bind` 时关闭 iroh 的端口映射，不发布未配置的路由器地址。`public_entry=true` 要求 `relay_listen` 和 `bootstrap` 为 `off`，且不能同时有 `entry`、`manager` 或 `roots`。`discovery-only` 还要求非零 UDP 端口，不能配置 `bind`、`relays`、`n0_relays`、`relay_url` 或其他发现服务。`catalog` 只能出现在 `discovery-only` 上，`relay_admission` 为 `grants` 只能出现在运行 `forward` relay 的公共入口上，且非公共入口不能使用它。`bootstrap` 的 `off` 是明确选择而不是回退：`custom` 来源不可用时不会改用官方服务。
 
 启用管理 Agent 时，`manager` 对象包含以下全部字段。Cursor 模式要求非空 `model`，Codex 模式可用空字符串选择其默认模型。
 
@@ -88,7 +91,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `data-epoch.json` | `{"data_epoch":1}`，程序拒绝其他 epoch |
 | `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=1` |
 | `bootstrap.json` | 建网前的一次性本机 capability，公共入口没有 |
-| `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；公共入口和使用它的成员 Node 各有一份 |
+| `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；采用 `operator-token` 策略的公共入口和使用它的成员 Node 各有一份，`grants` 策略的入口没有 |
 | `blobs/sha256/<前两位>/<hash>` | 附件正文，`blobs/partial/` 为续传暂存 |
 | `local-sessions.json` | 本机会话的 cookie 摘要 |
 | `delivery-settings.json` | 可选文件交付设置，与 `config.json` 分开 |
@@ -111,7 +114,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 
 允许的浏览器入口由 `public_url`、`allowed_origins`、本机 HTTP 别名，以及地址簿中未撤销成员 Node 的 `gateway_url` 组成。本机别名为 `127.0.0.1`、`localhost`、`0.0.0.0`，端口使用 `listen` 的端口。允许入口不会改变监听网卡或开放防火墙。
 
-显式入口是不含路径、查询参数或凭证的完整 HTTP 或 HTTPS origin。非本机 HTTP 入口需要 `allow_insecure_lan`。同一主机和端口不能同时配置两个 scheme。HTTP 检查 Host，带 Origin 时必须匹配该 Host 对应的同一入口；只有 `/api/client` 接受跨源连接。普通 HTTP 正文上限为 2 MiB，自定义工具回调上限为 1 MiB。
+显式入口是不含路径、查询参数或凭证的完整 HTTP 或 HTTPS origin。非本机 HTTP 入口需要 `allow_insecure_lan`。同一主机和端口不能同时配置两个 scheme。HTTP 检查 Host，带 Origin 时必须匹配该 Host 对应的同一入口；只有 `/api/client` 接受跨源连接，`/bootstrap/*` 和 `/api/relay/grant` 只检查 Host、不要求 Origin，因为它们交换的是自带签名的公开资料。普通 HTTP 正文上限为 2 MiB，自定义工具回调上限为 1 MiB，接入请求正文上限为 1024 字节。提供这些接入路径的公共入口即使 `--no-web` 也绑定 `listen`。
 
 | 路径 | 方法 | 用途 |
 | --- | --- | --- |
@@ -119,6 +122,9 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `/sw.js`、`/manifest.webmanifest`、`/icon.svg` | GET | 离线应用外壳和 PWA 清单，`no-cache` |
 | `/vibeface_secure.js`、`/vibeface_secure_bg.wasm` | GET | 同一 Rust 密码学实现的浏览器构建 |
 | `/api/info` | GET | `device_id`、`version` 和 `public_entry` |
+| `/bootstrap/catalog` | GET | 发布目录的 `discovery-only` 入口：签名服务目录，任意 Origin 可读，见[公共接入](#公共接入) |
+| `/bootstrap/grant` | POST | 同上：设备签名的许可申请 `{payload, signature}`，回 `{grant}`，拒绝回 403 |
+| `/api/relay/grant` | POST | `grants` 策略的公共入口：登记一张许可 `{grant}`，回 `{device_id, expires_at_ms}`，无效回 403 |
 | `/api/local/setup` | POST | 本机网页读取一次性初始化邀请或已有网络的当前入口；公共入口回 404 |
 | `/api/client` | GET，WebSocket upgrade | 浏览器网关 |
 | `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的随机回环端口上提供，是协调工具的唯一入口；Cursor SDK 回调和 `vibeface tool` 都发 `{toolName, args, agentId}`，回 `{result}`；Cursor 的 owner 进程在每轮发送前安装该 attempt 的 bearer，回调按 bearer 授权，`agentId` 不授予权限 |
@@ -401,7 +407,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 ### iroh Endpoint
 
-每台 Node 运行一个 iroh 1.3 `Endpoint`，`SecretKey` 就是设备密钥。Endpoint 用 Minimal 预设、`MemoryLookup` 和 `RelayMode::Custom`：relay 来自 `network.relays`、本 Node 自己的 relay、公共入口的 relay，以及可选的 n0 公共 relay。默认不向 n0 DNS 或 pkarr 发布地址，持久对端地址来自 ticket 和个人网络内部交换的签名地址记录。显式启用 `network.pkarr` 后，还可向指定 pkarr 目录发布或解析地址。配置的发现服务可提供临时 IP 提示，和已有 relay 路径合并后由 iroh 自动选择连接路径。连接优先直连，失败时经普通 relay 转发 QUIC 密文。
+每台 Node 运行一个 iroh 1.3 `Endpoint`，`SecretKey` 就是设备密钥。Endpoint 用 Minimal 预设、`MemoryLookup` 和 `RelayMode::Custom`：relay 来自 `network.relays`、本 Node 自己的 relay、公共入口的 relay、接入许可指向的公共 relay，以及可选的 n0 公共 relay。同一个 relay URL 出现多次时合并为一条配置，带凭证的配置不会被无凭证的副本覆盖，地址簿里学到的裸 URL 也不会替换已持许可的同一 relay。默认不向 n0 DNS 或 pkarr 发布地址，持久对端地址来自 ticket 和个人网络内部交换的签名地址记录。显式启用 `network.pkarr` 后，还可向指定 pkarr 目录发布或解析地址。配置的发现服务（含 `bootstrap` 来源）可提供临时 IP 提示，和已有 relay 路径合并后由 iroh 自动选择连接路径。连接优先直连，失败时经 relay 转发 QUIC 密文。
 
 成员 Node 另在局域网用 mDNS 广播 `_vibeface._udp.local.`。实例名和 TXT 记录 `t` 都是标签 `hex(HMAC-SHA256(network_id, "vibeface:lan:v1\0" ‖ device_id ‖ hour)[..16])`，`hour` 是 Unix 毫秒除以 3600000 的 u64 大端字节；主机名为 `<标签>.local.`，SRV 端口是 iroh 实际监听的 UDP 端口，A 和 AAAA 是本机非回环网卡地址，网卡变化时自动更新；iroh 在该端口没有监听的地址族不广播。每到整点，同步循环在几秒内改用新标签重新登记，旧实例发出 mDNS 告别。收到的广播在拨号时才比对，用前一、当前和后一小时的标签匹配要拨的成员 Node，过了时间窗的标签自然失效。比对上的地址在 `connect` 中与地址簿和发现服务提示合并；新出现或变化的广播只要属于当前成员 Node（不含自己），就立即唤醒与它的同步，同一 Node 每 10 秒最多唤醒一次；是否属于成员在收到时判定并记下，网络或成员变化时重新判定。只收私网 IPv4 和 ULA IPv6 地址，IPv4 在前，每条最多 4 个；拨号只用比对上的最新一条广播。最多保留 64 条广播，满时先删不属于成员 Node 的，再删最早收到的；收到告别或 SRV 记录过期后删除。Node 关闭网络时撤回自己的广播，最多等 1 秒让告别发出。公共入口和 `bind` 为具体地址的 Node 不启用 mDNS，尚未加入或已被移出网络的 Node 不广播；mDNS 失败只记录日志，不影响 Node 运行。
 
@@ -432,7 +438,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 ### 地址簿
 
-每台 Node 为自己签一条地址记录 `{ version, network_id, device_id, seq, endpoint, gateway_url }`，以 `address` 域签名，`seq` 严格递增。`gateway_url` 在配置了 `network.entry` 时取入口 URL，否则在启用 `gateway` 时取 `public_url`。同步循环每 5 秒检查本机地址，变化后重签并唤醒同步；成员之间经 `rpc` 的 `addresses` 交换记录，最多保留 256 条。浏览器经 `entrances` 读取，用 WASM 验签，丢弃非成员、已撤销、其他网络和带路径或凭证的 `gateway_url`。浏览器为每台 Node 保存已接受记录的 `seq` 高水位，撤回地址的记录也保存，刷新后不接受更旧的记录。HTTPS 且主机不是回环、私网或单段名称的入口算公网，二维码只用公网入口。
+每台 Node 为自己签一条地址记录 `{ version, network_id, device_id, seq, endpoint, gateway_url }`，以 `address` 域签名，`seq` 严格递增。`gateway_url` 在配置了 `network.entry` 时取入口 URL，否则取当前持有效许可的公共入口的 `gateway_url`，否则在启用网页时取 `public_url`；许可过期或丢失后不再写入该入口。同步循环每 5 秒检查本机地址，变化后重签并唤醒同步，接入状态变化时立即唤醒；成员之间经 `rpc` 的 `addresses` 交换记录，最多保留 256 条。浏览器经 `entrances` 读取，用 WASM 验签，丢弃非成员、已撤销、其他网络和带路径或凭证的 `gateway_url`。浏览器为每台 Node 保存已接受记录的 `seq` 高水位，撤回地址的记录也保存，刷新后不接受更旧的记录。HTTPS 且主机不是回环、私网或单段名称的入口算公网，二维码只用公网入口。
 
 ### 附件
 
@@ -462,7 +468,18 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 启用 `relay_listen` 的 Node 运行 `iroh-relay` 服务。个人网络里的 relay 只接纳当前成员 Node，以及带有效邀请令牌 `SHA256("vibeface:relay:v1" ‖ invite_hash)` 的加入者，所以只能经 relay 连通的新 Node 要用运行 relay 的 Node 发出的邀请。relay 看不到内容，但能看到哪些设备连接它、彼此何时通信和流量大小。
 
-公共入口（`init --public-entry`）不加入个人网络。它的 relay 只接纳持有 `entry-token` 的设备，它不运行调度、执行和同步，不保存个人网络的事件或附件，本机设置路径回 404。显式启用文件交付后，独立 `delivery/` 可以暂存交付密文及服务账本，不授予私人网络权限。成员 Node 用 `--entry URL --relay-token-file PATH` 指向它：把入口的 relay 加为自己的 relay 并带上令牌，地址记录的 `gateway_url` 写入口 URL，于是邀请链接和二维码打开的是入口的 origin。浏览器经入口的 `/api/client` 连到成员 Node，入口只搬运 Noise 密文。部署步骤见 [配置公共入口](node.md#配置公共入口)。
+公共入口（`init --public-entry`）不加入个人网络。它的 relay 按 `relay_admission` 接纳设备：`operator-token` 只接纳持有 `entry-token` 的设备，`grants` 只接纳持有有效接入许可的设备，见下节；入口自己的 Endpoint 始终可用自己的 relay。它不运行调度、执行和同步，不保存个人网络的事件或附件，本机设置路径回 404。显式启用文件交付后，独立 `delivery/` 可以暂存交付密文及服务账本，不授予私人网络权限。成员 Node 用 `--entry URL --relay-token-file PATH` 指向运营者令牌模式的入口：把入口的 relay 加为自己的 relay 并带上令牌，地址记录的 `gateway_url` 写入口 URL，于是邀请链接和二维码打开的是入口的 origin。浏览器经入口的 `/api/client` 连到成员 Node，入口只搬运 Noise 密文。部署步骤见 [配置公共入口](node.md#配置公共入口)。
+
+### 公共接入
+
+`bootstrap` 不为 `off` 的 Node 在 Endpoint 绑定后启动一个后台接入任务，本机 API、维护接口和局域网发现不等待它。来源是一台发现服务：`public` 读取仓库文件 `config/public-bootstrap.json` 里固定的 `issuer`（发现服务设备编号）、`udp_host:udp_port` 和 `https_base`，Core 用 `include_str!` 编入同一文件，不另抄一份；`custom` 的 `issuer` 取自 `vibeface://` 地址里的设备编号。三个签名域为 `bootstrap-catalog`、`bootstrap-grant` 和 `bootstrap-request`，签名用 `vibeface_secure` 的消息签名（`vibeface:message:v1:<域>:<SHA-256>`）。
+
+1. **目录**。先在发现服务的 UDP 控制连接上发 `{"type":"catalog"}`，3 秒内拿不到连接或应答时，改为 `GET <https_base>/catalog`，整个应答不超过 4096 字节。应答 `SignedCatalog = {payload, signature}`，`payload` 是 `Catalog {version: 1, issuer, issued_at_ms, expires_at_ms, entries: [{gateway_url, relay_url}]}` 的 JSON 文本，1 到 4 对，URL 必须是不带路径的 HTTPS origin（回环地址可用 HTTP）。`issuer` 必须等于钉住的发现服务编号，签名必须由它签出，过期或签发时间领先本机超过 60 秒的目录被丢弃。发现服务每 24 小时重签，Node 在目录到期前 6 小时刷新；拿不到新目录时沿用手里未过期的。目录只是地址提示，不是成员资格。
+2. **许可**。按目录顺序向发现服务申请 `relay_url` 的许可，UDP 上发 `{"type":"grant","relay_url"}`，由 QUIC TLS 证明设备；UDP 不通时 `POST <https_base>/grant`，正文 `{payload, signature}` 不超过 1024 字节，`payload` 是 `{device_id, relay_url, at_ms, nonce}` 的 JSON 文本，由设备私钥以 `bootstrap-request` 域签名，`at_ms` 与服务时间相差不得超过 5 分钟，`nonce` 为 32 个十六进制字符。发现服务只为目录中列出的 `relay_url` 签许可，每设备每分钟 6 张、每来源 IP 每分钟 30 张。许可的线格式是 `base64url(claims) + "." + hex(signature)`，不超过 1024 字节，`claims` 为 `{version: 1, issuer, device_id, relay_url, issued_at_ms, expires_at_ms, nonce}`，默认 30 分钟、最长 1 小时。
+3. **接纳**。Node 把许可作为该 relay 的 iroh 认证令牌写进 relay 表。`grants` 入口的 relay 对每条连接核对：许可由钉住的 `issuer` 签出，`device_id` 等于 TLS 证明的 `EndpointId`，`relay_url` 的 origin 等于本 relay，未过期。Node 还把每张许可 `POST <gateway_url>/api/relay/grant` 登记到入口，入口按 `EndpointId` 记住最新到期时间（最多 4096 条，满时先删已过期再删最早到期的）。iroh 的 relay 连接任务只在启动时读取令牌，所以续签不会替换正在使用的连接凭证；relay 重启后设备会带旧许可重连，这时登记过的续签让它在到期前仍被接纳，许可到期只阻止新接入。relay 报告拒绝认证时，Node 立即续签并登记，再等 iroh 自己的退避重连，两秒内不重复续签。
+4. **续签与状态**。许可过半有效期（加最多 10% 抖动）时续签，优先续同一入口，目录不再列出它时换下一对。接入状态经维护 socket 的 `health.bootstrap` 和 `vibeface status` 显示：`{"state":"seeking", since_ms, reason?}`、`{"state":"admitted", gateway_url, relay_url, grant_until_ms, via: "udp"|"https"}` 或 `{"state":"degraded", since_ms, reason, admitted?}`。只有持有效许可的入口写进签名地址记录的 `gateway_url`，状态变化立即触发地址重签。失败按 1 到 60 秒退避重试，不回退到其他来源，也不把失败当作成功。
+
+`vibeface join` 在加入时同样为本机 Endpoint 申请一张许可：Node 已在运行时取后台任务持有的许可（最多等 5 秒），否则经 HTTPS 一次性申请。网页和手机 App 只读取目录，不申请许可。
 
 ## 免费节点发现
 
@@ -512,13 +529,13 @@ VDP-1 服务默认关闭，与私人 DAG、附件同步和 Agent 工作分开。
 
 ### 仅发现协议
 
-`relay_mode=discovery-only` 的公共入口只注册 `vibeface/discovery/1`，不启动 `iroh-relay`，不提供 HTTP 浏览器转发，也不接受 `SYNC`、`BLOB`、`RPC`、`CLIENT`、`JOIN` 或 `DECISION` 业务 ALPN。网页开启时只提供静态资源和服务信息。
+`relay_mode=discovery-only` 的公共入口只注册 `vibeface/discovery/1`，不启动 `iroh-relay`，不提供 HTTP 浏览器转发，也不接受 `SYNC`、`BLOB`、`RPC`、`CLIENT`、`JOIN` 或 `DECISION` 业务 ALPN。网页开启时只提供静态资源和服务信息；配置了 `catalog` 时另提供 `/bootstrap/catalog` 和 `/bootstrap/grant`。
 
-发现协议使用长度前缀 JSON，单帧最多 512 字节，未知字段被拒绝。请求只有 `register`、`lookup {device_id}` 和空的 `probe`。服务端用连接的 TLS 身份和已选中的实际 IP 路径构造 `registered {address}`、`peer {device_id,address}` 和 `notice {device_id,address}`；不接受客户端提交地址或任意转发载荷。对端据通知发起固定空探测，再通过原有业务 ALPN 通信。发现服务的身份由客户端配置钉住。对端查询和通知提供的地址只作临时提示；本机观察地址会随自身签名地址记录在个人网络内传播。
+发现协议使用长度前缀 JSON，请求帧最多 1024 字节，应答帧最多 4608 字节以容纳签名目录，未知字段被拒绝。请求有 `register`、`lookup {device_id}`、空的 `probe`，以及配置了 `catalog` 的服务才回答的 `catalog` 和 `grant {relay_url}`。服务端用连接的 TLS 身份和已选中的实际 IP 路径构造 `registered {address}`、`peer {device_id,address}` 和 `notice {device_id,address}`；`catalog` 回 `catalog {catalog}`，`grant` 回绑定连接 TLS 身份的 `granted {grant}` 或 `refused {reason}`；不接受客户端提交地址或任意转发载荷。对端据通知发起固定空探测，再通过原有业务 ALPN 通信。发现服务的身份由客户端配置钉住。对端查询和通知提供的地址只作临时提示；本机观察地址会随自身签名地址记录在个人网络内传播。
 
 总控制连接上限为 512，同来源 IP 上限 8。租约覆盖整条控制会话和读写，最长 60 秒，每连接最多 60 个请求。每个登记最多暂存 8 条连接通知，同一目标的通知间隔至少 250 毫秒；客户端最多同时进行 8 个探测。一个设备可有并发登记，结束时只清理该连接的登记；临时加入连接退出后，已有主连接仍可被找到。
 
-已知设备编号可以查询在线状态和观察地址，不提供枚举接口。运营者可见设备、IP 和查询关系。仅发现不能补偿被封锁或不可打洞的 UDP 路径；普通 relay 仍由用户另行配置并由 iroh 自动回退。部署步骤见[运行公共发现服务](node.md#运行不转发业务数据的公共发现服务)。
+已知设备编号可以查询在线状态和观察地址，不提供枚举接口。运营者可见设备、IP、查询关系和许可申请。仅发现不能补偿被封锁或不可打洞的 UDP 路径；这类流量经目录里的公共 relay 或用户另行配置的 relay 转发，由 iroh 自动回退。部署步骤见[运行公共发现服务](node.md#运行不转发业务数据的公共发现服务)。
 
 ## 通知和自动后续
 

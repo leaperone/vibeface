@@ -95,9 +95,9 @@ impl ProtocolHandler for Inbound {
 }
 
 /// A member Node's relay admits member Nodes and joiners holding an open invite; a public
-/// entry's relay admits Nodes holding its operator token.
+/// entry's relay admits Nodes holding its operator token or a Discovery grant.
 #[derive(Clone)]
-struct RelayAccess(Weak<Runtime>);
+pub(super) struct RelayAccess(pub(super) Weak<Runtime>);
 impl std::fmt::Debug for RelayAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("RelayAccess")
@@ -243,6 +243,18 @@ impl Runtime {
                 }
             }
         }
+        if !self.config.network.bootstrap.is_off() {
+            // An admitted or lost public entry changes this Node's Gateway: the sync loop
+            // re-signs the address record at once instead of at its next tick.
+            let mut states = net.bootstrap().subscribe();
+            let node = Arc::downgrade(self);
+            tokio::spawn(async move {
+                while states.changed().await.is_ok() {
+                    let Some(node) = node.upgrade() else { break };
+                    node.wake_sync_all();
+                }
+            });
+        }
         let node = self.clone();
         tokio::spawn(async move { node.sync_loop().await });
         let node = self.clone();
@@ -267,11 +279,28 @@ impl Runtime {
     async fn relay_allows(&self, request: &iroh_relay::server::ClientRequest) -> bool {
         let device = net::device_id(&request.endpoint_id());
         if self.config.public_entry {
-            return self.identity.device_id().is_ok_and(|own| own == device)
-                || request
+            if self.identity.device_id().is_ok_and(|own| own == device) {
+                return true;
+            }
+            return match &self.config.network.relay_admission {
+                net::RelayAdmission::OperatorToken => request
                     .auth_token()
                     .zip(self.entry_token.as_deref())
-                    .is_some_and(|(token, own)| net::same_token(&token, own));
+                    .is_some_and(|(token, own)| net::same_token(&token, own)),
+                // The grant must name the TLS-proven endpoint, this relay and the pinned issuer;
+                // a renewal the Node registered admits a reconnect that still shows the old one.
+                net::RelayAdmission::Grants { .. } => self
+                    .net()
+                    .ok()
+                    .and_then(|net| net.grant_admission())
+                    .is_some_and(|admission| {
+                        admission.admits(
+                            &request.endpoint_id(),
+                            request.auth_token().as_deref(),
+                            now_ms(),
+                        )
+                    }),
+            };
         }
         if self.member_node(&device).await.is_ok() {
             return true;
@@ -1523,7 +1552,8 @@ impl Runtime {
         }
     }
 
-    /// Where browsers reach this Node: its public entry, else its own URL.
+    /// Where browsers reach this Node: its configured public entry, else the public entry whose
+    /// relay currently admits it, else its own URL.
     pub(crate) fn gateway_url(&self) -> Option<String> {
         self.config
             .network
@@ -1531,10 +1561,35 @@ impl Runtime {
             .as_ref()
             .map(|entry| entry.url.clone())
             .or_else(|| {
+                self.net
+                    .get()
+                    .and_then(|net| net.bootstrap().admitted())
+                    .map(|admitted| admitted.gateway_url)
+            })
+            .or_else(|| {
                 self.config
                     .web_enabled
                     .then(|| self.config.public_url.clone())
             })
+    }
+
+    /// The public relay and grant this Node holds, for a join link's own endpoint. Before the
+    /// Node's network runs, one grant is fetched over HTTPS.
+    pub(crate) async fn public_relay_credential(&self) -> Option<(iroh::RelayUrl, String)> {
+        let source = self.config.network.bootstrap.source().ok().flatten()?;
+        if let Ok(net) = self.net() {
+            if net.bootstrap().credential().is_none() {
+                let _ = net.bootstrap().wait_admitted(Duration::from_secs(5)).await;
+            }
+            return net.bootstrap().credential();
+        }
+        match net::bootstrap::admit_once(&self.identity, &source).await {
+            Ok(credential) => Some((credential.relay, credential.token)),
+            Err(error) => {
+                tracing::warn!(event = "bootstrap.join_grant_failed", %error, "no public relay grant for this join");
+                None
+            }
+        }
     }
 
     /// Re-signs this Node's record when its paths or Gateway changed; returns whether it did.

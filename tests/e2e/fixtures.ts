@@ -2,9 +2,18 @@ import assert from 'node:assert/strict';
 import { lstat, readFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import { test as base } from '@e2e-dev/web';
+import publicBootstrap from '../../config/public-bootstrap.json' with { type: 'json' };
 
 const root = resolve(import.meta.dirname, '../..');
 const artifacts = resolve(root, '.artifacts/e2e');
+base.beforeEach(async ({ browser }) => {
+  await browser.route(`${publicBootstrap.https_base}/**`, route => route.abort());
+  await browser.addInitScript(() => {
+    if (location.protocol !== 'http:' && location.protocol !== 'https:') return;
+    const key = 'vibeface.bootstrap-public-mode';
+    if (localStorage.getItem(key) === null) localStorage.setItem(key, 'off');
+  });
+});
 export type NodeInfo = { url: string; peer: string; directory: string };
 type Role = 'source' | 'receiver' | 'provider';
 type Control = (request: Record<string, unknown>) => Promise<unknown>;
@@ -39,8 +48,11 @@ async function control(baseUrl: string | undefined): Promise<Control> {
   assert(url.protocol === 'http:' && url.hostname === '127.0.0.1' && url.port && url.pathname === '/' && !url.search && !url.hash, 'Control stays on literal loopback');
   assert(/^[a-f0-9]{64}$/.test(token));
   return async request => {
-    const response = await fetch(url, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(request), signal: AbortSignal.timeout(30000) });
-    assert(response.ok, `Fixture operation returned ${response.status}`);
+    const response = await fetch(url, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(request), signal: AbortSignal.timeout(90000) });
+    if (!response.ok) {
+      const failure = record(await response.json());
+      assert.fail(`Fixture ${text(request.op)} returned ${response.status}: ${text(failure.error)}`);
+    }
     return response.json();
   };
 }
@@ -141,3 +153,79 @@ export const workspaceTest = base.extend<{ workspace: WorkspaceFixture }>({
     } finally { await call({ op: 'stop' }); }
   },
 });
+
+type BootstrapInfo = {
+  site: string;
+  invitation: string;
+  issuer: string;
+  member: NodeInfo;
+  gateway: NodeInfo;
+  via: 'udp' | 'https';
+  catalogReads: number;
+  memberHasOperatorToken: boolean;
+};
+type BootstrapFixture = BootstrapInfo & {
+  pairing(): Promise<{ peer: string; code: string }>;
+  approve(pairing: { peer: string; code: string }): Promise<void>;
+  inspect(): Promise<BootstrapInfo>;
+};
+function bootstrapInfo(value: unknown): BootstrapInfo {
+  const fields = record(value), members = nodes(value), status = record(fields.bootstrap);
+  const site = new URL(text(fields.site));
+  assert(site.protocol === 'http:' && site.hostname === '127.0.0.1' && site.port);
+  const member = node(members.member), gateway = node(members.entry), discovery = node(members.discovery);
+  const issuer = text(fields.issuer);
+  assert.equal(issuer, discovery.peer);
+  assert.equal(status.state, 'admitted');
+  assert.equal(status.gateway_url, gateway.url);
+  assert(status.via === 'udp' || status.via === 'https');
+  assert(typeof fields.member_has_operator_token === 'boolean');
+  assert(typeof fields.catalog_reads === 'number' && Number.isSafeInteger(fields.catalog_reads) && fields.catalog_reads >= 0);
+  return { site: site.origin, invitation: text(fields.invitation), issuer, member, gateway, via: status.via,
+    catalogReads: fields.catalog_reads, memberHasOperatorToken: fields.member_has_operator_token };
+}
+function bootstrapFixture(kind: 'bootstrap' | 'bootstrap-http') {
+  return base.extend<{ bootstrap: BootstrapFixture }>({
+    bootstrap: async ({ app, browser }, use) => {
+      const call = await control(app.baseUrl);
+      let primary: unknown;
+      try {
+        await call({ op: 'reset', kind });
+        const info = bootstrapInfo(await call({ op: 'bootstrap_info' }));
+        assert(app.baseUrl);
+        assert.equal(info.site, new URL(app.baseUrl).origin);
+        assert.notEqual(info.gateway.url, info.site, 'Only the signed catalogue names the working gateway');
+        await browser.addInitScript(({ base, issuer }) => {
+          if (location.protocol !== 'http:' && location.protocol !== 'https:') return;
+          localStorage.setItem('vibeface.bootstrap-public-mode', 'custom');
+          localStorage.setItem('vibeface.bootstrap-public-custom-base', base);
+          localStorage.setItem('vibeface.bootstrap-public-custom-issuer', issuer);
+        }, { base: `${info.site}/bootstrap`, issuer: info.issuer });
+        await use({ ...info,
+          async pairing() {
+            const result = record(await call({ op: 'bootstrap_pairing' }));
+            const peer = text(result.peer), code = text(result.code);
+            assert(/^[a-f0-9]{64}$/.test(peer) && /^[0-9]{6}$/.test(code));
+            return { peer, code };
+          },
+          async approve(pairing) {
+            const result = record(await call({ op: 'bootstrap_approve', ...pairing }));
+            assert.equal(result.approved, true);
+          },
+          async inspect() { return bootstrapInfo(await call({ op: 'bootstrap_info' })); },
+        });
+      } catch (error) {
+        primary = error;
+        throw error;
+      } finally {
+        try { await call({ op: 'stop' }); }
+        catch (cleanup) {
+          if (primary !== undefined) throw new AggregateError([primary, cleanup], `${String(primary)}; cleanup also failed: ${String(cleanup)}`);
+          throw cleanup;
+        }
+      }
+    },
+  });
+}
+export const bootstrapTest = bootstrapFixture('bootstrap');
+export const httpBootstrapTest = bootstrapFixture('bootstrap-http');

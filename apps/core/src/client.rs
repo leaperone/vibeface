@@ -1570,6 +1570,11 @@ impl JoinLink {
             relays.retain(|(known, _)| *known != url);
             relays.push((url, Some(token.clone())));
         }
+        // The public relay admits this device by its Discovery grant, not by an invite token.
+        if let Some((url, grant)) = node.public_relay_credential().await {
+            relays.retain(|(known, _)| *known != url);
+            relays.push((url, Some(grant)));
+        }
         let mut addrs: Vec<TransportAddr> = relays
             .iter()
             .map(|(url, _)| TransportAddr::Relay(url.clone()))
@@ -1582,12 +1587,13 @@ impl JoinLink {
                 .copied()
                 .map(TransportAddr::Ip),
         );
+        let discovery = node.config.network.discovery_servers()?;
         ensure!(
-            !addrs.is_empty() || !node.config.network.discovery.is_empty(),
+            !addrs.is_empty() || !discovery.is_empty(),
             "this invite carries no address and no discovery server is configured"
         );
         let config = NetworkConfig {
-            discovery: node.config.network.discovery.clone(),
+            discovery,
             bind: node
                 .config
                 .network

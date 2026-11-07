@@ -84,7 +84,7 @@ const notifier: Notifier = {
 export const webPlatform: Platform = {
   secure,
   transport: createTransport(secure, browserKeys),
-  storage: { getItem: key => localStorage.getItem(key), setItem: (key, value) => localStorage.setItem(key, value) },
+  storage: { getItem: key => typeof localStorage === 'undefined' ? null : localStorage.getItem(key), setItem: (key, value) => localStorage.setItem(key, value) },
   outbox: indexedOutbox(),
   notifier,
   onForeground(listener) {

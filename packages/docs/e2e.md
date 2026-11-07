@@ -32,6 +32,12 @@ headless 传输测试仅阻止临时文件输入打开原生系统选择框，�
 
 `workspace.e2e.ts` 从真实表单创建 Bot、独立 Task 和频道，检查连续补充、稍后队列控制、Context 来源、scope 隔离及窄屏输入和停止。控制器只释放固定的受控 Provider 门，并读取实际原生输入和回合记录，不直接写业务表。390px 网页通过不能替代原生手机制品验收。
 
+公共发现使用同一文件导出的 `bootstrapTest` 和 `httpBootstrapTest`。每项测试运行独立 Discovery、公共入口和新节点，不配置运营者口令。网页自身的连接接口返回 503，浏览器必须验证目录签名并使用目录里的另一处入口，完成真实安全码配对后读取助手列表。HTTP 专项还会把节点的 UDP 发现地址设为不可达，确认节点通过 HTTPS 获取接入许可。普通夹具关闭公共发现，并阻止请求默认公共服务。
+
+```sh
+pnpm exec e2e run --config tests/e2e/e2e.config.ts bootstrap.e2e.ts
+```
+
 只运行核心测试或显示浏览器：
 
 ```sh

@@ -10,6 +10,9 @@ const port = Number(process.argv[2]);
 assert(Number.isInteger(port) && port > 0 && port < 65536, 'Expected a TCP port');
 const repository = resolve(import.meta.dirname, '..');
 const binary = process.env.VIBEFACE_E2E_BINARY ?? 'vibeface';
+const appDir = process.env.VIBEFACE_E2E_APP_DIR;
+const cryptoModule = process.env.VIBEFACE_E2E_CRYPTO_MODULE
+  || (appDir ? resolve(appDir, 'vibeface_secure.js') : undefined);
 const root = resolve(repository, '.artifacts/e2e');
 await mkdir(`${root}/control`, { recursive: true, mode: 0o700 });
 const token = randomBytes(32).toString('hex');
@@ -18,6 +21,7 @@ let pending;
 let ready;
 let changing = false;
 let stopping = false;
+class FixtureError extends Error {}
 
 function object(value) {
   assert(value && typeof value === 'object' && !Array.isArray(value), 'Expected fixture object');
@@ -35,12 +39,12 @@ async function stopFixture() {
   });
 }
 async function startFixture(kind) {
-  assert(kind === 'single' || kind === 'delivery' || kind === 'workspace', 'Unknown fixture kind');
+  assert(['single', 'delivery', 'workspace', 'bootstrap', 'bootstrap-http'].includes(kind), 'Unknown fixture kind');
   await stopFixture();
   const args = [resolve(repository, 'scripts/verify-node.py'), '--e2e-fixture', '--binary', binary,
     '--artifacts', root, '--fixture-port', String(port), '--fixture-kind', kind];
-  if (process.env.VIBEFACE_E2E_CRYPTO_MODULE) args.push('--crypto-module', process.env.VIBEFACE_E2E_CRYPTO_MODULE);
-  if (process.env.VIBEFACE_E2E_APP_DIR) args.push('--app-dir', process.env.VIBEFACE_E2E_APP_DIR);
+  if (cryptoModule) args.push('--crypto-module', cryptoModule);
+  if (appDir) args.push('--app-dir', appDir);
   if (process.env.VIBEFACE_E2E_PROFILE_FILE) args.push('--fixture-profile', process.env.VIBEFACE_E2E_PROFILE_FILE);
   const child = spawn('python3', args, { cwd: repository, stdio: ['pipe', 'pipe', 'inherit'] });
   fixture = child;
@@ -60,7 +64,11 @@ async function startFixture(kind) {
       assert(waiter, 'Unexpected fixture response');
       if ('ready' in value) { ready = object(value.ready); waiter.resolve(ready); }
       else if (value.ok === true) waiter.resolve(value.result);
-      else waiter.reject(new Error('Fixture operation failed'));
+      else {
+        const kind = typeof value.error === 'string' && /^[A-Za-z]+Error$/.test(value.error) ? value.error : 'Error';
+        const frames = Array.isArray(value.frames) ? value.frames.filter(frame => typeof frame === 'string' && /^[A-Za-z0-9_.-]+:[0-9]+:[A-Za-z0-9_<>]+$/.test(frame)) : [];
+        waiter.reject(new FixtureError(`Fixture ${kind}${frames.length ? ` at ${frames.join(', ')}` : ''}`));
+      }
     } catch (error) { waiter?.reject(error); pending = undefined; child.kill('SIGTERM'); }
   });
   return first;
@@ -88,11 +96,11 @@ const control = createServer(async (request, response) => {
     let result;
     if (value.op === 'reset') result = await startFixture(value.kind);
     else if (value.op === 'stop') { await stopFixture(); result = { stopped: true }; }
-    else if (value.op === 'restart' || value.op === 'inspect' || value.op === 'workspace_release' || value.op === 'workspace_inspect' || value.op === 'workspace_native_setup') result = await command(value);
+    else if (['restart', 'inspect', 'workspace_release', 'workspace_inspect', 'workspace_native_setup', 'bootstrap_info', 'bootstrap_pairing', 'bootstrap_approve'].includes(value.op)) result = await command(value);
     else throw new Error('Unknown fixture operation');
     response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(result));
-  } catch {
-    response.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Fixture operation failed' }));
+  } catch (error) {
+    response.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: error instanceof FixtureError ? error.message : 'Fixture operation failed' }));
   } finally { changing = false; }
 });
 await new Promise((done, fail) => { control.once('error', fail); control.listen(0, '127.0.0.1', done); });

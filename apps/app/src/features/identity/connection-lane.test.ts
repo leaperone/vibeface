@@ -56,6 +56,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const afterRender: (() => void)[] = [], timers = new Map<number, () => void>()
   const stored = storage, calls: string[] = [], navigations: string[] = []
+  stored.set('vibeface.bootstrap-public-mode', 'off')
   const requests: { method: string; params: Record<string, unknown> }[] = []
   const setupRequests: { path: string; options: RequestInit }[] = []
   const joinStatus = { value: joining ? joinRequest(joining) : joinRequest('pending') } as { value: Record<string, unknown> }
@@ -84,10 +85,11 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     createContext: () => ({}), useContext: () => null, useCallback: (fn: unknown) => fn,
     useState(initial: unknown) {
       const index = cursor++
-      if (!(index in values)) values[index] = initial
+      if (!(index in values)) values[index] = typeof initial === 'function' ? initial() : initial
       return [values[index], (next: unknown) => { values[index] = typeof next === 'function' ? next(values[index]) : next }]
     },
     useRef(initial: unknown) { const index = cursor++; if (!(index in values)) values[index] = { current: initial }; return values[index] },
+    useMemo(read: () => unknown) { cursor++; return read() },
     useEffect(run: () => (() => void) | void, dependencies: unknown[]) {
       const index = cursor++, previous = effects.get(index)
       if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) afterRender.push(() => {
