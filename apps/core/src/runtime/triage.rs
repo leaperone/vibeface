@@ -5765,12 +5765,18 @@ pub(super) mod tests {
     }
 
     fn controlled_pi(node: &Runtime, dir: &Path, mode: &str) -> Result<()> {
+        let name = if cfg!(windows) {
+            "fake-pi.cmd"
+        } else {
+            "fake-pi"
+        };
+        let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        vibeface_bridge::platform::program::ensure_runnable(&bin, "controlled pi fixture")?;
         let mut providers = node.providers.lock().unwrap();
         providers.switches.execution = [Provider::Pi].into();
-        providers.bins.insert(
-            Provider::Pi,
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-pi"),
-        );
+        providers.bins.insert(Provider::Pi, bin);
         providers.env.apply(
             Provider::Pi,
             BTreeMap::from([

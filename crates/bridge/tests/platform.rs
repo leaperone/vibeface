@@ -256,6 +256,7 @@ async fn a_process_tree_is_cleared_when_the_node_ends_it() -> Result<()> {
 
     spawned.stop();
     let _ = child.start_kill();
+    child.wait().await?;
     eventually("the tree to be cleared", || !spawned.is_running());
     assert!(!tree::token_is_running(spawned.token()));
     Ok(())
@@ -297,6 +298,7 @@ async fn a_recorded_tree_is_ended_only_when_the_record_still_names_it() -> Resul
     );
     spawned.kill();
     let _ = child.start_kill();
+    child.wait().await?;
     Ok(())
 }
 
