@@ -290,7 +290,7 @@ mod windows {
 
     pub fn running_core_data_dirs() -> io::Result<Vec<PathBuf>> {
         let ps = system_powershell()?;
-        let script = "$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $n=0; $items=@(); Get-CimInstance Win32_Process | Where-Object { $_.Name -ieq 'vibeface-core.exe' } | ForEach-Object { if ($n -lt 64) { $p=$_; $o=$p.GetOwnerSid(); if ($o.Sid -eq $sid) { $n++; $line=[string]$p.CommandLine; if ($line.Length -gt 4096) { $line=$line.Substring(0,4096) }; $items+=@{owner_sid=$o.Sid;current_sid=$sid;name=$p.Name;command_line=$line} } } }; [pscustomobject]@{processes=$items} | ConvertTo-Json -Compress -Depth 2";
+        let script = "$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $n=0; $items=@(); Get-CimInstance Win32_Process | Where-Object { $_.Name -ieq 'vibeface-core.exe' } | ForEach-Object { if ($n -ge 64) { return }; $p=$_; try { $o=Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid -ErrorAction Stop } catch { return }; if ($o.ReturnValue -ne 0 -or -not $o.Sid) { return }; if ($o.Sid -ne $sid) { return }; $n++; $line=[string]$p.CommandLine; if ($line.Length -gt 4096) { $line=$line.Substring(0,4096) }; $items+=@{owner_sid=$o.Sid;current_sid=$sid;name=$p.Name;command_line=$line} }; [pscustomobject]@{processes=$items} | ConvertTo-Json -Compress -Depth 2";
         let output = run_powershell_bounded(&ps, script, 256 * 1024)?;
         if !output.status.success() || output.stdout.len() > 256 * 1024 {
             return Err(io::Error::other("process metadata unavailable"));
