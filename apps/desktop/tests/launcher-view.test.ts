@@ -84,6 +84,8 @@ describe('launcher view', () => {
     const backgroundNode: BackgroundNode = { kind: 'installed', nodeId: 'node-1', dataDir: '/var/data/node', health: 'stopped', manager: 'launchd' }
     expect(toView(status({ nodeMode: 'local', backgroundNode })).backgroundActions.map((item) => item.id)).toEqual(['start-background', 'remove-background'])
     expect(toView(status({ nodeMode: 'local', backgroundNode: { kind: 'conflict', message: '服务注册已更改' } })).backgroundActions).toEqual([])
+    const partial: BackgroundNode = { kind: 'partial', nodeId: 'node-1', dataDir: '/var/data/node', message: '后台服务注册不完整' }
+    expect(toView(status({ nodeMode: 'local', backgroundNode: partial })).backgroundActions.map(item => item.id)).toEqual(['discover', 'remove-background'])
   })
 
   it('keeps client action present while local Core is missing and reports discovery failure separately', () => {

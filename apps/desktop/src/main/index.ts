@@ -287,6 +287,7 @@ function registerIpc(): void {
   })
   handle(IPC.discoverNodes, async (passed) => {
     readNoArguments(passed, IPC.discoverNodes)
+    await requireCoordinator().refreshBackground()
     await requireCoordinator().discover()
     if (requireSession().preferences().openBusinessOnConnect && requireCoordinator().status().selectedNode) await openBusiness(true)
     return status()

@@ -45,7 +45,8 @@ export function backgroundNodeFromStatus(status: ManagedNodeStatus, platform: No
   if (status.state === 'not_installed') return { kind: 'absent' }
   if (status.state === 'conflict') return { kind: 'conflict', message: '后台节点服务注册与 Vibeface 记录不一致。' }
   if (status.state === 'unavailable') return { kind: 'failure', message: '无法检查后台节点服务健康状态。' }
-  if (status.state === 'partial') return { kind: 'partial', message: '后台节点安装未完整，请先检查服务状态。' }
+  if (status.state === 'partial') return { kind: 'partial', nodeId: status.device_id, dataDir: status.data_dir,
+    message: '后台服务注册不完整，可以核对后移除后台运行。节点数据会保留。' }
   const health = status.service_running === true && status.core_status === 'running'
     ? 'running'
     : status.service_running === false && status.core_status === 'stopped' ? 'stopped' : 'unhealthy'
@@ -175,6 +176,8 @@ export class DesktopCoordinator {
 
   async startOwnedAppNode(): Promise<void> {
     await this.serial(async () => {
+      const background = await this.options.managedNode.status()
+      if (background.state !== 'not_installed') throw new Error('应用节点已交给后台服务管理，请使用后台节点的启动或停止按钮。')
       await this.options.startOwnedAppNode()
       await this.discoverInner()
     })
@@ -223,8 +226,9 @@ export class DesktopCoordinator {
     await this.serial(async () => {
       const node = this.candidate(candidateId)
       if (node.kind !== 'stopped') throw new Error('这个节点不处于可启动的停止状态，请重新扫描。')
-      if (node.sources.includes('user_service')) {
-        const status = await this.options.managedNode.status()
+      const status = await this.options.managedNode.status()
+      const managed = status.state !== 'not_installed' && status.data_dir === node.dataDir
+      if (managed || node.sources.includes('user_service')) {
         if (status.state !== 'installed_stopped' || status.device_id !== node.deviceId || status.data_dir !== node.dataDir) {
           throw new Error('这个用户服务不是 Vibeface 可验证和管理的服务，拒绝直接启动。')
         }
@@ -294,9 +298,16 @@ export class DesktopCoordinator {
   private async backgroundAction(action: 'start' | 'stop' | 'uninstall'): Promise<void> {
     await this.serial(async () => {
       const current = this.backgroundNode
-      if (current.kind !== 'installed') throw new Error('没有可管理的已验证后台节点。')
+      if (current.kind !== 'installed' && !(action === 'uninstall' && current.kind === 'partial')) throw new Error('没有可管理的已验证后台节点。')
       let result: ManagedNodeStatus
       try {
+        if (action === 'uninstall') {
+          const fresh = await this.options.managedNode.status()
+          if (!['installed', 'installed_stopped', 'partial'].includes(fresh.state)
+              || fresh.device_id !== current.nodeId || fresh.data_dir !== current.dataDir) {
+            throw new Error('后台节点身份或服务状态已变化，请重新核对后再移除。')
+          }
+        }
         result = action === 'start' ? await this.options.managedNode.start(current.nodeId)
           : action === 'stop' ? await this.options.managedNode.stop(current.nodeId)
             : await this.options.managedNode.uninstall(current.nodeId)

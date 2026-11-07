@@ -6,13 +6,36 @@ use std::{
     fs,
     io::{BufRead as _, BufReader},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::{Duration, Instant},
+    process::{Child, Command, Stdio},
+    sync::mpsc,
+    thread,
+    time::Duration,
 };
 
 use vibeface_bridge::platform::{discovery, privatefs};
 
 const READY: &str = "vibeface-core-discovery-fixture-ready";
+
+struct Scratch(PathBuf);
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct FixtureProcess {
+    child: Child,
+    reader: Option<thread::JoinHandle<()>>,
+}
+impl Drop for FixtureProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
 
 fn scratch() -> PathBuf {
     let directory =
@@ -39,11 +62,9 @@ fn compile_fixture_core(root: &Path) -> PathBuf {
     .expect("write the fixture core source");
     let executable = root.join("vibeface-core.exe");
     let output = Command::new("rustc")
-        .args([
-            source.to_string_lossy().as_ref(),
-            "-o",
-            executable.to_string_lossy().as_ref(),
-        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
         .output()
         .expect("invoke rustc for the fixture core");
     assert!(
@@ -54,45 +75,42 @@ fn compile_fixture_core(root: &Path) -> PathBuf {
     executable
 }
 
-fn wait_for_ready(reader: &mut BufReader<impl std::io::Read>) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        let mut line = String::new();
-        if reader.read_line(&mut line).is_err() {
-            break;
-        }
-        if line.trim() == READY {
-            return;
-        }
-    }
-    panic!("timed out waiting for the fixture core ready marker");
-}
-
 #[test]
 fn running_core_data_dirs_finds_fixture_process_with_spaced_unicode_data_dir() {
-    let root = scratch();
-    let data_dir = root.join("Node 数据 With Space");
+    let root = Scratch(scratch());
+    let data_dir = root.0.join("Node 数据 With Space");
     privatefs::create_dir(&data_dir).expect("fixture data directory");
     let expected = data_dir.canonicalize().expect("canonical data directory");
 
-    let core = compile_fixture_core(&root);
-    let mut child = Command::new(&core)
+    let core = compile_fixture_core(&root.0);
+    let child = Command::new(&core)
         .arg("--data-dir")
         .arg(&data_dir)
         .stderr(Stdio::piped())
         .spawn()
         .expect("start the fixture core");
-    let stderr = child.stderr.take().expect("fixture core stderr");
-    let mut reader = BufReader::new(stderr);
-    wait_for_ready(&mut reader);
+    let mut process = FixtureProcess {
+        child,
+        reader: None,
+    };
+    let stderr = process.child.stderr.take().expect("fixture core stderr");
+    let (ready, receive) = mpsc::channel();
+    process.reader = Some(thread::spawn(move || {
+        let mut line = String::new();
+        if BufReader::new(stderr).read_line(&mut line).is_ok() {
+            let _ = ready.send(line);
+        }
+    }));
+    let marker = receive
+        .recv_timeout(Duration::from_secs(20))
+        .expect("fixture core ready marker");
+    assert_eq!(marker.trim(), READY);
 
     let found = discovery::running_core_data_dirs().expect("enumerate running cores");
     assert!(
-        found.iter().any(|path| path == &expected),
+        found
+            .iter()
+            .any(|path| path.canonicalize().ok().as_ref() == Some(&expected)),
         "expected canonical data directory {expected:?} in {found:?}"
     );
-
-    let _ = child.kill();
-    let _ = child.wait();
-    fs::remove_dir_all(&root).expect("remove enumeration scratch");
 }

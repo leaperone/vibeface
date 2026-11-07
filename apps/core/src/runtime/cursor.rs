@@ -1440,10 +1440,15 @@ mod tests {
             let bridge_ready = Arc::new(tokio::sync::Notify::new());
             let bridge_ready_hook = bridge_ready.clone();
             let mut running_config = config.clone();
-            running_config.process_started = Some(Arc::new(move |_| {
+            let original_process_started = running_config.process_started.take();
+            running_config.process_started = Some(Arc::new(move |group| {
                 let bridge_ready_hook = bridge_ready_hook.clone();
+                let original_process_started = original_process_started.clone();
                 Box::pin(async move {
-                    bridge_ready_hook.notify_waiters();
+                    if let Some(record) = original_process_started {
+                        record(group).await?;
+                    }
+                    bridge_ready_hook.notify_one();
                     Ok(())
                 })
             }));
@@ -1493,9 +1498,23 @@ mod tests {
                 )
                 .await
             });
-            tokio::time::timeout(Duration::from_secs(10), bridge_ready.notified())
-                .await
-                .context("controlled Cursor SDK bridge process did not report ready")?;
+            // Admission includes the bridge's separate 60-second startup budget in bridge::agent.
+            // The five-second native-run observation starts only after that transport is ready.
+            let ready = tokio::select! {
+                ready = tokio::time::timeout(Duration::from_secs(60), bridge_ready.notified()) => ready,
+                result = &mut task => {
+                    return match result {
+                        Ok(Ok(_)) => Err(anyhow::anyhow!("Cursor work completed before bridge admission")),
+                        Ok(Err(error)) => Err(error).context("Cursor work failed before bridge admission"),
+                        Err(error) => Err(error).context("Cursor work task failed before bridge admission"),
+                    };
+                }
+            };
+            if ready.is_err() {
+                cancel.send(true)?;
+                let _ = task.await;
+                bail!("controlled Cursor SDK bridge admission did not complete");
+            }
             let observed = tokio::select! {
                 observed = tokio::time::timeout(Duration::from_secs(5), started.notified()) => observed,
                 result = &mut task => {

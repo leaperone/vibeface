@@ -5,6 +5,15 @@ import type { Readable } from 'node:stream'
 const MAX_RESULT_BYTES = 64 * 1024
 const COMMAND_TIMEOUT_MS = 30_000
 
+const CLI_FAILURES: Record<string, string> = {
+  desktop_node_package_invalid: '安装包校验未通过，请重新安装桌面 App。',
+  desktop_node_service_failed: '系统服务操作没有成功，请重新核对后台节点状态。',
+  desktop_node_health_unconfirmed: '后台节点尚未确认就绪，请重新核对状态。',
+  desktop_node_lock_unconfirmed: '无法确认节点是否已退出，请重新核对状态。',
+  desktop_node_registration_unconfirmed: '无法确认系统中的节点服务，请重新核对状态。',
+}
+class CliOperationFailure extends Error {}
+
 export type ManagedNodeProgram = { command: string; args?: readonly string[] }
 type CoreStatus = 'running' | 'stopped' | 'unavailable' | null
 type ManagedNodeIdentity = { device_id: string; data_dir: string; service_id: string; managed_root: string }
@@ -78,14 +87,20 @@ async function invoke(program: ManagedNodeProgram, args: readonly string[]): Pro
   })
   try {
     const [text, close] = await Promise.race([Promise.all([outputPromise, closePromise]), timeout])
-    if (close.code !== 0 || close.signal !== null) throw new Error('desktop Node command failed')
+    if (close.code !== 0 || close.signal !== null) {
+      const diagnostic = await errorDrain
+      const code = /^Error: (desktop_node_[a-z_]+)\s*$/m.exec(diagnostic)?.[1]
+      const message = code ? CLI_FAILURES[code] : undefined
+      throw new CliOperationFailure(message ?? 'managed Node operation failed')
+    }
     const lines = text.trim().split(/\r?\n/)
     if (lines.length !== 1 || !lines[0]) throw new Error('desktop Node returned an invalid result')
     let value: unknown
     try { value = JSON.parse(lines[0]) } catch { throw new Error('desktop Node returned invalid JSON') }
     return value
-  } catch {
+  } catch (error) {
     try { child.kill('SIGKILL') } catch { /* already closed */ }
+    if (error instanceof CliOperationFailure) throw error
     throw new Error('managed Node operation failed')
   }
 }

@@ -233,15 +233,11 @@ test('one existing healthy Node is discovered and selected when the desktop open
 test('the optional background Node survives app quit and removal preserves its Node data', async ({ desktop }) => {
   const initial = await desktop.inspect();
   await desktop.invoke('chooseNodeMode', 'local');
-  await desktop.invoke('startOwned');
-  const provisioned = await desktop.status();
-  assert.equal(provisioned.core.kind, 'owned');
-  const nodeId = provisioned.core.deviceId;
-  assert(typeof nodeId === 'string' && nodeId.length > 0);
-  await desktop.invoke('stopOwned');
   const installed = await desktop.invoke('installBackgroundNode');
   assert.equal(installed.backgroundNode.kind, 'installed');
-  assert.equal(installed.backgroundNode.nodeId, nodeId);
+  const nodeId = installed.backgroundNode.nodeId;
+  assert.equal(installed.core.kind, 'none', 'a fresh GUI background install never pre-starts an App-owned Node');
+  assert.deepEqual((await desktop.inspect()).cores, []);
   const installedData = installed.backgroundNode.dataDir;
   const data = await desktop.snapshotNode(installedData);
   const service = await desktop.serviceStatus(nodeId);
@@ -249,6 +245,7 @@ test('the optional background Node survives app quit and removal preserves its N
   assert.equal(service.device_id, nodeId);
   assert.equal(service.data_dir, installedData);
   assert.equal(service.service_running, true);
+  assert.equal(service.core_status, 'running', 'installation waits for the actual Core to be healthy');
   const serviceId = service.service_id;
   assert(typeof serviceId === 'string' && serviceId.length > 0);
   assert(typeof service.managed_root === 'string');
@@ -261,6 +258,19 @@ test('the optional background Node survives app quit and removal preserves its N
     const managedHash = createHash('sha256').update(await readFile(join(managedPackage, binary))).digest('hex');
     assert.equal(managedHash, sourceHash, `the durable service runtime preserves the verified ${binary} bytes`);
   }
+
+  const firstRemoval = await desktop.invoke('removeBackgroundNode');
+  assert.equal(firstRemoval.backgroundNode.kind, 'absent');
+  assert.equal((await desktop.snapshotNode(installedData)).status, 'stopped');
+  await desktop.invoke('startOwned');
+  const temporary = await desktop.inspect();
+  assert.equal(temporary.status.core.kind, 'owned');
+  assert.equal(temporary.status.core.deviceId, nodeId);
+  const handedOff = await desktop.invoke('installBackgroundNode');
+  assert.equal(handedOff.backgroundNode.kind, 'installed');
+  assert.equal(handedOff.backgroundNode.nodeId, nodeId, 'service handoff preserves the App-owned Node identity');
+  assert.deepEqual((await desktop.inspect()).cores, [], 'the App-owned child exits before the same Node is installed as a service');
+  assert.equal((await desktop.serviceStatus(nodeId)).core_status, 'running');
 
   const exited = await desktop.quit();
   assert.equal(exited.forced, false, 'the app exited through its explicit menu quit action');

@@ -58,7 +58,7 @@ export type NodeDiscovery =
 export type BackgroundNode =
   | { kind: 'absent' | 'checking' }
   | { kind: 'installed'; nodeId: string; dataDir: string; health: 'running' | 'stopped' | 'unhealthy'; manager: 'launchd' | 'systemd' | 'task-scheduler' }
-  | { kind: 'partial'; message: string }
+  | { kind: 'partial'; nodeId: string; dataDir: string; message: string }
   | { kind: 'conflict'; message: string }
   | { kind: 'failure'; message: string }
 

@@ -64,7 +64,7 @@ export function describe(status: LauncherStatus): View {
           ...(background.health === 'running' ? [action('stop-background', '停止后台节点')] : [action('start-background', '启动后台节点')]),
           action('remove-background', '移除后台运行'),
         ]
-      : []
+      : background.kind === 'partial' ? [action('discover', '重新核对状态'), action('remove-background', '移除后台运行')] : []
 
   if (status.nodeMode === 'undecided') return {
     tone: 'idle', indicator: '可开始使用', headline: 'Vibeface',
@@ -85,7 +85,7 @@ export function describe(status: LauncherStatus): View {
     action('discover', '重新检查本机节点'),
     ...(!isLocal ? [action('local', '管理本机节点')] : []),
     ...(!hasCore ? [action('choose', '选择已有节点目录…')] : []),
-    ...(isLocal && !hasCore ? [action('start-owned', '在此电脑启用节点')] : []),
+    ...(isLocal && !hasCore && background.kind === 'absent' ? [action('start-owned', '在此电脑启用节点')] : []),
     ...(status.core.kind === 'owned' ? [action('stop-owned', '停止随 App 运行的节点')] : []),
   ]
   const core = status.core

@@ -100,6 +100,72 @@ describe('Desktop coordinator', () => {
     expect(await instance.value.resolveSelectedNode()).toMatchObject({ inspect: { dataDir: canonical, deviceId } })
   })
 
+  it('starts an installed App-profile Node through its service rather than taking child ownership', async () => {
+    const profile = await temp(), dataDir = await realpath(await temp())
+    let running = false
+    const installed: ManagedNodeStatus = { ok: true, state: 'installed_stopped', device_id: deviceId, data_dir: dataDir,
+      service_id: 'desktop-profile', managed_root: '/managed', service_running: false, core_status: 'stopped' }
+    const managed = { status: vi.fn(async () => installed),
+      start: vi.fn(async () => { running = true; return { ...installed, state: 'installed', service_running: true, core_status: 'running' } }),
+      stop: vi.fn(), installBackground: vi.fn(), uninstall: vi.fn() } as unknown as ManagedNodeController
+    const startChild = vi.fn()
+    const subject = new DesktopCoordinator({
+      profileDir: profile, controlProgram: { command: '/fixed/core', args: ['--control'] }, managedNode: managed,
+      discover: async () => parseLocalNodes({ nodes: [{ ...local(dataDir, deviceId, running ? 'running' : 'stopped'), sources: ['app_profile'] }], warnings: [] }),
+      inspect: async () => inspect(dataDir, deviceId, running ? 'running' : 'stopped'),
+      access: async () => ({ kind: 'local', url: 'http://127.0.0.1:4791/#local=secret', deviceId }),
+      prepareBackgroundNode: async () => { throw new Error('unused') },
+      startDiscovered: startChild, startOwnedAppNode: startChild,
+    })
+    await subject.initialize()
+    const catalog = subject.status().discovery
+    expect(catalog.kind).toBe('ready')
+    if (catalog.kind !== 'ready') throw new Error('expected stopped Node')
+    const candidate = catalog.nodes[0]
+    if (!candidate) throw new Error('expected stopped Node')
+    await subject.start(candidate.id)
+    expect(managed.start).toHaveBeenCalledWith(deviceId)
+    expect(startChild).not.toHaveBeenCalled()
+    expect(subject.status().selectedNode).toEqual({ dataDir, deviceId })
+    await expect(subject.startOwnedAppNode()).rejects.toThrow(/后台服务管理/)
+    expect(startChild).not.toHaveBeenCalled()
+  })
+
+  it('reconciles a partial removal and retries only the same verified Node', async () => {
+    const profile = await temp(), dataDir = await temp()
+    const partial: ManagedNodeStatus = { ok: true, state: 'partial', device_id: deviceId, data_dir: dataDir,
+      service_id: 'desktop-profile', managed_root: '/managed', service_running: false, core_status: 'stopped' }
+    const status = vi.fn().mockResolvedValueOnce(partial).mockResolvedValueOnce(partial).mockResolvedValue(noNode)
+    const uninstall = vi.fn().mockResolvedValue(noNode)
+    const managed = { status, uninstall } as unknown as ManagedNodeController
+    const subject = new DesktopCoordinator({
+      profileDir: profile, controlProgram: { command: '/fixed/core', args: ['--control'] }, managedNode: managed,
+      discover: async () => ({ nodes: [], warnings: [] }),
+      inspect: async () => { throw new Error('unused') }, access: async () => { throw new Error('unused') },
+      prepareBackgroundNode: async () => { throw new Error('unused') },
+      startDiscovered: vi.fn(), startOwnedAppNode: vi.fn(),
+    })
+    await subject.initialize()
+    expect(subject.status().backgroundNode).toMatchObject({ kind: 'partial', nodeId: deviceId, dataDir })
+    await subject.removeBackground()
+    expect(uninstall).toHaveBeenCalledTimes(1)
+    expect(uninstall).toHaveBeenCalledWith(deviceId)
+    expect(subject.status().backgroundNode.kind).toBe('absent')
+
+    status.mockReset().mockResolvedValueOnce(partial).mockResolvedValue({ ...partial, device_id: 'b'.repeat(64) })
+    uninstall.mockClear()
+    const replaced = new DesktopCoordinator({
+      profileDir: await temp(), controlProgram: { command: '/fixed/core', args: ['--control'] }, managedNode: managed,
+      discover: async () => ({ nodes: [], warnings: [] }),
+      inspect: async () => { throw new Error('unused') }, access: async () => { throw new Error('unused') },
+      prepareBackgroundNode: async () => { throw new Error('unused') },
+      startDiscovered: vi.fn(), startOwnedAppNode: vi.fn(),
+    })
+    await replaced.initialize()
+    await expect(replaced.removeBackground()).rejects.toThrow(/身份或服务状态已变化/)
+    expect(uninstall).not.toHaveBeenCalled()
+  })
+
   it('remembers only an existing inspected directory and forgets the client target without stopping a Node', async () => {
     const profile = await temp(), dataDir = await realpath(await temp())
     const instance = coordinator(profile, [local(dataDir)], new Map([[dataDir, inspect(dataDir)]]))

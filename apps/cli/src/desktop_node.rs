@@ -5,8 +5,7 @@ use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, OpenOptions},
-    io,
+    fs, io,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -15,6 +14,36 @@ use vibeface_control::{ControlRequest, DATA_EPOCH, UPDATE_PROTOCOL};
 
 const RECEIPT: &str = "desktop-node.json";
 const MAX_RECEIPT: u64 = 16 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+enum OperationFailure {
+    Package,
+    Service,
+    Health,
+    Lock,
+    Registration,
+}
+
+impl std::fmt::Display for OperationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Package => "desktop_node_package_invalid",
+            Self::Service => "desktop_node_service_failed",
+            Self::Health => "desktop_node_health_unconfirmed",
+            Self::Lock => "desktop_node_lock_unconfirmed",
+            Self::Registration => "desktop_node_registration_unconfirmed",
+        })
+    }
+}
+
+impl std::error::Error for OperationFailure {}
+
+fn public_failure(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<OperationFailure>() {
+        Some(failure) => anyhow::anyhow!(*failure),
+        None => anyhow::anyhow!("desktop_node_operation_failed"),
+    }
+}
 
 #[derive(Args)]
 pub struct DesktopNode {
@@ -158,24 +187,45 @@ fn data_dir(profile: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-/// Acquire the existing data lock without creating it. Success proves no Core currently holds it.
-fn require_data_unlocked(data: &Path) -> Result<()> {
+/// Mutating service operations may create the lock for a freshly initialized, unstarted Node.
+fn data_unlocked(data: &Path) -> Result<bool> {
     let path = data.join("node.lock");
-    let metadata = fs::symlink_metadata(&path)
-        .context("cannot verify that the App-owned Node data lock exists")?;
+    let file =
+        privatefs::open_or_create(&path).context("cannot open the App-owned Node data lock")?;
+    let metadata = fs::symlink_metadata(&path)?;
     ensure!(
         metadata.file_type().is_file() && privatefs::is_private(&path)?,
         "Node data lock is not a private regular file"
     );
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .context("cannot verify that the App-owned Node data lock is free")?;
-    file.try_lock()
-        .context("Node data is in use; stop the App-owned child and retry")?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
     file.unlock()?;
+    Ok(true)
+}
+
+fn require_data_unlocked(data: &Path) -> Result<()> {
+    ensure!(
+        data_unlocked(data)?,
+        "Node data is in use; stop the App-owned child and retry"
+    );
     Ok(())
+}
+
+async fn wait_data_unlocked(data: &Path) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if data_unlocked(data)? {
+            return Ok(());
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "Node did not release its data lock after stopping"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn inspect(data: &Path) -> Result<InspectResult> {
@@ -482,19 +532,20 @@ pub(crate) fn service_command(
 }
 
 async fn native_service(package: &Path, data: &Path, id: &str) -> Result<NativeService> {
-    let mut command = service_command(package, data, id, "verify")?;
+    let mut command =
+        service_command(package, data, id, "verify").context(OperationFailure::Package)?;
     let output = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
         .await
-        .context("inspect current-user Node service registration")?;
+        .context(OperationFailure::Registration)?;
     ensure!(
         output.status.success() && output.stdout.len() <= 4096,
-        "service registration does not match the Desktop receipt"
+        OperationFailure::Registration
     );
     let result: NativeService =
-        serde_json::from_slice(&output.stdout).context("invalid service status")?;
+        serde_json::from_slice(&output.stdout).context(OperationFailure::Registration)?;
     Ok(result)
 }
 
@@ -517,16 +568,14 @@ pub(crate) async fn managed_service_registered(service: &ManagedService) -> Resu
 }
 
 async fn run_service(package: &Path, data: &Path, id: &str, action: &str) -> Result<()> {
-    let status = service_command(package, data, id, action)?
+    let status = service_command(package, data, id, action)
+        .context(OperationFailure::Package)?
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .await
-        .context("run current-user Node service manager")?;
-    ensure!(
-        status.success(),
-        "current-user Node service operation failed"
-    );
+        .context(OperationFailure::Service)?;
+    ensure!(status.success(), OperationFailure::Service);
     Ok(())
 }
 
@@ -535,11 +584,12 @@ async fn wait_health(data: &Path, expected: &str) -> Result<()> {
     loop {
         if let Ok(result) = inspect(data).await
             && result.device_id == expected
+            && result.status == "running"
         {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("background Node did not become healthy with its existing identity");
+            anyhow::bail!(OperationFailure::Health);
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -575,7 +625,7 @@ fn output(
 pub async fn run(options: DesktopNode) -> Result<()> {
     match run_inner(options).await {
         Ok(()) => Ok(()),
-        Err(_) => anyhow::bail!("desktop_node_operation_failed"),
+        Err(error) => Err(public_failure(error)),
     }
 }
 
@@ -767,7 +817,9 @@ async fn run_inner(options: DesktopNode) -> Result<()> {
                     );
                     let package = managed_current(&receipt.managed_root)?;
                     run_service(&package, &data, &receipt.service_id, "stop").await?;
-                    require_data_unlocked(&data)?;
+                    wait_data_unlocked(&data)
+                        .await
+                        .context(OperationFailure::Lock)?;
                     let native = native_service(&package, &data, &receipt.service_id).await?;
                     ensure!(
                         native.installed && !native.running,
@@ -792,7 +844,9 @@ async fn run_inner(options: DesktopNode) -> Result<()> {
                     );
                     let package = managed_current(&receipt.managed_root)?;
                     run_service(&package, &data, &receipt.service_id, "uninstall-node").await?;
-                    require_data_unlocked(&data)?;
+                    wait_data_unlocked(&data)
+                        .await
+                        .context(OperationFailure::Lock)?;
                     let native = native_service(&package, &data, &receipt.service_id).await?;
                     ensure!(
                         !native.installed,
@@ -810,6 +864,23 @@ async fn run_inner(options: DesktopNode) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_errors_expose_only_fixed_codes_without_private_causes() {
+        let classified =
+            anyhow::anyhow!("private fixture contents").context(OperationFailure::Service);
+        assert_eq!(
+            format!("{:?}", public_failure(classified)),
+            "desktop_node_service_failed"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                public_failure(anyhow::anyhow!("private fixture contents"))
+            ),
+            "desktop_node_operation_failed"
+        );
+    }
 
     fn temp(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -855,6 +926,33 @@ mod tests {
         assert!(prepare_profile(&file).is_err());
         assert_eq!(fs::read(file).unwrap(), b"preserve");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_stop_waits_for_the_real_lock_and_a_fresh_install_can_create_it() {
+        let data = temp("service-data-lock");
+        assert!(!data.join("node.lock").exists());
+        require_data_unlocked(&data).unwrap();
+        assert!(privatefs::is_private(&data.join("node.lock")).unwrap());
+        let lock = privatefs::open_or_create(&data.join("node.lock")).unwrap();
+        lock.try_lock().unwrap();
+        assert!(!data_unlocked(&data).unwrap());
+        assert!(require_data_unlocked(&data).is_err());
+        let directory = data.clone();
+        let waiting = tokio::spawn(async move { wait_data_unlocked(&directory).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "a loaded service is not stopped until its Core releases the lock"
+        );
+        drop(lock);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(data_unlocked(&data).unwrap());
+        fs::remove_dir_all(data).unwrap();
     }
 
     fn sealed_fixture_version(root: &Path, version: &str) -> PathBuf {
