@@ -158,8 +158,20 @@ test('provider settings and queued cancellation work in the installed native app
   await assert.rejects(network.call({ op: 'native_provider_setup' }));
   await assert.rejects(network.call({ op: 'native_provider_stage', stage: 'invalid' }));
   await assert.rejects(network.call({ op: 'native_provider_stage', stage: 'ready', role: 'source' }));
+  const ci = process.env.GITHUB_ACTIONS === 'true';
+  const run = process.env.GITHUB_RUN_ID, attempt = process.env.GITHUB_RUN_ATTEMPT;
+  if (ci || run !== undefined || attempt !== undefined) {
+    assert(run && attempt && /^[0-9]+$/.test(run) && /^[0-9]+$/.test(attempt));
+    assert.equal((await readFile(resolve(root, '.artifacts/native/simulator.txt'), 'utf8')).trim(), simulator);
+    const devices = record(record(JSON.parse((await execute('xcrun', ['simctl', 'list', 'devices', '--json'])).stdout)).devices);
+    const assigned = Object.values(devices).flatMap(rows => { assert(Array.isArray(rows)); return rows.map(record); }).filter(row => row.udid === simulator);
+    assert.equal(assigned.length, 1);
+    assert.equal(assigned[0].name, `vibeface-provider-${run}-${attempt}`);
+    assert.equal(assigned[0].state, 'Booted');
+  }
   try {
-    await device.installApp(undefined, { reinstall: true });
+    if (ci) await device.installApp();
+    else await device.installApp(undefined, { reinstall: true });
   } catch (cause) {
     const failures: Record<string, string | number>[] = [];
     for (let error: unknown = cause, depth = 0; error instanceof Error && depth < 8; error = error.cause, depth++) {
@@ -192,15 +204,7 @@ test('provider settings and queued cancellation work in the installed native app
   await device.clearKeychain();
   await app.open();
   await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
-  const run = process.env.GITHUB_RUN_ID, attempt = process.env.GITHUB_RUN_ATTEMPT;
   if (run !== undefined || attempt !== undefined) {
-    assert(run && attempt && /^[0-9]+$/.test(run) && /^[0-9]+$/.test(attempt));
-    assert.equal((await readFile(resolve(root, '.artifacts/native/simulator.txt'), 'utf8')).trim(), simulator);
-    const devices = record(record(JSON.parse((await execute('xcrun', ['simctl', 'list', 'devices', '--json'])).stdout)).devices);
-    const assigned = Object.values(devices).flatMap(rows => { assert(Array.isArray(rows)); return rows.map(record); }).filter(row => row.udid === simulator);
-    assert.equal(assigned.length, 1);
-    assert.equal(assigned[0].name, `vibeface-provider-${run}-${attempt}`);
-    assert.equal(assigned[0].state, 'Booted');
     await copyFile(await app.screenshot('provider-initial'), join(publicPath, 'provider-initial.png'));
   }
   await screen.getByRole('textbox', /^加入链接(?:$|[\s,，])/).fill(secrets.get('nativeInvitation'), { timeout: 30000 });

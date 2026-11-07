@@ -192,7 +192,7 @@ pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' \
   --trace off --video off --retries 0 > .artifacts/native/private/ui.log 2>&1
 ```
 
-该用例重新安装当前 App，逐项核对已安装 bundle 与构建 bundle 的文件摘要，包括实际可执行文件、打包 JavaScript 和原生库。它用 e2e Secret 从任务私有文件读取邀请，填写原生“加入链接”表单，再核对双方安全码并授予管理权限。邀请不会作为普通深链接参数传入 UI driver。iOS 的 TextInput 可把 placeholder 或值附在可访问名称后面，因此输入定位使用 textbox 角色和以字段名称开头、带分隔边界的正则，仍要求唯一匹配。邀请填写后核对已解码的链接卡片，Secret fill 报错仍使验收失败；原输入可能已被卡片替换，不能保证每次逐字回读邀请。设备名、设置保存回读和私有命令剪贴板均作精确核对。
+该用例仅在 `GITHUB_ACTIONS=true` 且安装前核对 run ID、attempt、simulator 文件、实际唯一 UUID、专属名称和 Booted 状态后，才在本次新建的 simulator 上普通安装当前 App，避免先卸载一个尚未安装的应用。本地仍重新安装；GitHub Actions 缺少元数据，或已有 run ID/attempt 不完整或模拟器身份不符，都会在安装前失败。安装后逐项核对已安装 bundle 与构建 bundle 的文件摘要，包括实际可执行文件、打包 JavaScript 和原生库。它用 e2e Secret 从任务私有文件读取邀请，填写原生“加入链接”表单，再核对双方安全码并授予管理权限。邀请不会作为普通深链接参数传入 UI driver。iOS 的 TextInput 可把 placeholder 或值附在可访问名称后面，因此输入定位使用 textbox 角色和以字段名称开头、带分隔边界的正则，仍要求唯一匹配。邀请填写后核对已解码的链接卡片，Secret fill 报错仍使验收失败；原输入可能已被卡片替换，不能保证每次逐字回读邀请。设备名、设置保存回读和私有命令剪贴板均作精确核对。
 
 原生设备页的“Bot 与任务”进入真实 AI 设置页。fixture 只配置受控程序与连接模式，并关闭 Bot 和执行角色，真实返回 `manager=null`。用例先确认未启用的 Codex 尚未主动检查，再开启执行用途；依照 Node 的首次设置默认，这也开启 Bot，用例随后由原生界面关闭 Bot。启用和已有 manager 的 Node 启动都会主动检查，不能把这些结果称为未检查。用例在 execution-only 状态实际检查未登录提示，精确核对从界面复制的私有目录认证命令，由受限 fake CLI 完成一次合成登录，再主动检查并选择、手填和清空执行模型。之后开启 Bot，验证双角色草稿、独立保存、默认模型和 high。它还确认 Provider 控制强度时清除旧覆盖，包括带空白的手填已知模型，以及目录不可用时保留旧模型和强度。所有启用与保存均经已授权手机的正常接口执行。
 
@@ -200,7 +200,7 @@ pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' \
 
 native config 默认关闭 trace 和整段 video。原始日志、自动失败截图、e2e report、邀请、恢复文件、Node 数据与 driver 状态都属于私有材料，不能递归上传 `.artifacts/native/`。CI 只上传固定的 `provider.json`、`provider-probe.json`、`provider-initial.png`、`provider-selectable.png`、`provider-controlled.png`、`provider-typed.png` 和 `terminology-device-kinds.png`。`provider-probe.json` 只记录首轮检查的 `link`、`readiness`、`authentication`、`catalog` 和 `checked` 五个固定状态字段。
 
-`provider-initial.png` 是唯一的配对前诊断图。它只在本次 CI 新建的专属 simulator 上，重新安装、清除钥匙串并启动 App 后主动拍摄，且早于首次 `secrets.get` 和邀请输入。用例核对 simulator 文件、实际 UUID、Booted 状态以及包含当前 run ID 和 attempt 的专属名称。此时 App 尚未接收邀请、登录命令或凭证，也没有旧应用数据；初始图只用于查看路由、系统弹窗和空表单。`terminology-device-kinds.png` 在配对后的“添加设备”面板记录节点与客户端分类，其他三张图在配对后的设置页保存。诊断图不代表配对或表单验收通过。导航诊断仅记录固定阶段和已知界面的布尔状态，不输出界面文本、加入链接、命令或剪贴板内容。CI 按固定键与布尔类型校验后，将该诊断并入公开的 `provider.json`，不上传原始页面树或测试日志。最终收据只有在一个目标测试真实通过、fixture 退出、专属 simulator 删除和私有状态清理后才标为 `passed`。
+`provider-initial.png` 是唯一的配对前诊断图。它只在安装前完成身份核验的本次 CI 新建专属 simulator 上，安装、清除钥匙串并启动 App，确认欢迎页后主动拍摄，且早于首次 `secrets.get` 和邀请输入。此时 App 尚未接收邀请、登录命令或凭证，也没有旧应用数据；初始图只用于查看路由、系统弹窗和空表单。`terminology-device-kinds.png` 在配对后的“添加设备”面板记录节点与客户端分类，其他三张图在配对后的设置页保存。诊断图不代表配对或表单验收通过。导航诊断仅记录固定阶段和已知界面的布尔状态，不输出界面文本、加入链接、命令或剪贴板内容。CI 按固定键与布尔类型校验后，将该诊断并入公开的 `provider.json`，不上传原始页面树或测试日志。最终收据只有在一个目标测试真实通过、fixture 退出、专属 simulator 删除和私有状态清理后才标为 `passed`。
 
 失败收据与 stdout 保留固定阶段、报告是否可读，以及从实际 e2e report 提取的受限错误码、固定 `engine_reason` 和 `engine_timeout_kind`、已知 API 名和两个验收文件的行号。`completed_poll_samples` 只来自唯一合法的既有 expect 采样事件；零表示没有记录完成的采样，字段缺失不补零。错误 message、stack、locator label、值和原始报告不会导出。
 
