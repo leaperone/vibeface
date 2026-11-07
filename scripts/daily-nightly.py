@@ -151,12 +151,12 @@ def next_sequence(prefix, claimed):
 
 
 def next_ios_build_number(value):
-    """Increment the last canonical CFBundleVersion component without rollover."""
+    """Increment the last valid CFBundleVersion component without rollover."""
     require(isinstance(value, str), 'iOS build number must be a string')
     parts = value.split('.')
-    require(1 <= len(parts) <= 3 and re.fullmatch(r'[1-9][0-9]{0,3}', parts[0])
-            and all(re.fullmatch(r'(?:0|[1-9][0-9]?)', part) for part in parts[1:]),
-            'iOS build number must be a canonical Apple CFBundleVersion')
+    require(1 <= len(parts) <= 3 and re.fullmatch(r'[0-9]{1,4}', parts[0])
+            and int(parts[0]) > 0 and all(re.fullmatch(r'[0-9]{1,2}', part) for part in parts[1:]),
+            'iOS build number must be a valid Apple CFBundleVersion')
     maximum = 9999 if len(parts) == 1 else 99
     last = int(parts[-1])
     require(last < maximum, 'iOS build number component cannot be incremented without rollover')
@@ -643,7 +643,8 @@ def self_test():
             assert plan.versions['www'] == '0.0.1-nightly.20261106.1'
             assert plan.ios_build_number == '4'
             assert next_ios_build_number('3.1.9') == '3.1.10'
-            for invalid in ('', '0', '3.01', '10000', '3.100', '3.1.100', '3.1.2.3'):
+            assert next_ios_build_number('3.01') == '3.2'
+            for invalid in ('', '0', '10000', '3.100', '3.1.100', '3.1.2.3'):
                 rejected(lambda invalid=invalid: next_ios_build_number(invalid))
             assert plan_versions('20261105', base, []).versions['core'].endswith('.3')
             assert plan_versions('20261106', base, ['v0.0.1-nightly.20261106.9']).versions['cli'].endswith('.10')
