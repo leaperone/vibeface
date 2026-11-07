@@ -31,7 +31,7 @@ App 自己启动的 Core 使用内置固定路径和显式数据目录，保持�
 
 Windows 移植包含当前用户隔离的私有 IPC、文件权限、数据锁、进程树、命令/路径、用户级服务以及更新与恢复。正常功能不能用空实现或整块 cfg 排除替代。持久记录中的进程标识不能变成不核实归属就结束新 PID 的操作。
 
-桌面验收矩阵为 macOS ARM64、Windows x64、Linux x64 和 Linux ARM64，后者使用 `x86_64-pc-windows-msvc` 原生目标、`.exe` 程序。独立 Core/CLI 继续使用完整 `.tar.gz` 包格式，Windows 安装和运行不依赖 WSL、Git Bash、管理员权限或开发者模式。已有 Linux 目标保留。
+桌面验收矩阵为 macOS ARM64、Windows x64、Linux x64 和 Linux ARM64。Windows 使用 `x86_64-pc-windows-msvc` 原生目标和 `.exe` 程序。独立 Core/CLI 继续使用完整 `.tar.gz` 包格式，Windows 安装和运行不依赖 WSL、Git Bash、管理员权限或开发者模式。已有 Linux 目标保留。
 
 网络或执行结果未知时保留原工作身份并核对，不能重放写操作。现有仅在 Linux 提供的证明生成能力维持其原有平台约束，不以此关闭 Windows 的其他 Core 能力。
 

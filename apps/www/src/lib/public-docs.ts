@@ -5,6 +5,7 @@ export const PUBLIC_DOCS = [
   { file: 'user-guide.md', slug: 'user-guide' },
   { file: 'comparison.md', slug: 'comparison' },
   { file: 'install.md', slug: 'install' },
+  { file: 'ios.md', slug: 'ios' },
   { file: 'bot-and-execution.md', slug: 'bot-and-execution' },
   { file: 'history-sync.md', slug: 'history-sync' },
   { file: 'privacy-security.md', slug: 'privacy-security' },

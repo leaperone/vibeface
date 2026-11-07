@@ -9,24 +9,24 @@ description: 了解 Vibeface 的 CI、制品和 Nightly 发布流程。
 
 ## 按产品组合发布
 
-Core、CLI、Web App 和 Mobile 共享一个版本、一个 `v<version>` Tag 与一个 GitHub Release。`www-v<version>` 只发布独立官网与文档。产品版本以 `apps/cli/Cargo.toml` 为准，Core、Web App 和 Mobile 的发行版本必须与之相等。
+Core、CLI、Web App、Desktop 和 Mobile 共享一个版本、一个 `v<version>` Tag 与一个 GitHub Release。`www-v<version>` 只发布独立官网与文档。产品版本以 `apps/cli/Cargo.toml` 为准，各产品组件的发行版本必须与之相等。
 
 | 发布组 | Tag | 交付物 |
 | --- | --- | --- |
 | product | `v<version>` | 四个平台的完整 CLI/Core 包、macOS、Windows 与两个 Linux 架构的桌面安装包、Web App 归档、Android APK、iOS 设备归档及配置签名后的 IPA，以及各自校验信息 |
 | www | `www-v<version>` | 静态官网与文档归档 |
 
-首个正式版为 `0.0.1`。Nightly 使用 `0.0.1-nightly.YYYYMMDD.N`，日期取 UTC 准备日期，序号按发布组递增。Mobile 的 `expo.version` 保持 `0.0.1`，Android versionCode 独立递增。当前 Mobile 发行目标是 Android APK，不代表 TestFlight、App Store 或 OTA 交付。
+首个正式版为 `0.0.1`。Nightly 使用 `0.0.1-nightly.YYYYMMDD.N`，日期取 UTC 准备日期，序号按发布组递增。Mobile 的 `expo.version` 保持 `0.0.1`，Android versionCode 独立递增。Android 交付 APK；iOS 先走 TestFlight 内测，再准备 App Store 发布。构建签名 IPA 不代表已经上传、可供测试者安装或通过商店审核。
 
 身份检查后，Web、macOS 原生程序、Windows 原生程序、Linux x64 原生程序、Linux ARM64 原生程序、Android 和 iOS 同时构建。原生任务一次编译本平台 CLI 与 Core。每个平台的组包只等自己的原生输入和 Web，不等待其他平台，也不读取另一个公开 Release。
 
-流水线按不可变 artifact ID 传递输入，核对源码、版本、目标平台、完整文件集合及 SHA-256。所有目标通过后汇总 17 个载荷文件与一个 `release.json`，由唯一发布任务上传、回读验证，再公开 Release。缺失、错源、损坏或失败目标都会阻止公开。
+流水线按不可变 artifact ID 传递输入，核对源码、版本、目标平台、完整文件集合及 SHA-256。所有目标通过后，按 `scripts/release.py` 定义的完整文件集合汇总制品与 `release.json`，由唯一发布任务上传、回读验证，再公开 Release。文件集合包含所有平台安装包、校验和、来源收据及可选的签名 IPA。缺失、错源、损坏或失败目标都会阻止公开。
 
 `COMPONENT-INFO.json` 与 `release.json` 的 schema 保持 1。`BUILD-INFO.json` 仍包含九个既有字段，CLI、Core、App 的版本和源码提交必须完全一致。数据 epoch 与更新协议保持 1。旧公开 Tag 与字节保持不可变，不创建旧应用前缀别名。
 
 ## 每日 Nightly 的发布约束
 
-协调入口仍是 `ci.yml` 的 `daily-nightly`，只在 UTC 03:23 的 main 定时扩展检查和 `ci-gate` 成功后执行。手动 CI 和普通 main push 不发布每日 Nightly。产品四应用分配一个共同版本和 `v` Tag，官网独立分配版本和 `www-v` Tag；即使业务源码没有变化，每日仍递增版本。
+协调入口仍是 `ci.yml` 的 `daily-nightly`，只在 UTC 03:23 的 main 定时扩展检查和 `ci-gate` 成功后执行。手动 CI 和普通 main push 不发布每日 Nightly。各产品组件分配一个共同版本和 `v` Tag，官网独立分配版本和 `www-v` Tag；即使业务源码没有变化，每日仍递增版本。
 
 启用需要明确授权未来每日机械版本 PR 自动 squash，并配置单仓库 fine-grained `NIGHTLY_RELEASE_TOKEN`。实现或合并代码不代表凭证已配置或自动发布已启用。PAT 只处理受信版本 PR 创建与普通 squash；版本分支、只创建的 Tag 和精确 dispatch 使用 job 级 `GITHUB_TOKEN`。缺少凭证时明确失败，不挪用部署 token 或修改保护规则。
 
@@ -236,4 +236,4 @@ iOS 与 Android、桌面和原生程序独立并行构建。`release-ios.yml` �
 
 配置 `IOS_CERTIFICATE_P12_BASE64`、`IOS_CERTIFICATE_PASSWORD` 和 `IOS_PROVISIONING_PROFILE_BASE64` 后，工作流可签名并导出 IPA。三项必须完整，证书须为匹配 App 与 team 的 Apple Distribution 身份。Stable 产品在缺少该配置时提前失败。macOS Developer ID 证书和公证 API key 不能替代 iOS 签名材料。
 
-默认导出 `app-store-connect` IPA，收据为 `testflight_eligible=true`、`installable=false`，仍需另行授权并上传 TestFlight 才能安装。`ad-hoc` 仅适用于描述文件中已注册的设备，收据才标记 `installable=true`。本流程只构建和校验，不上传到 TestFlight 或 App Store。详见 [iOS 构建与分发](ios.md)。
+默认导出 `app-store-connect` IPA，收据为 `testflight_eligible=true`、`installable=false`。这只记录导出方式与描述文件校验结果，不代表 Apple 已接收。内测安装仍需另行授权上传、等待 Apple 处理，并分配到 TestFlight 内部测试组。`ad-hoc` 仅适用于描述文件中已注册的设备，收据才标记 `installable=true`。本流程只构建和校验，不上传到 TestFlight 或 App Store。详见 [iOS 构建与分发](ios.md)。
