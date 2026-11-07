@@ -260,10 +260,12 @@ mod windows {
     use std::{
         ffi::OsString,
         os::windows::ffi::{OsStrExt as _, OsStringExt as _},
+        os::windows::process::CommandExt as _,
         process::Command,
     };
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
     use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
     #[derive(Deserialize)]
     struct Proc {
@@ -376,13 +378,19 @@ mod windows {
             thread,
             time::{Duration, Instant},
         };
+        // A GUI parent has no inherited console codepage. Keep the metadata protocol UTF-8
+        // without changing a caller's console or replacing non-ASCII Node paths with '?'.
+        let script = format!(
+            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); {script}"
+        );
         let mut child = Command::new(path)
+            .creation_flags(CREATE_NO_WINDOW)
             .args([
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                script,
+                script.as_str(),
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
