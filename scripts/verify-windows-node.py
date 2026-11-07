@@ -492,17 +492,20 @@ def check_service_scripts(package, node, skip_service):
 
     task_probe = r"""
 $ErrorActionPreference = 'Stop'
-Import-Module ScheduledTasks
 try {
-    $task = Get-ScheduledTask -TaskName 'Node' -TaskPath '\Vibeface\' -ErrorAction Stop
-    if (-not $task) { [Console]::Error.WriteLine('Could not confirm task state.'); exit 1 }
+    $scheduler = New-Object -ComObject 'Schedule.Service'
+    $scheduler.Connect()
+    $task = $scheduler.GetFolder('\').GetTask('\Vibeface\Node')
+    if (-not $task) { throw 'Task Scheduler returned no task object' }
     'present'
 } catch {
-    if ($_.FullyQualifiedErrorId -like 'NoMSFT_ScheduledTaskObjectsFound,*') {
+    $failure = $_.Exception
+    while ($failure.InnerException) { $failure = $failure.InnerException }
+    if ($failure.HResult -eq -2147024894 -or $failure.HResult -eq -2147024893) {
         'absent'
         exit 0
     }
-    [Console]::Error.WriteLine('Could not safely inspect the existing task.')
+    [Console]::Error.WriteLine("Could not safely inspect the existing task (HRESULT $($failure.HResult)).")
     exit 1
 }
 """

@@ -57,23 +57,18 @@ function Invoke-Scheduler {
 # readable listing it prints.
 function Get-TaskCommandLine {
     param([string] $Name)
-    $separator = $Name.LastIndexOf('\')
-    $taskName = $Name.Substring($separator + 1)
-    $taskPath = $Name.Substring(0, $separator + 1)
     try {
-        $task = Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath -ErrorAction Stop
-        if (-not $task) { Fail "could not confirm whether task $Name exists; it was preserved." }
+        $scheduler = New-Object -ComObject 'Schedule.Service'
+        $scheduler.Connect()
+        $task = $scheduler.GetFolder('\').GetTask($Name)
+        $document = [xml] $task.Xml
     } catch {
-        if ($_.FullyQualifiedErrorId -like 'NoMSFT_ScheduledTaskObjectsFound,*') {
-            return $null
-        }
-        Fail "could not inspect task $Name; it was preserved."
+        $failure = $_.Exception
+        while ($failure.InnerException) { $failure = $failure.InnerException }
+        # The local Task Scheduler API distinguishes a missing task/path from query denial.
+        if ($failure.HResult -eq -2147024894 -or $failure.HResult -eq -2147024893) { return $null }
+        Fail "could not inspect task $Name (HRESULT $($failure.HResult)); it was preserved."
     }
-    $result = Invoke-Scheduler @('/Query', '/TN', $Name, '/XML', 'ONE')
-    if ($result.Code -ne 0) { Fail "could not inspect existing task $Name; it was preserved." }
-    # The declaration the scheduler writes names an encoding this text no longer has.
-    try { $document = [xml] ($result.Output -replace '<\?xml[^>]*\?>', '') }
-    catch { Fail "could not read existing task $Name; it was preserved." }
     $exec = $document.Task.Actions.Exec
     if (-not $exec) { Fail "the registered task $Name runs no program." }
     $line = [string] $exec.Command
