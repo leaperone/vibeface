@@ -470,6 +470,13 @@ fn installed(root: &Path) -> Result<PathBuf> {
 }
 
 async fn configure_timer(policy: &Policy, data: &Path) -> Result<()> {
+    let desktop = crate::desktop_node::managed_service_for_data(data)?;
+    let service_id = desktop.as_ref().map(|service| service.service_id.as_str());
+    let mut command = timer_command(policy, data, service_id)?;
+    checked(&mut command, "configure automatic update service").await
+}
+
+fn timer_command(policy: &Policy, data: &Path, service_id: Option<&str>) -> Result<Command> {
     let current = policy.install_root.join("current");
     let mut command = crate::service::service_script(&current.join(SERVICE_SCRIPT))?;
     if policy.automatic {
@@ -481,7 +488,10 @@ async fn configure_timer(policy: &Policy, data: &Path) -> Result<()> {
         command.arg("uninstall-updater");
     }
     command.arg("--data-dir").arg(data);
-    checked(&mut command, "configure automatic update service").await
+    if let Some(service_id) = service_id {
+        command.arg("--service-id").arg(service_id);
+    }
+    Ok(command)
 }
 
 fn persist(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -530,6 +540,14 @@ pub(crate) fn desktop_policy_matches(data: &Path, root: &Path) -> Result<bool> {
 
 pub(crate) fn desktop_policy_compatible(data: &Path, root: &Path) -> Result<bool> {
     Ok(desktop_saved_policy(data)?.is_none_or(|saved| saved.install_root == root))
+}
+
+pub(crate) fn desktop_policy_uses_root(data: &Path, root: &Path) -> Result<bool> {
+    Ok(desktop_saved_policy(data)?.is_some_and(|saved| saved.install_root == root))
+}
+
+pub(crate) fn desktop_policy_root(data: &Path) -> Result<Option<PathBuf>> {
+    Ok(desktop_saved_policy(data)?.map(|saved| saved.install_root))
 }
 
 fn desktop_saved_policy(data: &Path) -> Result<Option<Policy>> {
@@ -866,6 +884,7 @@ async fn prepare_firewall(inspected: &InspectResult, root: &Path, candidate: &Pa
 }
 
 struct Service {
+    desktop: Option<crate::desktop_node::ManagedService>,
     #[cfg(target_os = "macos")]
     domain: String,
     #[cfg(target_os = "macos")]
@@ -906,6 +925,27 @@ trait ServiceControl {
 
 impl Service {
     async fn load(data: &Path) -> Result<Self> {
+        if let Some(desktop) = crate::desktop_node::managed_service_for_data(data)? {
+            let binary = core_binary()?;
+            ensure!(
+                inspect(data, &binary).await?.device_id == desktop.device_id,
+                "Desktop Node identity changed since service installation"
+            );
+            ensure!(
+                crate::desktop_node::managed_service_registered(&desktop).await?,
+                "Desktop Node service registration is missing"
+            );
+            #[cfg(target_os = "macos")]
+            return Ok(Self {
+                desktop: Some(desktop),
+                domain: String::new(),
+                plist: PathBuf::new(),
+            });
+            #[cfg(not(target_os = "macos"))]
+            return Ok(Self {
+                desktop: Some(desktop),
+            });
+        }
         #[cfg(target_os = "macos")]
         {
             let home = std::env::var_os("HOME").context("HOME is required for the user service")?;
@@ -936,6 +976,7 @@ impl Service {
                 "invalid user id"
             );
             Ok(Self {
+                desktop: None,
                 domain: format!("gui/{uid}"),
                 plist,
             })
@@ -972,7 +1013,7 @@ impl Service {
                 starts.len() == 1 && starts[0].ends_with(&format!("--data-dir \"{escaped}\"")),
                 "installed node service uses a different data directory or an unsupported ExecStart"
             );
-            Ok(Self {})
+            Ok(Self { desktop: None })
         }
         #[cfg(windows)]
         {
@@ -988,7 +1029,7 @@ impl Service {
                 task_data_matches(&task_command_line(&output.stdout)?, data),
                 "installed node service uses a different data directory"
             );
-            Ok(Self {})
+            Ok(Self { desktop: None })
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         bail!(
@@ -1059,6 +1100,9 @@ fn task_data_matches(line: &str, data: &Path) -> bool {
 
 impl ServiceControl for Service {
     async fn stop(&self) -> Result<()> {
+        if let Some(desktop) = &self.desktop {
+            return crate::desktop_node::run_managed_service(desktop, "stop").await;
+        }
         #[cfg(target_os = "macos")]
         {
             let label = format!("{}/com.leaperone.vibeface.node", self.domain);
@@ -1103,6 +1147,9 @@ impl ServiceControl for Service {
     }
 
     async fn start(&self) -> Result<()> {
+        if let Some(desktop) = &self.desktop {
+            return crate::desktop_node::run_managed_service(desktop, "start").await;
+        }
         #[cfg(target_os = "macos")]
         {
             let label = format!("{}/com.leaperone.vibeface.node", self.domain);
@@ -1241,6 +1288,37 @@ mod tests {
         fs::read_to_string(script.with_file_name(name))
             .unwrap()
             .replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn updater_timer_command_uses_desktop_service_identity_when_present() {
+        let root = sandbox();
+        let data = root.join("data");
+        private_dir(&data).unwrap();
+        let package = package(&root, "1.0.0");
+        privatefs::link_dir(&package, &root.join("current")).unwrap();
+        let policy = Policy {
+            channel: Channel::Nightly,
+            automatic: true,
+            install_root: root.clone(),
+        };
+        let command = timer_command(&policy, &data, Some("desktop-a1b2")).unwrap();
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--service-id", "desktop-a1b2"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--data-dir", data.to_string_lossy().as_ref()])
+        );
+        let legacy = timer_command(&policy, &data, None).unwrap();
+        assert!(!legacy.as_std().get_args().any(|arg| arg == "--service-id"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

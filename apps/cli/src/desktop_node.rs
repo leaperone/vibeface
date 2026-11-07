@@ -51,14 +51,12 @@ struct ResultJson {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Receipt {
+pub(crate) struct Receipt {
     schema: u32,
-    device_id: String,
-    data_dir: PathBuf,
-    managed_root: PathBuf,
-    service_id: String,
-    version: String,
-    source_commit: String,
+    pub(crate) device_id: String,
+    pub(crate) data_dir: PathBuf,
+    pub(crate) managed_root: PathBuf,
+    pub(crate) service_id: String,
     update_protocol: u32,
     data_epoch: u32,
 }
@@ -75,6 +73,13 @@ struct InspectResult {
 struct NativeService {
     installed: bool,
     running: bool,
+}
+
+pub(crate) struct ManagedService {
+    pub(crate) package: PathBuf,
+    pub(crate) data_dir: PathBuf,
+    pub(crate) service_id: String,
+    pub(crate) device_id: String,
 }
 
 fn absolute_path(value: &str) -> Result<PathBuf, String> {
@@ -195,7 +200,7 @@ fn source_package() -> Result<PathBuf> {
     Ok(package.to_path_buf())
 }
 
-fn service_id(profile: &Path) -> String {
+pub(crate) fn service_id(profile: &Path) -> String {
     let hash = Sha256::digest(profile.as_os_str().to_string_lossy().as_bytes());
     format!("desktop-{}", hex::encode(&hash[..10]))
 }
@@ -205,17 +210,20 @@ fn receipt_path(root: &Path) -> PathBuf {
 }
 
 fn read_receipt(root: &Path) -> Result<Option<Receipt>> {
+    let root_metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        root_metadata.file_type().is_dir()
+            && !root_metadata.file_type().is_symlink()
+            && privatefs::is_private(root)?,
+        "managed runtime root is unsafe"
+    );
     let path = receipt_path(root);
     let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => {
-            ensure!(
-                metadata.file_type().is_dir()
-                    && !metadata.file_type().is_symlink()
-                    && privatefs::is_private(root)?,
-                "managed runtime root is unsafe"
-            );
-            metadata
-        }
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
@@ -240,13 +248,13 @@ fn read_receipt(root: &Path) -> Result<Option<Receipt>> {
     Ok(Some(receipt))
 }
 
-fn package_version(package: &Path) -> Result<(String, String)> {
+fn package_version(package: &Path) -> Result<String> {
     let build = crate::update::release::verify_sealed_package(
         package,
         env!("CARGO_PKG_VERSION"),
         &target()?,
     )?;
-    Ok((build.version, build.source_commit))
+    Ok(build.version)
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
@@ -304,7 +312,7 @@ fn ensure_root(profile: &Path) -> Result<PathBuf> {
 
 fn ensure_runtime(root: &Path, source: &Path) -> Result<PathBuf> {
     let root = fs::canonicalize(root)?;
-    let (version, _) = package_version(source)?;
+    let version = package_version(source)?;
     let releases = root.join("releases");
     if !releases.exists() {
         fs::create_dir(&releases)?;
@@ -387,7 +395,56 @@ fn managed_current(root: &Path) -> Result<PathBuf> {
     Ok(current)
 }
 
-fn service_command(
+pub(crate) fn managed_service_for_data(data: &Path) -> Result<Option<ManagedService>> {
+    let data = fs::canonicalize(data).context("initialized data directory is required")?;
+    if !data.file_name().is_some_and(|name| name == "node") {
+        return Ok(None);
+    }
+    let profile = fs::canonicalize(
+        data.parent()
+            .context("Node data directory has no profile")?,
+    )?;
+    ensure!(
+        data == profile.join("node") && privatefs::is_private(&profile)?,
+        "Desktop Node profile is not private"
+    );
+    let root = profile.join("node-runtime");
+    if let Some(saved_root) = crate::update::desktop_policy_root(&data)?
+        && saved_root != root
+        && (read_receipt(&saved_root)?.is_some()
+            || saved_root
+                .file_name()
+                .is_some_and(|name| name == "node-runtime"))
+    {
+        anyhow::bail!("Desktop updater policy points to another profile-owned runtime");
+    }
+    let Some(receipt) = read_receipt(&root)? else {
+        ensure!(
+            !crate::update::desktop_policy_uses_root(&data, &root)?,
+            "Desktop Node receipt is missing for its updater policy"
+        );
+        return Ok(None);
+    };
+    ensure!(
+        receipt.data_dir == data
+            && receipt.managed_root == root
+            && receipt.service_id == service_id(&profile),
+        "Desktop Node receipt does not own this data directory"
+    );
+    ensure!(
+        crate::update::desktop_policy_matches(&data, &root)?,
+        "Desktop Node updater policy changed"
+    );
+    let package = managed_current(&root)?;
+    Ok(Some(ManagedService {
+        package,
+        data_dir: data,
+        service_id: receipt.service_id,
+        device_id: receipt.device_id,
+    }))
+}
+
+pub(crate) fn service_command(
     package: &Path,
     data: &Path,
     id: &str,
@@ -423,6 +480,24 @@ async fn native_service(package: &Path, data: &Path, id: &str) -> Result<NativeS
     let result: NativeService =
         serde_json::from_slice(&output.stdout).context("invalid service status")?;
     Ok(result)
+}
+
+pub(crate) async fn run_managed_service(service: &ManagedService, action: &str) -> Result<()> {
+    run_service(
+        &service.package,
+        &service.data_dir,
+        &service.service_id,
+        action,
+    )
+    .await
+}
+
+pub(crate) async fn managed_service_registered(service: &ManagedService) -> Result<bool> {
+    Ok(
+        native_service(&service.package, &service.data_dir, &service.service_id)
+            .await?
+            .installed,
+    )
 }
 
 async fn run_service(package: &Path, data: &Path, id: &str, action: &str) -> Result<()> {
@@ -614,15 +689,12 @@ async fn run_inner(options: DesktopNode) -> Result<()> {
                     if existing.is_none() {
                         crate::update::bind_desktop_install_root(&data, &root)?;
                     }
-                    let (version, source_commit) = package_version(&package)?;
                     let receipt = Receipt {
                         schema: 1,
                         device_id: expected.into(),
                         data_dir: data.clone(),
                         managed_root: root.clone(),
                         service_id: service_id(&profile),
-                        version,
-                        source_commit,
                         update_protocol: UPDATE_PROTOCOL,
                         data_epoch: DATA_EPOCH,
                     };
@@ -733,7 +805,8 @@ mod tests {
         path
     }
 
-    fn sealed_fixture(root: &Path) -> PathBuf {
+    fn sealed_fixture_version(root: &Path, version: &str) -> PathBuf {
+        fs::create_dir_all(root).unwrap();
         let package = root.join("runtime");
         fs::create_dir(&package).unwrap();
         let names = [
@@ -756,9 +829,9 @@ mod tests {
         }
         let source_commit = "a".repeat(40);
         let build = serde_json::json!({
-            "core_version": env!("CARGO_PKG_VERSION"), "core_source_commit": source_commit,
-            "app_version": env!("CARGO_PKG_VERSION"), "app_source_commit": source_commit,
-            "version": env!("CARGO_PKG_VERSION"), "target": target().unwrap(),
+            "core_version": version, "core_source_commit": source_commit,
+            "app_version": version, "app_source_commit": source_commit,
+            "version": version, "target": target().unwrap(),
             "source_commit": source_commit, "update_protocol": UPDATE_PROTOCOL, "data_epoch": DATA_EPOCH
         });
         fs::write(
@@ -776,6 +849,22 @@ mod tests {
         }
         fs::write(package.join("FILES.sha256"), files.join("\n") + "\n").unwrap();
         package
+    }
+
+    fn sealed_fixture(root: &Path) -> PathBuf {
+        sealed_fixture_version(root, env!("CARGO_PKG_VERSION"))
+    }
+
+    fn install_test_receipt(profile: &Path, data: &Path, root: &Path) -> Receipt {
+        Receipt {
+            schema: 1,
+            device_id: "device-fixture".into(),
+            data_dir: data.to_path_buf(),
+            managed_root: root.to_path_buf(),
+            service_id: service_id(profile),
+            update_protocol: UPDATE_PROTOCOL,
+            data_epoch: DATA_EPOCH,
+        }
     }
 
     #[test]
@@ -796,8 +885,9 @@ mod tests {
     #[tokio::test]
     async fn readonly_status_does_not_create_node_or_runtime_directories() {
         let root = temp("status");
-        let profile = root.join("profile");
-        fs::create_dir(&profile).unwrap();
+        let profile_path = root.join("profile");
+        fs::create_dir(&profile_path).unwrap();
+        let profile = fs::canonicalize(&profile_path).unwrap();
         privatefs::restrict_dir(&profile).unwrap();
         run_inner(DesktopNode {
             profile_dir: profile.clone(),
@@ -857,6 +947,97 @@ mod tests {
         assert!(
             crate::update::release::verify_sealed_contents(&copied, &target().unwrap()).is_ok()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn valid_private_receipt_resolves_profile_service_across_runtime_switch() {
+        let root = temp("receipt-lifecycle");
+        let profile_path = root.join("profile");
+        fs::create_dir(&profile_path).unwrap();
+        privatefs::restrict_dir(&profile_path).unwrap();
+        let profile = fs::canonicalize(profile_path).unwrap();
+        let data = profile.join("node");
+        fs::create_dir(&data).unwrap();
+        privatefs::restrict_dir(&data).unwrap();
+        let managed_root = profile.join("node-runtime");
+        fs::create_dir(&managed_root).unwrap();
+        privatefs::restrict_dir(&managed_root).unwrap();
+        let source = sealed_fixture(&root);
+        let current = ensure_runtime(&managed_root, &source).unwrap();
+        crate::update::bind_desktop_install_root(&data, &managed_root).unwrap();
+
+        let receipt = install_test_receipt(&profile, &data, &managed_root);
+        privatefs::write_atomic(
+            &receipt_path(&managed_root),
+            &serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        let loaded = read_receipt(&managed_root).unwrap().unwrap();
+        assert_eq!(loaded.service_id, service_id(&profile));
+
+        let next_source = sealed_fixture_version(&root.join("next"), "0.0.2");
+        let next_release = managed_root.join("releases/0.0.2");
+        copy_tree(&next_source, &next_release).unwrap();
+        crate::update::release::verify_sealed_contents(&next_release, &target().unwrap()).unwrap();
+        crate::update::validate_desktop_package(&next_release).unwrap();
+        privatefs::point_dir_link(&next_release, &managed_root.join("current")).unwrap();
+        let managed = managed_service_for_data(&data).unwrap().unwrap();
+        assert_eq!(managed.service_id, service_id(&profile));
+        assert_eq!(managed.package, current);
+        let command =
+            service_command(&managed.package, &data, &managed.service_id, "stop").unwrap();
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--service-id", managed.service_id.as_str()])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--data-dir", data.to_string_lossy().as_ref()])
+        );
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "--binary",
+                managed
+                    .package
+                    .join(crate::update::release::PROGRAMS[0])
+                    .to_string_lossy()
+                    .as_ref(),
+            ]
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn desktop_policy_without_receipt_refuses_legacy_service_fallback() {
+        let root = temp("missing-receipt-policy");
+        let profile_path = root.join("profile");
+        fs::create_dir(&profile_path).unwrap();
+        privatefs::restrict_dir(&profile_path).unwrap();
+        let profile = fs::canonicalize(profile_path).unwrap();
+        let data = profile.join("node");
+        fs::create_dir(&data).unwrap();
+        privatefs::restrict_dir(&data).unwrap();
+        let managed_root = profile.join("node-runtime");
+        fs::create_dir(&managed_root).unwrap();
+        privatefs::restrict_dir(&managed_root).unwrap();
+        let policy = serde_json::json!({
+            "channel": "nightly", "automatic": false, "install_root": managed_root
+        });
+        privatefs::write_atomic(
+            &data.join("update.json"),
+            &serde_json::to_vec(&policy).unwrap(),
+        )
+        .unwrap();
+
+        assert!(managed_service_for_data(&data).is_err());
+        privatefs::write_atomic(&receipt_path(&managed_root), b"{}").unwrap();
+        assert!(managed_service_for_data(&data).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }
