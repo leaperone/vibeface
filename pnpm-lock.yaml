@@ -5,7 +5,7 @@ settings:
   excludeLinksFromLockfile: false
 
 overrides:
-  '@e2e-dev/mobile@0.12.4>agent-device': 0.21.32
+  '@e2e-dev/mobile@0.12.4>agent-device': 0.21.36
 
 importers:
 
@@ -3032,8 +3032,8 @@ packages:
     engines: {node: '>=18.18'}
     hasBin: true
 
-  agent-device@0.21.32:
-    resolution: {integrity: sha512-gfpNs+qeCHKKLY3mqD/NpC7Et7wh5qxNvM9A2cPOhOpzX21e9UHSkO7zOMBpUK7NGtOOkbtz67jco5SVmZOPog==}
+  agent-device@0.21.36:
+    resolution: {integrity: sha512-aG88WlEHjFc/OEBQC7AJg+2LfNoVT/ogxnnzIUYUEgafdiTvBaA+X6uQ2wNmpp2ZrHLy8QIXoEOyc3NEZgJCpQ==}
     engines: {node: '>=22.12'}
     hasBin: true
     peerDependencies:
@@ -7174,7 +7174,7 @@ snapshots:
 
   '@e2e-dev/mobile@0.12.4(ai@7.0.153(zod@4.6.7))(e2e@0.21.3(ai@7.0.153(zod@4.6.7)))':
     dependencies:
-      agent-device: 0.21.32(ai@7.0.153(zod@4.6.7))
+      agent-device: 0.21.36(ai@7.0.153(zod@4.6.7))
       e2e: 0.21.3(ai@7.0.153(zod@4.6.7))
       pngjs: 7.0.0
       zod: 4.6.1
@@ -10029,7 +10029,7 @@ snapshots:
 
   agent-cli-detector@0.1.7: {}
 
-  agent-device@0.21.32(ai@7.0.153(zod@4.6.7)):
+  agent-device@0.21.36(ai@7.0.153(zod@4.6.7)):
     optionalDependencies:
       ai: 7.0.153(zod@4.6.7)
 

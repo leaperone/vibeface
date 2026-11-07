@@ -9,7 +9,7 @@ import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 import { test as base } from '@e2e-dev/mobile';
-import { expect, secrets } from 'e2e';
+import { expect, secrets, type Locator } from 'e2e';
 
 const root = resolve(import.meta.dirname, '../..');
 const execute = promisify(execFile);
@@ -158,15 +158,9 @@ test('provider settings and queued cancellation work in the installed native app
   await assert.rejects(network.call({ op: 'native_provider_setup' }));
   await assert.rejects(network.call({ op: 'native_provider_stage', stage: 'invalid' }));
   await assert.rejects(network.call({ op: 'native_provider_stage', stage: 'ready', role: 'source' }));
-  await device.installApp(undefined, { reinstall: true });
-  const installedPath = (await execute('xcrun', ['simctl', 'get_app_container', simulator, 'one.leaper.vibeface', 'app'])).stdout.trim();
-  assert(installedPath.startsWith('/') && installedPath.toLowerCase().includes(simulator.toLowerCase()), 'Inspect only the assigned simulator installed bundle');
-  expect(await bundleManifest(installedPath)).toEqual(built);
-  await device.clearKeychain();
-  await app.open();
-  await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
+  const ci = process.env.GITHUB_ACTIONS === 'true';
   const run = process.env.GITHUB_RUN_ID, attempt = process.env.GITHUB_RUN_ATTEMPT;
-  if (run !== undefined || attempt !== undefined) {
+  if (ci || run !== undefined || attempt !== undefined) {
     assert(run && attempt && /^[0-9]+$/.test(run) && /^[0-9]+$/.test(attempt));
     assert.equal((await readFile(resolve(root, '.artifacts/native/simulator.txt'), 'utf8')).trim(), simulator);
     const devices = record(record(JSON.parse((await execute('xcrun', ['simctl', 'list', 'devices', '--json'])).stdout)).devices);
@@ -174,6 +168,43 @@ test('provider settings and queued cancellation work in the installed native app
     assert.equal(assigned.length, 1);
     assert.equal(assigned[0].name, `vibeface-provider-${run}-${attempt}`);
     assert.equal(assigned[0].state, 'Booted');
+  }
+  try {
+    if (ci) await device.installApp();
+    else await device.installApp(undefined, { reinstall: true });
+  } catch (cause) {
+    const failures: Record<string, string | number>[] = [];
+    for (let error: unknown = cause, depth = 0; error instanceof Error && depth < 8; error = error.cause, depth++) {
+      if (!('code' in error) || error.code !== 'COMMAND_FAILED' || !('details' in error)
+        || error.details === null || typeof error.details !== 'object' || Array.isArray(error.details)) continue;
+      const details = record(error.details);
+      const failure: Record<string, string | number> = { code: 'COMMAND_FAILED', operation: 'unknown' };
+      const args = details.args;
+      if (typeof details.cmd === 'string' && details.cmd.split('/').at(-1) === 'xcrun' && Array.isArray(args) && args[0] === 'simctl') {
+        if (args[1] === 'install' || args[1] === 'uninstall' || args[1] === 'bootstatus') failure.operation = `simctl-${args[1]}`;
+        else if (args[1] === 'list' && args[2] === 'devices') failure.operation = 'simctl-list-devices';
+      }
+      if (details.kind === 'daemon_startup_failed') failure.kind = details.kind;
+      if (details.reason === 'startup-exited' || details.reason === 'startup-stalled' || details.reason === 'startup-ceiling'
+        || details.reason === 'daemon_transport_timeout') failure.reason = details.reason;
+      const limits: Record<string, [number, number]> = { timeoutMs: [1, 1800000], startupTimeoutMs: [1, 1800000], exitCode: [0, 255], startupAttempts: [1, 2] };
+      for (const [key, [minimum, maximum]] of Object.entries(limits)) {
+        const value = details[key];
+        if (typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum && value <= maximum) failure[key] = value;
+      }
+      failures.push(failure);
+    }
+    await writeFile(join(publicPath, 'provider.json'), `${JSON.stringify({ source_commit: source, status: 'failed', driver_errors: failures })}\n`, { mode: 0o600 })
+      .catch(() => { process.stderr.write('Native driver failure diagnostic could not be recorded\n'); });
+    throw cause;
+  }
+  const installedPath = (await execute('xcrun', ['simctl', 'get_app_container', simulator, 'one.leaper.vibeface', 'app'])).stdout.trim();
+  assert(installedPath.startsWith('/') && installedPath.toLowerCase().includes(simulator.toLowerCase()), 'Inspect only the assigned simulator installed bundle');
+  expect(await bundleManifest(installedPath)).toEqual(built);
+  await device.clearKeychain();
+  await app.open();
+  await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
+  if (run !== undefined || attempt !== undefined) {
     await copyFile(await app.screenshot('provider-initial'), join(publicPath, 'provider-initial.png'));
   }
   await screen.getByRole('textbox', /^加入链接(?:$|[\s,，])/).fill(secrets.get('nativeInvitation'), { timeout: 30000 });
@@ -188,12 +219,14 @@ test('provider settings and queued cancellation work in the installed native app
   await expect(screen.getByLabel(`安全码 ${code.split('').join(' ')}`)).toBeVisible();
   await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
   await expect(screen.getByRole('link', '设置', { exact: true })).toBeVisible({ timeout: 30000 });
-  const openLink = async (url: string) => {
+  const openLink = async (url: string, destination: Locator) => {
     await device.openLink(url);
-    const consent = screen.getByRole('alert', /Open in.*Vibeface/);
+    const consent = screen.getByRole('alert', /Open in.*Vibeface/, { visible: true });
+    await expect(consent.or(destination).first()).toBeVisible();
     if (await consent.isVisible()) await consent.getByRole('button', 'Open', { exact: true }).click();
+    await expect(destination).toBeVisible();
   };
-  await openLink('vibeface://add-device');
+  await openLink('vibeface://add-device', screen.getByText('添加设备', { exact: true, visible: true }).first());
   await expect(screen.getByText('添加设备', { exact: true }).first()).toBeVisible();
   const clientKind = screen.getByRole('button', '客户端', { exact: true });
   const nodeKind = screen.getByRole('button', '节点', { exact: true });
@@ -439,7 +472,8 @@ test('provider settings and queued cancellation work in the installed native app
   const queue = await network.call({ op: 'native_provider_queue' });
   await assert.rejects(network.call({ op: 'native_provider_queue' }));
   const botId = text(queue.bot_id), runningTrigger = text(queue.running_trigger), queuedTrigger = text(queue.queued_trigger);
-  await openLink(`vibeface://b/${botId}`);
+  const composer = screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/, { visible: true });
+  await openLink(`vibeface://b/${botId}`, composer);
   const cancel = screen.getByRole('button', '取消排队', { exact: true });
   await screen.scrollUntilVisible(cancel, { direction: 'up', timeout: 30000 });
   await cancel.click();
@@ -451,8 +485,8 @@ test('provider settings and queued cancellation work in the installed native app
   const after = await inspect();
   expect(after.running_invocations).toBe(1);
   expect(after.queued_invocations).toBe(0);
-  await openLink('vibeface://settings');
-  await openLink(`vibeface://b/${botId}`);
+  await openLink('vibeface://settings', screen.getByText('我的设备', { exact: true, visible: true }));
+  await openLink(`vibeface://b/${botId}`, composer);
   await expect(screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/)).toBeVisible();
   const reopened = await inspect();
   expect(reopened.jobs).toEqual(after.jobs);

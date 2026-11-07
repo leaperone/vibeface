@@ -9,6 +9,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import signal
 import subprocess
 import tempfile
 import urllib.request
@@ -56,11 +58,12 @@ SLOW_TESTS = (
     "runtime::peers::tests::a_round_left_behind_pulls_again_without_waiting_for_hello",
 )
 PLATFORMS = (
-    {"runner": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu"},
-    {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu"},
-    {"runner": "macos-15", "target": "aarch64-apple-darwin"},
+    {"runner": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu", "key": "linux"},
+    {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu", "key": "linux-arm"},
+    {"runner": "macos-15", "target": "aarch64-apple-darwin", "key": "macos"},
 )
-JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
+PLATFORM_JOBS = tuple(f"{kind}-{platform['key']}" for kind in ("native", "package") for platform in PLATFORMS)
+JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "delivery", *PLATFORM_JOBS, "npm-package", "npm-smoke", "www")
 LOCAL_PROCESS_RULES = (
     ("memory-sync", ("apps/core/src/store/bot_settings.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs", "apps/core/src/store/sync.rs", "apps/core/src/agent_context.rs", "apps/core/src/identity*", "crates/secure/*")),
     ("auto-route", ("config/public-bootstrap.json", "apps/core/src/identity*", "apps/core/src/crypto.rs", "apps/core/src/local_access.rs", "apps/core/src/net*", "crates/secure/*", "crates/control/*")),
@@ -141,7 +144,8 @@ def scope_plan(scopes, event, ref_type, channel):
     }
     required = {"quick-check"}
     if web:
-        required.update(("crypto-web", "web", "package"))
+        required.update(("crypto-web", "web"))
+        required.update(f"{kind}-{platform['key']}" for platform in platforms for kind in ("native", "package"))
     if packages:
         required.update(("rust-check", "rust-fast"))
     if slow:
@@ -274,7 +278,7 @@ def write_plan(plan, output=None):
             "rust": str(bool(plan["rust_packages"])).lower(),
             "slow": str("slow" in plan["test_tiers"]).lower(),
             "delivery": str(plan["delivery"]).lower(),
-            "package": str("package" in plan["required_jobs"]).lower(),
+            "package": str(plan["web"]).lower(),
             "package_matrix": json.dumps(plan["package_matrix"], separators=(",", ":")),
             "package_mode": plan["package_mode"],
             "npm": str(plan["npm"]).lower(),
@@ -365,6 +369,14 @@ def gate(needs, plan=None, delivery_live=False):
     print(f"CI gate passed: {', '.join(required)}")
 
 
+def mobile_gate(needs, android_only):
+    required = ["android"] if android_only else ["android", "ios-build", "ios-accept"]
+    if (any(needs.get(job, {}).get("result") != "success" for job in required)
+            or any(job.get("result") in {"failure", "cancelled"} for job in needs.values())):
+        raise ValueError("Selected mobile jobs did not all succeed")
+    print(f"Mobile gate passed: {', '.join(required)}")
+
+
 def package_args(packages):
     if not packages or len(set(packages)) != len(packages) or set(packages) - set(PACKAGES):
         raise ValueError("Expected unique workspace package names")
@@ -409,12 +421,88 @@ def run_check(packages, msrv=None):
         subprocess.run(["cargo", f"+{msrv}", "check", "--locked", *selected], check=True)
 
 
+def parallel_processes(commands, artifacts):
+    artifacts.mkdir(parents=True, exist_ok=True)
+    processes, logs, results = {}, [], {}
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+
+    def interrupted(*_):
+        raise KeyboardInterrupt
+
+    try:
+        for sig in previous:
+            signal.signal(sig, interrupted)
+        for mode, (command, environment) in commands.items():
+            log = (artifacts / (mode + ".log")).open("w")
+            logs.append(log)
+            processes[mode] = subprocess.Popen(command, env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        for mode, process in processes.items():
+            results[mode] = process.wait()
+    finally:
+        for sig in previous:
+            signal.signal(sig, signal.SIG_IGN)
+        for process in processes.values():
+            if process.poll() is None:
+                process.send_signal(signal.SIGINT)
+        for mode, process in processes.items():
+            try:
+                results[mode] = process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                results[mode] = process.wait()
+        for log in logs:
+            log.close()
+        (artifacts / "results.json").write_text(json.dumps(results, sort_keys=True) + "\n")
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    if any(result != 0 for result in results.values()) or len(results) != len(commands):
+        raise ValueError(f"Process acceptance failed: {results}")
+
+
+def macos_process(package, artifacts):
+    import hashlib
+    package, artifacts = package.resolve(strict=True), artifacts.resolve()
+    commands, copies = {}, []
+    for mode, base in (("chat-agent", 41000), ("phase5", 51000)):
+        copied = artifacts / mode / "package"
+        shutil.copytree(package, copied)
+        copies.append(copied)
+        commands[mode] = (["python3", str(Path(__file__).with_name("verify-node.py")),
+                           "--binary", str(copied / "vibeface"), "--core-binary", str(copied / "vibeface-core"),
+                           "--crypto-module", str(copied / "web/vibeface_secure.js"),
+                           "--artifacts", str(artifacts / mode / "runs"), "--" + mode],
+                          dict(os.environ, VIBEFACE_PORT_BASE=str(base), VIBEFACE_PORT_LIMIT=str(base + 1000)))
+
+    def hashes(directory):
+        return {path.relative_to(directory).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in directory.rglob("*") if path.is_file()}
+
+    expected = hashes(package)
+    if any(hashes(copied) != expected for copied in copies):
+        raise ValueError("macOS package copies differ")
+    try:
+        parallel_processes(commands, artifacts)
+    finally:
+        if hashes(package) != expected or any(hashes(copied) != expected for copied in copies):
+            raise ValueError("macOS process acceptance changed its input package")
+
+
 def self_test():
     from unittest.mock import patch
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "check-release-workflow.py"), "--self-test"], check=True)
+    mobile = {job: {"result": "success"} for job in ("android", "ios-build", "ios-accept")}
+    mobile_gate(mobile, False)
+    mobile_gate({"android": {"result": "success"}, "ios-build": {"result": "skipped"}, "ios-accept": {"result": "skipped"}}, True)
+    for job in mobile:
+        for result in ("failure", "cancelled", "skipped", "missing"):
+            expect_failure(lambda: mobile_gate(dict(mobile, **{job: {"result": result}}), False))
+        expect_failure(lambda: mobile_gate({key: value for key, value in mobile.items() if key != job}, False))
     web = make_plan(["apps/app/src/routes/index.tsx"])
     assert web["rust_packages"] == [] and web["test_tiers"] == []
-    assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
+    assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "native-linux", "package-linux"]
     assert web["package_mode"] == "web" and web["package_matrix"]["include"] == list(PLATFORMS[:1])
     assert make_plan(["apps/app/src/content.md"])["web"]
     assert web["local_process_modes"] == []
@@ -479,7 +567,7 @@ def self_test():
         assert selected["scopes"] == ["delivery"] and selected["delivery"]
         assert selected["rust_packages"] == expected["delivery"] and selected["web"]
         assert "delivery" in selected["required_jobs"]
-        assert "package" in selected["required_jobs"] and selected["package_matrix"]["include"][0]["target"] == "x86_64-unknown-linux-gnu"
+        assert "package-linux" in selected["required_jobs"] and selected["package_matrix"]["include"][0]["target"] == "x86_64-unknown-linux-gnu"
     assert not docs["delivery"] and not web["delivery"]
     for path in ("Cargo.toml", "Cargo.lock", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml", ".github/workflows/ci.yml", "scripts/ci.py", "new-build-input"):
         assert make_plan([path])["rust_packages"] == list(PACKAGES)
@@ -637,16 +725,47 @@ def self_test():
     workflow = (root / ".github/workflows/ci.yml").read_text()
     concurrency = workflow.split("concurrency:\n", 1)[1].split("\npermissions:", 1)[0]
     assert "(github.event_name == 'workflow_dispatch' || github.run_attempt > 1) && github.run_id || ''" in concurrency
-    assert "cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == 1 }}" in concurrency
+    assert "github.run_attempt == 1 && (github.event_name == 'push' && github.ref == 'refs/heads/main'" in concurrency
+    for condition in ("inputs.feedback", "!inputs.delivery_live", "!inputs.delivery_small", "inputs.delivery_small_resume_run == ''"):
+        assert concurrency.count(condition) == 2
+    assert "feedback:\n" in workflow and "default: false" in workflow.split("feedback:\n", 1)[1].split("delivery_live:", 1)[0]
     assert "fetch-depth: 0" in workflow.split("\n  ci-gate:\n", 1)[1]
     for job in ("rust-check", "rust-fast", "rust-slow"):
         block = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  \w|\Z)", workflow)[1]
         dependency = "[plan, quick-check]" if job == "rust-check" else "plan"
         assert f"    needs: {dependency}\n" in block
         assert "actions/download-artifact@" not in block
-    package = re.search(r"(?ms)^  package:\n(.*?)(?=^  \w|\Z)", workflow)[1]
-    assert "    needs: [plan, crypto-web, web]\n" in package
-    assert "name: crypto-web-${{ github.sha }}" in package and "name: web-${{ github.sha }}" in package
+    for platform in PLATFORMS:
+        key, target, runner = (platform[field] for field in ("key", "target", "runner"))
+        for kind in ("native", "package"):
+            block = re.search(rf"(?ms)^  {kind}-{key}:\n(.*?)(?=^  [a-z]|\Z)", workflow)[1]
+            dependency = "plan" if kind == "native" else f"[plan, native-{key}, crypto-web, web]"
+            assert f"    needs: {dependency}\n" in block
+            assert f"runner: {runner}" in block and f"target: {target}" in block
+            assert f"uses: ./.github/workflows/ci-{kind}.yml" in block
+            assert f".include.*.target, '{target}'" in block
+        assert f"native-{key}" in ready["required_jobs"] and f"package-{key}" in ready["required_jobs"]
+    native = (root / ".github/workflows/ci-native.yml").read_text()
+    package = (root / ".github/workflows/ci-package.yml").read_text()
+    assert "actions/download-artifact@" not in native and "--native-output" in native
+    assert "shared-key: package-${{ inputs.target }}-package" in native
+    assert "--native-input" in package and "--producer-attempt" in package
+    assert "artifact-ids: ${{ inputs.crypto_artifact_id }}" in package and "artifact-ids: ${{ inputs.web_artifact_id }}" in package
+    assert "macos-process" in package
+    mobile_workflow = (root / ".github/workflows/mobile.yml").read_text()
+    build = mobile_workflow.split("  ios-build:\n", 1)[1].split("  ios-accept:\n", 1)[0]
+    accept = mobile_workflow.split("  ios-accept:\n", 1)[1].split("  mobile-gate:\n", 1)[0]
+    assert "seal ios" in build and "restore ios" in accept
+    assert "workspaces: |\n            . -> target\n            . -> .artifacts/native/target" in build
+    assert "xcodebuild" not in accept and "cargo build" not in accept and "build-web.sh" not in accept
+    assert "nativeInvitation" not in build and "simctl\", \"create" not in build
+    assert "artifact-ids: ${{ needs.ios-build.outputs.artifact_id }}" in accept and "needs.ios-build.outputs.producer_attempt" in accept
+    for text in (workflow, package, mobile_workflow):
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            if "artifact-ids:" in line:
+                assert "merge-multiple: true" in "\n".join(lines[index:index + 5])
+    process_pair_test(root, scratch)
     subprocess.run(["python3", str(root / "scripts/build-inputs.py"), "self-test"], check=True)
     config = (root / "crates/control/src/lib.rs").read_text()
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
@@ -726,7 +845,7 @@ def gatekeeper_test(root, scratch):
     import sys
     import textwrap
 
-    workflow = (root / ".github/workflows/ci.yml").read_text()
+    workflow = (root / ".github/workflows/ci-package.yml").read_text()
     step = workflow.split("      - name: Verify Developer ID signature\n", 1)[1]
     script = textwrap.dedent(step.split("        run: |\n", 1)[1].split("\n      - ", 1)[0])
     accepted = (0, "Notarized Developer ID")
@@ -855,7 +974,7 @@ def release_privacy_test(root, scratch):
         marker = repo / "cargo-called"
         environment.update(PATH=f"{fake_cargo.parent}{os.pathsep}{environment['PATH']}", CARGO_MARKER=str(marker))
         subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--target", "x86_64-unknown-linux-gnu"], env=environment, check=True, stdout=subprocess.PIPE)
-        assert marker.exists(), "packaging must always rebuild the native binary"
+        assert marker.exists(), "default packaging must rebuild the native binary"
         archive_path, = (repo / ".artifacts/packages").glob("*.tar.gz")
         with tarfile.open(archive_path) as archive:
             for entry in archive.getmembers():
@@ -867,9 +986,21 @@ def release_privacy_test(root, scratch):
             assert not any(entry.name.endswith(("/.env", "/untracked-note.md")) for entry in archive.getmembers())
             assert archive.getmember(f"{package}/vibeface").mode & 0o111
             assert archive.getmember(f"{package}/vibeface-core").mode & 0o111
+        marker.unlink()
+        native = repo / ".artifacts/native.tar.gz"
+        subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--target", "x86_64-unknown-linux-gnu", "--native-output", str(native)], env=environment, check=True, stdout=subprocess.PIPE)
+        assert marker.exists(), "native producer must compile"
+        restored = repo / ".artifacts/native-restored"
+        subprocess.run(["python3", str(repo / "scripts/build-inputs.py"), "restore", "native", "--target", "x86_64-unknown-linux-gnu", "--input", str(native), "--output", str(restored)], env=environment, check=True)
+        marker.unlink()
+        command = ["bash", str(repo / "scripts/package-node.sh"), "--target", "x86_64-unknown-linux-gnu", "--native-input", str(restored)]
+        subprocess.run(command, env=environment, check=True, stdout=subprocess.PIPE)
+        assert not marker.exists(), "verified native input must be reused without Cargo"
+        (restored / "vibeface").write_bytes(b"corrupt")
+        assert subprocess.run(command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode != 0
+        assert not marker.exists(), "invalid native input must fail without a silent rebuild"
         (repo / "scripts/release-rustflags.py").write_text('raise RuntimeError("fixture failure")')
         generated()
-        marker.unlink()
         assert subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--target", "x86_64-unknown-linux-gnu"], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode != 0
         assert not marker.exists(), "a failed privacy setup must stop the build"
     print("Release privacy self-test passed: caller flags, source paths, archive owners and extended attributes")
@@ -881,6 +1012,46 @@ def expect_failure(check):
     except ValueError:
         return
     raise AssertionError("Expected rejection")
+
+
+def process_pair_test(root, scratch):
+    from unittest.mock import patch
+    import runpy
+    import time
+    with tempfile.TemporaryDirectory(prefix="pair-", dir=scratch) as temporary:
+        directory = Path(temporary)
+        commands = {"good": (["python3", "-c", "raise SystemExit(0)"], None),
+                    "bad": (["python3", "-c", "raise SystemExit(7)"], None)}
+        expect_failure(lambda: parallel_processes(commands, directory))
+        assert json.loads((directory / "results.json").read_text()) == {"good": 0, "bad": 7}
+        child = "import pathlib,signal,time; signal.signal(signal.SIGINT,lambda *_: (_ for _ in ()).throw(KeyboardInterrupt())); "
+        child += "pathlib.Path({ready!r}).touch()\ntry: time.sleep(30)\nfinally: pathlib.Path({done!r}).touch()\n"
+        commands = {name: (["python3", "-c", child.format(ready=str(directory / (name + "-ready")), done=str(directory / (name + "-done")))], None) for name in ("a", "b")}
+        supervisor = "import runpy,pathlib; runpy.run_path({script!r})['parallel_processes']({commands!r},pathlib.Path({output!r}))"
+        process = subprocess.Popen(["python3", "-c", supervisor.format(script=str(root / "scripts/ci.py"), commands=commands, output=str(directory))], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 10
+            while not all((directory / (name + "-ready")).exists() for name in commands):
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise AssertionError("both controlled workers must start")
+                time.sleep(0.02)
+            process.terminate()
+            assert process.wait(timeout=10) != 0
+            assert all((directory / (name + "-done")).exists() for name in commands)
+            assert set(json.loads((directory / "results.json").read_text())) == {"a", "b"}
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        with patch.dict(os.environ, {"VIBEFACE_PORT_BASE": "41000", "VIBEFACE_PORT_LIMIT": "41001"}):
+            namespace = runpy.run_path(str(root / "scripts/verify-node.py"))
+            namespace["_port_base"][0] = 41001
+            try:
+                namespace["available_port"]()
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError("exhausted port range was accepted")
 
 
 def main():
@@ -898,6 +1069,9 @@ def main():
     needs = final_gate.add_mutually_exclusive_group(required=True)
     needs.add_argument("--needs", type=Path)
     needs.add_argument("--needs-env")
+    mobile = commands.add_parser("mobile-gate")
+    mobile.add_argument("--needs-env", required=True)
+    mobile.add_argument("--android-only", action="store_true")
     for name in ("test", "check"):
         command = commands.add_parser(name)
         selection = command.add_mutually_exclusive_group(required=True)
@@ -907,16 +1081,23 @@ def main():
             command.add_argument("--tier", choices=("fast", "slow"), required=True)
         else:
             command.add_argument("--msrv", help="also check the declared minimum Rust version")
+    macos = commands.add_parser("macos-process")
+    macos.add_argument("--package", type=Path, required=True)
+    macos.add_argument("--artifacts", type=Path, required=True)
     args = parser.parse_args()
     if args.self_test:
         from unittest.mock import patch
         with patch.dict(os.environ, {key: value for key, value in os.environ.items() if not key.startswith("GITHUB_") and key != "GH_TOKEN"}, clear=True):
             self_test()
+    elif args.command == "macos-process":
+        macos_process(args.package, args.artifacts)
     elif args.command == "plan":
         write_plan(event_plan(args), args.github_output)
     elif args.command == "gate":
         needs = json.loads(args.needs.read_text() if args.needs else os.environ[args.needs_env])
         gate(needs, json.loads(args.plan.read_text()) if args.plan else None, delivery_live=args.delivery_live)
+    elif args.command == "mobile-gate":
+        mobile_gate(json.loads(os.environ[args.needs_env]), args.android_only)
     elif args.command in {"test", "check"}:
         packages = args.packages if args.packages else json.loads(os.environ[args.plan_env])["rust_packages"]
         if args.command == "test":

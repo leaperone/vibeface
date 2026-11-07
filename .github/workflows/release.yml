@@ -95,6 +95,7 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with: {node-version: '24', cache: pnpm, cache-dependency-path: pnpm-lock.yaml}
       - run: pnpm install --frozen-lockfile
+        if: needs.identity.outputs.app == 'www'
       - name: Build and verify static application
         env:
           SCOPE: ${{ needs.identity.outputs.app }}

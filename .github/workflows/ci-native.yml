@@ -1,0 +1,41 @@
+name: ci-native
+on:
+  workflow_call:
+    inputs:
+      runner: {type: string, required: true}
+      target: {type: string, required: true}
+    outputs:
+      artifact_id:
+        value: ${{ jobs.build.outputs.artifact_id }}
+      producer_attempt:
+        value: ${{ jobs.build.outputs.producer_attempt }}
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      producer_attempt: ${{ github.run_attempt }}
+    env:
+      PACKAGE_TARGET: ${{ inputs.target }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          shared-key: package-${{ inputs.target }}-package
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+      - name: Build and seal native release input without Web dependencies
+        run: |
+          [[ "$(rustc -vV | sed -n 's/^host: //p')" == "$PACKAGE_TARGET" ]]
+          bash scripts/package-node.sh --target "$PACKAGE_TARGET" --native-output .artifacts/native-input.tar.gz
+      - id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-${{ inputs.target }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: .artifacts/native-input.tar.gz
+          if-no-files-found: error
+          retention-days: 14

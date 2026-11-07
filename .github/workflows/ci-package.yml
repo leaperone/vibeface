@@ -1,0 +1,328 @@
+name: ci-package
+on:
+  workflow_call:
+    inputs:
+      runner: {type: string, required: true}
+      target: {type: string, required: true}
+      native_artifact_id: {type: string, required: true}
+      producer_attempt: {type: string, required: true}
+      crypto_artifact_id: {type: string, required: true}
+      web_artifact_id: {type: string, required: true}
+      package_mode: {type: string, required: true}
+      delivery: {type: boolean, required: true}
+    secrets:
+      MACOS_CERTIFICATE_P12_BASE64: {required: false}
+      MACOS_CERTIFICATE_PASSWORD: {required: false}
+      APPLE_API_KEY_P8_BASE64: {required: false}
+      APPLE_API_KEY_ID: {required: false}
+      APPLE_API_ISSUER_ID: {required: false}
+    outputs:
+      artifact_id:
+        value: ${{ jobs.assemble.outputs.artifact_id }}
+permissions:
+  contents: read
+jobs:
+  assemble:
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    env:
+      PACKAGE_TARGET: ${{ inputs.target }}
+      VIBEFACE_INPUT_ATTEMPT: ${{ inputs.producer_attempt }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Require explicit producer artifact IDs
+        env:
+          ARTIFACT_IDS: ${{ inputs.crypto_artifact_id }}
+        run: '[[ "$ARTIFACT_IDS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.crypto_artifact_id }}
+          merge-multiple: true
+          path: apps/app/generated
+      - name: Require explicit producer artifact IDs
+        env:
+          ARTIFACT_IDS: ${{ inputs.web_artifact_id }}
+        run: '[[ "$ARTIFACT_IDS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.web_artifact_id }}
+          merge-multiple: true
+          path: apps/app/dist/client
+      - name: Require explicit producer artifact IDs
+        env:
+          ARTIFACT_IDS: ${{ inputs.native_artifact_id }}
+        run: '[[ "$ARTIFACT_IDS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.native_artifact_id }}
+          merge-multiple: true
+          path: .artifacts/native-download
+      - name: Restore verified same-run native input
+        run: python3 scripts/build-inputs.py restore native --input .artifacts/native-download/native-input.tar.gz --output .artifacts/native-input --target "$PACKAGE_TARGET" --producer-attempt "$VIBEFACE_INPUT_ATTEMPT"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          components: rustfmt
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        if: inputs.target == 'x86_64-unknown-linux-gnu'
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: ${{ inputs.target == 'x86_64-unknown-linux-gnu' && 'pnpm' || '' }}
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Import Developer ID signing identity
+        if: inputs.target == 'aarch64-apple-darwin' && github.event_name != 'merge_group'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          for name in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
+            [[ -n "${!name}" ]] || { echo "::error::Repository secret $name is required to sign and notarize macOS packages."; exit 1; }
+          done
+          echo "::add-mask::$APPLE_API_KEY_ID"
+          echo "::add-mask::$APPLE_API_ISSUER_ID"
+          keychain="$RUNNER_TEMP/vibeface-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          echo "::add-mask::$keychain_password"
+          umask 077
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/vibeface-signing.p12"
+          printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/vibeface-notary.p8"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/vibeface-signing.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -f pkcs12 -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/vibeface-signing.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+          existing=()
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            existing+=("${line//\"/}")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          identities="$(security find-identity -v -p codesigning "$keychain" | grep '"Developer ID Application: ' || true)"
+          [[ -n "$identities" && "$(wc -l <<< "$identities")" -eq 1 ]] || { echo '::error::Expected exactly one Developer ID Application identity in the certificate.'; exit 1; }
+          identity="$(awk '{print $2}' <<< "$identities")"
+          team="$(sed -n 's/.*(\([A-Z0-9]\{10\}\))"$/\1/p' <<< "$identities")"
+          [[ "$identity" =~ ^[0-9A-F]{40}$ && -n "$team" ]] || { echo '::error::Could not resolve the signing identity or team.'; exit 1; }
+          {
+            printf 'VIBEFACE_CODESIGN_IDENTITY=%s\n' "$identity"
+            printf 'VIBEFACE_CODESIGN_TEAM=%s\n' "$team"
+            printf 'VIBEFACE_NOTARY_KEY=%s\n' "$RUNNER_TEMP/vibeface-notary.p8"
+            printf 'VIBEFACE_NOTARY_KEY_ID=%s\n' "$APPLE_API_KEY_ID"
+            printf 'VIBEFACE_NOTARY_ISSUER=%s\n' "$APPLE_API_ISSUER_ID"
+          } >> "$GITHUB_ENV"
+      - name: Build native release package
+        run: |
+          [[ "$(rustc -vV | sed -n 's/^host: //p')" == "$PACKAGE_TARGET" ]]
+          bash scripts/package-node.sh --target "$PACKAGE_TARGET" --native-input "$PWD/.artifacts/native-input"
+          if [[ -n "${VIBEFACE_NOTARY_KEY:-}" ]]; then
+            security delete-keychain "$RUNNER_TEMP/vibeface-signing.keychain-db"
+            rm -f "$VIBEFACE_NOTARY_KEY"
+          fi
+      - name: Verify checksum and unpacked source identity
+        id: unpack
+        shell: bash
+        run: |
+          shopt -s nullglob
+          archives=(.artifacts/packages/*.tar.gz)
+          [[ "${#archives[@]}" == 1 ]]
+          archive="${archives[0]}"
+          name="$(basename "$archive" .tar.gz)"
+          (cd .artifacts/packages && shasum -a 256 -c "$name.tar.gz.sha256")
+          mkdir -p .artifacts/unpacked
+          tar -xzf "$archive" -C .artifacts/unpacked
+          package="$PWD/.artifacts/unpacked/$name"
+          python3 - "$package/BUILD-INFO.json" <<'PY'
+          import json, os, pathlib, re, subprocess, sys
+          info = json.load(open(sys.argv[1]))
+          config = pathlib.Path("crates/control/src/lib.rs").read_text()
+          protocol, epoch = (int(re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1]) for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
+          assert set(info) == {"version", "target", "source_commit", "update_protocol", "data_epoch", "core_version", "core_source_commit", "app_version", "app_source_commit"}
+          assert info["update_protocol"] == protocol and info["data_epoch"] == epoch
+          assert info["source_commit"] == os.environ["GITHUB_SHA"]
+          assert info["target"] == os.environ["PACKAGE_TARGET"]
+          binary = pathlib.Path(sys.argv[1]).parent / "vibeface"
+          web = binary.parent / "web"
+          assert (web / "_shell.html").stat().st_size > 0
+          assert (web / "index.html").stat().st_size > 0
+          assert (web / "_redirects").stat().st_size > 0
+          assert (web / "_headers").stat().st_size > 0
+          assert (web / ".vibeface-build.json").stat().st_size > 0
+          assert (web / "vibeface_secure.js").stat().st_size > 0
+          assert (web / "vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm")
+          assert (binary.parent / "vibeface-core").stat().st_size > 0
+          assert subprocess.check_output([str(binary), "--version"], text=True).strip() == f'vibeface {info["version"]}'
+          assert subprocess.check_output([str(binary.parent / "vibeface-core"), "--version"], text=True).strip() == f'vibeface-core {info["core_version"]}'
+          PY
+          "$package/vibeface" --help
+          "$package/vibeface-core" --help
+          printf 'package=%s\n' "$package" >> "$GITHUB_OUTPUT"
+      - name: Verify Developer ID signature
+        if: inputs.target == 'aarch64-apple-darwin' && github.event_name != 'merge_group'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: |
+          set -o pipefail
+          for binary in "$PACKAGE/vibeface" "$PACKAGE/vibeface-core"; do
+            codesign --verify --strict "$binary"
+            details="$(codesign -dvvv "$binary" 2>&1)"
+            printf '%s\n' "$details"
+            grep -qx 'Identifier=cn.leaperone.vibeface' <<< "$details"
+            grep -qx "TeamIdentifier=$VIBEFACE_CODESIGN_TEAM" <<< "$details"
+            grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime' <<< "$details"
+            binary_sha="$(shasum -a 256 "$binary" | cut -d ' ' -f 1)"
+            delays=(15 30 60 120 120 120 120 120 120)
+            for attempt in $(seq 0 "${#delays[@]}"); do
+              assessment="$RUNNER_TEMP/gatekeeper-assessment-$(basename "$binary")-$attempt.txt"
+              if spctl -a -vvv --ignore-cache --no-cache -t open --context context:primary-signature "$binary" >"$assessment" 2>&1; then
+                assessment_status=0
+              else
+                assessment_status=$?
+              fi
+              cat "$assessment"
+              printf 'Gatekeeper assessment %s exited %s\n' "$attempt" "$assessment_status"
+              test "$(shasum -a 256 "$binary" | cut -d ' ' -f 1)" = "$binary_sha"
+              if test "$assessment_status" -eq 0; then
+                grep -qx 'source=Notarized Developer ID' "$assessment"
+                break
+              fi
+              if test "$assessment_status" -ne 3 || ! grep -qx 'source=Unnotarized Developer ID' "$assessment" || test "$attempt" -eq "${#delays[@]}"; then
+                exit "$assessment_status"
+              fi
+              sleep "${delays[$attempt]}"
+            done
+          done
+      - name: Verify packaged Web assets and process
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
+      - name: Verify packaged free discovery and charity delivery over real Node processes
+        if: inputs.delivery && inputs.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+          VIBEFACE_PROBE_SOURCE_ROOT: ${{ github.workspace }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.artifacts/delivery-probe/target
+        run: |
+          cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml -- --check
+          cargo build --manifest-path tests/fixtures/delivery-probe/Cargo.toml --locked
+          python3 scripts/verify-node.py --delivery-charity --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts "$PWD/.artifacts/ci-delivery" --delivery-probe "$CARGO_TARGET_DIR/debug/vibeface-delivery-probe" --delivery-source-root "$PWD" --delivery-profile "$PWD/crates/delivery/proof/profile.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ !cancelled() && inputs.delivery && inputs.target == 'x86_64-unknown-linux-gnu' }}
+        with:
+          name: delivery-charity-${{ github.sha }}-${{ github.run_attempt }}
+          path: .artifacts/ci-delivery/delivery-charity-*/report.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Use official Ubuntu package mirror
+        if: inputs.target == 'x86_64-unknown-linux-gnu'
+        run: printf 'https://archive.ubuntu.com/ubuntu/\n' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+      - name: Cache Chromium binaries
+        if: inputs.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: .artifacts/e2e/browsers
+          key: ${{ inputs.runner }}-${{ runner.arch }}-chromium-${{ hashFiles('pnpm-lock.yaml') }}
+      - name: Verify packaged Web onboarding in Chromium
+        if: inputs.target == 'x86_64-unknown-linux-gnu'
+        env:
+          VIBEFACE_E2E_BINARY: ${{ steps.unpack.outputs.package }}/vibeface
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.artifacts/e2e/browsers
+          E2E_TELEMETRY_DISABLED: '1'
+        run: |
+          pnpm install --frozen-lockfile --filter .
+          pnpm test:e2e:check
+          pnpm exec e2e-web install chromium --with-deps
+          pnpm test:e2e
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ !cancelled() && inputs.target == 'x86_64-unknown-linux-gnu' }}
+        with:
+          name: e2e-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            tests/e2e/.artifacts/results
+            !tests/e2e/.artifacts/results/**/downloads/**
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Verify unpacked Node scheduling and signed log without model calls
+        if: inputs.package_mode == 'node' && inputs.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-node --phase1
+      - name: Verify multi-Node sync, entrances and delivery over iroh
+        if: inputs.package_mode == 'node' && inputs.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-multi-node
+      - name: Verify cross-device coordination, owner moves and attachments
+        if: inputs.package_mode == 'node' && inputs.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-phase4 --phase4
+      - name: Verify the public entry and its relay token
+        if: inputs.package_mode == 'node' && inputs.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-public-entry --public-entry
+      - name: Verify discovery-only assistance and headless Nodes
+        if: inputs.package_mode == 'node' && inputs.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-discovery --discovery
+      - name: Verify independent macOS process suites
+        if: inputs.package_mode == 'node' && inputs.target == 'aarch64-apple-darwin'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/ci.py macos-process --package "$PACKAGE" --artifacts .artifacts/macos-process
+      - name: Upload verified package
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: node-package-${{ inputs.target }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            .artifacts/packages/*.tar.gz
+            .artifacts/packages/*.tar.gz.sha256
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload Node failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: node-process-failure-${{ inputs.target }}-${{ github.run_attempt }}
+          path: |
+            .artifacts/macos-process/results.json
+            .artifacts/macos-process/*.log
+            .artifacts/ci-web/web-process-*/report.json
+            .artifacts/ci-web/web-process-*/WEB/process.log
+            .artifacts/ci-node/phase1-process-*/report.json
+            .artifacts/ci-node/phase1-process-*/A/process.log
+            .artifacts/ci-node/phase1-process-*/fixture-manager-*.stderr.log
+            .artifacts/macos-process/chat-agent/runs/chat-agent-process-*/report.json
+            .artifacts/macos-process/chat-agent/runs/chat-agent-process-*/A/process.log
+            .artifacts/macos-process/chat-agent/runs/chat-agent-process-*/fixture-manager-*.stderr.log
+            .artifacts/macos-process/chat-agent/runs/chat-agent-process-*/manager-tool-errors.jsonl
+            .artifacts/ci-phase4/phase4-*/report.json
+            .artifacts/ci-phase4/phase4-*/*/node.log
+            .artifacts/ci-discovery/discovery-*/report.json
+            .artifacts/ci-discovery/discovery-*/*/node.log
+            .artifacts/ci-public-entry/public-entry-*/report.json
+            .artifacts/ci-public-entry/public-entry-*/*/node.log
+            .artifacts/macos-process/phase5/runs/phase5-*/report.json
+            .artifacts/macos-process/phase5/runs/phase5-*/*/node.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Remove signing keychain and notary key
+        if: always() && inputs.target == 'aarch64-apple-darwin' && github.event_name != 'merge_group'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/vibeface-signing.keychain-db" 2> /dev/null || true
+          rm -f "$RUNNER_TEMP/vibeface-notary.p8" "$RUNNER_TEMP/vibeface-signing.p12"
