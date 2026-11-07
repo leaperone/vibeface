@@ -60,9 +60,15 @@ function Get-TaskCommandLine {
     $separator = $Name.LastIndexOf('\')
     $taskName = $Name.Substring($separator + 1)
     $taskPath = $Name.Substring(0, $separator + 1)
-    $task = Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath `
-        -ErrorAction SilentlyContinue
-    if (-not $task) { return $null }
+    try {
+        $task = Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath -ErrorAction Stop
+        if (-not $task) { Fail "could not confirm whether task $Name exists; it was preserved." }
+    } catch {
+        if ($_.FullyQualifiedErrorId -like 'NoMSFT_ScheduledTaskObjectsFound,*') {
+            return $null
+        }
+        Fail "could not inspect task $Name; it was preserved."
+    }
     $result = Invoke-Scheduler @('/Query', '/TN', $Name, '/XML', 'ONE')
     if ($result.Code -ne 0) { Fail "could not inspect existing task $Name; it was preserved." }
     # The declaration the scheduler writes names an encoding this text no longer has.
