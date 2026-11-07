@@ -1663,7 +1663,7 @@ pub(crate) struct NodeJoinTask {
     link: String,
     owner: JoinOwner,
     status: NodeJoin,
-    task: tokio::task::AbortHandle,
+    task: futures_util::future::AbortHandle,
     cancel: Arc<tokio::sync::Notify>,
 }
 
@@ -1754,7 +1754,8 @@ pub(crate) async fn start_node_join(
     let joining = link.clone();
     let cancel = Arc::new(tokio::sync::Notify::new());
     let cancelled = cancel.clone();
-    let task = tokio::spawn(async move {
+    let (task, registration) = futures_util::future::AbortHandle::new_pair();
+    let joining_task = async move {
         let report = |status: NodeJoin| {
             if let Ok(mut slot) = runner.node_join.lock()
                 && let Some(current) = slot.as_mut()
@@ -1778,8 +1779,10 @@ pub(crate) async fn start_node_join(
                 report(NodeJoin::Failed { reason });
             }
         }
-    })
-    .abort_handle();
+    };
+    node.spawn_background(async move {
+        let _ = futures_util::future::Abortable::new(joining_task, registration).await;
+    })?;
     *slot = Some(NodeJoinTask {
         link,
         owner,

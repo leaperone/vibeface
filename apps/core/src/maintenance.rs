@@ -949,9 +949,14 @@ mod tests {
         .await;
         server.abort();
         let _ = server.await;
+        let retired = Arc::downgrade(&node);
         node.shutdown().await;
         drop(node);
         let device = crate::config::identity(&dir)?.device_id()?;
+        assert!(
+            retired.upgrade().is_none(),
+            "shutdown releases the pending local join task"
+        );
         remove_dir_if_exists(&vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?)
             .with_context(|| format!("remove maintenance IPC directory for {device}"))?;
         std::fs::remove_dir_all(&dir)
