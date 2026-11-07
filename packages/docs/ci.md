@@ -155,7 +155,7 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 每四小时 Nightly 接在同一 schedule run 的 `ci-gate` 后，不新增第二套定时全量 CI。`daily-nightly` 仅接受 main 的 schedule，以显式 `!cancelled()` 和 `ci-gate` success 作为条件，允许上游不适用的检查正常跳过。协调器使用固定 concurrency 且不取消进行中的协调。启用需要明确授权未来每四小时机械版本 PR 自动 squash，并配置专用单仓库 `NIGHTLY_RELEASE_TOKEN`；当前实现不代表凭证或自动发布已启用。该 PAT 需 Contents、Pull requests、Actions 所需权限，只处理版本 PR 创建和普通 squash；版本 branch、tag 与精确 workflow dispatch 使用 job 级 `GITHUB_TOKEN`。未配置时明确失败，不修改权限或保护规则。
 
-协调脚本先验证精确机械版本 diff 和 `cargo metadata --locked --no-deps`，合并后只接受真实 squash SHA 的 main push CI success，再并行启动产品与官网发布组。不会为版本分支再派发一轮全量检查，也不为合并 SHA 再跑扩展全量 CI。原 run 的 `created_at` 转为 UTC 后向下取整到四小时批次，使用 `bot/daily-nightly/YYYYMMDDHH` 分支；版本日期保留 `YYYYMMDD`。不同批次分配新 PR 和递增版本，延迟启动或跨日重跑复用原批次 PR、版本、SHA 和留存制品。quick-check 与 preflight 注册 `python3 scripts/daily-nightly.py --self-test` 及 Python 语法检查，涵盖六个 UTC 批次、同批次恢复、同日递增、真实临时 Git、篡改 diff、完整产品发布门、未知写入对账和原 artifact 恢复。具体发布顺序与停止条件见 [每 4 小时 Nightly 的发布约束](releasing.md#每-4-小时-nightly-的发布约束)。
+协调脚本先验证精确机械版本 diff 和 `cargo metadata --locked --no-deps`，合并后只接受真实 squash SHA 的 main push CI success，再并行启动产品与官网发布组。不会为版本分支再派发一轮全量检查，也不为合并 SHA 再跑扩展全量 CI。原 run 的 `created_at` 转为 UTC 后向下取整到四小时批次，使用 `bot/daily-nightly/YYYYMMDDHH` 分支；版本日期保留 `YYYYMMDD`。不同批次分配新 PR 和递增版本，延迟启动或跨日重跑复用原批次 PR、版本、SHA 和留存制品。旧批次若尚无分支与 PR，而 main 的产品或官网 Nightly 日期已更晚，则拒绝初始化，避免版本倒退。quick-check 与 preflight 注册 `python3 scripts/daily-nightly.py --self-test` 及 Python 语法检查，涵盖六个 UTC 批次、同批次恢复、同日递增、旧批次拒绝倒退、真实临时 Git、篡改 diff、完整产品发布门、未知写入对账和原 artifact 恢复。具体发布顺序与停止条件见 [每 4 小时 Nightly 的发布约束](releasing.md#每-4-小时-nightly-的发布约束)。
 
 | 扩展检查 | 执行范围 |
 | --- | --- |

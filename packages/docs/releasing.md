@@ -30,7 +30,7 @@ Core、CLI、Web App 和 Mobile 共享一个版本、一个 `v<version>` Tag 与
 
 启用需要明确授权未来每四小时机械版本 PR 自动 squash，并配置单仓库 fine-grained `NIGHTLY_RELEASE_TOKEN`。实现或合并代码不代表凭证已配置或自动发布已启用。PAT 只处理受信版本 PR 创建与普通 squash；版本分支、只创建的 Tag 和精确 dispatch 使用 job 级 `GITHUB_TOKEN`。缺少凭证时明确失败，不挪用部署 token 或修改保护规则。
 
-原 schedule run 的 `created_at` 转为 UTC 后，向下取整到 00、04、08、12、16、20 时的批次。批次分支为 `bot/daily-nightly/YYYYMMDDHH`，版本日期仍为原 run 的 `YYYYMMDD`。同日不同批次各建一个版本 PR，并继续递增 Nightly 序号与 Android versionCode；协调器全局串行。延迟启动或跨日重跑仍恢复原批次唯一 PR、版本、实际 squash SHA 和留存制品，校验完整机械 tree、作者、base、head 和 Android versionCode。已有批次 PR 格式不符合时停止，不另建替代 PR 或重新分配版本。
+原 schedule run 的 `created_at` 转为 UTC 后，向下取整到 00、04、08、12、16、20 时的批次。批次分支为 `bot/daily-nightly/YYYYMMDDHH`，版本日期仍为原 run 的 `YYYYMMDD`。同日不同批次各建一个版本 PR，并继续递增 Nightly 序号与 Android versionCode；协调器全局串行。延迟启动或跨日重跑仍恢复原批次唯一 PR、版本、实际 squash SHA 和留存制品，校验完整机械 tree、作者、base、head 和 Android versionCode。旧批次若尚无分支与 PR，而 main 的产品或官网 Nightly 日期已晚于该批次，则停止初始化，避免版本倒退。已有批次 PR 格式不符合时停止，不另建替代 PR 或重新分配版本。
 
 只有实际合并 SHA 的 main push CI success 放行。产品与官网可并行启动独立发布运行，产品内部按依赖并行构建；不再先公开 Core、App 再启动 CLI。由 `GITHUB_TOKEN` 创建 Tag 后显式 dispatch，并指定 `publish=true`。
 

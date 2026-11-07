@@ -166,6 +166,10 @@ def next_sequence(prefix, claimed):
 def plan_versions(batch, base, tags):
     day = batch[:8]
     values = versions_at(base)
+    for app in ('cli', 'www'):
+        if release.version(values[app]) == 'nightly':
+            current_day = values[app].split('-nightly.', 1)[1].split('.', 1)[0]
+            require(day >= current_day, f'unstarted Nightly batch predates current {app} version; refusing a downgrade')
     claimed = declared_versions(tags)
     product_prefix = values['cli'].split('-', 1)[0] + f'-nightly.{day}.'
     product_ver = next_sequence(product_prefix, claimed['product'] + [values[app] for app in PRODUCT_APPS])
@@ -765,6 +769,24 @@ def self_test():
             assert pv == '0.0.1-nightly.20261107.1' and all(next_day.versions[a] == pv for a in PRODUCT_APPS)
             assert next_day.versions['www'] == '0.0.1-nightly.20261107.1'
             assert next_day.android_code == next_batch.android_code + 1
+            future_main = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                              'commit-tree', expected_tree(next_day), '-p', next_head, '-m', 'next-day main fixture')
+            git('update-ref', 'refs/remotes/origin/main', future_main)
+            with patch(f'{__name__}.git', side_effect=next_batch_git), patch(f'{__name__}.daily_pr', return_value=None), \
+                    patch(f'{__name__}.branch_sha', return_value=None), patch(f'{__name__}.api') as no_write, \
+                    patch(f'{__name__}.checkout', side_effect=AssertionError('stale batch generated a branch')) as no_checkout:
+                rejected(lambda: ensure_landed('2026110620', 'nightly-owner'), 'current cli version')
+                no_checkout.assert_not_called()
+                no_write.assert_not_called()
+            newer_www = versions_at(next_head)
+            newer_www['www'] = next_day.versions['www']
+            with patch(f'{__name__}.versions_at', return_value=newer_www):
+                rejected(lambda: plan_versions('2026110620', next_head, []), 'current www version')
+            with patch(f'{__name__}.git', side_effect=fixture_git), patch(f'{__name__}.daily_pr', return_value=state['pr']), \
+                    patch(f'{__name__}.branch_sha', return_value=head), \
+                    patch(f'{__name__}.plan_versions', side_effect=AssertionError('old batch was reallocated')):
+                assert ensure_landed(plan.batch, 'nightly-owner') == (plan, merged, 17)
+            git('update-ref', 'refs/remotes/origin/main', merged)
 
             good = dict(id=1, run_attempt=1, head_sha=merged, head_branch='main', event='push', path=CI,
                         repository=dict(full_name=REPO), head_repository=dict(full_name=REPO),
