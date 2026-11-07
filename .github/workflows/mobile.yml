@@ -510,10 +510,10 @@ jobs:
           cat > .artifacts/ios-runner-probe/private/probe.mjs <<'NODE'
           import assert from 'node:assert/strict';
           import { spawnSync } from 'node:child_process';
-          import { constants as fsConstants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+          import { constants as fsConstants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, opendirSync, readFileSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
           import { constants as cryptoConstants, createCipheriv, createHash, createPublicKey, publicEncrypt, randomBytes } from 'node:crypto';
           import { createRequire, findPackageJSON } from 'node:module';
-          import { dirname, join, resolve } from 'node:path';
+          import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
           import { pathToFileURL } from 'node:url';
 
           process.umask(0o077);
@@ -550,6 +550,7 @@ jobs:
             'simulator_service_hub_unavailable', 'simulator_set_destination_not_found'];
           const runnerLogScope = 'fresh-task-session-runner-log';
           const runnerLogAAD = 'vibeface-ci472-runner-log-v1';
+          const runnerContextAAD = 'vibeface-ci472-runner-context-v1';
           const runnerLogKeyId = 'beb7dc7bf91c12efe172c9b82e89758b630439162509345ca1fdb2f3b0decccc';
           const runnerLogPublicKey = "-----BEGIN PUBLIC KEY-----\nMIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAjTrGa8sXLaT5MeAJhIkI\ngqEMu+QNunCFHLV/z5bx/q+V9981uJi/hjg59hhaef5anN+JRBhqgzdGBDkkmmI+\nn8RZMQPGozzI/1dlfBnbeYX6DK19WntVr8J8df9uGuPOwqZ8Mp0jVa1oW+fLpdwS\nIIpzrmFXY+6JKZ1R+oeDzasxATSciBCZkOJxCk+CEQAL6A77Qyp6VEmKCdWs3zZ9\ndKaFeU4ERMVTdeAfhL9bIieaTW6a1kkJaQGe4iK5PQhyV2yZ27VSoappspH4wvQA\nNBkavdtpasbJ45+Wuzv6XwWvQf03+Yhcon6PUGF/M5Z1bUhyleluBgIpDoAxcij3\nttKYv19h9QzjKR6lgPRUBjMUMvjoB2msOsQzNvyTjM4TVeLNETYsP66TNLfA0Ifz\nOSuoSBCijOU80rWjG/22uVccADNhUN+s1kqRXeTwmFpfyEH2z6DYAICMfHshmf1T\nTIdzu6zWTKdDKgroJwUW5hZFaWiPHdQjgUiLc0hoyapFAgMBAAE=\n-----END PUBLIC KEY-----\n";
           const enumValue = (value, allowed, fallback = 'unknown') => allowed.includes(value) ? value : fallback;
@@ -700,11 +701,11 @@ jobs:
               return startupProjection(error, AppError, classify);
             } catch { return { reason: 'unavailable', matched: null }; }
           }
-          function sealRunnerLog(bytes, recipient) {
+          function sealEvidence(bytes, recipient, aad) {
             const key = randomBytes(32), iv = randomBytes(12);
             try {
               const cipher = createCipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
-              cipher.setAAD(Buffer.from(runnerLogAAD));
+              cipher.setAAD(Buffer.from(aad));
               const ciphertext = Buffer.concat([cipher.update(bytes), cipher.final()]);
               return { algorithm: 'RSA-OAEP-SHA256+A256GCM',
                 key_id: createHash('sha256').update(recipient.export({ type: 'spki', format: 'der' })).digest('hex'),
@@ -753,7 +754,7 @@ jobs:
               const recipient = createPublicKey(runnerLogPublicKey);
               assert.equal(recipient.asymmetricKeyType, 'rsa');
               assert.equal(recipient.asymmetricKeyDetails.modulusLength, 3072);
-              const envelope = sealRunnerLog(bytes, recipient);
+              const envelope = sealEvidence(bytes, recipient, runnerLogAAD);
               assert.equal(envelope.key_id, runnerLogKeyId);
               return { ...result, ...envelope, status: 'encrypted', reason: null };
             } catch { return result; }
@@ -761,6 +762,167 @@ jobs:
               if (fd !== undefined) { try { closeSync(fd); } catch {} }
               bytes?.fill(0);
             }
+          }
+          function openContextEntry(path, anchor, directory) {
+            assert(!path.toLowerCase().includes('trash'));
+            const before = lstatSync(path);
+            assert(!before.isSymbolicLink() && before.uid === process.getuid());
+            assert(directory ? before.isDirectory() : before.isFile());
+            const location = realpathSync(path), base = realpathSync(anchor), inside = relative(base, location);
+            assert(inside === '' || (!inside.startsWith('..') && !isAbsolute(inside)));
+            const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+            try {
+              const opened = fstatSync(fd);
+              assert(opened.uid === before.uid && opened.dev === before.dev && opened.ino === before.ino);
+              assert(directory ? opened.isDirectory() : opened.isFile());
+              return { fd, stat: opened, real: location };
+            } catch (error) { closeSync(fd); throw error; }
+          }
+          function contextBytes(path, anchor, maximum) {
+            const opened = openContextEntry(path, anchor, false);
+            try {
+              assert(Number.isSafeInteger(opened.stat.size) && opened.stat.size >= 0 && opened.stat.size <= maximum);
+              const bytes = Buffer.alloc(opened.stat.size);
+              let count = 0;
+              while (count < bytes.length) {
+                const size = readSync(opened.fd, bytes, count, bytes.length - count, count);
+                assert(size > 0); count += size;
+              }
+              assert.equal(fstatSync(opened.fd).size, opened.stat.size);
+              return bytes;
+            } finally { closeSync(opened.fd); }
+          }
+          function contextDeviceView(kind, bytes, requested) {
+            if (typeof requested !== 'string') return null;
+            try {
+              let text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+              const warning = 'WARNING: xcdevice is deprecated. Please use `devicectl list devices` instead.';
+              if (kind === 'xcdevice' && text.startsWith(warning + '\r\n')) text = text.slice(warning.length + 2);
+              else if (kind === 'xcdevice' && text.startsWith(warning + '\n')) text = text.slice(warning.length + 1);
+              const parsed = JSON.parse(text), matches = [], counts = new Map();
+              let total = 0;
+              const row = (value, id, platform, runtime) => {
+                assert(value && typeof value === 'object' && !Array.isArray(value) && typeof id === 'string');
+                total++;
+                const name = typeof platform === 'string' && platform.length <= 128 && (counts.has(platform) || counts.size < 32) ? platform : 'other';
+                counts.set(name, (counts.get(name) ?? 0) + 1);
+                if (id.toLowerCase() === requested.toLowerCase()) matches.push(runtime === undefined ? value : { runtime, device: value });
+              };
+              if (kind === 'simctl') {
+                assert(parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.devices && typeof parsed.devices === 'object' && !Array.isArray(parsed.devices));
+                for (const [runtime, devices] of Object.entries(parsed.devices)) {
+                  assert(Array.isArray(devices));
+                  const platform = runtime.includes('.SimRuntime.') ? runtime.split('.SimRuntime.')[1].split('-')[0] : 'other';
+                  for (const device of devices) row(device, device?.udid, platform, runtime);
+                }
+              } else {
+                assert(kind === 'xcdevice' && Array.isArray(parsed));
+                for (const device of parsed) row(device, device?.identifier, device?.platform);
+              }
+              return { interpretation: 'tool-view-only', total_count: total, platform_counts: Object.fromEntries(counts), requested_match_count: matches.length, requested_rows: matches };
+            } catch { return null; }
+          }
+          function captureRunnerContext(run = spawnSync, seal = sealEvidence) {
+            const started = performance.now(), limits = { entries: 512, files: 16, file_bytes: 65536, depth: 8,
+              payload_bytes: 262144, command_timeout_ms: 30000, command_max_buffer: 262144 };
+            const result = { scope: 'fresh-task-session-runner-context', payload_format: runnerContextAAD,
+              status: 'unavailable', reason: 'collection-failed', partial: false, entry_count: 0, file_count: 0,
+              payload_bytes: 0, collection_duration_ms: null, limits };
+            const derived = join(state, '.tmp', 'runner-derived'), products = join(derived, 'Build', 'Products');
+            const context = { payload_format: runnerContextAAD, requested_udid: null, requested_udid_status: 'unavailable',
+              environment: {}, derived_path: derived, inventory: { status: 'unavailable', entries: [], files: [] }, commands: [] };
+            const fits = () => Buffer.byteLength(JSON.stringify(context)) <= limits.payload_bytes - 1024;
+            const append = (array, value) => { array.push(value); if (fits()) return true; array.pop(); result.partial = true; return false; };
+            const stream = (command, key, bytes) => {
+              const output = { source_bytes: bytes.length, captured_bytes: 0, capped: false, bytes_base64: '' };
+              command[key] = output;
+              let low = 0, high = bytes.length;
+              while (low < high) {
+                const size = Math.ceil((low + high) / 2); output.bytes_base64 = bytes.subarray(0, size).toString('base64');
+                if (fits()) low = size; else high = size - 1;
+              }
+              output.bytes_base64 = bytes.subarray(0, low).toString('base64'); output.captured_bytes = low; output.capped = low < bytes.length;
+              if (output.capped) result.partial = true;
+            };
+            try {
+              for (const directory of [root, privateRoot, state]) { const opened = openContextEntry(directory, root, true); closeSync(opened.fd); }
+              try {
+                const bytes = contextBytes(simulatorPath, privateRoot, 128), value = bytes.toString('utf8').trim(); bytes.fill(0);
+                assert(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value));
+                context.requested_udid = value; context.requested_udid_status = 'captured';
+              } catch { result.partial = true; }
+              for (const key of ['HOME', 'CFFIXED_USER_HOME', 'SIMULATOR_DEVICE_SET_PATH', 'CORE_SIMULATOR_DEVICE_SET_PATH', 'DEVELOPER_DIR', 'SDKROOT', 'AGENT_DEVICE_IOS_RUNNER_DERIVED_PATH']) {
+                const value = process.env[key];
+                context.environment[key] = typeof value === 'string' && Buffer.byteLength(value) <= 8192 ? value : null;
+                if (typeof value === 'string' && Buffer.byteLength(value) > 8192) result.partial = true;
+                if (!fits()) { context.environment[key] = null; result.partial = true; }
+              }
+              for (const [kind, args] of [['simctl', ['simctl', 'list', 'devices', '--json']], ['xcdevice', ['xcdevice', 'list', '--timeout=10']]]) {
+                const command = { kind, status: 'unknown', exit_code: 'missing', signal: 'missing', duration_ms: null, view_status: 'unknown', view: null, stdout: null, stderr: null };
+                context.commands.push(command); const at = performance.now();
+                try {
+                  const completed = run('xcrun', args, { timeout: limits.command_timeout_ms, maxBuffer: limits.command_max_buffer,
+                    killSignal: 'SIGKILL', encoding: null, stdio: ['ignore', 'pipe', 'pipe'] });
+                  command.exit_code = exitCode(completed.status); command.signal = signal(completed.signal);
+                  command.status = completed.error ? enumValue(completed.error.code, ['ETIMEDOUT', 'ENOBUFS'], 'spawn-error') : Number.isInteger(completed.status) ? 'completed' : 'unknown';
+                  const stdout = Buffer.isBuffer(completed.stdout) ? completed.stdout : Buffer.from(typeof completed.stdout === 'string' ? completed.stdout : '');
+                  const stderr = Buffer.isBuffer(completed.stderr) ? completed.stderr : Buffer.from(typeof completed.stderr === 'string' ? completed.stderr : '');
+                  if (!completed.error && completed.status === 0) command.view = contextDeviceView(kind, stdout, context.requested_udid);
+                  if (command.view && fits()) command.view_status = 'parsed';
+                  else { command.view = null; result.partial = true; stream(command, 'stdout', stdout); }
+                  stream(command, 'stderr', stderr);
+                } catch { command.status = 'unavailable'; result.partial = true; }
+                command.duration_ms = ms(performance.now() - at);
+              }
+              try {
+                for (const directory of [join(state, '.tmp'), derived, join(derived, 'Build'), products]) { const opened = openContextEntry(directory, state, true); closeSync(opened.fd); }
+                context.inventory.status = 'complete'; const queue = [{ path: products, relative: '', depth: 0 }];
+                while (queue.length) {
+                  const current = queue.shift(), opened = openContextEntry(current.path, products, true);
+                  let directory;
+                  try {
+                    directory = opendirSync(current.path);
+                    for (let entry; (entry = directory.readSync()) !== null;) {
+                      if (result.entry_count >= limits.entries) { result.partial = true; context.inventory.status = 'partial'; queue.length = 0; break; }
+                      result.entry_count++;
+                      const path = join(current.path, entry.name), name = current.relative ? current.relative + '/' + entry.name : entry.name;
+                      if (path.toLowerCase().includes('trash')) { result.partial = true; context.inventory.status = 'partial'; continue; }
+                      const metadata = lstatSync(path), type = metadata.isSymbolicLink() ? 'symlink' : metadata.isDirectory() ? 'directory' : metadata.isFile() ? 'file' : 'other';
+                      if (type === 'file' || type === 'directory') { const child = openContextEntry(path, products, type === 'directory'); closeSync(child.fd); }
+                      if (!append(context.inventory.entries, { relative: name, type, size: metadata.size, mode: metadata.mode & 0o7777 })) { context.inventory.status = 'partial'; queue.length = 0; break; }
+                      if (type !== 'file' && type !== 'directory') { result.partial = true; context.inventory.status = 'partial'; continue; }
+                      if (type === 'directory') {
+                        if (current.depth < limits.depth) queue.push({ path, relative: name, depth: current.depth + 1 }); else { result.partial = true; context.inventory.status = 'partial'; }
+                      } else if (entry.name.endsWith('.xctestrun') || (entry.name === 'Info.plist' && /\.(app|xctest)$/i.test(basename(current.path)))) {
+                        if (context.inventory.files.length >= limits.files) { result.partial = true; context.inventory.status = 'partial'; continue; }
+                        const file = { relative: name, status: 'unavailable', size: metadata.size };
+                        try {
+                          if (metadata.size > limits.file_bytes) file.status = 'size-limit';
+                          else {
+                            const bytes = contextBytes(path, products, limits.file_bytes); assert.equal(bytes.length, metadata.size);
+                            file.bytes_base64 = bytes.toString('base64'); bytes.fill(0); file.status = 'captured';
+                            if (!append(context.inventory.files, file)) { delete file.bytes_base64; file.status = 'payload-limit'; append(context.inventory.files, file); }
+                          }
+                        } catch { file.status = 'unavailable'; }
+                        if (file.status !== 'captured') { result.partial = true; context.inventory.status = 'partial'; if (!context.inventory.files.includes(file)) append(context.inventory.files, file); }
+                      }
+                    }
+                    const after = lstatSync(current.path);
+                    assert(after.isDirectory() && !after.isSymbolicLink() && after.uid === process.getuid() && after.dev === opened.stat.dev && after.ino === opened.stat.ino);
+                    assert.equal(realpathSync(current.path), opened.real);
+                  } finally { try { if (directory) directory.closeSync(); } finally { closeSync(opened.fd); } }
+                  if (result.entry_count >= limits.entries && queue.length) { result.partial = true; context.inventory.status = 'partial'; break; }
+                }
+              } catch { context.inventory.status = 'unavailable'; result.partial = true; }
+              result.file_count = context.inventory.files.filter(file => file.status === 'captured').length;
+              const bytes = Buffer.from(JSON.stringify(context)); result.payload_bytes = bytes.length;
+              try {
+                assert(bytes.length <= limits.payload_bytes);
+                const envelope = seal(bytes, createPublicKey(runnerLogPublicKey), runnerContextAAD); assert.equal(envelope.key_id, runnerLogKeyId);
+                Object.assign(result, envelope, { status: 'encrypted', reason: null });
+              } finally { bytes.fill(0); }
+            } catch { result.partial = true; }
+            result.collection_duration_ms = ms(performance.now() - started); return result;
           }
           async function stage(name, operation, project = () => null) {
             const started = performance.now();
@@ -776,6 +938,7 @@ jobs:
               report[name].error = safeError(error);
               report[name].error.startup_classification = await startupClassification(error);
               if (name === 'prepare') report[name].error.encrypted_runner_log = captureRunnerLog();
+              if (name === 'prepare') report[name].error.encrypted_runner_context = captureRunnerContext();
               return false;
             } finally {
               report[name].duration_ms = ms(performance.now() - started);
@@ -873,13 +1036,25 @@ jobs:
             const recipient = createPublicKey(runnerLogPublicKey);
             assert.equal(recipient.asymmetricKeyType, 'rsa');
             assert.equal(recipient.asymmetricKeyDetails.modulusLength, 3072);
-            const encrypted = sealRunnerLog(Buffer.from(sentinel), recipient);
+            const encrypted = sealEvidence(Buffer.from(sentinel), recipient, runnerLogAAD);
             assert.equal(encrypted.key_id, runnerLogKeyId);
             assert.equal(Buffer.from(encrypted.iv, 'base64').length, 12);
             assert.equal(Buffer.from(encrypted.tag, 'base64').length, 16);
             assert.equal(Buffer.from(encrypted.wrapped_key, 'base64').length, 384);
             assert.equal(Buffer.from(encrypted.ciphertext, 'base64').length, Buffer.byteLength(sentinel));
             assert(!JSON.stringify(encrypted).includes(sentinel));
+            const simctl = contextDeviceView('simctl', Buffer.from(JSON.stringify({ devices: {
+              'com.apple.CoreSimulator.SimRuntime.iOS-26-5': [{ udid: fixtureExecId(1) }, { udid: fixtureExecId(2) }] } })), fixtureExecId(1).toUpperCase());
+            assert.equal(simctl.total_count, 2); assert.equal(simctl.requested_match_count, 1);
+            const warning = 'WARNING: xcdevice is deprecated. Please use `devicectl list devices` instead.';
+            const devices = JSON.stringify([{ identifier: fixtureExecId(1), platform: 'com.apple.platform.iphonesimulator' },
+              { identifier: fixtureExecId(2), platform: 'com.apple.platform.macosx' }]);
+            for (const prefix of ['', warning + '\n', warning + '\r\n']) {
+              const view = contextDeviceView('xcdevice', Buffer.from(prefix + devices), fixtureExecId(1));
+              assert.equal(view.total_count, 2); assert.equal(view.requested_match_count, 1);
+            }
+            assert.equal(contextDeviceView('xcdevice', Buffer.from('unknown warning\n' + devices), fixtureExecId(1)), null);
+            assert.equal(contextDeviceView('xcdevice', Buffer.from('bad JSON'), fixtureExecId(1)), null);
           }
           const mode = process.argv[2];
           if (mode === 'self-check') { selfCheck(); process.exit(0); }
