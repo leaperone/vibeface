@@ -8854,7 +8854,7 @@ def e2e_fixture(options):
                     require(deferred["deferred"] is True and deferred["cancelled"] is False
                             and deferred["source_event"] == deferred["control_event"]
                             and deferred["receipt"]["stage"] == "owner_accepted" and deferred["receipt"]["reason"] == "deferred"
-                            and deferred["receipt"]["actual_turn_id"] is None and deferred["receipt"]["retry_safe"] is False,
+                            and deferred["receipt"]["actual_turn_id"] is None and deferred["receipt"]["retry_safe"] is True,
                             "the real owner confirms its unsent native deferred input")
                     result = native_queue
                 elif op == "native_provider_inspect":

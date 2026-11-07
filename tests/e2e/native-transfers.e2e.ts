@@ -512,7 +512,7 @@ test('provider settings and deferred input cancellation work in the installed na
   expect(deferred).toEqual({ message_id: deferredMessageId, conversation_id: conversationId, target, intent: 'defer',
     deferred: true, cancelled: false, source_event: deferred.source_event, control_event: deferred.source_event,
     receipt: { message_id: deferredMessageId, target, control_event: deferred.source_event,
-      stage: 'owner_accepted', reason: 'deferred', actual_turn_id: null, retry_safe: false } });
+      stage: 'owner_accepted', reason: 'deferred', actual_turn_id: null, retry_safe: true } });
   const composer = screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/, { visible: true });
   await openLink(`vibeface://b/${botId}`, composer);
   const targetSheet = screen.getByTestId('input-options-sheet', { visible: true });
@@ -542,7 +542,7 @@ test('provider settings and deferred input cancellation work in the installed na
   const cancelled = await inspect(), cancelledInput = cancelled.deferred_input;
   assert(cancelledInput);
   expect(cancelledInput).toEqual({ ...deferred, cancelled: true, control_event: cancelledInput.control_event,
-    receipt: { ...deferred.receipt, control_event: cancelledInput.control_event, stage: 'refused', reason: 'cancelled_before_delivery' } });
+    receipt: { ...deferred.receipt, control_event: cancelledInput.control_event, stage: 'refused', reason: 'cancelled_before_delivery', retry_safe: false } });
   expect(cancelledInput.control_event).not.toBe(deferred.control_event);
   expect(cancelled.jobs).toEqual(prepared.jobs);
   expect(cancelled.running_invocations).toBe(1);
