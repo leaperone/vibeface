@@ -384,7 +384,11 @@ mod tests {
         files.sort();
         let mut hasher = Sha256::new();
         for path in files {
-            let name = path.strip_prefix(root).unwrap().to_str().unwrap();
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
             let body = std::fs::read(&path).unwrap();
             hasher.update(format!("{name}\0{}\0", body.len()));
             hasher.update(body);

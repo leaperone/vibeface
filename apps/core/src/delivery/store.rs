@@ -463,7 +463,7 @@ impl ServiceStore {
             }
             drop(file);
             std::fs::rename(&partial, self.object_path(order, index, kind, false)?)?;
-            File::open(partial.parent().context("object directory missing")?)?.sync_all()?;
+            privatefs::sync_dir(partial.parent().context("object directory missing")?)?;
         }
         self.db.execute(
             "UPDATE objects SET committed=?4,complete=?5 WHERE order_id=?1 AND idx=?2 AND kind=?3",
@@ -786,6 +786,7 @@ mod tests {
         drop(store);
         let mut store = ServiceStore::open(&dir, 200_000, 4).unwrap();
         assert_eq!(store.reserve_transaction(&intent, 20).unwrap().nonce, 7);
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -889,6 +890,7 @@ mod tests {
         );
         assert!(store.find_transaction("order/hold").unwrap().is_none());
         assert_eq!(store.recent_transactions().unwrap().len(), 1);
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -941,6 +943,7 @@ mod tests {
                 .reserve_object(&order, 1, "capsule", &digest, 81)
                 .is_err()
         );
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

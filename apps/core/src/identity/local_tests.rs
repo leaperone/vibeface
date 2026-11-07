@@ -322,6 +322,7 @@ fn bootstrap_capability_is_one_time_and_requires_a_manager_session() -> Result<(
             .bootstrap_network(state, &capability.capability, &admin.device_id()?)
             .is_err()
     );
+    drop(store);
     fs::remove_dir_all(dir)?;
     Ok(())
 }

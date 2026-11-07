@@ -1156,6 +1156,7 @@ mod tests {
         }.await;
         server.abort();
         let _ = server.await;
+        node.shutdown().await;
         drop(node);
         std::fs::remove_dir_all(dir)?;
         result
@@ -1277,6 +1278,7 @@ mod tests {
             for server in servers {
                 server.abort();
             }
+            node.shutdown().await;
             drop(node);
             std::fs::remove_dir_all(dir)?;
             result?;

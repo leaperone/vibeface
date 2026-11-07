@@ -2342,14 +2342,46 @@ mod tests {
         now_ms() as u64 - crate::identity::RECOVERY_DELAY_MS - 1_000
     }
 
-    async fn stop_nodes(nodes: Vec<(Arc<Runtime>, PathBuf)>) {
+    async fn stop_nodes(nodes: Vec<(Arc<Runtime>, PathBuf)>) -> Result<()> {
         for (node, _) in &nodes {
-            node.stop_network().await;
+            node.shutdown().await;
         }
         for (node, dir) in nodes {
             drop(node);
-            let _ = std::fs::remove_dir_all(dir);
+            std::fs::remove_dir_all(dir)?;
         }
+        Ok(())
+    }
+
+    fn remove_directory(path: &Path) -> Result<()> {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn copy_snapshot(source: &Path, destination: &Path) -> Result<()> {
+        vibeface_bridge::platform::privatefs::create_dir(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == "node.lock" {
+                continue;
+            }
+            let from = entry.path();
+            let to = destination.join(name);
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                copy_snapshot(&from, &to)?;
+            } else if kind.is_file() {
+                std::fs::copy(&from, &to)?;
+                vibeface_bridge::platform::privatefs::restrict_file(&to)?;
+            } else {
+                anyhow::bail!("unexpected entry in Node data snapshot: {}", from.display());
+            }
+        }
+        Ok(())
     }
 
     /// A Node that slept through the wait puts the recovery in effect by the wall clock; the
@@ -2400,7 +2432,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
         result
     }
 
@@ -2466,7 +2498,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(nodes).await;
+        stop_nodes(nodes).await?;
         result
     }
 
@@ -2509,7 +2541,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
         result
     }
 
@@ -2559,7 +2591,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
         result
     }
 
@@ -3158,7 +3190,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
         result
     }
 
@@ -3261,7 +3293,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
         result
     }
 
@@ -3304,34 +3336,33 @@ mod tests {
             listed(a.rpc(access.clone(), json!({"method":"nodes"})).await?)
         }
         .await;
+        let identity = std::fs::read(dir_a.join("identity.json"))?;
         a.shutdown().await;
-        b.stop_network().await;
-        // Background tasks still hold the stopped Runtime and its directory lock; a copy of the
-        // directory is what the next process would open.
+        b.shutdown().await;
+        drop(a);
+        drop(b);
+        // Copy the closed data directory as a fresh process would receive it. The OS lock file
+        // belongs to the old process and is intentionally not part of the snapshot.
         let copy = dir_a.with_extension("restarted");
         let result = async {
             let online = online?;
             assert_eq!(online["capabilities"]["manager"], "cursor");
-            std::process::Command::new("cp")
-                .arg("-R")
-                .args([&dir_a, &copy])
-                .status()?
-                .success()
-                .then_some(())
-                .context("copy the data directory")?;
-            std::fs::remove_file(copy.join("node.lock"))?;
+            copy_snapshot(&dir_a, &copy).context("copy the data directory")?;
+            assert_eq!(std::fs::read(copy.join("identity.json"))?, identity);
             let again = Arc::new(Runtime::open(&copy).await?);
             again.start_network().await?;
             let nodes = again.rpc(access.clone(), json!({"method":"nodes"})).await;
-            again.stop_network().await;
+            again.shutdown().await;
+            drop(again);
             let offline = listed(nodes?)?;
             assert_eq!(offline["online"], false);
             assert_eq!(offline["capabilities"], online["capabilities"]);
             anyhow::Ok(())
         }
         .await;
-        let _ = std::fs::remove_dir_all(copy);
-        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        remove_directory(&copy)?;
+        std::fs::remove_dir_all(dir_a)?;
+        std::fs::remove_dir_all(dir_b)?;
         result
     }
 
@@ -3857,7 +3888,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (b, dir_b), (x, dir_x)]).await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b), (x, dir_x)]).await?;
         result
     }
 
@@ -3923,7 +3954,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
         result
     }
 
@@ -3999,8 +4030,8 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        let _ = std::fs::remove_dir_all(&scratch_dir);
-        stop_nodes(vec![(l, dir_l), (c, dir_c)]).await;
+        remove_directory(&scratch_dir)?;
+        stop_nodes(vec![(l, dir_l), (c, dir_c)]).await?;
         result
     }
 
@@ -4122,7 +4153,7 @@ mod tests {
             anyhow::Ok(())
         }
         .await;
-        stop_nodes(vec![(l, dir_l), (c, dir_c)]).await;
+        stop_nodes(vec![(l, dir_l), (c, dir_c)]).await?;
         result
     }
     #[tokio::test]

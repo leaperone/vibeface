@@ -644,6 +644,14 @@ mod tests {
     };
     use anyhow::bail;
 
+    fn remove_dir_if_exists(path: &Path) -> Result<()> {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     #[test]
     fn device_id_health_uses_only_the_current_field() -> Result<()> {
         let wire = r#"{"device_id":"device","version":"version","web_enabled":true}"#;
@@ -793,13 +801,14 @@ mod tests {
         .await;
         server.abort();
         let _ = server.await;
+        node.shutdown().await;
         drop(node);
         assert!(
             !endpoint(&dir)?.is_held(),
             "the stopped listener releases its endpoint"
         );
         let device = crate::config::identity(&dir)?.device_id()?;
-        std::fs::remove_dir_all(vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?)?;
+        remove_dir_if_exists(&vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?)?;
         std::fs::remove_dir_all(&dir)?;
         result
     }
@@ -897,10 +906,10 @@ mod tests {
         .await;
         server.abort();
         let _ = server.await;
+        node.shutdown().await;
         drop(node);
         let device = crate::config::identity(&dir)?.device_id()?;
-        let _ =
-            std::fs::remove_dir_all(vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?);
+        remove_dir_if_exists(&vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?)?;
         std::fs::remove_dir_all(&dir)?;
         result
     }

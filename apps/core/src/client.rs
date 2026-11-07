@@ -2523,6 +2523,8 @@ mod tests {
             .await
             .is_err()
         );
+        node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -2609,6 +2611,8 @@ mod tests {
                 .await
                 .is_err()
         );
+        node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -2886,12 +2890,14 @@ mod tests {
             json!({"provider":"cursor","bot":true}),
         )
         .await?;
+        node.shutdown().await;
         drop(node);
         let reopened = Runtime::reopen(&dir).await?;
         assert_eq!(
             serde_json::to_value(reopened.settings_snapshot())?,
             saved["settings"]
         );
+        reopened.shutdown().await;
         drop(reopened);
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -3264,6 +3270,7 @@ mod tests {
         )
         .await?;
 
+        node.shutdown().await;
         drop(node);
         let reopened = Runtime::reopen(&dir).await?;
         let providers = reopened.providers();
@@ -3277,7 +3284,9 @@ mod tests {
             reopened.provider_env(Provider::Cursor)["CURSOR_API_KEY"],
             cursor_key
         );
+        reopened.shutdown().await;
         drop(reopened);
+        crate::logging::close_capture(&logs)?;
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -3360,6 +3369,7 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         }
         .await;
+        node.shutdown().await;
         drop(node);
         std::fs::remove_dir_all(dir)?;
         result
@@ -3475,6 +3485,7 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         }
         .await;
+        node.shutdown().await;
         drop(node);
         std::fs::remove_dir_all(dir)?;
         result
@@ -4206,6 +4217,7 @@ mod tests {
         .await;
         server.abort();
         let _ = server.await;
+        node.shutdown().await;
         drop(node);
         std::fs::remove_dir_all(&dir)?;
         result

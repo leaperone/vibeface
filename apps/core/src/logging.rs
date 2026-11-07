@@ -182,7 +182,7 @@ fn open(path: &Path) -> std::io::Result<fs::File> {
 
 struct Rotating {
     dir: PathBuf,
-    file: fs::File,
+    file: Option<fs::File>,
     len: u64,
     max_bytes: u64,
     keep: usize,
@@ -193,7 +193,10 @@ impl Rotating {
         if self.len > 0 && self.len + line.len() as u64 > self.max_bytes {
             self.rotate()?;
         }
-        self.file.write_all(line)?;
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "log sink closed"))?
+            .write_all(line)?;
         self.len += line.len() as u64;
         Ok(())
     }
@@ -202,7 +205,7 @@ impl Rotating {
         for index in (0..self.keep - 1).rev() {
             let _ = fs::rename(path(&self.dir, index), path(&self.dir, index + 1));
         }
-        self.file = open(&path(&self.dir, 0))?;
+        self.file = Some(open(&path(&self.dir, 0))?);
         self.len = 0;
         Ok(())
     }
@@ -223,7 +226,7 @@ impl Sink {
         Ok(Self {
             file: Mutex::new(Rotating {
                 dir: dir.to_owned(),
-                file,
+                file: Some(file),
                 len,
                 max_bytes,
                 keep,
@@ -237,6 +240,17 @@ impl Sink {
         if secret.len() >= 8 && !secrets.iter().any(|known| known == secret) {
             secrets.push(secret.to_owned());
         }
+    }
+
+    #[cfg(test)]
+    fn close(&self, dir: &Path) -> Result<()> {
+        let mut rotating = self
+            .file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("log sink lock poisoned"))?;
+        ensure!(rotating.dir == dir, "log sink fixture directory changed");
+        rotating.file = None;
+        Ok(())
     }
 
     pub fn write(&self, record: &Record) {
@@ -324,6 +338,14 @@ pub fn scrub(text: &str) -> String {
 pub(crate) fn capture(dir: &Path) -> Result<()> {
     SINK.set(Arc::new(Sink::open(dir, MAX_FILE_BYTES, KEEP_FILES)?))
         .map_err(|_| anyhow::anyhow!("the test log is already captured"))
+}
+
+#[cfg(test)]
+pub(crate) fn close_capture(dir: &Path) -> Result<()> {
+    if let Some(sink) = SINK.get() {
+        sink.close(dir)?;
+    }
+    Ok(())
 }
 
 pub fn write(record: &Record) {
@@ -846,12 +868,16 @@ mod tests {
             redact("Authorization: Bearer sk.abc-123/x= ok", &[]),
             "Authorization: Bearer [redacted] ok"
         );
-        add_private_path(Path::new("/private-redaction-fixture/project"));
+        let private_project = std::env::temp_dir()
+            .join(format!(
+                "vibeface-private-redaction-{}",
+                uuid::Uuid::new_v4()
+            ))
+            .join("project");
+        add_private_path(&private_project);
+        let private_message = format!("failed at {}/src/lib.rs", private_project.display());
         assert_eq!(
-            redact(
-                "failed at /private-redaction-fixture/project/src/lib.rs",
-                &[]
-            ),
+            redact(&private_message, &[]),
             "failed at [local-path]/src/lib.rs"
         );
         let dir = scratch("log-redact");

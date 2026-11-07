@@ -2215,7 +2215,12 @@ pub(super) mod tests {
     }
 
     async fn cleanup(node: Arc<Runtime>, dir: PathBuf) -> Result<()> {
-        let _ = std::fs::remove_file(named_socket(&node));
+        node.shutdown().await;
+        match std::fs::remove_file(named_socket(&node)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -2267,6 +2272,8 @@ pub(super) mod tests {
     async fn a_node_without_a_network_skips_the_session_scan() -> Result<()> {
         let (node, dir) = bare_node().await?;
         let result = node.scan_sources().await;
+        node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         result
     }
@@ -3484,17 +3491,25 @@ pub(super) mod tests {
 
     #[test]
     fn shared_events_keep_relative_context_without_local_identity() {
+        let private_root =
+            std::env::temp_dir().join(format!("vibeface-private-event-{}", uuid::Uuid::new_v4()));
+        let private_project = private_root.join("project");
+        let private_project_text = private_project.to_string_lossy();
         let event = AgentEvent {
             host: "private-host".into(),
-            repo: Some("/private-event-fixture/project".into()),
-            last_message: "failed in /private-event-fixture/project/src".into(),
-            ..turn("session", "turn", "/private-event-fixture/project")
+            repo: Some(private_project_text.to_string()),
+            last_message: format!("failed in {private_project_text}/src"),
+            ..turn("session", "turn", &private_project_text)
         };
-        let shared = shared_event(&event, &[PathBuf::from("/private-event-fixture")]);
+        let shared = shared_event(&event, std::slice::from_ref(&private_root));
         assert_eq!(shared.cwd, "workspace-1/project");
         assert!(shared.host.is_empty() && shared.repo.is_none());
-        assert!(!shared.last_message.contains("/private-event-fixture"));
-        assert_eq!(event.cwd, "/private-event-fixture/project");
+        assert!(
+            !shared
+                .last_message
+                .contains(private_root.to_string_lossy().as_ref())
+        );
+        assert_eq!(event.cwd, private_project_text);
         assert_eq!(shared.event_id, event.event_id);
         assert_eq!(shared_event(&event, &[]).cwd, "workspace");
     }
@@ -5457,22 +5472,25 @@ pub(super) mod tests {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &["s1", "s2"]).await?;
             let secret = "fixture-webhook-secret-0123456789";
+            let project = dir.join("hooked");
+            let project_text = project.to_string_lossy();
+            let elsewhere = dir.join("elsewhere");
             let settings = node
-                .configure_triage(json!({"default_outlet":"record","projects":[{"prefix":"/hooked","outlet":"both"}],
+                .configure_triage(json!({"default_outlet":"record","projects":[{"prefix":project_text,"outlet":"both"}],
                     "webhook_url":url,"scan_codex_sessions":false,"webhook_secret":secret}))
                 .await?;
             assert_eq!(settings["webhook_secret_set"], true);
             assert!(!settings.to_string().contains(secret));
             assert!(!std::fs::read_to_string(dir.join("config.json"))?.contains(secret));
 
-            let first = node.ingest_agent_event(turn("s1", "t1", "/hooked/app")).await?;
+            let first = node.ingest_agent_event(turn("s1", "t1", &format!("{project_text}/app"))).await?;
             assert_eq!(first["status"], "accepted");
-            let scanned = AgentEvent { source: triage::Source::SessionScan, status: Some("completed".into()), ..turn("s1", "t1", "/hooked/app") };
+            let scanned = AgentEvent { source: triage::Source::SessionScan, status: Some("completed".into()), ..turn("s1", "t1", &format!("{project_text}/app")) };
             assert_eq!(node.ingest_agent_event(scanned).await?["status"], "duplicate");
             let test = node.ingest_agent_event(AgentEvent { test: true, ..turn("s9", "t9", "/x") }).await?;
             assert_eq!(test["test"], true);
-            node.ingest_agent_event(turn("s1", "t2", "/hooked/app")).await?;
-            node.ingest_agent_event(turn("s2", "t1", "/elsewhere")).await?;
+            node.ingest_agent_event(turn("s1", "t2", &format!("{project_text}/app"))).await?;
+            node.ingest_agent_event(turn("s2", "t1", elsewhere.to_string_lossy().as_ref())).await?;
             let pending = node.triage_command(json!({"action":"events"})).await?;
             assert_eq!(pending["events"].as_array().unwrap().len(), 3);
 
