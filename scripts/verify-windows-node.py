@@ -15,7 +15,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -302,6 +301,7 @@ time.sleep(900)
 class Node:
     def __init__(self, package, workspace, name, provider):
         self.cli = package / "vibeface.exe"
+        self.core = package / "vibeface-core.exe"
         self.directory = workspace / name
         self.provider = provider
         self.port = free_port()
@@ -354,10 +354,9 @@ class Node:
         require(self.process is None, "the node is stopped before it is started")
         self.log = (self.directory / "process.log").open("ab")
         self.process = subprocess.Popen(
-            [str(self.cli), "serve", "--data-dir", str(self.directory)],
-            stdin=subprocess.DEVNULL, stdout=self.log, stderr=self.log,
+            [str(self.core), "--data-dir", str(self.directory), "--desktop-parent-stdin"],
+            stdin=subprocess.PIPE, stdout=self.log, stderr=self.log,
             env=self.environment(),
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
 
         def listener():
@@ -381,13 +380,14 @@ class Node:
     def ask_to_stop(self):
         require(self.process is not None, "the node is running before it is asked to stop")
         pid = self.process.pid
-        os.kill(pid, signal.CTRL_BREAK_EVENT)
+        require(self.process.stdin is not None, "the fixture owns the Core lifetime pipe")
+        self.process.stdin.close()
         try:
             self.process.wait(timeout=45)
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait(timeout=15)
-            raise AssertionError("the node did not stop when the console asked it to")
+            raise AssertionError("the node did not stop after its owning desktop pipe closed")
         self.process = None
         if self.log:
             self.log.close()
