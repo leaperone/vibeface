@@ -888,8 +888,7 @@ mod handed_over_pipe_tests {
     }
 
     #[test]
-    fn a_connected_same_account_peer_is_accepted_with_an_everyone_name_acl() -> io::Result<()>
-    {
+    fn a_connected_same_account_peer_is_accepted_with_an_everyone_name_acl() -> io::Result<()> {
         let (_descriptor, attributes) = everyone_pipe_attributes()?;
         let (server, client) = named_pipe(Some(&attributes))?;
         assert!(handed_over(server.0 as usize).is_ok());
