@@ -10,7 +10,7 @@ use super::{RelayUrl, device_id, endpoint_id, relay_config, relay_url};
 use crate::crypto::LocalIdentity;
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use iroh::{Endpoint, EndpointId, endpoint::RelayStatus};
+use iroh::{Endpoint, EndpointId, Watcher as _, endpoint::RelayStatus};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
