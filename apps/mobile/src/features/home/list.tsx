@@ -8,7 +8,7 @@ import { useUniwind, withUniwind } from 'uniwind'
 import { ConnectionMenu, OfflineBar } from '@/components/connection-pill'
 import { botMood, BotFace } from '@/components/bot-face'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
-import { Badge, botTint, EmptyState, Skeleton } from '@/components/kit'
+import { Badge, botTint, Details, EmptyState, Skeleton } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -63,6 +63,12 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
       <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('-me-1 size-11 rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} className="size-5" /></Button></Link>
     </View> : null}
     {empty === 'unreachable' && !bots.length ? null : <OfflineBar className="mx-1 mb-2 mt-1" />}
+    {shared?.error?.kind === 'read' ? <View className="mx-1 my-2">
+      <Details label="最新记录暂时没读到">
+        <Text className="text-meta text-muted-foreground">{shared.error.text}</Text>
+        <Button variant="ghost" size="sm" onPress={shared.error.retry}><Text>重试</Text></Button>
+      </Details>
+    </View> : null}
     {waiting ? <Item key="inbox" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1">
       <Link href="/inbox" replace={replace} asChild>
         <Pressable accessibilityState={{ selected: active('/inbox') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-2xl border px-3 py-2.5 active:opacity-70', device.pendingRecovery ? 'border-danger-border bg-danger-soft' : 'border-warning-border bg-warning-soft', active('/inbox') && (device.pendingRecovery ? 'border-danger' : 'border-warning'))}>
