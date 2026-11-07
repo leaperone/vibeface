@@ -1,4 +1,4 @@
-import { createFileRoute, Outlet } from '@tanstack/react-router'
+import { createFileRoute, Outlet, useRouterState } from '@tanstack/react-router'
 import { useEffect } from 'react'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 
@@ -9,9 +9,15 @@ function ChatRoute() {
   const { botId } = Route.useParams()
   const workspace = useWorkspace()
   const bot = workspace.bots.find((item) => item.bot_id === botId)
-  useEffect(() => { workspace.setView('chat'); return () => workspace.setView('other') }, [])
+  const visible = useRouterState({ select: (state) => /^\/b\/[^/]+\/?$/.test(state.location.pathname) })
   useEffect(() => {
-    if (bot && bot.conversation_id !== workspace.conversationId) void workspace.run(() => workspace.selectBot(bot))
-  }, [bot?.bot_id, workspace.conversationId])
+    let current = true
+    workspace.setView('other')
+    if (bot) void workspace.run(async () => {
+      await workspace.selectBot(bot)
+      if (current && workspace.isCurrent()) workspace.setView(visible ? 'chat' : 'other')
+    })
+    return () => { current = false; if (workspace.isCurrent()) workspace.setView('other') }
+  }, [bot?.bot_id, workspace.generation, visible])
   return <Outlet />
 }

@@ -18,9 +18,11 @@ import * as errors from "@vibeface/client/lib/errors.ts"
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
 import { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice, messageKey, replyStatusLabel } from "@vibeface/client/chat/protocol.ts"
 import { deviceCopy, offlineCopy, setUpOnManager } from "@vibeface/client/identity/copy.ts"
-import { chatTimeline, firstUnread, taskMessage, unreadCounts } from "@vibeface/client/chat/timeline.ts"
+import { byRank, chatTimeline, firstUnread, taskMessage, unreadCounts } from "@vibeface/client/chat/timeline.ts"
 import { accessOf } from "@vibeface/client/identity/access.ts"
 import { storageOf } from "@vibeface/client/workspace/storage.ts"
+import * as localRecords from "@vibeface/client/workspace/local-records.ts"
+import * as connectionHealth from "@vibeface/client/lib/connection-health.ts"
 import { unreachable } from "@vibeface/client/workspace/home.ts"
 import { primaryLane } from "@vibeface/client/identity/connection-lane.ts"
 import * as taskLabels from "@vibeface/client/workspace/labels.ts"
@@ -210,12 +212,13 @@ test("workspace preserves bot and message requests while routing native decision
   const workspaceModule = load(resolve(clientRoot, "workspace/context.tsx"))
   assert.equal(typeof workspaceModule.useWorkspaceState, "function")
   const { useWorkspaceState } = workspaceModule as { useWorkspaceState(platform: unknown, connection: ReadyConnection): Workspace }
+  let appForeground = true
   const platform = {
     secure: { attestationPayload: (network: string, scope: string, body: string) => `${network}|${scope}|${body}` },
     transport: { signClient: async (domain: string, payload: string) => { signed.push(`${domain}|${payload}`); return "signature" } },
     storage: browser.localStorage, outbox: memoryOutbox, self: "这个浏览器",
     notifier: { name: "浏览器提醒", permission: async () => "default", request: async () => "default", show() {} },
-    onForeground: () => () => {}, foreground: () => true,
+    onForeground: () => () => {}, foreground: () => appForeground,
   }
   const bot = { bot_id: "bot", conversation_id: "chat", name: "Bot", instructions: "处理项目", models: {}, skills: null, avatar: null, avatar_version: null, event_hash: "bot-event", last_message: null, busy: null }
   const work: WorkRecord = { work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", title: "工作", prompt: "工作", state: "running", resolved: { provider: "codex", model: null }, summary: "", outcome: null, result_text: "", failure_reason: null }
@@ -229,6 +232,9 @@ test("workspace preserves bot and message requests while routing native decision
     return { promise, resolve, reject }
   }
   let conversationHold: ReturnType<typeof deferred> | null = null, messageHold: ReturnType<typeof deferred> | null = null
+  const conversationGates = new Map<string, ReturnType<typeof deferred>>()
+  const ackGates = new Map<string, ReturnType<typeof deferred>>()
+  const conversationReads: string[] = []
   const acknowledgements: string[] = []
   let unreadNotifications: { notification_id: string; kind: string; text: string; conversation_id: string }[] = []
   const messages: Record<string, unknown>[] = [], controls: Record<string, unknown>[] = [], creations: Record<string, unknown>[] = []
@@ -259,8 +265,22 @@ test("workspace preserves bot and message requests while routing native decision
         questionRows = questionRows.filter((row) => row.question_id !== body.question_id)
         return { status: answerOutcome, message: { message_id: `a-${body.question_id}`, role: "user", text: answerOutcome === "answered" ? body.text : "停下", answers: body.question_id } }
       }
-      if (method === "ack") { acknowledgements.push(String(body.notification_id)); unreadNotifications = unreadNotifications.filter(item => item.notification_id !== body.notification_id); return {} }
-      if (method === "conversation") return conversationHold ? conversationHold.promise : { ...context, conversation: { ...context.conversation, conversation_id: body.conversation_id }, scheduler, messages: conversationMessages?.[String(body.conversation_id)] ?? transcript, works: [work] }
+      if (method === "ack") {
+        const id = String(body.notification_id)
+        acknowledgements.push(id)
+        const gate = ackGates.get(id)
+        if (gate) await gate.promise
+        unreadNotifications = unreadNotifications.filter(item => item.notification_id !== body.notification_id)
+        return {}
+      }
+      if (method === "conversation") {
+        const id = String(body.conversation_id)
+        conversationReads.push(id)
+        const gate = conversationGates.get(id)
+        if (gate) return gate.promise
+        if (conversationHold) return conversationHold.promise
+        return { ...context, conversation: { ...context.conversation, conversation_id: id }, scheduler, messages: conversationMessages?.[id] ?? transcript, works: [work] }
+      }
       if (method === "create_bot") {
         creations.push(JSON.parse(JSON.stringify(body)))
         assert.deepEqual(botBody(JSON.parse(stored.get("vibeface.pending-bot.client.network") ?? "null")), creations.at(-1))
@@ -320,6 +340,7 @@ test("workspace preserves bot and message requests while routing native decision
     await new Promise(setImmediate)
     assert.equal(messages.length, 0, "retry waits for an in-flight full read before sending")
     heldRefresh.resolve({ ...context, messages: [retryMessage], scheduler: retryScheduler })
+    conversationHold = null
     await refreshing
     assert.equal(await retrying, true)
     assert.equal(messages.length, 1)
@@ -449,6 +470,223 @@ test("workspace preserves bot and message requests while routing native decision
     assert.equal(render().selectedBot?.name, "corrected project")
     assert.equal(messages.length, 2)
 
+    await t.test("slow reads, retries and unread acknowledgements follow the current visible chat", async () => {
+      const botA = { ...bot, name: "Bot A" }
+      const botB = { ...bot, bot_id: "bot-b", conversation_id: "chat-b", name: "Bot B" }
+      knownBots = [botA, botB]
+      conversationMessages = {
+        chat: [{ message_id: "a1", event_hash: "ea", role: "assistant", text: "A 历史", created_at_ms: 1 }],
+        "chat-b": [{ message_id: "b1", event_hash: "read-b1", role: "assistant", text: "B 历史", created_at_ms: 1 },
+          { message_id: "b2", event_hash: "read-b2", role: "assistant", text: "B 的后续记录", created_at_ms: 2 }],
+      }
+      const payload = (id: string) => ({ ...context, conversation: { ...context.conversation, conversation_id: id }, scheduler: null, messages: conversationMessages?.[id] ?? [] })
+      const operations: Promise<unknown>[] = []
+      const track = <T,>(operation: Promise<T>) => { operations.push(operation); void operation.catch(() => {}); return operation }
+      try {
+        render().setView("other")
+        await render().selectBot(botA)
+        for (const outcome of ["success", "failure"]) {
+          const staleA = deferred(), currentB = deferred()
+          conversationGates.set("chat", staleA)
+          const background = track(render().refresh())
+          await new Promise(setImmediate)
+          conversationGates.set("chat-b", currentB)
+          let opened = false
+          const opening = track(render().selectBot(botB).then(() => { opened = true }))
+          await new Promise(setImmediate)
+          assert.equal(render().data, null, "another Bot's transcript is never shown as B")
+          currentB.resolve(payload("chat-b")); conversationGates.delete("chat-b")
+          await new Promise(setImmediate)
+          assert.equal(opened, true, "B opens without waiting for an unrelated A refresh")
+          await opening
+          assert.equal(render().data?.messages[0]?.text, "B 历史")
+          assert.equal(render().writable, true)
+          if (outcome === "success") staleA.resolve(payload("chat"))
+          else staleA.reject(new Error("old A read failed"))
+          conversationGates.delete("chat")
+          await background
+          assert.equal(render().conversationId, "chat-b")
+          assert.equal(render().data?.messages[0]?.text, "B 历史")
+          assert.equal(render().synced, true)
+          assert.equal(render().writable, true, "an obsolete refresh cannot invalidate B")
+          assert.equal(render().error, null)
+          await render().selectBot(botA)
+        }
+        await render().selectBot(botB)
+        const retryGate = deferred(), readsBefore = conversationReads.length
+        conversationGates.set("chat-b", retryGate)
+        const reopening = track(render().selectBot(botB))
+        await new Promise(setImmediate)
+        assert.equal(render().data?.messages[0]?.text, "B 历史", "a same-ID reread keeps loaded history")
+        retryGate.reject(new Error("current read unavailable")); conversationGates.delete("chat-b")
+        await assert.rejects(reopening, /current read unavailable/)
+        assert.equal(render().data?.messages[0]?.text, "B 历史")
+        assert.equal(render().writable, false)
+        await render().selectBot(botB)
+        assert.equal(conversationReads.length, readsBefore + 2, "retry rereads the same selected Bot")
+        assert.equal(render().writable, true)
+
+        unreadNotifications = [
+          { notification_id: "read-b1", kind: "manager_response", text: "B 未读一", conversation_id: "chat-b" },
+          { notification_id: "read-b2", kind: "manager_response", text: "B 未读二", conversation_id: "chat-b" },
+          { notification_id: "not-loaded", kind: "manager_response", text: "尚未读到的回复", conversation_id: "chat-b" },
+        ]
+        await render().refresh()
+        const ackBefore = acknowledgements.length, firstAck = deferred()
+        ackGates.set("read-b1", firstAck)
+        render().setView("chat")
+        const acknowledging = track(render().refresh())
+        await new Promise(setImmediate)
+        assert.deepEqual(acknowledgements.slice(ackBefore), ["read-b1"])
+        render().setView("other")
+        const switchingAway = track(render().selectBot(botA))
+        await new Promise(setImmediate)
+        firstAck.resolve({}); ackGates.clear()
+        await Promise.all([acknowledging, switchingAway])
+        assert.deepEqual(acknowledgements.slice(ackBefore), ["read-b1"], "switching away stops the remaining unread acknowledgements")
+        assert.equal(render().notifications.some((item) => item.notification_id === "read-b2"), true)
+        assert.equal(render().conversationId, "chat")
+        assert.equal(render().data?.messages[0]?.text, "A 历史")
+
+        appForeground = false
+        await render().selectBot(botB)
+        render().setView("chat")
+        await render().refresh()
+        assert.deepEqual(acknowledgements.slice(ackBefore), ["read-b1"], "background refresh never consumes unread")
+        appForeground = true
+        await render().refresh()
+        assert.deepEqual(acknowledgements.slice(ackBefore), ["read-b1", "read-b2"])
+        assert.equal(render().notifications.some((item) => item.notification_id === "not-loaded"), true, "a reply absent from loaded history stays unread")
+      } finally {
+        for (const [id, gate] of conversationGates) gate.resolve(payload(id))
+        conversationGates.clear()
+        for (const gate of ackGates.values()) gate.resolve({})
+        ackGates.clear()
+        await Promise.allSettled(operations)
+        appForeground = true
+        unreadNotifications = []
+        knownBots = [bot]
+        conversationMessages = null
+        render().setView("other")
+        await render().selectBot(bot)
+        render().setView("chat")
+      }
+    })
+
+    await t.test("a lightweight chat read cannot bypass the new entry's write-state read", async () => {
+      const previous = activeConnection, writeState = deferred()
+      const next: ReadyConnection = { ...connection, generation: previous.generation + 1, isCurrent: () => activeConnection === next,
+        request: async (method) => { assert.equal(method, "write_state"); return writeState.promise },
+      }
+      let opening: Promise<void> | undefined
+      try {
+        activeConnection = next; render()
+        await new Promise(setImmediate)
+        opening = render().selectBot(bot)
+        void opening.catch(() => {})
+        await new Promise(setImmediate)
+        assert.equal(render().writable, false)
+        writeState.resolve({ state: "read_only", conflicts: [] })
+        await opening
+        assert.equal(render().data?.conversation?.conversation_id, "chat")
+        assert.equal(render().writeState.state, "read_only")
+        assert.equal(render().writable, false, "reading a chat never bypasses the entry's read-only state")
+      } finally {
+        writeState.resolve({ state: "read_only", conflicts: [] })
+        if (opening) await opening.catch(() => {})
+        activeConnection = previous; render()
+        await new Promise(setImmediate)
+        await render().refresh()
+      }
+    })
+
+    await t.test("a queued receipt keeps the pending message visible when the history reread fails", async () => {
+      const failedHistory = deferred()
+      conversationHold = failedHistory
+      try {
+        const sending = render().sendMessage('已排队但记录暂未读到')
+        await new Promise(setImmediate)
+        failedHistory.reject(new Error('history reread unavailable'))
+        assert.equal(await sending, true)
+        assert.equal(render().messagePending?.text, '已排队但记录暂未读到')
+        conversationHold = null
+        await render().refresh()
+        assert.equal(render().messagePending, null, 'only matching history retires the pending copy')
+        assert.equal(render().error, null, 'a successful read clears a recovered background read error')
+      } finally {
+        failedHistory.resolve(context)
+        conversationHold = null
+      }
+    })
+
+    await t.test("an empty network finishes its read and can create its first Bot", async () => {
+      const previousMode = createMode
+      knownBots = []
+      try {
+        await render().refresh()
+        assert.equal(render().conversationId, '')
+        assert.equal(render().data, null)
+        assert.equal(render().synced, true, 'an empty catalog is a completed read, not an unread conversation')
+        assert.equal(render().writable, true)
+        createMode = 'success'
+        const first = await render().createBot({ name: 'First Bot after an empty catalog', instructions: '' })
+        assert.equal(first.name, 'First Bot after an empty catalog')
+        assert.equal(render().selectedBot?.bot_id, first.bot_id)
+        assert.equal(render().writable, true)
+      } finally {
+        createMode = previousMode
+        knownBots = [bot]
+        await render().refresh()
+        await render().selectBot(bot)
+      }
+    })
+
+    await t.test("the displayed route does not steal a Bot being created before navigation", async () => {
+      const previousMode = createMode, previousView = render().view
+      createMode = 'success'
+      knownBots = [bot]
+      await render().refresh(); await render().selectBot(bot)
+      let routeBotId = bot.bot_id, pathname = `/b/${routeBotId}`, currentWorkspace = render()
+      const route = componentHarness('../../routes/_app/b.$botId.tsx', {
+        '@tanstack/react-router': { createFileRoute: () => () => ({ useParams: () => ({ botId: routeBotId }) }), Outlet: 'Outlet',
+          useRouterState: ({ select }: { select: (state: { location: { pathname: string } }) => unknown }) => select({ location: { pathname } }) },
+        '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace },
+      }, {}, 'ChatRoute')
+      const routeRender = () => { currentWorkspace = render(); route.render('ChatRoute') }
+      const reading = deferred()
+      let creating: ReturnType<Workspace['createBot']> | undefined
+      let createdId = ''
+      try {
+        routeRender(); await settleComponent(); routeRender()
+        conversationHold = reading
+        creating = render().createBot({ name: 'Created from an existing chat', instructions: '' })
+        void creating.catch(() => {})
+        await new Promise(setImmediate)
+        createdId = render().conversationId
+        assert.notEqual(createdId, 'chat')
+        routeRender(); await new Promise(setImmediate)
+        assert.equal(render().conversationId, createdId, 'the old route cannot reset an explicit pending creation selection')
+        reading.resolve({ ...context, conversation: { ...context.conversation, conversation_id: createdId }, messages: [] })
+        conversationHold = null
+        const created = await creating
+        assert.equal(created.conversation_id, createdId)
+        routeBotId = created.bot_id; pathname = `/b/${routeBotId}`
+        routeRender(); await settleComponent(); routeRender()
+        assert.equal(render().conversationId, createdId)
+        assert.equal(render().view, 'chat')
+        pathname = `/b/${routeBotId}/work/readonly`
+        routeRender(); await settleComponent(); routeRender()
+        assert.equal(render().view, 'other', 'a nested detail route does not acknowledge the chat behind it')
+      } finally {
+        reading.resolve({ ...context, conversation: { ...context.conversation, conversation_id: createdId || 'chat' }, messages: [] })
+        conversationHold = null
+        if (creating) await creating.catch(() => {})
+        route.close(); createMode = previousMode; knownBots = [bot]
+        await render().refresh(); await render().selectBot(bot)
+        render().setView(previousView)
+      }
+    })
+
     await t.test("new connections wait for their own complete read and retain unknown writes without replay", async () => {
       knownBots = [bot]
       await render().refresh()
@@ -535,17 +773,19 @@ test("workspace preserves bot and message requests while routing native decision
       render().setView('other')
       await render().selectBot(botA)
       let shared = render()
-      const device = { get ready() { return activeConnection }, phase: 'ready', link: { kind: 'online' }, entries: [], directory: null, identity: { deviceId: 'client' }, join() {}, cancelJoin() {}, leave() {} }
-      const bridge = componentHarness('../../../../../apps/mobile/src/data/live.tsx', {
+      const device = { get ready() { return activeConnection }, phase: 'ready', link: { kind: 'online' }, entries: [], directory: { network_id: 'network', members: [{ device_id: 'gateway', kind: 'node', name: 'Mac', manage: true }, { device_id: 'client', kind: 'client', name: '手机', manage: true }] }, identity: { deviceId: 'client' }, join() {}, cancelJoin() {}, leave() {} }
+      const localPlatform = { storage: browser.localStorage, outbox: memoryOutbox, onForeground: () => () => {} }
+      const bridgeDependencies = {
         '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/identity/access.ts': { accessOf },
-        '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/lib/node.ts': { entryAddress },
-        '@vibeface/client/chat/protocol.ts': { botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage, unreadCounts },
+        '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/lib/node.ts': { entryAddress, messageOf },
+        '@vibeface/client/chat/protocol.ts': { botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { byRank, chatTimeline, firstUnread, taskMessage, unreadCounts },
         '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/inbox.ts': { inboxItems }, '@vibeface/client/workspace/labels.ts': taskLabels,
         '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers }, '@vibeface/client/workspace/storage.ts': { storageOf }, '@vibeface/client/workspace/types.ts': { isSessionNotification: () => false },
-        '@/platform': { mobilePlatform: { storage: browser.localStorage } }, './context': { WorkspaceProvider: 'NativeWorkspace' },
-      }, {}, 'Live')
+        '@/platform': { mobilePlatform: localPlatform }, './context': { WorkspaceProvider: 'NativeWorkspace' },
+      }
+      const bridge = componentHarness('../../../../../apps/mobile/src/data/live.tsx', bridgeDependencies, {}, 'Live')
       type NativeWorkspace = import('../../../../../apps/mobile/src/data/types.ts').Workspace
-      let native: NativeWorkspace
+      let native: NativeWorkspace | undefined
       const mobile = () => {
         shared = render()
         const value = bridge.render('Live').find(({ type }) => type === 'NativeWorkspace')?.props.value
@@ -557,7 +797,7 @@ test("workspace preserves bot and message requests while routing native decision
       const platform = { OS: 'android' }, insets = { bottom: 0 }, keyboard = { height: { value: 0 }, progress: { value: 0 } }
       let glass = false, theme = 'light'
       let dockHeight: { value: number } | undefined, emptyPadding = () => ({ paddingBottom: 0 })
-      const chat = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
+      const chatDependencies = {
         'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: botA.bot_id }) },
         'expo-router/react-navigation': { useHeaderHeight: () => platform.OS === 'ios' ? 96 : 0 },
         'react-native': { Platform: platform, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
@@ -565,13 +805,16 @@ test("workspace preserves bot and message requests while routing native decision
         'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: typeof emptyPadding) => { emptyPadding = read; return read() }, useSharedValue: (initial: number) => dockHeight ??= { value: initial } },
         'react-native-safe-area-context': { useSafeAreaInsets: () => insets, useSafeAreaFrame: () => ({ width: 390 }) },
         'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme }), useCSSVariable: () => theme === 'dark' ? 'black' : 'white' },
+        '@/platform': { mobilePlatform: localPlatform }, '@vibeface/client/lib/node.ts': { messageOf },
         '@/data/context': { useWorkspace: () => native }, '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
         '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/home.ts': { unreachable },
         '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
         '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
         '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
         '@/features/chat/chrome': { ChatMaterial: 'ChatMaterial', useChatChrome: () => glass ? { kind: 'glass', colorScheme: theme } : { kind: 'solid' } },
-      }, { requestAnimationFrame: (run: () => void) => run(), setInterval: () => 1, clearInterval() {} })
+      }
+      const chatGlobals = { requestAnimationFrame: (run: () => void) => run(), setInterval: () => 1, clearInterval() {}, setTimeout: () => 1, clearTimeout() {} }
+      const chat = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', chatDependencies, chatGlobals)
       const stack = { Screen: 'Screen', Protected: 'Protected' }
       const layout = componentHarness('../../../../../apps/mobile/app/_layout.tsx', {
         'expo-router': { Stack: stack }, 'expo-linking': { useLinkingURL: () => null }, '@/data/live': { LiveWorkspace: 'LiveWorkspace', useLive: () => shared },
@@ -579,6 +822,42 @@ test("workspace preserves bot and message requests while routing native decision
         'uniwind': { useCSSVariable: () => ['white', 'black'] }, '@/lib/layout': { useWide: () => false }, 'react-native': { Platform: { OS: 'ios' }, View: 'View' },
       })
       try {
+        const botC = { ...bot, bot_id: 'bot-c', conversation_id: 'chat-c', name: 'Bot C' }
+        assert.ok(conversationMessages); conversationMessages['chat-c'] = []
+        knownBots = [botA, botB, botC]
+        await render().refresh(); mobile()
+        const failedRead = deferred()
+        conversationGates.set('chat-c', failedRead)
+        const readingChat = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', { ...chatDependencies,
+          'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: botC.bot_id }) } }, chatGlobals)
+        try {
+          readingChat.render('default'); mobile()
+          const loadingTree = readingChat.render('default')
+          assert.equal(loadingTree.find(({ type }) => type === 'Composer')?.props.blocked, '正在加载')
+          assert.match(componentText(loadingTree), /正在加载聊天记录/)
+          assert.equal(starters.general.some((text) => componentText(loadingTree).includes(text)), false, 'a pending read never presents a new-chat starter')
+          failedRead.reject(new Error('当前聊天暂不可用')); await settleComponent(); mobile()
+          assert.equal(mobile().chatFocus?.kind, 'error')
+          assert.match(componentText(readingChat.render('default')), /当前聊天暂不可用/)
+          const readsBefore = conversationReads.length
+          await render().refresh().catch(() => {}); mobile(); await settleComponent()
+          assert.equal(conversationReads.length, readsBefore + 1, 'a background catalog update cannot automatically retry a failed chat visit')
+          conversationGates.delete('chat-c')
+          assert.equal(mobile().chatFocus?.kind, 'error')
+          const failedFocus = mobile().chatFocus
+          if (failedFocus?.kind === 'error') failedFocus.retry()
+          await settleComponent(); mobile()
+          assert.equal(mobile().chatFocus?.kind, 'ready')
+          assert.equal(shared.conversationId, 'chat-c')
+          assert.equal(mobile().conversations['chat-c'].messages.length, 0)
+          assert.equal(mobile().conversations['chat-c'].source, 'live')
+          assert.equal(starters.general.some((text) => componentText(readingChat.render('default')).includes(text)), true, 'only a successful empty read presents starters')
+        } finally {
+          failedRead.resolve({ ...context, conversation: { ...context.conversation, conversation_id: 'chat-c' }, messages: [] })
+          conversationGates.delete('chat-c'); readingChat.close()
+          knownBots = [botA, botB]
+          await render().refresh(); await render().selectBot(botA); mobile()
+        }
         const tree = layout.render('default')
         const screens = tree.find(({ type }) => typeof type === 'function' && type.name === 'Screens')
         assert.ok(screens && typeof screens.type === 'function')
@@ -739,6 +1018,106 @@ test("workspace preserves bot and message requests while routing native decision
           assert.ok(typeof options.headerTitle === 'function'); options.headerTitle()
           assert.equal(elements.some(({ type }) => type === 'ChatMaterial'), false, 'the native bar owns the title material')
         }
+        const cacheKey = 'vibeface.local-transcripts.network.client'
+        const cachedRaw = stored.get(cacheKey)
+        assert.ok(cachedRaw && localRecords.parseLocalTranscripts(cachedRaw, 'network', 'client').some((item) => item.messages.some((message) => message.text === 'Bot A 的消息')), 'the real Live bridge persists successfully read history')
+        const priorShared = shared
+        assert.ok(priorShared.data)
+        const warming = { ...priorShared, data: null, conversationId: '', bots: [], synced: false, reading: true }
+        const warmingBridge = componentHarness('../../../../../apps/mobile/src/data/live.tsx', { ...bridgeDependencies,
+          '@vibeface/client/workspace/context.tsx': { useWorkspace: () => warming } }, {}, 'Live')
+        try {
+          const value = warmingBridge.render('Live').find(({ type }) => type === 'NativeWorkspace')?.props.value
+          assert.ok(value && typeof value === 'object')
+          const reconnecting = value as NativeWorkspace
+          assert.equal(reconnecting.conversations.chat?.source, 'cache', 'reconnecting reads the cached route before the entry selects any conversation')
+          assert.equal(reconnecting.conversations.chat.messages.some((item) => item.text === 'Bot A 的消息'), true)
+          assert.ok(reconnecting.conversations.chat.blocked)
+        } finally { warmingBridge.close() }
+        const behind = { ...priorShared, conversationId: 'chat', data: { ...priorShared.data, conversation: { ...context.conversation }, messages: [] } }
+        const partialBridge = componentHarness('../../../../../apps/mobile/src/data/live.tsx', { ...bridgeDependencies,
+          '@vibeface/client/workspace/context.tsx': { useWorkspace: () => behind } }, {}, 'Live')
+        try {
+          const value = partialBridge.render('Live').find(({ type }) => type === 'NativeWorkspace')?.props.value
+          assert.ok(value && typeof value === 'object')
+          const partial = value as NativeWorkspace
+          assert.equal(partial.conversations.chat.messages.some((item) => item.text === 'Bot A 的消息'), true, 'an empty replica response never erases already displayed history')
+          assert.equal(partial.conversations.chat.source, 'cache')
+          assert.ok(partial.conversations.chat.blocked)
+        } finally { partialBridge.close() }
+        stored.set('vibeface.last-seen', JSON.stringify({ me: 'client', networkId: 'network', entry: 'Mac', bots: [botA], primary: 'chat', unread: { chat: 7 }, members: [] }))
+        const offlineDevice = { ...device, ready: undefined, phase: 'reconnecting', link: { kind: 'offline', attempt: 2, retryInMs: 1000, reason: 'connection lost' },
+          entries: [activeConnection.entry], entry: activeConnection.entry, entryName: () => 'Mac', directory: { network_id: 'network' }, identity: { deviceId: 'client' } }
+        const pending = { key: 'network.client:message:offline-pending', method: 'message', params: { conversation_id: 'chat', message_id: 'offline-pending', text: '未确认的发送' }, created_at_ms: 2 }
+        await memoryOutbox.put(pending)
+        const offlineBridge = componentHarness('../../../../../apps/mobile/src/data/live.tsx', { ...bridgeDependencies,
+          '@vibeface/client/identity/context.tsx': { useDevice: () => offlineDevice } }, {}, 'Offline')
+        const readOffline = () => {
+          const value = offlineBridge.render('Offline').find(({ type }) => type === 'NativeWorkspace')?.props.value
+          assert.ok(value && typeof value === 'object')
+          return value as NativeWorkspace
+        }
+        let coldChat: ReturnType<typeof componentHarness> | undefined
+        const ackCount = acknowledgements.length
+        try {
+          readOffline(); await settleComponent()
+          const offline = readOffline()
+          assert.deepEqual(JSON.parse(JSON.stringify(offline.ownerScope)), { networkId: 'network', deviceId: 'client' })
+          assert.equal(offline.conversations.chat.source, 'cache')
+          assert.equal(offline.conversations.chat.messages.some((item) => item.text === 'Bot A 的消息'), true)
+          assert.equal(offline.conversations.chat.messages.find((item) => item.message_id === 'offline-pending')?.state, 'sending')
+          assert.equal(offline.unread.chat, 7)
+          assert.equal(acknowledgements.length, ackCount, 'offline cached messages never acknowledge unread')
+          assert.equal(stored.get(cacheKey)?.includes('offline-pending'), false, 'pending sends never become persisted confirmed history')
+
+          mobile()
+          const composer = () => chat.render('default').find(({ type }) => type === 'Composer')?.props
+          const writeDraft = composer()?.onChange
+          assert.ok(typeof writeDraft === 'function'); writeDraft('恢复后的草稿')
+          assert.equal(composer()?.value, '恢复后的草稿')
+          coldChat = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', { ...chatDependencies,
+            '@/data/context': { useWorkspace: () => offline }, '@/data/live': { useLive: () => null },
+            '@vibeface/client/identity/context.tsx': { useDevice: () => offlineDevice } }, chatGlobals)
+          assert.equal(coldChat.render('default').find(({ type }) => type === 'Composer')?.props.value, '恢复后的草稿', 'a remounted offline chat recovers its scoped draft')
+          assert.ok(coldChat.render('default').find(({ type }) => type === 'Composer')?.props.blocked)
+          assert.equal(acknowledgements.length, ackCount)
+
+          let sendGate = deferred(), calls = 0
+          const sendingWorkspace: NativeWorkspace = { ...offline, connection: { state: 'online', entry: 'Mac', direct: false }, chatFocus: { kind: 'ready', id: 'chat' },
+            conversations: { chat: { ...offline.conversations.chat, source: 'live', blocked: null } },
+            actions: { ...offline.actions, send: async () => { calls++; await sendGate.promise; return true } } }
+          const sendingChat = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', { ...chatDependencies,
+            '@/data/context': { useWorkspace: () => sendingWorkspace } }, chatGlobals)
+          try {
+            const sendComposer = () => sendingChat.render('default').find(({ type }) => type === 'Composer')?.props
+            const send = sendComposer()?.onSend
+            assert.ok(typeof send === 'function'); send()
+            assert.equal(sendComposer()?.value, '恢复后的草稿', 'sending retains its durable draft until confirmation')
+            const edit = sendComposer()?.onChange
+            assert.ok(typeof edit === 'function'); edit('后来输入的新草稿')
+            sendGate.reject(new Error('服务器明确拒绝了这次发送')); await settleComponent()
+            assert.equal(sendComposer()?.value, '后来输入的新草稿', 'an older failure never replaces newer input')
+            sendGate = deferred()
+            const retry = sendComposer()?.onSend
+            assert.ok(typeof retry === 'function'); retry()
+            sendGate.resolve({}); await settleComponent()
+            assert.equal(sendComposer()?.value, '', 'confirmed sends clear only an unchanged draft')
+            assert.equal(calls, 2)
+          } finally { sendingChat.close() }
+
+          offlineDevice.directory.network_id = 'another-network'
+          assert.equal(readOffline().bots.length, 0)
+          assert.deepEqual(Object.keys(readOffline().conversations), [], 'another verified network never sees the cached transcript')
+          offlineDevice.directory.network_id = 'network'
+          offlineDevice.identity.deviceId = 'another-device'
+          assert.equal(readOffline().ownerScope, null)
+          assert.deepEqual(Object.keys(readOffline().conversations), [])
+          offlineDevice.identity.deviceId = 'client'
+          offlineDevice.phase = 'removed'
+          assert.equal(readOffline().ownerScope, null)
+          assert.deepEqual(Object.keys(readOffline().conversations), [])
+          assert.equal(stored.get(cacheKey), 'null', 'removal retires the actual persisted cache key')
+        } finally { coldChat?.close(); offlineBridge.close(); await memoryOutbox.delete(pending.key) }
       } finally { chat.close(); layout.close(); bridge.close() }
     })
   } finally {
@@ -793,6 +1172,8 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     })
   }
   const require = (specifier: string): unknown => {
+    if (specifier === '@vibeface/client/workspace/local-records.ts') return localRecords
+    if (specifier === '@vibeface/client/lib/connection-health.ts') return connectionHealth
     if (specifier === '@/features/chat/memory-summary') {
       const filename = fileURLToPath(new URL('../../../../../apps/mobile/src/features/chat/memory-summary.tsx', import.meta.url))
       const compiled = transpileModule(readFileSync(filename, 'utf8'), { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
@@ -805,7 +1186,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const filename = fileURLToPath(new URL(path, import.meta.url))
   const source = readFileSync(filename, 'utf8') + (privateExport ? `\nexport { ${privateExport} }\n` : '')
   const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
-  new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInNewContext({ Map, Error, TextEncoder, ...globals })(module.exports, require, module)
+  new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInNewContext({ Map, Error, TextEncoder, setTimeout, clearTimeout, ...globals })(module.exports, require, module)
   return {
     render(name: string, props: unknown = {}) {
       cursor = 0; elements.length = 0
@@ -2723,6 +3104,7 @@ test('native composer shows one actionable blocker while preserving send gates o
     let retried = 0
     const live = { ...parityShared(), nodes: parseNodes({ nodes: [{ ...parityNode, capabilities: { ...parityNode.capabilities, manager_state: 'unverified' } }] }) }
     const conversation: import('../../../../../apps/mobile/src/data/types.ts').Conversation = {
+      source: 'live',
       messages: [{ message_id: 'one', event_hash: 'one', role: 'user', text: 'hello', created_at_ms: 1 }], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null,
       works: [], replying: false, status: null, stoppable: false, blocked: null, sending: false,
     }
