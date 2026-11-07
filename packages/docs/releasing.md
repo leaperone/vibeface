@@ -24,13 +24,13 @@ Core、CLI、Web App 和 Mobile 共享一个版本、一个 `v<version>` Tag 与
 
 `COMPONENT-INFO.json` 与 `release.json` 的 schema 保持 1。`BUILD-INFO.json` 仍包含九个既有字段，CLI、Core、App 的版本和源码提交必须完全一致。数据 epoch 与更新协议保持 1。旧公开 Tag 与字节保持不可变，不创建旧应用前缀别名。
 
-## 每日 Nightly 的发布约束
+## 每 4 小时 Nightly 的发布约束
 
-协调入口仍是 `ci.yml` 的 `daily-nightly`，只在 UTC 03:23 的 main 定时扩展检查和 `ci-gate` 成功后执行。手动 CI 和普通 main push 不发布每日 Nightly。产品四应用分配一个共同版本和 `v` Tag，官网独立分配版本和 `www-v` Tag；即使业务源码没有变化，每日仍递增版本。
+协调入口仍是 `ci.yml` 的 `daily-nightly`。定时扩展检查使用 `23 */4 * * *`，每日 UTC 00:23、04:23、08:23、12:23、16:23、20:23 发起，只在 main 的 `ci-gate` 成功后执行协调。手动 CI 和普通 main push 不触发自动 Nightly。产品四应用分配一个共同版本和 `v` Tag，官网独立分配版本和 `www-v` Tag；即使业务源码没有变化，每个四小时批次仍递增版本。
 
-启用需要明确授权未来每日机械版本 PR 自动 squash，并配置单仓库 fine-grained `NIGHTLY_RELEASE_TOKEN`。实现或合并代码不代表凭证已配置或自动发布已启用。PAT 只处理受信版本 PR 创建与普通 squash；版本分支、只创建的 Tag 和精确 dispatch 使用 job 级 `GITHUB_TOKEN`。缺少凭证时明确失败，不挪用部署 token 或修改保护规则。
+启用需要明确授权未来每四小时机械版本 PR 自动 squash，并配置单仓库 fine-grained `NIGHTLY_RELEASE_TOKEN`。实现或合并代码不代表凭证已配置或自动发布已启用。PAT 只处理受信版本 PR 创建与普通 squash；版本分支、只创建的 Tag 和精确 dispatch 使用 job 级 `GITHUB_TOKEN`。缺少凭证时明确失败，不挪用部署 token 或修改保护规则。
 
-原 schedule run 的 `created_at` 固定 UTC 日期。协调器先恢复同一天的唯一版本 PR、版本与实际 squash SHA，校验完整机械 tree、作者、base、head 和 Android versionCode。已有但格式不兼容的日任务停止处理，不另建第二个 PR 或重新分配版本。
+原 schedule run 的 `created_at` 转为 UTC 后，向下取整到 00、04、08、12、16、20 时的批次。批次分支为 `bot/daily-nightly/YYYYMMDDHH`，版本日期仍为原 run 的 `YYYYMMDD`。同日不同批次各建一个版本 PR，并继续递增 Nightly 序号与 Android versionCode；协调器全局串行。延迟启动或跨日重跑仍恢复原批次唯一 PR、版本、实际 squash SHA 和留存制品，校验完整机械 tree、作者、base、head 和 Android versionCode。旧批次若尚无分支与 PR，而 main 的产品或官网 Nightly 日期已晚于该批次，则停止初始化，避免版本倒退。已有批次 PR 格式不符合时停止，不另建替代 PR 或重新分配版本。
 
 只有实际合并 SHA 的 main push CI success 放行。产品与官网可并行启动独立发布运行，产品内部按依赖并行构建；不再先公开 Core、App 再启动 CLI。由 `GITHUB_TOKEN` 创建 Tag 后显式 dispatch，并指定 `publish=true`。
 
@@ -211,6 +211,6 @@ gh workflow run npm-publish.yml --repo leaperone/vibeface --ref v<version> \
   -f tag=v<version> -F publish=false
 ```
 
-需要手动公开发布时，把 `publish` 设为 true。若原发布 run 的 npm job 失败，优先对账后使用 `gh run rerun <run-id> --failed`，复用原 artifact id；不要重建归档。每日协调器不会自动重试 npm 失败。
+需要手动公开发布时，把 `publish` 设为 true。若原发布 run 的 npm job 失败，协调器只在原产品与 npm 制品完整时尝试重跑原 run 的失败 publisher。手动恢复时，先对账后使用 `gh run rerun <run-id> --failed`，复用原 artifact id，不重建归档。
 
 发布器先读取公开 registry，只把 HTTP 404 当作包不存在，传输失败、其他 HTTP 错误和无效响应都停止发布。已有目标版本的 integrity 必须相同，且 `nightly` 等于目标或更高时直接成功，不降级。已有版本但 `nightly` 缺失或较旧时停止并要求对账，不自动修改 dist-tag。仅目标版本不存在且比当前 Nightly 更新时执行一次 `npm publish --provenance`。随后最多进行 40 次只读查询，等待 registry 确认 integrity 和渠道；包括发布响应丢失的情况，也不自动重发。未核实公开结果始终失败。公开版本不能覆盖，不能通过复用 tag 更换内容。
