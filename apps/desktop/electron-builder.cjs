@@ -93,4 +93,3 @@ module.exports = {
   },
   dmg: { artifactName, writeUpdateInfo: false },
 };
-
