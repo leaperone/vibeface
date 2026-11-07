@@ -115,6 +115,7 @@ jobs:
           python3 scripts/daily-nightly.py --self-test
           python3 scripts/release.py self-test
           python3 scripts/package-node-windows.py --self-test
+          python3 scripts/windows-diagnostic-input.py --self-test
           python3 scripts/checksum.py --self-test
           python3 scripts/ios_device.py --self-test
           python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/release.py", "scripts/package-node-windows.py", "scripts/verify-windows-imports.py", "scripts/check-release-workflow.py", "scripts/daily-nightly.py")]'
@@ -951,6 +952,9 @@ jobs:
     needs: [plan, package]
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && contains(needs.plan.outputs.package_matrix, 'x86_64-pc-windows-msvc') }}
     uses: ./.github/workflows/ci-windows-native.yml
+    permissions:
+      contents: read
+      actions: read
     with:
       source_sha: ${{ github.sha }}
       package_artifact: node-package-x86_64-pc-windows-msvc-${{ github.sha }}

@@ -175,7 +175,15 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK 和 App Server 夹具，`--phase5` 不启动 App Server。模拟协议通过不能证明真实模型理解需求或正确选择工具。
 
-产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本与 main 中的固定源码。产品先并行构建 Web、四个原生平台和 Android，再按平台组包；只有完整汇总成功才公开一个 Release。`publish=false` 手动入口只验证并生成制品。Stable 产品与官网各自保留部署入口，Nightly 不发站；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
+产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本与 main 中的固定源码。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App；完整汇总成功后才公开一个 Release。`publish=false` 手动入口只验证并生成制品。Stable 产品与官网各自保留部署入口，Nightly 不发站；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
+
+Windows 运行包的定位可复用已完成 CI 中成功的 Windows package 制品，单独运行当前验收脚本：
+
+```sh
+gh workflow run ci.yml --ref <branch> -F windows_only=true -f windows_package_run=<run-id>
+```
+
+入口核对原运行、成功生产者、不可变 artifact ID、来源提交、有效期和文件摘要。诊断收据分别记录运行包与验收脚本的源码，并使用独立 artifact 名称。该模式跳过 Rust 编译与其他平台构建；最终交付仍需用最终提交构建并验收完整产品集。
 
 ## 本地按改动补充验收
 

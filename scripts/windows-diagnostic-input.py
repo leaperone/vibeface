@@ -3,7 +3,6 @@
 import argparse
 import copy
 import datetime
-import hashlib
 import json
 import re
 from pathlib import Path
@@ -97,7 +96,7 @@ def validate_selection(run_id, repository, run, jobs_page, artifacts_page, *, no
     require(isinstance(workflow_run, dict) and workflow_run.get('id') == run_id
             and workflow_run.get('head_sha') == source_sha,
             'Windows package artifact belongs to another run or source')
-    if 'repository_id' in repo:
+    if 'id' in repo:
         require(workflow_run.get('repository_id') == repo['id'], 'package artifact repository mismatch')
     artifact_id = positive_id(artifact.get('id'), 'package artifact ID')
     require(artifact.get('expired') is False, 'Windows package artifact has expired')
@@ -248,6 +247,7 @@ def selection_self_test():
     rejects(lambda r, j, a: a['artifacts'][0].update(expires_at='2026-11-06T00:00:00Z'))
     rejects(lambda r, j, a: a['artifacts'][0].update(name='node-package-other-' + source))
     rejects(lambda r, j, a: a['artifacts'][0].update(workflow_run={'id': run_id + 1}))
+    rejects(lambda r, j, a: a['artifacts'][0]['workflow_run'].update(repository_id=r['repository']['id'] + 1))
     rejects(lambda r, j, a: a.update(artifacts=a['artifacts'] * 2, total_count=2), 'ambiguous')
     rejects(lambda r, j, a: a.update(total_count=2))
     for invalid in ('', '0', '-1', '01', '1x', str(MAX_ID + 1)):
