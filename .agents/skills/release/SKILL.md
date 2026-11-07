@@ -22,13 +22,13 @@ description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，核对
 
 版本只使用 `X.Y.Z`、`X.Y.Z-rc.N` 或 `X.Y.Z-nightly.YYYYMMDD.N`。Nightly 日期取 UTC，N 是该发布组、基准版本和日期下远端已有序号的最大值加一。先获取远端 tags，再计算；产品与官网独立计数。产品只使用 `v`，官网只使用 `www-v`；不新增旧应用前缀别名，不使用可变 `nightly` Tag、build metadata 或重复版本。
 
-## 每日自动 Nightly
+## 每 4 小时自动 Nightly
 
-`ci.yml` 的 main schedule 在 `ci-gate` 成功后运行 `scripts/daily-nightly.py`，手动 CI 和普通 main push 不运行它。启用须已明确授权未来每日机械版本 PR 的自动 squash，并配置单仓库 fine-grained `NIGHTLY_RELEASE_TOKEN`，授予 Contents、Pull requests、Actions 所需权限。实现合并与本 skill 变化均不代表配置或启用完成。缺 secret 时明确失败，不挪用站点部署 token，不改保护，不 fallback。
+`ci.yml` 的 main schedule 使用 `23 */4 * * *`，每日 UTC 00:23、04:23、08:23、12:23、16:23、20:23 发起扩展检查，在 `ci-gate` 成功后运行 `scripts/daily-nightly.py`，手动 CI 和普通 main push 不运行它。启用须已明确授权未来每四小时机械版本 PR 的自动 squash，并配置单仓库 fine-grained `NIGHTLY_RELEASE_TOKEN`，授予 Contents、Pull requests、Actions 所需权限。实现合并与本 skill 变化均不代表配置或启用完成。缺 secret 时明确失败，不挪用站点部署 token，不改保护，不 fallback。
 
-协调器从原 run.created_at 固定 UTC 日期，先恢复 `bot/daily-nightly/YYYYMMDD` 的唯一 PR、版本和真实 squash SHA。即使业务源码未变化，每日仍递增产品组和官网 Nightly；产品四应用使用同一版本，保留 marketing version、iOS buildNumber 和依赖解析结果。版本 PR 只允许机械版本字段、两个 Cargo.lock 本仓包版本、Android versionCode。PAT 只用于 PR 创建与普通立即 squash；PAT 没有路径级权限，限制由受信脚本的完整 tree、仓库、作者、base、head 校验执行。普通 GITHUB_TOKEN 处理分支、只创建的 tag 和精确 dispatch。
+协调器将原 run 的 `created_at` 转为 UTC，向下取整到 00、04、08、12、16、20 时的批次，用 `bot/daily-nightly/YYYYMMDDHH` 恢复该批次唯一 PR、版本和真实 squash SHA。发布版本日期仍取原 run 的 `YYYYMMDD`，不同批次独立创建 PR 并递增同日序号与 Android versionCode。即使业务源码未变化，每个批次仍递增产品组和官网 Nightly；产品四应用使用同一版本，保留 marketing version、iOS buildNumber 和依赖解析结果。协调器保持全局串行。版本 PR 只允许机械版本字段、两个 Cargo.lock 本仓包版本、Android versionCode。PAT 只用于 PR 创建与普通立即 squash；PAT 没有路径级权限，限制由受信脚本的完整 tree、仓库、作者、base、head 校验执行。普通 GITHUB_TOKEN 处理分支、只创建的 tag 和精确 dispatch。
 
-合并后仅实际 SHA 的 main push CI success 放行。产品内部并行构建并完整汇总后公开一个 Release，产品与官网运行可并行。产品 Nightly 自动发布 npm，Nightly 不发站、不做 iOS。失败或响应未知先对账，只从原 run 完整 artifact 重跑失败 publisher，不能重建后覆盖。npm 失败使每日协调器失败，不自动重试；对账后重跑原 release run 的失败 job，复用原 npm artifact id。artifact 丢失、过期或存在字节冲突时停止。重跑原 schedule run 即可恢复原日任务，不另建版本 PR，不重新分配同日版本。不要在人工发版会话中无授权调用此自动协调入口。
+合并后仅实际 SHA 的 main push CI success 放行。产品内部并行构建并完整汇总后公开一个 Release，产品与官网运行可并行。产品 Nightly 自动发布 npm，Nightly 不发站、不做 iOS。失败或响应未知先对账，只从原 run 完整 artifact 重跑失败 publisher，不能重建后覆盖。npm 失败不能当作成功；原产品与 npm artifact 完整时，协调器可重跑原 release run 的失败 job，复用原 npm artifact id。artifact 丢失、过期或存在字节冲突时停止。延迟启动或跨日重跑原 schedule run 仍恢复原批次任务，不另建版本 PR，不重新分配版本。不要在人工发版会话中无授权调用此自动协调入口。
 
 ## 准备并验证版本
 
