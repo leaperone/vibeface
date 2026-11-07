@@ -250,7 +250,20 @@ fn overlap(left: &str, right: &str) -> bool {
 fn eq_root_part(family: &RootFamily, left: &str, right: &str) -> bool {
     match family {
         RootFamily::Posix => left == right,
-        RootFamily::Windows => left.eq_ignore_ascii_case(right),
+        RootFamily::Windows => left
+            .chars()
+            .map(simple_uppercase)
+            .eq(right.chars().map(simple_uppercase)),
+    }
+}
+
+fn simple_uppercase(character: char) -> char {
+    let mut uppercase = character.to_uppercase();
+    let first = uppercase.next().unwrap_or(character);
+    if uppercase.next().is_none() {
+        first
+    } else {
+        character
     }
 }
 
@@ -322,6 +335,19 @@ mod root_path_tests {
             "\\\\server\\share\\work",
             "\\\\other\\share\\work"
         ));
+    }
+
+    #[test]
+    fn windows_unicode_case_aliases_overlap_without_normalization_or_expansion() {
+        assert!(overlap("C:\\Ä\\repo", "c:\\ä"));
+        assert!(overlap("\\\\SÉRVER\\SHÄRE\\repo", "\\\\sérver\\shäre"));
+        assert!(overlap("\\\\?\\C:\\Ä\\repo", "C:\\ä"));
+        assert!(overlap("C:\\Σ\\repo", "c:\\ς"));
+
+        assert!(!overlap("C:\\Straße", "c:\\STRASSE"));
+        assert!(!overlap("C:\\Ä", "C:\\A\u{0308}"));
+        assert!(!overlap("/srv/Ä", "/srv/ä"));
+        assert!(!overlap("C:\\ä", "C:\\ä-repo"));
     }
 }
 
