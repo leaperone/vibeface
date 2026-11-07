@@ -262,6 +262,8 @@ jobs:
           summary_path.write_text(json.dumps(summary) + "\n")
           print("iOS XCTest runner healthy: " + json.dumps(summary, sort_keys=True))
           PY
+      - name: Check bounded iOS actor diagnostics
+        run: python3 scripts/ios-actor-census.py --self-test
       - name: Verify Provider settings and cancellation in the installed iOS app
         env:
           VIBEFACE_E2E_SOURCE_COMMIT: ${{ github.sha }}
@@ -481,8 +483,138 @@ jobs:
               except (OSError, ValueError, TypeError, AssertionError, KeyError):
                   return {"status": "invalid"}
 
+          def safe_actor_process(value):
+              if not isinstance(value, dict) or value.get("status") not in {
+                  "running", "missing", "not_running", "probe_timeout", "probe_unavailable", "invalid",
+              }:
+                  return {"status": "invalid"}
+              output = {"status": value["status"]}
+              if value["status"] != "running":
+                  return output
+              if value.get("actor") not in {"vibeface", "snapshot_bridge", "xctest_runner", "node", "other"}:
+                  return {"status": "invalid"}
+              state = value.get("state")
+              if state is not None and (not isinstance(state, str) or not re.fullmatch(r"[A-Za-z<>?+!-]{1,8}", state)):
+                  return {"status": "invalid"}
+              output["actor"] = value["actor"]
+              if state is not None:
+                  output["state"] = state
+              return output
+
+          def safe_actor_census():
+              path = root / "private/ios-actor-census.json"
+              if path.is_symlink() or not path.is_file() or path.stat().st_size > 8192:
+                  return {"status": "missing"}
+              try:
+                  value = json.loads(path.read_text(encoding="utf-8"))
+                  assert isinstance(value, dict) and value.get("schema") == 1
+                  assert value.get("stage") == "initial-accessibility-failure"
+                  assert value.get("source_commit") == os.environ["GITHUB_SHA"]
+                  assert value.get("run_id") == os.environ["GITHUB_RUN_ID"]
+                  assert value.get("run_attempt") == os.environ["GITHUB_RUN_ATTEMPT"]
+                  marker = root / "simulator.txt"
+                  assert not marker.is_symlink() and marker.is_file()
+                  simulator = marker.read_text(encoding="utf-8").strip()
+                  assert re.fullmatch(r"[a-fA-F0-9-]{36}", simulator)
+                  expected = "vibeface-provider-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+                  devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "--json"], timeout=5))["devices"]
+                  matches = [row for rows in devices.values() for row in rows if row["udid"].casefold() == simulator.casefold()]
+                  assert len(matches) == 1 and matches[0]["name"] == expected and matches[0]["state"] == "Booted"
+                  source_simulator = value.get("simulator")
+                  assert isinstance(source_simulator, dict) and source_simulator.get("status") == "booted"
+                  app = source_simulator.get("app")
+                  assert isinstance(app, dict) and app.get("status") in {"captured", "query_timeout", "query_unavailable", "query_failed", "output_over_limit"}
+                  actors = app.get("actors")
+                  assert app["status"] != "captured" or isinstance(actors, dict)
+                  safe_actors = {}
+                  safe_sockets = []
+                  if app["status"] == "captured":
+                      assert set(actors) == {"vibeface", "snapshot_bridge", "xctest_runner", "node"}
+                      for actor, entries in actors.items():
+                          assert isinstance(entries, list) and len(entries) <= 8
+                          projected = []
+                          for entry in entries:
+                              assert isinstance(entry, dict)
+                              pid, ppid = entry.get("pid"), entry.get("ppid")
+                              state = entry.get("state")
+                              assert type(pid) is int and 0 < pid <= 2**31 - 1
+                              assert type(ppid) is int and 0 <= ppid <= 2**31 - 1
+                              assert isinstance(state, str) and re.fullmatch(r"[A-Za-z<>?+!-]{1,8}", state)
+                              projected.append({"pid": pid, "ppid": ppid, "state": state})
+                          safe_actors[actor] = projected
+                      sockets = app.get("bridge_sockets")
+                      assert isinstance(sockets, list) and len(sockets) <= 2
+                      socket_states = {"command_query_timeout", "command_query_unavailable", "command_query_failed",
+                                       "socket_path_not_owned", "socket_path_not_reported", "socket_missing",
+                                       "socket_unreadable", "socket_wrong_type", "socket_present"}
+                      for socket in sockets:
+                          assert isinstance(socket, dict) and socket.get("status") in socket_states
+                          projected = {"status": socket["status"]}
+                          socket_pid = socket.get("socket_owner_pid")
+                          bridge_pid = socket.get("bridge_process_pid")
+                          if socket_pid is not None:
+                              assert type(socket_pid) is int and 0 < socket_pid <= 2**31 - 1
+                              projected["socket_owner_pid"] = socket_pid
+                          if bridge_pid is not None:
+                              assert type(bridge_pid) is int and 0 < bridge_pid <= 2**31 - 1
+                              projected["bridge_process_pid"] = bridge_pid
+                          socket_owner_pid = socket.get("socket_owner_pid")
+                          if socket_owner_pid is not None:
+                              assert type(socket_owner_pid) is int and 0 < socket_owner_pid <= 2**31 - 1
+                              projected["socket_owner_pid"] = socket_owner_pid
+                          relation = socket.get("socket_owner_matches_agent_device_daemon")
+                          assert relation is None or type(relation) is bool
+                          if relation is not None:
+                              projected["socket_owner_matches_agent_device_daemon"] = relation
+                          safe_sockets.append(projected)
+                  cache = value.get("snapshot_bridge_cache")
+                  assert isinstance(cache, dict) and cache.get("status") in {"present", "missing", "unreadable", "invalid", "skipped_outside_ci"}
+                  assert type(cache.get("binary_count")) is int and 0 <= cache["binary_count"] <= 32
+                  safe_cache = {"status": cache["status"], "binary_count": cache["binary_count"]}
+                  binaries = cache.get("binaries")
+                  if binaries is not None:
+                      assert isinstance(binaries, list) and len(binaries) <= 8
+                      assert all(isinstance(item, dict) and type(item.get("executable")) is bool
+                                 and type(item.get("bytes")) is int and 0 <= item["bytes"] <= 100000000 for item in binaries)
+                      safe_cache["executable_count"] = sum(item["executable"] for item in binaries)
+
+                  def record_status(record, kind):
+                      assert isinstance(record, dict) and record.get("status") in {"present", "missing", "unreadable", "invalid", "lease_directory_unavailable"}
+                      if record["status"] != "present":
+                          return {"status": record["status"]}
+                      if kind == "daemon":
+                          assert record.get("transport") in {"socket", "http", "dual", "unknown"}
+                          assert record.get("ownership") in {"detached", "embedded", "unknown"}
+                          version = record.get("version")
+                          assert version == "unknown" or isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+", version)
+                          count = record.get("plugin_count")
+                          assert count is None or type(count) is int and 0 <= count <= 32
+                          pid = record.get("pid")
+                          assert type(pid) is int and 0 < pid <= 2**31 - 1
+                          return {"status": "present", "pid": pid, "process": safe_actor_process(record.get("process")),
+                                  "transport": record["transport"], "ownership": record["ownership"],
+                                  "version": version, "plugin_count": count}
+                      owner_pid, runner_pid = record.get("owner_pid"), record.get("runner_pid")
+                      assert type(owner_pid) is int and 0 < owner_pid <= 2**31 - 1
+                      assert runner_pid is None or type(runner_pid) is int and 0 < runner_pid <= 2**31 - 1
+                      assert type(record.get("device_matches")) is bool and type(record.get("session_matches")) is bool
+                      return {"status": "present", "owner_pid": owner_pid, "runner_pid": runner_pid,
+                              "device_matches": record["device_matches"],
+                              "session_matches": record["session_matches"],
+                              "owner_process": safe_actor_process(record.get("owner_process")),
+                              "runner_process": safe_actor_process(record.get("runner_process"))}
+
+                  return {"status": "captured", "simulator": {"status": "booted", "app": {"status": app["status"],
+                              **({"actors": safe_actors, "bridge_sockets": safe_sockets} if app["status"] == "captured" else {})}},
+                          "snapshot_bridge_cache": safe_cache,
+                          "agent_device_daemon": record_status(value.get("agent_device_daemon"), "daemon"),
+                          "xctest_runner": record_status(value.get("xctest_runner"), "runner")}
+              except (OSError, subprocess.SubprocessError, ValueError, TypeError, AssertionError, KeyError):
+                  return {"status": "invalid"}
+
           diagnostics["driver"] = safe_driver_diagnostic()
           diagnostics["runner_prepare"] = safe_runner_prepare()
+          diagnostics["ios_actor_census"] = safe_actor_census()
 
           runner_root = pathlib.Path("tests/e2e/.artifacts/native")
           report_path = runner_root / "e2e/report.json"

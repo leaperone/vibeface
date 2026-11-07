@@ -55,6 +55,19 @@ async function recordDriverFailure(error: unknown): Promise<void> {
     // Keep the original driver error as the test result if private evidence cannot be written.
   }
 }
+async function recordInitialActorCensus(simulator: string): Promise<void> {
+  try {
+    await execute('python3', [resolve(root, 'scripts/ios-actor-census.py'), simulator], {
+      cwd: root,
+      timeout: 20000,
+      maxBuffer: 8192,
+      env: { ...process.env, AGENT_DEVICE_HOME: resolve(root, '.artifacts/native/agent-device'),
+        AGENT_DEVICE_STATE_DIR: resolve(root, '.artifacts/native/agent-device') },
+    });
+  } catch {
+    // Preserve the accessibility failure even if bounded actor diagnostics are unavailable.
+  }
+}
 function text(value: unknown): string { assert(typeof value === 'string' && value.length > 0); return value; }
 type NativeNetwork = { invitation: string; receiver: string; call(request: Record<string, unknown>): Promise<Record<string, unknown>> };
 const test = base.extend<{ network: NativeNetwork }>({
@@ -189,6 +202,7 @@ test('provider settings and queued cancellation work in the installed native app
   await mkdir(publicPath, { recursive: true, mode: 0o700 });
   const driverFailurePath = resolve(root, '.artifacts/native/private/ios-driver-failure.json');
   await unlink(driverFailurePath).catch(error => { if (error.code !== 'ENOENT') throw error; });
+  await unlink(resolve(root, '.artifacts/native/private/ios-actor-census.json')).catch(error => { if (error.code !== 'ENOENT') throw error; });
   for (const name of ['provider.json', 'provider-navigation.json', 'provider-probe.json', 'provider-initial.png', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png', 'terminology-device-kinds.png']) {
     await unlink(join(publicPath, name)).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
@@ -221,6 +235,7 @@ test('provider settings and queued cancellation work in the installed native app
     await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
   } catch (error: unknown) {
     await recordDriverFailure(error);
+    await recordInitialActorCensus(simulator);
     throw error;
   }
   const run = process.env.GITHUB_RUN_ID, attempt = process.env.GITHUB_RUN_ATTEMPT;
