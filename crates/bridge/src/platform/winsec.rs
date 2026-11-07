@@ -700,7 +700,7 @@ mod handed_over_pipe_tests {
     };
 
     fn anonymous_pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
-        let mut attributes = SECURITY_ATTRIBUTES {
+        let attributes = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: std::ptr::null_mut(),
             bInheritHandle: 1,
@@ -708,7 +708,7 @@ mod handed_over_pipe_tests {
         let mut read = std::ptr::null_mut();
         let mut write = std::ptr::null_mut();
         // SAFETY: both output handles and the inheritable attributes are live locals.
-        if unsafe { CreatePipe(&mut read, &mut write, &mut attributes, 0) } == 0 {
+        if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
             return Err(io::Error::last_os_error());
         }
         Ok((OwnedHandle(read), OwnedHandle(write)))
