@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 
@@ -23,7 +25,24 @@ ACTORS = {
 }
 
 
-def inside_artifacts(root: Path, candidate: Path) -> Path:
+class ProbeBudget:
+    def __init__(self, seconds=14, *, run=subprocess.run, clock=time.monotonic):
+        self.clock = clock
+        self.deadline = clock() + seconds
+        self.runner = run
+
+    def remaining(self):
+        return self.deadline - self.clock()
+
+    def run(self, command, **options):
+        remaining = self.remaining()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, 0)
+        options["timeout"] = min(options.get("timeout", remaining), remaining)
+        return self.runner(command, **options)
+
+
+def checked_task_path(root: Path, candidate: Path) -> Path:
     canonical_root = root.resolve()
     absolute = candidate.absolute()
     try:
@@ -41,9 +60,28 @@ def inside_artifacts(root: Path, candidate: Path) -> Path:
             continue
         if stat.S_ISLNK(metadata.st_mode):
             raise ValueError("diagnostic path cannot contain symlinks")
-    if not relative.parts or relative.parts[0] != ".artifacts":
+    if not relative.parts:
+        raise ValueError("task path must be inside the repository")
+    return absolute
+
+
+def inside_artifacts(root: Path, candidate: Path) -> Path:
+    absolute = checked_task_path(root, candidate)
+    if absolute.relative_to(root.resolve()).parts[0] != ".artifacts":
         raise ValueError("diagnostic path is outside task artifacts")
     return absolute
+
+
+def artifact_layout_safe(repo: Path) -> bool:
+    repo = repo.resolve()
+    try:
+        for relative in (".artifacts/native/private", ".artifacts/native/public", "tests/e2e/.artifacts/native"):
+            target = checked_task_path(repo, repo / relative)
+            if target.exists() and not target.is_dir():
+                return False
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def public_census_projection(value: object) -> dict[str, Any]:
@@ -96,7 +134,7 @@ def public_census_projection(value: object) -> dict[str, Any]:
             projected_sockets.append(item)
         projected_app.update(actors=projected_actors, bridge_sockets=projected_sockets)
     cache = value.get("snapshot_bridge_cache")
-    cache_states = {"present", "missing", "unreadable", "invalid", "skipped_outside_ci"}
+    cache_states = {"present", "missing", "unreadable", "invalid", "skipped_outside_ci", "budget_exhausted"}
     if not isinstance(cache, dict) or cache.get("status") not in cache_states:
         raise ValueError("invalid cache census")
     count = cache.get("binary_count")
@@ -244,7 +282,7 @@ def safe_home_directory(path: Path) -> bool:
     return True
 
 
-def snapshot_cache() -> dict[str, Any]:
+def snapshot_cache(budget: ProbeBudget | None = None) -> dict[str, Any]:
     if os.environ.get("CI") != "true":
         return {"status": "skipped_outside_ci", "binary_count": 0}
     home = Path.home()
@@ -263,14 +301,20 @@ def snapshot_cache() -> dict[str, Any]:
     binaries = []
     directories = [directory]
     visited = 0
-    while directories and visited < 256:
+    entries_seen = 0
+    while directories and visited < 32 and entries_seen < 128:
+        if budget is not None and budget.remaining() <= 0:
+            return {"status": "budget_exhausted", "binary_count": len(binaries)}
         current = directories.pop()
         visited += 1
         try:
-            entries = list(current.iterdir())
+            entries = list(itertools.islice(current.iterdir(), 128 - entries_seen))
         except OSError:
             continue
         for entry in entries:
+            entries_seen += 1
+            if budget is not None and budget.remaining() <= 0:
+                return {"status": "budget_exhausted", "binary_count": len(binaries)}
             try:
                 info = entry.lstat()
             except OSError:
@@ -366,6 +410,8 @@ def simulator_processes(simulator: str, daemon_pid: int | None, *, run: Any = su
 
 
 def capture(simulator: str, *, run: Any = subprocess.run) -> dict[str, Any]:
+    budget = ProbeBudget(run=run)
+    run = budget.run
     if not UUID.fullmatch(simulator):
         raise ValueError("simulator identifier is invalid")
     root = Path(__file__).resolve().parents[1]
@@ -391,7 +437,8 @@ def capture(simulator: str, *, run: Any = subprocess.run) -> dict[str, Any]:
         raise ValueError("assigned simulator identity or state changed")
 
     daemon_state = safe_task_directory(Path(os.environ.get("AGENT_DEVICE_STATE_DIR", "")), artifacts)
-    daemon_record = safe_task_record(daemon_state / "daemon.json", kind="daemon")
+    process_lookup = lambda pid: actor_process(pid, run=run)
+    daemon_record = safe_task_record(daemon_state / "daemon.json", kind="daemon", process_lookup=process_lookup)
     daemon_pid = daemon_record.get("pid") if daemon_record.get("status") == "present" else None
     census: dict[str, Any] = {
         "schema": 1,
@@ -400,7 +447,7 @@ def capture(simulator: str, *, run: Any = subprocess.run) -> dict[str, Any]:
         "run_id": run_id,
         "run_attempt": attempt,
         "simulator": {"status": "booted", "app": simulator_processes(simulator, daemon_pid, run=run)},
-        "snapshot_bridge_cache": snapshot_cache(),
+        "snapshot_bridge_cache": snapshot_cache(budget),
     }
     census["agent_device_daemon"] = daemon_record
     if os.environ.get("CI") != "true":
@@ -412,7 +459,7 @@ def capture(simulator: str, *, run: Any = subprocess.run) -> dict[str, Any]:
             census["xctest_runner"] = {"status": "lease_directory_unavailable"}
         else:
             lease_path = lease_root / f"{simulator}.json"
-            census["xctest_runner"] = safe_task_record(lease_path, kind="runner")
+            census["xctest_runner"] = safe_task_record(lease_path, kind="runner", process_lookup=process_lookup)
     return census
 
 
@@ -432,6 +479,19 @@ def write_private_census(root: Path, census: dict[str, Any]) -> Path:
     return output
 
 def self_test() -> None:
+    ticks = iter([0.0, 1.0, 13.5, 14.1])
+    probe_timeouts = []
+    budget = ProbeBudget(run=lambda command, **options: probe_timeouts.append(options["timeout"]),
+                         clock=lambda: next(ticks))
+    budget.run(["fixture"], timeout=4)
+    budget.run(["fixture"], timeout=4)
+    try:
+        budget.run(["fixture"], timeout=4)
+    except subprocess.TimeoutExpired:
+        pass
+    else:
+        raise AssertionError("an exhausted probe budget started another process")
+    assert probe_timeouts == [4, 0.5]
     from tempfile import TemporaryDirectory
 
     table = """  41  1 S snapshot-bridge
@@ -486,6 +546,16 @@ def self_test() -> None:
         output = write_private_census(root, fixture)
         assert output.is_relative_to(root.resolve())
         assert stat.S_IMODE(output.stat().st_mode) == 0o600
+        assert artifact_layout_safe(root)
+
+        for relative in (".artifacts/native/public", "tests/e2e/.artifacts"):
+            guarded = Path(temporary) / ("layout-" + relative.replace("/", "-"))
+            link = guarded / relative
+            link.parent.mkdir(parents=True)
+            link.symlink_to(Path(temporary) / "outside-layout", target_is_directory=True)
+            assert not artifact_layout_safe(guarded)
+        fixture["snapshot_bridge_cache"] = {"status": "budget_exhausted", "binary_count": 0}
+        assert public_census_projection(fixture)["snapshot_bridge_cache"] == {"status": "budget_exhausted", "binary_count": 0}
 
         outside = Path(temporary) / "outside"
         root2 = Path(temporary) / "repo-with-parent-link"

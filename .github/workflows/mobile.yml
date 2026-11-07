@@ -290,31 +290,56 @@ jobs:
           echo "Native Provider e2e exit code: $result"
           exit "$result"
       - name: Remove only this task simulator and private acceptance state
+        id: native_cleanup
         if: always()
         env:
           SOURCE_COMMIT: ${{ github.sha }}
         run: |
           umask 077
+          echo "safe_public_artifacts=false" >> "$GITHUB_OUTPUT"
           python3 - <<'PY'
           import hashlib, importlib.util, json, os, pathlib, re, shutil, stat, subprocess, sys
           repo = pathlib.Path.cwd().resolve()
           root = repo / ".artifacts/native"
-          def artifact_layout_safe():
-              current = repo
-              for part in (".artifacts", "native", "private", "public"):
-                  current = current / part
-                  try:
-                      mode = current.lstat().st_mode
-                  except FileNotFoundError:
-                      continue
-                  if stat.S_ISLNK(mode):
-                      return False
-              return True
-          if not artifact_layout_safe():
-              raise SystemExit("refusing artifact paths with symlink components")
           spec = importlib.util.spec_from_file_location("ios_actor_census", repo / "scripts/ios-actor-census.py")
           census_module = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(census_module)
+          if not census_module.artifact_layout_safe(repo):
+              # Marker paths cannot be trusted here. The unique task name still identifies
+              # this run's simulator without following a rejected filesystem path.
+              simulator_cleanup = "unavailable"
+              try:
+                  run_id, attempt = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
+                  assert run_id.isdigit() and attempt.isdigit()
+                  expected = "vibeface-provider-" + run_id + "-" + attempt
+                  devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "--json"], timeout=5))["devices"]
+                  matches = [row for rows in devices.values() for row in rows if row["name"] == expected]
+                  assert len(matches) <= 1
+                  simulator_cleanup = "not_present"
+                  if matches:
+                      simulator = matches[0]["udid"]
+                      assert re.fullmatch(r"[a-fA-F0-9-]{36}", simulator)
+                      if matches[0]["state"] != "Shutdown":
+                          subprocess.run(["xcrun", "simctl", "shutdown", simulator], check=True,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                      subprocess.run(["xcrun", "simctl", "delete", simulator], check=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                      simulator_cleanup = "removed"
+              except Exception:
+                  simulator_cleanup = "unavailable"
+              finally:
+                  # Remove only independently validated task directories. Untrusted roots
+                  # remain untouched and are never read by the artifact upload step.
+                  for relative in (".artifacts/native/network", ".artifacts/native/agent-device", ".artifacts/native/cache",
+                                   ".artifacts/native/e2e", ".artifacts/native/private", "tests/e2e/.artifacts/native"):
+                      try:
+                          path = census_module.checked_task_path(repo, repo / relative)
+                          if path.is_dir():
+                              shutil.rmtree(path)
+                      except (OSError, ValueError):
+                          pass
+              print(json.dumps({"artifact_layout": "refused", "simulator_cleanup": simulator_cleanup}))
+              raise SystemExit("refusing task artifact paths with symlink components")
           public_census_projection = census_module.public_census_projection
           public = root / "public"
           public.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -649,10 +674,13 @@ jobs:
                                  diagnostics=diagnostics, run_id=os.environ["GITHUB_RUN_ID"], run_attempt=os.environ["GITHUB_RUN_ATTEMPT"])
                   receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
           print(json.dumps(diagnostics, sort_keys=True))
+          if census_module.artifact_layout_safe(repo) and all(not path.is_symlink() for path in public.iterdir()):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  output.write("safe_public_artifacts=true\n")
           raise SystemExit(0 if passed else 1)
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: ${{ always() && !cancelled() }}
+        if: ${{ always() && !cancelled() && steps.native_cleanup.outputs.safe_public_artifacts == 'true' }}
         with:
           name: native-provider-ios-${{ github.sha }}
           path: |
