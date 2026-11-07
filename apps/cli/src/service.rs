@@ -461,9 +461,9 @@ mod tests {
         expected.extend([
             "install".into(),
             "--data-dir".into(),
-            data.clone().into_os_string(),
+            script_os_argument(&data).into_os_string(),
             "--binary".into(),
-            binary.clone().into_os_string(),
+            script_os_argument(&binary).into_os_string(),
         ]);
         assert_eq!(whole_call(&install), expected);
         assert!(command(&root, &data, &binary, Action::InstallUpdater).is_err());
