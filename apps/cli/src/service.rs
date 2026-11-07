@@ -2,7 +2,6 @@ use crate::update;
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
 use serde::Deserialize;
-#[cfg(any(windows, test))]
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -155,7 +154,6 @@ fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Resul
 
 /// Windows canonical paths can carry a verbatim `\\?\` prefix that PowerShell 5 `-File` and Task
 /// Scheduler reject; spell them as ordinary DOS or UNC paths at the script boundary.
-#[cfg(any(windows, test))]
 fn strip_verbatim_windows_path(path: &str) -> Cow<'_, str> {
     if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
         Cow::Owned(format!(r"\\{rest}"))
@@ -170,15 +168,12 @@ fn strip_verbatim_windows_path(path: &str) -> Cow<'_, str> {
 }
 
 fn script_os_argument(path: &Path) -> PathBuf {
-    #[cfg(windows)]
-    {
+    if cfg!(windows) {
         match path.to_str() {
-            Some(path) => PathBuf::from(strip_verbatim_windows_path(path)),
+            Some(path) => PathBuf::from(strip_verbatim_windows_path(path).as_ref()),
             None => path.to_path_buf(),
         }
-    }
-    #[cfg(not(windows))]
-    {
+    } else {
         path.to_path_buf()
     }
 }
