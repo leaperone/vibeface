@@ -405,29 +405,47 @@ impl Store {
 
     /// Each bot conversation's newest message, by conversation; one indexed lookup per bot.
     pub fn last_messages(&self, network: &str) -> Result<BTreeMap<String, LastMessage>> {
+        let conversations = self
+            .connection
+            .prepare("SELECT conversation_id FROM bots WHERE network_id=?")?
+            .query_map([network], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut statement = self.connection.prepare(
-            "SELECT m.conversation_id,m.text,m.author,m.role,m.created_at_ms FROM bots b
-             JOIN messages m ON m.network_id=b.network_id AND m.conversation_id=b.conversation_id
-              AND m.rank=(SELECT max(x.rank) FROM messages x WHERE x.network_id=b.network_id AND x.conversation_id=b.conversation_id)
-             WHERE b.network_id=?1",
+            "SELECT message_id,text,author,role,created_at_ms FROM messages
+             WHERE network_id=? AND conversation_id=?
+             AND (target IS NULL OR json_extract(target,'$.kind')='bot_main') ORDER BY rank DESC",
         )?;
-        let rows = statement.query_map(params![network], |r| {
-            let text: String = r.get(1)?;
-            let mut preview: String = text.chars().take(PREVIEW_CHARS).collect();
-            if preview.len() < text.len() {
-                preview.push('…');
+        let mut last = BTreeMap::new();
+        for conversation in conversations {
+            let mut rows = statement.query(params![network, conversation])?;
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                if !super::scope_projection::message_is_main_from(
+                    &self.connection,
+                    network,
+                    &conversation,
+                    &id,
+                )? {
+                    continue;
+                }
+                let text: String = row.get(1)?;
+                let mut preview: String = text.chars().take(PREVIEW_CHARS).collect();
+                if preview.len() < text.len() {
+                    preview.push('…');
+                }
+                last.insert(
+                    conversation.clone(),
+                    LastMessage {
+                        text: preview,
+                        author: row.get(2)?,
+                        role: row.get(3)?,
+                        created_at_ms: row.get(4)?,
+                    },
+                );
+                break;
             }
-            Ok((
-                r.get(0)?,
-                LastMessage {
-                    text: preview,
-                    author: r.get(2)?,
-                    role: r.get(3)?,
-                    created_at_ms: r.get(4)?,
-                },
-            ))
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        }
+        Ok(last)
     }
 
     /// What the bot of `conversation` wrote to other bots, oldest first.

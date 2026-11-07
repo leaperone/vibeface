@@ -54,6 +54,13 @@ pub struct WorkRequest {
     pub thread: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct NativeExecution {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub work_ids: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct WorkAdmission {
     pub spec: WorkSpec,
@@ -313,6 +320,7 @@ pub enum Signal {
     },
     /// The App Server restarted; live requests from the old epoch are gone.
     Disconnected,
+    SubmissionUnverified(String),
     Probed(Probe),
     InterruptTimedOut,
     /// The DAG already holds a settled result (the user's signed choice); no event is implied.
@@ -453,6 +461,14 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
     use WorkState::*;
     let state = record.state.clone();
     match (state, signal) {
+        (Unverified { evidence, .. }, Signal::SubmissionUnverified(reason))
+            if evidence == reason =>
+        {
+            None
+        }
+        (state, Signal::SubmissionUnverified(reason)) if !state.finished() => {
+            unverified(record, state.handle().cloned(), &reason, true)
+        }
         (Accepted | Starting { thread: None }, Signal::ThreadCreated(thread)) => {
             record.state = Starting {
                 thread: Some(thread),
@@ -935,6 +951,29 @@ mod tests {
             "a disconnect then a missing turn is reported once"
         );
         assert!(transition(&mut work, Signal::Probed(Probe::Missing)).is_none());
+    }
+
+    #[test]
+    fn a_mismatched_native_submission_stays_unknown_and_is_reported_once() {
+        for mut work in [record(), running()] {
+            if work.state.thread().is_none() {
+                transition(&mut work, Signal::ThreadCreated("th".into()));
+            }
+            let thread = work.state.thread().map(str::to_owned);
+            let handle = work.state.handle().cloned();
+            let signal = || Signal::SubmissionUnverified("reserved turn differs".into());
+            assert!(matches!(
+                transition(&mut work, signal()),
+                Some(EventBody::WorkFinished {
+                    outcome: WorkOutcome::Unverified,
+                    ..
+                })
+            ));
+            assert!(matches!(work.state, WorkState::Unverified { .. }));
+            assert_eq!(work.state.thread(), thread.as_deref());
+            assert_eq!(work.state.handle(), handle.as_ref());
+            assert!(transition(&mut work, signal()).is_none());
+        }
     }
 
     #[test]

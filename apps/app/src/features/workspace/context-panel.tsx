@@ -6,6 +6,7 @@ import { Link } from "@tanstack/react-router"
 import { Button } from "@/components/ui/button"
 import { Details, SettingsGroup, SettingsRow, StatusPill, useAction, type Tone } from "@/components/app/kit"
 import { Textarea } from "@/components/ui/textarea"
+import { Input } from '@/components/ui/input'
 import { messageOf } from "@vibeface/client/lib/node.ts"
 import { newId } from "@vibeface/client/workspace/storage.ts"
 import { memoryBase, memoryResultLabel, memorySaved, memorySyncConflictLabel, type MemoryControls } from "@vibeface/client/workspace/memory.ts"
@@ -15,6 +16,8 @@ import { runtimeLabel } from "@vibeface/client/chat/protocol.ts"
 import type { BotChange, BotRecord, BotSettings, ContextProjection, ConversationPayload, CoordinationCheck, MemoryBase, MemoryControlResult, NodeInfo, Question, WorkRecord } from "@vibeface/client/workspace/types.ts"
 import { CollaborationPanel } from "./collaboration-panel"
 import { cn } from "@/lib/utils"
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import { ScopeContextDetails, WorkspaceInputStatus } from './workspace-chat'
 
 type ContextPanelProps = {
   bot: Pick<BotRecord, "bot_id" | "name">
@@ -28,13 +31,15 @@ type ContextPanelProps = {
 const continuityProviderLabels: Record<string, string> = { codex: "Codex", cursor: "Cursor", claude: "Claude Code", pi: "pi", opencode: "opencode" }
 
 export function ContextPanel({ bot, data, nodes, connected, onBack, memory }: ContextPanelProps) {
+  const workspace = useWorkspace()
+  const [historyQuery, setHistoryQuery] = useState('')
   const root = useRef<HTMLDivElement>(null)
   useLayoutEffect(() => {
     root.current?.closest<HTMLElement>('[data-slot="sheet-content"]')?.scrollTo({ top: 0, behavior: "auto" })
   }, [])
   const owner = data.conversation?.owner
   const ownerName = nodeName(owner ?? undefined, { nodes })
-  const messages = data.messages.slice(-4)
+  const messages = historyQuery.trim() ? data.messages.filter((message) => message.text.toLocaleLowerCase().includes(historyQuery.trim().toLocaleLowerCase())) : data.messages.slice(-4)
   const works = data.works
   const changes = data.changes
   const questions = data.questions
@@ -60,6 +65,15 @@ export function ContextPanel({ bot, data, nodes, connected, onBack, memory }: Co
         </div>
       </div>
     </section>
+    <section className="grid gap-3 rounded-xl border bg-card p-4" aria-label="本轮来源和补充归属">
+      <h3 className="font-medium">本轮来源和补充归属</h3>
+      <p className="text-meta text-muted-foreground">当前范围为 {bot.name} 的主聊天。任务、频道与例行任务使用各自的执行上下文。</p>
+      <p className="text-meta text-muted-foreground">已同步的消息和持久记忆，只有进入本轮来源记录才显示为引用。</p>
+      {!connected || data.scheduler?.remote?.reachable === false ? <p role="status" className="text-meta text-warning">目标状态未知，显示最近的上下文记录。</p> : null}
+      {data.scheduler?.context ? <ScopeContextDetails context={data.scheduler.context} /> : <p className="text-meta text-muted-foreground">本轮编译与省略记录尚未提供。</p>}
+      {workspace.pendingMessages.filter((item) => item.target.kind === 'bot_main' && item.target.bot_id === bot.bot_id).map((item) => <div key={item.message_id} className="grid gap-2"><p className="line-clamp-2 text-meta">{item.text}</p><WorkspaceInputStatus pending={item} /></div>)}
+      {(data.scheduler?.jobs ?? []).filter((job) => job.receipt).map((job) => <p key={job.trigger} className="break-all text-meta text-muted-foreground">补充 {job.message_id ?? job.trigger} · 执行服务已接受输入{job.receipt?.actual_turn_id ? ` · 实际回合 ${job.receipt.actual_turn_id}` : ' · 回合归属尚未确认'}</p>)}
+    </section>
     <Details label="数据来源和边界">
       <ul className="grid gap-2">
         <li><span className="font-medium text-foreground">共享聊天事实：</span>消息、工作、变更和问题来自当前聊天快照。</li>
@@ -76,6 +90,7 @@ export function ContextPanel({ bot, data, nodes, connected, onBack, memory }: Co
     </SettingsGroup>
 
     <SettingsGroup title="共享上下文">
+      <label className="grid gap-2 px-4 pt-3 text-meta">搜索这个 Bot 已加载的历史<Input type="search" value={historyQuery} onChange={(event) => setHistoryQuery(event.currentTarget.value)} placeholder="输入关键词" /><span className="text-muted-foreground">范围为 {bot.name} 当前已加载的 {data.messages.length} 条主聊天消息。</span></label>
       <SettingsRow icon={MessageCircle} label="消息摘要" description="共享聊天事实" children={<span>{data.messages.length} 条</span>} />
       {messages.length ? <Details label="查看最近消息">
         <ul className="grid gap-3">
@@ -334,10 +349,12 @@ function profileField(field: string) {
 }
 
 function QuestionSummary({ question }: { question: Question }) {
-  const settled = question.answer ? "已回答" : question.closed ? "已失效" : "等待回答"
+  const action = question.choices.find((choice) => choice.label === question.answer?.text)?.action
+  const answer = action === 'allow_once' ? '允许本次' : action === 'deny' ? '拒绝' : question.answer?.text
+  const settled = question.answer ? action === 'deny' ? '已拒绝' : "已回答" : question.closed ? "已失效" : "等待回答"
   return <li className="grid min-w-0 gap-1 rounded-lg border bg-card px-3 py-2">
-    <div className="flex min-w-0 items-center gap-2"><StatusPill tone={question.answer ? "success" : question.closed ? "neutral" : "warning"} icon={question.answer ? CircleCheck : question.closed ? CircleX : CircleHelp}>{settled}</StatusPill><span className="min-w-0 truncate font-medium" title={question.text}>{question.text}</span></div>
-    {question.answer ? <p className="line-clamp-2 text-meta text-muted-foreground [overflow-wrap:anywhere]">{question.answer.text}</p> : null}
+    <div className="flex min-w-0 items-center gap-2"><StatusPill tone={question.answer ? action === 'deny' ? 'danger' : "success" : question.closed ? "neutral" : "warning"} icon={question.answer ? action === 'deny' ? CircleX : CircleCheck : question.closed ? CircleX : CircleHelp}>{settled}</StatusPill><span className="min-w-0 truncate font-medium" title={question.text}>{question.text}</span></div>
+    {question.answer ? <p className="line-clamp-2 text-meta text-muted-foreground [overflow-wrap:anywhere]">{answer}</p> : null}
   </li>
 }
 

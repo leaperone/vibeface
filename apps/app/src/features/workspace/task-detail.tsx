@@ -12,14 +12,19 @@ import { workChecks, type WorkCheck } from "@vibeface/client/workspace/model.ts"
 import { BackOnline, confirmText } from "./task-activity"
 import { ActionButton } from "./present"
 import { QuestionCard } from "./question-card"
-import { agentLaneLabels, contextStages, fixOnDevice, fixOnDeviceLabel, nodeName, parseSummarySteps, progressLabel, promptSummary, queueHoldLabels, schedulerStatus, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskProgress, taskStale, followUp, followUpCopy, type FollowUp, type SummaryStep } from "@vibeface/client/workspace/labels.ts"
+import { agentLaneLabels, fixOnDevice, fixOnDeviceLabel, nodeName, parseSummarySteps, progressLabel, promptSummary, queueHoldLabels, schedulerStatus, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskProgress, taskStale, followUp, followUpCopy, type FollowUp, type SummaryStep } from "@vibeface/client/workspace/labels.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import { CopyDiagnostics } from "@/features/identity/device-controls"
 import { projectName, workApproval } from "@vibeface/client/workspace/questions.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
+import type { InputIntent, WorkDetail } from '@vibeface/client/workspace/types.ts'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import { PromptInput } from "@/features/chat/elements/prompt-input"
+import { InputQueue, TargetContextButton, WorkspaceInputStatus } from "./workspace-chat"
 
 const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
+type ComposerDraft = { text: string; files: File[]; intent: InputIntent; workId: string; conversationId: string }
 
 // The route change unmounts the panel, so focus would otherwise drop to <body>. Module scope keeps the ref stable across renders.
 function holdFocus(node: HTMLElement | null) {
@@ -59,23 +64,48 @@ function inertAround(keep: Element) {
  */
 export function TaskDetail({ botId, workId, from }: { botId: string; workId: string; from?: "inbox" | "tasks" }) {
   const workspace = useWorkspace()
-  const activeTask = useRef<{ botId: string; workId: string } | null>({ botId, workId })
-  activeTask.current = { botId, workId }
-  useEffect(() => {
-    activeTask.current = { botId, workId }
-    return () => { activeTask.current = null }
-  }, [botId, workId])
   const { directory } = useDevice()
   const action = useAction()
+  const routeActive = useRef(true)
+  useEffect(() => { routeActive.current = true; return () => { routeActive.current = false } }, [])
   const lookup = { nodes: workspace.nodes, directory }
-  const work = workspace.data?.works.find((item) => item.work_id === workId)
+  const bot = workspace.bots.find((item) => item.bot_id === botId)
+  const conversationId = bot?.conversation_id
+  const [detail, setDetail] = useState<{ generation: number; value: WorkDetail } | null>(null)
+  const [readError, setReadError] = useState<{ generation: number; conversationId: string; workId: string; cause: unknown } | null>(null)
+  const [retry, setRetry] = useState(0)
+  const latest = useRef(workspace)
+  latest.current = workspace
+  useEffect(() => {
+    const current = latest.current
+    if (!conversationId || !current.connectionOnline) return
+    let alive = true
+    setReadError(null)
+    void current.readWork({ conversation_id: conversationId, work_id: workId }).then((value) => {
+      if (alive && current.isCurrent()) setDetail({ generation: current.generation, value })
+    }, (cause: unknown) => {
+      if (alive && current.isCurrent()) setReadError({ generation: current.generation, conversationId, workId, cause })
+    })
+    return () => { alive = false }
+  }, [conversationId, workId, workspace.generation, workspace.connectionOnline, workspace.data, workspace.openWorks, retry])
+  const loaded = detail?.generation === workspace.generation && detail.value.work.conversation_id === conversationId && detail.value.work.work_id === workId ? detail.value : null
+  const readFailure = readError?.generation === workspace.generation && readError.conversationId === conversationId && readError.workId === workId ? readError.cause : null
+  const work = loaded ? { ...loaded.work, target: loaded.work.target ?? undefined } : undefined
   // A running turn held on an approval reads as 需要你同意, as in the chat, and the question is answered right here.
-  const asking = work ? workApproval({ work, conversationId: workspace.data?.conversation?.conversation_id ?? "", questions: workspace.data?.questions ?? [], answered: workspace.answered }) : undefined
+  const asking = work ? workApproval({ work, conversationId: work.conversation_id, questions: workspace.questions, answered: workspace.answered }) : undefined
   const shown = work ? shownState(work, workspace.nodes) : ""
   const state = shown === "running" && asking ? "waiting" : shown
   const [confirming, setConfirming] = useState(false)
+  const [input, setInput] = useState('')
+  const [intent, setIntent] = useState<InputIntent>('continue')
+  const [files, setFiles] = useState<File[]>([])
+  const [sendError, setSendError] = useState<unknown>(null)
+  const draftRef = useRef<ComposerDraft>({ text: input, files, intent, workId, conversationId: conversationId ?? '' })
+  if (draftRef.current.text !== input || draftRef.current.files !== files || draftRef.current.intent !== intent || draftRef.current.workId !== workId || draftRef.current.conversationId !== (conversationId ?? '')) draftRef.current = { text: input, files, intent, workId, conversationId: conversationId ?? '' }
+  const draft = draftRef.current
+  const savingDrafts = useRef(new Set<ComposerDraft>())
   // Its device cannot say whether it finished, so the person settles it here; nothing is re-run.
-  const check = work && state === "awaiting_confirmation" ? workChecks([{ ...work, conversation_id: workspace.data?.conversation?.conversation_id ?? "" }], workspace.nodes).find((item): item is WorkCheck => item.kind === "work") : undefined
+  const check = work && state === "awaiting_confirmation" ? workChecks([work], workspace.nodes).find((item): item is WorkCheck => item.kind === "work") : undefined
   const settle = (choice: "completed" | "interrupted") => async () => { if (!check) return; await workspace.resolveCheck(check, choice, ""); toast(choice === "completed" ? "已记为做完" : "已记为没做完", { tone: "success" }) }
   const device = work?.target_node ?? ""
   const agent = work ? taskAgent(work) : null
@@ -89,9 +119,9 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const progressStatus = progress?.status && progress.status !== "awaiting_input" ? progressLabel(progress.status) : ""
   const progressHeadline = taskActive(state) ? conciseProgress || (progressStatus !== "进行中" ? progressStatus : "") : ""
   const navigate = useNavigate()
-  const askBotCheck = async () => {
-    if (!work || !(await workspace.sendMessage(followUpCopy.check.ask(work.title || "这个任务")))) return
-    if (workspace.isCurrent() && activeTask.current?.botId === botId && activeTask.current.workId === workId) void navigate({ to: "/b/$botId", params: { botId } })
+  const checkResult = async () => {
+    await workspace.refresh()
+    setRetry((value) => value + 1)
   }
   const canAskCheck = workspace.writable && workspace.connectionOnline && !workspace.incomplete && check?.reason !== "offline"
   // Any entry forwards the stop; an unreachable device gets it when it is back.
@@ -117,11 +147,15 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   // It may have done its writes anyway, so it is checked first; running it again could do them twice.
   const unknown = Boolean(work && (state === "dispatch_unverified" || outcomeUnknown(work.failure, work.failure_reason)))
   const next = followUp(state ?? "", unknown)
+  const taskTarget = work?.target?.kind === 'task' || work?.target?.kind === 'channel_task' ? work.target : null
+  const followUpLabel = unknown ? followUpCopy[next].action : taskTarget ? '继续所属任务' : state === 'interrupted' ? '新任务继续' : '新任务重做'
   // App Server cannot withdraw one input steered into a turn, so stopping one stops every work sharing it.
-  const sharing = work?.turn_id ? (workspace.data?.works ?? []).filter((item) => item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
+  const sharing = work?.turn_id ? workspace.openWorks.filter((item) => item.conversation_id === work.conversation_id && item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
   const stop = canStop ? () => workspace.interruptWork(work.work_id) : null
   const asked = promptSummary(work?.prompt ?? "", work?.title ?? "")
   const coordination = work?.coordination_job
+  const canContinue = Boolean(work && !work.outcome && !work.stop && ["accepted", "running"].includes(work.state))
+  const inputBlocked = !canContinue && intent !== "new_task"
 
   return <div ref={layer} className="contents">
   {/* Clicking it must not move focus to the page behind, or React hands focus back there instead of to the task link. */}
@@ -135,8 +169,11 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       {state ? taskStale(state, workspace.connectionOnline) ? <StatusPill>{staleTaskLabel}</StatusPill> : <StatusPill tone={tone(state)}>{taskLabel(state)}</StatusPill> : null}
       <Button asChild variant="ghost" size="icon" className="max-md:hidden"><Link {...leave} aria-label="关闭" title="关闭"><X aria-hidden="true" /></Link></Button>
     </header>
-    {!work ? <EmptyState icon={ListChecks} title="找不到这个任务" /> : <div className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-4">
-      {workspace.selectedBot?.bot_id === botId ? <Link to="/b/$botId" params={{ botId }} className="flex min-h-11 w-fit items-center gap-1.5 rounded-md text-meta font-medium underline-offset-4 hover:underline"><Bot aria-hidden="true" className="size-4" /><span className="sr-only">所属 Bot </span>{workspace.selectedBot.name}</Link> : null}
+    {!work ? <div className="grid gap-3 p-4"><EmptyState icon={ListChecks} title={!bot ? '找不到这个 Bot' : !workspace.connectionOnline ? '工作状态未知，连接后再读取' : readFailure ? '未能读取这个工作' : '正在读取工作'} /><InlineError error={readFailure} />{bot ? <Button type="button" variant="outline" className="justify-self-start" disabled={!workspace.connectionOnline} onClick={() => setRetry((value) => value + 1)}>重新读取</Button> : null}</div> : <div className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-4">
+      {bot ? <Link to="/b/$botId" params={{ botId }} className="flex min-h-11 w-fit items-center gap-1.5 rounded-md text-meta font-medium underline-offset-4 hover:underline"><Bot aria-hidden="true" className="size-4" /><span className="sr-only">所属 Bot </span>{bot.name}</Link> : null}
+      <div className="grid gap-1"><p className="text-meta text-muted-foreground">来源：共享历史中的工作记录。完整执行历史未提供。</p><Button type="button" variant="ghost" size="sm" className="justify-self-start" disabled={!workspace.connectionOnline} onClick={() => setRetry((value) => value + 1)}>重新读取工作</Button></div>
+      {!workspace.connectionOnline ? <p role="status" className="text-meta text-warning">连接已断开，显示最近记录；当前状态未知。</p> : null}
+      <InlineError error={readFailure} action={{ label: '重新读取', onClick: () => setRetry((value) => value + 1) }} />
       {device || work.cwd || agent ? <p className="flex min-w-0 items-center gap-x-3 text-meta text-muted-foreground">
         {agent && AgentIcon ? <span className="flex shrink-0 items-center gap-1.5"><AgentIcon aria-hidden="true" className="size-4 shrink-0" />{providerNames[agent]}</span> : null}
         {device ? <span className="flex min-w-0 items-center gap-1.5"><Laptop aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">设备 </span><span className="truncate">{nodeName(device, lookup)}</span></span> : null}
@@ -147,8 +184,6 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
         {coordination ? <>
           <p>{!workspace.connectionOnline || workspace.nodes.find((node) => node.device_id === device)?.online === false ? '当前状态未知，显示最近记录' : schedulerStatus(coordination.state).label}{coordination.lane ? ` · ${agentLaneLabels[coordination.lane]}` : ''}</p>
           {coordination.hold_reason ? <p>{queueHoldLabels[coordination.hold_reason]}</p> : null}
-          {coordination.pending_check ? <p>执行结果需要核对，不能据此重发。</p> : null}
-          {coordination.context ? <p>会话代次 {coordination.context.session_generation} · {contextStages[coordination.context.stage].label}</p> : null}
         </> : <p>执行设备尚未提供这个任务的协调回合观察。</p>}
         <p className="text-meta text-muted-foreground">这里显示 Bot 的准备和排队情况，任务结果仍以上面的共享记录为准。</p>
       </Details> : null}
@@ -160,7 +195,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
         <h3 className="flex items-center gap-2 font-medium"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0 text-warning" />还不知道做完没有</h3>
         <p className="text-meta text-muted-foreground">{confirmText(check, nodeName(device, lookup))}</p>
         {check.reason === "offline" ? <BackOnline device={nodeName(device, lookup)} /> : null}
-        <ActionButton variant="default" className="w-fit justify-self-end" disabled={!canAskCheck || action.busy !== null} action={askBotCheck}><SearchCheck aria-hidden="true" />先查结果</ActionButton>
+        <ActionButton variant="default" className="w-fit justify-self-end" disabled={!canAskCheck || action.busy !== null} action={checkResult}><SearchCheck aria-hidden="true" />先查结果</ActionButton>
         <Details label="我已自行核对">
           <p className="text-meta text-muted-foreground">只记录你的核对结论，不会重新执行任务。</p>
           <div className="flex flex-wrap justify-end gap-2">
@@ -183,10 +218,19 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       {(!check && (failed || unknown || state === "interrupted")) ? <div className="grid gap-2"><div className="flex flex-wrap gap-2">
         {failed && device && fixOnDevice(work) ? <Button asChild variant="outline"><Link to="/devices/$deviceId" params={{ deviceId: device }}><Settings aria-hidden="true" />{fixOnDeviceLabel(nodeName(device, lookup))}</Link></Button> : null}
         {/* After a failure trying again is the next step; a task the person stopped only offers it. */}
-        <Button type="button" variant={state === "interrupted" ? "outline" : "default"} className="w-fit" disabled={!workspace.writable || workspace.incomplete || !workspace.connectionOnline || action.busy !== null} onClick={() => void action.run("retry", async () => {
-          if (next === "check") await askBotCheck()
-          else if (await workspace.sendMessage(followUpCopy[next].ask(work.title || "这个任务"))) void navigate({ to: "/b/$botId", params: { botId } })
-        })}><BusyIcon busy={action.busy === "retry"} icon={followUpIcons[next]} />{next === "check" ? "先查结果" : followUpCopy[next].action}</Button>
+        <Button type="button" variant={state === "interrupted" ? "outline" : "default"} className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("retry", async () => {
+          if (unknown) { await checkResult(); return }
+          let revision: number | undefined
+          if (taskTarget) {
+            const state = await workspace.readWorkspaceState({ task_id: taskTarget.task_id })
+            const task = state.tasks.find((item) => item.task_id === taskTarget.task_id)
+            if (!task) throw new Error('尚未读到所属任务，请先查询任务。')
+            if (task.action !== 'continue') { await navigate({ to: '/tasks/$taskId', params: { taskId: task.task_id } }); return }
+            revision = task.revision
+          }
+          const request = `${followUpCopy[next].ask(work.title || '这项工作')}\n\n原交代：\n${work.prompt}${work.result_text ? `\n\n上次已有输出：\n${work.result_text}` : ''}`
+          await workspace.sendMessage(request, [], undefined, { target: taskTarget ?? { kind: 'work', work_id: work.work_id }, intent: taskTarget ? 'continue' : 'new_task', ...(revision === undefined ? {} : { expected_revision: revision }), conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !workspace.isCurrent()) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: saved.target.task_id } }) } })
+        })}><BusyIcon busy={action.busy === "retry"} icon={followUpIcons[next]} />{followUpLabel}</Button>
         </div><InlineError error={action.error} />
       </div> : null}
       <Details>
@@ -196,7 +240,16 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
         {work.cwd ? <DetailRow label="文件夹" value={work.cwd} mono /> : null}
         <CopyDiagnostics label="复制编号" lines={[["任务编号", work.work_id], ["设备编号", device]]} />
       </Details>
+      {workspace.pendingMessages.filter((item) => item.target.kind === 'work' && item.target.work_id === workId).map((item) => <WorkspaceInputStatus key={item.message_id} pending={item} />)}
     </div>}
+    {work ? <div className="shrink-0 border-t p-3"><PromptInput value={input} onChange={setInput} files={files} onFiles={setFiles} hint="" reason={inputBlocked ? "这个工作当前不能接收补充。选择「新任务」继续。" : workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages || inputBlocked} busy={false} label={`补充给 ${work.title || '这个工作'}`} sendLabel={intent === "defer" ? "保存为稍后处理" : intent === "new_task" ? "发送为新任务" : "补充这个工作"} target={<><span className="text-meta text-muted-foreground">补充给 · {work.title || '这个工作'}</span><NativeSelect size="sm" aria-label="发送方式" value={intent} onChange={(event) => { const value = event.currentTarget.value; if (value === "continue" || value === "new_task" || value === "defer") setIntent(value) }}><NativeSelectOption value="continue" disabled={!canContinue}>补充这个工作</NativeSelectOption><NativeSelectOption value="new_task">新任务</NativeSelectOption><NativeSelectOption value="defer" disabled={!canContinue}>稍后处理</NativeSelectOption></NativeSelect><TargetContextButton target={{ kind: "work", work_id: workId }} conversationId={work.conversation_id} /><InputQueue target={{ kind: "work", work_id: workId }} /></>} onSubmit={() => {
+      const submittedDraft = draft
+      if (savingDrafts.current.has(submittedDraft)) return
+      savingDrafts.current.add(submittedDraft)
+      const text = input, selectedFiles = files
+      setSendError(null)
+      void workspace.sendMessage(text, selectedFiles, undefined, { target: { kind: 'work', work_id: workId }, intent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !workspace.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: saved.target.task_id } }) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setInput((current) => current === text ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
+    }}><InlineError error={sendError} /></PromptInput></div> : null}
   </aside>
   </div>
 }

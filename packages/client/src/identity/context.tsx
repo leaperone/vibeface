@@ -446,11 +446,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     return seen
   }
   function currentBootstrapCatalog(): VerifiedCatalog | null {
-    if (publicBootstrap.kind === 'off') return null
-    const expected = publicBootstrap.kind === 'custom' ? publicBootstrap : publicBootstrapDefaults
+    const mode = getPublicBootstrapMode(platform.storage)
+    if (mode.kind === 'off') return null
+    const expected = mode.kind === 'custom' ? mode : publicBootstrapDefaults
     const catalog = bootstrapCatalogRef.current
     if (catalog && catalog.issuer === expected.issuer && catalog.defaults.https_base === expected.https_base && catalog.expires_at_ms > Date.now()) return catalog
-    return readCachedCatalog(platform.storage, publicBootstrap, platform.secure, Date.now())
+    return readCachedCatalog(platform.storage, mode, platform.secure, Date.now())
   }
   async function refreshBootstrapCatalog() {
     await bootstrap.refresh({ secure: platform.secure, storage: platform.storage })

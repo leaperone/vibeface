@@ -3,10 +3,10 @@
 //! The Node names the session and the user message before anything is sent, so a turn it lost
 //! sight of is read back from Claude Code's own transcript and never sent again. Hooks of the
 //! owner's own sessions hold permission requests and questions for the bot.
-use super::executor::{Executor, SteerAck, SteerTrace};
+use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::*;
 use crate::manager::{self, CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
-use crate::scheduling::SteerTarget;
+use crate::scheduling::{SteerOutcome, SteerTarget};
 use crate::triage::RequestKind;
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
 use futures_util::future::BoxFuture;
@@ -34,12 +34,35 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(10);
 /// Seeds of the IDs a work's session and user message get from the work ID.
 const SESSION_SEED: &str = "claude-session:";
 const MESSAGE_SEED: &str = "claude-user:";
+const STEER_MESSAGE_SEED: &str = "claude-steer:";
 
 /// The process groups of running agent processes, by the program each one runs. The pidfile
 /// lists them, so a Node that could not end them ends them when it starts again.
 pub struct Processes {
     pidfile: PathBuf,
     running: std::sync::Mutex<BTreeMap<u32, PathBuf>>,
+    inputs: std::sync::Mutex<HashMap<String, InputChannel>>,
+}
+
+#[derive(Clone)]
+struct InputChannel {
+    turn: String,
+    group: u32,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    open: Arc<AtomicBool>,
+    pending: Arc<std::sync::Mutex<BTreeSet<String>>>,
+    projects: Option<PathBuf>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SteerLocator {
+    session: String,
+    projects: PathBuf,
+    group: u32,
+    target_turn: String,
+    message: String,
+    input_hash: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -55,6 +78,7 @@ impl Processes {
         Self {
             pidfile,
             running: Default::default(),
+            inputs: Default::default(),
         }
     }
 
@@ -100,6 +124,14 @@ impl Processes {
 
     /// Ends every recorded process; the Node calls this before it exits.
     pub(super) async fn stop(&self) {
+        for input in self
+            .inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+        {
+            input.open.store(false, Ordering::SeqCst);
+        }
         let pidfile = self.pidfile.clone();
         let _ = tokio::task::spawn_blocking(move || {
             vibeface_bridge::agent::SdkBridge::kill_orphan(&pidfile)
@@ -115,6 +147,7 @@ impl Processes {
     }
 
     pub(super) fn forget(&self, group: u32) {
+        self.remove_input(group);
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         if running.remove(&group).is_some() {
             let _ = self.save(&running);
@@ -126,6 +159,170 @@ impl Processes {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .contains_key(&group)
+    }
+
+    fn register_input(
+        &self,
+        session: &str,
+        turn: &str,
+        process: &Process,
+        projects: Option<PathBuf>,
+    ) -> Result<()> {
+        let mut inputs = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
+        ensure!(
+            !inputs.contains_key(session),
+            "Claude Code already runs this session"
+        );
+        inputs.insert(
+            session.into(),
+            InputChannel {
+                turn: turn.into(),
+                group: process.group,
+                stdin: process.stdin.clone(),
+                open: Arc::new(AtomicBool::new(true)),
+                pending: Default::default(),
+                projects,
+            },
+        );
+        Ok(())
+    }
+
+    fn close_input(&self, group: u32) {
+        for input in self
+            .inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+        {
+            if input.group == group {
+                let _pending = input.pending.lock().unwrap_or_else(PoisonError::into_inner);
+                input.open.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn remove_input(&self, group: u32) {
+        self.close_input(group);
+        self.inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, input| input.group != group);
+    }
+
+    fn drained(&self, group: u32, results: usize) -> bool {
+        let channel = self
+            .inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(_, input)| input.group == group)
+            .map(|(session, input)| (session.clone(), input.clone()));
+        let Some((session, input)) = channel else {
+            return true;
+        };
+        let pending = input
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if pending.is_empty() {
+            return true;
+        }
+        let Ok(steers) = self.steer_messages(&session) else {
+            return false;
+        };
+        let Some(path) = transcript(input.projects.as_deref(), &session) else {
+            return false;
+        };
+        let turns = native_turns(&path, &steers);
+        let Some(first) = turns.iter().position(|turn| turn.id == input.turn) else {
+            return false;
+        };
+        pending.iter().all(|message| {
+            turns
+                .iter()
+                .enumerate()
+                .find(|(_, turn)| turn.messages.contains(message))
+                .is_some_and(|(index, turn)| {
+                    turn.reply.status.ended()
+                        && index
+                            .checked_sub(first)
+                            .is_some_and(|index| index < results)
+                })
+        })
+    }
+
+    fn steer_messages(&self, session: &str) -> Result<BTreeSet<String>> {
+        Ok(self
+            .steer_locators(session)?
+            .into_iter()
+            .map(|locator| locator.message)
+            .collect())
+    }
+
+    fn steer_locators(&self, session: &str) -> Result<Vec<SteerLocator>> {
+        let entries = match std::fs::read_dir(self.steer_dir()?) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut locators = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                let locator: SteerLocator = serde_json::from_slice(&std::fs::read(path)?)?;
+                if locator.session == session {
+                    locators.push(locator);
+                }
+            }
+        }
+        Ok(locators)
+    }
+
+    fn reply_seen(&self, session: &str, projects: Option<&Path>, message: &str) -> Result<Seen> {
+        let locators: Vec<SteerLocator> = self
+            .steer_locators(session)?
+            .into_iter()
+            .filter(|locator| locator.target_turn == message)
+            .collect();
+        let root = if let Some(first) = locators.first() {
+            ensure!(
+                first.projects.is_absolute()
+                    && locators.iter().all(|locator| locator.group == first.group
+                        && locator.projects == first.projects),
+                "the Claude reply has inconsistent native input groups"
+            );
+            Some(first.projects.as_path())
+        } else {
+            projects
+        };
+        let steers = locators
+            .iter()
+            .map(|locator| locator.message.clone())
+            .collect();
+        Ok(seen(transcript(root, session).as_deref(), message, &steers))
+    }
+
+    fn steer_dir(&self) -> Result<PathBuf> {
+        Ok(self
+            .pidfile
+            .parent()
+            .context("Claude pidfile has no parent")?
+            .join("claude")
+            .join("inputs"))
+    }
+
+    fn steer_locator_path(&self, message_id: &str) -> Result<PathBuf> {
+        vibeface_protocol::validate_id(message_id).map_err(anyhow::Error::msg)?;
+        Ok(self.steer_dir()?.join(format!(
+            "{}.json",
+            crate::crypto::digest(message_id.as_bytes())
+        )))
     }
 
     fn save(&self, running: &BTreeMap<u32, PathBuf>) -> Result<()> {
@@ -176,6 +373,23 @@ struct Ending {
 }
 
 impl Ending {
+    fn append(previous: &mut Option<Self>, next: Self) {
+        if let Some(previous) = previous {
+            if !next.text.is_empty() {
+                if !previous.text.is_empty() {
+                    previous.text.push_str("\n\n");
+                }
+                previous.text.push_str(&next.text);
+            }
+            if next.status != TurnStatus::Completed {
+                previous.status = next.status;
+                previous.error = next.error;
+            }
+        } else {
+            *previous = Some(next);
+        }
+    }
+
     /// The `result` frame of a turn.
     fn of(result: &Value) -> Self {
         let text = result["result"].as_str().unwrap_or_default().to_owned();
@@ -384,6 +598,8 @@ enum Seen {
     Unsent,
     /// The message is there and its turn has not ended.
     Open,
+    /// This native process group has registered input without a complete recoverable reply.
+    PendingInputs,
     Ended(Ending),
 }
 
@@ -401,70 +617,174 @@ fn text_of(message: &Value) -> String {
     texts.join("\n")
 }
 
-/// Reads the turn back from the transcript of a process that no longer runs. Every block of a
-/// message is its own record and carries the message's stop reason, so the turn ends with the
-/// message that stopped at `end_turn`, an API error or an interruption; what follows belongs to
-/// later turns.
-fn seen(transcript: Option<&Path>, message: &str) -> Seen {
+/// Recovers the initial turn and every registered input from the same native process group.
+/// An ordinary later prompt remains a boundary, and every registered input needs a terminal reply.
+fn seen(transcript: Option<&Path>, message: &str, steers: &BTreeSet<String>) -> Seen {
     let Some(path) = transcript else {
-        return Seen::Unsent;
+        return if steers.is_empty() {
+            Seen::Unsent
+        } else {
+            Seen::PendingInputs
+        };
     };
-    // ponytail: reads the whole transcript on every probe; keep an offset if sessions grow large.
-    let mut records = records(path);
-    if !records
-        .by_ref()
-        .any(|record| record["type"] == "user" && record["uuid"] == message)
+    let turns = native_turns(path, steers);
+    let Some(first) = turns
+        .iter()
+        .position(|turn| turn.messages.contains(message))
+    else {
+        return if steers.is_empty() {
+            Seen::Unsent
+        } else {
+            Seen::PendingInputs
+        };
+    };
+    let mut received = BTreeSet::new();
+    let mut ending = None;
+    for turn in turns[first..]
+        .iter()
+        .take_while(|turn| turn.id == turns[first].id || steers.contains(&turn.id))
     {
-        return Seen::Unsent;
+        if !turn.reply.status.ended() {
+            return if steers.is_empty() {
+                Seen::Open
+            } else {
+                Seen::PendingInputs
+            };
+        }
+        received.extend(turn.messages.intersection(steers).cloned());
+        Ending::append(&mut ending, turn.reply.clone());
     }
-    let (mut reply, mut current, mut done) = (String::new(), Value::Null, false);
-    for record in records {
+    if !steers.is_subset(&received) {
+        return Seen::PendingInputs;
+    }
+    match ending {
+        Some(ending) => Seen::Ended(ending),
+        None => Seen::Open,
+    }
+}
+
+fn user_prompt(body: &Value) -> bool {
+    body["content"].is_string()
+        || body["content"]
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|block| block["type"] != "tool_result"))
+}
+
+struct NativeTurn {
+    id: String,
+    messages: BTreeSet<String>,
+    reply: Ending,
+    assistant: Value,
+}
+
+fn native_turns(path: &Path, steers: &BTreeSet<String>) -> Vec<NativeTurn> {
+    let mut turns: Vec<NativeTurn> = Vec::new();
+    for record in records(path) {
         let body = &record["message"];
         match record["type"].as_str() {
-            Some("user") if done => break,
-            Some("assistant") if done && body["id"] != current => break,
-            Some("assistant") => {
-                if record["isApiErrorMessage"] == true {
-                    return Seen::Ended(Ending::failed(ExecFailure::upstream(
-                        text_of(body),
-                        FailureKind::Unknown,
-                    )));
-                }
-                if body["id"] != current {
-                    reply.clear();
-                    current = body["id"].clone();
-                }
-                let text = text_of(body);
-                if !text.is_empty() {
-                    if !reply.is_empty() {
-                        reply.push('\n');
-                    }
-                    reply.push_str(&text);
-                }
-                done |= body["stop_reason"] == "end_turn";
-            }
             Some("user")
                 if record["interruptedMessageId"].is_string()
                     || text_of(body).starts_with("[Request interrupted") =>
             {
-                return Seen::Ended(Ending {
-                    status: TurnStatus::Interrupted,
-                    text: reply,
-                    error: None,
-                });
+                if let Some(turn) = turns.last_mut() {
+                    turn.reply.status = TurnStatus::Interrupted;
+                }
             }
-            Some("user") if !text_of(body).is_empty() => break,
+            Some("user") if user_prompt(body) => {
+                let Some(id) = record["uuid"].as_str() else {
+                    continue;
+                };
+                if !steers.contains(id) || turns.last().is_none_or(|turn| turn.reply.status.ended())
+                {
+                    turns.push(NativeTurn {
+                        id: id.into(),
+                        messages: BTreeSet::new(),
+                        reply: Ending {
+                            status: TurnStatus::InProgress,
+                            text: String::new(),
+                            error: None,
+                        },
+                        assistant: Value::Null,
+                    });
+                }
+                if let Some(turn) = turns.last_mut() {
+                    turn.messages.insert(id.into());
+                }
+            }
+            Some("assistant") => {
+                if let Some(turn) = turns.last_mut() {
+                    if turn.reply.status.ended() && body["id"] != turn.assistant {
+                        continue;
+                    }
+                    if record["isApiErrorMessage"] == true {
+                        turn.reply = Ending::failed(ExecFailure::upstream(
+                            text_of(body),
+                            FailureKind::Unknown,
+                        ));
+                        continue;
+                    }
+                    if body["id"] != turn.assistant {
+                        turn.reply.text.clear();
+                        turn.assistant = body["id"].clone();
+                    }
+                    let text = text_of(body);
+                    if !text.is_empty() {
+                        if !turn.reply.text.is_empty() {
+                            turn.reply.text.push('\n');
+                        }
+                        turn.reply.text.push_str(&text);
+                    }
+                    if body["stop_reason"] == "end_turn" {
+                        turn.reply.status = TurnStatus::Completed;
+                    }
+                }
+            }
             _ => {}
         }
     }
-    match done {
-        true => Seen::Ended(Ending {
-            status: TurnStatus::Completed,
-            text: reply,
-            error: None,
-        }),
-        false => Seen::Open,
-    }
+    turns
+}
+
+fn steer_trace(
+    path: Option<&Path>,
+    target: &str,
+    message: &str,
+    running: bool,
+    steers: &BTreeSet<String>,
+) -> Option<SteerTrace> {
+    let turns = native_turns(path?, steers);
+    Some(
+        if let Some(turn) = turns.iter().find(|turn| turn.messages.contains(message)) {
+            let turn_id = turn.id.clone();
+            if turn.reply.status.ended() {
+                SteerTrace::Ended {
+                    turn_id,
+                    outcome: if turn.reply.status == TurnStatus::Completed {
+                        SteerOutcome::Answered
+                    } else {
+                        SteerOutcome::Unfinished
+                    },
+                }
+            } else if running {
+                SteerTrace::Received { turn_id }
+            } else {
+                SteerTrace::Ended {
+                    turn_id,
+                    outcome: SteerOutcome::Unfinished,
+                }
+            }
+        } else if !turns.iter().any(|turn| turn.messages.contains(target)) {
+            SteerTrace::TargetUnseen
+        } else if !running
+            && turns
+                .iter()
+                .any(|turn| turn.id == target && turn.reply.status.ended())
+        {
+            SteerTrace::NotArrived
+        } else {
+            SteerTrace::Pending
+        },
+    )
 }
 
 /// A UUID that `id` always maps to; Claude Code takes only UUIDs as session and message IDs.
@@ -481,6 +801,26 @@ fn derived(seed: &str, id: &str) -> String {
 fn user_frame(prompt: &str, message: &str) -> Value {
     json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":prompt}]},
         "parent_tool_use_id":null,"session_id":"","uuid":message})
+}
+
+fn steer_frame(input: &SteerInput, message_id: &str, session: &str) -> Value {
+    let mut frame = user_frame(
+        &input.message(message_id),
+        &derived(STEER_MESSAGE_SEED, message_id),
+    );
+    frame["session_id"] = json!(session);
+    let blocks = frame["message"]["content"]
+        .as_array_mut()
+        .expect("user content");
+    for file in &input.files {
+        if file.is_image() || file.mime_type == "application/pdf" {
+            blocks.push(
+                json!({"type":if file.is_image() {"image"} else {"document"},
+                "source":{"type":"base64","media_type":file.mime_type,"data":file.base64()}}),
+            );
+        }
+    }
+    frame
 }
 
 fn interrupt_frame() -> Value {
@@ -521,6 +861,7 @@ impl Launch<'_> {
                 "--verbose",
                 "--permission-mode",
                 "bypassPermissions",
+                "--replay-user-messages",
             ])
             .arg(if self.resume {
                 "--resume"
@@ -633,6 +974,7 @@ impl Process {
 
     /// Closes its input, so it exits once its turn is done, and ends its group.
     async fn end(&mut self, processes: &Processes) {
+        processes.remove_input(self.group);
         self.stdin.lock().await.take();
         let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
         if agent::terminate_process_group(&mut self.child, self.group).await {
@@ -790,6 +1132,7 @@ where
         if let Some(started) = &config.process_started {
             started(process.group).await?;
         }
+        processes.register_input(&session, &message, &process, projects.clone())?;
         stage.enter(ProviderStage::TurnStart);
         *start.lock().unwrap() = manager::StartEvidence::Unknown;
         send(&process.stdin, &user_frame(prompt, &message)).await
@@ -801,6 +1144,9 @@ where
         return Err(error(ManagerFailure::Failed, native, failure));
     }
     let mut turn = Turn::default();
+    let mut ending = None;
+    let mut results = 0;
+    let mut drain = tokio::time::interval(Duration::from_millis(50));
     let mut reported_start = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
     let outcome = 'turn: loop {
@@ -821,9 +1167,24 @@ where
                 };
                 break Err(error(kind, native, ExecFailure::new(FailureKind::TimedOut, "Claude Code management timed out")));
             }
+            _ = drain.tick(), if ending.is_some() => {
+                if processes.drained(process.group, results) { break Ok(ending.take().expect("result")); }
+                continue;
+            }
             line = process.lines.next_line() => line,
         };
         let Ok(Some(line)) = line else {
+            if let Some(ending) = ending.take() {
+                break if processes.drained(process.group, results) {
+                    Ok(ending)
+                } else {
+                    Err(error(
+                        ManagerFailure::Unknown,
+                        native,
+                        own("Claude Code exited before all accepted input results were read"),
+                    ))
+                };
+            }
             // Its group ends below, so nothing of the turn runs on.
             let failure = match &turn.session {
                 Some(_) => ExecFailure::new(
@@ -845,6 +1206,9 @@ where
             break Err(error(ManagerFailure::Failed, native, failure));
         };
         for frame in frames(&line) {
+            if matches!(&frame, Frame::Ended(_)) {
+                results += 1;
+            }
             if let Frame::Started { session: actual } = &frame
                 && actual != &session
             {
@@ -881,8 +1245,12 @@ where
             stage.enter(ProviderStage::Run);
             *start.lock().unwrap() = manager::StartEvidence::Started;
         }
-        if let Some(ending) = turn.ending.take() {
-            break Ok(ending);
+        if let Some(next) = turn.ending.take() {
+            processes.close_input(process.group);
+            Ending::append(&mut ending, next);
+            if processes.drained(process.group, results) {
+                break Ok(ending.take().expect("result"));
+            }
         }
     };
     process.end(processes).await;
@@ -942,6 +1310,59 @@ struct Live {
 }
 
 impl Claude {
+    pub(super) async fn native_directory(&self, session: &str) -> Result<PathBuf> {
+        uuid::Uuid::parse_str(session)?;
+        let mut roots: BTreeSet<PathBuf> = self.projects().into_iter().collect();
+        for locator in self.processes.steer_locators(session)? {
+            roots.insert(locator.projects);
+        }
+        let replies = self
+            .processes
+            .pidfile
+            .parent()
+            .context("Claude pidfile has no parent")?
+            .join("claude")
+            .join("replies");
+        match std::fs::read_dir(replies) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry?.path();
+                    if path
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                    {
+                        let locator: ReplyLocator = serde_json::from_slice(&std::fs::read(path)?)?;
+                        if locator.session == session {
+                            roots.insert(locator.projects);
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut directories = BTreeSet::new();
+        for root in roots {
+            if let Some(path) = transcript(Some(&root), session) {
+                let cwd =
+                    session_cwd(&path).context("the Claude transcript has no native directory")?;
+                ensure!(
+                    cwd.is_absolute(),
+                    "the Claude session directory is not absolute"
+                );
+                directories.insert(cwd);
+            }
+        }
+        ensure!(
+            directories.len() == 1,
+            "the Claude session has no unique local directory"
+        );
+        directories
+            .into_iter()
+            .next()
+            .context("the Claude session directory is unavailable")
+    }
+
     /// Ends the processes an earlier Node run left, so their turns are read back as they are.
     pub(super) fn open(dir: &Path, env: &BTreeMap<String, String>) -> Self {
         Self {
@@ -993,11 +1414,13 @@ impl Claude {
         {
             return Ok(Probe::Missing);
         }
-        let path = transcript(Some(&locator.projects), session);
         Ok(
-            match path.as_deref().map(|path| seen(Some(path), &message)) {
-                Some(Seen::Ended(ending)) => ending.probe(message),
-                Some(Seen::Open | Seen::Unsent) | None => Probe::Missing,
+            match self
+                .processes
+                .reply_seen(session, Some(&locator.projects), &message)?
+            {
+                Seen::Ended(ending) => ending.probe(message),
+                Seen::Open | Seen::Unsent | Seen::PendingInputs => Probe::Missing,
             },
         )
     }
@@ -1024,15 +1447,31 @@ async fn follow(
     projects: Option<PathBuf>,
 ) {
     let mut turn = Turn::default();
+    let mut ending = None;
+    let mut results = 0;
+    let mut missing_input_results = false;
+    let mut drain = tokio::time::interval(Duration::from_millis(50));
     loop {
-        let line = process.lines.next_line().await;
+        let line = tokio::select! {
+            _ = drain.tick(), if ending.is_some() => {
+                let Some(node) = node.upgrade() else { return; };
+                if node.claude.processes.drained(process.group, results) { break; }
+                continue;
+            }
+            line = process.lines.next_line() => line,
+        };
         let Some(node) = node.upgrade() else {
             return;
         };
         let Ok(Some(line)) = line else {
+            missing_input_results =
+                ending.is_some() && !node.claude.processes.drained(process.group, results);
             break;
         };
         for frame in frames(&line) {
+            if matches!(&frame, Frame::Ended(_)) {
+                results += 1;
+            }
             let signal = match &frame {
                 Frame::Started { .. } if turn.session.is_none() => Some(Signal::TurnStarted {
                     turn_id: message.clone(),
@@ -1059,9 +1498,16 @@ async fn follow(
                 tracing::warn!(event = "claude.work_update_pending", %error, work_id, "a Claude Code work update was not recorded");
             }
         }
-        if turn.ending.is_some() {
-            break;
+        if let Some(next) = turn.ending.take() {
+            node.claude.processes.close_input(process.group);
+            Ending::append(&mut ending, next);
+            if node.claude.processes.drained(process.group, results) {
+                break;
+            }
         }
+    }
+    if let Some(node) = node.upgrade() {
+        node.claude.processes.remove_input(process.group);
     }
     process.stdin.lock().await.take();
     let _ = tokio::time::timeout(Duration::from_secs(5), process.child.wait()).await;
@@ -1074,41 +1520,61 @@ async fn follow(
     if stopped {
         node.claude.processes.forget(process.group);
     }
-    let signals = match turn.ending {
+    if missing_input_results {
+        if let Err(error) = node
+            .signal_work(&network, &work_id, Signal::Probed(Probe::Missing))
+            .await
+        {
+            tracing::warn!(event = "claude.work_input_results_pending", %error, work_id, "Claude Code exited before all accepted input results were read");
+        }
+        return;
+    }
+    let signals = match ending {
         Some(ending) => vec![Signal::Probed(ending.probe(message))],
-        None => match seen(
-            transcript(projects.as_deref(), &session).as_deref(),
-            &message,
-        ) {
-            Seen::Ended(ending) => vec![Signal::Probed(ending.probe(message))],
-            Seen::Open => vec![Signal::Probed(Probe::Terminal {
-                turn_id: message,
-                status: TurnStatus::Interrupted,
-                text: String::new(),
-                error: (!interrupted.load(Ordering::Relaxed)).then(|| {
-                    ExecFailure::new(
+        None => {
+            let reply = match node.claude.processes.reply_seen(
+                &session,
+                projects.as_deref(),
+                &message,
+            ) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    tracing::warn!(event = "claude.work_inputs_unreadable", %error, work_id, "the Claude input locators could not be read");
+                    return;
+                }
+            };
+            match reply {
+                Seen::Ended(ending) => vec![Signal::Probed(ending.probe(message))],
+                Seen::PendingInputs => vec![Signal::Probed(Probe::Missing)],
+                Seen::Open => vec![Signal::Probed(Probe::Terminal {
+                    turn_id: message,
+                    status: TurnStatus::Interrupted,
+                    text: String::new(),
+                    error: (!interrupted.load(Ordering::Relaxed)).then(|| {
+                        ExecFailure::new(
+                            FailureKind::Lost,
+                            "Claude Code exited before the turn ended",
+                        )
+                    }),
+                })],
+                // Nothing ran: it is refused, or, when its start was already recorded, failed.
+                Seen::Unsent => {
+                    let detail = process.stderr().await;
+                    let failure = ExecFailure::upstream(
+                        if detail.is_empty() {
+                            "Claude Code exited before it took the prompt".into()
+                        } else {
+                            detail
+                        },
                         FailureKind::Lost,
-                        "Claude Code exited before the turn ended",
-                    )
-                }),
-            })],
-            // Nothing ran: it is refused, or, when its start was already recorded, failed.
-            Seen::Unsent => {
-                let detail = process.stderr().await;
-                let failure = ExecFailure::upstream(
-                    if detail.is_empty() {
-                        "Claude Code exited before it took the prompt".into()
-                    } else {
-                        detail
-                    },
-                    FailureKind::Lost,
-                );
-                vec![
-                    Signal::StartRejected(failure.clone()),
-                    Signal::Probed(Ending::failed(failure).probe(message)),
-                ]
+                    );
+                    vec![
+                        Signal::StartRejected(failure.clone()),
+                        Signal::Probed(Ending::failed(failure).probe(message)),
+                    ]
+                }
             }
-        },
+        }
     };
     for signal in signals {
         match node.signal_work(&network, &work_id, signal).await {
@@ -1190,6 +1656,8 @@ impl Executor for Claude {
             };
             let sent = async {
                 self.processes.track(process.group, &bin)?;
+                self.processes
+                    .register_input(&session, &message, &process, projects.clone())?;
                 send(&process.stdin, &user_frame(&work.prompt, &message)).await
             }
             .await;
@@ -1235,21 +1703,26 @@ impl Executor for Claude {
                     epoch: 0,
                 });
             }
-            let path = transcript(self.projects().as_deref(), session);
-            Ok(match seen(path.as_deref(), &message) {
-                Seen::Ended(ending) => ending.probe(message),
-                Seen::Unsent => Probe::NotStarted,
-                // It ran under an earlier Node run, whose processes this one ended at start.
-                Seen::Open => Probe::Terminal {
-                    turn_id: message,
-                    status: TurnStatus::Interrupted,
-                    text: String::new(),
-                    error: Some(ExecFailure::new(
-                        FailureKind::Restarted,
-                        "the device restarted while Claude Code ran this work",
-                    )),
+            Ok(
+                match self
+                    .processes
+                    .reply_seen(session, self.projects().as_deref(), &message)?
+                {
+                    Seen::Ended(ending) => ending.probe(message),
+                    Seen::Unsent => Probe::NotStarted,
+                    Seen::PendingInputs => Probe::Missing,
+                    // It ran under an earlier Node run, whose processes this one ended at start.
+                    Seen::Open => Probe::Terminal {
+                        turn_id: message,
+                        status: TurnStatus::Interrupted,
+                        text: String::new(),
+                        error: Some(ExecFailure::new(
+                            FailureKind::Restarted,
+                            "the device restarted while Claude Code ran this work",
+                        )),
+                    },
                 },
-            })
+            )
         })
     }
 
@@ -1278,24 +1751,144 @@ impl Executor for Claude {
 
     fn send_turn<'a>(
         &'a self,
-        _: &'a SteerTarget,
-        _: &'a str,
-        _: &'a str,
+        into: &'a SteerTarget,
+        message_id: &'a str,
+        input: &'a SteerInput,
     ) -> BoxFuture<'a, SteerAck> {
-        Box::pin(async {
-            SteerAck::Refused(
-                "Claude Code takes no message into a running turn: a user message sent then waits for a turn of its own"
-                    .into(),
-            )
+        Box::pin(async move {
+            let path = match self.processes.steer_locator_path(message_id) {
+                Ok(path) => path,
+                Err(error) => return SteerAck::Refused(error.to_string()),
+            };
+            let frame = steer_frame(input, message_id, &into.thread_id);
+            let input_hash = crate::crypto::digest(frame.to_string().as_bytes());
+            let existing = match std::fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => return SteerAck::Unknown,
+            };
+            if let Some(bytes) = existing {
+                let Ok(locator) = serde_json::from_slice::<SteerLocator>(&bytes) else {
+                    return SteerAck::Unknown;
+                };
+                if locator.session != into.thread_id
+                    || locator.target_turn != into.turn_id
+                    || locator.input_hash != input_hash
+                {
+                    return SteerAck::Refused(
+                        "this input ID already names another Claude input".into(),
+                    );
+                }
+                return match self.read_back(into, message_id).await {
+                    Some(SteerTrace::Received { turn_id } | SteerTrace::Ended { turn_id, .. }) => {
+                        SteerAck::Accepted {
+                            turn_id: Some(turn_id),
+                        }
+                    }
+                    _ => SteerAck::Unknown,
+                };
+            }
+            let channel = self
+                .processes
+                .inputs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&into.thread_id)
+                .filter(|input| input.turn == into.turn_id)
+                .cloned();
+            let Some(channel) = channel else {
+                return SteerAck::Refused("the Claude Code turn is not running".into());
+            };
+            let mut stdin = channel.stdin.lock().await;
+            if !channel.open.load(Ordering::SeqCst) {
+                return SteerAck::Refused("the Claude Code turn ended".into());
+            }
+            let Some(pipe) = stdin.as_mut() else {
+                return SteerAck::Refused("Claude Code no longer takes input".into());
+            };
+            let Some(projects) = channel.projects else {
+                return SteerAck::Refused("the Claude transcript root is unavailable".into());
+            };
+            let locator = SteerLocator {
+                session: into.thread_id.clone(),
+                projects,
+                group: channel.group,
+                target_turn: into.turn_id.clone(),
+                message: derived(STEER_MESSAGE_SEED, message_id),
+                input_hash,
+            };
+            {
+                let mut pending = channel
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if !channel.open.load(Ordering::SeqCst) {
+                    return SteerAck::Refused("the Claude Code turn ended".into());
+                }
+                pending.insert(locator.message.clone());
+            }
+            let persisted = (|| -> Result<()> {
+                config::private_dir(
+                    path.parent()
+                        .context("Claude input locator has no parent")?,
+                )?;
+                config::private_write(&path, &serde_json::to_vec(&locator)?)
+            })();
+            if let Err(error) = persisted {
+                channel
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&locator.message);
+                return SteerAck::Refused(format!(
+                    "record the Claude input before sending: {error}"
+                ));
+            }
+            let result = async {
+                pipe.write_all(format!("{frame}\n").as_bytes()).await?;
+                pipe.flush().await
+            }
+            .await;
+            drop(stdin);
+            if result.is_err() {
+                return SteerAck::Unknown;
+            }
+            match self.read_back(into, message_id).await {
+                Some(SteerTrace::Received { turn_id } | SteerTrace::Ended { turn_id, .. }) => {
+                    SteerAck::Accepted {
+                        turn_id: Some(turn_id),
+                    }
+                }
+                _ => SteerAck::Unknown,
+            }
         })
     }
 
     fn read_back<'a>(
         &'a self,
-        _: &'a SteerTarget,
-        _: &'a str,
+        into: &'a SteerTarget,
+        message_id: &'a str,
     ) -> BoxFuture<'a, Option<SteerTrace>> {
-        Box::pin(async { None })
+        Box::pin(async move {
+            let bytes = std::fs::read(self.processes.steer_locator_path(message_id).ok()?).ok()?;
+            let locator: SteerLocator = serde_json::from_slice(&bytes).ok()?;
+            if locator.session != into.thread_id
+                || locator.target_turn != into.turn_id
+                || locator.message != derived(STEER_MESSAGE_SEED, message_id)
+                || !locator.projects.is_absolute()
+            {
+                return None;
+            }
+            let running = self.processes.tracked(locator.group);
+            let steers = self.processes.steer_messages(&locator.session).ok()?;
+            steer_trace(
+                transcript(Some(&locator.projects), &locator.session).as_deref(),
+                &locator.target_turn,
+                &locator.message,
+                running,
+                &steers,
+            )
+        })
     }
 }
 
@@ -1360,7 +1953,7 @@ pub fn hook_output(input: &Value, answer: &Value) -> Option<Value> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, NetworkState};
     use crate::work::WorkState;
@@ -1453,6 +2046,237 @@ mod tests {
                 fresh_prompt: Some("fresh full context".into()),
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn continuous_input_keeps_attachments_ids_and_late_native_turns() -> Result<()> {
+        for (late, delayed, lose_results) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let place = Place::new()?;
+            let (record, _) = recorder();
+            let mut config = bot_config(&place, record);
+            let result_gate = place.dir.join("late-result-release");
+            if delayed {
+                config.provider_env.insert(
+                    "FAKE_CLAUDE_RESULT_GATE".into(),
+                    result_gate.display().to_string(),
+                );
+            }
+            let reader_gate = Arc::new(tokio::sync::Notify::new());
+            let reader_blocked = Arc::new(AtomicBool::new(false));
+            let finished = AtomicBool::new(false);
+            let started = Arc::new(AtomicBool::new(false));
+            let mark = started.clone();
+            config.codex_turn.as_mut().unwrap().started = Some(Arc::new(move |_| {
+                mark.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }));
+            let manager::Sdk::Claude { processes, .. } = &config.sdk else {
+                unreachable!()
+            };
+            let executor = Claude {
+                processes: processes.clone(),
+                live: Default::default(),
+                starting: Default::default(),
+                projects: std::sync::Mutex::new(projects_dir(&config.provider_env)),
+            };
+            let content = b"the complete attached content".to_vec();
+            let path = place.dir.join("attachment.txt");
+            std::fs::write(&path, &content)?;
+            let input = SteerInput {
+                text: "keep this constraint".into(),
+                files: vec![super::super::executor::PreparedAttachment {
+                    attachment: Attachment {
+                        hash: crate::crypto::digest(&content),
+                        size: content.len() as u64,
+                        name: "attachment.txt".into(),
+                    },
+                    local_path: path,
+                    mime_type: "text/plain".into(),
+                    bytes: content,
+                }],
+            };
+            let sending = async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !started.load(Ordering::SeqCst)
+                        || (late && !delayed && !reader_blocked.load(Ordering::SeqCst))
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await?;
+                let (session, channel) = processes
+                    .inputs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .next()
+                    .map(|(s, c)| (s.clone(), c.clone()))
+                    .context("live input")?;
+                let target = SteerTarget {
+                    provider: Provider::Claude,
+                    attempt_id: "attempt-1".into(),
+                    thread_id: session,
+                    turn_id: channel.turn,
+                };
+                let count = if late { 1 } else { 3 };
+                for index in 0..count {
+                    let ack = executor
+                        .send_turn(&target, &format!("message-{index}"), &input)
+                        .await;
+                    assert!(!matches!(ack, SteerAck::Refused(_)), "{ack:?}");
+                    if !late && index == 0 {
+                        assert_eq!(
+                            ack,
+                            SteerAck::Unknown,
+                            "writing a pipe is not provider acceptance"
+                        );
+                        assert_eq!(
+                            executor.send_turn(&target, "message-0", &input).await,
+                            SteerAck::Unknown
+                        );
+                    }
+                }
+                if late {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while !matches!(
+                            executor.read_back(&target, "message-0").await,
+                            Some(SteerTrace::Ended { .. })
+                        ) || (delayed && !result_gate.with_extension("waiting").is_file())
+                        {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await?;
+                    assert!(
+                        !processes.drained(channel.group, 1),
+                        "the late native result is still unread"
+                    );
+                    assert!(processes.drained(channel.group, 2));
+                    if delayed {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    }
+                    assert!(
+                        !finished.load(Ordering::SeqCst),
+                        "the transcript cannot replace an unread result"
+                    );
+                    if delayed {
+                        std::fs::write(&result_gate, b"release")?;
+                    } else {
+                        reader_gate.notify_one();
+                    }
+                }
+                anyhow::Ok(target)
+            };
+            let running = async {
+                let result = manager::run_manager(
+                    &config,
+                    if delayed {
+                        "steer-late-delayed"
+                    } else if late {
+                        "steer-late"
+                    } else {
+                        "steer"
+                    },
+                    None,
+                    |_| async { Ok(()) },
+                    tokio::sync::watch::channel(false).1,
+                    |update| {
+                        let reader_gate = reader_gate.clone();
+                        let reader_blocked = reader_blocked.clone();
+                        async move {
+                            if late
+                                && !delayed
+                                && update["type"] == "text_snapshot"
+                                && update["text"] == "Looking."
+                                && !reader_blocked.swap(true, Ordering::SeqCst)
+                            {
+                                reader_gate.notified().await;
+                                if lose_results {
+                                    bail!("fixture lost the native results before recording them");
+                                }
+                            }
+                            Ok(())
+                        }
+                    },
+                )
+                .await;
+                finished.store(true, Ordering::SeqCst);
+                result
+            };
+            let (reply, target) = tokio::join!(running, sending);
+            let target = target?;
+            let expected = if late {
+                format!("initial finished\n\ndone: {}", input.message("message-0"))
+            } else {
+                "Got all three inputs".into()
+            };
+            if lose_results {
+                assert_eq!(
+                    reply
+                        .err()
+                        .context("the unread results require reconciliation")?
+                        .downcast_ref::<ManagerError>()
+                        .context("manager error")?
+                        .outcome,
+                    ManagerFailure::Unknown
+                );
+            } else {
+                assert_eq!(reply?.output, expected);
+            }
+            let Some(SteerTrace::Ended { turn_id, outcome }) =
+                executor.read_back(&target, "message-0").await
+            else {
+                bail!("the input has no terminal native evidence");
+            };
+            assert_eq!(outcome, SteerOutcome::Answered);
+            assert_eq!(
+                turn_id != target.turn_id,
+                late,
+                "a late input belongs to its actual native turn"
+            );
+            let replay = Claude {
+                processes: Arc::new(Processes::new(place.dir.join(PIDFILE))),
+                live: Default::default(),
+                starting: Default::default(),
+                projects: Default::default(),
+            };
+            assert_eq!(
+                replay.read_back(&target, "message-0").await,
+                Some(SteerTrace::Ended { turn_id, outcome })
+            );
+            assert_eq!(
+                replay
+                    .probe_reply(&target.thread_id, Some(&target.turn_id), "attempt-1")
+                    .await?,
+                Probe::Terminal {
+                    turn_id: target.turn_id.clone(),
+                    status: TurnStatus::Completed,
+                    text: expected,
+                    error: None
+                }
+            );
+            let inputs: Vec<Value> = place
+                .log()
+                .into_iter()
+                .filter(|entry| entry["message"].is_object())
+                .collect();
+            assert_eq!(inputs.len(), if late { 0 } else { 3 });
+            if !late {
+                assert!(
+                    inputs[0]["message"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("the complete attached content")
+                );
+                assert_eq!(inputs[0]["uuid"], derived(STEER_MESSAGE_SEED, "message-0"));
+            }
+        }
+        Ok(())
     }
 
     type Calls = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
@@ -1626,6 +2450,64 @@ mod tests {
             reader.probe_reply(&session, None, "attempt-a").await?,
             Probe::Missing
         );
+        let steered = derived(STEER_MESSAGE_SEED, "input-after-recovery");
+        let input_path = reader
+            .processes
+            .steer_locator_path("input-after-recovery")?;
+        config::private_dir(input_path.parent().context("input locator")?)?;
+        config::private_write(
+            &input_path,
+            &serde_json::to_vec(&SteerLocator {
+                session: session.clone(),
+                projects: project.parent().context("projects")?.into(),
+                group: 0,
+                target_turn: later.clone(),
+                message: steered.clone(),
+                input_hash: "fixture".into(),
+            })?,
+        )?;
+        reader
+            .processes
+            .record_reply(&session, "attempt-b", project.parent())?;
+        write(vec![
+            user(&message),
+            assistant("reply-a", "unfinished", Value::Null),
+            user(&later),
+            assistant("reply-b", "working", json!("tool_use")),
+            user(&steered),
+            assistant("reply-b-final", "recovered result", json!("end_turn")),
+        ])?;
+        assert_eq!(
+            reader.probe_reply(&session, None, "attempt-a").await?,
+            Probe::Missing
+        );
+        assert_eq!(
+            reader.probe_reply(&session, None, "attempt-b").await?,
+            Probe::Terminal {
+                turn_id: later.clone(),
+                status: TurnStatus::Completed,
+                text: "recovered result".into(),
+                error: None,
+            }
+        );
+        let recovered = Claude::open(&place.dir, &place.env());
+        assert_eq!(
+            recovered
+                .read_back(
+                    &SteerTarget {
+                        provider: Provider::Claude,
+                        attempt_id: "attempt-b".into(),
+                        thread_id: session.clone(),
+                        turn_id: later.clone()
+                    },
+                    "input-after-recovery"
+                )
+                .await,
+            Some(SteerTrace::Ended {
+                turn_id: later.clone(),
+                outcome: SteerOutcome::Answered
+            })
+        );
         write(vec![
             user(&message),
             assistant("reply-a", "first result", json!("end_turn")),
@@ -1660,6 +2542,153 @@ mod tests {
             Probe::Missing
         );
         config::private_write(&locator_path, &locator)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bot_readback_recovers_every_input_of_its_own_native_group() -> Result<()> {
+        let place = Place::new()?;
+        let session = uuid::Uuid::new_v4().to_string();
+        let initial = derived(MESSAGE_SEED, "group-attempt");
+        let late = derived(STEER_MESSAGE_SEED, "late-input");
+        let later = derived(MESSAGE_SEED, "ordinary-later-attempt");
+        let projects = projects_dir(&place.env()).context("projects")?;
+        config::private_dir(&projects.join("fixture"))?;
+        let path = projects.join("fixture").join(format!("{session}.jsonl"));
+        let processes = Processes::new(place.dir.join(PIDFILE));
+        processes.record_reply(&session, "group-attempt", Some(&projects))?;
+        let persist = |input: &str, target: &str, group| -> Result<()> {
+            let path = processes.steer_locator_path(input)?;
+            config::private_dir(path.parent().context("input locator")?)?;
+            config::private_write(
+                &path,
+                &serde_json::to_vec(&SteerLocator {
+                    session: session.clone(),
+                    projects: projects.clone(),
+                    group,
+                    target_turn: target.into(),
+                    message: derived(STEER_MESSAGE_SEED, input),
+                    input_hash: "fixture".into(),
+                })?,
+            )
+        };
+        persist("late-input", &initial, 73)?;
+        persist("unrelated-input", &later, 74)?;
+        let user = |id: &str| json!({"type":"user","uuid":id,"message":{"role":"user","content":"question"}});
+        let assistant = |id: &str, text: &str, stop: Value| {
+            json!({"type":"assistant","message":{"id":id,
+            "content":[{"type":"text","text":text}],"stop_reason":stop}})
+        };
+        let write = |rows: &[Value]| -> Result<()> {
+            std::fs::write(
+                &path,
+                rows.iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )?;
+            Ok(())
+        };
+        let initial_rows = vec![
+            user(&initial),
+            assistant("initial-reply", "initial result", json!("end_turn")),
+        ];
+        write(&initial_rows)?;
+        let recovered = Claude::open(&place.dir, &place.env());
+        assert_eq!(
+            recovered
+                .probe_reply(&session, Some(&initial), "group-attempt")
+                .await?,
+            Probe::Missing
+        );
+        let mut rows = initial_rows.clone();
+        rows.extend([
+            user(&late),
+            assistant("late-reply", "still working", json!("tool_use")),
+        ]);
+        write(&rows)?;
+        assert_eq!(
+            recovered
+                .probe_reply(&session, Some(&initial), "group-attempt")
+                .await?,
+            Probe::Missing
+        );
+        rows = initial_rows.clone();
+        rows.extend([
+            user(&later),
+            assistant("ordinary-reply", "unrelated result", json!("end_turn")),
+            user(&late),
+            assistant("late-reply", "misplaced late result", json!("end_turn")),
+        ]);
+        write(&rows)?;
+        assert_eq!(
+            recovered
+                .probe_reply(&session, Some(&initial), "group-attempt")
+                .await?,
+            Probe::Missing,
+            "a registered input past an ordinary prompt cannot complete the old group"
+        );
+        rows = initial_rows;
+        rows.extend([
+            user(&late),
+            assistant("late-reply", "late result", json!("end_turn")),
+            user(&later),
+            assistant("ordinary-reply", "unrelated result", json!("end_turn")),
+        ]);
+        write(&rows)?;
+        assert_eq!(
+            recovered
+                .probe_reply(&session, Some(&initial), "group-attempt")
+                .await?,
+            Probe::Terminal {
+                turn_id: initial.clone(),
+                status: TurnStatus::Completed,
+                text: "initial result\n\nlate result".into(),
+                error: None,
+            }
+        );
+        persist("second-late-input", &initial, 73)?;
+        assert_eq!(
+            recovered
+                .probe_reply(&session, Some(&initial), "group-attempt")
+                .await?,
+            Probe::Missing,
+            "every registered UUID needs evidence before completion"
+        );
+        rows.truncate(4);
+        rows.extend([
+            user(&derived(STEER_MESSAGE_SEED, "second-late-input")),
+            assistant("second-late-reply", "second late result", json!("end_turn")),
+        ]);
+        write(&rows)?;
+        assert_eq!(
+            recovered
+                .probe_reply(&session, Some(&initial), "group-attempt")
+                .await?,
+            Probe::Terminal {
+                turn_id: initial,
+                status: TurnStatus::Completed,
+                text: "initial result\n\nlate result\n\nsecond late result".into(),
+                error: None,
+            }
+        );
+        *rows.last_mut().context("second late reply")? = json!({"type":"assistant","isApiErrorMessage":true,
+            "message":{"id":"second-late-error","content":[{"type":"text","text":"API Error: 401 Invalid API key"}],"stop_reason":"stop_sequence"}});
+        write(&rows)?;
+        let Probe::Terminal {
+            status,
+            text,
+            error: Some(error),
+            ..
+        } = recovered
+            .probe_reply(&session, None, "group-attempt")
+            .await?
+        else {
+            bail!("a failed late input fails recovery of the whole group");
+        };
+        assert_eq!(status, TurnStatus::Failed);
+        assert_eq!(text, "initial result\n\nlate result");
+        assert_eq!(error.kind, FailureKind::AuthFailed);
         Ok(())
     }
 
@@ -1699,6 +2728,16 @@ mod tests {
         );
         let reopened = Claude::open(&place.dir, &place.env());
         assert_eq!(reopened.projects(), Some(projects_a));
+        assert_eq!(
+            reopened.native_directory(&session).await?,
+            place.dir.join("work")
+        );
+        assert!(
+            reopened
+                .native_directory(&uuid::Uuid::new_v4().to_string())
+                .await
+                .is_err()
+        );
         assert_eq!(
             reopened.probe_reply(&session, None, "attempt-1").await?,
             expected
@@ -2072,7 +3111,8 @@ mod tests {
     async fn node(place: &Place) -> Result<(Arc<Runtime>, LocalIdentity, String)> {
         let dir = place.dir.join("node");
         config::private_dir(&dir)?;
-        let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        let mut configuration =
+            Config::local("127.0.0.1:0".parse()?, vec![place.dir.join("work")], false);
         // Nothing listens there: the Node never reaches this computer's own App Server.
         let socket = format!(
             "/tmp/vf-{}.sock",
@@ -2104,16 +3144,22 @@ mod tests {
         )?)?;
         node.install_membership(state).await?;
         let network = node.membership_state().await?.genesis.network_id;
-        conversation(&node, &admin, &network).await?;
+        conversation(&node, &admin, &network, "c", "m").await?;
         Ok((node, admin, network))
     }
 
-    /// The bot conversation "c", owned by this Node.
-    async fn conversation(node: &Runtime, admin: &LocalIdentity, network: &str) -> Result<()> {
+    /// A bot conversation with an owner and signed input for provider work.
+    pub(crate) async fn conversation(
+        node: &Runtime,
+        admin: &LocalIdentity,
+        network: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<()> {
         let local = node.identity.device_id()?;
         let owner = admin.attest(
             network,
-            "c",
+            conversation_id,
             EventBody::ConversationOwner {
                 scheduler_node: local.clone(),
                 epoch: 1,
@@ -2127,9 +3173,9 @@ mod tests {
         };
         let bot = admin.attest(
             network,
-            "c",
+            conversation_id,
             EventBody::BotCreated {
-                bot_id: "c".into(),
+                bot_id: conversation_id.into(),
                 name: "bot".into(),
                 instructions: String::new(),
                 project: None,
@@ -2138,8 +3184,47 @@ mod tests {
             },
         )?;
         let mut store = node.store.lock().await;
-        store.create_conversation(&node.identity, network, "c", "bot", owner, now_ms())?;
-        store.append_event(&node.identity, network, "c", bot, vec![], now_ms())?;
+        store.create_conversation(
+            &node.identity,
+            network,
+            conversation_id,
+            "bot",
+            owner,
+            now_ms(),
+        )?;
+        store.append_event(
+            &node.identity,
+            network,
+            conversation_id,
+            bot,
+            vec![],
+            now_ms(),
+        )?;
+        let input = admin.attest(
+            network,
+            conversation_id,
+            EventBody::InputPosted {
+                message_id: message_id.into(),
+                target: crate::workspace::InputTarget::BotMain {
+                    bot_id: conversation_id.into(),
+                },
+                intent: crate::workspace::InputIntent::Continue,
+                sequence: 1,
+                expected_revision: None,
+                text: "Run the provider fixture work".into(),
+                attachments: vec![],
+                report_results: Some(true),
+                attestation: None,
+            },
+        )?;
+        store.append_event(
+            &node.identity,
+            network,
+            conversation_id,
+            input,
+            vec![],
+            now_ms(),
+        )?;
         Ok(())
     }
 
@@ -2246,6 +3331,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_work_reads_the_late_input_result_before_finishing() -> Result<()> {
+        let place = Place::new()?;
+        let (node, _, network) = node(&place).await?;
+        let work = spec(&node, &place, "late-input", "steer-late")?;
+        dispatch(&node, &network, &work).await?;
+        until(&node, &work.work_id, |state| {
+            matches!(state, WorkState::Running { .. })
+        })
+        .await?;
+        let target = SteerTarget {
+            provider: Provider::Claude,
+            attempt_id: work.work_id.clone(),
+            thread_id: derived(SESSION_SEED, &work.work_id),
+            turn_id: derived(MESSAGE_SEED, &work.work_id),
+        };
+        let input = SteerInput {
+            text: "the work's late constraint".into(),
+            files: vec![],
+        };
+        let store = node.store.lock().await;
+        assert!(!matches!(
+            node.claude.send_turn(&target, "work-input", &input).await,
+            SteerAck::Refused(_)
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                node.claude.read_back(&target, "work-input").await,
+                Some(SteerTrace::Ended { .. })
+            ) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        assert!(
+            !store
+                .work_record(&work.work_id)?
+                .context("work")?
+                .state
+                .finished()
+        );
+        drop(store);
+        let finished = until(&node, &work.work_id, WorkState::finished).await?;
+        assert_eq!(
+            finished.state,
+            WorkState::Finished {
+                outcome: WorkOutcome::Completed
+            }
+        );
+        assert_eq!(
+            finished.text,
+            format!("initial finished\n\ndone: {}", input.message("work-input"))
+        );
+        let recovered = Claude::open(&place.dir.join("node"), &place.env());
+        let pending = WorkRecord {
+            state: WorkState::Starting {
+                thread: Some(target.thread_id.clone()),
+            },
+            ..finished.clone()
+        };
+        assert_eq!(
+            recovered.probe(&pending).await?,
+            Probe::Terminal {
+                turn_id: target.turn_id.clone(),
+                status: TurnStatus::Completed,
+                text: finished.text,
+                error: None
+            }
+        );
+        let locator: SteerLocator = serde_json::from_slice(&std::fs::read(
+            node.claude.processes.steer_locator_path("work-input")?,
+        )?)?;
+        let path =
+            transcript(Some(&locator.projects), &target.thread_id).context("work transcript")?;
+        let rows: Vec<Value> = records(&path).collect();
+        let last = rows
+            .iter()
+            .rposition(|row| {
+                row["type"] == "assistant" && row["message"]["stop_reason"] == "end_turn"
+            })
+            .context("late reply")?;
+        std::fs::write(
+            &path,
+            rows[..last]
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )?;
+        assert_eq!(
+            recovered.probe(&pending).await?,
+            Probe::Missing,
+            "a late open reply cannot restore the initial partial success"
+        );
+        let mut failed_rows = rows[..last].to_vec();
+        failed_rows.push(json!({"type":"assistant","isApiErrorMessage":true,"message":{"id":"late-error",
+            "content":[{"type":"text","text":"API Error: 401 Invalid API key"}],"stop_reason":"stop_sequence"}}));
+        std::fs::write(
+            &path,
+            failed_rows
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )?;
+        let Probe::Terminal {
+            status,
+            text,
+            error: Some(error),
+            ..
+        } = recovered.probe(&pending).await?
+        else {
+            bail!("a failed late work input fails the recovered group");
+        };
+        assert_eq!(status, TurnStatus::Failed);
+        assert_eq!(text, "initial finished");
+        assert_eq!(error.kind, FailureKind::AuthFailed);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_work_is_read_back_after_a_restart_and_never_sent_again() -> Result<()> {
         let place = Place::new()?;
         let (node, _, network) = node(&place).await?;
@@ -2345,9 +3550,15 @@ mod tests {
         let refused: Vec<_> = [a, b].into_iter().filter_map(Result::err).collect();
         assert_eq!(refused.len(), 1, "the start of the other one says why");
         assert!(
-            format!("{:#}", refused[0]).contains("still runs another work in this session"),
+            format!("{:#}", refused[0]).contains("resource_conflict"),
             "{:#}",
             refused[0]
+        );
+        assert_eq!(
+            refused[0]
+                .downcast_ref::<ExecFailure>()
+                .map(|failure| failure.kind),
+            Some(FailureKind::WriterBusy)
         );
         let mut rejected = 0;
         for spec in &specs {
@@ -2368,6 +3579,11 @@ mod tests {
             }
         }
         assert_eq!(rejected, 1, "one session runs one work at a time");
+        assert_eq!(
+            place.user_frames(),
+            2,
+            "the first turn and exactly one concurrent work reached Claude"
+        );
         Ok(())
     }
 
@@ -2398,7 +3614,7 @@ mod tests {
             &'a self,
             _: &'a SteerTarget,
             _: &'a str,
-            _: &'a str,
+            _: &'a SteerInput,
         ) -> BoxFuture<'a, SteerAck> {
             unreachable!()
         }
@@ -2583,15 +3799,18 @@ mod tests {
             json!({"type":"user","interruptedMessageId":"c","message":{"role":"user","content":"[Request interrupted by user]"}}),
         ])?;
         assert_eq!(
-            seen(Some(&path), "m1"),
+            seen(Some(&path), "m1", &BTreeSet::new()),
             ended(TurnStatus::Completed, "the answer")
         );
-        assert_eq!(seen(Some(&path), "m2"), ended(TurnStatus::Interrupted, ""));
-        assert_eq!(seen(Some(&path), "m3"), Seen::Unsent);
-        assert_eq!(seen(None, "m1"), Seen::Unsent);
+        assert_eq!(
+            seen(Some(&path), "m2", &BTreeSet::new()),
+            ended(TurnStatus::Interrupted, "")
+        );
+        assert_eq!(seen(Some(&path), "m3", &BTreeSet::new()), Seen::Unsent);
+        assert_eq!(seen(None, "m1", &BTreeSet::new()), Seen::Unsent);
 
         write(&[user("m1"), reply("a", text("Looking."), "tool_use")])?;
-        assert_eq!(seen(Some(&path), "m1"), Seen::Open);
+        assert_eq!(seen(Some(&path), "m1", &BTreeSet::new()), Seen::Open);
 
         write(&[
             user("m1"),
@@ -2602,7 +3821,7 @@ mod tests {
             status: TurnStatus::Failed,
             error: Some(failure),
             ..
-        }) = seen(Some(&path), "m1")
+        }) = seen(Some(&path), "m1", &BTreeSet::new())
         else {
             bail!("an API error fails the turn");
         };

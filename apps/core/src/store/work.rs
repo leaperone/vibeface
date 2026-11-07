@@ -496,6 +496,36 @@ impl Store {
         query_runs(&self.connection, "thread_id=?", [thread])
     }
 
+    pub(crate) fn local_work_provider_on_thread(
+        &self,
+        network: &str,
+        node: &str,
+        thread: &str,
+    ) -> Result<Option<crate::providers::Provider>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT r.kind FROM works w JOIN conversations c
+                ON c.network_id=w.network_id AND c.conversation_id=w.conversation_id
+             JOIN work_runs r
+                ON r.work_id=w.work_id AND r.conversation_id=w.conversation_id
+             WHERE w.network_id=?1 AND w.target_node=?2 AND w.dispatch IS NOT NULL
+                AND (r.thread_id=?3 OR w.thread_id=?3 OR json_extract(w.dispatch,'$.thread')=?3)",
+        )?;
+        let kinds = statement.query_map(params![network, node, thread], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut provider = None;
+        for kind in kinds {
+            if let WorkKind::Agent(ran) = enum_from(&kind?)? {
+                ensure!(
+                    provider.is_none_or(|provider| provider == ran),
+                    "native session has conflicting provider evidence"
+                );
+                provider = Some(ran);
+            }
+        }
+        Ok(provider)
+    }
+
     /// The folder a dispatched work runs in, found by its App Server thread.
     pub fn work_cwd_on_thread(&self, thread: &str) -> Result<Option<String>> {
         Ok(self

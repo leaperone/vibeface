@@ -188,6 +188,15 @@ pub struct AttentionRequest {
 #[serde(deny_unknown_fields)]
 pub struct Choice {
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<QuestionAction>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionAction {
+    AllowOnce,
+    Deny,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -978,6 +987,31 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
+    InputPosted {
+        message_id: String,
+        target: crate::workspace::InputTarget,
+        intent: crate::workspace::InputIntent,
+        sequence: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_revision: Option<u64>,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report_results: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+    },
+    WorkspaceCommanded {
+        command_id: String,
+        command: crate::workspace::WorkspaceCommand,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acting_assignment: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<Cause>,
+    },
     /// Written by the target Node when it accepts the work, so no progress precedes it.
     WorkDispatched {
         work_id: String,
@@ -1037,6 +1071,8 @@ pub enum EventBody {
     /// message `a-<question_id>`.
     QuestionAsked {
         question_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<crate::workspace::InputTarget>,
         attention: AttentionRequest,
         severity: Severity,
         text: String,
@@ -1145,7 +1181,7 @@ pub enum EventBody {
         text: String,
         hops: u8,
     },
-    /// Written only by the owner in a read-only closing turn; covered events stay stored.
+    /// Deterministic excerpts recorded by the owner at Store settlement; covered events stay stored.
     ContextCheckpoint {
         covers: VersionVector,
         summary: String,
@@ -1172,7 +1208,9 @@ impl EventBody {
     /// Present on writes that need the user's own device signature; see `crypto::validate_event_shape`.
     pub fn attestation(&self) -> Option<&Attestation> {
         match self {
-            Self::ConversationOwner { attestation, .. }
+            Self::InputPosted { attestation, .. }
+            | Self::WorkspaceCommanded { attestation, .. }
+            | Self::ConversationOwner { attestation, .. }
             | Self::BotCreated { attestation, .. }
             | Self::BotDeleted { attestation, .. }
             | Self::MessagePosted { attestation, .. }
@@ -1193,6 +1231,8 @@ impl EventBody {
             Self::ConversationOwner { .. } => "conversation_owner",
             Self::BotCreated { .. } => "bot_created",
             Self::MessagePosted { .. } => "message_posted",
+            Self::InputPosted { .. } => "input_posted",
+            Self::WorkspaceCommanded { .. } => "workspace_commanded",
             Self::WorkDispatched { .. } => "work_dispatched",
             Self::WorkProgress { .. } => "work_progress",
             Self::WorkFinished { .. } => "work_finished",
@@ -1217,9 +1257,10 @@ impl EventBody {
     /// The message, work or question the event is about; a turn finds its trigger by it.
     pub fn subject(&self) -> Option<&str> {
         match self {
-            Self::MessagePosted { message_id, .. } | Self::BotMessaged { message_id, .. } => {
-                Some(message_id)
-            }
+            Self::MessagePosted { message_id, .. }
+            | Self::InputPosted { message_id, .. }
+            | Self::BotMessaged { message_id, .. } => Some(message_id),
+            Self::WorkspaceCommanded { command_id, .. } => Some(command_id),
             Self::QuestionAsked { question_id, .. } => Some(question_id),
             Self::MemoryControlled { memory_id, .. }
             | Self::BotChanged {
@@ -1389,6 +1430,7 @@ pub struct Conversation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Message {
     pub message_id: String,
+    pub target: Option<crate::workspace::InputTarget>,
     pub role: Role,
     pub text: String,
     pub event_hash: EventHash,
@@ -1411,6 +1453,8 @@ pub struct Message {
 pub struct Notification {
     pub notification_id: String,
     pub conversation_id: ScopeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<crate::workspace::InputTarget>,
     pub kind: String,
     pub text: String,
 }

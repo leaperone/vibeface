@@ -97,6 +97,63 @@ export const deliveryTest = base.extend<{ network: DeliveryFixture }>({
   },
 });
 
+type WorkspaceGate = 'taskA' | 'taskB' | 'main' | 'channel';
+export type WorkspaceEvidence = {
+  invocations: { label: string; conversation_id: string; trigger: string; thread_id: string; messages: string[] }[];
+  steers: { message_id: string; thread_id: string; turn_id: string; text: string }[];
+  starts: { thread_id: string; turn_id: string }[];
+  interrupts: { thread_id: string; turn_id: string }[];
+  turns: { thread_id: string; turn_id: string; state: string }[];
+};
+type WorkspaceFixture = {
+  source: NodeInfo;
+  gates: Record<WorkspaceGate, string>;
+  release(gate: WorkspaceGate): Promise<void>;
+  inspect(): Promise<WorkspaceEvidence>;
+};
+function rows(value: unknown): Record<string, unknown>[] {
+  assert(Array.isArray(value), 'Expected fixture rows');
+  return value.map(record);
+}
+function workspaceEvidence(value: unknown): WorkspaceEvidence {
+  const fields = record(value);
+  const turn = (row: Record<string, unknown>) => ({ thread_id: text(row.thread_id), turn_id: text(row.turn_id) });
+  return {
+    invocations: rows(fields.invocations).map(row => {
+      assert(Array.isArray(row.messages) && row.messages.every(item => typeof item === 'string'), 'Fixture context contains text only');
+      return { label: text(row.label), conversation_id: text(row.conversation_id), trigger: text(row.trigger), thread_id: text(row.thread_id), messages: row.messages };
+    }),
+    steers: rows(fields.steers).map(row => ({ ...turn(row), message_id: text(row.message_id), text: text(row.text) })),
+    starts: rows(fields.starts).map(turn),
+    interrupts: rows(fields.interrupts).map(turn),
+    turns: rows(fields.turns).map(row => ({ ...turn(row), state: text(row.state) })),
+  };
+}
+export const workspaceTest = base.extend<{ workspace: WorkspaceFixture }>({
+  workspace: async ({ app }, use) => {
+    const call = await control(app.baseUrl);
+    try {
+      const ready = record(await call({ op: 'reset', kind: 'workspace' }));
+      const source = node(nodes(ready).source);
+      assert(app.baseUrl);
+      assert.equal(source.url, new URL(app.baseUrl).origin);
+      const paths = record(ready.gates);
+      const gate = (name: WorkspaceGate) => {
+        const path = text(paths[name]);
+        const inside = relative(artifacts, resolve(path));
+        assert(inside && !inside.startsWith('..') && !inside.startsWith('/'), 'Controlled gates remain in this task');
+        return path;
+      };
+      await use({ source, gates: { taskA: gate('taskA'), taskB: gate('taskB'), main: gate('main'), channel: gate('channel') },
+        async release(gate) {
+          assert.deepEqual(await call({ op: 'workspace_release', gate }), { released: gate });
+        },
+        async inspect() { return workspaceEvidence(await call({ op: 'workspace_inspect' })); },
+      });
+    } finally { await call({ op: 'stop' }); }
+  },
+});
+
 type BootstrapInfo = {
   site: string;
   invitation: string;

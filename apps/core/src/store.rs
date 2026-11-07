@@ -15,6 +15,7 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) mod admission;
 pub(crate) mod bot_settings;
 pub(crate) mod bots;
 mod log;
@@ -22,12 +23,14 @@ pub(crate) mod mailbox;
 pub(crate) mod questions;
 mod reduce;
 pub(crate) mod scheduler;
+pub(crate) mod scope_projection;
 mod sync;
 pub(crate) mod triage;
 pub use sync::{MAX_PULL_BYTES, MAX_PULL_EVENTS};
 #[cfg(test)]
 mod tests;
 pub(crate) mod work;
+pub(crate) mod workspace;
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/1_initial.sql");
 pub const SCHEMA_VERSION: u32 = crate::config::DATA_EPOCH;
@@ -477,15 +480,58 @@ impl Store {
         let connection = &self.connection;
         let (checkpoint, since) = match resumed {
             Some((covers, _)) => (None, covers.clone()),
-            None => match latest_checkpoint_from(connection, network_id, scope_id, basis)? {
-                Some((covers, body)) => (Some(body), covers),
-                None => (None, VersionVector::new()),
-            },
+            None if job.scope == crate::scheduling::SessionScope::Main => {
+                match latest_checkpoint_from(connection, network_id, scope_id, basis)? {
+                    Some((covers, body)) => (Some(body), covers),
+                    None => (None, VersionVector::new()),
+                }
+            }
+            None => (None, VersionVector::new()),
         };
-        let recent = context_after(connection, network_id, scope_id, basis, &since)?;
-        let trigger = match crate::scheduler::trigger_event_key(&job.trigger) {
-            Some((kind, subject)) => {
-                event_about_from(connection, network_id, scope_id, kind, subject)?.filter(|event| {
+        let mut recent = context_after(connection, network_id, scope_id, basis, &since)?;
+        recent.events = recent
+            .events
+            .into_iter()
+            .filter_map(|event| {
+                match scheduler::event_in_session_scope_from(
+                    connection,
+                    network_id,
+                    scope_id,
+                    &job.scope,
+                    &event.event,
+                ) {
+                    Ok(true) => Some(Ok(event)),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<_>>()?;
+        let trigger = if let Some(assignment_id) = job.trigger.strip_prefix("assignment:") {
+            self.workspace_assignment(network_id, assignment_id)?
+                .map(|assignment| {
+                    Ok::<HashedEvent, anyhow::Error>(HashedEvent {
+                        hash: assignment.event_hash.clone(),
+                        event: log::event_from(connection, network_id, &assignment.event_hash)?
+                            .context("assignment event missing")?,
+                    })
+                })
+                .transpose()?
+        } else if let Some(message_id) = job.trigger.strip_prefix("message:") {
+            message_from(connection, network_id, scope_id, message_id)?
+                .map(|message| {
+                    Ok::<HashedEvent, anyhow::Error>(HashedEvent {
+                        hash: message.event_hash.clone(),
+                        event: log::event_from(connection, network_id, &message.event_hash)?
+                            .context("input event missing")?,
+                    })
+                })
+                .transpose()?
+        } else {
+            match crate::scheduler::trigger_event_key(&job.trigger) {
+                Some((kind, subject)) => event_about_from(
+                    connection, network_id, scope_id, kind, subject,
+                )?
+                .filter(|event| {
                     !matches!(
                         event.event.body,
                         EventBody::MessagePosted {
@@ -493,9 +539,9 @@ impl Store {
                             ..
                         }
                     )
-                })
+                }),
+                None => None,
             }
-            None => None,
         };
         let question = match trigger.as_ref().map(|event| &event.event.body) {
             Some(EventBody::MessagePosted {
@@ -505,7 +551,27 @@ impl Store {
                 .map(|event| event.event.body),
             _ => None,
         };
+        let task_context =
+            if let crate::scheduling::SessionScope::WorkspaceTask { task_id } = &job.scope {
+                let task = self
+                    .workspace_task(network_id, task_id)?
+                    .context("task not found")?;
+                let assignment = if let Some(id) = job.trigger.strip_prefix("assignment:") {
+                    self.workspace_assignment(network_id, id)?
+                } else {
+                    task.current_assignment
+                        .as_ref()
+                        .map(|id| self.workspace_assignment(network_id, id))
+                        .transpose()?
+                        .flatten()
+                };
+                Some(serde_json::json!({"task":task,"assignment":assignment}))
+            } else {
+                None
+            };
         Ok(crate::scheduler::TurnHistory {
+            task_context,
+            effective_input: self.queued_workspace_input(network_id, &job.reply_to)?,
             recent,
             since,
             checkpoint,
@@ -544,6 +610,7 @@ impl Store {
     /// Up to `limit` effective events of the conversation within `basis`, of `kinds` when any are
     /// given, next to the event `at` names by author and seq: before it newest first, or after it
     /// oldest first. Without `at`, the newest. The flag says more follow in that direction.
+    #[cfg(test)]
     pub(crate) fn history_page(
         &self,
         network_id: &str,
@@ -670,6 +737,44 @@ impl Store {
         Ok(log::blob_file_matches(&self.blob_path(&blob.hash)?, blob))
     }
 
+    pub(crate) fn verified_blob_path(
+        &self,
+        network: &str,
+        scope: &str,
+        attachment: &Attachment,
+    ) -> Result<(PathBuf, Vec<u8>)> {
+        let (blob, bytes) = self.read_blob(network, scope, &attachment.hash)?;
+        ensure!(blob == attachment.blob(), "attachment metadata mismatch");
+        Ok((self.blob_path(&attachment.hash)?.canonicalize()?, bytes))
+    }
+
+    pub(crate) fn verified_input_attachment(
+        &self,
+        network: &str,
+        conversation: &str,
+        message_id: &str,
+        attachment: &Attachment,
+    ) -> Result<(PathBuf, Vec<u8>)> {
+        if let Some(input) = self.queued_workspace_input(network, message_id)? {
+            ensure!(
+                input.conversation_id == conversation
+                    && input.input.attachments.contains(attachment),
+                "attachment is outside the signed input"
+            );
+            if self
+                .referenced_size(network, conversation, &attachment.hash)
+                .is_err()
+            {
+                return self.verified_blob_path(
+                    network,
+                    crate::workspace::WORKSPACE_SCOPE,
+                    attachment,
+                );
+            }
+        }
+        self.verified_blob_path(network, conversation, attachment)
+    }
+
     /// Attachments are files named by their SHA-256; writes are atomic and reads re-verify.
     pub fn put_blob(&mut self, expected: &BlobRef, content: &[u8]) -> Result<()> {
         ensure!(
@@ -774,6 +879,20 @@ impl Store {
             .map(|row| row?)
             .collect()
     }
+    pub fn main_messages(&self, network_id: &str, scope_id: &str) -> Result<Vec<Message>> {
+        let mut messages = Vec::new();
+        for message in self.messages(network_id, scope_id)? {
+            if scope_projection::message_is_main_from(
+                &self.connection,
+                network_id,
+                scope_id,
+                &message.message_id,
+            )? {
+                messages.push(message);
+            }
+        }
+        Ok(messages)
+    }
     pub fn message(&self, network: &str, scope: &str, message_id: &str) -> Result<Option<Message>> {
         message_from(&self.connection, network, scope, message_id)
     }
@@ -848,16 +967,25 @@ impl Store {
         client_id: &str,
     ) -> Result<Vec<Notification>> {
         let mut statement = self.connection.prepare("SELECT n.notification_id,n.conversation_id,n.kind,n.text FROM notifications n WHERE n.network_id=? AND NOT EXISTS(SELECT 1 FROM notification_acks a WHERE a.network_id=n.network_id AND a.notification_id=n.notification_id AND a.client_id=?) ORDER BY n.rank")?;
-        statement
+        let rows = statement
             .query_map(params![network_id, client_id], |r| {
-                Ok(Notification {
-                    notification_id: r.get(0)?,
-                    conversation_id: r.get(1)?,
-                    kind: r.get(2)?,
-                    text: r.get(3)?,
-                })
+                Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?
-            .map(|row| Ok(row?))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(notification_id, conversation_id, kind, text)| {
+                Ok(Notification {
+                    target: scope_projection::notification_target_from(
+                        &self.connection,
+                        network_id,
+                        &notification_id,
+                    )?,
+                    notification_id,
+                    conversation_id,
+                    kind,
+                    text,
+                })
+            })
             .collect()
     }
     /// Counts one more model run against today's UTC limit, or refuses it.
@@ -1018,7 +1146,7 @@ pub(crate) fn conversation_from(
         .optional()?)
 }
 
-const MESSAGE_COLUMNS: &str = "message_id,role,text,event_hash,author,created_at_ms,in_reply_to,status,report_results,attachments,answers,rank,sender,failure";
+const MESSAGE_COLUMNS: &str = "message_id,role,text,event_hash,author,created_at_ms,in_reply_to,status,report_results,attachments,answers,rank,sender,failure,target";
 
 fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
     let role: String = r.get(1)?;
@@ -1035,9 +1163,11 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
     let rank: String = r.get(11)?;
     let sender: Option<String> = r.get(12)?;
     let failure: Option<String> = r.get(13)?;
+    let target: Option<String> = r.get(14)?;
     Ok((|| {
         Ok(Message {
             message_id,
+            target: optional_json(target)?,
             role: serde_json::from_value(Value::String(role))?,
             text,
             event_hash,

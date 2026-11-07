@@ -1,8 +1,11 @@
 import assert from "node:assert/strict"
+import type { SessionScope } from './types.ts'
 import test from "node:test"
 import { openWorksFromOverview, overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
 import { cardState, overviewScope, taskGroup, taskLabel, unrepresentedOverviewChecks, workspaceActivities } from "./labels.ts"
 import type { BotRecord, NodeInfo, OpenWork, PendingCheck, Question } from "./types.ts"
+
+const mainScope: SessionScope = { kind: 'main' }
 
 const bot = (conversation_id: string, bot_id = `bot-${conversation_id}`, name = conversation_id): BotRecord => ({
   bot_id, conversation_id, name, instructions: "", models: {}, skills: null, avatar: null, avatar_version: null,
@@ -27,7 +30,7 @@ const question = (extra: Partial<Question> = {}): Question => ({
 test("the conversation parser keeps WorkProjection relation and phase fields", () => {
   const parsed = parseConversation({
     conversation: { conversation_id: "chat-1", title: "Bot", owner: "gateway", owner_epoch: 1 }, messages: [],
-    works: [work()], deliveries: [], checks: [], local_node: "gateway", changes: [], overwritten: [], questions: [], sessions: [], sent: [],
+    works: [work()], deliveries: [], checks: [], local_node: "gateway", changes: [], overwritten: [], questions: [], sessions: [], sent: [], sent_coverage: { scope: 'main', omitted_unknown: 0 },
     bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } },
   }, "chat-1")
   assert.deepEqual(parsed.works[0] && {
@@ -280,7 +283,7 @@ test("workspace activities show a standalone question once across full and overv
 test("workspace activities merge same-source job observations without hiding newer or uncertain state", () => {
   const runtime = { provider: "codex" as const, model: "frozen", reasoning_effort: null, generation: "g", session_generation: 1, delivery_id: "d", stage: "run" as const, execution: "started" as const, attempted_at_ms: 2, switched_from: null, switch_reason: null }
   const overview = parseWorkspaceOverview({ jobs: [{ job_id: "job-1", conversation_id: "chat-1", trigger: "message:ordinary", state: "queued", source_node: "entry" }] })
-  const local = { conversation_id: "chat-1", job: { trigger: "message:ordinary", state: "running", runtime, failure: { kind: "unknown" as const, detail: "保留本地说明" } } }
+  const local = { conversation_id: "chat-1", job: { scope: mainScope, trigger: "message:ordinary", state: "running", runtime, failure: { kind: "unknown" as const, detail: "保留本地说明" } } }
   const input = { works: [], questions: [], checks: [], overview, jobs: [local], nodes: [node("entry", true, true)] }
   const merged = workspaceActivities(input).activities
   assert.equal(merged.length, 1)
@@ -346,8 +349,8 @@ test("workspace activities dedupe live and overview questions, keep approvals on
   const view = workspaceActivities({
     works: [running, sibling], questions: [approval], checks: [], overview,
     jobs: [
-      { conversation_id: "chat-1", job: { trigger: "message:done", state: "completed" } },
-      { conversation_id: "chat-1", job: { trigger: "message:queue", state: "queued" } },
+      { conversation_id: "chat-1", job: { scope: mainScope, trigger: "message:done", state: "completed" } },
+      { conversation_id: "chat-1", job: { scope: mainScope, trigger: "message:queue", state: "queued" } },
     ], nodes: [node("worker")], read: true, connected: true, answered: {},
   })
   const workActivities = view.activities.filter((activity) => activity.kind === "work")
@@ -373,7 +376,7 @@ test("workspace activities dedupe overview and live scheduler jobs by trusted so
   const overview = parseWorkspaceOverview({ jobs: [{ job_id: "job-queue", conversation_id: "chat-1", trigger: "message:queue", state: "queued", source_node: "entry" }] })
   const view = workspaceActivities({
     works: [], questions: [], checks: [], overview,
-    jobs: [{ conversation_id: "chat-1", job: { trigger: "message:queue", state: "running" } }],
+    jobs: [{ conversation_id: "chat-1", job: { scope: mainScope, trigger: "message:queue", state: "running" } }],
     nodes: [node("entry", true, true)], read: true, connected: true,
   })
   const turns = view.activities.filter((activity): activity is Extract<typeof view.activities[number], { kind: "turn" }> => activity.kind === "turn")

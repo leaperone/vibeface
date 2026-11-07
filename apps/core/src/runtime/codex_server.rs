@@ -1,7 +1,7 @@
 //! The coordination runtime's App Server: the process, its socket and the Node's own client.
 //! A managed App Server runs in its own process group recorded in a pidfile, so a crash of
 //! this Node never leaves an unmanaged one behind: the next start kills the recorded group.
-use super::executor::{Executor, SteerAck, SteerTrace};
+use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::*;
 use crate::providers::{
     Authentication, CatalogCoverage, CodexLaunch, CodexTarget, EffortOptions, ModelCatalog,
@@ -80,12 +80,24 @@ fn steer_trace(turns: &[Value], message_id: &str, target: &str) -> SteerTrace {
             Some(_) => SteerTrace::NotArrived,
         };
     };
+    let Some(turn_id) = turn["id"].as_str() else {
+        return SteerTrace::Pending;
+    };
     match turn_snapshot(turn).status {
-        Some(TurnStatus::InProgress) => SteerTrace::Pending,
-        Some(TurnStatus::Completed) if turn["id"] == target => {
-            SteerTrace::Ended(SteerOutcome::Answered)
-        }
-        _ => SteerTrace::Ended(SteerOutcome::Unfinished),
+        Some(TurnStatus::InProgress) => SteerTrace::Received {
+            turn_id: turn_id.into(),
+        },
+        Some(status) if status.ended() => SteerTrace::Ended {
+            turn_id: turn_id.into(),
+            outcome: if status == TurnStatus::Completed {
+                SteerOutcome::Answered
+            } else {
+                SteerOutcome::Unfinished
+            },
+        },
+        _ => SteerTrace::Received {
+            turn_id: turn_id.into(),
+        },
     }
 }
 
@@ -286,18 +298,25 @@ impl Executor for CodexServer {
         &'a self,
         into: &'a SteerTarget,
         message_id: &'a str,
-        text: &'a str,
+        input: &'a SteerInput,
     ) -> BoxFuture<'a, SteerAck> {
-        let message = json!({"message_id":message_id,"text":text});
-        let text = format!(
-            "The user sent another message in this conversation while you were replying. Take it into account and answer it in this same reply.\n\n{message}"
-        );
+        let mut blocks =
+            vec![json!({"type":"text","text":input.message(message_id),"text_elements":[]})];
+        for file in &input.files {
+            blocks.push(if file.is_image() {
+                json!({"type":"image","url":file.data_url()})
+            } else {
+                json!({"type":"mention","name":file.attachment.name,"path":file.local_path})
+            });
+        }
         let params = json!({"threadId":into.thread_id,"expectedTurnId":into.turn_id,
             "clientUserMessageId":message_id,
-            "input":[{"type":"text","text":text,"text_elements":[]}]});
+            "input":blocks});
         Box::pin(async move {
             match self.client.request("turn/steer", params).await {
-                Ok(_) => SteerAck::Accepted,
+                Ok(reply) => SteerAck::Accepted {
+                    turn_id: reply["turnId"].as_str().map(str::to_owned),
+                },
                 Err(error) if !error.uncertain => SteerAck::Refused(error.message),
                 Err(_) => SteerAck::Unknown,
             }
@@ -1328,22 +1347,36 @@ mod tests {
             json!({"id":id,"status":status,"items":items})
         };
         let trace = |turns: &[Value]| steer_trace(turns, "m", "r");
-        assert_eq!(trace(&[turn("r", "inProgress", true)]), SteerTrace::Pending);
+        assert_eq!(
+            trace(&[turn("r", "inProgress", true)]),
+            SteerTrace::Received {
+                turn_id: "r".into()
+            }
+        );
         assert_eq!(
             trace(&[turn("r", "inProgress", false)]),
             SteerTrace::Pending
         );
         assert_eq!(
             trace(&[turn("r", "completed", true)]),
-            SteerTrace::Ended(SteerOutcome::Answered)
+            SteerTrace::Ended {
+                turn_id: "r".into(),
+                outcome: SteerOutcome::Answered
+            }
         );
         assert_eq!(
             trace(&[turn("r", "interrupted", true)]),
-            SteerTrace::Ended(SteerOutcome::Unfinished)
+            SteerTrace::Ended {
+                turn_id: "r".into(),
+                outcome: SteerOutcome::Unfinished
+            }
         );
         assert_eq!(
             trace(&[turn("r", "completed", false), turn("x", "completed", true)]),
-            SteerTrace::Ended(SteerOutcome::Unfinished)
+            SteerTrace::Ended {
+                turn_id: "x".into(),
+                outcome: SteerOutcome::Answered
+            }
         );
         assert_eq!(
             trace(&[turn("r", "interrupted", false)]),

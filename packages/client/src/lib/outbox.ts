@@ -1,3 +1,5 @@
+import type { InputReceipt, WorkspaceCommandNotSaved } from '../workspace/types.ts'
+
 /**
  * Signed writes the entry has not confirmed. A write is kept byte-for-byte until the network
  * shows it recorded; it is never re-signed or sent to a different conversation.
@@ -8,6 +10,15 @@ export type OutboxItem = {
   params: Record<string, unknown>
   created_at_ms: number
   rejected?: string
+  rejection_code?: 'input_not_saved' | 'input_conflict'
+  /** Local message bytes stay here until the Node has the signed input. */
+  uploads?: { hash: string; size: number; name: string; data: string }[]
+  delivery?: 'saved' | 'uploading' | 'submitting' | 'accepted' | 'unknown'
+  receipt?: InputReceipt
+  release_expected_event?: string
+  release_command_id?: string
+  command_rejection?: WorkspaceCommandNotSaved
+  prerequisite?: Pick<OutboxItem, 'key' | 'method' | 'params' | 'created_at_ms'>
 }
 
 export interface OutboxStore {

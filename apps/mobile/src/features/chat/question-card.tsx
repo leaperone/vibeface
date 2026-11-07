@@ -47,8 +47,12 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const attempted = useRef('')
   const textRef = useRef<ComponentRef<typeof TextInput>>(null)
   const id = question.question_id
+  const inputTarget = question.target
+  const taskScope = inputTarget?.kind === 'task' || inputTarget?.kind === 'channel_task' ? inputTarget.task_id : null
   const standing = question.answer?.text ?? answer
   const settled = settledAnswer(standing, shared?.answered[id] ?? result?.text, question.answer?.author, ready?.principal.device_id)
+  const displayAnswer = (value: string) => { const choice = question.choices.find((choice) => choice.label === value); return choice?.action === 'allow_once' ? '允许本次' : choice?.action === 'deny' ? '拒绝' : value }
+  const approvalChoices = question.choices.filter((choice) => choice.action === 'allow_once' || choice.action === 'deny')
   const raced = result?.status === 'already_answered' && settled?.text === result.text && result.text !== attempted.current
   const elsewhere = settled?.elsewhere || raced
   const warned = settled?.beaten || raced
@@ -57,7 +61,7 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   // Read back later, an answered approval says which task on which device it settled.
   const heldTask = inTask ? null : approvalTask(question, [...shared?.openWorks ?? [], ...shared?.data?.works ?? []])
   const about = heldTask ? `${heldTask} · ${member?.name ?? '另一台设备'}` : undefined
-  if (settled) return <Settled icon={warned ? CircleAlert : declined(settled.text) ? CircleX : CircleCheck} className={warned ? 'text-warning' : declined(settled.text) ? 'text-danger' : 'text-success'} ask={ask} detail={detail} about={about}>{elsewhere ? `已由另一端回答：${settled.text}` : answerLabel(settled.text)}</Settled>
+  if (settled) return <Settled icon={warned ? CircleAlert : declined(displayAnswer(settled.text)) ? CircleX : CircleCheck} className={warned ? 'text-warning' : declined(displayAnswer(settled.text)) ? 'text-danger' : 'text-success'} ask={ask} detail={detail} about={about}>{elsewhere ? `已由另一端回答：${displayAnswer(settled.text)}` : answerLabel(displayAnswer(settled.text))}</Settled>
   if (question.closed) return <Settled icon={CircleSlash} ask={ask} detail={detail} about={about}>已失效</Settled>
 
   const pending = shared?.pendingAnswers.find((item) => item.question_id === id)
@@ -92,6 +96,7 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
     {question.attention?.kind === 'browser_takeover' ? <Text className="text-meta text-muted-foreground">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</Text> : null}
     {detail ? <Text className="text-body">{detail}</Text> : null}
     {inTask ? null : <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
+      {taskScope ? <Link href={`/task/${taskScope}`} asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-1"><Icon as={ListChecks} className="size-4 text-muted-foreground" /><Text className="text-meta underline">打开所属任务</Text></Pressable></Link> : null}
       {task ? <Link href={`/b/${task.bot_id}/work/${task.work_id}`} asChild>
         <Pressable accessibilityRole="link" accessibilityLabel={`任务 ${task.title}`} hitSlop={8} className="min-w-0 flex-row items-center gap-1 active:opacity-60">
           <Icon as={ListChecks} className="size-4 text-muted-foreground" />
@@ -103,12 +108,12 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
       {local ? null : <Meta icon={member ? deviceIcon(member) : Laptop} label="设备">{member?.name ?? '另一台设备'}</Meta>}
     </View>}
     {pending ? <View role="status" className="gap-2">
-      <Text className="text-body">{pending.text}</Text>
+      <Text className="text-body">{displayAnswer(pending.text)}</Text>
       <Text className="text-meta text-muted-foreground">{busy !== null ? '正在发送' : '没确认送达'}</Text>
       <Button variant="outline" className="min-h-11 self-start" disabled={disabled} accessibilityState={{ disabled, busy: busy === 'retry' }} onPress={() => void send('retry', pending.text)}>
         <Icon as={busy === 'retry' ? LoaderCircle : RotateCw} /><Text>再试</Text>
       </Button>
-    </View> : <View className="gap-2">
+    </View> : approvalChoices.length ? <View className="flex-row flex-wrap gap-2">{approvalChoices.map((choice) => <Button key={choice.label} variant={choice.action === 'allow_once' ? 'default' : 'outline'} className="min-h-11" accessibilityLabel={choice.action === 'allow_once' ? '允许本次' : '拒绝'} disabled={disabled} accessibilityState={{ disabled, busy: busy === `permission:${choice.action}` }} onPress={() => void send(`permission:${choice.action}`, choice.label)}><Icon as={busy === `permission:${choice.action}` ? LoaderCircle : choice.action === 'allow_once' ? CircleCheck : CircleX} /><Text>{choice.action === 'allow_once' ? '允许本次' : '拒绝'}</Text></Button>)}</View> : <View className="gap-2">
       {question.choices.length ? <View accessibilityRole="radiogroup" accessibilityLabel="选一个回答" className="gap-2">
         {question.choices.map((choice, index) => {
           const checked = selection.kind === 'choice' && selection.label === choice.label

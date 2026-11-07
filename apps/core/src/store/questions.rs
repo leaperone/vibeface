@@ -428,9 +428,8 @@ impl Store {
         Ok((owner, super::version(&event.hash), Some(event)))
     }
 
-    /// Posts the one answer to `question`. A retry with the same text returns it; a different
-    /// text finds the answer that stands. A new answer in a conversation is admitted on the owner,
-    /// or kept for delivery to it, as an `answer` turn.
+    /// Posts the standing answer. Ordinary questions schedule a turn; held requests return to
+    /// the Node that holds their original transport.
     pub fn accept_answer(
         &mut self,
         identity: &LocalIdentity,
@@ -439,6 +438,34 @@ impl Store {
         text: &str,
         attestation: Option<Attestation>,
         created_at_ms: i64,
+    ) -> Result<Answered> {
+        self.accept_answer_with_control(
+            identity,
+            network,
+            question,
+            text,
+            attestation,
+            created_at_ms,
+            None,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the answer fact and its local request binding commit together"
+    )]
+    pub(crate) fn accept_answer_with_control(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        question: &str,
+        text: &str,
+        attestation: Option<Attestation>,
+        created_at_ms: i64,
+        control: Option<(
+            &crate::triage::HeldAnswerRequest,
+            crate::triage::AnswerAuthority,
+        )>,
     ) -> Result<Answered> {
         let local = identity.device_id()?;
         let tx = self
@@ -453,8 +480,35 @@ impl Store {
             )
             .optional()?
             .context("no such question on this device")?;
+        let question_body = question_from(&tx, network, question)?.context("question missing")?;
+        let held = question_body["about"]["request_id"].is_string();
+        ensure!(
+            !held
+                || closed.is_some()
+                || attestation.is_some()
+                || control.is_some_and(|(request, authority)| {
+                    request.node == local
+                        && authority == crate::triage::AnswerAuthority::DecisionToken
+                }),
+            "a held request needs the user's signed answer or an authorized decision token"
+        );
         let message_id = answer_id(question);
         if let Some(message) = message_from(&tx, network, &scope, &message_id)? {
+            if let Some((request, authority)) = control {
+                ensure!(
+                    request.node == local,
+                    "only the request's Node queues its answer control"
+                );
+                super::triage::queue_answer_control_from(
+                    &tx,
+                    network,
+                    question,
+                    request,
+                    authority,
+                    created_at_ms,
+                )?;
+                tx.commit()?;
+            }
             return Ok(Answered {
                 already_answered: message.text != text,
                 conversation_id: scope,
@@ -464,6 +518,22 @@ impl Store {
         }
         if let Some(reason) = closed {
             bail!("this question was closed ({reason}); nothing can act on an answer now");
+        }
+        if held && question_body["attention"]["kind"] == "approval" {
+            let choices: Vec<_> = question_body["choices"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|choice| choice["label"].as_str() == Some(text))
+                .collect();
+            ensure!(
+                choices.len() == 1
+                    && matches!(choices[0]["action"].as_str(), Some("allow_once" | "deny")),
+                "choose one of this approval's actions; free text cannot approve a request"
+            );
+        }
+        if let Some((request, _)) = control {
+            super::triage::approval_answer_result(&question_body, text, &request.response)?;
         }
         log::append_from(
             &tx,
@@ -487,21 +557,44 @@ impl Store {
             created_at_ms,
         )?;
         let trigger = message_trigger(&message_id);
-        let owner = conversation_from(&tx, network, &scope)?
-            .and_then(|conversation| conversation.owner)
-            .context("conversation has no scheduling Node")?;
-        let receipt = Some(if owner == local {
-            admit_from(
+        let owner = if held {
+            question_body["about"]["node"]
+                .as_str()
+                .context("request has no Node")?
+                .to_owned()
+        } else {
+            conversation_from(&tx, network, &scope)?
+                .and_then(|conversation| conversation.owner)
+                .context("conversation has no scheduling Node")?
+        };
+        let receipt = if owner != local {
+            Some(queue_delivery_from(&tx, network, &scope, &trigger)?)
+        } else if held {
+            None
+        } else {
+            Some(admit_from(
                 &tx,
                 network,
                 &scope,
                 &trigger,
                 TriggerKind::Answer,
                 &message_id,
-            )?
-        } else {
-            queue_delivery_from(&tx, network, &scope, &trigger)?
-        });
+            )?)
+        };
+        if let Some((request, authority)) = control {
+            ensure!(
+                held && request.node == local,
+                "only the request's Node queues its answer control"
+            );
+            super::triage::queue_answer_control_from(
+                &tx,
+                network,
+                question,
+                request,
+                authority,
+                created_at_ms,
+            )?;
+        }
         let message = message_from(&tx, network, &scope, &message_id)?.context("answer missing")?;
         tx.commit()?;
         Ok(Answered {

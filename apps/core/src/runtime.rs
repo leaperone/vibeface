@@ -27,10 +27,12 @@ pub(crate) mod codex_server;
 mod cursor;
 mod executor;
 mod followup;
+mod input_receipts;
 mod manager_control;
 mod observation;
 pub mod opencode;
 mod peers;
+mod permission_fences;
 pub mod pi;
 mod provider_adapter;
 mod provider_probe;
@@ -38,6 +40,8 @@ mod schedule_delivery;
 mod settings;
 mod triage;
 mod work;
+mod work_input;
+mod workspace;
 pub(crate) use cursor::record_reply as record_cursor_reply;
 pub use manager_control::ManagerAccess;
 pub(crate) use observation::{ObservationGuard, native_progress};
@@ -389,6 +393,11 @@ pub struct Runtime {
     pub(crate) claim_to_start_barrier:
         std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     schedule_workers: Mutex<BTreeSet<(String, crate::scheduling::SessionKey)>>,
+    steer_workers: Mutex<BTreeSet<(String, crate::scheduling::SessionKey)>>,
+    steer_read_workers: Mutex<BTreeSet<(String, String, String)>>,
+    steer_read_slots: Arc<tokio::sync::Semaphore>,
+    work_input_locks: Mutex<HashMap<String, std::sync::Weak<tokio::sync::RwLock<()>>>>,
+    pub(super) local_permission_epoch: std::sync::atomic::AtomicU64,
     schedule_wakeup: tokio::sync::Notify,
     observation: std::sync::Mutex<observation::ObservationState>,
     pub tool_url: std::sync::OnceLock<String>,
@@ -647,6 +656,11 @@ impl Runtime {
             #[cfg(test)]
             claim_to_start_barrier: std::sync::Mutex::new(None),
             schedule_workers: Mutex::new(BTreeSet::new()),
+            steer_workers: Mutex::new(BTreeSet::new()),
+            steer_read_workers: Mutex::new(BTreeSet::new()),
+            steer_read_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            work_input_locks: Mutex::new(HashMap::new()),
+            local_permission_epoch: std::sync::atomic::AtomicU64::new(0),
             schedule_wakeup: tokio::sync::Notify::new(),
             observation: std::sync::Mutex::new(Default::default()),
             tool_url: std::sync::OnceLock::new(),
@@ -1464,8 +1478,14 @@ impl Runtime {
                 let store = self.store.lock().await;
                 Ok(json!({"works":chat_controls::open_works(&store, network, None)?}))
             }
+            "work_detail" => self.work_detail(&access, &input).await,
             "workspace_overview" => self.workspace_overview(&access, &input).await,
+            "workspace_command" => self.workspace_command(&access, &input).await,
+            "workspace_state" => self.workspace_state(&access, &input).await,
+            "workspace_history" => self.workspace_history(&access, &input).await,
             "message" => self.accept_chat_message(&access, &input).await,
+            "input_receipt" => self.input_receipt(&access, &input).await,
+            "scope_context" => self.scope_context(&access, &input).await,
             "set_owner" => {
                 let scope = scope.context("conversation_id is required")?;
                 self.set_owner(&access, &scope, &input).await

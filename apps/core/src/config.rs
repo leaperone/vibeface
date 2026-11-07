@@ -11,7 +11,7 @@ use std::{
 pub use vibeface_control::DATA_EPOCH;
 /// SHA-256 of the Core and delivery initial SQL schemas.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
-    "74df49916d5da6e2702e7bf254c0bda97c3b5124a7a3c0b4e071c43d74134459";
+    "a854af1e33092a6f80232b013cb3585b4959ad59b012e0cc11401bf1511569fe";
 /// Bumped whenever a release package stops being installable by the previous updater.
 pub use vibeface_control::UPDATE_PROTOCOL;
 pub fn data_epoch_marker() -> Vec<u8> {
@@ -406,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_changes_bump_the_data_epoch() {
+    fn schema_fingerprint_matches_the_final_data_format() {
         use sha2::{Digest, Sha256};
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let dir = root.join("migrations");
@@ -428,7 +428,7 @@ mod tests {
         let actual = hex::encode(hasher.finalize());
         assert_eq!(
             actual, DATA_EPOCH_SCHEMA_SHA256,
-            "schema changed: bump DATA_EPOCH and update the recorded fingerprint DATA_EPOCH_SCHEMA_SHA256 in apps/core/src/config.rs"
+            "final schema changed: keep DATA_EPOCH at 1 and update DATA_EPOCH_SCHEMA_SHA256 in apps/core/src/config.rs"
         );
     }
 

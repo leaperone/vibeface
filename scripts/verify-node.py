@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run local Node process acceptance without making paid provider calls.
 
-The default run starts four Nodes over iroh (one runs the member relay, one
-reaches others only through it) and checks sync, signed entrances, forwarding
+The default run starts four member Nodes over iroh (one runs the member relay,
+one reaches others only through it) and an outside-network Node. It checks sync, signed entrances, forwarding
 through other Gateways, delivery to the scheduling Node without replay, a relay
 outage and an entrance switch. Host work uses bot turns on a controlled fixture App Server, never a model. All state and logs stay beneath
 --artifacts with private permissions. The script prints no credentials.
@@ -173,6 +173,8 @@ const client = device(await loadSecret(process.argv[2]));
 const roots = new Map();
 const connections = new Map();
 const invites = new Map();
+const requests = new Map();
+let requestSequence = 0;
 const root = name => { const value = roots.get(name); if (!value) throw new Error('unknown root key'); return value; };
 async function connect(input) {
   const local = input.local_cookie !== undefined;
@@ -323,6 +325,28 @@ for await (const line of createInterface({ input: process.stdin })) {
       }
       case 'attest': result = { device_id: client.deviceId, signature: client.sign('attestation', attestationPayload(input.network_id, input.scope_id, JSON.stringify(input.body))) }; break;
       case 'request_key': result = createHash('sha256').update(attestationPayload(input.network_id, input.scope_id, JSON.stringify(input.body))).update(client.deviceId, 'utf8').digest('hex'); break;
+      case 'begin_requests': {
+        const connection = connections.get(input.connection || 'main');
+        if (!connection || !Array.isArray(input.requests) || !input.requests.length) throw new Error('requests require a connected client');
+        const ids = [];
+        let firstPending = true;
+        for (const request of input.requests) {
+          if (ids.length) firstPending &&= requests.get(ids[0]).pending;
+          const id = String(++requestSequence);
+          const entry = { pending: true };
+          requests.set(id, entry);
+          ids.push(id);
+          connection.request(request.method, request.params).then(response => Object.assign(entry, { pending: false, response }));
+        }
+        result = { request_ids: ids, first_pending_when_later_sent: firstPending };
+        break;
+      }
+      case 'request_result': {
+        result = requests.get(input.request_id);
+        if (!result) throw new Error('unknown pending request');
+        if (!result.pending) requests.delete(input.request_id);
+        break;
+      }
       default: {
         const connection = connections.get(input.connection || 'main');
         if (!connection) throw new Error('no connection');
@@ -341,6 +365,9 @@ for (const key of roots.values()) key.free();
 
 
 class Client:
+    input_routes = {}
+    input_sequences = {}
+
     def __init__(self, url, helper, *, identity_file=None):
         self.url = url
         self.helper = helper
@@ -393,17 +420,49 @@ class Client:
     def own_id(self):
         return self.command("identity")["device_id"]
 
+    def message_arguments(self, arguments):
+        key = (self.network_id, arguments["conversation_id"], arguments["message_id"])
+        route = self.input_routes.get(key)
+        if "target" not in arguments:
+            if route:
+                arguments["target"] = copy.deepcopy(route["target"])
+            else:
+                bots = self.rpc("bots")["bots"]
+                bot = next((bot for bot in bots if bot["conversation_id"] == arguments["conversation_id"]), None)
+                require(bot is not None, "normal fixture messages name a real Bot; missing-Bot negatives supply their target")
+                arguments["target"] = {"kind": "bot_main", "bot_id": bot["bot_id"]}
+        arguments.setdefault("intent", route["intent"] if route else "continue")
+        target = (self.network_id, json.dumps(arguments["target"], sort_keys=True))
+        if "sequence" not in arguments:
+            arguments["sequence"] = route["sequence"] if route else self.input_sequences.get(target, 0) + 1
+        self.input_sequences[target] = max(self.input_sequences.get(target, 0), arguments["sequence"])
+        self.input_routes.setdefault(key, {field: copy.deepcopy(arguments[field]) for field in ("target", "intent", "sequence")})
+        arguments.setdefault("report_results", True)
+        if arguments.get("attachments"):
+            arguments["attachments"] = sorted({blob["hash"]: blob for blob in arguments["attachments"]}.values(),
+                                              key=lambda blob: blob["hash"])
+        return arguments
+
     def attestation(self, method, arguments):
         """The device signature over the exact event body the Node writes for this request."""
         if method == "message":
-            arguments.setdefault("report_results", True)
-            body = {"type": "message_posted", "message_id": arguments["message_id"], "role": "user",
-                    "text": arguments["text"], "report_results": arguments["report_results"]}
+            self.message_arguments(arguments)
+            body = {"type": "input_posted", "message_id": arguments["message_id"],
+                    **{field: arguments[field] for field in ("target", "intent", "sequence")}}
+            if arguments.get("expected_revision") is not None:
+                body["expected_revision"] = arguments["expected_revision"]
+            body["text"] = arguments["text"]
             if arguments.get("attachments"):
-                arguments["attachments"] = sorted({blob["hash"]: blob for blob in arguments["attachments"]}.values(),
-                                                  key=lambda blob: blob["hash"])
-                body = {**{key: body[key] for key in ("type", "message_id", "role", "text")},
-                        "attachments": arguments["attachments"], "report_results": body["report_results"]}
+                body["attachments"] = arguments["attachments"]
+            if arguments.get("report_results") is not None:
+                body["report_results"] = arguments["report_results"]
+        elif method == "workspace_command":
+            command = {key: value for key, value in arguments["command"].items() if value is not None}
+            if command["kind"] == "post_channel_message" and not command.get("attachments"):
+                command.pop("attachments", None)
+            arguments["command"] = command
+            body = {"type": "workspace_commanded", "command_id": arguments["command_id"], "command": command}
+            return self.command("attest", network_id=self.network_id, scope_id="workspace", body=body)
         elif method == "create_bot":
             body = {"type": "bot_created", "bot_id": arguments["bot_id"], "name": arguments["name"],
                     "instructions": arguments.get("instructions", "")}
@@ -436,6 +495,8 @@ class Client:
         return self.command("attest", network_id=self.network_id, scope_id=arguments["conversation_id"], body=body)
 
     def rpc(self, method, *, status=200, unsigned=False, **arguments):
+        if method == "message":
+            self.message_arguments(arguments)
         if method in ("create_conversation", "create_bot") and not unsigned:
             arguments.setdefault("scheduler_node", self.device_id)
             arguments.setdefault("owner_attestation", self.command(
@@ -1042,6 +1103,8 @@ def fixture_codex(arguments):
                 self.turn["status"] = status
                 self.thread["status"] = {"type": "idle"}
                 private_json(state_path, state)
+                fixture_record(run, "codex-inputs.jsonl", {"event": "turn_completed", "thread_id": self.thread["id"],
+                               "turn_id": self.turn["id"], "status": status})
                 self.send("turn/completed", {"turn": self.turn})
 
     def bot_turn(stream, thread, turn, params, resumed):
@@ -1058,6 +1121,9 @@ def fixture_codex(arguments):
                    "custom_tools": [name for name, _ in advertised],
                    "custom_tool_schemas": {name: json.loads(schema) for name, schema in advertised}}
         bot = BotTurn(stream, thread, turn)
+        fixture_record(run, "codex-inputs.jsonl", {"event": "turn_started", "thread_id": thread["id"], "turn_id": turn["id"]})
+        with state_lock:
+            bot.send("turn/started", {"turn": turn})
         try:
             fixture_manager(run, initial, bot)
         except Exception as error:
@@ -1067,6 +1133,30 @@ def fixture_codex(arguments):
 
     def summary(thread):
         return {key: value for key, value in thread.items() if key not in ("turns", "directive", "request")}
+
+    def reply_steer(stream, message):
+        params = message["params"]
+        thread_id = params["threadId"]
+        thread = state["threads"].get(thread_id)
+        active = next((turn for turn in reversed(thread["turns"]) if turn["status"] == "inProgress"), None) if thread else None
+        if not active or active["id"] != params.get("expectedTurnId"):
+            websocket_send(stream, {"id": message["id"], "error": {
+                "code": -32600, "message": "expectedTurnId does not match the active turn"}})
+            return False
+        active["items"].append(user_message(params))
+        private_json(state_path, state)
+        fixture_record(run, "codex-inputs.jsonl", {"event": "input", "thread_id": thread_id,
+                       "turn_id": active["id"], "status": active["status"],
+                       "message_id": params.get("clientUserMessageId"), "input": params.get("input", [])})
+        dropped = run / "fixture-codex-drop-steer-ack"
+        if dropped.exists() and dropped.read_text() == params.get("clientUserMessageId"):
+            fixture_record(run, "codex-inputs.jsonl", {"event": "ack_dropped", "thread_id": thread_id,
+                           "turn_id": active["id"], "message_id": params.get("clientUserMessageId")})
+            return True
+        websocket_send(stream, {"id": message["id"], "result": {"turnId": active["id"]}})
+        fixture_record(run, "codex-inputs.jsonl", {"event": "input_ack", "thread_id": thread_id,
+                       "turn_id": active["id"], "message_id": params.get("clientUserMessageId")})
+        return False
 
     def connection(stream):
         stream.settimeout(5)
@@ -1161,6 +1251,21 @@ def fixture_codex(arguments):
                 fixture_record(run, "codex-rpc.jsonl", {"connection": connection_id, "pid": os.getpid(), "message": message,
                                                         "bot": bot})
                 initialized = initialized or method == "initialized"
+                steer_barrier = run / "fixture-codex-steer-barrier.json"
+                held = json.loads(steer_barrier.read_text()) if method == "turn/steer" and steer_barrier.exists() else None
+                if held and held["message_id"] == params.get("clientUserMessageId") and not Path(held["gate"]).exists():
+                    fixture_record(run, "codex-inputs.jsonl", {"event": "input_blocked", "thread_id": params["threadId"],
+                                   "message_id": params["clientUserMessageId"]})
+                    def delayed_input(request=copy.deepcopy(message), gate=held["gate"]):
+                        try:
+                            wait_for("the controlled native input is released", lambda: Path(gate).exists(), timeout=120)
+                            with state_lock:
+                                if reply_steer(stream, request):
+                                    stream.close()
+                        except (AssertionError, OSError):
+                            pass
+                    threading.Thread(target=delayed_input, daemon=True).start()
+                    continue
                 with state_lock:
                     if method is None:
                         answered = str(message.get("id", ""))
@@ -1243,12 +1348,9 @@ def fixture_codex(arguments):
                                 private_json(state_path, state)
                                 return
                     elif method == "turn/steer":
-                        active = next((turn for turn in reversed(thread["turns"]) if turn["status"] == "inProgress"), None)
-                        if not active or active["id"] != params.get("expectedTurnId"):
-                            error = {"code": -32600, "message": "expectedTurnId does not match the active turn"}
-                        else:
-                            active["items"].append(user_message(params))
-                            result = {"turnId": active["id"]}
+                        if reply_steer(stream, message):
+                            return
+                        continue
                     elif method == "turn/interrupt" and params.get("turnId") in bot_stops:
                         bot_stops[params["turnId"]].set()
                         result = {}
@@ -1289,7 +1391,20 @@ def fixture_codex(arguments):
                         websocket_send(stream, {"id": message["id"], "error": error})
                         continue
                     private_json(state_path, state)
-                    websocket_send(stream, {"id": message["id"], "result": result})
+                    barrier = run / "fixture-codex-read-barrier.json"
+                    held = json.loads(barrier.read_text()) if method == "thread/read" and barrier.exists() else None
+                    if held and held["thread_id"] == thread_id and not Path(held["gate"]).exists():
+                        fixture_record(run, "codex-inputs.jsonl", {"event": "read_blocked", "thread_id": thread_id})
+                        def delayed_reply(response=copy.deepcopy(result), request_id=message["id"], gate=held["gate"]):
+                            try:
+                                wait_for("the controlled read response is released", lambda: Path(gate).exists(), timeout=120)
+                                with state_lock:
+                                    websocket_send(stream, {"id": request_id, "result": response})
+                            except (AssertionError, OSError):
+                                pass
+                        threading.Thread(target=delayed_reply, daemon=True).start()
+                    else:
+                        websocket_send(stream, {"id": message["id"], "result": result})
         except (EOFError, OSError):
             pass
         finally:
@@ -1300,8 +1415,8 @@ def fixture_codex(arguments):
         threading.Thread(target=connection, args=(stream,), daemon=True).start()
 
 
-READ_TOOLS = {"nodes", "context", "history_search", "history_read", "work_status", "call_lookup", "read_skill", "recall", "fetch_url", "list_bots", "read_bot", "list_sessions"}
-WORK_TOOLS = {"dispatch_work", "interrupt_work", "hand_over_session", "propose_provider_config", "apply_provider_config"}
+READ_TOOLS = {"nodes", "context", "history_search", "history_read", "work_status", "call_lookup", "read_skill", "recall", "fetch_url", "list_bots", "read_bot", "list_sessions", "workspace_state", "workspace_history"}
+WORK_TOOLS = {"dispatch_work", "interrupt_work", "hand_over_session", "propose_provider_config", "apply_provider_config", "workspace_command"}
 WAKE_TOOLS = {"remind", "message_bot"}
 SETTINGS_TOOLS = {"update_profile", "save_skill", "remove_skill", "save_schedule", "remove_schedule", "remember", "forget",
                   "create_bot", "configure_bot", "delete_bot"}
@@ -1340,12 +1455,13 @@ def fixture_triage(run, initial, prompt, bot):
             elif mode == "ask":
                 asked = [json.loads(fixture_cli(initial, "triage", "raise", "--event-id", event["event_id"], "--severity", "urgent",
                                                 "--question", "Codex 想运行一条命令，允许吗？", "--request-id", event["request_id"],
-                                                "--choice", "允许", "--choice", "拒绝").stdout) for _ in range(2)]
+                                                "--choice", "允许本次", "--choice", "拒绝").stdout) for _ in range(2)]
                 action.update(action="ask", asked=asked)
             else:
                 action.update(action="ignore")
         elif "triage-raise" in event["cwd"] or "needs-human" in event.get("last_message", ""):
-            choices = ["--choice", "继续", "--choice", "停下"] if "choose-next" in event.get("last_message", "") else []
+            choices = ["--choice", "继续", "--choice", "停下"] if (
+                "choose-next" in event.get("last_message", "") or Path(event["cwd"]).name == "triage-raise-decision") else []
             asked = json.loads(fixture_cli(initial, "triage", "raise", "--event-id", event["event_id"], "--severity", "attention",
                                            "--question", "会话停下等你回复：下一步做什么？", *choices).stdout)
             action.update(action="raise", asked=asked)
@@ -1372,11 +1488,26 @@ def fixture_manager(run, initial, bot):
     context, _ = json.JSONDecoder().raw_decode(prompt[start + 2:])
     trigger, kind = context["trigger"]["trigger"], context["trigger"]["kind"]
     body = (context["trigger"].get("event") or {}).get("body", {})
+    if kind == "human" and body.get("truncated"):
+        effective = (context["trigger"].get("event") or {}).get("effective_input")
+        require(isinstance(effective, dict) and effective.get("conversation_id") == context["conversation_id"]
+                and effective.get("input", {}).get("message_id") == trigger.removeprefix("message:"),
+                "the full effective input belongs to this exact truncated trigger")
+        body = effective["input"]
+    scope = context.get("scope") or {}
+    task_context = context.get("task") or {}
+    workspace_task = task_context.get("task") or {}
+    workspace_scoped = scope.get("kind") == "workspace_task" or bool(workspace_task.get("task_id"))
+    tool_kind = ("agent_task" if workspace_scoped or scope.get("kind") == "task"
+                 else "schedule" if scope.get("kind") == "routine" else kind)
+    reply_only = workspace_task.get("reply_only") is True
+    main_human = kind == "human" and scope.get("kind") == "main" and not workspace_scoped and not reply_only
     autonomous = kind == "work_result"
     directive = {}
     if not autonomous:
         try:
-            candidate = json.loads(body.get("prompt" if kind == "agent_task" else "text", ""))
+            candidate = json.loads(workspace_task["request"] if kind == "workspace_task"
+                                   else body.get("prompt" if kind == "agent_task" else "text", ""))
             if isinstance(candidate, dict):
                 directive = candidate
         except ValueError:
@@ -1385,13 +1516,16 @@ def fixture_manager(run, initial, bot):
     record = {"conversation_id": context["conversation_id"], "trigger": trigger, "label": label,
               "native_session_id": native, "resumed": bool(initial.get("session_id")),
               "autonomous": autonomous, "pid": os.getpid(), "kind": kind,
+              "scope": context.get("scope"), "workspace_task_id": workspace_task.get("task_id"),
+              "assignment_id": (task_context.get("assignment") or {}).get("assignment_id"),
+              "reply_only": reply_only,
               "work_id": body.get("work_id"), "outcome": body.get("outcome"),
               "resumed_session": context["conversation"]["resumed_session"],
               "checkpoint": context["conversation"]["checkpoint"] is not None,
               "handoff": context.get("handoff") is not None,
               "memory_context": context.get("memory_context"),
               "messages": [row["text"][:200] for row in context["conversation"]["messages"]],
-              "trigger_text": str(((context["trigger"].get("event") or {}).get("body") or {}).get("text", ""))[:200],
+              "trigger_text": str(workspace_task["request"] if kind == "workspace_task" else body.get("text", ""))[:200],
               "works": [row["work_id"] for row in context["works"]] if isinstance(context["works"], list) else None,
               "bot": context["bot"].get("configured_bot"),
               "sessions": [row["session_id"] for row in context["bot"].get("sessions") or []],
@@ -1411,10 +1545,10 @@ def fixture_manager(run, initial, bot):
             "every initially exposed tool has exactly one advertised schema")
     require(not (initial_tools & set(context["trigger"].get("unavailable_tools") or [])),
             "the initial entrypoints remain available in every trigger")
-    expected_tools = READ_TOOLS | WORK_TOOLS
-    if kind != "agent_task":
+    expected_tools = READ_TOOLS if reply_only else READ_TOOLS | WORK_TOOLS
+    if tool_kind not in ("agent_task", "workspace_task") and not reply_only:
         expected_tools |= WAKE_TOOLS
-    if kind == "human":
+    if main_human:
         expected_tools |= SETTINGS_TOOLS
     described = set()
 
@@ -1487,25 +1621,25 @@ def fixture_manager(run, initial, bot):
         if name in initial_tools:
             require(schema["input_schema"] == initial["custom_tool_schemas"][name],
                     "initial domain schemas match the Node's authoritative descriptions")
-    for name in sorted((SETTINGS_TOOLS | WAKE_TOOLS) - expected_tools):
+    for name in sorted((SETTINGS_TOOLS | WAKE_TOOLS | WORK_TOOLS) - expected_tools):
         tool("tool_describe", {"tool": name}, expected=False, rejection="unknown or unavailable coordination tool")
     fixture_record(run, "manager-catalogs.jsonl", {"conversation_id": context["conversation_id"],
                    "trigger": trigger, "kind": kind, "advertised": sorted(initial["custom_tools"]),
-                   "available": sorted(catalog), "unavailable": sorted((SETTINGS_TOOLS | WAKE_TOOLS) - expected_tools),
+                   "available": sorted(catalog), "unavailable": sorted((SETTINGS_TOOLS | WAKE_TOOLS | WORK_TOOLS) - expected_tools),
                    "cli_matches_api": True})
     fixture_record(run, "manager-invocations.jsonl", record)
 
-    def dispatch_cli(arguments, expected=True, rejection=""):
-        """`vibeface tool dispatch_work` from the Agent's Shell: the CLI registers, then talks to the socket itself."""
-        completed = fixture_cli(initial, "tool", "dispatch_work", "--json", json.dumps(arguments),
+    def work_cli(arguments, expected=True, rejection="", *, name="dispatch_work"):
+        """The Agent's real Shell CLI registers and executes the scoped command."""
+        completed = fixture_cli(initial, "tool", name, "--json", json.dumps(arguments),
                                 "--call-ref", arguments["call_ref"], check=False)
         accepted = completed.returncode == 0
         fixture_record(run, "manager-tools.jsonl", {"conversation_id": context["conversation_id"], "trigger": trigger,
-                       "name": "dispatch_work", "cli": True, "accepted": accepted, "expected": expected,
+                       "name": name, "cli": True, "accepted": accepted, "expected": expected,
                        "call_ref": arguments["call_ref"], "result": json.loads(completed.stdout) if accepted else None,
                        "error": completed.stderr[-2048:]})
         require(accepted == expected and (accepted or rejection in completed.stderr),
-                "dispatch_work from the Shell has its expected outcome: " + completed.stderr[-300:])
+                name + " from the Shell has its expected outcome: " + completed.stderr[-300:])
         return json.loads(completed.stdout) if accepted else None
 
     if directive.get("paid_delivery_security") is True:
@@ -1520,7 +1654,7 @@ def fixture_manager(run, initial, bot):
             require(replies[0] == replies[1] and replies[0]["status"] in ("applied", "declined"),
                     "a settings card's answer is applied once; a repeat reads it back")
         elif about.get("request_id"):
-            result = json.dumps({"decision": "accept" if answer == "允许" else "decline"})
+            result = json.dumps({"decision": "accept" if answer == "允许本次" else "decline"})
             replies = [json.loads(fixture_cli(initial, "respond", about["request_id"], result, "--node", about["node"]).stdout)
                        for _ in range(2)]
         else:
@@ -1548,13 +1682,13 @@ def fixture_manager(run, initial, bot):
                      **{key: dispatch[key] for key in ("parent", "target_node", "continues", "model", "effort") if key in dispatch}}
         work = None
         for index in range(dispatch.get("repeat", 1)):
-            work = dispatch_cli(arguments)
+            work = work_cli(arguments)
             if dispatch.get("discard_first") and index == 0:
                 work = None
         found = tool("call_lookup", {"call_ref": arguments["call_ref"]})
         require(work is None or work["work_id"] == found["work_id"], "call_lookup finds the dispatched work")
         if dispatch.get("changed"):
-            dispatch_cli({**arguments, "prompt": "different work"}, expected=False, rejection=dispatch["changed"])
+            work_cli({**arguments, "prompt": "different work"}, expected=False, rejection=dispatch["changed"])
         fixture_record(run, "manager-native-work.jsonl", {"trigger": trigger, "label": dispatch["label"],
                        "work_id": found["work_id"], "first": work})
     send = directive.get("send")
@@ -1565,10 +1699,10 @@ def fixture_manager(run, initial, bot):
             if send.get("conflict_text") else None
         fixture_record(run, "manager-sends.jsonl", {"trigger": trigger, "label": label, "sent": sent,
                        "conflict": None if conflict is None else {"code": conflict.returncode, "error": conflict.stderr[-500:]}})
-    if kind in ("schedule", "bot_message"):
-        tool("update_profile", {"call_ref": kind + "-rename", "name": "forbidden"}, expected=False,
+    if tool_kind in ("schedule", "bot_message"):
+        tool("update_profile", {"call_ref": tool_kind + "-rename", "name": "forbidden"}, expected=False,
              rejection="is not offered in")
-    rename = re.match(r"^(rename yourself to|改名为|改名叫)\s*(.+)$", body.get("text", "")) if kind == "human" else None
+    rename = re.match(r"^(rename yourself to|改名为|改名叫)\s*(.+)$", body.get("text", "")) if main_human else None
     if rename:
         tool("update_profile", {"call_ref": "rename", "name": rename.group(2).strip()})
     for action in directive.get("tools", []):
@@ -1577,8 +1711,13 @@ def fixture_manager(run, initial, bot):
             require(action["name"] == "remember" and action.get("accepted") is False,
                     "only the negative remember fixture constructs a synthetic credential")
             arguments = {**arguments, "text": "api key sk-" + "a" * 40}
-        tool(action["name"], arguments, expected=action.get("accepted", True),
-             rejection=action.get("rejection", "unknown"), discard=action.get("discard", False))
+        if action.get("cli"):
+            require(action["name"] == "workspace_command", "the workspace fixture uses only its actual scoped command CLI")
+            work_cli(arguments, name=action["name"], expected=action.get("accepted", True),
+                     rejection=action.get("rejection", ""))
+        else:
+            tool(action["name"], arguments, expected=action.get("accepted", True),
+                 rejection=action.get("rejection", "unknown"), discard=action.get("discard", False))
     sequence = 0
     gate = directive.get("gate")
     # Screens show these replies, so only an explicit test label is echoed back.
@@ -2024,7 +2163,8 @@ def work_checks(run, workspace, a, network, passed):
         directory.mkdir()
         if gate_open:
             (directory / "release").touch()
-        a.client.rpc("create_conversation", conversation_id=name, title=name)
+        a.client.rpc("create_bot", bot_id="bot-" + name, conversation_id=name, name=name, instructions="",
+                     project={"target_node": a.device_id, "cwd": str(directory)})
         receipt = a.client.rpc("message", conversation_id=name, message_id=name, report_results=report_results,
             text=json.dumps({"chat_agent": True, "label": name, "dispatch": {
                 "label": name, "cwd": str(directory), **dispatch,
@@ -2183,16 +2323,19 @@ def work_checks(run, workspace, a, network, passed):
     thread_id, question_id = question["about"]["session_id"], question["question_id"]
     asked = wait_for("the triage turn records its question", lambda: [row for row in fixture_records(run, "triage-actions.jsonl")
                      if row["session_id"] == thread_id])
-    require([choice["label"] for choice in question["choices"]] == ["允许", "拒绝"] and question["about"]["request_id"]
+    require([choice["label"] for choice in question["choices"]] == ["允许本次", "拒绝"] and question["about"]["request_id"]
             and thread_id == (work(name, work_id) or {}).get("thread_id") and len(asked) == 1
             and asked[0]["asked"][0]["question_id"] == asked[0]["asked"][1]["question_id"] == question_id,
             "the question about the request lands once in the chat that owns the thread")
-    require(any(row["question_id"] == question_id and row["answer"] is None for row in snapshot(name)["questions"]),
-            "the conversation shows the unanswered question")
+    require(question.get("target") == {"kind": "work", "work_id": work_id}
+            and any(row["question_id"] == question_id and row["answer"] is None
+                    for row in a.client.rpc("questions")["questions"])
+            and not any(row["question_id"] == question_id for row in snapshot(name)["questions"]),
+            "the pending question keeps its exact Work scope and stays out of Main")
     require_quiet("a request a question holds waits for the answer", lambda: in_state(name, work_id, "running") and not answers(thread_id))
     first = a.client.rpc("answer", question_id=question_id, text="拒绝", scope_id=name)
     retry = a.client.rpc("answer", question_id=question_id, text="拒绝", scope_id=name)
-    other = a.client.rpc("answer", question_id=question_id, text="允许", scope_id=name)
+    other = a.client.rpc("answer", question_id=question_id, text="允许本次", scope_id=name)
     require(first["status"] == retry["status"] == "answered" and retry["message"] == first["message"]
             and first["message"]["message_id"] == "a-" + question_id and first["message"]["answers"] == question_id
             and other["status"] == "already_answered" and other["message"]["text"] == "拒绝",
@@ -2200,15 +2343,15 @@ def work_checks(run, workspace, a, network, passed):
     finished = wait_for("the bot acts on the answer and the work finishes", lambda: in_state(name, work_id, "finished"), timeout=90)
     replies = answers(finished["thread_id"])
     turns = [row for row in fixture_records(run) if row["kind"] == "answer" and row["conversation_id"] == name]
-    acted = wait_for("the answer turn records its replies", lambda: [row for row in fixture_records(run, "answer-actions.jsonl")
-                     if row["question_id"] == question_id])
-    require(len(replies) == 1 and replies[0]["result"] == {"decision": "decline"} and len(turns) == 1
-            and turns[0]["trigger"] == "message:a-" + question_id and len(acted) == 1
-            and acted[0]["replies"][0] == acted[0]["replies"][1] and acted[0]["replies"][0]["by"] == "agent",
-            "the answer is one turn of the bot, whose respond reaches Codex once")
+    acted = [row for row in fixture_records(run, "answer-actions.jsonl") if row["question_id"] == question_id]
+    require(len(replies) == 1 and replies[0]["result"] == {"decision": "decline"} and not turns and not acted
+            and first["receipt"] is None and scheduler_record(a, network, "message:a-" + question_id) is None,
+            "the trusted signed answer reaches its native request once without an ordinary Answer turn")
     require(all(row["question_id"] != question_id for row in a.client.rpc("questions")["questions"])
-            and any(row["question_id"] == question_id and row["answer"]["text"] == "拒绝" for row in snapshot(name)["questions"]),
-            "the answered question leaves the pending list and shows its answer in the chat")
+            and first["message"].get("target") == question["target"]
+            and first["message"]["text"] == "拒绝"
+            and not any(row["question_id"] == question_id for row in snapshot(name)["questions"]),
+            "the answered Work question leaves pending, preserves its signed fact and stays out of Main")
     passed("a question in the chat holds the request until the user's answer reaches it once through the bot",
            work_id=work_id, question=question_id)
 
@@ -2343,11 +2486,39 @@ def triage_checks(run, workspace, a, network, passed):
         require(tested["ok"] and receiver.deliveries[-1]["valid"], "the test button sends one signed request")
         threads = json.loads((run / "fixture-codex-state.json").read_text())["threads"]
         owner = "chat-work-dedup"
-        thread_id = next(thread_id for thread_id, thread in threads.items() if thread["cwd"].endswith(owner))
-        completed_turn = threads[thread_id]["turns"][-1]["id"]
-        replayed = node_cli(a, "hook", "codex", stdin=json.dumps({"hook_event_name": "Stop", "session_id": thread_id,
-                            "turn_id": completed_turn, "cwd": threads[thread_id]["cwd"], "last_assistant_message": "done"}))
-        hook = {"hook_event_name": "Stop", "session_id": thread_id, "turn_id": "hook-turn-1", "cwd": str(raise_dir),
+
+        def hook_source(directory, label):
+            wait_for("the owner's earlier Main turns settle before the next source input", lambda:
+                     not scheduler_sessions(a, owner).get("main", {}).get("active") and all(
+                         row["state"] in {"completed", "failed", "cancelled", "interrupted", "steered"}
+                         for row in scheduler_records(a, network) if row["conversation_id"] == owner and row["scope"] == "main"), timeout=60)
+            release = directory / "release"
+            release.touch()
+            receipt = a.client.rpc("message", conversation_id=owner, message_id=label, text=json.dumps({
+                "label": label, "dispatch": {"label": label, "cwd": str(directory), "native": {"gate": str(release)}}}))
+            dispatch = wait_for("the hook's real source Work is recorded", lambda: next(
+                (row for row in fixture_records(run, "manager-native-work.jsonl")
+                 if row["label"] == label and row["trigger"] == receipt["trigger"]), None))
+            source = wait_for("the hook's source Work finishes with its real native turn", lambda: next(
+                (row for row in a.client.rpc("conversation", conversation_id=owner)["works"]
+                 if row["work_id"] == dispatch["work_id"] and row["state"] == "finished"
+                 and row.get("thread_id") and row.get("turn_id")), None), timeout=60)
+            require(source["trigger"] == receipt["trigger"] and source["target_node"] == a.device_id
+                    and source["cwd"] == str(directory) and source["kind"] == "codex" and source["outcome"] == "completed",
+                    "the hook's thread and turn belong to the exact signed source Work")
+            wait_for("the source Human turn completes before another producer", lambda:
+                     (scheduler_record(a, network, receipt["trigger"]) or {}).get("state") == "completed", timeout=60)
+            wait_for("the source WorkResult turn completes before another producer", lambda:
+                     (scheduler_record(a, network, "work:" + dispatch["work_id"]) or {}).get("state") == "completed", timeout=60)
+            return source
+
+        original_thread = next(thread_id for thread_id, thread in threads.items() if thread["cwd"].endswith(owner))
+        completed_turn = threads[original_thread]["turns"][-1]["id"]
+        replayed = node_cli(a, "hook", "codex", stdin=json.dumps({"hook_event_name": "Stop", "session_id": original_thread,
+                            "turn_id": completed_turn, "cwd": threads[original_thread]["cwd"], "last_assistant_message": "done"}))
+        source = hook_source(raise_dir, "triage-hook-source")
+        thread_id = source["thread_id"]
+        hook = {"hook_event_name": "Stop", "session_id": thread_id, "turn_id": source["turn_id"], "cwd": str(raise_dir),
                 "last_assistant_message": "需要你决定下一步 needs-human"}
         for _ in range(2):
             node_cli(a, "hook", "codex", stdin=json.dumps(hook))
@@ -2357,13 +2528,14 @@ def triage_checks(run, workspace, a, network, passed):
             (row for row in a.client.rpc("questions")["questions"] if row["about"]["cwd"] == shared_raise_dir), None), timeout=90)
         question_id = question["question_id"]
         require(question["conversation_id"] == owner and question["severity"] == "attention"
-                and question["about"]["session_id"] == thread_id and question["about"]["node"] == a.device_id,
+                and question["about"]["session_id"] == thread_id and question["about"]["node"] == a.device_id
+                and question.get("target") == {"kind": "work", "work_id": source["work_id"]},
                 "the question names the chat, session and device it is about")
         wait_for("the triage turn records its question", lambda: any(row["cwd"] == shared_raise_dir and row["session_id"] == thread_id
                  for row in fixture_records(run, "triage-actions.jsonl")))
         actions = fixture_records(run, "triage-actions.jsonl")
         raised = [row for row in actions if row["cwd"] == shared_raise_dir and row["session_id"] == thread_id]
-        same_turn = [row for row in actions if row["session_id"] == thread_id and row["cwd"] != shared_raise_dir
+        same_turn = [row for row in actions if row["session_id"] == original_thread and row["cwd"] != shared_raise_dir
                      and not row.get("request_id")]
         require(len(raised) == 1 and len(same_turn) == 1,
                 "a repeated hook and the App Server's report of the same turn reach the Agent once")
@@ -2392,6 +2564,16 @@ def triage_checks(run, workspace, a, network, passed):
         require(first["status"] == "answered" and retry["message"] == first["message"] and len(acted) == 1
                 and acted[0]["replies"][1]["work_id"] == answer_work and len(sends) == 1,
                 "a text answer reaches the session once as the bot's work; a retry reads it back")
+        answer_job = wait_for("the first generic Answer manager completes", lambda:
+                              (lambda row: row if row and row["state"] == "completed" else None)(
+                                  scheduler_record(a, network, acted[0]["trigger"])), timeout=60)
+        answer_detail = a.client.rpc("work_detail", conversation_id=owner, work_id=answer_work)["work"]
+        require(answer_job["scope"] == "task:" + source["work_id"]
+                and answer_detail["work_id"] == answer_work and answer_detail["trigger"] == acted[0]["trigger"]
+                and answer_detail["target"] == question["target"] and answer_detail["thread_id"] == thread_id
+                and not any(row["work_id"] == answer_work
+                            for row in a.client.rpc("conversation", conversation_id=owner)["works"]),
+                "the Answer manager and its native work keep the original Work scope and stay outside Main")
         told = wait_for("the webhook hears the answer", lambda: [row for row in receiver.deliveries
                         if row["event_id"].startswith("answered-" + question_id + "-") and row["status"] == 200] or None, timeout=60)
         require(told[-1]["body"] == {"schema_version": 1, "type": "answered", "event_id": told[-1]["event_id"],
@@ -2400,10 +2582,15 @@ def triage_checks(run, workspace, a, network, passed):
         # The decision token answers a question about a live session, so the bot's answer turn sends real work.
         decide_dir = workspace / "triage-raise-decision"
         decide_dir.mkdir()
-        node_cli(a, "hook", "codex", stdin=json.dumps({"hook_event_name": "Stop", "session_id": thread_id, "turn_id": "hook-turn-decision",
+        decision_source = hook_source(decide_dir, "triage-decision-source")
+        node_cli(a, "hook", "codex", stdin=json.dumps({"hook_event_name": "Stop", "session_id": decision_source["thread_id"],
+                                                       "turn_id": decision_source["turn_id"],
                                                        "cwd": str(decide_dir), "last_assistant_message": "choose-next needs-human"}))
         pending = wait_for("the Agent asks about the live session again", lambda: next(
             (row for row in a.client.rpc("questions")["questions"] if row["about"]["cwd"] == "workspace-1/triage-raise-decision"), None), timeout=90)
+        require(pending.get("target") == {"kind": "work", "work_id": decision_source["work_id"]}
+                and [choice["label"] for choice in pending["choices"]] == ["继续", "停下"],
+                "the decision question keeps its actual Work scope")
         tokens = a.client.call("create_decision_token", {"label": "grok"})
         listed = a.client.call("triage_settings")
         require(tokens["token"] not in json.dumps(listed) and tokens["token"] not in (a.directory / "decision-tokens.json").read_text(),
@@ -2422,7 +2609,8 @@ def triage_checks(run, workspace, a, network, passed):
                          and row["message"]["params"].get("clientUserMessageId") == decided_work]
         handle = decided[0]["replies"][0]["state"]
         require(len(decided) == 1 and decided[0]["answer"] == "继续" and decided[0]["replies"][1]["work_id"] == decided_work
-                and len(decided_sends) == 1 and handle["state"] == "running" and handle["handle"]["thread_id"] == thread_id
+                and len(decided_sends) == 1 and handle["state"] == "running"
+                and handle["handle"]["thread_id"] == decision_source["thread_id"]
                 and not any((row["message"].get("params") or {}).get("threadId") == "dead-session"
                             for row in fixture_records(run, "codex-rpc.jsonl")),
                 f"a decision token's answer reaches the live session once as the bot's work, and nothing targets a dead one: {handle}")
@@ -2654,8 +2842,19 @@ def bot_settings_checks(run, a, network, passed):
                 if row["trigger"] == trigger and row["name"] == tool_name]
 
     def replies_to(prefix, conversation=name):
-        return [message for message in snapshot(conversation)["messages"]
-                if (message.get("in_reply_to") or "").startswith(prefix)]
+        replies = [event["body"] for event in scope_events(a, network, conversation)
+                   if event["body"].get("type") == "message_posted" and event["body"].get("role") == "assistant"
+                   and (event["body"].get("in_reply_to") or "").startswith(prefix)]
+        main = snapshot(conversation)
+        require(all(message.get("status") == "completed"
+                    and (job := scheduler_record(a, network, message["in_reply_to"]))
+                    and job["conversation_id"] == conversation and job["scope"] == "routine:" + message["in_reply_to"]
+                    and message.get("target") in (None, {"kind": "routine", "bot_id": main["bot"]["bot_id"],
+                                                        "trigger": message["in_reply_to"]}) for message in replies)
+                and not any((message.get("in_reply_to") or "").startswith(prefix)
+                            for message in main["messages"]),
+                "scheduled replies keep their exact signed Routine source and never enter Main")
+        return replies
 
     first_run = int(time.time() * 1000) + 3000
     profile = {"call_ref": "profile", "name": "Nova", "instructions": "bot-nova-instructions"}
@@ -2699,6 +2898,10 @@ def bot_settings_checks(run, a, network, passed):
 
     prefix = "schedule:" + saved["schedule_id"] + ":"
     replies = wait_for("the schedule runs at its first time", lambda: replies_to(prefix), timeout=60)
+    routine = scheduler_record(a, network, replies[0]["in_reply_to"])
+    require(routine["state"] == "completed" and routine["scope"] == "routine:" + replies[0]["in_reply_to"]
+            and routine["conversation_id"] == name,
+            "the signed Routine reply matches its actual scheduler completion and Bot conversation")
     deadline = time.monotonic() + 32
     while time.monotonic() < deadline:
         require(len(replies_to(prefix)) == 1, "one schedule time runs exactly once")
@@ -2973,10 +3176,11 @@ def phase1_acceptance(options):
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     nodes = []
+    fixture_roots = [run]
     report = {"status": "running", "source_binary": str(source_binary),
               "binary_sha256": file_sha256(binary),
               "core_binary_sha256": file_sha256(run / "vibeface-core"), "provider_calls": 0,
-              "coverage": "one real Node, durable Scheduler and signed log; fixture SDK",
+              "coverage": "real Node processes, durable Scheduler and signed log; controlled Codex protocol",
               "evidence": [], "not_checked": ["real Cursor/Codex model success",
                   "rendered browser UI", "cross-device delivery (phase 2)",
                   "instruction-boundary claim/final-commit crash injection (verify separately in Rust tests)"]}
@@ -2994,20 +3198,83 @@ def phase1_acceptance(options):
         return a.client.rpc("conversation", conversation_id=name)
 
     def new_conversation(name):
-        a.client.rpc("create_conversation", conversation_id=name, title=name)
+        a.client.rpc("create_bot", bot_id="bot-" + name, conversation_id=name, name=name, instructions="",
+                     project={"target_node": a.device_id, "cwd": str(workspace)})
         return name
 
-    def send(name, label, **directive):
-        text = json.dumps({"phase1": True, "label": label, **directive})
-        receipt = a.client.rpc("message", conversation_id=name, message_id=label, text=text,
-                               report_results=directive.get("report_results", False))
+    def accepted(name, label, receipt):
         require(receipt["accepted"] is True and receipt["message_id"] == label
                 and receipt["trigger"] == "message:" + label, "acceptance pins the message trigger")
         proof = receipt["receipt"]
         require(proof["network_id"] == network
                 and proof["conversation_id"] == name and proof["trigger"] == receipt["trigger"],
                 "durable receipt has the exact accepted identity")
-        return receipt, text
+        return receipt
+
+    def send(name, label, *, target=None, expected_revision=None, attachments=None, **directive):
+        text = json.dumps({"phase1": True, "label": label, **directive})
+        receipt = a.client.rpc("message", conversation_id=name, message_id=label, text=text,
+                               report_results=directive.get("report_results", False),
+                               **({"target": target} if target is not None else {}),
+                               **({"expected_revision": expected_revision} if expected_revision is not None else {}),
+                               **({"attachments": attachments} if attachments is not None else {}))
+        return accepted(name, label, receipt), text
+
+    def native_turn(name):
+        thread = wait_for("the controlled Bot invocation starts", lambda: calls(name))[0]["native_session_id"]
+        turn = wait_for("the fixture emits turnStarted before follow-up input", lambda: next(
+            (row["turn_id"] for row in fixture_records(run, "codex-inputs.jsonl")
+             if row["event"] == "turn_started" and row["thread_id"] == thread), None))
+        return thread, turn
+
+    def native_inputs(labels):
+        return [row for row in fixture_records(run, "codex-inputs.jsonl")
+                if row["event"] == "input" and row["message_id"] in labels]
+
+    def inputs_before_completion(thread, turn, labels, *, acknowledged=True):
+        rows = native_inputs(labels)
+        require([row["message_id"] for row in rows] == labels
+                and all(row["thread_id"] == thread and row["turn_id"] == turn and row["status"] == "inProgress" for row in rows),
+                "distinct native inputs reach the original active turn in target order")
+        records = fixture_records(run, "codex-inputs.jsonl")
+        require(not any(row["event"] == "turn_completed" and row["turn_id"] == turn for row in records),
+                "native input acceptance precedes the original turnCompleted barrier")
+        if acknowledged:
+            require([row["message_id"] for row in records if row["event"] == "input_ack"
+                     and row["message_id"] in labels] == labels,
+                    "the provider emits one acceptance receipt for each distinct input before completion")
+        requests = [row["message"] for row in fixture_records(run, "codex-rpc.jsonl")
+                    if row["message"].get("params", {}).get("threadId") == thread]
+        require(sum(request.get("method") == "turn/start" for request in requests) == 1
+                and not any(request.get("method") == "turn/interrupt" for request in requests),
+                "follow-ups add no new turn and never cancel the active turn")
+        return rows
+
+    def input_proof(name, label, target):
+        return a.client.rpc("input_receipt", conversation_id=name, message_id=label, target=target)
+
+    def batch_inputs(name, labels):
+        requests, texts = [], {}
+        for label in labels:
+            text = texts[label] = json.dumps({"phase1": True, "label": label, "report_results": True})
+            arguments = {"conversation_id": name, "message_id": label, "text": text, "report_results": True}
+            signature = a.client.attestation("message", arguments)
+            requests.append({"method": "rpc", "params": {"method": "message", **arguments, "attestation": signature}})
+        begun = a.client.command("begin_requests", requests=requests)
+        require(begun["first_pending_when_later_sent"] is True and len(begun["request_ids"]) == len(labels),
+                "later messages leave the client while its first RPC is still unresolved")
+        receipts = {}
+        def finished():
+            for label, request_id in zip(labels, begun["request_ids"]):
+                if label in receipts:
+                    continue
+                result = a.client.command("request_result", request_id=request_id)
+                if not result["pending"]:
+                    response = result["response"]
+                    require(not response.get("error"), "each concurrent signed input is durably accepted")
+                    receipts[label] = accepted(name, label, response["result"])
+            return receipts if len(receipts) == len(labels) else None
+        return wait_for("all concurrent input RPCs complete", finished), texts
 
     def state(receipt, expected):
         record = scheduler_record(a, network, receipt["trigger"])
@@ -3036,6 +3303,16 @@ def phase1_acceptance(options):
         a.client.call("subscribe")
         passed("one real Node bootstraps; the Manager uses a controlled protocol fixture")
 
+        bare = "phase1-no-bot"
+        a.client.rpc("create_conversation", conversation_id=bare, title="No Bot negative")
+        refused = a.client.rpc("message", conversation_id=bare, message_id="no-bot-input", text="must not run",
+                               target={"kind": "bot_main", "bot_id": "missing-fixture-bot"})
+        require(refused.get("accepted") is False and refused.get("stored") is False
+                and refused.get("code") == "input_not_saved"
+                and conversation(bare)["messages"] == [] and not calls(bare),
+                "a valid signed input to a missing Bot is rejected before persistence or provider execution")
+        passed("an explicitly missing Bot is refused without falling back to conversation-only input")
+
         name = new_conversation("phase1-queue")
         gate = run / "release-first"
         first, original = send(name, "queue-first", gate=str(gate))
@@ -3049,7 +3326,16 @@ def phase1_acceptance(options):
         retry = a.client.rpc("message", conversation_id=name, message_id="queue-first", text=original,
                              report_results=False)
         require(retry["trigger"] == first["trigger"], "message retry retains its exact trigger")
-        a.client.rpc("message", conversation_id=name, message_id="queue-first", text="changed", status=400)
+        stored_before_conflict = next(row for row in conversation(name)["messages"] if row["message_id"] == "queue-first")
+        conflict_calls = len(calls(name))
+        conflict = a.client.rpc("message", conversation_id=name, message_id="queue-first", text="changed")
+        require(conflict.get("accepted") is False and conflict.get("stored") is True
+                and conflict.get("code") == "input_conflict" and conflict.get("message_id") == "queue-first",
+                "changing a saved input returns its typed stored conflict")
+        require_quiet("a conflicting retry preserves the original message, trigger and provider call count", lambda:
+            [row for row in conversation(name)["messages"] if row["message_id"] == "queue-first"] == [stored_before_conflict]
+            and [row["trigger"] for row in calls(name, label="queue-first")] == [first["trigger"]]
+            and len(calls(name)) == conflict_calls)
         progress = wait_for("the client observes actual management text", lambda:
             [event["payload"] for event in a.client.command("events") if event.get("payload", {}).get("type") == "manager_progress"
              and event["payload"].get("conversation_id") == name and event["payload"].get("trigger") == first["trigger"]])
@@ -3111,31 +3397,419 @@ def phase1_acceptance(options):
         gate = run / "release-steer"
         first, _ = send(name, "steer-first", gate=str(gate), report_results=True)
         wait_for("the reply runs on its App Server turn", lambda: state(first, "running") and calls(name))
-        joined, joined_text = send(name, "steer-joined", report_results=True)
-        def steers():
-            return [row["message"] for row in map(json.loads, (run / "codex-rpc.jsonl").read_text().splitlines())
-                    if row["message"].get("method") == "turn/steer"
-                    and row["message"]["params"].get("clientUserMessageId") == "steer-joined"]
-        steering = wait_for("a message sent mid-reply joins the running turn",
-                            lambda: state(joined, "steering") and steers() and state(joined, "steering"))
-        into = json.loads(steering["detail"])["into"]
-        retry = a.client.rpc("message", conversation_id=name, message_id="steer-joined", text=joined_text,
+        thread, turn = native_turn(name)
+        labels = ["steer-m1", "steer-m2", "steer-m3"]
+        joined, texts = batch_inputs(name, labels)
+        wait_for("three concurrent messages reach the current native turn", lambda: len(native_inputs(labels)) == 3)
+        wait_for("the native server acknowledges every input", lambda: sum(row["event"] == "input_ack"
+                 and row.get("message_id") in labels for row in fixture_records(run, "codex-inputs.jsonl")) == 3)
+        inputs_before_completion(thread, turn, labels)
+        target = {"kind": "bot_main", "bot_id": "bot-" + name}
+        proofs = [wait_for("the owner reports actual provider acceptance", lambda label=label:
+                  (proof if (proof := input_proof(name, label, target))["stage"] in ("provider_accepted", "associated") else None))
+                  for label in labels]
+        require(all(proof["message_id"] == label and proof["target"] == target and proof["retry_safe"] is False
+                    and proof["actual_turn_id"] == turn
+                    for label, proof in zip(labels, proofs)), "input receipts retain each distinct target and forbid an unsafe resend")
+        retry = a.client.rpc("message", conversation_id=name, message_id=labels[0], text=texts[labels[0]],
                              report_results=True)
-        require(retry["trigger"] == joined["trigger"], "a retried message keeps its trigger")
+        require(retry["trigger"] == joined[labels[0]]["trigger"], "a retried message keeps its trigger")
         gate.touch()
         done = wait_for("the reply that took the message completes", lambda: completed(first))
         answer = reply(name, done)
-        merged = wait_for("the joined message settles once its reply completed", lambda: state(joined, "steered"))
-        require(json.loads(merged["detail"])["outcome"] == "answered", "the joined message was answered by that reply")
-        require(len(steers()) == 1 and steers()[0]["params"]["expectedTurnId"] == into["turn_id"],
-                "the message is steered once into the running turn, whatever the retries")
-        require(len(answer) == 1 and answer[0]["text"].endswith("+steer-joined"),
-                "the running turn's one reply answers the joined message")
-        require(len(calls(name)) == 1 and state(joined, "steered")
-                and not any(message.get("in_reply_to") == "steer-joined" for message in conversation(name)["messages"]),
-                "a joined message gets no turn or reply of its own")
-        passed("a message sent while the bot replies joins that reply through one turn/steer",
-               trigger=joined["trigger"], turn=into["turn_id"])
+        merged = [wait_for("each joined message settles after the same reply", lambda label=label: state(joined[label], "steered"))
+                  for label in labels]
+        require(all(json.loads(job["detail"])["outcome"] == "answered" for job in merged),
+                "each concurrent message was answered by the original reply")
+        require([row["message_id"] for row in native_inputs(labels)] == labels
+                and len(answer) == 1 and all("+" + label in answer[0]["text"] for label in labels),
+                "retries never repeat a native write and the original reply answers all three inputs")
+        require(len(calls(name)) == 1
+                and not any(message.get("in_reply_to") in labels for message in conversation(name)["messages"]),
+                "joined messages get no new turn or separate reply")
+        passed("three distinct inputs reach one active turn before completion while the first RPC is unresolved",
+               message_ids=labels, thread=thread, turn=turn, native_receipts=len(proofs))
+
+        name = new_conversation("phase1-ack-lost")
+        gate = run / "release-ack-lost"
+        first, _ = send(name, "ack-lost-first", gate=str(gate), report_results=True)
+        thread, turn = native_turn(name)
+        (run / "fixture-codex-drop-steer-ack").write_text("ack-lost-input")
+        joined, text = send(name, "ack-lost-input", report_results=True)
+        wait_for("the provider accepts the input before losing its ACK", lambda: any(
+            row["event"] == "ack_dropped" and row["message_id"] == "ack-lost-input"
+            for row in fixture_records(run, "codex-inputs.jsonl")))
+        inputs_before_completion(thread, turn, ["ack-lost-input"], acknowledged=False)
+        duplicate = a.client.rpc("message", conversation_id=name, message_id="ack-lost-input", text=text, report_results=True)
+        require(duplicate["trigger"] == joined["trigger"], "client retry preserves the uncertain input's identity")
+        target = {"kind": "bot_main", "bot_id": "bot-" + name}
+        proof = wait_for("the owner reads back the actual accepted input", lambda:
+            (value if (value := input_proof(name, "ack-lost-input", target))["stage"] in ("provider_accepted", "associated")
+             and value["actual_turn_id"] == turn else None))
+        require(proof["retry_safe"] is False, "a lost provider ACK never becomes permission to repeat the write")
+        require_quiet("ACK loss and same-ID retry never send again", lambda: len(native_inputs(["ack-lost-input"])) == 1)
+        (run / "fixture-codex-drop-steer-ack").unlink()
+        gate.touch()
+        wait_for("the original reply completes after the read-back", lambda: completed(first))
+        wait_for("the uncertain joined input settles from native evidence", lambda: state(joined, "steered"))
+        passed("a lost provider ACK is read back by the same message ID and never resubmitted", turn=turn, native_writes=1)
+
+        slow = new_conversation("phase1-slow-read")
+        fast = new_conversation("phase1-independent-read")
+        slow_gate, fast_gate, read_gate = (run / name for name in ("release-slow-read", "release-independent-read", "release-read-response"))
+        slow_first, _ = send(slow, "slow-read-first", gate=str(slow_gate), report_results=True)
+        fast_first, _ = send(fast, "independent-read-first", gate=str(fast_gate), report_results=True)
+        slow_thread, slow_turn = native_turn(slow)
+        fast_thread, fast_turn = native_turn(fast)
+        barrier = run / "fixture-codex-read-barrier.json"
+        private_json(barrier, {"thread_id": slow_thread, "gate": str(read_gate)})
+        dropped_ack = run / "fixture-codex-drop-steer-ack"
+        dropped_ack.write_text("slow-read-input")
+        slow_joined, _ = send(slow, "slow-read-input", report_results=True)
+        wait_for("A's input is persisted before its ACK is lost", lambda: any(
+            row["event"] == "ack_dropped" and row["message_id"] == "slow-read-input"
+            for row in fixture_records(run, "codex-inputs.jsonl")))
+        wait_for("A's native read-back is held without completing its turn", lambda: any(
+            row["event"] == "read_blocked" and row["thread_id"] == slow_thread
+            for row in fixture_records(run, "codex-inputs.jsonl")))
+        inputs_before_completion(slow_thread, slow_turn, ["slow-read-input"], acknowledged=False)
+        dropped_ack.unlink()
+        fast_joined, _ = send(fast, "independent-read-input", report_results=True)
+        wait_for("B's input reaches its active turn while A's read is held", lambda: native_inputs(["independent-read-input"]))
+        wait_for("B gets its native input receipt independently", lambda: any(
+            row["event"] == "input_ack" and row["message_id"] == "independent-read-input"
+            for row in fixture_records(run, "codex-inputs.jsonl")))
+        inputs_before_completion(fast_thread, fast_turn, ["independent-read-input"])
+        require(not read_gate.exists() and state(slow_first, "running") and state(fast_first, "running"),
+                "the blocked target remains live when the other target's provider accepts its input")
+        fast_gate.touch()
+        wait_for("B finishes independently of A's held read-back", lambda: completed(fast_first))
+        wait_for("B's joined input settles independently", lambda: state(fast_joined, "steered"))
+        require(state(slow_first, "running") and not read_gate.exists(), "B completes while A's read is still blocked")
+        read_gate.touch()
+        barrier.unlink()
+        slow_gate.touch()
+        wait_for("A finishes after its read barrier is released", lambda: completed(slow_first))
+        wait_for("A's joined input settles after its own release", lambda: state(slow_joined, "steered"))
+        require([row["message_id"] for row in native_inputs(["slow-read-input", "independent-read-input"])]
+                == ["slow-read-input", "independent-read-input"],
+                "held read-back preserves both unique input IDs with exactly one native write each")
+        passed("a blocked native read-back for one Bot never blocks another Bot's input or completion",
+               blocked_turn=slow_turn, independent_turn=fast_turn)
+
+        name = new_conversation("phase1-attachment-order")
+        gate = run / "release-attachment-order"
+        first, _ = send(name, "attachment-order-first", gate=str(gate), report_results=True)
+        thread, turn = native_turn(name)
+        image = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+        digest = hashlib.sha256(image).hexdigest()
+        attachment = {"hash": digest, "size": len(image), "name": "ordered-input.png"}
+        uploaded = a.client.rpc("upload_attachment", conversation_id=name, hash=digest, size=len(image),
+                                offset=0, data=base64.b64encode(image).decode())
+        require(uploaded["complete"] is True, "the exact signed input attachment is committed before posting")
+        native_gate = run / "release-attachment-native-input"
+        barrier = run / "fixture-codex-steer-barrier.json"
+        private_json(barrier, {"message_id": "attachment-order-m1", "gate": str(native_gate)})
+        with_image, _ = send(name, "attachment-order-m1", attachments=[attachment], report_results=True)
+        wait_for("the complete image waits at its controlled native input gate", lambda: any(
+            row["event"] == "input_blocked" and row["message_id"] == "attachment-order-m1"
+            for row in fixture_records(run, "codex-inputs.jsonl")))
+        text_only, _ = send(name, "attachment-order-m2", report_results=True)
+        labels = ["attachment-order-m1", "attachment-order-m2"]
+        saved = conversation(name)["messages"]
+        require([row["message_id"] for row in saved if row["message_id"] in labels] == labels,
+                "both input intents are durably saved while the first native input remains blocked")
+        require_quiet("text cannot overtake its target's blocked image input", lambda: not native_inputs(labels))
+        native_gate.touch()
+        barrier.unlink()
+        wait_for("the complete image and following text reach the provider", lambda: len(native_inputs(labels)) == 2)
+        wait_for("both ordered inputs receive native ACKs", lambda: sum(row["event"] == "input_ack"
+                 and row.get("message_id") in labels for row in fixture_records(run, "codex-inputs.jsonl")) == 2)
+        rows = inputs_before_completion(thread, turn, labels)
+        expected_image = "data:image/png;base64," + base64.b64encode(image).decode()
+        require([part["url"] for part in rows[0]["input"] if part["type"] == "image"] == [expected_image]
+                and any(digest in part.get("text", "") and "ordered-input.png" in part.get("text", "") for part in rows[0]["input"])
+                and not any(part["type"] == "image" for part in rows[1]["input"]),
+                "the provider receives the complete named image only on its original input")
+        gate.touch()
+        wait_for("the attachment target's original turn completes", lambda: completed(first))
+        for joined in (with_image, text_only):
+            wait_for("each attachment-ordered input settles", lambda joined=joined: state(joined, "steered"))
+        passed("a following text input never overtakes its target's blocked complete image input",
+               message_ids=labels, attachment_hash=digest, bytes=len(image), turn=turn)
+
+        name = new_conversation("phase1-workspace-tasks")
+        reviewer = new_conversation("phase1-workspace-reviewer")
+        bot_id, reviewer_id = "bot-" + name, "bot-" + reviewer
+        channel_id = "phase1-workspace-channel"
+        channel_command = {"kind": "create_channel", "channel_id": channel_id, "title": "Controlled workspace",
+                           "purpose": "Keep two business tasks separate", "members": sorted([bot_id, reviewer_id]),
+                           "coordinator_bot": bot_id, "coordinator_node": a.device_id}
+        created = a.client.rpc("workspace_command", command_id="phase1-create-channel", command=channel_command)
+        duplicate = a.client.rpc("workspace_command", command_id="phase1-create-channel", command=channel_command)
+        require(created["event_hash"] == duplicate["event_hash"] and duplicate["duplicate"] is True,
+                "retrying the same signed Channel creation reads the original command")
+        channel = next(row for row in a.client.rpc("workspace_state", channel_id=channel_id)["channels"]
+                       if row["channel_id"] == channel_id)
+        require(channel["members"] == sorted([bot_id, reviewer_id]) and channel["coordinator_bot"] == bot_id
+                and channel["coordinator_node"] == a.device_id and channel["revision"] == 1,
+                "the real shared Channel retains its members and coordinator identity")
+        task_ids = ["phase1-task-alpha", "phase1-task-beta"]
+        for task_id in task_ids:
+            a.client.rpc("workspace_command", command_id="create-" + task_id, command={
+                "kind": "create_task", "task_id": task_id, "channel_id": channel_id, "owner_bot": bot_id,
+                "title": task_id, "request": "private request for " + task_id, "expected_result": "one isolated reply",
+                "source_events": [], "dependencies": [], "reply_only": False})
+        require(not calls(name), "creating business Task intentions alone never invokes the provider")
+        targets = [{"kind": "channel_task", "channel_id": channel_id, "task_id": task_ids[0], "bot_id": bot_id},
+                   {"kind": "task", "task_id": task_ids[1]}]
+        task_gates = [run / ("release-" + task_id) for task_id in task_ids]
+        invocations, task_threads = [], []
+        for task_id, target, gate in zip(task_ids, targets, task_gates):
+            first, _ = send(name, task_id + "-first", target=target, expected_revision=1,
+                            gate=str(gate), report_results=True)
+            invocation = wait_for("each business Task starts its own native session", lambda task_id=task_id:
+                                  calls(name, label=task_id + "-first"))[0]
+            invocations.append(invocation)
+            require(invocation["kind"] == "human" and invocation["scope"] == {"kind": "workspace_task", "task_id": task_id}
+                    and invocation["workspace_task_id"] == task_id,
+                    "a Task's signed human input keeps its stable task scope independently of its trigger kind")
+            thread = invocation["native_session_id"]
+            task_threads.append(thread)
+            require(state(first, "running"), "the Task's actual first turn runs before its follow-up is sent")
+            turn = wait_for("each Task emits its own turnStarted", lambda: next(
+                (row["turn_id"] for row in fixture_records(run, "codex-inputs.jsonl")
+                 if row["event"] == "turn_started" and row["thread_id"] == thread), None))
+            label = task_id + "-follow"
+            joined, _ = send(name, label, target=target, expected_revision=1, report_results=True)
+            wait_for("each follow-up reaches its own Task turn", lambda label=label: native_inputs([label]))
+            wait_for("each Task's provider ACK is visible", lambda label=label: any(
+                row["event"] == "input_ack" and row["message_id"] == label
+                for row in fixture_records(run, "codex-inputs.jsonl")))
+            inputs_before_completion(thread, turn, [label])
+            gate.touch()
+            wait_for("the Task completes before the same workspace is used by its sibling", lambda: completed(first))
+            wait_for("the Task's own joined input settles", lambda: state(joined, "steered"))
+        require(len(set(task_threads)) == 2, "two Tasks owned by one Bot retain distinct native sessions")
+        require(all(task_id + "-first" in invocation["trigger_text"]
+                    and not any(sibling in text for text in invocation["messages"])
+                    for task_id, sibling, invocation in zip(task_ids, task_ids[::-1], invocations)),
+                "each actual provider prompt contains its own trigger and excludes its sibling Task's private messages")
+        for task_id in task_ids:
+            label = task_id + "-follow"
+            history = a.client.rpc("workspace_history", task_id=task_id, limit=100)
+            inputs = [row["body"]["message_id"] for row in history["events"] if row["kind"] == "input_posted"]
+            require(set(inputs) == {task_id + "-first", label} and history["coverage"]["scope"] == "task"
+                    and history["coverage"]["truncated"] is False,
+                    "Task history returns its actual inputs without its sibling Task's private conversation")
+        sessions = scheduler_sessions(a, name)
+        require(all(sessions["workspace_task:" + task_id]["native_id"] == thread
+                    for task_id, thread in zip(task_ids, task_threads)),
+                "stable Task IDs own separate persisted scheduler session keys")
+        stale_calls = len(calls(name))
+        stale = a.client.rpc("message", conversation_id=name, message_id="phase1-task-stale", text="stale revision",
+                             target=targets[0], expected_revision=0)
+        require(stale.get("accepted") is False and stale.get("stored") is False
+                and stale.get("code") == "input_not_saved" and stale.get("message_id") == "phase1-task-stale"
+                and isinstance(stale.get("reason"), str) and "revision" in stale["reason"].lower(),
+                "a stale Task revision returns a typed refusal before saving or invoking")
+        require_quiet("the stale input stays outside shared records and every provider call", lambda:
+            not any(row["message_id"] == "phase1-task-stale" for row in conversation(name)["messages"])
+            and len(calls(name)) == stale_calls and not native_inputs(["phase1-task-stale"]))
+        channel_history = a.client.rpc("workspace_history", channel_id=channel_id, limit=100)
+        require({row["body"]["message_id"] for row in channel_history["events"] if row["kind"] == "input_posted"}
+                == {task_id + suffix for task_id in task_ids for suffix in ("-first", "-follow")},
+                "Channel history includes both related Tasks through their real business identities")
+        passed("a real Channel keeps two same-Bot Tasks in separate persistent scopes and private histories",
+               channel=channel_id, task_ids=task_ids, native_sessions=task_threads)
+
+        child_workspace = run / "delegate-workspace"
+        child_workspace.mkdir()
+        child_fixture = run / "delegate-fixture"
+        child_fixture.mkdir(mode=0o700)
+        fixture_roots.append(child_fixture)
+        b = Node(run, "DELEGATE", binary, child_workspace, helper)
+        nodes.append(b)
+        b.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(child_fixture, child_workspace),
+                    bins={"codex": str(fixture_wrapper(child_fixture, "fixture-codex", "--fixture-codex"))},
+                    app_server=SPAWN_APP_SERVER)
+        b.pair(a)
+        b.start()
+        root_workspace = run / "delegate-root-workspace"
+        root_workspace.mkdir()
+        root_fixture = run / "delegate-root-fixture"
+        root_fixture.mkdir(mode=0o700)
+        fixture_roots.append(root_fixture)
+        root_node = Node(run, "ROOT", binary, root_workspace, helper)
+        nodes.append(root_node)
+        root_node.configure(timeout_secs=600, daily_decision_limit=100,
+                            manager=fixture_manager_settings(root_fixture, root_workspace),
+                            bins={"codex": str(fixture_wrapper(root_fixture, "fixture-codex", "--fixture-codex"))},
+                            app_server=SPAWN_APP_SERVER)
+        root_node.pair(a)
+        root_node.start()
+        root_node.client = Client(root_node.url, helper, identity_file=a.client.identity_file)
+        root_node.client.connect(root_node.device_id)
+        wait_for("the original management client authenticates at the root Node", lambda:
+                 root_node.client.authenticate(network))
+        coordinator = new_conversation("phase1-delegate-coordinator")
+        coordinator_bot = "bot-" + coordinator
+        root_bot, root_conversation = "phase1-delegate-root", "phase1-delegate-root-history"
+        a.client.rpc("create_bot", bot_id=root_bot, conversation_id=root_conversation, name="Root waits for child",
+                     instructions="Return the assigned task result", scheduler_node=root_node.device_id,
+                     project={"target_node": root_node.device_id, "cwd": str(root_workspace)})
+        child_bot, child_conversation = "phase1-delegate-child", "phase1-delegate-child-history"
+        a.client.rpc("create_bot", bot_id=child_bot, conversation_id=child_conversation, name="Reply-only child",
+                     instructions="Return the assigned task result", scheduler_node=b.device_id,
+                     project={"target_node": b.device_id, "cwd": str(child_workspace)})
+        channel_id, root_task, child_task = "phase1-delegate-channel", "phase1-delegate-root-task", "phase1-delegate-child-task"
+        root_assignment, child_assignment = "phase1-delegate-root-assignment", "phase1-delegate-child-assignment"
+        a.client.rpc("workspace_command", command_id="phase1-delegate-channel-create", command={
+            "kind": "create_channel", "channel_id": channel_id, "title": "Delegated result", "purpose": "A real child must finish first",
+            "members": sorted([coordinator_bot, root_bot, child_bot]), "coordinator_bot": coordinator_bot, "coordinator_node": a.device_id})
+        wait_for("the delegated Bots and Channel reach their actual owners", lambda: converged((a, root_node, b), network), timeout=60)
+        child_gate, root_gate, main_gate = (run / value for value in ("release-delegate-child", "release-delegate-root", "release-delegate-main"))
+        state_arguments = {"channel_id": channel_id, "limit": 100}
+        child_directive = {"label": "delegate-child", "gate": str(child_gate), "tools": [
+            {"name": "workspace_state", "arguments": state_arguments},
+            {"name": "workspace_command", "cli": True, "accepted": False,
+             "rejection": "reply-only tasks cannot dispatch or control other work", "arguments": {
+                 "call_ref": "forbidden-child-dispatch", "command": {
+                     "kind": "create_task", "task_id": "phase1-forbidden-grandchild", "channel_id": channel_id,
+                     "parent_task_id": child_task, "owner_bot": child_bot, "title": "must not run", "request": "must not run",
+                     "expected_result": "must not exist", "source_events": [], "dependencies": [], "reply_only": True}}},
+            {"name": "workspace_state", "arguments": state_arguments}]}
+        root_request = json.dumps({"label": "delegate-root", "gate": str(root_gate)})
+        commands = [
+            {"kind": "create_task", "task_id": root_task, "channel_id": channel_id, "owner_bot": root_bot,
+             "title": "Root waits for its child", "request": root_request, "expected_result": "delegate-root:complete",
+             "source_events": [], "dependencies": [], "reply_only": False},
+            {"kind": "create_task", "task_id": child_task, "channel_id": channel_id, "parent_task_id": root_task,
+             "owner_bot": child_bot, "title": "Reply once", "request": json.dumps(child_directive),
+             "expected_result": "delegate-child:complete", "source_events": [], "dependencies": [], "reply_only": True},
+            {"kind": "revise_task", "task_id": root_task, "expected_revision": 1, "request": root_request,
+             "expected_result": "delegate-root:complete", "dependencies": [child_task]},
+            {"kind": "assign_task", "task_id": root_task, "expected_revision": 2, "assignment_id": root_assignment,
+             "bot_id": root_bot, "execution_node": root_node.device_id, "bot_owner_epoch": 1, "channel_owner_epoch": 1,
+             "resource_roots": [str(root_workspace)], "automatic": True},
+            {"kind": "assign_task", "task_id": child_task, "expected_revision": 1, "assignment_id": child_assignment,
+             "bot_id": child_bot, "execution_node": b.device_id, "bot_owner_epoch": 1, "channel_owner_epoch": 1,
+             "resource_roots": [str(child_workspace)], "automatic": True},
+        ]
+        coordinating, _ = send(coordinator, "delegate-coordinate", gate=str(main_gate), tools=[
+            {"name": "workspace_command", "cli": True, "arguments": {"call_ref": "delegate-command-" + str(index), "command": command}}
+            for index, command in enumerate(commands)])
+        coordinator_commands = wait_for("the coordinator issues all five commands through the real scoped CLI", lambda:
+            (rows if len(rows := [row for row in fixture_records(run, "manager-tools.jsonl")
+                if row["trigger"] == coordinating["trigger"] and row["name"] == "workspace_command"
+                and row.get("cli") and row["accepted"]]) == 5 else None), timeout=60)
+        require([row["call_ref"] for row in coordinator_commands] == ["delegate-command-" + str(index) for index in range(5)]
+                and state(coordinating, "running") and not main_gate.exists(),
+                "the same active coordinating Main turn accepts all five exact CLI command references")
+        child_call = wait_for("the assigned child actually reaches its owner's provider", lambda: next(
+            (row for row in fixture_records(child_fixture) if row["label"] == "delegate-child"), None), timeout=60)
+        child_tools = wait_for("the reply-only child completes the real CLI rejection and read-back", lambda:
+            (rows if len(rows := [row for row in fixture_records(child_fixture, "manager-tools.jsonl")
+                if row["trigger"] == "assignment:" + child_assignment and row["name"] == "workspace_state"]) == 2 else None), timeout=60)
+        require(child_call["trigger"] == "assignment:" + child_assignment
+                and child_call["kind"] == "workspace_task" and child_call["workspace_task_id"] == child_task
+                and child_call["scope"] == {"kind": "workspace_task", "task_id": child_task}
+                and child_call["assignment_id"] == child_assignment and child_call["reply_only"] is True,
+                "a genuine assignment turn executes in the child Bot's stable task scope without a forged human input")
+        for row in child_tools:
+            require({task["task_id"] for task in row["result"]["tasks"]} == {child_task}
+                    and {assignment["assignment_id"] for assignment in row["result"]["assignments"]} == {child_assignment},
+                    "the reply-only child reads the same actual task and assignment before and after rejection")
+        child_catalog = next(row for row in fixture_records(child_fixture, "manager-catalogs.jsonl")
+                             if row["trigger"] == "assignment:" + child_assignment)
+        require(set(child_catalog["available"]) == READ_TOOLS and WORK_TOOLS <= set(child_catalog["unavailable"]),
+                "the reply-only provider sees only reads and cannot discover any work tool")
+
+        def live_assignment(node, fixture, assignment_id, task_id, invocation):
+            def recorded():
+                with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+                    return connection.execute(
+                        "SELECT j.attempt_id,t.thread_id,t.turn_id FROM scheduler_jobs j JOIN manager_turns t ON t.attempt_id=j.attempt_id "
+                        "WHERE j.conversation_id=? AND j.trigger=? AND j.scope=? AND j.state='running' AND t.turn_id IS NOT NULL",
+                        (invocation["conversation_id"], "assignment:" + assignment_id, "workspace_task:" + task_id)).fetchone()
+            native = wait_for("the running assignment persists its actual native turn", recorded)
+            events = fixture_records(fixture, "codex-inputs.jsonl")
+            require(native[1] == invocation["native_session_id"]
+                    and [(row["thread_id"], row["turn_id"]) for row in events if row["event"] == "turn_started"] == [native[1:]]
+                    and not any(row["event"] == "turn_completed" for row in events),
+                    "the live scheduler attempt and sole native turn agree before its gate is released")
+            return native
+
+        child_native = live_assignment(b, child_fixture, child_assignment, child_task, child_call)
+        root_queued = wait_for("the root assignment is durably queued behind its necessary dependency", lambda:
+            (row if (row := scheduler_record(root_node, network, "assignment:" + root_assignment)) and row["state"] == "queued" else None))
+        shared = root_node.client.rpc("workspace_state", channel_id=channel_id)
+        require(root_queued["attempt"] is None
+                and next(task for task in shared["tasks"] if task["task_id"] == root_task)["state"] == "waiting_dependencies"
+                and not fixture_records(root_fixture) and not child_gate.exists(),
+                "the root has no provider attempt while its required child is still running")
+        child_gate.touch()
+        wait_for("the actual child result reaches the root's shared state", lambda: next(
+            (assignment for assignment in root_node.client.rpc("workspace_state", channel_id=channel_id)["assignments"]
+             if assignment["assignment_id"] == child_assignment and assignment["state"] == "completed"), None), timeout=60)
+        root_call = wait_for("the existing queued root starts after the child result", lambda: next(
+            (row for row in fixture_records(root_fixture) if row["label"] == "delegate-root"), None), timeout=60)
+        require(root_call["trigger"] == "assignment:" + root_assignment
+                and root_call["conversation_id"] == root_conversation
+                and root_call["kind"] == "workspace_task" and root_call["workspace_task_id"] == root_task
+                and root_call["scope"] == {"kind": "workspace_task", "task_id": root_task}
+                and root_call["assignment_id"] == root_assignment and len(fixture_records(root_fixture)) == 1,
+                "dependency completion continues the original root assignment exactly once")
+        root_native = live_assignment(root_node, root_fixture, root_assignment, root_task, root_call)
+        root_gate.touch()
+        wait_for("both actual assignments report their final results", lambda:
+            (value if len((value := a.client.rpc("workspace_state", channel_id=channel_id))["assignments"]) == 2
+             and all(row["state"] == "completed" for row in value["assignments"]) else None), timeout=60)
+        shared = a.client.rpc("workspace_state", channel_id=channel_id)
+        require({row["task_id"] for row in shared["tasks"]} == {root_task, child_task}
+                and all(row["state"] == "completed" for row in shared["tasks"])
+                and {row["assignment_id"]: row["result"] for row in shared["assignments"]}
+                    == {root_assignment: "delegate-root:complete", child_assignment: "delegate-child:complete"},
+                "only the intended root and reply-only child complete with their real provider results")
+        for node, fixture, assignment_id, task_id, native in ((root_node, root_fixture, root_assignment, root_task, root_native),
+                                                           (b, child_fixture, child_assignment, child_task, child_native)):
+            job = wait_for("the assignment's actual scheduler job is completed", lambda:
+                (row if (row := scheduler_record(node, network, "assignment:" + assignment_id)) and row["state"] == "completed" else None))
+            finished = [row for row in fixture_records(fixture, "codex-inputs.jsonl") if row["event"] == "turn_completed"]
+            require(job["kind"] == "workspace_task" and job["scope"] == "workspace_task:" + task_id
+                    and job["attempt"]["id"] == native[0]
+                    and [(row["thread_id"], row["turn_id"], row["status"]) for row in finished]
+                        == [(native[1], native[2], "completed")],
+                    "the completed assignment keeps the captured scheduler attempt and its sole actual native result")
+        require(state(coordinating, "running") and not main_gate.exists(),
+                "the coordinating Main turn stays active until both real assignments complete")
+        main_gate.touch()
+        wait_for("the coordinating Main turn completes after its real delegated work", lambda: completed(coordinating))
+        wait_for("all owners retain the same final signed facts", lambda: converged((a, root_node, b), network), timeout=60)
+        for task_id, history, assignment_id, bot_id, expected in (
+                (root_task, root_conversation, root_assignment, root_bot, "delegate-root:complete"),
+                (child_task, child_conversation, child_assignment, child_bot, "delegate-child:complete")):
+            messages = a.client.rpc("conversation", conversation_id=history)["messages"]
+            task_history = a.client.rpc("workspace_history", task_id=task_id, limit=100)
+            replies = [row for row in task_history["events"] if row["kind"] == "message_posted"
+                       and row["body"]["role"] == "assistant"]
+            with sqlite3.connect(f"file:{a.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+                human_inputs = connection.execute("SELECT count(*) FROM events WHERE network_id=? AND scope_id=? AND kind='input_posted'",
+                                                  (network, history)).fetchone()[0]
+            require(human_inputs == 0 and messages == [] and task_history["coverage"]["scope"] == "task"
+                    and task_history["coverage"]["truncated"] is False
+                    and not any(row["kind"] == "input_posted" for row in task_history["events"])
+                    and [(row["scope_id"], row["speaker"], row["body"]["text"], row["body"]["status"], row["body"]["in_reply_to"])
+                         for row in replies] == [(history, {"kind": "bot", "bot_id": bot_id}, expected, "completed", assignment_id)],
+                    "each assigned Bot produces its exact scoped result without synthetic Human input or a Main message")
+        require(len(fixture_records(root_fixture)) == 1, "the root assignment executes exactly one provider turn")
+        require(len(fixture_records(child_fixture)) == 1, "a reply-only child never starts a grandchild or repeated provider turn")
+        root_node.stop()
+        b.stop()
+        stop_fixture_processes(root_fixture)
+        stop_fixture_processes(child_fixture)
+        passed("the real coordinator CLI assigns a child on another Node, waits for its result and rejects reply-only redispatch",
+               root_task=root_task, child_task=child_task, assignments=[root_assignment, child_assignment], child_native_turns=1)
 
         for unconfirmed in (False, True):
             name = new_conversation("phase1-cancel-" + str(unconfirmed).lower())
@@ -3265,7 +3939,8 @@ def phase1_acceptance(options):
         for node in reversed(nodes):
             node.client.close()
             node.stop()
-        stop_fixture_processes(run)
+        for fixture_root in fixture_roots:
+            stop_fixture_processes(fixture_root)
         private_json(run / "report.json", report)
         print("REPORT " + str(run / "report.json"), flush=True)
 
@@ -3688,7 +4363,7 @@ def acceptance(options):
     helper.chmod(0o600)
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
-              "coverage": "four real Node processes over iroh with a member relay; WASM browser client; fixture SDK",
+              "coverage": "five real Node processes over iroh (four members and one outsider) with a member relay; WASM browser client; fixture SDK",
               "not_checked": ["real NAT and public ingress (disjoint loopback IP families require the relay)",
                               "attachment resume is not covered here; --phase4 checks 64 MiB upload, restart and resume",
                               "non-member endpoints refused by sync and RPC are covered by Rust test "
@@ -3708,7 +4383,8 @@ def acceptance(options):
 
     def signed_message(client, conversation, message_id, text):
         body = {"conversation_id": conversation, "message_id": message_id, "text": text, "report_results": False}
-        return {"method": "message", **body, "attestation": client.attestation("message", dict(body))}
+        signature = client.attestation("message", body)
+        return {"method": "message", **body, "attestation": signature}
 
     try:
         relay_port = available_port()
@@ -3734,7 +4410,8 @@ def acceptance(options):
         for node in (b, c):
             node.start()
         conversation = "p3-conversation"
-        a.client.rpc("create_conversation", conversation_id=conversation, title="Phase 3 acceptance")
+        a.client.rpc("create_bot", bot_id="phase3-bot", conversation_id=conversation, name="Phase 3 acceptance",
+                     instructions="", project={"target_node": a.device_id, "cwd": str(workspace)})
         a.client.call("rpc", signed_message(a.client, conversation, "m1", "first message from A"))
         members = (a, p, b, c)
         synced = wait_for("A, P, B (IPv6-only) and C converge", lambda: converged(members, network), timeout=60)
@@ -3862,8 +4539,14 @@ def acceptance(options):
             view = at_c.rpc("conversation", conversation_id=conversation)
             job = next((row for row in view["scheduler"]["jobs"] if row["trigger"] == held["trigger"]), None)
             remote = view["scheduler"]["remote"]
+            scope_jobs = remote.get("scope_jobs")
             return view if job and job["state"] == state and job.get("source_node") == a.device_id \
-                and set(remote) == {"owner", "reachable", "context", "memory_staged_count", "memory_conflicts"} \
+                and set(remote) == {"owner", "reachable", "context", "scope_jobs", "memory_staged_count", "memory_conflicts"} \
+                and isinstance(scope_jobs, list) \
+                and all(isinstance(row, dict) and row.get("conversation_id") == conversation
+                        and row.get("source_node") == a.device_id and row.get("scope") == {"kind": "main"}
+                        for row in scope_jobs) \
+                and any(row.get("trigger") == held["trigger"] and row.get("state") == state for row in scope_jobs) \
                 and remote["owner"] == a.device_id and remote["reachable"] is True else None
         view = wait_for("C shows A's running reply", lambda: owner_job("running"), timeout=60)
         remote = view["scheduler"]["remote"]
@@ -3993,8 +4676,10 @@ def phase4_acceptance(options):
         return next((row["state"] for row in rows if row["work_id"] == work_id), None)
 
     def work_in(client, work_id, *states):
-        row = works(client).get(work_id)
-        return row if row and row["state"] in states else None
+        row = client.rpc("work_detail", conversation_id=conversation, work_id=work_id)["work"]
+        require(row["work_id"] == work_id and row["conversation_id"] == conversation,
+                "the work detail belongs to the exact requested identity and conversation")
+        return row if row["state"] in states else None
 
     def dispatched(node, label):
         return wait_for(f"{node.name} dispatches {label}", lambda: next(
@@ -4126,10 +4811,12 @@ def phase4_acceptance(options):
         passed("cross-entrance-context", messages=len(shown), native_session=t1["native_session_id"][:24],
                thread=done["thread_id"][:24], resumed=t2["resumed"])
 
+        turn(a, "work:" + continued)
         task_dir = folder("p4-task")
+        child_dir = folder("p4-task-child")
         task_directive = {"label": "p4-task", "gate": str(task_dir / "task-release"),
-                          "dispatch": {"label": "p4-task-child", "cwd": str(task_dir),
-                                       "native": {"gate": str(task_dir / "release"), "request": "item/commandExecution/requestApproval",
+                          "dispatch": {"label": "p4-task-child", "cwd": str(child_dir),
+                                       "native": {"gate": str(child_dir / "release"), "request": "item/commandExecution/requestApproval",
                                                   "request_mode": "ask"}},
                           "tools": [{"name": "answer_approval", "arguments": {"work_id": "any", "request_id": "any"},
                                      "accepted": False, "rejection": "unknown or unavailable"}]}
@@ -4147,30 +4834,73 @@ def phase4_acceptance(options):
         passed("cross-node-profile-generation", generation=new_session["shown"]["session_generation"],
                next_trigger=after_profile["trigger"], handoff=after_profile["handoff"])
         child = dispatched(b, "p4-task-child")
-        (task_dir / "release").touch()
+        (child_dir / "release").touch()
         question = wait_for("A shows the question B's Agent asked about its App Server request", lambda: next(
             (row for row in a.client.rpc("questions")["questions"] if row["about"]["node"] == b.device_id
              and row["about"].get("request_id")), None), timeout=90)
         question_id = question["question_id"]
-        require(question["conversation_id"] == conversation, "B's question lands in the chat that owns the child's thread")
+        require(question["conversation_id"] == conversation and question.get("target") == {"kind": "work", "work_id": task},
+                "B's question keeps the exact parent Task Work scope")
+        scoped_works = {work_id: at_b.rpc("work_detail", conversation_id=conversation, work_id=work_id)["work"]
+                        for work_id in (task, child)}
+        require(scoped_works[task]["cwd"] == str(task_dir) and scoped_works[child]["cwd"] == str(child_dir)
+                and all(scoped_works[work_id]["target_node"] == b.device_id for work_id in (task, child)),
+                "B's real parent and child run in their distinct sibling workspaces")
         task_turn = next(row for row in records(b) if row["trigger"] == "task:" + task)
         require(task_turn["kind"] == "agent_task", "B's own Agent runs the task")
         refused = [row for row in records(b, "manager-tool-errors.jsonl")
                    if row["trigger"] == "task:" + task and row["name"] == "answer_approval"]
         require(len(refused) == 1, "B's Agent has no tool to answer for the user")
-        answered = a.client.rpc("answer", question_id=question_id, text="允许", scope_id=conversation)
-        require(answered["status"] == "answered" and a.client.rpc("answer", question_id=question_id, text="允许",
+        answered = a.client.rpc("answer", question_id=question_id, text="允许本次", scope_id=conversation)
+        require(answered["status"] == "answered" and a.client.rpc("answer", question_id=question_id, text="允许本次",
                 scope_id=conversation)["message"] == answered["message"], "the user's answer at entrance A is written once")
-        answer_turn = turn(a, "message:a-" + question_id)
-        require(answer_turn["kind"] == "answer", "the answer is a turn of A's bot")
+        answer_trigger = "message:a-" + question_id
+        require(answered["receipt"] == {"network_id": network, "conversation_id": conversation,
+                                        "trigger": answer_trigger, "state": "pending_delivery"},
+                "A queues the user's signed answer for the Node holding the native request")
         wait_for("the answered child finishes", lambda: work_in(a.client, child, "finished"), timeout=60)
+
+        def held_delivery():
+            with sqlite3.connect(f"file:{b.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+                controls = connection.execute(
+                    "SELECT json_extract(result,'$.receipt.state'),json_extract(result,'$.receipt.trigger'),"
+                    "json_extract(result,'$.control.authority'),json_extract(result,'$.control.question_id'),"
+                    "json_extract(result,'$.control.answer_id'),json_extract(result,'$.control.answer_hash'),"
+                    "json_extract(result,'$.control.request.node'),json_extract(result,'$.control.request.request_id') "
+                    "FROM triage_handled WHERE json_extract(result,'$.control.question_id')=?", (question_id,)).fetchall()
+            with sqlite3.connect(f"file:{a.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+                delivered = connection.execute(
+                    "SELECT json_extract(value,'$.state') FROM identity_meta WHERE key LIKE 'mailbox:%' "
+                    "AND json_extract(value,'$.network_id')=? AND json_extract(value,'$.conversation_id')=? "
+                    "AND json_extract(value,'$.trigger')=?", (network, conversation, answer_trigger)).fetchall()
+            return controls == [("answer_control_saved", answer_trigger, "signed", question_id, "a-" + question_id,
+                                 answered["message"]["event_hash"], b.device_id, question["about"]["request_id"])] and delivered == [("delivered",)]
+
+        wait_for("B saves the same signed native control and A completes its outbox delivery", held_delivery, timeout=60)
+        answer_events = [[event for event in scope_events(node, network, conversation)
+                          if event["body"].get("answers") == question_id] for node in (a, b)]
+        require(len(answer_events[0]) == len(answer_events[1]) == 1 and answer_events[0] == answer_events[1]
+                and answer_events[0][0]["body"]["message_id"] == "a-" + question_id
+                and answer_events[0][0]["body"].get("attestation")
+                and answer_events[0][0]["body"]["text"] == "允许本次",
+                "A and B retain one identical signed answer fact after the same-ID retry")
         answers = [row for row in records(b, "codex-rpc.jsonl") if "method" not in row["message"]
                    and str(row["message"].get("id", "")).startswith("req-")]
-        acted = [row for row in records(a, "answer-actions.jsonl") if row["question_id"] == question_id]
-        require(len(answers) == 1 and answers[0]["message"]["result"] == {"decision": "accept"} and len(acted) == 1
-                and acted[0]["replies"][0] == acted[0]["replies"][1] and acted[0]["replies"][0]["by"] == "agent",
-                "A's bot answers B's held request once with respond --node")
-        starts = [row for row in codex_rpc(b, "thread/start") if row["message"]["params"]["cwd"] == str(task_dir)]
+        acted = [row for node in (a, b) for row in records(node, "answer-actions.jsonl") if row["question_id"] == question_id]
+        require(len(answers) == 1 and answers[0]["message"]["result"] == {"decision": "accept"} and not acted
+                and all(scheduler_record(node, network, answer_trigger) is None for node in (a, b))
+                and not any(row["kind"] == "answer" and row["trigger"] == answer_trigger
+                            for node in (a, b) for row in records(node))
+                and not any(row["question_id"] == question_id for client in (a.client, at_b)
+                            for row in client.rpc("conversation", conversation_id=conversation)["questions"]),
+                "A's same signed answer reaches B's trusted native control once without another Answer turn")
+        require_quiet("the held answer never replays its native callback or starts an ordinary Answer", lambda:
+                      len([row for row in records(b, "codex-rpc.jsonl") if "method" not in row["message"]
+                           and str(row["message"].get("id", "")).startswith("req-")]) == 1
+                      and all(scheduler_record(node, network, answer_trigger) is None for node in (a, b))
+                      and not any(row["question_id"] == question_id for node in (a, b)
+                                  for row in records(node, "answer-actions.jsonl")))
+        starts = [row for row in codex_rpc(b, "thread/start") if row["message"]["params"]["cwd"] == str(child_dir)]
         require(len(starts) == 1 and starts[0]["message"]["params"].get("approvalPolicy") == "never",
                 "B's Agent starts the child itself with full access")
         (task_dir / "task-release").touch()
@@ -4179,11 +4909,12 @@ def phase4_acceptance(options):
         turn(a, "work:" + task)
         wait_for("B's events reach A", lambda: converged(members, network), timeout=60)
         by_b = {event["body"]["type"] for event in scope_events(a, network, conversation) if event["author"] == b.device_id
+                and event["body"]["type"] != "input_posted"
                 and not (event["body"]["type"] == "message_posted" and event["body"]["role"] == "user")}
         require(by_b and by_b <= {"work_dispatched", "work_progress", "work_finished", "question_asked"},
                 "B's Agent writes only work events and its question to the conversation")
         passed("agent-task-on-target", task=task, child=child, b_event_types=sorted(by_b), question=question_id,
-               answer_turn=answer_turn["trigger"])
+               answer_trigger=answer_trigger, answer_control="signed")
 
         r4 = send(a.client, "p4-m4", {"label": "p4-m4", "tools": [
             {"name": "dispatch_work", "arguments": {"title": "outside", "prompt": "outside", "cwd": str(run), "call_ref": "outside-codex"},
@@ -4192,8 +4923,24 @@ def phase4_acceptance(options):
                                                     "target_node": b.device_id}}]})
         turn(a, r4["trigger"])
         remote = next(row for row in records(a, "manager-tools.jsonl") if row["call_ref"] == "outside-agent")["result"]
-        require(remote["state"] == "dispatch_rejected" and "outside configured roots" in remote["reason"], "B refuses an agent task outside its roots")
-        send(a.client, "p4-unsigned", "no signature", unsigned=True, status=400)
+        remote = wait_for("B confirms the outside-root task's refusal", lambda: next(
+            (row for row in a.client.rpc("conversation", conversation_id=conversation)["deliveries"]
+             if row["work_id"] == remote["work_id"] and row["state"] == "dispatch_rejected"), None), timeout=60)
+        require("outside configured roots" in remote["reason"], "B refuses an agent task outside its roots")
+        require_quiet("the rejected remote task never starts a provider turn", lambda:
+                      not any(row["trigger"] == "task:" + remote["work_id"] for row in records(b))
+                      and not any(row["message"]["params"].get("clientUserMessageId") == remote["work_id"]
+                                  for method in ("turn/start", "turn/steer") for row in codex_rpc(b, method)))
+        unsigned_calls = {node.name: len(records(node)) for node in (a, b, c)}
+        refused = send(a.client, "p4-unsigned", "no signature", unsigned=True)
+        require(refused.get("accepted") is False and refused.get("stored") is False
+                and refused.get("code") == "input_not_saved" and refused.get("message_id") == "p4-unsigned",
+                "an unsigned input returns a typed refusal before persistence")
+        require_quiet("the unsigned input creates no shared message or provider call on any execution Node", lambda:
+            not any(row["message_id"] == "p4-unsigned" for row in a.client.rpc("conversation", conversation_id=conversation)["messages"])
+            and all(len(records(node)) == unsigned_calls[node.name] for node in (a, b, c))
+            and all(not any(row.get("message_id") == "p4-unsigned" for row in records(node, "codex-inputs.jsonl"))
+                    for node in (a, b, c)))
         passed("authority-checks", codex="outside configured roots", agent=remote["reason"][:80], unsigned="rejected")
 
         revoked_dir = folder("p4-revoked")
@@ -4219,13 +4966,13 @@ def phase4_acceptance(options):
         require(delivery(a.client, lost) is None, "the unknown work drops its stop request")
         passed("offline-stop-and-revoke", stop="stop_timed_out", outcome=unknown["outcome"])
 
-        check_dir = folder("p4-check")
-        r6a = send(a.client, "p4-m6a", {"label": "p4-m6a", "dispatch": {"label": "p4-check-done", "cwd": str(check_dir),
-                                                                       "native": {"gate": str(check_dir / "release")}}})
+        check_dirs = [folder("p4-check-" + outcome) for outcome in ("done", "not")]
+        r6a = send(a.client, "p4-m6a", {"label": "p4-m6a", "dispatch": {"label": "p4-check-done", "cwd": str(check_dirs[0]),
+                                                                       "native": {"gate": str(check_dirs[0] / "release")}}})
         done_id = dispatched(a, "p4-check-done")
         turn(a, r6a["trigger"])
-        r6b = send(a.client, "p4-m6b", {"label": "p4-m6b", "dispatch": {"label": "p4-check-not", "cwd": str(check_dir),
-                                                                       "native": {"gate": str(check_dir / "release")}}})
+        r6b = send(a.client, "p4-m6b", {"label": "p4-m6b", "dispatch": {"label": "p4-check-not", "cwd": str(check_dirs[1]),
+                                                                       "native": {"gate": str(check_dirs[1] / "release")}}})
         not_id = dispatched(a, "p4-check-not")
         turn(a, r6b["trigger"])
         threads = [wait_for("the check work runs", lambda: work_in(a.client, work_id, "running"))["thread_id"] for work_id in (done_id, not_id)]
@@ -4255,21 +5002,21 @@ def phase4_acceptance(options):
         require(len(codex_rpc(a, "turn/start")) == turns_before, "settling a check never reruns the work")
         passed("pending-check-choices", recheck="pending", completed=done_id, interrupted=not_id)
 
-        for index in range(6):
-            send(a.client, f"p4-pad-{index}", f"p4-pad-{index} " + "背景资料" * 1200, report_results=False)
-        for index in range(6):
-            turn(a, f"message:p4-pad-{index}")
         for work_id in (done_id, not_id):
             turn(a, "work:" + work_id)
+        for index in range(6):
+            send(a.client, f"p4-pad-{index}", f"p4-pad-{index} " + "背景资料" * 1200, report_results=False)
+            turn(a, f"message:p4-pad-{index}")
         wait_for("A condenses the long history into a checkpoint", lambda: any(
             event["body"]["type"] == "context_checkpoint" for event in scope_events(a, network, conversation)), timeout=90)
         wait_for("the checkpoint reaches B", lambda: any(
             event["body"]["type"] == "context_checkpoint" for event in scope_events(b, network, conversation)), timeout=60)
         parallel_gate = workspace / "p4-parallel-release"
+        parallel_dirs = [folder("p4-parallel-" + str(index)) for index in range(2)]
         parallel = send(a.client, "p4-parallel", {"label": "p4-parallel", "tools": [
             {"name": "dispatch_work", "arguments": {"call_ref": f"parallel-{index}", "title": f"parallel-{index}",
                 "prompt": json.dumps({"label": f"p4-parallel-{index}", "gate": str(parallel_gate)}),
-                "cwd": str(workspace), "target_node": b.device_id}} for index in range(2)]})
+                "cwd": str(parallel_dirs[index]), "target_node": b.device_id}} for index in range(2)]})
         turn(a, parallel["trigger"])
         parallel_tasks = wait_for("two independent tasks are running on B", lambda: (lambda rows: rows if len(rows) == 2 else None)(
             [row for row in records(b) if row["label"] in ("p4-parallel-0", "p4-parallel-1")]), timeout=60)
@@ -4463,7 +5210,9 @@ def public_entry_acceptance(options):
         passed("browser-joins-the-member-through-the-public-entry", elapsed_ms=round((time.monotonic() - started) * 1000))
 
         conversation = "public-entry-chat"
-        phone.rpc("create_conversation", conversation_id=conversation, title="经公共入口")
+        phone.rpc("create_bot", bot_id="public-entry-bot", conversation_id=conversation, name="经公共入口",
+                  instructions="", scheduler_node=m.device_id,
+                  project={"target_node": m.device_id, "cwd": str(workspace)})
         phone.rpc("message", conversation_id=conversation, message_id="pe-1", text="你好")
         wait_for("M answers the phone", lambda: any(row["role"] == "assistant" for row in
                  phone.rpc("conversation", conversation_id=conversation)["messages"]), timeout=60)
@@ -4488,19 +5237,38 @@ def public_entry_acceptance(options):
         require(direct.connect(x.device_id, check=False).get("ok"), "X itself is running")
         passed("relay-refuses-a-wrong-token", error=str(outcome.get("error", ""))[:200])
 
-        work_dir = workspace / "pe-work"
+        wait_for("M's Main scheduler settles before the hook producer", lambda:
+                 not scheduler_sessions(m, conversation).get("main", {}).get("active") and all(
+                     row["state"] == "completed" for row in scheduler_records(m, network)
+                     if row["conversation_id"] == conversation and row["scope"] == "main"), timeout=60)
+        work_dir = workspace / "triage-raise-pe-work"
         work_dir.mkdir()
         (work_dir / "release").touch()
         phone.rpc("message", conversation_id=conversation, message_id="pe-3", text=json.dumps({"label": "pe-3", "dispatch": {
             "label": "pe-work", "cwd": str(work_dir), "native": {"gate": str(work_dir / "release")}}}))
-        thread_id = wait_for("M's Agent starts a Codex thread", lambda: next((thread_id for thread_id, thread in json.loads(
-            (fixture / "fixture-codex-state.json").read_text())["threads"].items() if thread["cwd"] == str(work_dir)), None)
-            if (fixture / "fixture-codex-state.json").exists() else None, timeout=60)
-        local_post(m, "/api/hooks", {"source": "hook", "agent": "codex", "event": "turn_end", "session_id": thread_id,
-                                     "turn_id": "pe-hook", "cwd": str(work_dir), "last_message": "需要你决定 needs-human"})
+        dispatch = wait_for("M records the public-entry source Work", lambda: next(
+            (row for row in fixture_records(fixture, "manager-native-work.jsonl")
+             if row["label"] == "pe-work" and row["trigger"] == "message:pe-3"), None), timeout=60)
+        source = wait_for("M's exact Work records its Codex thread and turn", lambda: next(
+            (row for row in phone.rpc("conversation", conversation_id=conversation)["works"]
+             if row["work_id"] == dispatch["work_id"] and row["state"] == "finished"
+             and row.get("thread_id") and row.get("turn_id")), None), timeout=60)
+        require(source["trigger"] == "message:pe-3" and source["target_node"] == m.device_id
+                and source["cwd"] == str(work_dir) and source["kind"] == "codex" and source["outcome"] == "completed",
+                "the public-entry hook keeps its original Work's native identity")
+        wait_for("M's source Human turn completes before the answer", lambda:
+                 (scheduler_record(m, network, "message:pe-3") or {}).get("state") == "completed", timeout=60)
+        wait_for("M's source WorkResult turn completes before the answer", lambda:
+                 (scheduler_record(m, network, "work:" + source["work_id"]) or {}).get("state") == "completed", timeout=60)
+        thread_id = source["thread_id"]
+        for _ in range(2):
+            local_post(m, "/api/hooks", {"source": "hook", "agent": "codex", "event": "turn_end", "session_id": thread_id,
+                                         "turn_id": source["turn_id"], "cwd": str(work_dir), "last_message": "需要你决定 needs-human"})
         question = wait_for("M's Agent asks in the chat that owns the thread", lambda: next(
             (row for row in m.client.rpc("questions")["questions"] if row["about"]["session_id"] == thread_id), None), timeout=90)
         question_id = question["question_id"]
+        require(question.get("target") == {"kind": "work", "work_id": source["work_id"]},
+                "the repeated hook's question keeps the actual Work scope")
         token = m.client.call("create_decision_token", {"label": "grok"})["token"]
         decision = {"device_id": m.device_id, "question_id": question_id, "text": "经入口送达的回答"}
         sent = p.client.request("/api/decision", decision, origin=False, headers={"Authorization": "Bearer " + token}, timeout=60)
@@ -4517,6 +5285,23 @@ def public_entry_acceptance(options):
                                   "text": "经入口送达的回答"} and question["conversation_id"] == conversation
                 and len(acted) == 1 and len(sends) == 1,
                 "a decision token's POST through P answers M's question once and the answer reaches the thread once; a wrong token gets 401")
+        before_unknown = len([row for row in fixture_records(fixture, "codex-rpc.jsonl")
+                              if row["message"].get("method") in ("turn/start", "turn/steer")
+                              and row["message"]["params"].get("threadId") == thread_id])
+        local_post(m, "/api/hooks", {"source": "hook", "agent": "codex", "event": "turn_end", "session_id": thread_id,
+                                     "turn_id": "pe-unknown-turn", "cwd": str(work_dir), "last_message": "needs-human"})
+        unknown = wait_for("the unknown-turn question remains unscoped", lambda: next(
+            (row for row in m.client.rpc("questions")["questions"]
+             if row["about"]["session_id"] == thread_id and row["question_id"] != question_id), None), timeout=60)
+        require(unknown.get("target") is None, "an unknown turn never borrows Main authority")
+        p.client.request("/api/decision", {"device_id": m.device_id, "question_id": unknown["question_id"], "text": "继续"},
+                         origin=False, headers={"Authorization": "Bearer " + token}, status=400, timeout=60)
+        require_quiet("an unknown turn persists no answer and sends no native work", lambda:
+                      scheduler_record(m, network, "message:a-" + unknown["question_id"]) is None
+                      and not any(row["body"].get("answers") == unknown["question_id"] for row in scope_events(m, network, conversation))
+                      and len([row for row in fixture_records(fixture, "codex-rpc.jsonl")
+                               if row["message"].get("method") in ("turn/start", "turn/steer")
+                               and row["message"]["params"].get("threadId") == thread_id]) == before_unknown)
         require(token not in (p.directory / "process.log").read_text(errors="replace"), "P does not log the token")
         passed("decision-through-the-public-entry", question=question_id, thread=thread_id[:24])
 
@@ -4599,7 +5384,7 @@ def discovery_acceptance(options):
         nodes.append(d)
         require(not (d.directory / "entry-token").exists(), "discovery has no data-relay operator token")
         d.start()
-        require(b"<html" in d.client.request("/").lower(), "discovery defaults to serving its embedded webpage")
+        require(b"<html" in d.client.request("/").lower(), "discovery serves its configured Web page")
         for path in ("/api/client", "/api/decision", "/api/local/setup"):
             d.client.request(path, status=404)
         try:
@@ -5033,19 +5818,33 @@ def auto_route_acceptance(options):
         passed("revocation", revoked=member.own_id())
 
         conversation = "entry-conversation"
-        target.client.rpc("create_conversation", conversation_id=conversation, title="Entry acceptance")
+        target.client.rpc("create_bot", bot_id="entry-bot", conversation_id=conversation, name="Entry acceptance",
+                          instructions="", project={"target_node": target.device_id, "cwd": str(workspace)})
         unsigned = {"conversation_id": conversation, "message_id": "unsigned", "text": "no signature"}
-        target.client.rpc("message", unsigned=True, status=400, **unsigned)
+        target.client.message_arguments(unsigned)
         forged = {**unsigned, "attestation": manager.attestation("message", dict(unsigned))}
-        target.client.call("rpc", {"method": "message", **forged}, status=400)
         changed = {**unsigned, "attestation": target.client.attestation("message", dict(unsigned)), "text": "changed"}
-        target.client.call("rpc", {"method": "message", **changed}, status=400)
+        for kind, invalid in (("unsigned", unsigned), ("other-device", forged), ("changed-text", changed)):
+            if kind == "other-device":
+                refused = target.client.call("rpc", {"method": "message", **invalid}, status=400)
+                require(isinstance(refused.get("error"), str) and "another device" in refused["error"],
+                        "another device cannot sign for the authenticated client connection")
+            else:
+                refused = target.client.call("rpc", {"method": "message", **invalid})
+                require(refused.get("accepted") is False and refused.get("stored") is False
+                        and refused.get("code") == "input_not_saved" and refused.get("message_id") == unsigned["message_id"],
+                        f"{kind} input returns a typed refusal before persistence")
+        require_quiet("invalid signatures create no shared input or provider execution", lambda:
+            not any(row["message_id"] == unsigned["message_id"] for row in target.client.rpc("conversation", conversation_id=conversation)["messages"])
+            and not fixture_records(run)
+            and not any(row.get("message_id") == unsigned["message_id"] for row in fixture_records(run, "codex-inputs.jsonl")))
         passed("attestation-required", refused=["unsigned", "other-device", "changed-text"])
 
         directive = json.dumps({"label": "auto-route", "host_command": "printf once >> auto-route-count.txt",
                                 "host_cwd": str(workspace), "gate": str(run / "never-release")})
         original = {"conversation_id": conversation, "message_id": "auto-route-unknown", "text": directive,
                     "report_results": False}
+        target.client.message_arguments(original)
         signed = {**original, "attestation": target.client.attestation("message", dict(original))}
         target.client.command("drop", method="rpc", params={"method": "message", **signed})
         marker = workspace / "auto-route-count.txt"
@@ -7756,6 +8555,8 @@ def e2e_fixture(options):
     native_ready = False
     native_provider = None
     native_queue = None
+    workspace_gates = {name: run / ("workspace-release-" + name) for name in ("taskA", "taskB", "main", "channel")} \
+        if options.fixture_kind == "workspace" else None
     bootstrap_site = None
     bootstrap_invitation = None
     bootstrap_kind = options.fixture_kind in ("bootstrap", "bootstrap-http")
@@ -7764,7 +8565,7 @@ def e2e_fixture(options):
         return {"run": str(run), "site": bootstrap_site.url if bootstrap_site else None, "nodes": {
             role: {"url": node.url, "peer": node.device_id, "directory": str(node.directory)}
             for role, node in nodes.items()
-        }}
+        }, **({"gates": {name: str(path) for name, path in workspace_gates.items()}} if workspace_gates else {})}
 
     def stop(*_):
         raise SystemExit(0)
@@ -7822,6 +8623,10 @@ def e2e_fixture(options):
             if rpc:
                 private_json(node.directory / "delivery-settings.json",
                              free_delivery_settings(rpc, options.fixture_profile, enabled=role == "provider"))
+            if workspace_gates:
+                node.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(run, workspace),
+                               bins={"codex": str(fixture_wrapper(run, "workspace-codex", "--fixture-codex"))},
+                               app_server=SPAWN_APP_SERVER)
             node.start()
         print(json.dumps({"ready": details()}), flush=True)
         for line in sys.stdin:
@@ -7841,6 +8646,51 @@ def e2e_fixture(options):
                               "pkarr_reads": relay.reads if relay else 0,
                               "pkarr_writes": relay.writes if relay else 0,
                               "chain_rpc_calls": rpc.calls if rpc else 0}
+                elif op == "workspace_release":
+                    require(set(request) == {"op", "gate"} and workspace_gates and request["gate"] in workspace_gates,
+                            "workspace release names only one of this fixture's fixed gates")
+                    workspace_gates[request["gate"]].touch(mode=0o600)
+                    result = {"released": request["gate"]}
+                elif op == "workspace_inspect":
+                    require(set(request) == {"op"} and workspace_gates, "workspace inspection reads only this controlled fixture")
+                    inputs = fixture_records(run, "codex-inputs.jsonl")
+                    state_path = run / "fixture-codex-state.json"
+                    state = json.loads(state_path.read_text()) if state_path.exists() else {"threads": {}}
+                    result = {
+                        "invocations": [{"label": row["label"], "conversation_id": row["conversation_id"], "trigger": row["trigger"],
+                                         "thread_id": row["native_session_id"], "messages": row["messages"]}
+                                        for row in fixture_records(run)],
+                        "steers": [{"message_id": row["message_id"], "thread_id": row["thread_id"], "turn_id": row["turn_id"],
+                                    "text": "\n".join(part["text"] for part in row["input"] if part["type"] == "text")}
+                                   for row in inputs if row["event"] == "input"],
+                        "starts": [{"thread_id": row["thread_id"], "turn_id": row["turn_id"]}
+                                   for row in inputs if row["event"] == "turn_started"],
+                        "turns": [{"thread_id": thread["id"], "turn_id": turn["id"], "state": turn["status"]}
+                                  for thread in state["threads"].values() for turn in thread["turns"]],
+                        "interrupts": [{"thread_id": row["message"]["params"]["threadId"],
+                                        "turn_id": row["message"]["params"]["turnId"]}
+                                       for row in fixture_records(run, "codex-rpc.jsonl")
+                                       if row["message"].get("method") == "turn/interrupt"],
+                    }
+                    if native_ready:
+                        result["inputs"] = [{"message_id": row["input"]["message_id"], "conversation_id": row["conversation_id"],
+                                             "target": row["input"]["target"], "text": row["input"]["text"],
+                                             "deferred": row["deferred"], "cancelled": row["cancelled"]}
+                                            for row in nodes["source"].client.rpc("workspace_state")["inputs"]]
+                    require(len(json.dumps({"ok": True, "result": result}).encode()) <= 65536,
+                            "workspace inspection returns one bounded public JSON event")
+                elif op == "workspace_native_setup":
+                    require(set(request) == {"op", "invitation_file"} and workspace_gates and not native_ready,
+                            "native workspace setup initializes only its own fresh workspace fixture")
+                    path = Path(request["invitation_file"])
+                    require(path.is_absolute() and path.resolve().is_relative_to(options.artifacts.resolve())
+                            and not path.exists() and not path.is_symlink(), "native invitation stays in a new private task file")
+                    nodes["source"].bootstrap()
+                    invitation = nodes["source"].client.invite()
+                    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
+                        output.write(invitation)
+                    native_ready = True
+                    result = details()
                 elif op == "bootstrap_info":
                     require(bootstrap_kind, "bootstrap info belongs to its controlled fixture")
                     result = {**details(), "invitation": bootstrap_invitation,
@@ -7885,8 +8735,8 @@ def e2e_fixture(options):
                     native_ready = True
                     result = details()
                 elif op == "native_join":
-                    require(native_ready, "native pairing requires the controlled initialized receiver")
-                    client = nodes["receiver"].client
+                    require(native_ready, "native pairing requires the controlled initialized Node")
+                    client = nodes["source" if workspace_gates else "receiver"].client
 
                     def revealed():
                         entries = client.call("join_status")["requests"]
@@ -7900,8 +8750,8 @@ def e2e_fixture(options):
                     pending = wait_for("native client reveals its actual pairing nonce", revealed)
                     result = {"peer": pending["device_id"], "code": client.command("short_code", request=pending)}
                 elif op == "native_approve":
-                    require(native_ready, "native approval belongs to the controlled receiver")
-                    client = nodes["receiver"].client
+                    require(native_ready, "native approval belongs to the controlled initialized Node")
+                    client = nodes["source" if workspace_gates else "receiver"].client
                     pending = client.pending_join(request["peer"])
                     require(pending and pending["name"] == "VDP native receiver" and pending.get("joiner_nonce")
                             and request["code"] == client.command("short_code", request=pending),
@@ -8050,7 +8900,7 @@ if __name__ == "__main__":
         parser.add_argument("--delivery-config", type=Path)
         parser.add_argument("--delivery-ui-control", type=Path)
         parser.add_argument("--delivery-ui-timeout-ms", type=int, default=43_200_000)
-        parser.add_argument("--fixture-kind", choices=("single", "delivery", "bootstrap", "bootstrap-http"), default="single", help=argparse.SUPPRESS)
+        parser.add_argument("--fixture-kind", choices=("single", "delivery", "workspace", "bootstrap", "bootstrap-http"), default="single", help=argparse.SUPPRESS)
         parser.add_argument("--fixture-port", type=int, help=argparse.SUPPRESS)
         parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()
