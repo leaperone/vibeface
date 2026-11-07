@@ -76,10 +76,15 @@ async function inPage(page, expression) {
       socket.addEventListener('error', () => fail(new Error('The application page could not be reached')));
       socket.addEventListener('open', () => socket.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, returnByValue: true, awaitPromise: true } })));
       socket.addEventListener('message', event => {
-        const message = JSON.parse(event.data);
-        if (message.id !== 1) return;
-        assert(!message.error && !message.result?.exceptionDetails, 'The application page rejected the operation');
-        done(message.result.result.value);
+        try {
+          const message = JSON.parse(event.data);
+          if (message.id !== 1) return;
+          assert(!message.error && !message.result?.exceptionDetails,
+            `The application page rejected the operation: ${message.error?.message ?? message.result?.exceptionDetails?.text ?? 'no result'}`);
+          done(message.result.result.value);
+        } catch (error) {
+          fail(error);
+        }
       });
     });
   } finally {
@@ -96,8 +101,18 @@ async function enterBusiness() {
     const pages = await devtools('/json/list');
     const launcher = pages.find(page => page.type === 'page' && page.url === 'vibeface-launcher://app/index.html');
     if (launcher) {
-      last = await inPage(launcher, 'document.body.innerText');
-      const state = await inPage(launcher, 'typeof window.vibefaceLauncher === "object" ? window.vibefaceLauncher.getStatus().then(status => status.core.kind) : "loading"');
+      let state;
+      try {
+        const loaded = await inPage(launcher, 'document.readyState === "complete" && document.body !== null');
+        if (!loaded) { await sleep(100); continue; }
+        last = await inPage(launcher, 'document.body.innerText');
+        state = await inPage(launcher, 'typeof window.vibefaceLauncher === "object" ? window.vibefaceLauncher.getStatus().then(status => status.core.kind) : "loading"');
+      } catch (error) {
+        // DevTools can announce a page before its first JavaScript context is ready.
+        last = error instanceof Error ? error.message : String(error);
+        await sleep(100);
+        continue;
+      }
       assert(state !== 'failed', `The launcher could not start its Core: ${last}`);
       if (!clicked && ['none', 'uninitialized', 'offline'].includes(state)) {
         clicked = await inPage(launcher, `(() => {
@@ -247,6 +262,7 @@ try {
   await start();
 } catch (error) {
   console.error(`The desktop application did not start: ${error instanceof Error ? error.message : String(error)}`);
+  await shutdown();
   process.exit(1);
 }
 // The control file is published only once the window is up, so its presence means the application is ready.

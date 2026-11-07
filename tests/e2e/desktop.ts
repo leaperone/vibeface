@@ -104,11 +104,15 @@ async function command(target: Page, method: string, params: Record<string, unkn
       socket.addEventListener('error', () => fail(new Error(`${method} could not reach the page`)));
       socket.addEventListener('open', () => socket.send(JSON.stringify({ id: 1, method, params })));
       socket.addEventListener('message', event => {
-        assert(typeof event.data === 'string', 'Expected a DevTools message');
-        const message = record(JSON.parse(event.data));
-        if (message.id !== 1) return;
-        assert(message.error === undefined, `${method} failed on the page`);
-        done(record(message.result));
+        try {
+          assert(typeof event.data === 'string', 'Expected a DevTools message');
+          const message = record(JSON.parse(event.data));
+          if (message.id !== 1) return;
+          assert(message.error === undefined, `${method} failed on the page`);
+          done(record(message.result));
+        } catch (error) {
+          fail(error);
+        }
       });
     });
   } finally {
