@@ -24,23 +24,89 @@ ACTORS = {
 
 
 def inside_artifacts(root: Path, candidate: Path) -> Path:
-    artifact_root = root / ".artifacts/native"
-    if artifact_root.is_symlink() or not artifact_root.is_dir():
-        raise ValueError("artifact root cannot be a symlink")
-    artifact_root = artifact_root.absolute()
+    canonical_root = root.resolve()
     absolute = candidate.absolute()
     try:
-        relative = absolute.relative_to(artifact_root)
+        relative = absolute.relative_to(canonical_root)
     except ValueError as error:
-        raise ValueError("diagnostic path is outside task artifacts") from error
-    current = artifact_root
+        raise ValueError("diagnostic path is outside the repository") from error
+    current = canonical_root
     for part in relative.parts:
-        if part == ".":
-            continue
+        if part in {"", ".", ".."}:
+            raise ValueError("diagnostic path is not normalized")
         current = current / part
-        if current.is_symlink():
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
             raise ValueError("diagnostic path cannot contain symlinks")
+    if not relative.parts or relative.parts[0] != ".artifacts":
+        raise ValueError("diagnostic path is outside task artifacts")
     return absolute
+
+
+def public_census_projection(value: object) -> dict[str, Any]:
+    """Return only actor PID/state, socket status/relation, and cache counts."""
+    if not isinstance(value, dict) or value.get("schema") != 1:
+        raise ValueError("unsupported census")
+    simulator = value.get("simulator")
+    if not isinstance(simulator, dict) or simulator.get("status") != "booted":
+        raise ValueError("invalid simulator census")
+    app = simulator.get("app")
+    app_states = {"captured", "query_timeout", "query_unavailable", "query_failed", "output_over_limit"}
+    if not isinstance(app, dict) or app.get("status") not in app_states:
+        raise ValueError("invalid app census")
+    projected_app: dict[str, Any] = {"status": app["status"]}
+    if app["status"] == "captured":
+        actors = app.get("actors")
+        if not isinstance(actors, dict) or set(actors) != set(ACTORS):
+            raise ValueError("invalid actor census")
+        projected_actors = {}
+        for actor, entries in actors.items():
+            if not isinstance(entries, list) or len(entries) > 8:
+                raise ValueError("invalid actor list")
+            projected = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ValueError("invalid actor")
+                pid, state = entry.get("pid"), entry.get("state")
+                if type(pid) is not int or not 0 < pid <= 2**31 - 1:
+                    raise ValueError("invalid actor PID")
+                if not isinstance(state, str) or not re.fullmatch(r"[A-Za-z<>?+!-]{1,8}", state):
+                    raise ValueError("invalid actor state")
+                projected.append({"pid": pid, "state": state})
+            projected_actors[actor] = projected
+        sockets = app.get("bridge_sockets")
+        socket_states = {"command_query_timeout", "command_query_unavailable", "command_query_failed",
+                         "socket_path_not_owned", "socket_path_not_reported", "socket_missing",
+                         "socket_unreadable", "socket_wrong_type", "socket_present"}
+        if not isinstance(sockets, list) or len(sockets) > 2:
+            raise ValueError("invalid socket census")
+        projected_sockets = []
+        for socket in sockets:
+            if not isinstance(socket, dict) or socket.get("status") not in socket_states:
+                raise ValueError("invalid socket state")
+            relation = socket.get("socket_owner_matches_agent_device_daemon")
+            if relation is not None and type(relation) is not bool:
+                raise ValueError("invalid socket relation")
+            item = {"status": socket["status"]}
+            if relation is not None:
+                item["daemon_owner_matches"] = relation
+            projected_sockets.append(item)
+        projected_app.update(actors=projected_actors, bridge_sockets=projected_sockets)
+    cache = value.get("snapshot_bridge_cache")
+    cache_states = {"present", "missing", "unreadable", "invalid", "skipped_outside_ci"}
+    if not isinstance(cache, dict) or cache.get("status") not in cache_states:
+        raise ValueError("invalid cache census")
+    count = cache.get("binary_count")
+    if type(count) is not int or not 0 <= count <= 32:
+        raise ValueError("invalid cache count")
+    return {
+        "status": "captured",
+        "simulator": {"status": "booted", "app": projected_app},
+        "snapshot_bridge_cache": {"status": cache["status"], "binary_count": count},
+    }
 
 
 def bounded_process_table(text: str) -> dict[str, list[dict[str, Any]]]:
@@ -350,6 +416,21 @@ def capture(simulator: str, *, run: Any = subprocess.run) -> dict[str, Any]:
     return census
 
 
+
+def write_private_census(root: Path, census: dict[str, Any]) -> Path:
+    output_dir = inside_artifacts(root, root.resolve() / ".artifacts/native/private")
+    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output = inside_artifacts(root, output_dir / "ios-actor-census.json")
+    if output.is_symlink() or output.exists() and not output.is_file():
+        raise ValueError("census output must be a regular file")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output_dir, prefix="ios-actor-census.", delete=False) as stream:
+        os.chmod(stream.name, 0o600)
+        stream.write(json.dumps(census, separators=(",", ":")) + "\n")
+        temporary = Path(stream.name)
+    temporary.replace(output)
+    os.chmod(output, 0o600)
+    return output
+
 def self_test() -> None:
     from tempfile import TemporaryDirectory
 
@@ -377,16 +458,55 @@ def self_test() -> None:
     else:
         raise AssertionError("accepted a socket namespace for another simulator")
 
+    secret = "unknown-raw-secret-path-token-uuid-args-must-drop"
+    fixture = {
+        "schema": 1, "stage": "private-stage", "source_commit": secret,
+        "simulator": {"status": "booted", "extra": secret, "app": {
+            "status": "captured", "command": secret,
+            "actors": {actor: ([{"pid": 42, "ppid": 1, "state": "S", "args": secret}] if actor == "snapshot_bridge" else [])
+                       for actor in ACTORS},
+            "bridge_sockets": [{"status": "socket_present", "socket_owner_pid": 42,
+                                "socket_owner_matches_agent_device_daemon": True, "path": secret}],
+        }},
+        "snapshot_bridge_cache": {"status": "present", "binary_count": 1, "binaries": [secret]},
+        "agent_device_daemon": {"version": secret, "transport": secret, "ownership": secret, "plugin_count": 8},
+        "xctest_runner": {"owner_pid": 42, "device_matches": True, "session_matches": True},
+    }
+    public = public_census_projection(fixture)
+    encoded = json.dumps(public)
+    assert public["simulator"]["app"]["actors"]["snapshot_bridge"] == [{"pid": 42, "state": "S"}]
+    assert public["simulator"]["app"]["bridge_sockets"] == [{"status": "socket_present", "daemon_owner_matches": True}]
+    assert public["snapshot_bridge_cache"] == {"status": "present", "binary_count": 1}
+    assert secret not in encoded and "version" not in encoded and "transport" not in encoded
+
     with TemporaryDirectory(prefix="ios-actor-census-") as temporary:
-        daemon = Path(temporary) / "daemon.json"
-        daemon.write_text(json.dumps({
-            "pid": 42, "transport": "socket", "ownership": "detached", "version": "0.21.32",
-            "plugins": [], "token": "must-not-escape",
-        }), encoding="utf-8")
-        projected = safe_task_record(daemon, kind="daemon", process_lookup=lambda _pid: {"status": "running", "actor": "node", "state": "S"})
-        encoded = json.dumps(projected)
-        assert projected["process"]["actor"] == "node"
-        assert "must-not-escape" not in encoded and "token" not in encoded
+        root = Path(temporary) / "repo"
+        private = root / ".artifacts/native/private"
+        private.mkdir(parents=True)
+        output = write_private_census(root, fixture)
+        assert output.is_relative_to(root.resolve())
+        assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+        outside = Path(temporary) / "outside"
+        root2 = Path(temporary) / "repo-with-parent-link"
+        root2.mkdir()
+        root2.joinpath(".artifacts").symlink_to(outside, target_is_directory=True)
+        original_lstat = Path.lstat
+        def reject_outside_lstat(path):
+            if path == outside or outside in path.parents:
+                raise AssertionError("followed parent artifact symlink")
+            return original_lstat(path)
+        Path.lstat = reject_outside_lstat
+        try:
+            try:
+                inside_artifacts(root2, root2 / ".artifacts/native/private")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("accepted a parent artifact symlink")
+        finally:
+            Path.lstat = original_lstat
+        assert not outside.exists()
     print("iOS actor census bounds passed")
 
 
@@ -397,17 +517,9 @@ def main(argv: list[str]) -> None:
     if len(argv) != 1 or not UUID.fullmatch(argv[0]):
         raise SystemExit("usage: python3 scripts/ios-actor-census.py <assigned-simulator-uuid>")
     root = Path(__file__).resolve().parents[1]
-    output_dir = inside_artifacts(root, root / ".artifacts/native/private")
-    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    inside_artifacts(root, root / ".artifacts/native/private")
     census = capture(argv[0])
-    output = output_dir / "ios-actor-census.json"
-    if output.is_symlink() or output.exists() and not output.is_file():
-        raise ValueError("census output must be a regular file")
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output_dir, prefix="ios-actor-census.", delete=False) as stream:
-        os.chmod(stream.name, 0o600)
-        stream.write(json.dumps(census, separators=(",", ":")) + "\n")
-        temporary = Path(stream.name)
-    temporary.replace(output)
+    write_private_census(root, census)
 
 
 if __name__ == "__main__":
