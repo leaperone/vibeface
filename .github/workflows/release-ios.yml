@@ -1,0 +1,109 @@
+name: Release iOS device archive
+
+on:
+  workflow_call:
+    inputs:
+      version: {type: string, required: true}
+      source_sha: {type: string, required: true}
+      distribution_method:
+        type: string
+        required: false
+        default: app-store-connect
+        description: app-store-connect for TestFlight or ad-hoc for devices registered in the profile
+    secrets:
+      IOS_CERTIFICATE_P12_BASE64: {required: false}
+      IOS_CERTIFICATE_PASSWORD: {required: false}
+      IOS_PROVISIONING_PROFILE_BASE64: {required: false}
+    outputs:
+      artifact_id:
+        value: ${{ jobs.build.outputs.artifact_id }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ inputs.source_sha }}', persist-credentials: false}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with: {targets: aarch64-apple-ios}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with: {version: 11.9.0}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '24', cache: pnpm, cache-dependency-path: pnpm-lock.yaml}
+      - name: Verify requested release identity
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(python3 -c 'import json; print(json.load(open("apps/mobile/app.json"))["expo"]["extra"]["releaseVersion"])')" = "$RELEASE_VERSION"
+      - run: pnpm install --frozen-lockfile
+      - name: Build generic iOS device archive
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          IOS_DISTRIBUTION_METHOD: ${{ inputs.distribution_method }}
+          IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: scripts/build-ios.sh "$RELEASE_VERSION" "$SOURCE_SHA"
+      - name: Package and verify archive provenance
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          IOS_DISTRIBUTION_METHOD: ${{ inputs.distribution_method }}
+          IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          mkdir -p .artifacts/ios
+          configured=0
+          for value in "$IOS_CERTIFICATE_P12_BASE64" "$IOS_CERTIFICATE_PASSWORD" "$IOS_PROVISIONING_PROFILE_BASE64"; do
+            [[ -z "$value" ]] || ((configured+=1))
+          done
+          if (( configured == 3 )); then
+            archive_name="vibeface-${RELEASE_VERSION}-ios-device-signed.xcarchive.zip"
+          else
+            archive_name="vibeface-${RELEASE_VERSION}-ios-device-unsigned.xcarchive.zip"
+          fi
+          ditto -c -k --sequesterRsrc --keepParent .artifacts/ios-build/Vibeface.xcarchive ".artifacts/ios/$archive_name"
+          verify_args=()
+          if (( configured == 3 )); then verify_args+=(--signed); fi
+          python3 -B scripts/verify-ios-archive.py \
+            --archive .artifacts/ios-build/Vibeface.xcarchive \
+            --zip ".artifacts/ios/$archive_name" \
+            --source-sha "$SOURCE_SHA" \
+            --release-version "$RELEASE_VERSION" \
+            --output ".artifacts/ios/$archive_name.provenance.json" "${verify_args[@]}"
+          if (( configured == 3 )); then
+            ipa_name="vibeface-${RELEASE_VERSION}-ios.ipa"
+            cp .artifacts/ios/export/Vibeface.ipa ".artifacts/ios/$ipa_name"
+            python3 -B scripts/verify-ios-ipa.py \
+              --ipa ".artifacts/ios/$ipa_name" \
+              --source-sha "$SOURCE_SHA" \
+              --release-version "$RELEASE_VERSION" \
+              --distribution-method "$IOS_DISTRIBUTION_METHOD" \
+              --output ".artifacts/ios/$ipa_name.provenance.json"
+          fi
+          python3 -B scripts/release.py manifest product .artifacts/ios
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        id: upload
+        with:
+          name: ios-device-archive-${{ inputs.source_sha }}-${{ github.run_attempt }}
+          path: |
+            .artifacts/ios/*.xcarchive.zip
+            .artifacts/ios/*.xcarchive.zip.sha256
+            .artifacts/ios/*.xcarchive.zip.provenance.json
+            .artifacts/ios/*.ipa
+            .artifacts/ios/*.ipa.sha256
+            .artifacts/ios/*.ipa.provenance.json
+            .artifacts/ios/release.json
+          if-no-files-found: error
+          retention-days: 14
