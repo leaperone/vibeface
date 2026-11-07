@@ -108,6 +108,7 @@ fn lexical_root(path: &str) -> Option<LexicalRoot> {
     if path.is_empty() || path.len() > 4096 || path.chars().any(char::is_control) {
         return None;
     }
+    let verbatim = path.starts_with("\\\\?\\");
     let (family, anchor, body, separator, root_only) = if path.starts_with('/') {
         if path.starts_with("//") {
             return None;
@@ -203,6 +204,9 @@ fn lexical_root(path: &str) -> Option<LexicalRoot> {
     if parts
         .iter()
         .any(|part| part.is_empty() || part == "." || part == "..")
+        || (family == RootFamily::Windows
+            && !verbatim
+            && parts.iter().any(|part| part.ends_with(['.', ' '])))
     {
         return None;
     }
@@ -214,7 +218,11 @@ fn lexical_root(path: &str) -> Option<LexicalRoot> {
 }
 
 fn valid_unc_anchor(part: &str) -> bool {
-    !part.is_empty() && part != "." && part != ".." && !part.contains(['/', ':'])
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && !part.contains(['/', ':'])
+        && !part.ends_with(['.', ' '])
 }
 
 fn valid_roots(roots: &[String]) -> Result<()> {
@@ -266,6 +274,8 @@ mod root_path_tests {
             "D:/work",
             "\\\\server\\share\\work",
             "\\\\?\\C:\\work",
+            "\\\\?\\C:\\work.",
+            "\\\\?\\C:\\work ",
             "\\\\?\\UNC\\server\\share\\work",
         ] {
             assert!(valid_roots(&[path.to_owned()]).is_ok(), "{path}");
@@ -285,10 +295,15 @@ mod root_path_tests {
             "C:\\work/../other",
             "C:/work\\..\\other",
             "C:\\work\\",
+            "C:\\work.",
+            "C:\\work ",
+            "C:/work./repo",
             "\\\\.\\share\\work",
             "\\\\server\\..\\work",
             "\\\\server\\share\\..\\work",
             "\\\\server\\share\\work\\\\x",
+            "\\\\server\\share\\work.",
+            "\\\\server.\\share\\work",
             "/srv/wo\u{7}rk",
         ] {
             assert!(valid_roots(&[path.to_owned()]).is_err(), "{path:?}");
@@ -299,6 +314,8 @@ mod root_path_tests {
     fn overlap_uses_portable_components() {
         assert!(overlap("C:\\Work\\repo", "c:\\work"));
         assert!(overlap("\\\\?\\C:\\Work\\repo", "C:/work"));
+        assert!(!overlap("\\\\?\\C:\\work.", "C:\\work"));
+        assert!(!overlap("\\\\?\\C:\\work ", "C:\\work"));
         assert!(!overlap("C:\\Work", "D:\\Work"));
         assert!(overlap("/srv/work", "/srv/work/repo"));
         assert!(!overlap("/srv/work", "/srv/worker"));
