@@ -1287,12 +1287,17 @@ async fn supervise(
     exited: watch::Sender<bool>,
     processes: Arc<Processes>,
 ) {
-    tokio::select! {
-        _ = &mut process.stdout => {}
-        _ = &mut process.stderr => {}
-        _ = process.child.wait() => {}
-        _ = kill.notified() => {}
+    enum JoinedIo {
+        Stdout,
+        Stderr,
+        Neither,
     }
+    let joined = tokio::select! {
+        _ = &mut process.stdout => JoinedIo::Stdout,
+        _ = &mut process.stderr => JoinedIo::Stderr,
+        _ = process.child.wait() => JoinedIo::Neither,
+        _ = kill.notified() => JoinedIo::Neither,
+    };
     let token = process.tree.as_ref().map(|tree| tree.token().to_owned());
     if let Some(mut tree) = process.tree.take() {
         if !terminate_process_tree(&mut process.child, &mut tree).await {
@@ -1306,8 +1311,12 @@ async fn supervise(
     // outlive SdkBridge::stop and race its owner removing the bridge state directory.
     process.stdout.abort();
     process.stderr.abort();
-    let _ = (&mut process.stdout).await;
-    let _ = (&mut process.stderr).await;
+    if !matches!(joined, JoinedIo::Stdout) {
+        let _ = (&mut process.stdout).await;
+    }
+    if !matches!(joined, JoinedIo::Stderr) {
+        let _ = (&mut process.stderr).await;
+    }
     drop(process);
     if let Some(token) = token {
         processes.forget(&token);
