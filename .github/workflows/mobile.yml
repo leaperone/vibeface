@@ -272,6 +272,84 @@ jobs:
                   result["phase"] = error["phase"]
               return result
 
+          def safe_driver_diagnostic():
+              private_dir = root / "private"
+              pointer_path = root / "private/ios-driver-failure.json"
+              if private_dir.is_symlink() or not pointer_path.is_file() or pointer_path.is_symlink():
+                  return {"status": "pointer_missing"}
+              try:
+                  pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+                  assert isinstance(pointer, dict)
+                  output = {"status": "captured"}
+                  if pointer.get("code") in {"ENGINE_FAILURE", "COMMAND_FAILED"}:
+                      output["code"] = pointer["code"]
+                  if pointer.get("reason") in {"daemon_transport_timeout", "daemon_request_timeout"}:
+                      output["reason"] = pointer["reason"]
+                  if pointer.get("message_kind") == "daemon_request_timeout":
+                      output["message_kind"] = pointer["message_kind"]
+                  timeout_ms = pointer.get("timeout_ms")
+                  if type(timeout_ms) is int and 0 <= timeout_ms <= 600000:
+                      output["timeout_ms"] = timeout_ms
+                  log_path = pointer.get("log_path")
+                  if not isinstance(log_path, str) or len(log_path) > 4096:
+                      output["log"] = "pointer_unavailable"
+                      return output
+                  candidate = pathlib.Path(log_path)
+                  state_dir = root / "agent-device"
+                  if state_dir.is_symlink():
+                      output["log"] = "pointer_refused"
+                      return output
+                  allowed = state_dir.resolve()
+                  if (not candidate.is_absolute() or ".." in candidate.parts
+                          or "trash" in str(candidate).lower()
+                          or candidate.is_symlink()):
+                      output["log"] = "pointer_refused"
+                      return output
+                  resolved = candidate.resolve(strict=True)
+                  if (not resolved.is_relative_to(allowed)
+                          or "trash" in str(resolved).lower()
+                          or not resolved.is_file() or resolved.stat().st_size > 1048576):
+                      output["log"] = "pointer_refused"
+                      return output
+                  events = []
+                  for line in resolved.read_text(encoding="utf-8").splitlines():
+                      try:
+                          event = json.loads(line)
+                      except ValueError:
+                          continue
+                      if isinstance(event, dict) and event.get("phase") == "daemon_request_timeout":
+                          events.append(event)
+                  if not events:
+                      output["log"] = "event_missing"
+                      return output
+                  event = events[-1]
+                  data = event.get("data")
+                  summary = {}
+                  duration = event.get("durationMs")
+                  if type(duration) in {int, float} and 0 <= duration <= 600000:
+                      summary["duration_ms"] = int(duration)
+                  if isinstance(data, dict):
+                      timeout = data.get("timeoutMs")
+                      if type(timeout) is int and 0 <= timeout <= 600000:
+                          summary["timeout_ms"] = timeout
+                      for source, destination in (("daemonLivenessProbeAnswered", "liveness_probe_answered"),
+                                                  ("daemonPreservedAfterTimeout", "daemon_preserved")):
+                          if type(data.get(source)) is bool:
+                              summary[destination] = data[source]
+                      retirement = data.get("daemonRetirement")
+                      if isinstance(retirement, dict) and retirement.get("status") in {"retired", "retained", "absent"}:
+                          summary["retirement"] = retirement["status"]
+                          termination = retirement.get("termination")
+                          if isinstance(termination, dict) and termination.get("status") in {"exited", "already-exited", "retained"}:
+                              summary["termination"] = termination["status"]
+                  output["log"] = "event_found"
+                  output["event"] = summary
+                  return output
+              except (OSError, ValueError, TypeError, AssertionError):
+                  return {"status": "unreadable"}
+
+          diagnostics["driver"] = safe_driver_diagnostic()
+
           runner_root = pathlib.Path("tests/e2e/.artifacts/native")
           report_path = runner_root / "e2e/report.json"
           if report_path.exists():

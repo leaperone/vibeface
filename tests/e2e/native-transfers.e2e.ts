@@ -18,6 +18,43 @@ function record(value: unknown): Record<string, unknown> {
   assert(valid(value), 'Expected bounded fixture JSON');
   return value;
 }
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function driverFailurePointer(error: unknown): Record<string, unknown> {
+  const pointer: Record<string, unknown> = {};
+  const visited = new Set<object>();
+  let current: unknown = error;
+  for (let depth = 0; depth < 8 && isRecord(current) && !visited.has(current); depth += 1) {
+    visited.add(current);
+    const details = isRecord(current.details) ? current.details : undefined;
+    for (const source of [current, details]) {
+      if (!source) continue;
+      if (typeof source.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(source.code)) pointer.code = source.code;
+      if (['daemon_transport_timeout', 'daemon_request_timeout'].includes(String(source.reason))) pointer.reason = source.reason;
+      if (typeof source.timeoutMs === 'number' && Number.isSafeInteger(source.timeoutMs) && source.timeoutMs >= 0 && source.timeoutMs <= 600000) pointer.timeout_ms = source.timeoutMs;
+      if (typeof source.diagnosticId === 'string' && /^[A-Za-z0-9._-]{1,80}$/.test(source.diagnosticId)) pointer.diagnostic_id = source.diagnosticId;
+      if (typeof source.logPath === 'string' && source.logPath.length <= 4096 && !/[\u0000-\u001f]/.test(source.logPath)) {
+        const stateDir = resolve(root, '.artifacts/native/agent-device');
+        const logPath = resolve(source.logPath);
+        const relativePath = relative(stateDir, logPath);
+        if (relativePath && !relativePath.startsWith('..') && !relativePath.startsWith('/')) pointer.log_path = logPath;
+      }
+      if (typeof source.message === 'string' && /daemon request timed out/i.test(source.message)) pointer.message_kind = 'daemon_request_timeout';
+    }
+    current = current.cause;
+  }
+  return pointer;
+}
+async function recordDriverFailure(error: unknown): Promise<void> {
+  const path = resolve(root, '.artifacts/native/private/ios-driver-failure.json');
+  try {
+    await mkdir(resolve(root, '.artifacts/native/private'), { recursive: true, mode: 0o700 });
+    await writeFile(path, `${JSON.stringify(driverFailurePointer(error))}\n`, { mode: 0o600 });
+  } catch {
+    // Keep the original driver error as the test result if private evidence cannot be written.
+  }
+}
 function text(value: unknown): string { assert(typeof value === 'string' && value.length > 0); return value; }
 type NativeNetwork = { invitation: string; receiver: string; call(request: Record<string, unknown>): Promise<Record<string, unknown>> };
 const test = base.extend<{ network: NativeNetwork }>({
@@ -139,6 +176,8 @@ test('provider settings and queued cancellation work in the installed native app
   assert(simulator && appPath && binary && crypto && source && /^[a-f0-9]{40}$/.test(source), 'Provider acceptance pins its source and actual artifacts');
   const publicPath = resolve(root, '.artifacts/native/public');
   await mkdir(publicPath, { recursive: true, mode: 0o700 });
+  const driverFailurePath = resolve(root, '.artifacts/native/private/ios-driver-failure.json');
+  await unlink(driverFailurePath).catch(error => { if (error.code !== 'ENOENT') throw error; });
   for (const name of ['provider.json', 'provider-navigation.json', 'provider-probe.json', 'provider-initial.png', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png', 'terminology-device-kinds.png']) {
     await unlink(join(publicPath, name)).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
@@ -167,7 +206,12 @@ test('provider settings and queued cancellation work in the installed native app
   // Capture the fresh-install screen through CoreSimulator before asking the
   // UI daemon for an accessibility tree. This image contains no invitation.
   await execute('xcrun', ['simctl', 'io', simulator, 'screenshot', join(publicPath, 'provider-initial.png')]);
-  await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
+  try {
+    await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
+  } catch (error: unknown) {
+    await recordDriverFailure(error);
+    throw error;
+  }
   const run = process.env.GITHUB_RUN_ID, attempt = process.env.GITHUB_RUN_ATTEMPT;
   if (run !== undefined || attempt !== undefined) {
     assert(run && attempt && /^[0-9]+$/.test(run) && /^[0-9]+$/.test(attempt));
