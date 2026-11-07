@@ -32,6 +32,8 @@ jobs:
         with: {ref: '${{ inputs.source_sha }}', persist-credentials: false}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ${{ runner.os == 'Windows' && 'windows-static-crt' || '' }}
       - name: Select this platform's Python
         run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
       - uses: ./.github/actions/msvc-environment

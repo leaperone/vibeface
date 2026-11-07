@@ -45,7 +45,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         if: inputs.package_artifact == ''
         with:
-          key: desktop-native-${{ inputs.target }}
+          key: desktop-native-${{ inputs.target }}${{ runner.os == 'Windows' && '-static-crt' || '' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
       - uses: ./.github/actions/msvc-environment
