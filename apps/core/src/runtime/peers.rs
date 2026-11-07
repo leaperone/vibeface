@@ -1757,7 +1757,7 @@ impl Runtime {
             }
             if let Some(guard) = self.peer_delivery_locks.try_lock("reconcile_works") {
                 let (node, network) = (self.clone(), network.to_owned());
-                tokio::spawn(async move {
+                if let Err(error) = self.background_tasks.spawn(async move {
                     let _guard = guard;
                     if let Err(error) = node.reconcile_works(&network).await {
                         tracing::debug!(%error, "work reconciliation pending");
@@ -1765,7 +1765,9 @@ impl Runtime {
                     if let Err(error) = node.reconcile_checks(&network).await {
                         tracing::debug!(%error, "pending check reconciliation pending");
                     }
-                });
+                }) {
+                    tracing::debug!(%error, "work reconciliation stopped");
+                }
             }
         }
     }
@@ -1809,7 +1811,7 @@ impl Runtime {
             };
             entries.sort_by_key(|(sequence, _)| *sequence);
             let (node, network) = (self.clone(), network.clone());
-            tokio::spawn(async move {
+            self.background_tasks.spawn(async move {
                 let _guard = guard;
                 let mut progressed = false;
                 for (_, entry) in entries {
@@ -1825,7 +1827,7 @@ impl Runtime {
                 if progressed {
                     node.outbox_wakeup.notify_one();
                 }
-            });
+            })?;
         }
         Ok(())
     }
@@ -2021,7 +2023,7 @@ impl Runtime {
                 continue;
             };
             let (node, network) = (self.clone(), network.to_owned());
-            tokio::spawn(async move {
+            self.background_tasks.spawn(async move {
                 let _guard = guard;
                 let mut drained = false;
                 let mut progressed = false;
@@ -2052,7 +2054,7 @@ impl Runtime {
                 if drained && progressed {
                     node.outbox_wakeup.notify_one();
                 }
-            });
+            })?;
         }
         Ok(())
     }
@@ -2498,6 +2500,86 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_joins_a_queued_peer_command_worker_and_reopens_the_data_dir() -> Result<()> {
+        let (sender, owner) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let (sender_id, owner_id) = (sender.device_id()?, owner.device_id()?);
+        let network = sender.fixture_network_id()?;
+        let state = sender.sign_network_fixture(1, vec![sender_id.clone(), owner_id.clone()])?;
+        let (node, dir) = node(&owner).await?;
+        let weak = Arc::downgrade(&node);
+        let result = async {
+            node.install_membership(state).await?;
+            {
+                let mut store = node.store.lock().await;
+                let grant = sender.owner_fixture(&network, "c", &owner_id)?;
+                store.create_conversation(
+                    &sender,
+                    &network,
+                    "c",
+                    "peer shutdown",
+                    grant,
+                    now_ms(),
+                )?;
+                store.append_event(
+                    &sender,
+                    &network,
+                    "c",
+                    posted(&sender, &network, "c", "peer-shutdown-input")?,
+                    vec![],
+                    now_ms(),
+                )?;
+                store.accept_message(
+                    &sender,
+                    &network,
+                    "c",
+                    "peer-shutdown-input",
+                    "peer-shutdown-input",
+                    vec![],
+                    true,
+                    user(&sender, &network, "peer-shutdown-input")?,
+                    now_ms(),
+                )?;
+                let command =
+                    store.peer_delivery_command(&network, "c", "message:peer-shutdown-input")?;
+                store.save_peer_command(&network, &sender_id, &command.envelope, now_ms())?;
+            }
+            let owners_before = Arc::strong_count(&node);
+            node.drive_peer_commands(&network).await?;
+            let store_guard = node
+                .store
+                .clone()
+                .try_lock_owned()
+                .context("hold Store before the queued peer lane polls")?;
+            tokio::task::yield_now().await;
+            assert!(
+                Arc::strong_count(&node) > owners_before,
+                "queued peer command worker retains the Runtime until shutdown joins it"
+            );
+            node.shutdown().await;
+            drop(store_guard);
+            anyhow::Ok(())
+        }
+        .await;
+        drop(node);
+        ensure!(
+            weak.upgrade().is_none(),
+            "shutdown must join the queued peer command worker"
+        );
+        let reopened = Runtime::open(&dir)
+            .await
+            .context("reopen fixture after peer command worker shutdown")?;
+        reopened.shutdown().await;
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).with_context(|| {
+            format!(
+                "remove peer command shutdown fixture directory {}",
+                dir.display()
+            )
+        })?;
+        result
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn peer_delivery_locks_serialize_same_target_and_allow_other_scopes() -> Result<()> {
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -2758,6 +2840,7 @@ mod tests {
             for node in [&a, &r] { node.start_network().await?; }
             a.net()?.learn(&r.net()?.addr()).await;
             r.net()?.learn(&a.net()?.addr()).await;
+            ready_member_rpc(&a, &network, &request_node_id).await?;
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     let answer = a.peer_request(&network, &request_node_id, json!({"type":"deliver","command":command.envelope})).await?;
@@ -2771,8 +2854,7 @@ mod tests {
             assert!(r.store.lock().await.held_answer_receipt(&network, "c", "a-q-held")?.is_none());
             anyhow::Ok(())
         }.await;
-        stop_nodes(vec![(a, dir_a), (r, dir_r)]).await?;
-        result
+        finish_nodes(result, vec![(a, dir_a), (r, dir_r)]).await
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3538,14 +3620,56 @@ mod tests {
         now_ms() as u64 - crate::identity::RECOVERY_DELAY_MS - 1_000
     }
 
+    async fn ready_member_rpc(node: &Runtime, network: &str, peer: &str) -> Result<()> {
+        // SYNC/BLOB traffic does not establish the separately cached RPC connection.
+        // An empty address exchange only reads member metadata and does not sync inputs.
+        let reply = node
+            .peer_request(network, peer, json!({"type":"addresses","records":[]}))
+            .await
+            .context("member RPC is ready before timing delivery")?;
+        ensure!(
+            reply["records"].is_array(),
+            "member RPC returns address records"
+        );
+        Ok(())
+    }
+
+    async fn finish_nodes(result: Result<()>, nodes: Vec<(Arc<Runtime>, PathBuf)>) -> Result<()> {
+        match (result, stop_nodes(nodes).await) {
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("peer fixture cleanup also failed: {cleanup:#}")))
+            }
+            (Ok(()), result) | (result, Ok(())) => result,
+        }
+    }
+
     async fn stop_nodes(nodes: Vec<(Arc<Runtime>, PathBuf)>) -> Result<()> {
         for (node, _) in &nodes {
             node.shutdown().await;
         }
+        let mut cleanup_errors = Vec::new();
         for (node, dir) in nodes {
+            let weak = Arc::downgrade(&node);
             drop(node);
-            std::fs::remove_dir_all(&dir)
-                .with_context(|| format!("remove peer Node fixture directory {}", dir.display()))?;
+            if weak.upgrade().is_some() {
+                cleanup_errors.push(anyhow::anyhow!(
+                    "shutdown left a strong Runtime owner for {}",
+                    dir.display()
+                ));
+            } else if let Err(error) = std::fs::remove_dir_all(&dir) {
+                cleanup_errors.push(anyhow::anyhow!(
+                    "remove peer Node fixture directory {}: {error:#}",
+                    dir.display()
+                ));
+            }
+        }
+        if !cleanup_errors.is_empty() {
+            let details = cleanup_errors
+                .iter()
+                .map(|error| format!("{error:#}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!("peer fixture cleanup failed: {details}");
         }
         Ok(())
     }
@@ -4645,6 +4769,7 @@ mod tests {
             );
             a.sync_peer(&network, &ib.device_id()?).await?;
 
+            ready_member_rpc(&b, &network, &peer_a).await?;
             b.store.lock().await.accept_message(&ib, &network, "c", "m4", "m4", vec![], true,
                 user(&ia, &network, "m4")?, now_ms())?;
             assert_eq!(b.store.lock().await.scheduler_outbox()?.len(), 1);
@@ -4654,7 +4779,18 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 anyhow::Ok(())
-            }).await.context("owner returns the stored delivery receipt")??;
+            }).await.with_context(|| {
+                let sender = b.store.try_lock().ok().and_then(|store|
+                    store.mailbox_for_test(&network, "c", "message:m4").ok().flatten());
+                let owner = a.store.try_lock().ok().map(|store| (
+                    store.message(&network, "c", "m4").ok().map(|message| message.is_some()),
+                    store.scheduler_job("c", "message:m4").ok().map(|job| job.is_some()),
+                ));
+                format!("owner returns the stored delivery receipt: sender_state={:?}, attempts={:?}, next_attempt_in_ms={:?}, owner_has_message_and_job={owner:?}",
+                    sender.as_ref().map(|record| record.state),
+                    sender.as_ref().map(|record| record.attempts),
+                    sender.as_ref().map(|record| record.next_attempt_ms.saturating_sub(now_ms()).max(0)))
+            })??;
             let trigger = crate::scheduling::message_trigger("m4");
             assert_eq!(
                 b.store
@@ -4699,14 +4835,7 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         }
         .await;
-        for node in [&a, &b, &outsider] {
-            node.stop_network().await;
-        }
-        drop((a, b, outsider));
-        for dir in [dir_a, dir_b, dir_c] {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-        result
+        finish_nodes(result, vec![(a, dir_a), (b, dir_b), (outsider, dir_c)]).await
     }
 
     #[tokio::test(flavor = "multi_thread")]
