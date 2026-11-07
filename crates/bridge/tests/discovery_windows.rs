@@ -9,12 +9,18 @@ use std::{
     process::{Child, Command, Stdio},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+use std::os::windows::process::CommandExt;
 
 use vibeface_bridge::platform::{discovery, privatefs};
 
 const READY: &str = "vibeface-core-discovery-fixture-ready";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const HELPER_MARKER: &str = "VIBEFACE_DISCOVERY_CONSOLE_PROOF";
+const HELPER_EXPECTED: &str = "VIBEFACE_DISCOVERY_CONSOLE_PROOF_EXPECTED_DIR";
+const HELPER_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct Scratch(PathBuf);
 impl Drop for Scratch {
@@ -38,8 +44,11 @@ impl Drop for FixtureProcess {
 }
 
 fn scratch() -> PathBuf {
-    let directory =
-        std::env::temp_dir().join(format!("vibeface-discovery-enum-{}", uuid::Uuid::new_v4()));
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let directory = workspace.join(format!(
+        "target/vibeface-discovery-enum-{}",
+        uuid::Uuid::new_v4()
+    ));
     privatefs::create_dir(&directory).expect("enumeration scratch directory");
     directory
 }
@@ -81,8 +90,7 @@ fn compile_fixture_core(root: &Path) -> PathBuf {
     executable
 }
 
-#[test]
-fn running_core_data_dirs_finds_fixture_process_with_spaced_unicode_data_dir() {
+fn start_fixture() -> (Scratch, PathBuf, FixtureProcess) {
     let root = Scratch(scratch());
     let data_dir = root.0.join("Node 数据 With Space");
     privatefs::create_dir(&data_dir).expect("fixture data directory");
@@ -91,7 +99,7 @@ fn running_core_data_dirs_finds_fixture_process_with_spaced_unicode_data_dir() {
     let core = compile_fixture_core(&root.0);
     let child = Command::new(&core)
         .arg("--data-dir")
-        .arg(&data_dir)
+        .arg(&expected)
         .stderr(Stdio::piped())
         .spawn()
         .expect("start the fixture core");
@@ -111,12 +119,75 @@ fn running_core_data_dirs_finds_fixture_process_with_spaced_unicode_data_dir() {
         .recv_timeout(Duration::from_secs(20))
         .expect("fixture core ready marker");
     assert_eq!(marker.trim(), READY);
+    (root, expected, process)
+}
 
+fn assert_enumeration_matches(expected: &Path) {
     let found = discovery::running_core_data_dirs().expect("enumerate running cores");
+    let count = found.len();
+    let matched = found
+        .iter()
+        .any(|path| path.canonicalize().ok().as_deref() == Some(expected));
     assert!(
-        found
-            .iter()
-            .any(|path| path.canonicalize().ok().as_ref() == Some(&expected)),
-        "expected canonical data directory {expected:?} in {found:?}"
+        matched,
+        "enumeration miss: found_count={count} matched={matched}"
     );
+}
+
+fn wait_helper(child: &mut Child) {
+    let deadline = Instant::now() + HELPER_QUERY_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                assert!(status.success(), "helper exit success={}", status.success());
+                let _ = child.wait();
+                return;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("helper wait failed");
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("helper query timed out");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn spawn_no_console_helper(expected: &Path) {
+    let exe = std::env::current_exe().expect("current test executable");
+    let token = uuid::Uuid::new_v4().to_string();
+    let mut child = Command::new(&exe)
+        .arg("--exact")
+        .arg("running_core_data_dirs_finds_fixture_process_with_spaced_unicode_data_dir")
+        .arg("--nocapture")
+        .env(HELPER_MARKER, token)
+        .env(HELPER_EXPECTED, expected)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .expect("spawn no-console helper");
+    wait_helper(&mut child);
+}
+
+#[test]
+fn running_core_data_dirs_finds_fixture_process_with_spaced_unicode_data_dir() {
+    if std::env::var_os(HELPER_MARKER).is_some() {
+        let expected = std::env::var_os(HELPER_EXPECTED)
+            .map(PathBuf::from)
+            .and_then(|path| path.canonicalize().ok())
+            .expect("helper expected directory");
+        assert_enumeration_matches(&expected);
+        return;
+    }
+    let (_root, expected, _process) = start_fixture();
+
+    assert_enumeration_matches(&expected);
+    spawn_no_console_helper(&expected);
 }
