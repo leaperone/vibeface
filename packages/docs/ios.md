@@ -27,6 +27,10 @@ iOS 先通过 TestFlight 内测，验证后再上 App Store。当前工作流只
 请求的分发方式，再签名归档并导出 `vibeface-<releaseVersion>-ios.ipa`。
 输出包含经签名与描述文件校验的 SHA256 和来源收据。只配置部分 secrets 时构建失败。
 
+每日 Nightly 的版本准备会将 iOS `buildNumber` 递增一次，同日恢复沿用已经准备的值。
+构建号按 Apple 的 CFBundleVersion 分段规则验证；末段超出上限时停止，不重置或自动进位。
+Mobile 的 marketing version 仍保持 `0.0.1`。
+
 `distribution_method` 默认是 `app-store-connect`。对应收据中的
 `testflight_eligible=true` 只表示导出方式和描述文件校验通过，
 不代表 App Store Connect 已接收或测试者已经可以安装。内测安装还需要单独授权上传、

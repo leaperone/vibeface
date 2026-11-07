@@ -644,7 +644,7 @@ def self_test():
             assert plan.ios_build_number == '4'
             assert next_ios_build_number('3.1.9') == '3.1.10'
             assert next_ios_build_number('3.01') == '3.2'
-            for invalid in ('', '0', '10000', '3.100', '3.1.100', '3.1.2.3'):
+            for invalid in ('', '0', '10000', '9999', '3.99', '3.1.99', '3.100', '3.1.100', '3.1.2.3'):
                 rejected(lambda invalid=invalid: next_ios_build_number(invalid))
             assert plan_versions('20261105', base, []).versions['core'].endswith('.3')
             assert plan_versions('20261106', base, ['v0.0.1-nightly.20261106.9']).versions['cli'].endswith('.10')
@@ -678,6 +678,8 @@ def self_test():
                 ('apps/core/Cargo.toml', contents['apps/core/Cargo.toml'] + b'\n[dependencies]\nserde = "1"\n'),
                 ('apps/cli/Cargo.toml', contents['apps/cli/Cargo.toml'].replace(b'0.0.1-nightly.20261106.8', b'0.0.1-nightly.20261106.9')),
                 ('apps/mobile/app.json', contents['apps/mobile/app.json'].replace(b'250002', b'1')),
+                ('apps/mobile/app.json', contents['apps/mobile/app.json'].replace(b'"buildNumber": "4"', b'"buildNumber": "3"')),
+                ('apps/mobile/app.json', contents['apps/mobile/app.json'].replace(b'"buildNumber": "4"', b'"buildNumber": "5"')),
                 ('apps/mobile/app.json', contents['apps/mobile/app.json'].replace(b'"supportsTablet": true', b'"supportsTablet": false')),
                 ('extra.txt', b'not a version file\n'),
             ):

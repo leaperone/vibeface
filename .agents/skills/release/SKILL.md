@@ -26,7 +26,7 @@ description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，核对
 
 `ci.yml` 的 main schedule 在 `ci-gate` 成功后运行 `scripts/daily-nightly.py`，手动 CI 和普通 main push 不运行它。启用须已明确授权未来每日机械版本 PR 的自动 squash，并配置单仓库 fine-grained `NIGHTLY_RELEASE_TOKEN`，授予 Contents、Pull requests、Actions 所需权限。实现合并与本 skill 变化均不代表配置或启用完成。缺 secret 时明确失败，不挪用站点部署 token，不改保护，不 fallback。
 
-协调器从原 run.created_at 固定 UTC 日期，先恢复 `bot/daily-nightly/YYYYMMDD` 的唯一 PR、版本和真实 squash SHA。即使业务源码未变化，每日仍递增产品组和官网 Nightly；各产品组件使用同一版本，保留 marketing version、iOS buildNumber 和依赖解析结果。版本 PR 只允许机械版本字段、两个 Cargo.lock 本仓包版本、Android versionCode。PAT 只用于 PR 创建与普通立即 squash；PAT 没有路径级权限，限制由受信脚本的完整 tree、仓库、作者、base、head 校验执行。普通 GITHUB_TOKEN 处理分支、只创建的 tag 和精确 dispatch。
+协调器从原 run.created_at 固定 UTC 日期，先恢复 `bot/daily-nightly/YYYYMMDD` 的唯一 PR、版本和真实 squash SHA。即使业务源码未变化，每日仍递增产品组和官网 Nightly；各产品组件使用同一版本，保留 marketing version 和依赖解析结果，Android versionCode 与 iOS buildNumber 各递增一次。版本 PR 只允许机械版本字段、两个 Cargo.lock 本仓包版本，以及这两个原生构建号。iOS 递增 CFBundleVersion 的末段数字，超出 Apple 分段上限时停止，不重置或自动进位。PAT 只用于 PR 创建与普通立即 squash；PAT 没有路径级权限，限制由受信脚本的完整 tree、仓库、作者、base、head 校验执行。普通 GITHUB_TOKEN 处理分支、只创建的 tag 和精确 dispatch。
 
 合并后仅实际 SHA 的 main push CI success 放行。产品内部并行构建并完整汇总后公开一个 Release，产品与官网运行可并行。产品 Nightly 自动发布 npm，Nightly 不发站，也不上传 TestFlight 或 App Store；仍构建 iOS 设备归档，签名配置完整时导出 IPA。失败或响应未知先对账，只从原 run 完整 artifact 重跑失败 publisher，不能重建后覆盖。npm 失败使每日协调器失败，不自动重试；对账后重跑原 release run 的失败 job，复用原 npm artifact id。artifact 丢失、过期或存在字节冲突时停止。重跑原 schedule run 即可恢复原日任务，不另建版本 PR，不重新分配同日版本。不要在人工发版会话中无授权调用此自动协调入口。
 
