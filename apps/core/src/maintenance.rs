@@ -290,19 +290,20 @@ async fn write_packet<T: Serialize>(stream: &mut Stream, value: &T) -> Result<()
     Ok(())
 }
 /// The maintenance endpoint of the Node whose data directory this is.
-fn endpoint(data_dir: &Path) -> Result<Endpoint> {
+fn endpoint_parts(data_dir: &Path) -> Result<(PathBuf, Endpoint)> {
     let device_id = crate::config::identity(data_dir)?.device_id()?;
     let socket_dir = vibeface_bridge::platform::ipc::runtime_dir(&device_id[..32])?;
-    Endpoint::in_private_dir(&socket_dir, SOCKET_NAME)
+    let endpoint = Endpoint::in_private_dir(&socket_dir, SOCKET_NAME)?;
+    Ok((socket_dir, endpoint))
+}
+
+fn endpoint(data_dir: &Path) -> Result<Endpoint> {
+    Ok(endpoint_parts(data_dir)?.1)
 }
 
 /// Creates and locks down the endpoint directory only when this Node is starting its listener.
 fn listener_endpoint(data_dir: &Path) -> Result<Endpoint> {
-    let endpoint = endpoint(data_dir)?;
-    let socket_dir = endpoint
-        .path()
-        .parent()
-        .context("maintenance endpoint has no parent directory")?;
+    let (socket_dir, endpoint) = endpoint_parts(data_dir)?;
     match privatefs::create_dir(&socket_dir) {
         Ok(()) => {}
         Err(error)
@@ -702,6 +703,47 @@ mod tests {
         }
         #[cfg(windows)]
         assert_eq!(privatefs::is_private(&dir)?, permissions);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn listener_endpoint_secures_the_runtime_directory_not_the_abstract_endpoint_name() -> Result<()>
+    {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!(
+                "maintenance-listener-endpoint-{}",
+                uuid::Uuid::new_v4()
+            ));
+        config::private_dir(&dir)?;
+        let dir = dir.canonicalize()?;
+        let node_identity = LocalIdentity::generate();
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&node_identity)?,
+        )?;
+        let device_id = node_identity.device_id()?;
+        let runtime_dir = vibeface_bridge::platform::ipc::runtime_dir(&device_id[..32])?;
+        assert!(!runtime_dir.exists());
+
+        let endpoint = listener_endpoint(&dir)?;
+        assert!(runtime_dir.is_dir());
+        assert!(privatefs::is_private(&runtime_dir)?);
+        assert!(privatefs::same_owner(&runtime_dir, &dir)?);
+        #[cfg(unix)]
+        assert_eq!(endpoint.path(), &runtime_dir.join(SOCKET_NAME));
+        #[cfg(windows)]
+        {
+            assert!(endpoint.path().to_string_lossy().starts_with(r"\\.\pipe\"));
+            assert!(
+                !endpoint.is_held(),
+                "path preparation must not create a named pipe"
+            );
+            assert_ne!(endpoint.path().parent(), Some(runtime_dir.as_path()));
+        }
+
+        std::fs::remove_dir_all(runtime_dir)?;
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
