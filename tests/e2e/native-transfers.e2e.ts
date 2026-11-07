@@ -164,6 +164,9 @@ test('provider settings and queued cancellation work in the installed native app
   expect(await bundleManifest(installedPath)).toEqual(built);
   await device.clearKeychain();
   await app.open();
+  // Capture the fresh-install screen through CoreSimulator before asking the
+  // UI daemon for an accessibility tree. This image contains no invitation.
+  await execute('xcrun', ['simctl', 'io', simulator, 'screenshot', join(publicPath, 'provider-initial.png')]);
   await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
   const run = process.env.GITHUB_RUN_ID, attempt = process.env.GITHUB_RUN_ATTEMPT;
   if (run !== undefined || attempt !== undefined) {
@@ -174,7 +177,6 @@ test('provider settings and queued cancellation work in the installed native app
     assert.equal(assigned.length, 1);
     assert.equal(assigned[0].name, `vibeface-provider-${run}-${attempt}`);
     assert.equal(assigned[0].state, 'Booted');
-    await copyFile(await app.screenshot('provider-initial'), join(publicPath, 'provider-initial.png'));
   }
   await screen.getByRole('textbox', /^加入链接(?:$|[\s,，])/).fill(secrets.get('nativeInvitation'), { timeout: 30000 });
   await expect(screen.getByText('已填入加入链接', { exact: true })).toBeVisible();
