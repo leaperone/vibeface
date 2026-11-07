@@ -119,12 +119,13 @@ describe('businessNavigation', () => {
     })
   })
 
-  it('opens an invite for another local Node in the external browser target', () => {
-    expect(businessNavigation(access(), inspect(), invite('http://localhost:5800'))).toEqual({
-      kind: 'external',
-      url: 'http://localhost:5800/join#vibeface1qq2ww3ee4',
+  it.each(['http://localhost:5800', 'http://127.0.0.2:4790', 'https://localhost:4790'])(
+    'keeps another Node or listener %s in the external browser target', (origin) => {
+      expect(businessNavigation(access(), inspect(), invite(origin))).toEqual({
+        kind: 'external',
+        url: `${origin}/join#vibeface1qq2ww3ee4`,
+      })
     })
-  })
 
   it('keeps a raw ticket on the selected Node', () => {
     expect(businessNavigation(access(), inspect(), invite(null))).toEqual({

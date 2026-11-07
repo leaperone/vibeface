@@ -150,28 +150,28 @@ function reportFailure(title: string, error: unknown): void {
  */
 async function handleJoin(link: DeepLink): Promise<void> {
   if (link.kind !== 'join') return
-  const target = await requireSession().businessTarget(link).catch((error: unknown) => {
-    if (link.origin !== null && !isLoopbackOrigin(link.origin)) {
-      return { kind: 'external' as const, url: `${link.origin}/join#${link.ticket}` }
-    }
-    throw error
-  })
-  if (target.kind === 'external') {
-    showLauncher()
-    const origin = new URL(target.url).origin
-    const answer = await dialog.showMessageBox({
-      type: 'question',
-      title: '收到其他入口的加入链接',
-      message: '这条加入链接指向另一个入口地址。',
-      detail: `${origin}\n\n可以在系统浏览器中打开它继续加入流程。`,
-      buttons: ['在浏览器中打开', '取消'],
-      defaultId: 1,
-      cancelId: 1,
-    })
-    if (answer.response === 0) openExternally(target.url)
-    return
-  }
   try {
+    const target = await requireSession().businessTarget(link).catch((error: unknown) => {
+      if (link.origin !== null && !isLoopbackOrigin(link.origin)) {
+        return { kind: 'external' as const, url: `${link.origin}/join#${link.ticket}` }
+      }
+      throw error
+    })
+    if (target.kind === 'external') {
+      showLauncher()
+      const origin = new URL(target.url).origin
+      const answer = await dialog.showMessageBox({
+        type: 'question',
+        title: '收到其他入口的加入链接',
+        message: '这条加入链接指向另一个入口地址。',
+        detail: `${origin}\n\n可以在系统浏览器中打开它继续加入流程。`,
+        buttons: ['在浏览器中打开', '取消'],
+        defaultId: 1,
+        cancelId: 1,
+      })
+      if (answer.response === 0) openExternally(target.url)
+      return
+    }
     await loadBusiness(target.url)
   } catch (error) {
     reportFailure('无法打开加入链接', error)
