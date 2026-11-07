@@ -380,9 +380,8 @@ mod windows {
         };
         // A GUI parent has no inherited console codepage. Keep the metadata protocol UTF-8
         // without changing a caller's console or replacing non-ASCII Node paths with '?'.
-        let script = format!(
-            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); {script}"
-        );
+        let script =
+            format!("[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); {script}");
         let mut child = Command::new(path)
             .creation_flags(CREATE_NO_WINDOW)
             .args([
