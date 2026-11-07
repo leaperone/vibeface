@@ -360,7 +360,6 @@ impl BackgroundTasks {
                     break;
                 }
                 tokio::select! {
-                    biased;
                     command = receiver.recv(), if !stopping => match command {
                         Some(BackgroundCommand::Spawn(task)) => { tasks.spawn(task); }
                         Some(BackgroundCommand::Stop) | None => {
@@ -401,13 +400,12 @@ impl BackgroundTasks {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
+            && sender.send(BackgroundCommand::Stop).is_err()
         {
-            if sender.send(BackgroundCommand::Stop).is_err() {
-                tracing::warn!(
-                    event = "runtime.background_task",
-                    "background task supervisor stopped before shutdown"
-                );
-            }
+            tracing::warn!(
+                event = "runtime.background_task",
+                "background task supervisor stopped before shutdown"
+            );
         }
         if let Some(supervisor) = self.supervisor.lock().await.take()
             && let Err(error) = supervisor.await
@@ -454,7 +452,7 @@ pub struct Runtime {
     net: std::sync::OnceLock<Arc<crate::net::Net>>,
     router: Mutex<Option<iroh::protocol::Router>>,
     relay: Mutex<Option<iroh_relay::server::Server>>,
-    /// Strong Runtime clones held by background network tasks, released by final shutdown.
+    /// Runtime-owned workers, cancelled and joined by final shutdown.
     background_tasks: BackgroundTasks,
     sync_peers: std::sync::Mutex<HashMap<String, peers::PeerSync>>,
     peer_delivery_locks: peers::PeerDeliveryLocks,

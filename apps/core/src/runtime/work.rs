@@ -1189,7 +1189,7 @@ impl Runtime {
 
     pub(super) fn start_codex(self: &Arc<Self>, mut events: mpsc::UnboundedReceiver<ExecEvent>) {
         let node = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             // Known before the first connect, so requests on these threads come back to the Node
             // before the client reports its threads observed.
             node.observe_live_threads().await;
@@ -1216,6 +1216,8 @@ impl Runtime {
                     tracing::warn!(event = "app_server.event_failed", %error, "could not apply an App Server event");
                 }
             }
-        });
+        }) {
+            tracing::debug!(%error, "App Server event worker skipped while the Node is shutting down");
+        }
     }
 }

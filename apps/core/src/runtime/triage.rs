@@ -931,11 +931,13 @@ impl Runtime {
                     ..Default::default()
                 };
                 let node = self.clone();
-                tokio::spawn(async move {
+                if let Err(error) = self.background_tasks.spawn(async move {
                     if let Err(error) = node.ingest_agent_event(event).await {
                         tracing::debug!(%error, "App Server turn was not triaged");
                     }
-                });
+                }) {
+                    tracing::debug!(%error, "App Server triage skipped while the Node is shutting down");
+                }
             }
             _ => {}
         }
@@ -943,7 +945,7 @@ impl Runtime {
 
     pub(super) fn start_triage(self: &Arc<Self>) {
         let node = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(WAKE_EVERY) => {}
@@ -953,9 +955,11 @@ impl Runtime {
                     tracing::warn!(event = "triage.wake_failed", %error, "could not hand triage events to the Agent");
                 }
             }
-        });
+        }) {
+            tracing::debug!(%error, "triage event worker skipped while the Node is shutting down");
+        }
         let node = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 if let Err(error) = node.expire_requests().await {
@@ -965,9 +969,11 @@ impl Runtime {
                     tracing::warn!(event = "webhook.answers_failed", %error, "could not tell the webhook about answers");
                 }
             }
-        });
+        }) {
+            tracing::debug!(%error, "request-expiry worker skipped while the Node is shutting down");
+        }
         let node = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             loop {
                 if let Err(error) = node.deliver_webhooks().await {
                     tracing::warn!(event = "webhook.failed", %error, "webhook delivery failed");
@@ -975,9 +981,11 @@ impl Runtime {
                 let _ = tokio::time::timeout(Duration::from_secs(5), node.triage.outbox.notified())
                     .await;
             }
-        });
+        }) {
+            tracing::debug!(%error, "webhook worker skipped while the Node is shutting down");
+        }
         let node = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
             loop {
                 if let Err(error) = node.scan_sources().await {
@@ -985,7 +993,9 @@ impl Runtime {
                 }
                 tokio::time::sleep(SCAN_EVERY).await;
             }
-        });
+        }) {
+            tracing::debug!(%error, "session scan worker skipped while the Node is shutting down");
+        }
     }
 
     async fn pending_events(&self) -> Result<Vec<AgentEvent>> {

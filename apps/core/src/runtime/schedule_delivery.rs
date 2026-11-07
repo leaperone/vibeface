@@ -109,16 +109,18 @@ impl Runtime {
 
     pub(super) fn start_schedule_delivery(self: &Arc<Self>) {
         let node = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             if let Some(manager) = node.manager() {
                 if manager.provider.on_app_server() {
                     node.codex.ready().await;
                 }
                 node.probe_provider(manager.provider).await;
             }
-        });
+        }) {
+            tracing::debug!(%error, "provider readiness probe skipped while the Node is shutting down");
+        }
         let node = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(3));
             loop {
                 tokio::select! {
@@ -130,9 +132,11 @@ impl Runtime {
                     tracing::warn!(event = "schedule.reconcile_pending", %error, "durable scheduling reconciliation is pending");
                 }
             }
-        });
+        }) {
+            tracing::debug!(%error, "schedule reconciliation worker skipped while the Node is shutting down");
+        }
         let node = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.background_tasks.spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(30));
             loop {
                 tick.tick().await;
@@ -141,7 +145,9 @@ impl Runtime {
                     tracing::warn!(event = "schedule.runs_pending", %error, "schedule runs are pending");
                 }
             }
-        });
+        }) {
+            tracing::debug!(%error, "scheduled-run worker skipped while the Node is shutting down");
+        }
     }
 
     /// Queues the schedules that are due in conversations this Node schedules.
@@ -257,7 +263,8 @@ impl Runtime {
             return;
         }
         let node = self.clone();
-        tokio::spawn(async move {
+        let failed_key = key.clone();
+        if let Err(error) = self.background_tasks.spawn(async move {
             let result = std::panic::AssertUnwindSafe(node.drain_schedule(&network, &session))
                 .catch_unwind()
                 .await;
@@ -276,7 +283,10 @@ impl Runtime {
             }
             node.schedule_workers.lock().await.remove(&key);
             // The periodic durable scan covers enqueue racing this final empty check.
-        });
+        }) {
+            self.schedule_workers.lock().await.remove(&failed_key);
+            tracing::debug!(%error, "schedule consumer skipped while the Node is shutting down");
+        }
     }
 
     async fn drain_schedule(self: &Arc<Self>, network: &str, key: &SessionKey) -> Result<bool> {

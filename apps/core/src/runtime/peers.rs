@@ -2178,6 +2178,37 @@ mod tests {
         result
     }
 
+    #[tokio::test]
+    async fn shutdown_releases_runtime_after_controlled_writer_start() -> Result<()> {
+        let identity = LocalIdentity::generate();
+        let (node, dir) = node(&identity).await?;
+        assert!(
+            node.manager().is_none(),
+            "fixture has no configured Provider"
+        );
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.start_writers(receiver);
+        let weak = Arc::downgrade(&node);
+
+        node.shutdown().await;
+        node.shutdown().await;
+        drop(node);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "shutdown releases all Runtime writer workers"
+        );
+        drop(events);
+        let reopened = Runtime::open(&dir)
+            .await
+            .context("reopen a fixture after all Runtime writer workers stopped")?;
+        reopened.shutdown().await;
+        drop(reopened);
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("remove writer-start fixture directory {}", dir.display()))?;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn peer_delivery_locks_serialize_same_peer_and_allow_other_peers() -> Result<()> {
         use std::sync::atomic::{AtomicBool, Ordering};
