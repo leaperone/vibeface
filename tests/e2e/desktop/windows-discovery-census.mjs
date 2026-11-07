@@ -105,8 +105,8 @@ export async function censusCoreProcess(pid, expectedCorePath, inMain) {
   assert(Number.isInteger(pid) && pid > 0);
   const driver = await probeProcess(pid, expectedCorePath);
   const main = await inMain(`(async () => {
-    const { execFile } = await import('node:child_process');
-    const { promisify } = await import('node:util');
+    const { execFile } = process.mainModule.require('node:child_process');
+    const { promisify } = process.mainModule.require('node:util');
     const run = promisify(execFile);
     const encoded = ${JSON.stringify(encodeCommand(PROCESS_SCRIPT))};
     const env = { ...process.env, VIBEFACE_CENSUS_PID: ${JSON.stringify(String(pid))},
@@ -171,9 +171,9 @@ export async function discoverFromDriver(core, profileDir, remembered) {
 export async function discoverFromMain(profileDir, remembered, inMain) {
   const request = { command: 'discover_local_nodes', app_profile_dir: profileDir, remembered_data_dirs: remembered };
   return inMain(`(async () => {
-    const { execFile } = await import('node:child_process');
-    const { join } = await import('node:path');
-    const assert = (await import('node:assert/strict')).default;
+    const { execFile } = process.mainModule.require('node:child_process');
+    const { join } = process.mainModule.require('node:path');
+    const assert = process.mainModule.require('node:assert/strict');
     const WARNINGS = new Set(${JSON.stringify([...WARNINGS])});
     const sanitizeDiscover = ${sanitizeDiscover.toString()};
     const core = join(process.resourcesPath, 'runtime', 'vibeface-core.exe');
