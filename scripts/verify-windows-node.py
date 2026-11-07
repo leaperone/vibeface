@@ -866,16 +866,36 @@ try {
         return states if states == absent_tasks else None
 
     def registered_node_action():
+        # schtasks can emit console-encoded bytes with an unchanged UTF-16 XML declaration.
+        # Read the scheduler's Unicode definition and transport it as ASCII base64 instead.
+        script = r"""
+$ErrorActionPreference = 'Stop'
+try {
+    $scheduler = New-Object -ComObject 'Schedule.Service'
+    $scheduler.Connect()
+    $definition = $scheduler.GetFolder('\').GetTask('\Vibeface\Node').Xml
+    [Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($definition)))
+} catch {
+    $failure = $_.Exception
+    while ($failure.InnerException) { $failure = $failure.InnerException }
+    [Console]::Error.WriteLine("Could not read task definition (HRESULT $($failure.HResult)).")
+    exit 1
+}
+"""
+        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
         result = run([
-            Path(os.environ["SystemRoot"]) / "System32/schtasks.exe",
-            "/Query", "/TN", "\\Vibeface\\Node", "/XML", "ONE",
+            shell, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded,
         ], check=False, timeout=60)
         if result.returncode != 0:
             summary = service_task_action_matches(b"", node.cli, node.directory)
             summary["query_succeeded"] = False
             summary["encoding"] = "unknown"
             return summary
-        summary = service_task_action_matches(result.stdout, node.cli, node.directory)
+        try:
+            definition = base64.b64decode(result.stdout.strip(), validate=True)
+        except ValueError:
+            definition = b""
+        summary = service_task_action_matches(definition, node.cli, node.directory)
         summary["query_succeeded"] = True
         return summary
 
