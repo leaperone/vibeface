@@ -193,6 +193,40 @@ function Stop-Task {
         $result = Invoke-Scheduler @('/End', '/TN', $Name)
         if ($result.Code -ne 0) { Fail "could not stop $Name`n$($result.Output)" }
     }
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while (Test-TaskRunning -Name $Name) {
+        if ([DateTime]::UtcNow -ge $deadline) { Fail "task $Name did not finish stopping." }
+        Start-Sleep -Milliseconds 100
+    }
+    if ($Name -eq $NodeTask) { Wait-NodeReleased -Directory $dataDir }
+}
+
+function Wait-NodeReleased {
+    param([string] $Directory)
+    $lockPath = Join-Path $Directory 'node.lock'
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while ($true) {
+        $handle = $null
+        try {
+            # An exclusive open waits for the old Core's handle, not just the scheduler's state.
+            $handle = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            return
+        } catch {
+            $failure = $_.Exception
+            while ($failure.InnerException) { $failure = $failure.InnerException }
+            if ($failure.HResult -eq -2147024894) { return }
+            if ($failure.HResult -ne -2147024864 -and $failure.HResult -ne -2147024863) {
+                Fail "could not inspect the node lock (HRESULT $($failure.HResult))."
+            }
+            if ([DateTime]::UtcNow -ge $deadline) {
+                Fail 'the data directory is still in use after stopping the task.'
+            }
+        } finally {
+            if ($null -ne $handle) { $handle.Dispose() }
+        }
+        Start-Sleep -Milliseconds 100
+    }
 }
 
 function Start-Task {
