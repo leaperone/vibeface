@@ -2216,6 +2216,7 @@ pub(super) mod tests {
 
     async fn cleanup(node: Arc<Runtime>, dir: PathBuf) -> Result<()> {
         node.shutdown().await;
+        #[cfg(unix)]
         match std::fs::remove_file(named_socket(&node)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4609,13 +4610,21 @@ pub(super) mod tests {
         .await?;
         let (sent, received) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
-            while let Ok(stream) = listener.accept().await {
+            loop {
+                let stream = tokio::select! {
+                    _ = sent.closed() => break,
+                    accepted = listener.accept() => match accepted { Ok(stream) => stream, Err(_) => break },
+                };
                 let sent = sent.clone();
                 tokio::spawn(async move {
                     let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
                         return;
                     };
-                    while let Some(Ok(message)) = server.next().await {
+                    loop {
+                        let message = tokio::select! {
+                            _ = sent.closed() => break,
+                            message = server.next() => match message { Some(Ok(message)) => message, _ => break },
+                        };
                         let Ok(request) = serde_json::from_slice::<Value>(&message.into_data())
                         else {
                             continue;
@@ -5248,8 +5257,15 @@ pub(super) mod tests {
             Ok::<_, anyhow::Error>((action, dismissed, answered_request))
         }
         .await;
-        let _ = std::fs::remove_file(named_socket(&node));
+        let endpoint = vibeface_bridge::platform::ipc::Endpoint::from_path(&named_socket(&node))?;
+        node.shutdown().await;
         drop(node);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while endpoint.is_held() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
         let reopened = Arc::new(Runtime::reopen(&dir).await?);
         let result = async {
             let (old_action, dismissed, answered_request) = before?;
@@ -5295,6 +5311,7 @@ pub(super) mod tests {
             Ok::<_, anyhow::Error>(held["request_id"].as_str().context("request")?.to_owned())
         }
         .await;
+        node.shutdown().await;
         drop(node);
         let reopened = Arc::new(Runtime::reopen(&dir).await?);
         let result = async {
@@ -5413,7 +5430,7 @@ pub(super) mod tests {
         let result = async {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
-            coordination_app_server(&node).await?;
+            let _requests = coordination_app_server(&node).await?;
             node.coordination_turn(None, |_| Ok("triage".into()))
                 .await?;
             *node.triage.config.lock().unwrap() = TriageConfig {

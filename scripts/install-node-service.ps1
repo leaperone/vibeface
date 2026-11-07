@@ -52,22 +52,31 @@ function Invoke-Scheduler {
     return [pscustomobject]@{ Code = $LASTEXITCODE; Output = ($output | Out-String) }
 }
 
-# The command line a registered task runs, or $null when the task is not registered. The
-# scheduler writes a definition the same way whatever language Windows displays, unlike the
-# readable listing it prints.
-function Get-TaskCommandLine {
+# Return the registered task, treating only the scheduler's missing-task/path codes as absent.
+function Get-RegisteredTask {
     param([string] $Name)
     try {
         $scheduler = New-Object -ComObject 'Schedule.Service'
         $scheduler.Connect()
-        $task = $scheduler.GetFolder('\').GetTask($Name)
-        $document = [xml] $task.Xml
+        return $scheduler.GetFolder('\').GetTask($Name)
     } catch {
         $failure = $_.Exception
         while ($failure.InnerException) { $failure = $failure.InnerException }
         # The local Task Scheduler API distinguishes a missing task/path from query denial.
         if ($failure.HResult -eq -2147024894 -or $failure.HResult -eq -2147024893) { return $null }
         Fail "could not inspect task $Name (HRESULT $($failure.HResult)); it was preserved."
+    }
+}
+
+function Get-TaskCommandLine {
+    param([string] $Name)
+    $task = Get-RegisteredTask -Name $Name
+    if ($null -eq $task) { return $null }
+    try { $document = [xml] $task.Xml }
+    catch { Fail "could not read task $Name; it was preserved." }
+    $actions = @($document.Task.Actions.ChildNodes)
+    if ($actions.Count -ne 1 -or $actions[0].LocalName -ne 'Exec') {
+        Fail "task $Name has unsupported actions; it was preserved."
     }
     $exec = $document.Task.Actions.Exec
     if (-not $exec) { Fail "the registered task $Name runs no program." }
@@ -170,16 +179,12 @@ function Register-Definition {
     }
 }
 
-# Whether a registered task has a run in progress. The scheduler translates the readable state
-# it prints, so the result code it never translates is read instead.
+# TASK_STATE_RUNNING is the scheduler's current state, independent of display language and
+# the result code of an earlier run.
 function Test-TaskRunning {
     param([string] $Name)
-    $result = Invoke-Scheduler @('/Query', '/TN', $Name, '/V', '/FO', 'CSV', '/NH')
-    if ($result.Code -ne 0) { return $false }
-    foreach ($field in ($result.Output -split '[",\r\n]')) {
-        if ($field.Trim() -eq '267009') { return $true }
-    }
-    return $false
+    $task = Get-RegisteredTask -Name $Name
+    return $null -ne $task -and [int] $task.State -eq 4
 }
 
 function Stop-Task {

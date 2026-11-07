@@ -1090,19 +1090,24 @@ impl ServiceControl for Service {
 /// Whether this account's Node task has a run in progress.
 #[cfg(windows)]
 async fn task_is_running() -> Result<bool> {
-    let output = Command::new(schtasks()?)
-        .args(["/Query", "/TN", TASK, "/V", "/FO", "CSV", "/NH"])
-        .output()
-        .await?;
+    let root =
+        std::env::var_os("SystemRoot").context("SystemRoot is required to query the node task")?;
+    let shell = PathBuf::from(root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let output = Command::new(shell)
+        .args(["-NoProfile", "-NonInteractive", "-Command",
+            "$ErrorActionPreference='Stop'; $scheduler=New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); [int]$scheduler.GetFolder('\\').GetTask($env:VIBEFACE_NODE_TASK).State"])
+        .env("VIBEFACE_NODE_TASK", TASK)
+        .output().await?;
     ensure!(
         output.status.success(),
-        "installed node task of this account is required"
+        "could not query the installed node task of this account"
     );
-    // The scheduler translates the readable state it prints, so the result code it never
-    // translates is read instead. A run in progress is reported as this one value.
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .split(['"', ',', '\r', '\n'])
-        .any(|field| field.trim() == "267009"))
+    let state = String::from_utf8(output.stdout)?
+        .trim()
+        .parse::<u32>()
+        .context("invalid scheduled task state")?;
+    ensure!(state <= 4, "unknown scheduled task state");
+    Ok(state == 4)
 }
 
 #[cfg(any(target_os = "macos", test))]

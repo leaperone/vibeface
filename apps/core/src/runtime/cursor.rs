@@ -1120,6 +1120,7 @@ mod tests {
             1
         );
         node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -1592,6 +1593,7 @@ mod tests {
             }
         }
         node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -1643,6 +1645,7 @@ mod tests {
             1
         );
         node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -1691,6 +1694,7 @@ mod tests {
         );
         assert!(running.state.handle().is_some());
         node.shutdown().await;
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
