@@ -1,5 +1,6 @@
 import { Link, Stack, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
+import { File } from 'expo-file-system'
 import { ArrowDown, Bot, Crown, LoaderCircle, MessageSquareOff, Star } from 'lucide-react-native'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { FlatList, Platform, Pressable, StyleSheet, View, type NativeScrollEvent } from 'react-native'
@@ -13,6 +14,9 @@ import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
 import { outcomeUnknown } from '@vibeface/client/lib/errors.ts'
+import { messageOf } from '@vibeface/client/lib/node.ts'
+import { connectionHealth } from '@vibeface/client/lib/connection-health.ts'
+import { encodeLocalDraft, parseLocalDraft } from '@vibeface/client/workspace/local-records.ts'
 import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
 import { unreachable } from '@vibeface/client/workspace/home.ts'
 import { botMood, BotFace, ScreenFaces, type FaceBot } from '@/components/bot-face'
@@ -23,6 +27,7 @@ import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
 import { useLive } from '@/data/live'
+import { mobilePlatform } from '@/platform'
 import type { Attachment, ChatMessage, Conversation } from '@/data/types'
 import type { Question } from '@vibeface/client/workspace/types.ts'
 import { Composer } from '@/features/chat/composer'
@@ -105,16 +110,43 @@ export default function ChatScreen() {
   const bot = workspace.bots.find((item) => item.bot_id === botId)
   const id = bot?.conversation_id
   const chat = id ? workspace.conversations[id] : undefined
+  const focus = id && workspace.chatFocus?.id === id ? workspace.chatFocus : null
   const live = useLive()
   const latestWorkspace = useRef(workspace)
   latestWorkspace.current = workspace
+  const device = useDevice()
+  const draftIdentity = id && workspace.ownerScope ? { ...workspace.ownerScope, conversationId: id } : null
+  const draftKey = draftIdentity ? `local-draft.${draftIdentity.networkId}.${draftIdentity.deviceId}.${id}` : null
   const [drafts, setDrafts] = useState<Record<string, { text: string; files: Attachment[] }>>({})
+  const draftsRef = useRef(drafts)
+  draftsRef.current = drafts
   const [launching, setLaunching] = useState(false)
-  const draft = (id && drafts[id]) || { text: '', files: [] }
-  const setDraft = (next: Partial<typeof draft>) => { if (id) setDrafts((current) => ({ ...current, [id]: { ...draft, ...next } })) }
+  const [sendError, setSendError] = useState<string | null>(null)
+  const [statusExpanded, setStatusExpanded] = useState(false)
+  const [, setHealthTick] = useState(0)
+  const readStarted = useRef<number | null>(null)
+  let loadedDraft: ReturnType<typeof parseLocalDraft> = null
+  if (draftIdentity && draftKey) {
+    try { loadedDraft = parseLocalDraft(mobilePlatform.storage.getItem(draftKey), draftIdentity) } catch { /* Keep this visit usable if local storage cannot be read. */ }
+  }
+  const draftScope = draftKey ?? id ?? ''
+  const draft = drafts[draftScope] ?? { text: loadedDraft?.text ?? '', files: loadedDraft?.attachments ?? [] }
+  const persistDraft = (value: typeof draft) => {
+    if (!draftIdentity || !draftKey) return
+    const raw = encodeLocalDraft({ ...draftIdentity, text: value.text, attachments: value.files })
+    if (raw === null) { setSendError('草稿或附件信息过大或无法安全保存；当前页面中的内容仍保留。'); return }
+    try { mobilePlatform.storage.setItem(draftKey, raw) } catch { setSendError('本机暂时无法保存草稿；当前页面中的内容仍保留。') }
+  }
+  const setDraft = (next: Partial<typeof draft>) => {
+    if (!id) return
+    const updated = { ...draft, ...next }
+    const nextDrafts = { ...draftsRef.current, [draftScope]: updated }
+    draftsRef.current = nextDrafts
+    setDrafts(nextDrafts)
+    persistDraft(updated)
+  }
   useFocusEffect(useCallback(() => id ? latestWorkspace.current.actions.open(id) : undefined, [id, live?.generation]))
   const extras = useChatExtras(id ?? '', botId, (text) => setDraft({ text }))
-  const device = useDevice()
   // As on the web: until a device can reply, the empty chat says so and points a manager at the AI settings instead of offering starters.
   const reach = live ? botReach(live.nodes) : 'ready'
   const canSetUp = device.ready?.principal.can_manage === true
@@ -159,25 +191,64 @@ export default function ChatScreen() {
     if (!landed || !unsettled.current) return
     if (draft.text.trim() === unsettled.current.text) setDraft({ text: '', files: [] })
     unsettled.current = null
+    setSendError(null)
   }, [landed])
   // The empty state stays centred in the space above the composer instead of riding up with the list.
   const above = useAnimatedStyle(() => ({ paddingBottom: ios
     ? dockHeight.value + Math.max(0, Math.abs(keyboard.height.value) - insets.bottom * keyboard.progress.value)
     : Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) }))
 
-  if (!bot || !id) return <EmptyState icon={Bot} title={botCopy.notFound} className="flex-1 justify-center" />
   const offline = unreachable(device.link)
-  const blocked = offline ? '离线，恢复后可发送' : chat?.blocked ?? (chat ? null : '稍等')
+  const reconnecting = workspace.connection.state === 'connecting' || workspace.connection.state === 'syncing'
+  const transcriptReady = Boolean(chat)
+  const loading = Boolean(focus?.kind === 'loading' || live?.reading || (!transcriptReady && focus?.kind !== 'error' && (reconnecting || live?.refreshing || live?.incomplete)))
+  useEffect(() => {
+    if (!loading) { readStarted.current = null; return }
+    if (readStarted.current === null) readStarted.current = Date.now()
+    const timer = setTimeout(() => setHealthTick((tick) => tick + 1), 8000)
+    return () => clearTimeout(timer)
+  }, [loading])
+  const health = connectionHealth({ disconnects: 'attempt' in device.link ? device.link.attempt : 0,
+    readStartedAt: loading ? readStarted.current : null, now: Date.now(), timedOut: false })
+  if (!bot || !id) return <EmptyState icon={Bot} title={botCopy.notFound} className="flex-1 justify-center" />
+  const loadError = focus?.kind === 'error' ? focus.message : null
+  const sharedError = live?.error?.text && (live.conversationId === id || !transcriptReady) ? live.error : null
+  const detailError = loadError ? { text: loadError, retry: focus?.kind === 'error' ? focus.retry : undefined } : sharedError
+  const readError = sharedError?.kind === 'read' ? sharedError : null
+  const pending = live?.messagePending
+  const uncertainSameSend = unsettled.current !== null && draft.text.trim() === unsettled.current.text
+    || pending?.conversation_id === id && pending.rejected === undefined && pending.text === draft.text.trim()
+  const loadNotice = sendError ?? detailError?.text ?? (health === 'recovering' ? '连接响应较慢，正在恢复' : offline ? chat?.source === 'cache' ? '离线，显示本机记录' : '连接中断，正在恢复' : reconnecting ? '正在恢复连接' : loading ? '正在加载聊天记录' : chat?.source === 'cache' ? '显示本机记录，正在更新' : null)
+  const blocked = offline ? '离线，恢复后可发送' : loadError || readError ? `${loadError ?? readError?.text}。只读，点按重试` : loading ? '正在加载' : uncertainSameSend ? '发送结果尚未确认，请勿重复发送' : chat?.blocked ?? null
   const send = () => {
     const { text, files } = draft
-    setDraft({ text: '', files: [] })
+    if (uncertainSameSend) return
+    try {
+      if (files.some((file) => !new File(file.uri).exists)) { setSendError('附件已无法读取，请重新选择。'); return }
+    } catch { setSendError('附件已无法读取，请重新选择。'); return }
+    setSendError(null)
     // Held from the tap itself: the shared sending flag lands a frame or two after the draft clears.
     setLaunching(true)
     toLatest()
-    workspace.actions.send(id, text.trim(), files).catch(() => { unsettled.current = { text: text.trim(), seen: sent(text.trim()) }; setDraft({ text, files }) }).finally(() => setLaunching(false))
+    workspace.actions.send(id, text.trim(), files).then((confirmed) => {
+      if (!confirmed) {
+        unsettled.current = { text: text.trim(), seen: sent(text.trim()) }
+        setSendError('发送结果尚未确认，请勿重复发送。')
+        return
+      }
+      const current = draftsRef.current[draftScope] ?? draft
+      if (current.text === text && JSON.stringify(current.files) === JSON.stringify(files)) setDraft({ text: '', files: [] })
+    }).catch((cause: unknown) => {
+      const held = latestLive.current?.messagePending
+      if (held?.conversation_id === id && held.text === text.trim() && held.rejected === undefined) {
+        unsettled.current = { text: text.trim(), seen: sent(text.trim()) }
+        setSendError('发送结果尚未确认，请勿重复发送。')
+      } else setSendError(messageOf(cause, '发送消息'))
+    }).finally(() => setLaunching(false))
   }
   const rows = chat ? entries(chat, extras, bot, offline) : []
-  const setupBlocked = !offline && blocked === composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) && (reach === 'needs_setup' || reach === 'none' || reach === 'offline')
+  const setupBlocked = !loading && !loadError && !offline && blocked === composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) && (reach === 'needs_setup' || reach === 'none' || reach === 'offline')
+  const showStarters = botCanSend(reach) && transcriptReady && chat?.source === 'live' && !loading && !loadError && rows.length === 0
   // 重试 on the newest reply once it failed or was stopped, as on the web.
   const newest = chat?.messages.at(-1)
   const asked = newest && ['failed', 'stopped'].includes(newest.status ?? '') ? newest.in_reply_to : undefined
@@ -248,7 +319,12 @@ export default function ChatScreen() {
             <Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /><Text className="text-meta text-muted-foreground">主 Bot</Text>
           </View> : null}
         </View>
-        {botCanSend(reach) ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
+        {loadNotice ? <>
+          <View role="status" className="flex-row items-center gap-1.5">{loading ? <Icon as={LoaderCircle} className="text-muted-foreground" /> : null}
+            <Text className={`text-center ${loadError ? 'text-danger' : 'text-muted-foreground'}`}>{loadNotice}</Text>
+          </View>
+          {detailError?.retry ? <Button variant="outline" onPress={detailError.retry}><Text>重试</Text></Button> : null}
+        </> : showStarters ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
           {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="outline" className="rounded-full" style={{ borderColor: tint.edge }} onPress={() => setDraft({ text: example })}><Text className="text-muted-foreground">{example}</Text></Button>)}
         </View> : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted-foreground" /><Text className="text-muted-foreground">Bot 正在启动</Text></View> : <>
           <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="text-muted-foreground" /><Text className="text-muted-foreground">Bot 还不能回复</Text></View>
@@ -267,7 +343,14 @@ export default function ChatScreen() {
         </View> : null}
         <Composer chrome={chrome} value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
           blocked={blocked} sending={launching || (chat?.sending ?? false)} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} tint={tint}>
-          {offline ? <OfflineBar chat className="self-center" /> : setupBlocked && rows.length ? <View role="status" className="flex-row flex-wrap items-center gap-x-2 px-2">
+          {chat && (chat.source === 'cache' || loadNotice || live?.noticeText || workspace.cacheNotice) ? <Pressable accessibilityRole="button" accessibilityLabel="聊天状态详情" onPress={() => setStatusExpanded((value) => !value)} className="self-center px-2 py-1">
+            <Text className="text-meta text-muted-foreground">{loadNotice ?? live?.noticeText ?? workspace.cacheNotice ?? '显示本机记录，正在更新'}</Text>
+            {statusExpanded ? <View className="flex-row flex-wrap items-center gap-2">
+              <Text className="text-meta text-muted-foreground">{workspace.cacheNotice ?? detailError?.text ?? (chat.source === 'cache' ? '聊天记录已保留在本机；连接恢复后会自动更新。' : live?.noticeText)}</Text>
+              {detailError?.retry ? <Button variant="ghost" size="sm" onPress={detailError.retry}><Text>重试</Text></Button> : null}
+              {offline ? <Button variant="ghost" size="sm" onPress={device.retryNow}><Text>重新连接</Text></Button> : null}
+            </View> : null}
+          </Pressable> : offline ? <OfflineBar chat className="self-center" /> : setupBlocked && rows.length ? <View role="status" className="flex-row flex-wrap items-center gap-x-2 px-2">
             <Text className="text-meta text-muted-foreground">{blocked}</Text>
             {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild><Button variant="ghost" size="sm"><Text>{reach === 'offline' ? '查看设备' : '去设置'}</Text></Button></Link>
               : <Text className="text-meta text-muted-foreground">{setUpOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))}</Text>}

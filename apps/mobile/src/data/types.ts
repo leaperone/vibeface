@@ -23,6 +23,7 @@ export type ChatMessage = TranscriptMessage & { state?: 'sending' | 'streaming' 
  * `stoppable`: the running reply can be cancelled. `blocked`: why sending is off right now, or null when it is allowed.
  */
 export type Conversation = {
+  source: 'live' | 'cache'
   messages: ChatMessage[]
   /** Questions before the message written after them, and those asked after the last. */
   before: ReadonlyMap<string, Question[]>
@@ -47,6 +48,9 @@ export type Attachment = { uri: string; name: string; size: number | null; mimeT
 export type Member = { device_id: string; name: string; kind: 'node' | 'client'; admin: boolean; online: boolean | undefined; current: boolean; entry: boolean; bot: BotReadiness | null }
 
 type WorkspaceSnapshot = {
+  /** Verified current owner, or last joined owner while its saved membership is reconnecting offline. */
+  ownerScope: { networkId: string; deviceId: string } | null
+  cacheNotice: string | null
   session: Session
   connection: Connection
   bots: BotRecord[]
@@ -59,6 +63,8 @@ type WorkspaceSnapshot = {
   members: Member[]
   /** Loaded chats by conversation; a chat appears once `open` has loaded it. */
   conversations: Record<string, Conversation>
+  /** The chat route is waiting on a read for this conversation, or failed until retried. */
+  chatFocus: null | { kind: 'loading'; id: string } | { kind: 'error'; id: string; message: string; retry: () => void } | { kind: 'ready'; id: string }
 }
 
 export type WorkspaceActions = {
@@ -66,7 +72,7 @@ export type WorkspaceActions = {
   cancelJoin(): void
   /** Loads the chat and keeps it live while on screen; reading it acknowledges its notifications. */
   open(conversationId: string): () => void
-  send(conversationId: string, text: string, attachments: Attachment[]): Promise<void>
+  send(conversationId: string, text: string, attachments: Attachment[]): Promise<boolean>
   stop(conversationId: string): Promise<void>
   answer(question: Question, text: string): Promise<AnswerResult>
   /** Takes this phone out of the network; coming back takes a join link. */
