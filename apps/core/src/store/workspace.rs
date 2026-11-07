@@ -9,10 +9,7 @@ use crate::{
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Component, Path},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Graph {
@@ -92,25 +89,139 @@ fn valid_text(value: &str, max: usize, field: &str) -> Result<()> {
     );
     Ok(())
 }
+#[derive(Debug, PartialEq, Eq)]
+struct LexicalRoot {
+    family: RootFamily,
+    anchor: String,
+    parts: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RootFamily {
+    Posix,
+    Windows,
+}
+
+// Shared workspace metadata is replayed on different host OSes. Parse its spelling
+// as data instead of asking the current host's std::path implementation.
+fn lexical_root(path: &str) -> Option<LexicalRoot> {
+    if path.is_empty() || path.len() > 4096 || path.chars().any(char::is_control) {
+        return None;
+    }
+    let (family, anchor, body, separator, root_only) = if path.starts_with('/') {
+        if path.starts_with("//") {
+            return None;
+        }
+        (
+            RootFamily::Posix,
+            "/".to_owned(),
+            &path[1..],
+            '/',
+            path == "/",
+        )
+    } else if path.starts_with("\\\\?\\UNC\\") || path.starts_with("\\\\?\\unc\\") {
+        let rest = &path[8..];
+        let mut it = rest.split('\\');
+        let server = it.next()?;
+        let share = it.next()?;
+        if !valid_unc_anchor(server) || !valid_unc_anchor(share) {
+            return None;
+        }
+        let consumed = server.len() + 1 + share.len();
+        let body = &rest[consumed..];
+        (
+            RootFamily::Windows,
+            format!("\\\\{server}\\{share}"),
+            body.strip_prefix('\\').unwrap_or(body),
+            '\\',
+            body.is_empty() || body == "\\",
+        )
+    } else if path.starts_with("\\\\?\\") {
+        let rest = &path[4..];
+        if rest.len() < 3
+            || !rest.as_bytes()[0].is_ascii_alphabetic()
+            || rest.as_bytes()[1] != b':'
+            || rest.as_bytes()[2] != b'\\'
+        {
+            return None;
+        }
+        (
+            RootFamily::Windows,
+            format!("{}:", (rest.as_bytes()[0] as char).to_ascii_uppercase()),
+            &rest[3..],
+            '\\',
+            rest.len() == 3,
+        )
+    } else if path.starts_with("\\\\") {
+        let rest = &path[2..];
+        let mut it = rest.split('\\');
+        let server = it.next()?;
+        let share = it.next()?;
+        if !valid_unc_anchor(server) || !valid_unc_anchor(share) {
+            return None;
+        }
+        let consumed = server.len() + 1 + share.len();
+        let body = &rest[consumed..];
+        (
+            RootFamily::Windows,
+            format!("\\\\{server}\\{share}"),
+            body.strip_prefix('\\').unwrap_or(body),
+            '\\',
+            body.is_empty() || body == "\\",
+        )
+    } else if path.len() >= 3
+        && path.as_bytes()[0].is_ascii_alphabetic()
+        && path.as_bytes()[1] == b':'
+        && matches!(path.as_bytes()[2], b'/' | b'\\')
+    {
+        let sep = path.as_bytes()[2] as char;
+        (
+            RootFamily::Windows,
+            format!("{}:", (path.as_bytes()[0] as char).to_ascii_uppercase()),
+            &path[3..],
+            sep,
+            path.len() == 3,
+        )
+    } else {
+        return None;
+    };
+    if root_only {
+        return Some(LexicalRoot {
+            family,
+            anchor,
+            parts: Vec::new(),
+        });
+    }
+    if body.is_empty()
+        || body.ends_with(separator)
+        || (family == RootFamily::Windows
+            && body.contains(if separator == '\\' { '/' } else { '\\' }))
+    {
+        return None;
+    }
+    let parts: Vec<String> = body.split(separator).map(str::to_owned).collect();
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return None;
+    }
+    Some(LexicalRoot {
+        family,
+        anchor,
+        parts,
+    })
+}
+
+fn valid_unc_anchor(part: &str) -> bool {
+    !part.is_empty() && part != "." && part != ".." && !part.contains(['/', ':'])
+}
+
 fn valid_roots(roots: &[String]) -> Result<()> {
     ensure!(roots.len() <= 16, "too many workspace roots");
     for root in roots {
         ensure!(
-            root.len() <= 4096
-                && Path::new(root).is_absolute()
-                && !root.chars().any(char::is_control)
-                && !Path::new(root)
-                    .components()
-                    .any(|part| matches!(part, Component::ParentDir | Component::CurDir)),
-            "workspace roots must be normalized absolute paths"
-        );
-        ensure!(
-            Path::new(root)
-                .components()
-                .collect::<std::path::PathBuf>()
-                .to_string_lossy()
-                == *root
-                && (root == "/" || !root.ends_with('/')),
+            lexical_root(root).is_some(),
             "workspace roots must be normalized absolute paths"
         );
     }
@@ -121,7 +232,86 @@ fn valid_roots(roots: &[String]) -> Result<()> {
     Ok(())
 }
 fn overlap(left: &str, right: &str) -> bool {
-    Path::new(left).starts_with(right) || Path::new(right).starts_with(left)
+    let (Some(left), Some(right)) = (lexical_root(left), lexical_root(right)) else {
+        return false;
+    };
+    if left.family != right.family || !eq_root_part(&left.family, &left.anchor, &right.anchor) {
+        return false;
+    }
+    let common = left.parts.len().min(right.parts.len());
+    left.parts[..common]
+        .iter()
+        .zip(&right.parts[..common])
+        .all(|(a, b)| eq_root_part(&left.family, a, b))
+}
+
+fn eq_root_part(family: &RootFamily, left: &str, right: &str) -> bool {
+    match family {
+        RootFamily::Posix => left == right,
+        RootFamily::Windows => left.eq_ignore_ascii_case(right),
+    }
+}
+
+#[cfg(test)]
+mod root_path_tests {
+    use super::{overlap, valid_roots};
+
+    #[test]
+    fn accepts_normalized_absolute_paths_for_each_platform() {
+        for path in [
+            "/srv/work",
+            "/srv/项目",
+            "C:\\Users\\dev\\work",
+            "C:\\资料\\项目",
+            "D:/work",
+            "\\\\server\\share\\work",
+            "\\\\?\\C:\\work",
+            "\\\\?\\UNC\\server\\share\\work",
+        ] {
+            assert!(valid_roots(&[path.to_owned()]).is_ok(), "{path}");
+        }
+    }
+
+    #[test]
+    fn rejects_relative_and_noncanonical_paths_for_each_platform() {
+        for path in [
+            "relative/work",
+            "/srv/./work",
+            "/srv/../work",
+            "/srv//work",
+            "/srv/work/",
+            "C:work",
+            "C:\\work\\..\\other",
+            "C:\\work/../other",
+            "C:/work\\..\\other",
+            "C:\\work\\",
+            "\\\\.\\share\\work",
+            "\\\\server\\..\\work",
+            "\\\\server\\share\\..\\work",
+            "\\\\server\\share\\work\\\\x",
+            "/srv/wo\u{7}rk",
+        ] {
+            assert!(valid_roots(&[path.to_owned()]).is_err(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn overlap_uses_portable_components() {
+        assert!(overlap("C:\\Work\\repo", "c:\\work"));
+        assert!(overlap("\\\\?\\C:\\Work\\repo", "C:/work"));
+        assert!(!overlap("C:\\Work", "D:\\Work"));
+        assert!(overlap("/srv/work", "/srv/work/repo"));
+        assert!(!overlap("/srv/work", "/srv/worker"));
+        assert!(overlap("\\\\server\\share\\work", "\\\\server\\share"));
+        assert!(overlap(
+            "\\\\?\\UNC\\server\\share\\work",
+            "\\\\server\\share"
+        ));
+        assert!(!overlap(
+            "\\\\server\\share\\work",
+            "\\\\other\\share\\work"
+        ));
+    }
 }
 
 pub(crate) fn validate_target(target: &InputTarget) -> Result<()> {
