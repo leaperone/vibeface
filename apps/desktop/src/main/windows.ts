@@ -1,5 +1,5 @@
 import { join } from 'node:path'
-import { BrowserWindow, shell, type Session } from 'electron'
+import { BrowserWindow, shell, type Event, type Session } from 'electron'
 import { LAUNCHER_URL, PRODUCT_NAME } from '../shared/contract.js'
 
 /** Permissions the Core-served page may ask for; everything else is refused. */
@@ -21,6 +21,16 @@ export function openExternally(rawUrl: string): void {
   } catch {
     /* an unparsable link is not opened */
   }
+}
+
+function guardNavigation(window: BrowserWindow, allowed: (url: string) => boolean): void {
+  const navigate = (event: Event, url: string) => {
+    if (allowed(url)) return
+    event.preventDefault()
+    openExternally(url)
+  }
+  window.webContents.on('will-navigate', navigate)
+  window.webContents.on('will-redirect', navigate)
 }
 
 export function createLauncherWindow(mainDir: string): BrowserWindow {
@@ -46,11 +56,7 @@ export function createLauncherWindow(mainDir: string): BrowserWindow {
     openExternally(url)
     return { action: 'deny' }
   })
-  window.webContents.on('will-navigate', (event, url) => {
-    if (url === LAUNCHER_URL) return
-    event.preventDefault()
-    openExternally(url)
-  })
+  guardNavigation(window, (url) => url === LAUNCHER_URL)
   window.webContents.on('will-attach-webview', (event) => event.preventDefault())
   void window.loadURL(LAUNCHER_URL)
   return window
@@ -77,11 +83,7 @@ export function createBusinessWindow(origin: string): BrowserWindow {
     openExternally(url)
     return { action: 'deny' }
   })
-  window.webContents.on('will-navigate', (event, url) => {
-    if (sameOrigin(url, origin)) return
-    event.preventDefault()
-    openExternally(url)
-  })
+  guardNavigation(window, (url) => sameOrigin(url, origin))
   window.webContents.on('will-attach-webview', (event) => event.preventDefault())
   return window
 }

@@ -27,7 +27,6 @@ import {
 } from './windows.js'
 
 const MAX_PATH = 1024
-const LOAD_TIMEOUT_MS = 20_000
 
 const mainDir = __dirname
 
@@ -102,7 +101,7 @@ function showLauncher(): void {
   broadcast()
 }
 
-async function loadBusiness(target: string): Promise<BrowserWindow> {
+async function loadBusiness(target: string): Promise<void> {
   const origin = new URL(target).origin
   if (businessWindow && !businessWindow.isDestroyed() && !sameOrigin(businessWindow.webContents.getURL(), origin)) {
     businessWindow.destroy()
@@ -124,29 +123,14 @@ async function loadBusiness(target: string): Promise<BrowserWindow> {
   window.show()
   window.focus()
   broadcast()
-  return window
 }
 
 /**
- * Open the UI Core serves at its own private origin. An invite continues in the same window
- * on that origin, after the access URL has established the local session.
+ * Open Core's private UI origin. An invite enters the ordinary join flow directly.
  */
 async function openBusiness(invite?: { ticket: string }): Promise<void> {
   const target = await requireSession().businessTarget()
-  const origin = new URL(target).origin
-  const connected =
-    businessWindow && !businessWindow.isDestroyed() && sameOrigin(businessWindow.webContents.getURL(), origin)
-  if (invite && connected) {
-    await loadBusiness(`${origin}/join#${invite.ticket}`)
-    return
-  }
-  const window = await loadBusiness(target)
-  if (!invite) return
-  await Promise.race([
-    new Promise<void>((resolve) => window.webContents.once('did-finish-load', () => resolve())),
-    new Promise<void>((resolve) => setTimeout(resolve, LOAD_TIMEOUT_MS)),
-  ])
-  await loadBusiness(`${origin}/join#${invite.ticket}`)
+  await loadBusiness(invite ? `${new URL(target).origin}/join#${invite.ticket}` : target)
 }
 
 function openBusinessSafely(): void {
