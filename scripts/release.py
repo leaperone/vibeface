@@ -89,11 +89,11 @@ def read_version(app, root=None):
     require(app in APPS, 'unknown app')
     directory = root / 'apps' / app
     if app in ('core', 'cli'):
-        text = (directory / 'Cargo.toml').read_text()
+        text = (directory / 'Cargo.toml').read_text(encoding='utf-8')
         match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
         require(match, f'{app} must own its package version')
         return match[1]
-    data = json.loads((directory / ('app.json' if app == 'mobile' else 'package.json')).read_text())
+    data = json.loads((directory / ('app.json' if app == 'mobile' else 'package.json')).read_text(encoding='utf-8'))
     return data['expo']['extra']['releaseVersion'] if app == 'mobile' else data['version']
 
 
@@ -207,13 +207,13 @@ def unpack(archive, destination):
 
 
 def control_constant(name):
-    match = re.search(rf'pub const {name}: u32 = (\d+);', (ROOT / 'crates/control/src/lib.rs').read_text())
+    match = re.search(rf'pub const {name}: u32 = (\d+);', (ROOT / 'crates/control/src/lib.rs').read_text(encoding='utf-8'))
     require(match, f'missing {name}')
     return int(match[1])
 
 
 def verify_component(directory, app, expected=None):
-    info = json.loads((directory / 'COMPONENT-INFO.json').read_text())
+    info = json.loads((directory / 'COMPONENT-INFO.json').read_text(encoding='utf-8'))
     fields = {'app', 'version', 'tag', 'source_commit', 'channel', 'schema', 'target', 'files'}
     if app == 'core':
         fields.add('data_epoch')
@@ -320,7 +320,7 @@ def verify_release_identity(info):
 
 
 def verify_manifest(directory, expected=None):
-    info = json.loads((directory / 'release.json').read_text())
+    info = json.loads((directory / 'release.json').read_text(encoding='utf-8'))
     verify_release_identity(info)
     if expected:
         require(all(info[k] == v for k, v in expected.items()), 'release identity mismatch')
@@ -340,7 +340,7 @@ def native_receipt(native_dir, target, product_version, source_commit):
     """Read and bind a native staging receipt to this target, version and checkout."""
     path = native_dir / 'NATIVE-INFO.json'
     require(path.is_file(), 'missing NATIVE-INFO.json')
-    info = json.loads(path.read_text())
+    info = json.loads(path.read_text(encoding='utf-8'))
     require(set(info) == {'schema', 'target', 'version', 'source_commit', 'files', 'data_epoch'},
             'unsupported native receipt fields')
     for key, value in (('schema', SCHEMA_VERSION), ('data_epoch', control_constant('DATA_EPOCH'))):
@@ -432,7 +432,7 @@ def compose_offline(target, native_dir, app_archive, output):
 
 
 def mobile_provenance(apk):
-    expo = json.loads((ROOT / 'apps/mobile/app.json').read_text())['expo']
+    expo = json.loads((ROOT / 'apps/mobile/app.json').read_text(encoding='utf-8'))['expo']
     candidates = sorted((Path(os.environ.get('ANDROID_HOME', '/nonexistent')) / 'build-tools').glob('*/aapt'))
     tool = shutil.which('aapt') or (str(candidates[-1]) if candidates else None)
     require(tool, 'Android aapt is required to verify APK identity')
@@ -468,7 +468,7 @@ def verify_desktop_receipt(directory, target, pins, runtime_digest=None):
     version_value = pins['version']
     path = directory / f'{desktop_basename(version_value, target)}.provenance.json'
     require(path.is_file(), 'missing desktop provenance receipt')
-    info = json.loads(path.read_text())
+    info = json.loads(path.read_text(encoding='utf-8'))
     require(set(info) == {'schema', 'app', 'target', 'version', 'tag', 'channel', 'source_commit',
                           'electron', 'signed', 'signing', 'runtime', 'artifacts'},
             'unsupported desktop receipt fields')
@@ -520,7 +520,7 @@ def ios_asset_names(version_value, signed=False):
 def verify_ios_assets(directory, pins):
     version_value = pins['version']
     signed = (directory / f'vibeface-{version_value}-ios.ipa').is_file()
-    mobile = json.loads((ROOT / 'apps/mobile/app.json').read_text())['expo']
+    mobile = json.loads((ROOT / 'apps/mobile/app.json').read_text(encoding='utf-8'))['expo']
     identity_fields = dict(schema=1, platform='ios-device', source_sha=pins['source_commit'],
                            release_version=version_value, bundle_identifier=mobile['ios']['bundleIdentifier'],
                            bundle_short_version=mobile['version'], build_number=mobile['ios']['buildNumber'])
@@ -532,7 +532,7 @@ def verify_ios_assets(directory, pins):
         payload = directory / name
         require(payload.is_file() and not payload.is_symlink(), 'missing regular iOS payload')
         verify_checksum_file(directory, name)
-        receipt = json.loads((directory / (name + '.provenance.json')).read_text())
+        receipt = json.loads((directory / (name + '.provenance.json')).read_text(encoding='utf-8'))
         fields = set(identity_fields) | {'artifact', 'sha256', 'signed', 'installable', 'kind'}
         if index:
             fields |= {'distribution_method', 'team_id', 'provisioning_profile_uuid', 'provisioning_profile_expiration', 'testflight_eligible'}
@@ -597,7 +597,7 @@ def expected_asset_names(release_app, version_value, ios_signed=False):
 
 
 def verify_checksum_file(directory, name):
-    require((directory / (name + '.sha256')).read_text() == f'{digest(directory / name)}  {name}\n',
+    require((directory / (name + '.sha256')).read_text(encoding='utf-8') == f'{digest(directory / name)}  {name}\n',
             f'checksum file for {name} mismatch')
 
 
@@ -622,7 +622,7 @@ def verify_product_release(directory, expected):
             verify_checksum_file(directory, bundle_name)
             verify_checksum_file(directory, core_name)
             bundle = unpack(directory / bundle_name, tmp / f'cli-{index}')
-            build = json.loads((bundle / 'BUILD-INFO.json').read_text())
+            build = json.loads((bundle / 'BUILD-INFO.json').read_text(encoding='utf-8'))
             verify_build_info(build)
             require(build['version'] == product_version and build['source_commit'] == source_commit
                     and build['target'] == target, 'CLI bundle version, source or target mismatch')
@@ -633,14 +633,14 @@ def verify_product_release(directory, expected):
             require((bundle / 'web/vibeface_secure.js').is_file() and (bundle / 'web/vibeface_secure_bg.wasm').is_file(),
                     'CLI bundle must contain the browser cryptography SDK')
             content = files(bundle, ('FILES.sha256',))
-            require((bundle / 'FILES.sha256').read_text() == ''.join(f'{value}  {name}\n' for name, value in content.items()),
+            require((bundle / 'FILES.sha256').read_text(encoding='utf-8') == ''.join(f'{value}  {name}\n' for name, value in content.items()),
                     'CLI bundled content changed')
             verify_component(unpack(directory / core_name, tmp / f'core-{index}'), 'core', dict(pins, target=target))
             if target in DESKTOP_TARGETS:
                 verify_desktop_receipt(directory, target, pins, digest(directory / bundle_name))
         apk = directory / f'vibeface-{product_version}-android.apk'
         verify_checksum_file(directory, apk.name)
-        provenance = json.loads((directory / (apk.name + '.provenance.json')).read_text())
+        provenance = json.loads((directory / (apk.name + '.provenance.json')).read_text(encoding='utf-8'))
         require(provenance == mobile_provenance(apk), 'APK provenance mismatch')
         require(provenance['version'] == product_version and provenance['sourceCommit'] == source_commit,
                 'APK is not part of this product cohort')
@@ -733,7 +733,7 @@ def publish(release_app, directory, repo=GITHUB_REPO):
 def producer_manifest(directory, pins):
     path = directory / 'release.json'
     require(path.is_file(), 'missing producer release.json')
-    info = json.loads(path.read_text())
+    info = json.loads(path.read_text(encoding='utf-8'))
     verify_release_identity(info)
     require(all(info[key] == value for key, value in pins.items()), 'producer release identity mismatch')
     return info
@@ -830,13 +830,31 @@ def self_test():
             raise AssertionError(f'accepted {label}')
         counts['rejected'] += 1
 
+    with tempfile.TemporaryDirectory(prefix='vibeface-release-utf8-') as temporary:
+        root = Path(temporary)
+        mobile = root / 'apps/mobile'
+        mobile.mkdir(parents=True)
+        (mobile / 'app.json').write_bytes(json.dumps({
+            'expo': {'name': '浏览', 'extra': {'releaseVersion': '1.2.3-nightly.20261107.1'}},
+        }, ensure_ascii=False).encode('utf-8'))
+        original_read_text = Path.read_text
+
+        def windows_default_read(path, *args, **kwargs):
+            if not args and 'encoding' not in kwargs:
+                kwargs['encoding'] = 'cp1252'
+            return original_read_text(path, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', windows_default_read):
+            accepts(lambda: require(read_version('mobile', root) == '1.2.3-nightly.20261107.1',
+                                    'UTF-8 mobile configuration must ignore the host default codepage'))
+
     accepts(lambda: require(parse_tag(product_tag) == ('product', product_version, channel), 'product tag'))
     accepts(lambda: require(parse_tag(www_tag) == ('www', www_version, version(www_version)), 'www tag'))
     for bad in ('v01.0.1', 'v1', 'www-v', 'app-v0.0.1', 'cli-v0.0.1', 'mobile-v0.0.1',
                 'v0.0.1-nightly.20260229.1', 'v1.0.0+extra'):
         rejects(f'invalid tag {bad}', lambda bad=bad: parse_tag(bad))
 
-    expo = json.loads((ROOT / 'apps/mobile/app.json').read_text())['expo']
+    expo = json.loads((ROOT / 'apps/mobile/app.json').read_text(encoding='utf-8'))['expo']
     badging = (f"package: name='{expo['android']['package']}' versionCode='{expo['android']['versionCode']}'"
                f" versionName='{expo['version']}'")
     public_view = {'directory': None, 'draft': False, 'source': source}
@@ -877,7 +895,7 @@ def self_test():
         tmp = Path(tmp)
 
         def repoint(path, **changes):
-            write_json(path, json.loads(path.read_text()) | changes)
+            write_json(path, json.loads(path.read_text(encoding='utf-8')) | changes)
 
         # Identity: one public product identity, one independent portal identity.
         product = accepts(lambda: identity('product'))
@@ -928,7 +946,7 @@ def self_test():
         (web_source / 'vibeface_secure_bg.wasm').write_bytes(b'\x00asm\x01\x00\x00\x00')
         accepts(lambda: pack_component('app', web_source, app_dir))
         app_archive = app_dir / f'vibeface-app-{product_version}.tar.gz'
-        require(json.loads((app_dir / 'release.json').read_text())['app'] == 'product',
+        require(json.loads((app_dir / 'release.json').read_text(encoding='utf-8'))['app'] == 'product',
                 'the App producer stages the product release')
 
         # Native staging: real executable fixtures reporting the cohort version, per platform basename.
@@ -1127,7 +1145,7 @@ def self_test():
         require(provenance['sha256'] == digest(apk) and provenance['sourceCommit'] == source
                 and provenance['version'] == product_version, 'APK provenance')
         accepts(lambda: manifest('product', mobile_dir))
-        require(json.loads((mobile_dir / 'release.json').read_text())['app'] == 'product',
+        require(json.loads((mobile_dir / 'release.json').read_text(encoding='utf-8'))['app'] == 'product',
                 'the Android producer stages the product release')
         rejects('standalone mobile release manifest', lambda: manifest('mobile', mobile_dir))
         for bad in (badging.replace(expo['android']['package'], 'other.package'),
@@ -1236,7 +1254,7 @@ def self_test():
         def forge_producer_provenance(directory):
             """A producer that restaged its own checksums and manifest around a foreign payload."""
             path = directory / 'mobile' / (apk.name + '.provenance.json')
-            write_json(path, json.loads(path.read_text()) | {'sourceCommit': foreign})
+            write_json(path, json.loads(path.read_text(encoding='utf-8')) | {'sourceCommit': foreign})
             manifest('product', directory / 'mobile')
 
         def swap_producer_app(directory):
@@ -1343,13 +1361,13 @@ def self_test():
 
         def forge_apk_provenance(directory):
             path = directory / (apk.name + '.provenance.json')
-            write_json(path, json.loads(path.read_text()) | {'sourceCommit': foreign})
+            write_json(path, json.loads(path.read_text(encoding='utf-8')) | {'sourceCommit': foreign})
             manifest('product', directory)
 
         def forge_desktop_runtime(directory):
             """A desktop installer rebuilt on a runtime that this release never published."""
             path = directory / f'{desktop_basename(product_version, DESKTOP_TARGETS[0])}.provenance.json'
-            receipt = json.loads(path.read_text())
+            receipt = json.loads(path.read_text(encoding='utf-8'))
             write_json(path, receipt | {'runtime': dict(receipt['runtime'], sha256='0' * 64)})
             manifest('product', directory)
 
@@ -1413,7 +1431,7 @@ def self_test():
                 lambda: verify_published(staged_release('public-corrupt', lambda d: repoint(
                     d / 'release.json',
                     assets=[dict(a, sha256='0' * 64) if a['name'].endswith('.apk') else a
-                            for a in json.loads((d / 'release.json').read_text())['assets']])), label='corrupt'),
+                            for a in json.loads((d / 'release.json').read_text(encoding='utf-8'))['assets']])), label='corrupt'),
                 'checksum mismatch')
 
         # BUILD-INFO keeps exactly nine fields and one version and commit for CLI, Core and App.
