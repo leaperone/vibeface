@@ -1,6 +1,7 @@
-import { realpath } from 'node:fs/promises'
-import { isAbsolute } from 'node:path'
-import type { Access, Inspect } from './control-types.js'
+import { lstat, readdir, realpath } from 'node:fs/promises'
+import { isAbsolute, join } from 'node:path'
+import { parseInspect, type Access, type Inspect } from './control-types.js'
+import { runControl } from './control-client.js'
 import { discoverLocalNodes, type LocalNodes } from './local-nodes.js'
 import type { ManagedNodeController, ManagedNodeStatus } from './managed-node.js'
 import { loadClientPreferences, saveClientPreferences, type ClientPreferences } from './client-preferences.js'
@@ -16,7 +17,9 @@ export type DesktopCoordinatorOptions = {
   access(dataDir: string): Promise<Access>
   managedNode: ManagedNodeController
   startDiscovered(node: LocalNode): Promise<void>
-  beforeInstallBackground?(node: SelectedLocalNode): Promise<void>
+  startOwnedAppNode(): Promise<void>
+  prepareBackgroundNode(): Promise<Inspect>
+  beforeInstallBackground?(node: Inspect): Promise<void>
   onChange?(): void
   platform?: NodeJS.Platform
 }
@@ -41,6 +44,35 @@ export function backgroundNodeFromStatus(status: ManagedNodeStatus, platform: No
     ? 'running'
     : status.service_running === false && status.core_status === 'stopped' ? 'stopped' : 'unhealthy'
   return { kind: 'installed', nodeId: status.device_id, dataDir: status.data_dir, health, manager: manager(platform) }
+}
+
+/** Prepare only the App profile Node, and only when the user explicitly asks for background install. */
+export async function prepareAppProfileNode(
+  profileDir: string,
+  program: CoreProgram,
+  run: typeof runControl = runControl,
+): Promise<Inspect> {
+  const dataDir = join(profileDir, 'node')
+  let entries: string[]
+  try {
+    const metadata = await lstat(dataDir)
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error('应用节点目录不是普通目录。')
+    entries = await readdir(dataDir)
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') entries = []
+    else throw error
+  }
+
+  const initialized = entries.includes('config.json') && entries.includes('identity.json')
+  if (!initialized) {
+    if (entries.length !== 0) throw new Error('应用节点目录已有不完整数据，拒绝初始化或覆盖。')
+    await run(program, { command: 'init', options: { data_dir: dataDir } })
+  }
+
+  const inspected = parseInspect(await run(program, { command: 'inspect', data_dir: dataDir }))
+  const canonical = await realpath(dataDir)
+  if (inspected.dataDir !== canonical || inspected.status === 'unavailable') throw new Error('应用节点目录无法通过身份检查。')
+  return inspected
 }
 
 /**
@@ -131,6 +163,10 @@ export class DesktopCoordinator {
     })
   }
 
+  async startOwnedAppNode(): Promise<void> {
+    await this.serial(() => this.options.startOwnedAppNode())
+  }
+
   async connect(candidateId: string): Promise<void> {
     await this.serial(async () => {
       const node = this.candidate(candidateId)
@@ -196,15 +232,19 @@ export class DesktopCoordinator {
 
   async installBackground(): Promise<void> {
     await this.serial(async () => {
-      const node = await this.resolveSelectedNode()
-      if (!node) throw new Error('请先连接一个已验证的本机节点。')
-      if (node.inspect.dataDir !== await this.appProfileNodePath()) throw new Error('只能为 Vibeface 应用配置目录安装后台节点。')
+      const existing = await this.options.managedNode.status()
+      if (existing.state !== 'not_installed') throw new Error('后台节点服务已经存在或状态不明确，请先刷新状态。')
+      const node = await this.options.prepareBackgroundNode()
       await this.options.beforeInstallBackground?.(node)
+      const verified = await this.options.inspect(node.dataDir)
+      if (verified.dataDir !== node.dataDir || verified.deviceId !== node.deviceId || verified.status !== 'stopped') {
+        throw new Error('应用节点未能确认处于相同身份的停止状态，拒绝安装后台服务。')
+      }
       let result: ManagedNodeStatus
-      try { result = await this.options.managedNode.installBackground(node.inspect.deviceId) }
+      try { result = await this.options.managedNode.installBackground(node.deviceId) }
       catch (error) { await this.refreshBackground(); throw error }
       this.backgroundNode = backgroundNodeFromStatus(result, this.platform)
-      if (this.backgroundNode.kind !== 'installed' || this.backgroundNode.nodeId !== node.inspect.deviceId || this.backgroundNode.dataDir !== node.inspect.dataDir) {
+      if (this.backgroundNode.kind !== 'installed' || this.backgroundNode.nodeId !== node.deviceId || this.backgroundNode.dataDir !== node.dataDir) {
         throw new Error('后台节点安装后未能确认相同的节点身份。')
       }
       this.changed()
@@ -232,11 +272,6 @@ export class DesktopCoordinator {
       await this.refreshBackground()
       this.changed()
     })
-  }
-
-  private async appProfileNodePath(): Promise<string> {
-    const profile = await realpath(this.options.profileDir)
-    return realpath(`${profile}/node`).catch(() => `${profile}/node`)
   }
 
   private async resolveCandidate(nodes: readonly LocalNode[], expected: { dataDir: string; deviceId: string } | null): Promise<SelectedLocalNode | null> {

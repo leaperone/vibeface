@@ -10,7 +10,7 @@ import {
 } from '../shared/contract.js'
 import { ActivationQueue, type JoinActivation } from './activation-queue.js'
 import { parseArgs } from './cli.js'
-import { DesktopCoordinator } from './desktop-coordinator.js'
+import { DesktopCoordinator, prepareAppProfileNode } from './desktop-coordinator.js'
 import { runControl } from './control-client.js'
 import { parseAccess, parseInspect } from './control-types.js'
 import { deepLinkFromArgv, parseDeepLink, type DeepLink } from './deeplink.js'
@@ -260,7 +260,7 @@ function registerIpc(): void {
   handle(IPC.startOwned, async (passed) => {
     readNoArguments(passed, IPC.startOwned)
     const current = requireSession()
-    await current.startOwned()
+    await requireCoordinator().startOwnedAppNode()
     if (current.preferences().openBusinessOnConnect) await openBusiness()
     return status()
   })
@@ -408,15 +408,20 @@ async function start(): Promise<void> {
     profileDir,
     controlProgram: controlProgram(),
     managedNode,
+    prepareBackgroundNode: () => prepareAppProfileNode(profileDir, controlProgram()),
     inspect: async (dataDir) => parseInspect(await runControl(controlProgram(), { command: 'inspect', data_dir: dataDir })),
     access: async (dataDir) => parseAccess(await runControl(controlProgram(), { command: 'access', data_dir: dataDir, json: true })),
     startDiscovered: async (node) => requireSession().startDiscoveredNode(node.dataDir, node.deviceId),
+    startOwnedAppNode: async () => requireSession().startOwned(),
     beforeInstallBackground: async (node) => {
       const current = requireSession()
       const state = current.state()
-      if (state.kind !== 'owned') return
-      if (state.dataDir !== node.inspect.dataDir) throw new Error('请先停止 Vibeface 启动的其他本机节点。')
-      await current.stopOwned()
+      if (state.kind === 'owned') {
+        if (state.dataDir !== node.dataDir) throw new Error('请先停止 Vibeface 启动的其他本机节点。')
+        await current.stopOwned()
+      } else if (node.status === 'running') {
+        throw new Error('应用节点已由其他进程运行，停止它后才能安装后台服务。')
+      }
     },
     onChange: broadcast,
   })
