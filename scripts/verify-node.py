@@ -20,11 +20,13 @@ through another member Gateway.
 
 import argparse
 import base64
+import contextlib
 import copy
 import hashlib
 import hmac
 import http.client
 import http.server
+import io
 import ipaddress
 import json
 import os
@@ -912,7 +914,9 @@ def native_provider_clipboard(invitation, *, env=None, cwd=None, runner=subproce
     require(re.fullmatch(r"[0-9]+", run_id) is not None and re.fullmatch(r"[0-9]+", attempt) is not None,
             "native clipboard requires a hosted task run identity")
     expected_name = f"vibeface-provider-{run_id}-{attempt}"
-    marker = (cwd / ".artifacts/native/simulator.txt").resolve(strict=True)
+    marker = cwd / ".artifacts/native/simulator.txt"
+    require(not marker.is_symlink(), "native clipboard requires the task's regular simulator marker")
+    marker = marker.resolve(strict=True)
     root = cwd.resolve(strict=True)
     require(marker.is_relative_to(root) and marker.is_file() and marker.read_text().strip() == simulator,
             "native clipboard simulator matches this repository task marker")
@@ -948,7 +952,6 @@ def native_clipboard_selfcheck(options):
         marker.parent.mkdir(parents=True)
         marker.write_text(simulator + "\n")
         calls = []
-        outputs = []
 
         def runner(argv, **kwargs):
             calls.append((argv, kwargs))
@@ -956,29 +959,50 @@ def native_clipboard_selfcheck(options):
                 output = {"devices": {"iOS": [{"udid": simulator,
                     "name": "vibeface-provider-123-2", "state": "Booted"}]}}
             else:
-                output = ""
-            completed = subprocess.CompletedProcess(argv, 0, json.dumps(output) if isinstance(output, dict) else output, "")
-            outputs.append(completed)
+                output = invitation
+            completed = subprocess.CompletedProcess(argv, 0, json.dumps(output) if isinstance(output, dict) else output,
+                                                    "" if "--json" in argv else invitation)
             return completed
 
-        native_provider_clipboard(invitation, env=env, cwd=cwd, runner=runner, system="darwin", xcrun_path="/usr/bin/xcrun")
+        public_output = io.StringIO()
+        with contextlib.redirect_stdout(public_output), contextlib.redirect_stderr(public_output):
+            result = native_provider_clipboard(invitation, env=env, cwd=cwd, runner=runner,
+                                               system="darwin", xcrun_path="/usr/bin/xcrun")
         argv, kwargs = calls[-1]
-        pasted = outputs[-1]
         require(argv == ["/usr/bin/xcrun", "simctl", "pbcopy", simulator]
                 and kwargs.get("input") == invitation.encode() and invitation not in argv
-                and invitation not in pasted.stdout and invitation not in pasted.stderr,
+                and kwargs.get("capture_output") is True
+                and result == {"pasted": True} and invitation not in public_output.getvalue(),
                 "private invitation is sent only on subprocess stdin")
         checks.append("invitation_stdin_only")
+        target = cwd / "another-simulator-marker.txt"
+        target.write_text(simulator + "\n")
+        marker.unlink()
+        marker.symlink_to(target)
+        calls.clear()
+        try:
+            native_provider_clipboard(invitation, env=env, cwd=cwd, runner=runner,
+                                      system="darwin", xcrun_path="/usr/bin/xcrun")
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("native clipboard must reject a symlinked marker")
+        require(not calls, "a symlinked marker is refused before invoking xcrun")
+        marker.unlink()
+        marker.write_text(simulator + "\n")
+        checks.append("symlinked_marker")
         for name, altered_env, rows in (
-            ("foreign_simulator", {**env, "VIBEFACE_E2E_SIMULATOR": "BBBBCCDD-1111-2222-3333-ABCDEFABCDEF"}, None),
+            ("foreign_simulator", {**env, "VIBEFACE_E2E_SIMULATOR": "BBBBCCDD-1111-2222-3333-ABCDEFABCDEF"},
+             [{"udid": "BBBBCCDD-1111-2222-3333-ABCDEFABCDEF", "name": "vibeface-provider-123-2", "state": "Booted"}]),
             ("unbooted_simulator", env, [{"udid": simulator, "name": "vibeface-provider-123-2", "state": "Shutdown"}]),
             ("mismatched_task_name", env, [{"udid": simulator, "name": "some-other-task", "state": "Booted"}]),
         ):
+            negative_calls = []
             def negative(argv, rows=rows, **kwargs):
+                negative_calls.append(argv)
                 if "--json" in argv:
-                    inventory = rows if rows is not None else [{"udid": simulator, "name": "vibeface-provider-123-2", "state": "Booted"}]
-                    return subprocess.CompletedProcess(argv, 0, json.dumps({"devices": {"iOS": inventory}}), "")
-                raise AssertionError("refusal must happen before pbcopy")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"devices": {"iOS": rows}}), "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
             refused = False
             try:
                 native_provider_clipboard(invitation, env=altered_env, cwd=cwd, runner=negative,
@@ -986,6 +1010,8 @@ def native_clipboard_selfcheck(options):
             except AssertionError:
                 refused = True
             require(refused, "native clipboard must refuse " + name)
+            require(not any("pbcopy" in argv for argv in negative_calls),
+                    "native clipboard must refuse before modifying " + name)
             checks.append(name)
         private_json(options.artifacts / "native-clipboard-selfcheck.json", {"status": "passed", "checks": checks})
         print(json.dumps({"status": "passed", "checks": checks}), flush=True)
