@@ -619,6 +619,28 @@ test("workspace preserves bot and message requests while routing native decision
       }
     })
 
+    await t.test("an empty network finishes its read and can create its first Bot", async () => {
+      const previousMode = createMode
+      knownBots = []
+      try {
+        await render().refresh()
+        assert.equal(render().conversationId, '')
+        assert.equal(render().data, null)
+        assert.equal(render().synced, true, 'an empty catalog is a completed read, not an unread conversation')
+        assert.equal(render().writable, true)
+        createMode = 'success'
+        const first = await render().createBot({ name: 'First Bot after an empty catalog', instructions: '' })
+        assert.equal(first.name, 'First Bot after an empty catalog')
+        assert.equal(render().selectedBot?.bot_id, first.bot_id)
+        assert.equal(render().writable, true)
+      } finally {
+        createMode = previousMode
+        knownBots = [bot]
+        await render().refresh()
+        await render().selectBot(bot)
+      }
+    })
+
     await t.test("new connections wait for their own complete read and retain unknown writes without replay", async () => {
       knownBots = [bot]
       await render().refresh()

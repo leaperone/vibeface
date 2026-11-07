@@ -380,6 +380,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (selectionAtStart === selectionEpoch.current) {
         if (activeId.current !== target) selectConversation(target)
         if (activeId.current) await readConversation(activeId.current)
+        else readConnection.current = connection
       }
       requireCurrent()
       setError((previous) => previous?.kind === "read" ? null : previous)
