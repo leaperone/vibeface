@@ -109,19 +109,15 @@ fn lexical_root(path: &str) -> Option<LexicalRoot> {
         return None;
     }
     let verbatim = path.starts_with("\\\\?\\");
-    let (family, anchor, body, separator, root_only) = if path.starts_with('/') {
+    let (family, anchor, body, separator, root_only) = if let Some(body) = path.strip_prefix('/') {
         if path.starts_with("//") {
             return None;
         }
-        (
-            RootFamily::Posix,
-            "/".to_owned(),
-            &path[1..],
-            '/',
-            path == "/",
-        )
-    } else if path.starts_with("\\\\?\\UNC\\") || path.starts_with("\\\\?\\unc\\") {
-        let rest = &path[8..];
+        (RootFamily::Posix, "/".to_owned(), body, '/', path == "/")
+    } else if let Some(rest) = path
+        .strip_prefix("\\\\?\\UNC\\")
+        .or_else(|| path.strip_prefix("\\\\?\\unc\\"))
+    {
         let mut it = rest.split('\\');
         let server = it.next()?;
         let share = it.next()?;
@@ -137,8 +133,7 @@ fn lexical_root(path: &str) -> Option<LexicalRoot> {
             '\\',
             body.is_empty() || body == "\\",
         )
-    } else if path.starts_with("\\\\?\\") {
-        let rest = &path[4..];
+    } else if let Some(rest) = path.strip_prefix("\\\\?\\") {
         if rest.len() < 3
             || !rest.as_bytes()[0].is_ascii_alphabetic()
             || rest.as_bytes()[1] != b':'
@@ -153,8 +148,7 @@ fn lexical_root(path: &str) -> Option<LexicalRoot> {
             '\\',
             rest.len() == 3,
         )
-    } else if path.starts_with("\\\\") {
-        let rest = &path[2..];
+    } else if let Some(rest) = path.strip_prefix("\\\\") {
         let mut it = rest.split('\\');
         let server = it.next()?;
         let share = it.next()?;

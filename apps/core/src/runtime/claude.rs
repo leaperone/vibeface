@@ -3150,16 +3150,16 @@ pub(super) mod tests {
             Config::local("127.0.0.1:0".parse()?, vec![place.dir.join("work")], false);
         // Nothing listens there: the Node never reaches this computer's own App Server.
         #[cfg(unix)]
-        let socket = format!(
+        let socket = PathBuf::from(format!(
             "/tmp/vf-{}.sock",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
-        );
+        ));
         #[cfg(windows)]
         let socket =
             vibeface_bridge::platform::ipc::Endpoint::in_private_dir(&place.dir, "absent-codex")?
                 .path()
                 .to_owned();
-        configuration.providers.codex_app_server.socket = Some(socket.into());
+        configuration.providers.codex_app_server.socket = Some(socket);
         configuration.providers.execution = [Provider::Claude].into();
         configuration.bins.insert(Provider::Claude, fixture());
         configuration.save(&dir)?;
