@@ -1,14 +1,7 @@
 import { createHash } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import { runControl, type CoreProgram } from './control-client.js'
-
-export type NodeSource = 'remembered' | 'app_profile' | 'default_home' | 'user_service' | 'running_process'
-type NodeIdentity = { id: string; deviceId: string; dataDir: string; sources: NodeSource[] }
-type AvailableNode = NodeIdentity & { localListen: string; listen: string; webEnabled: boolean; coreVersion: string }
-export type LocalNode =
-  | (AvailableNode & { kind: 'running' })
-  | (AvailableNode & { kind: 'stopped' })
-  | (NodeIdentity & { kind: 'unavailable'; reason: 'identity_mismatch' | 'maintenance_unavailable' | 'inspection_unavailable' })
+import type { LocalNode, NodeSource } from '../shared/contract.js'
 
 export type LocalNodes = { nodes: LocalNode[]; warnings: string[] }
 
