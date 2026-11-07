@@ -34,6 +34,7 @@ const MAX_PROMPT_BYTES: usize = 86_016;
 const AGENT_SERVICE: &str = "SdkAgentService";
 const CONTROL_SERVICE: &str = "SdkBridgeControlService";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const STARTUP_DIAGNOSTIC_BYTES: usize = 2_048;
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_METADATA_BYTES: usize = 65_536;
@@ -1131,11 +1132,24 @@ impl SdkBridge {
             .take()
             .context("Cursor SDK stderr unavailable")?;
         let (ready_tx, ready_rx) = oneshot::channel();
+        let startup_diagnostics = Arc::new(std::sync::Mutex::new(String::new()));
+        let startup_secrets = std::iter::once(api_key)
+            .chain(env.values().map(String::as_str))
+            .chain(self.env.values().map(String::as_str))
+            .chain(std::iter::once(self.callback.auth_token.as_str()))
+            .filter(|secret| !secret.is_empty())
+            .map(str::to_owned)
+            .collect();
         let process = SdkProcess {
             child,
             tree: Some(tree),
             stdout: tokio::spawn(drain(stdout)),
-            stderr: tokio::spawn(read_discovery(stderr, ready_tx)),
+            stderr: tokio::spawn(read_discovery(
+                stderr,
+                ready_tx,
+                startup_diagnostics.clone(),
+                startup_secrets,
+            )),
         };
         let kill = Arc::new(Notify::new());
         let (exited_tx, exited) = watch::channel(false);
@@ -1158,10 +1172,19 @@ impl SdkBridge {
         let mut died = exited.clone();
         let (rpc, agents) = tokio::select! {
             ready = tokio::time::timeout(STARTUP_TIMEOUT, self.connect(ready_rx)) => ready.map_err(|_| {
+                let diagnostics = startup_diagnostics
+                    .lock()
+                    .map(|diagnostics| diagnostics.clone())
+                    .unwrap_or_default();
+                let diagnostics = if diagnostics.is_empty() {
+                    "no stderr output before discovery".to_owned()
+                } else {
+                    format!("stderr before discovery: {diagnostics}")
+                };
                 ExecFailure::new(
                     FailureKind::TimedOut,
                     format!(
-                        "Cursor SDK bridge did not start within {}s; the reply did not start",
+                        "Cursor SDK bridge did not start within {}s; the reply did not start ({diagnostics})",
                         STARTUP_TIMEOUT.as_secs()
                     ),
                 )
@@ -1639,6 +1662,8 @@ impl Drop for SdkProcess {
 async fn read_discovery(
     stderr: impl AsyncRead + Unpin,
     ready: oneshot::Sender<Result<Discovery>>,
+    diagnostics: Arc<std::sync::Mutex<String>>,
+    secrets: Vec<String>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stderr);
     loop {
@@ -1651,6 +1676,22 @@ async fn read_discovery(
                 .map_err(|_| anyhow!("Cursor SDK emitted invalid discovery JSON"));
             let _ = ready.send(discovery);
             return forward(reader).await;
+        }
+        let line = String::from_utf8_lossy(&line);
+        let secret_refs = secrets.iter().map(String::as_str).collect::<Vec<_>>();
+        let line = redact_text(line.into_owned(), &secret_refs);
+        if let Ok(mut diagnostics) = diagnostics.lock() {
+            let available = STARTUP_DIAGNOSTIC_BYTES.saturating_sub(diagnostics.len());
+            if available > 0 {
+                let line = format!("{}\n", line.trim_end());
+                let end = line
+                    .char_indices()
+                    .map(|(index, character)| index + character.len_utf8())
+                    .take_while(|end| *end <= available)
+                    .last()
+                    .unwrap_or(0);
+                diagnostics.push_str(&line[..end]);
+            }
         }
     }
 }
