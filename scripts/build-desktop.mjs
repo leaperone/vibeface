@@ -17,6 +17,8 @@ const SCHEMA_VERSION = 1;
 const PLATFORMS = {
   'aarch64-apple-darwin': { platform: 'darwin', flag: '--mac', installer: 'dmg', exe: '', signing: 'developer-id-notarized' },
   'x86_64-pc-windows-msvc': { platform: 'win32', flag: '--win', installer: 'exe', exe: '.exe', signing: 'authenticode' },
+  'x86_64-unknown-linux-gnu': { platform: 'linux', flag: '--linux', installer: 'AppImage', exe: '', signing: 'platform-checksums', arch: 'x64' },
+  'aarch64-unknown-linux-gnu': { platform: 'linux', flag: '--linux', installer: 'AppImage', exe: '', signing: 'platform-checksums', arch: 'arm64' },
 };
 const BUILD_FIELDS = ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch',
   'core_version', 'core_source_commit', 'app_version', 'app_source_commit'];
@@ -99,6 +101,10 @@ const MAC_SIGNING_VARS = ['VIBEFACE_CODESIGN_IDENTITY', 'VIBEFACE_CODESIGN_TEAM'
   'VIBEFACE_NOTARY_KEY_ID', 'VIBEFACE_NOTARY_ISSUER'];
 
 function signingState(target, requested) {
+  if (target.endsWith('-unknown-linux-gnu')) {
+    assert(!requested, 'Linux has no platform signing identity; use checksums and provenance');
+    return { signed: false, signing: 'platform-checksums' };
+  }
   const configured = target === 'aarch64-apple-darwin'
     ? MAC_SIGNING_VARS.every(name => process.env[name])
     : Boolean(process.env.WIN_CSC_LINK || process.env.CSC_LINK);
@@ -127,7 +133,9 @@ function copyRuntime(source, destination) {
 function packagedRuntime(outputRoot, target) {
   const candidates = target === 'aarch64-apple-darwin'
     ? [path.join(outputRoot, 'mac-arm64/Vibeface.app/Contents/Resources/runtime')]
-    : [path.join(outputRoot, 'win-unpacked/resources/runtime')];
+    : target === 'x86_64-pc-windows-msvc'
+      ? [path.join(outputRoot, 'win-unpacked/resources/runtime')]
+      : [path.join(outputRoot, target.startsWith('aarch64-') ? 'linux-arm64-unpacked' : 'linux-unpacked', 'resources/runtime')];
   const found = candidates.find(candidate => fs.existsSync(candidate));
   assert(found, `cannot find the packaged runtime under ${outputRoot}`);
   return found;
@@ -145,6 +153,7 @@ function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   const platform = PLATFORMS[target];
   assert(platform, `--target must be one of ${Object.keys(PLATFORMS).join(', ')}`);
   assert.equal(process.platform, platform.platform, `${target} desktop applications are built on their own platform`);
+  if (platform.platform === 'linux') assert.equal(process.arch, platform.arch, `${target} desktop applications are built on their matching native architecture`);
   const version = productVersion();
   assert.equal(run('git', ['status', '--porcelain'], { cwd: repo }).trim(), '', 'desktop packaging source must be clean');
   const sourceCommit = run('git', ['rev-parse', 'HEAD'], { cwd: repo }).trim();
@@ -156,7 +165,8 @@ function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   assert(fs.statSync(archive).isFile(), `the released runtime archive is required beside --runtime-dir or named with --runtime-archive`);
   const { signed, signing } = signingState(target, sign);
   const channel = version.includes('-nightly.') ? 'nightly' : version.includes('-rc.') ? 'rc' : 'stable';
-  assert(signed || channel !== 'stable', 'a stable desktop distribution requires a configured signer');
+  assert(signed || channel !== 'stable' || target.endsWith('-unknown-linux-gnu'),
+    'a stable desktop distribution requires a configured signer except on Linux, which uses checksums and provenance');
   if (signed && target === 'x86_64-pc-windows-msvc') {
     for (const program of ['vibeface.exe', 'vibeface-core.exe']) requireAuthenticode(path.join(runtimeDir, program));
   }
@@ -211,7 +221,7 @@ function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   writeJson(path.join(output, `${base}.provenance.json`), receipt);
   run('python3', ['-B', path.join(repo, 'scripts/release.py'), 'verify-desktop', '--target', target,
     '--runtime-archive', archive, output], { cwd: repo, stdio: 'inherit' });
-  console.log(`${signed ? `Signed (${signing})` : 'Unsigned development preview'} desktop build for ${target}:`);
+  console.log(`${signed ? `Signed (${signing})` : signing === 'platform-checksums' ? 'Checksum/provenance protected' : 'Unsigned development preview'} desktop build for ${target}:`);
   for (const name of payloads) console.log(`  ${path.join(output, name)}`);
   return receipt;
 }
@@ -284,7 +294,11 @@ function selfTest() {
 
     assert.deepEqual(signingState('x86_64-pc-windows-msvc', false), { signed: false, signing: 'unsigned-development-preview' });
     assert.deepEqual(signingState('aarch64-apple-darwin', false), { signed: false, signing: 'unsigned-development-preview' });
-    for (const platform of Object.keys(PLATFORMS)) {
+    for (const target of ['x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu']) {
+      assert.deepEqual(signingState(target, false), { signed: false, signing: 'platform-checksums' });
+      assert.throws(() => signingState(target, true), /Linux has no platform signing identity/);
+    }
+    for (const platform of Object.keys(PLATFORMS).filter(target => !target.endsWith('-unknown-linux-gnu'))) {
       assert.throws(() => signingState(platform, true), /configured signing certificate/, platform);
     }
     // A partial macOS credential set must never pass as signed, and never reaches notarization.

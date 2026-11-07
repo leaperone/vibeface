@@ -11,6 +11,8 @@ const ELECTRON_VERSION = '45.2.3';
 const PLATFORMS = {
   'aarch64-apple-darwin': { os: 'mac', arch: 'arm64' },
   'x86_64-pc-windows-msvc': { os: 'win', arch: 'x64' },
+  'x86_64-unknown-linux-gnu': { os: 'linux', arch: 'x64' },
+  'aarch64-unknown-linux-gnu': { os: 'linux', arch: 'arm64' },
 };
 
 const target = process.env.VIBEFACE_DESKTOP_TARGET;
@@ -81,6 +83,13 @@ module.exports = {
     shortcutName: 'Vibeface',
     artifactName,
     differentialPackage: false,
+  },
+  linux: {
+    target: [{ target: 'AppImage', arch: [arch] }, { target: 'zip', arch: [arch] }],
+    category: 'Utility',
+    executableName: 'vibeface',
+    icon: path.join(desktop, 'build/icon.png'),
+    artifactName,
   },
   dmg: { artifactName, writeUpdateInfo: false },
 };
