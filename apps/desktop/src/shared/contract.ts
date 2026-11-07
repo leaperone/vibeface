@@ -23,7 +23,44 @@ export const IPC = {
   openBusiness: 'launcher:open-business',
   setPreference: 'launcher:set-preference',
   openExternal: 'launcher:open-external',
+  discoverNodes: 'launcher:discover-nodes',
+  connectDiscoveredNode: 'launcher:connect-discovered-node',
+  startDiscoveredNode: 'launcher:start-discovered-node',
+  installBackgroundNode: 'launcher:install-background-node',
+  startBackgroundNode: 'launcher:start-background-node',
+  stopBackgroundNode: 'launcher:stop-background-node',
+  removeBackgroundNode: 'launcher:remove-background-node',
+  chooseNodeMode: 'launcher:choose-node-mode',
 } as const
+
+/** Read-only current-user Node observations; kept separate from App-host lifecycle state. */
+export type NodeSource = 'remembered' | 'app_profile' | 'default_home' | 'user_service' | 'running_process'
+type NodeIdentity = { id: string; deviceId: string; dataDir: string; sources: NodeSource[] }
+type AvailableNode = NodeIdentity & {
+  localListen: string
+  listen: string
+  webEnabled: boolean
+  coreVersion: string
+}
+export type LocalNode =
+  | (AvailableNode & { kind: 'running' })
+  | (AvailableNode & { kind: 'stopped' })
+  | (NodeIdentity & {
+      kind: 'unavailable'
+      reason: 'identity_mismatch' | 'maintenance_unavailable' | 'inspection_unavailable'
+    })
+
+export type NodeDiscovery =
+  | { kind: 'idle' | 'scanning' }
+  | { kind: 'ready'; nodes: LocalNode[]; warnings: string[] }
+  | { kind: 'failed'; message: string }
+
+export type BackgroundNode =
+  | { kind: 'absent' | 'checking' }
+  | { kind: 'installed'; nodeId: string; dataDir: string; health: 'running' | 'stopped' | 'unhealthy'; manager: 'launchd' | 'systemd' | 'task-scheduler' }
+  | { kind: 'partial'; message: string }
+  | { kind: 'conflict'; message: string }
+  | { kind: 'failure'; message: string }
 
 /** Core availability as the desktop can actually prove it, not a guess. */
 export type RuntimeState =
@@ -66,6 +103,12 @@ export type LauncherStatus = {
   version: string
   /** Connection-only session: the desktop will not start or stop any Core. */
   attachOnly: boolean
+  /** Desktop client is usable independently of whether the bundled Core runtime is available. */
+  clientAvailable: boolean
+  /** User's first-run decision and whether this App may host an optional local Node. */
+  nodeMode: 'undecided' | 'controller' | 'local'
+  discovery: NodeDiscovery
+  backgroundNode: BackgroundNode
 }
 
 export type LauncherApi = {
@@ -80,4 +123,12 @@ export type LauncherApi = {
   setPreference(key: PreferenceKey, value: boolean): Promise<LauncherStatus>
   openExternal(url: string): Promise<void>
   onStatus(handler: (status: LauncherStatus) => void): () => void
+  discoverNodes(): Promise<LauncherStatus>
+  connectDiscoveredNode(candidateId: string): Promise<LauncherStatus>
+  startDiscoveredNode(candidateId: string): Promise<LauncherStatus>
+  chooseNodeMode(mode: 'controller' | 'local'): Promise<LauncherStatus>
+  installBackgroundNode(): Promise<LauncherStatus>
+  startBackgroundNode(): Promise<LauncherStatus>
+  stopBackgroundNode(): Promise<LauncherStatus>
+  removeBackgroundNode(): Promise<LauncherStatus>
 }

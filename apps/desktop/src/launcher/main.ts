@@ -28,6 +28,11 @@ const facts = element('facts', HTMLDListElement)
 const diagnostics = element('diagnostics', HTMLDetailsElement)
 const failure = element('failure', HTMLParagraphElement)
 const actions = element('actions', HTMLDivElement)
+const nodes = element('nodes', HTMLUListElement)
+const discoveryMessage = element('discovery-message', HTMLParagraphElement)
+const backgroundNode = element('background-node', HTMLElement)
+const backgroundMessage = element('background-message', HTMLParagraphElement)
+const backgroundActions = element('background-actions', HTMLDivElement)
 const autoOpen = element('auto-open', HTMLInputElement)
 const profilePath = element('profile-dir', HTMLElement)
 const corePath = element('core-path', HTMLElement)
@@ -57,32 +62,73 @@ function run(work: () => Promise<LauncherStatus | void>): void {
 }
 
 function setBusy(busy: boolean): void {
-  for (const control of actions.querySelectorAll('button')) control.disabled = busy || control.dataset['locked'] === 'true'
+  for (const control of document.querySelectorAll<HTMLButtonElement>('#actions button, #nodes button, #background-actions button')) {
+    control.disabled = busy || control.dataset['locked'] === 'true'
+  }
   forget.disabled = busy
   autoOpen.disabled = busy
 }
 
 const RUN: Record<ActionId, () => Promise<LauncherStatus>> = {
-  choose: () => api.chooseDataDir(),
-  start: () => api.startOwned(),
-  attach: () => api.attachExisting(),
-  stop: () => api.stopOwned(),
+  controller: () => api.chooseNodeMode('controller'),
+  local: () => api.chooseNodeMode('local'),
+  discover: () => api.discoverNodes(),
+  'start-owned': () => api.startOwned(),
+  'stop-owned': () => api.stopOwned(),
   open: () => api.openBusiness(),
-  recheck: () => api.getStatus(),
+  choose: () => api.chooseDataDir(),
+  connect: () => api.getStatus(),
+  'start-discovered': () => api.getStatus(),
+  'install-background': () => api.installBackgroundNode(),
+  'start-background': () => api.startBackgroundNode(),
+  'stop-background': () => api.stopBackgroundNode(),
+  'remove-background': () => api.removeBackgroundNode(),
 }
 
-function paintActions(view: View): void {
-  actions.replaceChildren()
-  for (const item of view.actions) {
+function paintActions(target: HTMLDivElement, items: View['actions']): void {
+  target.replaceChildren()
+  for (const item of items) {
     const button = document.createElement('button')
     button.type = 'button'
     button.dataset['action'] = item.id
     button.textContent = item.label
-    button.disabled = item.disabled
+    button.disabled = item.disabled ?? false
     button.dataset['locked'] = item.disabled ? 'true' : 'false'
     if (item.primary) button.classList.add('primary')
-    button.addEventListener('click', () => run(RUN[item.id]))
-    actions.append(button)
+    button.addEventListener('click', () => run(() => {
+      if (item.id === 'connect') return api.connectDiscoveredNode(item.nodeId ?? '')
+      if (item.id === 'start-discovered') return api.startDiscoveredNode(item.nodeId ?? '')
+      return RUN[item.id]()
+    }))
+    target.append(button)
+  }
+}
+
+function paintNodes(view: View): void {
+  nodes.replaceChildren()
+  nodes.hidden = view.rows.length === 0
+  for (const row of view.rows) {
+    const item = document.createElement('li')
+    const content = document.createElement('div')
+    content.className = 'node-copy'
+    const title = document.createElement('strong')
+    title.textContent = `${row.status} · ${row.node.deviceId.slice(0, 12)}`
+    const detail = document.createElement('span')
+    detail.textContent = row.detail
+    const location = document.createElement('details')
+    location.className = 'node-location'
+    const summary = document.createElement('summary')
+    summary.textContent = '节点位置'
+    const path = document.createElement('span')
+    path.textContent = row.node.dataDir
+    path.className = 'path'
+    location.append(summary, path)
+    content.append(title, detail, location)
+    const controls = document.createElement('div')
+    controls.className = 'node-controls'
+    paintActions(controls, row.actions)
+    item.append(content, controls)
+    nodes.append(item)
   }
 }
 
@@ -109,7 +155,12 @@ function paint(status: LauncherStatus): void {
   failure.textContent = view.failure ?? ''
   failure.hidden = view.failure === null
   paintFacts(view)
-  paintActions(view)
+  paintActions(actions, view.actions)
+  paintNodes(view)
+  discoveryMessage.textContent = view.discoveryMessage
+  backgroundNode.hidden = view.backgroundActions.length === 0 && !view.backgroundMessage
+  backgroundMessage.textContent = view.backgroundMessage
+  paintActions(backgroundActions, view.backgroundActions)
 
   if (view.headline !== lastHeadline) {
     lastHeadline = view.headline

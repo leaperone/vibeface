@@ -32,6 +32,13 @@
         <p id="explain"></p>
         <p id="failure" class="failure" role="alert" hidden></p>
         <div id="actions" class="actions"></div>
+        <p id="discovery-message" class="meta" aria-live="polite"></p>
+        <ul id="nodes" class="node-list" aria-label="发现的本机节点"></ul>
+        <section id="background-node" class="background-node" hidden aria-live="polite">
+          <h3>后台节点</h3>
+          <p id="background-message" class="meta"></p>
+          <div id="background-actions" class="actions"></div>
+        </section>
         <details id="diagnostics" class="diagnostics" hidden>
           <summary>连接详情</summary>
           <dl id="facts" class="facts"></dl>

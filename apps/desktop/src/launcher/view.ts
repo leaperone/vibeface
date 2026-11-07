@@ -1,21 +1,12 @@
-import type { LauncherStatus } from '../shared/contract.js'
+import type { LauncherStatus, LocalNode } from '../shared/contract.js'
 
-/**
- * The launcher's whole state machine, kept free of the DOM so it can be tested directly.
- * Every line it produces comes from something the main process actually observed: there is
- * no optimistic wording and no progress that is not a real attempt count.
- */
 export type Tone = 'idle' | 'live' | 'busy' | 'bad'
-
-export type ActionId = 'choose' | 'start' | 'attach' | 'stop' | 'open' | 'recheck'
-
-export type Action = {
-  id: ActionId
-  label: string
-  primary: boolean
-  disabled: boolean
-}
-
+export type ActionId =
+  | 'controller' | 'local' | 'discover' | 'connect' | 'start-discovered'
+  | 'choose' | 'start-owned' | 'stop-owned' | 'open'
+  | 'install-background' | 'start-background' | 'stop-background' | 'remove-background'
+export type Action = { id: ActionId; label: string; primary?: boolean; disabled?: boolean; nodeId?: string }
+export type NodeRow = { node: LocalNode; status: string; detail: string; actions: Action[] }
 export type View = {
   tone: Tone
   indicator: string
@@ -24,148 +15,88 @@ export type View = {
   facts: Array<[string, string]>
   failure: string | null
   actions: Action[]
+  rows: NodeRow[]
+  discoveryMessage: string
+  backgroundMessage: string
+  backgroundActions: Action[]
   scope: string
 }
 
-const action = (id: ActionId, label: string, primary = false, disabled = false): Action => ({
-  id,
-  label,
-  primary,
-  disabled,
-})
+const action = (id: ActionId, label: string, primary = false, disabled = false, nodeId?: string): Action => ({ id, label, primary, disabled, ...(nodeId ? { nodeId } : {}) })
 
-const choose = (label = '选择数据目录…', primary = false) => action('choose', label, primary)
-const recheck = () => action('recheck', '重新检查')
+const unavailable = (node: Extract<LocalNode, { kind: 'unavailable' }>): string => ({
+  identity_mismatch: '身份信息不一致，请重新检查。',
+  maintenance_unavailable: '节点正在维护，稍后重新检查。',
+  inspection_unavailable: '暂时无法读取节点状态，请重新检查。',
+})[node.reason]
+
+function rows(status: LauncherStatus): NodeRow[] {
+  if (status.discovery.kind !== 'ready') return []
+  return status.discovery.nodes.map((node) => {
+    if (node.kind === 'running') return { node, status: '正在运行', detail: `节点 ${node.deviceId.slice(0, 12)} · ${node.coreVersion}`, actions: [action('connect', '连接', true, false, node.id)] }
+    if (node.kind === 'stopped') return { node, status: '已停止', detail: `节点 ${node.deviceId.slice(0, 12)} · ${node.coreVersion}`, actions: [action('start-discovered', '启动并连接', true, false, node.id)] }
+    return { node, status: '暂不可用', detail: unavailable(node), actions: [action('discover', '重新检查')] }
+  })
+}
 
 export function describe(status: LauncherStatus): View {
-  const scope = status.attachOnly
-    ? '连接已有的 Vibeface，此入口不会管理其运行。'
-    : '在这台电脑上使用 Vibeface。'
+  const discoveryMessage = status.discovery.kind === 'scanning'
+    ? '正在检查已知的本机节点…'
+    : status.discovery.kind === 'failed'
+      ? status.discovery.message
+      : status.discovery.kind === 'ready'
+        ? status.discovery.warnings.length ? `有 ${status.discovery.warnings.length} 项位置未能检查。` : ''
+        : ''
 
-  if (status.runtime.kind === 'missing') {
-    return {
-      tone: 'bad',
-      indicator: '运行时缺失',
-      headline: 'Vibeface 程序不完整',
-      explain: status.runtime.detail,
-      facts: [['期望路径', status.runtime.corePath]],
-      failure: null,
-      actions: [],
-      scope,
-    }
+  const background = status.backgroundNode
+  const backgroundMessage = background.kind === 'installed'
+    ? `后台节点${background.health === 'running' ? '正在运行' : background.health === 'stopped' ? '已停止' : '状态异常'} · ${background.nodeId.slice(0, 12)} · ${background.dataDir}`
+    : background.kind === 'checking' ? '正在核对后台节点状态…'
+      : background.kind === 'partial' || background.kind === 'conflict' || background.kind === 'failure' ? background.message
+        : '安装后台节点后，退出 Vibeface 仍会运行，并在此用户登录后启动。'
+  const backgroundActions: Action[] = background.kind === 'absent'
+    ? [action('install-background', '安装后台节点')]
+    : background.kind === 'installed'
+      ? [
+          ...(background.health === 'running' ? [action('stop-background', '停止后台节点')] : [action('start-background', '启动后台节点')]),
+          action('remove-background', '移除后台运行'),
+        ]
+      : []
+
+  if (status.nodeMode === 'undecided') return {
+    tone: 'idle', indicator: '可开始使用', headline: 'Vibeface',
+    explain: '你可以连接个人网络中的节点，也可以选择在这台电脑启用节点。',
+    failure: null,
+    facts: [],
+    actions: [action('controller', '仅作控制端', true), action('local', '在这台电脑启用节点')],
+    rows: [], discoveryMessage: '', backgroundMessage: '', backgroundActions: [],
+    scope: '桌面端可独立连接和控制节点。',
   }
 
+  const isLocal = status.nodeMode === 'local'
+  const hasCore = status.core.kind === 'owned' || status.core.kind === 'attached'
+  const failed = status.discovery.kind === 'failed'
+  const actions: Action[] = [
+    ...(status.clientAvailable ? [action('open', hasCore ? '打开 Vibeface' : '连接节点', true)] : []),
+    action('discover', '重新检查本机节点'),
+    ...(isLocal && !hasCore ? [action('start-owned', '在此电脑新建节点'), action('choose', '选择已有数据目录…')] : []),
+    ...(status.core.kind === 'owned' ? [action('stop-owned', '停止随 App 运行的节点')] : []),
+  ]
   const core = status.core
-  switch (core.kind) {
-    case 'none':
-      return {
-        tone: 'idle',
-        indicator: '尚未开始',
-        headline: '开始使用 Vibeface',
-        explain:
-          status.attachOnly
-            ? '选择已经在运行的 Vibeface 所使用的数据位置。'
-            : '开始后，身份和记录会保存在这台电脑的应用目录。已有数据时也可以选择原来的位置。',
-        facts: [],
-        failure: null,
-        actions: status.attachOnly
-          ? [choose('选择数据目录…', true)]
-          : [action('start', '在这台电脑开始使用', true), choose('使用已有数据…')],
-        scope,
-      }
-
-    case 'uninitialized':
-      return {
-        tone: 'idle',
-        indicator: '尚未初始化',
-        headline: '这个位置还没有配置 Vibeface',
-        explain: status.attachOnly
-          ? '请选择正在运行的 Vibeface 所使用的数据位置。'
-          : '启动会在此位置建立这台电脑的身份与配置，后续设置在 Vibeface 界面完成。',
-        facts: [['数据目录', core.dataDir]],
-        failure: null,
-        actions: status.attachOnly
-          ? [choose('换一个目录'), action('attach', '连接已有 Vibeface')]
-          : [action('start', '初始化并启动', true), choose('换一个目录')],
-        scope,
-      }
-
-    case 'offline':
-      return {
-        tone: 'idle',
-        indicator: '未运行',
-        headline: 'Vibeface 尚未启动',
-        explain: status.attachOnly
-          ? '等待这台电脑上的 Vibeface 启动后，再点重新检查。'
-          : '在这台电脑上启动后，即可进入 Vibeface 界面。',
-        facts: [
-          ['数据目录', core.dataDir],
-          ...(core.deviceId ? ([['设备 ID', core.deviceId]] as Array<[string, string]>) : []),
-        ],
-        failure: null,
-        actions: status.attachOnly
-          ? [action('attach', '连接已有 Vibeface', true), recheck(), choose('换一个目录')]
-          : [action('start', '启动 Vibeface', true), action('attach', '连接已有 Vibeface'), choose('换一个目录')],
-        scope,
-      }
-
-    case 'starting':
-      return {
-        tone: 'busy',
-        indicator: '正在启动',
-        headline: '正在启动 Vibeface',
-        explain:
-          core.attempts > 0
-            ? `已检查 ${core.attempts} 次，仍在等待启动完成。`
-            : '正在等待这台电脑就绪。',
-        facts: [['数据目录', core.dataDir]],
-        failure: null,
-        actions: [action('open', '打开 Vibeface', true, true), action('stop', '停止在这台电脑运行', false, true)],
-        scope,
-      }
-
-    case 'owned':
-      return {
-        tone: 'live',
-        indicator: '已启动',
-        headline: 'Vibeface 正在这台电脑运行',
-        explain: '关闭窗口后会在后台继续运行，选择退出时才会停止。',
-        facts: [
-          ['数据目录', core.dataDir],
-          ['设备 ID', core.deviceId],
-          ['本机入口', core.origin],
-        ],
-        failure: null,
-        actions: [action('open', '打开 Vibeface', true), action('stop', '停止在这台电脑运行'), recheck()],
-        scope,
-      }
-
-    case 'attached':
-      return {
-        tone: 'live',
-        indicator: '已连接',
-        headline: '已连接正在运行的 Vibeface',
-        explain: '运行不受此窗口控制，退出 App 后也会保持运行。',
-        facts: [
-          ['数据目录', core.dataDir],
-          ['设备 ID', core.deviceId],
-          ['本机入口', core.origin],
-        ],
-        failure: null,
-        actions: [action('open', '打开 Vibeface', true), recheck(), choose('换一个目录')],
-        scope,
-      }
-
-    case 'failed':
-      return {
-        tone: 'bad',
-        indicator: '出错',
-        headline: '上一步没有完成',
-        explain: '可以重新检查当前状态，或调整设置后重试。',
-        facts: core.dataDir ? [['数据目录', core.dataDir]] : [],
-        failure: core.message,
-        actions: [recheck(), choose('换一个目录')],
-        scope,
-      }
+  const failure = core.kind === 'failed' ? core.message : failed ? status.discovery.kind === 'failed' ? status.discovery.message : null : null
+  const tone: Tone = failure ? 'bad' : hasCore ? 'live' : status.discovery.kind === 'scanning' ? 'busy' : 'idle'
+  const headline = hasCore ? '节点已连接' : status.nodeMode === 'controller' ? '连接你的 Vibeface 节点' : '在这台电脑启用节点'
+  const explain = hasCore
+    ? '控制端连接与本机节点运行彼此独立；切换连接目标不会停止本机节点。'
+    : status.nodeMode === 'controller'
+      ? '选择一个正在运行的节点即可开始。已停止的节点只会在你明确选择后启动。'
+      : '可以连接已有节点，或在此电脑创建新节点。退出 App 会停止由 App 临时运行的节点。'
+  return {
+    tone, indicator: hasCore ? '已连接' : failed ? '检查未完成' : '等待连接', headline, explain,
+    facts: core.kind === 'owned' || core.kind === 'attached' ? [['节点 ID', core.deviceId], ['数据目录', core.dataDir]] : [],
+    failure, actions, rows: rows(status), discoveryMessage,
+    backgroundMessage: isLocal || background.kind !== 'absent' ? backgroundMessage : '',
+    backgroundActions: isLocal ? backgroundActions : [],
+    scope: isLocal ? '这台电脑可以运行节点，也可以连接其他节点。' : '此模式只控制节点，不会在这台电脑启用节点。',
   }
 }

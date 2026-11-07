@@ -1,76 +1,86 @@
 import { describe, expect, it } from 'vitest'
 import { describe as toView } from '../src/launcher/view.js'
-import type { CoreState, LauncherStatus } from '../src/shared/contract.js'
+import type { BackgroundNode, CoreState, LauncherStatus, LocalNode } from '../src/shared/contract.js'
 
-const status = (core: CoreState, overrides: Partial<LauncherStatus> = {}): LauncherStatus => ({
+const status = (overrides: Partial<LauncherStatus> = {}): LauncherStatus => ({
   runtime: { kind: 'ready', corePath: '/app/resources/runtime/vibeface-core' },
-  core,
+  core: { kind: 'none' },
   businessOpen: false,
   preferences: { openBusinessOnConnect: true },
   profileDir: '/tmp/profile',
-  version: '0.0.1-nightly.20261106.3',
+  version: '0.0.1-nightly.20261107.1',
   attachOnly: false,
+  clientAvailable: true,
+  nodeMode: 'undecided',
+  discovery: { kind: 'idle' },
+  backgroundNode: { kind: 'absent' },
   ...overrides,
 })
 
-const ids = (core: CoreState, overrides?: Partial<LauncherStatus>) =>
-  toView(status(core, overrides)).actions.map((action) => action.id)
+const node = (kind: LocalNode['kind'], id = 'candidate-1'): LocalNode => {
+  const identity = { id, deviceId: 'a'.repeat(64), dataDir: '/Users/example/.vibeface', sources: ['default_home'] as const }
+  if (kind === 'unavailable') return { ...identity, sources: [...identity.sources], kind, reason: 'inspection_unavailable' }
+  return {
+    ...identity, sources: [...identity.sources], kind,
+    localListen: '127.0.0.1:4790', listen: '127.0.0.1:4790', webEnabled: true, coreVersion: '0.0.1',
+  }
+}
 
 describe('launcher view', () => {
-  it('offers a local start and a separate existing-data choice', () => {
-    expect(ids({ kind: 'none' })).toEqual(['start', 'choose'])
+  it('offers controller-only and local-node choices on first open', () => {
+    expect(toView(status()).actions.map((item) => item.id)).toEqual(['controller', 'local'])
   })
 
-  it('offers initialization for an empty directory and says what will be created', () => {
-    const view = toView(status({ kind: 'uninitialized', dataDir: '/tmp/node' }))
-    expect(view.actions[0]?.id).toBe('start')
-    expect(view.explain).toContain('身份与配置')
+  it('keeps the controller available without a Core runtime and discovers healthy choices', () => {
+    const view = toView(status({
+      nodeMode: 'controller',
+      runtime: { kind: 'missing', corePath: '/missing', detail: 'Core unavailable' },
+      discovery: { kind: 'ready', nodes: [node('running'), node('running', 'candidate-2')], warnings: [] },
+    }))
+    expect(view.actions.map((item) => item.id)).toContain('open')
+    expect(view.rows.map((row) => row.actions[0]?.id)).toEqual(['connect', 'connect'])
+    expect(view.rows[0]?.actions[0]?.nodeId).toBe('candidate-1')
   })
 
-  it('offers both starting and connecting when a directory is idle', () => {
-    expect(ids({ kind: 'offline', dataDir: '/tmp/node', deviceId: null })).toEqual(['start', 'attach', 'choose'])
+  it('requires an explicit action to start a stopped discovered node', () => {
+    const view = toView(status({ nodeMode: 'controller', discovery: { kind: 'ready', nodes: [node('stopped')], warnings: [] } }))
+    expect(view.rows[0]?.actions.map((item) => item.id)).toEqual(['start-discovered'])
   })
 
-  it('shows the real attempt count while starting and locks the actions', () => {
-    const view = toView(status({ kind: 'starting', dataDir: '/tmp/node', attempts: 3 }))
-    expect(view.tone).toBe('busy')
-    expect(view.explain).toContain('3')
-    expect(view.actions.every((action) => action.disabled)).toBe(true)
+  it('shows bounded unavailable observations without offering ownership actions', () => {
+    const view = toView(status({ nodeMode: 'controller', discovery: { kind: 'ready', nodes: [node('unavailable')], warnings: [] } }))
+    expect(view.rows[0]?.detail).toContain('重新检查')
+    expect(view.rows[0]?.actions.map((item) => item.id)).toEqual(['discover'])
+    expect(view.rows[0]?.actions.some((item) => /stop|remove/.test(item.id))).toBe(false)
   })
 
-  it('offers stopping only for a Core this app owns', () => {
-    const owned: CoreState = { kind: 'owned', dataDir: '/tmp/node', deviceId: 'a', origin: 'http://127.0.0.1:4791' }
-    const attached: CoreState = { ...owned, kind: 'attached' }
-    expect(ids(owned)).toContain('stop')
-    expect(ids(attached)).not.toContain('stop')
-    expect(toView(status(attached)).explain).toContain('退出 App 后也会保持运行')
+  it('separates App child stop controls from connected Nodes', () => {
+    const core: CoreState = { kind: 'owned', dataDir: '/tmp/node', deviceId: 'a', origin: 'http://127.0.0.1:4791' }
+    expect(toView(status({ nodeMode: 'local', core })).actions.map((item) => item.id)).toContain('stop-owned')
+    const attached: CoreState = { ...core, kind: 'attached' }
+    expect(toView(status({ nodeMode: 'local', core: attached })).actions.map((item) => item.id)).not.toContain('stop-owned')
   })
 
-  it('shows the failure and asks to check the current state', () => {
-    const view = toView(status({ kind: 'failed', dataDir: '/tmp/node', message: '端口 4790 被占用，可用 --listen 更换' }))
-    expect(view.tone).toBe('bad')
-    expect(view.failure).toBe('端口 4790 被占用，可用 --listen 更换')
-    expect(view.explain).toBe('可以重新检查当前状态，或调整设置后重试。')
+  it('shows installed background ownership even in controller mode and never offers its removal there', () => {
+    const backgroundNode: BackgroundNode = { kind: 'installed', nodeId: 'node-1', dataDir: '/var/data/node', health: 'running', manager: 'launchd' }
+    const view = toView(status({ nodeMode: 'controller', backgroundNode }))
+    expect(view.backgroundMessage).toContain('正在运行')
+    expect(view.backgroundActions).toEqual([])
   })
 
-  it('hides every start action in a connection-only run', () => {
-    expect(ids({ kind: 'none' }, { attachOnly: true })).toEqual(['choose'])
-    expect(ids({ kind: 'offline', dataDir: '/tmp/node', deviceId: null }, { attachOnly: true })).not.toContain('start')
-    expect(ids({ kind: 'uninitialized', dataDir: '/tmp/node' }, { attachOnly: true })).not.toContain('start')
+  it('offers truthful background service controls only when local hosting is selected', () => {
+    const backgroundNode: BackgroundNode = { kind: 'installed', nodeId: 'node-1', dataDir: '/var/data/node', health: 'stopped', manager: 'launchd' }
+    expect(toView(status({ nodeMode: 'local', backgroundNode })).backgroundActions.map((item) => item.id)).toEqual(['start-background', 'remove-background'])
+    expect(toView(status({ nodeMode: 'local', backgroundNode: { kind: 'conflict', message: '服务注册已更改' } })).backgroundActions).toEqual([])
   })
 
-  it('blocks everything when the bundled runtime is missing', () => {
-    const view = toView(
-      status({ kind: 'none' }, { runtime: { kind: 'missing', corePath: '/absent', detail: '重新安装' } })
-    )
-    expect(view.actions).toEqual([])
-    expect(view.facts).toEqual([['期望路径', '/absent']])
-  })
-
-  it('lists the private origin once a Core answers', () => {
-    const view = toView(
-      status({ kind: 'owned', dataDir: '/tmp/node', deviceId: 'a', origin: 'http://127.0.0.1:4791' })
-    )
-    expect(view.facts).toContainEqual(['本机入口', 'http://127.0.0.1:4791'])
+  it('keeps client action present while local Core is missing and reports discovery failure separately', () => {
+    const view = toView(status({
+      nodeMode: 'controller', clientAvailable: true,
+      runtime: { kind: 'missing', corePath: '/missing', detail: 'Bundled Core missing' },
+      discovery: { kind: 'failed', message: '本机节点检查失败，可重新检查。' },
+    }))
+    expect(view.actions.map((item) => item.id)).toContain('open')
+    expect(view.discoveryMessage).toContain('失败')
   })
 })
