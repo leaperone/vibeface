@@ -241,6 +241,15 @@ const control = createServer(async (request, response) => {
 });
 const controlPath = resolveBoundedPath(controlRoot, `${port}.json`);
 
+async function prepareOfflineNode() {
+  await mkdir(profile, { recursive: true });
+  const cli = join(resources, 'runtime', windows ? 'vibeface.exe' : 'vibeface');
+  const dataDir = join(profile, 'node');
+  await run(cli, ['init', '--data-dir', dataDir, '--bootstrap', 'off'], { cwd: repository });
+  const configuration = JSON.parse(await readFile(join(dataDir, 'config.json'), 'utf8'));
+  assert.equal(configuration.network.bootstrap.mode, 'off', 'The desktop fixture uses no public bootstrap');
+}
+
 async function shutdown() {
   if (stopping) return;
   stopping = true;
@@ -259,6 +268,7 @@ await new Promise((done, fail) => { control.once('error', fail); control.listen(
 const address = control.address();
 assert(address && typeof address === 'object');
 try {
+  await prepareOfflineNode();
   await start();
 } catch (error) {
   console.error(`The desktop application did not start: ${error instanceof Error ? error.message : String(error)}`);

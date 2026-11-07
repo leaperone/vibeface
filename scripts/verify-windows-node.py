@@ -491,6 +491,7 @@ class Node:
             self.cli, "init", "--data-dir", self.directory,
             "--listen", f"127.0.0.1:{self.port}",
             "--local-listen", f"127.0.0.1:{self.local_port}",
+            "--bootstrap", "off",
             "--root", str(workspace),
             "--bin", f"codex={provider.program}",
         ], timeout=120, env=self.environment())
