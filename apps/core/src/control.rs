@@ -680,7 +680,7 @@ mod tests {
     fn initialization_selects_system_only_for_an_explicit_codex_socket() {
         for socket in [
             None,
-            Some(PathBuf::from("/tmp/vibeface-fixture-codex.sock")),
+            Some(std::env::temp_dir().join("vibeface-fixture-codex.sock")),
         ] {
             let dir = temp_dir("mode");
             let listen = free_addr();

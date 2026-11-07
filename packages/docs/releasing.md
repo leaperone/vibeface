@@ -13,7 +13,7 @@ Core、CLI、Web App 和 Mobile 共享一个版本、一个 `v<version>` Tag 与
 
 | 发布组 | Tag | 交付物 |
 | --- | --- | --- |
-| product | `v<version>` | 四个平台的完整 CLI/Core 包、macOS 与 Windows 桌面安装包、Web App 归档、Android APK，以及各自校验信息 |
+| product | `v<version>` | 四个平台的完整 CLI/Core 包、macOS、Windows 与两个 Linux 架构的桌面安装包、Web App 归档、Android APK，以及各自校验信息 |
 | www | `www-v<version>` | 静态官网与文档归档 |
 
 首个正式版为 `0.0.1`。Nightly 使用 `0.0.1-nightly.YYYYMMDD.N`，日期取 UTC 准备日期，序号按发布组递增。Mobile 的 `expo.version` 保持 `0.0.1`，Android versionCode 独立递增。当前 Mobile 发行目标是 Android APK，不代表 TestFlight、App Store 或 OTA 交付。
@@ -219,7 +219,7 @@ gh workflow run npm-publish.yml --repo leaperone/vibeface --ref v<version> \
 
 ## 桌面与 Windows 签名
 
-每个平台的桌面任务只等待自身完整运行包。macOS 生成 DMG 和 ZIP，Windows 生成当前用户安装的 NSIS EXE 和 ZIP。每组制品携带 SHA256 与来源收据，记录 Electron 版本、产品版本、源码和内置运行包摘要。打包后再次核对运行包的 `FILES.sha256`，禁止 Electron 重新签名或改写已经封存的 CLI 与 Core。
+每个平台的桌面任务只等待自身完整运行包。macOS 生成 DMG 和 ZIP，Windows 生成当前用户安装的 NSIS EXE 和 ZIP，Linux 生成 AppImage 和 ZIP。Linux 的完整性由 SHA256 与来源收据验证，不声明平台厂商签名。每组制品携带 SHA256 与来源收据，记录 Electron 版本、产品版本、源码和内置运行包摘要。打包后再次核对运行包的 `FILES.sha256`，禁止 Electron 重新签名或改写已经封存的 CLI 与 Core。
 
 Windows 签名使用可选仓库 secrets `WINDOWS_CERTIFICATE_PFX_BASE64` 和 `WINDOWS_CERTIFICATE_PASSWORD`，证书密码可以为空。可通过 `WINDOWS_CERTIFICATE_SUBJECT` 和 `WINDOWS_CERTIFICATE_THUMBPRINT` 约束签名身份。配置证书后，原生任务先使用现有 Windows SDK 的 signtool 签名和添加时间戳，再封存程序；桌面任务签名应用与安装器，并在 Windows 上验证 Authenticode、时间戳和配置的身份。
 

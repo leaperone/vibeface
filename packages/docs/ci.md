@@ -286,7 +286,7 @@ GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate`
 
 ## 桌面专项验收
 
-在开发分支手动运行已注册的 `ci.yml`，设置 `desktop_only=true`。共享密码学与 Web 输入构建后，Mac ARM64 和 Windows x64 各自编译、组包并驱动真实 Electron 窗口，一端不等待另一端的原生构建或测试。独立的 `windows-platform` 同时执行 MSVC Clippy 和 Windows Rust 测试。最终 `desktop-gate` 要求所有这些任务成功。
+在开发分支手动运行已注册的 `ci.yml`，设置 `desktop_only=true`。共享密码学与 Web 输入构建后，Mac ARM64、Windows x64、Linux x64 和 Linux ARM64 各自编译、组包并驱动真实 Electron 窗口，一端不等待另一端的原生构建或测试。独立的 `windows-platform` 同时执行 MSVC Clippy 和 Windows Rust 测试。Linux 用例在 Xvfb 中启动实际 AppImage 解包后的 App，保持 Chromium 沙箱开启。最终 `desktop-gate` 要求所有这些任务成功。
 
 ```sh
 	gh workflow run ci.yml --repo leaperone/vibeface --ref <branch> -f desktop_only=true

@@ -1,6 +1,6 @@
-# macOS、Windows 桌面与 Windows 本机运行
+# 五个平台的 App 与桌面本机运行
 
-本次提供 Electron 桌面宿主，复用 React 业务界面，并补齐原生 Windows Rust Core/CLI。用户指定 Grok Bot 为参考；本机 0.79.2 安装包包含 Electron Framework 与 app.asar。Electron 固定为本轮核对过的稳定版本 45.2.3。本轮目标是实现、验证并提交一个 PR，合并与发布另行按授权执行。
+Windows、macOS 和 Linux 使用 Electron 桌面宿主，复用 React 业务界面，并内置各自平台的 Rust Core 与 CLI。iOS 和 Android 使用现有 React Native/Expo 原生 App，共享客户端与 Rust 密码学模块。手机通过自己的设备身份连接个人网络中的 Node。用户指定 Grok Bot 为参考；本机 0.79.2 安装包包含 Electron Framework 与 app.asar。Electron 固定为本轮核对过的稳定版本 45.2.3。本轮目标是实现、验证并提交一个 PR，合并与发布另行按授权执行。
 
 ## 模块与调用关系
 
@@ -31,7 +31,7 @@ App 自己启动的 Core 使用内置固定路径和显式数据目录，保持�
 
 Windows 移植包含当前用户隔离的私有 IPC、文件权限、数据锁、进程树、命令/路径、用户级服务以及更新与恢复。正常功能不能用空实现或整块 cfg 排除替代。持久记录中的进程标识不能变成不核实归属就结束新 PID 的操作。
 
-初始桌面验收矩阵为 macOS ARM64 与 Windows x64，后者使用 `x86_64-pc-windows-msvc` 原生目标、`.exe` 程序。独立 Core/CLI 继续使用完整 `.tar.gz` 包格式，Windows 安装和运行不依赖 WSL、Git Bash、管理员权限或开发者模式。已有 Linux 目标保留。
+桌面验收矩阵为 macOS ARM64、Windows x64、Linux x64 和 Linux ARM64，后者使用 `x86_64-pc-windows-msvc` 原生目标、`.exe` 程序。独立 Core/CLI 继续使用完整 `.tar.gz` 包格式，Windows 安装和运行不依赖 WSL、Git Bash、管理员权限或开发者模式。已有 Linux 目标保留。
 
 网络或执行结果未知时保留原工作身份并核对，不能重放写操作。现有仅在 Linux 提供的证明生成能力维持其原有平台约束，不以此关闭 Windows 的其他 Core 能力。
 
@@ -45,3 +45,18 @@ Windows 移植包含当前用户隔离的私有 IPC、文件权限、数据锁�
 
 
 Windows 的维护通道与 Codex App Server 使用不同接口。维护通道是带当前 SID DACL 的命名管道；Codex 使用官方 `unix://PATH`，底层为 Windows AF_UNIX。连接前核对私有父目录和内核报告的对端进程账户。App Server 的路径指针使用 `.endpoint`，不把指针文件当作 socket，也不向上游传入未定义的命名管道 URL。
+
+
+## 面向用户的安装形态
+
+| 平台 | App | 本机执行与交付 |
+|---|---|---|
+| Windows x64 | Electron 桌面 App | 当前用户安装器与 ZIP，内置原生 Core、CLI 和 Web |
+| macOS Apple Silicon | Electron 桌面 App | DMG 与 ZIP，内置原生 Core、CLI 和 Web |
+| Linux x64、ARM64 | Electron 桌面 App | AppImage 与 ZIP，内置对应架构的 Core、CLI 和 Web |
+| Android | React Native App | APK，连接个人网络中的 Node |
+| iOS、iPadOS | React Native App | 设备归档及配置签名后的 IPA，安装渠道由 Apple 分发方式决定 |
+
+桌面首次打开时可以直接选择在这台电脑开始使用，身份和记录保存在应用配置目录下的独立 Node 目录。只有用户点击开始后才初始化。选择已有数据可连接独立服务，应用不能取得该服务的进程所有权。
+
+五个平台共享业务和身份规则，不要求它们使用同一套窗口技术。iOS 的未签名设备归档用于证明原生代码能构建，不能安装到 iPhone；可安装 IPA 必须有适用于该 App 的 iOS 证书和 provisioning profile。

@@ -470,16 +470,13 @@ fn installed(root: &Path) -> Result<PathBuf> {
 }
 
 async fn configure_timer(policy: &Policy, data: &Path) -> Result<()> {
-    let mut command = Command::new(
-        policy
-            .install_root
-            .join("current/scripts/install-node-service.sh"),
-    );
+    let current = policy.install_root.join("current");
+    let mut command = crate::service::service_script(&current.join(SERVICE_SCRIPT))?;
     if policy.automatic {
         command
             .arg("install-updater")
             .arg("--binary")
-            .arg(policy.install_root.join("current/vibeface"));
+            .arg(current.join(PROGRAMS[0]));
     } else {
         command.arg("uninstall-updater");
     }
@@ -1294,6 +1291,25 @@ mod tests {
         assert_eq!(
             recorded_arguments(&installer),
             format!("uninstall-updater\n--data-dir\n{}\n", data.display())
+        );
+        run(Update {
+            action: Action::Configure {
+                channel: Channel::Nightly,
+                automatic: true,
+                install_root: root.clone(),
+                data: Data {
+                    data_dir: data.clone(),
+                },
+            },
+        })
+        .await?;
+        assert_eq!(
+            recorded_arguments(&installer),
+            format!(
+                "install-updater\n--binary\n{}\n--data-dir\n{}\n",
+                root.join("current").join(PROGRAMS[0]).display(),
+                data.display()
+            )
         );
         run(Update {
             action: Action::Status(Data { data_dir: data }),

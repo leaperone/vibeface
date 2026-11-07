@@ -153,7 +153,7 @@ fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Resul
 /// Unix runs the script directly. Windows has no script a process can start on its own, so the
 /// shell that interprets it is named by its full path under the system directory, which keeps
 /// anything earlier on the search path out of it.
-fn service_script(script: &Path) -> Result<Command> {
+pub(crate) fn service_script(script: &Path) -> Result<Command> {
     ensure!(
         script.is_file(),
         "this installation carries no service script: {}",
