@@ -3,6 +3,12 @@ name: mobile
 # Extended platform build: run by hand or from the delivery proof workflow.
 on:
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: Native mobile platforms to build and verify
+        type: choice
+        options: [all, android, ios]
+        default: all
   workflow_call:
     inputs:
       android_only:
@@ -21,7 +27,7 @@ env:
 
 jobs:
   android:
-    if: inputs.android_only || github.event_name == 'workflow_dispatch'
+    if: inputs.android_only || (github.event_name == 'workflow_dispatch' && inputs.platforms != 'ios')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -68,7 +74,7 @@ jobs:
           if-no-files-found: error
 
   ios:
-    if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' }}
+    if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' && inputs.platforms != 'android' }}
     runs-on: macos-26
     timeout-minutes: 60
     steps:
