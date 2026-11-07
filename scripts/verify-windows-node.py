@@ -45,6 +45,54 @@ class FixtureProcessCheckError(AssertionError):
         super().__init__(f"fake provider {role} identity check failed: {reason}")
 
 
+class StatusCommandFailure(AssertionError):
+    """A nonzero CLI status result with bounded, path- and secret-redacted evidence."""
+
+    def __init__(self, result, node):
+        self.returncode = result.returncode
+        self.category, self.stderr = safe_status_stderr(result.stderr, node)
+        super().__init__("status inspects the initialized node")
+
+
+def safe_status_stderr(stderr, node):
+    text = stderr.decode(errors="replace")
+    paths = (node.directory, node.home, node.home / ".codex", node.cli, node.core,
+             node.directory.parent)
+    spellings = {
+        spelling
+        for path in paths
+        for spelling in (str(path), str(path).replace("/", "\\"), str(path).replace("\\", "/"))
+        if spelling
+    }
+    for spelling in sorted(spellings, key=len, reverse=True):
+        text = text.replace(spelling, "[path]")
+    text = re.sub(
+        r"(?i)\b(?:authorization\s*:\s*)?(?:bearer|basic)\s+[^\s,;]+",
+        "[redacted authorization]", text,
+    )
+    text = re.sub(
+        r"(?i)\b(auth[_ -]?token|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|"
+        r"token|credential|auth(?:orization)?|password|secret)\b"
+        r"(\s*[:=]\s*|\s+)[^\s,;]+",
+        r"\1\2[redacted]", text,
+    )
+    text = re.sub(r"(?i)https?://[^/\s:@]+:[^/\s@]+@", "https://[redacted]@", text)
+    text = "".join(character for character in text if character in "\n\t" or character.isprintable())
+    text = text.strip()[:512]
+    lowered = text.lower()
+    if not text:
+        category = "empty_stderr"
+    elif "core control process failed" in lowered:
+        category = "core_control_process_failed"
+    elif "start core control process" in lowered:
+        category = "core_control_launch_failed"
+    elif "invalid core control response" in lowered:
+        category = "invalid_core_control_response"
+    else:
+        category = "cli_status_failed"
+    return category, text
+
+
 def require(condition, description):
     if not condition:
         raise AssertionError(description)
@@ -374,7 +422,8 @@ class Node:
     def status(self):
         result = run([self.cli, "status", "--json", "--data-dir", self.directory], check=False,
                      env=self.environment())
-        require(result.returncode == 0, "status inspects the initialized node")
+        if result.returncode != 0:
+            raise StatusCommandFailure(result, self)
         return json.loads(result.stdout)
 
     def ask_to_stop(self):
@@ -606,6 +655,12 @@ def main():
             if isinstance(error, FixtureProcessCheckError):
                 diagnostic["fixture_process_check"] = {
                     "role": error.role, "result": error.reason,
+                }
+            if isinstance(error, StatusCommandFailure):
+                diagnostic["status_command"] = {
+                    "returncode": error.returncode,
+                    "category": error.category,
+                    "stderr_excerpt": error.stderr,
                 }
             (options.artifacts / "windows-node-failure.json").write_text(
                 json.dumps(diagnostic, indent=2) + "\n", encoding="utf-8"
