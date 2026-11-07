@@ -10,7 +10,7 @@ import {
 } from '../shared/contract.js'
 import { ActivationQueue, type JoinActivation } from './activation-queue.js'
 import { parseArgs } from './cli.js'
-import { deepLinkFromArgv, isLoopbackOrigin, parseDeepLink, type DeepLink } from './deeplink.js'
+import { deepLinkFromArgv, parseDeepLink, type DeepLink } from './deeplink.js'
 import { isTrustedLauncherCall, readBoolean, readExternalUrl, readNoArguments, readString } from './ipc-guard.js'
 import { registerLauncherScheme, serveLauncher } from './launcher-protocol.js'
 import { applyApplicationMenu } from './menu.js'
@@ -152,7 +152,7 @@ async function handleJoin(link: DeepLink): Promise<void> {
   if (link.kind !== 'join') return
   try {
     const target = await requireSession().businessTarget(link).catch((error: unknown) => {
-      if (link.origin !== null && !isLoopbackOrigin(link.origin)) {
+      if (link.origin !== null) {
         return { kind: 'external' as const, url: `${link.origin}/join#${link.ticket}` }
       }
       throw error
@@ -178,8 +178,8 @@ async function handleJoin(link: DeepLink): Promise<void> {
   }
 }
 
-function canHandleLocally(link: JoinActivation): boolean {
-  if (link.origin !== null && !isLoopbackOrigin(link.origin)) return true
+function canHandleJoin(link: JoinActivation): boolean {
+  if (link.origin !== null) return true
   const state = coreSession?.state()
   return state?.kind === 'owned' || state?.kind === 'attached'
 }
@@ -297,7 +297,7 @@ async function start(): Promise<void> {
   }
 
   const activations = new ActivationQueue(async (link) => {
-    if (!canHandleLocally(link)) {
+    if (!canHandleJoin(link)) {
       showLauncher()
       return 'defer'
     }

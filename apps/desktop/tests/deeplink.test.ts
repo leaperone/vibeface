@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { deepLinkFromArgv, isLoopbackOrigin, parseDeepLink } from '../src/main/deeplink.js'
+import { deepLinkFromArgv, parseDeepLink } from '../src/main/deeplink.js'
 
 const TICKET = 'vibeface1qq2ww3ee4'
 
@@ -57,14 +57,5 @@ describe('deepLinkFromArgv', () => {
   it('never reads a path or a flag value as a link', () => {
     expect(deepLinkFromArgv(['--profile-dir', '/tmp/profile', '--attach']).kind).toBe('ignored')
     expect(deepLinkFromArgv(['--runtime=/tmp/evil/vibeface-core']).kind).toBe('ignored')
-  })
-})
-
-describe('isLoopbackOrigin', () => {
-  it('separates this machine from a published entry', () => {
-    expect(isLoopbackOrigin('http://127.0.0.1:4790')).toBe(true)
-    expect(isLoopbackOrigin('http://localhost:4790')).toBe(true)
-    expect(isLoopbackOrigin('https://vb.example.com')).toBe(false)
-    expect(isLoopbackOrigin('http://127.0.0.1.example.com')).toBe(false)
   })
 })

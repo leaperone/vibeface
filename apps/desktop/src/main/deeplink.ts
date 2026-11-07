@@ -55,13 +55,3 @@ export function deepLinkFromArgv(argv: readonly string[]): DeepLink {
   }
   return { kind: 'ignored' }
 }
-
-/** An invite published at this machine's own Core opens in the desktop window. */
-export function isLoopbackOrigin(origin: string): boolean {
-  try {
-    const host = new URL(origin).hostname.replace(/^\[/, '').replace(/\]$/, '').toLowerCase()
-    return host === 'localhost' || host === '::1' || /^127\.\d+\.\d+\.\d+$/.test(host)
-  } catch {
-    return false
-  }
-}
