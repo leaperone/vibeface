@@ -283,7 +283,7 @@ switch ($action) {
             -Description 'Vibeface personal node' `
             -Command $binary `
             -Arguments "serve --data-dir `"$dataDir`"" `
-            -WorkingDirectory (Split-Path -LiteralPath $binary -Parent) `
+            -WorkingDirectory (Split-Path -LiteralPath $binary) `
             -Trigger $trigger
         Register-Definition -Name $NodeTask -Definition $definition
         Stop-Task -Name $NodeTask
@@ -315,7 +315,7 @@ switch ($action) {
             -Description 'Update Vibeface personal node' `
             -Command $shell `
             -Arguments $redirected `
-            -WorkingDirectory (Split-Path -LiteralPath $binary -Parent) `
+            -WorkingDirectory (Split-Path -LiteralPath $binary) `
             -Trigger $trigger
         Register-Definition -Name $UpdateTask -Definition $definition
         "Installed $UpdateTask"
