@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
+import { createServer as createNetServer } from 'node:net';
 import { mkdir, readFile, rename, rm, stat, unlink } from 'node:fs/promises';
 import { basename, join, resolve, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -30,14 +31,22 @@ const taskId = `${process.pid}-${port}-${randomBytes(6).toString('hex')}`;
 const profile = join(root, 'profiles', `测试 配置 ${taskId}`);
 const fixtureRoot = resolve(root, 'fixtures', taskId);
 let child;
+let inspectorPort;
 let stopping = false;
 let changing = false;
 const fixtures = new Map();
 
 async function devtools(path) {
-  const response = await fetch(`http://127.0.0.1:${port}${path}`, { signal: AbortSignal.timeout(10000) });
+  const response = await fetchBounded(`http://127.0.0.1:${port}${path}`, 10000);
   assert(response.ok, `The DevTools endpoint answered ${response.status}`);
   return response.json();
+}
+
+async function fetchBounded(url, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try { return await fetch(url, { signal: controller.signal }); }
+  finally { clearTimeout(timer); }
 }
 
 /** Every direct child of the application, so a Core it owns is distinguished from an attached one. */
@@ -78,26 +87,102 @@ function alive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-/** Evaluate inside an existing Electron page; no second browser is created. */
-async function inPage(page, expression) {
-  const socket = new WebSocket(page.webSocketDebuggerUrl);
+/** Send one bounded CDP operation and close its socket and timer on every outcome. */
+async function devtoolsCommand(endpoint, method, params, timeoutMs = 30000) {
+  const socket = new WebSocket(endpoint);
   try {
     return await new Promise((done, fail) => {
-      const limit = AbortSignal.timeout(30000);
-      limit.addEventListener('abort', () => fail(new Error('The application page did not answer')));
-      socket.addEventListener('error', () => fail(new Error('The application page could not be reached')));
-      socket.addEventListener('open', () => socket.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, returnByValue: true, awaitPromise: true } })));
-      socket.addEventListener('message', event => {
+      let timer;
+      const finish = (error, value) => {
+        clearTimeout(timer);
+        socket.removeEventListener('open', onOpen);
+        socket.removeEventListener('message', onMessage);
+        socket.removeEventListener('error', onError);
+        socket.removeEventListener('close', onClose);
+        if (error) fail(error); else done(value);
+      };
+      const onOpen = () => socket.send(JSON.stringify({ id: 1, method, params }));
+      const onMessage = event => {
         try {
           const message = JSON.parse(event.data);
           if (message.id !== 1) return;
-          assert(!message.error && !message.result?.exceptionDetails,
-            `The application page rejected the operation: ${message.error?.message ?? message.result?.exceptionDetails?.text ?? 'no result'}`);
-          done(message.result.result.value);
-        } catch (error) { fail(error); }
-      });
+          assert(!message.error, `${method} failed: ${message.error?.message ?? 'unknown DevTools error'}`);
+          finish(null, message.result);
+        } catch (error) { finish(error); }
+      };
+      const onError = () => finish(new Error(`${method} could not reach its owned application target`));
+      const onClose = () => finish(new Error(`${method} target closed before answering`));
+      socket.addEventListener('open', onOpen);
+      socket.addEventListener('message', onMessage);
+      socket.addEventListener('error', onError);
+      socket.addEventListener('close', onClose);
+      timer = setTimeout(() => finish(new Error(`${method} timed out after ${timeoutMs} ms`)), timeoutMs);
     });
-  } finally { socket.close(); }
+  } finally {
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close();
+  }
+}
+
+/** Evaluate in a renderer page for read-only UI and preload assertions. */
+async function inPage(page, expression) {
+  const result = await devtoolsCommand(page.webSocketDebuggerUrl, 'Runtime.evaluate', {
+    expression, returnByValue: true, awaitPromise: true,
+  });
+  assert(result && !result.exceptionDetails,
+    `The application page rejected the evaluation: ${result?.exceptionDetails?.text ?? 'no result'}`);
+  return result.result?.value;
+}
+
+async function freePort() {
+  const server = createNetServer();
+  try {
+    await new Promise((done, fail) => { server.once('error', fail); server.listen(0, '127.0.0.1', done); });
+    const address = server.address();
+    assert(address && typeof address === 'object');
+    return address.port;
+  } finally { await new Promise(done => server.close(done)); }
+}
+
+async function inspectorTargets() {
+  assert(Number.isInteger(inspectorPort), 'The app-owned inspector port is assigned');
+  const response = await fetchBounded(`http://127.0.0.1:${inspectorPort}/json/list`, 10000);
+  assert(response.ok, 'The app-owned Node inspector answered its target listing');
+  const targets = await response.json();
+  assert(Array.isArray(targets));
+  const main = targets.filter(target => target.type === 'node');
+  assert.equal(main.length, 1, 'the dedicated inspector port exposes only this app main process');
+  const endpoint = new URL(main[0].webSocketDebuggerUrl);
+  assert(endpoint.protocol === 'ws:' && endpoint.hostname === '127.0.0.1' && endpoint.port === String(inspectorPort),
+    'the app main inspector stays on its dedicated literal-loopback port');
+  return main[0];
+}
+
+async function inMain(expression) {
+  const target = await inspectorTargets();
+  const result = await devtoolsCommand(target.webSocketDebuggerUrl, 'Runtime.evaluate', {
+    expression, returnByValue: true, awaitPromise: true,
+  });
+  assert(result && !result.exceptionDetails,
+    `The owned Electron main process rejected the evaluation: ${result?.exceptionDetails?.text ?? 'no result'}`);
+  return result.result?.value;
+}
+
+async function waitForExit(process, timeoutMs) {
+  if (process.exitCode !== null || process.signalCode !== null) return true;
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = exited => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      process.off('exit', onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    process.once('exit', onExit);
+    if (process.exitCode !== null || process.signalCode !== null) finish(true);
+  });
 }
 
 async function launcherPage() {
@@ -134,7 +219,8 @@ async function prepareProfileParent() {
 async function start() {
   assert(!child || child.exitCode !== null, 'The desktop application is already running');
   await prepareProfileParent();
-  const started = spawn(executable, ['--profile-dir', profile, `--remote-debugging-port=${port}`],
+  inspectorPort = await freePort();
+  const started = spawn(executable, [`--inspect=127.0.0.1:${inspectorPort}`, '--profile-dir', profile, `--remote-debugging-port=${port}`],
     { cwd: repository, stdio: 'ignore' });
   child = started;
   await new Promise((done, fail) => {
@@ -147,60 +233,71 @@ async function start() {
     try { await devtools('/json/version'); ready = true; break; } catch { await sleep(500); }
   }
   assert(ready, 'The packaged desktop DevTools endpoint became ready');
+  let inspected = false;
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    assert(started.exitCode === null, `The desktop application exited ${started.exitCode} before main inspection started`);
+    try {
+      const pid = await inMain('process.pid');
+      assert.equal(pid, started.pid, 'main-process inspection is bound to the driver-owned Electron PID');
+      inspected = true;
+      break;
+    } catch { await sleep(500); }
+  }
+  assert(inspected, 'The app-owned loopback main-process inspector became ready');
   await waitLauncher();
 }
 
-/** Quit using the actual browser endpoint, and report only Core children owned by this app. */
+/** Invoke the product quit menu in this app's main process and report only its owned Core children. */
 async function quit() {
   const running = child;
-  child = undefined;
-  if (!running || running.exitCode !== null) return { pid: running ? running.pid : null, owned: [], surviving: [] };
+  if (!running || running.exitCode !== null) {
+    child = undefined;
+    inspectorPort = undefined;
+    return { pid: running ? running.pid : null, owned: [], surviving: [], forced: false };
+  }
   const owned = await cores(running.pid);
-  const exited = new Promise(done => running.once('exit', done));
-  try {
-    const launcher = await launcherPage();
-    assert(launcher, 'The trusted launcher is available for its explicit quit accelerator');
-    const socket = new WebSocket(launcher.webSocketDebuggerUrl);
-    const mac = process.platform === 'darwin';
-    const key = mac ? 'q' : 'F4';
-    const code = mac ? 'KeyQ' : 'F4';
-    const modifiers = mac ? 4 : 1;
-    await new Promise((done, fail) => {
-      let replies = 0;
-      socket.addEventListener('open', () => {
-        socket.send(JSON.stringify({ id: 1, method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key, code, modifiers } }));
-        socket.send(JSON.stringify({ id: 2, method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', key, code, modifiers } }));
-      });
-      socket.addEventListener('message', event => {
-        const message = JSON.parse(event.data);
-        if (message.id !== 1 && message.id !== 2) return;
-        if (message.error) { fail(new Error('The desktop quit accelerator was rejected')); return; }
-        replies += 1;
-        if (replies === 2) done();
-      });
-      socket.addEventListener('error', () => fail(new Error('The launcher rejected the quit accelerator')));
-    });
-    socket.close();
-  } catch {
-    // Close the window as a secondary user-facing route; the app's tray remains responsible for quit.
-    try {
-      const { webSocketDebuggerUrl } = await devtools('/json/version');
-      const socket = new WebSocket(webSocketDebuggerUrl);
-      await new Promise(done => { socket.addEventListener('open', () => { socket.send(JSON.stringify({ id: 1, method: 'Browser.close' })); done(); }); });
-      socket.close();
-    } catch { /* fall through to scoped process cleanup below */ }
-  }
+  assert(Number.isInteger(inspectorPort), 'the app-owned inspector is available for its explicit menu quit');
   let forced = false;
-  const limit = AbortSignal.timeout(30000);
-  const timeout = new Promise(resolve => limit.addEventListener('abort', () => resolve('timeout')));
-  const result = await Promise.race([exited.then(() => 'exit'), timeout]);
-  if (result === 'timeout') {
+  try {
+    const clicked = await inMain(`(() => {
+      const { Menu, BrowserWindow } = process.mainModule.require('electron');
+      const menu = Menu.getApplicationMenu();
+      if (!menu) throw new Error('application menu is unavailable');
+      const pending = [...menu.items];
+      let quitItem;
+      while (pending.length) {
+        const item = pending.pop();
+        if (item.label === '退出 Vibeface') { quitItem = item; break; }
+        if (item.submenu) pending.push(...item.submenu.items);
+      }
+      if (!quitItem || typeof quitItem.click !== 'function') throw new Error('the product quit menu item has no click handler');
+      const focused = BrowserWindow.getFocusedWindow();
+      quitItem.click(null, focused, focused?.webContents);
+      return JSON.stringify({ pid: process.pid, label: quitItem.label });
+    })()`);
+    assert.equal(typeof clicked, 'string');
+    const action = JSON.parse(clicked);
+    assert.equal(action.pid, running.pid, 'the product menu handler ran in the driver-owned app process');
+    assert.equal(action.label, '退出 Vibeface', 'the real product quit menu item handled the request');
+    forced = !(await waitForExit(running, 30000));
+  } catch (error) {
     forced = true;
-    // Only this driver's own child handle is ever signalled, to avoid leaking a failed fixture.
-    running.kill();
+    console.error(`The product quit menu did not complete normally: ${error instanceof Error ? error.message : String(error)}`);
   }
-  if (forced) await Promise.race([exited, new Promise((_, fail) => setTimeout(() => fail(new Error('The desktop application did not exit after task-scoped cleanup')), 30000))]);
-  for (let attempt = 0; attempt < 20 && owned.some(alive); attempt += 1) await sleep(500);
+  // A failed product quit still gets task-scoped cleanup, but is reported as forced and fails acceptance.
+  if (forced) {
+    running.kill();
+    assert(await waitForExit(running, 5000), 'the driver-owned app process exited after fallback cleanup');
+  }
+  child = undefined;
+  inspectorPort = undefined;
+  let surviving = owned.filter(alive);
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline && surviving.length) {
+    await sleep(100);
+    surviving = owned.filter(alive);
+  }
+  assert.deepEqual(surviving, [], 'normal product quit stopped every Core child owned by this application');
   return { pid: running.pid, owned, surviving: owned.filter(alive), forced };
 }
 
@@ -217,35 +314,15 @@ async function status() {
 
 async function closeWindows() {
   assert(child && child.exitCode === null, 'The desktop application is running');
-  const pages = (await devtools('/json/list')).filter(page => page.type === 'page');
-  const results = [];
-  for (const page of pages) {
-    const modifiers = process.platform === 'darwin' ? 4 : 2;
-    const socket = new WebSocket(page.webSocketDebuggerUrl);
-    await new Promise((done, fail) => {
-      let replies = 0;
-      socket.addEventListener('open', () => {
-        socket.send(JSON.stringify({ id: 1, method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'w', code: 'KeyW', modifiers } }));
-        socket.send(JSON.stringify({ id: 2, method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', key: 'w', code: 'KeyW', modifiers } }));
-      });
-      socket.addEventListener('message', event => {
-        const message = JSON.parse(event.data);
-        if (message.id !== 1 && message.id !== 2) return;
-        if (message.error) { fail(new Error('The close-window accelerator was rejected')); return; }
-        if (++replies === 2) done();
-      });
-      socket.addEventListener('error', () => fail(new Error('The window refused its close accelerator')));
-    });
-    socket.close();
-    let visibility = 'visible';
-    const deadline = Date.now() + 10000;
-    while (Date.now() < deadline && visibility !== 'hidden') {
-      visibility = await inPage(page, 'document.visibilityState');
-      if (visibility !== 'hidden') await sleep(100);
-    }
-    results.push({ url: page.url, visibility });
-  }
-  return results;
+  const result = await inMain(`(() => {
+    const { BrowserWindow } = process.mainModule.require('electron');
+    const windows = BrowserWindow.getAllWindows();
+    const before = windows.map(window => ({ window, url: window.webContents.getURL() }));
+    for (const entry of before) entry.window.close();
+    return JSON.stringify(before.map(({ window, url }) => ({ url, visibility: window.isVisible() ? 'visible' : 'hidden' })));
+  })()`);
+  assert.equal(typeof result, 'string');
+  return JSON.parse(result);
 }
 
 async function invoke(method, args = []) {
@@ -265,14 +342,6 @@ async function inspect() {
   const runtimeInfo = JSON.parse(await readFile(join(runtime, 'BUILD-INFO.json'), 'utf8'));
   const pages = await devtools('/json/list');
   return { pid: child.pid, profile, runtime: runtimeInfo, cores: await cores(child.pid), status: await status(), pages: pageSummary(pages) };
-}
-
-async function freePort() {
-  const server = createServer();
-  try {
-    await new Promise((done, fail) => { server.once('error', fail); server.listen(0, '127.0.0.1', done); });
-    const address = server.address(); assert(address && typeof address === 'object'); return address.port;
-  } finally { await new Promise(done => server.close(done)); }
 }
 
 async function controlCore(request) {
@@ -325,10 +394,8 @@ async function stopFixture(dataDir) {
   assert(fixture, 'Fixture Node belongs to this driver task');
   const process = fixture.child;
   if (process && process.exitCode === null) {
-    const exited = new Promise(done => process.once('exit', done));
     process.kill('SIGTERM');
-    const timeout = new Promise((_, fail) => setTimeout(() => fail(new Error('Task-owned fixture Node did not stop')), 30000));
-    await Promise.race([exited, timeout]);
+    assert(await waitForExit(process, 30000), 'Task-owned fixture Node stopped within its existing cleanup bound');
   }
   fixture.child = undefined;
   const inspected = await controlCore({ command: 'inspect', data_dir: dataDir });

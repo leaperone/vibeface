@@ -97,13 +97,19 @@ async function control(port: number) {
   assert(url.protocol === 'http:' && url.hostname === '127.0.0.1' && url.port && url.pathname === '/' && !url.search && !url.hash, 'Control stays on literal loopback');
   assert(/^[a-f0-9]{64}$/.test(token));
   return async (request: Record<string, unknown>): Promise<unknown> => {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify(request),
-      signal: AbortSignal.timeout(120000),
-    });
-    const body: unknown = await response.json();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 120000);
+    let response: Response;
+    let body: unknown;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+        signal: controller.signal,
+      });
+      body = await response.json();
+    } finally { clearTimeout(timer); }
     assert(response.ok, `The desktop control operation returned ${response.status}: ${isRecord(body) && typeof body.error === 'string' ? body.error : 'see driver log'}`);
     return body;
   };
@@ -114,24 +120,34 @@ async function command(target: Page, method: string, params: Record<string, unkn
   const socket = new WebSocket(target.webSocketDebuggerUrl);
   try {
     return await new Promise<Record<string, unknown>>((done, fail) => {
-      const limit = AbortSignal.timeout(60000);
-      limit.addEventListener('abort', () => fail(new Error(`${method} did not answer`)));
-      socket.addEventListener('error', () => fail(new Error(`${method} could not reach the page`)));
-      socket.addEventListener('open', () => socket.send(JSON.stringify({ id: 1, method, params })));
-      socket.addEventListener('message', event => {
+      const finish = (error?: unknown, value?: Record<string, unknown>) => {
+        clearTimeout(timer);
+        socket.removeEventListener('error', onError);
+        socket.removeEventListener('open', onOpen);
+        socket.removeEventListener('message', onMessage);
+        socket.removeEventListener('close', onClose);
+        if (error) fail(error); else done(value as Record<string, unknown>);
+      };
+      const onError = () => finish(new Error(`${method} could not reach the page`));
+      const onClose = () => finish(new Error(`${method} target closed before answering`));
+      const onOpen = () => socket.send(JSON.stringify({ id: 1, method, params }));
+      const onMessage = (event: MessageEvent) => {
         try {
           assert(typeof event.data === 'string', 'Expected a DevTools message');
           const message = record(JSON.parse(event.data));
           if (message.id !== 1) return;
           assert(message.error === undefined, `${method} failed on the page`);
-          done(record(message.result));
-        } catch (error) {
-          fail(error);
-        }
-      });
+          finish(undefined, record(message.result));
+        } catch (error) { finish(error); }
+      };
+      const timer = setTimeout(() => finish(new Error(`${method} did not answer within 60000 ms`)), 60000);
+      socket.addEventListener('error', onError);
+      socket.addEventListener('open', onOpen);
+      socket.addEventListener('message', onMessage);
+      socket.addEventListener('close', onClose);
     });
   } finally {
-    socket.close();
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close();
   }
 }
 
@@ -191,7 +207,8 @@ export const test = base.extend<{ desktop: Desktop }>({
         invoke: async (method, ...args) => record(await call({ op: 'invoke', method, args })) as LauncherStatus,
         quit: async () => {
           const result = record(await call({ op: 'quit' }));
-          return { pid: result.pid === null ? null : identifier(result.pid), owned: identifiers(result.owned), surviving: identifiers(result.surviving), forced: result.forced === true };
+          assert(typeof result.forced === 'boolean', 'The driver reports whether application quit was forced');
+          return { pid: result.pid === null ? null : identifier(result.pid), owned: identifiers(result.owned), surviving: identifiers(result.surviving), forced: result.forced };
         },
         closeWindows: async () => {
           const value = await call({ op: 'close-windows' });
