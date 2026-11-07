@@ -600,8 +600,8 @@ foreach ($process in $coreProcesses) {
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
         environment = {
             **self.environment(),
-            "VIBEFACE_EXPECTED_CORE_IMAGE": str(self.core),
-            "VIBEFACE_EXPECTED_NODE_DATA": str(self.directory),
+            "VIBEFACE_EXPECTED_CORE_IMAGE": str(self.core.resolve(strict=True)),
+            "VIBEFACE_EXPECTED_NODE_DATA": str(self.directory.resolve(strict=True)),
         }
         try:
             result = subprocess.run(

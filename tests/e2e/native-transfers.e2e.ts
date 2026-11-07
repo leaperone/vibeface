@@ -343,8 +343,10 @@ test('provider settings and queued cancellation work in the installed native app
   expect((await inspect()).manager).toBeNull();
   await assert.rejects(network.call({ op: 'native_provider_queue' }));
   await initialProvider.click();
+  await expect(screen.getByLabel('Codex 执行任务', { exact: true })).toBeEnabled();
   await screen.getByLabel('Codex 执行任务', { exact: true }).click();
   await expect.poll(async () => (await inspect()).roles, { timeout: 15000 }).toEqual(['agent', 'execution']);
+  await expect(screen.getByLabel('Codex 运行 Bot', { exact: true })).toBeEnabled();
   await screen.getByLabel('Codex 运行 Bot', { exact: true }).click();
   await expect.poll(async () => (await inspect()).roles, { timeout: 15000 }).toEqual(['execution']);
   expect((await inspect()).manager).toBeNull();
@@ -400,6 +402,7 @@ test('provider settings and queued cancellation work in the installed native app
   await screen.scrollUntilVisible(executionDetails, { direction: 'up' });
   await executionDetails.click();
   await screen.scrollUntilVisible(screen.getByLabel('Codex 运行 Bot', { exact: true }), { direction: 'up' });
+  await expect(screen.getByLabel('Codex 运行 Bot', { exact: true })).toBeEnabled();
   await screen.getByLabel('Codex 运行 Bot', { exact: true }).click();
   await expect.poll(async () => (await inspect()).manager?.provider, { timeout: 15000 }).toBe('codex');
   await openSettings('ai');
