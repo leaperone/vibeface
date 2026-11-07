@@ -97,6 +97,24 @@ export function firstUnread<M extends Pick<TranscriptMessage, "message_id" | "ev
   return timeline.rest.find(waiting)
 }
 
+/**
+ * Whether a job should still show the chat as replying: an active one without its reply yet, or a finished one whose
+ * trigger is already visible while the Node's reply is still catching up; steered jobs join another reply and never get
+ * their own message, so a missing allocated reply id alone does not count.
+ */
+export function jobAwaitingReply(
+  job: Pick<ManagerJob, "state" | "message_id" | "reply_message_id">,
+  synced: ReadonlySet<string>,
+  visibleTriggers: ReadonlySet<string>,
+  busy: readonly string[],
+): boolean {
+  if (job.state === "steered") return false
+  const replyDelivered = job.reply_message_id !== undefined && synced.has(job.reply_message_id)
+  if (busy.includes(job.state)) return !replyDelivered
+  return job.reply_message_id !== undefined && job.message_id !== undefined
+    && !synced.has(job.reply_message_id) && visibleTriggers.has(job.message_id)
+}
+
 /** A bot's reply, or another bot's message, this device has not read; its notification ID is the hash of the event that wrote the message. */
 export const unreadReply = (notification: Pick<NotificationRecord, "kind">) => ["manager_response", "manager_attention", "bot_message"].includes(notification.kind)
 

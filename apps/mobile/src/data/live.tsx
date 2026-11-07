@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { File } from 'expo-file-system'
 import { botReach, composerHint } from '@vibeface/client/chat/protocol.ts'
-import { byRank, chatTimeline, firstUnread, unreadCounts } from '@vibeface/client/chat/timeline.ts'
+import { byRank, chatTimeline, firstUnread, jobAwaitingReply, unreadCounts } from '@vibeface/client/chat/timeline.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
 import { entryAddress, messageOf } from '@vibeface/client/lib/node.ts'
@@ -223,14 +223,14 @@ function Live({ children }: { children: ReactNode }) {
     if (pending && !data.messages.some((message) => message.message_id === pending.message_id)) messages.push({ message_id: pending.message_id, event_hash: pending.message_id, role: 'user', text: pending.text, created_at_ms: Date.now(), state: 'sending' })
     if (live) messages.push({ message_id: `live:${live.key}`, event_hash: `live:${live.key}`, role: 'assistant', text: live.text, created_at_ms: Date.now(), state: 'streaming', in_reply_to: liveTrigger })
     const stopJob = jobs.find((job) => data.scheduler?.capabilities?.cancel === true && ['queued', 'steering', 'claimed', 'running'].includes(job.state))
+    const synced = new Set(data.messages.map((message) => message.message_id))
+    const visible = new Set(messages.map((message) => message.message_id))
     conversations[conversationId] = {
       source: missing.length ? 'cache' : 'live', messages, before: timeline.before, rest: timeline.rest, answers: folded.answers, hidden: folded.hidden, works: data.works,
       unread: unread ? 'question_id' in unread ? `q:${unread.question_id}` : unread.message_id : null,
       // A finished job whose reply has not synced yet still counts, so the activity row hands over to the reply instead of
       // vanishing a frame early; its trigger being shown, even still sending, means the newer reply is on its way, not paged out.
-      replying: Boolean(live) || !handedOver && jobs.some((job) => busyStates.includes(job.state) && !(job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))
-        || job.reply_message_id && job.message_id
-        && !data.messages.some((message) => message.message_id === job.reply_message_id) && messages.some((message) => message.message_id === job.message_id)),
+      replying: Boolean(live) || !handedOver && jobs.some((job) => jobAwaitingReply(job, synced, visible, busyStates)),
       status: jobs.some((job) => job.state === 'cancelling') ? '正在停止…' : shared.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status ?? null,
       stoppable: Boolean(stopJob && shared.writable),
       blocked: shared.readOnlyNotice || (missing.length ? '正在补读记录，稍后可发送' : '') || (shared.writeNotice ? '同步中，稍后可发送' : '') || composerHint({ hasConversation: true, loaded: true, bot: botReach(nodes) }) || null,

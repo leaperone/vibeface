@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chatTimeline, firstUnread, messageTime, messageTimes, taskMessage, threadReplies, unreadCounts } from "./timeline.ts"
+import { chatTimeline, firstUnread, jobAwaitingReply, messageTime, messageTimes, taskMessage, threadReplies, unreadCounts } from "./timeline.ts"
 
 const minute = 60_000
 const at = (hour: number, min: number, day = 30) => new Date(2026, 9, day, hour, min, 5).getTime()
@@ -130,6 +130,25 @@ test("a message from another day names the day, and another year the year", () =
   assert.equal(messageTime(new Date(2025, 11, 31, 8, 0).getTime(), now), "2025/12/31 08:00")
   const times = messageTimes([{ message_id: "yesterday", created_at_ms: at(23, 59, 29) }, { message_id: "today", created_at_ms: at(23, 59, 29) + minute }], now)
   assert.deepEqual([...times.values()], ["10月29日 23:59", "00:00"])
+})
+
+const busy = ["pending_delivery", "queued", "steering", "claimed", "running", "cancelling"]
+
+test("replying waits on active jobs and completed handoff, not terminal steered jobs without their own reply", () => {
+  const synced = (ids: string[]) => new Set(ids)
+  const visible = (ids: string[]) => new Set(ids)
+  const active = (state: string) => jobAwaitingReply({ state, message_id: "m1", reply_message_id: "r-pending" }, synced([]), visible(["m1"]), busy)
+  assert.equal(active("running"), true)
+  assert.equal(active("claimed"), true)
+  assert.equal(jobAwaitingReply({ state: "running", message_id: "m1", reply_message_id: "r1" }, synced(["r1"]), visible(["m1"]), busy), false)
+
+  const handoff = jobAwaitingReply({ state: "completed", message_id: "m1", reply_message_id: "r1" }, synced(["m1"]), visible(["m1"]), busy)
+  assert.equal(handoff, true, "trigger visible while the Node reply has not synced yet")
+  assert.equal(jobAwaitingReply({ state: "completed", message_id: "m1", reply_message_id: "r1" }, synced(["m1", "r1"]), visible(["m1"]), busy), false, "reply settled once it lands")
+
+  const steered = jobAwaitingReply({ state: "steered", message_id: "m1", reply_message_id: "r-missing" }, synced(["m1"]), visible(["m1"]), busy)
+  assert.equal(steered, false, "steered jobs joined another reply and never publish their own")
+  assert.equal(jobAwaitingReply({ state: "steered", message_id: "m1", reply_message_id: "r-missing" }, synced([]), visible(["m1"]), busy), false)
 })
 
 test("another bot's message counts as unread and starts 新消息", () => {
