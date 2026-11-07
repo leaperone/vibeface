@@ -2,5 +2,5 @@
   "issuer": "82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235",
   "udp_host": "discovery.vibeface.dev",
   "udp_port": 4792,
-  "https_base": "https://app.vibeface.dev/bootstrap"
+  "https_base": "https://discovery.vibeface.dev/bootstrap"
 }
