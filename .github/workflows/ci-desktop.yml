@@ -147,6 +147,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           command -v xvfb-run
+          # Hosted images omit CJK fonts; the real Chinese UI must remain readable in captures.
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk
           test -f .artifacts/desktop-app/squashfs-root/chrome-sandbox
           # A disposable hosted runner installs the extracted Chromium helper with its required
           # ownership; the application keeps its Chromium sandbox enabled throughout the test.
