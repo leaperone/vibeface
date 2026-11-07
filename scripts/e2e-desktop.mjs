@@ -11,6 +11,9 @@ import { basename, join, resolve, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { ensurePrivateDirectory, resolveBoundedPath, writePrivateControlFile } from './private-control.mjs';
+import {
+  censusCoreProcess, discoverFromDriver, discoverFromMain, publicCensusProjection,
+} from '../tests/e2e/desktop/windows-discovery-census.mjs';
 
 const run = promisify(execFile);
 const port = Number(process.argv[2]);
@@ -373,6 +376,38 @@ async function inspect() {
   return { pid: child.pid, profile, runtime: runtimeInfo, cores: await cores(child.pid), status: await status(), pages: pageSummary(pages) };
 }
 
+async function controlledCorePids() {
+  const pids = new Set(await cores(child?.pid ?? 0));
+  for (const fixture of fixtures.values()) {
+    if (fixture.child && fixture.child.exitCode === null) pids.add(fixture.child.pid);
+  }
+  return [...pids];
+}
+
+async function discoveryCensus(rememberedDataDirs = []) {
+  assert(child && child.exitCode === null, 'The desktop application is running');
+  assert(Array.isArray(rememberedDataDirs) && rememberedDataDirs.length <= 32);
+  if (!windows) {
+    return publicCensusProjection({ schema: 1, platform: process.platform });
+  }
+  const remembered = rememberedDataDirs.filter(entry => typeof entry === 'string');
+  const automaticDriver = await discoverFromDriver(core, profile, []);
+  const automaticMain = await discoverFromMain(profile, [], inMain);
+  const driverDiscover = await discoverFromDriver(core, profile, remembered);
+  const mainDiscover = await discoverFromMain(profile, remembered, inMain);
+  const processRows = [];
+  for (const pid of await controlledCorePids()) {
+    processRows.push(await censusCoreProcess(pid, core, inMain));
+  }
+  return publicCensusProjection({
+    schema: 1,
+    platform: 'win32',
+    cores: processRows,
+    discover: { driver: driverDiscover, main: mainDiscover },
+    automatic: { driver: automaticDriver, main: automaticMain },
+  });
+}
+
 async function controlCore(request) {
   const process = spawn(core, ['--control'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   const stdout = []; const stderr = [];
@@ -527,6 +562,7 @@ const control = createServer(async (request, response) => {
     else if (value.op === 'snapshot-node') result = await snapshotNode(value.dataDir);
     else if (value.op === 'service-status') result = await nativeServiceStatus(value.deviceId);
     else if (value.op === 'detach-source-runtime') result = await detachSourceRuntime(value.deviceId);
+    else if (value.op === 'discovery-census') result = await discoveryCensus(value.remembered ?? []);
     else if (value.op === 'cleanup') { await cleanup(); result = { cleaned: true }; }
     else throw new Error('Unknown control operation');
     response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(result));

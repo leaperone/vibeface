@@ -1,14 +1,42 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { access, readFile, stat } from 'node:fs/promises';
-import { join, sep } from 'node:path';
-import { realpath } from 'node:fs/promises';
+import { access, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { expect } from 'e2e';
 import { evaluate, screenshot, test, type Inspection, type Page } from '../desktop';
 
 const ELECTRON_VERSION = '45.2.3';
 const BUILD_INFO_FIELDS = ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch',
   'core_version', 'core_source_commit', 'app_version', 'app_source_commit'];
+const DESKTOP_ARTIFACTS = resolve(import.meta.dirname, '../.artifacts/desktop');
+
+async function assertManagedPackageUnderReleases(managedRoot: string): Promise<string> {
+  const [releasesRoot, currentPath] = await Promise.all([
+    realpath(join(managedRoot, 'releases')),
+    realpath(join(managedRoot, 'current')),
+  ]);
+  const [releasesStat, currentStat] = await Promise.all([
+    stat(releasesRoot, { bigint: true }),
+    stat(currentPath, { bigint: true }),
+  ]);
+  assert(releasesStat.isDirectory(), 'the managed runtime keeps a releases directory');
+  assert(currentStat.isDirectory(), 'the managed runtime current entry resolves to a directory');
+  const underReleases = relative(releasesRoot, currentPath);
+  assert(underReleases.length > 0 && underReleases !== '..'
+    && !underReleases.startsWith(`..${sep}`) && !isAbsolute(underReleases),
+    'the registered service executes a versioned copy under its profile-managed runtime root');
+  return currentPath;
+}
+
+async function persistWindowsDiscoveryCensus(
+  desktop: { discoveryCensus(remembered?: string[]): Promise<Record<string, unknown>> },
+  remembered: string[],
+) {
+  if (process.platform !== 'win32') return;
+  const census = await desktop.discoveryCensus(remembered);
+  await mkdir(DESKTOP_ARTIFACTS, { recursive: true });
+  await writeFile(resolve(DESKTOP_ARTIFACTS, `windows-discovery-census-${remembered.length}.json`), `${JSON.stringify(census, null, 2)}\n`);
+}
 
 function isClientUrl(raw: string): boolean {
   const url = new URL(raw);
@@ -159,6 +187,7 @@ test('local discovery chooses among healthy Nodes and explicitly starts a stoppe
   await desktop.start();
   await desktop.invoke('chooseNodeMode', 'controller');
   await desktop.invoke('discoverNodes');
+  await persistWindowsDiscoveryCensus(desktop, [first.dataDir, second.dataDir]);
   const choice = await desktop.status();
   assert.equal(choice.core.kind, 'none', 'discovery never chooses arbitrarily among multiple healthy Nodes');
   assert.equal(choice.selectedNode, null);
@@ -218,6 +247,7 @@ test('one existing healthy Node is discovered and selected when the desktop open
   const fixture = await desktop.createFixture(true);
   const before = await desktop.snapshotNode(fixture.dataDir);
   const opened = await desktop.start();
+  await persistWindowsDiscoveryCensus(desktop, [fixture.dataDir]);
   assert.equal(opened.status.nodeMode, 'controller', `automatic discovery warnings=${opened.status.discovery.kind === 'ready' ? JSON.stringify(opened.status.discovery.warnings) : opened.status.discovery.kind}`);
   assert.deepEqual(opened.status.selectedNode, { dataDir: fixture.dataDir, deviceId: fixture.deviceId });
   assert.equal(opened.status.core.kind, 'none');
@@ -249,9 +279,8 @@ test('the optional background Node survives app quit and removal preserves its N
   const serviceId = service.service_id;
   assert(typeof serviceId === 'string' && serviceId.length > 0);
   assert(typeof service.managed_root === 'string');
-  const managedPackage = await realpath(join(service.managed_root, 'current'));
-  assert(managedPackage.startsWith(join(service.managed_root, 'releases') + sep),
-    'the registered service executes a versioned copy under its profile-managed runtime root');
+  const managedPackage = await assertManagedPackageUnderReleases(service.managed_root);
+  const managedIdentity = await stat(managedPackage, { bigint: true });
   const sourceRuntime = process.env.VIBEFACE_E2E_DESKTOP_RUNTIME ?? '';
   for (const binary of ['BUILD-INFO.json', process.platform === 'win32' ? 'vibeface-core.exe' : 'vibeface-core']) {
     const sourceHash = createHash('sha256').update(await readFile(join(sourceRuntime, binary))).digest('hex');
@@ -291,8 +320,12 @@ test('the optional background Node survives app quit and removal preserves its N
   assert.equal(afterQuitNode.status, 'running');
   assert.equal(afterQuitNode.deviceId, data.deviceId);
   assert.deepEqual(afterQuitNode.values, data.values, 'the same Node identity/config remains durable after app quit');
-  assert.equal(await realpath(join(afterQuit.managed_root as string, 'current')), managedPackage,
-    'the native registration still points to the same durable managed runtime after app quit');
+  assert(typeof afterQuit.managed_root === 'string');
+  const afterQuitIdentity = await stat(await assertManagedPackageUnderReleases(afterQuit.managed_root), { bigint: true });
+  assert.deepEqual(
+    [afterQuitIdentity.dev, afterQuitIdentity.ino], [managedIdentity.dev, managedIdentity.ino],
+    'the native registration still points to the same durable managed runtime after app quit',
+  );
 
   const relaunched = await desktop.start();
   const observed = await desktop.status();

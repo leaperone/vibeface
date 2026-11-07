@@ -27,6 +27,7 @@ export type Desktop = {
   inspect(): Promise<Inspection>;
   status(): Promise<LauncherStatus>;
   invoke(method: string, ...args: unknown[]): Promise<LauncherStatus>;
+  discoveryCensus(remembered?: string[]): Promise<Record<string, unknown>>;
   quit(): Promise<{ pid: number | null; owned: number[]; surviving: number[]; forced: boolean }>;
   closeWindows(): Promise<Array<{ url: string; visibility: string }>>;
   start(): Promise<Inspection>;
@@ -233,6 +234,11 @@ export const test = base.extend<{ desktop: Desktop }>({
         },
         serviceStatus: async deviceId => record(await call({ op: 'service-status', deviceId })),
         detachSourceRuntime: async deviceId => record(await call({ op: 'detach-source-runtime', deviceId })),
+        discoveryCensus: async (remembered = []) => {
+          const value = record(await call({ op: 'discovery-census', remembered }));
+          assert(value.schema === 1 && typeof value.platform === 'string');
+          return value;
+        },
       });
     } finally {
       await stop();
