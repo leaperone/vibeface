@@ -129,6 +129,10 @@ pub async fn handle(request: vibeface_control::ControlRequest) -> Result<Value> 
             initialize_from_options(options)
         }
         vibeface_control::ControlRequest::Inspect { data_dir } => inspect(&data_dir).await,
+        vibeface_control::ControlRequest::DiscoverLocalNodes {
+            app_profile_dir,
+            remembered_data_dirs,
+        } => crate::control_discovery::discover(&app_profile_dir, &remembered_data_dirs).await,
         vibeface_control::ControlRequest::Access { data_dir, json: _ } => access(&data_dir).await,
         vibeface_control::ControlRequest::SetLocalAccess { data_dir, enabled } => {
             set_local_access(&data_dir, enabled)

@@ -35,6 +35,11 @@ pub enum ControlRequest {
     Inspect {
         data_dir: PathBuf,
     },
+    DiscoverLocalNodes {
+        app_profile_dir: PathBuf,
+        #[serde(default)]
+        remembered_data_dirs: Vec<PathBuf>,
+    },
     Access {
         data_dir: PathBuf,
         json: bool,
