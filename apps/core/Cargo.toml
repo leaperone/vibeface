@@ -25,6 +25,7 @@ iroh.workspace = true
 iroh-dns = "=1.3.0"
 iroh-relay.workspace = true
 mdns-sd = { version = "=0.21.6", default-features = false, features = ["async"] }
+plist = "1.10"
 rand.workspace = true
 reqwest.workspace = true
 rusqlite = { workspace = true, features = ["hooks"] }

@@ -9,6 +9,7 @@
 
 pub mod account;
 pub mod clock;
+pub mod discovery;
 pub mod ipc;
 pub mod privatefs;
 pub mod program;

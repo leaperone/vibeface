@@ -241,6 +241,23 @@ pub mod maintenance;
 mod tests {
     use super::*;
 
+    #[test]
+    fn discover_local_nodes_control_request_has_a_strict_wire_shape() -> Result<()> {
+        let request = ControlRequest::DiscoverLocalNodes {
+            app_profile_dir: PathBuf::from("/controlled/profile"),
+            remembered_data_dirs: vec![PathBuf::from("/controlled/node")],
+        };
+        assert_eq!(
+            serde_json::to_value(request)?,
+            serde_json::json!({
+                "command":"discover_local_nodes",
+                "app_profile_dir":"/controlled/profile",
+                "remembered_data_dirs":["/controlled/node"]
+            })
+        );
+        Ok(())
+    }
+
     /// A one-megabyte-and-one-byte file the fixtures below pour into their standard output.
     fn oversized_file() -> Result<PathBuf> {
         let path =
