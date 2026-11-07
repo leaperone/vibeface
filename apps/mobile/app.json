@@ -47,7 +47,7 @@
         "android.permission.READ_EXTERNAL_STORAGE",
         "android.permission.WRITE_EXTERNAL_STORAGE"
       ],
-      "versionCode": 250004
+      "versionCode": 250005
     },
     "plugins": [
       "expo-router",
@@ -129,7 +129,7 @@
       ]
     ],
     "extra": {
-      "releaseVersion": "0.0.1-nightly.20261106.3"
+      "releaseVersion": "0.0.1-nightly.20261107.1"
     }
   }
 }
