@@ -19,6 +19,45 @@ function record(value: unknown): Record<string, unknown> {
   return value;
 }
 function text(value: unknown): string { assert(typeof value === 'string' && value.length > 0); return value; }
+const jobStates = ['queued', 'steering', 'steered', 'claimed', 'running', 'cancelling', 'reconciling', 'completed', 'failed', 'cancelled', 'interrupted', 'pending_delivery', 'unknown'];
+function enumText(value: unknown, allowed: string[]) { const found = text(value); assert(allowed.includes(found)); return found; }
+function nullableIdentifier(value: unknown, pattern: RegExp) {
+  assert(value === null || typeof value === 'string' && pattern.test(value));
+  return value;
+}
+function welcomeDriverErrors(cause: unknown) {
+  const context = { phase: 'body', operation: 'welcome-snapshot' };
+  try {
+    const codes = new Set(['ENGINE_FAILURE', 'COMMAND_FAILED', 'IOS_SNAPSHOT_ENGINE_FAILED', 'RUNNER_WEDGED', 'SESSION_NOT_FOUND', 'INVALID_ARGS', 'CANCELLED', 'UNSUPPORTED_CAPABILITY']);
+    const reasons = new Set(['malformed-graph', 'invalid-viewport', 'missing-viewport', 'invalid-presented-payload', 'invalid-quality-payload',
+      'runner_busy', 'runner_main_thread_timeout', 'regular-degenerate-actionable-node', 'regular-node-outside-cumulative-clip', 'projection-mismatch']);
+    const runnerKinds = new Map([['RUNNER_BUSY', 'runner_busy'], ['MAIN_THREAD_TIMEOUT', 'runner_main_thread_timeout'], ['APP_NOT_RUNNING', 'app_not_running'],
+      ['APP_SCREEN_WINDOW_UNRESOLVED', 'app_screen_window_unresolved'], ['APP_SCREEN_UNRESOLVED', 'app_screen_unresolved'], ['APP_SCREEN_CAPTURE_UNRENDERABLE', 'app_screen_capture_unrenderable']]);
+    const failures: Record<string, string | number>[] = [], seen = new Set<Error>();
+    for (let error = cause; error instanceof Error && failures.length < 8 && !seen.has(error); error = error.cause) {
+      seen.add(error);
+      const code = 'code' in error && typeof error.code === 'string' && codes.has(error.code) ? error.code : 'unknown';
+      const details = 'details' in error && error.details !== null && typeof error.details === 'object' && !Array.isArray(error.details) ? record(error.details) : {};
+      const kind = typeof details.reason === 'string' && reasons.has(details.reason) ? details.reason
+        : typeof details.runnerErrorCode === 'string' ? runnerKinds.get(details.runnerErrorCode) ?? 'unknown'
+        : code === 'RUNNER_WEDGED' ? 'runner_wedged' : 'unknown';
+      const failure: Record<string, string | number> = { ...context, code, kind };
+      for (const [key, minimum, maximum] of [['timeoutMs', 1, 1800000], ['exitCode', 0, 255]] satisfies [string, number, number][]) {
+        const value = details[key];
+        if (typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum && value <= maximum) failure[key] = value;
+      }
+      failures.push(failure);
+    }
+    return failures.length ? failures : [{ ...context, code: 'unknown', kind: 'unknown' }];
+  } catch { return [{ ...context, code: 'unknown', kind: 'unavailable' }]; }
+}
+async function recordProviderFailure(path: string, source: string, driverErrors: unknown) {
+  try {
+    await writeFile(join(path, 'provider.json'), `${JSON.stringify({ source_commit: source, status: 'failed', driver_errors: driverErrors })}\n`, { mode: 0o600 });
+  } catch {
+    try { process.stderr.write('Native failure diagnostic unavailable\n'); } catch {}
+  }
+}
 type NativeNetwork = { invitation: string; receiver: string; call(request: Record<string, unknown>): Promise<Record<string, unknown>> };
 const test = base.extend<{ network: NativeNetwork }>({
   network: async ({}, use) => {
@@ -130,8 +169,53 @@ function providerDeferredInput(value: unknown) {
       stage, reason: receipt.reason, actual_turn_id: receipt.actual_turn_id, retry_safe: receipt.retry_safe } };
 }
 
+function providerRunningStop(value: unknown) {
+  if (value === null) return null;
+  const stop = record(value);
+  assert.deepEqual(Object.keys(stop).sort(), ['job', 'receipt', 'fixture', 'owner_is_receiver'].sort());
+  assert(stop.owner_is_receiver === null || typeof stop.owner_is_receiver === 'boolean');
+  const job = stop.job === null ? null : (() => {
+    const item = record(stop.job);
+    assert.deepEqual(Object.keys(item).sort(), ['conversation_id', 'trigger', 'kind', 'scope', 'state', 'attempt_id', 'runtime', 'pending_check', 'failure_kind'].sort());
+    assert(item.conversation_id === 'native-provider' && item.trigger === 'message:native-running');
+    assert(item.pending_check === null || typeof item.pending_check === 'boolean');
+    const runtime = item.runtime === null ? null : (() => {
+      const saved = record(item.runtime);
+      assert.deepEqual(Object.keys(saved).sort(), ['provider', 'stage', 'execution'].sort());
+      return { provider: enumText(saved.provider, ['codex', 'cursor', 'claude', 'pi', 'opencode', 'unknown']),
+        stage: enumText(saved.stage, ['validate', 'install', 'launch', 'authentication', 'model_list', 'session_start', 'turn_start', 'run', 'read_back', 'interrupt', 'compact', 'handoff', 'record', 'unknown']),
+        execution: enumText(saved.execution, ['not_started', 'started', 'unknown']) };
+    })();
+    return { kind: enumText(item.kind, ['human', 'answer', 'work_result', 'agent_task', 'workspace_task', 'schedule', 'bot_message', 'unknown']),
+      scope: enumText(item.scope, ['main', 'workspace_task', 'task', 'routine', 'unknown']), state: enumText(item.state, jobStates),
+      attempt_id: nullableIdentifier(item.attempt_id, /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/), runtime, pending_check: item.pending_check,
+      failure_kind: item.failure_kind === null ? null : enumText(item.failure_kind, ['missing_key', 'auth_failed', 'quota', 'missing_binary', 'execution_disabled', 'no_model', 'no_bot', 'writer_busy', 'rejected', 'transport', 'timed_out', 'restarted', 'lost', 'unknown']) };
+  })();
+  const receipt = stop.receipt === null ? null : (() => {
+    const item = record(stop.receipt);
+    assert.deepEqual(Object.keys(item).sort(), ['stage', 'reason', 'actual_turn_id', 'control_event', 'retry_safe'].sort());
+    assert(item.retry_safe === null || typeof item.retry_safe === 'boolean');
+    return { stage: enumText(item.stage, ['entry_accepted', 'owner_accepted', 'submitting', 'provider_accepted', 'associated', 'refused', 'unknown']),
+      reason: item.reason === null ? null : enumText(item.reason, ['deferred', 'cancelled_before_delivery', 'awaiting_admission', 'awaiting_owner', 'native_delivery_unconfirmed', 'execution_result_unconfirmed', 'unknown']),
+      actual_turn_id: nullableIdentifier(item.actual_turn_id, /^fixture-turn-[0-9a-f]{32}$/), control_event: nullableIdentifier(item.control_event, /^[0-9a-f]{64}$/), retry_safe: item.retry_safe };
+  })();
+  const fixture = stop.fixture === null ? null : (() => {
+    const item = record(stop.fixture);
+    assert.deepEqual(Object.keys(item).sort(), ['thread_id', 'turn_id', 'process_id', 'instance_id', 'stop_event_set', 'interrupt_received', 'terminal_status', 'gate_exists', 'process_current'].sort());
+    const threadId = nullableIdentifier(item.thread_id, /^fixture-thread-[0-9a-f]{32}$/), turnId = nullableIdentifier(item.turn_id, /^fixture-turn-[0-9a-f]{32}$/);
+    const instanceId = nullableIdentifier(item.instance_id, /^[0-9a-f]{64}$/);
+    assert(threadId !== null && turnId !== null && instanceId !== null);
+    assert(typeof item.process_id === 'number' && Number.isSafeInteger(item.process_id) && item.process_id > 0 && item.process_id <= 2147483647);
+    assert(typeof item.stop_event_set === 'boolean' && typeof item.interrupt_received === 'boolean' && typeof item.gate_exists === 'boolean');
+    assert(item.process_current === null || typeof item.process_current === 'boolean');
+    return { thread_id: threadId, turn_id: turnId, process_id: item.process_id, instance_id: instanceId, stop_event_set: item.stop_event_set, interrupt_received: item.interrupt_received,
+      terminal_status: item.terminal_status === null ? null : enumText(item.terminal_status, ['completed', 'interrupted', 'failed', 'unknown']), gate_exists: item.gate_exists, process_current: item.process_current };
+  })();
+  return { job, receipt, fixture, owner_is_receiver: stop.owner_is_receiver };
+}
+
 function providerInspection(value: Record<string, unknown>) {
-  assert.deepEqual(Object.keys(value).sort(), ['manager', 'roles', 'execution_model', 'setup', 'login_count', 'app_server_link_state', 'readiness', 'catalog', 'authentication', 'checked_at_ms', 'jobs', 'deferred_input', 'running_invocations', 'deferred_invocations'].sort());
+  assert.deepEqual(Object.keys(value).sort(), ['manager', 'roles', 'execution_model', 'setup', 'login_count', 'app_server_link_state', 'readiness', 'catalog', 'authentication', 'checked_at_ms', 'jobs', 'deferred_input', 'running_stop', 'running_invocations', 'deferred_invocations'].sort());
   let manager: { provider: string; model: string; reasoning_effort: string | null } | null = null;
   if (value.manager !== null) {
     const saved = record(value.manager);
@@ -155,7 +239,33 @@ function providerInspection(value: Record<string, unknown>) {
     checked_at_ms: value.checked_at_ms, checked: value.checked_at_ms !== null,
     jobs: value.jobs.map((item: unknown) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state) }; }),
     deferred_input: providerDeferredInput(value.deferred_input),
+    running_stop: providerRunningStop(value.running_stop),
     running_invocations: value.running_invocations, deferred_invocations: value.deferred_invocations };
+}
+
+function providerStopEvidence(value: ReturnType<typeof providerInspection> | null, baseline: ReturnType<typeof providerRunningStop>) {
+  if (value === null) return { availability: 'unavailable' };
+  const stop = value.running_stop, job = stop?.job, receipt = stop?.receipt, fixture = stop?.fixture;
+  const same = (left: unknown, right: unknown) => left == null || right == null ? null : left === right;
+  const threadSame = same(fixture?.thread_id, baseline?.fixture?.thread_id), turnSame = same(fixture?.turn_id, baseline?.fixture?.turn_id);
+  const processSame = same(fixture?.process_id, baseline?.fixture?.process_id);
+  const instanceSame = same(fixture?.instance_id, baseline?.fixture?.instance_id), identities = [threadSame, turnSame, processSame, instanceSame];
+  const state = value.jobs.find(item => item.trigger === 'message:native-running')?.state;
+  return { availability: stop === null ? 'unavailable' : 'available', state: state === undefined ? null : jobStates.includes(state) ? state : 'unknown',
+    running_invocations: value.running_invocations <= 1000000 ? value.running_invocations : null,
+    deferred_invocations: value.deferred_invocations <= 1000000 ? value.deferred_invocations : null,
+    job: job ? { kind: job.kind, scope: job.scope, state: job.state, same_attempt: same(job.attempt_id, baseline?.job?.attempt_id),
+      runtime: job.runtime, pending_check: job.pending_check, failure_kind: job.failure_kind } : null,
+    receipt: receipt ? { stage: receipt.stage, reason: receipt.reason, retry_safe: receipt.retry_safe,
+      same_control_event: same(receipt.control_event, baseline?.receipt?.control_event), same_actual_turn: same(receipt.actual_turn_id, baseline?.receipt?.actual_turn_id),
+      matches_fixture_turn: same(receipt.actual_turn_id, fixture?.turn_id) } : null,
+    fixture: fixture ? { stop_event_set: fixture.process_current === true ? fixture.stop_event_set : null,
+      interrupt_received: fixture.process_current === true ? fixture.interrupt_received : null,
+      terminal_status: fixture.process_current === true ? fixture.terminal_status : 'unknown', gate_exists: fixture.gate_exists,
+      process_current: fixture.process_current, same_thread: threadSame, same_turn: turnSame, same_process: processSame, same_instance: instanceSame,
+      identity_changed: fixture.process_current === false || identities.includes(false) ? true
+        : fixture.process_current === null || identities.includes(null) ? null : false } : null,
+    owner_is_receiver: stop?.owner_is_receiver ?? null };
 }
 
 test('provider settings and deferred input cancellation work in the installed native app', { platforms: ['ios'], timeout: 600000 }, async ({ app, device, network, screen }) => {
@@ -229,7 +339,12 @@ test('provider settings and deferred input cancellation work in the installed na
   expect(await bundleManifest(installedPath)).toEqual(built);
   await device.clearKeychain();
   await app.open();
-  await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
+  try {
+    await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
+  } catch (cause) {
+    await recordProviderFailure(publicPath, source, welcomeDriverErrors(cause));
+    throw cause;
+  }
   if (run !== undefined || attempt !== undefined) {
     await copyFile(await app.screenshot('provider-initial'), join(publicPath, 'provider-initial.png'));
   }
@@ -516,7 +631,8 @@ test('provider settings and deferred input cancellation work in the installed na
   const composer = screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/, { visible: true });
   await openLink(`vibeface://b/${botId}`, composer);
   const targetSheet = screen.getByTestId('input-options-sheet', { visible: true });
-  await screen.getByRole('button', /^输入目标 Native Provider · 主聊天，/, { visible: true }).click();
+  const inputOptions = screen.getByRole('button', /^输入目标 Native Provider · 主聊天，/, { visible: true });
+  await inputOptions.click();
   await expect(targetSheet).toHaveCount(1);
   const queued = targetSheet.getByText('稍后处理 1 条', { exact: true });
   const cancel = targetSheet.getByRole('button', '取消稍后输入', { exact: true, visible: true });
@@ -552,8 +668,38 @@ test('provider settings and deferred input cancellation work in the installed na
   await expect(targetSheet).toHaveCount(1);
   await targetSheet.getByRole('button', '关闭目标和队列', { exact: true }).click();
   await expect(targetSheet).toHaveCount(0);
+  await expect(inputOptions).toBeEnabled();
   await screen.getByRole('button', '停止', { exact: true }).click();
-  await expect.poll(async () => (await inspect()).jobs.find(job => job.trigger === runningTrigger)?.state, { timeout: 30000 }).toBe('cancelled');
+  let lastStopInspection: Awaited<ReturnType<typeof inspect>> | null = null, stopSamples = 0;
+  try {
+    await expect.poll(async () => {
+      const observed = await inspect();
+      lastStopInspection = observed;
+      stopSamples++;
+      return observed.jobs.find(job => job.trigger === runningTrigger)?.state;
+    }, { timeout: 30000 }).toBe('cancelled');
+  } catch (cause) {
+    let failedStopInspection: Awaited<ReturnType<typeof inspect>> | null = null;
+    try { failedStopInspection = await inspect(); } catch {}
+    let stopRenderAvailable = false;
+    try {
+      const image = await app.screenshot('native-stop-failure');
+      const directory = resolve(root, '.artifacts/native/private');
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await writeFile(join(directory, 'native-stop-failure.png'), await readFile(image), { mode: 0o600, flag: 'wx' });
+      stopRenderAvailable = true;
+    } catch {}
+    try {
+      await recordProviderFailure(publicPath, source, [{ phase: 'body', operation: 'running-stop', kind: 'stop_poll',
+        code: cause instanceof Error && 'code' in cause && cause.code === 'ASSERTION_FAILED' ? 'ASSERTION_FAILED' : 'unknown', expected: 'cancelled',
+        completed_poll_samples: stopSamples <= 1000000 ? stopSamples : null, stop_render_available: stopRenderAvailable,
+        running_stop: { before: providerStopEvidence(cancelled, cancelled.running_stop), last_sample: providerStopEvidence(lastStopInspection, cancelled.running_stop),
+          after_failure: providerStopEvidence(failedStopInspection, cancelled.running_stop) } }]);
+    } catch {
+      await recordProviderFailure(publicPath, source, [{ phase: 'body', operation: 'running-stop', kind: 'unavailable', code: 'unknown', stop_render_available: stopRenderAvailable }]);
+    }
+    throw cause;
+  }
   await expect(screen.getByRole('button', '停止', { exact: true })).toBeHidden();
   const after = await inspect();
   expect(after.deferred_input).toEqual(cancelledInput);

@@ -1076,6 +1076,23 @@ def fixture_codex(arguments):
     # A bot thread's Shell environment holds its tool token, so it stays in memory only, as do
     # the developer instructions it was started or resumed with.
     bot_env, bot_guide, bot_stops = {}, {}, {}
+    native_stop = None
+
+    def record_native_stop(thread_id, turn_id, stopped, *, interrupted=False, terminal=None):
+        # All three writers hold state_lock; atomic replacement alone cannot serialize updates.
+        if native_stop is None or (native_stop["thread_id"], native_stop["turn_id"]) != (thread_id, turn_id):
+            return
+        native_stop["stop_event_set"] = stopped.is_set()
+        native_stop["interrupt_received"] |= interrupted
+        if terminal is not None:
+            native_stop["terminal_status"] = terminal
+        try:
+            private_json(run / "native-provider-stop.json", native_stop)
+        except OSError:
+            try:
+                (run / "native-provider-stop.json").unlink(missing_ok=True)
+            except OSError:
+                pass
 
     class BotTurn:
         """One bot turn: progress and its end go to the connection that started it."""
@@ -1083,6 +1100,14 @@ def fixture_codex(arguments):
         def __init__(self, stream, thread, turn):
             self.stream, self.thread, self.turn = stream, thread, turn
             self.stopped = bot_stops[turn["id"]] = threading.Event()
+
+        def observe_native_stop(self):
+            nonlocal native_stop
+            with state_lock:
+                native_stop = {"thread_id": self.thread["id"], "turn_id": self.turn["id"], "process_id": os.getpid(),
+                               "instance_id": hashlib.sha256(str(socket_path).encode()).hexdigest(),
+                               "stop_event_set": self.stopped.is_set(), "interrupt_received": False, "terminal_status": None}
+                record_native_stop(self.thread["id"], self.turn["id"], self.stopped)
 
         def send(self, method, params):
             try:
@@ -1097,12 +1122,13 @@ def fixture_codex(arguments):
 
         def end(self, status, text=None):
             with state_lock:
-                bot_stops.pop(self.turn["id"], None)
                 if text is not None:
                     item = {"id": "fixture-answer", "type": "agentMessage", "text": text}
                     self.turn["items"].append(item)
                     self.send("item/completed", {"item": item})
                 self.turn["status"] = status
+                record_native_stop(self.thread["id"], self.turn["id"], self.stopped, terminal=self.turn["status"])
+                bot_stops.pop(self.turn["id"], None)
                 self.thread["status"] = {"type": "idle"}
                 private_json(state_path, state)
                 fixture_record(run, "codex-inputs.jsonl", {"event": "turn_completed", "thread_id": self.thread["id"],
@@ -1354,7 +1380,9 @@ def fixture_codex(arguments):
                             return
                         continue
                     elif method == "turn/interrupt" and params.get("turnId") in bot_stops:
-                        bot_stops[params["turnId"]].set()
+                        stopped = bot_stops[params["turnId"]]
+                        stopped.set()
+                        record_native_stop(thread["id"], params["turnId"], stopped, interrupted=True)
                         result = {}
                     elif method == "turn/interrupt":
                         require(thread["turns"][-1]["id"] == params["turnId"], "interrupt selects the original turn")
@@ -1629,6 +1657,10 @@ def fixture_manager(run, initial, bot):
                    "trigger": trigger, "kind": kind, "advertised": sorted(initial["custom_tools"]),
                    "available": sorted(catalog), "unavailable": sorted((SETTINGS_TOOLS | WAKE_TOOLS | WORK_TOOLS) - expected_tools),
                    "cli_matches_api": True})
+    if context["conversation_id"] == "native-provider" and trigger == "message:native-running" and main_human \
+            and directive == {"phase1": True, "label": "native-running", "gate": str(run / "native-never-release")} \
+            and (run / "native-provider-stage.json").is_file():
+        bot.observe_native_stop()
     fixture_record(run, "manager-invocations.jsonl", record)
 
     def work_cli(arguments, expected=True, rejection="", *, name="dispatch_work"):
@@ -8538,6 +8570,76 @@ class BootstrapSite:
         require(not self.thread.is_alive(), "bootstrap site stops its own thread")
 
 
+def native_running_stop(run, client, queue, conversation, calls, receiver):
+    if queue is None:
+        return None
+
+    def enum(value, allowed):
+        return value if isinstance(value, str) and value in allowed else "unknown"
+
+    def identifier(value, pattern):
+        return value if isinstance(value, str) and re.fullmatch(pattern, value) else None
+
+    jobs = [row for row in conversation["scheduler"]["jobs"]
+            if row.get("conversation_id") == "native-provider" and row.get("trigger") == "message:native-running"]
+    job = None
+    if len(jobs) == 1:
+        row = jobs[0]
+        runtime, attempt, failure, scope = (row[key] if isinstance(row.get(key), dict) else {}
+                                            for key in ("runtime", "attempt", "failure", "scope"))
+        job = {"conversation_id": "native-provider", "trigger": "message:native-running",
+               "kind": enum(row.get("kind"), ("human", "answer", "work_result", "agent_task", "workspace_task", "schedule", "bot_message")),
+               "scope": enum(scope.get("kind"), ("main", "workspace_task", "task", "routine")),
+               "state": enum(row.get("state"), ("queued", "steering", "steered", "claimed", "running", "cancelling", "reconciling",
+                                               "completed", "failed", "cancelled", "interrupted", "pending_delivery")),
+               "attempt_id": identifier(attempt.get("id"), r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"),
+               "runtime": {"provider": enum(runtime.get("provider"), ("codex", "cursor", "claude", "pi", "opencode")),
+                           "stage": enum(runtime.get("stage"), ("validate", "install", "launch", "authentication", "model_list", "session_start",
+                                                               "turn_start", "run", "read_back", "interrupt", "compact", "handoff", "record")),
+                           "execution": enum(runtime.get("execution"), ("not_started", "started", "unknown"))} if runtime else None,
+               "pending_check": row.get("pending_check") if type(row.get("pending_check")) is bool else None,
+               "failure_kind": enum(failure.get("kind"), ("missing_key", "auth_failed", "quota", "missing_binary", "execution_disabled", "no_model",
+                                                          "no_bot", "writer_busy", "rejected", "transport", "timed_out", "restarted", "lost", "unknown")) if failure else None}
+    receipt = None
+    try:
+        saved = client.rpc("input_receipt", conversation_id="native-provider", message_id="native-running", target=queue["target"])
+        if saved["message_id"] == "native-running" and saved["target"] == {"kind": "bot_main", "bot_id": "native-provider"}:
+            receipt = {"stage": enum(saved.get("stage"), ("entry_accepted", "owner_accepted", "submitting", "provider_accepted", "associated", "refused", "unknown")),
+                       "reason": enum(saved["reason"], ("deferred", "cancelled_before_delivery", "awaiting_admission", "awaiting_owner",
+                                                       "native_delivery_unconfirmed", "execution_result_unconfirmed")) if saved.get("reason") is not None else None,
+                       "actual_turn_id": identifier(saved.get("actual_turn_id"), r"fixture-turn-[0-9a-f]{32}"),
+                       "control_event": identifier(saved.get("control_event"), r"[0-9a-f]{64}"),
+                       "retry_safe": saved.get("retry_safe") if type(saved.get("retry_safe")) is bool else None}
+    except (OSError, ValueError, AssertionError, KeyError, TypeError, http.client.HTTPException):
+        pass
+    fixture = None
+    try:
+        path = run / "native-provider-stop.json"
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 2048 or metadata.st_mode & 0o077:
+            raise ValueError("unavailable")
+        marker = json.loads(path.read_text())
+        running = [row for row in calls if row["conversation_id"] == "native-provider" and row["trigger"] == "message:native-running"]
+        if len(running) == 1 and set(marker) == {"thread_id", "turn_id", "process_id", "instance_id", "stop_event_set", "interrupt_received", "terminal_status"} \
+                and marker["thread_id"] == running[0]["native_session_id"] and marker["process_id"] == running[0]["pid"] \
+                and identifier(marker["thread_id"], r"fixture-thread-[0-9a-f]{32}") and identifier(marker["turn_id"], r"fixture-turn-[0-9a-f]{32}") \
+                and identifier(marker["instance_id"], r"[0-9a-f]{64}") \
+                and type(marker["process_id"]) is int and 0 < marker["process_id"] <= 2147483647 \
+                and type(marker["stop_event_set"]) is bool and type(marker["interrupt_received"]) is bool:
+            servers = [row for row in fixture_records(run, "codex-server.jsonl") if isinstance(row, dict)
+                       and isinstance(row.get("socket"), str) and len(row["socket"]) <= 4096
+                       and hashlib.sha256(row["socket"].encode()).hexdigest() == marker["instance_id"]]
+            current_pid = servers[-1].get("pid") if servers else None
+            fixture = {**marker, "terminal_status": enum(marker["terminal_status"], ("completed", "interrupted", "failed"))
+                       if marker["terminal_status"] is not None else None, "gate_exists": (run / "native-never-release").exists(),
+                       "process_current": current_pid == marker["process_id"] if type(current_pid) is int and 0 < current_pid <= 2147483647 else None}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    owner = conversation["conversation"].get("owner")
+    return {"job": job, "receipt": receipt, "fixture": fixture,
+            "owner_is_receiver": owner == receiver if isinstance(owner, str) and owner else None}
+
+
 def e2e_fixture(options):
     program = shutil.which(str(options.binary)) if len(options.binary.parts) == 1 else str(options.binary)
     require(program is not None, "the isolated e2e Node binary exists on PATH or at its explicit path")
@@ -8863,10 +8965,15 @@ def e2e_fixture(options):
                     settings = client.call("node_settings")
                     provider = next(item for item in settings["providers"] if item["provider"] == "codex")
                     manager = settings["settings"]["manager"]
-                    jobs = client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"] if native_queue else []
+                    conversation = client.rpc("conversation", conversation_id=native_queue["conversation_id"]) if native_queue else None
+                    jobs = conversation["scheduler"]["jobs"] if conversation else []
                     calls = [row for row in fixture_records(run) if native_queue and row["conversation_id"] == native_queue["conversation_id"]]
                     running_trigger = native_queue["running_trigger"] if native_queue else None
                     deferred_trigger = "message:" + native_queue["deferred_message_id"] if native_queue else None
+                    try:
+                        running_stop = native_running_stop(run, client, native_queue, conversation, calls, nodes["receiver"].device_id)
+                    except (OSError, ValueError, AssertionError, KeyError, TypeError, http.client.HTTPException):
+                        running_stop = None
                     result = {"manager": {key: manager[key] for key in ("provider", "model", "reasoning_effort")} if manager is not None else None,
                               "roles": provider["roles"], "execution_model": provider["execution_model"], "setup": provider["setup"],
                               "login_count": len(fixture_records(run, "native-provider-login.jsonl")),
@@ -8877,6 +8984,7 @@ def e2e_fixture(options):
                               "jobs": [{"trigger": row["trigger"], "state": row["state"]} for row in jobs
                                        if row["trigger"] in (running_trigger, deferred_trigger)],
                               "deferred_input": native_deferred_input(client),
+                              "running_stop": running_stop,
                               "running_invocations": sum(row["trigger"] == running_trigger for row in calls),
                               "deferred_invocations": sum(row["trigger"] == deferred_trigger for row in calls)}
                 elif op == "native_send":
