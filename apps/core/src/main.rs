@@ -28,7 +28,7 @@ struct CoreArgs {
     /// Read one bounded control request from stdin and write one bounded JSON response.
     #[arg(long, hide = true)]
     control: bool,
-    /// Stop this desktop-owned Core normally when its parent's private stdin pipe closes.
+    /// Stop this owned Core when its desktop or Windows CLI parent's private stdin closes.
     #[arg(long, hide = true, conflicts_with = "control")]
     desktop_parent_stdin: bool,
 }

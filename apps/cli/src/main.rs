@@ -703,11 +703,28 @@ async fn main() -> Result<()> {
 }
 
 fn exec_core(args: &[&str]) -> Result<()> {
-    Err(vibeface_bridge::platform::program::become_program(
-        &core_binary()?,
-        args,
-    ))
-    .context("run vibeface-core")
+    let binary = core_binary()?;
+    #[cfg(unix)]
+    {
+        Err(vibeface_bridge::platform::program::become_program(
+            &binary, args,
+        ))
+        .context("run vibeface-core")
+    }
+    #[cfg(windows)]
+    {
+        let mut child = std::process::Command::new(binary)
+            .args(args)
+            .arg("--desktop-parent-stdin")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("run vibeface-core")?;
+        // Child::wait closes child.stdin. Hold the writer separately so only CLI exit sends EOF.
+        let lifetime = child.stdin.take().context("Core lifetime pipe")?;
+        let status = child.wait().context("wait for vibeface-core");
+        drop(lifetime);
+        std::process::exit(status?.code().unwrap_or(1));
+    }
 }
 
 fn core_binary() -> Result<PathBuf> {
