@@ -51,6 +51,17 @@ class StatusCommandFailure(AssertionError):
     def __init__(self, result, node):
         self.returncode = result.returncode
         self.category, self.stderr = safe_status_stderr(result.stderr, node)
+        self.node_status = 'unknown'
+        self.probe_error = ''
+        try:
+            status = json.loads(result.stdout)
+        except ValueError:
+            status = None
+        if isinstance(status, dict):
+            if status.get('status') in ('running', 'stopped', 'unavailable'):
+                self.node_status = status['status']
+            if isinstance(status.get('error'), str):
+                _, self.probe_error = safe_status_stderr(status['error'].encode('utf-8', errors='replace'), node)
         super().__init__("status inspects the initialized node")
 
 
@@ -661,6 +672,8 @@ def main():
                     "returncode": error.returncode,
                     "category": error.category,
                     "stderr_excerpt": error.stderr,
+                    "node_status": error.node_status,
+                    "probe_error": error.probe_error,
                 }
             (options.artifacts / "windows-node-failure.json").write_text(
                 json.dumps(diagnostic, indent=2) + "\n", encoding="utf-8"
