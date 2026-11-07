@@ -173,20 +173,32 @@ export class CoreSession {
         await this.useDataDir(join(this.options.profileDir, 'node'))
       }
       const dataDir = this.requireDataDir()
-      if (this.lifecycle.state().kind === 'owned') throw new Error('这台电脑上的 Core 已经在运行。')
-      if (initialized(dataDir)) {
-        const inspect = await this.inspect(dataDir)
-        if (inspect.status === 'running') {
-          throw new Error('这个数据目录已经有 Core 在运行，请改用仅连接。')
-        }
-      } else {
-        await runControl(this.programs.control(), { command: 'init', options: { data_dir: dataDir } })
-      }
-      this.core = { kind: 'starting', dataDir, attempts: 0 }
-      this.options.onChange()
-      this.lifecycle.startOwned(this.programs.service(dataDir), dataDir)
-      await this.awaitRunning(dataDir)
+      await this.startChild(dataDir, true, null)
     })
+  }
+
+  /** Explicitly start one already-initialized discovered Node without changing the App host preference. */
+  async startDiscoveredNode(dataDir: string, expectedDeviceId: string): Promise<void> {
+    await this.guard(async () => {
+      if (this.options.attachOnly) throw new Error('这次会话以仅连接模式启动，不会启动 Core。')
+      if (!isAbsolute(dataDir) || !/^[a-f0-9]{64}$/.test(expectedDeviceId)) throw new Error('节点身份无效。')
+      await this.startChild(dataDir, false, expectedDeviceId)
+    })
+  }
+
+  private async startChild(dataDir: string, initializeEmpty: boolean, expectedDeviceId: string | null): Promise<void> {
+    if (this.lifecycle.state().kind === 'owned') throw new Error('这台电脑上已经有 Vibeface 启动的 Core。')
+    if (!initialized(dataDir)) {
+      if (!initializeEmpty) throw new Error('这个停止的节点没有完整的 Core 配置，无法启动。')
+      await runControl(this.programs.control(), { command: 'init', options: { data_dir: dataDir } })
+    }
+    const before = await this.inspect(dataDir)
+    if (expectedDeviceId !== null && before.deviceId !== expectedDeviceId) throw new Error('节点身份已经变化，拒绝启动。')
+    if (before.status === 'running') throw new Error('这个数据目录已经有 Core 在运行，请改用仅连接。')
+    this.core = { kind: 'starting', dataDir, attempts: 0 }
+    this.options.onChange()
+    this.lifecycle.startOwned(this.programs.service(dataDir), dataDir)
+    await this.awaitRunning(dataDir)
   }
 
   private async awaitRunning(dataDir: string): Promise<void> {

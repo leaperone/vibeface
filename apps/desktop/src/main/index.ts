@@ -10,12 +10,16 @@ import {
 } from '../shared/contract.js'
 import { ActivationQueue, type JoinActivation } from './activation-queue.js'
 import { parseArgs } from './cli.js'
+import { DesktopCoordinator } from './desktop-coordinator.js'
+import { runControl } from './control-client.js'
+import { parseAccess, parseInspect } from './control-types.js'
 import { deepLinkFromArgv, parseDeepLink, type DeepLink } from './deeplink.js'
 import { isTrustedLauncherCall, readBoolean, readExternalUrl, readNoArguments, readString } from './ipc-guard.js'
 import { registerLauncherScheme, serveLauncher } from './launcher-protocol.js'
 import { applyApplicationMenu } from './menu.js'
-import { controlProgram, runtimeState, serviceProgram } from './paths.js'
+import { cliBinary, controlProgram, runtimeState, serviceProgram } from './paths.js'
 import { CoreSession } from './session.js'
+import { ManagedNodeController } from './managed-node.js'
 import { createTray } from './tray.js'
 import {
   createBusinessWindow,
@@ -35,6 +39,7 @@ let businessWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let quitting = false
 let coreSession: CoreSession | null = null
+let coordinator: DesktopCoordinator | null = null
 
 function profileDirectory(explicit: string | null): string {
   if (explicit) return explicit
@@ -68,6 +73,12 @@ function businessOrigin(): string | null {
 
 function status(): LauncherStatus {
   const current = requireSession()
+  const client = coordinator?.status() ?? {
+    clientAvailable: true,
+    nodeMode: 'undecided' as const,
+    discovery: { kind: 'idle' as const },
+    backgroundNode: { kind: 'checking' as const },
+  }
   return {
     runtime: runtimeState(),
     core: current.state(),
@@ -76,6 +87,7 @@ function status(): LauncherStatus {
     profileDir,
     version: app.getVersion(),
     attachOnly: args.attachOnly,
+    ...client,
   }
 }
 
@@ -216,6 +228,11 @@ function preferenceKey(value: unknown): PreferenceKey {
   return found
 }
 
+function stringArgument(args: readonly unknown[], what: string, maxLength: number): string {
+  if (args.length !== 1) throw new TypeError(`${what} requires one argument`)
+  return readString(args[0], what, maxLength)
+}
+
 function registerIpc(): void {
   handle(IPC.getStatus, async (passed) => {
     readNoArguments(passed, IPC.getStatus)
@@ -271,6 +288,50 @@ function registerIpc(): void {
   handle(IPC.openExternal, async (passed) => {
     openExternally(readExternalUrl(passed[0]))
   })
+  handle(IPC.discoverNodes, async (passed) => {
+    readNoArguments(passed, IPC.discoverNodes)
+    await requireCoordinator().discover()
+    return status()
+  })
+  handle(IPC.chooseNodeMode, async (passed) => {
+    const mode = stringArgument(passed, '节点模式', 16)
+    if (mode !== 'controller' && mode !== 'local') throw new TypeError('未知的节点模式')
+    await requireCoordinator().chooseMode(mode)
+    return status()
+  })
+  handle(IPC.connectDiscoveredNode, async (passed) => {
+    await requireCoordinator().connect(stringArgument(passed, '节点标识', 64))
+    return status()
+  })
+  handle(IPC.startDiscoveredNode, async (passed) => {
+    await requireCoordinator().start(stringArgument(passed, '节点标识', 64))
+    return status()
+  })
+  handle(IPC.installBackgroundNode, async (passed) => {
+    readNoArguments(passed, IPC.installBackgroundNode)
+    await requireCoordinator().installBackground()
+    return status()
+  })
+  handle(IPC.startBackgroundNode, async (passed) => {
+    readNoArguments(passed, IPC.startBackgroundNode)
+    await requireCoordinator().startBackground()
+    return status()
+  })
+  handle(IPC.stopBackgroundNode, async (passed) => {
+    readNoArguments(passed, IPC.stopBackgroundNode)
+    await requireCoordinator().stopBackground()
+    return status()
+  })
+  handle(IPC.removeBackgroundNode, async (passed) => {
+    readNoArguments(passed, IPC.removeBackgroundNode)
+    await requireCoordinator().removeBackground()
+    return status()
+  })
+}
+
+function requireCoordinator(): DesktopCoordinator {
+  if (!coordinator) throw new Error('桌面节点协调器还没有就绪')
+  return coordinator
 }
 
 /** A download always asks where it goes; the page never writes to disk on its own. */
@@ -342,6 +403,23 @@ async function start(): Promise<void> {
       },
     }
   )
+  const managedNode = new ManagedNodeController({ profileDir, bundledCli: { command: cliBinary() } })
+  coordinator = new DesktopCoordinator({
+    profileDir,
+    controlProgram: controlProgram(),
+    managedNode,
+    inspect: async (dataDir) => parseInspect(await runControl(controlProgram(), { command: 'inspect', data_dir: dataDir })),
+    access: async (dataDir) => parseAccess(await runControl(controlProgram(), { command: 'access', data_dir: dataDir, json: true })),
+    startDiscovered: async (node) => requireSession().startDiscoveredNode(node.dataDir, node.deviceId),
+    beforeInstallBackground: async (node) => {
+      const current = requireSession()
+      const state = current.state()
+      if (state.kind !== 'owned') return
+      if (state.dataDir !== node.inspect.dataDir) throw new Error('请先停止 Vibeface 启动的其他本机节点。')
+      await current.stopOwned()
+    },
+    onChange: broadcast,
+  })
 
   applyApplicationMenu({ showLauncher, openBusiness: openBusinessSafely, quit })
   tray = createTray({ showLauncher, openBusiness: openBusinessSafely, quit })
@@ -372,6 +450,7 @@ async function start(): Promise<void> {
   })
 
   showLauncher()
+  await coordinator.initialize()
   await coreSession.restore()
   broadcast()
 
