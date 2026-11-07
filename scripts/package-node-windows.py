@@ -127,6 +127,8 @@ def self_test():
         assert len(info) == 9 and info['target'] == TARGET and info['source_commit'] == source
         sealed = (package / 'FILES.sha256').read_text().splitlines()
         assert {line.split('  ')[1] for line in sealed} == names | {'BUILD-INFO.json'}, sorted(sealed)
+        assert (package / 'FILES.sha256').read_bytes() == ('\n'.join(sealed) + '\n').encode('utf-8'), \
+            'the sealed manifest must use canonical UTF-8/LF bytes on every build host'
         archive = tmp / f'vibeface-{version}-{TARGET}.tar.gz'
         release.public_archive(package, archive)
         assert archive.with_name(archive.name + '.sha256').read_text() == f'{release.digest(archive)}  {archive.name}\n'

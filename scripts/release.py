@@ -167,7 +167,7 @@ def files(directory, exclude=()):
 
 
 def write_json(path, value):
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n', encoding='utf-8', newline='\n')
 
 
 def public_archive(directory, output):
@@ -180,7 +180,7 @@ def public_archive(directory, output):
     output.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(output, 'w:gz') as archive:
         archive.add(directory, arcname=directory.name, filter=clean)
-    output.with_name(output.name + '.sha256').write_text(f'{digest(output)}  {output.name}\n')
+    output.with_name(output.name + '.sha256').write_text(f'{digest(output)}  {output.name}\n', encoding='utf-8', newline='\n')
 
 
 def unpack(archive, destination):
@@ -290,7 +290,7 @@ def seal_bundle(directory):
     verify_build_info(build)
     write_json(directory / 'BUILD-INFO.json', build)
     content = files(directory, ('FILES.sha256',))
-    (directory / 'FILES.sha256').write_text(''.join(f'{value}  {name}\n' for name, value in content.items()))
+    (directory / 'FILES.sha256').write_text(''.join(f'{value}  {name}\n' for name, value in content.items()), encoding='utf-8', newline='\n')
     return build
 
 
