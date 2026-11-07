@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chatTimeline, firstUnread, messageTime, messageTimes, threadReplies, unreadCounts } from "./timeline.ts"
+import { chatTimeline, firstUnread, messageTime, messageTimes, taskMessage, threadReplies, unreadCounts } from "./timeline.ts"
 
 const minute = 60_000
 const at = (hour: number, min: number, day = 30) => new Date(2026, 9, day, hour, min, 5).getTime()
@@ -21,6 +21,30 @@ const late = [
 
 test("a task's late report stays where the Node put it, after what was said meanwhile", () => {
   assert.deepEqual(ids(chatTimeline(late).messages), ["m1", "r1", "m2", "r2", "m3", "r3", "report"])
+})
+
+test("tasks keep the originating visible message when replies arrive or scheduler jobs are gone", () => {
+  const jobs = [{ trigger: "message:m1", message_id: "m1", reply_message_id: "r1" }]
+  const locate = (messages: Row[], trigger = "message:m1") => taskMessage({ trigger, jobs, messages, works: [] })
+  assert.equal(locate(late.slice(0, 1)), "m1")
+  assert.equal(locate(late), "m1")
+  assert.equal(taskMessage({ trigger: "message:m1", jobs: [], messages: late, works: [] }), "m1")
+  assert.equal(locate(late.filter((item) => item.message_id !== "m1")), undefined, "a hidden or missing source never falls back to its reply")
+  const bot = { ...message("bot-ask", 1, now), role: "bot" }
+  assert.equal(taskMessage({ trigger: "bot_message:bot-ask", jobs: [], messages: [bot], works: [] }), "bot-ask")
+  assert.equal(locate(late, "message:r1"), undefined, "a reply cannot stand in for the person's request")
+})
+
+test("nested task triggers follow recorded work origins, while cycles and missing roots stay in history", () => {
+  const works = [{ work_id: "root", trigger: "message:m1" }, { work_id: "child", trigger: "task:root" }]
+  const locate = (trigger: string, records = works) => taskMessage({ trigger, jobs: [{ trigger: "task:child", message_id: "work:child" }], messages: late, works: records })
+  assert.equal(locate("task:child"), "m1")
+  assert.equal(locate("work:child"), "m1")
+  assert.equal(locate("work:missing"), undefined)
+  assert.equal(locate("task:child", [{ work_id: "root", trigger: "work:child" }, works[1]]), undefined)
+  const scheduled = { ...message("scheduled", 1, now, "schedule:daily:100"), role: "assistant" }
+  assert.equal(taskMessage({ trigger: "schedule:daily:100", jobs: [], messages: [scheduled], works }), "scheduled")
+  assert.equal(taskMessage({ trigger: "schedule:daily:100", jobs: [], messages: [], works }), undefined)
 })
 
 test("every device shows one order, whatever order the messages arrived in", () => {

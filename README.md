@@ -78,13 +78,13 @@ Compare the six-digit code on both devices before approving. Join the existing n
 
 ## Public discovery service
 
-Vibeface offers an optional public discovery service to look up Node addresses and try direct connections:
+The default public discovery service provides address hints, signed connection entries, and short-lived Relay admission:
 
 ```text
 vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@discovery.vibeface.dev:4792
 ```
 
-Nodes do not connect to it by default. It has no web entry point and does not relay application data. Use `--discovery` during first initialization to opt in. See [Use the public discovery service](packages/docs/node.md#使用公共发现服务) for existing Node configuration, visible metadata, and connection limits. Joining a personal network still requires an invitation and approval.
+New personal Nodes connect by default to obtain address hints, a signed catalogue of public entries and relays, and short-lived admission grants. Mobile and browser clients use the same discovery service through HTTPS, while LAN connections remain preferred. Discovery does not relay application data; the public entry forwards ciphertext, without distributing its operator token. Use `--bootstrap off` during first initialization to disable public bootstrap, or configure a self-hosted service. See [Use the public discovery service](packages/docs/node.md#使用公共发现服务) for configuration, visible metadata, and connection limits. Joining a personal network still requires an invitation and approval.
 
 ## Privacy and permissions
 

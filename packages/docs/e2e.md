@@ -30,6 +30,12 @@ headless 传输测试仅阻止临时文件输入打开原生系统选择框，�
 
 测试使用 `tests/e2e/fixtures.ts` 导出的 `test` 或 `deliveryTest`，每项测试均重建 Node。保持 `workers: 1` 和 `retries: 0`，避免重复执行有外部副作用的验收。
 
+公共发现使用同一文件导出的 `bootstrapTest` 和 `httpBootstrapTest`。每项测试运行独立 Discovery、公共入口和新节点，不配置运营者口令。网页自身的连接接口返回 503，浏览器必须验证目录签名并使用目录里的另一处入口，完成真实安全码配对后读取助手列表。HTTP 专项还会把节点的 UDP 发现地址设为不可达，确认节点通过 HTTPS 获取接入许可。普通夹具关闭公共发现，并阻止请求默认公共服务。
+
+```sh
+pnpm exec e2e run --config tests/e2e/e2e.config.ts bootstrap.e2e.ts
+```
+
 只运行核心测试或显示浏览器：
 
 ```sh

@@ -108,7 +108,7 @@ vibeface --help
 vibeface
 ```
 
-数据目录默认为 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定，见[部署配置](deployment.md)。首次仅在空目录或不存在的目录中创建本机身份与配置，监听 `127.0.0.1:4790`，不开放局域网，不允许执行目录，不启用管理 Agent，不配置 relay 或公共入口。已有配置按原身份启动；损坏、非空未初始化或符号链接目录不会被重置。启动不自动输出配对秘密。
+数据目录默认为 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定，见[部署配置](deployment.md)。首次仅在空目录或不存在的目录中创建本机身份与配置，本机网页监听 `127.0.0.1:4790`，不允许执行目录，也不启用管理 Agent。个人 Node 在后台尝试默认公共发现与入口，局域网连接仍可独立使用。已有配置按原身份启动；损坏、非空未初始化或符号链接目录不会被重置。启动不自动输出配对秘密。
 
 保持进程运行，在本机可信浏览器打开 `http://localhost:4790`。首屏选**新建我的网络**，填写这个节点的名称及恢复包口令（浏览器名称自动生成），下载并确认保存加密恢复包后创建个人网络，不需要复制终端邀请。已有网络的节点会尝试核验当前浏览器；新浏览器可使用本机自动访问，永久成员授权仍需原有成员邀请或恢复包。使用恢复包时，本机入口和初始化授权自动选取。
 
@@ -134,9 +134,9 @@ vibeface init --relay-listen 127.0.0.1:3340 --relay-url https://relay.example   
 vibeface init --relay https://relay.example                                      # 其他 Node，可重复
 ```
 
-设置写入 `config.json` 的 `network` 字段，之后修改该字段并重启。程序不内置公共 relay。更多说明见 [Node 之间的连接](node.md#node-之间的连接)。
+显式设置写入 `config.json` 的 `network` 字段，之后修改该字段并重启。默认公共 Relay 由发现服务的签名目录提供，也可以指定自己的 Relay。更多说明见 [Node 之间的连接](node.md#node-之间的连接)。
 
-要让手机从外网打开网页而公网机器不保存你的数据，在公网机器上运行公共入口，个人设备上的 Node 指向它：
+自建并使用运营者令牌限制接入时，在公网机器上运行入口，个人设备上的 Node 指向它：
 
 ```sh
 vibeface init --public-entry --public-url https://vb.example.com --relay-listen 127.0.0.1:3340 --relay-url https://vb.example.com   # 公网机器

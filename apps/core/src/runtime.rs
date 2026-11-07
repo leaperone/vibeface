@@ -20,6 +20,8 @@ use std::{
 use tokio::sync::{Mutex, broadcast, mpsc};
 
 pub(crate) mod agent_tools;
+#[cfg(test)]
+mod bootstrap_tests;
 mod bots;
 mod chat_controls;
 pub mod claude;
@@ -565,8 +567,10 @@ impl Runtime {
         ] {
             config::private_dir(directory)?;
         }
+        // A public entry admitting by Discovery grants holds no operator token at all.
         let entry_token = ((config.public_entry
-            && config.network.relay_mode == crate::net::RelayServiceMode::Forward)
+            && config.network.relay_mode == crate::net::RelayServiceMode::Forward
+            && !config.network.relay_admission.is_grants())
             || config.network.entry.is_some())
         .then(|| crate::net::read_token_file(&dir.join(crate::net::ENTRY_TOKEN_FILE)))
         .transpose()?;
@@ -837,6 +841,28 @@ impl Runtime {
     }
     pub fn info(&self) -> Value {
         json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"public_entry":self.config.public_entry})
+    }
+    /// Where this Node stands with the public infrastructure; `None` when bootstrap is off.
+    pub fn bootstrap_state(&self) -> Option<crate::net::bootstrap::BootstrapState> {
+        if self.config.network.bootstrap.is_off() {
+            return None;
+        }
+        Some(self.net.get().map(|net| net.bootstrap().state()).unwrap_or(
+            crate::net::bootstrap::BootstrapState::Seeking {
+                since_ms: now_ms(),
+                reason: None,
+            },
+        ))
+    }
+    /// Whether this Node answers bootstrap HTTP: the catalogue and grants of a discovery entry,
+    /// or grant registrations of a public entry's relay.
+    pub fn serves_bootstrap_http(&self) -> bool {
+        use crate::net::RelayServiceMode;
+        self.config.public_entry
+            && match self.config.network.relay_mode {
+                RelayServiceMode::DiscoveryOnly => self.config.network.catalog.is_some(),
+                RelayServiceMode::Forward => self.config.network.relay_admission.is_grants(),
+            }
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         let events = self

@@ -43,7 +43,11 @@
         "android.permission.ACCESS_WIFI_STATE",
         "android.permission.CHANGE_WIFI_MULTICAST_STATE"
       ],
-      "versionCode": 250004
+      "blockedPermissions": [
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+      ],
+      "versionCode": 250005
     },
     "plugins": [
       "expo-router",
@@ -55,6 +59,14 @@
           "cameraPermission": "扫描加入二维码",
           "microphonePermission": false,
           "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": false,
+          "cameraPermission": "扫描加入二维码",
+          "microphonePermission": false
         }
       ],
       [
@@ -117,7 +129,7 @@
       ]
     ],
     "extra": {
-      "releaseVersion": "0.0.1-nightly.20261106.3"
+      "releaseVersion": "0.0.1-nightly.20261107.1"
     }
   }
 }

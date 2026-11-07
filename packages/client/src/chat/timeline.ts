@@ -1,5 +1,6 @@
 import { placeByTime } from "../workspace/questions.ts"
-import type { NotificationRecord } from "../workspace/types.ts"
+import type { ManagerJob, NotificationRecord, WorkRecord } from "../workspace/types.ts"
+import { scheduleTrigger } from "../workspace/bot-settings.ts"
 import type { TranscriptMessage } from "./types.ts"
 
 type Ordered = Pick<TranscriptMessage, "message_id" | "role" | "in_reply_to" | "created_at_ms" | "rank">
@@ -36,6 +37,27 @@ export function threadReplies<T extends Pick<TranscriptMessage, "message_id" | "
 export function chatTimeline<M extends Ordered, A extends { created_at_ms: number }>(messages: readonly M[], asides: readonly A[] = [], joined: { has(id: string): boolean } = new Set()) {
   const ranked = byRank(messages)
   return { messages: threadReplies(ranked, joined), ...placeByTime(ranked, asides) }
+}
+
+/** Follow recorded triggers to a visible originating message; missing roots and cycles stay in task history. */
+export function taskMessage({ trigger, jobs, messages, works }: {
+  trigger: string
+  jobs: readonly Pick<ManagerJob, "trigger" | "message_id">[]
+  messages: readonly Pick<TranscriptMessage, "message_id" | "role" | "in_reply_to">[]
+  works: readonly Pick<WorkRecord, "work_id" | "trigger">[]
+}): string | undefined {
+  const seen = new Set<string>()
+  while (trigger && !seen.has(trigger)) {
+    seen.add(trigger)
+    const job = jobs.find((item) => item.trigger === trigger)
+    const messageId = job?.message_id ?? (/^(message|bot_message):/.test(trigger) ? trigger.slice(trigger.indexOf(":") + 1) : undefined)
+    const source = messages.find((message) => message.message_id === messageId && message.role !== "assistant")
+    if (source) return source.message_id
+    if (scheduleTrigger(trigger)) return messages.find((message) => message.role === "assistant" && message.in_reply_to === trigger)?.message_id
+    const workId = /^(work|task):/.test(trigger) ? trigger.slice(trigger.indexOf(":") + 1) : undefined
+    trigger = works.find((work) => work.work_id === workId)?.trigger ?? ""
+  }
+  return undefined
 }
 
 const pad = (value: number) => String(value).padStart(2, "0")

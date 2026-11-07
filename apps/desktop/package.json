@@ -1,6 +1,6 @@
 {
   "name": "vibeface-desktop",
-  "version": "0.0.1-nightly.20261106.3",
+  "version": "0.0.1-nightly.20261107.1",
   "private": true,
   "type": "module",
   "description": "Vibeface Electron desktop host (trusted launcher + Core-served business window)",

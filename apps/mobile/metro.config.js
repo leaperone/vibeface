@@ -3,6 +3,9 @@ const { getDefaultConfig } = require('expo/metro-config')
 const { withUniwindConfig } = require('uniwind/metro')
 
 const config = getDefaultConfig(__dirname)
+// Shared client imports `config/public-bootstrap.json`; Metro must watch that tree for JSON resolution.
+const workspaceRoot = path.resolve(__dirname, '../..')
+config.watchFolders = [...new Set([...(config.watchFolders ?? []), workspaceRoot])]
 // Workspace packages list react as a peer, and pnpm can give them a newer patch than the app's; two copies crash the
 // release bundle on the first hook, so every import of react resolves from the app.
 const resolve = config.resolver.resolveRequest
