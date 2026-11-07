@@ -593,6 +593,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     clearMessages()
     if (label) reportLog({ level: "info", event: "web.action", message: label })
     try { await action() } catch (caught) {
+      if (caught instanceof SupersededRead) return
       reportLog({ level: "warn", event: "web.action_failed", message: messageOf(caught), fields: { action: label } })
       showError(caught, label)
     }

@@ -641,6 +641,52 @@ test("workspace preserves bot and message requests while routing native decision
       }
     })
 
+    await t.test("the displayed route does not steal a Bot being created before navigation", async () => {
+      const previousMode = createMode, previousView = render().view
+      createMode = 'success'
+      knownBots = [bot]
+      await render().refresh(); await render().selectBot(bot)
+      let routeBotId = bot.bot_id, pathname = `/b/${routeBotId}`, currentWorkspace = render()
+      const route = componentHarness('../../routes/_app/b.$botId.tsx', {
+        '@tanstack/react-router': { createFileRoute: () => () => ({ useParams: () => ({ botId: routeBotId }) }), Outlet: 'Outlet',
+          useRouterState: ({ select }: { select: (state: { location: { pathname: string } }) => unknown }) => select({ location: { pathname } }) },
+        '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace },
+      }, {}, 'ChatRoute')
+      const routeRender = () => { currentWorkspace = render(); route.render('ChatRoute') }
+      const reading = deferred()
+      let creating: ReturnType<Workspace['createBot']> | undefined
+      let createdId = ''
+      try {
+        routeRender(); await settleComponent(); routeRender()
+        conversationHold = reading
+        creating = render().createBot({ name: 'Created from an existing chat', instructions: '' })
+        void creating.catch(() => {})
+        await new Promise(setImmediate)
+        createdId = render().conversationId
+        assert.notEqual(createdId, 'chat')
+        routeRender(); await new Promise(setImmediate)
+        assert.equal(render().conversationId, createdId, 'the old route cannot reset an explicit pending creation selection')
+        reading.resolve({ ...context, conversation: { ...context.conversation, conversation_id: createdId }, messages: [] })
+        conversationHold = null
+        const created = await creating
+        assert.equal(created.conversation_id, createdId)
+        routeBotId = created.bot_id; pathname = `/b/${routeBotId}`
+        routeRender(); await settleComponent(); routeRender()
+        assert.equal(render().conversationId, createdId)
+        assert.equal(render().view, 'chat')
+        pathname = `/b/${routeBotId}/work/readonly`
+        routeRender(); await settleComponent(); routeRender()
+        assert.equal(render().view, 'other', 'a nested detail route does not acknowledge the chat behind it')
+      } finally {
+        reading.resolve({ ...context, conversation: { ...context.conversation, conversation_id: createdId || 'chat' }, messages: [] })
+        conversationHold = null
+        if (creating) await creating.catch(() => {})
+        route.close(); createMode = previousMode; knownBots = [bot]
+        await render().refresh(); await render().selectBot(bot)
+        render().setView(previousView)
+      }
+    })
+
     await t.test("new connections wait for their own complete read and retain unknown writes without replay", async () => {
       knownBots = [bot]
       await render().refresh()
