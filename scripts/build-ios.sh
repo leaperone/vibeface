@@ -36,6 +36,8 @@ private="$(mktemp -d "$temp_root/vibeface-ios-signing.XXXXXX")"
 keychain="$private/signing.keychain-db"
 provisioning_dir="$HOME/Library/MobileDevice/Provisioning Profiles"
 existing_profile=""
+profile_changed=0
+keychain_list_changed=0
 provisioning_dir_existed=0
 mobile_device_dir_existed=0
 [[ ! -d "$HOME/Library/MobileDevice" ]] || mobile_device_dir_existed=1
@@ -48,7 +50,7 @@ with open(sys.argv[1], 'w') as output:
 PY
 cleanup() {
   security delete-keychain "$keychain" >/dev/null 2>&1 || true
-  if [[ -f "$private/keychains.json" ]]; then
+  if (( keychain_list_changed == 1 )); then
     # Restore the caller's keychain search list without adding signing material to it.
     python3 - "$private/keychains.json" <<'PY' >/dev/null 2>&1 || true
 import json, subprocess, sys
@@ -57,7 +59,7 @@ with open(sys.argv[1]) as source:
 subprocess.run(['security', 'list-keychains', '-d', 'user', '-s', *old], check=True)
 PY
   fi
-  if [[ -n "${profile_uuid:-}" ]]; then
+  if (( profile_changed == 1 )); then
     installed_profile="$provisioning_dir/$profile_uuid.mobileprovision"
     if [[ -n "$existing_profile" ]]; then
       cp -p "$existing_profile" "$installed_profile"
@@ -77,7 +79,7 @@ if (( configured == 3 )); then
   printf '%s' "$profile" | base64 -D > "$private/profile.mobileprovision"
   security cms -D -i "$private/profile.mobileprovision" > "$private/profile.plist"
   profile_data="$(python3 - "$private/profile.plist" "$method" <<'PY'
-import datetime, hashlib, json, plistlib, sys
+import datetime, hashlib, json, plistlib, re, sys
 with open(sys.argv[1], 'rb') as source:
     profile = plistlib.load(source)
 entitlements = profile.get('Entitlements', {})
@@ -85,6 +87,8 @@ app_id = entitlements.get('application-identifier', '')
 teams = profile.get('TeamIdentifier', [])
 if not profile.get('UUID') or not profile.get('Name') or not teams:
     raise SystemExit('Provisioning profile is missing its identity fields')
+if not re.fullmatch(r'[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}', str(profile['UUID'])) or not re.fullmatch(r'[A-Z0-9]{10}', str(teams[0])):
+    raise SystemExit('Provisioning profile UUID or team is invalid')
 if app_id != teams[0] + '.one.leaper.vibeface':
     raise SystemExit('Provisioning profile application identifier does not exactly match the app bundle')
 if entitlements.get('get-task-allow') is not False:
@@ -115,6 +119,7 @@ with open(sys.argv[1]) as source:
     old = json.load(source)
 subprocess.run(['security', 'list-keychains', '-d', 'user', '-s', sys.argv[2], *old], check=True)
 PY
+  keychain_list_changed=1
   identity_line="$(security find-identity -v -p codesigning "$keychain" | sed -nE "s/^[[:space:]]*[0-9]+\) ([A-Fa-f0-9]{40}) \"(Apple Distribution:.* \\($team\\))\"$/\\1|\\2/p" | head -n 1)"
   [[ -n "$identity_line" ]] || { echo 'P12 has no Apple Distribution identity matching the profile team' >&2; exit 1; }
   certificate_fingerprint="${identity_line%%|*}"
@@ -128,6 +133,7 @@ PY
     existing_profile="$private/existing-profile.mobileprovision"
     cp -p "$installed_profile" "$existing_profile"
   fi
+  profile_changed=1
   install -m 600 "$private/profile.mobileprovision" "$installed_profile"
   python3 - "$private/export-options.plist" "$method" "$team" "$profile_uuid" <<'PY'
 import plistlib, sys
