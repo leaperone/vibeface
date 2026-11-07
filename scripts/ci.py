@@ -40,7 +40,7 @@ PATH_RULES = (
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("www", ("apps/www/*",)),
     ("docs", ("README.md", "README.zh-CN.md", "AGENTS.md", "CLAUDE.md", "packages/docs/*")),
-    ("node", ("packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts")),
+    ("node", ("config/public-bootstrap.json", "packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts")),
     ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
@@ -63,13 +63,13 @@ PLATFORMS = (
 JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
 LOCAL_PROCESS_RULES = (
     ("memory-sync", ("apps/core/src/store/bot_settings.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs", "apps/core/src/store/sync.rs", "apps/core/src/agent_context.rs", "apps/core/src/identity*", "crates/secure/*")),
-    ("auto-route", ("apps/core/src/identity*", "apps/core/src/crypto.rs", "apps/core/src/local_access.rs", "apps/core/src/net*", "crates/secure/*", "crates/control/*")),
-    ("default", ("apps/core/src/net*", "apps/core/src/discovery.rs", "apps/core/src/runtime/peers.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/log.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/fetch.rs", "apps/core/src/identity*", "crates/secure/*")),
+    ("auto-route", ("config/public-bootstrap.json", "apps/core/src/identity*", "apps/core/src/crypto.rs", "apps/core/src/local_access.rs", "apps/core/src/net*", "crates/secure/*", "crates/control/*")),
+    ("default", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/discovery.rs", "apps/core/src/runtime/peers.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/log.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/fetch.rs", "apps/core/src/identity*", "crates/secure/*")),
     ("phase1", ("apps/core/src/manager.rs", "apps/core/src/schedul*", "apps/core/src/work.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/followup.rs", "apps/core/src/runtime/schedule_delivery.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/store/work.rs", "apps/core/src/store/scheduler.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs")),
     ("chat-agent", ("crates/bridge/*", "crates/control/*", "apps/cli/*", "apps/core/src/runtime/codex_server.rs", "apps/core/src/runtime/claude.rs", "apps/core/src/runtime/pi.rs", "apps/core/src/runtime/opencode.rs", "apps/core/src/runtime/provider_adapter.rs", "apps/core/src/runtime/provider_probe.rs", "apps/core/src/runtime/agent_tools.rs", "apps/core/src/runtime/chat_controls.rs", "apps/core/src/runtime/executor.rs", "apps/core/src/runtime/observation.rs", "apps/core/src/runtime/triage.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/followup.rs", "apps/core/src/runtime/bots.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/agent_context.rs", "apps/core/src/providers.rs", "apps/core/src/triage.rs", "apps/core/src/tools.rs", "apps/core/src/work.rs", "apps/core/src/manager.rs", "apps/core/src/control.rs", "apps/core/src/store/triage.rs", "apps/core/src/store/questions.rs", "apps/core/src/store/work.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/bots.rs")),
     ("phase4", ("crates/bridge/*", "crates/control/*", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/agent_tools.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/work.rs", "apps/core/src/tools.rs", "apps/core/src/store/work.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/bots.rs", "apps/core/src/identity*", "apps/core/src/fetch.rs")),
-    ("public-entry", ("apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/identity*", "apps/core/src/local_access.rs", "apps/core/src/crypto.rs", "crates/control/*")),
-    ("discovery", ("apps/core/src/discovery.rs", "apps/core/src/net*", "apps/core/src/runtime/peers.rs")),
+    ("public-entry", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/identity*", "apps/core/src/local_access.rs", "apps/core/src/crypto.rs", "crates/control/*")),
+    ("discovery", ("config/public-bootstrap.json", "apps/core/src/discovery.rs", "apps/core/src/net*", "apps/core/src/runtime/peers.rs")),
     ("phase5", ("apps/core/src/store/*", "apps/core/src/identity*", "apps/core/src/maintenance.rs", "apps/core/src/logging.rs", "crates/control/*", "crates/secure/src/recovery.rs")),
     ("delivery-charity", PATH_RULES[0][1]),
 )
@@ -418,6 +418,9 @@ def self_test():
     assert web["package_mode"] == "web" and web["package_matrix"]["include"] == list(PLATFORMS[:1])
     assert make_plan(["apps/app/src/content.md"])["web"]
     assert web["local_process_modes"] == []
+    bootstrap = make_plan(["config/public-bootstrap.json"])
+    assert bootstrap["rust_packages"] == ["vibeface-core"] and bootstrap["web"]
+    assert bootstrap["local_process_modes"] == ["auto-route", "default", "public-entry", "discovery"]
     www = make_plan(["apps/www/src/routes/index.tsx"])
     assert www["www"] and not www["web"] and not www["rust_packages"]
     assert www["required_jobs"] == ["quick-check", "www"]

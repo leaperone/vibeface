@@ -1,0 +1,9 @@
+{
+  "note": "Public test vector generated with the real WebAssembly signing-message format.",
+  "issuer": "197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61",
+  "now_ms": 1700000000000,
+  "catalog": {
+    "payload": "{\"version\":1,\"issuer\":\"197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61\",\"issued_at_ms\":1699999999000,\"expires_at_ms\":1700000060000,\"entries\":[{\"gateway_url\":\"https://gateway.fixture.test\",\"relay_url\":\"https://relay.fixture.test\"}]}",
+    "signature": "ad0c2d04fdadbfaab9aca1539276762ce58b0a14831d4b10de131ff1aa60e33de23a871164ef43b62a58d8cab6350d09aeaf08085ee44160d034dcf2a13a810c"
+  }
+}
