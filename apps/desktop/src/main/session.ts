@@ -197,8 +197,8 @@ export class CoreSession {
     if (before.status === 'running') throw new Error('这个数据目录已经有 Core 在运行，请改用仅连接。')
     this.core = { kind: 'starting', dataDir, attempts: 0 }
     this.options.onChange()
-    this.lifecycle.startOwned(this.programs.service(dataDir), dataDir)
-    await this.awaitRunning(dataDir)
+    this.lifecycle.startOwned(this.programs.service(before.dataDir), before.dataDir)
+    await this.awaitRunning(before.dataDir)
   }
 
   private async awaitRunning(dataDir: string): Promise<void> {

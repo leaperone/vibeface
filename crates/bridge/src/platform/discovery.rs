@@ -470,40 +470,28 @@ pub fn read_only_powershell(script: &str, output_limit: usize) -> io::Result<Vec
 #[cfg(test)]
 mod tests {
     use super::parse_node_args;
-    use std::{ffi::OsString, path::PathBuf};
+    use std::ffi::OsString;
+    #[cfg(any(target_os = "macos", windows))]
+    use std::path::PathBuf;
     #[test]
     fn parses_unicode_and_spaced_absolute_path_without_splitting() {
+        let path = std::env::temp_dir().join("Node 数据 With Space");
         let args = [
-            "vibeface-core",
-            "serve",
-            "--data-dir",
-            "/Users/test/Node 数据 2",
-        ]
-        .map(OsString::from);
-        assert_eq!(
-            parse_node_args(&args).unwrap().to_string_lossy(),
-            "/Users/test/Node 数据 2"
-        );
+            OsString::from("vibeface-core"),
+            OsString::from("--data-dir"),
+            path.clone().into_os_string(),
+        ];
+        assert_eq!(parse_node_args(&args), Some(path.clone()));
+        let args = [
+            OsString::from("vibeface-core"),
+            OsString::from(format!("--data-dir={}", path.display())),
+        ];
+        assert_eq!(parse_node_args(&args), Some(path));
     }
     #[test]
     fn rejects_relative_data_directory_and_unbounded_args() {
         assert!(parse_node_args(&["core".into(), "--data-dir=relative".into()]).is_none());
         assert!(parse_node_args(&vec![OsString::from("x"); 257]).is_none());
-    }
-
-    #[test]
-    fn parser_never_splits_spaces_inside_absolute_paths() {
-        let args = [
-            "vibeface-core",
-            "serve",
-            "--data-dir",
-            "/home/test/Node With Space",
-        ]
-        .map(std::ffi::OsString::from);
-        assert_eq!(
-            parse_node_args(&args).unwrap(),
-            PathBuf::from("/home/test/Node With Space")
-        );
     }
 
     #[cfg(target_os = "macos")]

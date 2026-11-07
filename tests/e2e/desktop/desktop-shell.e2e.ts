@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { access, readFile } from 'node:fs/promises';
+import { access, readFile, stat } from 'node:fs/promises';
 import { join, sep } from 'node:path';
 import { realpath } from 'node:fs/promises';
 import { expect } from 'e2e';
@@ -45,6 +45,7 @@ test('a fresh packaged desktop is a controller without initializing a Node', asy
   assert.match(before.profile, /[^\x20-\x7e]/, 'the profile path carries characters outside ASCII');
   assert.match(before.profile, / /, 'the profile path carries a space');
   assert.equal(before.status.core.kind, 'none');
+  assert.equal(before.status.backgroundNode.kind, 'absent', 'the product prepares its own private profile before querying managed Node state');
   assert.equal(before.status.nodeMode, 'undecided');
   await noPath(join(before.profile, 'node'), 'a fresh controller profile has no Node data directory');
 
@@ -68,6 +69,9 @@ test('a fresh packaged desktop is a controller without initializing a Node', asy
   assert(client, 'the controller opens its packaged private client page');
   assert(isClientUrl(client.url));
   expect(await evaluate(client, 'typeof window.vibefaceClient')).toBe('object');
+  expect(await evaluate(client, 'Boolean(isSecureContext && crypto.subtle && indexedDB)')).toBe(true);
+  await expect.poll(() => evaluate(client, 'document.querySelector("textarea[aria-label=\\"加入链接\\"]") !== null'),
+    { timeout: 30000 }).toBe(true);
   const clientBridge = await evaluate(client, 'Object.keys(window.vibefaceClient).sort().join(",")');
   assert(typeof clientBridge === 'string');
   const bridgeKeys = clientBridge.split(',');
@@ -95,7 +99,11 @@ test('explicit local enable owns one bundled Node and restart keeps its identity
   const nodeId = started.status.core.deviceId;
   assert(typeof nodeId === 'string' && nodeId.length > 0);
   const dataDir = started.status.core.dataDir;
-  assert.equal(dataDir, join(started.profile, 'node'));
+  const [actualDirectory, profileDirectory] = await Promise.all([
+    stat(dataDir, { bigint: true }), stat(join(started.profile, 'node'), { bigint: true }),
+  ]);
+  assert.deepEqual([actualDirectory.dev, actualDirectory.ino], [profileDirectory.dev, profileDirectory.ino],
+    'the owned Core uses exactly the App profile node directory');
   const epoch = JSON.parse(await readFile(join(dataDir, 'data-epoch.json'), 'utf8'));
   assert.equal(epoch.data_epoch, 1, 'Node data keeps the fixed epoch');
   const identity = await desktop.snapshotNode(dataDir);

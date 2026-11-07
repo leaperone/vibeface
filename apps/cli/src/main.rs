@@ -78,6 +78,12 @@ enum Action {
     /// Internal Desktop managed Node provisioning interface.
     #[command(hide = true)]
     DesktopNode(crate::desktop_node::DesktopNode),
+    /// Prepare only the Electron profile's current-user filesystem permissions.
+    #[command(hide = true)]
+    DesktopProfile {
+        #[arg(long)]
+        profile_dir: PathBuf,
+    },
     /// Call a local tool with JSON arguments.
     Tool {
         /// Tool name.
@@ -704,6 +710,11 @@ async fn main() -> Result<()> {
         Some(Action::Service(options)) => crate::service::run(options).await,
         Some(Action::Update(options)) => crate::update::run(options).await,
         Some(Action::DesktopNode(options)) => crate::desktop_node::run(options).await,
+        Some(Action::DesktopProfile { profile_dir }) => {
+            crate::desktop_node::prepare_profile(&profile_dir)?;
+            println!("{}", json!({"ok": true}));
+            Ok(())
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join, resolve, toNamespacedPath } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DesktopCoordinator, backgroundNodeFromStatus, prepareAppProfileNode } from '../src/main/desktop-coordinator.js'
 import { parseLocalNodes, type LocalNodes } from '../src/main/local-nodes.js'
@@ -88,6 +88,16 @@ describe('Desktop coordinator', () => {
     expect(await instance.value.resolveSelectedNode()).toBeNull()
     expect(instance.managed.start).not.toHaveBeenCalled()
     expect(instance.managed.stop).not.toHaveBeenCalled()
+  })
+
+  it('recognizes one directory across the native inspector and JavaScript path spellings', async () => {
+    const profile = await temp(), dataDir = await temp()
+    const canonical = toNamespacedPath(await realpath(dataDir))
+    const identities = new Map([[dataDir, inspect(canonical)], [canonical, inspect(canonical)]])
+    const instance = coordinator(profile, [local(dataDir)], identities)
+    await instance.value.initialize()
+    expect(instance.value.status().selectedNode).toEqual({ dataDir: canonical, deviceId })
+    expect(await instance.value.resolveSelectedNode()).toMatchObject({ inspect: { dataDir: canonical, deviceId } })
   })
 
   it('remembers only an existing inspected directory and forgets the client target without stopping a Node', async () => {

@@ -58,11 +58,8 @@ function isStatus(value: unknown): value is ManagedNodeStatus {
   }
 }
 
-async function invoke(program: ManagedNodeProgram, profileDir: string, action: string, expectedDeviceId?: string): Promise<ManagedNodeStatus> {
-  const args = [...(program.args ?? []), 'desktop-node', '--profile-dir', profileDir]
-  if (expectedDeviceId !== undefined) args.push('--expected-device-id', expectedDeviceId)
-  args.push(action)
-  const child = spawn(program.command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+async function invoke(program: ManagedNodeProgram, args: readonly string[]): Promise<unknown> {
+  const child = spawn(program.command, [...(program.args ?? []), ...args], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
   const { stdout, stderr } = child
   if (!stdout || !stderr) throw new Error('desktop Node command streams are unavailable')
   const outputPromise = readBounded(stdout, MAX_RESULT_BYTES)
@@ -86,7 +83,6 @@ async function invoke(program: ManagedNodeProgram, profileDir: string, action: s
     if (lines.length !== 1 || !lines[0]) throw new Error('desktop Node returned an invalid result')
     let value: unknown
     try { value = JSON.parse(lines[0]) } catch { throw new Error('desktop Node returned invalid JSON') }
-    if (!isStatus(value)) throw new Error('desktop Node returned an unsupported result')
     return value
   } catch {
     try { child.kill('SIGKILL') } catch { /* already closed */ }
@@ -104,6 +100,13 @@ export class ManagedNodeController {
     this.#profileDir = options.profileDir
     this.#bundledCli = options.bundledCli
     this.#onChange = options.onChange
+  }
+
+  async prepareProfile(): Promise<void> {
+    const result = await invoke(this.#bundledCli, ['desktop-profile', '--profile-dir', this.#profileDir])
+    if (typeof result !== 'object' || result === null || Array.isArray(result) || Object.keys(result).length !== 1 || !('ok' in result) || result.ok !== true) {
+      throw new Error('Desktop profile permissions could not be prepared')
+    }
   }
 
   async status(): Promise<ManagedNodeStatus> {
@@ -127,7 +130,11 @@ export class ManagedNodeController {
   }
 
   async #run(action: string, expectedNodeId?: string): Promise<ManagedNodeStatus> {
-    const result = await invoke(this.#bundledCli, this.#profileDir, action, expectedNodeId)
+    const args = ['desktop-node', '--profile-dir', this.#profileDir]
+    if (expectedNodeId !== undefined) args.push('--expected-device-id', expectedNodeId)
+    args.push(action)
+    const result = await invoke(this.#bundledCli, args)
+    if (!isStatus(result)) throw new Error('desktop Node returned an unsupported result')
     this.#onChange?.(result)
     return result
   }

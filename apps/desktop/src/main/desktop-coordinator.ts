@@ -1,4 +1,4 @@
-import { lstat, readdir, realpath } from 'node:fs/promises'
+import { lstat, readdir, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
 import { parseInspect, type Access, type Inspect } from './control-types.js'
 import { runControl } from './control-client.js'
@@ -26,6 +26,12 @@ export type DesktopCoordinatorOptions = {
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : '操作失败。'
+}
+
+/** Rust and Node may spell a Windows canonical path with different namespace prefixes. */
+async function sameDirectory(first: string, second: string): Promise<boolean> {
+  const [a, b] = await Promise.all([stat(first, { bigint: true }), stat(second, { bigint: true })])
+  return a.isDirectory() && b.isDirectory() && a.dev === b.dev && a.ino === b.ino
 }
 
 function manager(platform: NodeJS.Platform): 'launchd' | 'systemd' | 'task-scheduler' {
@@ -70,8 +76,7 @@ export async function prepareAppProfileNode(
   }
 
   const inspected = parseInspect(await run(program, { command: 'inspect', data_dir: dataDir }))
-  const canonical = await realpath(dataDir)
-  if (inspected.dataDir !== canonical || inspected.status === 'unavailable') throw new Error('应用节点目录无法通过身份检查。')
+  if (!await sameDirectory(inspected.dataDir, dataDir) || inspected.status === 'unavailable') throw new Error('应用节点目录无法通过身份检查。')
   return inspected
 }
 
@@ -180,10 +185,10 @@ export class DesktopCoordinator {
     await this.serial(async () => {
       const canonical = await realpath(dataDir)
       const inspected = await this.options.inspect(canonical)
-      if (inspected.dataDir !== canonical || !/^[a-f0-9]{64}$/.test(inspected.deviceId)) throw new Error('目录未能通过节点身份检查。')
+      if (!await sameDirectory(inspected.dataDir, canonical) || !/^[a-f0-9]{64}$/.test(inspected.deviceId)) throw new Error('目录未能通过节点身份检查。')
       this.preferences = { ...this.preferences,
         nodeMode: this.preferences.nodeMode === 'undecided' ? 'controller' : this.preferences.nodeMode,
-        rememberedDataDirs: [...new Set([...this.preferences.rememberedDataDirs, canonical])].slice(-16),
+        rememberedDataDirs: [...new Set([...this.preferences.rememberedDataDirs, inspected.dataDir])].slice(-16),
       }
       await this.persist()
       await this.discoverInner()
@@ -311,9 +316,7 @@ export class DesktopCoordinator {
     if (nodes.length && !nodes.some((node) => node.dataDir === expected.dataDir && node.deviceId === expected.deviceId && node.kind === 'running')) return null
     try {
       const inspected = await this.options.inspect(expected.dataDir)
-      const actualPath = await realpath(inspected.dataDir)
-      const expectedPath = await realpath(expected.dataDir)
-      if (actualPath !== expectedPath || inspected.dataDir !== expected.dataDir || inspected.deviceId !== expected.deviceId || inspected.status !== 'running' || !inspected.webEnabled || inspected.publicEntry) return null
+      if (!await sameDirectory(inspected.dataDir, expected.dataDir) || inspected.deviceId !== expected.deviceId || inspected.status !== 'running' || !inspected.webEnabled || inspected.publicEntry) return null
       const access = await this.options.access(inspected.dataDir)
       if (access.deviceId !== inspected.deviceId || access.kind !== 'local') return null
       return { inspect: inspected, access }

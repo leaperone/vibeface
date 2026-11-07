@@ -263,7 +263,7 @@ fn user_service_data_dir() -> std::result::Result<Option<PathBuf>, ()> {
     parse_linux_service_unit(text)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn parse_linux_service_unit(text: &str) -> std::result::Result<Option<PathBuf>, ()> {
     let starts = text
         .lines()
@@ -293,7 +293,7 @@ fn parse_linux_service_unit(text: &str) -> std::result::Result<Option<PathBuf>, 
     Ok(path.is_absolute().then_some(path))
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn first_systemd_argument(line: &str) -> Option<&str> {
     let line = line.trim_start();
     if let Some(quoted) = line.strip_prefix('"') {
@@ -333,12 +333,11 @@ fn user_service_data_dir() -> std::result::Result<Option<PathBuf>, ()> {
             action.command,
             action.arguments.unwrap_or_default()
         );
-        if let Some(args) = vibeface_bridge::platform::discovery::command_line_args(&combined) {
-            if args.iter().any(|arg| arg == "serve") {
-                if let Some(path) = data_dir_arg_os(&args) {
-                    return Ok(Some(path));
-                }
-            }
+        if let Some(args) = vibeface_bridge::platform::discovery::command_line_args(&combined)
+            && args.iter().any(|arg| arg == "serve")
+            && let Some(path) = data_dir_arg_os(&args)
+        {
+            return Ok(Some(path));
         }
     }
     Ok(None)
@@ -349,6 +348,7 @@ fn user_service_data_dir() -> std::result::Result<Option<PathBuf>, ()> {
     Err(())
 }
 
+#[cfg(target_os = "macos")]
 fn data_dir_arg(args: &[String]) -> Option<&str> {
     let mut i = 0;
     while i < args.len() {
@@ -502,6 +502,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn systemd_fixture_extracts_only_known_node_and_spaced_path() {
         let fixture = "[Service]\nExecStart=\"/opt/Vibeface/vibeface\" serve --data-dir \"/home/user/Node 数据 2\"\n";
@@ -521,7 +522,7 @@ mod tests {
     fn inspect_projection_distinguishes_healthy_stopped_and_identity_mismatch_without_raw_error() {
         let make = |status: &str, error: Value| {
             json!({
-                "status": status, "device_id":"device-fixture", "data_dir":"/controlled/Node",
+                "status": status, "device_id":"device-fixture", "data_dir": std::env::temp_dir().join("controlled Node"),
                 "local_listen":"127.0.0.1:4791", "listen":"127.0.0.1:4790",
                 "web_enabled":true, "core_version":"0.0.1-fixture", "error":error
             })

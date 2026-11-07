@@ -360,6 +360,7 @@ async function start(): Promise<void> {
     app.exit(0)
     return
   }
+  const managedNode = new ManagedNodeController({ profileDir, bundledCli: { command: cliBinary() } })
 
   const activations = new ActivationQueue(async (link) => {
     await handleJoin(link)
@@ -386,6 +387,7 @@ async function start(): Promise<void> {
     void activations.flush()
   })
 
+  await managedNode.prepareProfile()
   await app.whenReady()
 
   serveLauncher(launcherAssets(mainDir))
@@ -403,7 +405,6 @@ async function start(): Promise<void> {
       },
     }
   )
-  const managedNode = new ManagedNodeController({ profileDir, bundledCli: { command: cliBinary() } })
   coordinator = new DesktopCoordinator({
     profileDir,
     controlProgram: controlProgram(),

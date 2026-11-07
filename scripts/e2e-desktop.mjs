@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
-import { chmod, mkdir, readFile, rename, rm, stat, unlink } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, stat, unlink } from 'node:fs/promises';
 import { basename, join, resolve, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
@@ -126,19 +126,14 @@ async function waitLauncher() {
   throw new Error(`The packaged desktop launcher did not become ready: ${last}`);
 }
 
-async function protectProfile() {
-  await mkdir(profile, { recursive: true, mode: 0o700 });
-  if (windows) {
-    await run('powershell', ['-NoProfile', '-NonInteractive', '-Command',
-      'icacls.exe $args[0] /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F" /setowner $env:USERNAME; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }', profile]);
-  } else {
-    await chmod(profile, 0o700);
-  }
+async function prepareProfileParent() {
+  // The product must create and protect its own profile just as on a real first launch.
+  await mkdir(join(profile, '..'), { recursive: true, mode: 0o700 });
 }
 
 async function start() {
   assert(!child || child.exitCode !== null, 'The desktop application is already running');
-  await protectProfile();
+  await prepareProfileParent();
   const started = spawn(executable, ['--profile-dir', profile, `--remote-debugging-port=${port}`],
     { cwd: repository, stdio: 'ignore' });
   child = started;
@@ -301,10 +296,11 @@ async function createFixture(startNow = true) {
   await run(cli, ['init', '--data-dir', dataDir, '--listen', `127.0.0.1:${peerPort}`,
     '--local-listen', `127.0.0.1:${localPort}`, '--bootstrap', 'off'], { cwd: runtime });
   const inspected = await controlCore({ command: 'inspect', data_dir: dataDir });
-  const fixture = { dataDir, peerPort, localPort, deviceId: inspected.device_id, child: undefined };
-  fixtures.set(dataDir, fixture);
-  if (startNow) await startFixture(dataDir);
-  return { dataDir, peerPort, localPort, deviceId: fixture.deviceId, running: Boolean(fixture.child) };
+  const fixture = { dataDir: inspected.data_dir, peerPort, localPort, deviceId: inspected.device_id, child: undefined };
+  assert(typeof fixture.dataDir === 'string', 'Core reports the canonical fixture directory');
+  fixtures.set(fixture.dataDir, fixture);
+  if (startNow) await startFixture(fixture.dataDir);
+  return { dataDir: fixture.dataDir, peerPort, localPort, deviceId: fixture.deviceId, running: Boolean(fixture.child) };
 }
 
 async function startFixture(dataDir) {
@@ -406,7 +402,7 @@ async function cleanup() {
 }
 
 await ensurePrivateDirectory(controlRoot, { root });
-await protectProfile();
+await prepareProfileParent();
 const token = randomBytes(32).toString('hex');
 const control = createServer(async (request, response) => {
   const authorization = request.headers.authorization;
