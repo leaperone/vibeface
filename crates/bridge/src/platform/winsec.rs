@@ -453,23 +453,20 @@ pub fn handle_is_private(handle: HANDLE) -> io::Result<bool> {
 /// Pipe ACLs govern who may create connections. Each connected instance is a separate byte
 /// stream, so the account holding the opposite endpoint is the identity that can read or write
 /// this channel.
-pub fn pipe_peer_is_current_user(handle: HANDLE) -> io::Result<bool> {
+fn pipe_peer_is_current_user(handle: HANDLE) -> io::Result<bool> {
     use windows_sys::Win32::System::Pipes::{
         GetNamedPipeClientProcessId, GetNamedPipeInfo, GetNamedPipeServerProcessId, PIPE_SERVER_END,
     };
 
     let mut flags = 0;
-    let mut out_buffer_size = 0;
-    let mut in_buffer_size = 0;
-    let mut max_instances = 0;
-    // SAFETY: `handle` is open and each output points to a writable local.
+    // SAFETY: `handle` is open and `flags` points to a writable local.
     if unsafe {
         GetNamedPipeInfo(
             handle,
             &mut flags,
-            &mut out_buffer_size,
-            &mut in_buffer_size,
-            &mut max_instances,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     } == 0
     {
@@ -687,8 +684,8 @@ mod handed_over_pipe_tests {
     };
     use windows_sys::Win32::{
         Foundation::{
-            ERROR_PIPE_CONNECTED, GENERIC_WRITE, GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
-            HLOCAL, LocalFree,
+            ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, HANDLE,
+            HANDLE_FLAG_INHERIT, LocalFree,
         },
         Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
         Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES},
@@ -696,8 +693,8 @@ mod handed_over_pipe_tests {
             CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, ReadFile, WriteFile,
         },
         System::Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, CreatePipe, GetNamedPipeInfo, PIPE_ACCESS_INBOUND,
-            PIPE_READMODE_BYTE, PIPE_SERVER_END, PIPE_TYPE_BYTE, PIPE_WAIT,
+            ConnectNamedPipe, CreateNamedPipeW, CreatePipe, GetNamedPipeInfo, PIPE_ACCESS_DUPLEX,
+            PIPE_ACCESS_INBOUND, PIPE_READMODE_BYTE, PIPE_SERVER_END, PIPE_TYPE_BYTE, PIPE_WAIT,
         },
     };
 
@@ -725,7 +722,7 @@ mod handed_over_pipe_tests {
         let server = unsafe {
             CreateNamedPipeW(
                 pipe_name.as_ptr(),
-                PIPE_ACCESS_INBOUND,
+                PIPE_ACCESS_DUPLEX,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 1,
                 4096,
@@ -738,22 +735,23 @@ mod handed_over_pipe_tests {
             return Err(io::Error::last_os_error());
         }
         let server = OwnedHandle(server);
-        // SAFETY: the name is terminated; this client requests only the write end.
-        let client_name = pipe_name.clone();
-        let client = std::thread::spawn(move || {
-            // SAFETY: the name is terminated; this client requests only the write end.
-            unsafe {
-                CreateFileW(
-                    client_name.as_ptr(),
-                    GENERIC_WRITE,
-                    0,
-                    std::ptr::null(),
-                    OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
-                    std::ptr::null_mut(),
-                )
-            }
-        });
+        // SAFETY: the terminated name identifies the server created above. Connecting before
+        // ConnectNamedPipe is supported and is reported below as ERROR_PIPE_CONNECTED.
+        let client = unsafe {
+            CreateFileW(
+                pipe_name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if client.is_null() || client == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let client = OwnedHandle(client);
         // SAFETY: `server` is an open server endpoint and no overlapped structure is used.
         if unsafe { ConnectNamedPipe(server.0, std::ptr::null_mut()) } == 0 {
             let error = io::Error::last_os_error();
@@ -761,13 +759,7 @@ mod handed_over_pipe_tests {
                 return Err(error);
             }
         }
-        let client = client
-            .join()
-            .map_err(|_| io::Error::other("named pipe client panicked"))?;
-        if client.is_null() || client == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        Ok((server, OwnedHandle(client)))
+        Ok((server, client))
     }
 
     struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
@@ -775,7 +767,7 @@ mod handed_over_pipe_tests {
     impl Drop for LocalSecurityDescriptor {
         fn drop(&mut self) {
             // SAFETY: ConvertStringSecurityDescriptorToSecurityDescriptorW allocated this value.
-            unsafe { LocalFree(self.0.cast::<std::ffi::c_void>() as HLOCAL) };
+            unsafe { LocalFree(self.0) };
         }
     }
 
@@ -887,11 +879,16 @@ mod handed_over_pipe_tests {
         let mut byte = [0];
         handed.read_exact(&mut byte)?;
         assert_eq!(byte, [b'c']);
+
+        let mut handed_client = handed_over(client.0 as usize)?;
+        write_one(server.0, b'e')?;
+        handed_client.read_exact(&mut byte)?;
+        assert_eq!(byte, [b'e']);
         Ok(())
     }
 
     #[test]
-    fn an_everyone_named_pipe_acl_does_not_share_its_stream_with_other_instances() -> io::Result<()>
+    fn a_connected_same_account_peer_is_accepted_with_an_everyone_name_acl() -> io::Result<()>
     {
         let (_descriptor, attributes) = everyone_pipe_attributes()?;
         let (server, client) = named_pipe(Some(&attributes))?;
