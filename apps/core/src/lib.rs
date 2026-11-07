@@ -24,6 +24,7 @@ pub mod store;
 pub mod tools;
 pub mod triage;
 pub mod work;
+pub mod workspace;
 
 /// The CLI binary lives beside the core binary in packaged installs.  Backend processes use it
 /// when they need to ask a user-facing tool or hook to continue a turn.

@@ -1,4 +1,5 @@
-import { Link, Stack } from 'expo-router'
+import { Link, Stack, router, useLocalSearchParams } from 'expo-router'
+import { useEffect } from 'react'
 import { useHeaderHeight } from 'expo-router/react-navigation'
 import { ListChecks, MessageSquare, Settings } from 'lucide-react-native'
 import { View } from 'react-native'
@@ -16,6 +17,13 @@ import { useWide } from '@/lib/layout'
 export default function Home() {
   const wide = useWide()
   const workspace = useWorkspace()
+  const { conversation, work, routine } = useLocalSearchParams<{ conversation?: string; work?: string; routine?: string }>()
+  const bot = workspace.bots.find((item) => item.conversation_id === conversation)
+  useEffect(() => {
+    if (!bot || !conversation) return
+    if (work) router.replace(`/b/${bot.bot_id}/work/${work}`)
+    else router.replace({ pathname: '/b/[botId]', params: { botId: bot.bot_id, ...(routine ? { routine } : {}) } })
+  }, [conversation, work, routine, bot?.bot_id])
   const bar = useHeaderHeight()
   const frame = useSafeAreaFrame()
   const insets = useSafeAreaInsets()

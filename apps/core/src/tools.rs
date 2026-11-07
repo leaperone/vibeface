@@ -16,7 +16,9 @@ use serde_json::{Value, json};
 pub const PERMISSION_POLICY_VERSION: u64 = 1;
 
 /// Event types `context` filters by; see `EventBody::kind`.
-const EVENT_TYPES: [&str; 12] = [
+const EVENT_TYPES: [&str; 14] = [
+    "input_posted",
+    "workspace_commanded",
     "message_posted",
     "bot_messaged",
     "question_asked",
@@ -68,6 +70,9 @@ pub enum Tool {
     WaitWork,
     HistorySearch,
     HistoryRead,
+    WorkspaceState,
+    WorkspaceHistory,
+    WorkspaceCommand,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -125,7 +130,10 @@ struct ToolCall {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 35] = [
+    pub const ALL: [Tool; 38] = [
+        Tool::WorkspaceState,
+        Tool::WorkspaceHistory,
+        Tool::WorkspaceCommand,
         Tool::Search,
         Tool::Describe,
         Tool::Call,
@@ -169,6 +177,9 @@ impl Tool {
 
     pub fn name(self) -> &'static str {
         match self {
+            Tool::WorkspaceState => "workspace_state",
+            Tool::WorkspaceHistory => "workspace_history",
+            Tool::WorkspaceCommand => "workspace_command",
             Tool::Search => "tool_search",
             Tool::Describe => "tool_describe",
             Tool::Call => "tool_call",
@@ -225,13 +236,15 @@ impl Tool {
             | Tool::ReadBot
             | Tool::ListSessions
             | Tool::WaitWork => Effect::Read,
+            Tool::WorkspaceState | Tool::WorkspaceHistory => Effect::Read,
             Tool::DispatchWork
             | Tool::InterruptWork
             | Tool::HandOverSession
             | Tool::ProposeProviderConfig
             | Tool::ApplyProviderConfig
             | Tool::TrackWork
-            | Tool::BindWork => Effect::Work,
+            | Tool::BindWork
+            | Tool::WorkspaceCommand => Effect::Work,
             Tool::Remind | Tool::MessageBot => Effect::Wake,
             Tool::UpdateProfile
             | Tool::SaveSkill
@@ -362,6 +375,16 @@ impl Tool {
         };
         let executors = || json!(Provider::executing(|_| true));
         Some(match self {
+            Tool::WorkspaceState | Tool::WorkspaceHistory => (
+                "Read the task graph or signed shared history within this turn's task and channel. A task turn may read its own root and descendants. Native transcripts stay private.",
+                json!({"task_id":string(),"channel_id":string(),"limit":{"type":"integer","minimum":1,"maximum":512}}),
+                &[],
+            ),
+            Tool::WorkspaceCommand => (
+                "Create or revise a task, assign its work, reply in its channel, or explicitly adopt an accepted correction. The Node supplies this turn's signed cause and enforces its root, revision, dependencies and dispatch budget. Reuse call_ref to read back the same command after an uncertain result. Only the user configures channels or controls unsent inputs.",
+                json!({"call_ref":string(),"command":{"type":"object","properties":{"kind":{"type":"string","enum":["post_channel_message","create_task","revise_task","control_task","assign_task","assignment_progress"]}},"required":["kind"],"additionalProperties":true}}),
+                &["call_ref", "command"],
+            ),
             Tool::Search => (
                 "Search the tools this turn may use by name or description. An empty query lists them; next is the offset for another page. Describe a result before calling it.",
                 json!({"query":{"type":"string","maxLength":256},
@@ -412,7 +435,7 @@ impl Tool {
                 "agent":{"type":"string","enum":executors()},
                 "cwd":string(),"call_ref":string(),"target_node":string(),
                 "parent":string(),"continues":string(),
-                "thread":{"type":"string","minLength":1,"description":"An existing session on this device for prompt; cwd is taken from it. Any Codex thread but a sub-agent's, steering its running turn or starting one; for another agent only a session one of this device's works ran in"},
+                "thread":{"type":"string","minLength":1,"description":"An existing session on this device for prompt; its verified cwd must be inside the current allowed roots. Codex accepts a thread other than a sub-agent's, steering its running turn or starting one; another agent requires a session one of this device's works ran in"},
                 "model":string(),
                 "effort":{"type":"string","enum":["none","minimal","low","medium","high","xhigh"],
                     "description":format!("Taken by agent {:?}", Provider::executing(|can| can.effort))},

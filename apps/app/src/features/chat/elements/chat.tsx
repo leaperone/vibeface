@@ -15,7 +15,7 @@ import { Message, type ChatMessage } from './message'
 
 /** One row of the conversation: a message bubble, or a task, change, question or hand-off row between them. */
 export type ChatEntry =
-  | { key: string; anchor?: boolean; message: ChatMessage; schedule?: string; retry?: () => Promise<void>; detail?: string }
+  | { key: string; anchor?: boolean; message: ChatMessage; conversationId?: string; schedule?: string; retry?: () => Promise<void>; detail?: string }
   | { key: string; anchor?: undefined; node: ReactNode }
 
 /** Tasks one turn started stack as a group instead of spacing out like separate turns. */
@@ -68,7 +68,7 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
           <MessageScrollerContent className="mx-auto w-full max-w-(--page-width) gap-0 px-4 pt-6 pb-[calc(1.5rem+var(--toast-cover,0px))] sm:px-6">
             {entries.map((entry, index) => (
               <MessageScrollerItem key={entry.key} messageId={entry.key} scrollAnchor={index === anchor || undefined} className={cn(index > 0 && (stacked(entry, entries[index - 1]) ? 'mt-2' : 'mt-6'), entered.current.has(entry.key) && 'message-enter')}>
-                {'message' in entry ? <Message message={entry.message} schedule={entry.schedule} time={times.get(entry.message.message_id)} retry={entry.retry} detail={entry.detail} /> : entry.node}
+                {'message' in entry ? <Message message={entry.message} conversationId={entry.conversationId} schedule={entry.schedule} time={times.get(entry.message.message_id)} retry={entry.retry} detail={entry.detail} /> : entry.node}
               </MessageScrollerItem>
             ))}
           </MessageScrollerContent>

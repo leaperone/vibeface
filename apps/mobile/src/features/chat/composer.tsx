@@ -1,8 +1,10 @@
 import * as DocumentPicker from 'expo-document-picker'
+import { File } from 'expo-file-system'
 import * as Haptics from 'expo-haptics'
+import * as ImagePicker from 'expo-image-picker'
 import { ArrowUp, LoaderCircle, Paperclip, Square, X } from 'lucide-react-native'
-import type { ReactNode } from 'react'
-import { Platform, Pressable, ScrollView, TextInput, View } from 'react-native'
+import { useEffect, useRef, type ReactNode } from 'react'
+import { ActionSheetIOS, Alert, Platform, Pressable, ScrollView, TextInput, View } from 'react-native'
 import { Button } from '@/components/ui/button'
 import { caret } from '@/components/ui/input'
 import { Icon } from '@/components/ui/icon'
@@ -16,43 +18,87 @@ type Props = {
   onChange: (value: string) => void
   files: Attachment[]
   onFiles: (files: Attachment[]) => void
+  attachmentScope: string
   /** Why sending is off, in place of the placeholder, or under the box while it holds a draft; null when it is allowed. */
   blocked: string | null
   sending: boolean
   onSend: () => void
-  /** Present while a reply runs and can be cancelled: the send button becomes stop. */
   onStop?: () => void
-  /** An actionable blocker that replaces the placeholder and draft note. */
+  /** Status and actions shown below the input. */
   children?: ReactNode
   /** The bot's accent for the live send button; the neutral fill without it. */
   tint?: { fill: string; ink: string }
+  target?: ReactNode
+  sendLabel?: string
+  label?: string
 }
 
-export function Composer({ chrome, value, onChange, files, onFiles, blocked, sending, onSend, onStop, children, tint }: Props) {
+export function Composer({ chrome, value, onChange, files, onFiles, attachmentScope, blocked, sending, onSend, onStop, children, tint, target, sendLabel = '发送', label = '给 Bot 发消息' }: Props) {
   const ios = Platform.OS === 'ios'
-  // While writing a follow-up, keep Send available and move Stop beside it.
+  const enabled = !blocked && !sending
+  const latest = useRef({ files, onFiles, attachmentScope, enabled, generation: 0, mounted: true })
+  if (latest.current.attachmentScope !== attachmentScope || latest.current.enabled !== enabled) latest.current.generation++
+  latest.current = { ...latest.current, files, onFiles, attachmentScope, enabled }
+  useEffect(() => {
+    latest.current.mounted = true
+    return () => { latest.current.mounted = false; latest.current.generation++ }
+  }, [])
+  const picking = useRef(false)
   const drafting = value.trim().length > 0 || files.length > 0
-  const stop = drafting ? undefined : onStop
   const canSend = !blocked && !sending && drafting
   const armed = canSend
-  const pick = async () => {
-    const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })
-    if (picked.canceled) return
-    onFiles([...files, ...picked.assets.map((asset) => ({ uri: asset.uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null }))])
+  const pick = async (source: 'photos' | 'files', generation: number) => {
+    if (picking.current || !latest.current.mounted || !latest.current.enabled || latest.current.generation !== generation) return
+    picking.current = true
+    const scope = latest.current.attachmentScope, request = ++latest.current.generation
+    const current = () => latest.current.mounted && latest.current.enabled && latest.current.attachmentScope === scope && latest.current.generation === request
+    try {
+      let added: Attachment[]
+      if (source === 'photos') {
+        const picked = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], allowsMultipleSelection: true, quality: 1, preferredAssetRepresentationMode: ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Current })
+        if (picked.canceled) return
+        added = picked.assets.map((asset) => {
+          const file = new File(asset.uri)
+          return { uri: asset.uri, name: asset.fileName || file.name, size: asset.fileSize ?? file.size, mimeType: asset.mimeType || file.type || null }
+        })
+      } else {
+        const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })
+        if (picked.canceled) return
+        added = picked.assets.map((asset) => ({ uri: asset.uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null }))
+      }
+      if (current()) latest.current.onFiles([...latest.current.files, ...added])
+    } catch (error) {
+      if (current()) Alert.alert('未能添加附件', error instanceof Error ? error.message : '请重试，或选择其他文件。')
+    } finally {
+      picking.current = false
+    }
   }
-  const attach = <Button variant="ghost" size="icon" className={ios ? 'size-13 rounded-full' : 'rounded-full'} accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} onPress={pick}>
+  const choose = () => {
+    if (picking.current || !latest.current.mounted || !latest.current.enabled) return
+    const generation = latest.current.generation
+    if (ios) ActionSheetIOS.showActionSheetWithOptions({ options: ['照片图库', '文件', '取消'], cancelButtonIndex: 2 }, (index) => {
+      if (index === 0) void pick('photos', generation)
+      if (index === 1) void pick('files', generation)
+    })
+    else Alert.alert('添加附件', undefined, [
+      { text: '照片图库', onPress: () => void pick('photos', generation) },
+      { text: '文件', onPress: () => void pick('files', generation) },
+      { text: '取消', style: 'cancel' },
+    ])
+  }
+  const attach = <Button variant="ghost" size="icon" className={ios ? 'size-13 rounded-full' : 'rounded-full'} accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} disabled={!enabled} onPress={choose}>
     <Icon as={Paperclip} className="text-muted-foreground" />
   </Button>
   const controls = <>
-    {drafting && onStop ? <Button instant size="icon" variant="outline" className="rounded-full shadow-none" accessibilityLabel="停止" onPress={onStop}>
+    {onStop ? <Button instant size="icon" variant="outline" className="rounded-full shadow-none" accessibilityLabel="停止" onPress={onStop}>
       <Icon as={Square} className="fill-foreground" />
     </Button> : null}
-    <Button instant size="icon" variant={stop ? 'outline' : 'default'} className="rounded-full shadow-none" style={armed && tint ? { backgroundColor: tint.fill } : undefined} accessibilityLabel={stop ? '停止' : sending ? '发送中' : '发送'} disabled={!stop && !canSend}
-      onPress={stop ?? (sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() })}>
-      {stop ? <Icon as={Square} className="fill-foreground" /> : sending ? <Icon as={LoaderCircle} /> : <Icon as={ArrowUp} color={armed ? tint?.ink : undefined} />}
+    <Button instant size="icon" variant="default" className="rounded-full shadow-none" style={armed && tint ? { backgroundColor: tint.fill } : undefined} accessibilityLabel={sending ? '本地保存中' : sendLabel} disabled={!canSend}
+      onPress={sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() }}>
+      {sending ? <Icon as={LoaderCircle} /> : <Icon as={ArrowUp} color={armed ? tint?.ink : undefined} />}
     </Button>
   </>
-  const input = <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel="给 Bot 发消息" placeholder={children ? '发消息' : blocked ?? '发消息'} placeholderTextColorClassName="accent-muted-foreground" multiline maxLength={100000}
+  const input = <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel={label} placeholder={blocked ?? '发消息'} placeholderTextColorClassName="accent-muted-foreground" multiline maxLength={100000}
     className={ios ? 'max-h-40 min-h-11 min-w-0 flex-1 ps-3.5 pe-2 py-2.5 font-sans text-body text-foreground' : 'max-h-40 min-h-11 px-4 pt-3 pb-1 font-sans text-body text-foreground'} value={value} onChangeText={onChange} />
   const box = <>
     {files.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 px-3 pt-3">
@@ -71,12 +117,13 @@ export function Composer({ chrome, value, onChange, files, onFiles, blocked, sen
     </>}
   </>
   return <View pointerEvents={ios ? 'box-none' : undefined} className={ios ? 'gap-2 px-4 pb-2' : 'gap-2 bg-background px-4 pb-3'}>
+    {target ? <View className="w-full max-w-3xl self-center">{target}</View> : null}
     {ios ? <View pointerEvents="box-none" className="w-full max-w-3xl flex-row items-end gap-2 self-center">
       <ChatMaterial chrome={chrome} className="size-13">{attach}</ChatMaterial>
       <ChatMaterial chrome={chrome} className="min-w-0 flex-1">{box}</ChatMaterial>
     </View> : <View className="w-full max-w-3xl self-center rounded-2xl border border-input bg-card shadow-sm">{box}</View>}
     {blocked && value || children ? <View className={ios ? 'w-full max-w-3xl self-center rounded-xl bg-card py-1' : 'w-full max-w-3xl self-center'}>
-      {blocked && value && !children ? <Text className="px-2 text-meta text-muted-foreground">{blocked}</Text> : null}
+      {blocked && value ? <Text className="px-2 text-meta text-muted-foreground">{blocked}</Text> : null}
       {children}
     </View> : null}
   </View>

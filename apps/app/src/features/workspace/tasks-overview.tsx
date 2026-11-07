@@ -21,6 +21,7 @@ import { useInbox } from "./inbox"
 import { ConfirmCard } from "./task-activity"
 import { QuestionCard } from "./question-card"
 import { useCreateBot } from "./workspace-shell"
+import { WorkspaceTasks } from "./workspace-tasks"
 
 type ProjectedWork = Extract<OverviewTask, { kind: "work" | "dispatch" }>
 
@@ -63,8 +64,13 @@ export function TasksOverview() {
   const botIds = new Map(workspace.bots.map((bot) => [bot.conversation_id, bot.bot_id]))
   const matchesBot = (conversationId: string, projectedBotId?: string | null) => botFilter === "all" || projectedBotId === botFilter || botIds.get(conversationId) === botFilter
   const activityBot = (activity: WorkspaceActivity) => activity.conversation_id ? workspace.bots.find((bot) => bot.conversation_id === activity.conversation_id) ?? overview.bots.find((bot) => bot.conversation_id === activity.conversation_id) : undefined
+  const taskStates: Record<TaskGroup, string[]> = { attention: ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'], working: ['running'], waiting: ['not_started', 'waiting_dependencies', 'deferred'] }
+  const businessTasks = (workspace.workspaceState?.tasks ?? []).filter((task) => botFilter === 'all' || task.owner_bot === botFilter)
+  const taskCounts = { attention: businessTasks.filter((task) => taskStates.attention.includes(task.state)).length, working: businessTasks.filter((task) => taskStates.working.includes(task.state)).length, waiting: businessTasks.filter((task) => taskStates.waiting.includes(task.state)).length }
+  const assignedWorkIds = new Set((workspace.workspaceState?.assignments ?? []).flatMap((assignment) => assignment.work_id && workspace.workspaceState?.tasks.some((task) => task.task_id === assignment.task_id) ? [assignment.work_id] : []))
   const visibleGroups: Record<TaskGroup, WorkspaceActivity[]> = { attention: [], working: [], waiting: [] }
   for (const group of taskGroups.map(({ group }) => group)) for (const activity of groups[group]) {
+    if (activity.kind === 'work' && activity.work && assignedWorkIds.has(activity.work.work_id)) continue
     const bot = activityBot(activity)
     const deviceWorks = activity.kind === "attention" && "kind" in activity.attention && activity.attention.kind === "device" ? activity.attention.works.filter((work) => matchesBot(work.conversation_id)) : undefined
     if (!matchesBot(activity.conversation_id ?? "", bot?.bot_id) && !deviceWorks?.length) continue
@@ -72,8 +78,8 @@ export function TasksOverview() {
     else visibleGroups[group].push(activity)
   }
   const visible = (group: TaskGroup) => filter === "all" || filter === group
-  const noticed = visible("attention") ? visibleGroups.attention.length : 0
-  const visibleCount = noticed + (visible("working") ? visibleGroups.working.length : 0) + (visible("waiting") ? visibleGroups.waiting.length : 0)
+  const noticed = visible("attention") ? visibleGroups.attention.length + taskCounts.attention : 0
+  const visibleCount = (visible("attention") ? visibleGroups.attention.length : 0) + (visible("working") ? visibleGroups.working.length : 0) + (visible("waiting") ? visibleGroups.waiting.length : 0) + businessTasks.filter((task) => filter === "all" || taskStates[filter].includes(task.state)).length
   const hasContent = visibleCount > 0
   const emptyLabel = !read ? workspace.connectionOnline ? "正在读取当前连接的任务" : "尚未读取任务，连接后再确认" : filter === "all" && botFilter === "all" ? "当前记录没有未完成的任务" : "没有符合筛选的任务"
   const renderedDeviceChecks = new Set<string>()
@@ -95,9 +101,10 @@ export function TasksOverview() {
 
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     <p className="sr-only" role="status" aria-live="polite">{hasContent ? `${visibleCount} 项任务` : emptyLabel}</p>
-    <WorkspaceMasthead attention={read ? visibleGroups.attention.length : null} working={read ? visibleGroups.working.length : null} waiting={read ? visibleGroups.waiting.length : null} online={workspace.connectionOnline} />
+    <WorkspaceMasthead attention={read ? visibleGroups.attention.length + taskCounts.attention : null} working={read ? visibleGroups.working.length + taskCounts.working : null} waiting={read ? visibleGroups.waiting.length + taskCounts.waiting : null} online={workspace.connectionOnline} />
     <p className="text-meta text-muted-foreground">{[...overviewScope(overview.coverage), ...(!read ? ["当前连接尚未完成首读"] : !workspace.connectionOnline ? ["连接已断开，显示最近记录"] : [])].join(" · ")}</p>
     <TaskFilters filter={filter} botFilter={botFilter} bots={workspace.bots} onFilter={setFilter} onBotFilter={setBotFilter} />
+    <WorkspaceTasks botFilter={botFilter} filter={filter} />
     {noticed ? <Link to="/inbox" className="flex min-h-12 items-center gap-2 rounded-lg border px-3 py-2 font-medium hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0" /><span>待处理 {noticed} 项</span><ChevronRight aria-hidden="true" className="ms-auto size-4 shrink-0 text-muted-foreground" /></Link> : null}
     {taskGroups.map(({ group, title }) => {
       if (!visible(group)) return null

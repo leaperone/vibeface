@@ -30,6 +30,12 @@ const HOOKS: &str = "/api/hooks";
 const HOOKS_WAIT: &str = "/api/hooks/wait";
 const TRIAGE: &str = "/api/triage";
 const LOG: &str = "/api/log";
+/// A discovery entry's signed service catalogue, fetched by Nodes and clients.
+pub const BOOTSTRAP_CATALOG: &str = "/bootstrap/catalog";
+/// A discovery entry issues a relay grant for a device-signed request.
+pub const BOOTSTRAP_GRANT: &str = "/bootstrap/grant";
+/// A public entry's relay learns a renewed grant for an endpoint it already admits.
+pub const RELAY_GRANT: &str = "/api/relay/grant";
 
 #[derive(Clone)]
 struct App {
@@ -135,7 +141,7 @@ pub async fn serve(node: Arc<Runtime>, app_dir: Option<PathBuf>) -> Result<()> {
         site.secure || node.config.listen.ip().is_loopback() || node.config.allow_insecure_lan,
         "non-loopback HTTP requires allow_insecure_lan; use HTTPS for public access"
     );
-    let listener = if node.config.web_enabled {
+    let listener = if node.config.web_enabled || node.serves_bootstrap_http() {
         Some(TcpListener::bind(node.config.listen).await?)
     } else {
         None
@@ -264,6 +270,24 @@ fn browser_router_with_assets(
 ) -> Router {
     let app = App::new(node, sites, assets);
     let mut routes = Router::new();
+    if app.node.serves_bootstrap_http() {
+        // Bootstrap bodies are small by contract; the limit is enforced per request below too.
+        let mut bootstrap = Router::new();
+        if app.node.config.network.catalog.is_some() {
+            bootstrap = bootstrap
+                .route(BOOTSTRAP_CATALOG, get(bootstrap_catalog))
+                .route(BOOTSTRAP_GRANT, post(bootstrap_grant));
+        }
+        if app.node.config.network.relay_admission.is_grants() {
+            bootstrap = bootstrap.route(RELAY_GRANT, post(relay_grant));
+        }
+        routes = routes.merge(bootstrap.layer(DefaultBodyLimit::max(
+            crate::net::bootstrap::MAX_GRANT_BYTES * 2,
+        )));
+        if !app.node.config.web_enabled {
+            routes = routes.route("/api/info", get(info));
+        }
+    }
     if app.node.config.web_enabled {
         routes = routes.route("/api/info", get(info)).fallback(frontend);
         if app.node.config.network.relay_mode != crate::net::RelayServiceMode::DiscoveryOnly {
@@ -361,7 +385,13 @@ async fn check_boundary(
     path: &str,
     ip: IpAddr,
 ) -> ApiResult<()> {
-    let site = if path == "/api/client" && *method == Method::GET {
+    // Bootstrap resources carry their own signatures and are public by design: any origin may
+    // read the catalogue, and grants are requested and registered by Nodes, not browsers.
+    let bootstrap_path =
+        path == BOOTSTRAP_CATALOG || path == BOOTSTRAP_GRANT || path == RELAY_GRANT;
+    let site = if bootstrap_path {
+        host_site(&app.sites, headers)?
+    } else if path == "/api/client" && *method == Method::GET {
         // Cross-origin by design: this Node's browser origins and those of the personal
         // network's other Gateways, as their signed address records state them.
         let site = host_site(&app.sites, headers)?;
@@ -407,7 +437,8 @@ async fn check_boundary(
             || path == HOOKS
             || path == HOOKS_WAIT
             || path == TRIAGE
-            || path == LOG;
+            || path == LOG
+            || bootstrap_path;
         if !bearer_call
             && !one_header(headers, header::ORIGIN.as_str())
                 .is_some_and(|origin| site.origin.eq_ignore_ascii_case(origin))
@@ -480,6 +511,98 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 async fn info(State(app): State<App>) -> Json<Value> {
     Json(app.node.info())
+}
+
+fn unavailable(error: impl std::fmt::Display) -> ApiError {
+    ApiError(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+}
+
+/// When the TCP peer is loopback, optional single `X-Real-IP` set by a trusted local reverse proxy;
+/// otherwise the connecting peer IP. Never trusts `X-Forwarded-For` or `Forwarded`.
+fn client_ip(request: &Request) -> IpAddr {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|peer| peer.0.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    if !peer.is_loopback() {
+        return peer;
+    }
+    let headers = request.headers();
+    one_header(headers, "x-real-ip")
+        .and_then(|ip| ip.trim().parse().ok())
+        .unwrap_or(peer)
+}
+
+/// Reads a bootstrap body within the contract's size limit.
+async fn small_json<T: serde::de::DeserializeOwned>(
+    request: Request,
+    limit: usize,
+) -> ApiResult<T> {
+    let bytes = axum::body::to_bytes(request.into_body(), limit)
+        .await
+        .map_err(|_| ApiError::bad("request body exceeds the bootstrap limit"))?;
+    serde_json::from_slice(&bytes).map_err(ApiError::bad)
+}
+
+/// `GET /bootstrap/catalog`: the discovery entry's signed catalogue. Any origin may read it;
+/// its signature, not the transport, is what clients and Nodes trust.
+async fn bootstrap_catalog(State(app): State<App>) -> ApiResult<Response> {
+    let catalog = app
+        .node
+        .net()
+        .ok()
+        .and_then(|net| net.issuer().cloned())
+        .ok_or_else(|| unavailable("the catalogue is not being published yet"))?
+        .catalog(crate::runtime::now_ms())
+        .map_err(unavailable)?;
+    let mut response = Json(catalog).into_response();
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    Ok(response)
+}
+
+/// `POST /bootstrap/grant`: a device-signed request for a relay grant.
+async fn bootstrap_grant(State(app): State<App>, request: Request) -> ApiResult<Json<Value>> {
+    let issuer = app
+        .node
+        .net()
+        .ok()
+        .and_then(|net| net.issuer().cloned())
+        .ok_or_else(|| unavailable("grants are not being issued yet"))?;
+    let ip = client_ip(&request);
+    let signed: crate::net::bootstrap::SignedRequest =
+        small_json(request, crate::net::bootstrap::MAX_REQUEST_BYTES).await?;
+    let grant = issuer
+        .grant_signed(&signed, ip, crate::runtime::now_ms())
+        .map_err(|error| ApiError(StatusCode::FORBIDDEN, error.to_string()))?;
+    Ok(Json(json!({"grant": grant.as_str()})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantRegistration {
+    grant: String,
+}
+
+/// `POST /api/relay/grant`: a Node registers its renewed grant with the public entry's relay.
+async fn relay_grant(State(app): State<App>, request: Request) -> ApiResult<Json<Value>> {
+    let admission = app
+        .node
+        .net()
+        .ok()
+        .and_then(|net| net.grant_admission().cloned())
+        .ok_or_else(|| unavailable("the relay is not admitting by grants yet"))?;
+    let registration: GrantRegistration =
+        small_json(request, crate::net::bootstrap::MAX_GRANT_BYTES + 32).await?;
+    let grant = admission
+        .register(&registration.grant, crate::runtime::now_ms())
+        .map_err(|error| ApiError(StatusCode::FORBIDDEN, error.to_string()))?;
+    Ok(Json(
+        json!({"device_id": grant.device_id, "expires_at_ms": grant.expires_at_ms}),
+    ))
 }
 
 async fn local_info(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -756,13 +879,18 @@ async fn tool(
     }
 }
 
-async fn hooks(
-    State(app): State<App>,
-    Json(event): Json<crate::triage::AgentEvent>,
-) -> ApiResult<Json<Value>> {
+async fn hooks(State(app): State<App>, Json(mut input): Json<Value>) -> ApiResult<Json<Value>> {
+    let schema = input
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad("hook event must be an object"))?
+        .remove("_request")
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(ApiError::bad)?;
+    let event = serde_json::from_value(input).map_err(ApiError::bad)?;
     Ok(Json(
         app.node
-            .ingest_agent_event(event)
+            .ingest_hook_event(event, schema)
             .await
             .map_err(ApiError::bad)?,
     ))
@@ -1292,5 +1420,55 @@ mod tests {
         assert_eq!(bearer(&headers), Some("secret"));
         headers.append(header::AUTHORIZATION, "Bearer second".parse().unwrap());
         assert!(bearer(&headers).is_none());
+    }
+
+    fn request_from_peer(peer: IpAddr, build: impl FnOnce(&mut HeaderMap)) -> Request {
+        let mut headers = HeaderMap::new();
+        build(&mut headers);
+        let mut request = Request::builder()
+            .uri("/bootstrap/grant")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        *request.headers_mut() = headers;
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer, 40_000)));
+        request
+    }
+
+    #[test]
+    fn client_ip_loopback_accepts_only_a_single_valid_x_real_ip() {
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        let from_header: IpAddr = "203.0.113.55".parse().unwrap();
+        let r = request_from_peer(peer, |headers| {
+            headers.insert("x-real-ip", "203.0.113.55".parse().unwrap());
+        });
+        assert_eq!(client_ip(&r), from_header);
+        let r = request_from_peer(peer, |headers| {
+            headers.append("x-real-ip", "203.0.113.1".parse().unwrap());
+            headers.append("x-real-ip", "203.0.113.2".parse().unwrap());
+        });
+        assert_eq!(client_ip(&r), peer);
+        let r = request_from_peer(peer, |headers| {
+            headers.insert("x-real-ip", "not-an-ip".parse().unwrap());
+        });
+        assert_eq!(client_ip(&r), peer);
+    }
+
+    #[test]
+    fn client_ip_ignores_forwarded_headers_and_non_loopback_spoofing() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let r = request_from_peer(loopback, |headers| {
+            headers.insert(
+                "x-forwarded-for",
+                "203.0.113.1, 198.51.100.2".parse().unwrap(),
+            );
+        });
+        assert_eq!(client_ip(&r), loopback);
+        let public: IpAddr = "198.51.100.9".parse().unwrap();
+        let r = request_from_peer(public, |headers| {
+            headers.insert("x-real-ip", "127.0.0.1".parse().unwrap());
+        });
+        assert_eq!(client_ip(&r), public);
     }
 }

@@ -1,10 +1,39 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, retryText, roleLabel, reachDevice } from './protocol.ts'
+import { awaitsDevice, botReach, botCanSend, canRetryJob, inputEventBody, inputTargetKey, inputTaskCommand, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, retryText, roleLabel, reachDevice } from './protocol.ts'
 import type { ManagerJob, TurnRuntime } from '../workspace/types.ts'
-import { parseNodes, parseTurnRuntime } from '../workspace/model.ts'
+import { parseInputReceipt, parseNodes, parsePendingMessage, parseTurnRuntime, parseWorkspaceCommand, parseWorkspaceCommandNotSaved } from '../workspace/model.ts'
+import { enqueue, type OutboxItem } from '../lib/outbox.ts'
+
+const prepareMainSend = (input: Omit<Parameters<typeof prepareSend>[0], 'target' | 'sequence'>) => prepareSend({ ...input, target: { kind: 'bot_main', bot_id: 'bot' }, sequence: 1 })
 
 const ready = { hasConversation: true, loaded: true, bot: 'ready' as const }
+test('a command refusal settles only the exact explicitly unsaved write', () => {
+  const commandId = 'c'.repeat(64)
+  const refusal = { accepted: false, code: 'workspace_command_not_saved', stored: false, command_id: commandId, reason: '任务已更新，本次操作未保存。' }
+  assert.deepEqual(parseWorkspaceCommandNotSaved(refusal, commandId), refusal)
+  assert.equal(parseWorkspaceCommandNotSaved({ ...refusal, reason: '' }, commandId)?.reason, '')
+  for (const changed of [{ command_id: 'd'.repeat(64) }, { command_id: undefined }, { accepted: true }, { stored: true }, { stored: undefined }, { reason: undefined }]) assert.throws(() => parseWorkspaceCommandNotSaved({ ...refusal, ...changed }, commandId))
+  assert.equal(parseWorkspaceCommandNotSaved({ ...refusal, code: 'forward_error' }, commandId), null)
+  assert.equal(parseWorkspaceCommandNotSaved({ responded: true, message: 'ACK lost' }, commandId), null)
+})
+test('automatic Task commands meet the Node expected-result contract and retain their source', () => {
+  const sources = ['a'.repeat(64), 'b'.repeat(64)]
+  for (const input of [
+    { task_id: 'main-task', owner_bot: 'bot', text: '  检查项目  ' },
+    { task_id: 'channel-task', owner_bot: 'bot', channel_id: 'channel', text: '给出频道调查结论' },
+    { task_id: 'work-task', owner_bot: 'bot', text: '先看原工作结果，再继续完成', source_events: sources },
+    { task_id: 'attachment-task', owner_bot: 'bot', text: '' },
+  ]) {
+    const command = inputTaskCommand(input)
+    assert.equal(command.task_id, input.task_id)
+    assert.equal(command.request, input.text.trim() || '附件输入')
+    assert.ok(command.expected_result.trim().length > 0)
+    assert.ok(Buffer.byteLength(command.expected_result, 'utf8') <= 16384)
+    assert.deepEqual(command.source_events, 'source_events' in input ? sources : [])
+  }
+  assert.deepEqual(sources, ['a'.repeat(64), 'b'.repeat(64)])
+})
 test('send waits for a loaded conversation', () => {
   assert.equal(roleLabel('user'), '你')
   assert.equal(roleLabel('assistant'), 'Bot')
@@ -52,17 +81,62 @@ test('a bot computer the Node lists offline with its last capabilities reads as 
   assert.equal(composerHint({ hasConversation: true, loaded: true, bot: reach }), '能运行 Bot 的设备离线了')
 })
 test('an explicit retry preserves the complete original message request', () => {
-  const first = prepareSend({ conversationId: 'chat', text: ' 继续  ', pending: null })
+  const first = prepareMainSend({ conversationId: 'chat', text: ' 继续  ', pending: null })
   assert.equal(first.ok, true)
   if (!first.ok) return
-  const retry = prepareSend({ conversationId: 'chat', text: '继续', pending: first.pending })
+  const retry = prepareMainSend({ conversationId: 'chat', text: '继续', pending: first.pending })
   assert.equal(retry.ok, true)
   if (!retry.ok) return
   assert.deepEqual(retry.body, first.body)
   assert.equal(retry.body.text, '继续')
-  assert.equal(prepareSend({ conversationId: 'chat', text: '另一句', pending: first.pending }).ok, false)
-  assert.equal(prepareSend({ conversationId: 'other-chat', text: '继续', pending: first.pending }).ok, false)
-  assert.equal(prepareSend({ conversationId: 'chat', text: '继续', pending: first.pending }).ok, true, 'another entrance resends the same request')
+  assert.equal(prepareMainSend({ conversationId: 'chat', text: '另一句', pending: first.pending }).ok, false)
+  assert.equal(prepareMainSend({ conversationId: 'other-chat', text: '继续', pending: first.pending }).ok, false)
+  assert.equal(prepareMainSend({ conversationId: 'chat', text: '继续', pending: first.pending }).ok, true, 'another entrance resends the same request')
+})
+test('three inputs for one target keep independent IDs and signed target order', () => {
+  const target = { kind: 'channel_task', channel_id: 'channel', task_id: 'task', bot_id: 'bot' } satisfies Parameters<typeof prepareSend>[0]['target']
+  const prepared = [1, 2, 3].map((sequence) => prepareSend({ conversationId: 'chat', target, sequence, expected_revision: 4, text: `补充${sequence}` }))
+  const accepted = prepared.flatMap((item) => item.ok ? [item] : [])
+  assert.equal(accepted.length, 3)
+  assert.equal(new Set(accepted.map((item) => item.pending.message_id)).size, 3)
+  assert.deepEqual(accepted.map((item) => inputEventBody(item.body)), accepted.map((item, index) => ({ type: 'input_posted', message_id: item.pending.message_id, target, intent: 'continue', sequence: index + 1, expected_revision: 4, text: `补充${index + 1}`, report_results: true })))
+  assert.notEqual(inputTargetKey(target), inputTargetKey({ ...target, task_id: 'sibling' }))
+  const deferred = prepareSend({ conversationId: 'chat', target, sequence: 4, expected_revision: 4, text: '稍后处理', intent: 'defer' })
+  assert.equal(deferred.ok && deferred.body.target, target)
+  assert.equal(deferred.ok && deferred.body.intent, 'defer')
+  assert.equal(prepareSend({ conversationId: 'chat', target, sequence: 0, text: '无效顺序' }).ok, false)
+})
+test('a persisted unknown input retains the original signature, attachment bytes and target', async () => {
+  const prepared = prepareSend({ conversationId: 'chat', target: { kind: 'task', task_id: 'task' }, sequence: 1, expected_revision: 2, text: '', files: true })
+  assert.equal(prepared.ok, true)
+  if (!prepared.ok) return
+  const attachment = { hash: 'a'.repeat(64), size: 3, name: 'note.txt' }
+  const item: OutboxItem = { key: prepared.pending.message_id, method: 'message', params: { ...prepared.body, attachments: [attachment], attestation: { device_id: 'client', signature: 'original-signature' } }, created_at_ms: 1, delivery: 'unknown', uploads: [{ ...attachment, data: 'YWJj' }] }
+  const entries = new Map<string, OutboxItem>()
+  const store = { all: async () => [...entries.values()], put: async (item: OutboxItem) => { entries.set(item.key, structuredClone(item)) }, delete: async (key: string) => { entries.delete(key) } }
+  await enqueue(store, item)
+  assert.deepEqual(await enqueue(store, { ...item, delivery: 'saved', uploads: [] }), item)
+  const restored = parsePendingMessage((await store.all())[0])
+  assert.equal(restored.message_id, item.params.message_id)
+  assert.equal(restored.delivery, 'unknown')
+  assert.deepEqual(restored.target, { kind: 'task', task_id: 'task' })
+  assert.deepEqual(restored.attachments, [attachment])
+  assert.deepEqual((await store.all())[0].params, item.params)
+  assert.deepEqual((await store.all())[0].uploads, item.uploads)
+  const releasing = parsePendingMessage({ ...item, release_expected_event: 'a'.repeat(64), release_command_id: 'c'.repeat(64) })
+  assert.equal(releasing.release_expected_event, 'a'.repeat(64))
+  assert.equal(releasing.release_command_id, 'c'.repeat(64))
+  const receipt = { message_id: restored.message_id, target: restored.target, stage: 'provider_accepted', actual_turn_id: null, reason: null, retry_safe: false, control_event: null }
+  assert.equal(parseInputReceipt(receipt).actual_turn_id, null)
+  assert.equal(parseInputReceipt(receipt).control_event, null)
+  const safe = { ...receipt, stage: 'refused', retry_safe: true, control_event: 'a'.repeat(64) }
+  assert.equal(parseInputReceipt(safe).control_event, safe.control_event)
+  assert.equal(parseInputReceipt({ ...safe, control_event: 'A'.repeat(64) }).control_event, 'A'.repeat(64))
+  for (const control_event of [undefined, null, 1, '', 'a'.repeat(63), 'g'.repeat(64)]) assert.throws(() => parseInputReceipt({ ...safe, control_event }))
+  assert.throws(() => parseInputReceipt({ ...receipt, control_event: undefined }))
+  for (const rejection_code of ['input_not_saved', 'input_conflict'] satisfies NonNullable<OutboxItem['rejection_code']>[]) assert.equal(parsePendingMessage({ ...item, rejection_code }).rejection_code, rejection_code)
+  assert.throws(() => parseInputReceipt({ ...receipt, stage: 'read' }))
+  for (const stage of ['unknown', 'submitting', 'provider_accepted', 'associated']) assert.throws(() => parseInputReceipt({ ...safe, stage }))
 })
 
 test('Enter submits only after IME composition finishes and Shift Enter remains a newline', () => {
@@ -75,15 +149,15 @@ test('Enter submits only after IME composition finishes and Shift Enter remains 
 })
 test('invalid message content is rejected before a durable request is created', () => {
   const input = { conversationId: 'chat', pending: null }
-  assert.equal(prepareSend({ ...input, text: '  ' }).ok, false)
-  assert.equal(prepareSend({ ...input, text: '中'.repeat(21846) }).ok, false)
-  assert.equal(prepareSend({ ...input, text: 'a'.repeat(65536) }).ok, true)
+  assert.equal(prepareMainSend({ ...input, text: '  ' }).ok, false)
+  assert.equal(prepareMainSend({ ...input, text: '中'.repeat(21846) }).ok, false)
+  assert.equal(prepareMainSend({ ...input, text: 'a'.repeat(65536) }).ok, true)
 })
 test('report results default on and survive retries; only the exact admission receipt settles a message', () => {
-  const prepared = prepareSend({ conversationId: 'chat', text: '后台处理', pending: null, reportResults: true })
+  const prepared = prepareMainSend({ conversationId: 'chat', text: '后台处理', pending: null, reportResults: true })
   assert.equal(prepared.ok, true)
   if (!prepared.ok) return
-  const retry = prepareSend({ conversationId: 'chat', text: '后台处理', pending: prepared.pending, reportResults: false })
+  const retry = prepareMainSend({ conversationId: 'chat', text: '后台处理', pending: prepared.pending, reportResults: false })
   assert.equal(retry.ok, true)
   if (!retry.ok) return
   assert.deepEqual(retry.body, prepared.body)
@@ -101,11 +175,19 @@ test('stopped and interrupted replies are labelled; completed replies are not', 
 
 test('retry requires explicit not-started evidence and an affirmative job receipt', () => {
   const runtime: TurnRuntime = { provider: 'claude', model: null, reasoning_effort: null, generation: 'g', session_generation: 1, delivery_id: 'd', stage: 'turn_start', execution: 'not_started', attempted_at_ms: 1, switched_from: null, switch_reason: null }
-  const job: ManagerJob = { trigger: 'm', state: 'failed', retryable: true, runtime }
+  const job: ManagerJob = { scope: { kind: 'main' }, trigger: 'm', state: 'failed', retryable: true, runtime }
   assert.equal(canRetryJob(job), true)
   for (const changed of [{ ...job, runtime: null }, { ...job, pending_check: true }, { ...job, retryable: false }, { ...job, state: 'reconciling' }, { ...job, runtime: { ...runtime, execution: 'unknown' as const } }, { ...job, runtime: { ...runtime, execution: 'started' as const } }]) assert.equal(canRetryJob(changed), false)
   assert.deepEqual(parseTurnRuntime(runtime), runtime)
   assert.throws(() => parseTurnRuntime({ ...runtime, execution: 'maybe' }))
+  const progress = { kind: 'assignment_progress', assignment_id: 'assignment', revision: 1, state: 'accepted' }
+  for (const execution of ['not_started', 'started', 'unknown']) {
+    const parsed = parseWorkspaceCommand({ ...progress, execution })
+    assert.equal(parsed.kind === 'assignment_progress' && parsed.execution, execution)
+  }
+  assert.equal('execution' in parseWorkspaceCommand(progress), false)
+  assert.throws(() => parseWorkspaceCommand({ ...progress, execution: true }))
+  assert.throws(() => parseWorkspaceCommand({ ...progress, execution: 'maybe' }))
   assert.match(runtimeLabel(runtime), /默认模型，实际模型未确认/)
   assert.doesNotMatch(runtimeLabel(runtime), /medium/)
   assert.match(runtimeLabel({ ...runtime, provider: 'pi', switched_from: { provider: 'claude', model: 'opus', reasoning_effort: 'high' }, switch_reason: 'quota' }), /由 Claude Code 的 opus 切换/)
@@ -124,8 +206,8 @@ test('重试 sends the message as it was only when the reply provably did nothin
 })
 
 test('a message may be only its files', () => {
-  assert.equal(prepareSend({ conversationId: 'chat', text: ' ', pending: null }).ok, false)
-  const files = prepareSend({ conversationId: 'chat', text: ' ', pending: null, files: true })
+  assert.equal(prepareMainSend({ conversationId: 'chat', text: ' ', pending: null }).ok, false)
+  const files = prepareMainSend({ conversationId: 'chat', text: ' ', pending: null, files: true })
   assert.equal(files.ok && files.body.text, '')
 })
 

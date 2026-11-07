@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { createHash, createPublicKey, verify } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { dirname, extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -9,6 +10,8 @@ import type { ConnectionEntry, MembershipView } from '@vibeface/client/lib/node.
 import { primaryLane, shouldAutoConnect } from '@vibeface/client/identity/connection-lane.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
+import { setPublicBootstrapMode, type PublicBootstrapMode } from '@vibeface/client/lib/bootstrap.ts'
+import bootstrapFixture from '../../../../../tests/fixtures/bootstrap-catalog.json' with { type: 'json' }
 
 test('one saved entry connects itself, and several entries stay listed', () => {
   assert.equal(shouldAutoConnect({ hasInvitation: false, savedCount: 1 }), true)
@@ -52,10 +55,16 @@ const until = async (ready: () => boolean) => {
 }
 
 const remote = '6'.repeat(64), freshKey = '7'.repeat(64)
-function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), removed = false } = {}) {
+function verifyCatalogSignature(deviceId: string, domain: string, payload: Uint8Array, signature: string) {
+  const key = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(deviceId, 'hex')]), format: 'der', type: 'spki' })
+  const digest = createHash('sha256').update(payload).digest('hex')
+  assert.ok(verify(null, Buffer.from(`vibeface:message:v1:${domain}:${digest}`), key, Buffer.from(signature, 'hex')), 'invalid catalogue signature')
+}
+function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), removed = false, now = Date.now } = {}) {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const afterRender: (() => void)[] = [], timers = new Map<number, () => void>()
   const stored = storage, calls: string[] = [], navigations: string[] = []
+  if (!stored.has('vibeface.bootstrap-public-mode')) stored.set('vibeface.bootstrap-public-mode', 'off')
   const requests: { method: string; params: Record<string, unknown> }[] = []
   const setupRequests: { path: string; options: RequestInit }[] = []
   const joinStatus = { value: joining ? joinRequest(joining) : joinRequest('pending') } as { value: Record<string, unknown> }
@@ -84,10 +93,11 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     createContext: () => ({}), useContext: () => null, useCallback: (fn: unknown) => fn,
     useState(initial: unknown) {
       const index = cursor++
-      if (!(index in values)) values[index] = initial
+      if (!(index in values)) values[index] = typeof initial === 'function' ? initial() : initial
       return [values[index], (next: unknown) => { values[index] = typeof next === 'function' ? next(values[index]) : next }]
     },
     useRef(initial: unknown) { const index = cursor++; if (!(index in values)) values[index] = { current: initial }; return values[index] },
+    useMemo(read: () => unknown) { cursor++; return read() },
     useEffect(run: () => (() => void) | void, dependencies: unknown[]) {
       const index = cursor++, previous = effects.get(index)
       if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) afterRender.push(() => {
@@ -113,7 +123,8 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
       const close = () => { if (closed) return; closed = true; options.onClose?.(new Error('connection lost')) }
       sockets.push({ entry: candidate, close, drop: close })
       options.signal?.addEventListener('abort', close)
-      if (holds.has('open')) await holds.get('open')?.promise
+      const opening = holds.get(candidate.kind === 'lan' ? 'open' : `open:${candidate.address}`) ?? holds.get('open')
+      if (opening) await opening.promise
       return { deviceId: candidate.device_id, close, async request(method: string, params: Record<string, unknown> = {}) {
         if (method === 'log') return { accepted: 1 }
         calls.push(method)
@@ -155,10 +166,12 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   }
   const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }
   const sandbox = createContext({
+    Date: class extends Date { static now = now },
     localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) },
     location, addEventListener: (type: string, listener: () => void) => { if (type === 'hashchange') hashListeners.add(listener) }, removeEventListener: (_type: string, listener: () => void) => hashListeners.delete(listener),
     history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, TextDecoder, Uint8Array, Error, crypto: globalThis.crypto,
     async fetch(path: string, options: RequestInit) {
+      if (path.endsWith('/catalog')) { calls.push(`catalog:${path}`); return { ok: false, status: 503 } }
       if (path === '/api/local/info') calls.push('local-info')
       if (path === '/api/local/info') return localSession
         ? { ok: true, json: async () => ({ enabled: localState.enabled, has_session: localState.enabled, device_id: subject, network_id: network, entry: sessionEntry }) }
@@ -180,6 +193,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const modules = new Map<string, { exports: Record<string, unknown> }>(), sourceRoot = fileURLToPath(new URL('../../', import.meta.url))
   const clientRoot = fileURLToPath(new URL('../../../../../packages/client/src/', import.meta.url))
   function load(filename: string): Record<string, unknown> {
+    if (extname(filename) === '.json') return { default: JSON.parse(readFileSync(filename, 'utf8')) }
     const cached = modules.get(filename)
     if (cached) return cached.exports
     const module = { exports: {} }; modules.set(filename, module)
@@ -196,7 +210,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     return module.exports
   }
   const Provider = load(resolve(clientRoot, 'identity/context.tsx')).DeviceProvider
-  const platform = { secure: {}, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery() {} }
+  const platform = { secure: { verify: verifyCatalogSignature }, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery() {} }
   assert.equal(typeof Provider, 'function')
   type Device = ReturnType<typeof import('@vibeface/client/identity/context.tsx').useDevice>
   const render = (): Device => {
@@ -1174,6 +1188,51 @@ test('unexpected closure reconnects the same target with fresh authentication an
     assert.equal(app.verifications(), 2)
     assert.deepEqual(app.calls, [`open:${target}`, 'info', 'authenticate', 'info', 'subscribe', 'entrances', `open:${target}`, 'info', 'authenticate', 'info', 'subscribe', 'entrances'])
     assert.equal(app.timers.size, 0)
+  } finally { app.close() }
+})
+
+for (const change of ['off', 'custom', 'unchanged']) test(`an existing channel reconnects with ${change} public bootstrap settings`, async () => {
+  const source = { kind: 'custom', issuer: bootstrapFixture.issuer, https_base: 'https://catalog-a.fixture.test' } satisfies PublicBootstrapMode
+  const cache = JSON.stringify({ v: 2, source_key: `${source.issuer}:${source.https_base}`, issuer: source.issuer, https_base: source.https_base, fetched_at_ms: bootstrapFixture.now_ms, ...bootstrapFixture.catalog })
+  const storage = new Map([
+    ['vibeface.stay-disconnected', 'true'],
+    [`vibeface.network-for.${target}`, JSON.stringify(network)],
+    ['vibeface.bootstrap-catalog-cache-v1', cache],
+  ])
+  setPublicBootstrapMode({ getItem: key => storage.get(key) ?? null, setItem: (key, value) => { storage.set(key, value) } }, source)
+  const app = deviceHarness({ saved: true, storage, now: () => bootstrapFixture.now_ms })
+  const entrance = { ...entry, address: 'https://entrance.fixture.test' }
+  const fallback = { ...entry, address: 'https://gateway.fixture.test' }
+  try {
+    app.render(); await settle(); await app.render().connect(entry)
+    assert.equal(app.render().ready?.isCurrent(), true)
+    assert.deepEqual(plain(app.sockets[0].entry), entry)
+    const selected: PublicBootstrapMode = change === 'off' ? { kind: 'off' } : change === 'custom' ? { ...source, https_base: 'https://catalog-b.fixture.test' } : source
+    app.render().setPublicBootstrapMode(selected); app.render(); await settle()
+    assert.deepEqual(plain(app.render().publicBootstrap), selected)
+    assert.equal(app.stored.get('vibeface.bootstrap-catalog-cache-v1'), cache)
+    app.stored.set(`vibeface.entrances.${network}`, JSON.stringify([{ device_id: target, seq: 1, gateway_url: entrance.address, public: true, direct: [], last_ok_ms: 0 }]))
+    const unavailable = deferred(); unavailable.promise.catch(() => {}); unavailable.reject(new Error('address unavailable'))
+    app.holds.set(`open:${entry.address}`, unavailable); app.holds.set(`open:${entrance.address}`, unavailable)
+    app.sockets[0].drop()
+    assert.equal(app.timers.size, 1)
+    const [id, retry] = [...app.timers.entries()][0]
+    app.timers.delete(id); retry(); await settle()
+    assert.deepEqual(app.sockets.slice(1).map(socket => plain(socket.entry)), change === 'unchanged' ? [entry, entrance, fallback] : [entry, entrance])
+    if (change === 'unchanged') {
+      assert.deepEqual(plain(app.render().ready?.entry), fallback)
+      assert.equal(app.render().ready?.isCurrent(), true)
+      assert.equal(app.timers.size, 0)
+    } else {
+      assert.equal(app.render().phase, 'reconnecting')
+      assert.equal(app.render().ready?.isCurrent(), false)
+      app.holds.delete(`open:${entrance.address}`)
+      const [next, again] = [...app.timers.entries()][0]
+      app.timers.delete(next); again(); await settle()
+      assert.deepEqual(plain(app.render().ready?.entry), entrance)
+      assert.equal(app.render().ready?.isCurrent(), true, 'saved entrances remain usable with public bootstrap disabled or changed')
+      assert.equal(app.timers.size, 0)
+    }
   } finally { app.close() }
 })
 

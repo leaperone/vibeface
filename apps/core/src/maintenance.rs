@@ -178,6 +178,9 @@ pub struct Health {
     pub web_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_state: Option<crate::store::WriteState>,
+    /// Standing with the public infrastructure; absent when bootstrap is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<crate::net::bootstrap::BootstrapState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<PeerHealth>,
 }
@@ -490,6 +493,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: UnixStr
         version: env!("CARGO_PKG_VERSION").into(),
         web_enabled: runtime.config.web_enabled,
         write_state: (!runtime.config.public_entry).then(|| *runtime.write_state.borrow()),
+        bootstrap: runtime.bootstrap_state(),
         peers: runtime.peer_health().await,
     };
     let mut response = Response {

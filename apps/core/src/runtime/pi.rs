@@ -3,7 +3,7 @@
 //! Before a prompt is sent the Node keeps where pi writes the session, so after a restart it
 //! reads the turn back from that file and never sends it again.
 use super::claude::Processes;
-use super::executor::{Executor, SteerAck, SteerTrace};
+use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::*;
 use crate::manager::{CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
 use crate::scheduling::{SteerOutcome, SteerTarget};
@@ -43,6 +43,7 @@ pub struct Pi {
     sessions: PathBuf,
     processes: Arc<Processes>,
     live: std::sync::Mutex<HashMap<String, Live>>,
+    preparing: std::sync::Mutex<HashMap<String, watch::Sender<bool>>>,
     /// Sessions a work resumes, from its start until its pi has ended.
     resuming: std::sync::Mutex<std::collections::HashSet<String>>,
 }
@@ -54,6 +55,28 @@ impl Drop for Claim {
     fn drop(&mut self) {
         lock(&self.0.resuming).remove(&self.1);
     }
+}
+
+/// A work's cancellation entry stays registered until its process ends.
+struct Preparing(Arc<Pi>, String);
+
+impl Drop for Preparing {
+    fn drop(&mut self) {
+        lock(&self.0.preparing).remove(&self.1);
+    }
+}
+
+struct WorkFirstInput {
+    node: Arc<Runtime>,
+    network: String,
+    work: WorkSpec,
+    session: String,
+}
+
+struct PromptWrite<'a> {
+    work: Option<&'a WorkFirstInput>,
+    cancel: &'a watch::Receiver<bool>,
+    writing: &'a AtomicBool,
 }
 
 /// A turn running in this process, by its session.
@@ -337,7 +360,16 @@ impl Seen {
 }
 
 impl Rpc {
-    async fn call(&self, mut command: Value, within: Duration) -> Reply {
+    async fn call(&self, command: Value, within: Duration) -> Reply {
+        self.call_with_prompt(command, within, None).await
+    }
+
+    async fn call_with_prompt(
+        &self,
+        mut command: Value,
+        within: Duration,
+        prompt: Option<PromptWrite<'_>>,
+    ) -> Reply {
         let id = format!("vf-{}", self.next.fetch_add(1, Relaxed));
         command["id"] = json!(id);
         let (sender, answer) = oneshot::channel();
@@ -345,11 +377,16 @@ impl Rpc {
             Some(waiting) => waiting.insert(id.clone(), sender),
             None => return Reply::Unsent,
         };
-        if !self.write(&command).await {
+        let written = match prompt {
+            Some(prompt) => self.write_prompt(&command, prompt).await,
+            None if self.write(&command).await => Ok(()),
+            None => Err(Reply::Unsent),
+        };
+        if let Err(reply) = written {
             if let Some(waiting) = lock(&self.waiting).as_mut() {
                 waiting.remove(&id);
             }
-            return Reply::Unsent;
+            return reply;
         }
         let answer = tokio::time::timeout(within, answer).await;
         if let Some(waiting) = lock(&self.waiting).as_mut() {
@@ -367,6 +404,33 @@ impl Rpc {
             ),
             Ok(Err(_)) | Err(_) => Reply::Lost,
         }
+    }
+
+    async fn write_prompt(&self, line: &Value, prompt: PromptWrite<'_>) -> Result<(), Reply> {
+        let mut bytes = line.to_string().into_bytes();
+        bytes.push(b'\n');
+        let mut stdin = self.stdin.lock().await;
+        if *prompt.cancel.borrow() {
+            return Err(Reply::Refused("stopped before pi took the prompt".into()));
+        }
+        let Some(pipe) = stdin.as_mut() else {
+            return Err(Reply::Unsent);
+        };
+        let _lease = match prompt.work {
+            Some(work) => Some(
+                work.node
+                    .work_first_input_lease(&work.network, &work.work, &work.session)
+                    .await
+                    .map_err(|error| Reply::Refused(format!("{error:#}")))?,
+            ),
+            None => None,
+        };
+        if *prompt.cancel.borrow() {
+            return Err(Reply::Refused("stopped before pi took the prompt".into()));
+        }
+        prompt.writing.store(true, Relaxed);
+        pipe.write_all(&bytes).await.map_err(|_| Reply::Lost)?;
+        pipe.flush().await.map_err(|_| Reply::Lost)
     }
 
     /// One JSON line on pi's input; false when pi no longer reads it.
@@ -520,27 +584,57 @@ impl Process {
     }
 
     /// Sends the prompt and waits until pi keeps its user message, whose entry ID names the
-    /// turn. A stop before pi took it aborts what pi does first, as compacting.
+    /// turn. Once the write may have started, cancellation leaves its outcome for a probe.
     async fn begin(
         &mut self,
         after: Option<&str>,
         prompt: Value,
         within: Duration,
         cancel: &mut watch::Receiver<bool>,
+        first_input: Option<&WorkFirstInput>,
     ) -> Begin {
-        let rpc = self.rpc.clone();
-        let sent = rpc.call(prompt, within);
-        tokio::pin!(sent);
-        let mut aborted = false;
-        let reply = loop {
-            tokio::select! {
-                reply = &mut sent => break reply,
-                _ = agent::wait_for_cancel(cancel), if !aborted => {
-                    aborted = true;
-                    rpc.write(&json!({"type":"abort"})).await;
+        let stopped =
+            || ExecFailure::new(FailureKind::Rejected, "stopped before pi took the prompt");
+        if *cancel.borrow() {
+            return Begin::Refused(stopped());
+        }
+        let writing = AtomicBool::new(false);
+        let write_cancel = cancel.clone();
+        let begin = self.take_prompt(
+            after,
+            prompt,
+            within,
+            PromptWrite {
+                work: first_input,
+                cancel: &write_cancel,
+                writing: &writing,
+            },
+        );
+        tokio::select! {
+            biased;
+            _ = agent::wait_for_cancel(cancel) => {
+                if writing.load(Relaxed) {
+                    Begin::Unknown(ExecFailure::new(
+                        FailureKind::Unknown,
+                        "stopped while pi may have taken the prompt",
+                    ))
+                } else {
+                    Begin::Refused(stopped())
                 }
             }
-        };
+            result = begin => result,
+        }
+    }
+
+    async fn take_prompt(
+        &mut self,
+        after: Option<&str>,
+        prompt: Value,
+        within: Duration,
+        write: PromptWrite<'_>,
+    ) -> Begin {
+        let rpc = self.rpc.clone();
+        let reply = rpc.call_with_prompt(prompt, within, Some(write)).await;
         match reply {
             Reply::Done(data) if data["disposition"] == "handled" => {
                 return Begin::Refused(ExecFailure::new(
@@ -549,7 +643,9 @@ impl Process {
                 ));
             }
             Reply::Done(_) => {}
-            Reply::Refused(error) => return Begin::Refused(failure(error, FailureKind::Rejected)),
+            Reply::Refused(error) => {
+                return Begin::Refused(failure(error, FailureKind::Rejected));
+            }
             Reply::Unsent => {
                 return Begin::Refused(ExecFailure::new(
                     FailureKind::Lost,
@@ -609,6 +705,18 @@ impl Process {
 }
 
 impl Pi {
+    pub(super) async fn native_directory(&self, session: &str) -> Result<PathBuf> {
+        let cwd = self
+            .pointer(session)?
+            .context("the pi session has no local pointer")?
+            .cwd;
+        ensure!(
+            cwd.is_absolute(),
+            "the pi session directory is not absolute"
+        );
+        Ok(cwd)
+    }
+
     /// Ends the pi processes an earlier Node run left, so their turns are read back as they are.
     pub(crate) fn new(data_dir: &Path) -> Self {
         Self {
@@ -616,6 +724,7 @@ impl Pi {
             sessions: ProviderRoots::new(data_dir).pi_sessions,
             processes: Arc::new(Processes::open(data_dir.join(PIDFILE))),
             live: Default::default(),
+            preparing: Default::default(),
             resuming: Default::default(),
         }
     }
@@ -755,16 +864,32 @@ impl Pi {
         &self,
         launch: &Launch,
         session: &str,
+        cancel: &mut watch::Receiver<bool>,
     ) -> Result<(Process, Option<String>), ManagerError> {
-        let before_start = |stage, failure| ManagerError {
+        let before_start = |stage, outcome, failure| ManagerError {
             stage,
-            outcome: ManagerFailure::Failed,
+            outcome,
             start: crate::manager::StartEvidence::NotStarted,
             session_id: None,
             failure,
         };
-        let process = Process::spawn(launch, &self.processes, &self.sessions)
-            .map_err(|failure| before_start(ProviderStage::Launch, failure))?;
+        let stopped = || {
+            ExecFailure::new(
+                FailureKind::Rejected,
+                "stopped before pi opened the session",
+            )
+        };
+        if *cancel.borrow() {
+            return Err(before_start(
+                ProviderStage::SessionStart,
+                ManagerFailure::Cancelled,
+                stopped(),
+            ));
+        }
+        let process =
+            Process::spawn(launch, &self.processes, &self.sessions).map_err(|failure| {
+                before_start(ProviderStage::Launch, ManagerFailure::Failed, failure)
+            })?;
         let opened = async {
             let state = match process.rpc.call(json!({"type":"get_state"}), ANSWER).await {
                 Reply::Done(state) => state,
@@ -780,14 +905,23 @@ impl Pi {
             let file = PathBuf::from(state["sessionFile"].as_str().unwrap_or_default());
             self.keep(session, &file, &launch.cwd, process.group)
                 .map_err(|error| own(format!("keep where pi writes the session: {error:#}")))
-        }
-        .await;
+        };
+        let opened = tokio::select! {
+            biased;
+            _ = agent::wait_for_cancel(cancel) => Err(stopped()),
+            result = opened => result,
+        };
         match opened {
             Ok(after) => Ok((process, after)),
             Err(failure) => {
                 let tail = process.end().await;
                 Err(before_start(
                     ProviderStage::SessionStart,
+                    if *cancel.borrow() {
+                        ManagerFailure::Cancelled
+                    } else {
+                        ManagerFailure::Failed
+                    },
                     with_tail(failure, &tail),
                 ))
             }
@@ -905,10 +1039,13 @@ impl Pi {
         if *cancel.borrow() {
             return Err(stopped(previous));
         }
-        let (mut process, after) = self.open(&launch, &session).await.map_err(|failure| {
-            stage.enter(failure.stage);
-            error(failure.outcome, previous, failure.failure)
-        })?;
+        let (mut process, after) =
+            self.open(&launch, &session, &mut cancel)
+                .await
+                .map_err(|failure| {
+                    stage.enter(failure.stage);
+                    error(failure.outcome, previous, failure.failure)
+                })?;
         let native = Some(session.as_str());
         stage.enter(ProviderStage::Record);
         if let Some(turn) = &config.codex_turn
@@ -964,7 +1101,7 @@ impl Pi {
         stage.enter(ProviderStage::TurnStart);
         *start.lock().unwrap() = crate::manager::StartEvidence::Unknown;
         let turn = match process
-            .begin(after.as_deref(), prompt, within, &mut cancel)
+            .begin(after.as_deref(), prompt, within, &mut cancel, None)
             .await
         {
             Begin::Started(turn) => turn,
@@ -998,7 +1135,16 @@ impl Pi {
         );
         stage.enter(ProviderStage::Record);
         let recorded = match &config.codex_turn {
-            Some(record) => (record.record)(session.clone(), Some(turn.clone())).await,
+            Some(record) => {
+                async {
+                    (record.record)(session.clone(), Some(turn.clone())).await?;
+                    if let Some(started) = &record.started {
+                        started(turn.clone()).await?;
+                    }
+                    anyhow::Ok(())
+                }
+                .await
+            }
             None => Ok(()),
         };
         let outcome = match recorded {
@@ -1078,21 +1224,27 @@ impl Pi {
     async fn run_work(
         self: Arc<Self>,
         launch: Launch,
-        session: String,
+        first_input: WorkFirstInput,
         prompt: Value,
         report: mpsc::UnboundedSender<Report>,
+        mut cancel: watch::Receiver<bool>,
     ) {
+        let session = first_input.session.clone();
         let send = |item| {
             let _ = report.send(item);
         };
-        let (mut process, after) = match self.open(&launch, &session).await {
+        let (mut process, after) = match self.open(&launch, &session, &mut cancel).await {
             Ok(opened) => opened,
             Err(error) => return send(Report::Signal(Signal::StartRejected(error.failure))),
         };
-        // A work is stopped through `interrupt`, once its turn runs.
-        let mut unstoppable = watch::channel(false).1;
         let turn = match process
-            .begin(after.as_deref(), prompt, PREFLIGHT, &mut unstoppable)
+            .begin(
+                after.as_deref(),
+                prompt,
+                PREFLIGHT,
+                &mut cancel,
+                Some(&first_input),
+            )
             .await
         {
             Begin::Started(turn) => turn,
@@ -1107,7 +1259,7 @@ impl Pi {
                 return send(Report::Probe);
             }
         };
-        // Live before it runs, so a stop finds it.
+        // Keep the turn interruptible before reporting its native handle.
         let stopping = Arc::new(AtomicBool::new(false));
         lock(&self.live).insert(
             session.clone(),
@@ -1123,8 +1275,19 @@ impl Pi {
         }));
         let mut seen = Seen::default();
         let settled = loop {
-            let Some(event) = process.events.recv().await else {
-                break false;
+            let event = tokio::select! {
+                biased;
+                _ = agent::wait_for_cancel(&mut cancel), if !stopping.load(Relaxed) => {
+                    stopping.store(true, Relaxed);
+                    if !process.rpc.write(&json!({"type":"abort"})).await {
+                        break false;
+                    }
+                    continue;
+                }
+                event = process.events.recv() => match event {
+                    Some(event) => event,
+                    None => break false,
+                },
             };
             for update in seen.apply(&event) {
                 send(Report::Progress(update));
@@ -1336,9 +1499,29 @@ impl Executor for Pi {
                 args: launch_args,
             };
             let (sender, mut reports) = mpsc::unbounded_channel();
-            let run = node.pi.clone().run_work(launch, session, prompt, sender);
+            let (stop, cancel) = watch::channel(false);
+            {
+                let mut preparing = lock(&self.preparing);
+                ensure!(
+                    !preparing.contains_key(&work.work_id),
+                    "pi is already preparing this work"
+                );
+                preparing.insert(work.work_id.clone(), stop);
+            }
+            let preparing = Preparing(node.pi.clone(), work.work_id.clone());
+            let first_input = WorkFirstInput {
+                node: node.clone(),
+                network: network.to_owned(),
+                work: work.clone(),
+                session,
+            };
+            let run = node
+                .pi
+                .clone()
+                .run_work(launch, first_input, prompt, sender, cancel);
             tokio::spawn(async move {
                 run.await;
+                drop(preparing);
                 drop(claim);
             });
             let (node, network, conversation, work_id) = (
@@ -1429,6 +1612,12 @@ impl Executor for Pi {
 
     fn interrupt<'a>(&'a self, work: &'a WorkRecord) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            if work.state.handle().is_none()
+                && let Some(stop) = lock(&self.preparing).get(&work.work_id)
+            {
+                let _ = stop.send(true);
+                return Ok(());
+            }
             let handle = work.state.handle().context("the work has no turn")?;
             let live = self
                 .live_turn(&handle.thread_id, &handle.turn_id)
@@ -1446,22 +1635,36 @@ impl Executor for Pi {
         &'a self,
         into: &'a SteerTarget,
         message_id: &'a str,
-        text: &'a str,
+        input: &'a SteerInput,
     ) -> BoxFuture<'a, SteerAck> {
-        let message = format!(
-            "{STEER_LEAD} Take it into account and answer it in this same reply.\n\n{}",
-            json!({"message_id":message_id,"text":text})
-        );
+        let message = format!("{STEER_LEAD}\n\n{}", input.message(message_id));
         Box::pin(async move {
             let Some(live) = self.live_turn(&into.thread_id, &into.turn_id) else {
                 return SteerAck::Refused("the pi turn is not running".into());
             };
+            let images: Vec<Value> = input
+                .files
+                .iter()
+                .filter(|file| file.is_image())
+                .map(|file| json!({"type":"image","data":file.base64(),"mimeType":file.mime_type}))
+                .collect();
+            if input
+                .files
+                .iter()
+                .filter(|file| file.is_image())
+                .any(|file| file.bytes.len() as u64 > MAX_IMAGE)
+            {
+                return SteerAck::Refused("pi images must be at most 10 MiB".into());
+            }
             match live
                 .rpc
-                .call(json!({"type":"steer","message":message}), ANSWER)
+                .call(
+                    json!({"type":"steer","message":message,"images":images}),
+                    ANSWER,
+                )
                 .await
             {
-                Reply::Done(_) => SteerAck::Accepted,
+                Reply::Done(_) => SteerAck::Accepted { turn_id: None },
                 Reply::Refused(error) => SteerAck::Refused(error),
                 Reply::Unsent => SteerAck::Refused("the pi turn ended".into()),
                 Reply::Lost => SteerAck::Unknown,
@@ -1476,31 +1679,47 @@ impl Executor for Pi {
     ) -> BoxFuture<'a, Option<SteerTrace>> {
         Box::pin(async move {
             let pointer = self.pointer(&into.thread_id).ok()??;
-            if self.live_turn(&into.thread_id, &into.turn_id).is_some()
-                || self.processes.tracked(pointer.group)
-            {
-                return Some(SteerTrace::Pending);
-            }
             let entries = entries(&pointer.file).ok()?;
             let Some(turn) = entries.iter().position(|entry| entry["id"] == into.turn_id) else {
                 return Some(SteerTrace::TargetUnseen);
             };
-            let run = run(&entries, turn);
             let marker = format!("\"message_id\":{}", json!(message_id));
-            let Some(at) = run.iter().position(|entry| {
+            let Some(at) = entries.iter().position(|entry| {
                 is_message(entry, "user") && text(&entry["message"]).contains(&marker)
             }) else {
-                return Some(SteerTrace::NotArrived);
+                return Some(
+                    if self.live_turn(&into.thread_id, &into.turn_id).is_some()
+                        || self.processes.tracked(pointer.group)
+                    {
+                        SteerTrace::Pending
+                    } else {
+                        SteerTrace::NotArrived
+                    },
+                );
             };
-            let answered = run[at..]
+            let actual = entries[..=at]
+                .iter()
+                .rposition(|entry| {
+                    is_message(entry, "user") && !text(&entry["message"]).starts_with(STEER_LEAD)
+                })
+                .unwrap_or(turn);
+            let turn_id = entries[actual]["id"].as_str()?.to_owned();
+            if self.live_turn(&into.thread_id, &turn_id).is_some() {
+                return Some(SteerTrace::Received { turn_id });
+            }
+            let actual_run = run(&entries, actual);
+            let answered = actual_run[at - actual..]
                 .iter()
                 .rev()
                 .find(|entry| is_message(entry, "assistant"))
                 .is_some_and(|entry| entry["message"]["stopReason"] == "stop");
-            Some(SteerTrace::Ended(match answered {
-                true => SteerOutcome::Answered,
-                false => SteerOutcome::Unfinished,
-            }))
+            Some(SteerTrace::Ended {
+                turn_id,
+                outcome: match answered {
+                    true => SteerOutcome::Answered,
+                    false => SteerOutcome::Unfinished,
+                },
+            })
         })
     }
 }
@@ -1723,20 +1942,22 @@ mod tests {
     async fn node(dir: &Path, mode: &str) -> Result<(Arc<Runtime>, String)> {
         let data = dir.join("node");
         config::private_dir(&data)?;
-        let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![dir.to_owned()], false);
         configuration.providers.execution = [Provider::Pi].into();
         configuration.save(&data)?;
         config::private_write(&data.join("data-epoch.json"), &config::data_epoch_marker())?;
         let identity = LocalIdentity::generate();
         config::private_write(&data.join("identity.json"), &serde_json::to_vec(&identity)?)?;
         let node = Arc::new(Runtime::open(&data).await?);
+        let admin = LocalIdentity::generate();
         let state = NetworkState::new(Genesis::create(
             &LocalIdentity::generate(),
-            Member::client(&LocalIdentity::generate(), "admin", true)?,
+            Member::client(&admin, "admin", true)?,
             Member::node(&node.identity, "node")?,
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state).await?;
+        super::super::claude::tests::conversation(&node, &admin, &network, "c", "m1").await?;
         let mut local = node.providers.lock().unwrap();
         local.bins.insert(Provider::Pi, fake());
         let variables = env(dir, mode).into_iter().map(|(k, v)| (k, Some(v)));
@@ -1758,6 +1979,33 @@ mod tests {
         let sends = (node.start_work(pi.as_ref(), network, &spec, None, &Value::Null)).await?;
         ensure!(!sends, "the Node sends a pi work itself");
         Ok(())
+    }
+
+    fn gate_state(node: &Runtime, dir: &Path) -> Result<()> {
+        node.providers.lock().unwrap().env.apply(
+            Provider::Pi,
+            BTreeMap::from([(
+                "FAKE_PI_STATE_GATE".into(),
+                Some(dir.join("state-release").display().to_string()),
+            )]),
+        )
+    }
+
+    async fn state_waiting(dir: &Path) -> Result<u32> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(pid) = log(dir)
+                    .iter()
+                    .find(|entry| entry["state_waiting"].is_string())
+                    .and_then(|entry| entry["pid"].as_u64())
+                {
+                    return pid as u32;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("pi reached the get_state gate")
     }
 
     /// The work `w-1` once its state is `done`.
@@ -1789,15 +2037,16 @@ mod tests {
             launch
                 .env
                 .insert("PI_CODING_AGENT_DIR".into(), user.display().to_string());
-            let (mut process, _) = pi.open(&launch, name).await?;
             let (_cancel, mut cancel) = watch::channel(false);
+            let (mut process, _) = pi.open(&launch, name, &mut cancel).await?;
             assert!(matches!(
                 process
                     .begin(
                         None,
                         json!({"type":"prompt", "message":"hello"}),
                         ANSWER,
-                        &mut cancel
+                        &mut cancel,
+                        None,
                     )
                     .await,
                 Begin::Started(_)
@@ -1960,7 +2209,32 @@ mod tests {
         let dir = scratch("steer");
         let pi = Arc::new(Pi::new(&dir));
         let turns = Turns::default();
-        let config = bot(&dir, &pi, "wait", Some(&turns));
+        let mut config = bot(&dir, &pi, "wait", Some(&turns));
+        let native_starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_starts = native_starts.clone();
+        let start_ready = Arc::new(tokio::sync::Notify::new());
+        let marked = start_ready.clone();
+        config.codex_turn.as_mut().unwrap().started = Some(Arc::new(move |turn| {
+            recorded_starts.lock().unwrap().push(turn);
+            marked.notify_one();
+            Box::pin(async { Ok(()) })
+        }));
+        let bytes = b"\x89PNG\r\n\x1a\nfull-fixture-image".to_vec();
+        let image_path = dir.join("image.png");
+        std::fs::write(&image_path, &bytes)?;
+        let input = SteerInput {
+            text: "also this".into(),
+            files: vec![super::super::executor::PreparedAttachment {
+                attachment: Attachment {
+                    hash: crate::crypto::digest(&bytes),
+                    size: bytes.len() as u64,
+                    name: "image.png".into(),
+                },
+                local_path: image_path,
+                mime_type: "image/png".into(),
+                bytes: bytes.clone(),
+            }],
+        };
         let (_stop, cancel) = watch::channel(false);
         let reply = run_manager(
             &config,
@@ -1971,7 +2245,11 @@ mod tests {
             |_| async { anyhow::Ok(()) },
         );
         let steer = async {
+            tokio::time::timeout(Duration::from_secs(5), start_ready.notified())
+                .await
+                .expect("the held turn reports its actual native start");
             let (thread_id, turn_id) = started(&turns).await;
+            assert_eq!(*native_starts.lock().unwrap(), vec![turn_id.clone()]);
             let into = SteerTarget {
                 provider: Provider::Pi,
                 attempt_id: "a".into(),
@@ -1979,23 +2257,46 @@ mod tests {
                 turn_id,
             };
             assert_eq!(
-                pi.send_turn(&into, "m-1", "also this").await,
-                SteerAck::Accepted
+                pi.send_turn(&into, "m-1", &input).await,
+                SteerAck::Accepted { turn_id: None }
             );
             into
         };
         let (reply, into) = tokio::join!(reply, steer);
         assert_eq!(reply?.output, "Got it");
+        let pointer = pi.pointer(&into.thread_id)?.context("pi session")?;
+        let entries = entries(&pointer.file)?;
+        let content = entries
+            .iter()
+            .find(|entry| text(&entry["message"]).contains("\"message_id\":\"m-1\""))
+            .context("steered input")?["message"]["content"]
+            .clone();
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(
+            content[1]["data"],
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
         assert_eq!(
             pi.read_back(&into, "m-1").await,
-            Some(SteerTrace::Ended(SteerOutcome::Answered))
+            Some(SteerTrace::Ended {
+                turn_id: into.turn_id.clone(),
+                outcome: SteerOutcome::Answered
+            })
         );
         assert_eq!(
             pi.read_back(&into, "m-2").await,
             Some(SteerTrace::NotArrived)
         );
         assert_eq!(
-            pi.send_turn(&into, "m-3", "late").await,
+            pi.send_turn(
+                &into,
+                "m-3",
+                &SteerInput {
+                    text: "late".into(),
+                    files: vec![]
+                }
+            )
+            .await,
             SteerAck::Refused("the pi turn is not running".into())
         );
         std::fs::remove_dir_all(&dir)?;
@@ -2161,6 +2462,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_preparing_work_rechecks_execution_and_roots_before_its_first_prompt() -> Result<()> {
+        for revoked in ["unchanged", "execution", "roots"] {
+            let dir = scratch(revoked);
+            let (node, network) = node(&dir, "reply").await?;
+            gate_state(&node, &dir)?;
+            dispatch(&node, &network, &dir).await?;
+            let pid = state_waiting(&dir).await?;
+            assert!(prompts(&dir).is_empty());
+            match revoked {
+                "execution" => {
+                    node.providers.lock().unwrap().switches.execution.clear();
+                }
+                "roots" => {
+                    node.settings.lock().unwrap().roots.clear();
+                }
+                _ => {}
+            }
+            std::fs::write(dir.join("state-release"), "")?;
+            let record = work(&node, WorkState::finished).await?;
+            assert_eq!(
+                record.state,
+                WorkState::Finished {
+                    outcome: if revoked == "unchanged" {
+                        WorkOutcome::Completed
+                    } else {
+                        WorkOutcome::Rejected
+                    },
+                },
+                "{revoked}"
+            );
+            assert_eq!(
+                prompts(&dir),
+                if revoked == "unchanged" {
+                    vec![json!("do it")]
+                } else {
+                    vec![]
+                },
+                "{revoked}"
+            );
+            assert!(ended(pid).await, "pi ended after {revoked}");
+            std::fs::remove_dir_all(&dir)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_preparing_work_can_be_stopped_without_a_turn_or_get_state_reply() -> Result<()> {
+        let dir = scratch("preparing-stop");
+        let (node, network) = node(&dir, "reply").await?;
+        gate_state(&node, &dir)?;
+        dispatch(&node, &network, &dir).await?;
+        let pid = state_waiting(&dir).await?;
+        let preparing = node
+            .store
+            .lock()
+            .await
+            .work_record("w-1")?
+            .context("work")?;
+        assert!(preparing.state.handle().is_none());
+        tokio::time::timeout(Duration::from_secs(2), node.stop_work(&network, "c", "w-1"))
+            .await??;
+        node.reconcile_works(&network).await?;
+        assert_eq!(
+            work(&node, WorkState::finished).await?.state,
+            WorkState::Finished {
+                outcome: WorkOutcome::Rejected
+            }
+        );
+        assert!(ended(pid).await, "cancelling get_state ended pi");
+        std::fs::write(dir.join("state-release"), "")?;
+        assert!(prompts(&dir).is_empty());
+        assert!(!lock(&node.pi.preparing).contains_key("w-1"));
+        assert!(node.store.lock().await.stop_requests()?.is_empty());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_prompt_never_wins_a_ready_or_queued_stdin_write() -> Result<()> {
+        for queued in [false, true] {
+            let dir = scratch("cancel-before-write");
+            let pi = Pi::new(&dir);
+            let (stop, mut cancel) = watch::channel(false);
+            let (mut process, after) = pi
+                .open(&launch(&dir, "reply", "s-1"), "s-1", &mut cancel)
+                .await?;
+            let rpc = process.rpc.clone();
+            let stdin = if queued {
+                Some(rpc.stdin.lock().await)
+            } else {
+                None
+            };
+            if !queued {
+                stop.send(true)?;
+            }
+            let result = {
+                let begin = process.begin(
+                    after.as_deref(),
+                    json!({"type":"prompt", "message":"do it"}),
+                    ANSWER,
+                    &mut cancel,
+                    None,
+                );
+                tokio::pin!(begin);
+                if queued {
+                    tokio::select! {
+                        result = &mut begin => panic!("the prompt wrote through a held stdin lock: {}", matches!(result, Begin::Started(_))),
+                        _ = tokio::task::yield_now() => {}
+                    }
+                    stop.send(true)?;
+                    drop(stdin);
+                }
+                begin.await
+            };
+            assert!(
+                matches!(result, Begin::Refused(_)),
+                "cancelled before writing"
+            );
+            process.end().await;
+            assert!(prompts(&dir).is_empty());
+            std::fs::remove_dir_all(&dir)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_after_the_prompt_write_keeps_an_unknown_outcome() -> Result<()> {
+        let dir = scratch("cancel-after-write");
+        let pi = Pi::new(&dir);
+        let (stop, mut cancel) = watch::channel(false);
+        let (mut process, after) = pi
+            .open(&launch(&dir, "prompt-pending", "s-1"), "s-1", &mut cancel)
+            .await?;
+        let stopping = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while prompts(&dir).is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            stop.send(true)?;
+            anyhow::Ok(())
+        };
+        let (result, cancelled) = tokio::join!(
+            process.begin(
+                after.as_deref(),
+                json!({"type":"prompt", "message":"do it"}),
+                ANSWER,
+                &mut cancel,
+                None
+            ),
+            stopping,
+        );
+        cancelled?;
+        assert!(matches!(result, Begin::Unknown(_)));
+        process.end().await;
+        assert_eq!(prompts(&dir), ["do it"]);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_work_given_a_thread_goes_on_in_that_session() -> Result<()> {
         let dir = scratch("resume");
         let (node, network) = node(&dir, "reply").await?;
@@ -2170,6 +2633,8 @@ mod tests {
             .into_iter()
             .find_map(|work| work.thread_id)
             .context("a session")?;
+        assert_eq!(node.pi.native_directory(&session).await?, dir);
+        assert!(node.pi.native_directory("missing-session").await.is_err());
         let file = node.pi.pointer(&session)?.context("pointer")?.file;
         let pi = node.pi.clone();
         let elsewhere = dir.join("elsewhere");
@@ -2190,14 +2655,14 @@ mod tests {
             .err()
             .context("another directory is refused")?;
         assert!(
-            format!("{refused:#}").contains("this pi session runs in"),
+            format!("{refused:#}")
+                .contains("declared work directory differs from the native session"),
             "{refused:#}"
         );
-        // A work that names no directory goes on where the session runs.
+        // A continuation uses the session's verified directory.
         let spec = WorkSpec {
             prompt: "again".into(),
             thread: Some(session.clone()),
-            cwd: String::new(),
             ..spec("w-2", &node.identity.device_id()?, &dir)
         };
         node.store.lock().await.accept_work_fixture(
@@ -2252,6 +2717,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_running_pi_work_retries_native_abort_until_it_settles() -> Result<()> {
+        let dir = scratch("abort-retry");
+        let (node, network) = node(&dir, "retry-abort").await?;
+        dispatch(&node, &network, &dir).await?;
+        let running = work(&node, |state| state.handle().is_some()).await?;
+        let handle = running.state.handle().context("native handle")?;
+        let group = node
+            .pi
+            .pointer(&handle.thread_id)?
+            .context("pointer")?
+            .group;
+        let aborts = || {
+            log(&dir)
+                .iter()
+                .filter(|entry| entry["abort"] == true)
+                .count()
+        };
+        let mut absent_handle = handle.clone();
+        absent_handle.turn_id.push_str("-missing");
+        let absent = WorkRecord {
+            state: WorkState::Running {
+                handle: absent_handle,
+            },
+            ..running.clone()
+        };
+        let missing = node
+            .pi
+            .interrupt(&absent)
+            .await
+            .expect_err("an unknown native handle must not cancel preparation");
+        assert!(format!("{missing:#}").contains("pi is not running this work"));
+        assert_eq!(aborts(), 0);
+        node.stop_work(&network, "c", "w-1").await?;
+        wait_for_abort(&dir).await?;
+        assert_eq!(aborts(), 1, "the first native abort reached pi");
+        let first = node
+            .store
+            .lock()
+            .await
+            .work_record("w-1")?
+            .context("work")?;
+        assert!(matches!(first.state, WorkState::Interrupting { .. }));
+        assert_eq!(
+            node.pi.probe(&first).await?,
+            Probe::Running {
+                turn_id: handle.turn_id.clone(),
+                epoch: 0
+            }
+        );
+        let mut held = node
+            .store
+            .lock()
+            .await
+            .stop_requests()?
+            .into_iter()
+            .find(|request| request.work_id == "w-1")
+            .context("the unsettled turn keeps its stop request")?;
+        held.deadline_ms = now_ms() - 1;
+        node.store.lock().await.save_stop_request(&held)?;
+        node.reconcile_works(&network).await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while aborts() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the stop retry sent another native abort")?;
+        let finished = work(&node, WorkState::finished).await?;
+        assert_eq!(
+            finished.state,
+            WorkState::Finished {
+                outcome: WorkOutcome::Interrupted
+            }
+        );
+        assert_eq!(
+            node.pi.probe(&running).await?,
+            Probe::Terminal {
+                turn_id: handle.turn_id.clone(),
+                status: TurnStatus::Interrupted,
+                text: "Working".into(),
+                error: None,
+            }
+        );
+        assert!(ended(group).await, "settled pi ended its process");
+        assert!(node.store.lock().await.stop_requests()?.is_empty());
+        assert!(!lock(&node.pi.preparing).contains_key("w-1"));
+        assert!(
+            node.pi
+                .live_turn(&handle.thread_id, &handle.turn_id)
+                .is_none()
+        );
+        node.reconcile_works(&network).await?;
+        assert_eq!(aborts(), 2, "a settled turn receives no further abort");
+        assert_eq!(prompts(&dir), ["do it"], "the prompt was never resent");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_work_whose_pi_died_is_read_back_from_its_session_and_never_sent_again() -> Result<()>
     {
         let dir = scratch("crash");
@@ -2284,44 +2848,34 @@ mod tests {
     async fn a_restart_ends_the_pi_its_last_run_left_and_reads_the_work_back() -> Result<()> {
         use std::os::unix::process::CommandExt as _;
         let dir = scratch("restart");
-        let pi = Arc::new(Pi::new(&dir));
-        let (sender, mut reports) = mpsc::unbounded_channel();
-        let prompt = json!({"type":"prompt","message":"do it"});
-        tokio::spawn(pi.clone().run_work(
-            launch(&dir, "wait", "s-1"),
-            "s-1".into(),
-            prompt,
-            sender,
-        ));
-        while !matches!(
-            reports.recv().await,
-            Some(Report::Signal(Signal::TurnStarted { .. })) | None
-        ) {}
-        let left = pi.pointer("s-1")?.context("pointer")?.group;
+        let (node, network) = node(&dir, "wait").await?;
+        dispatch(&node, &network, &dir).await?;
+        let running = work(&node, |state| state.handle().is_some()).await?;
+        let session = running.state.thread().context("thread")?;
+        let left = node.pi.pointer(session)?.context("pointer")?.group;
         let mut stranger = std::process::Command::new("/bin/sleep")
             .arg("30")
             .process_group(0)
             .spawn()?;
-        let pidfile = dir.join(PIDFILE);
+        let data = dir.join("node");
+        let pidfile = data.join(PIDFILE);
         let mut recorded = std::fs::read_to_string(&pidfile).unwrap_or_default();
         recorded.push_str(&format!("{} {}\n", stranger.id(), fake().display()));
         std::fs::write(&pidfile, recorded)?;
-        let restarted = Pi::new(&dir);
+        let restarted = Pi::new(&data);
         assert!(ended(left).await, "the restart ended the pi it left");
         assert!(!pidfile.exists());
         assert!(
             stranger.try_wait()?.is_none(),
             "a process the Node did not start is left alone"
         );
-        let mut pointer = restarted.pointer("s-1")?.context("pointer")?;
+        let mut pointer = restarted.pointer(session)?.context("pointer")?;
         pointer.group = stranger.id();
         config::private_write(
-            &restarted.pointer_path("s-1")?,
+            &restarted.pointer_path(session)?,
             &serde_json::to_vec(&pointer)?,
         )?;
-        let (mut work, _) = crate::work::accept(spec("w-1", "t", &dir), 0);
-        crate::work::transition(&mut work, Signal::ThreadCreated("s-1".into()));
-        let probe = restarted.probe(&work).await?;
+        let probe = restarted.probe(&running).await?;
         assert!(
             matches!(probe, Probe::Terminal { .. }),
             "a reused group is not the work's pi: {probe:?}"
@@ -2353,7 +2907,13 @@ mod tests {
         let (mut work, _) = crate::work::accept(spec("w-1", "t", &dir), 0);
         crate::work::transition(&mut work, Signal::ThreadCreated("s-1".into()));
         assert_eq!(pi.probe(&work).await?, Probe::NotStarted);
-        let (process, _) = pi.open(&launch(&dir, "reply", "s-1"), "s-1").await?;
+        let (process, _) = pi
+            .open(
+                &launch(&dir, "reply", "s-1"),
+                "s-1",
+                &mut watch::channel(false).1,
+            )
+            .await?;
         assert!(pi.probe(&work).await.is_err());
         process.end().await;
         assert!(pi.pointer("s-1")?.is_some());
@@ -2496,16 +3056,23 @@ mod tests {
     #[tokio::test]
     async fn a_prompt_pi_refuses_rejects_the_work() -> Result<()> {
         let dir = scratch("refuse");
-        let pi = Arc::new(Pi::new(&dir));
-        let (sender, mut reports) = mpsc::unbounded_channel();
-        let prompt = json!({"type":"prompt","message":"do it"});
-        pi.run_work(launch(&dir, "refuse", "s-1"), "s-1".into(), prompt, sender)
-            .await;
-        let Some(Report::Signal(Signal::StartRejected(failure))) = reports.recv().await else {
-            panic!("the work was not rejected");
-        };
-        assert_eq!(failure.kind, FailureKind::MissingKey);
-        assert!(reports.recv().await.is_none());
+        let (node, network) = node(&dir, "refuse").await?;
+        dispatch(&node, &network, &dir).await?;
+        assert_eq!(
+            work(&node, WorkState::finished).await?.state,
+            WorkState::Finished {
+                outcome: WorkOutcome::Rejected
+            }
+        );
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .work(&network, "w-1")?
+                .context("work")?
+                .failure,
+            Some(FailureKind::MissingKey)
+        );
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

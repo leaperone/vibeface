@@ -42,8 +42,12 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
   // Answered here, the result line takes focus after the controls disappear.
   const answering = useRef(false)
   const id = question.question_id
+  const inputTarget = question.target
+  const taskScope = inputTarget?.kind === 'task' || inputTarget?.kind === 'channel_task' ? inputTarget.task_id : null
   const standing = question.answer?.text ?? answer
   const settled = settledAnswer(standing, workspace.answered[id], question.answer?.author, ready?.principal.device_id)
+  const displayAnswer = (value: string) => { const choice = question.choices.find((choice) => choice.label === value); return choice?.action === 'allow_once' ? '允许本次' : choice?.action === 'deny' ? '拒绝' : value }
+  const approvalChoices = question.choices.filter((choice) => choice.action === 'allow_once' || choice.action === 'deny')
   const { ask, detail } = questionParts(question.text)
   const node = nodeName(question.about.node, { nodes: workspace.nodes, directory })
   // Read back later, an answered approval says which task on which device it settled.
@@ -51,8 +55,8 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
   const about = heldTask ? <span className="flex min-w-0 items-center gap-1"><ListChecks aria-hidden="true" className="size-3.5 shrink-0" /><span className="sr-only">任务 </span><span className="min-w-0 truncate">{heldTask}</span>
     <span aria-hidden="true">·</span><Laptop aria-hidden="true" className="size-3.5 shrink-0" /><span className="sr-only">设备 </span><span className="min-w-0 truncate">{node}</span></span> : null
   if (settled) return <Settled ask={ask} detail={detail} about={about} focus={answering.current} role={standing === undefined || settled.beaten ? "status" : undefined}
-    mark={settled.beaten ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : declined(settled.text) ? <CircleX aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}>
-    <span className="text-foreground">{settled.elsewhere ? `已由另一端回答：${settled.text}` : answerLabel(settled.text)}</span>
+    mark={settled.beaten ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : declined(displayAnswer(settled.text)) ? <CircleX aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}>
+    <span className="text-foreground">{settled.elsewhere ? `已由另一端回答：${displayAnswer(settled.text)}` : answerLabel(displayAnswer(settled.text))}</span>
   </Settled>
 
   if (question.closed) return <Settled ask={ask} detail={detail} about={about} mark={<CircleSlash aria-hidden="true" className="mt-0.5 size-4 shrink-0" />}>已失效</Settled>
@@ -90,7 +94,12 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
   // Answered in 待处理, the card leaves; the toast leads to the chat the answer went to.
   const settledToast = () => {
     const bot = question.bot
-    toast("已回答", { tone: "success", action: bot ? { label: "查看", onClick: () => { void navigate({ to: "/b/$botId", params: { botId: bot.bot_id } }) } } : undefined })
+    toast("已回答", { tone: "success", action: inputTarget && (taskScope || bot) ? { label: "查看", onClick: () => {
+      if (taskScope) void navigate({ to: '/tasks/$taskId', params: { taskId: taskScope } })
+      else if (inputTarget?.kind === 'channel_member') void navigate({ to: '/channels/$channelId', params: { channelId: inputTarget.channel_id } })
+      else if (bot && inputTarget?.kind === 'work') void navigate({ to: '/b/$botId/work/$workId', params: { botId: bot.bot_id, workId: inputTarget.work_id } })
+      else if (bot) void navigate({ to: "/b/$botId", params: { botId: bot.bot_id }, ...(inputTarget?.kind === 'routine' ? { search: { routine: inputTarget.trigger } } : {}) })
+    } } : undefined })
   }
   return <ActionCard
     icon={icon}
@@ -101,6 +110,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
     {question.attention?.kind === 'browser_takeover' ? <p className="text-meta text-muted-foreground">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</p> : null}
     <Lines text={detail} />
     {inTask ? null : <p className="flex min-w-0 items-center gap-3 text-meta text-muted-foreground">
+      {taskScope ? <Link to="/tasks/$taskId" params={{ taskId: taskScope }} className="inline-flex min-h-11 items-center gap-1 underline underline-offset-4"><ListChecks aria-hidden="true" className="size-4" />打开所属任务</Link> : null}
       {task ? <Link to="/b/$botId/work/$workId" params={{ botId: task.bot_id, workId: task.work_id }} search={from === "tasks" ? { from: "tasks" } : from === "inbox" || inbox ? { from: "inbox" } : {}} className="inline-flex min-w-12 items-center gap-1 rounded-md underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
         <ListChecks aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">任务 </span><span className="truncate">{task.title}</span>
       </Link> : null}
@@ -109,16 +119,16 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
       {/* As on task rows, only another device is named on screen. */}
       {local ? <span className="sr-only">设备 {node}</span>
         : <Meta icon={Laptop} label="设备" title={node} compact={Boolean(task)}>{node}</Meta>}
-      {inbox && question.bot ? <Link to="/b/$botId" params={{ botId: question.bot.bot_id }} title={question.bot.name} className="ms-auto inline-flex min-w-0 shrink-[2] items-center justify-end gap-1.5 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11 max-md:min-w-11">
+      {inbox && question.bot && inputTarget && !taskScope ? <Link to="/b/$botId" params={{ botId: question.bot.bot_id }} search={inputTarget?.kind === "routine" ? { routine: inputTarget.trigger } : {}} title={question.bot.name} className="ms-auto inline-flex min-w-0 shrink-[2] items-center justify-end gap-1.5 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11 max-md:min-w-11">
         <BotFace bot={workspace.bots.find((item) => item.bot_id === question.bot?.bot_id) ?? { bot_id: question.bot.bot_id, avatar: null }} mood="idle" size={16} /><span className="sr-only">去对话 </span><span className="truncate max-sm:sr-only">{question.bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
       </Link> : null}
     </p>}
     {pending ? <p role="status" className="flex min-w-0 flex-wrap items-center gap-x-2 text-meta text-muted-foreground">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0 text-warning" />
-      <span className="min-w-0 whitespace-pre-wrap [overflow-wrap:anywhere] text-foreground">{pending.text}</span>
+      <span className="min-w-0 whitespace-pre-wrap [overflow-wrap:anywhere] text-foreground">{displayAnswer(pending.text)}</span>
       <span aria-hidden="true">·</span>{action.busy !== null ? "正在发送" : "没确认送达"}<span aria-hidden="true">·</span>
       <Button type="button" variant="ghost" disabled={disabled} aria-busy={action.busy === "retry" || undefined} onClick={() => void send("retry", pending.text)}><BusyIcon busy={action.busy === "retry"} icon={RotateCw} />再试</Button>
-    </p> : <div className="grid gap-2">
+    </p> : approvalChoices.length ? <div className="flex flex-wrap gap-2">{approvalChoices.map((choice) => <Button key={choice.label} type="button" variant={choice.action === 'allow_once' ? 'default' : 'outline'} className="min-h-11" disabled={disabled} aria-busy={action.busy === `permission:${choice.action}` || undefined} onClick={() => void send(`permission:${choice.action}`, choice.label)}><BusyIcon busy={action.busy === `permission:${choice.action}`} icon={choice.action === 'allow_once' ? CircleCheck : CircleX} />{choice.action === 'allow_once' ? '允许本次' : '拒绝'}</Button>)}</div> : <div className="grid gap-2">
       {question.choices.length ? <fieldset ref={choicesRef} disabled={disabled} aria-describedby={`${fieldId}-hint${validation ? ` ${fieldId}-error` : ""}`} aria-invalid={Boolean(validation) || undefined} className="grid min-w-0 gap-2">
         <legend className="sr-only">选一个回答</legend>
         {question.choices.map((choice, index) => <label key={index} className={row}>

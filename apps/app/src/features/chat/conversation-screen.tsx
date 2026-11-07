@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
-import { Link } from '@tanstack/react-router'
+import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import { ArrowDown, ArrowRightLeft, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Hourglass, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, RotateCw, Send, Unplug, WifiOff } from 'lucide-react'
-import { ActionCard, Details, EmptyState, InlineError, PrimaryMark } from '@/components/app/kit'
+import { ActionCard, Details, EmptyState, InlineError, PageActions, PrimaryMark } from '@/components/app/kit'
 import { BotFace, botMood, botTint, useDark } from '@/components/app/bot-face'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
 import { Button } from '@/components/ui/button'
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { failureText, outcomeUnknown, taskError, workFailure } from '@vibeface/client/lib/errors.ts'
@@ -13,21 +14,25 @@ import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton, useCreateBot } from '@/features/workspace/workspace-shell'
 import { ConfirmCard } from '@/features/workspace/task-activity'
 import { QuestionCard } from '@/features/workspace/question-card'
-import { chatTaskState, nodeName, progressLabel, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { chatTaskState, nodeName, progressLabel, queueHoldLabels, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
 import type { BotChangeRecord, ManagerJob, SentBotMessage, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { botCopy, placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
-import { awaitsAnswer, foldAnswers, questionOpen } from '@vibeface/client/workspace/questions.ts'
-import { firstLine } from '@/lib/markdown'
+import { awaitsAnswer, foldAnswers, workApproval } from '@vibeface/client/workspace/questions.ts'
 import { providerIcons } from '@/features/devices/ai-settings'
 import { providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
 import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import type { ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import { InputQueue, TargetContextButton, WorkspaceInputStatus } from '@/features/workspace/workspace-chat'
+import type { InputIntent, InputTarget } from '@vibeface/client/workspace/types.ts'
 import { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
-import { chatTimeline, firstUnread } from '@vibeface/client/chat/timeline.ts'
+import { chatTimeline, firstUnread, taskMessage } from '@vibeface/client/chat/timeline.ts'
+import { networkKey, storageOf } from '@vibeface/client/workspace/storage.ts'
+import { webPlatform } from '@/lib/platform'
 import './chat.css'
 
 const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
@@ -35,6 +40,7 @@ const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'runnin
 const failureReason = (raw: string) => taskError(raw).split('\n').at(-1) ?? ''
 // The owner wrote the reply but it has not synced here yet; its streamed text stands in until it lands.
 const streamingStates = [...busyStates, 'publishing']
+type ComposerDraft = { text: string; files: File[]; intent: InputIntent; target: string; conversationId: string }
 
 function NoBot() {
   const { bots } = useWorkspace()
@@ -45,20 +51,28 @@ function NoBot() {
 }
 
 /** `missing`: the route names a bot this network does not have. */
-export function ConversationScreen({ missing = false }: { missing?: boolean }) {
+export function ConversationScreen({ missing = false, active }: { missing?: boolean; active: boolean }) {
   const workspace = useWorkspace()
+  const navigate = useNavigate()
+  const routeRoutine = useRouterState({ select: (state) => 'routine' in state.location.search && typeof state.location.search.routine === 'string' ? state.location.search.routine : null })
   const { directory, ready, retryNow } = useDevice()
-  const [drafts, setDrafts] = useState<Map<string, string>>(() => new Map())
+  const draftStorage = storageOf(webPlatform.storage)
+  const draftKey = networkKey('bot-drafts', ready?.principal.network_id ?? '')
+  const [drafts, setDrafts] = useState<Map<string, string>>(() => { const stored = draftStorage.readStorage<unknown>(draftKey, {}); return stored && typeof stored === 'object' && !Array.isArray(stored) ? new Map(Object.entries(stored).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) : new Map() })
   const [sendError, setSendError] = useState<unknown>(null)
   const [files, setFiles] = useState<File[]>([])
-  const sentDrafts = useRef(new Map<string, { message_id: string; text: string }>())
-  const { conversationId, data, messagePending, messageBusy, chatSlot } = workspace
+  const [intent, setIntent] = useState<InputIntent>('continue')
+  const [selectedTarget, setSelectedTarget] = useState(routeRoutine ? `routine:${routeRoutine}` : 'main')
+  const { conversationId, data, chatSlot } = workspace
+  const pendingMessages = workspace.pendingMessages.filter((item) => item.conversation_id === conversationId && item.target.kind === 'bot_main')
   const bot = workspace.selectedBot
   const dark = useDark()
   const tint = bot ? botTint(faceOf(bot.bot_id, bot.avatar).hue, dark) : undefined
   const text = drafts.get(conversationId) ?? ''
-  const input = useRef({ conversationId, text, hasFiles: files.length > 0 })
-  input.current = { conversationId, text, hasFiles: files.length > 0 }
+  const draftRef = useRef<ComposerDraft>({ text, files, intent, target: selectedTarget, conversationId })
+  if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.intent !== intent || draftRef.current.target !== selectedTarget || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, intent, target: selectedTarget, conversationId }
+  const draft = draftRef.current
+  const savingDrafts = useRef(new Set<ComposerDraft>())
   const jobs = data?.scheduler?.jobs ?? []
   const unanswered = data?.scheduler?.unanswered ?? []
   const activeJobs = jobs.filter((job) => busyStates.includes(job.state))
@@ -66,8 +80,12 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
   const reach = botReach(workspace.nodes), agentReady = botCanSend(reach)
-  const sendDisabled = !workspace.writable || !bot || !agentReady || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
+  const sendDisabled = !workspace.canSaveMessages || !bot || !canSend({ ...gate, busy: false })
   const botBusy = activeJobs.length > 0
+  const inputTarget: InputTarget | null = bot ? selectedTarget.startsWith('work:') ? { kind: 'work', work_id: selectedTarget.slice(5) } : selectedTarget.startsWith('routine:') ? { kind: 'routine', bot_id: bot.bot_id, trigger: selectedTarget.slice(8) } : { kind: 'bot_main', bot_id: bot.bot_id } : null
+  const selectedWork = inputTarget?.kind === 'work' ? data?.works.find((work) => work.work_id === inputTarget.work_id) : undefined
+  const stopSharing = selectedWork?.turn_id ? (data?.works ?? []).filter((work) => !work.outcome && work.thread_id === selectedWork.thread_id && work.turn_id === selectedWork.turn_id) : []
+  const targetBusy = inputTarget?.kind === 'work' ? Boolean(selectedWork && !selectedWork.outcome) : inputTarget?.kind === 'routine' ? Boolean(data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && busyStates.includes(job.state))) : botBusy
   const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'steering', 'claimed', 'running'].includes(job.state))
   const lookup = { nodes: workspace.nodes, directory }
 
@@ -77,21 +95,19 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   // Tasks sit right after the message that started them.
   const works = data?.works ?? []
   // A running turn paused on an approval reads as waiting; a steered input names the task it joined.
-  const asking = new Set((data?.questions ?? []).filter((question) => questionOpen(question) && question.about.request_id).map((question) => question.about.session_id))
+  const currentWorks = new Set(workspace.openWorks?.filter((work) => work.conversation_id === conversationId).map((work) => work.work_id))
+  const confirming = new Set(checks.flatMap((check) => check.kind === 'work' ? [check.work_id] : []))
   const tasks: TaskRow[] = works.map((work, index) => {
-    const state = chatTaskState(work, works, workspace.nodes)
+    const shown = chatTaskState(work, works, workspace.nodes)
+    const asking = workApproval({ work, conversationId, questions: data?.questions ?? [], answered: workspace.answered })
+    const state = shown === 'running' && asking ? 'waiting' : shown
     const joined = work.turn_id ? works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id) : undefined
-    return { id: work.work_id, state: state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state, device: work.target_node, summary: taskProgress(work, workspace.liveProgress), agent: taskAgent(work), trigger: work.trigger, work, joined: joined?.title }
+    const attention = state === 'waiting' || confirming.has(work.work_id) || currentWorks.has(work.work_id) && (taskStale(state, workspace.connectionOnline) || ['failed', 'rejected', 'dispatch_rejected', 'dispatch_unverified', 'unknown', 'unverified', 'awaiting_confirmation'].includes(state))
+    return { id: work.work_id, state, attention, device: work.target_node, summary: taskProgress(work, workspace.liveProgress), agent: taskAgent(work), trigger: work.trigger, work, joined: joined?.title }
   })
   const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'waiting' || task.state === 'awaiting_children')
-  const placed = new Set<string>()
-  const taskRows = (task: TaskRow) => {
-    placed.add(task.id)
-    // A task held on an approval or waiting for confirmation shows as that card, which names and links the task.
-    if (task.state === 'waiting' || task.state === 'awaiting_confirmation') return []
-    const away = task.state === 'dispatch_waiting' && workspace.nodes.some((node) => node.device_id === task.device && !node.online)
-    return bot ? [{ key: `task:${task.id}`, node: <TaskCard task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} here={task.device === ready?.entry.device_id} open={openTasks.includes(task)} live={workspace.connectionOnline} away={away} /> }] : []
-  }
+  const groups = new Map<string, TaskRow[]>()
+  for (const task of tasks) groups.set(task.trigger, [...groups.get(task.trigger) ?? [], task])
 
   // What a turn changed in the bot shows after its reply, or after the message while no reply exists.
   const changes = data?.changes ?? []
@@ -101,6 +117,18 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   // Questions and messages to other bots sit where they happened as rows, not bubbles; an answer shows inside its question.
   const questions = data?.questions ?? []
   const folded = foldAnswers(data?.messages ?? [], questions)
+  const visible = (data?.messages ?? []).filter((message) => !folded.hidden.has(message.message_id))
+  const taskGroups = new Map<string, ChatEntry[]>()
+  for (const [trigger, group] of groups) {
+    const messageId = taskMessage({ trigger, jobs, messages: visible, works })
+    if (!messageId || !bot) continue
+    const cards = group.map((task) => <TaskCard key={task.id} task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} here={task.device === ready?.entry.device_id} live={workspace.connectionOnline} away={task.state === 'dispatch_waiting' && workspace.nodes.some((node) => node.device_id === task.device && !node.online)} />)
+    const working = group.filter((task) => workspace.connectionOnline && (taskActive(task.state) || task.state === 'awaiting_children') && !task.attention).length
+    const attention = group.filter((task) => task.attention).length
+    const label = [`${group.length} 个任务`, working ? `${working} 进行中` : '', attention ? `${attention} 待处理` : '', !working && !attention && group.every((task) => task.state === 'completed') ? '已完成' : ''].filter(Boolean).join(' · ')
+    const row = { key: `task-group:${trigger}`, node: group.length > 1 ? <Details label={label} className="min-w-0">{cards}</Details> : cards[0] }
+    taskGroups.set(messageId, [...taskGroups.get(messageId) ?? [], row])
+  }
   const merged = new Map(jobs.filter((job) => job.state === 'steered').map((job) => [job.message_id, job.outcome]))
   const timeline = chatTimeline(data?.messages ?? [], [
     ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, waiting: awaitsAnswer(question, workspace.answered, folded.answers), node: <div id={`question-${question.question_id}`} className="scroll-mb-4"><QuestionCard question={question} answer={folded.answers.get(question.question_id)} /></div> })),
@@ -118,11 +146,9 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   // A message sent while the bot replies waits behind that reply, so it shows after it until its own turn starts.
   const replying = jobs.some((job) => ['claimed', 'steering', 'running', 'cancelling'].includes(job.state))
   const queued = new Set(replying ? jobs.filter((job) => job.message_id && ['pending_delivery', 'queued', 'steering'].includes(job.state)).map((job) => job.message_id) : [])
-  // Steering already went into the running reply; it only settles once that reply ends.
   const merging = new Set(jobs.filter((job) => job.state === 'steering').map((job) => job.message_id))
   const entries: ChatEntry[] = placedChanges.first.map(changeRow)
   const waiting: ChatEntry[] = []
-  const announced = new Map<string, ChatEntry[]>()
   for (const message of timeline.messages) {
     const start = entries.length
     for (const aside of timeline.before.get(message.message_id) ?? []) entries.push(aside)
@@ -131,24 +157,15 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
     if (schedule) {
       // A schedule run has no message of the person; its reply stands alone and the tasks it started follow it.
       entries.push({ key: message.message_id, message, schedule: scheduleName(schedule, data?.bot_settings, changes), detail })
-      for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
     } else if (!folded.hidden.has(message.message_id)) entries.push({ ...pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message, message.message_id === newest?.message_id ? retry : undefined), detail })
+    entries.push(...taskGroups.get(message.message_id) ?? [])
     const recordedJob = jobs.find((job) => job.reply_message_id === message.message_id || !job.reply_message_id && job.message_id === message.message_id)
     if (recordedJob?.runtime) entries.push({ key: `runtime:${recordedJob.trigger}`, node: <Details label="运行信息">{runtimeLabel(recordedJob.runtime)}</Details> })
     if (message.status === 'failed' && !recordedJob?.pending_check && (!recordedJob || !canRetryJob(recordedJob))) entries.push({ key: `query:${message.message_id}`, node: <ActionButton variant="ghost" action={() => workspace.refresh()}>再查一次</ActionButton> })
     if (recordedJob?.state === 'reconciling' || recordedJob?.pending_check) entries.push({ key: `reconcile:${recordedJob.trigger}`, node: <ActionCard icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>}><p className="text-meta text-muted-foreground">设备正在查询上次回复，系统不会自动重发。</p></ActionCard> })
-    entries.push(...announced.get(message.message_id) ?? [])
     for (const job of jobs) {
       if (job.message_id !== message.message_id) continue
-      if (job.state === 'queued' && message.role === 'user') entries.push({ key: `queued-actions:${job.trigger}`, node: <QueuedMessage job={job} text={message.text} attachments={Boolean(message.attachments?.length)} canEdit={!text.trim() && !files.length} edit={(value) => {
-        if (!workspace.isCurrent() || input.current.conversationId !== conversationId) throw new Error('对话已切换，未替换输入内容。')
-        if (input.current.text.trim() || input.current.hasFiles) throw new Error('已取消排队，输入框的新内容已保留。原消息仍在记录中。')
-        setText(value)
-      }} /> })
-      // Tasks follow the reply that started them once it is here, so the cause reads before its effect.
-      const started = tasks.filter((task) => task.trigger === job.trigger).flatMap(taskRows)
-      if (job.reply_message_id && replied.has(job.reply_message_id) && message.role === 'user') announced.set(job.reply_message_id, started)
-      else entries.push(...started)
+      if (job.state === 'queued' && message.role === 'user') entries.push({ key: `queued-actions:${job.trigger}`, node: <p className="text-meta text-muted-foreground">{job.hold_reason ? queueHoldLabels[job.hold_reason] : '等待开始工作'}</p> })
       if ((job.state !== 'failed' && job.state !== 'rejected') || replied.has(job.reply_message_id ?? '')) continue
       // A reply that ended with no message of its own: 重试 sits on this line while the message is the newest.
       const again = message.role === 'user' && message.message_id === newest?.message_id ? retryOf(message.message_id) : undefined
@@ -160,8 +177,10 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   }
   entries.push(...timeline.rest)
   for (const reply of workspace.interrupted) if (!reply.after || !data?.messages.some((message) => message.message_id === reply.after)) entries.push(pendingRow(interruptedRow(reply)))
-  for (const task of tasks) if (!placed.has(task.id)) entries.push(...taskRows(task))
-  if (messagePending && !data?.messages.some((message) => message.message_id === messagePending.message_id)) entries.push(pendingRow({ message_id: messagePending.message_id, event_hash: messagePending.message_id, role: 'user', text: messagePending.text, created_at_ms: 0, state: 'sending' }))
+  for (const pending of pendingMessages) {
+    if (!data?.messages.some((message) => message.message_id === pending.message_id)) entries.push(pendingRow({ message_id: pending.message_id, event_hash: pending.message_id, role: 'user', text: pending.text, created_at_ms: pending.created_at_ms, state: 'sending' }))
+    entries.push({ key: `delivery:${pending.message_id}`, node: <WorkspaceInputStatus pending={pending} /> })
+  }
   for (const progress of live) entries.push(pendingRow({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.text, created_at_ms: 0, state: 'streaming' }))
 
   const owner = data?.conversation?.owner
@@ -194,13 +213,6 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
 
   // Everything waiting on the person ends the conversation, so it scrolls with it instead of covering it.
   const cards = [
-    messagePending && !messageBusy ? <ActionCard key="undelivered" icon={terms.undelivered.icon} title="消息可能没送达" actions={<>
-      <ActionButton variant="ghost" disabled={!workspace.writable || messagePending.rejected === undefined} action={() => workspace.releaseMessagePending()}>不发了</ActionButton>
-      <ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>
-      <ActionButton variant="default" disabled={!workspace.writable || workspace.incomplete} action={async () => {
-        if (await workspace.sendMessage(messagePending.text) && workspace.isCurrent()) clearSentDraft(messagePending.conversation_id, messagePending.text)
-      }}>重新发送</ActionButton>
-    </>}><p className="line-clamp-2 text-muted-foreground">{messagePending.text}</p></ActionCard> : null,
     ownerAway && owner && here ? <ActionCard key="owner" icon={WifiOff} title={`${nodeName(owner, lookup)} 离线，对话在等它`} actions={
       <ActionButton variant="default" disabled={!workspace.writable} action={() => workspace.takeOver()}><ArrowRightLeft aria-hidden="true" />换到 {nodeName(here.device_id, lookup)}</ActionButton>
     } /> : null,
@@ -215,8 +227,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const notice = !workspace.connectionOnline ? ''
     : workspace.readOnlyNotice ? workspace.readOnlyNotice
     : workspace.writeNotice ? '同步中，稍后可发送'
-    : messagePending && messageBusy ? '上一条消息还没确认送达'
-    : botBusy && !sendDisabled ? '可以继续补充要求，处理状态会显示在消息下方。' : ''
+    : targetBusy && !sendDisabled ? '可以继续补充要求，处理状态会显示在消息下方。' : ''
   // Questions sit where they were asked, so an older one scrolls away; the pill above the composer brings back the first still open.
   const waitingTarget = asked ? `question-${asked.question_id}` : cards.length ? 'chat-waiting' : null
   const waitingCount = toAnswer.length + cards.length
@@ -228,20 +239,8 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const setupTo = setupDevice ? '/devices/$deviceId' : '/devices'
   const canSetUp = ready?.principal.can_manage === true || ready?.principal.source === 'local_session'
 
-  useEffect(() => {
-    if (messagePending) sentDrafts.current.set(messagePending.conversation_id, messagePending)
-    const previous = sentDrafts.current.get(conversationId)
-    if (!previous || !data?.messages.some((message) => message.message_id === previous.message_id)) return
-    sentDrafts.current.delete(conversationId)
-    setDrafts((current) => {
-      if (current.get(conversationId)?.trim() !== previous.text) return current
-      const next = new Map(current)
-      next.delete(conversationId)
-      return next
-    })
-  }, [conversationId, data, messagePending])
   // Picked files belong to the bot they were picked for.
-  useEffect(() => { setSendError(null); setFiles([]) }, [conversationId])
+  useEffect(() => { setSendError(null); setFiles([]); setSelectedTarget(routeRoutine ? `routine:${routeRoutine}` : 'main'); setIntent('continue') }, [conversationId, routeRoutine])
   // Nothing pushes a device's bot readiness, so while a device that could reply to an open bot is not ready, read it again every 10s, or every 2s while it starts.
   const latest = useRef(workspace)
   latest.current = workspace
@@ -260,19 +259,19 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
       if (current.get(id)?.trim() !== sent.trim()) return current
       const next = new Map(current)
       next.delete(id)
+      draftStorage.writeStorage(draftKey, Object.fromEntries(next))
       return next
     })
   }
-  const setText = (value: string) => {
-    input.current = { ...input.current, text: value }
-    setDrafts((current) => new Map(current).set(conversationId, value))
-  }
+  const setText = (value: string) => setDrafts((current) => { const next = new Map(current).set(conversationId, value); draftStorage.writeStorage(draftKey, Object.fromEntries(next)); return next })
 
   if (missing) return <section className="conversation-screen" aria-label="对话"><Chat key="missing" entries={[]} empty={<NoBot />} /></section>
-  if (bot && !data) return <section className="conversation-screen" aria-label="对话"><ChatSkeleton /></section>
+  const history = active && bot ? <TaskHistory key={`task-history:${conversationId}`} tasks={tasks} botId={bot.bot_id} name={bot.name} /> : null
+  if (bot && !data) return <section className="conversation-screen" aria-label="对话">{history}<ChatSkeleton /></section>
 
   return (
     <section className="conversation-screen" aria-label="对话">
+      {history}
       <Chat
         key={conversationId}
         entries={entries}
@@ -294,7 +293,8 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
             </div>}
         </div> : workspace.synced ? <NoBot /> : null}
       />
-      {bot ? <PromptInput
+      {bot && inputTarget ? <PromptInput
+        id="message-text"
         above={<div className="flex max-w-full flex-col items-start gap-2">
           {!workspace.connectionOnline ? <p role="status" className="flex min-h-8 max-w-full flex-wrap items-center gap-1.5 rounded-xl border bg-card ps-2.5 pe-1 text-meta font-medium max-md:min-h-11">
           <WifiOff aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="min-w-0 break-words">连不上{ready ? nodeName(ready.entry.device_id, lookup) : '设备'}</span>
@@ -310,18 +310,26 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         hint={notice}
         reason={reason}
         disabled={sendDisabled}
-        busy={messageBusy}
-        onStop={stopJob && workspace.writable && bot ? () => { setSendError(null); workspace.cancelManager(stopJob.trigger).catch(setSendError) } : undefined}
+        busy={false}
+        sendLabel={intent === 'defer' ? '保存为稍后处理' : intent === 'new_task' ? '发送为新任务' : targetBusy ? '补充当前工作' : '发送'}
+        target={<><span className="min-w-0 flex-1 truncate">{targetBusy ? '补充给' : '发送给'} · {bot.name}</span><NativeSelect size="sm" aria-label="输入目标" value={selectedTarget} onChange={(event) => setSelectedTarget(event.currentTarget.value)}><NativeSelectOption value="main">主聊天</NativeSelectOption>{openTasks.map((task) => <NativeSelectOption key={task.id} value={`work:${task.id}`}>{task.work.title || '工作'}</NativeSelectOption>)}{selectedWork && !openTasks.some((task) => task.id === selectedWork.work_id) ? <NativeSelectOption value={`work:${selectedWork.work_id}`}>{selectedWork.title || '工作'} · 已结束</NativeSelectOption> : null}{(data?.scopeJobs ?? []).filter((job) => job.lane === 'schedule_routine' && (busyStates.includes(job.state) || selectedTarget === `routine:${job.trigger}`)).map((job) => <NativeSelectOption key={job.trigger} value={`routine:${job.trigger}`}>例行任务 · {scheduleName(job.trigger, data?.bot_settings, changes)}</NativeSelectOption>)}{inputTarget.kind === "routine" && !(data?.scopeJobs ?? []).some((job) => job.lane === "schedule_routine" && job.trigger === inputTarget.trigger) ? <NativeSelectOption value={selectedTarget}>例行任务 · 状态待查询</NativeSelectOption> : null}</NativeSelect><NativeSelect size="sm" aria-label="发送方式" value={intent} onChange={(event) => { const value = event.currentTarget.value; if (value === 'continue' || value === 'new_task' || value === 'defer') setIntent(value) }}><NativeSelectOption value="continue">{targetBusy ? '补充当前工作' : '发送'}</NativeSelectOption><NativeSelectOption value="new_task">新任务</NativeSelectOption><NativeSelectOption value="defer">稍后处理</NativeSelectOption></NativeSelect><TargetContextButton key={JSON.stringify(inputTarget)} target={inputTarget} conversationId={conversationId} /><InputQueue target={inputTarget} /></>}
+        onStop={workspace.writable && (inputTarget.kind === 'bot_main' ? stopJob : targetBusy) ? () => { setSendError(null); workspace.stopInputTarget({ target: inputTarget }).catch(setSendError) } : undefined}
         onChange={setText}
         files={files}
         onFiles={setFiles}
         onSubmit={() => {
           if (sendDisabled || !text.trim() && !files.length) return
+          const submittedDraft = draft
+          if (savingDrafts.current.has(submittedDraft)) return
+          savingDrafts.current.add(submittedDraft)
           setSendError(null)
-          workspace.sendMessage(text, files).then((sent) => { if (sent && workspace.isCurrent()) { clearSentDraft(conversationId, text); setFiles([]) } }).catch(setSendError)
+          const submittedFiles = files
+          workspace.sendMessage(text, submittedFiles, undefined, { target: inputTarget, intent, onSaved: (input) => { if (!workspace.isCurrent() || latest.current.conversationId !== conversationId || latest.current.view !== "chat" || draftRef.current !== submittedDraft) return; if (intent === "new_task" && (input.target.kind === "task" || input.target.kind === "channel_task")) void navigate({ to: "/tasks/$taskId", params: { taskId: input.target.task_id } }) } }).then((sent) => { if (sent && workspace.isCurrent()) { if (latest.current.conversationId !== conversationId || draftRef.current === submittedDraft) clearSentDraft(conversationId, text); if (draftRef.current === submittedDraft) setFiles((current) => current === submittedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
         }}
       >
         <InlineError error={sendError} className="basis-full" />
+        {inputTarget.kind !== "bot_main" ? <p className="basis-full">上方是 Bot 主聊天记录，当前输入补充所选工作。</p> : null}
+        {stopSharing.length > 1 ? <p className="basis-full text-warning">停止会影响这些工作 · {stopSharing.map((work) => work.title || "工作").join("、")}</p> : null}
         {needsSetup && !starting && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
     </section>
@@ -341,48 +349,75 @@ function useOffscreen(id: string | null, revision: number) {
   return hidden
 }
 
-type TaskRow = { id: string; state: string; device: string; summary: string; agent: ProviderId | null; trigger: string; work: WorkRecord; joined?: string }
+type TaskRow = { id: string; state: string; attention: boolean; device: string; summary: string; agent: ProviderId | null; trigger: string; work: WorkRecord; joined?: string }
 
-/** The current progress stays beside its request; finished work keeps its result and a link to details. */
-/** `away`: its device is offline, so it waits for that device rather than spinning. */
-function TaskCard({ task, botId, device, here, open, live, away }: { task: TaskRow; botId: string; device: string; here: boolean; open: boolean; live: boolean; away: boolean }) {
+function TaskIcon({ state, stale, away = false }: { state: string; stale: boolean; away?: boolean }) {
+  const failed = ['failed', 'rejected', 'dispatch_rejected'].includes(state)
+  const Icon = stale ? CircleQuestionMark : away ? WifiOff : state === 'completed' ? CircleCheck
+    : failed ? CircleX : state === 'interrupted' ? CircleStop
+    : state === 'waiting' ? terms.approval.icon : state === 'awaiting_children' ? Hourglass
+    : taskActive(state) ? LoaderCircle : CircleQuestionMark
+  return <Icon aria-hidden="true" className={`size-4 shrink-0 ${state === 'completed' ? 'text-success' : failed ? 'text-danger' : state === 'waiting' ? 'text-warning' : !stale && !away && taskActive(state) ? 'animate-spin text-info motion-reduce:animate-none' : 'text-muted-foreground'}`} />
+}
+
+function TaskCard({ task, botId, device, here, live, away }: { task: TaskRow; botId: string; device: string; here: boolean; live: boolean; away: boolean }) {
   const failed = task.state === 'failed' || task.state === 'rejected' || task.state === 'dispatch_rejected'
-  // A failed task's text is what it said before failing, so its cause leads.
-  const result = failed ? workFailure(task.work) : task.work.result_text ? firstLine(task.work.result_text) : workFailure(task.work)
   const title = task.work.title || '任务'
-  const stale = taskStale(task.state, live)
-  // The reason wraps on its own line, so a phone shows why a task stopped.
-  // Breaks by the chat column, which a task panel beside it narrows, not by the window.
-  if (!open) return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground active:bg-muted max-md:min-h-11 max-md:py-3">
-    {task.state === 'dispatch_unverified' ? <CircleQuestionMark aria-hidden="true" className="size-4 shrink-0" /> : task.state === 'interrupted' ? <CircleStop aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
-    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} label={taskLabel(task.state)} agent={task.agent} quiet={task.state === 'completed' || failed && Boolean(result)} /></span>{result ? <span className={`block break-words ${failed ? 'text-danger' : ''}`}>{result}</span> : null}</span>
-    <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
-  </Link></div>
-  return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-12 items-start gap-2 rounded-lg px-2 py-2 transition-colors hover:bg-muted/60 hover:text-foreground active:bg-muted">
-    {task.state === 'waiting' ? <terms.approval.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
-      : stale ? <CircleQuestionMark aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
-      : away ? <WifiOff aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
-      : task.state === 'awaiting_children' ? <Hourglass aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
-      : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className="size-5 shrink-0 animate-spin text-info" /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
-    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} label={stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)} agent={task.agent} className="text-meta" /></span>
+  const ongoing = taskActive(task.state) || task.state === 'awaiting_children'
+  const stale = taskStale(task.state, live) || !live && task.state === 'awaiting_children'
+  const label = stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)
+  const reason = !ongoing && task.state !== 'completed' ? workFailure(task.work).split('\n')[0] : ''
+  return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} aria-label={`${title} · ${label} · 查看任务`} className="-mx-2 flex min-h-9 items-start gap-2 rounded-lg px-2 py-2 text-meta transition-colors hover:bg-muted/60 hover:text-foreground active:bg-muted max-md:min-h-11 max-md:py-3">
+    <TaskIcon state={task.state} stale={stale} away={away} />
+    <span className="min-w-0 flex-1">{ongoing ? <><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} label={label} agent={task.agent} className="text-meta" /></span>
       {task.joined ? <span className="flex min-w-0 items-center gap-1 text-meta text-muted-foreground"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">补充到「{task.joined}」</span></span>
-        : taskActive(task.state) && task.summary ? <span className="line-clamp-2 whitespace-pre-wrap break-words text-meta text-muted-foreground">{stale ? '最近进展：' : ''}{task.summary}</span> : null}</span>
-    <ChevronRight aria-label="详情" className="size-4 shrink-0 text-muted-foreground" />
+        : taskActive(task.state) && task.summary ? <span className="line-clamp-2 whitespace-pre-wrap break-words text-meta text-muted-foreground">{stale ? '最近进展：' : ''}{task.summary}</span> : null}</>
+      : <><span className="text-muted-foreground">{label} · 查看任务</span>{reason ? <span className={`block break-words ${failed ? 'text-danger' : 'text-muted-foreground'}`}>{reason}</span> : null}</>}</span>
+    {task.state === 'completed' ? null : <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />}
   </Link></div>
 }
 
+function TaskHistory({ tasks, botId, name }: { tasks: TaskRow[]; botId: string; name: string }) {
+  const workspace = useWorkspace()
+  const { directory } = useDevice()
+  const [open, setOpen] = useState(false)
+  const leaving = useRef(false)
+  useEffect(() => () => { leaving.current = true }, [])
+  const working = tasks.filter((task) => workspace.connectionOnline && !task.attention && (taskActive(task.state) || task.state === 'awaiting_children')).length
+  const attention = tasks.filter((task) => task.attention).length
+  const count = [working ? `${working} 进行中` : '', attention ? `${attention} 待处理` : ''].filter(Boolean).join(' · ')
+  return <>
+    <PageActions><Button type="button" variant="ghost" size="sm" aria-label={`任务${count ? ` · ${count}` : ''}`} onClick={() => { leaving.current = false; setOpen(true) }}><ListChecks aria-hidden="true" /><span>任务</span>{count ? <span className="text-meta text-muted-foreground max-sm:sr-only">{count}</span> : null}{count ? <span className="text-meta sm:hidden">{working + attention}</span> : null}</Button></PageActions>
+    <Sheet open={open} onOpenChange={setOpen}>
+      <SheetContent className="!w-full min-w-0 gap-0 sm:!max-w-md" onCloseAutoFocus={(event) => { if (leaving.current) event.preventDefault() }}>
+        <SheetHeader className="shrink-0 pe-14"><SheetTitle>任务记录</SheetTitle><SheetDescription>{name} 的任务</SheetDescription></SheetHeader>
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-6">
+          {!workspace.connectionOnline || workspace.incomplete ? <p role="status" className="pb-3 text-meta text-muted-foreground">{!workspace.connectionOnline ? '暂时收不到最新任务状态，显示最近记录。' : '任务记录正在同步，显示已读取的部分。'}</p> : null}
+          {!workspace.data ? <p role="status" className="py-6 text-meta text-muted-foreground">正在读取任务记录</p> : tasks.length ? <ul className="divide-y">{tasks.map((task) => {
+            const stale = taskStale(task.state, workspace.connectionOnline) || !workspace.connectionOnline && task.state === 'awaiting_children'
+            const away = task.state === 'dispatch_waiting' && workspace.nodes.some((node) => node.device_id === task.device && !node.online)
+            return <li key={task.id}><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} onClick={() => { leaving.current = true; setOpen(false) }} className="-mx-2 flex min-h-11 min-w-0 items-start gap-2 rounded-lg px-2 py-3 hover:bg-muted/60 active:bg-muted">
+              <TaskIcon state={task.state} stale={stale} away={away} />
+              <span className="grid min-w-0 flex-1 gap-1"><span className="break-words font-medium">{task.work.title || '任务'}</span><span className="flex min-w-0 flex-wrap gap-x-1 text-meta text-muted-foreground"><span>{stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)}</span><span aria-hidden="true">·</span><span className="min-w-0 break-words">{nodeName(task.device, { nodes: workspace.nodes, directory })}</span></span></span>
+              <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+            </Link></li>
+          })}</ul> : <p className="py-6 text-meta text-muted-foreground">{!workspace.connectionOnline || workspace.incomplete ? '最近记录中还没有任务。' : '还没有任务'}</p>}
+        </div>
+      </SheetContent>
+    </Sheet>
+  </>
+}
+
 /** Device and state never yield to a long title: in a column narrower than `@sm` they take their own line. */
-/** Only another device is named on screen. `quiet`: the icon already says the state, so its word is only read out. `agent`: the provider doing the task. */
-function TaskMeta({ device, here, label, agent, quiet = false, className = '' }: { device: string; here: boolean; label: string; agent: ProviderId | null; quiet?: boolean; className?: string }) {
+function TaskMeta({ device, here, label, agent, className = '' }: { device: string; here: boolean; label: string; agent: ProviderId | null; className?: string }) {
   const by = agent ? providerNames[agent] : ''
-  if (here && quiet && !agent) return <span className="sr-only">{device} · {label}</span>
   const Agent = agent ? providerIcons[agent] : null
   const dot = <span aria-hidden="true">·</span>
   return <span className={`flex min-w-0 shrink-0 items-center gap-1 text-muted-foreground ${className}`}>
     <span aria-hidden="true" className="hidden @sm:inline">·</span>
-    {Agent ? <><Agent aria-hidden="true" className="size-3.5 shrink-0" /><span className="shrink-0">{by}</span>{here && quiet ? null : dot}</> : null}
-    {here ? <span className="sr-only">{device}</span> : <><Laptop aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">{device}</span>{quiet ? null : dot}</>}
-    <span className={quiet ? 'sr-only' : 'shrink-0'}>{label}</span>
+    {Agent ? <><Agent aria-hidden="true" className="size-3.5 shrink-0" /><span className="shrink-0">{by}</span>{dot}</> : null}
+    {here ? <span className="sr-only">{device}</span> : <><Laptop aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">{device}</span>{dot}</>}
+    <span className="shrink-0">{label}</span>
   </span>
 }
 
@@ -405,18 +440,5 @@ function JobLine({ job, retry, refresh }: { job: ManagerJob; retry?: () => Promi
     <span className="flex shrink-0 items-center gap-1 text-danger"><CircleX aria-hidden="true" className="size-4 shrink-0" />Bot 没能回复</span>
     {job.failure ? <span className="min-w-0 truncate text-muted-foreground" title={job.failure.detail}>{failureText(job.failure.kind) || failureReason(job.failure.detail)}</span> : null}
     {retry ? <ActionButton variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11" action={retry}><RotateCcw aria-hidden="true" />重试</ActionButton> : <ActionButton variant="ghost" action={refresh}>再查一次</ActionButton>}
-  </div>
-}
-
-function QueuedMessage({ job, text, attachments, canEdit, edit }: { job: ManagerJob; text: string; attachments: boolean; canEdit: boolean; edit(text: string): void }) {
-  const workspace = useWorkspace()
-  return <div className="flex flex-wrap gap-2 text-meta">
-    <ActionButton variant="ghost" disabled={!workspace.writable} action={async () => { await workspace.cancelManager(job.trigger) }}>取消排队</ActionButton>
-    {!attachments ? <ActionButton variant="ghost" disabled={!workspace.writable || !canEdit} title={!canEdit ? '先发送或清空输入框，再编辑排队消息' : undefined} action={async () => {
-      if (!await workspace.cancelManager(job.trigger)) throw new Error('还没确认取消，请先再查一次。')
-      edit(text)
-      document.getElementById('message-text')?.focus()
-    }}>取消并编辑重发</ActionButton> : null}
-    <ActionButton variant="ghost" action={() => workspace.refresh()}>再查一次</ActionButton>
   </div>
 }

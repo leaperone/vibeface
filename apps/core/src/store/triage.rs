@@ -1,10 +1,11 @@
-use super::Store;
+use super::{Store, log, message_from, questions};
 use crate::{
     manager::{ManagerError, StartEvidence},
-    triage::AgentEvent,
+    model::{EventBody, Message, Role},
+    triage::{AgentEvent, AnswerAuthority, HeldAnswerControl, HeldAnswerRequest},
 };
 use anyhow::{Context as _, Result, ensure};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -26,6 +27,7 @@ struct TriageClaim {
 struct StoredTriageEvent {
     event: AgentEvent,
     claim: Option<TriageClaim>,
+    answer: Option<HeldAnswerControl>,
 }
 
 impl StoredTriageEvent {
@@ -38,8 +40,16 @@ impl StoredTriageEvent {
             .remove("_triage")
             .map(serde_json::from_value)
             .transpose()?;
+        let answer = fields
+            .remove("_answer")
+            .map(serde_json::from_value)
+            .transpose()?;
         let event = serde_json::from_value(value).context("invalid stored triage event")?;
-        Ok(Self { event, claim })
+        Ok(Self {
+            event,
+            claim,
+            answer,
+        })
     }
 
     fn encode(&self) -> Result<String> {
@@ -49,6 +59,12 @@ impl StoredTriageEvent {
                 .as_object_mut()
                 .context("triage event must be an object")?
                 .insert("_triage".into(), serde_json::to_value(claim)?);
+        }
+        if let Some(answer) = &self.answer {
+            value
+                .as_object_mut()
+                .context("triage event must be an object")?
+                .insert("_answer".into(), serde_json::to_value(answer)?);
         }
         Ok(serde_json::to_string(&value)?)
     }
@@ -73,6 +89,7 @@ pub(crate) struct TriageAttempt {
     day: String,
     units: u64,
     events: Vec<AgentEvent>,
+    answer: Option<Box<HeldAnswerControl>>,
 }
 
 impl TriageAttempt {
@@ -81,6 +98,9 @@ impl TriageAttempt {
     }
     pub(crate) fn events(&self) -> &[AgentEvent] {
         &self.events
+    }
+    pub(crate) fn answer(&self) -> Option<&HeldAnswerControl> {
+        self.answer.as_deref()
     }
 }
 
@@ -141,7 +161,293 @@ fn budget(connection: &Connection, key: &str, limit: u64, now: i64) -> Result<Bu
     })
 }
 
+fn answer_input_from(
+    connection: &Connection,
+    control: &HeldAnswerControl,
+) -> Result<(Value, Message)> {
+    let question = questions::question_from(connection, &control.network, &control.question_id)?
+        .context("the answer's question no longer exists")?;
+    let (rank, author, closed): (String, String, Option<String>) = connection.query_row(
+        "SELECT rank,author,closed FROM questions WHERE network_id=? AND question_id=?",
+        params![control.network, control.question_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    ensure!(
+        rank.rsplit(':').next() == Some(control.question_hash.as_str())
+            && author == control.request.node
+            && closed.is_none()
+            && question["conversation_id"] == control.conversation_id
+            && question["about"]["node"] == control.request.node
+            && question["about"]["request_id"] == control.request.request_id
+            && question["about"]["session_id"] == control.request.session_id
+            && question["about"]["agent"] == serde_json::to_value(control.request.provider)?,
+        "the answer no longer belongs to this request and question"
+    );
+    let message = message_from(
+        connection,
+        &control.network,
+        &control.conversation_id,
+        &control.answer_id,
+    )?
+    .context("the standing answer no longer exists")?;
+    ensure!(
+        control.answer_id == questions::answer_id(&control.question_id)
+            && message.event_hash == control.answer_hash
+            && message.role == Role::User
+            && message.answers.as_deref() == Some(control.question_id.as_str()),
+        "the standing answer changed"
+    );
+    let answer = log::event_from(connection, &control.network, &control.answer_hash)?
+        .context("the answer event no longer exists")?;
+    ensure!(
+        matches!(
+            &answer.body,
+            EventBody::MessagePosted {
+                attestation: Some(_),
+                ..
+            }
+        ) || (control.authority == AnswerAuthority::DecisionToken
+            && answer.author == control.request.node),
+        "a held request needs the user's signed answer or an authorized decision token"
+    );
+    approval_answer_result(&question, &message.text, &control.request.response)?;
+    Ok((question, message))
+}
+
+pub(crate) fn approval_answer_result(
+    question: &Value,
+    text: &str,
+    response: &crate::triage::AnswerResponse,
+) -> Result<Option<Value>> {
+    let crate::triage::AnswerResponse::Approval { allow_once, deny } = response else {
+        return Ok(None);
+    };
+    let choices: Vec<_> = question["choices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|choice| choice["label"].as_str() == Some(text))
+        .collect();
+    ensure!(choices.len() == 1, "choose one of this approval's actions");
+    let result = match choices[0]["action"].as_str() {
+        Some("allow_once") => allow_once
+            .as_ref()
+            .context("this request does not allow a one-time approval")?,
+        Some("deny") => deny,
+        _ => anyhow::bail!("this choice has no trusted approval action"),
+    };
+    Ok(Some(result.clone()))
+}
+
+pub(super) fn queue_answer_control_from(
+    connection: &Connection,
+    network: &str,
+    question: &str,
+    request: &HeldAnswerRequest,
+    authority: AnswerAuthority,
+    now: i64,
+) -> Result<bool> {
+    let (scope, rank): (String, String) = connection.query_row(
+        "SELECT conversation_id,rank FROM questions WHERE network_id=? AND question_id=?",
+        params![network, question],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let answer_id = questions::answer_id(question);
+    let Some(message) = message_from(connection, network, &scope, &answer_id)? else {
+        return Ok(false);
+    };
+    let control = HeldAnswerControl {
+        network: network.into(),
+        conversation_id: scope,
+        question_id: question.into(),
+        question_hash: rank
+            .rsplit(':')
+            .next()
+            .context("invalid question rank")?
+            .into(),
+        answer_id,
+        answer_hash: message.event_hash,
+        request: request.clone(),
+        authority,
+    };
+    answer_input_from(connection, &control)?;
+    let event_id = format!("answer:{}:{}", control.question_hash, control.answer_hash);
+    let first = connection.execute(
+        "INSERT INTO triage_seen(event_id,ts_ms) VALUES(?,?) ON CONFLICT(event_id) DO NOTHING",
+        params![event_id, now],
+    )?;
+    if first == 0 {
+        return Ok(false);
+    }
+    let row = StoredTriageEvent {
+        event: AgentEvent {
+            event_id,
+            node: request.node.clone(),
+            agent: request.provider,
+            event: crate::triage::Kind::NeedsInput,
+            session_id: request.session_id.clone(),
+            turn_id: request.turn_id.clone(),
+            request_id: Some(request.request_id.clone()),
+            ts_ms: now,
+            ..Default::default()
+        },
+        claim: None,
+        answer: Some(control),
+    };
+    connection.execute(
+        "INSERT INTO triage_queue(ts_ms,event_id,request_id,event) VALUES(?,?,?,?)",
+        params![
+            row.event.ts_ms,
+            row.event.event_id,
+            row.event.request_id,
+            row.encode()?
+        ],
+    )?;
+    let receipt = crate::scheduling::AdmissionReceipt {
+        network_id: network.into(),
+        conversation_id: row
+            .answer
+            .as_ref()
+            .context("answer control missing")?
+            .conversation_id
+            .clone(),
+        trigger: crate::scheduling::message_trigger(
+            &row.answer
+                .as_ref()
+                .context("answer control missing")?
+                .answer_id,
+        ),
+        state: "answer_control_saved".into(),
+    };
+    connection.execute(
+        "INSERT INTO triage_handled(event_id,ts_ms,result) VALUES(?,?,?) ON CONFLICT(event_id) DO NOTHING",
+        params![row.event.event_id, now, serde_json::to_string(&serde_json::json!({"control":row.answer,"receipt":receipt}))?],
+    )?;
+    Ok(true)
+}
+
+pub(crate) fn held_answer_receipt_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    message_id: &str,
+) -> Result<Option<crate::scheduling::AdmissionReceipt>> {
+    let Some(message) = message_from(connection, network, conversation, message_id)? else {
+        return Ok(None);
+    };
+    let Some(question_id) = &message.answers else {
+        return Ok(None);
+    };
+    let rank: Option<String> = connection
+        .query_row(
+            "SELECT rank FROM questions WHERE network_id=? AND question_id=? AND conversation_id=?",
+            params![network, question_id, conversation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(rank) = rank else {
+        return Ok(None);
+    };
+    let event_id = format!(
+        "answer:{}:{}",
+        rank.rsplit(':').next().context("invalid question rank")?,
+        message.event_hash
+    );
+    let saved: Option<String> = connection
+        .query_row(
+            "SELECT result FROM triage_handled WHERE event_id=?",
+            [event_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(saved) = saved else {
+        return Ok(None);
+    };
+    let saved: Value = serde_json::from_str(&saved)?;
+    let control: HeldAnswerControl = serde_json::from_value(saved["control"].clone())?;
+    ensure!(
+        control.network == network
+            && control.conversation_id == conversation
+            && control.answer_id == message_id
+            && control.answer_hash == message.event_hash,
+        "saved answer control belongs to another answer"
+    );
+    answer_input_from(connection, &control)?;
+    Ok(Some(serde_json::from_value(saved["receipt"].clone())?))
+}
+
 impl Store {
+    pub(crate) fn has_pending_answer_controls(&self) -> Result<bool> {
+        Ok(queued(&self.connection)?
+            .iter()
+            .any(|row| row.answer.is_some() && row.claim.is_none()))
+    }
+    pub(crate) fn held_answer_receipt(
+        &self,
+        network: &str,
+        conversation: &str,
+        message_id: &str,
+    ) -> Result<Option<crate::scheduling::AdmissionReceipt>> {
+        held_answer_receipt_from(&self.connection, network, conversation, message_id)
+    }
+
+    pub(crate) fn queue_answer_control(
+        &mut self,
+        network: &str,
+        question: &str,
+        request: &HeldAnswerRequest,
+        authority: AnswerAuthority,
+        now: i64,
+    ) -> Result<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let queued = queue_answer_control_from(&tx, network, question, request, authority, now)?;
+        tx.commit()?;
+        Ok(queued)
+    }
+
+    pub(crate) fn answer_control_input(
+        &self,
+        control: &HeldAnswerControl,
+    ) -> Result<(Value, Message)> {
+        answer_input_from(&self.connection, control)
+    }
+
+    pub(crate) fn answer_control_attempt(
+        &self,
+        boot: &str,
+        attempt: &str,
+    ) -> Result<Option<HeldAnswerControl>> {
+        Ok(queued(&self.connection)?
+            .into_iter()
+            .find(|row| {
+                row.claim
+                    .as_ref()
+                    .is_some_and(|claim| claim.boot == boot && claim.attempt == attempt)
+                    && row.answer.is_some()
+            })
+            .and_then(|row| row.answer))
+    }
+
+    pub(crate) fn validate_answer_control_claim(
+        &self,
+        boot: &str,
+        attempt: &str,
+        control: &HeldAnswerControl,
+    ) -> Result<()> {
+        ensure!(
+            queued(&self.connection)?.iter().any(|row| {
+                row.eligible(Some((boot, attempt)))
+                    && row.answer.as_ref() == Some(control)
+                    && row.event.request_id.as_deref() == Some(control.request.request_id.as_str())
+            }),
+            "answer control claim is no longer live"
+        );
+        answer_input_from(&self.connection, control)?;
+        Ok(())
+    }
+
     pub(crate) fn queue_triage_event(&mut self, event: AgentEvent, now: i64) -> Result<bool> {
         let tx = self
             .connection
@@ -153,7 +459,11 @@ impl Store {
         if first == 0 {
             return Ok(false);
         }
-        let row = StoredTriageEvent { event, claim: None };
+        let row = StoredTriageEvent {
+            event,
+            claim: None,
+            answer: None,
+        };
         tx.execute(
             "INSERT INTO triage_queue(ts_ms,event_id,request_id,event) VALUES(?,?,?,?)",
             params![
@@ -170,7 +480,7 @@ impl Store {
     pub(crate) fn triage_events(&self, context: Option<(&str, &str)>) -> Result<Vec<AgentEvent>> {
         Ok(queued(&self.connection)?
             .into_iter()
-            .filter(|row| row.eligible(context))
+            .filter(|row| row.answer.is_none() && row.eligible(context))
             .map(|row| row.event)
             .collect())
     }
@@ -193,6 +503,12 @@ impl Store {
         for mut row in queued(&tx)? {
             if let Some(claim) = &mut row.claim {
                 claim.state = ClaimState::Unknown;
+            } else if row.answer.is_some() {
+                row.claim = Some(TriageClaim {
+                    attempt: String::new(),
+                    boot: String::new(),
+                    state: ClaimState::Unknown,
+                });
             }
             row.event.request_id = None;
             row.event.hold = None;
@@ -259,11 +575,16 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut rows: Vec<_> = queued(&tx)?
+        let pending: Vec<_> = queued(&tx)?
             .into_iter()
             .filter(|row| row.claim.is_none())
-            .take(max)
             .collect();
+        let mut rows: Vec<_> =
+            if let Some(index) = pending.iter().position(|row| row.answer.is_some()) {
+                pending.into_iter().skip(index).take(1).collect()
+            } else {
+                pending.into_iter().take(max).collect()
+            };
         if rows.is_empty() {
             return Ok(TriageAdmission::Empty);
         }
@@ -286,6 +607,10 @@ impl Store {
             params![key, status.day, status.used + 1],
         )?;
         tx.commit()?;
+        let answer = rows
+            .first()
+            .and_then(|row| row.answer.clone())
+            .map(Box::new);
         Ok(TriageAdmission::Claimed(TriageAttempt {
             id,
             boot: boot.into(),
@@ -293,6 +618,7 @@ impl Store {
             day: status.day,
             units: 1,
             events: rows.into_iter().map(|row| row.event).collect(),
+            answer,
         }))
     }
 

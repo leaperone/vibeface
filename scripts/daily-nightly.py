@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Land one mechanical daily version PR, then reconcile the product and www Nightlies."""
+"""Land one mechanical version PR per four-hour UTC batch, then reconcile both Nightlies."""
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -33,14 +33,28 @@ require = release.require
 
 @dataclass(frozen=True)
 class DailyPlan:
-    day: str
+    batch: str
     base: str
     versions: dict
     android_code: int
 
+    def __post_init__(self):
+        slot = datetime.datetime.strptime(self.batch, '%Y%m%d%H')
+        require(slot.strftime('%Y%m%d%H') == self.batch and slot.hour % 4 == 0,
+                'Nightly batch must be a four-hour UTC slot')
+
+    @property
+    def day(self):
+        return self.batch[:8]
+
     @property
     def branch(self):
-        return 'bot/daily-nightly/' + self.day
+        return 'bot/daily-nightly/' + self.batch
+
+
+def schedule_batch(created_at):
+    created = datetime.datetime.fromisoformat(created_at.replace('Z', '+00:00')).astimezone(datetime.timezone.utc)
+    return created.replace(hour=created.hour // 4 * 4).strftime('%Y%m%d%H')
 
 
 def git(*args, root=None, data=None, env=None):
@@ -149,9 +163,13 @@ def next_sequence(prefix, claimed):
     return prefix + str(max(sequences, default=0) + 1)
 
 
-def plan_versions(day, base, tags):
-    datetime.datetime.strptime(day, '%Y%m%d')
+def plan_versions(batch, base, tags):
+    day = batch[:8]
     values = versions_at(base)
+    for app in ('cli', 'www'):
+        if release.version(values[app]) == 'nightly':
+            current_day = values[app].split('-nightly.', 1)[1].split('.', 1)[0]
+            require(day >= current_day, f'unstarted Nightly batch predates current {app} version; refusing a downgrade')
     claimed = declared_versions(tags)
     product_prefix = values['cli'].split('-', 1)[0] + f'-nightly.{day}.'
     product_ver = next_sequence(product_prefix, claimed['product'] + [values[app] for app in PRODUCT_APPS])
@@ -162,7 +180,7 @@ def plan_versions(day, base, tags):
     expo = json.loads(blob(base, 'apps/mobile/app.json'))['expo']
     code = expo['android']['versionCode']
     require(type(code) is int and 0 < code < 2100000000, 'Android versionCode cannot be incremented')
-    return DailyPlan(day, base, values, code + 1)
+    return DailyPlan(batch, base, values, code + 1)
 
 
 def generated(plan):
@@ -206,11 +224,11 @@ def generated(plan):
     return {path: text.encode() for path, text in result.items()}
 
 
-def recovered_plan(day, head):
+def recovered_plan(batch, head):
     parents = git('rev-list', '--parents', '-n', '1', head).split()
     require(len(parents) == 2, 'daily version head must be one ordinary commit')
     expo = json.loads(blob(head, 'apps/mobile/app.json'))['expo']
-    return DailyPlan(day, parents[1], versions_at(head), expo['android']['versionCode'])
+    return DailyPlan(batch, parents[1], versions_at(head), expo['android']['versionCode'])
 
 
 def expected_tree(plan):
@@ -274,7 +292,7 @@ def validate_pr(pr, plan, head, login):
     require(pr['user']['login'] == login and pr['head']['repo']['full_name'] == REPO
             and pr['base']['repo']['full_name'] == REPO and pr['base']['ref'] == 'main'
             and pr['head']['ref'] == plan.branch and pr['head']['sha'] == head
-            and pr['commits'] == 1 and not pr['draft'] and pr['title'] == 'chore(release): daily nightly ' + plan.day,
+            and pr['commits'] == 1 and not pr['draft'] and pr['title'] == 'chore(release): nightly ' + plan.batch,
             'daily PR identity, author, base or head mismatch')
     require(pr['state'] == 'open' or pr.get('merged'), 'daily PR was closed without merge; refusing a replacement')
     verify_tree(plan, head)
@@ -284,8 +302,8 @@ def create_pr(plan, head, login):
     def read():
         return daily_pr(plan.branch)
     pr = reconcile_write(lambda: api('pulls', 'POST', dict(head=plan.branch, base='main',
-                         title='chore(release): daily nightly ' + plan.day,
-                         body='Mechanical daily Nightly versions. Only the trusted daily coordinator may merge this PR.'), pat=True),
+                         title='chore(release): nightly ' + plan.batch,
+                         body='Mechanical four-hour Nightly versions. Only the trusted Nightly coordinator may merge this PR.'), pat=True),
                          read, lambda value: value is not None, 'daily PR creation')
     validate_pr(pr, plan, head, login)
     return pr
@@ -316,25 +334,25 @@ def merge_pr(pr, plan, head, login):
     git('merge-base', '--is-ancestor', source, 'origin/main')
     parents = git('rev-list', '--parents', '-n', '1', source).split()
     require(len(parents) == 2, 'daily squash merge must have one real main parent')
-    landed = DailyPlan(plan.day, parents[1], plan.versions, plan.android_code)
+    landed = DailyPlan(plan.batch, parents[1], plan.versions, plan.android_code)
     require(git('rev-parse', source + '^{tree}') == expected_tree(landed),
             'actual main merge differs from exact mechanical versions on its real parent; retain original PR and stop')
     return source
 
 
-def ensure_landed(day, login):
-    branch = 'bot/daily-nightly/' + day
+def ensure_landed(batch, login):
+    branch = 'bot/daily-nightly/' + batch
     pr = daily_pr(branch)
     remote = branch_sha(branch)
     if pr:
         head = pr['head']['sha']
         require(remote is None and pr.get('merged') or remote == head, 'daily branch no longer matches original PR head')
         git('fetch', 'origin', f'pull/{pr["number"]}/head')
-        plan = recovered_plan(day, head)
+        plan = recovered_plan(batch, head)
     elif remote:
         git('fetch', 'origin', 'refs/heads/' + branch)
         head = remote
-        plan = recovered_plan(day, head)
+        plan = recovered_plan(batch, head)
         verify_tree(plan, head)
         pr = create_pr(plan, head, login)
     else:
@@ -342,14 +360,14 @@ def ensure_landed(day, login):
         base = git('rev-parse', 'origin/main')
         tags = [line.split('\t')[1][10:] for line in git('ls-remote', '--tags', 'origin').splitlines()
                 if not line.endswith('^{}')]
-        plan = plan_versions(day, base, tags)
+        plan = plan_versions(batch, base, tags)
         with checkout(base) as source:
             for path, content in generated(plan).items():
                 (source / path).write_bytes(content)
             metadata(source, plan)
             git('add', '--', *PATHS, root=source)
             git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
-                'commit', '-m', 'chore(release): daily nightly ' + day, root=source)
+                'commit', '-m', 'chore(release): nightly ' + batch, root=source)
             head = git('rev-parse', 'HEAD', root=source)
             verify_tree(plan, head)
             reconcile_write(lambda: git('push', 'origin', head + ':refs/heads/' + branch),
@@ -539,10 +557,10 @@ def run_daily(run_id):
     require(original['event'] == 'schedule' and original['head_branch'] == 'main' and original['path'] == CI
             and original['head_sha'] == os.environ.get('GITHUB_SHA') and original['repository']['full_name'] == REPO,
             'untrusted daily schedule source')
-    day = datetime.datetime.fromisoformat(original['created_at'].replace('Z', '+00:00')).astimezone(datetime.timezone.utc).strftime('%Y%m%d')
+    batch = schedule_batch(original['created_at'])
     login = api('/user', pat=True)['login']
     deadline = time.monotonic() + 5 * 60 * 60
-    plan, source, number = ensure_landed(day, login)
+    plan, source, number = ensure_landed(batch, login)
     ci = wait_main_ci(source, deadline)
     with checkout(source) as clean:
         previous = release.ROOT
@@ -559,7 +577,7 @@ def run_daily(run_id):
             releases = publish_daily(source, deadline)
         finally:
             release.ROOT = previous
-    print(json.dumps(dict(day=day, pr=number, source_commit=source, versions=plan.versions,
+    print(json.dumps(dict(batch=batch, day=plan.day, pr=number, source_commit=source, versions=plan.versions,
                           main_ci=ci['html_url'], releases=releases), indent=2))
 
 
@@ -580,6 +598,14 @@ def self_test():
             assert message is None or message in str(error), str(error)
         else:
             raise AssertionError('unsafe operation was accepted')
+
+    for hour in range(24):
+        assert schedule_batch(f'2026-11-06T{hour:02}:23:00Z') == f'20261106{hour // 4 * 4:02}'
+        assert schedule_batch(f'2026-11-06T{hour:02}:59:59Z') == f'20261106{hour // 4 * 4:02}'
+    assert schedule_batch('2026-11-07T00:23:00+08:00') == '2026110616'
+    assert schedule_batch('2026-11-07T00:00:00Z') == '2026110700'
+    for batch in ('20261106', '2026110601', '2026110624', '2026130600'):
+        rejected(lambda: DailyPlan(batch, '', {}, 1))
 
     with tempfile.TemporaryDirectory(dir=scratch(), prefix='self-test-') as temporary:
         root = Path(temporary) / 'repo'; root.mkdir()
@@ -617,15 +643,16 @@ def self_test():
             assert RELEASES == ('product', 'www') and PRODUCT_APPS == ('app', 'core', 'cli', 'mobile')
             base = git('rev-parse', 'HEAD')
             # Legacy component tags no longer claim a sequence; only real v/www-v tags and the current cohort do.
-            plan = plan_versions('20261106', base, ['v0.0.1-nightly.20261106.7', 'core-v0.0.1-nightly.20261106.9',
+            plan = plan_versions('2026110600', base, ['v0.0.1-nightly.20261106.7', 'core-v0.0.1-nightly.20261106.9',
                                                     'mobile-v0.0.1-nightly.20261106.9', 'cli-v0.0.1-nightly.20261106.9'])
             assert plan.versions['core'] == '0.0.1-nightly.20261106.8'
             assert all(plan.versions[app] == plan.versions['cli'] for app in PRODUCT_APPS)
             assert plan.versions['www'] == '0.0.1-nightly.20261106.1'
-            assert plan_versions('20261105', base, []).versions['core'].endswith('.3')
-            assert plan_versions('20261106', base, ['v0.0.1-nightly.20261106.9']).versions['cli'].endswith('.10')
-            assert plan_versions('20261106', base, ['www-v0.0.1-nightly.20261106.4']).versions['www'].endswith('.5')
-            assert plan_versions('20261106', base, ['www-v0.0.1-nightly.20261106.4']).versions['cli'].endswith('.1')
+            assert plan.day == '20261106' and plan.branch == 'bot/daily-nightly/2026110600'
+            assert plan_versions('2026110500', base, []).versions['core'].endswith('.3')
+            assert plan_versions('2026110600', base, ['v0.0.1-nightly.20261106.9']).versions['cli'].endswith('.10')
+            assert plan_versions('2026110600', base, ['www-v0.0.1-nightly.20261106.4']).versions['www'].endswith('.5')
+            assert plan_versions('2026110600', base, ['www-v0.0.1-nightly.20261106.4']).versions['cli'].endswith('.1')
             contents = generated(plan)
             assert json.loads(contents['apps/mobile/app.json'])['expo']['ios']['buildNumber'] == '99'
             assert contents['Cargo.lock'].count(b'[[package]]') == 2
@@ -641,7 +668,7 @@ def self_test():
                 return git('rev-parse', 'HEAD')
 
             head = commit_files({})
-            assert recovered_plan(plan.day, head) == plan
+            assert recovered_plan(plan.batch, head) == plan
             verify_tree(plan, head)
             metadata(root, plan)
             for path, content in (
@@ -659,7 +686,7 @@ def self_test():
             stale = commit_files({'apps/mobile/app.json': contents['apps/mobile/app.json'].replace(
                 b'"releaseVersion": "0.0.1-nightly.20261106.8"', b'"releaseVersion": "0.0.1-nightly.20261106.9"')})
             rejected(lambda: verify_tree(plan, stale), 'mechanical')
-            rejected(lambda: verify_tree(recovered_plan(plan.day, stale), stale), 'canonical version')
+            rejected(lambda: verify_tree(recovered_plan(plan.batch, stale), stale), 'canonical version')
             git('checkout', '--detach', '-q', base)
             head = commit_files({})
             git('checkout', '--detach', '-q', base)
@@ -667,7 +694,7 @@ def self_test():
             git('add', 'business.txt')
             git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', 'independent main change')
             advanced = git('rev-parse', 'HEAD')
-            landed = DailyPlan(plan.day, advanced, plan.versions, plan.android_code)
+            landed = DailyPlan(plan.batch, advanced, plan.versions, plan.android_code)
             merged = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
                          'commit-tree', expected_tree(landed), '-p', advanced, '-m', 'actual squash fixture')
             assert merged != head
@@ -675,7 +702,7 @@ def self_test():
             git('update-ref', 'refs/remotes/origin/main', advanced)
             pr = dict(number=17, user=dict(login='nightly-owner'), head=dict(repo=dict(full_name=REPO), ref=plan.branch, sha=head),
                       base=dict(repo=dict(full_name=REPO), ref='main'), commits=1, draft=False,
-                      title='chore(release): daily nightly ' + plan.day, state='open', merged=False, mergeable=True)
+                      title='chore(release): nightly ' + plan.batch, state='open', merged=False, mergeable=True)
             state = {'pr': None, 'merge_checks': 0}; writes = []
             real_git = git
 
@@ -685,6 +712,7 @@ def self_test():
             def pr_api(path, method='GET', data=None, pat=False, missing=False):
                 if method == 'POST':
                     assert path == 'pulls' and pat
+                    assert data['head'] == plan.branch and data['base'] == 'main' and data['title'] == pr['title']
                     writes.append((path, method, data)); state['pr'] = dict(pr)
                     raise ValueError('PR created but response lost')
                 if method == 'PUT':
@@ -707,14 +735,58 @@ def self_test():
                 assert merge_pr(created, plan, head, 'nightly-owner') == merged
                 assert len(writes) == 2
                 assert merge_pr(state['pr'], plan, head, 'nightly-owner') == merged and len(writes) == 2
-                with patch(f'{__name__}.branch_sha', return_value=head), patch(f'{__name__}.plan_versions', side_effect=AssertionError('same-day reallocation')):
-                    assert ensure_landed(plan.day, 'nightly-owner') == (plan, merged, 17)
+                with patch(f'{__name__}.branch_sha', return_value=head), patch(f'{__name__}.plan_versions', side_effect=AssertionError('same-batch reallocation')):
+                    assert ensure_landed(plan.batch, 'nightly-owner') == (plan, merged, 17)
                 rejected(lambda: validate_pr(dict(pr, user=dict(login='outsider')), plan, head, 'nightly-owner'), 'identity')
-            next_day = plan_versions('20261107', merged, [])
+            next_batch = plan_versions('2026110604', merged, [])
+            assert next_batch.day == plan.day and next_batch.branch != plan.branch
+            assert next_batch.versions['cli'] == '0.0.1-nightly.20261106.9'
+            assert next_batch.versions['www'] == '0.0.1-nightly.20261106.2'
+            assert next_batch.android_code == plan.android_code + 1
+            new_remote = {}
+            def next_batch_git(*args, **kwargs):
+                if args[0] in ('fetch', 'ls-remote'):
+                    return ''
+                if args[0] == 'push':
+                    pushed, ref = args[2].split(':')
+                    assert ref == 'refs/heads/' + next_batch.branch
+                    new_remote['head'] = pushed
+                    return ''
+                return real_git(*args, **kwargs)
+            with patch(f'{__name__}.git', side_effect=next_batch_git), \
+                    patch(f'{__name__}.daily_pr', side_effect=lambda branch: state['pr'] if branch == plan.branch else None) as lookup, \
+                    patch(f'{__name__}.branch_sha', side_effect=lambda branch: new_remote.get('head')), \
+                    patch(f'{__name__}.create_pr', return_value=dict(number=18)) as new_pr, \
+                    patch(f'{__name__}.merge_pr', side_effect=lambda pr, plan, head, login: head):
+                allocated, next_head, number = ensure_landed(next_batch.batch, 'nightly-owner')
+                assert allocated == next_batch and number == 18
+                lookup.assert_called_once_with(next_batch.branch)
+                new_pr.assert_called_once_with(next_batch, next_head, 'nightly-owner')
+            assert recovered_plan(next_batch.batch, next_head) == next_batch
+            verify_tree(next_batch, next_head)
+            next_day = plan_versions('2026110700', next_head, [])
             pv = next_day.versions['cli']
-            assert all(next_day.versions[a] == pv for a in PRODUCT_APPS)
-            assert '-nightly.20261107.1' in next_day.versions['www']
-            assert next_day.android_code == plan.android_code + 1
+            assert pv == '0.0.1-nightly.20261107.1' and all(next_day.versions[a] == pv for a in PRODUCT_APPS)
+            assert next_day.versions['www'] == '0.0.1-nightly.20261107.1'
+            assert next_day.android_code == next_batch.android_code + 1
+            future_main = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                              'commit-tree', expected_tree(next_day), '-p', next_head, '-m', 'next-day main fixture')
+            git('update-ref', 'refs/remotes/origin/main', future_main)
+            with patch(f'{__name__}.git', side_effect=next_batch_git), patch(f'{__name__}.daily_pr', return_value=None), \
+                    patch(f'{__name__}.branch_sha', return_value=None), patch(f'{__name__}.api') as no_write, \
+                    patch(f'{__name__}.checkout', side_effect=AssertionError('stale batch generated a branch')) as no_checkout:
+                rejected(lambda: ensure_landed('2026110620', 'nightly-owner'), 'current cli version')
+                no_checkout.assert_not_called()
+                no_write.assert_not_called()
+            newer_www = versions_at(next_head)
+            newer_www['www'] = next_day.versions['www']
+            with patch(f'{__name__}.versions_at', return_value=newer_www):
+                rejected(lambda: plan_versions('2026110620', next_head, []), 'current www version')
+            with patch(f'{__name__}.git', side_effect=fixture_git), patch(f'{__name__}.daily_pr', return_value=state['pr']), \
+                    patch(f'{__name__}.branch_sha', return_value=head), \
+                    patch(f'{__name__}.plan_versions', side_effect=AssertionError('old batch was reallocated')):
+                assert ensure_landed(plan.batch, 'nightly-owner') == (plan, merged, 17)
+            git('update-ref', 'refs/remotes/origin/main', merged)
 
             good = dict(id=1, run_attempt=1, head_sha=merged, head_branch='main', event='push', path=CI,
                         repository=dict(full_name=REPO), head_repository=dict(full_name=REPO),
@@ -893,27 +965,34 @@ def self_test():
 
             environment = dict(GITHUB_REPOSITORY=REPO, GITHUB_EVENT_NAME='schedule', GITHUB_REF='refs/heads/main',
                                GITHUB_RUN_ID='42', GITHUB_SHA=merged, NIGHTLY_RELEASE_TOKEN='fixture-only', GH_TOKEN='fixture-only')
-            original = dict(good, event='schedule', created_at='2026-11-06T23:59:59Z')
-            dates = []
-            def observe_day(day, login):
-                dates.append(day)
-                raise ValueError('date recovered from original run')
-            with patch.dict(os.environ, environment), patch(f'{__name__}.api', side_effect=lambda path, **kwargs: dict(login='owner') if path == '/user' else original), \
-                    patch(f'{__name__}.ensure_landed', side_effect=observe_day):
-                rejected(lambda: run_daily(42), 'date recovered')
-                assert dates == ['20261106']
+            original = dict(good, event='schedule', created_at='2026-11-06T00:23:00Z')
+            observed_batches = []
+            def observe_batch(batch, login):
+                observed_batches.append(batch)
+                raise ValueError('batch recovered from original run')
+            for now, attempt in ((datetime.datetime(2026, 11, 6, 23, tzinfo=datetime.timezone.utc), 1),
+                                 (datetime.datetime(2026, 11, 7, 12, tzinfo=datetime.timezone.utc), 2)):
+                original['run_attempt'] = attempt
+                with patch.dict(os.environ, environment), \
+                        patch(f'{__name__}.api', side_effect=lambda path, **kwargs: dict(login='owner') if path == '/user' else original), \
+                        patch(f'{__name__}.ensure_landed', side_effect=observe_batch), \
+                        patch(f'{__name__}.datetime.datetime', wraps=datetime.datetime) as clock:
+                    clock.now.return_value = now
+                    rejected(lambda: run_daily(42), 'batch recovered')
+                    clock.now.assert_not_called()
+            assert observed_batches == ['2026110600', '2026110600']
             for changes in ({'NIGHTLY_RELEASE_TOKEN': ''}, {'GITHUB_EVENT_NAME': 'workflow_dispatch'}):
                 with patch.dict(os.environ, dict(environment, **changes)), patch(f'{__name__}.api') as no_write:
                     rejected(lambda: run_daily(42))
                     no_write.assert_not_called()
 
     workflow = (ROOT / CI).read_text()
-    assert "cron: '23 3 * * *'" in workflow and 'group: daily-nightly\n      cancel-in-progress: false' in workflow
-    assert "if: github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.ci-gate.result == 'success'" in workflow
+    assert "cron: '23 */4 * * *'" in workflow and 'group: daily-nightly\n      cancel-in-progress: false' in workflow
+    assert "if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.ci-gate.result == 'success' }}" in workflow
     npm = (ROOT / '.github/workflows/npm-publish.yml').read_text()
     assert 'id-token: write' in npm and 'environment: npm-release' in npm and 'default: false' in npm
     assert 'NPM_TOKEN' not in npm and 'secrets.' not in npm
-    print('daily Nightly real-Git, identity, reconciliation and original-artifact self-tests passed')
+    print('four-hour Nightly real-Git, batch identity, reconciliation and original-artifact self-tests passed')
 
 
 def main():

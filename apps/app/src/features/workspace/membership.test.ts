@@ -10,13 +10,14 @@ import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
 const network = 'b'.repeat(64), browser = 'c'.repeat(64), entry = 'a'.repeat(64)
 const conversationId = 'conversation-1'
 const bot = { bot_id: 'bot-1', conversation_id: conversationId, name: 'Bot 一', instructions: '', models: {}, skills: null, event_hash: 'h' }
+const target = { kind: 'bot_main' as const, bot_id: bot.bot_id }
 const question = {
-  question_id: 'q-1', conversation_id: conversationId, bot: null, severity: 'attention', text: '继续吗？', choices: [{ label: '继续' }],
-  about: { node: entry, agent: 'codex', session_id: 's', cwd: '/p', summary: '' }, author: entry, created_at_ms: 1, answer: null,
+  question_id: 'q-1', conversation_id: conversationId, target, bot: { bot_id: bot.bot_id, name: bot.name }, severity: 'attention', text: '继续吗？', choices: [{ label: '继续' }],
+  about: { node: entry, agent: 'codex', session_id: 's', cwd: '/p', summary: '' }, author: entry, created_at_ms: 1, answer: null, closed: null,
 }
 const conversation = {
   conversation: { conversation_id: conversationId, title: '', owner: entry, owner_epoch: 1 }, messages: [], works: [], deliveries: [], scheduler: null,
-  checks: [], local_node: entry, changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], questions: [question], sessions: [],
+  checks: [], local_node: entry, changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], sent_coverage: { scope: 'main', omitted_unknown: 0 }, questions: [question], sessions: [],
 }
 const notMember = 'device is not a member of this personal network'
 const settle = () => new Promise(setImmediate)
@@ -53,8 +54,8 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
   const afterRender: (() => void)[] = []
   const rpcs: string[] = [], stored = new Map<string, string>(), failing = new Set<string>(), ticks: (() => void)[] = []
   let notificationReads = [
-    { notification_id: 'n-1', conversation_id: conversationId, kind: 'progress', text: '有新进展' },
-    { notification_id: 'n-session', conversation_id: conversationId, kind: 'session_attributed', text: 'tests fail' },
+    { notification_id: 'n-1', conversation_id: conversationId, target, kind: 'progress', text: '有新进展' },
+    { notification_id: 'n-session', conversation_id: conversationId, target, kind: 'session_attributed', text: 'tests fail' },
   ]
   if (readBefore) stored.set(`vibeface.read-before.${browser}.${network}`, JSON.stringify(readBefore))
   let cursor = 0
@@ -80,6 +81,7 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
   const reads: Record<string, unknown> = {
     nodes: { nodes: [] }, bots: { bots: [bot], primary: conversationId }, questions: { questions: [question] }, conversation, open_works: { works: [] },
     notifications: { notifications: notificationReads },
+    workspace_state: { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } },
   }
   const connection = {
     generation: 1, entry: { address: 'https://node.example', device_id: entry },

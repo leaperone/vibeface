@@ -7,20 +7,20 @@ import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
 import { entryAddress, entryJson, entryKey, messageOf, parseEntry, parseInfo, providerNames } from "@vibeface/client/lib/node.ts"
 import * as nodeSettings from "@vibeface/client/lib/node.ts"
+import type { OutboxItem } from '@vibeface/client/lib/outbox.ts'
 import type { NodeSettingsResponse, ProviderReadiness, ProviderStatus, ReadyConnection } from "@vibeface/client/lib/node.ts"
-import type { WorkRecord } from "@vibeface/client/workspace/types.ts"
-import type { PendingMessage } from "@vibeface/client/chat/types.ts"
+import type { InputReceipt, InputOptions, InputTarget, ManagerJob, PendingMessage, WorkRecord, WorkspaceDomainState } from "@vibeface/client/workspace/types.ts"
 import { cardState, nodeName, taskGroup } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
 import { botCopy, folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
 import { agentName, answerLabel, attentionLabel, approvalTask, awaitsAnswer, declined, foldAnswers, projectName, questionMeta, questionOpen, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
 import * as errors from "@vibeface/client/lib/errors.ts"
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
-import { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice, messageKey, replyStatusLabel } from "@vibeface/client/chat/protocol.ts"
+import { messageKey, replyStatusLabel, inputTargetKey, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
 import { deviceCopy, offlineCopy, setUpOnManager } from "@vibeface/client/identity/copy.ts"
-import { chatTimeline, firstUnread, unreadCounts } from "@vibeface/client/chat/timeline.ts"
+import { chatTimeline, firstUnread, taskMessage, unreadCounts } from "@vibeface/client/chat/timeline.ts"
 import { accessOf } from "@vibeface/client/identity/access.ts"
-import { storageOf } from "@vibeface/client/workspace/storage.ts"
+import { networkKey, storageOf } from "@vibeface/client/workspace/storage.ts"
 import { unreachable } from "@vibeface/client/workspace/home.ts"
 import { primaryLane } from "@vibeface/client/identity/connection-lane.ts"
 import * as taskLabels from "@vibeface/client/workspace/labels.ts"
@@ -38,7 +38,7 @@ test("bulk inbox actions re-arm focus after an intervening list update", () => {
 
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
-  works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], questions: [], sessions: [],
+  works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], sent_coverage: { scope: 'main', omitted_unknown: 0 }, questions: [], sessions: [],
 }
 test("attachment names are signed clean and files once each in content order", () => {
   assert.equal(attachmentName("../etc/pass\\wd\u0007\n.txt"), "..etcpasswd.txt")
@@ -71,7 +71,7 @@ test("capabilities parse the actual provider name and reject malformed node list
 })
 test("works, reply status and pending checks keep their exact shape", () => {
   const work = { work_id: "work", trigger: "message:one", target_node: "worker", cwd: "/project", title: "检查项目", prompt: "检查项目", state: "running", summary: "进行中", outcome: null, result_text: "", failure_reason: null, resolved: { provider: "codex", model: null } }
-  const scheduler = { jobs: [{ trigger: "message:one", state: "queued", message_id: "one" }], unanswered: [], capabilities: { streaming: true, cancel: false, steer: false } }
+  const scheduler = { scope_jobs: [], jobs: [{ scope: { kind: 'main' as const }, trigger: "message:one", state: "queued", message_id: "one" }], unanswered: [], capabilities: { streaming: true, cancel: false, steer: false } }
   const message = { message_id: "reply", event_hash: "event", role: "assistant", text: "部分回复", created_at_ms: 1, in_reply_to: "one", status: "stopped" }
   const sent = { message_id: "one", event_hash: "sent", role: "user", text: "看附件", created_at_ms: 0, attachments: [{ hash: "file", size: 20, name: "报告.pdf" }] }
   const parsed = parseConversation({ ...context, works: [work], scheduler, messages: [message, sent] })
@@ -123,8 +123,8 @@ test("works, reply status and pending checks keep their exact shape", () => {
   assert.deepEqual(delivered.works[1], { work_id: "new", trigger: "", target_node: "other", cwd: "/p", title: "新任务", prompt: "", state: "dispatch_rejected", summary: "", outcome: null, result_text: "", failure_reason: "project unavailable" })
   assert.throws(() => parseConversation({ ...context, deliveries: [{ work_id: "w", target_node: "n", state: "waiting_for_device" }] }))
   assert.throws(() => parseConversation({ ...context, scheduler: { ...scheduler, jobs: [{ ...scheduler.jobs[0], state: 1 }] } }))
-  assert.equal(parseConversation({ ...context, scheduler: { jobs: [{ trigger: "message:two", owner: "node", conversation_id: "c", state: "pending_delivery", message_id: "two" }], unanswered: [] } }).scheduler?.jobs[0].state, "pending_delivery")
-  assert.throws(() => parseConversation({ ...context, scheduler: { jobs: [] } }), "the unanswered list is always sent")
+  assert.equal(parseConversation({ ...context, scheduler: { scope_jobs: [], jobs: [{ scope: { kind: 'main' as const }, trigger: "message:two", owner: "node", conversation_id: "c", state: "pending_delivery", message_id: "two" }], unanswered: [] } }).scheduler?.jobs[0].state, "pending_delivery")
+  assert.throws(() => parseConversation({ ...context, scheduler: { scope_jobs: [], jobs: [] } }), "the unanswered list is always sent")
 })
 test("artifact pages stay bound to their original reference and advance without skipping the end", () => {
   const page = { blob_hash: "result", text: "first", offset: 0, next_offset: 5, size: 10 }
@@ -174,17 +174,17 @@ test("workspace preserves bot and message requests while routing native decision
     history: { replaceState(_state: unknown, _title: string, url: string) { browser.location.href = new URL(url, browser.location.href).href } }, setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
   }
   const sandbox = createContext({
-    window: browser, URL, TextEncoder, TextDecoder, Error, crypto: globalThis.crypto,
+    window: browser, URL, TextEncoder, TextDecoder, Error, crypto: globalThis.crypto, btoa, atob,
     setTimeout: browser.setTimeout, clearTimeout: browser.clearTimeout, setInterval: browser.setInterval, clearInterval: browser.clearInterval,
     structuredClone, navigator: { locks: { request: async (_key: string, _options: unknown, run: (lock: object) => Promise<void>) => run({}) } },
     document: { hidden: false, addEventListener() {}, removeEventListener() {} },
   })
   const signed: string[] = [], attestation = { device_id: "client", signature: "signature" }
   const botBody = (pending: unknown) => ({ ...JSON.parse(JSON.stringify(parseCreateBot(pending))), scheduler_node: "gateway", owner_attestation: attestation, attestation })
-  const outboxItems = new Map<string, { key: string }>()
+  const outboxItems = new Map<string, OutboxItem>()
   const memoryOutbox = {
     all: async () => [...outboxItems.values()].map((item) => structuredClone(item)),
-    put: async (item: { key: string }) => { outboxItems.set(item.key, structuredClone(item)) },
+    put: async (item: OutboxItem) => { outboxItems.set(item.key, structuredClone(item)) },
     delete: async (key: string) => { outboxItems.delete(key) },
   }
   const modules = new Map<string, { exports: Record<string, unknown> }>()
@@ -211,7 +211,7 @@ test("workspace preserves bot and message requests while routing native decision
   assert.equal(typeof workspaceModule.useWorkspaceState, "function")
   const { useWorkspaceState } = workspaceModule as { useWorkspaceState(platform: unknown, connection: ReadyConnection): Workspace }
   const platform = {
-    secure: { attestationPayload: (network: string, scope: string, body: string) => `${network}|${scope}|${body}` },
+    secure: { attestationPayload: (network: string, scope: string, body: string) => { const event = JSON.parse(body); assert.equal(typeof event.type, "string"); assert.equal(event.attestation, undefined); return `${network}|${scope}|${body}` } },
     transport: { signClient: async (domain: string, payload: string) => { signed.push(`${domain}|${payload}`); return "signature" } },
     storage: browser.localStorage, outbox: memoryOutbox, self: "这个浏览器",
     notifier: { name: "浏览器提醒", permission: async () => "default", request: async () => "default", show() {} },
@@ -229,10 +229,15 @@ test("workspace preserves bot and message requests while routing native decision
     return { promise, resolve, reject }
   }
   let conversationHold: ReturnType<typeof deferred> | null = null, messageHold: ReturnType<typeof deferred> | null = null
+  let uploadHold: ReturnType<typeof deferred> | null = null
   const acknowledgements: string[] = []
-  let unreadNotifications: { notification_id: string; kind: string; text: string; conversation_id: string }[] = []
+  let unreadNotifications: { notification_id: string; kind: string; text: string; conversation_id: string; target?: InputTarget }[] = []
   const messages: Record<string, unknown>[] = [], controls: Record<string, unknown>[] = [], creations: Record<string, unknown>[] = []
-  let failControl = false, failBotCheck = false, failMessage = false
+  let failControl = false, failBotCheck = false, failMessage = false, inputQuerySafe = false
+  let inputControlEvent = 'c'.repeat(64), inputQueryStage: InputReceipt['stage'] | null = null
+  const inputReleases: Record<string, unknown>[] = []
+  const inputReceiptOverrides = new Map<string, InputReceipt>(), inputReceiptQueries: Record<string, unknown>[] = []
+  let inputReleaseReply: ((body: Record<string, unknown>) => unknown) | null = null
   const questionRow = { question_id: "q1", conversation_id: "chat" as string | null, bot: { bot_id: "bot", name: "Bot" } as { bot_id: string; name: string } | null, severity: "attention", text: "要不要继续", choices: [{ label: "继续" }, { label: "停下" }], about: { node: "worker", agent: "codex", session_id: "thread", cwd: "/project", summary: "改登录" }, author: "gateway", created_at_ms: 1, answer: null }
   const otherRow = { ...questionRow, question_id: "s1", conversation_id: "other" }
   let questionRows: Record<string, unknown>[] = [questionRow, otherRow]
@@ -253,6 +258,21 @@ test("workspace preserves bot and message requests while routing native decision
       if (method === "questions") return { questions: questionRows }
       if (method === "open_works") return { works: [] }
       if (method === "workspace_overview") return {}
+      if (method === "workspace_state") return { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } }
+      if (method === "input_receipt") {
+        inputReceiptQueries.push(JSON.parse(JSON.stringify(body)))
+        return inputReceiptOverrides.get(String(body.message_id)) ?? { message_id: body.message_id, target: body.target, stage: inputQueryStage ?? (inputQuerySafe ? "refused" : transcript.some((message) => message.message_id === body.message_id) ? "entry_accepted" : "unknown"), actual_turn_id: null, reason: "原输入待确认", retry_safe: inputQuerySafe, control_event: inputQuerySafe || inputQueryStage ? inputControlEvent : null }
+      }
+      if (method === 'workspace_command') {
+        const command = workspaceModel.parseWorkspaceCommand(body.command)
+        assert.ok(command.kind === 'control_input' && command.action.kind === 'release')
+        assert.equal(command.expected_event, inputControlEvent)
+        assert.ok(messages.some((message) => message.message_id === command.message_id), 'Release refers to the original stored input')
+        inputReleases.push(JSON.parse(JSON.stringify(body)))
+        if (inputReleaseReply) return inputReleaseReply(body)
+        throw new Error('release acknowledgement lost')
+      }
+      if (method === 'upload_attachment') return uploadHold ? uploadHold.promise : { complete: true }
       if (method === "answer") {
         answers.push(JSON.parse(JSON.stringify(body)))
         if (answerOutcome === "lost") throw new Error("connection lost")
@@ -309,7 +329,7 @@ test("workspace preserves bot and message requests while routing native decision
     state = render()
     assert.equal(state.selectedBot?.bot_id, "bot")
     const retryMessage = { message_id: "retry-1", event_hash: "retry-event", role: "user", text: "改 README", created_at_ms: 1 }
-    const retryScheduler = { jobs: [{ trigger: "message:retry-1", state: "failed", message_id: "retry-1", failure: { kind: "rejected", detail: "没有执行" } }], unanswered: [] }
+    const retryScheduler = { scope_jobs: [], jobs: [{ scope: { kind: 'main' as const }, trigger: "message:retry-1", state: "failed", message_id: "retry-1", failure: { kind: "rejected", detail: "没有执行" } }], unanswered: [] }
     transcript = [retryMessage]
     scheduler = retryScheduler
     const heldRefresh = deferred()
@@ -322,14 +342,17 @@ test("workspace preserves bot and message requests while routing native decision
     heldRefresh.resolve({ ...context, messages: [retryMessage], scheduler: retryScheduler })
     await refreshing
     assert.equal(await retrying, true)
+    await new Promise(setImmediate)
     assert.equal(messages.length, 1)
     assert.match(String(messages[0]?.text), /上次没回完/)
+    conversationHold = null
+    await render().refresh()
     messages.splice(0)
     conversationHold = null
     scheduler = null
     transcript = []
     stored.set("vibeface.ignored-inbox.client.network", JSON.stringify(["from-other-tab"]))
-    unreadNotifications = [{ notification_id: "local-note", kind: "manager_attention", text: "看看进展", conversation_id: "chat" }]
+    unreadNotifications = [{ notification_id: "local-note", kind: "manager_attention", text: "看看进展", conversation_id: "chat", target: { kind: "bot_main", bot_id: "bot" } }]
     render().setView("tasks")
     await render().refresh()
     render().ignoreNotifications(["local-note"])
@@ -337,19 +360,61 @@ test("workspace preserves bot and message requests while routing native decision
     unreadNotifications = []
     render().setView("chat")
     failMessage = true
-    await assert.rejects(state.sendMessage("work"), /connection lost/)
+    assert.equal(await render().sendMessage("work", [{ name: "retry.txt", arrayBuffer: async () => new Uint8Array([7, 8, 9]).buffer }]), true)
+    await new Promise(setImmediate)
     state = render()
-    assert.ok(state.messagePending)
-    const pending = JSON.parse(JSON.stringify(state.messagePending))
-    assert.deepEqual(messages[0], { conversation_id: "chat", message_id: pending.message_id, text: "work", report_results: true, attestation })
-    assert.equal(signed.at(-1), `attestation|network|chat|${JSON.stringify({ type: "message_posted", message_id: pending.message_id, role: "user", text: "work", report_results: true })}`)
-    await assert.rejects(render().sendMessage("different work"), /上一条消息/)
+    const saved = state.pendingMessages.find((item) => item.text === "work")
+    assert.ok(saved)
+    const pending = JSON.parse(JSON.stringify(saved))
+    assert.deepEqual(messages[0], { conversation_id: "chat", message_id: pending.message_id, target: { kind: "bot_main", bot_id: "bot" }, intent: "continue", sequence: pending.sequence, text: "work", attachments: pending.attachments, report_results: true, attestation })
+    assert.equal(signed.at(-1), `attestation|network|chat|${JSON.stringify({ type: "input_posted", message_id: pending.message_id, target: pending.target, intent: pending.intent, sequence: pending.sequence, text: "work", attachments: pending.attachments, report_results: true })}`)
+    assert.equal(render().canSaveMessages, true, "an unknown prior input leaves local saving available")
     failMessage = false
     connection.entry.device_id = "other-gateway"
-    await render().sendMessage("work")
-    assert.deepEqual(messages[1], messages[0], "another entrance receives the same signed request")
+    const inputUiErrors: string[] = []
+    let inputWork = Promise.resolve()
+    const inputUi = componentHarness('./workspace-chat.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/chat/protocol.ts': { inputTargetKey },
+      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, action: () => Promise<void>) => { inputWork = action().catch((cause) => { inputUiErrors.push(String(cause)) }); return inputWork } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+    })
+    const inputButton = (label: string) => {
+      const saved = render().pendingMessages.find((item) => item.message_id === pending.message_id)
+      assert.ok(saved)
+      return inputUi.render('WorkspaceInputStatus', { pending: saved }).find(({ type, props }) => type === 'Button' && componentText(props.children) === label)?.props
+    }
+    const pressInput = async (label: string) => { const press = inputButton(label)?.onClick; assert.ok(press); press(); await inputWork; await settleComponent() }
+    try {
+      await pressInput('查询结果')
+      assert.equal(inputButton('重试原输入'), undefined, 'unknown writes are queried without replay')
+      assert.equal(messages.length, 1)
+      inputQuerySafe = true
+      await pressInput('查询结果')
+      transcript = [{ ...posted(pending.message_id), target: pending.target, attachments: pending.attachments }]
+      await render().refresh()
+      assert.ok(inputButton('重试原输入'), 'a stored safe refusal survives history until the user chooses recovery')
+      await pressInput('重试原输入')
+      assert.equal(inputReleases.length, 1, inputUiErrors.join(' | '))
+      assert.equal(messages.length, 1, 'the recovery is a Release CAS, never a second message write')
+      assert.equal(inputButton('重试原输入'), undefined, 'a lost Release answer must not offer another Release')
+      await pressInput('查询结果')
+      const unresolved = render().pendingMessages.find((item) => item.message_id === pending.message_id)
+      assert.equal(unresolved?.delivery, 'unknown', 'an old refused receipt cannot confirm the lost Release')
+      const retained = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === pending.message_id)
+      assert.ok(retained)
+      assert.deepEqual(retained.params, messages[0], 'original ID, signature, sequence and attachments stay unchanged')
+      assert.equal(signed.filter((value) => value.includes('"type":"input_posted"') && value.includes(pending.message_id)).length, 1)
+      assert.equal(inputReleases.length, 1)
+      const retainedControl = [...outboxItems.values()].find((item) => item.method === 'workspace_command')
+      assert.ok(retainedControl); assert.deepEqual(retainedControl.params, inputReleases[0], 'the unknown Release retains its original signed control request')
+      inputControlEvent = 'd'.repeat(64); inputQuerySafe = false; inputQueryStage = 'entry_accepted'
+      await pressInput('查询结果')
+      const settled = render().pendingMessages.find((item) => item.message_id === pending.message_id)
+      assert.ok(!settled || settled.delivery === 'accepted')
+      if (settled) assert.equal(inputButton('重试原输入'), undefined)
+    } finally { inputUi.close(); inputQuerySafe = false; inputQueryStage = null }
     connection.entry.device_id = "gateway"
-    assert.equal(render().messagePending, null)
+    await render().refresh()
+    assert.equal(render().pendingMessages.length, 0)
     await render().interruptWork("work")
     assert.deepEqual(controls, [{ method: "interrupt_work", conversation_id: "chat", work_id: "work" }])
     const [question, other] = render().questions
@@ -447,62 +512,53 @@ test("workspace preserves bot and message requests while routing native decision
     await render().createBot({ name: "corrected project", instructions: "" })
     assert.equal(render().pendingBot, null)
     assert.equal(render().selectedBot?.name, "corrected project")
-    assert.equal(messages.length, 2)
+    assert.equal(messages.length, 1, "Bot creation and recovery never re-post the stored input")
 
     await t.test("new connections wait for their own complete read and retain unknown writes without replay", async () => {
       knownBots = [bot]
       await render().refresh()
-      assert.equal(render().messagePending, null)
+      assert.equal(render().pendingMessages.length, 0)
       for (const outcome of ["success", "failure"]) {
         const write = deferred(); messageHold = write
         const before = messages.length
-        const sending = render().sendMessage("reconnect payload")
-        const rejected = assert.rejects(sending, /连接换了|old response lost/)
+        assert.equal(await render().sendMessage("reconnect payload"), true, "local acceptance does not wait for the entry RPC")
         await new Promise(setImmediate)
-        assert.equal(render().messageBusy, true)
-        const original = JSON.parse(JSON.stringify(render().messagePending))
+        assert.equal(render().messageBusy, false)
+        const original = render().pendingMessages.find((item) => item.text === "reconnect payload")
+        assert.ok(original)
+        assert.equal(messages.length, before + 1)
         const reading = deferred(); conversationHold = reading
         const ackBefore = acknowledgements.length
-        unreadNotifications = [{ notification_id: `note-${activeConnection.generation}`, kind: "result", text: "unread", conversation_id: "chat" }]
+        unreadNotifications = [{ notification_id: `note-${activeConnection.generation}`, kind: "result", text: "unread", conversation_id: "chat", target: { kind: "bot_main", bot_id: "bot" } }]
         const next: ReadyConnection = { ...connection, generation: activeConnection.generation + 1, isCurrent: () => activeConnection === next }
         activeConnection = next
         assert.equal(render().writable, false)
         await new Promise(setImmediate)
-        assert.equal(render().messageBusy, false)
-        assert.equal(render().writable, false)
-        await assert.rejects(render().sendMessage("reconnect payload"), /补读/)
+        assert.equal(render().canSaveMessages, false, "the new connection must finish its own authorized read")
+        await assert.rejects(render().sendMessage("new unread connection"), /先读取|补读/)
         assert.equal(messages.length, before + 1)
         if (outcome === "success") reading.resolve({ ...context, scheduler: null, works: [work] })
         else reading.reject(new Error("new read unavailable"))
         await new Promise(setImmediate)
         assert.equal(render().writable, outcome === "success")
+        assert.equal(render().canSaveMessages, outcome === "success")
         assert.equal(acknowledgements.length, ackBefore)
-        if (outcome === "failure") await assert.rejects(render().sendMessage("reconnect payload"), /补读/)
+        if (outcome === "failure") await assert.rejects(render().sendMessage("new unread connection"), /先读取|补读/)
         conversationHold = null; scheduler = null
         await render().run(() => render().refresh())
         assert.equal(render().writable, true)
-        assert.deepEqual(JSON.parse(JSON.stringify(render().messagePending)), original)
+        assert.equal(render().pendingMessages.some((item) => item.message_id === original.message_id), true)
+        messageHold = null
         if (outcome === "success") write.resolve({ accepted: true, state: "queued", message_id: original.message_id })
         else write.reject(new Error("old response lost"))
-        await rejected
-        assert.equal(render().messageBusy, false)
-        assert.equal(render().error, null)
-        if (outcome === "success") {
-          await new Promise(setImmediate)
-          assert.equal(messages.length, before + 2, "the new entry's first complete read resubmits the unconfirmed message once")
-          assert.deepEqual(messages.at(-1), messages.at(-2), "byte for byte, without a new signature")
-          assert.equal(render().messagePending, null)
-        } else {
-          assert.deepEqual(JSON.parse(JSON.stringify(render().messagePending)), original)
-          assert.equal(messages.length, before + 1, "a failed read resubmits nothing")
-        }
+        await new Promise(setImmediate)
+        assert.equal(messages.length, before + 1, "reconnect queries the original input without replaying its write")
+        transcript = [...transcript, posted(original.message_id)]
+        await render().queryInput(original)
+        await render().refresh()
+        assert.equal(render().pendingMessages.some((item) => item.message_id === original.message_id), false)
       }
       messageHold = null
-      const original = render().messagePending
-      assert.ok(original)
-      transcript = [...transcript, posted(original.message_id)]
-      await render().refresh()
-      assert.equal(render().messagePending, null)
       conversationHold = deferred()
       const next: ReadyConnection = { ...connection, generation: activeConnection.generation + 1, isCurrent: () => activeConnection === next }
       activeConnection = next; render(); await new Promise(setImmediate)
@@ -513,7 +569,7 @@ test("workspace preserves bot and message requests while routing native decision
       await render().createBot({ name: "unrelated new bot", instructions: "" })
       assert.equal(render().selectedBot?.name, "unrelated new bot")
       const currentId = render().conversationId, ackBefore = acknowledgements.length
-      unreadNotifications = [{ notification_id: "after-reconnect", kind: "result", text: "unread", conversation_id: currentId }]
+      unreadNotifications = [{ notification_id: "after-reconnect", kind: "result", text: "unread", conversation_id: currentId, target: { kind: "bot_main", bot_id: render().selectedBot!.bot_id } }]
       conversationHold = deferred()
       const restored: ReadyConnection = { ...connection, generation: activeConnection.generation + 1, isCurrent: () => activeConnection === restored }
       activeConnection = restored; render(); await new Promise(setImmediate)
@@ -526,6 +582,231 @@ test("workspace preserves bot and message requests while routing native decision
       assert.deepEqual(acknowledgements.slice(ackBefore), ["after-reconnect"])
     })
 
+    await t.test('opening Bot Main acknowledges only its typed Main notices and leaves Task and unknown scope unread', async () => {
+      knownBots = [bot]
+      await render().refresh()
+      render().setView('chat')
+      const before = acknowledgements.length
+      const writes = messages.length
+      unreadNotifications = [
+        { notification_id: 'task-scope-notice', kind: 'result', text: '任务更新', conversation_id: 'chat', target: { kind: 'task', task_id: 'workspace-task' } },
+        { notification_id: 'unknown-scope-notice', kind: 'result', text: '归属未提供', conversation_id: 'chat' },
+        { notification_id: 'main-scope-notice', kind: 'result', text: '主聊天更新', conversation_id: 'chat', target: { kind: 'bot_main', bot_id: 'bot' } },
+      ]
+      await render().refresh()
+      assert.deepEqual(acknowledgements.slice(before), ['main-scope-notice'])
+      assert.deepEqual(render().notifications.map((item) => item.notification_id), ['task-scope-notice', 'unknown-scope-notice'])
+      await render().markNotificationsRead(['task-scope-notice', 'unknown-scope-notice'])
+      assert.deepEqual(acknowledgements.slice(before), ['main-scope-notice', 'task-scope-notice', 'unknown-scope-notice'])
+      assert.equal(messages.length, writes, 'reading notifications does not answer or continue a task')
+    })
+
+    await t.test('three inputs save before the first RPC returns and reach their target in order without waiting for refresh', async () => {
+      knownBots = [bot]
+      await render().refresh()
+      const before = messages.length
+      const firstRpc = deferred()
+      messageHold = firstRpc
+      assert.deepEqual(await Promise.all([render().sendMessage('input one'), render().sendMessage('input two'), render().sendMessage('input three')]), [true, true, true])
+      await new Promise(setImmediate)
+      const saved = render().pendingMessages
+      assert.deepEqual(saved.map((item) => item.text), ['input one', 'input two', 'input three'])
+      assert.equal(new Set(saved.map((item) => item.message_id)).size, 3)
+      assert.equal(messages.length, before + 1, 'only the first write is in flight for this target')
+      const read = deferred(); conversationHold = read
+      const refreshing = render().refresh()
+      await new Promise(setImmediate)
+      messageHold = null
+      transcript = [...transcript, posted(saved[0].message_id)]
+      firstRpc.resolve({ accepted: true, state: 'steering', message_id: saved[0].message_id })
+      await new Promise(setImmediate)
+      assert.deepEqual(messages.slice(before).map((message) => message.text), ['input one', 'input two', 'input three'])
+      assert.deepEqual(messages.slice(before).map((message) => message.message_id), saved.map((item) => item.message_id))
+      read.resolve({ ...context, messages: transcript, scheduler: null, works: [work] })
+      await refreshing
+      conversationHold = null
+      await render().refresh()
+      assert.equal(render().pendingMessages.length, 0)
+    })
+
+    await t.test('attachment upload holds target order while later drafts remain locally recoverable', async () => {
+      const before = messages.length
+      const uploading = deferred(); uploadHold = uploading
+      const bytes = new TextEncoder().encode('attachment body')
+      const file = { name: 'notes.txt', arrayBuffer: async () => bytes.buffer }
+      assert.equal(await render().sendMessage('attachment first', [file]), true)
+      assert.equal(await render().sendMessage('text second'), true)
+      assert.equal(await render().sendMessage('text third'), true)
+      await new Promise(setImmediate)
+      const saved = render().pendingMessages
+      assert.deepEqual(saved.map((item) => item.text), ['attachment first', 'text second', 'text third'])
+      assert.equal(saved[0].attachments?.[0]?.name, 'notes.txt')
+      assert.equal(messages.length, before, 'the later text cannot pass the earlier attachment')
+      await reload()
+      assert.deepEqual(render().pendingMessages.map((item) => item.message_id), saved.map((item) => item.message_id), 'reload retains each original input identity')
+      uploadHold = null; uploading.resolve({ complete: true })
+      await new Promise(setImmediate)
+      assert.deepEqual(messages.slice(before).map((message) => message.text), ['attachment first', 'text second', 'text third'])
+      await render().refresh()
+      assert.equal(render().pendingMessages.length, 0)
+    })
+
+    await t.test('a locally created channel task receives follow-ups before its create command is acknowledged', async () => {
+      const current = activeConnection, originalRpc = current.rpc
+      const creating = deferred()
+      const commands: Record<string, unknown>[] = []
+      const saved: PendingMessage[] = []
+      const before = messages.length
+      let domain: WorkspaceDomainState = {
+        channels: [{ channel_id: 'channel', title: '频道', purpose: '', members: ['bot'], coordinator_bot: 'bot', coordinator_node: 'gateway', owner_epoch: 1, revision: 1, event_hash: 'channel-event', created_at_ms: 1 }],
+        tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false },
+      }
+      current.rpc = async (method, body = {}) => {
+        if (method === 'workspace_state') return domain
+        if (method === 'workspace_command') {
+          const command = workspaceModel.parseWorkspaceCommand(body.command)
+          assert.ok(command.kind === 'create_task')
+          assert.ok(command.expected_result.trim(), 'Node valid_text rejects an empty expected result')
+          assert.ok(new TextEncoder().encode(command.expected_result).length <= 16384)
+          commands.push(JSON.parse(JSON.stringify(body))); return creating.promise
+        }
+        if (method === 'workspace_history') return {
+          events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...message, type: 'input_posted' } })),
+          coverage: { limit: 128, truncated: false, scope: 'task' },
+        }
+        return originalRpc(method, body)
+      }
+      try {
+        await render().readWorkspaceState()
+        assert.equal(await render().sendMessage('channel one', [], undefined, { target: { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }, onSaved: (input) => { saved.push(input) } }), true)
+        const first = saved[0]
+        assert.ok(first)
+        assert.ok(first.target.kind === 'channel_task')
+        assert.equal(first.expected_revision, 1)
+        assert.equal(first.conversation_id, 'chat')
+        const target = first.target
+        const plainTarget = JSON.parse(JSON.stringify(target))
+        assert.deepEqual(await Promise.all([
+          render().sendMessage('channel two', [], undefined, { target }),
+          render().sendMessage('channel three', [], undefined, { target, expected_revision: first.expected_revision, conversation_id: first.conversation_id }),
+        ]), [true, true])
+        await new Promise(setImmediate)
+        assert.equal(commands.length, 1, 'only the original creation is submitted while its acknowledgement is held')
+        assert.equal(messages.length, before, 'input delivery waits behind its real task creation')
+        assert.deepEqual(JSON.parse(JSON.stringify(render().pendingMessages.map((input) => input.target))), [plainTarget, plainTarget, plainTarget])
+        const command = workspaceModel.parseWorkspaceCommand(commands[0].command)
+        assert.ok(command.kind === 'create_task')
+        assert.equal(command.task_id, target.task_id)
+        const event = 'c'.repeat(64)
+        domain = { ...domain, tasks: [{ ...command, root_task_id: command.task_id, revision: 1, action: 'continue', request_event: event, event_hash: event, created_at_ms: 1, updated_at_ms: 1, state: 'not_started' }] }
+        creating.resolve({ ...domain, command_id: commands[0].command_id, event_hash: event, duplicate: false })
+        await new Promise(setImmediate)
+        assert.deepEqual(messages.slice(before).map((message) => message.text), ['channel one', 'channel two', 'channel three'])
+        assert.deepEqual(messages.slice(before).map((message) => message.target), [plainTarget, plainTarget, plainTarget])
+        await render().readWorkspaceHistory({ task_id: target.task_id })
+        assert.equal(render().pendingMessages.length, 0)
+      } finally { current.rpc = originalRpc }
+    })
+
+    await t.test('Main and Work explicit NewTask use a real valid expected result and preserve Work sources', async () => {
+      const current = activeConnection, originalRpc = current.rpc
+      const sourceEvents = ['a'.repeat(64)]
+      for (const kind of ['main', 'work']) {
+        const before = messages.length, commands: Extract<import('@vibeface/client/workspace/types.ts').WorkspaceCommand, { kind: 'create_task' }>[] = []
+        let domain: WorkspaceDomainState = { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } }
+        current.rpc = async (method, body = {}) => {
+          if (method === 'workspace_state') return domain
+          if (method === 'work_detail') return { work: { ...work, conversation_id: 'chat', target: null, source_events: sourceEvents }, coverage: { source: 'shared_history', complete: false } }
+          if (method === 'workspace_command') {
+            const command = workspaceModel.parseWorkspaceCommand(body.command)
+            assert.ok(command.kind === 'create_task')
+            assert.ok(command.expected_result.trim(), 'the real Node requires nonempty expected_result')
+            assert.ok(new TextEncoder().encode(command.expected_result).length <= 16384)
+            assert.deepEqual(command.source_events, kind === 'work' ? sourceEvents : [])
+            commands.push(command)
+            const event = 'd'.repeat(64)
+            domain = { ...domain, tasks: [{ ...command, root_task_id: command.task_id, revision: 1, action: 'continue', request_event: event, event_hash: event, created_at_ms: 1, updated_at_ms: 1, state: 'not_started' }] }
+            return { ...domain, command_id: body.command_id, event_hash: event, duplicate: false }
+          }
+          if (method === 'workspace_history') return { events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...message, type: 'input_posted' } })), coverage: { limit: 128, truncated: false, scope: 'task' } }
+          return originalRpc(method, body)
+        }
+        try {
+          await render().readWorkspaceState()
+          if (kind === 'work') await render().readWork({ conversation_id: 'chat', work_id: work.work_id })
+          let saved: PendingMessage | undefined
+          const target: InputTarget = kind === 'work' ? { kind: 'work', work_id: work.work_id } : { kind: 'bot_main', bot_id: bot.bot_id }
+          assert.equal(await render().sendMessage(`${kind} new task original request`, [], undefined, { target, intent: 'new_task', onSaved: (input) => { saved = input } }), true)
+          await settleComponent()
+          assert.ok(saved && saved.target.kind === 'task')
+          assert.equal(commands.length, 1)
+          assert.equal(commands[0].task_id, saved.target.task_id)
+          assert.equal(messages.length, before + 1)
+          assert.equal((messages.at(-1)?.target as { task_id: string }).task_id, saved.target.task_id)
+          await render().readWorkspaceHistory({ task_id: saved.target.task_id })
+        } finally { current.rpc = originalRpc }
+      }
+    })
+
+    await t.test('Task and Channel attachment reads follow the signed event scope while Main stays on another Bot', async () => {
+      const current = activeConnection, originalRpc = current.rpc
+      const otherBot = { ...bot, bot_id: 'attachment-bot', conversation_id: 'attachment-chat', name: '附件 Bot' }
+      knownBots = [bot, otherBot]
+      await render().refresh(); await render().selectBot(bot)
+      const bytes = new TextEncoder().encode('test')
+      const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+      const calls: Record<string, unknown>[] = []
+      let delayedMainRead: ReturnType<typeof deferred> | null = null
+      let target: InputTarget = { kind: 'task', task_id: 'attachment-task' }
+      current.rpc = async (method, body = {}) => {
+        if (method === 'workspace_history') return { events: [{ event_hash: 'attachment-event', created_at_ms: 1, scope_id: otherBot.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { type: 'input_posted', message_id: 'attachment-input', target, intent: 'continue', sequence: 1, expected_revision: 1, text: '任务附件', attachments: [{ hash, size: bytes.length, name: 'scope.txt' }] } }], coverage: { limit: 128, truncated: false, scope: target.kind === 'task' ? 'task' : 'channel' } }
+        if (method === 'read_artifact') {
+          calls.push(JSON.parse(JSON.stringify(body)))
+          if (delayedMainRead) return delayedMainRead.promise
+          assert.equal(body.conversation_id, otherBot.conversation_id, 'the fake Node enforces attachment ownership')
+          return { blob_hash: hash, offset: 0, size: bytes.length, next_offset: null, ...(body.binary ? { data: btoa('test') } : { text: 'test' }) }
+        }
+        return originalRpc(method, body)
+      }
+      try {
+        for (const channel of [false, true]) {
+          target = channel ? { kind: 'channel_task', channel_id: 'attachment-channel', task_id: 'attachment-task', bot_id: otherBot.bot_id } : { kind: 'task', task_id: 'attachment-task' }
+          const shared = { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: activeConnection, directory: null }) }, '@vibeface/client/chat/protocol.ts': { inputTargetKey } }
+          const scope = componentHarness('./workspace-chat.tsx', shared, { setInterval: () => 1, clearInterval() {} }, 'ScopedConversation')
+          const props = { target, conversationId: otherBot.conversation_id, label: '附件任务', ...(channel ? { channelId: 'attachment-channel' } : {}) }
+          const chat = componentHarness('../chat/elements/chat.tsx', { '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } })
+          const message = componentHarness('../chat/elements/message.tsx', { ...shared, '@vibeface/client/chat/protocol.ts': { messageKey, replyStatusLabel }, '@vibeface/client/lib/errors.ts': errors })
+          let downloads = 0
+          const artifact = componentHarness('../chat/elements/artifact.tsx', { ...shared, '@vibeface/client/workspace/model.ts': { formatSize } }, { crypto, Blob, URL: { createObjectURL: () => 'blob:fixture', revokeObjectURL() {} }, document: { createElement: () => ({ click() { downloads++ } }) }, window: { setTimeout: () => 1 } })
+          try {
+            scope.render('ScopedConversation', props); await settleComponent()
+            const chatProps = scope.render('ScopedConversation', props).find(({ type }) => type === 'Chat')?.props
+            assert.ok(chatProps)
+            const messageProps = chat.render('Chat', chatProps).find(({ type }) => type === 'Message')?.props
+            assert.ok(messageProps); assert.equal(messageProps.conversationId, otherBot.conversation_id)
+            const artifactProps = message.render('Message', messageProps).find(({ type }) => type === 'Artifact')?.props
+            assert.ok(artifactProps); assert.equal(artifactProps.conversationId, otherBot.conversation_id)
+            const controls = () => artifact.render('Artifact', artifactProps)
+            const open = controls().find(({ props }) => props.label === '打开')?.props.action
+            assert.ok(open); await open()
+            assert.equal(controls().find(({ type }) => type === 'pre')?.props.children, 'test', String(render().error))
+            const download = controls().find(({ props }) => props.label === '下载')?.props.action
+            assert.ok(download); await download(); assert.equal(downloads, 1)
+            assert.equal(render().conversationId, bot.conversation_id, 'attachment reads do not select another Main')
+          } finally { scope.close(); chat.close(); message.close(); artifact.close() }
+        }
+        assert.equal(calls.length, 4)
+        assert.ok(calls.every((call) => call.conversation_id === otherBot.conversation_id))
+        delayedMainRead = deferred()
+        const oldMain = render().readArtifact(hash)
+        await render().selectBot(otherBot)
+        delayedMainRead.resolve({ blob_hash: hash, offset: 0, size: bytes.length, next_offset: null, text: 'test' })
+        await assert.rejects(oldMain, /对话已切换/)
+        delayedMainRead = null
+        await render().selectBot(bot)
+      } finally { current.rpc = originalRpc; knownBots = [bot]; await render().refresh() }
+    })
+
     await t.test('retained native chat focus restores its route through the real live bridge without acknowledging the previously selected Bot', async () => {
       const botA = { ...bot, name: 'Bot A' }, botB = { ...bot, bot_id: 'bot-b', conversation_id: 'chat-b', name: 'Bot B' }
       knownBots = [botA, botB]
@@ -536,29 +817,38 @@ test("workspace preserves bot and message requests while routing native decision
       await render().selectBot(botA)
       let shared = render()
       const device = { get ready() { return activeConnection }, phase: 'ready', link: { kind: 'online' }, entries: [], directory: null, identity: { deviceId: 'client' }, join() {}, cancelJoin() {}, leave() {} }
+      const fileReads = new Map<string, ReturnType<typeof deferred>>()
+      class SelectedFile { readonly uri: string; constructor(uri: string) { this.uri = uri } arrayBuffer() { const read = fileReads.get(this.uri); assert.ok(read); return read.promise } }
       const bridge = componentHarness('../../../../../apps/mobile/src/data/live.tsx', {
+        'expo-file-system': { File: SelectedFile },
         '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/identity/access.ts': { accessOf },
         '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/lib/node.ts': { entryAddress },
-        '@vibeface/client/chat/protocol.ts': { botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, unreadCounts },
+        '@vibeface/client/chat/protocol.ts': { botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage, unreadCounts },
         '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/inbox.ts': { inboxItems }, '@vibeface/client/workspace/labels.ts': taskLabels,
         '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers }, '@vibeface/client/workspace/storage.ts': { storageOf }, '@vibeface/client/workspace/types.ts': { isSessionNotification: () => false },
         '@/platform': { mobilePlatform: { storage: browser.localStorage } }, './context': { WorkspaceProvider: 'NativeWorkspace' },
       }, {}, 'Live')
       type NativeWorkspace = import('../../../../../apps/mobile/src/data/types.ts').Workspace
+      const mainSaves: ReturnType<NativeWorkspace['actions']['send']>[] = []
       let native: NativeWorkspace
-      const mobile = () => {
+      const mobile = (liveProgress?: typeof shared.liveProgress) => {
         shared = render()
+        if (liveProgress) shared = { ...shared, liveProgress }
         const value = bridge.render('Live').find(({ type }) => type === 'NativeWorkspace')?.props.value
         assert.ok(value && typeof value === 'object')
         native = value as NativeWorkspace
         return native
       }
       mobile()
+      let routine: string | undefined
+      const nativeNavigations: string[] = []
       const platform = { OS: 'android' }, insets = { bottom: 0 }, keyboard = { height: { value: 0 }, progress: { value: 0 } }
       let glass = false, theme = 'light'
       let dockHeight: { value: number } | undefined, emptyPadding = () => ({ paddingBottom: 0 })
       const chat = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
-        'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: botA.bot_id }) },
+        'expo-router': { Stack: { Screen: 'Screen' }, router: { push: (target: string) => { nativeNavigations.push(target) } }, useLocalSearchParams: () => ({ botId: botA.bot_id, routine }) },
+        '@vibeface/client/lib/node.ts': { messageOf },
+        '@/platform': { mobilePlatform: { storage: browser.localStorage } },
         'expo-router/react-navigation': { useHeaderHeight: () => platform.OS === 'ios' ? 96 : 0 },
         'react-native': { Platform: platform, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
         'react-native-keyboard-controller': { KeyboardChatScrollView: 'KeyboardChatScrollView', KeyboardStickyView: 'KeyboardStickyView', useReanimatedKeyboardAnimation: () => keyboard },
@@ -567,18 +857,55 @@ test("workspace preserves bot and message requests while routing native decision
         'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme }), useCSSVariable: () => theme === 'dark' ? 'black' : 'white' },
         '@/data/context': { useWorkspace: () => native }, '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
         '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/home.ts': { unreachable },
-        '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+        '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
         '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
         '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
         '@/features/chat/chrome': { ChatMaterial: 'ChatMaterial', useChatChrome: () => glass ? { kind: 'glass', colorScheme: theme } : { kind: 'solid' } },
       }, { requestAnimationFrame: (run: () => void) => run(), setInterval: () => 1, clearInterval() {} })
       const stack = { Screen: 'Screen', Protected: 'Protected' }
       const layout = componentHarness('../../../../../apps/mobile/app/_layout.tsx', {
-        'expo-router': { Stack: stack }, 'expo-linking': { useLinkingURL: () => null }, '@/data/live': { LiveWorkspace: 'LiveWorkspace', useLive: () => shared },
+        'expo-router': { Stack: stack, usePathname: () => '/' }, 'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) }, 'expo-linking': { useLinkingURL: () => null }, '@/data/live': { LiveWorkspace: 'LiveWorkspace', useLive: () => shared },
         '@/data/context': { useWorkspace: () => ({ session: { phase: 'ready' } }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
         'uniwind': { useCSSVariable: () => ['white', 'black'] }, '@/lib/layout': { useWide: () => false }, 'react-native': { Platform: { OS: 'ios' }, View: 'View' },
       })
       try {
+        const originalMessages = conversationMessages, originalScheduler = scheduler
+        const input = { message_id: 'host-input', event_hash: 'host-input-event', role: 'user', text: '主输入', created_at_ms: 1 }
+        const followup = { message_id: 'steered-input', event_hash: 'steered-input-event', role: 'user', text: '补充输入', created_at_ms: 2 }
+        const reply = { message_id: 'host-reply', event_hash: 'host-reply-event', role: 'assistant', text: '共同回复', in_reply_to: input.message_id, status: 'completed', created_at_ms: 3 }
+        try {
+          for (const outcome of ['answered', 'unfinished', 'unknown']) {
+            conversationMessages = { chat: [input, followup] }
+            const host = { scope: { kind: 'main' }, trigger: 'message:host-input', state: 'running', message_id: input.message_id, reply_message_id: reply.message_id }
+            scheduler = { scope_jobs: [], unanswered: [], capabilities: { cancel: true, streaming: true, steer: true }, jobs: [
+              host,
+              { scope: { kind: 'main' }, trigger: 'message:steered-input', state: 'steered', outcome, message_id: followup.message_id, reply_message_id: 'unused-steered-reply' },
+            ] }
+            await render().refresh()
+            assert.equal(mobile().conversations.chat.replying, true, 'the host turn still runs after accepting a supplement')
+            assert.equal(mobile().conversations.chat.stoppable, true)
+            const streaming = mobile([{ kind: 'manager', key: 'host-progress', conversation_id: 'chat', trigger: host.trigger, source_node: 'gateway', text: '部分回复', sequence: 1, items: [], needsRefresh: false }]).conversations.chat.messages.find((message) => message.state === 'streaming')
+            assert.equal(streaming?.in_reply_to, input.message_id, 'the streamed reply retains its host input after a supplement')
+            host.state = 'completed'
+            await render().refresh()
+            assert.equal(mobile().conversations.chat.replying, true, 'a completed host keeps its activity until its reply syncs')
+            conversationMessages.chat.push(reply)
+            await render().refresh()
+            const completed = mobile().conversations.chat
+            assert.equal(completed.messages.some((message) => message.message_id === reply.message_id), true)
+            assert.equal(completed.replying, false, `a ${outcome} supplement never waits for an independent reply`)
+            assert.equal(completed.stoppable, false)
+          }
+          conversationMessages = { chat: [input] }
+          for (const state of ['publishing', 'completed', 'failed', 'interrupted', 'cancelled', 'rejected', 'reconciling']) {
+            scheduler = { scope_jobs: [], unanswered: [], jobs: [{ scope: { kind: 'main' }, trigger: 'message:host-input', state, message_id: input.message_id, reply_message_id: reply.message_id }] }
+            await render().refresh()
+            assert.equal(mobile().conversations.chat.replying, !['cancelled', 'rejected', 'reconciling'].includes(state), `${state} waits only when the job produces its own reply`)
+          }
+        } finally {
+          conversationMessages = originalMessages; scheduler = originalScheduler
+          await render().refresh(); mobile()
+        }
         const tree = layout.render('default')
         const screens = tree.find(({ type }) => typeof type === 'function' && type.name === 'Screens')
         assert.ok(screens && typeof screens.type === 'function')
@@ -593,8 +920,8 @@ test("workspace preserves bot and message requests while routing native decision
         chat.blur()
         focus('tasks')
         unreadNotifications = [
-          { notification_id: 'native-a', kind: 'result', text: 'A 的通知', conversation_id: 'chat' },
-          { notification_id: 'native-b', kind: 'result', text: 'B 的通知', conversation_id: 'chat-b' },
+          { notification_id: 'native-a', kind: 'result', text: 'A 的通知', conversation_id: 'chat', target: { kind: 'bot_main', bot_id: botA.bot_id } },
+          { notification_id: 'native-b', kind: 'result', text: 'B 的通知', conversation_id: 'chat-b', target: { kind: 'bot_main', bot_id: botB.bot_id } },
         ]
         await render().selectBot(botB)
         mobile()
@@ -615,6 +942,136 @@ test("workspace preserves bot and message requests while routing native decision
         const rows = elements.find(({ type }) => type === 'FlatList')?.props.data as { message?: { text?: string } }[]
         assert.equal(rows[0]?.message?.text, 'Bot A 的消息')
         assert.equal(elements.find(({ type }) => type === 'Composer')?.props.blocked, null)
+        const sentOptions: (InputOptions | undefined)[] = []
+        const currentNative = mobile()
+        const originalSend = currentNative.actions.send
+        currentNative.actions.send = async (_id, _text, _files, options) => { sentOptions.push(options) }
+        try {
+          routine = 'schedule:not-loaded'
+          chat.render('default')
+          const target = chat.render('default').find(({ type }) => type === 'InputOptions')?.props
+          assert.equal(target?.selected, `routine:${routine}`, 'an explicit routine route survives a bounded scheduler snapshot')
+          const composer = chat.render('default').find(({ type }) => type === 'Composer')?.props
+          composer?.onChange?.('补充这个例行任务')
+          const send = chat.render('default').find(({ type }) => type === 'Composer')?.props.onSend
+          assert.ok(typeof send === 'function'); send(); await settleComponent()
+          assert.deepEqual(JSON.parse(JSON.stringify(sentOptions[0]?.target)), { kind: 'routine', bot_id: botA.bot_id, trigger: routine }, 'a missing observation must not redirect input to Main')
+        } finally {
+          currentNative.actions.send = originalSend
+          routine = undefined
+          chat.render('default'); chat.render('default')
+        }
+        const mainActions = mobile().actions, originalMainSend = mainActions.send
+        mainActions.send = (...args) => { const saved = originalMainSend(...args); mainSaves.push(saved); return saved }
+        const composer = () => chat.render('default').find(({ type }) => type === 'Composer')?.props
+        const attach = (uri: string) => { const input = composer()?.onFiles; assert.ok(typeof input === 'function'); const files = [{ uri, name: uri.split('/').at(-1), size: 3 }]; input(files); return files }
+        const sendDraft = () => { const send = composer()?.onSend; assert.ok(typeof send === 'function'); send() }
+        const storedDraft = () => JSON.parse(stored.get(`vibeface.${networkKey('bot-drafts', 'network')}`) ?? '{}').chat
+        const preparing = deferred(); fileReads.set('file:///first.txt', preparing)
+        const sentBefore = messages.length
+        composer()?.onChange?.('原草稿仍在准备附件')
+        attach('file:///first.txt'); sendDraft(); sendDraft(); await settleComponent()
+        composer()?.onChange?.('原草稿仍在准备附件'); sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, 1, 'repeated taps and unchanged text cannot submit the same pending draft twice')
+        assert.equal(composer()?.value, '原草稿仍在准备附件')
+        assert.equal(storedDraft(), '原草稿仍在准备附件', 'the durable text remains recoverable before local enqueue')
+        assert.equal(render().pendingMessages.some((item) => item.text === '原草稿仍在准备附件'), false, 'the file read is still before durable acceptance')
+        const preparingLater = deferred(); fileReads.set('file:///later.txt', preparingLater)
+        composer()?.onChange?.('后来输入的内容')
+        const laterFiles = attach('file:///later.txt')
+        sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, 2, 'editing creates a separate draft that can save while the first is preparing')
+        preparing.resolve(new Uint8Array([1, 2, 3]).buffer)
+        await mainSaves[0]; await settleComponent(); mobile()
+        assert.equal(composer()?.value, '后来输入的内容')
+        assert.equal(composer()?.files, laterFiles, 'local acceptance cannot remove attachments selected after submission')
+        assert.equal(storedDraft(), '后来输入的内容')
+        preparingLater.resolve(new Uint8Array([4, 5, 6]).buffer)
+        await mainSaves[1]; await settleComponent(); mobile()
+        assert.equal(composer()?.value, '')
+        assert.deepEqual(messages.slice(sentBefore).map((message) => message.text), ['原草稿仍在准备附件', '后来输入的内容'])
+        assert.equal(new Set(messages.slice(sentBefore).map((message) => message.message_id)).size, 2, 'each edited draft produces exactly one input identity')
+        const matching = deferred(); fileReads.set('file:///matching.txt', matching)
+        composer()?.onChange?.('保存后才清空')
+        attach('file:///matching.txt'); sendDraft(); await settleComponent()
+        assert.equal(storedDraft(), '保存后才清空')
+        matching.resolve(new Uint8Array([7, 8, 9]).buffer)
+        await mainSaves[2]; await settleComponent(); mobile()
+        assert.equal(composer()?.value, '')
+        const clearedFiles = composer()?.files
+        assert.ok(Array.isArray(clearedFiles)); assert.equal(clearedFiles.length, 0)
+        assert.equal(storedDraft(), '', 'only the still-matching draft clears after the real client saves it')
+        const failedRead = deferred(); fileReads.set('file:///retry.txt', failedRead)
+        composer()?.onChange?.('附件失败后可重发')
+        attach('file:///retry.txt'); sendDraft(); await settleComponent()
+        failedRead.reject(new Error('file unavailable'))
+        await assert.rejects(mainSaves[3], /file unavailable/); await settleComponent(); mobile()
+        assert.equal(storedDraft(), '附件失败后可重发')
+        const retriedRead = deferred(); fileReads.set('file:///retry.txt', retriedRead)
+        sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, 5, 'a failed local save releases only its pending draft guard')
+        retriedRead.resolve(new Uint8Array([10, 11, 12]).buffer)
+        await mainSaves[4]; await settleComponent(); mobile()
+        assert.equal(storedDraft(), '')
+        assert.equal(messages.slice(sentBefore).filter((message) => message.text === '附件失败后可重发').length, 1)
+        const changingOptions = deferred(); fileReads.set('file:///options.txt', changingOptions)
+        const optionStart = mainSaves.length, optionMessages = messages.length
+        composer()?.onChange?.('切换目标和发送方式仍是独立输入')
+        const optionFiles = attach('file:///options.txt')
+        sendDraft(); await settleComponent()
+        const changeIntent = chat.render('default').find(({ type }) => type === 'InputOptions')?.props.onIntent
+        assert.ok(typeof changeIntent === 'function')
+        changeIntent('defer'); sendDraft(); sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, optionStart + 2, 'changing only intent saves a distinct input while unchanged repeated taps remain deduplicated')
+        routine = 'schedule:pending-draft'
+        chat.render('default'); chat.render('default')
+        sendDraft(); sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, optionStart + 3, 'changing only target saves a distinct input with the same text and attachment')
+        const selectTarget = chat.render('default').find(({ type }) => type === 'InputOptions')?.props.onSelect
+        assert.ok(typeof selectTarget === 'function')
+        selectTarget({ key: 'main', label: '主聊天', target: { kind: 'bot_main', bot_id: botA.bot_id } })
+        sendDraft(); sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, optionStart + 4, 'changing only target with an unchanged intent preserves a separate input identity')
+        changeIntent('defer'); chat.render('default')
+        changingOptions.resolve(new Uint8Array([13, 14, 15]).buffer)
+        await Promise.all(mainSaves.slice(optionStart)); await settleComponent(); mobile()
+        assert.equal(composer()?.value, '切换目标和发送方式仍是独立输入')
+        assert.equal(composer()?.files, optionFiles, 'an earlier target or intent cannot clear the current attachment')
+        assert.equal(storedDraft(), '切换目标和发送方式仍是独立输入')
+        assert.equal(chat.render('default').find(({ type }) => type === 'InputOptions')?.props.intent, 'defer', 'earlier completion cannot reset the current send intent')
+        const optionMainTarget = { kind: 'bot_main', bot_id: botA.bot_id }, optionRoutineTarget = { kind: 'routine', bot_id: botA.bot_id, trigger: routine }
+        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionMainTarget, 'defer'], [optionRoutineTarget, 'continue'], [optionMainTarget, 'continue']].map(value => JSON.stringify(value)).sort())
+        sendDraft(); await mainSaves.at(-1); await settleComponent(); mobile()
+        assert.equal(mainSaves.length, optionStart + 5)
+        assert.equal(composer()?.value, '')
+        assert.equal(storedDraft(), '', 'the matching target and intent still clear after durable acceptance')
+        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionMainTarget, 'defer'], [optionRoutineTarget, 'continue'], [optionMainTarget, 'continue'], [optionMainTarget, 'defer']].map(value => JSON.stringify(value)).sort())
+        assert.equal(new Set(messages.slice(optionMessages).map(message => message.message_id)).size, 5)
+        routine = undefined
+        chat.render('default'); chat.render('default')
+        mainActions.send = originalMainSend
+        for (const change of ['text', 'intent', 'unchanged']) {
+          const actions = mobile().actions, original = actions.send, accepted = deferred(), before = nativeNavigations.length
+          let saving = Promise.resolve()
+          actions.send = (_id, text, _files, options) => {
+            assert.ok(options)
+            saving = accepted.promise.then(() => { options.onSaved?.({ message_id: 'native-saved', conversation_id: 'chat', target: { kind: 'task', task_id: 'native-created-task' }, intent: 'continue', expected_revision: 1, sequence: 1, text, attachments: [], created_at_ms: 1, delivery: 'saved' }) })
+            return saving
+          }
+          try {
+            const onIntent = chat.render('default').find(({ type }) => type === 'InputOptions')?.props.onIntent
+            assert.ok(typeof onIntent === 'function'); onIntent('new_task')
+            composer()?.onChange?.(`手机新任务 ${change}`); sendDraft()
+            if (change === 'text') composer()?.onChange?.('手机仍在编辑')
+            if (change === 'intent') onIntent('continue')
+            chat.render('default')
+            accepted.resolve(undefined); await saving; await settleComponent()
+            assert.equal(nativeNavigations.length, before + (change === 'unchanged' ? 1 : 0), 'native Main only navigates for its unchanged submitted draft')
+            assert.equal(composer()?.value, change === 'unchanged' ? '' : change === 'text' ? '手机仍在编辑' : `手机新任务 ${change}`)
+            if (change === 'unchanged') assert.equal(nativeNavigations.at(-1), '/task/native-created-task')
+          } finally { actions.send = original }
+        }
+
         await render().refresh()
         assert.deepEqual(acknowledgements.slice(ackBefore), ['native-a'])
         assert.equal(render().notifications.some((item) => item.notification_id === 'native-b'), true)
@@ -739,7 +1196,192 @@ test("workspace preserves bot and message requests while routing native decision
           assert.ok(typeof options.headerTitle === 'function'); options.headerTitle()
           assert.equal(elements.some(({ type }) => type === 'ChatMaterial'), false, 'the native bar owns the title material')
         }
-      } finally { chat.close(); layout.close(); bridge.close() }
+      } finally {
+        for (const read of fileReads.values()) read.resolve(new Uint8Array([0]).buffer)
+        await Promise.allSettled(mainSaves)
+        chat.close(); layout.close(); bridge.close()
+      }
+    })
+    await t.test('a cancelled safe-false refusal settles transport, allows its next input and never releases the cancellation', async () => {
+      knownBots = [bot]
+      await render().refresh(); await render().selectBot(bot)
+      const before = messages.length, releases = inputReleases.length
+      failMessage = true
+      assert.equal(await render().sendMessage('cancelled head'), true)
+      await settleComponent()
+      const head = render().pendingMessages.find((item) => item.text === 'cancelled head')
+      assert.ok(head); assert.equal(head.delivery, 'unknown')
+      const inbox = () => inboxItems({ device: { ready: activeConnection, joins: [], pendingRecovery: null, rotateHint: false }, workspace: render() })
+      failMessage = false
+      try {
+        await assert.rejects(render().releaseMessagePending(head.message_id))
+        assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'unknown')
+        assert.ok(inbox().some((item) => item.key === `undelivered:${head.message_id}`), 'an unknown reminder cannot be dismissed')
+        inputQuerySafe = false; inputQueryStage = 'refused'
+        assert.equal(await render().sendMessage('following input'), true)
+        await settleComponent()
+        assert.deepEqual(messages.slice(before).map((message) => message.text), ['cancelled head', 'following input'])
+        assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'accepted')
+        await render().retryPendingMessage(head.message_id)
+        assert.equal(inputReleases.length, releases, 'safe=false cannot release a cancelled input')
+        assert.equal(messages.slice(before).filter((message) => message.message_id === head.message_id).length, 1)
+        const saved = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
+        assert.ok(saved)
+        inputQueryStage = 'unknown'
+        await assert.rejects(render().releaseMessagePending(head.message_id))
+        assert.ok(outboxItems.has(saved.key), 'a stale refused card cannot close after the fresh result becomes unknown')
+        inputQueryStage = 'refused'; await render().queryInput(head)
+        await memoryOutbox.put({ ...saved, rejected: '原输入内容不同', rejection_code: 'input_conflict' })
+        await assert.rejects(render().releaseMessagePending(head.message_id))
+        assert.ok(outboxItems.has(saved.key), 'a conflict keeps both copies for reconciliation')
+        await memoryOutbox.put(saved); await render().queryInput(head)
+        const rpcConnection = activeConnection, originalRpc = rpcConnection.rpc
+        const closeCalls: string[] = []
+        const history = { events: [{ event_hash: 'a'.repeat(64), created_at_ms: 1, scope_id: head.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...messages[before], type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
+        rpcConnection.rpc = async (method, body = {}) => { closeCalls.push(method); return method === 'workspace_history' ? history : originalRpc(method, body) }
+        let closeWork = Promise.resolve()
+        const status = componentHarness('./workspace-chat.tsx', {
+          '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/chat/protocol.ts': { inputTargetKey },
+          '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, action: () => Promise<void>) => { closeWork = action(); return closeWork } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+        })
+        try {
+          const sharedHistory = JSON.parse(JSON.stringify(await render().readWorkspaceHistory()))
+          const cancelled = render().pendingMessages.find((item) => item.message_id === head.message_id)
+          assert.ok(cancelled); assert.equal(cancelled.rejected, undefined); assert.ok(inbox().some((item) => item.key === `undelivered:${head.message_id}`))
+          const close = status.render('WorkspaceInputStatus', { pending: cancelled }).find(({ type, props }) => type === 'Button' && componentText(props.children) === '关闭提醒')?.props.onClick
+          assert.ok(typeof close === 'function')
+          const writes = messages.length, commands = inputReleases.length, signatures = signed.length
+          closeCalls.splice(0); close(); await closeWork; await settleComponent()
+          assert.deepEqual(closeCalls, ['input_receipt'], 'closing only queries the terminal receipt and sends no write')
+          assert.equal(render().pendingMessages.some((item) => item.message_id === head.message_id), false)
+          assert.equal(inbox().some((item) => item.key === `undelivered:${head.message_id}`), false, 'the cancelled input leaves Inbox after closing its local reminder')
+          assert.equal(outboxItems.has(saved.key), false)
+          assert.deepEqual(JSON.parse(JSON.stringify(await render().readWorkspaceHistory())), sharedHistory, 'closing the local reminder preserves shared history')
+          assert.equal(messages.length, writes); assert.equal(inputReleases.length, commands); assert.equal(signed.length, signatures)
+        } finally { status.close(); rpcConnection.rpc = originalRpc }
+      } finally { inputQueryStage = null; failMessage = false }
+    })
+    for (const outcome of ['not_saved', 'wrong_id', 'stored', 'responded', 'forward_ack']) await t.test(`Release ${outcome} only settles its exact proven unwritten command before advancing the lane`, async () => {
+      knownBots = [bot]
+      await render().refresh(); await render().selectBot(bot)
+      inputControlEvent = 'e'.repeat(64)
+      const before = messages.length, releases = inputReleases.length
+      const firstText = `Release ${outcome} original`, nextText = `Release ${outcome} following`
+      const response = deferred(), requested = deferred()
+      void response.promise.catch(() => {})
+      let recovery = Promise.resolve<PromiseSettledResult<void>[]>([])
+      try {
+        failMessage = true
+        assert.equal(await render().sendMessage(firstText, [{ name: 'original.txt', arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer }]), true)
+        await settleComponent(); failMessage = false
+        const head = render().pendingMessages.find((item) => item.text === firstText)
+        assert.ok(head)
+        const receipt: InputReceipt = { message_id: head.message_id, target: head.target, stage: 'refused', actual_turn_id: null, reason: '原输入已拒绝', retry_safe: true, control_event: inputControlEvent }
+        inputReceiptOverrides.set(head.message_id, receipt)
+        await render().queryInput(head)
+        inputReleaseReply = (body) => { requested.resolve(body); return response.promise }
+        recovery = Promise.allSettled([render().retryPendingMessage(head.message_id)])
+        const request = nodeSettings.record(JSON.parse(JSON.stringify(await requested.promise)))
+        assert.equal(typeof request.command_id, 'string')
+        const original = messages[before]
+        const releasing = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
+        assert.ok(releasing); assert.equal(releasing.delivery, 'unknown'); assert.equal(releasing.release_expected_event, receipt.control_event); assert.equal(releasing.release_command_id, request.command_id)
+        await assert.rejects(render().releaseMessagePending(head.message_id))
+        assert.ok(outboxItems.has(releasing.key), 'an in-flight Release cannot be dismissed')
+        assert.equal(await render().sendMessage(nextText), true)
+        await settleComponent()
+        const following = render().pendingMessages.find((item) => item.text === nextText)
+        assert.ok(following)
+        assert.deepEqual(messages.slice(before).map((message) => message.text), [firstText], 'the following input waits for the Release result')
+        inputReceiptOverrides.set(head.message_id, { ...receipt, retry_safe: false })
+        const queries = inputReceiptQueries.length
+        const refusal = { accepted: false, code: 'workspace_command_not_saved', stored: false, command_id: request.command_id, reason: '任务版本已变化，操作未写入。' }
+        if (outcome === 'responded') response.reject(Object.assign(new Error('owner response could not be confirmed'), { responded: true }))
+        else if (outcome === 'forward_ack') response.reject(new Error('forward acknowledgement lost'))
+        else response.resolve({ ...refusal, ...(outcome === 'wrong_id' ? { command_id: 'another-command' } : outcome === 'stored' ? { stored: true } : {}) })
+        const [completed] = await recovery
+        await settleComponent()
+        assert.ok(inputReceiptQueries.slice(queries).some((query) => query.message_id === head.message_id), 'the Release result is followed by a fresh query of the original input')
+        const checked = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
+        const control = [...outboxItems.values()].find((item) => item.method === 'workspace_command' && item.params.command_id === request.command_id)
+        assert.ok(checked); assert.deepEqual(checked.params, original, 'the original ID, signature, sequence and attachments are unchanged')
+        assert.ok(control); assert.deepEqual(control.params, request, 'the original signed Release request remains durable')
+        if (outcome === 'not_saved') {
+          assert.equal(completed.status, 'rejected')
+          if (completed.status === 'rejected') assert.match(String(completed.reason), /任务版本已变化/)
+          assert.equal(checked.delivery, 'accepted'); assert.equal(checked.release_expected_event, undefined); assert.equal(checked.release_command_id, undefined)
+          assert.equal(checked.receipt?.control_event, receipt.control_event); assert.equal(checked.receipt?.retry_safe, false)
+          assert.deepEqual(control.command_rejection, refusal, 'only the exact trusted prewrite proof is durable')
+        } else {
+          assert.equal(completed.status, 'rejected')
+          assert.equal(checked.delivery, 'unknown'); assert.equal(checked.release_expected_event, receipt.control_event); assert.equal(checked.release_command_id, request.command_id)
+          assert.equal(control.command_rejection, undefined, 'an ambiguous or mismatched response is not an unwritten proof')
+          await render().queryInput(head)
+          await render().retryPendingMessage(head.message_id)
+          await assert.rejects(render().releaseMessagePending(head.message_id))
+          await settleComponent()
+          const stillUnknown = render().pendingMessages.find((item) => item.message_id === head.message_id)
+          assert.equal(stillUnknown?.delivery, 'unknown')
+          assert.deepEqual(messages.slice(before).map((message) => message.text), [firstText], 'an old safe-false receipt cannot unblock an unconfirmed Release')
+          inputReceiptOverrides.set(head.message_id, { ...receipt, retry_safe: false, control_event: 'f'.repeat(64) })
+          await render().queryInput(head); await settleComponent()
+        }
+        assert.equal(inputReleases.length, releases + 1, 'queries never create another Release command')
+        assert.deepEqual(messages.slice(before).map((message) => message.text), [firstText, nextText])
+        assert.deepEqual(messages.slice(before).map((message) => message.message_id), [head.message_id, following.message_id])
+        assert.equal(signed.filter((value) => value.includes('"type":"input_posted"') && value.includes(head.message_id)).length, 1, 'the original input is never re-signed')
+        assert.equal(signed.filter((value) => value.includes('"type":"workspace_commanded"') && value.includes('"kind":"control_input"') && value.includes(String(request.command_id))).length, 1, 'the Release keeps its original signed identity')
+      } finally {
+        response.reject(new Error('fixture cleanup'))
+        await recovery
+        for (const receipt of inputReceiptOverrides.values()) {
+          inputReceiptOverrides.set(receipt.message_id, { ...receipt, retry_safe: false, control_event: 'f'.repeat(64) })
+          await render().queryInput(receipt)
+        }
+        await settleComponent()
+        inputReleaseReply = null; inputReceiptOverrides.clear(); failMessage = false
+      }
+    })
+    await t.test('a restored new Release identity cannot consume an older unwritten proof for the same input and CAS', async () => {
+      const previous = [...outboxItems.values()].find((item) => item.method === 'workspace_command' && item.command_rejection !== undefined)
+      assert.ok(previous?.command_rejection)
+      const command = workspaceModel.parseWorkspaceCommand(previous.params.command)
+      assert.ok(command.kind === 'control_input' && command.action.kind === 'release')
+      const original = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === command.message_id)
+      assert.ok(original)
+      const oldProof = structuredClone(previous)
+      const secondId = previous.params.command_id === 'a'.repeat(64) ? 'b'.repeat(64) : 'a'.repeat(64)
+      const second: OutboxItem = { ...previous, key: previous.key.replace(String(previous.params.command_id), secondId), params: { ...previous.params, command_id: secondId }, rejected: undefined, command_rejection: undefined }
+      const receipt: InputReceipt = { message_id: command.message_id, target: workspaceModel.parsePendingMessage(original).target, stage: 'refused', actual_turn_id: null, reason: '原输入已拒绝', retry_safe: false, control_event: command.expected_event }
+      // Restore the durable state of another command whose forward acknowledgement was lost; requestKey stays real.
+      await memoryOutbox.put(second)
+      await memoryOutbox.put({ ...original, receipt, delivery: 'unknown', release_expected_event: command.expected_event, release_command_id: secondId })
+      inputReceiptOverrides.set(command.message_id, receipt)
+      const before = messages.length, releases = inputReleases.length
+      try {
+        await render().queryInput(receipt)
+        const waiting = render().pendingMessages.find((item) => item.message_id === command.message_id)
+        assert.equal(waiting?.delivery, 'unknown', 'an old proof cannot settle a different current Release ID')
+        assert.equal(await render().sendMessage('following restored Release'), true)
+        await settleComponent()
+        const following = render().pendingMessages.find((item) => item.text === 'following restored Release')
+        assert.ok(following)
+        await render().retryPendingMessage(command.message_id); await settleComponent()
+        const retained = [...outboxItems.values()].find((item) => item.key === original.key)
+        assert.ok(retained); assert.equal(retained.delivery, 'unknown'); assert.equal(retained.release_expected_event, command.expected_event); assert.equal(retained.release_command_id, secondId)
+        assert.deepEqual(retained.params, original.params)
+        assert.deepEqual(outboxItems.get(previous.key), oldProof, 'the first command keeps its exact durable proof')
+        assert.deepEqual(outboxItems.get(second.key)?.params, second.params, 'the second command keeps its own request identity')
+        assert.equal(inputReleases.length, releases, 'restored unknown control requests are only queried')
+        assert.equal(messages.length, before, 'the same lane remains blocked until this command is reconciled')
+        inputReceiptOverrides.set(command.message_id, { ...receipt, control_event: 'f'.repeat(64) })
+        await render().queryInput(receipt); await settleComponent()
+        assert.deepEqual(messages.slice(before).map((message) => message.message_id), [following.message_id])
+      } finally {
+        inputReceiptOverrides.set(command.message_id, { ...receipt, control_event: 'f'.repeat(64) })
+        await render().queryInput(receipt); await settleComponent()
+        inputReceiptOverrides.clear()
+      }
     })
   } finally {
     for (const effect of effects.values()) effect.cleanup?.()
@@ -750,7 +1392,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const focusEffects = new Map<number, { run: () => (() => void) | void; cleanup?: () => void }>()
   type Props = Record<string, unknown> & { name?: string; type?: string; role?: string; disabled?: boolean; value?: unknown; onChange?: (event: unknown) => void; onSubmit?: (event?: unknown) => void; onClick?: () => void; action?: () => Promise<unknown> }
-  const elements: { type: unknown; props: Props }[] = [], afterRender: (() => void)[] = []
+  const elements: { type: unknown; props: Props; key?: string }[] = [], afterRender: (() => void)[] = []
   let cursor = 0, focused = true, output: unknown
   function effect(run: () => (() => void) | void, dependencies: unknown[]) {
     const index = cursor++, previous = effects.get(index)
@@ -782,9 +1424,11 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     },
     useEffect: effect, useLayoutEffect: effect,
   }
-  const jsx = (type: unknown, props: Props) => { const element = { type, props }; elements.push(element); return element }
+  const jsx = (type: unknown, props: Props, key?: string) => { const element = key === undefined ? { type, props } : { type, props, key }; elements.push(element); return element }
   const ui = new Proxy({}, { get: (_target, name) => name === 'useAction' ? () => ({ busy: null, error: null, run() {}, clear() {} }) : String(name) })
   const module: { exports: Record<string, unknown> } = { exports: {} }
+  const draftStorage = new Map<string, string>()
+  const platformStorage = { getItem: (key: string) => draftStorage.get(key) ?? null, setItem: (key: string, value: string) => { draftStorage.set(key, value) } }
   const useFocusEffect = (run: () => (() => void) | void) => {
     const index = cursor++, previous = focusEffects.get(index)
     if (!previous || previous.run !== run) afterRender.push(() => {
@@ -800,6 +1444,11 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInNewContext({ Error, TextEncoder, ...globals })(memoryModule.exports, require, memoryModule)
       return memoryModule.exports
     }
+    if (specifier === '@/features/chat/chrome' || specifier === './chrome') return { ChatMaterial: 'ChatMaterial', useChatChrome: () => ({ kind: 'solid' }), ...dependencies[specifier] as object }
+    if (specifier === '@vibeface/client/workspace/storage.ts') return { storageOf, networkKey, ...dependencies[specifier] as object }
+    if (specifier === '@/lib/platform') return { webPlatform: { storage: platformStorage }, ...dependencies[specifier] as object }
+    if (specifier === '@/platform') return { mobilePlatform: { storage: platformStorage }, ...dependencies[specifier] as object }
+    if (specifier === '@tanstack/react-router') return { Link: 'Link', useNavigate: () => () => {}, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { search: {} } }), ...dependencies[specifier] as object }
     return specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
   }
   const filename = fileURLToPath(new URL(path, import.meta.url))
@@ -1188,11 +1837,6 @@ function findActionProps(node: unknown, label: string): Record<string, unknown> 
   return undefined
 }
 
-function renderComponent(element: HarnessElement) {
-  assert.equal(typeof element.type, 'function')
-  return (element.type as (props: unknown) => unknown)(element.props)
-}
-
 function conversationHarness(workspace: () => Record<string, unknown>, device: Record<string, unknown> = {}) {
   const chatGlobals = {
     setInterval: () => 1, clearInterval() {},
@@ -1213,10 +1857,10 @@ function conversationHarness(workspace: () => Record<string, unknown>, device: R
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { can_manage: false, source: 'membership' } }, retryNow: () => {}, ...device }) },
     '@vibeface/client/identity/copy.ts': { setUpOnManager },
     '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters },
-    '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread },
+    '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage },
     '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger },
     '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks },
-    '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject },
+    '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval },
     '@vibeface/client/lib/errors.ts': errors,
   }, chatGlobals)
   const messages = componentHarness('../chat/elements/message.tsx', {
@@ -1224,7 +1868,7 @@ function conversationHarness(workspace: () => Record<string, unknown>, device: R
     '@vibeface/client/chat/protocol.ts': { messageKey, replyStatusLabel },
     '@vibeface/client/lib/errors.ts': errors,
   })
-  const render = () => app.render('ConversationScreen')
+  const render = (props: object = {}) => app.render('ConversationScreen', props)
   const composer = () => render().find(({ type }) => type === 'PromptInput')?.props as Record<string, unknown> | undefined
   const chatEntries = () => (render().find(({ type }) => type === 'Chat')?.props.entries ?? []) as { key: string; message?: { message_id: string; state?: string; text?: string }; node?: HarnessElement }[]
   const messageTree = (messageId: string) => {
@@ -1247,8 +1891,463 @@ const parityShared = () => ({
   generation: 1, isCurrent: () => true, synced: true, connectionOnline: true, conversationId: 'chat', data: paritySnapshot(context),
   bots: [parityBot], selectedBot: parityBot, nodes: [parityNode], openWorks: [{ ...parityWork(), conversation_id: 'chat' }],
   overview: workspaceModel.parseWorkspaceOverview({}), questions: [] as ReturnType<typeof parseConversation>['questions'], answered: {} as Record<string, string>, liveProgress: [], writable: true,
-  writeState: { state: 'writable' as const, conflicts: [] }, notifications: [], ignoredNotifications: new Set<string>(), messagePending: null, messageBusy: false,
+  writeState: { state: 'writable' as const, conflicts: [] }, notifications: [], ignoredNotifications: new Set<string>(), pendingMessages: [], canSaveMessages: true, workspaceState: null,
   setView(_view: string) {}, selectBot: async (_bot: typeof parityBot) => {}, interruptWork: async (_work: string) => {}, sendMessage: async () => true,
+  async readWork(input: { conversation_id: string; work_id: string }) {
+    const work = this.data?.conversation?.conversation_id === input.conversation_id ? this.data.works.find((item) => item.work_id === input.work_id) : undefined
+    if (!work) throw new Error('共享历史中找不到这个工作')
+    return { work: { ...work, target: work.target ?? null, source_events: ['a'.repeat(64)], conversation_id: input.conversation_id }, coverage: { source: 'shared_history' as const, complete: false as const } }
+  },
+})
+
+test('both pending input controls retry only a matching safe refusal and keep all scope targets', async () => {
+  const targets: InputTarget[] = [{ kind: 'bot_main', bot_id: 'bot' }, { kind: 'task', task_id: 'task' }, { kind: 'channel_task', channel_id: 'channel', task_id: 'task', bot_id: 'bot' }, { kind: 'work', work_id: 'work' }, { kind: 'routine', bot_id: 'bot', trigger: 'schedule:one' }, { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }]
+  for (const platform of ['web', 'native']) for (const target of targets) {
+    let pending: PendingMessage = { message_id: 'original', conversation_id: 'chat', target, intent: 'continue', text: '保留原交代', sequence: 1, created_at_ms: 1, delivery: 'unknown', attachments: [{ hash: 'a'.repeat(64), size: 3, name: 'notes.txt' }] }
+    const retries: string[] = [], closed: string[] = []
+    const shared = { ...parityShared(), workspaceState: { channels: [], tasks: [], assignments: [], inputs: [] as WorkspaceDomainState['inputs'], coverage: { limit: 128, truncated: false } },
+      queryInput: async () => { pending = { ...pending, delivery: 'accepted', receipt: { message_id: pending.message_id, target, stage: 'refused', retry_safe: true, control_event: 'c'.repeat(64), actual_turn_id: null, reason: '可以重试原输入' } } },
+      retryPendingMessage: async (id: string) => { retries.push(id) },
+      releaseMessagePending: async (id: string) => { closed.push(id) },
+      sendMessage: async () => { throw new Error('must not create another input') },
+    }
+    const app = componentHarness(platform === 'web' ? './workspace-chat.tsx' : '../../../../../apps/mobile/src/features/workspace/workspace.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared }, '@vibeface/client/chat/protocol.ts': { inputTargetKey },
+      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, action: () => Promise<void>) => action() }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+      '@/lib/use-run': { useRun: () => ({ busy: null, error: '', run: async (_key: string, action: () => Promise<void>) => action() }) }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+    })
+    const render = () => app.render(platform === 'web' ? 'WorkspaceInputStatus' : 'InputStatus', { pending })
+    const button = (label: string) => render().find(({ type, props }) => type === 'Button' && componentText(props.children) === label)?.props
+    const press = async (label: string) => { const control = button(label); assert.ok(control); const action = platform === 'web' ? control.onClick : control.onPress; assert.ok(typeof action === 'function'); action(); await settleComponent() }
+    try {
+      assert.equal(button('重试原输入'), undefined, 'unknown delivery alone never authorizes replay')
+      assert.equal(button('关闭提醒'), undefined); assert.equal(button('不再发送'), undefined)
+      await press('查询结果')
+      const accepted = pending
+      assert.ok(accepted.receipt)
+      const acceptedReceipt = accepted.receipt
+      assert.ok(button('重试原输入'))
+      assert.ok(button('关闭提醒'))
+      for (const delivery of ['saved', 'unknown', 'uploading', 'submitting'] as const) { pending = { ...accepted, delivery }; assert.equal(button('重试原输入'), undefined); assert.equal(button('关闭提醒'), undefined) }
+      pending = accepted
+      await press('重试原输入')
+      assert.deepEqual(retries, ['original'])
+      assert.equal(pending, accepted, 'the UI never replaces the original input or its attachments')
+      await press('关闭提醒')
+      pending = { ...accepted, receipt: { ...acceptedReceipt, retry_safe: false, control_event: null } }
+      assert.ok(button('关闭提醒'), 'closing a terminal reminder needs no retry authorization or control event')
+      await press('关闭提醒')
+      assert.deepEqual(closed, ['original', 'original'])
+      for (const stage of ['unknown', 'entry_accepted', 'owner_accepted', 'provider_accepted', 'associated', 'submitting'] as const) { pending = { ...accepted, receipt: { ...acceptedReceipt, stage } }; assert.equal(button('重试原输入'), undefined); assert.equal(button('关闭提醒'), undefined) }
+      for (const receipt of [{ ...acceptedReceipt, retry_safe: false }, { ...acceptedReceipt, control_event: null }, { ...acceptedReceipt, control_event: '' }, { ...acceptedReceipt, control_event: ' ' }, { ...acceptedReceipt, message_id: 'different' }, { ...acceptedReceipt, target: { kind: 'bot_main' as const, bot_id: 'different' } }]) { pending = { ...accepted, receipt }; assert.equal(button('重试原输入'), undefined) }
+      for (const receipt of [{ ...acceptedReceipt, message_id: 'different' }, { ...acceptedReceipt, target: { kind: 'bot_main' as const, bot_id: 'different' } }]) { pending = { ...accepted, receipt }; assert.equal(button('关闭提醒'), undefined) }
+      for (const marker of [{ release_expected_event: 'c'.repeat(64) }, { release_command_id: 'a'.repeat(64) }]) {
+        pending = { ...accepted, ...marker }; assert.equal(button('重试原输入'), undefined); assert.equal(button('关闭提醒'), undefined)
+        pending = { ...pending, delivery: 'saved', rejected: '尚未确认' }; assert.equal(button('不再发送'), undefined)
+      }
+      pending = { ...accepted, rejection_code: 'input_conflict', rejected: '原内容不同' }; assert.equal(button('重试原输入'), undefined); assert.equal(button('关闭提醒'), undefined); assert.equal(button('不再发送'), undefined)
+      pending = { ...accepted, delivery: 'unknown' }; assert.match(componentText(render()), /重试请求待确认/); assert.equal(button('重试原输入'), undefined)
+      pending = { ...pending, rejected: '尚未确认' }; assert.equal(button('关闭提醒'), undefined); assert.equal(button('不再发送'), undefined)
+      pending = accepted
+      shared.writable = false; assert.equal(button('重试原输入'), undefined); assert.ok(button('关闭提醒'), 'closing only the local reminder needs no write permission'); shared.writable = true
+      const queued: WorkspaceDomainState['inputs'][number] = { input: { message_id: pending.message_id, target, intent: 'defer', sequence: 1, text: pending.text }, conversation_id: 'chat', source_event: 'source', control_event: 'control', effective_order: 1, deferred: true, cancelled: false }
+      shared.workspaceState.inputs = [queued]; assert.equal(button('重试原输入'), undefined)
+      assert.ok(button('关闭提醒'), 'the matched refused receipt determines closure, not a queue flag')
+      shared.workspaceState.inputs = [{ ...queued, deferred: false, cancelled: true }]; assert.equal(button('重试原输入'), undefined); assert.ok(button('关闭提醒'))
+      pending = { ...accepted, delivery: 'saved', receipt: undefined, rejected: '原输入未保存', rejection_code: 'input_not_saved' }
+      assert.equal(button('关闭提醒'), undefined); assert.ok(button('不再发送'))
+      await press('不再发送'); assert.deepEqual(closed, ['original', 'original', 'original'])
+    } finally { app.close() }
+  }
+})
+
+test('new task creation uses the displayed default Bot after the catalog loads and the Bot filter changes', async () => {
+  for (const mode of ['cold', 'filter']) {
+    const other = { ...parityBot, bot_id: 'other', conversation_id: 'other-chat', name: '另一个 Bot' }
+    const commands: unknown[] = []
+    const shared = { ...parityShared(), bots: [] as ReturnType<typeof parseBot>[], selectedBot: undefined,
+      workspaceCommand: async (command: unknown) => { commands.push(command); return { tasks: [{ task_id: 'created-task', revision: 1 }] } },
+      sendMessage: async () => true,
+    }
+    let botId: string | undefined
+    if (mode === 'filter') { shared.bots = [parityBot, other]; botId = parityBot.bot_id }
+    const app = componentHarness('./workspace-tasks.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/workspace/storage.ts': { newId: () => 'created-task' },
+      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, action: () => Promise<void>) => action() }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+    }, {}, 'CreateWorkspaceTask')
+    const render = () => app.render('CreateWorkspaceTask', { open: true, onOpenChange() {}, botId })
+    const owner = () => render().find(({ type }) => type === 'NativeSelect')?.props.value
+    try {
+      if (mode === 'cold') { assert.equal(owner(), ''); shared.bots = [parityBot] }
+      else { assert.equal(owner(), parityBot.bot_id); botId = other.bot_id; render() }
+      const expected = mode === 'cold' ? parityBot.bot_id : other.bot_id
+      assert.equal(owner(), expected, 'the visible default is also the command owner without changing the select')
+      const fields = render()
+      fields.find(({ type }) => type === 'Input')?.props.onChange?.({ currentTarget: { value: '检查界面' } })
+      fields.find(({ type }) => type === 'Textarea')?.props.onChange?.({ currentTarget: { value: '检查当前界面的操作' } })
+      const submit = render().find(({ type }) => type === 'form')?.props.onSubmit
+      assert.ok(submit); submit({ preventDefault() {} }); await settleComponent()
+      assert.equal(commands.length, 1)
+      assert.equal((commands[0] as { owner_bot: string }).owner_bot, expected)
+    } finally { app.close() }
+  }
+})
+
+test('routine input links preserve their exact trigger', () => {
+  const shared = parityShared()
+  for (const platform of ['web', 'native']) {
+    const app = componentHarness(platform === 'web' ? './workspace-chat.tsx' : '../../../../../apps/mobile/src/features/workspace/workspace.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
+    })
+    try {
+      for (const trigger of ['schedule:exact', 'schedule:+/?&中文#%']) {
+        const link = app.render(platform === 'web' ? 'InputTargetLink' : 'InputLocation', { conversationId: 'chat', target: { kind: 'routine', bot_id: 'bot', trigger } }).find(({ type }) => type === 'Link')
+        assert.ok(link)
+        if (platform === 'web') {
+          assert.deepEqual(JSON.parse(JSON.stringify(link.props.params)), { botId: 'bot' })
+          assert.deepEqual(JSON.parse(JSON.stringify(link.props.search)), { routine: trigger })
+        } else {
+          assert.equal(typeof link.props.href, 'string')
+          const url = new URL(String(link.props.href), 'https://app.vibeface.dev')
+          assert.equal(url.pathname, '/b/bot')
+          assert.deepEqual([...url.searchParams], [['routine', trigger]])
+          assert.equal(url.hash, '')
+        }
+      }
+    } finally { app.close() }
+  }
+})
+
+test('composers save each pending draft once and let edited drafts save independently', async (t) => {
+  const cases = [
+    { name: 'web Main', path: '../chat/conversation-screen.tsx', component: 'ConversationScreen', native: false, privateExport: '', props: {} },
+    { name: 'web Scoped', path: './workspace-chat.tsx', component: 'ScopedConversation', native: false, privateExport: 'ScopedConversation', props: { target: { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }, conversationId: 'chat', channelId: 'channel', label: '项目 Bot' } },
+    { name: 'web Work', path: './task-detail.tsx', component: 'TaskDetail', native: false, privateExport: '', props: { botId: 'bot', workId: 'work' } },
+    { name: 'native Scoped', path: '../../../../../apps/mobile/src/features/workspace/workspace.tsx', component: 'ScopedWorkspaceScreen', native: true, privateExport: '', props: { channelId: 'channel' } },
+    { name: 'native Work', path: '../../../../../apps/mobile/app/b/[botId]/work/[workId].tsx', component: 'TaskDetail', native: true, privateExport: 'TaskDetail', props: { botId: 'bot', workId: 'work' } },
+    { name: 'web Scoped Task', path: './workspace-chat.tsx', component: 'ScopedConversation', native: false, privateExport: 'ScopedConversation', props: { target: { kind: 'task', task_id: 'task' }, conversationId: 'chat', label: '项目 Bot' } },
+    { name: 'native Scoped Task', path: '../../../../../apps/mobile/src/features/workspace/workspace.tsx', component: 'ScopedWorkspaceScreen', native: true, privateExport: '', props: { taskId: 'task' } },
+  ]
+  for (const example of cases) await t.test(example.name, async () => {
+    type ReadableFile = { name: string; arrayBuffer: () => Promise<ArrayBuffer> }
+    const reads = new Map<string, ReturnType<typeof pendingResult>>()
+    const read = async (name: string) => { const held = reads.get(name); assert.ok(held); const buffer = await held.promise; assert.ok(buffer instanceof ArrayBuffer); return buffer }
+    const attempts: { text: string; files: string[]; target: InputTarget; intent: string | undefined }[] = []
+    const saved: { text: string; attachments: { name: string; bytes: number[] }[] }[] = [], saves: Promise<boolean>[] = []
+    const navigations: unknown[] = []
+    const domain: WorkspaceDomainState = {
+      channels: [{ channel_id: 'channel', title: '频道', purpose: '', members: ['bot'], coordinator_bot: 'bot', coordinator_node: 'worker', revision: 1, owner_epoch: 1, event_hash: 'channel-event', created_at_ms: 1 }],
+      tasks: [{ task_id: 'task', root_task_id: 'task', owner_bot: 'bot', title: '任务', request: '交代', expected_result: '结果', source_events: [], dependencies: [], reply_only: false, revision: 1, action: 'continue', request_event: 'request', event_hash: 'task-event', created_at_ms: 1, updated_at_ms: 1, state: 'running' }], assignments: [], inputs: [], coverage: { limit: 128, truncated: false },
+    }
+    const shared = {
+      ...parityShared(), data: parseConversation({ ...context, works: [parityWork()] }), workspaceState: domain,
+      chatSlot: { conversationId: 'chat', missing: false }, fresh: new Set<string>(), interrupted: [], view: 'chat',
+      readWork: async () => ({ work: { ...parityWork(), conversation_id: 'chat', target: null, source_events: [] }, coverage: { source: 'shared_history', complete: false } }),
+      readWorkspaceState: async () => domain, readWorkspaceHistory: async () => ({ events: [], coverage: { limit: 128, truncated: false, scope: 'channel' } }),
+      sendMessage: (text: string, files: ReadableFile[], _sent: unknown, options: InputOptions) => {
+        attempts.push({ text, files: files.map((file) => file.name), target: options.target, intent: options.intent })
+        const taskId = `created-task-${attempts.length}`
+        const save = Promise.all(files.map(async (file) => ({ name: file.name, bytes: Array.from(new Uint8Array(await file.arrayBuffer())) }))).then((attachments) => {
+          saved.push({ text, attachments })
+          if (options.intent === 'new_task') options.onSaved?.({ message_id: `input-${taskId}`, conversation_id: 'chat', target: { kind: 'task', task_id: taskId }, intent: 'continue', expected_revision: 1, sequence: attempts.length, text, attachments: [], created_at_ms: 1, delivery: 'saved' })
+          return true
+        })
+        saves.push(save)
+        return save
+      },
+    }
+    const app = componentHarness(example.path, {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { network_id: 'network', can_manage: false, source: 'membership' } } }) },
+      '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/lib/node.ts': { providerNames, messageOf }, '@vibeface/client/lib/errors.ts': errors,
+      '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
+      '@vibeface/client/workspace/bot-settings.ts': { botCopy, folderLabels, placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage },
+      '@vibeface/client/chat/protocol.ts': { inputTargetKey, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters },
+      '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) },
+      '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+      '@tanstack/react-router': { useNavigate: () => (target: unknown) => { navigations.push(target) } },
+      'expo-router': { Stack: { Screen: 'Screen' }, router: { push: (target: unknown) => { navigations.push(target) } }, useRouter: () => ({ push: (target: unknown) => { navigations.push(target) }, back() {} }) },
+      'expo-file-system': { File: class { uri: string; constructor(uri: string) { this.uri = uri } arrayBuffer() { return read(this.uri.split('/').at(-1) ?? '') } } },
+      'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) },
+      '@/lib/use-run': { useRun: () => ({ busy: null, error: '', run: async (_key: string, action: () => Promise<void>) => action() }) },
+    }, { setInterval: () => 1, clearInterval() {}, window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } }, example.privateExport)
+    const render = () => app.render(example.component, example.props)
+    const composer = () => { const props = render().find(({ type }) => type === (example.native ? 'Composer' : 'PromptInput'))?.props; assert.ok(props); return props }
+    const submit = () => { const send = composer()[example.native ? 'onSend' : 'onSubmit']; assert.ok(typeof send === 'function'); send() }
+    const attach = (name: string) => {
+      const input = composer().onFiles; assert.ok(typeof input === 'function')
+      const files = example.native ? [{ uri: `file:///${name}`, name, size: 3, mimeType: 'text/plain' }] : [{ name, arrayBuffer: () => read(name) }]
+      input(files)
+      return files
+    }
+    try {
+      render(); await settleComponent()
+      const first = pendingResult(); reads.set('first.txt', first)
+      composer().onChange?.('第一份草稿'); attach('first.txt'); submit(); submit()
+      composer().onChange?.('第一份草稿'); submit(); await settleComponent()
+      assert.equal(attempts.length, 1, 'unchanged redraws, taps and text events keep the pending draft identity')
+      assert.equal(saved.length, 0, 'the first attachment is still preparing before local acceptance')
+      const later = pendingResult(); reads.set('later.txt', later)
+      composer().onChange?.('第二份草稿'); const laterFiles = attach('later.txt'); submit(); await settleComponent()
+      assert.equal(attempts.length, 2, 'editing can submit a new draft while the first attachment is blocked')
+      first.resolve(new Uint8Array([1, 2, 3]).buffer); await saves[0]; await settleComponent()
+      assert.equal(composer().value, '第二份草稿')
+      assert.equal(composer().files, laterFiles, 'the earlier save cannot remove the new attachments')
+      const intent = render().find(({ type, props }) => example.native ? typeof type === 'function' && type.name === 'InputOptions' || type === 'InputOptions' : type === 'NativeSelect' && props['aria-label'] === '发送方式')?.props
+      const changeIntent = intent?.[example.native ? 'onIntent' : 'onChange']; assert.ok(typeof changeIntent === 'function')
+      changeIntent(example.native ? 'defer' : { currentTarget: { value: 'defer' } }); submit(); submit(); await settleComponent()
+      assert.equal(attempts.length, 3, 'a changed send intent is a separate draft without blocking it globally')
+      later.resolve(new Uint8Array([4, 5, 6]).buffer); await Promise.all(saves); await settleComponent()
+      assert.equal(composer().value, '')
+      assert.deepEqual(JSON.parse(JSON.stringify(composer().files)), [])
+      assert.deepEqual(JSON.parse(JSON.stringify(attempts.map(({ text, files, intent }) => ({ text, files, intent })))), [
+        { text: '第一份草稿', files: ['first.txt'], intent: 'continue' }, { text: '第二份草稿', files: ['later.txt'], intent: 'continue' }, { text: '第二份草稿', files: ['later.txt'], intent: 'defer' },
+      ])
+      assert.deepEqual(saved, [
+        { text: '第一份草稿', attachments: [{ name: 'first.txt', bytes: [1, 2, 3] }] }, { text: '第二份草稿', attachments: [{ name: 'later.txt', bytes: [4, 5, 6] }] }, { text: '第二份草稿', attachments: [{ name: 'later.txt', bytes: [4, 5, 6] }] },
+      ])
+      const target: InputTarget = example.name.endsWith('Task') ? { kind: 'task', task_id: 'task' } : example.name === 'web Main' ? { kind: 'bot_main', bot_id: 'bot' } : example.component.includes('Scoped') ? { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' } : { kind: 'work', work_id: 'work' }
+      if (example.native) assert.equal(composer().attachmentScope, JSON.stringify(['network', 'chat', target.kind === 'work' ? ['work', target.work_id] : inputTargetKey(target), example.component.includes('Scoped') ? 'continue' : 'defer']))
+      assert.deepEqual(JSON.parse(JSON.stringify(attempts.map((item) => item.target))), [target, target, target])
+      const failed = pendingResult(); reads.set('retry.txt', failed)
+      composer().onChange?.('原样重试'); const retryFiles = attach('retry.txt'); submit()
+      failed.reject(new Error('file unavailable')); await assert.rejects(saves[3], /file unavailable/); await settleComponent()
+      assert.equal(composer().value, '原样重试'); assert.equal(composer().files, retryFiles)
+      const retry = pendingResult(); reads.set('retry.txt', retry); submit(); submit(); await settleComponent()
+      assert.equal(attempts.length, 5, 'a failed save releases the draft guard for exactly one retry')
+      retry.resolve(new Uint8Array([7, 8, 9]).buffer); await saves[4]; await settleComponent()
+      assert.equal(composer().value, '')
+      assert.deepEqual(saved.at(-1), { text: '原样重试', attachments: [{ name: 'retry.txt', bytes: [7, 8, 9] }] })
+      if (!example.name.endsWith('Scoped')) for (const change of ['text', 'intent', 'unchanged']) {
+        const before = navigations.length, taskId: string = `created-task-${attempts.length + 1}`, name = `navigate-${change}.txt`
+        const held = pendingResult(); reads.set(name, held)
+        changeIntent(example.native ? 'new_task' : { currentTarget: { value: 'new_task' } })
+        composer().onChange?.(`新任务 ${change}`); attach(name); submit()
+        if (change === 'text') composer().onChange?.('当前正在编辑的正文')
+        if (change === 'intent') changeIntent(example.native ? 'continue' : { currentTarget: { value: 'continue' } })
+        render()
+        held.resolve(new Uint8Array([10, 11, 12]).buffer); await saves.at(-1); await settleComponent()
+        assert.equal(navigations.length, before + (change === 'unchanged' ? 1 : 0), 'only the unchanged submitted draft can navigate after local acceptance')
+        if (change === 'unchanged') {
+          assert.deepEqual(JSON.parse(JSON.stringify(navigations.at(-1))), example.native ? `/task/${taskId}` : { to: '/tasks/$taskId', params: { taskId } })
+          assert.equal(composer().value, '')
+        } else assert.equal(composer().value, change === 'text' ? '当前正在编辑的正文' : `新任务 ${change}`, 'late navigation cannot discard the active draft')
+      }
+    } finally {
+      for (const held of reads.values()) held.resolve(new ArrayBuffer(0))
+      await Promise.allSettled(saves)
+      app.close()
+    }
+  })
+})
+
+test('both channel composers retain the durable task target before the domain snapshot arrives', async () => {
+  for (const platform of ['web', 'native']) {
+    const domain: WorkspaceDomainState = {
+      channels: [{ channel_id: 'channel', title: '官网改版', purpose: '', members: ['bot', 'other'], coordinator_bot: 'bot', coordinator_node: 'worker', revision: 1, owner_epoch: 1, event_hash: 'channel-event', created_at_ms: 1 }],
+      tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false },
+    }
+    const durable: PendingMessage = { message_id: 'locally-saved', conversation_id: 'chat', target: { kind: 'channel_task', channel_id: 'channel', task_id: 'stable-task', bot_id: 'bot' }, intent: 'continue', expected_revision: 1, sequence: 1, text: 'first', created_at_ms: 1, delivery: 'saved' }
+    const pendingMessages: PendingMessage[] = []
+    const sends: InputOptions[] = []
+    const shared = { ...parityShared(), workspaceState: domain, pendingMessages,
+      readWorkspaceState: async () => domain,
+      readWorkspaceHistory: async () => ({ events: [], coverage: { limit: 128, truncated: false, scope: 'channel' } }),
+      sendMessage: async (_text: string, _files: unknown[], _sent: unknown, options?: InputOptions) => { assert.ok(options); sends.push(options); const saved: PendingMessage = options.target.kind === 'channel_member' && options.target.bot_id === 'other' ? { ...durable, conversation_id: 'other-chat', target: { kind: 'channel_task', channel_id: 'channel', task_id: 'other-task', bot_id: 'other' } } : durable; shared.pendingMessages = [saved]; options.onSaved?.(saved); return true },
+    }
+    shared.bots.push({ ...parityBot, bot_id: 'other', conversation_id: 'other-chat', name: '另一个 Bot' })
+    const saved = new Map<string, string>()
+    const storage = { getItem: (key: string) => saved.get(key) ?? null, setItem: (key: string, value: string) => { saved.set(key, value) } }
+    const dependencies = {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
+      '@vibeface/client/chat/protocol.ts': { inputTargetKey },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: { principal: { network_id: 'network' } } }) },
+      '@/lib/platform': { webPlatform: { storage } }, '@/platform': { mobilePlatform: { storage } },
+      'expo-router': { Stack: { Screen: 'Screen' }, router: { push() {} } }, 'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) },
+      '@/lib/use-run': { useRun: () => ({ busy: null, error: '', run: async (_key: string, action: () => Promise<void>) => action() }) },
+      '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+    }
+    const source = platform === 'web' ? './workspace-chat.tsx' : '../../../../../apps/mobile/src/features/workspace/workspace.tsx'
+    const make = () => componentHarness(source, dependencies, { setInterval: () => 1, clearInterval() {} })
+    let app = make()
+    try {
+      if (platform === 'web') {
+        const scoped = () => app.render('ChannelWorkspace', { channelId: 'channel' }).find(({ type }) => typeof type === 'function' && type.name === 'ScopedConversation')?.props
+        assert.deepEqual(JSON.parse(JSON.stringify(scoped()?.target)), { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' })
+        const accepted = scoped()?.onSaved
+        assert.ok(typeof accepted === 'function')
+        shared.pendingMessages = [durable]
+        accepted(durable)
+        assert.deepEqual(JSON.parse(JSON.stringify(scoped()?.target)), durable.target)
+        assert.equal(scoped()?.expectedRevision, 1)
+        assert.equal(scoped()?.task, undefined, 'the local target does not invent a server task projection')
+        app.close(); app = make()
+        assert.deepEqual(JSON.parse(JSON.stringify(scoped()?.target)), durable.target, 'a reload restores the selected task from durable input evidence')
+        assert.equal(scoped()?.expectedRevision, 1)
+        const previousSaved = scoped()?.onSaved
+        const selector = app.render('ChannelWorkspace', { channelId: 'channel' }).find(({ props }) => props['aria-label'] === '频道消息目标')?.props
+        assert.ok(typeof selector?.onChange === 'function'); selector.onChange({ currentTarget: { value: 'other' } })
+        scoped()
+        assert.ok(typeof previousSaved === 'function'); previousSaved(durable)
+        assert.deepEqual(JSON.parse(JSON.stringify(scoped()?.target)), { kind: 'channel_member', channel_id: 'channel', bot_id: 'other' }, 'a late save cannot undo a later explicit Bot selection')
+      } else {
+        const composer = () => app.render('ScopedWorkspaceScreen', { channelId: 'channel' }).find(({ type }) => type === 'Composer')?.props
+        composer()?.onChange?.('first')
+        const first = composer()?.onSend
+        assert.ok(typeof first === 'function'); first(); await settleComponent()
+        composer()?.onChange?.('second')
+        const second = composer()?.onSend
+        assert.ok(typeof second === 'function'); second(); await settleComponent()
+        assert.deepEqual(sends.map((input) => JSON.parse(JSON.stringify(input.target))), [{ kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }, durable.target])
+        assert.equal(sends[1].expected_revision, 1)
+        app.close(); app = make()
+        composer()?.onChange?.('after reload')
+        const afterReload = composer()?.onSend
+        assert.ok(typeof afterReload === 'function'); afterReload(); await settleComponent()
+        assert.deepEqual(JSON.parse(JSON.stringify(sends[2].target)), durable.target)
+        assert.equal(sends[2].expected_revision, 1)
+        const controls = app.render('ScopedWorkspaceScreen', { channelId: 'channel' }).find(({ type }) => typeof type === 'function' && type.name === 'InputOptions')?.props
+        const other = (controls?.options as { key: string }[]).find((option) => option.key === 'member:other')
+        assert.ok(other && typeof controls?.onSelect === 'function'); controls.onSelect(other)
+        composer()
+        sends[2].onSaved?.(durable)
+        composer()?.onChange?.('交给另一个 Bot')
+        const sendOther = composer()?.onSend
+        assert.ok(typeof sendOther === 'function'); sendOther(); await settleComponent()
+        assert.deepEqual(JSON.parse(JSON.stringify(sends[3].target)), { kind: 'channel_member', channel_id: 'channel', bot_id: 'other' }, 'a late save cannot redirect the next native input back to the old Bot')
+      }
+    } finally { app.close() }
+  }
+})
+
+test('chat task groups stay at their originating message and orphan tasks remain available only in history', () => {
+  const messages = [
+    { message_id: 'one', event_hash: 'one', role: 'user', text: '核对项目', created_at_ms: 1 },
+    { message_id: 'reply', event_hash: 'reply', role: 'assistant', text: '已开始核对', created_at_ms: 2, in_reply_to: 'one' },
+    { message_id: 'two', event_hash: 'two', role: 'user', text: '继续', created_at_ms: 3 },
+  ]
+  const complete = (work_id: string, trigger = 'message:one') => parityWork({ work_id, trigger, state: 'finished', outcome: 'completed', title: `已完成的 ${work_id}`, result_text: '不在聊天重复的结果' })
+  const shared = { ...parityShared(), fresh: new Set<string>(), interrupted: [], chatSlot: { conversationId: 'chat', missing: false } }
+  shared.data = parseConversation({ ...context, messages, works: [complete('root'), complete('sibling'), parityWork({ work_id: 'child', trigger: 'task:root' }), complete('orphan', 'message:missing')] })
+  const harness = conversationHarness(() => shared)
+  try {
+    const entries = harness.chatEntries()
+    assert.deepEqual(entries.map((entry) => entry.key), ['one', 'task-group:message:one', 'task-group:task:root', 'reply', 'two'])
+    const group = entries.find((entry) => entry.key === 'task-group:message:one')?.node
+    assert.equal(group?.type, 'Details')
+    assert.equal(group?.props.label, '2 个任务 · 已完成')
+    const elements = harness.render()
+    const cards = elements.filter(({ type }) => typeof type === 'function' && type.name === 'TaskCard')
+    assert.equal(cards.length, 3, 'the orphan cannot create a chat row')
+    const finished = cards.find(({ props }) => (props.task as { id: string }).id === 'sibling')
+    assert.ok(finished)
+    assert.equal(componentText(nestedElements([finished], ['TaskCard']).find(({ type }) => type === 'div')), '已完成 · 查看任务')
+    const history = elements.find(({ type }) => typeof type === 'function' && type.name === 'TaskHistory')
+    assert.equal(history, undefined, 'an inactive chat never mounts a history portal')
+    const active = harness.render({ active: true })
+    const historyKey = active.find(({ type }) => typeof type === 'function' && type.name === 'TaskHistory')?.key
+    const chatKey = active.find(({ type }) => type === 'Chat')?.key
+    assert.ok(historyKey && chatKey)
+    assert.notEqual(historyKey, chatKey, 'history and the retained chat are different siblings during reconciliation')
+    shared.data = parseConversation({ ...context, messages: messages.slice(0, 1), works: shared.data.works })
+    assert.equal(harness.chatEntries()[1].key, 'task-group:message:one', 'a reply arriving never moves the task group')
+    shared.data = parseConversation({ ...context, messages, works: [complete('root'), complete('sibling'), complete('child', 'task:root'), complete('orphan', 'message:missing')] })
+    assert.equal(harness.chatEntries()[2].key, 'task-group:task:root', 'progress changes retain the group key')
+  } finally { harness.app.close() }
+})
+
+test('chat task history keeps completed and unknown records while counting only current attention', () => {
+  const approval = { question_id: 'approval', conversation_id: 'chat', target: { kind: 'bot_main', bot_id: 'bot' }, attention: { kind: 'approval', device_id: 'worker' }, severity: 'attention', text: '允许继续吗？', choices: [{ label: '继续' }], author: 'worker', created_at_ms: 2, answer: null, closed: null, about: { node: 'worker', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' } }
+  const failed = parityWork({ work_id: 'failed', state: 'finished', outcome: 'failed', failure_reason: '已保留修改' })
+  const openWorks: (WorkRecord & { conversation_id: string })[] = []
+  const shared = { ...parityShared(), openWorks, fresh: new Set<string>(), interrupted: [], chatSlot: { conversationId: 'chat', missing: false } }
+  shared.data = parseConversation({ ...context, works: [parityWork(), failed, parityWork({ work_id: 'unknown', state: 'unverified', outcome: 'unverified', failure_reason: '结果无法确认' }), parityWork({ work_id: 'completed', state: 'finished', outcome: 'completed' })], questions: [approval] })
+  shared.openWorks = shared.data.works.map((work) => ({ ...work, conversation_id: 'chat' }))
+  const dependencies = {
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+    '@vibeface/client/workspace/labels.ts': taskLabels, '@/lib/glossary': { terms: { approval: { icon: 'ApprovalIcon' } } },
+  }
+  const app = componentHarness('../chat/conversation-screen.tsx', dependencies, {}, 'TaskHistory, TaskIcon')
+  const harness = conversationHarness(() => shared)
+  const render = () => {
+    const history = harness.render({ active: true }).find(({ type }) => typeof type === 'function' && type.name === 'TaskHistory')
+    assert.ok(history)
+    return app.render('TaskHistory', history.props)
+  }
+  const label = () => render().find(({ type }) => type === 'Button')?.props['aria-label']
+  try {
+    assert.equal(label(), '任务 · 3 待处理')
+    assert.equal(render().filter(({ type }) => type === 'Link').length, 4, 'history includes completed, missing-origin and uncertain tasks')
+    assert.match(componentText(render()), /已完成/)
+    assert.match(componentText(render()), /待确认/)
+    assert.equal(app.render('TaskIcon', { state: 'unknown', stale: false }).some(({ type }) => type === 'CircleQuestionMark'), true)
+    assert.equal(app.render('TaskIcon', { state: 'completed', stale: false }).some(({ type }) => type === 'CircleCheck'), true)
+    shared.answered = { approval: '继续' }
+    shared.openWorks = shared.openWorks.filter((work) => work.work_id !== 'failed')
+    assert.equal(label(), '任务 · 1 进行中 · 1 待处理', 'answered approvals and closed historical failures stop counting')
+    const trigger = render().find(({ type }) => type === 'Button')
+    trigger?.props.onClick?.()
+    assert.equal(render().find(({ type }) => type === 'Sheet')?.props.open, true)
+    const onCloseAutoFocus = render().find(({ type }) => type === 'SheetContent')?.props.onCloseAutoFocus as (event: { preventDefault(): void }) => void
+    render().find(({ type }) => type === 'Link')?.props.onClick?.()
+    assert.equal(render().find(({ type }) => type === 'Sheet')?.props.open, false, 'navigation closes the sheet first')
+    let prevented = false
+    const closeFocus = () => onCloseAutoFocus({ preventDefault() { prevented = true } })
+    closeFocus()
+    assert.equal(prevented, true, 'detail navigation owns focus after the sheet closes')
+    render().find(({ type }) => type === 'Button')?.props.onClick?.()
+    prevented = false
+    closeFocus()
+    assert.equal(prevented, false, 'ordinary dismissal still restores the opening button')
+    shared.connectionOnline = false
+    assert.equal(label(), '任务 · 2 待处理', 'offline active tasks are uncertain instead of counted as running')
+  } finally { app.close(); harness.app.close() }
+})
+
+test('the retained conversation only mounts task history on its exact chat route', () => {
+  let pathname = '/b/bot'
+  const shared = { ...parityShared(), readWorkspaceState: async () => workspaceModel.parseWorkspaceState({ coverage: { limit: 128, truncated: false } }) }
+  const app = componentHarness('./workspace-shell.tsx', {
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: null, directory: null }) },
+    '@tanstack/react-router': { Link: 'Link', useNavigate: () => () => {}, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { pathname, search: {} } }) },
+    '@/components/ui/sidebar': { useSidebar: () => ({ isMobile: false, setOpenMobile() {} }) }, './inbox': { useInbox: () => [] },
+    '@/features/devices/join': { useOpenJoins: () => [] }, '@vibeface/client/workspace/inbox.ts': { waitingItems: () => [] },
+    '@vibeface/client/workspace/home.ts': { backTo: () => undefined }, '@/lib/glossary': { terms: Object.fromEntries(['inbox', 'task', 'myDevices', 'settings'].map((key) => [key, { label: key, icon: key }])) },
+    '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+    '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle' }, '@vibeface/client/avatar/mood.ts': { moodLabel: { idle: '待命' } },
+  }, {}, 'WorkspaceLayout')
+  const active = () => app.render('WorkspaceLayout', { children: null, landing: false }).find(({ type }) => type === 'ConversationScreen')?.props.active
+  try {
+    assert.equal(active(), true)
+    for (const route of ['/b/bot/work/work', '/devices', '/tasks', '/b/missing']) { pathname = route; assert.equal(active(), false, route) }
+    pathname = '/b/bot'
+    assert.equal(active(), true)
+  } finally { app.close() }
+})
+
+test('closing task detail restores a connected opener or the persistent workspace after history unmounts', () => {
+  const focused: string[] = []
+  class Target {
+    isConnected = true
+    readonly name: string
+    constructor(name: string) { this.name = name }
+    focus(options: { preventScroll: boolean }) { assert.equal(options.preventScroll, true); focused.push(this.name) }
+  }
+  const body = new Target('body'), main = new Target('main'), link = new Target('history-link')
+  const ownerDocument = { activeElement: link, body, getElementById: (id: string) => { assert.equal(id, 'main'); return main } }
+  const panel = { ownerDocument, focus: (options: { preventScroll: boolean }) => { assert.equal(options.preventScroll, true); focused.push('detail') } }
+  const app = componentHarness('./task-detail.tsx', {}, { HTMLElement: Target }, 'holdFocus')
+  try {
+    for (const source of ['connected', 'removed', 'body']) {
+      ownerDocument.activeElement = source === 'body' ? body : link
+      link.isConnected = source === 'connected'
+      app.render('holdFocus', panel)
+      const close = app.output
+      assert.equal(typeof close, 'function')
+      if (typeof close === 'function') close()
+    }
+    assert.deepEqual(focused, ['detail', 'history-link', 'detail', 'main', 'detail', 'main'])
+  } finally { app.close() }
 })
 
 test('both task overviews preserve known records, show their coverage and only navigate cross-Bot program checks', () => {
@@ -1450,10 +2549,86 @@ test('both task overviews reconcile raw confirmations and only fold task process
   }
 })
 
-test('both task details bind approval to current unfinished work and keep stops above approval', () => {
+test('both work details read terminal shared records outside Main and discard late route responses', async () => {
+  for (const platform of ['web', 'native']) {
+    const first = pendingResult(), second = pendingResult()
+    const calls: { conversation_id: string; work_id: string }[] = []
+    const shared = { ...parityShared(), openWorks: [], readWork: (input: { conversation_id: string; work_id: string }) => { calls.push(input); return input.work_id === 'first' ? first.promise : second.promise } }
+    shared.data = parseConversation(context)
+    let workId = 'first'
+    const app = componentHarness(platform === 'web' ? './task-detail.tsx' : '../../../../../apps/mobile/app/b/[botId]/work/[workId].tsx', {
+      '@tanstack/react-router': { Link: 'Link', useNavigate: () => () => {} }, 'expo-router': { Stack: { Screen: 'Screen' }, useRouter: () => ({ push() {}, back() {} }) },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': taskLabels,
+      '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/lib/node.ts': { providerNames, messageOf }, '@vibeface/client/lib/errors.ts': errors,
+      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: () => Promise.resolve() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) }),
+      '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+    }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } }, platform === 'native' ? 'TaskDetail' : '')
+    const render = () => app.render('TaskDetail', { botId: 'bot', workId })
+    const content = () => { const elements = render(); return componentText(elements) + elements.map(({ props }) => typeof props.text === 'string' ? props.text : '').join('') }
+    try {
+      render()
+      workId = 'second'
+      render()
+      second.resolve({ work: { ...parityWork({ work_id: 'second', title: 'Task 内已结束工作', state: 'finished', outcome: 'completed', result_text: '完整结果记录' }), target: null, source_events: ['a'.repeat(64)], conversation_id: 'chat' }, coverage: { source: 'shared_history', complete: false } })
+      await settleComponent()
+      assert.deepEqual(JSON.parse(JSON.stringify(calls)), [{ conversation_id: 'chat', work_id: 'first' }, { conversation_id: 'chat', work_id: 'second' }])
+      assert.match(content(), /完整结果记录/)
+      assert.match(content(), /完整执行历史未提供/)
+      first.resolve({ work: { ...parityWork({ work_id: 'first', title: '旧路由迟到内容' }), target: null, source_events: ['b'.repeat(64)], conversation_id: 'chat' }, coverage: { source: 'shared_history', complete: false } })
+      await settleComponent()
+      assert.match(content(), /完整结果记录/)
+      assert.doesNotMatch(content(), /旧路由迟到内容/)
+      assert.equal(shared.data.works.length, 0, 'detail reads never refill Main')
+      assert.equal(shared.openWorks.length, 0, 'terminal history does not depend on the open-work list')
+    } finally { app.close() }
+  }
+})
+
+test('terminal work followups retain their Task identity or explicitly create a task from the original request', async () => {
+  for (const platform of ['web', 'native']) for (const kind of ['task', 'channel_task', 'raw']) {
+    const target: InputTarget | null = kind === 'task' ? { kind: 'task', task_id: 'stable-task' } : kind === 'channel_task' ? { kind: 'channel_task', task_id: 'stable-task', channel_id: 'channel', bot_id: 'bot' } : null
+    const work = parityWork({ state: 'finished', outcome: 'failed', prompt: '原始完整交代', result_text: '上次已经产生的输出' })
+    const sends: { text: string; options: InputOptions }[] = [], reads: unknown[] = []
+    const shared = { ...parityShared(), data: parseConversation(context), openWorks: [],
+      readWork: async () => ({ work: { ...work, target, source_events: ['a'.repeat(64)], conversation_id: 'chat' }, coverage: { source: 'shared_history', complete: false } }),
+      readWorkspaceState: async (filter: unknown) => { reads.push(filter); return { tasks: [{ task_id: 'stable-task', revision: 3, action: 'continue' }] } },
+      sendMessage: async (text: string, _files: unknown[], _sent: unknown, options: InputOptions) => { sends.push({ text, options }); return true },
+    }
+    const app = componentHarness(platform === 'web' ? './task-detail.tsx' : '../../../../../apps/mobile/app/b/[botId]/work/[workId].tsx', {
+      '@tanstack/react-router': { Link: 'Link', useNavigate: () => () => {} }, 'expo-router': { Stack: { Screen: 'Screen' }, useRouter: () => ({ push() {}, back() {} }) },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': taskLabels,
+      '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/lib/node.ts': { providerNames, messageOf }, '@vibeface/client/lib/errors.ts': errors,
+      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, action: () => Promise<void>) => action() }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+      '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+    }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } }, platform === 'native' ? 'TaskDetail' : '')
+    const render = () => app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    try {
+      render(); await settleComponent()
+      const elements = render()
+      const composer = elements.find(({ type }) => type === (platform === 'web' ? 'PromptInput' : 'Composer'))
+      assert.ok(platform === 'web' ? composer?.props.disabled : composer?.props.blocked, 'a terminal Work cannot accept the default Continue')
+      const follow = elements.find(({ type, props }) => type === (platform === 'web' ? 'Button' : 'ActionButton') && componentText(props.children) === (target ? '继续所属任务' : '新任务重做'))
+      assert.ok(follow)
+      if (platform === 'web') { assert.ok(follow.props.onClick); follow.props.onClick(); await settleComponent() }
+      else { assert.ok(follow.props.action); await follow.props.action() }
+      assert.equal(sends.length, 1)
+      assert.deepEqual(JSON.parse(JSON.stringify(sends[0].options.target)), target ?? { kind: 'work', work_id: 'work' })
+      assert.equal(sends[0].options.intent, target ? 'continue' : 'new_task')
+      assert.equal(sends[0].options.expected_revision, target ? 3 : undefined)
+      assert.match(sends[0].text, /原始完整交代/)
+      assert.match(sends[0].text, /上次已经产生的输出/)
+      assert.deepEqual(JSON.parse(JSON.stringify(reads)), target ? [{ task_id: 'stable-task' }] : [])
+    } finally { app.close() }
+  }
+})
+
+test('both task details bind approval to current unfinished work and keep stops above approval', async () => {
   for (const platform of ['web', 'native']) {
     const shared = parityShared()
-    const approval = { question_id: 'approval', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '继续吗', choices: [], author: 'worker', created_at_ms: 2, answer: null, closed: null, about: { node: 'worker', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' } }
+    const approval = { target: { kind: 'work', work_id: 'work' }, question_id: 'approval', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '继续吗', choices: [], author: 'worker', created_at_ms: 2, answer: null, closed: null, about: { node: 'worker', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' } }
+    shared.questions = workspaceModel.parseQuestions({ questions: [approval] })
     shared.data = parseConversation({ ...context, works: [parityWork({ work_id: 'old', state: 'finished', outcome: 'completed' }), parityWork()], questions: [approval] })
     let workId = 'old'
     const app = componentHarness(platform === 'web' ? './task-detail.tsx' : '../../../../../apps/mobile/app/b/[botId]/work/[workId].tsx', {
@@ -1464,27 +2639,27 @@ test('both task details bind approval to current unfinished work and keep stops 
       '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: () => Promise.resolve() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) }),
       '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
       './task-activity': { confirmText: () => '设备无法报告结果', BackOnline: 'BackOnline' },
-    }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
-    const render = () => app.render(platform === 'web' ? 'TaskDetail' : 'default', { botId: 'bot', workId })
+    }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } }, platform === 'native' ? 'TaskDetail' : '')
+    const render = async () => { app.render('TaskDetail', { botId: 'bot', workId }); await settleComponent(); return app.render('TaskDetail', { botId: 'bot', workId }) }
     try {
-      assert.equal(render().some(({ type }) => type === 'QuestionCard'), false, `${platform} old work cannot inherit the later approval`)
+      assert.equal((await render()).some(({ type }) => type === 'QuestionCard'), false, `${platform} old work cannot inherit the later approval`)
       workId = 'work'
-      let elements = render()
+      let elements = await render()
       assert.equal(elements.some(({ type }) => type === 'QuestionCard'), true)
       assert.match(componentText(elements), /需要你同意/)
       assert.equal(elements.some(({ props }) => props.label === '最近步骤摘要 · 3'), true)
       shared.answered = { approval: '继续' }
-      assert.equal(render().some(({ type }) => type === 'QuestionCard'), false)
+      assert.equal((await render()).some(({ type }) => type === 'QuestionCard'), false)
       shared.answered = {}
       shared.data = parseConversation({ ...context, works: [parityWork()], deliveries: [{ work_id: 'work', target_node: 'worker', state: 'stop_waiting' }], questions: [approval] })
-      elements = render()
+      elements = await render()
       assert.match(componentText(elements), /停止中/)
       assert.doesNotMatch(componentText(elements), /需要你同意/)
       shared.nodes = [{ ...parityNode, capabilities: { ...parityNode.capabilities, codex_connected: false } }]
-      assert.match(componentText(render()), /待确认/)
+      assert.match(componentText(await render()), /待确认/)
       shared.nodes = [parityNode]
-      shared.data = parseConversation({ ...context, works: [parityWork({ kind: 'task', coordination_job: { trigger: 'task:work', state: 'queued', lane: 'task', hold_reason: 'machine_slot' } })] })
-      elements = render()
+      shared.data = parseConversation({ ...context, works: [parityWork({ kind: 'task', coordination_job: { conversation_id: 'chat', scope: { kind: 'task', work_id: 'work' }, trigger: 'task:work', kind: 'workspace_task', state: 'queued', sequence: 1, lane: 'task', source_node: 'worker', owner: 'worker', message_id: null, reply_message_id: 'reply', hold_reason: 'machine_slot' } })] })
+      elements = await render()
       assert.equal(elements.some(({ props }) => props.label === '协调回合'), true)
       assert.match(componentText(elements), /等待设备运行名额/)
       assert.equal(shared.data.works[0].state, 'running', 'queue observations leave DAG work state intact')
@@ -1494,8 +2669,8 @@ test('both task details bind approval to current unfinished work and keep stops 
 
 test('context shows scheduler observations without promising native resume or repeating external sessions', () => {
   const shared = parityShared()
-  const data = parseConversation({ ...context, scheduler: { jobs: [{ trigger: 'message:queued', state: 'queued' }], unanswered: [] } })
-  const dependencies = { '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/chat/protocol.ts': { runtimeLabel }, '@vibeface/client/workspace/bot-settings.ts': { scheduleFrequency: () => '一次', formatWhen: () => '刚才' }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } }
+  const data = parseConversation({ ...context, scheduler: { scope_jobs: [], jobs: [{ scope: { kind: 'main' as const }, trigger: 'message:queued', state: 'queued' }], unanswered: [] } })
+  const dependencies = { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/chat/protocol.ts': { runtimeLabel }, '@vibeface/client/workspace/bot-settings.ts': { scheduleFrequency: () => '一次', formatWhen: () => '刚才' }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } }
   const app = componentHarness('./context-panel.tsx', dependencies)
   try {
     const elements = app.render('ContextPanel', { bot: parityBot, data, nodes: shared.nodes, connected: true, onBack() {} })
@@ -1506,19 +2681,19 @@ test('context shows scheduler observations without promising native resume or re
     assert.match(componentText(tree), /排队中/)
     assert.doesNotMatch(componentText(tree), /正在运行|首次模型|续接记录|设备默认模型 · 设备默认模型/)
     assert.equal(elements.filter(({ type }) => typeof type === 'function' && type.name === 'ContinuitySession').length, 0)
-    data.scheduler!.jobs = [{ trigger: 'message:stop', state: 'cancelling' }]
+    data.scheduler!.jobs = [{ scope: { kind: 'main' as const }, trigger: 'message:stop', state: 'cancelling' }]
     tree = continuity.type(continuity.props)
     assert.match(componentText(tree), /停止中/)
-    data.scheduler!.jobs = [{ trigger: 'message:publish', state: 'publishing' }]
+    data.scheduler!.jobs = [{ scope: { kind: 'main' as const }, trigger: 'message:publish', state: 'publishing' }]
     assert.match(componentText(continuity.type(continuity.props)), /回复同步中/)
     data.scheduler!.provider = 'claude'
     data.scheduler!.model = 'new-device-default'
-    data.scheduler!.jobs = [{ trigger: 'message:read-back', state: 'reconciling', runtime: workspaceModel.parseTurnRuntime({ provider: 'codex', model: 'frozen-model', reasoning_effort: 'high', generation: 'config', session_generation: 1, delivery_id: 'delivery', stage: 'read_back', execution: 'unknown', attempted_at_ms: 1, switched_from: null, switch_reason: null }) }]
+    data.scheduler!.jobs = [{ scope: { kind: 'main' as const }, trigger: 'message:read-back', state: 'reconciling', runtime: workspaceModel.parseTurnRuntime({ provider: 'codex', model: 'frozen-model', reasoning_effort: 'high', generation: 'config', session_generation: 1, delivery_id: 'delivery', stage: 'read_back', execution: 'unknown', attempted_at_ms: 1, switched_from: null, switch_reason: null }) }]
     tree = continuity.type(continuity.props)
     assert.match(componentText(tree), /正在查询上次回复/)
     assert.match(componentText(tree), /Codex · 提交模型 frozen-model/)
     assert.doesNotMatch(componentText(tree), /new-device-default|Claude Code/)
-    data.scheduler = parseConversation({ ...context, scheduler: { provider: 'codex', model: 'current-model', unanswered: [], jobs: [{ trigger: 'message:reconcile', state: 'reconciling', runtime: { provider: 'claude', model: 'frozen-model', reasoning_effort: 'high', generation: 'generation', session_generation: 1, delivery_id: 'delivery', stage: 'read_back', execution: 'unknown', attempted_at_ms: 1, switched_from: null, switch_reason: null } }] } }).scheduler
+    data.scheduler = parseConversation({ ...context, scheduler: { scope_jobs: [], provider: 'codex', model: 'current-model', unanswered: [], jobs: [{ scope: { kind: 'main' as const }, trigger: 'message:reconcile', state: 'reconciling', runtime: { provider: 'claude', model: 'frozen-model', reasoning_effort: 'high', generation: 'generation', session_generation: 1, delivery_id: 'delivery', stage: 'read_back', execution: 'unknown', attempted_at_ms: 1, switched_from: null, switch_reason: null } }] } }).scheduler
     tree = continuity.type(continuity.props)
     assert.match(componentText(tree), /正在查询上次回复/)
     assert.match(componentText(tree), /Claude Code.*frozen-model/)
@@ -1526,7 +2701,7 @@ test('context shows scheduler observations without promising native resume or re
     const runtime = data.scheduler?.jobs[0]?.runtime
     assert.ok(runtime)
     for (const state of ['publishing', 'pending_delivery']) {
-      data.scheduler = parseConversation({ ...context, scheduler: { unanswered: [], jobs: [{ trigger: 'message:history', state: 'completed', runtime: { ...runtime, model: 'newer-history', attempted_at_ms: 2 } }, { trigger: 'message:active', state, runtime }] } }).scheduler
+      data.scheduler = parseConversation({ ...context, scheduler: { scope_jobs: [], unanswered: [], jobs: [{ scope: { kind: 'main' as const }, trigger: 'message:history', state: 'completed', runtime: { ...runtime, model: 'newer-history', attempted_at_ms: 2 } }, { scope: { kind: 'main' as const }, trigger: 'message:active', state, runtime }] } }).scheduler
       tree = continuity.type(continuity.props)
       assert.match(componentText(tree), /Claude Code.*frozen-model/)
       assert.doesNotMatch(componentText(tree), /newer-history/)
@@ -1540,7 +2715,7 @@ test('context shows scheduler observations without promising native resume or re
     '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/lib/node.ts': { providerNames }, '@/features/devices/ai-settings': { providerIcons: { codex: 'CodexIcon' } },
   })
   const records = parseConversation({ ...context,
-    scheduler: { jobs: [{ trigger: 'message:q', state: 'queued' }, { trigger: 'message:p', state: 'publishing' }, { trigger: 'message:u', state: 'future' }, { trigger: 'message:d', state: 'completed' }], unanswered: [] },
+    scheduler: { scope_jobs: [], jobs: [{ scope: { kind: 'main' as const }, trigger: 'message:q', state: 'queued' }, { scope: { kind: 'main' as const }, trigger: 'message:p', state: 'publishing' }, { scope: { kind: 'main' as const }, trigger: 'message:u', state: 'future' }, { scope: { kind: 'main' as const }, trigger: 'message:d', state: 'completed' }], unanswered: [] },
     sessions: [{ node: 'worker', agent: 'codex', session_id: 'external', cwd: '/shared', summary: '外部摘要', muted: true, created_at_ms: 1 }],
     sent: [{ message_id: 'sent', to: 'chat', text: '协作请求', created_at_ms: 2 }],
   })
@@ -1587,43 +2762,46 @@ test('native context and task detail keep selection errors and foreign payloads 
       '@vibeface/client/lib/node.ts': { messageOf, providerNames }, '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel,
       '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/lib/errors.ts': errors, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
       '@/components/kit': { EmptyState: 'EmptyState', Details: 'Details', providerIcons: { codex: 'CodexIcon' }, toneText: {} },
-    })
+    }, {}, route === 'work' ? 'TaskDetail' : '')
+    const render = () => app.render(route === 'work' ? 'TaskDetail' : 'default', { botId: 'bot', workId: 'work' })
     const emptyTitle = (elements: ReturnType<typeof app.render>) => elements.find(({ type }) => type === 'EmptyState')?.props.title
     try {
-      assert.match(String(emptyTitle(app.render('default'))), /正在读取/)
+      assert.match(String(emptyTitle(render())), /正在读取/)
       assert.deepEqual(views, ['other'], 'read-only routes never acknowledge chat notifications')
       generation = 2
       shared = { ...shared, generation, isCurrent: () => generation === 2, selectBot: () => next.promise.then(() => {}) }
-      app.render('default')
+      render()
       next.reject(new Error('当前读取失败'))
       await settleComponent()
-      assert.match(String(emptyTitle(app.render('default'))), /当前读取失败/)
+      assert.match(String(emptyTitle(render())), /当前读取失败/)
       old.resolve(undefined)
       await settleComponent()
-      assert.match(String(emptyTitle(app.render('default'))), /当前读取失败/, 'an old successful select cannot erase this connection error')
-      const retry = app.render('default').find(({ type, props }) => type === 'Button' && typeof props.onPress === 'function')
+      assert.match(String(emptyTitle(render())), /当前读取失败/, 'an old successful select cannot erase this connection error')
+      const retry = render().find(({ type, props }) => type === 'Button' && typeof props.onPress === 'function')
       assert.ok(retry && typeof retry.props.onPress === 'function')
       shared.selectBot = async () => {}
       retry.props.onPress()
-      app.render('default')
+      render()
       await settleComponent()
       shared.conversationId = 'chat'
-      let elements = app.render('default')
+      let elements = render()
       assert.equal(elements.some(({ type }) => typeof type === 'function' && type.name === 'ContextRecords'), false, 'matching selection alone cannot expose a foreign payload')
       assert.doesNotMatch(componentText(elements), /秘密记录/)
       shared.data = parseConversation({ ...context, works: [parityWork()] })
-      elements = app.render('default')
+      render()
+      await settleComponent()
+      elements = render()
       assert.match(componentText(elements), /当前连接尚未完成首读/)
       shared.synced = true
       shared.bots = []
-      assert.match(String(emptyTitle(app.render('default'))), /找不到这个 Bot/)
+      assert.match(String(emptyTitle(render())), /找不到这个 Bot/)
       shared.bots = [parityBot]
       shared.data = parseConversation(context)
-      elements = app.render('default')
-      if (route === 'work') assert.match(String(emptyTitle(elements)), /找不到这个任务/)
+      elements = render()
+      if (route === 'work') assert.match(componentText(elements), /来源：共享历史中的工作记录/, 'a known work stays visible when Main no longer includes it')
       else assert.equal(elements.some(({ type }) => typeof type === 'function' && type.name === 'ContextRecords'), true)
       shared.connectionOnline = false
-      elements = app.render('default')
+      elements = render()
       assert.match(componentText(elements) + String(emptyTitle(elements)), /状态未知/)
     } finally { app.close() }
   }
@@ -1633,7 +2811,7 @@ test('native context renders shared memory, external attribution, scheduler stat
   const shared = parityShared()
   shared.data = parseConversation({ ...context,
     bot_settings: { skills: [], memory: [{ memory_id: 'm', text: '共享笔记', metadata: { epoch: 1, revision: 'a'.repeat(64), control_revision: 0, source_event_hash: 'b'.repeat(64), origin: 'agent', user_controlled: false, essential: true } }], memory_sync_conflicts: { items: [], has_more: false }, schedules: [] },
-    scheduler: { jobs: [{ trigger: 'message:p', state: 'publishing' }, { trigger: 'message:d', state: 'completed' }], unanswered: [] },
+    scheduler: { scope_jobs: [], jobs: [{ scope: { kind: 'main' as const }, trigger: 'message:p', state: 'publishing' }, { scope: { kind: 'main' as const }, trigger: 'message:d', state: 'completed' }], unanswered: [] },
     sessions: [{ node: 'worker', agent: 'codex', session_id: 'external', cwd: '/shared', summary: '外部摘要', muted: true, created_at_ms: 1 }],
     sent: [{ message_id: 'sent', to: 'chat', text: '协作请求', created_at_ms: 2 }],
   })
@@ -1667,19 +2845,19 @@ test('context on both platforms separates compilation, sending, native cache and
     const shared = parityShared()
     const projection = {
       attempt_id: 'attempt', provider: 'codex', stage: 'compiled', session_generation: 4,
-      stable_fingerprint: 'a'.repeat(64), dynamic_fingerprint: 'b'.repeat(64), stable_bytes: 100, dynamic_bytes: 200,
+      scope: { kind: 'main' }, sources: [], sources_omitted: 0, inputs: [], inputs_omitted: 0, stable_fingerprint: 'a'.repeat(64), dynamic_fingerprint: 'b'.repeat(64), stable_bytes: 100, dynamic_bytes: 200,
       invalidation_reason: 'stable_prompt_or_provider_changed', session_status: { resumable: true, pending_generation: true },
       coverage: { messages_omitted: 1, works_omitted: 0, dispatches_omitted: 0, questions_omitted: 0, attachments_omitted: 0, memory_omitted: 3, checkpoint_omitted: 1, handoff_omitted: 0, pending_checks_omitted: 2, bot_indexes_omitted: { skills: 4 }, history_retrieval: 'context' },
       native_token: 'private-native-token', rendered: 'private-prompt',
     }
-    shared.data = parseConversation({ ...context, scheduler: { jobs: [], unanswered: [], context: projection }, bot_settings: {
+    shared.data = parseConversation({ ...context, scheduler: { scope_jobs: [], jobs: [], unanswered: [], context: projection }, bot_settings: {
       skills: [], schedules: [], memory_staged_count: 2, memory_sync_conflicts: { items: [], has_more: false },
       memory_conflicts: [{ call_ref: 'remember', memory_id: 'memory', expected_epoch: 1, actual_epoch: 1, expected_revision: 'old', actual_revision: 'new', reason: 'revision_changed' }],
       memory: [{ memory_id: 'memory', text: '已保存的事实', metadata: { epoch: 1, revision: 'a'.repeat(64), control_revision: 1, origin: 'user', user_controlled: true, essential: true, source_event_hash: 'b'.repeat(64) } }],
     } })
     const dependencies = {
       'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot' }) }, '@/data/live': { useLive: () => shared },
-      '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
       '@vibeface/client/lib/node.ts': { messageOf, providerNames }, '@vibeface/client/workspace/bot-settings.ts': { scheduleFrequency: () => '一次', formatWhen: () => '刚才' },
       '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') }, '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, SettingsGroup: 'SettingsGroup', SettingsRow: 'SettingsRow', Details: 'Details' },
     }
@@ -1720,7 +2898,7 @@ test('native Stack focus restores non-chat views while the chat route owns its a
   const views: string[] = []
   const stack = { Screen: 'Screen', Protected: 'Protected' }
   const app = componentHarness('../../../../../apps/mobile/app/_layout.tsx', {
-    'expo-router': { Stack: stack }, 'expo-linking': { useLinkingURL: () => null },
+    'expo-router': { Stack: stack, usePathname: () => '/' }, 'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) }, 'expo-linking': { useLinkingURL: () => null },
     '@/data/live': { LiveWorkspace: 'LiveWorkspace', useLive: () => ({ setView: (view: string) => { views.push(view) } }) },
     '@/data/context': { useWorkspace: () => ({ session: { phase: 'ready' } }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({}) },
     'uniwind': { useCSSVariable: () => ['white', 'black'] }, '@/lib/layout': { useWide: () => false }, 'react-native': { Platform: { OS: 'ios' }, View: 'View' },
@@ -1849,6 +3027,52 @@ test("mobile task overview shows an unbound question summary and Bot entry", () 
   } finally { app.close() }
 })
 
+test('bound permission choices show readable actions and return their original signed labels on both platforms', async () => {
+  for (const platform of ['web', 'native']) for (const selected of ['allow_once', 'deny']) {
+    const labels = { allow_once: '{"decision":"accept"}', deny: '{"decision":"decline"}' }
+    const question = workspaceModel.parseQuestions({ questions: [{ question_id: 'permission', conversation_id: 'chat', target: { kind: 'work', work_id: 'work' }, bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '是否允许本次读取？', choices: [{ label: labels.allow_once, action: 'allow_once' }, { label: labels.deny, action: 'deny' }], about: { node: 'worker', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'held-request' }, author: 'worker', created_at_ms: 1, answer: null, closed: null }] })[0]
+    assert.ok(question)
+    const sent: string[] = [], request = pendingResult()
+    const shared = { ...parityShared(), pendingAnswers: [] as { question_id: string; text: string }[], answer: async (_question: unknown, value: string) => { sent.push(value); return request.promise } }
+    const app = componentHarness(platform === 'web' ? './question-card.tsx' : '../../../../../apps/mobile/src/features/chat/question-card.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
+      '@/data/context': { useWorkspace: () => ({ members: [], bots: shared.bots, actions: { answer: shared.answer } }) },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'client' } } }) },
+      '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/lib/errors.ts': errors,
+      '@/lib/glossary': { terms: { approval: { icon: 'Hand' } } },
+      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, run: () => Promise<void>) => { try { await run() } catch {} } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+      '@tanstack/react-router': { Link: 'Link', useNavigate: () => () => {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+      'expo-haptics': { notificationAsync: async () => {}, NotificationFeedbackType: { Success: 'success' } },
+    })
+    const render = () => app.render('QuestionCard', { question })
+    const readable = selected === 'allow_once' ? '允许本次' : '拒绝'
+    const raw = selected === 'allow_once' ? labels.allow_once : labels.deny
+    const press = () => {
+      const button = render().find(({ type, props }) => type === 'Button' && (props.accessibilityLabel === readable || componentText(props.children) === readable))
+      assert.ok(button)
+      if (platform === 'web') { assert.ok(button.props.onClick); button.props.onClick() }
+      else { assert.ok(typeof button.props.onPress === 'function'); button.props.onPress() }
+    }
+    try {
+      const elements = render()
+      assert.match(componentText(elements), /允许本次/)
+      assert.match(componentText(elements), /拒绝/)
+      assert.doesNotMatch(componentText(elements), /decision|accept|decline/)
+      assert.equal(elements.some(({ type }) => type === 'textarea' || type === 'TextInput'), false)
+      shared.writable = false; press(); assert.equal(sent.length, 0)
+      shared.writable = true; press(); assert.deepEqual(sent, [raw])
+      shared.pendingAnswers = [{ question_id: question.question_id, text: raw }]
+      request.reject(new Error('connection lost')); await settleComponent()
+      assert.match(componentText(render()), new RegExp(readable))
+      assert.doesNotMatch(componentText(render()), /decision|accept|decline/)
+      shared.pendingAnswers = []
+      shared.answered = { [question.question_id]: raw }
+      assert.match(componentText(render()), selected === 'allow_once' ? /已回答 · 允许本次/ : /已拒绝/)
+      assert.doesNotMatch(componentText(render()), /decision|accept|decline/)
+    } finally { app.close() }
+  }
+})
+
 test("question cards select locally, send exact answers only on confirmation, and keep unknown retries and winning answers", async () => {
   const sent: unknown[][] = [], notices: string[] = []
   let actionBusy: string | null = null, answerStatus = 'answered'
@@ -1860,7 +3084,7 @@ test("question cards select locally, send exact answers only on confirmation, an
   const router = { Link: 'Link', useNavigate: () => (target: unknown) => { visited.push(target) } }
   const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'web', source: 'membership', can_manage: false } } }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, answerLabel, attentionLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
   const longChoice = '只在本机验证完整配置并保留现有服务，检查通过后再决定是否发布'
-  const question = { question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '\n是否允许继续？\n已完成本机检查。\n\n线上结果未知。', choices: [{ label: '允许' }, { label: longChoice }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
+  const question = { target: { kind: 'bot_main', bot_id: 'bot' }, question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '\n是否允许继续？\n已完成本机检查。\n\n线上结果未知。', choices: [{ label: '允许' }, { label: longChoice }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
   const render = (props: object = {}) => app.render('QuestionCard', { question, ...props })
   const choose = (value: string) => {
     const option = render().find(({ type, props }) => type === 'input' && props.value === value)
@@ -2079,18 +3303,20 @@ test("remounted question cards identify the answer author and reserve warning st
 
 test("task overview keeps pending decisions with their task and every real task visible", () => {
   const work = { resolved: { provider: 'codex', model: null }, trigger: 'message:one', target_node: 'offline', cwd: '/project', title: '检查项目', prompt: '', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null }
-  const data = parseConversation({ ...context, works: [{ ...work, work_id: 'held', thread_id: 'session' }, { ...work, work_id: 'running', target_node: 'online' }], questions: [{ question_id: 'approval', conversation_id: 'chat', bot: null, severity: 'attention', text: '继续吗？', choices: [{ label: '继续' }], about: { node: 'offline', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' }, author: 'offline', created_at_ms: 1, answer: null, closed: null }] })
+  const approvalRows = [{ target: { kind: 'work', work_id: 'held' }, question_id: 'approval', conversation_id: 'chat', bot: null, severity: 'attention', text: '继续吗？', choices: [{ label: '继续' }], about: { node: 'offline', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' }, author: 'offline', created_at_ms: 1, answer: null, closed: null }]
+  const approvalQuestions = workspaceModel.parseQuestions({ questions: approvalRows })
+  const data = parseConversation({ ...context, works: [{ ...work, work_id: 'held', thread_id: 'session' }, { ...work, work_id: 'running', target_node: 'online' }], questions: approvalRows })
   const works = data.works.map((item) => ({ ...item, conversation_id: 'chat' }))
   const nodes = parseNodes({ nodes: [{ device_id: 'offline', name: '离线电脑', online: false, local: false, revoked: false }, { device_id: 'online', name: '在线电脑', online: true, local: false, revoked: false }] })
   const overview = workspaceModel.overviewFromWorkspace({ openWorks: works, bots: [], questions: [], nodes })
-  const workspace = { nodes, openWorks: works, bots: [], questions: data.questions, overview, selectedBot: null, data, conversationId: 'chat', synced: true, connectionOnline: true, answered: {}, liveProgress: [] }
+  const workspace = { nodes, openWorks: works, bots: [], questions: approvalQuestions, overview, selectedBot: null, data, conversationId: 'chat', synced: true, connectionOnline: true, answered: {}, liveProgress: [] }
   const checks = workspaceModel.workChecks(works, nodes)
   const app = componentHarness('./tasks-overview.tsx', {
     '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace },
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
     '@vibeface/client/workspace/model.ts': workspaceModel,
     '@vibeface/client/workspace/labels.ts': taskLabels,
-    './inbox': { useInbox: () => [{ kind: 'question', done: false, question: data.questions[0] }, ...checks.map((check) => ({ kind: 'confirm', check }))] },
+    './inbox': { useInbox: () => [{ kind: 'question', done: false, question: approvalQuestions[0] }, ...checks.map((check) => ({ kind: 'confirm', check }))] },
     './workspace-shell': { useCreateBot: () => () => {} },
     '@tanstack/react-router': { Link: 'Link' },
   })
@@ -2106,40 +3332,45 @@ test("task overview keeps pending decisions with their task and every real task 
 
 test("any entrance stops an unfinished task once, after a confirming second tap, even on another device", async () => {
   const stopped: string[] = []
-  const data = { local_node: 'worker', works: [] as unknown[], questions: [] }
-  const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data, interruptWork: async (work: string) => { stopped.push(work) } }
+  const data = { local_node: 'worker', works: [] as ReturnType<typeof parityWork>[], questions: [] }
+  const workspace = { ...parityShared(), generation: 1, nodes: [], liveProgress: [], writable: true, pendingMessages: [], canSaveMessages: true, questions: [], data, interruptWork: async (work: string) => { stopped.push(work) }, async readWork(input: { conversation_id: string; work_id: string }) {
+    const work = data.works.find((item) => item.work_id === input.work_id)
+    if (!work) throw new Error('共享历史中找不到这个工作')
+    return { work: { ...work, target: work.target ?? null, source_events: ['a'.repeat(64)], conversation_id: input.conversation_id }, coverage: { source: 'shared_history', complete: false } }
+  } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { ...taskLabels, nodeName: () => '设备', promptSummary, taskActive: () => true, taskLabel: () => '', taskStale: () => false, staleTaskLabel: '', progressLabel: () => '', shownState: (work: { state: string }) => work.state, taskAgent: () => null, followUp, followUpCopy }, '@vibeface/client/lib/errors.ts': errors, '@vibeface/client/workspace/questions.ts': workspaceQuestions }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
+  const render = async () => { workspace.data = { ...data }; workspace.openWorks = data.works.map((item) => ({ ...item, conversation_id: 'chat' })); app.render('TaskDetail', { botId: 'bot', workId: 'work' }); await settleComponent(); return app.render('TaskDetail', { botId: 'bot', workId: 'work' }) }
   const stop = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'destructive')
   const ask = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'outline' && [props.children].flat().some((child) => typeof child === 'string' && child.includes('停止')))
   try {
-    const work = { work_id: 'work', target_node: 'worker', cwd: '/p', title: '工作', prompt: '工作', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null }
+    const work = parityWork({ target_node: 'worker', cwd: '/p', title: '工作', prompt: '工作', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null })
     data.works = [{ ...work, state: 'unverified' }]
-    assert.equal(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' })), undefined)
+    assert.equal(stop(await render()), undefined)
     data.works = [{ ...work, target_node: 'other', stop: 'stop_waiting' }]
-    assert.equal(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' })), undefined, "a stop already on its way is not sent twice")
+    assert.equal(stop(await render()), undefined, "a stop already on its way is not sent twice")
     data.works = [{ ...work, target_node: 'other' }]
-    const first = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    const first = await render()
     assert.equal(stop(first), undefined, 'one tap never stops a task')
     ;(ask(first)?.props.onClick as () => void)()
-    ;(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' }))?.props.onClick as () => void)()
+    ;(stop(await render())?.props.onClick as () => void)()
     await settleComponent()
     assert.deepEqual(stopped, ['work'])
     const words = (elements: { props: Record<string, unknown> }[]) => elements.flatMap(({ props }) => [props.children].flat()).filter((child) => typeof child === 'string' || typeof child === 'number').join('')
     const turn = { thread_id: 'th', turn_id: 'tu' }
     data.works = [{ ...work, ...turn }, { ...work, ...turn, work_id: 'steered' }]
-    const elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    const elements = await render()
     assert.match(words(elements), /会一起停止/, 'a shared turn lists what stops with it')
     assert.match(words(elements), /一起停止 2 个任务/)
     ;(ask(elements)?.props.onClick as () => void)()
-    ;(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' }))?.props.onClick as () => void)()
+    ;(stop(await render())?.props.onClick as () => void)()
     await settleComponent()
     assert.deepEqual(stopped, ['work', 'work'], 'the count is named before the confirming tap stops them all')
   } finally { app.close() }
 })
 
 test("below lg the task panel is a modal dialog that makes the rest of the page inert, and beside the chat it is not", () => {
-  const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data: { local_node: 'worker', questions: [], works: [{ work_id: 'work', target_node: 'worker', cwd: '/p', title: '整理日志', prompt: '', state: 'completed', summary: '', outcome: 'completed', result_text: '好了', failure_reason: null }] } }
+  const workspace = { ...parityShared(), generation: 1, nodes: [], liveProgress: [], writable: true, pendingMessages: [], canSaveMessages: true, questions: [], data: { local_node: 'worker', questions: [], works: [{ work_id: 'work', target_node: 'worker', cwd: '/p', title: '整理日志', prompt: '', state: 'completed', summary: '', outcome: 'completed', result_text: '好了', failure_reason: null }] } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: () => Promise.resolve() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   let wide = false
   const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { ...taskLabels, nodeName: () => '设备', promptSummary, taskActive: () => false, taskLabel: () => '', taskStale: () => false, staleTaskLabel: '', progressLabel: () => '', shownState: (work: { state: string }) => work.state, taskAgent: () => null, followUp, followUpCopy }, '@vibeface/client/lib/errors.ts': errors, '@vibeface/client/workspace/questions.ts': workspaceQuestions }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: (query: string) => ({ matches: query === '(min-width: 1024px)' && wide }) } })
@@ -2222,12 +3453,12 @@ test("bot drafts survive a new connection while old create completion cannot clo
 test("conversation keeps unknown and newly edited drafts across connection changes", async () => {
   let generation = 1, work = pendingResult()
   const workspace = () => { const owner = generation; return {
-    generation: owner, isCurrent: () => owner === generation, conversationId: 'chat', fresh: new Set(), data: context, messagePending: null, messageBusy: false,
+    generation: owner, isCurrent: () => owner === generation, conversationId: 'chat', fresh: new Set(), data: context, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -2432,9 +3663,9 @@ test('changing the recovery password keeps what was typed when it fails, and cle
 test('native chat folds runtime diagnostics and retains result checks without provider availability cards', async () => {
   let refreshed = 0
   const runtime = workspaceModel.parseTurnRuntime({ provider: 'codex', model: 'submitted-model', reasoning_effort: 'high', generation: 'generation', session_generation: 1, delivery_id: 'delivery', stage: 'record', execution: 'started', attempted_at_ms: 1, switched_from: null, switch_reason: null })
-  const job = { trigger: 'message:one', message_id: 'one', reply_message_id: 'reply', state: 'completed', runtime }
+  const job: ManagerJob = { scope: { kind: 'main' }, trigger: 'message:one', message_id: 'one', reply_message_id: 'reply', state: 'completed', runtime }
   const shared = { ...parityShared(), refresh: async () => { refreshed++ }, nodes: [{ ...parityNode, capabilities: { ...parityNode.capabilities, manager_state: 'unverified' as const } }] }
-  shared.data = parseConversation({ ...context, messages: [{ message_id: 'reply', event_hash: 'reply', role: 'assistant', text: '完成', created_at_ms: 2 }], scheduler: { jobs: [job], unanswered: [] } })
+  shared.data = parseConversation({ ...context, messages: [{ message_id: 'reply', event_hash: 'reply', role: 'assistant', text: '完成', created_at_ms: 2 }], scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } })
   const extras = componentHarness('../../../../../apps/mobile/src/features/chat/work.tsx', {
     '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
     '@vibeface/client/chat/protocol.ts': { canRetryJob, runtimeLabel }, '@vibeface/client/workspace/model.ts': workspaceModel,
@@ -2479,13 +3710,219 @@ test('native chat folds runtime diagnostics and retains result checks without pr
   } finally { extras.close(); details.close() }
 })
 
-test('native composer shows one actionable blocker while preserving send gates on iOS and Android', () => {
+test('native composer adds photos and files without replacing current attachments or drafts', async (t) => {
+  type Attachment = import('../../../../../apps/mobile/src/data/types.ts').Attachment
+  type NativeButton = { text: string; onPress?: () => void; style?: string }
+  for (const os of ['ios', 'android']) await t.test(os, async () => {
+    const original = { uri: 'file:///report.pdf', name: 'report.pdf', size: 20, mimeType: 'application/pdf' }
+    const current = { uri: 'file:///current.txt', name: 'current.txt', size: null, mimeType: null }
+    const cache = new Map([
+      ['file:///cache/original.heic', { name: 'original.heic', size: 30, type: 'image/heic' }],
+      ['file:///cache/transparent.png', { name: 'transparent.png', size: 40, type: 'image/png' }],
+      ['file:///cache/photo.jpg', { name: 'photo.jpg', size: 50, type: 'image/jpeg' }],
+    ])
+    let files: Attachment[] = [original], updates = 0, renders = 0, usedCallback = 0
+    let photos = pendingResult(), documents = pendingResult(), selected: (() => void) | undefined
+    const photoCalls: unknown[] = [], fileCalls: unknown[] = []
+    const alerts: { title: string; message?: string; buttons?: NativeButton[] }[] = []
+    let sheet: { options: string[]; cancelButtonIndex: number } | undefined, sheetSelect: ((index: number) => void) | undefined
+    const app = componentHarness('../../../../../apps/mobile/src/features/chat/composer.tsx', {
+      'react-native': {
+        Platform: { OS: os }, TextInput: 'TextInput', View: 'View',
+        ActionSheetIOS: { showActionSheetWithOptions(options: typeof sheet, select: typeof sheetSelect) { sheet = options; sheetSelect = select } },
+        Alert: { alert(title: string, message?: string, buttons?: NativeButton[]) { alerts.push({ title, message, buttons }) } },
+      },
+      'expo-image-picker': {
+        UIImagePickerPreferredAssetRepresentationMode: { Current: 'current' },
+        launchImageLibraryAsync(options: unknown) { photoCalls.push(options); return photos.promise },
+      },
+      'expo-document-picker': { getDocumentAsync(options: unknown) { fileCalls.push(options); return documents.promise } },
+      'expo-file-system': { File: class {
+        readonly name: string; readonly size: number; readonly type: string
+        constructor(uri: string) {
+          const file = cache.get(uri)
+          assert.ok(file)
+          this.name = file.name; this.size = file.size; this.type = file.type
+        }
+      } },
+    })
+    const render = () => {
+      const callback = ++renders
+      return app.render('Composer', {
+        chrome: { kind: 'solid' }, value: '保留草稿', onChange() {}, files, attachmentScope: JSON.stringify(['network', 'chat', ['bot_main', 'bot'], 'continue']),
+        onFiles(next: Attachment[]) { usedCallback = callback; updates++; files = next }, blocked: null, sending: false, onSend() {},
+      })
+    }
+    const choose = (index: number) => {
+      const attach = render().find(({ props }) => String(props.accessibilityLabel).startsWith('添加附件'))?.props.onPress
+      assert.equal(typeof attach, 'function')
+      if (typeof attach === 'function') attach()
+      if (os === 'ios') {
+        assert.deepEqual(JSON.parse(JSON.stringify(sheet)), { options: ['照片图库', '文件', '取消'], cancelButtonIndex: 2 })
+        selected = () => sheetSelect?.(index)
+      } else {
+        const menu = alerts.at(-1)
+        assert.ok(menu)
+        assert.equal(menu?.title, '添加附件')
+        assert.deepEqual(Array.from(menu.buttons ?? [], ({ text }) => text), ['照片图库', '文件', '取消'])
+        selected = menu.buttons?.[index]?.onPress
+      }
+      selected?.()
+    }
+    const snapshot = () => JSON.parse(JSON.stringify(files))
+    try {
+      choose(0)
+      selected?.()
+      assert.equal(photoCalls.length, 1, 'only one picker can run at once')
+      assert.equal(fileCalls.length, 0)
+      assert.deepEqual(JSON.parse(JSON.stringify(photoCalls[0])), { mediaTypes: ['images'], allowsMultipleSelection: true, quality: 1, preferredAssetRepresentationMode: 'current' })
+      files = [current]; render()
+      photos.resolve({ canceled: false, assets: [
+        { uri: 'file:///cache/original.heic', fileName: null },
+        { uri: 'file:///cache/transparent.png' },
+        { uri: 'file:///cache/photo.jpg', fileName: 'holiday.jpg', fileSize: 50, mimeType: 'image/jpeg' },
+      ] })
+      await settleComponent()
+      assert.equal(usedCallback, renders, 'completion uses the current draft setter')
+      assert.deepEqual(snapshot(), [current,
+        { uri: 'file:///cache/original.heic', name: 'original.heic', size: 30, mimeType: 'image/heic' },
+        { uri: 'file:///cache/transparent.png', name: 'transparent.png', size: 40, mimeType: 'image/png' },
+        { uri: 'file:///cache/photo.jpg', name: 'holiday.jpg', size: 50, mimeType: 'image/jpeg' },
+      ])
+      assert.equal(render().find(({ type }) => type === 'TextInput')?.props.value, '保留草稿')
+      const selectedFiles = snapshot()
+      photos = pendingResult(); choose(0); photos.resolve({ canceled: true, assets: null }); await settleComponent()
+      choose(2)
+      assert.equal(updates, 1, 'picker cancellation and menu cancellation leave the draft alone')
+      assert.deepEqual(snapshot(), selectedFiles)
+      photos = pendingResult(); choose(0); photos.reject(new Error('无法读取所选照片')); await settleComponent()
+      assert.equal(alerts.at(-1)?.title, '未能添加附件')
+      assert.equal(alerts.at(-1)?.message, '无法读取所选照片')
+      assert.deepEqual(snapshot(), selectedFiles)
+      photos = pendingResult(); choose(0); photos.reject(new Error('照片权限已拒绝')); await settleComponent()
+      assert.equal(alerts.at(-1)?.message, '照片权限已拒绝')
+      assert.deepEqual(snapshot(), selectedFiles, 'permission denial preserves the draft attachments')
+      choose(1)
+      assert.equal(fileCalls.length, 1, 'an error releases the picker for another attempt')
+      assert.deepEqual(JSON.parse(JSON.stringify(fileCalls[0])), { multiple: true, copyToCacheDirectory: true })
+      documents.resolve({ canceled: false, assets: [
+        { uri: 'file:///report.pdf', name: 'report.pdf', size: 20, mimeType: 'application/pdf' },
+        { uri: 'file:///notes.txt', name: 'notes.txt' },
+      ] })
+      await settleComponent()
+      assert.deepEqual(snapshot(), [...selectedFiles, original, { uri: 'file:///notes.txt', name: 'notes.txt', size: null, mimeType: null }])
+      documents = pendingResult(); choose(1); documents.resolve({ canceled: true, assets: null }); await settleComponent()
+      assert.equal(updates, 2)
+      const remove = render().find(({ props }) => props.accessibilityLabel === '移除 transparent.png')?.props.onPress
+      assert.equal(typeof remove, 'function')
+      if (typeof remove === 'function') remove()
+      assert.equal(files.some(({ name }) => name === 'transparent.png'), false)
+      assert.equal(files.some(({ name }) => name === 'holiday.jpg'), true)
+    } finally { app.close() }
+  })
+})
+
+test('native attachment results cannot cross a draft scope or survive its disabled or unmounted lifetime', async (t) => {
+  type NativeButton = { text: string; onPress?: () => void }
+  for (const os of ['ios', 'android']) for (const source of ['photos', 'files']) for (const change of ['bot', 'bot-roundtrip', 'network', 'work', 'work-roundtrip', 'intent', 'blocked', 'blocked-roundtrip', 'sending', 'unmounted', 'stale-menu', 'blocked-before-menu', 'sending-before-menu']) await t.test(`${os} ${source} ${change}`, async () => {
+    const live = parityShared()
+    const conversation: import('../../../../../apps/mobile/src/data/types.ts').Conversation = {
+      messages: [], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null,
+      works: [parityWork()], replying: false, status: null, stoppable: false, blocked: null,
+    }
+    const workspace = { bots: [parityBot, { ...parityBot, bot_id: 'other', conversation_id: 'other-chat' }], conversations: { chat: conversation, 'other-chat': { ...conversation } }, members: [], primary: null, actions: { open() {} }, connection: { entry: '工作设备' } }
+    const device = { link: { kind: 'online' }, ready: { entry: { device_id: 'gateway' }, principal: { network_id: 'network', can_manage: true } } }
+    let botId = 'bot', sending = false, calls = 0, selected: (() => void) | undefined
+    const result = pendingResult()
+    const screen = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
+      'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId }) }, 'expo-router/react-navigation': { useHeaderHeight: () => 96 },
+      'react-native': { Platform: { OS: os }, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
+      'react-native-keyboard-controller': { useReanimatedKeyboardAnimation: () => ({ height: { value: 0 }, progress: { value: 0 } }) },
+      'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read(), useSharedValue: (value: number) => ({ value }) },
+      'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 34 }), useSafeAreaFrame: () => ({ width: 390 }) },
+      'uniwind': { withUniwind: (value: unknown) => value, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
+      '@/data/context': { useWorkspace: () => workspace }, '@/data/live': { useLive: () => live }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
+      '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+      '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy },
+      '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
+      '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
+    })
+    const composer = componentHarness('../../../../../apps/mobile/src/features/chat/composer.tsx', {
+      'react-native': {
+        Platform: { OS: os }, TextInput: 'TextInput', View: 'View',
+        ActionSheetIOS: { showActionSheetWithOptions(_options: unknown, select: (index: number) => void) { selected = () => select(source === 'photos' ? 0 : 1) } },
+        Alert: { alert(_title: string, _message?: string, buttons?: NativeButton[]) { selected = buttons?.[source === 'photos' ? 0 : 1]?.onPress } },
+      },
+      'expo-image-picker': { UIImagePickerPreferredAssetRepresentationMode: { Current: 'current' }, launchImageLibraryAsync() { calls++; return result.promise } },
+      'expo-document-picker': { getDocumentAsync() { calls++; return result.promise } },
+      'expo-file-system': { File: class { name = 'photo.jpg'; size = 20; type = 'image/jpeg' } },
+    })
+    const props = () => {
+      screen.render('default')
+      const current = screen.render('default').find(({ type }) => type === 'Composer')?.props
+      assert.ok(current)
+      return current
+    }
+    const render = () => composer.render('Composer', { ...props(), sending })
+    const selectTarget = (key: 'main' | 'work:work') => {
+      const select = screen.render('default').find(({ type }) => type === 'InputOptions')?.props.onSelect
+      assert.ok(typeof select === 'function'); select({ key })
+      render()
+    }
+    try {
+      props().onChange?.('A 草稿')
+      const original = [{ uri: 'file:///a.txt', name: 'a.txt', size: 1, mimeType: 'text/plain' }]
+      const onFiles = props().onFiles; assert.ok(typeof onFiles === 'function'); onFiles(original)
+      const scope = props().attachmentScope
+      assert.equal(typeof scope, 'string')
+      if (change === 'blocked-before-menu') conversation.blocked = '当前设备仅可查看'
+      if (change === 'sending-before-menu') sending = true
+      const attach = render().find(({ props }) => String(props.accessibilityLabel).startsWith('添加附件'))?.props.onPress
+      assert.ok(typeof attach === 'function'); attach()
+      if (change.endsWith('-before-menu')) assert.equal(calls, 0, 'a disabled composer cannot open a picker even when its handler is invoked')
+      else if (change !== 'stale-menu') { assert.ok(selected); selected(); assert.equal(calls, 1) }
+      if (change === 'bot' || change === 'bot-roundtrip' || change === 'stale-menu') {
+        botId = 'other'; render()
+        props().onChange?.('B 草稿')
+        const setFiles = props().onFiles; assert.ok(typeof setFiles === 'function')
+        setFiles([{ uri: 'file:///b.txt', name: 'b.txt', size: 2, mimeType: 'text/plain' }]); render()
+        if (change === 'bot-roundtrip') { botId = 'bot'; render(); assert.equal(props().attachmentScope, scope) }
+      }
+      if (change === 'network') { device.ready.principal.network_id = 'other-network'; render() }
+      if (change === 'work' || change === 'work-roundtrip') { selectTarget('work:work'); if (change === 'work-roundtrip') { selectTarget('main'); assert.equal(props().attachmentScope, scope) } }
+      if (change === 'intent') {
+        const intent = screen.render('default').find(({ type }) => type === 'InputOptions')?.props.onIntent
+        assert.ok(typeof intent === 'function'); intent('defer'); render()
+      }
+      if (change === 'blocked' || change === 'blocked-roundtrip') { conversation.blocked = '当前设备仅可查看'; render(); if (change === 'blocked-roundtrip') { conversation.blocked = null; render() } }
+      if (change === 'sending') { sending = true; render() }
+      if (['bot', 'network', 'work', 'intent', 'stale-menu'].includes(change)) assert.notEqual(props().attachmentScope, scope)
+      if (change === 'unmounted') composer.close()
+      if (change === 'stale-menu') { assert.ok(selected); selected(); assert.equal(calls, 0, 'a menu opened in A cannot start a picker in B') }
+      if (change === 'blocked' || change === 'sending') {
+        const button = render().find(({ props }) => String(props.accessibilityLabel).startsWith('添加附件'))?.props
+        assert.equal(button?.disabled, true)
+        assert.ok(typeof button?.onPress === 'function'); button.onPress(); assert.equal(calls, 1)
+      }
+      const before = JSON.stringify(props().files), text = props().value
+      result.resolve({ canceled: false, assets: [{ uri: 'file:///photo.jpg', name: 'photo.jpg', fileName: 'photo.jpg', size: 20, mimeType: 'image/jpeg' }] })
+      await settleComponent()
+      assert.equal(JSON.stringify(props().files), before, 'late completion leaves the actual bound draft setter untouched')
+      assert.equal(props().value, text)
+      botId = 'bot'
+      assert.equal(props().value, 'A 草稿')
+      assert.equal(JSON.stringify(props().files), JSON.stringify(original), 'the original draft also retains its attachments')
+    } finally { composer.close(); screen.close() }
+  })
+})
+
+test('native composer preserves local input and visible blockers with compact chat chrome on iOS and Android', () => {
   for (const os of ['ios', 'android']) {
     let retried = 0
     const live = { ...parityShared(), nodes: parseNodes({ nodes: [{ ...parityNode, capabilities: { ...parityNode.capabilities, manager_state: 'unverified' } }] }) }
     const conversation: import('../../../../../apps/mobile/src/data/types.ts').Conversation = {
       messages: [{ message_id: 'one', event_hash: 'one', role: 'user', text: 'hello', created_at_ms: 1 }], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null,
-      works: [], replying: false, status: null, stoppable: false, blocked: null, sending: false,
+      works: [], replying: false, status: null, stoppable: false, blocked: null,
     }
     const workspace = { bots: [parityBot], conversations: { chat: conversation }, members: [], primary: null, actions: { open() {} }, connection: { entry: '工作设备' } }
     const device = { link: { kind: 'online' }, ready: { entry: { device_id: 'gateway' }, principal: { can_manage: true } }, retryNow: () => { retried++ } }
@@ -2497,7 +3934,7 @@ test('native composer shows one actionable blocker while preserving send gates o
       'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 34 }), useSafeAreaFrame: () => ({ width: 390 }) },
       'uniwind': { withUniwind: (value: unknown) => value, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
       '@/data/context': { useWorkspace: () => workspace }, '@/data/live': { useLive: () => live }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
-      '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+      '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
       '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy },
       '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
       '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/features/chat/chrome': { useChatChrome: () => ({ kind: 'solid' }) }, '@/lib/layout': { useWide: () => false },
@@ -2511,82 +3948,92 @@ test('native composer shows one actionable blocker while preserving send gates o
     const render = () => composer.render('Composer', { ...props(), value: 'draft' })
     try {
       assert.equal(props().blocked, null)
-      assert.equal(props().children, null, 'unverified readiness adds no availability prompt')
+      assert.equal(componentText(props().children), '', 'unverified readiness adds no availability prompt')
+      assert.equal(props().sending, false, 'network activity does not lock local saving')
+      assert.equal(screen.render('default').filter(({ type }) => type === 'OfflineBar').length, 0)
       assert.equal(render().find(({ props }) => props.accessibilityLabel === '发送')?.props.disabled, false)
       device.link.kind = 'offline'
-      assert.equal(props().blocked, '离线，恢复后可发送')
+      assert.equal(screen.render('default').filter(({ type }) => type === 'OfflineBar').length, 1)
+      assert.equal(props().blocked, null, 'a disconnected transport still permits durable local input')
       assert.equal(render().find(({ type }) => type === 'TextInput')?.props.placeholder, '发消息')
-      assert.doesNotMatch(componentText(composer.output), /离线，恢复后可发送/)
       const recovery = offline.render('OfflineBar', { chat: true })
       assert.equal(recovery.filter(({ props }) => props.role === 'status').length, 1)
       const retry = recovery.find(({ type }) => type === 'Button')?.props.onPress
       assert.equal(typeof retry, 'function')
       if (typeof retry === 'function') retry()
       assert.equal(retried, 1)
-      assert.equal(render().find(({ props }) => props.accessibilityLabel === '发送')?.props.disabled, true)
+      assert.equal(render().find(({ props }) => props.accessibilityLabel === '发送')?.props.disabled, false)
       device.link.kind = 'online'
       for (const state of ['needs_setup', 'none', 'offline'] as const) {
         live.nodes = state === 'none' ? [] : parseNodes({ nodes: [{ ...parityNode, online: state !== 'offline', capabilities: { ...parityNode.capabilities, manager_state: 'needs_setup' } }] })
-        conversation.blocked = composerHint({ hasConversation: true, loaded: true, bot: botReach(live.nodes) })
+        const executionHint = composerHint({ hasConversation: true, loaded: true, bot: botReach(live.nodes) })
+        assert.ok(executionHint)
         const elements = render()
+        assert.equal(props().blocked, null, 'execution readiness does not block local saving')
         assert.equal(elements.find(({ type }) => type === 'TextInput')?.props.placeholder, '发消息')
-        assert.equal(componentText(composer.output).split(conversation.blocked).length - 1, 1)
+        assert.equal(elements.find(({ props }) => props.accessibilityLabel === '发送')?.props.disabled, false)
+        assert.equal(componentText(composer.output).split(executionHint).length - 1, 1)
         const links = screen.render('default').filter(({ type, props }) => type === 'Link' && componentText(props.children).includes(state === 'offline' ? '查看设备' : '去设置'))
         assert.equal(links.filter(({ props }) => props.href === (state === 'none' ? '/ai' : '/device/worker')).length, 1)
       }
       conversation.blocked = '当前设备仅可查看'
-      assert.equal(props().children, null, 'setup does not replace a higher-priority write blocker')
       assert.equal(render().find(({ type }) => type === 'TextInput')?.props.placeholder, conversation.blocked)
+      assert.equal(componentText(composer.output).split(conversation.blocked).length - 1, 1, 'the write blocker remains visible beside any actionable children')
       assert.equal(render().find(({ props }) => props.accessibilityLabel === '发送')?.props.disabled, true)
     } finally { screen.close(); composer.close(); offline.close() }
   }
 })
 
-test("conversation blocks sending until an online node can run the manager Agent", () => {
+test("conversation preserves local input while execution devices are unavailable", () => {
   let sent = 0, refreshed = 0
   const workspace = (nodes: unknown[]) => ({
-    generation: 1, isCurrent: () => true, refresh: async () => { refreshed++ }, conversationId: 'chat', fresh: new Set(), data: context, messagePending: null, messageBusy: false,
+    generation: 1, isCurrent: () => true, refresh: async () => { refreshed++ }, conversationId: 'chat', fresh: new Set(), data: context, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes, liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()
-    assert.equal(composer()?.disabled, true)
+    assert.equal(composer()?.disabled, false)
     assert.match(String(composer()?.reason), /运行 Bot/)
-    assert.equal(sent, 0)
+    assert.equal(sent, 1, 'offline execution does not block local input acceptance')
     assert.ok(refreshed > 0, "a bot no device can reply for reads readiness again")
     currentWorkspace = workspace([{ device_id: 'gateway', online: true, revoked: false, capabilities: { manager: 'codex', manager_state: 'needs_setup', roots: [] } }])
-    assert.equal(composer()?.disabled, true, "a bot switch without a working provider cannot send")
+    assert.equal(composer()?.disabled, false, "execution setup does not lock the local composer")
     assert.equal(composer()?.hint, '', "an empty chat offers setup in its middle, not again under the box")
-    assert.equal(composer()?.reason, '运行 Bot 的设备需设置', "the greyed box still says why")
+    assert.equal(composer()?.reason, '运行 Bot 的设备需设置', "the composer still explains the execution hold")
     currentWorkspace = workspace([{ device_id: 'gateway', online: true, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }])
     assert.equal(composer()?.disabled, false)
+    composer()?.onChange?.('second input')
     composer()?.onSubmit?.()
-    assert.equal(sent, 1)
+    assert.equal(sent, 2)
     currentWorkspace = workspace([{ device_id: 'gateway', online: true, capabilities: { manager: 'codex', manager_state: 'unverified', roots: [] } }])
     assert.equal(composer()?.disabled, false, 'unknown authentication can be tried without claiming readiness')
     assert.equal(composer()?.reason, '')
     assert.doesNotMatch(componentText(composer()?.children), /尚未确认|检查状态|可用性|Codex/)
+    composer()?.onChange?.('third input')
     composer()?.onSubmit?.()
-    assert.equal(sent, 2)
+    assert.equal(sent, 3)
+    currentWorkspace.canSaveMessages = false
+    assert.equal(composer()?.disabled, true, "an unread or revoked identity still prevents signing new input")
+    currentWorkspace.canSaveMessages = true
     currentWorkspace.data = { ...context, conversation: { ...context.conversation, owner: 'away' } }
     assert.equal(app.render('ConversationScreen').some(({ props }) => String(props.title).includes('离线，对话在等它')), true, 'an unverified local provider still offers to take over from an offline owner')
   } finally { app.close() }
 })
 
 test("an owner's reply on its way keeps its streamed text until the reply lands", () => {
-  const job = { trigger: "message:m1", state: "publishing", message_id: "m1", reply_message_id: "r1", source_node: "owner" }
+  const job = { scope: { kind: 'main' as const }, trigger: "message:m1", state: "publishing", message_id: "m1", reply_message_id: "r1", source_node: "owner" }
   const ask = { message_id: "m1", event_hash: "m1", role: "user", text: "hi", created_at_ms: 1 }
   const progress = { kind: "manager", key: "live", conversation_id: "chat", trigger: "message:m1", source_node: "owner", sequence: 1, text: "partial answer", items: [], needsRefresh: false }
   let messages: object[] = [ask]
   const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
-    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages, scheduler: { jobs: [job], unanswered: [] } }, messagePending: null, messageBusy: false,
+    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [progress], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     refresh: async () => {},
-  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const streamed = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { message?: { state?: string; text: string } }[]).filter((entry) => entry.message?.state === 'streaming').map((entry) => entry.message?.text).join()
   try {
     assert.equal(streamed(), "partial answer")
@@ -2596,16 +4043,16 @@ test("an owner's reply on its way keeps its streamed text until the reply lands"
 })
 
 test("a closed question neither waits on the person nor hides 思考中", () => {
-  const job = { trigger: "message:m1", state: "running", message_id: "m1" }
+  const job = { scope: { kind: 'main' as const }, trigger: "message:m1", state: "running", message_id: "m1" }
   const ask = { message_id: "m1", event_hash: "m1", role: "user", text: "hi", created_at_ms: 1 }
   const question = (question_id: string, closed: string | null) => ({ question_id, conversation_id: "chat", bot: null, severity: "attention", text: "允许吗？", choices: [],
     about: { node: "gateway", agent: "codex", session_id: "s", cwd: "/w", summary: "", request_id: "r" }, author: "gateway", created_at_ms: 2, answer: null, closed })
   let questions = [question("lost", "request_lost")]
   const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
-    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages: [ask], questions, scheduler: { jobs: [job], unanswered: [] } }, messagePending: null, messageBusy: false,
+    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages: [ask], questions, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true, answered: {},
     refresh: async () => {},
-  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const thinking = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { key: string }[]).some((entry) => entry.key === 'activity')
   try {
     assert.equal(thinking(), true, "a question its device closed is not the bot's status")
@@ -2620,7 +4067,7 @@ test('offline chat keeps reconnect and stale waiting summary above the composer,
   const question = { question_id: 'wait-q', conversation_id: 'chat', bot: null, severity: 'attention' as const, text: '继续吗？', choices: [{ label: '继续' }],
     about: { node: 'gateway', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
   const workspace = () => ({
-    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), messagePending: null, messageBusy: false,
+    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), pendingMessages: [], canSaveMessages: connectionOnline, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', name: '本机', online: true, local: true, revoked: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }],
     liveProgress: [], interrupted: [], writable: connectionOnline, selectedBot: parityBot, connectionOnline, answered: {},
     data: { ...parseConversation(context, 'chat'), questions: [question], scheduler: null, messages: [] },
@@ -2648,13 +4095,13 @@ test('merged and in-flight user messages show honest status labels and refresh-o
   let connectionOnline = true
   const baseAsk = { message_id: 'm0', event_hash: 'm0', role: 'user' as const, text: 'first', created_at_ms: 0 }
   const build = (jobs: object[], messages: object[], pending: PendingMessage | null = null) => ({
-    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), messagePending: pending, messageBusy: false,
+    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), pendingMessages: pending ? [pending] : [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: connectionOnline, local: true, revoked: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }],
     liveProgress: [], interrupted: [], writable: true, selectedBot: parityBot, connectionOnline,
     data: { ...parseConversation(context, 'chat'), messages, scheduler: { jobs, unanswered: [], capabilities: { streaming: true, cancel: true, steer: true } } },
     refresh: async () => { refreshed++ }, sendMessage: async () => { sent++; return true },
   })
-  let current = build([], [], { message_id: 'pending', text: 'sending', conversation_id: 'chat' })
+  let current = build([], [], { message_id: 'pending', text: 'sending', conversation_id: 'chat', target: { kind: 'bot_main', bot_id: parityBot.bot_id }, intent: 'continue', sequence: 1, created_at_ms: 1, delivery: 'submitting' })
   const harness = conversationHarness(() => current)
   try {
     assert.match(componentText(harness.messageTree('pending')), /正在确认送达/)
@@ -2663,7 +4110,7 @@ test('merged and in-flight user messages show honest status labels and refresh-o
       [baseAsk, { message_id: 'm1', event_hash: 'm1', role: 'user', text: 'queued', created_at_ms: 1 }],
     )
     assert.match(componentText(harness.messageTree('m1')), /已排队/)
-    for (const [outcome, label] of [['answered', '已加入本轮'], ['unfinished', '已加入本轮，回复未完成'], ['unknown', '补充结果尚未确认']] as const) {
+    for (const [outcome, label] of [['answered', '关联回合已完成'], ['unfinished', '关联回合未完成'], ['unknown', '补充结果未知']] as const) {
       current = build([{ trigger: 'message:m2', state: 'steered', message_id: 'm2', outcome }], [{ message_id: 'm2', event_hash: 'm2', role: 'user', text: outcome, created_at_ms: 2 }])
       const tree = harness.messageTree('m2')
       assert.ok(componentText(tree).includes(label))
@@ -2683,60 +4130,45 @@ test('merged and in-flight user messages show honest status labels and refresh-o
   } finally { harness.app.close() }
 })
 
-test('queued message edit respects draft occupancy and only repopulates the composer after a confirmed cancel', async () => {
-  let draft = 'draft stays', cancelled = 0, confirmed = true
-  let delayed = false, completeCancel: (() => void) | undefined
-  const workspace = () => ({
-    generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), messagePending: null, messageBusy: false,
-    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, local: true, revoked: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }],
-    liveProgress: [], interrupted: [], writable: true, selectedBot: parityBot, connectionOnline: true, answered: {},
-    data: { ...parseConversation(context, 'chat'), messages: [
-      { message_id: 'm0', event_hash: 'm0', role: 'user', text: 'running', created_at_ms: 0 },
-      { message_id: 'm1', event_hash: 'm1', role: 'user', text: 'queued text', created_at_ms: 1 },
-    ], scheduler: { jobs: [{ trigger: 'message:m0', state: 'running', message_id: 'm0' }, { trigger: 'message:m1', state: 'queued', message_id: 'm1' }], unanswered: [], capabilities: { streaming: true, cancel: true, steer: false } } },
-    refresh: async () => {}, cancelManager: async () => {
-      cancelled++
-      if (delayed) return new Promise<boolean>((resolve) => { completeCancel = () => resolve(true) })
-      return confirmed
-    },
-  })
-  const harness = conversationHarness(workspace)
-  const queuedNode = () => {
-    const entry = harness.chatEntries().find(({ key }) => key.startsWith('queued-actions:'))
-    assert.ok(entry?.node)
-    return renderComponent(entry.node)
+test('queued input edits and cancellation use the exact input CAS and leave the chat draft alone', async () => {
+  const target: InputTarget = { kind: 'bot_main', bot_id: parityBot.bot_id }
+  const queued: WorkspaceDomainState['inputs'][number] = { input: { message_id: 'queued', target, intent: 'defer', sequence: 1, text: 'original queued text' }, conversation_id: 'chat', source_event: 'source', control_event: 'control', effective_order: 1, deferred: true, cancelled: false }
+  const controls: unknown[] = [], queries: unknown[] = []
+  let stage: InputReceipt['stage'] = 'entry_accepted', error: unknown = null
+  const shared = { ...parityShared(), workspaceState: { channels: [], tasks: [], assignments: [], inputs: [queued], coverage: { limit: 128, truncated: false } },
+    queryInput: async (request: unknown) => { queries.push(JSON.parse(JSON.stringify(request))); return { stage } },
+    controlInput: async (request: unknown) => { controls.push(JSON.parse(JSON.stringify(request))) },
+    readWorkspaceState: async () => {},
+    cancelManager: async () => { throw new Error('an input cannot cancel the manager job') },
+    sendMessage: async () => { throw new Error('editing must not send a replacement message') },
   }
+  const app = componentHarness('./workspace-chat.tsx', {
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared },
+    '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error, run: async (_key: string, action: () => Promise<void>) => { try { await action() } catch (cause) { error = cause } } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+  })
+  const render = () => app.render('InputQueue', { target })
+  const press = async (label: string) => { const button = render().find(({ type, props }) => type === 'Button' && componentText(props.children) === label); assert.ok(button && typeof button.props.onClick === 'function'); button.props.onClick(); await settleComponent() }
   try {
-    const change = harness.composer()?.onChange
-    assert.equal(typeof change, 'function')
-    if (typeof change !== 'function') return
-    change(draft)
-    const blocked = findActionProps(queuedNode(), '取消并编辑重发')
-    assert.equal(blocked?.disabled, true)
-    assert.equal(blocked?.title, '先发送或清空输入框，再编辑排队消息')
-    change('')
-    confirmed = false
-    await (findActionProps(queuedNode(), '取消并编辑重发')?.action as () => Promise<void>)().catch(() => {})
-    assert.equal(harness.composer()?.value, '')
-    confirmed = true
-    await (findActionProps(queuedNode(), '取消并编辑重发')?.action as () => Promise<void>)()
-    assert.equal(cancelled, 2)
-    assert.equal(harness.composer()?.value, 'queued text')
-    change('')
-    delayed = true
-    const cancelAndEdit = findActionProps(queuedNode(), '取消并编辑重发')?.action
-    assert.equal(typeof cancelAndEdit, 'function')
-    if (typeof cancelAndEdit !== 'function') return
-    const editing = cancelAndEdit()
-    change('new draft typed while waiting')
-    completeCancel?.()
-    await assert.rejects(editing, /输入框的新内容已保留/)
-    assert.equal(harness.composer()?.value, 'new draft typed while waiting')
-  } finally { harness.app.close() }
+    await press('编辑输入')
+    const edit = render().find(({ type }) => type === 'Textarea')
+    assert.ok(edit && typeof edit.props.onChange === 'function')
+    edit.props.onChange({ currentTarget: { value: 'edited queued text' } })
+    await press('保存输入修改')
+    assert.deepEqual(queries, [{ message_id: 'queued', target, conversation_id: 'chat' }])
+    assert.deepEqual(controls, [{ message_id: 'queued', expected_event: 'control', action: { kind: 'edit', text: 'edited queued text', attachments: [] } }])
+    await press('取消稍后输入')
+    assert.deepEqual(controls.at(-1), { message_id: 'queued', expected_event: 'control', action: { kind: 'cancel' } })
+    stage = 'unknown'
+    await press('取消稍后输入')
+    assert.equal(controls.length, 2, 'a changed receipt cannot authorize another control write')
+    assert.match(String(error), /可能已提交/)
+  } finally { app.close() }
 })
 
-test('task detail keeps long progress collapsed by default and finished tasks keep their result over stale progress', () => {
+test('task detail keeps long progress collapsed by default and finished tasks keep their result over stale progress', async () => {
+  const work = parityWork({ state: 'finished', outcome: 'completed', result_text: '最终结果', summary: '✓ 读记录\n→ 核对结果\n· 等待同步' })
   const workspace = {
+    ...parityShared(), readWork: async () => ({ work: { ...work, conversation_id: 'chat' }, coverage: { source: 'shared_history', complete: false } }),
     generation: 1, connectionOnline: true, writable: true, incomplete: false, selectedBot: parityBot, nodes: [parityNode], answered: {},
     data: parseConversation({ ...context, works: [parityWork({ state: 'finished', outcome: 'completed', result_text: '最终结果', summary: '✓ 读记录\n→ 核对结果\n· 等待同步' })] }),
     liveProgress: [{ kind: 'native', work_id: 'work', target_node: 'worker', text: '旧进展行', sequence: 1 }],
@@ -2753,6 +4185,8 @@ test('task detail keeps long progress collapsed by default and finished tasks ke
     '@vibeface/client/lib/node.ts': { providerNames },
   }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
   try {
+    app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    await settleComponent()
     const elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
     assert.equal(elements.some(({ props }) => props.text === '最终结果'), true)
     assert.doesNotMatch(componentText(elements), /旧进展行/)
@@ -2762,15 +4196,19 @@ test('task detail keeps long progress collapsed by default and finished tasks ke
   } finally { app.close() }
 })
 
-test('unknown task detail asks with check wording, navigates on success, and keeps manual settlement available', async () => {
-  let navigated = false, sent: string | null = null
+test('unknown task detail reads its exact work without starting a Main request and keeps manual settlement available', async () => {
+  let navigated = false, sent = 0, refreshed = 0
+  const reads: unknown[] = []
   let connectionOnline = true
   const work = parityWork({ state: 'unverified', outcome: 'unverified', failure_reason: '无法证明结果' })
   const workspace = {
+    ...parityShared(),
+    readWork: async (input: unknown) => { reads.push(JSON.parse(JSON.stringify(input))); return { work: { ...work, conversation_id: 'chat' }, coverage: { source: 'shared_history', complete: false } } },
+    refresh: async () => { refreshed++ },
     generation: 1, isCurrent: () => true, connectionOnline, writable: true, incomplete: false, selectedBot: parityBot, nodes: [parityNode], answered: {},
     data: parseConversation({ ...context, works: [work] }),
     liveProgress: [],
-    sendMessage: async (text: string) => { sent = text; return false },
+    sendMessage: async () => { sent++; return false },
     resolveCheck: async () => {},
   }
   const app = componentHarness('./task-detail.tsx', {
@@ -2786,33 +4224,24 @@ test('unknown task detail asks with check wording, navigates on success, and kee
     './task-activity': { confirmText: () => '设备无法报告结果', BackOnline: 'BackOnline' },
   }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
   try {
+    app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    await settleComponent()
     let elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
     assert.match(componentText(elements), /还不知道做完没有/)
     const ask = findActionProps(elements, '先查结果')
     assert.ok(ask?.action)
     assert.equal(ask.disabled, false)
     await (ask.action as () => Promise<void>)()
-    assert.equal(sent, followUpCopy.check.ask('核对项目'))
+    assert.equal(sent, 0)
+    assert.equal(refreshed, 1)
     assert.equal(navigated, false)
-    workspace.sendMessage = async (text: string) => { sent = text; return true }
-    await (ask.action as () => Promise<void>)()
-    assert.equal(navigated, true)
+    app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    await settleComponent()
+    assert.deepEqual(reads, [{ conversation_id: 'chat', work_id: 'work' }, { conversation_id: 'chat', work_id: 'work' }])
     workspace.connectionOnline = false
     elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
     assert.equal(findActionProps(elements, '先查结果')?.disabled, true)
     assert.equal(elements.some(({ props }) => props.label === '我已自行核对'), true)
-    workspace.connectionOnline = true
-    navigated = false
-    let release: ((value: boolean) => void) | undefined
-    workspace.sendMessage = async (text: string) => {
-      sent = text
-      return new Promise<boolean>((resolve) => { release = resolve })
-    }
-    const querying = (ask.action as () => Promise<void>)()
-    app.render('TaskDetail', { botId: 'other-bot', workId: 'other-work' })
-    release?.(true)
-    await querying
-    assert.equal(navigated, false, 'a late receipt cannot pull the person back to a task they left')
   } finally { app.close() }
 })
 

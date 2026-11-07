@@ -44,7 +44,7 @@ bash scripts/build-web.sh
 
 ```sh
 ./vibeface init \
-	--root /absolute/path/to/projects
+    --root /absolute/path/to/projects
 ./vibeface serve
 ```
 
@@ -88,11 +88,11 @@ bash scripts/build-web.sh
 
 ```sh
 ./vibeface init \
-	--root /absolute/path/to/projects \
-	--manager cursor \
-	--workspace /absolute/path/to/manager-workspace \
-	--model auto \
-	--bin cursor=/absolute/path/to/bin/cursor-sdk-bridge
+    --root /absolute/path/to/projects \
+    --manager cursor \
+    --workspace /absolute/path/to/manager-workspace \
+    --model auto \
+    --bin cursor=/absolute/path/to/bin/cursor-sdk-bridge
 ```
 
 此命令用于尚未初始化的 Node。默认使用 `auto` 模型。SDK 程序在本机运行，模型请求仍发往 Cursor 服务，消耗 Cursor 额度。
@@ -109,10 +109,10 @@ Codex Bot 的回合在 Codex App Server 上运行。装好并登录 Codex 后，
 
 ```sh
 ./vibeface init \
-	--root /absolute/path/to/projects \
-	--manager codex \
-	--codex-socket '<App Server socket 的绝对路径>' \
-	--workspace /absolute/path/to/manager-workspace
+    --root /absolute/path/to/projects \
+    --manager codex \
+    --codex-socket '<App Server socket 的绝对路径>' \
+    --workspace /absolute/path/to/manager-workspace
 ```
 
 可用 `--model` 指定模型，省略时使用 Codex 配置中的默认模型。
@@ -190,10 +190,10 @@ vibeface join 'https://gateway.example/join#vibeface1…' --name '<设备显示�
 
 ```json
 {
-	"listen": "0.0.0.0:4790",
-	"public_url": "http://192.168.1.10:4790",
-	"allowed_origins": [],
-	"allow_insecure_lan": true
+    "listen": "0.0.0.0:4790",
+    "public_url": "http://192.168.1.10:4790",
+    "allowed_origins": [],
+    "allow_insecure_lan": true
 }
 ```
 
@@ -221,12 +221,27 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
 ## 配置公共入口
 
-手机或另一台电脑要从外网打开网页，需要一个 HTTPS 入口。有两种做法：
+手机或另一台电脑要从外网打开网页，需要一个 HTTPS 入口。有三种做法：
 
-- **公共入口**：在有公网地址的机器上运行一个不加入个人网络的 `vibeface`，它默认只提供网页、relay 和密文转发，不保存个人网络的事件或附件。个人设备不需要入站端口。推荐用这种方式。
+- **官方公共入口（默认）**：新初始化的 Node 自动从 Vibeface 的公共发现服务取得官方公共入口的地址和一张绑定本设备的 relay 许可，不需要令牌或任何服务器。见下文 [自动接入官方公共入口](#自动接入官方公共入口)。
+- **自建公共入口**：在有公网地址的机器上运行一个不加入个人网络的 `vibeface`，它默认只提供网页、relay 和密文转发，不保存个人网络的事件或附件。个人设备不需要入站端口。
 - **成员 Gateway**：让公网机器上的 Node 作为普通成员加入个人网络，同时提供网页，见本节末尾。
 
-### 公共入口：Linux 服务器加 nginx
+### 自动接入官方公共入口
+
+`vibeface init` 和首次直接启动在空数据目录里写入 `"bootstrap": {"mode": "public"}`。Node 启动后在后台做三件事，本机网页、维护接口和局域网发现不等待它们：
+
+1. 向 `config/public-bootstrap.json` 里固定的发现服务（`discovery.vibeface.dev:4792`，UDP）索取**服务目录**；UDP 不通时改从 `https://app.vibeface.dev/bootstrap/catalog` 获取。目录由发现服务的设备密钥签名，列出成对的网页入口 `gateway_url` 和 relay `relay_url`，最多 4 对；签名、签发者、有效期或大小不符的目录一律丢弃。
+2. 按目录顺序向发现服务申请 **relay 许可**。许可绑定本设备的设备编号和那台 relay 的 origin，默认 30 分钟有效，最长 1 小时；UDP 路径由 QUIC TLS 证明设备，HTTPS 路径由设备私钥签名请求。许可在过半有效期时续签，续签结果同时登记到入口，所以 relay 重启后拿旧许可重连的设备仍被接纳，不会反复重连。
+3. 把许可交给 iroh 连接那台 relay，并把这台入口的 `gateway_url` 写进自己的签名地址记录，让其他设备和浏览器知道经哪个入口能找到它。
+
+`vibeface status` 的 `Bootstrap` 一行显示 `seeking`（还没拿到许可，附带最近一次失败原因）、`admitted`（已接入，附带入口地址）或 `degraded`（续签或登记失败，仍持有旧许可）。接入失败不影响本机使用和局域网内同步，只是外网设备暂时找不到它。
+
+目录只是地址提示：公共入口看不到对话内容，个人网络仍按邀请和成员目录授权。公共入口的 relay 只接纳持有效许可的设备，一台入口服务多个人的 Node，各人的网络互不相通。
+
+不想使用官方服务时，初始化加 `--bootstrap off`；指定了自建入口 `--entry` 时默认就是关闭，不会悄悄回退到官方服务。自建一套同样协议的发现服务和入口后，用 `--bootstrap 'vibeface://<发现服务设备编号>@<主机>:<UDP 端口>'` 指向它，可选 `--bootstrap-https https://<入口>/bootstrap` 作为 UDP 不通时的第二路径；自建来源永远不会回退到官方服务。已初始化的 Node 停掉后修改 `config.json` 里 `network.bootstrap`（`{"mode":"off"}`、`{"mode":"public"}` 或 `{"mode":"custom","discovery":"vibeface://…","https":"https://…/bootstrap"}`）再启动。
+
+### 自建公共入口：Linux 服务器加 nginx
 
 下面以一台 Linux 服务器为公共入口，域名为 `vb.example.com`。个人电脑运行加入个人网络的 Node。
 
@@ -237,8 +252,8 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
    ```sh
    export VIBEFACE_ENTRY_DATA_DIR='<入口 Node 数据目录的绝对路径>'
    vibeface init --data-dir "$VIBEFACE_ENTRY_DATA_DIR" \
-   	--public-entry \
-   	--public-url https://vb.example.com \
+    --public-entry \
+    --public-url https://vb.example.com \
        --relay-listen 127.0.0.1:3340 \
        --relay-url https://vb.example.com
    vibeface serve --data-dir "$VIBEFACE_ENTRY_DATA_DIR"
@@ -250,37 +265,45 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
    ```nginx
    map $http_upgrade $connection_upgrade {
-   	default upgrade;
-   	''      close;
+    default upgrade;
+    ''      close;
    }
 
    server {
-   	listen 443 ssl http2;
-   	server_name vb.example.com;
-   	ssl_certificate     /etc/letsencrypt/live/vb.example.com/fullchain.pem;
-   	ssl_certificate_key /etc/letsencrypt/live/vb.example.com/privkey.pem;
+    listen 443 ssl http2;
+    server_name vb.example.com;
+    ssl_certificate     /etc/letsencrypt/live/vb.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/vb.example.com/privkey.pem;
 
-   	location ~ ^/(relay|ping|generate_204)$ {
-   		proxy_pass http://127.0.0.1:3340;
-   		proxy_http_version 1.1;
-   		proxy_set_header Upgrade $http_upgrade;
-   		proxy_set_header Connection $connection_upgrade;
-   		proxy_set_header Host $host;
-   		proxy_read_timeout 1h;
-   	}
+    location ~ ^/(relay|ping|generate_204)$ {
+        proxy_pass http://127.0.0.1:3340;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Forwarded "";
+        proxy_set_header X-Forwarded-For "";
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 1h;
+    }
 
-   	location / {
-   		proxy_pass http://127.0.0.1:4790;
-   		proxy_http_version 1.1;
-   		proxy_set_header Upgrade $http_upgrade;
-   		proxy_set_header Connection $connection_upgrade;
-   		proxy_set_header Host $host;
-   		proxy_read_timeout 1h;
-   	}
+    location / {
+        proxy_pass http://127.0.0.1:4790;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Forwarded "";
+        proxy_set_header X-Forwarded-For "";
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 1h;
+    }
    }
    ```
 
-   `Host` 必须是 `public_url` 的主机名，Node 会拒绝其他 Host。
+   `Host` 必须与 `public_url` 的主机名一致。Core 只在 TCP 对端为回环时读取单个 `X-Real-IP`，忽略 `Forwarded` 和 `X-Forwarded-For`。反代必须覆盖 `X-Real-IP` 并清空这两个转发头，后端仅监听回环地址。域名经过 CDN 时，先用官方 CDN IP 段限制 `set_real_ip_from` 的信任来源，再让 `$remote_addr` 表示经过校验的客户端地址。
 
 4. 在个人电脑上指定服务器的 SSH 地址、步骤 2 选择的数据目录，以及本机用于接收令牌的临时文件，再复制 `entry-token`：
 
@@ -296,8 +319,8 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 
    ```sh
    vibeface init \
-   	--root /absolute/path/to/projects \
-   	--entry https://vb.example.com \
+    --root /absolute/path/to/projects \
+    --entry https://vb.example.com \
        --relay-token-file "$VIBEFACE_RELAY_TOKEN_FILE"
    vibeface serve
    ```
@@ -309,6 +332,10 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 默认公共入口只搬运浏览器与个人电脑上的 Node 之间的 Noise 密文，看不到对话内容，也不保存个人网络事件或附件。另行启用文件交付服务时，它还会独立暂存交付密文，见[可选文件传输](#启用可选文件传输)。它的 relay 只接纳持有令牌的设备，持错误令牌的 Node 连不上。一台公共入口可以同时服务多台带令牌的 Node，各人的个人网络互不相通。令牌泄露时，停掉入口和使用它的 Node，用同一份新令牌（`openssl rand -hex 32` 生成的 64 个十六进制字符）替换它们数据目录里的 `entry-token`，再依次启动。
 
 已经初始化的 Node 要改用公共入口，停掉它，在 `config.json` 的 `network` 中加入 `"entry": {"url": "https://vb.example.com", "relay": "https://vb.example.com"}`，把令牌放到数据目录的 `entry-token`（权限 600），再启动。
+
+### 自建公共入口：按许可接纳设备
+
+不想分发运营者令牌时，可以让自建入口像官方入口一样，由一台发现服务签发目录和许可。入口初始化时改用 `--relay-admission grants --grant-issuer <发现服务设备编号>`，此时不生成 `entry-token`，relay 只接纳该发现服务签发、绑定到连接设备和本 relay origin 的许可，并在 `POST /api/relay/grant` 接受设备登记续签的许可。发现服务按 [运行不转发业务数据的公共发现服务](#运行不转发业务数据的公共发现服务) 初始化，加上 `--catalog-gateway https://vb.example.com --catalog-relay https://vb.example.com` 发布目录，nginx 把入口域名下的 `/bootstrap/` 转给发现服务的网页端口（`Host` 仍是入口域名，发现服务的 `--public-url` 也设为入口域名，并传递 `X-Real-IP` 以便按来源限流）。个人设备用 `--bootstrap 'vibeface://<发现服务设备编号>@discovery.example:4792' --bootstrap-https https://vb.example.com/bootstrap` 初始化即可，不需要令牌。
 
 ### 成员 Gateway
 
@@ -348,6 +375,12 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | `--relay-mode <MODE>` | `relay_mode` | 默认 `forward`；`discovery-only` 只提供连接协助，需要 `--public-entry` |
 | `--discovery <URL>` | `discovery` | 钉住身份的发现服务，格式为 `vibeface://<device-id>@<host>:<UDP-port>`，最多 4 个 |
 | `--relay-url <URL>` | `relay_url` | 其他 Node 访问本 relay 的 URL，必须明确提供其他 Node 可访问的 URL |
+| `--bootstrap <MODE\|URL>` | `bootstrap` | `public`（无 `--entry` 的新 Node 默认值）、`off`，或自建发现服务的 `vibeface://` 地址 |
+| `--bootstrap-https <URL>` | `bootstrap.https` | 自建发现服务的 HTTPS 接入基址，UDP 不通时使用 |
+| `--relay-admission <POLICY>` | `relay_admission` | 公共入口 relay 的接纳策略：`operator-token`（默认）或 `grants` |
+| `--grant-issuer <DEVICE-ID>` | `relay_admission.issuer` | `grants` 策略信任的发现服务设备编号 |
+| `--catalog-gateway <URL>`、`--catalog-relay <URL>` | `catalog.entries` | 仅发现服务：成对发布的网页入口和 relay，最多 4 对 |
+| `--grant-ttl-minutes <N>` | `catalog.grant_ttl_ms` | 仅发现服务：签发许可的有效期，默认 30 分钟，最长 60 分钟 |
 | 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
 | 无 | `n0_relays` | 同时使用 n0 公共 relay，默认关闭 |
 
@@ -355,8 +388,8 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 
 ```sh
 vibeface init \
-	--relay-listen 127.0.0.1:3340 --relay-url https://relay.example \
-	--public-url https://vibe.example
+    --relay-listen 127.0.0.1:3340 --relay-url https://relay.example \
+    --public-url https://vibe.example
 vibeface join '<管理设备给出的加入链接>' --name '<设备显示名称>'
 ```
 
@@ -425,29 +458,15 @@ vibeface wallet --data-dir /path/to/node-data backup /path/to/new-wallet-backup.
 
 ## 使用公共发现服务
 
-Vibeface 提供以下可选的公共发现服务，帮助不同用户各自网络中的 Node 查询已知设备的地址并尝试直连。它不会把个人网络合并，也不会授予成员权限；加入仍需邀请和批准。Node 不会默认连接这项服务。
+Vibeface 的公共发现服务帮助不同用户各自网络中的 Node 查询已知设备的地址并尝试直连，同时签发官方公共入口的服务目录和 relay 许可，见 [自动接入官方公共入口](#自动接入官方公共入口)。它不会把个人网络合并，也不会授予成员权限；加入仍需邀请和批准。它的设备编号、UDP 地址和 HTTPS 基址固定在仓库的 `config/public-bootstrap.json`，Core、网页和手机 App 都从这一个文件取值：
 
 ```text
 vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@discovery.vibeface.dev:4792
 ```
 
-首次初始化且数据目录为空或不存在时，可以显式选择它：
+新初始化的 Node 默认（`bootstrap` 为 `public`）就向它登记地址、索取目录和许可，不需要再传 `--discovery`。`--bootstrap off` 的 Node 不会连接它；之后要启用，停掉 Node，把 `config.json` 里 `network.bootstrap` 改为 `{"mode": "public"}` 再启动。只想用它查询地址、不接入官方公共入口的 Node，可以在 `--bootstrap off` 的同时显式传 `--discovery` 这个地址，或把它加入 `config.json` 的 `network.discovery` 数组后重启。不要为修改发现配置重新运行 `init`，也不需要重新创建个人网络。
 
-```sh
-vibeface init --discovery 'vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@discovery.vibeface.dev:4792'
-```
-
-已有节点先停止 Core，再把这个地址添加到数据目录 `config.json` 的 `network.discovery` 数组，保留其他配置。例如该字段的值为：
-
-```json
-[
-  "vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235@discovery.vibeface.dev:4792"
-]
-```
-
-随后按原方式启动 Core。不要为修改发现配置重新运行 `init`，也不需要重新创建个人网络。
-
-服务使用 UDP 4792，通过地址中的设备编号核验身份，不经过 Cloudflare HTTP 代理。运营者能看到设备编号、UDP 地址和查询关系；地址登记只保存在内存中，不保存会话或附件。它不提供网页入口，不接受 `--relay` 或 `--entry` 的配置用途，也不转发业务数据。对称 NAT 或 UDP 被封锁时仍可能无法直连，需要另行配置普通中继。自建同类服务见下一节。
+服务使用 UDP 4792，通过地址中的设备编号核验身份，不经过 Cloudflare HTTP 代理；只有目录和许可的 HTTPS 第二路径经 `https://app.vibeface.dev/bootstrap/` 到达同一个实例。运营者能看到设备编号、UDP 地址、查询关系和许可申请；地址登记只保存在内存中，不保存会话或附件。它不提供网页入口，不接受 `--relay` 或 `--entry` 的配置用途，也不转发业务数据。对称 NAT 或 UDP 被封锁时仍可能无法直连，业务流量经许可的公共 relay 转发。自建同类服务见下一节。
 
 ## 运行不转发业务数据的公共发现服务
 
@@ -455,27 +474,30 @@ vibeface init --discovery 'vibeface://82169062e48d543dc9af8e02340c5248d6fcbe43fc
 
 ```sh
 vibeface init --data-dir /srv/vibeface-discovery \
-	--public-entry --relay-mode discovery-only \
-	--relay-listen 0.0.0.0:4792 --no-web
+    --public-entry --relay-mode discovery-only \
+    --relay-listen 0.0.0.0:4792 --no-web
 vibeface serve --data-dir /srv/vibeface-discovery
 ```
 
 `init` 输出发现服务的设备编号。UDP 4792 必须能从公网直接访问，不能用 HTTP 反向代理替代。监听地址的端口必须非零；使用 `0.0.0.0` 或 `[::]` 时同时尝试监听 IPv4 和 IPv6。此模式不使用 `--relay-url`，也不生成 `entry-token`。省略 `--no-web` 时仍提供静态网页，但不提供 `/api/client`、`/api/decision` 或建网入口。
 
+要让它同时为一台或多台公共入口签发目录和许可，初始化时成对传入 `--catalog-gateway <入口网页 URL>` 和 `--catalog-relay <入口 relay URL>`（最多 4 对，公网地址必须是 HTTPS），可选 `--grant-ttl-minutes` 调整许可有效期（默认 30，最长 60）。发布目录的发现服务在 `listen` 上提供 `GET /bootstrap/catalog` 和 `POST /bootstrap/grant`，即使 `--no-web`；把入口域名下的 `/bootstrap/` 反代到这个端口，`Host` 保持入口域名并把 `--public-url` 设为同一入口，传递 `X-Real-IP` 以按来源限流（每设备每分钟 6 张、每来源 IP 每分钟 30 张）。目录每 24 小时重签，Node 每 6 小时刷新；对应的公共入口用 `--relay-admission grants --grant-issuer <这台发现服务的设备编号>` 初始化。
+
 用户在自己的 Node 上明确配置这个发现服务的编号和公网地址：
 
 ```sh
 vibeface init --data-dir /absolute/personal-node \
-	--discovery 'vibeface://<发现服务设备编号>@discovery.example:4792'
+    --bootstrap 'vibeface://<发现服务设备编号>@discovery.example:4792' \
+    --bootstrap-https https://<入口域名>/bootstrap
 ```
 
-已有 Node 可在 `config.json` 的 `network.discovery` 数组里添加同一 URL 后重启。发现服务的编号通过 QUIC TLS 校验，域名解析结果不能冒充运营者。不要把这个地址传给 `--relay` 或 `--entry`，它没有业务转发能力。
+只做地址查询、不接入它发布的公共入口时，改传 `--bootstrap off --discovery 'vibeface://…'`；已有 Node 可在 `config.json` 的 `network.discovery` 数组里添加同一 URL 后重启。发现服务的编号通过 QUIC TLS 校验，域名解析结果不能冒充运营者。不要把这个地址传给 `--relay` 或 `--entry`，它没有业务转发能力。
 
 Node 用自身的业务 UDP 端口登记。发现服务只交换它从已认证连接上观察到的地址，并通知双方发起直连探测。服务端没有转发客户端数据报的实现，也不接受个人网络的业务 ALPN。加入设备仍需有效邀请，读取、同步和执行仍按原有成员权限校验。
 
-发现服务不会列出所有用户；知道设备编号的人可以查询它是否在线及其公网地址。运营者能看到设备编号、UDP 地址和查询关系。地址登记只保存在内存中，连接租约到期或断开后移除，不保存会话、附件、事件或个人网络。每个服务最多接纳 512 条控制连接，每个来源 IP 最多 8 条；单连接最多处理 60 个固定请求，租约为 60 秒，单帧最多 512 字节。连接通知队列和并发探测也有上限。
+发现服务不会列出所有用户；知道设备编号的人可以查询它是否在线及其公网地址。运营者能看到设备编号、UDP 地址、查询关系和许可申请。地址登记只保存在内存中，连接租约到期或断开后移除，不保存会话、附件、事件或个人网络。每个服务最多接纳 512 条控制连接，每个来源 IP 最多 8 条；单连接最多处理 60 个固定请求，租约为 60 秒，请求帧最多 1024 字节，应答帧最多容纳一份 4096 字节的签名目录。连接通知队列和并发探测也有上限。
 
-仅发现不保证所有 NAT 类型都能直连。对称 NAT、UDP 被封锁或双方没有可用直连路径时，仅发现会报告不可达。需要这类网络仍可自动连接时，用户可另行配置普通 `--relay`。Node 自动选择直连或普通 relay；发现节点始终不承载业务流量。本项目不默认连接任何官方发现服务。
+仅发现不保证所有 NAT 类型都能直连。对称 NAT、UDP 被封锁或双方没有可用直连路径时，仅发现会报告不可达。这类网络的业务流量经它目录里的公共入口 relay 转发，用户也可另行配置普通 `--relay`。Node 自动选择直连或 relay；发现节点始终不承载业务流量。新 Node 默认只连接 `config/public-bootstrap.json` 里固定的官方发现服务，`--bootstrap off` 关闭自动公共引导，显式配置的 `--discovery` 或 `network.discovery` 来源仍会使用。
 
 ## 多个访问地址
 
@@ -506,13 +528,13 @@ Node 用自身的业务 UDP 端口登记。发现服务只交换它从已认证�
 - **停止当前回复**只请求取消当前管理轮，并撤销该轮的 Node 工具权限。已输出的部分回复保留为一条标记“已停止”的回答。取消待确认时不能当作已经停止，也不停止已派发的工作。
 - **停止工作**作用于选中的工作，中断它的原生 turn，并一并停止它委派出的工作。任何入口都能停止其他设备上的工作。停止请求先存在本机再发送，直到工作结束都不会放弃：目标离线时入口以 3 秒起、最长 1 分钟的间隔持续投递，设备上线后照样收到并停下；执行设备在 `turn/interrupt` 失败或重启后先读回合再重发，回合已结束就不再中断。页面显示“停止中”，30 秒仍未确认显示“还在尝试停止”。执行器接受中断后 30 秒回合仍未结束时再读一次：仍在运行就再发，读不到则进入待核对。
 
-Cursor SDK 和 Codex 都提供进度和取消请求。Codex Bot 的回合在 App Server 上运行，回复进行中再发的消息直接并入当前回复（`turn/steer`），网页显示“Bot 正在看这条补充”，并入后显示“已补充给 Bot”，该回复未正常完成时显示“补充后回复没完成”，无法确认时显示“不确定 Bot 看到了没有”；Cursor 没有原生 steer，新消息排在当前回复之后。Codex 线程创建时把本轮的工具令牌和本机工具地址写进 Shell 环境，之后续接同一线程的回合沿用这个令牌，令牌在该线程每轮都有效（接受的取舍）；Node 重启时沿用上次的工具端口（记在数据目录的 `tool-port`），端口被占用而换了地址时 Bot 开新线程。Cursor 需要匹配的 Provider 终态才能确认取消；本地进程退出时仍须核对结果。Codex 停止时发 `turn/interrupt`，确认回合已结束才回报已停止；无法确认时该轮进入 `reconciling`，保留部分回复并列入待核对，待查询或本人确认后再记录最终状态。停止回复不影响已派发的工作，停止工作是单独操作。
+Codex、Claude Code、pi 和 OpenCode 的活动输入走各自原生补充路径。每条输入区分设备保存、执行设备接纳、服务接受、实际回合归属和结果未知，不能仅凭提交成功显示 Bot 已读。完整附件按同目标顺序交付。Cursor 的新版 SDK 有文本 steer，但当前独立 Bridge 未暴露该能力，活动补充仍有缺口。Codex 线程创建时把本轮工具令牌和本机工具地址写进 Shell 环境，续接同一线程沿用该令牌；每次使用仍核验当前 attempt 和权限围栏。Node 重启沿用上次的工具端口，端口变化时开新线程。Codex 以 App Server 回合结束确认停止。Claude Code、pi 和 OpenCode 以 Provider 终态或受管进程退出确认，Cursor 须 Provider 终态。无法确认时进入待确认并保留部分回复。停止回复与停止已派发工作分别操作。
 
 Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool dispatch_work --json '{"title":"跑测试","prompt":"...","cwd":"...","call_ref":"REF","target_node":"<设备编号>"}'`。`title` 是给本人看的几个字，任务卡片以它为名，`prompt` 放在详细信息里。省略 `target_node` 时派发到本机，由 `agent` 指定的产品执行（本机只开了一个执行产品时可省略）：Codex 工作由 CLI 先向 Node 登记，再直接连本机 App Server 开线程、以完全访问（`approvalPolicy=never`、`danger-full-access`）发一个 turn，Node 记录并观察它。`target_node` 是另一台设备时，任务交给那台设备的协调 Agent，作为它的一轮执行，由它在本机派发，不能再向其他设备派发；远端任务由目标 Bot 选择并冻结模型。`continues` 填原工作编号时，在原工作的 thread 上继续；`thread` 填本机已有线程时，消息进入该线程，与 `continues` 互斥。目标 Node 核对派发方仍是成员且处于进行中的调度轮次，并要求 `cwd` 位于目标自己 `config.json` 的 `roots` 内，不满足时拒绝，页面显示“未接收”。同一轮用同一 `call_ref` 重试得到同一工作，不会启动第二个 turn；结果不明时用 `call_lookup` 查询。
 
-协调 Agent 的 Shell 完全访问本机，可以改文件、跑 git 和 gh。它用 `vibeface codex call <method> [json]` 调用 App Server 的读取和线程管理方法，开始、引导或停止回合的方法（`turn/start`、`turn/steer`、`turn/interrupt`、`thread/start`、`thread/fork`、`thread/compact/start`、`thread/shellCommand`、`thread/revert`、`thread/inject_items`、`review/start`）一律拒绝，改用 `dispatch_work`、`codex send` 和 `interrupt_work`，让每个回合都是 Node 登记过的工作；`vibeface codex send <thread> <text> --id <id>` 给已有会话插话（回合进行中时 steer，否则开新回合）。这条消息是本轮的一项工作，与 `dispatch_work` 相同：发送前向 Node 登记，`--id` 即 `call_ref`，Node 观察它所在的回合，结束后结果作为 `work_result` 轮回到 Bot；同一轮同一 `--id` 再次执行只回读、绝不重发，换了内容或会话则拒绝。会话的目录取自线程，不受 `roots` 限制。它只能在 Bot 的一轮里运行，因为它要用这一轮的工具令牌；Cursor 的 Shell 没有这个令牌，Cursor 回合用带 `thread` 的 `dispatch_work` 工具做同样的事。`vibeface codex watch <thread>` 查看事件，`vibeface log <level> <message> --conversation <id>` 把它遇到的问题写进 Node 日志（经本机监听器的 `/api/log`，边界与 `/api/hooks` 相同）。Socket 路径在 `VIBEFACE_CODEX_SOCKET`。
+协调 Agent 的 Shell 完全访问本机，可以改文件、跑 git 和 gh。它用 `vibeface codex call <method> [json]` 调用 App Server 的读取和线程管理方法，开始、引导或停止回合的方法（`turn/start`、`turn/steer`、`turn/interrupt`、`thread/start`、`thread/fork`、`thread/compact/start`、`thread/shellCommand`、`thread/revert`、`thread/inject_items`、`review/start`）一律拒绝，改用 `dispatch_work`、`codex send` 和 `interrupt_work`，让每个回合都是 Node 登记过的工作；`vibeface codex send <thread> <text> --id <id>` 给已有会话插话（回合进行中时 steer，否则开新回合）。这条消息是本轮的一项工作，与 `dispatch_work` 相同：发送前向 Node 登记，`--id` 即 `call_ref`，Node 观察它所在的回合，结束后结果作为 `work_result` 轮回到 Bot；同一轮同一 `--id` 再次执行只回读、绝不重发，换了内容或会话则拒绝。Node 发送前读取并规范化线程的真实目录，核对它位于本机 `roots` 内。给出 `cwd` 时还须与真实目录一致。它只能在 Bot 的一轮里运行，因为它要用这一轮的工具令牌；Cursor 的 Shell 没有这个令牌，Cursor 回合用带 `thread` 的 `dispatch_work` 工具做同样的事。`vibeface codex watch <thread>` 查看事件，`vibeface log <level> <message> --conversation <id>` 把它遇到的问题写进 Node 日志（经本机监听器的 `/api/log`，边界与 `/api/hooks` 相同）。Socket 路径在 `VIBEFACE_CODEX_SOCKET`。
 
-Codex 默认 bypass，正常不会发起请求。仍发起的请求（审批、提问、登录等）由 Node 挂起并立即唤醒协调 Agent：它用 `vibeface requests` 查看，`vibeface respond <request_id> '<result-json>'` 回答，同一请求只回答一次。需要本人拍板时，它用 `vibeface triage raise --event-id <ID> --request-id <请求> --question <问题> --choice 批准 --choice 拒绝` 在拥有该会话的 Bot 聊天里提问，按项目设置也经 webhook 转发 Grok Bot。提问挂住请求直到有回答；回答作为一轮交给该 Bot，它在 120 秒内用 `vibeface respond <请求> '<result-json>' --node <设备>` 应答。没有协调 Agent，或它 120 秒内既没回答也没提问时，Node 按方法拒绝并记录。等待回答的 hook 挂起的请求同样经 `vibeface requests` 和 `vibeface respond` 处理，30 秒内没有回答时交回会话自己决定。没有协调 Agent 时分诊事件直接丢弃。协调 Agent 每次启动分诊都预占一次额度，上限同为 `daily_decision_limit`，但与 Bot 的自动轮次分开记账，不占它们的额度。额度用完时保留未审阅事件，挂起请求仍按原期限兜底；额度恢复后只重新审阅事件，不重放原工具或已执行的工作。只有当前进程确认模型未启动时才退还原日额度；启动后失败、结果未知或 Node 重启时不退款，也不自动重跑该批事件。设置和诊断包显示已用额度、上限、下次尝试时间，以及待审阅、处理中和结果未知的事件数。协调 Agent 能看到拥有该会话的 Bot 的说明开头和最新记忆，各有长度上限。hook 挂起的 `continue` 只在执行本人已要求的事时代发；下一步需要本人决定、难以撤销或需要本人未给的授权时，改为提问。不是 Bot 发起的交互会话由运行它的设备归给主 Bot；Bot 每轮能看到名下的会话，自己判断后用 `hand_over_session` 转给其他 Bot 或不再关注；`codex exec`、子代理等后台会话不处理，见 [聊天里的提问与回答](design/questions-in-chat.md)。
+Codex 默认 bypass，正常不会发起请求。仍发起的请求（审批、提问、登录等）由 Node 挂起并立即唤醒协调 Agent：它用 `vibeface requests` 查看，`vibeface respond <request_id> '<result-json>'` 回答，同一请求只回答一次。需要本人拍板时，它用 `vibeface triage raise --event-id <ID> --request-id <请求> --question <问题> --choice 批准 --choice 拒绝` 在拥有该会话的 Bot 聊天里提问，按项目设置也经 webhook 转发 Grok Bot。提问挂住请求直到有回答。本人答案沿独立私有控制队列回到原执行设备，不等待被挂起 Task 的 scheduler 槽位。基础审批只按原请求动作递交，文字题由捕获配置的新协调会话按原题型整理。普通问题仍在原 Task 或 Main 排后续轮，未知结果只查询。没有协调 Agent，或它 120 秒内既没回答也没提问时，Node 按方法拒绝并记录。等待回答的 hook 挂起的请求同样经 `vibeface requests` 和 `vibeface respond` 处理，30 秒内没有回答时交回会话自己决定。没有协调 Agent 时分诊事件直接丢弃。协调 Agent 每次启动分诊都预占一次额度，上限同为 `daily_decision_limit`，但与 Bot 的自动轮次分开记账，不占它们的额度。额度用完时保留未审阅事件，挂起请求仍按原期限兜底；额度恢复后只重新审阅事件，不重放原工具或已执行的工作。只有当前进程确认模型未启动时才退还原日额度；启动后失败、结果未知或 Node 重启时不退款，也不自动重跑该批事件。设置和诊断包显示已用额度、上限、下次尝试时间，以及待审阅、处理中和结果未知的事件数。协调 Agent 能看到拥有该会话的 Bot 的说明开头和最新记忆，各有长度上限。hook 挂起的 `continue` 只在执行本人已要求的事时代发；下一步需要本人决定、难以撤销或需要本人未给的授权时，改为提问。不是 Bot 发起的交互会话由运行它的设备归给主 Bot；Bot 每轮能看到名下的会话，自己判断后用 `hand_over_session` 转给其他 Bot 或不再关注；`codex exec`、子代理等后台会话不处理，见 [聊天里的提问与回答](design/questions-in-chat.md)。
 
 Node 默认不启用 Codex。启用 Codex Bot 或任务执行时，缺少的程序路径由 Node 从本机找出并写进配置，设备设置里显示并可修改；Bot 也能用 `propose_provider_config` 提议显式 App Server socket、会话扫描目录或添加可用文件夹（`roots`），经聊天里的「允许 / 不允许」卡片同意后由 Node 写入。首次设置时打开 Codex 运行 Bot 会同时打开执行任务，并可一键添加家目录下常见的项目文件夹（`node_settings.suggested_roots`）。整个 `providers.codex_app_server` 对象省略时默认 `spawn`，提供对象时 `mode` 必填。spawn 时 Node 托管自己的 `codex app-server`，使用 `<data-dir>/providers/codex` 和私有的 `/tmp/vibeface-<identity>/` socket；不会扫描用户 control socket、sessions 或 hooks。`system` 只连接明确配置的 socket，不启动或结束外部服务。App Server 运行在独立进程组，进程组号写入数据目录的 `codex-app-server.pid`。Node 启动时先结束上次遗留的进程组，正常退出时一并停止它，异常退出则退避重启。连接系统 App Server 时，同时设置 `providers.codex_app_server.mode` 为 `system` 和显式的绝对 `socket`；`init --codex-socket` 会同时保存两者。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中工作的实际状态。
 
@@ -524,7 +546,7 @@ App Server 重启或重连后，Node 只读复查未结束的工作，不重发�
 
 Codex 结束一轮不等于交付目标已经达成，由本人核对产物后确认。停止回复不会自动停止已经运行的进程，仍需核对后台工作的实际状态。
 
-未读提醒归属原机器人聊天。普通通知不消耗模型调用；浏览器提醒取决于浏览器支持与设置中的通知权限。关闭网页后没有独立的手机推送服务。
+未读提醒保留原 Bot Main、Task 或频道目标。无法确定来源时保留未知，不默认跳回主聊天。普通通知不消耗模型调用；浏览器提醒取决于浏览器支持与设置中的通知权限。关闭网页后没有独立的手机推送服务。
 
 从另一台入口打开原会话，可只读观察原管理节点和执行节点的临时进度。重连后读取持久状态，缺失的临时文字不会触发重做。缓存状态会标明新鲜度，离线时不能据此确认远端仍在运行。长文本结果可在聊天中展开或下载；尚未同步的附件需等待原副本可达，只有哈希不能补回正文。
 
@@ -540,9 +562,9 @@ Codex 结束一轮不等于交付目标已经达成，由本人核对产物后�
 
 A 已派发 B 后掉线时，从 C 打开原业务会话，等待 DAG 补齐，再核对 B 的实际执行状态。缺失历史、App Server 不可达和结果未知分别显示，不能通过创建同名新任务代替恢复。
 
-本机 scheduler 按 Provider descriptor 检查实际 Bot/provider instance 的并发能力。Serial instance 的回合互斥，其他 Bot 可并行；Parallel instance 可同时运行主聊天和独立 task。`config.json` 的 `scheduling.machine_slots` 默认 4，限制本机所有 Bot 协调回合；`scheduling.task_limit` 默认 2，限制单个 Bot 的并行 Agent task。两者不限制独立编码工作的执行器。结果未知的回合继续占用 slot，先核对再释放。排队状态按真实 gate 显示当前回合、steer 核对、Provider 串行、task 上限、机器 slot 或待核对。本人消息优先，其余按 admission sequence、会话与 trigger 稳定排序；受阻 task 不挡住可运行的本人消息。Node 不提供项目目录锁或跨设备全局文件锁。多个 Agent 需要修改同一项目时，使用独立 worktree 或独立根目录隔离。
+本机 scheduler 按 Provider descriptor 检查实际 Bot/provider instance 的并发能力。Serial instance 的回合互斥，其他 Bot 可并行；Parallel instance 可同时运行主聊天和独立 task。`config.json` 的 `scheduling.machine_slots` 默认 4，限制本机所有 Bot 协调回合；`scheduling.task_limit` 默认 2，限制单个 Bot 的并行 Agent task。两者不限制独立编码工作的执行器。结果未知的回合继续占用 slot，先核对再释放。排队状态按真实 gate 显示当前回合、steer 核对、Provider 串行、task 上限、机器 slot 或待核对。本人消息优先，其余按 admission sequence、会话与 trigger 稳定排序；受阻 task 不挡住可运行的本人消息。业务 Task Assignment 在本机核验已声明资源目录冲突，同目录写任务需要等待。该约束不构成跨设备全局文件锁。多个 Agent 修改同一项目时，仍使用独立 worktree 或独立根目录隔离。
 
-浏览器在 IndexedDB 中保留尚未确认的消息和它的设备签名，入口把消息写进自己的签名日志并回执后删除。入口回执 `pending_delivery` 时，由入口负责继续投递给调度 Node，浏览器不再重发。回执丢失时，浏览器经同一或另一个访问地址原样重发同一请求，Node 按消息编号返回原来的结果。刷新后重试须使用原内容和汇报意图；改写正文会被拒绝，避免把新内容误当成旧操作重试。
+浏览器在 IndexedDB 中逐条保存输入、附件和设备签名。入口确认保存后由入口继续投递，客户端回读原消息的逐阶段状态；历史确认接纳后才清理普通本地记录。拒绝和未知项保留原身份，查询结果未知不重发。只有明确未开始且 Node 允许重试的失败输入，才显示“重试原输入”，用新的签名 Release 继续原任务。取消的输入不能复活。详细回执与幂等边界见 [可靠调度回执](node-protocol.md#可靠调度回执)。
 
 ## 作为后台应用运行
 
@@ -585,9 +607,9 @@ vibeface service uninstall
 
 ```sh
 "$VIBEFACE_INSTALL_ROOT/current/vibeface" update configure \
-	--install-root "$VIBEFACE_INSTALL_ROOT" \
-	--channel stable \
-	--automatic true
+    --install-root "$VIBEFACE_INSTALL_ROOT" \
+    --channel stable \
+    --automatic true
 ```
 
 将 `stable` 改为 `nightly` 可跟随开发预发布。Stable 不会安装 Nightly；尚无正式版时不会自动更换版本。切换渠道不触发降级。更新渠道和安装目录必须先配置；已有 Nightly 安装应显式选择 `nightly`。
@@ -608,9 +630,9 @@ vibeface service uninstall
 
 ```sh
 "$VIBEFACE_INSTALL_ROOT/current/vibeface" update configure \
-	--install-root "$VIBEFACE_INSTALL_ROOT" \
-	--channel stable \
-	--automatic false
+    --install-root "$VIBEFACE_INSTALL_ROOT" \
+    --channel stable \
+    --automatic false
 ```
 
 这会移除更新定时服务，手动 `check` 和 `apply` 仍可使用。`vibeface service install-updater` 和 `uninstall-updater` 可单独安装或移除定时服务，不改变已保存的更新策略。策略的 `automatic` 为 `false` 时，即使手动安装定时服务也不会自动更新。重新配置自动更新会重新安装或移除定时服务。

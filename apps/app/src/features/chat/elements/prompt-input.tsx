@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type ChangeEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
+import { useId, useLayoutEffect, useRef, useState, type ChangeEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
 import { ArrowUpIcon, CircleAlertIcon, PaperclipIcon, SquareIcon, XIcon } from 'lucide-react'
 import { Spinner } from '@/components/ui/spinner'
 import { cn } from '@/lib/utils'
@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/input-group'
 
 export function PromptInput({
+  id,
   value,
   hint,
   reason,
@@ -24,12 +25,15 @@ export function PromptInput({
   files = [],
   onFiles,
   above,
+  target,
+  sendLabel = '发送',
+  label = '给 Bot 发消息',
   tint,
   children,
 }: {
+  id?: string
   value: string
   hint: string
-  /** Why it cannot send; a disabled box shows it in place of its placeholder, or under the box while it holds a draft. */
   reason: string
   disabled: boolean
   busy: boolean
@@ -40,6 +44,9 @@ export function PromptInput({
   onFiles?: (files: File[]) => void
   /** Floats over the transcript, just above the box. */
   above?: ReactNode
+  target?: ReactNode
+  sendLabel?: string
+  label?: string
   /** The bot's tint, taken by the send button once there is something to send. */
   tint?: { fill: string; ink: string }
   children?: ReactNode
@@ -47,19 +54,18 @@ export function PromptInput({
   const formRef = useRef<HTMLFormElement>(null)
   const pickerRef = useRef<HTMLInputElement>(null)
   const textRef = useRef<HTMLTextAreaElement>(null)
+  const hintId = useId()
   // One line until the text is focused, so the transcript keeps the screen; it grows while writing.
   const [open, setOpen] = useState(false)
   // Buttons keep the focus on the text, so a tap acts instead of collapsing the box under the finger.
   const keepFocus = (event: MouseEvent) => event.preventDefault()
-  // A written message is always sendable; while writing, Stop moves beside Send instead of leaving.
   const drafting = Boolean(value.trim() || files.length)
-  const stop = drafting ? undefined : onStop
   // Caught on pick: the upload would only refuse it after the person pressed Send.
   const unfits = (file: File) => !file.size || file.size > attachmentLimit
   const unfit = files.find(unfits)
   const sendable = !disabled && !busy && drafting && !unfit
   const limit = `${attachmentLimit / 2 ** 20} MiB`
-  const note = hint || (disabled && value ? reason : '')
+  const note = disabled && reason ? reason : hint
   // The box sizes itself to the text (field-sizing), already at its new height when this runs; CSS cannot ease
   // between two content heights, so the change is replayed from the height last shown. It lets go once there, so a
   // resized window still fits the text.
@@ -87,22 +93,20 @@ export function PromptInput({
         onSubmit()
       }}
     >
+      {target ? <div className="mb-2 flex min-w-0 flex-wrap items-center gap-2 text-meta">{target}</div> : null}
       <div className="relative">
         <div data-toast-above="" className="absolute start-0 bottom-full flex max-w-[calc(100%-3.5rem)] pb-2 empty:hidden">{above}</div>
         <InputGroup className="rounded-2xl bg-card shadow-sm dark:bg-card has-[[data-slot=input-group-control]:focus-visible]:ring-2">
           <InputGroupTextarea
             ref={textRef}
-            id="message-text"
+            id={id}
             name="text"
             required={!files.length}
             maxLength={100000}
             value={value}
-            placeholder={disabled && reason ? reason : files.length ? '给附件写句说明' : '发消息'}
-            disabled={disabled}
-            // Read-only, not disabled, while sending: a disabled box drops focus, which folds it and closes a phone's keyboard.
-            readOnly={busy}
-            aria-label="给 Bot 发消息"
-            aria-describedby={note ? 'manager-hint' : undefined}
+            placeholder={files.length ? '给附件写句说明' : '发消息'}
+            aria-label={label}
+            aria-describedby={note ? hintId : undefined}
             title="Enter 发送，Shift+Enter 换行"
             rows={1}
             className={cn('px-4 transition-[height,color,background-color,border-color,box-shadow] duration-200', open ? 'basis-auto min-h-24 max-h-[min(20rem,calc(var(--app-height,100dvh)*0.45))] overflow-y-auto py-3' : 'h-13 min-h-13 overflow-hidden py-3.5 md:h-12 md:min-h-12 md:py-3')}
@@ -130,23 +134,22 @@ export function PromptInput({
               </span>)}
             </> : null}
             <span className="ms-auto flex shrink-0 gap-1">
-              {drafting && onStop ? <InputGroupButton type="button" variant="outline" size="icon-sm" aria-label="停止" title="停止" className="size-9 rounded-full max-md:size-11" onMouseDown={keepFocus} onClick={onStop}>
+              {onStop ? <InputGroupButton type="button" variant="outline" size="icon-sm" aria-label="停止" title="停止" className="size-9 rounded-full max-md:size-11" onMouseDown={keepFocus} onClick={onStop}>
                 <SquareIcon aria-hidden="true" className="fill-current" />
               </InputGroupButton> : null}
               <InputGroupButton
-                type={stop ? 'button' : 'submit'}
-                variant={stop ? 'outline' : 'default'}
+                type="submit"
+                variant="default"
                 size="icon-sm"
-                disabled={!stop && !sendable}
+                disabled={!sendable}
                 aria-busy={busy || undefined}
-                aria-label={stop ? '停止' : '发送'}
-                title={stop ? '停止' : '发送'}
-                style={!stop && sendable && tint ? { backgroundColor: tint.fill, color: tint.ink } : undefined}
-                className={cn('size-9 rounded-full max-md:size-11', !stop && (sendable ? 'hover:opacity-88' : 'bg-muted text-muted-foreground disabled:opacity-100'))}
+                aria-label={sendLabel}
+                title={sendLabel}
+                style={sendable && tint ? { backgroundColor: tint.fill, color: tint.ink } : undefined}
+                className={cn('size-9 rounded-full max-md:size-11', sendable ? 'hover:opacity-88' : 'bg-muted text-muted-foreground disabled:opacity-100')}
                 onMouseDown={keepFocus}
-                onClick={stop}
               >
-                {stop ? <SquareIcon aria-hidden="true" className="fill-current" /> : busy ? <Spinner aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}
+                {busy ? <Spinner aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}
               </InputGroupButton>
             </span>
           </InputGroupAddon>
@@ -154,7 +157,7 @@ export function PromptInput({
       </div>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-2 text-meta text-muted-foreground empty:hidden">
         {unfit ? <p role="alert" className="flex basis-full items-center gap-1.5 text-danger"><CircleAlertIcon aria-hidden="true" className="size-4 shrink-0" />{unfit.size ? `附件超过 ${limit}` : '附件是空文件'}，移除后再发送</p> : null}
-        {note ? <p id="manager-hint">{note}</p> : null}
+        {note ? <p id={hintId}>{note}</p> : null}
         {children}
       </div>
     </form>

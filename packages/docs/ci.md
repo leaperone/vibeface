@@ -42,7 +42,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 `www` 使用 Node.js 24 和冻结的 pnpm 依赖，依次运行 `typecheck`、`build`、`check:static`，上传 `apps/www/dist/client` 为 `www-<SHA>-<attempt>` 制品。门户与独立 App 分别构建；根 `packages/docs/` 是门户文档正文的唯一来源，修改文档也会触发 `www`。
 
-改 `apps/core/migrations/` 或 `apps/core/src/delivery/schema.sql` 的 schema 必须同时提高共享控制 crate `crates/control/src/lib.rs` 的 `DATA_EPOCH`，并更新 `apps/core/src/config.rs` 中相邻的 `DATA_EPOCH_SCHEMA_SHA256`；否则 Node 快速测试 `schema_changes_bump_the_data_epoch` 失败。存储 epoch 不变时旧数据库能打开，运行中才因缺列出错，自更新也会误判可原地升级。`install.sh` 中写死的 epoch 一并修改，由 `ci.py --self-test` 核对。
+首个正式版前按 `AGENTS.md` 保持 `DATA_EPOCH=1`，不随功能或 Nightly 递增。改 `apps/core/migrations/` 或 `apps/core/src/delivery/schema.sql` 时直接维护最终 schema，并更新 `apps/core/src/config.rs` 的 `DATA_EPOCH_SCHEMA_SHA256`。当前检查比较 schema digest，不证明 epoch 增加。确需调整 epoch 时须单独说明理由，并同步 `crates/control/src/lib.rs`、`install.sh` 与 `ci.py --self-test`；不以新增迁移或兼容回退代替最终数据形状。
 
 Web 路径优先于 Node 路径，只有 `packages/client/src/avatar/face.ts` 与 `derived-faces.json` 例外：它们按 Node 路径选取，因为这组向量也是 Node Rust 测试的输入，核对 Node 由 bot ID 派生的长相与客户端一致；Node 受影响时 Web 检查照常运行。Node 对 Protocol、Bridge、Secure 的依赖用于向上扩展检查范围。PR 按 `merge-base(base, head)..head` 的完整差异选取，删除与重命名包括旧、新路径。无法识别的输入选择整个工作区核心检查。
 
@@ -155,11 +155,11 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 ## 定期、手动和发布检查
 
-每日 UTC 03:23 定时和 Actions 中手动运行 `ci` 强制执行扩展检查，不受路径影响。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或三平台打包。开发分支 PR 不触发 `ci`。产品 `v` Tag 由 `release.yml` 并行构建全部产品目标，`www-v` 独立构建官网。`ci` 的手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
+定时检查每 4 小时运行一次，使用 `23 */4 * * *`，每日 UTC 00:23、04:23、08:23、12:23、16:23、20:23 发起。定时和 Actions 中手动运行 `ci` 强制执行扩展检查，不受路径影响。merge queue 执行整个工作区的核心检查，不启用慢测试、MSRV 或三平台打包。开发分支 PR 不触发 `ci`。产品 `v` Tag 由 `release.yml` 并行构建全部产品目标，`www-v` 独立构建官网。`ci` 的手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
 
-每日 Nightly 接在同一 schedule run 的 `ci-gate` 后，不新增第二套定时全量 CI。`daily-nightly` 仅接受 main 的 schedule，使用固定 concurrency 且不取消进行中的协调。启用需要明确授权未来每日机械版本 PR 自动 squash，并配置专用单仓库 `NIGHTLY_RELEASE_TOKEN`；当前实现不代表凭证或自动发布已启用。该 PAT 需 Contents、Pull requests、Actions 所需权限，只处理版本 PR 创建和普通 squash；版本 branch、tag 与精确 workflow dispatch 使用 job 级 `GITHUB_TOKEN`。未配置时明确失败，不修改权限或保护规则。
+每四小时 Nightly 接在同一 schedule run 的 `ci-gate` 后，不新增第二套定时全量 CI。`daily-nightly` 仅接受 main 的 schedule，以显式 `!cancelled()` 和 `ci-gate` success 作为条件，允许上游不适用的检查正常跳过。协调器使用固定 concurrency 且不取消进行中的协调。启用需要明确授权未来每四小时机械版本 PR 自动 squash，并配置专用单仓库 `NIGHTLY_RELEASE_TOKEN`；当前实现不代表凭证或自动发布已启用。该 PAT 需 Contents、Pull requests、Actions 所需权限，只处理版本 PR 创建和普通 squash；版本 branch、tag 与精确 workflow dispatch 使用 job 级 `GITHUB_TOKEN`。未配置时明确失败，不修改权限或保护规则。
 
-协调脚本先验证精确机械版本 diff 和 `cargo metadata --locked --no-deps`，合并后只接受真实 squash SHA 的 main push CI success，再并行启动产品与官网发布组。不会为版本分支再派发一轮全量检查，也不为合并 SHA 再跑扩展全量 CI。原 run 的 `created_at` 固定当日身份，重跑复用原 PR、版本、SHA 和留存制品。quick-check 与 preflight 注册 `python3 scripts/daily-nightly.py --self-test` 及 Python 语法检查，涵盖真实临时 Git、篡改 diff、完整产品发布门、未知写入对账和原 artifact 恢复。具体发布顺序与停止条件见 [每日 Nightly 的发布约束](releasing.md#每日-nightly-的发布约束)。
+协调脚本先验证精确机械版本 diff 和 `cargo metadata --locked --no-deps`，合并后只接受真实 squash SHA 的 main push CI success，再并行启动产品与官网发布组。不会为版本分支再派发一轮全量检查，也不为合并 SHA 再跑扩展全量 CI。原 run 的 `created_at` 转为 UTC 后向下取整到四小时批次，使用 `bot/daily-nightly/YYYYMMDDHH` 分支；版本日期保留 `YYYYMMDD`。不同批次分配新 PR 和递增版本，延迟启动或跨日重跑复用原批次 PR、版本、SHA 和留存制品。旧批次若尚无分支与 PR，而 main 的产品或官网 Nightly 日期已更晚，则拒绝初始化，避免版本倒退。quick-check 与 preflight 注册 `python3 scripts/daily-nightly.py --self-test` 及 Python 语法检查，涵盖六个 UTC 批次、同批次恢复、同日递增、旧批次拒绝倒退、真实临时 Git、篡改 diff、完整产品发布门、未知写入对账和原 artifact 恢复。具体发布顺序与停止条件见 [每 4 小时 Nightly 的发布约束](releasing.md#每-4-小时-nightly-的发布约束)。
 
 | 扩展检查 | 执行范围 |
 | --- | --- |

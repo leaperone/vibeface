@@ -2,8 +2,8 @@ import '@/platform/polyfills'
 import '../global.css'
 
 import { useLinkingURL } from 'expo-linking'
-import { Stack, router } from 'expo-router'
-import { X } from 'lucide-react-native'
+import { Link, Stack, router, usePathname } from 'expo-router'
+import { Inbox, ListChecks, MessageSquare, X } from 'lucide-react-native'
 import * as SystemUI from 'expo-system-ui'
 import { StatusBar } from 'expo-status-bar'
 import { useEffect } from 'react'
@@ -11,9 +11,11 @@ import { Platform, View } from 'react-native'
 import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { KeyboardProvider } from 'react-native-keyboard-controller'
 import { useCSSVariable } from 'uniwind'
+import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
+import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
 import { LiveWorkspace, useLive } from '@/data/live'
 import { HomeList } from '@/features/home/list'
@@ -51,6 +53,8 @@ function Screens() {
     else router.navigate('/')
   }, [url, ready])
   const wide = useWide()
+  const pathname = usePathname()
+  const insets = useSafeAreaInsets()
   // Beside the sidebar, its own screens are roots: no back button or swipe to the empty placeholder.
   const root = wide ? { headerBackVisible: false, gestureEnabled: false } : {}
   // The Stack keeps its place in the tree whether or not the sidebar shows, so a rotation never resets the route.
@@ -81,6 +85,13 @@ function Screens() {
             <Stack.Screen name="b/[botId]/context" options={{ title: '上下文和协作' }} />
             <Stack.Screen name="b/[botId]/work/[workId]" options={{ title: '任务' }} />
             <Stack.Screen name="tasks" options={{ title: '任务', ...root }} />
+            <Stack.Screen name="new-task" options={{ title: '新任务' }} />
+            <Stack.Screen name="task/[taskId]" options={{ title: '任务对话' }} />
+            <Stack.Screen name="task/[taskId]/context" options={{ title: '任务上下文和历史' }} />
+            <Stack.Screen name="channels" options={{ title: '频道' }} />
+            <Stack.Screen name="new-channel" options={{ title: '新频道' }} />
+            <Stack.Screen name="channel/[channelId]" options={{ title: '频道' }} />
+            <Stack.Screen name="channel/[channelId]/settings" options={{ title: '频道设置' }} />
             <Stack.Screen name="new-bot" options={{ title: '新 Bot', presentation: 'modal', headerLeft: Close }} />
             {/* Opened from the new bot sheet it is a sheet too, with no back button of its own. */}
             <Stack.Screen name="ai" options={({ route }) => ({ title: 'Bot 与任务', headerLeft: (route.params as { sheet?: string } | undefined)?.sheet ? Close : undefined })} />
@@ -96,6 +107,11 @@ function Screens() {
             <Stack.Screen name="switch-network" options={{ headerShown: false, presentation: 'formSheet', sheetAllowedDetents: 'fitToContents', sheetGrabberVisible: true }} />
           </Stack.Protected>
         </Stack>
+        {ready && !wide && ['/', '/tasks', '/inbox'].includes(pathname) ? <View className="flex-row border-t border-border bg-background px-3 pt-1" style={{ paddingBottom: insets.bottom }}>
+          <Link href="/" replace asChild><Button variant="ghost" className="min-h-14 flex-1 flex-col gap-1" accessibilityLabel="消息" accessibilityState={{ selected: pathname === '/' }}><Icon as={MessageSquare} /><Text className="text-meta">消息</Text></Button></Link>
+          <Link href="/tasks" replace asChild><Button variant="ghost" className="min-h-14 flex-1 flex-col gap-1" accessibilityLabel="任务" accessibilityState={{ selected: pathname === '/tasks' }}><Icon as={ListChecks} /><Text className="text-meta">任务</Text></Button></Link>
+          <Link href="/inbox" replace asChild><Button variant="ghost" className="min-h-14 flex-1 flex-col gap-1" accessibilityLabel="待处理" accessibilityState={{ selected: pathname === '/inbox' }}><Icon as={Inbox} /><Text className="text-meta">待处理</Text></Button></Link>
+        </View> : null}
       </View>
     </View>
   </>

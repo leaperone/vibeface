@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, Bell, ChevronLeft, CircleAlert, Hand, LoaderCircle, Plus, RefreshCw, RotateCw, ShieldAlert, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Bell, ChevronLeft, CircleAlert, Hand, LoaderCircle, MessagesSquare, Plus, RefreshCw, RotateCw, ShieldAlert, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "@/lib/utils"
@@ -22,7 +22,7 @@ import {
   SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger, useSidebar,
 } from "@/components/ui/sidebar"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { BotPanelButton } from "./bot-panel"
+import { BotPanelButton, openBotContext } from "./bot-panel"
 import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
 import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
@@ -60,12 +60,12 @@ export function MoodTag({ mood }: { mood: Mood }) {
 }
 
 const JOINS_SEEN = "vibeface.joins-seen"
-const titles: Record<string, string> = { "/": "消息", "/inbox": terms.inbox.label, "/tasks": terms.task.label, "/devices": terms.myDevices.label, "/settings": terms.settings.label, "/settings/logs": "日志", "/settings/lab": "实验室", "/settings/lab/transfers": "文件传输实验" }
+const titles: Record<string, string> = { "/": "消息", "/inbox": terms.inbox.label, "/tasks": terms.task.label, "/channels": "频道", "/devices": terms.myDevices.label, "/settings": terms.settings.label, "/settings/logs": "日志", "/settings/lab": "实验室", "/settings/lab/transfers": "文件传输实验" }
 
 function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: boolean }) {
   const workspace = useWorkspace()
   // A question answered here stays on screen, collapsed, until the next read; it no longer counts.
-  const waiting = waitingItems(useInbox()).length
+  const waiting = waitingItems(useInbox()).length + (workspace.workspaceState?.tasks ?? []).filter((task) => ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'].includes(task.state)).length
   // A recovery about to take over outranks every other waiting item, so 待处理 shows a red shield instead of a count.
   const device = useDevice()
   const recovering = Boolean(device.pendingRecovery)
@@ -76,6 +76,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const chatRoute = pathname.startsWith("/b/")
   const taskOpen = /^\/b\/[^/]+\/work\//.test(pathname)
+  const scopedChat = pathname.startsWith('/channels/') || /^\/tasks\/[^/]+/.test(pathname)
   const back = backTo(pathname, useRouterState({ select: (state) => (state.location.search as { bot?: string }).bot }))
   const nested = Boolean(back) && back !== "/" && !chatRoute
   const [creatingBot, setCreatingBot] = useState(false)
@@ -87,7 +88,8 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   // On a phone the back button stands in for the sidebar, so a device's page is titled by the device.
   const deviceId = /^\/devices\/([^/]+)$/.exec(pathname)?.[1]
   const deviceName = isMobile && deviceId ? device.directory?.members.find((member) => member.device_id === decodeURIComponent(deviceId))?.name : undefined
-  const title = chatRoute ? "对话" : deviceName || (titles[pathname] ?? (pathname.startsWith("/devices") ? terms.myDevices.label : ""))
+  const scopedTitle = pathname.startsWith('/channels/') ? '频道' : pathname.startsWith('/tasks/') ? '任务' : ''
+  const title = chatRoute ? "对话" : scopedTitle || deviceName || (titles[pathname] ?? (pathname.startsWith("/devices") ? terms.myDevices.label : ""))
   const navigate = useNavigate()
   const joins = useOpenJoins()
   const [actionsSlot, setActionsSlot] = useState<HTMLElement | null>(null)
@@ -95,6 +97,9 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   const phoneHome = isMobile && pathname === "/"
   const inboxInHeader = pathname !== "/inbox"
   const devicesAttention = joins.length > 0 || workspace.nodes.some((node) => !node.revoked && !node.online)
+  const latest = useRef(workspace)
+  latest.current = workspace
+  useEffect(() => { void latest.current.readWorkspaceState().catch(() => {}) }, [workspace.generation])
 
   useEffect(() => { setOpenMobile(false) }, [pathname, setOpenMobile])
   // Each request toasts once, also across reloads of this tab; on a page that lists it, seeing it there counts.
@@ -134,6 +139,11 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
             </SidebarMenu>
           </SidebarGroup>
           <SidebarGroup>
+            <SidebarGroupLabel>频道</SidebarGroupLabel>
+            <SidebarGroupAction title="管理频道" aria-label="管理频道" onClick={() => void navigate({ to: "/channels" })}><Plus aria-hidden="true" /></SidebarGroupAction>
+            <SidebarGroupContent><SidebarMenu>{(workspace.workspaceState?.channels ?? []).map((channel) => <SidebarMenuItem key={channel.channel_id}><SidebarMenuButton asChild isActive={pathname === `/channels/${channel.channel_id}`} className="h-10 max-md:h-11"><Link to="/channels/$channelId" params={{ channelId: channel.channel_id }}><MessagesSquare aria-hidden="true" /><span className="truncate">{channel.title}</span></Link></SidebarMenuButton></SidebarMenuItem>)}{!workspace.workspaceState?.channels.length ? <SidebarMenuItem><SidebarMenuButton asChild><Link to="/channels"><MessagesSquare aria-hidden="true" /><span>查看频道</span></Link></SidebarMenuButton></SidebarMenuItem> : null}</SidebarMenu></SidebarGroupContent>
+          </SidebarGroup>
+          <SidebarGroup>
             <SidebarGroupLabel>Bot</SidebarGroupLabel>
             <SidebarGroupAction title="新 Bot" aria-label="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={openCreator}><Plus /></SidebarGroupAction>
             <SidebarGroupContent>
@@ -141,7 +151,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
                 {!workspace.bots.length && !workspace.synced ? [0, 1, 2].map((item) => <SidebarMenuItem key={item} aria-hidden="true"><Skeleton className="h-10 max-md:h-11" /></SidebarMenuItem>) : null}
                 {workspace.bots.map((bot) => {
                   const active = chatRoute && !missingBot && bot.bot_id === workspace.selectedBot?.bot_id
-                  const marked = !active && (workspace.notifications.some((item) => item.conversation_id === bot.conversation_id && !workspace.ignoredNotifications.has(item.notification_id)))
+                  const marked = !active && (workspace.notifications.some((item) => item.conversation_id === bot.conversation_id && item.target?.kind === 'bot_main' && item.target.bot_id === bot.bot_id && !workspace.ignoredNotifications.has(item.notification_id)))
                   const mood = botMood(bot, workspace)
                   return <SidebarMenuItem key={bot.bot_id}>
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
@@ -183,6 +193,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
             <div className="flex min-w-0 flex-1 items-center gap-2">
               {/* On the chat route the bot's name is the button that opens its panel; the heading around it still takes the focus. */}
               <h1 ref={landing ? claimFocus : undefined} tabIndex={-1} className={cn("min-w-0 text-title font-semibold outline-none", botTitle ? "flex" : "truncate")} title={botTitle ? undefined : title}>{botTitle ? <BotPanelButton /> : title}</h1>
+              {botTitle ? <Button type="button" variant="ghost" size="sm" onClick={openBotContext}>上下文和历史</Button> : null}
             </div>
             <div ref={setActionsSlot} className="flex shrink-0 items-center gap-1 empty:hidden" />
           </div>
@@ -214,10 +225,10 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
         {/* Kept laid out while hidden so the chat keeps its scroll position across pages. */}
         <div className={cn("flex min-h-0 min-w-0 flex-1", !chatRoute && "invisible absolute inset-x-0 top-14 bottom-0")} inert={!chatRoute} aria-hidden={!chatRoute || undefined}>
-          <div className="conversation-view"><ConversationScreen missing={missingBot} /></div>
+          <div className="conversation-view"><ConversationScreen missing={missingBot} active={/^\/b\/[^/]+\/?$/.test(pathname) && !missingBot} /></div>
           {chatRoute ? children : null}
         </div>
-        {chatRoute ? null : <div className="workspace-screen">{children}</div>}
+        {chatRoute ? null : <div className={scopedChat ? 'flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden' : 'workspace-screen'}>{children}</div>}
       </SidebarInset>
       <BotForm open={creatingBot} onOpenChange={setCreatingBot} restoreFocus={() => {
         const target = creatorTrigger.current

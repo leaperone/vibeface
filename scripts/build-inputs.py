@@ -22,7 +22,7 @@ OUTPUTS = {"crypto": "apps/app/generated", "web": "apps/app/dist/client"}
 COMMON = {".gitignore", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain", "scripts/build-inputs.py"}
 INPUTS = {
     "crypto": ("crates/secure/", "scripts/build-web-crypto.sh", "scripts/release-rustflags.py"),
-    "web": ("apps/app/", "packages/client/", "packages/theme/", "package.json",
+    "web": ("apps/app/", "packages/client/", "packages/theme/", "config/public-bootstrap.json", "package.json",
             "pnpm-lock.yaml", "pnpm-workspace.yaml", "scripts/build-web.sh"),
 }
 CACHE_POLICIES = (
@@ -57,7 +57,7 @@ def content_security_policy(shell):
     policy = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'"
     if hashes:
         policy += " " + " ".join(hashes)
-    return policy + "; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    return policy + "; style-src 'self' 'unsafe-inline'; connect-src 'self' https: ws: wss:; img-src 'self' data: blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 
 
 def static_headers(policy):
@@ -386,6 +386,9 @@ def self_test():
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         (repo / ".gitignore").write_text(".artifacts/\napps/app/generated/\napps/app/dist/\n")
         (repo / "Cargo.toml").write_text("source one")
+        defaults = repo / "config/public-bootstrap.json"
+        defaults.parent.mkdir()
+        defaults.write_text('{"issuer":"fixture-one"}')
         for component in OUTPUTS:
             prepare(repo, component)
             output = repo / OUTPUTS[component]
@@ -395,6 +398,11 @@ def self_test():
             finish(repo, component)
             check(repo, component)
         headers = (repo / OUTPUTS["web"] / "_headers").read_text()
+        csp = next(line.split(": ", 1)[1] for line in headers.splitlines()
+                   if line.startswith("  Content-Security-Policy: "))
+        directives = {parts[0]: parts[1:] for directive in csp.split(";")
+                      if (parts := directive.split())}
+        assert directives["connect-src"] == ["'self'", "https:", "ws:", "wss:"]
         rules = []
         for line in headers.splitlines():
             if line and not line.startswith(" "):
@@ -441,6 +449,16 @@ def self_test():
         else:
             raise AssertionError("extra output was accepted")
         (output / "private-note").unlink()
+        defaults.write_text('{"issuer":"fixture-two"}')
+        check(repo, "crypto")
+        try:
+            check(repo, "web")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("changed public bootstrap defaults reused stale web output")
+        defaults.write_text('{"issuer":"fixture-one"}')
+        check(repo, "web")
         (repo / "Cargo.toml").write_text("changed source")
         for component in OUTPUTS:
             try:
