@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { businessUrl, parsePrivateOrigin } from '../src/main/business-url.js'
+import { businessNavigation, businessUrl, parsePrivateOrigin } from '../src/main/business-url.js'
 import type { Access, Inspect } from '../src/main/control-types.js'
 
 const DEVICE = 'a'.repeat(64)
@@ -101,5 +101,51 @@ describe('businessUrl', () => {
     expect(() =>
       businessUrl({ kind: 'public_entry', url: 'http://vb.example.com/', deviceId: DEVICE }, inspect({ publicEntry: true }))
     ).toThrow(/HTTPS/)
+  })
+})
+
+describe('businessNavigation', () => {
+  const invite = (origin: string | null, ticket = 'vibeface1qq2ww3ee4') => ({ origin, ticket })
+
+  it.each([
+    'http://localhost:4790',
+    'http://127.0.0.1:4790',
+    'http://127.0.0.1:4791',
+    'http://localhost:4791',
+  ])('opens the selected local listener %s in the business window', (origin) => {
+    expect(businessNavigation(access(), inspect(), invite(origin))).toEqual({
+      kind: 'business',
+      url: 'http://127.0.0.1:4791/join#vibeface1qq2ww3ee4',
+    })
+  })
+
+  it('opens an invite for another local Node in the external browser target', () => {
+    expect(businessNavigation(access(), inspect(), invite('http://localhost:5800'))).toEqual({
+      kind: 'external',
+      url: 'http://localhost:5800/join#vibeface1qq2ww3ee4',
+    })
+  })
+
+  it('keeps a raw ticket on the selected Node', () => {
+    expect(businessNavigation(access(), inspect(), invite(null))).toEqual({
+      kind: 'business',
+      url: 'http://127.0.0.1:4791/join#vibeface1qq2ww3ee4',
+    })
+  })
+
+  it('keeps a remote origin and ticket for external confirmation', () => {
+    expect(businessNavigation(access(), inspect(), invite('https://vb.example.com'))).toEqual({
+      kind: 'external',
+      url: 'https://vb.example.com/join#vibeface1qq2ww3ee4',
+    })
+  })
+
+  it('owns the selected public origin as well as its private listener', () => {
+    const publicAccess: Access = { kind: 'public_entry', url: 'https://vb.example.com/', deviceId: DEVICE }
+    expect(businessNavigation(publicAccess, inspect({ publicEntry: true }), invite('https://vb.example.com'))).toEqual({
+      kind: 'business',
+      url: 'https://vb.example.com/join#vibeface1qq2ww3ee4',
+    })
+    expect(businessNavigation(publicAccess, inspect({ publicEntry: true }), invite('http://127.0.0.1:4791')).kind).toBe('business')
   })
 })

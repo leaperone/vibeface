@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { runControl, type CoreProgram } from './control-client.js'
 import { parseAccess, parseInspect, type Inspect } from './control-types.js'
-import { businessUrl, parsePrivateOrigin } from './business-url.js'
+import { businessNavigation, parsePrivateOrigin, type BusinessNavigation, type JoinRequest } from './business-url.js'
 import { CoreLifecycle } from './lifecycle.js'
 import { defaultSettings, loadSettings, saveSettings, type Settings } from './settings.js'
 import type { CoreState, PreferenceKey, RuntimeState } from '../shared/contract.js'
@@ -228,7 +228,7 @@ export class CoreSession {
   }
 
   /** Resolve the Core-served URL for the business window, canonicalized to Core's private origin. */
-  async businessTarget(): Promise<string> {
+  async businessTarget(invite?: JoinRequest): Promise<BusinessNavigation> {
     const dataDir = this.requireDataDir()
     const inspect = await this.inspect(dataDir)
     if (inspect.status !== 'running') throw new Error('Core 还没有运行，无法打开 Vibeface 窗口。')
@@ -238,7 +238,7 @@ export class CoreSession {
     )
     this.core = this.stateFromInspect(inspect)
     this.options.onChange()
-    return businessUrl(access, inspect)
+    return businessNavigation(access, inspect, invite)
   }
 
   /** Quit closes only a Core this app started; an attached service is left alone. */

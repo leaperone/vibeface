@@ -64,8 +64,9 @@ describe('CoreSession against protocol fixtures', () => {
     expect(session.state().kind).toBe('owned')
     expect(session.ownsCore()).toBe(true)
     const target = await session.businessTarget()
-    expect(target.startsWith('http://127.0.0.1:4791/')).toBe(true)
-    expect(target).toContain('#local=')
+    expect(target.kind).toBe('business')
+    expect(target.url.startsWith('http://127.0.0.1:4791/')).toBe(true)
+    expect(target.url).toContain('#local=')
   })
 
   it('stopping an owned Core leaves the directory offline, and it can start again', async () => {

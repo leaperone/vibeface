@@ -10,6 +10,12 @@
 
 import type { Access, Inspect } from './control-types.js'
 
+export type BusinessNavigation =
+  | { kind: 'business'; url: string }
+  | { kind: 'external'; url: string }
+
+export type JoinRequest = { origin: string | null; ticket: string }
+
 export type PrivateOrigin = { host: string; port: number; origin: string }
 
 const HEX64 = /^[0-9a-f]{64}$/
@@ -74,4 +80,46 @@ export function businessUrl(access: Access, inspect: Inspect): string {
   const target = new URL(`${parsePrivateOrigin(inspect.localListen).origin}${url.pathname}${url.search}`)
   target.hash = url.hash
   return target.toString()
+}
+
+/** Resolve invite ownership from the selected Core's inspected listeners and access URL. */
+export function businessNavigation(
+  access: Access,
+  inspect: Inspect,
+  invite?: JoinRequest
+): BusinessNavigation {
+  const target = businessUrl(access, inspect)
+  if (!invite) return { kind: 'business', url: target }
+
+  const targetOrigin = new URL(target).origin
+  if (invite.origin !== null && !ownsInviteOrigin(invite.origin, access, inspect, targetOrigin)) {
+    return { kind: 'external', url: `${invite.origin}/join#${invite.ticket}` }
+  }
+  const join = new URL('/join', targetOrigin)
+  join.hash = invite.ticket
+  return { kind: 'business', url: join.toString() }
+}
+
+function ownsInviteOrigin(origin: string, access: Access, inspect: Inspect, targetOrigin: string): boolean {
+  const selected = [targetOrigin, new URL(access.url).origin, parsePrivateOrigin(inspect.localListen).origin]
+  return selected.some((candidate) => sameListenerOrigin(origin, candidate))
+}
+
+function sameListenerOrigin(left: string, right: string): boolean {
+  let a: URL
+  let b: URL
+  try {
+    a = new URL(left)
+    b = new URL(right)
+  } catch {
+    return false
+  }
+  if (a.origin === b.origin) return true
+  if (a.protocol !== 'http:' || b.protocol !== 'http:' || effectivePort(a) !== effectivePort(b)) return false
+  return (a.hostname === 'localhost' && b.hostname === '127.0.0.1')
+    || (b.hostname === 'localhost' && a.hostname === '127.0.0.1')
+}
+
+function effectivePort(url: URL): string {
+  return url.port || (url.protocol === 'https:' ? '443' : '80')
 }

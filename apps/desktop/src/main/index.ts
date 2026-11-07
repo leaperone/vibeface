@@ -128,9 +128,9 @@ async function loadBusiness(target: string): Promise<void> {
 /**
  * Open Core's private UI origin. An invite enters the ordinary join flow directly.
  */
-async function openBusiness(invite?: { ticket: string }): Promise<void> {
+async function openBusiness(): Promise<void> {
   const target = await requireSession().businessTarget()
-  await loadBusiness(invite ? `${new URL(target).origin}/join#${invite.ticket}` : target)
+  await loadBusiness(target.url)
 }
 
 function openBusinessSafely(): void {
@@ -150,22 +150,29 @@ function reportFailure(title: string, error: unknown): void {
  */
 async function handleJoin(link: DeepLink): Promise<void> {
   if (link.kind !== 'join') return
-  if (link.origin !== null && !isLoopbackOrigin(link.origin)) {
+  const target = await requireSession().businessTarget(link).catch((error: unknown) => {
+    if (link.origin !== null && !isLoopbackOrigin(link.origin)) {
+      return { kind: 'external' as const, url: `${link.origin}/join#${link.ticket}` }
+    }
+    throw error
+  })
+  if (target.kind === 'external') {
     showLauncher()
+    const origin = new URL(target.url).origin
     const answer = await dialog.showMessageBox({
       type: 'question',
       title: '收到其他入口的加入链接',
       message: '这条加入链接指向另一个入口地址。',
-      detail: `${link.origin}\n\n可以在系统浏览器中打开它继续加入流程。`,
+      detail: `${origin}\n\n可以在系统浏览器中打开它继续加入流程。`,
       buttons: ['在浏览器中打开', '取消'],
       defaultId: 1,
       cancelId: 1,
     })
-    if (answer.response === 0) openExternally(`${link.origin}/join#${link.ticket}`)
+    if (answer.response === 0) openExternally(target.url)
     return
   }
   try {
-    await openBusiness({ ticket: link.ticket })
+    await loadBusiness(target.url)
   } catch (error) {
     reportFailure('无法打开加入链接', error)
   }
