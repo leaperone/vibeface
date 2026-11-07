@@ -878,7 +878,20 @@ async fn provider_observation_bounds_oversize_catalog_response() {
         SdkProviderAuthentication::Authenticated
     );
     assert_eq!(observation.catalog, SdkCatalog::Unavailable);
+    let token = std::fs::read_to_string(root.join("bridge.pid"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
     bridge.stop().await;
+    assert!(
+        matches!(
+            vibeface_bridge::platform::tree::Leftover::find(&token),
+            Ok(None)
+        ),
+        "Bridge::stop returns only after the SDK wrapper and child tree have exited"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -197,6 +197,7 @@ fn provider_cancel_failure(native_terminal: Option<AgentFailure>) -> AgentFailur
 /// `true` means nothing of the tree is left. A `false` answer keeps the tree recorded so a
 /// later attempt, or the next run of the Node, ends it rather than losing track of it.
 pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree::Tree) -> bool {
+    let token = tree.token().to_owned();
     tree.stop();
     let reaped = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
     if !matches!(reaped, Ok(Ok(_))) {
@@ -209,8 +210,14 @@ pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree
         }
     }
     for _ in 0..20 {
-        if !tree.is_running() {
-            return true;
+        // Windows Tree::kill drops its Job handle after terminating it. Query the recorded job
+        // by token so this checks the whole tree, including children of a `.cmd` launcher.
+        match platform::tree::Leftover::find(&token) {
+            Ok(None) => return true,
+            Ok(Some(_)) => {}
+            Err(error) => {
+                tracing::warn!(%error, "could not confirm Cursor SDK process-tree exit");
+            }
         }
         tree.kill();
         tokio::time::sleep(Duration::from_millis(50)).await;
