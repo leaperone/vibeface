@@ -11,6 +11,7 @@ import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from ios_device import verify_device_executable
 
 
 def profile_data(path, bundle_id, method):
@@ -41,6 +42,7 @@ def verify_app(app, bundle_id, method):
         raise SystemExit('IPA bundle identifier differs from committed app metadata')
     if info.get('CFBundleSupportedPlatforms') != ['iPhoneOS']:
         raise SystemExit('IPA app is not marked for iPhoneOS')
+    verify_device_executable(app, info)
     profile, team = profile_data(app / 'embedded.mobileprovision', bundle_id, method)
     subprocess.run(['codesign', '--verify', '--deep', '--strict', '--verbose=2', str(app)], check=True)
     details = subprocess.run(['codesign', '-dv', '--verbose=4', str(app)], text=True, capture_output=True, check=True)

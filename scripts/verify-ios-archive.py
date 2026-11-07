@@ -4,10 +4,10 @@ import argparse
 import hashlib
 import json
 import plistlib
-import re
 import subprocess
 import zipfile
 from pathlib import Path
+from ios_device import verify_device_executable
 
 
 def sha256_file(path):
@@ -48,14 +48,7 @@ def main():
     if info.get('CFBundleSupportedPlatforms') != ['iPhoneOS']:
         raise SystemExit('archive app is not marked for iPhoneOS')
     app = info_path.parent
-    executable = app / info['CFBundleExecutable']
-    architectures = subprocess.check_output(['lipo', '-archs', str(executable)], text=True).split()
-    if 'arm64' not in architectures:
-        raise SystemExit('archive executable does not contain the iPhone arm64 architecture')
-    load_commands = subprocess.check_output(['otool', '-l', str(executable)], text=True)
-    build_commands = re.findall(r'Load command \d+\s+cmd LC_BUILD_VERSION(.*?)(?=Load command|\Z)', load_commands, re.S)
-    if not any(re.search(r'^\s*platform\s+2\s*$', command, re.M) for command in build_commands):
-        raise SystemExit('archive executable is not built for iPhoneOS')
+    executable = verify_device_executable(app, info)
     has_profile = (app / 'embedded.mobileprovision').exists()
     if has_profile != args.signed:
         raise SystemExit('archive signing state does not match the requested verification mode')
