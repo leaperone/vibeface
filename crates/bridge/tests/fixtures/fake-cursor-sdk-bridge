@@ -13,6 +13,13 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+def startup_phase(name):
+    print("fake-cursor-sdk-bridge phase " + name, file=sys.stderr, flush=True)
+
+
+startup_phase("python-started")
+
+
 def argument(name):
     return sys.argv[sys.argv.index(name) + 1]
 
@@ -22,13 +29,16 @@ if not os.environ.get("CURSOR_API_KEY") or os.environ.get("CURSOR_SDK_CLIENT_LAN
 local_store = json.loads(argument("--local-store"))
 if local_store.get("type") != "jsonl" or not os.path.isabs(local_store.get("rootDir", "")):
     sys.exit(4)
+startup_phase("arguments-validated")
 token = uuid.uuid4().hex
 token_file = os.path.join(argument("--state-root"), "fake-bridge-token")
 descriptor = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 os.write(descriptor, token.encode())
 os.close(descriptor)
 os.chmod(token_file, 0o600)
+startup_phase("token-created")
 if os.name == "nt":
+    startup_phase("windows-acl-start")
     import base64
     import subprocess
     acl_script = """
@@ -45,6 +55,7 @@ Set-Acl -LiteralPath $env:VIBEFACE_FAKE_TOKEN_FILE -AclObject $acl
                     base64.b64encode(acl_script.encode("utf-16le")).decode("ascii")],
                    env={**os.environ, "VIBEFACE_FAKE_TOKEN_FILE": token_file},
                    check=True, stdout=subprocess.DEVNULL)
+    startup_phase("windows-acl-complete")
 if os.environ.get("FAKE_BRIDGE_LOG"):
     with open(os.environ["FAKE_BRIDGE_LOG"], "a") as log:
         log.write(f"{os.getpid()}\n")
@@ -251,6 +262,7 @@ class Bridge(BaseHTTPRequestHandler):
 
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
+startup_phase("server-bound")
 server.daemon_threads = True
 time.sleep(int(os.environ.get("FAKE_BRIDGE_STARTUP_MS", "0")) / 1000)
 if os.environ.get("FAKE_BRIDGE_EXIT_BEFORE_READY"):
