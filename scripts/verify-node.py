@@ -45,6 +45,7 @@ import sys
 import time
 import traceback
 import threading
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -896,6 +897,98 @@ def native_provider_login(run, setup, command, bin_sha256):
             and json.loads((run / "native-provider-stage.json").read_text()) == "ready",
             "the controlled CLI records one private-root login and changes only fake authentication")
     return {"executed": True, "private_root_verified": True, "controlled_bin_verified": True, "login_count": len(records)}
+
+
+def native_provider_clipboard(invitation, *, env=None, cwd=None, runner=subprocess.run, system=None, xcrun_path=None):
+    """Paste only this fixture's invitation into its explicitly assigned hosted iOS simulator."""
+    env = os.environ if env is None else env
+    cwd = Path.cwd() if cwd is None else Path(cwd)
+    system = sys.platform if system is None else system
+    require(system == "darwin", "native clipboard is available only on the hosted macOS runner")
+    simulator = env.get("VIBEFACE_E2E_SIMULATOR", "")
+    require(re.fullmatch(r"[a-fA-F0-9]{8}-(?:[a-fA-F0-9]{4}-){3}[a-fA-F0-9]{12}", simulator) is not None,
+            "native clipboard requires the explicit assigned simulator UUID")
+    run_id, attempt = env.get("GITHUB_RUN_ID", ""), env.get("GITHUB_RUN_ATTEMPT", "")
+    require(re.fullmatch(r"[0-9]+", run_id) is not None and re.fullmatch(r"[0-9]+", attempt) is not None,
+            "native clipboard requires a hosted task run identity")
+    expected_name = f"vibeface-provider-{run_id}-{attempt}"
+    marker = (cwd / ".artifacts/native/simulator.txt").resolve(strict=True)
+    root = cwd.resolve(strict=True)
+    require(marker.is_relative_to(root) and marker.is_file() and marker.read_text().strip() == simulator,
+            "native clipboard simulator matches this repository task marker")
+    xcrun = xcrun_path or shutil.which("xcrun")
+    require(xcrun is not None and Path(xcrun).is_absolute(), "native clipboard uses the installed absolute xcrun")
+    listed = runner([str(Path(xcrun).resolve()), "simctl", "list", "devices", "--json"],
+                    capture_output=True, timeout=15)
+    require(listed.returncode == 0, "native simulator inventory is readable")
+    try:
+        groups = json.loads(listed.stdout).get("devices", {}).values()
+        matches = [row for rows in groups for row in rows if row.get("udid", "").lower() == simulator.lower()]
+    except (AttributeError, TypeError, ValueError):
+        raise AssertionError("native simulator inventory is valid") from None
+    require(len(matches) == 1 and matches[0].get("state") == "Booted" and matches[0].get("name") == expected_name,
+            "native clipboard refuses a foreign, ambiguous, or unbooted simulator")
+    require(isinstance(invitation, str) and invitation and "\n" not in invitation and "\r" not in invitation,
+            "native clipboard receives the fixture's private invitation value")
+    pasted = runner([str(Path(xcrun).resolve()), "simctl", "pbcopy", simulator],
+                    input=invitation.encode(), capture_output=True, timeout=15)
+    require(pasted.returncode == 0, "native clipboard paste command succeeds")
+    return {"pasted": True}
+
+
+def native_clipboard_selfcheck(options):
+    simulator = "AABBCCDD-1111-2222-3333-ABCDEFABCDEF"
+    invitation = "fixture-private-invitation"
+    env = {"VIBEFACE_E2E_SIMULATOR": simulator, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2"}
+    checks = []
+    options.artifacts.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="native-clipboard-selfcheck-") as temporary:
+        cwd = Path(temporary)
+        marker = cwd / ".artifacts/native/simulator.txt"
+        marker.parent.mkdir(parents=True)
+        marker.write_text(simulator + "\n")
+        calls = []
+        outputs = []
+
+        def runner(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if "--json" in argv:
+                output = {"devices": {"iOS": [{"udid": simulator,
+                    "name": "vibeface-provider-123-2", "state": "Booted"}]}}
+            else:
+                output = ""
+            completed = subprocess.CompletedProcess(argv, 0, json.dumps(output) if isinstance(output, dict) else output, "")
+            outputs.append(completed)
+            return completed
+
+        native_provider_clipboard(invitation, env=env, cwd=cwd, runner=runner, system="darwin", xcrun_path="/usr/bin/xcrun")
+        argv, kwargs = calls[-1]
+        pasted = outputs[-1]
+        require(argv == ["/usr/bin/xcrun", "simctl", "pbcopy", simulator]
+                and kwargs.get("input") == invitation.encode() and invitation not in argv
+                and invitation not in pasted.stdout and invitation not in pasted.stderr,
+                "private invitation is sent only on subprocess stdin")
+        checks.append("invitation_stdin_only")
+        for name, altered_env, rows in (
+            ("foreign_simulator", {**env, "VIBEFACE_E2E_SIMULATOR": "BBBBCCDD-1111-2222-3333-ABCDEFABCDEF"}, None),
+            ("unbooted_simulator", env, [{"udid": simulator, "name": "vibeface-provider-123-2", "state": "Shutdown"}]),
+            ("mismatched_task_name", env, [{"udid": simulator, "name": "some-other-task", "state": "Booted"}]),
+        ):
+            def negative(argv, rows=rows, **kwargs):
+                if "--json" in argv:
+                    inventory = rows if rows is not None else [{"udid": simulator, "name": "vibeface-provider-123-2", "state": "Booted"}]
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"devices": {"iOS": inventory}}), "")
+                raise AssertionError("refusal must happen before pbcopy")
+            refused = False
+            try:
+                native_provider_clipboard(invitation, env=altered_env, cwd=cwd, runner=negative,
+                                          system="darwin", xcrun_path="/usr/bin/xcrun")
+            except AssertionError:
+                refused = True
+            require(refused, "native clipboard must refuse " + name)
+            checks.append(name)
+        private_json(options.artifacts / "native-clipboard-selfcheck.json", {"status": "passed", "checks": checks})
+        print(json.dumps({"status": "passed", "checks": checks}), flush=True)
 
 
 def native_provider_selfcheck(options):
@@ -7754,6 +7847,7 @@ def e2e_fixture(options):
     relay = PkarrRelay() if options.fixture_kind == "delivery" else None
     rpc = DeliveryRpcSpy() if relay else None
     native_ready = False
+    native_invitation = None
     native_provider = None
     native_queue = None
     bootstrap_site = None
@@ -7883,7 +7977,13 @@ def e2e_fixture(options):
                     with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
                         output.write(invitation)
                     native_ready = True
+                    native_invitation = invitation
                     result = details()
+                elif op == "native_provider_clipboard":
+                    require(set(request) == {"op"} and native_ready and native_provider and native_invitation,
+                            "native clipboard belongs to its initialized provider fixture and accepts no secret input")
+                    native_provider_clipboard(native_invitation, cwd=Path.cwd())
+                    result = {"pasted": True}
                 elif op == "native_join":
                     require(native_ready, "native pairing requires the controlled initialized receiver")
                     client = nodes["receiver"].client
@@ -8041,6 +8141,7 @@ if __name__ == "__main__":
         modes.add_argument("--phase5", action="store_true", help="check write protection after a restore, alone and as a copied data directory, status, logs and diagnostics")
         modes.add_argument("--e2e-fixture", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--native-provider-selfcheck", action="store_true", help=argparse.SUPPRESS)
+        modes.add_argument("--native-clipboard-selfcheck", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--delivery-charity", action="store_true", help="check free discovery, charity transfer, loopback service boundaries and durable restart")
         modes.add_argument("--delivery", action="store_true", help="check the full paid delivery flow; requires a private local deployment configuration")
         modes.add_argument("--delivery-ui-selfcheck", action="store_true", help="check only the local UI controller schema without starting Nodes, UI, chain or proofs")
@@ -8055,7 +8156,8 @@ if __name__ == "__main__":
         parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()
         try:
-            needs_process = not (arguments.delivery_ui_selfcheck or arguments.native_provider_selfcheck)
+            needs_process = not (arguments.delivery_ui_selfcheck or arguments.native_provider_selfcheck
+                                 or arguments.native_clipboard_selfcheck)
             if needs_process:
                 program = shutil.which(str(arguments.binary)) if len(arguments.binary.parts) == 1 else str(arguments.binary)
                 require(program is not None, "the Vibeface CLI binary exists on PATH or at its explicit path")
@@ -8079,6 +8181,8 @@ if __name__ == "__main__":
             require(30_000 <= arguments.delivery_ui_timeout_ms <= 86_400_000, "UI acceptance has a bounded explicit execution deadline")
             if arguments.native_provider_selfcheck:
                 native_provider_selfcheck(arguments)
+            elif arguments.native_clipboard_selfcheck:
+                native_clipboard_selfcheck(arguments)
             elif arguments.delivery_ui_selfcheck:
                 delivery_ui_selfcheck(arguments)
             elif arguments.e2e_fixture:

@@ -222,7 +222,10 @@ test('provider settings and queued cancellation work in the installed native app
     assert.equal(assigned[0].name, `vibeface-provider-${run}-${attempt}`);
     assert.equal(assigned[0].state, 'Booted');
   }
-  await screen.getByRole('textbox', /^加入链接(?:$|[\s,，])/).fill(secrets.get('nativeInvitation'), { timeout: 30000 });
+  await network.call({ op: 'native_provider_clipboard' });
+  const pasteInvitation = screen.getByRole('button', /^(Paste|粘贴)$/);
+  await expect(pasteInvitation).toBeEnabled({ timeout: 30000 });
+  await pasteInvitation.click();
   await expect(screen.getByText('已填入加入链接', { exact: true })).toBeVisible();
   const deviceName = screen.getByRole('textbox', /^这台设备的名字(?:$|[\s,，])/);
   await deviceName.fill('VDP native receiver');
