@@ -154,6 +154,18 @@ jobs:
           else
             pnpm exec e2e run --config tests/e2e/e2e.desktop.config.ts
           fi
+      - name: Keep compact desktop failure evidence independently
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ !cancelled() }}
+        with:
+          name: desktop-diagnostics-${{ inputs.target }}-${{ inputs.source_sha }}-${{ github.run_attempt }}
+          path: |
+            .artifacts/ci-windows-node
+            .artifacts/e2e/desktop/*.log
+            tests/e2e/.artifacts/desktop
+            !tests/e2e/.artifacts/desktop/**/downloads/**
+          if-no-files-found: warn
+          retention-days: 7
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ !cancelled() }}
         with:
