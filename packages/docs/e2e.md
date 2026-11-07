@@ -192,7 +192,7 @@ pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' \
   --trace off --video off --retries 0 > .artifacts/native/private/ui.log 2>&1
 ```
 
-该用例重新安装当前 App，逐项核对已安装 bundle 与构建 bundle 的文件摘要，包括实际可执行文件、打包 JavaScript 和原生库。它用 e2e Secret 从任务私有文件读取邀请，填写原生“加入链接”表单，再核对双方安全码并授予管理权限。邀请不会作为普通深链接参数传入 UI driver。iOS 的 TextInput 可把 placeholder 或值附在可访问名称后面，因此输入定位使用 textbox 角色和以字段名称开头、带分隔边界的正则，仍要求唯一匹配。已填写值、保存回读和私有命令剪贴板均作精确核对。
+该用例重新安装当前 App，逐项核对已安装 bundle 与构建 bundle 的文件摘要，包括实际可执行文件、打包 JavaScript 和原生库。它用 e2e Secret 从任务私有文件读取邀请，填写原生“加入链接”表单，再核对双方安全码并授予管理权限。邀请不会作为普通深链接参数传入 UI driver。iOS 的 TextInput 可把 placeholder 或值附在可访问名称后面，因此输入定位使用 textbox 角色和以字段名称开头、带分隔边界的正则，仍要求唯一匹配。邀请填写后核对已解码的链接卡片，Secret fill 报错仍使验收失败；原输入可能已被卡片替换，不能保证每次逐字回读邀请。设备名、设置保存回读和私有命令剪贴板均作精确核对。
 
 原生设备页的“Bot 与任务”进入真实 AI 设置页。fixture 只配置受控程序与连接模式，并关闭 Bot 和执行角色，真实返回 `manager=null`。用例先确认未启用的 Codex 尚未主动检查，再开启执行用途；依照 Node 的首次设置默认，这也开启 Bot，用例随后由原生界面关闭 Bot。启用和已有 manager 的 Node 启动都会主动检查，不能把这些结果称为未检查。用例在 execution-only 状态实际检查未登录提示，精确核对从界面复制的私有目录认证命令，由受限 fake CLI 完成一次合成登录，再主动检查并选择、手填和清空执行模型。之后开启 Bot，验证双角色草稿、独立保存、默认模型和 high。它还确认 Provider 控制强度时清除旧覆盖，包括带空白的手填已知模型，以及目录不可用时保留旧模型和强度。所有启用与保存均经已授权手机的正常接口执行。
 
