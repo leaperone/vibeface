@@ -10,6 +10,9 @@ const port = Number(process.argv[2]);
 assert(Number.isInteger(port) && port > 0 && port < 65536, 'Expected a TCP port');
 const repository = resolve(import.meta.dirname, '..');
 const binary = process.env.VIBEFACE_E2E_BINARY ?? 'vibeface';
+const appDir = process.env.VIBEFACE_E2E_APP_DIR;
+const cryptoModule = process.env.VIBEFACE_E2E_CRYPTO_MODULE
+  || (appDir ? resolve(appDir, 'vibeface_secure.js') : undefined);
 const root = resolve(repository, '.artifacts/e2e');
 await mkdir(`${root}/control`, { recursive: true, mode: 0o700 });
 const token = randomBytes(32).toString('hex');
@@ -40,8 +43,8 @@ async function startFixture(kind) {
   await stopFixture();
   const args = [resolve(repository, 'scripts/verify-node.py'), '--e2e-fixture', '--binary', binary,
     '--artifacts', root, '--fixture-port', String(port), '--fixture-kind', kind];
-  if (process.env.VIBEFACE_E2E_CRYPTO_MODULE) args.push('--crypto-module', process.env.VIBEFACE_E2E_CRYPTO_MODULE);
-  if (process.env.VIBEFACE_E2E_APP_DIR) args.push('--app-dir', process.env.VIBEFACE_E2E_APP_DIR);
+  if (cryptoModule) args.push('--crypto-module', cryptoModule);
+  if (appDir) args.push('--app-dir', appDir);
   if (process.env.VIBEFACE_E2E_PROFILE_FILE) args.push('--fixture-profile', process.env.VIBEFACE_E2E_PROFILE_FILE);
   const child = spawn('python3', args, { cwd: repository, stdio: ['pipe', 'pipe', 'inherit'] });
   fixture = child;

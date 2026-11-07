@@ -131,6 +131,7 @@ function bootstrapFixture(kind: 'bootstrap' | 'bootstrap-http') {
   return base.extend<{ bootstrap: BootstrapFixture }>({
     bootstrap: async ({ app, browser }, use) => {
       const call = await control(app.baseUrl);
+      let primary: unknown;
       try {
         await call({ op: 'reset', kind });
         const info = bootstrapInfo(await call({ op: 'bootstrap_info' }));
@@ -156,7 +157,16 @@ function bootstrapFixture(kind: 'bootstrap' | 'bootstrap-http') {
           },
           async inspect() { return bootstrapInfo(await call({ op: 'bootstrap_info' })); },
         });
-      } finally { await call({ op: 'stop' }); }
+      } catch (error) {
+        primary = error;
+        throw error;
+      } finally {
+        try { await call({ op: 'stop' }); }
+        catch (cleanup) {
+          if (primary !== undefined) throw new AggregateError([primary, cleanup], `${String(primary)}; cleanup also failed: ${String(cleanup)}`);
+          throw cleanup;
+        }
+      }
     },
   });
 }

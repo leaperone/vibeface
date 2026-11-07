@@ -7778,7 +7778,7 @@ def e2e_fixture(options):
             gateway_url = f"http://127.0.0.1:{entry_port}"
             relay_url = f"http://127.0.0.1:{relay_port}"
             discovery = Node(run, "discovery", binary, workspace, helper, init_args=[
-                "--public-entry", "--relay-mode", "discovery-only", "--no-web",
+                "--public-entry", "--relay-mode", "discovery-only",
                 "--relay-listen", f"127.0.0.1:{discovery_port}",
                 "--catalog-gateway", gateway_url, "--catalog-relay", relay_url])
             nodes["discovery"] = discovery
