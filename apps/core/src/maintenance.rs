@@ -711,14 +711,17 @@ mod tests {
         let node = Arc::new(Runtime::open(&dir).await?);
         let server = tokio::spawn(serve(node.clone(), dir.clone()));
         let result = async {
-            for _ in 0..100 {
-                if socket_path(&dir)?.exists() {
-                    break;
+            let health = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Ok(health) = probe(&dir).await {
+                        break health;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::task::yield_now().await;
-            }
+            })
+            .await
+            .context("the maintenance listener did not become ready")?;
             assert!(node.maintenance.enter().is_err());
-            let health = probe(&dir).await?;
             assert_eq!(health.device_id, node.identity.device_id()?);
             assert_eq!(health.version, env!("CARGO_PKG_VERSION"));
             for enabled in [false, true] {
@@ -791,9 +794,12 @@ mod tests {
         server.abort();
         let _ = server.await;
         drop(node);
-        let socket = socket_path(&dir)?;
-        std::fs::remove_file(&socket)?;
-        std::fs::remove_dir_all(socket.parent().unwrap())?;
+        assert!(
+            !endpoint(&dir)?.is_held(),
+            "the stopped listener releases its endpoint"
+        );
+        let device = crate::config::identity(&dir)?.device_id()?;
+        std::fs::remove_dir_all(vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?)?;
         std::fs::remove_dir_all(&dir)?;
         result
     }
@@ -843,12 +849,16 @@ mod tests {
             }
         };
         let result = async {
-            for _ in 0..100 {
-                if socket_path(&dir)?.exists() {
-                    break;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if probe(&dir).await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::task::yield_now().await;
-            }
+            })
+            .await
+            .context("the maintenance listener did not become ready")?;
             let first = link(7)?;
             assert_eq!(join(&dir, &first, "工作室 Mac").await?, NodeJoin::Waiting);
             committed().await;
@@ -888,9 +898,9 @@ mod tests {
         server.abort();
         let _ = server.await;
         drop(node);
-        let socket = socket_path(&dir)?;
-        let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
+        let device = crate::config::identity(&dir)?.device_id()?;
+        let _ =
+            std::fs::remove_dir_all(vibeface_bridge::platform::ipc::runtime_dir(&device[..32])?);
         std::fs::remove_dir_all(&dir)?;
         result
     }

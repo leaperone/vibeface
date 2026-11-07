@@ -71,7 +71,7 @@ impl Sid {
         if length == 0 {
             return Err(io::Error::last_os_error());
         }
-        if length % std::mem::size_of::<u32>() != 0 {
+        if !length.is_multiple_of(std::mem::size_of::<u32>()) {
             return Err(io::Error::other(
                 "security identifier has an invalid length",
             ));

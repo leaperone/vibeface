@@ -18,8 +18,8 @@ const repository = resolve(import.meta.dirname, '..');
 const application = process.env.VIBEFACE_E2E_DESKTOP_APP;
 assert(application, 'VIBEFACE_E2E_DESKTOP_APP names the built desktop application');
 const windows = process.platform === 'win32';
-const executable = windows ? application : join(application, 'Contents/MacOS/Vibeface');
-const resources = windows ? join(application, '..', 'resources') : join(application, 'Contents/Resources');
+const executable = process.platform === 'darwin' ? join(application, 'Contents/MacOS/Vibeface') : application;
+const resources = process.platform === 'darwin' ? join(application, 'Contents/Resources') : join(application, '..', 'resources');
 const root = resolve(repository, '.artifacts/e2e/desktop');
 const controlRoot = resolveBoundedPath(root, 'control');
 // A personal directory really does carry spaces and characters outside ASCII.

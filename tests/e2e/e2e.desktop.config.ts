@@ -11,7 +11,7 @@ assert(process.env.VIBEFACE_E2E_DESKTOP_RUNTIME, 'Name the verified runtime the 
 // browser beside the application.
 export default {
   tests: ['desktop/*.e2e.ts'],
-  targets: [{ name: 'vibeface-desktop', platform: process.platform === 'win32' ? 'windows' : 'macos' }],
+  targets: [{ name: 'vibeface-desktop', platform: process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'macos' : 'linux' }],
   workers: 1,
   retries: 0,
   timeout: 300000,

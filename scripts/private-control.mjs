@@ -82,7 +82,7 @@ export function resolveBoundedPath(root, candidate) {
 }
 
 async function powershellJson(script, ...args) {
-  const invocation = '$ErrorActionPreference = "Stop"\n$values = @(ConvertFrom-Json -InputObject $env:VIBEFACE_PRIVATE_CONTROL_ARGS)\n& {\n' + script + '\n} @values';
+  const invocation = '$ErrorActionPreference = "Stop"\n$values = [object[]](ConvertFrom-Json -InputObject $env:VIBEFACE_PRIVATE_CONTROL_ARGS)\n& {\n' + script + '\n} @values';
   const result = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(invocation, 'utf16le').toString('base64')], {
     windowsHide: true,
     maxBuffer: 8 * 1024 * 1024,

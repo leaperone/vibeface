@@ -242,14 +242,33 @@ jobs:
       WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
       WINDOWS_CERTIFICATE_SUBJECT: ${{ secrets.WINDOWS_CERTIFICATE_SUBJECT }}
       WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+  desktop-linux-x64:
+    needs: [identity, compose-linux-x64]
+    if: needs.identity.outputs.app == 'product'
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: ubuntu-24.04
+      target: x86_64-unknown-linux-gnu
+      native_artifact_id: ${{ needs.compose-linux-x64.outputs.artifact_id }}
+  desktop-linux-arm64:
+    needs: [identity, compose-linux-arm64]
+    if: needs.identity.outputs.app == 'product'
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: ubuntu-24.04-arm
+      target: aarch64-unknown-linux-gnu
+      native_artifact_id: ${{ needs.compose-linux-arm64.outputs.artifact_id }}
   collect:
-    needs: [identity, static, compose-macos, compose-linux-x64, compose-linux-arm64, compose-windows, desktop-macos, desktop-windows, android]
+    needs: [identity, static, compose-macos, compose-linux-x64, compose-linux-arm64, compose-windows, desktop-macos, desktop-windows, desktop-linux-x64, desktop-linux-arm64, android]
     if: >-
       always() && !cancelled() && needs.identity.result == 'success' && needs.static.result == 'success' &&
       (needs.identity.outputs.app == 'www' ||
       (needs.compose-macos.result == 'success' && needs.compose-linux-x64.result == 'success' &&
       needs.compose-linux-arm64.result == 'success' && needs.compose-windows.result == 'success' &&
       needs.desktop-macos.result == 'success' && needs.desktop-windows.result == 'success' &&
+      needs.desktop-linux-x64.result == 'success' && needs.desktop-linux-arm64.result == 'success' &&
       needs.android.result == 'success'))
     runs-on: ubuntu-24.04
     outputs:
@@ -303,6 +322,18 @@ jobs:
           artifact-ids: ${{ needs.desktop-windows.outputs.artifact_id }}
           merge-multiple: true
           path: .artifacts/input/desktop/x86_64-pc-windows-msvc
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.identity.outputs.app == 'product'
+        with:
+          artifact-ids: ${{ needs.desktop-linux-x64.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/input/desktop/x86_64-unknown-linux-gnu
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.identity.outputs.app == 'product'
+        with:
+          artifact-ids: ${{ needs.desktop-linux-arm64.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/input/desktop/aarch64-unknown-linux-gnu
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         if: needs.identity.outputs.app == 'product'
         with:

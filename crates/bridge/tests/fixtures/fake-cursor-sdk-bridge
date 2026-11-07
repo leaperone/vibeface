@@ -28,6 +28,23 @@ descriptor = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 os.write(descriptor, token.encode())
 os.close(descriptor)
 os.chmod(token_file, 0o600)
+if os.name == "nt":
+    import base64
+    import subprocess
+    acl_script = """
+$ErrorActionPreference = 'Stop'
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = New-Object System.Security.AccessControl.FileSecurity
+$acl.SetAccessRuleProtection($true, $false)
+$acl.SetOwner($sid)
+$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')
+$acl.SetAccessRule($rule)
+Set-Acl -LiteralPath $env:VIBEFACE_FAKE_TOKEN_FILE -AclObject $acl
+"""
+    subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                    base64.b64encode(acl_script.encode("utf-16le")).decode("ascii")],
+                   env={**os.environ, "VIBEFACE_FAKE_TOKEN_FILE": token_file},
+                   check=True, stdout=subprocess.DEVNULL)
 if os.environ.get("FAKE_BRIDGE_LOG"):
     with open(os.environ["FAKE_BRIDGE_LOG"], "a") as log:
         log.write(f"{os.getpid()}\n")

@@ -179,8 +179,8 @@ function selfTest() {
     };
     const buildFixture = (target, changes = {}) => {
       const platform = PLATFORMS[target];
-    const mac = target === 'aarch64-apple-darwin';
-    const windows = target === 'x86_64-pc-windows-msvc';
+      const mac = target === 'aarch64-apple-darwin';
+      const windows = target === 'x86_64-pc-windows-msvc';
       const root = fs.mkdtempSync(path.join(scratch, 'fixture-'));
       const application = mac ? path.join(root, 'Vibeface.app') : root;
       const resources = mac ? path.join(application, 'Contents/Resources') : path.join(application, 'resources');

@@ -983,6 +983,24 @@ jobs:
       runner: windows-2025
       target: x86_64-pc-windows-msvc
 
+  desktop-only-linux-x64:
+    needs: [plan, crypto-web, web]
+    if: github.event_name == 'workflow_dispatch' && inputs.desktop_only
+    uses: ./.github/workflows/ci-desktop.yml
+    with:
+      source_sha: ${{ github.sha }}
+      runner: ubuntu-24.04
+      target: x86_64-unknown-linux-gnu
+
+  desktop-only-linux-arm64:
+    needs: [plan, crypto-web, web]
+    if: github.event_name == 'workflow_dispatch' && inputs.desktop_only
+    uses: ./.github/workflows/ci-desktop.yml
+    with:
+      source_sha: ${{ github.sha }}
+      runner: ubuntu-24.04-arm
+      target: aarch64-unknown-linux-gnu
+
   windows-platform:
     if: github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only)
     uses: ./.github/workflows/ci-windows-native.yml
@@ -1001,10 +1019,10 @@ jobs:
 
   desktop-gate:
     if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.desktop_only }}
-    needs: [plan, crypto-web, web, desktop-only-macos, desktop-only-windows, windows-platform]
+    needs: [plan, crypto-web, web, desktop-only-macos, desktop-only-windows, desktop-only-linux-x64, desktop-only-linux-arm64, windows-platform]
     runs-on: ubuntu-24.04
     steps:
-      - name: Require both native platforms and their real desktop windows
+      - name: Require all native platforms and their real desktop windows
         env:
           DESKTOP_NEEDS: ${{ toJSON(needs) }}
         run: |
@@ -1014,7 +1032,7 @@ jobs:
           failed = {name: job['result'] for name, job in checks.items() if job['result'] != 'success'}
           if failed:
               raise SystemExit('Desktop acceptance is incomplete: ' + json.dumps(failed))
-          print('Both native desktop applications and Windows platform checks passed')
+          print('All native desktop applications and Windows platform checks passed')
           PYTHON
 
   ci-gate:

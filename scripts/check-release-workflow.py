@@ -7,7 +7,7 @@ import re
 
 ROOT = Path(__file__).resolve().parent.parent
 TARGETS = ('macos', 'linux-x64', 'linux-arm64', 'windows')
-DESKTOP_TARGETS = ('macos', 'windows')
+DESKTOP_TARGETS = TARGETS
 
 
 def require(condition, message):
@@ -114,6 +114,8 @@ def self_test(source, helpers):
         source.replace('needs: [identity, compose-macos]', 'needs: [identity, compose-macos, compose-windows]'),
         source.replace("needs.android.result == 'success'", "True"),
         source.replace("needs.desktop-windows.result == 'success' &&", ''),
+        source.replace("needs.desktop-linux-x64.result == 'success' &&", ''),
+        source.replace("needs.desktop-linux-arm64.result == 'success' &&", ''),
         source.replace("needs.compose-windows.result == 'success' &&", ''),
         source.replace("if: needs.identity.outputs.publish == 'true' && needs.collect.result == 'success'", 'if: always()'),
         source.replace("&& needs.collect.result == 'success'", ''),

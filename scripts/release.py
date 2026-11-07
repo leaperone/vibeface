@@ -26,10 +26,11 @@ COMPONENTS = ('app', 'core', 'www')
 TARGETS = ('aarch64-apple-darwin', 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-gnu',
            'x86_64-pc-windows-msvc')
 WINDOWS_TARGETS = ('x86_64-pc-windows-msvc',)
-DESKTOP_TARGETS = ('aarch64-apple-darwin', 'x86_64-pc-windows-msvc')
-DESKTOP_INSTALLERS = {'aarch64-apple-darwin': 'dmg', 'x86_64-pc-windows-msvc': 'exe'}
+DESKTOP_TARGETS = TARGETS
+DESKTOP_INSTALLERS = {'aarch64-apple-darwin': 'dmg', 'x86_64-pc-windows-msvc': 'exe',
+                      'x86_64-unknown-linux-gnu': 'AppImage', 'aarch64-unknown-linux-gnu': 'AppImage'}
 ELECTRON_VERSION = '45.2.3'
-SIGNING_STATES = ('developer-id-notarized', 'authenticode', 'unsigned-development-preview')
+SIGNING_STATES = ('developer-id-notarized', 'authenticode', 'unsigned-development-preview', 'platform-checksums')
 VERSION = r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(nightly)\.([0-9]{8})\.([1-9][0-9]*)|-(rc)\.([1-9][0-9]*))?'
 COMMIT = r'[a-f0-9]{40}'
 MAX_ARCHIVE = 384 * 1024 * 1024
@@ -475,10 +476,13 @@ def verify_desktop_receipt(directory, target, pins, runtime_digest=None):
     require(re.fullmatch(COMMIT, info['source_commit']), 'invalid desktop source commit')
     require(info['electron'] == ELECTRON_VERSION, 'desktop receipt must name the pinned Electron version')
     require(type(info['signed']) is bool and info['signing'] in SIGNING_STATES, 'invalid desktop signing status')
-    require(info['signed'] == (info['signing'] != 'unsigned-development-preview'),
+    require(info['signed'] == (info['signing'] in ('developer-id-notarized', 'authenticode')),
             'desktop signing status and signed flag disagree')
-    # Nothing unsigned may reach a stable distribution; Nightly previews must say so plainly.
-    require(info['signed'] or pins['channel'] != 'stable', 'stable desktop distribution requires a signed application')
+    linux = target.endswith('-unknown-linux-gnu')
+    require((info['signing'] == 'platform-checksums') == linux,
+            'Linux platform checksums must match the desktop target')
+    require(info['signed'] or linux or pins['channel'] != 'stable',
+            'stable desktop distribution requires a signed application')
     expected_signing = 'developer-id-notarized' if target == 'aarch64-apple-darwin' else 'authenticode'
     require(not info['signed'] or info['signing'] == expected_signing, 'desktop signing kind does not match its platform')
     require(set(info['runtime']) == {'archive', 'sha256'}, 'unsupported desktop runtime reference')
@@ -924,6 +928,7 @@ def self_test():
                            tag=product_tag, channel=channel, source_commit=source, electron=ELECTRON_VERSION,
                            signed=target == 'aarch64-apple-darwin',
                            signing='developer-id-notarized' if target == 'aarch64-apple-darwin'
+                           else 'platform-checksums' if target.endswith('-unknown-linux-gnu')
                            else 'unsigned-development-preview',
                            runtime={'archive': runtime.name, 'sha256': digest(runtime)}, artifacts=artifacts)
             receipt.update(changes)
@@ -948,8 +953,20 @@ def self_test():
         def desktop_variant(label, target, **changes):
             return stage_desktop(tmp / f'desktop-{label}', target, **changes)
 
-        mac_target, windows_target = DESKTOP_TARGETS
+        mac_target, windows_target = 'aarch64-apple-darwin', 'x86_64-pc-windows-msvc'
         mac_runtime = digest(collected / 'native' / mac_target / f'vibeface-{product_version}-{mac_target}.tar.gz')
+        for linux_target in ('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu'):
+            accepts(lambda target=linux_target: verify_desktop_receipt(
+                desktop_variant('stable-' + target, target, channel='stable'), target,
+                dict(desktop_pins, channel='stable')))
+            rejects('Linux cannot borrow a macOS signature claim', lambda target=linux_target:
+                    verify_desktop_receipt(desktop_variant('signed-' + target, target,
+                        signed=True, signing='developer-id-notarized'), target, desktop_pins),
+                    'Linux platform checksums must match')
+        rejects('Windows cannot use Linux checksums instead of a signature', lambda:
+                verify_desktop_receipt(desktop_variant('windows-linux-claim', windows_target,
+                    signing='platform-checksums'), windows_target, desktop_pins),
+                'Linux platform checksums must match')
         rejects('an unsigned desktop payload for a stable channel',
                 lambda: verify_desktop_receipt(
                     desktop_variant('stable-unsigned', windows_target, channel='stable'), windows_target,
@@ -1064,8 +1081,8 @@ def self_test():
         assembled = tmp / 'assembled'
         info = accepts(lambda: assemble_product(collected, assembled))
         require({p.name for p in assembled.iterdir()} == product_asset_names(product_version), 'assembled asset set')
-        require(len(info['assets']) == 31 and len(product_asset_names(product_version)) == 32,
-                'the product publishes exactly 31 payloads plus its manifest')
+        require(len(info['assets']) == 41 and len(product_asset_names(product_version)) == 42,
+                'the product publishes exactly 41 payloads plus its manifest')
         rejects('assembling into a populated output', lambda: assemble_product(collected, assembled))
 
         def assemble(label, mutate):

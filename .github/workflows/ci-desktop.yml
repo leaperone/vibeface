@@ -119,9 +119,29 @@ jobs:
           [[ "${#archives[@]}" == 1 ]]
           mkdir -p .artifacts/desktop-app
           tar -xf "${archives[0]}" -C .artifacts/desktop-app
-          if [[ "$TARGET" == *-apple-darwin ]]; then application="$PWD/.artifacts/desktop-app/Vibeface.app"; else application="$PWD/.artifacts/desktop-app/Vibeface.exe"; fi
+          if [[ "$TARGET" == *-apple-darwin ]]; then
+            application="$PWD/.artifacts/desktop-app/Vibeface.app"
+          elif [[ "$TARGET" == *-windows-* ]]; then
+            application="$PWD/.artifacts/desktop-app/Vibeface.exe"
+          else
+            images=(.artifacts/desktop/*.AppImage)
+            [[ "${#images[@]}" == 1 ]]
+            image="$PWD/${images[0]}"
+            chmod +x "$image"
+            (cd .artifacts/desktop-app && "$image" --appimage-extract > "$RUNNER_TEMP/vibeface-appimage-extract.log")
+            application="$PWD/.artifacts/desktop-app/squashfs-root/AppRun"
+          fi
           test -e "$application"
           printf 'path=%s\n' "$application" >> "$GITHUB_OUTPUT"
+      - name: Prepare the Linux GUI and sandbox helper
+        if: runner.os == 'Linux'
+        run: |
+          command -v xvfb-run
+          test -f .artifacts/desktop-app/squashfs-root/chrome-sandbox
+          # A disposable hosted runner installs the extracted Chromium helper with its required
+          # ownership; the application keeps its Chromium sandbox enabled throughout the test.
+          sudo chown root:root .artifacts/desktop-app/squashfs-root/chrome-sandbox
+          sudo chmod 4755 .artifacts/desktop-app/squashfs-root/chrome-sandbox
       - name: Drive the real desktop window end to end
         env:
           VIBEFACE_E2E_DESKTOP_APP: ${{ steps.application.outputs.path }}
@@ -129,7 +149,11 @@ jobs:
           E2E_TELEMETRY_DISABLED: '1'
         run: |
           pnpm test:e2e:check
-          pnpm exec e2e run --config tests/e2e/e2e.desktop.config.ts
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            xvfb-run --auto-servernum --server-args='-screen 0 1440x1000x24' pnpm exec e2e run --config tests/e2e/e2e.desktop.config.ts
+          else
+            pnpm exec e2e run --config tests/e2e/e2e.desktop.config.ts
+          fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ !cancelled() }}
         with:
