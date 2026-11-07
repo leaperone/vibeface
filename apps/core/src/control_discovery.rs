@@ -1,8 +1,7 @@
 //! Bounded discovery of already initialized Nodes visible to this account.
 //!
-//! This deliberately reads only known data directories. It never creates a directory or starts,
-//! stops, or changes a Node. Platform process/service registrations are left to the desktop host;
-//! its remembered directory list is passed explicitly in the control request.
+//! This reads only known data directories, one named user service per platform, and argv metadata
+//! for the fixed Core executable. It never creates a directory or starts, stops, or changes a Node.
 
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;

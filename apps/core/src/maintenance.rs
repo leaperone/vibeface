@@ -293,6 +293,16 @@ async fn write_packet<T: Serialize>(stream: &mut Stream, value: &T) -> Result<()
 fn endpoint(data_dir: &Path) -> Result<Endpoint> {
     let device_id = crate::config::identity(data_dir)?.device_id()?;
     let socket_dir = vibeface_bridge::platform::ipc::runtime_dir(&device_id[..32])?;
+    Endpoint::in_private_dir(&socket_dir, SOCKET_NAME)
+}
+
+/// Creates and locks down the endpoint directory only when this Node is starting its listener.
+fn listener_endpoint(data_dir: &Path) -> Result<Endpoint> {
+    let endpoint = endpoint(data_dir)?;
+    let socket_dir = endpoint
+        .path()
+        .parent()
+        .context("maintenance endpoint has no parent directory")?;
     match privatefs::create_dir(&socket_dir) {
         Ok(()) => {}
         Err(error)
@@ -311,7 +321,7 @@ fn endpoint(data_dir: &Path) -> Result<Endpoint> {
         "private maintenance socket directory has unexpected ownership"
     );
     privatefs::restrict_dir(&socket_dir)?;
-    Endpoint::in_private_dir(&socket_dir, SOCKET_NAME)
+    Ok(endpoint)
 }
 
 /// Where the CLI reaches this Node's maintenance endpoint, as a person sees it.
@@ -465,7 +475,7 @@ pub async fn delivery_key_operation(
 }
 
 pub async fn serve(runtime: Arc<Runtime>, data_dir: PathBuf) -> Result<()> {
-    let mut listener = Listener::claim(&endpoint(&data_dir)?).await?;
+    let mut listener = Listener::claim(&listener_endpoint(&data_dir)?).await?;
     loop {
         let stream = listener.accept().await?;
         let node = runtime.clone();
@@ -644,6 +654,57 @@ mod tests {
         crypto::LocalIdentity,
     };
     use anyhow::bail;
+
+    #[tokio::test]
+    async fn inspecting_a_stopped_node_does_not_create_or_restrict_its_endpoint_directory()
+    -> Result<()> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!(
+                "maintenance-inspect-stopped-{}",
+                uuid::Uuid::new_v4()
+            ));
+        config::private_dir(&dir)?;
+        let dir = dir.canonicalize()?;
+        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
+        let node_identity = LocalIdentity::generate();
+        let data = Config::local("127.0.0.1:4790".parse()?, vec![dir.clone()], false);
+        data.save(&dir)?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&node_identity)?,
+        )?;
+
+        let runtime_dir =
+            vibeface_bridge::platform::ipc::runtime_dir(&node_identity.device_id()?[..32])?;
+        assert!(
+            !runtime_dir.exists(),
+            "the controlled fixture endpoint must start absent"
+        );
+        #[cfg(unix)]
+        let permissions = {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::metadata(&dir)?.permissions().mode()
+        };
+        #[cfg(windows)]
+        let permissions = privatefs::is_private(&dir)?;
+
+        let inspected = crate::control::inspect(&dir).await?;
+        assert_eq!(inspected["status"], "stopped");
+        assert!(
+            !runtime_dir.exists(),
+            "read-only inspection must not create the endpoint directory"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(&dir)?.permissions().mode(), permissions);
+        }
+        #[cfg(windows)]
+        assert_eq!(privatefs::is_private(&dir)?, permissions);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn shutdown_releases_a_maintenance_connection_with_its_client_still_open() -> Result<()> {

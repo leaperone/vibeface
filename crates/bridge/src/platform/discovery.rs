@@ -319,7 +319,7 @@ mod windows {
                 .iter()
                 .map(|arg| {
                     let mut n = 0;
-                    while unsafe { **arg.add(n) } != 0 {
+                    while unsafe { *(*arg).add(n) } != 0 {
                         n += 1;
                     }
                     OsString::from_wide(unsafe { std::slice::from_raw_parts(*arg, n) })
