@@ -147,6 +147,8 @@ def safe_task_directory(path: Path, artifact_root: Path) -> Path:
         relative = path.relative_to(artifact_root)
     except ValueError as error:
         raise ValueError("task state directory is outside task artifacts") from error
+    if any(part in {".", ".."} for part in relative.parts):
+        raise ValueError("task state directory is not normalized")
     current = artifact_root
     for part in relative.parts:
         current = current / part
@@ -157,13 +159,32 @@ def safe_task_directory(path: Path, artifact_root: Path) -> Path:
     return current
 
 
+def safe_home_directory(path: Path) -> bool:
+    home = Path.home().absolute()
+    candidate = path.absolute()
+    if home.is_symlink():
+        return False
+    try:
+        relative = candidate.relative_to(home)
+    except ValueError:
+        return False
+    if any(part in {".", ".."} for part in relative.parts):
+        return False
+    current = home
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return False
+    return True
+
+
 def snapshot_cache() -> dict[str, Any]:
     if os.environ.get("CI") != "true":
         return {"status": "skipped_outside_ci", "binary_count": 0}
     home = Path.home()
     agent_home = home / ".agent-device"
     directory = agent_home / "snapshot-source"
-    if home.is_symlink() or agent_home.is_symlink():
+    if not safe_home_directory(directory):
         return {"status": "invalid", "binary_count": 0}
     try:
         metadata = directory.lstat()
@@ -321,16 +342,7 @@ def capture(simulator: str, *, run: Any = subprocess.run) -> dict[str, Any]:
     else:
         agent_home = Path.home() / ".agent-device"
         lease_root = Path(os.environ.get("AGENT_DEVICE_IOS_RUNNER_LEASE_DIR", agent_home / "apple-runner/leases"))
-        try:
-            lease_relative = lease_root.absolute().relative_to(agent_home.absolute())
-            current = agent_home
-            invalid_path = agent_home.is_symlink()
-            for part in lease_relative.parts:
-                current = current / part
-                invalid_path = invalid_path or current.is_symlink()
-        except ValueError:
-            invalid_path = True
-        if invalid_path or not lease_root.is_dir():
+        if not safe_home_directory(lease_root) or not lease_root.is_dir():
             census["xctest_runner"] = {"status": "lease_directory_unavailable"}
         else:
             lease_path = lease_root / f"{simulator}.json"
