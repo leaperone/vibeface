@@ -486,8 +486,7 @@ async fn configure_timer(policy: &Policy, data: &Path) -> Result<()> {
 
 fn persist(path: &Path, value: &impl Serialize) -> Result<()> {
     private_write(path, &serde_json::to_vec_pretty(value)?)?;
-    File::open(path.parent().context("missing parent directory")?)?.sync_all()?;
-    Ok(())
+    privatefs::sync_dir(path.parent().context("missing parent directory")?)
 }
 
 fn switch(root: &Path, package: &Path) -> Result<()> {
@@ -621,7 +620,7 @@ async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
         .build()?;
     let mut last = String::new();
     for _ in 0..150 {
-        match inspect(data, &package.join("vibeface-core")).await {
+        match inspect(data, &package.join(PROGRAMS[1])).await {
             Ok(inspected) => {
                 let running_version = inspected
                     .core_version
@@ -744,7 +743,10 @@ fn backup(source: &Path, destination: &Path) -> Result<()> {
             );
             fs::copy(&path, &target)?;
             privatefs::restrict_file(&target)?;
-            File::open(target)?.sync_all()?;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(target)?
+                .sync_all()?;
         }
     }
     privatefs::sync_dir(destination)
@@ -1244,7 +1246,7 @@ mod tests {
 
     fn build_info(version: &str) -> serde_json::Value {
         serde_json::json!({
-            "version": version, "target": "aarch64-apple-darwin", "source_commit": "a".repeat(40),
+            "version": version, "target": if cfg!(windows) { "x86_64-pc-windows-msvc" } else { "aarch64-apple-darwin" }, "source_commit": "a".repeat(40),
             "core_version": version, "core_source_commit": "a".repeat(40),
             "app_version": version, "app_source_commit": "a".repeat(40),
             "update_protocol": vibeface_control::UPDATE_PROTOCOL,
@@ -1325,7 +1327,12 @@ mod tests {
         let original = package(&root, "1.2.3-nightly.20261019.1");
         assert_eq!(npm_install_root(&original.join(PROGRAMS[0])).unwrap(), None);
         fs::create_dir_all(root.join("vendor")).unwrap();
-        let native = root.join("vendor/aarch64-apple-darwin");
+        let target = if cfg!(windows) {
+            "x86_64-pc-windows-msvc"
+        } else {
+            "aarch64-apple-darwin"
+        };
+        let native = root.join("vendor").join(target);
         fs::rename(original, &native).unwrap();
         fs::create_dir(root.join("bin")).unwrap();
         fs::write(root.join("bin/vibeface.mjs"), b"launcher").unwrap();
@@ -1586,7 +1593,7 @@ mod tests {
                 "only a confirmed activation can open admission"
             );
             fs::remove_file(pending)?;
-            File::open(data)?.sync_all()?;
+            privatefs::sync_dir(data)?;
             Ok(())
         }
     }

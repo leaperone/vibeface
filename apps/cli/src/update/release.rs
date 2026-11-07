@@ -174,6 +174,7 @@ fn host_target() -> Result<&'static str> {
         ("x86_64", "macos") => Ok("x86_64-apple-darwin"),
         ("aarch64", "linux") => Ok("aarch64-unknown-linux-gnu"),
         ("x86_64", "linux") => Ok("x86_64-unknown-linux-gnu"),
+        ("x86_64", "windows") => Ok("x86_64-pc-windows-msvc"),
         _ => bail!("updates are not available for this platform"),
     }
 }

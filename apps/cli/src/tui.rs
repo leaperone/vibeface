@@ -727,9 +727,17 @@ mod tests {
     use ratatui::backend::TestBackend;
     use serde_json::json;
 
+    fn test_data_dir() -> String {
+        if cfg!(windows) {
+            r"C:\vibeface\node\long directory\设备".to_owned()
+        } else {
+            "/node/long directory/设备".to_owned()
+        }
+    }
+
     fn node() -> NodeStatus {
         NodeStatus::parse(json!({
-            "status":"running", "device_id":"local-device-id", "data_dir":"/node/long directory/设备", "listen":"127.0.0.1:4790",
+            "status":"running", "device_id":"local-device-id", "data_dir":test_data_dir(), "listen":"127.0.0.1:4790",
             "web_enabled":true, "core_version":"0.0.1", "write_state":"writable",
             "peers":[
                 {"device_id":"peer-a", "name":"设备 e\u{301} 👩‍💻 \u{1b}]52;c;secret\u{7}\u{202e}extra long name", "path":"direct", "reachable":true, "synced_ms":1},

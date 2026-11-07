@@ -2144,15 +2144,51 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
+    const TEST_PRIVATE_NODE: &str = if cfg!(windows) {
+        r"C:\vibeface\private\node"
+    } else {
+        "/private/node"
+    };
+    const TEST_DATA_NODE: &str = if cfg!(windows) {
+        r"C:\vibeface\data\node"
+    } else {
+        "/data/node"
+    };
+    const TEST_PRIVATE_NODE_WITH_SPACE: &str = if cfg!(windows) {
+        r"C:\vibeface\private\node data"
+    } else {
+        "/private/node data"
+    };
+    const TEST_APP_DIR: &str = if cfg!(windows) {
+        r"C:\vibeface\app"
+    } else {
+        "/app"
+    };
+    const TEST_ONE_DIR: &str = if cfg!(windows) {
+        r"C:\vibeface\one"
+    } else {
+        "/one"
+    };
+    const TEST_TWO_DIR: &str = if cfg!(windows) {
+        r"C:\vibeface\two"
+    } else {
+        "/two"
+    };
+    const TEST_BIN_PATH: &str = if cfg!(windows) {
+        r"C:\vibeface\bin\claude"
+    } else {
+        "/opt/bin/claude"
+    };
+
     #[test]
     fn tui_is_explicit_read_only_and_help_describes_every_command() {
         use clap::CommandFactory;
         let options =
-            Cli::try_parse_from(["vibeface", "tui", "--data-dir", "/private/node"]).unwrap();
+            Cli::try_parse_from(["vibeface", "tui", "--data-dir", TEST_PRIVATE_NODE]).unwrap();
         let Some(Action::Tui(options)) = options.command else {
             panic!("expected tui")
         };
-        assert_eq!(options.data_dir, Path::new("/private/node"));
+        assert_eq!(options.data_dir, Path::new(TEST_PRIVATE_NODE));
         assert!(Cli::try_parse_from(["vibeface", "tui", "--json"]).is_err());
         assert!(Cli::try_parse_from(["vibeface", "tui", "--data-dir", "relative"]).is_err());
         let command = Cli::command();
@@ -2330,17 +2366,17 @@ mod tests {
     fn cli_direct_start_keeps_data_directory_arguments_unambiguous() {
         let default = Cli::try_parse_from(["vibeface"]).unwrap();
         assert!(default.command.is_none() && default.data_dir.is_none());
-        let direct = Cli::try_parse_from(["vibeface", "--data-dir", "/private/node"]).unwrap();
+        let direct = Cli::try_parse_from(["vibeface", "--data-dir", TEST_PRIVATE_NODE]).unwrap();
         assert!(direct.command.is_none());
-        assert_eq!(direct.data_dir.unwrap(), Path::new("/private/node"));
+        assert_eq!(direct.data_dir.unwrap(), Path::new(TEST_PRIVATE_NODE));
         let explicit =
-            Cli::try_parse_from(["vibeface", "serve", "--data-dir", "/private/node"]).unwrap();
+            Cli::try_parse_from(["vibeface", "serve", "--data-dir", TEST_PRIVATE_NODE]).unwrap();
         let Some(Action::Serve(options)) = explicit.command else {
             panic!("expected serve")
         };
-        assert_eq!(options.data_dir, Path::new("/private/node"));
+        assert_eq!(options.data_dir, Path::new(TEST_PRIVATE_NODE));
         assert!(
-            Cli::try_parse_from(["vibeface", "--data-dir", "/data/node", "--no-web"])
+            Cli::try_parse_from(["vibeface", "--data-dir", TEST_DATA_NODE, "--no-web"])
                 .unwrap()
                 .no_web
         );
@@ -2348,24 +2384,24 @@ mod tests {
             "vibeface",
             "serve",
             "--data-dir",
-            "/data/node",
+            TEST_DATA_NODE,
             "--no-web",
             "--app-dir",
-            "/app",
+            TEST_APP_DIR,
         ])
         .unwrap();
         let Some(Action::Serve(options)) = explicit.command else {
             panic!("expected serve")
         };
-        assert!(options.no_web && options.app_dir.as_deref() == Some(Path::new("/app")));
+        assert!(options.no_web && options.app_dir.as_deref() == Some(Path::new(TEST_APP_DIR)));
         assert!(
             Cli::try_parse_from([
                 "vibeface",
                 "--data-dir",
-                "/one",
+                TEST_ONE_DIR,
                 "serve",
                 "--data-dir",
-                "/two"
+                TEST_TWO_DIR
             ])
             .is_err()
         );
@@ -2384,7 +2420,7 @@ mod tests {
                 "--name",
                 "Build Node",
                 "--data-dir",
-                "/data/node"
+                TEST_DATA_NODE
             ])
             .is_ok()
         );
@@ -2394,17 +2430,23 @@ mod tests {
                 "join",
                 "https://node.example/join#vibeface1abc",
                 "--data-dir",
-                "/data/node"
+                TEST_DATA_NODE
             ])
             .is_err()
         );
         assert!(
-            Cli::try_parse_from(["vibeface", "access", "--json", "--data-dir", "/data/node"])
+            Cli::try_parse_from(["vibeface", "access", "--json", "--data-dir", TEST_DATA_NODE])
                 .is_ok()
         );
         assert!(
-            Cli::try_parse_from(["vibeface", "access", "--enable", "--data-dir", "/data/node"])
-                .is_ok()
+            Cli::try_parse_from([
+                "vibeface",
+                "access",
+                "--enable",
+                "--data-dir",
+                TEST_DATA_NODE
+            ])
+            .is_ok()
         );
         assert!(Cli::try_parse_from(["vibeface", "access", "--enable", "--disable"]).is_err());
         assert!(Cli::try_parse_from(["vibeface", "status", "--enable"]).is_err());
@@ -2424,7 +2466,7 @@ mod tests {
                     "service",
                     action,
                     "--data-dir",
-                    "/private/node data"
+                    TEST_PRIVATE_NODE_WITH_SPACE
                 ])
                 .is_ok()
             );
@@ -2434,7 +2476,7 @@ mod tests {
                 "vibeface",
                 "init",
                 "--data-dir",
-                "/data/node",
+                TEST_DATA_NODE,
                 "--relay",
                 "https://relay.test",
                 "--relay-listen",
@@ -2449,7 +2491,7 @@ mod tests {
                 "vibeface",
                 "init",
                 "--data-dir",
-                "/data/node",
+                TEST_DATA_NODE,
                 "--manager",
                 "cursor",
                 "--workspace",
@@ -2464,7 +2506,7 @@ mod tests {
                 "vibeface",
                 "init",
                 "--data-dir",
-                "/data/node",
+                TEST_DATA_NODE,
                 "--manager",
                 "cursor_sdk",
                 "--workspace",
@@ -2477,9 +2519,9 @@ mod tests {
                 "vibeface",
                 "init",
                 "--data-dir",
-                "/data/node",
+                TEST_DATA_NODE,
                 "--bin",
-                "/opt/bin/claude"
+                TEST_BIN_PATH
             ])
             .is_err()
         );

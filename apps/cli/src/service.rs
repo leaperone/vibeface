@@ -287,7 +287,6 @@ mod tests {
         std::fs::write(package.join(PROGRAMS[0]), b"binary").unwrap();
         mark_runnable(&package.join(PROGRAMS[0]));
         std::fs::write(package.join(SERVICE_SCRIPT), b"script").unwrap();
-        mark_runnable(&package.join(SERVICE_SCRIPT));
         privatefs::link_dir(&package, &root.join("current")).unwrap();
         let data = root.join("data with spaces");
         std::fs::create_dir(&data).unwrap();
@@ -329,7 +328,12 @@ mod tests {
     fn npm_service_uses_the_native_package_and_rejects_a_second_updater() {
         let root =
             std::env::temp_dir().join(format!("vibeface-npm-service-{}", uuid::Uuid::new_v4()));
-        let package = root.join("vendor/aarch64-apple-darwin");
+        let target = if cfg!(windows) {
+            "x86_64-pc-windows-msvc"
+        } else {
+            "aarch64-apple-darwin"
+        };
+        let package = root.join("vendor").join(target);
         std::fs::create_dir_all(package.join("scripts")).unwrap();
         std::fs::create_dir(root.join("bin")).unwrap();
         std::fs::write(root.join("bin/vibeface.mjs"), b"launcher").unwrap();
@@ -345,11 +349,10 @@ mod tests {
         std::fs::create_dir(package.join("web")).unwrap();
         std::fs::write(package.join("web/index.html"), b"web").unwrap();
         std::fs::write(package.join(SERVICE_SCRIPT), b"script").unwrap();
-        mark_runnable(&package.join(SERVICE_SCRIPT));
         std::fs::write(
             package.join("BUILD-INFO.json"),
             serde_json::to_vec(&serde_json::json!({
-                "version": "1.2.3-nightly.20261019.1", "target": "aarch64-apple-darwin",
+                "version": "1.2.3-nightly.20261019.1", "target": target,
                 "source_commit": "a".repeat(40), "core_version": "1.2.3-nightly.20261019.1",
                 "core_source_commit": "a".repeat(40), "app_version": "1.2.3-nightly.20261019.1",
                 "app_source_commit": "a".repeat(40),
@@ -360,7 +363,7 @@ mod tests {
         )
         .unwrap();
         let root = std::fs::canonicalize(root).unwrap();
-        let package = root.join("vendor/aarch64-apple-darwin");
+        let package = root.join("vendor").join(target);
         let binary = package.join(PROGRAMS[0]);
         let data = root.join("data with spaces");
         std::fs::create_dir(&data).unwrap();
