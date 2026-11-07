@@ -106,6 +106,7 @@ async fn main() -> Result<()> {
         stop = vibeface_bridge::platform::stop::requested() => stop.map(drop).map_err(Into::into),
     };
     runtime.shutdown().await;
+    drop(runtime);
     if rejoin {
         return vibeface_core::control::restart_fresh(&data_dir);
     }
