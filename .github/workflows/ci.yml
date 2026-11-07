@@ -931,7 +931,7 @@ jobs:
             vendor="$prefix/lib/node_modules/@leaperone/vibeface/vendor/$PACKAGE_TARGET"
           fi
           [[ "$("$launcher" --version)" == "vibeface $PACKAGE_VERSION" ]]
-          core_version="$(node -p "require('$vendor/BUILD-INFO.json').core_version")"
+          core_version="$(node -p 'require(process.argv[1]).core_version' "$vendor/BUILD-INFO.json")"
           [[ "$("$vendor/vibeface-core$exe" --version)" == "vibeface-core $core_version" ]]
           "$launcher" --help
           printf 'vendor=%s\n' "$vendor" >> "$GITHUB_OUTPUT"
