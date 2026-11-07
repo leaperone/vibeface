@@ -45,14 +45,111 @@ class FixtureProcessCheckError(AssertionError):
         super().__init__(f"fake provider {role} identity check failed: {reason}")
 
 
+def private_pipe_diagnostics(device_id, endpoint):
+    """Return pipe namespace facts without retaining or emitting endpoint names."""
+    prefix = f"vibeface-{device_id[:32]}-maintenance.sock-"
+    pipe_root = "\\\\.\\pipe\\"
+    named_pipe = isinstance(endpoint, str) and endpoint.startswith(pipe_root)
+    leaf = endpoint[len(pipe_root):] if named_pipe else ""
+    scoped = bool(leaf and leaf.startswith(prefix))
+    suffix_valid = bool(re.fullmatch(re.escape(prefix) + r"[0-9a-f]{16}", leaf))
+    result = {
+        "reported_endpoint_is_named_pipe": named_pipe,
+        "reported_endpoint_matches_device_scope": scoped,
+        "reported_endpoint_suffix_shape_valid": suffix_valid,
+        "device_scope_pipe_count": None,
+        "reported_endpoint_present_in_namespace": None,
+        "reported_endpoint_wait_state": "not_checked",
+    }
+    if os.name != "nt" or not named_pipe:
+        return result
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_ulong), ("high", ctypes.c_ulong)]
+
+    class WIN32_FIND_DATAW(ctypes.Structure):
+        _fields_ = [
+            ("attributes", ctypes.c_ulong),
+            ("created", FILETIME),
+            ("accessed", FILETIME),
+            ("written", FILETIME),
+            ("size_high", ctypes.c_ulong),
+            ("size_low", ctypes.c_ulong),
+            ("reserved0", ctypes.c_ulong),
+            ("reserved1", ctypes.c_ulong),
+            ("name", ctypes.c_wchar * 260),
+            ("alternate_name", ctypes.c_wchar * 14),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.FindFirstFileW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(WIN32_FIND_DATAW)]
+    kernel.FindFirstFileW.restype = ctypes.c_void_p
+    kernel.FindNextFileW.argtypes = [ctypes.c_void_p, ctypes.POINTER(WIN32_FIND_DATAW)]
+    kernel.FindNextFileW.restype = ctypes.c_int
+    kernel.FindClose.argtypes = [ctypes.c_void_p]
+    kernel.FindClose.restype = ctypes.c_int
+    data = WIN32_FIND_DATAW()
+    handle = kernel.FindFirstFileW(pipe_root + "*", ctypes.byref(data))
+    if handle == ctypes.c_void_p(-1).value:
+        if ctypes.get_last_error() in (2, 3, 18):
+            result["device_scope_pipe_count"] = 0
+            result["reported_endpoint_present_in_namespace"] = False
+    else:
+        count = 0
+        exact = False
+        try:
+            while True:
+                candidate = data.name
+                if candidate.casefold().startswith(prefix.casefold()):
+                    count += 1
+                    exact |= candidate.casefold() == leaf.casefold()
+                if not kernel.FindNextFileW(handle, ctypes.byref(data)):
+                    if ctypes.get_last_error() == 18:
+                        result["device_scope_pipe_count"] = count
+                        result["reported_endpoint_present_in_namespace"] = exact
+                    break
+        finally:
+            kernel.FindClose(handle)
+
+    kernel.WaitNamedPipeW.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong]
+    kernel.WaitNamedPipeW.restype = ctypes.c_int
+    if kernel.WaitNamedPipeW(endpoint, 1):
+        result["reported_endpoint_wait_state"] = "available"
+    else:
+        result["reported_endpoint_wait_state"] = {
+            2: "not_found", 3: "not_found", 121: "busy",
+        }.get(ctypes.get_last_error(), "other_error")
+    return result
+
+
+def status_observation(result, node):
+    """Summarize process and endpoint identity without exposing IDs or names."""
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        payload = None
+    if not isinstance(payload, dict):
+        payload = {}
+    process_alive = node.process is not None and node.process.poll() is None
+    return {
+        "core_process_alive": process_alive,
+        "http_device_matches_initialized": node.http_device_id == node.device_id,
+        "status_device_matches_initialized": payload.get("device_id") == node.device_id,
+        "status_value": payload.get("status") if payload.get("status") in
+            ("running", "stopped", "unavailable") else "unknown",
+        "pipe": private_pipe_diagnostics(node.device_id, payload.get("maintenance_socket")),
+    }
+
+
 class StatusCommandFailure(AssertionError):
     """A nonzero CLI status result with bounded, path- and secret-redacted evidence."""
 
-    def __init__(self, result, node):
+    def __init__(self, result, node, diagnose_runtime=False):
         self.returncode = result.returncode
         self.category, self.stderr = safe_status_stderr(result.stderr, node)
         self.node_status = 'unknown'
         self.probe_error = ''
+        self.runtime_diagnostics = None
         try:
             status = json.loads(result.stdout)
         except ValueError:
@@ -62,6 +159,15 @@ class StatusCommandFailure(AssertionError):
                 self.node_status = status['status']
             if isinstance(status.get('error'), str):
                 _, self.probe_error = safe_status_stderr(status['error'].encode('utf-8', errors='replace'), node)
+        if diagnose_runtime:
+            try:
+                self.runtime_diagnostics = status_observation(result, node)
+            except Exception:
+                self.runtime_diagnostics = {"diagnostic_state": "unavailable"}
+            try:
+                self.runtime_diagnostics["one_immediate_followup"] = node.followup_status_observation()
+            except Exception:
+                self.runtime_diagnostics["one_immediate_followup"] = {"command_state": "unavailable"}
         super().__init__("status inspects the initialized node")
 
 
@@ -77,6 +183,13 @@ def safe_status_stderr(stderr, node):
     }
     for spelling in sorted(spellings, key=len, reverse=True):
         text = text.replace(spelling, "[path]")
+    device_id = getattr(node, "device_id", "")
+    if device_id:
+        text = text.replace(device_id, "[device id]")
+        pipe_prefix = re.escape(
+            rf"\\.\pipe\vibeface-{device_id[:32]}-maintenance.sock-"
+        )
+        text = re.sub(pipe_prefix + r"[0-9a-f]{16}", "[private pipe]", text, flags=re.IGNORECASE)
     text = re.sub(
         r"(?i)\b(?:authorization\s*:\s*)?(?:bearer|basic)\s+[^\s,;]+",
         "[redacted authorization]", text,
@@ -368,6 +481,7 @@ class Node:
         self.url = f"http://127.0.0.1:{self.port}"
         self.process = None
         self.log = None
+        self.http_device_id = None
         self.home = workspace / f"{name} home"
         self.home.mkdir(parents=True, exist_ok=True)
         run([
@@ -428,13 +542,30 @@ class Node:
 
         info = wait_for("the node's local HTTP listener", listener)
         require(info["device_id"] == self.device_id, "the node serves its own device identity")
+        self.http_device_id = info["device_id"]
         return info
 
-    def status(self):
-        result = run([self.cli, "status", "--json", "--data-dir", self.directory], check=False,
-                     env=self.environment())
+    def read_status(self, timeout=60):
+        return run(
+            [self.cli, "status", "--json", "--data-dir", self.directory],
+            check=False, timeout=timeout, env=self.environment(),
+        )
+
+    def followup_status_observation(self):
+        try:
+            result = self.read_status(timeout=15)
+        except subprocess.TimeoutExpired:
+            return {"command_state": "timeout"}
+        except (OSError, ValueError):
+            return {"command_state": "unavailable"}
+        observation = status_observation(result, self)
+        observation["returncode"] = result.returncode
+        return observation
+
+    def status(self, diagnose_runtime=False):
+        result = self.read_status()
         if result.returncode != 0:
-            raise StatusCommandFailure(result, self)
+            raise StatusCommandFailure(result, self, diagnose_runtime=diagnose_runtime)
         return json.loads(result.stdout)
 
     def ask_to_stop(self):
@@ -638,7 +769,7 @@ def main():
         node = Node(package, workspace, NODE_NAME, provider)
         check_private_paths(node)
         node.start()
-        status = node.status()
+        status = node.status(diagnose_runtime=True)
         require(status["status"] == "running", f"status reports a running node: {status}")
         check_private_endpoint(node, status)
         checks["pipe"] = "owner-only named pipe probe passed"
@@ -674,6 +805,7 @@ def main():
                     "stderr_excerpt": error.stderr,
                     "node_status": error.node_status,
                     "probe_error": error.probe_error,
+                    "runtime_diagnostics": error.runtime_diagnostics,
                 }
             (options.artifacts / "windows-node-failure.json").write_text(
                 json.dumps(diagnostic, indent=2) + "\n", encoding="utf-8"
