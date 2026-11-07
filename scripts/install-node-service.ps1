@@ -86,7 +86,7 @@ function Get-TaskCommandLine {
 }
 
 function Confirm-TaskData {
-    param([string] $Name, [string] $DataDir, [string] $Verb, [bool] $Anchored)
+    param([string] $Name, [string] $DataDir, [string] $Verb, [bool] $Anchored, [string] $Binary = '')
     if (-not $DataDir) { return }
     $line = Get-TaskCommandLine -Name $Name
     if ($null -eq $line) { return }
@@ -98,6 +98,9 @@ function Confirm-TaskData {
         ((-not $Anchored) -or $line.EndsWith($quoted))
     if (-not $matched) {
         Fail 'installed service uses a different data directory or unsupported arguments; no service was changed.'
+    }
+    if ($Binary -and -not $line.StartsWith("$Binary ", [StringComparison]::OrdinalIgnoreCase)) {
+        Fail 'installed service uses a different executable; no service was changed.'
     }
 }
 
@@ -266,47 +269,53 @@ $arguments = @($args)
 if ($arguments.Count -eq 0) { Show-Usage; exit 0 }
 $action = $arguments[0]
 if ($action -eq '--help' -or $action -eq '-h') { Show-Usage; exit 0 }
-if (@('install', 'install-updater', 'start', 'stop', 'restart', 'status', 'uninstall-updater', 'uninstall') -notcontains $action) {
+if (@('install', 'install-updater', 'start', 'stop', 'restart', 'status', 'verify', 'uninstall-updater', 'uninstall-node', 'uninstall') -notcontains $action) {
     Fail-Usage "unknown action: $action"
 }
 $binary = ''
 $dataDir = ''
+$serviceId = 'node'
 $seen = @{}
 $index = 1
 while ($index -lt $arguments.Count) {
     $name = $arguments[$index]
-    if (($name -ne '--binary' -and $name -ne '--data-dir') -or ($index + 1) -ge $arguments.Count) {
+    if (($name -notin @('--binary', '--data-dir', '--service-id')) -or ($index + 1) -ge $arguments.Count) {
         Fail-Usage "unknown argument: $name"
     }
     if ($seen.ContainsKey($name)) { Fail-Usage "duplicate argument: $name" }
     $seen[$name] = $true
-    if ($name -eq '--binary') { $binary = $arguments[$index + 1] } else { $dataDir = $arguments[$index + 1] }
+    if ($name -eq '--binary') { $binary = $arguments[$index + 1] } elseif ($name -eq '--data-dir') { $dataDir = $arguments[$index + 1] } else { $serviceId = $arguments[$index + 1] }
     $index += 2
 }
+if ($serviceId -notmatch '^[a-z0-9][a-z0-9-]{0,40}$') { Fail-Usage 'Invalid service identity.' }
+if ($serviceId -eq 'node') { $NodeTask = '\Vibeface\Node'; $UpdateTask = '\Vibeface\Update' }
+else { $NodeTask = "\Vibeface\Node-$serviceId"; $UpdateTask = "\Vibeface\Update-$serviceId" }
 if ($dataDir) { $dataDir = Resolve-DataDir -Value $dataDir }
-if ($binary -and $action -notin @('install', 'install-updater')) {
-    Fail-Usage '--binary is only valid when installing a task.'
-}
 if ($action -ne 'status' -and -not $dataDir) {
     Fail-Usage 'An initialized absolute --data-dir is required for this action.'
 }
 
-if ($action -eq 'install' -or $action -eq 'install-updater') {
+if ($binary) {
     if (-not $binary -or -not [System.IO.Path]::IsPathRooted($binary) -or
         -not (Test-Path -LiteralPath $binary -PathType Leaf)) {
         Fail-Usage 'An absolute --binary that exists is required.'
     }
-    if (-not $dataDir) { Fail-Usage 'An initialized absolute --data-dir is required.' }
     $binary = (Get-Item -LiteralPath $binary -Force).FullName
+}
+if ($action -eq 'install' -or $action -eq 'install-updater') {
+    if (-not $binary) { Fail-Usage 'An absolute --binary that exists is required.' }
+    if (-not $dataDir) { Fail-Usage 'An initialized absolute --data-dir is required.' }
 }
 
 switch ($action) {
-    'start' { Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true }
-    'stop' { Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true }
-    'restart' { Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true }
-    'uninstall-updater' { Confirm-TaskData -Name $UpdateTask -DataDir $dataDir -Verb 'apply' -Anchored $false }
+    'start' { Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true -Binary $binary }
+    'stop' { Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true -Binary $binary }
+    'restart' { Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true -Binary $binary }
+    'uninstall-updater' { Confirm-TaskData -Name $UpdateTask -DataDir $dataDir -Verb 'apply' -Anchored $false -Binary $binary }
+    'uninstall-node' { Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true -Binary $binary }
+    'verify' { Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true -Binary $binary }
     default {
-        Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true
+        Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true -Binary $binary
         Confirm-TaskData -Name $UpdateTask -DataDir $dataDir -Verb 'apply' -Anchored $false
     }
 }
@@ -379,10 +388,19 @@ switch ($action) {
         if ($updater.Code -eq 0) { $updater.Output } else { 'Updater is not installed.' }
         exit $node.Code
     }
+    'verify' {
+        $installed = $null -ne (Get-RegisteredTask -Name $NodeTask)
+        $running = $installed -and (Test-TaskRunning -Name $NodeTask)
+        '{"installed":' + ([string] $installed).ToLowerInvariant() + ',"running":' + ([string] $running).ToLowerInvariant() + '}'
+    }
     'uninstall' {
         Remove-Task -Name $UpdateTask
         Remove-Task -Name $NodeTask
         'Removed requested services; node data was kept.'
+    }
+    'uninstall-node' {
+        Remove-Task -Name $NodeTask
+        'Removed requested node service; node data was kept.'
     }
     'uninstall-updater' {
         Remove-Task -Name $UpdateTask

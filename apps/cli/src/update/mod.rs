@@ -489,6 +489,71 @@ fn persist(path: &Path, value: &impl Serialize) -> Result<()> {
     privatefs::sync_dir(path.parent().context("missing parent directory")?)
 }
 
+/// Bind an App-managed Node to the existing updater policy without installing an updater task.
+/// A policy already bound to another root is never rewritten or taken over.
+pub(crate) fn bind_desktop_install_root(data: &Path, root: &Path) -> Result<()> {
+    let root = fs::canonicalize(root)?;
+    installed(&root)?;
+    let policy_path = data.join("update.json");
+    match desktop_saved_policy(data)? {
+        Some(existing) => {
+            ensure!(
+                existing.install_root == root,
+                "node updater is already bound to a different installation"
+            );
+        }
+        None => {
+            persist(
+                &policy_path,
+                &Policy {
+                    channel: Channel::Nightly,
+                    automatic: false,
+                    install_root: root,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn desktop_policy_matches(data: &Path, root: &Path) -> Result<bool> {
+    let root = fs::canonicalize(root)?;
+    let Some(saved) = desktop_saved_policy(data)? else {
+        return Ok(false);
+    };
+    if saved.install_root != root {
+        return Ok(false);
+    }
+    installed(&root)?;
+    Ok(true)
+}
+
+pub(crate) fn desktop_policy_compatible(data: &Path, root: &Path) -> Result<bool> {
+    Ok(desktop_saved_policy(data)?.is_none_or(|saved| saved.install_root == root))
+}
+
+fn desktop_saved_policy(data: &Path) -> Result<Option<Policy>> {
+    let path = data.join("update.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        metadata.file_type().is_file()
+            && metadata.len() <= 64 * 1024
+            && privatefs::is_private(&path)?,
+        "unsafe Node updater policy"
+    );
+    let saved: Policy =
+        serde_json::from_slice(&fs::read(path)?).context("invalid update policy")?;
+    Ok(Some(saved))
+}
+
+pub(crate) fn validate_desktop_package(package: &Path) -> Result<()> {
+    manifest(package).map(|_| ())
+}
+
 fn switch(root: &Path, package: &Path) -> Result<()> {
     let root = fs::canonicalize(root)?;
     let package = fs::canonicalize(package)?;

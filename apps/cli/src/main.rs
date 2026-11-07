@@ -17,6 +17,7 @@ use vibeface_control::{
     maintenance::{self, MaintenanceCommand, SecretString, WalletCommand},
 };
 
+mod desktop_node;
 mod service;
 mod terminal;
 mod triage;
@@ -74,6 +75,9 @@ enum Action {
     Service(crate::service::Service),
     /// Check releases and manage the automatic update policy.
     Update(crate::update::Update),
+    /// Internal Desktop managed Node provisioning interface.
+    #[command(hide = true)]
+    DesktopNode(crate::desktop_node::DesktopNode),
     /// Call a local tool with JSON arguments.
     Tool {
         /// Tool name.
@@ -699,6 +703,7 @@ async fn main() -> Result<()> {
         Some(Action::Logs(options)) => logs(options).await,
         Some(Action::Service(options)) => crate::service::run(options).await,
         Some(Action::Update(options)) => crate::update::run(options).await,
+        Some(Action::DesktopNode(options)) => crate::desktop_node::run(options).await,
     }
 }
 

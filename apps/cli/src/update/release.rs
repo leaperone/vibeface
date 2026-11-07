@@ -634,14 +634,14 @@ fn unpack(archive: &Path, destination: &Path, root_name: &str) -> Result<PathBuf
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct BuildInfo {
+pub(crate) struct BuildInfo {
     pub(super) core_version: String,
     core_source_commit: String,
     app_version: String,
     app_source_commit: String,
-    pub(super) version: String,
+    pub(crate) version: String,
+    pub(crate) source_commit: String,
     target: String,
-    source_commit: String,
     pub(super) update_protocol: u32,
     pub(super) data_epoch: u32,
 }
@@ -667,6 +667,72 @@ impl BuildInfo {
         );
         Ok(())
     }
+}
+
+/// Verify an already-bundled package using the same sealed file list as release installs.
+/// This never downloads or modifies the source package.
+pub(crate) fn verify_sealed_package(
+    package: &Path,
+    expected_version: &str,
+    expected_target: &str,
+) -> Result<BuildInfo> {
+    let build = verify_sealed_contents(package, expected_target)?;
+    ensure!(
+        build.version == expected_version,
+        "bundled package version differs from this CLI"
+    );
+    Ok(build)
+}
+
+pub(crate) fn verify_sealed_contents(package: &Path, expected_target: &str) -> Result<BuildInfo> {
+    let metadata = fs::symlink_metadata(package.join("BUILD-INFO.json"))?;
+    ensure!(
+        metadata.file_type().is_file() && metadata.len() <= 4096,
+        "invalid BUILD-INFO"
+    );
+    let entries = tree(package)?;
+    let checksums = fs::read_to_string(package.join("FILES.sha256"))?;
+    ensure!(
+        checksums.len() <= 1024 * 1024,
+        "file checksums exceed limit"
+    );
+    let mut declared = BTreeMap::new();
+    for line in checksums.lines() {
+        let (hash, name) = line.split_once("  ").context("invalid file checksum")?;
+        ensure!(name != "FILES.sha256", "self-referencing checksum");
+        ensure!(
+            declared
+                .insert(PathBuf::from(name), hash.to_owned())
+                .is_none(),
+            "duplicate file checksum"
+        );
+    }
+    let actual: BTreeMap<_, _> = entries
+        .iter()
+        .filter_map(|(name, entry)| match entry {
+            TreeEntry::File { sha256, .. } if name != Path::new("FILES.sha256") => Some((
+                name.clone(),
+                sha256
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            )),
+            _ => None,
+        })
+        .collect();
+    ensure!(declared == actual, "package file checksums differ");
+    let build: BuildInfo = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
+        .context("invalid package manifest")?;
+    build.validate()?;
+    ensure!(
+        build.target == expected_target,
+        "bundled package target differs from this host"
+    );
+    Ok(build)
+}
+
+pub(crate) fn same_package_bytes(left: &Path, right: &Path) -> Result<bool> {
+    Ok(tree(left)? == tree(right)?)
 }
 
 fn verify_build(package: &Path, release: &Release) -> Result<BuildInfo> {
