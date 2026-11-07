@@ -189,7 +189,7 @@ function Live({ children }: { children: ReactNode }) {
   const focusRef = useRef(chatFocus)
   focusRef.current = chatFocus
 
-  const conversations: Record<string, Conversation> = {}
+  const conversations: Record<string, Conversation> = Object.fromEntries(records.map((record) => [record.conversationId, cachedConversation(record)]))
   if (cacheOwnerActive && data && conversationId && data.conversation?.conversation_id === conversationId) {
     const cached = byConversation.get(conversationId)?.messages ?? []
     const missing = cached.filter((message) => !data.messages.some((item) => item.message_id === message.message_id))
@@ -238,11 +238,6 @@ function Live({ children }: { children: ReactNode }) {
     }
   }
 
-  if (cacheOwnerActive && networkId && me) {
-    const id = conversationId ?? ''
-    const cached = id ? byConversation.get(id) ?? null : null
-    if (id && !conversations[id] && cached?.messages.length) conversations[id] = cachedConversation(cached)
-  }
   const transcriptMessages = cacheOwnerActive && networkId && me && conversationId && data?.conversation?.conversation_id === conversationId && !shared.reading && !shared.error
     ? data.messages : null
   useEffect(() => {

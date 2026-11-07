@@ -955,6 +955,17 @@ test("workspace preserves bot and message requests while routing native decision
         assert.ok(cachedRaw && localRecords.parseLocalTranscripts(cachedRaw, 'network', 'client').some((item) => item.messages.some((message) => message.text === 'Bot A 的消息')), 'the real Live bridge persists successfully read history')
         const priorShared = shared
         assert.ok(priorShared.data)
+        const warming = { ...priorShared, data: null, conversationId: '', bots: [], synced: false, reading: true }
+        const warmingBridge = componentHarness('../../../../../apps/mobile/src/data/live.tsx', { ...bridgeDependencies,
+          '@vibeface/client/workspace/context.tsx': { useWorkspace: () => warming } }, {}, 'Live')
+        try {
+          const value = warmingBridge.render('Live').find(({ type }) => type === 'NativeWorkspace')?.props.value
+          assert.ok(value && typeof value === 'object')
+          const reconnecting = value as NativeWorkspace
+          assert.equal(reconnecting.conversations.chat?.source, 'cache', 'reconnecting reads the cached route before the entry selects any conversation')
+          assert.equal(reconnecting.conversations.chat.messages.some((item) => item.text === 'Bot A 的消息'), true)
+          assert.ok(reconnecting.conversations.chat.blocked)
+        } finally { warmingBridge.close() }
         const behind = { ...priorShared, conversationId: 'chat', data: { ...priorShared.data, conversation: { ...context.conversation }, messages: [] } }
         const partialBridge = componentHarness('../../../../../apps/mobile/src/data/live.tsx', { ...bridgeDependencies,
           '@vibeface/client/workspace/context.tsx': { useWorkspace: () => behind } }, {}, 'Live')
