@@ -192,7 +192,7 @@ describe('CoreLifecycle with a real child process', () => {
     const realKill = child.kill.bind(child)
     ;(child as ChildProcess & { kill: (signal?: NodeJS.Signals | number) => boolean }).kill = () => false
     try {
-      await expect(lifecycle.stopOwned('replace')).rejects.toThrow(/无法确认本机 Core 已退出/)
+      await expect(lifecycle.stopOwned('replace')).rejects.toThrow(/无法确认后台进程已退出/)
       expect(lifecycle.state().kind).toBe('owned')
     } finally {
       ;(child as ChildProcess & { kill: (signal?: NodeJS.Signals | number) => boolean }).kill = realKill

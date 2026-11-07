@@ -371,7 +371,13 @@ async function start(): Promise<void> {
     quitting = true
     if (!coreSession?.ownsCore()) return
     event.preventDefault()
-    void coreSession.shutdown().finally(() => app.exit(0))
+    void coreSession.shutdown().then(
+      () => app.exit(0),
+      (error: unknown) => {
+        quitting = false
+        reportFailure('暂时无法退出 Vibeface', error)
+      }
+    )
   })
 
   showLauncher()

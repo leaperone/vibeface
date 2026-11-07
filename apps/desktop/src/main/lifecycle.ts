@@ -167,7 +167,7 @@ export class CoreLifecycle {
     if (await this.waitForExit(child, this.signalGrace('SIGKILL'))) return
 
     // If exit cannot be confirmed, keep ownership so callers never treat a live child as stopped.
-    throw new Error('无法确认本机 Core 已退出；保留 owned 状态以避免误报已停止。')
+    throw new Error('无法确认后台进程已退出。请稍后再次选择退出。')
   }
 
   /** Close stdin, wait for Core's own shutdown, and only then kill this exact child handle. */
