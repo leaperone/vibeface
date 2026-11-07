@@ -6742,6 +6742,7 @@ dependencies = [
  "vibeface-delivery",
  "vibeface-protocol",
  "vibeface-secure",
+ "vibeface-secure-ffi",
  "zeroize",
 ]
 

@@ -1,14 +1,19 @@
 import init, * as wasm from '../../generated/vibeface_secure.js'
 import type { Notifier, Platform } from '@vibeface/client/lib/platform.ts'
 import { createTransport } from '@vibeface/client/lib/transport.ts'
-import type { DeviceKeys } from '@vibeface/client/lib/transport.ts'
+import type { DeviceKeys, LanDial, LanStream, NativeLocalCarrier, NativeLocalGatewayCarrier } from '@vibeface/client/lib/transport.ts'
 import type { SecureApi } from '@vibeface/client/secure-api.ts'
 import { lostKeyText } from '@vibeface/client/identity/copy.ts'
 import { indexedOutbox } from './indexed-outbox'
 import { localPage } from './local-page'
 import { joinTabs } from './tabs'
+import { desktopLocalPage } from './desktop-local-page'
+import type { ClientPreloadApi } from '../../../desktop/src/shared/client-contract.ts'
 
 const secure: SecureApi = wasm
+declare global {
+  interface Window { vibefaceClient?: ClientPreloadApi }
+}
 const lostKeyMessage = lostKeyText('这个浏览器')
 const hex = (bytes: ArrayBuffer) => [...new Uint8Array(bytes)].map(value => value.toString(16).padStart(2, '0')).join('')
 type StoredKey = { privateKey: CryptoKey; deviceId: string; created_at: number }
@@ -81,7 +86,7 @@ const notifier: Notifier = {
   },
 }
 
-export const webPlatform: Platform = {
+const browserPlatform: Platform = {
   secure,
   transport: createTransport(secure, browserKeys),
   storage: { getItem: key => typeof localStorage === 'undefined' ? null : localStorage.getItem(key), setItem: (key, value) => localStorage.setItem(key, value) },
@@ -125,3 +130,43 @@ export const webPlatform: Platform = {
   page: localPage,
   get joinTabs() { return typeof BroadcastChannel !== 'undefined' && globalThis.navigator?.locks ? joinTabs : undefined },
 }
+
+function desktopPlatform(native: ClientPreloadApi): Platform {
+  let localGatewayOrigin: string | null = null
+  const stream = (id: string): LanStream => {
+    let closed = false
+    let sending = 0
+    return {
+      send(data) {
+        if (closed) return
+        if (sending >= 16) { closed = true; native.carrier.close(id); throw new Error('设备连接的发送队列已满。') }
+        sending += 1
+        void native.carrier.send(id, new Uint8Array(data)).catch(() => { closed = true; native.carrier.close(id) }).finally(() => { sending -= 1 })
+      },
+      async recv() {
+        if (closed) return null
+        const frame = await native.carrier.receive(id)
+        if (!frame) closed = true
+        return frame
+      },
+      close() { if (!closed) { closed = true; native.carrier.close(id) } },
+    }
+  }
+  const nativeLan: LanDial = async (deviceId, addrs, timeoutMs) => stream(await native.carrier.openLan(deviceId, addrs, timeoutMs))
+  const nativeLocal: NativeLocalCarrier = async (entry, timeoutMs) => stream(await native.carrier.open(entry.device_id, timeoutMs))
+  const nativeLocalGateway: NativeLocalGatewayCarrier = async (entry, target, timeoutMs) => {
+    if (entry.address !== localGatewayOrigin) return null
+    const id = await native.carrier.openGateway(target, entry.address, timeoutMs)
+    if (!id) throw new Error('本机节点已切换。刷新后重试。')
+    return stream(id)
+  }
+  return {
+    ...browserPlatform,
+    transport: createTransport(secure, browserKeys, nativeLan, nativeLocal, nativeLocalGateway),
+    page: desktopLocalPage(native, origin => { localGatewayOrigin = origin }),
+  }
+}
+
+export const webPlatform: Platform = typeof window !== 'undefined' && window.vibefaceClient
+  ? desktopPlatform(window.vibefaceClient)
+  : browserPlatform

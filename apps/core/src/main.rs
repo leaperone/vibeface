@@ -1,3 +1,4 @@
+mod desktop_client_bridge;
 mod desktop_parent;
 
 use anyhow::{Context, Result, bail};
@@ -31,11 +32,17 @@ struct CoreArgs {
     /// Stop this owned Core when its desktop or Windows CLI parent's private stdin closes.
     #[arg(long, hide = true, conflicts_with = "control")]
     desktop_parent_stdin: bool,
+    /// Open one bounded client-only LAN stream over the existing iroh protocol.
+    #[arg(long, hide = true, conflicts_with_all = ["control", "desktop_parent_stdin"])]
+    desktop_client_bridge: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = CoreArgs::parse();
+    if args.desktop_client_bridge {
+        return desktop_client_bridge::run().await;
+    }
     if args.control {
         let mut input = Vec::new();
         std::io::stdin()

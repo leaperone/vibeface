@@ -3,7 +3,7 @@
   "version": "0.0.1-nightly.20261107.1",
   "private": true,
   "type": "module",
-  "description": "Vibeface Electron desktop host (trusted launcher + Core-served business window)",
+  "description": "Vibeface Electron desktop app (sealed client + optional local Core)",
   "main": "dist/main/index.cjs",
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.launcher.json",
@@ -11,7 +11,9 @@
     "build": "node scripts/bundle.mjs",
     "package": "node ../../scripts/build-desktop.mjs"
   },
-  "dependencies": {},
+  "dependencies": {
+    "ws": "8.22.0"
+  },
   "devDependencies": {
     "@electron/notarize": "3.1.2",
     "@electron/osx-sign": "2.7.2",

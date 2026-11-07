@@ -47,6 +47,12 @@ await esbuild.build({
 })
 
 await esbuild.build({
+  ...node,
+  entryPoints: [join(desktopRoot, 'src/preload/client.ts')],
+  outfile: join(dist, 'preload/client.cjs'),
+})
+
+await esbuild.build({
   ...shared,
   entryPoints: [join(desktopRoot, 'src/launcher/main.ts')],
   outfile: join(dist, 'launcher/launcher.js'),
@@ -64,4 +70,4 @@ await esbuild.build({
 
 await cp(join(desktopRoot, 'src/launcher/index.html'), join(dist, 'launcher/index.html'))
 
-console.log('desktop build: dist/main/index.cjs, dist/preload/launcher.cjs, dist/launcher/index.html')
+console.log('desktop build: dist/main/index.cjs, dist/preload/launcher.cjs, dist/preload/client.cjs, dist/launcher/index.html')
