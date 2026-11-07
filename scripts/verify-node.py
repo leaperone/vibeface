@@ -8967,6 +8967,7 @@ def e2e_fixture(options):
                                                   "target": deferred_input["input"]["target"],
                                                   "deferred": deferred_input["deferred"], "cancelled": deferred_input["cancelled"]}
                                                  if deferred_input else None),
+                              "total_invocations": len(calls),
                               "running_invocations": sum(row["trigger"] == native_queue["running_trigger"] for row in calls),
                               "deferred_invocations": sum(row["trigger"] == "message:" + native_queue["deferred_message_id"]
                                                            for row in calls)}

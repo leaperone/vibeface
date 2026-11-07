@@ -162,6 +162,7 @@ function providerInspection(value: Record<string, unknown>) {
     return { message_id: text(input.message_id), target: { kind: 'bot_main' as const, bot_id: text(target.bot_id) },
       deferred: input.deferred, cancelled: input.cancelled };
   })();
+  assert(typeof value.total_invocations === 'number' && Number.isSafeInteger(value.total_invocations) && value.total_invocations >= 0);
   assert(typeof value.running_invocations === 'number' && Number.isSafeInteger(value.running_invocations) && value.running_invocations >= 0);
   assert(typeof value.deferred_invocations === 'number' && Number.isSafeInteger(value.deferred_invocations) && value.deferred_invocations >= 0);
   assert(Array.isArray(value.roles) && value.roles.every(role => role === 'agent' || role === 'execution'));
@@ -175,7 +176,8 @@ function providerInspection(value: Record<string, unknown>) {
     app_server_link_state: link, readiness: text(value.readiness), authentication: text(value.authentication), catalog: text(value.catalog),
     checked_at_ms: value.checked_at_ms, checked: value.checked_at_ms !== null,
     jobs: value.jobs.map((item: unknown) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state) }; }),
-    deferred_input: deferredInput, running_invocations: value.running_invocations, deferred_invocations: value.deferred_invocations };
+    deferred_input: deferredInput, total_invocations: value.total_invocations,
+    running_invocations: value.running_invocations, deferred_invocations: value.deferred_invocations };
 }
 
 test('provider settings and queued cancellation work in the installed native app', { platforms: ['ios'], timeout: 600000 }, async ({ app, device, network, screen }) => {
@@ -510,6 +512,7 @@ test('provider settings and queued cancellation work in the installed native app
     message_id: deferredMessageId, target: { kind: 'bot_main', bot_id: botId }, deferred: true, cancelled: false,
   });
   expect((await inspect()).jobs).toEqual([{ trigger: runningTrigger, state: 'running' }]);
+  expect((await inspect()).total_invocations).toBe(1);
   const cancel = optionsSheet.getByRole('button', '取消稍后输入', { exact: true, visible: true });
   const deferredScroll = device.locator('role=scroll-area').filter({ has: cancel });
   await expect(deferredScroll).toHaveCount(1);
@@ -522,11 +525,14 @@ test('provider settings and queued cancellation work in the installed native app
   await expect(optionsSheet).toHaveCount(1);
   await optionsSheet.getByRole('button', '关闭目标和队列', { exact: true }).click();
   await expect(optionsSheet).toHaveCount(0);
+  expect((await inspect()).total_invocations).toBe(1);
   expect((await inspect()).deferred_invocations).toBe(0);
   await screen.getByRole('button', '停止', { exact: true }).click();
   await expect.poll(async () => (await inspect()).jobs.find(job => job.trigger === runningTrigger)?.state, { timeout: 30000 }).toBe('cancelled');
   await expect(screen.getByRole('button', '停止', { exact: true })).toBeHidden();
   const after = await inspect();
+  expect(after.jobs).toEqual([{ trigger: runningTrigger, state: 'cancelled' }]);
+  expect(after.total_invocations).toBe(1);
   expect(after.running_invocations).toBe(1);
   expect(after.deferred_invocations).toBe(0);
   expect(after.deferred_input).toEqual({
@@ -537,6 +543,7 @@ test('provider settings and queued cancellation work in the installed native app
   await expect(screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/)).toBeVisible();
   const reopened = await inspect();
   expect(reopened.jobs).toEqual(after.jobs);
+  expect(reopened.total_invocations).toBe(1);
   expect(reopened.running_invocations).toBe(1);
   expect(reopened.deferred_invocations).toBe(0);
   expect(reopened.deferred_input).toEqual(after.deferred_input);
@@ -564,6 +571,7 @@ test('provider settings and queued cancellation work in the installed native app
     synthetic_login_count: reopened.login_count, native_authenticated_recheck: true, trimmed_controlled_cleared_effort: true,
     real_provider_model_calls: 0, not_checked: ['real Provider authentication', 'Claude-specific native login'],
     running_trigger: runningTrigger, deferred_message_id: deferredMessageId, jobs: reopened.jobs,
+    total_invocations: reopened.total_invocations,
     running_invocations: reopened.running_invocations, deferred_input: reopened.deferred_input,
     deferred_invocations: reopened.deferred_invocations,
     native_cancelled_queue: true, native_stopped_running: true, reopened_without_execution: true }, null, 2)}\n`, { mode: 0o600 });
