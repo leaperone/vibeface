@@ -98,8 +98,9 @@ def restrict_windows_private_file(path):
     TRUSTEE_IS_USER = 1
     NO_MULTIPLE_TRUSTEE = 0
     SE_FILE_OBJECT = 1
+    OWNER_SECURITY_INFORMATION = 0x00000001
     DACL_SECURITY_INFORMATION = 0x00000004
-    PROTECTED_DACL_SECURITY_INFORMATION = 0x00008000
+    PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
     ERROR_SUCCESS = 0
     ERROR_INSUFFICIENT_BUFFER = 122
 
@@ -111,6 +112,12 @@ def restrict_windows_private_file(path):
         if code != ERROR_SUCCESS:
             raise ctypes.WinError(code) from None
 
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [wintypes.LPVOID]
+    kernel32.LocalFree.restype = wintypes.LPVOID
     advapi32.OpenProcessToken.argtypes = [
         wintypes.HANDLE,
         wintypes.DWORD,
@@ -179,8 +186,8 @@ def restrict_windows_private_file(path):
                 advapi32.SetNamedSecurityInfoW(
                     path,
                     SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                    None,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    user_sid,
                     None,
                     new_acl,
                     None,

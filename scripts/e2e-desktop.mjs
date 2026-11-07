@@ -250,10 +250,10 @@ async function start() {
 /** Invoke the product quit menu in this app's main process and report only its owned Core children. */
 async function quit() {
   const running = child;
-  if (!running || running.exitCode !== null) {
+  if (!running || running.exitCode !== null || running.signalCode !== null) {
     child = undefined;
     inspectorPort = undefined;
-    return { pid: running ? running.pid : null, owned: [], surviving: [], forced: false };
+    return { pid: running ? running.pid : null, owned: [], surviving: [], forced: Boolean(running) };
   }
   const owned = await cores(running.pid);
   assert(Number.isInteger(inspectorPort), 'the app-owned inspector is available for its explicit menu quit');
