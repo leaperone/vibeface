@@ -24,7 +24,7 @@ Core、CLI、Web App 和 Mobile 共享一个版本、一个 `v<version>` Tag 与
 
 `COMPONENT-INFO.json` 与 `release.json` 的 schema 保持 1。`BUILD-INFO.json` 仍包含九个既有字段，CLI、Core、App 的版本和源码提交必须完全一致。数据 epoch 与更新协议保持 1。旧公开 Tag 与字节保持不可变，不创建旧应用前缀别名。
 
-## 每日 Nightly 的发布约束
+## 每 4 小时 Nightly 的发布约束
 
 协调入口仍是 `ci.yml` 的 `daily-nightly`，只在 UTC 03:23 的 main 定时扩展检查和 `ci-gate` 成功后执行。手动 CI 和普通 main push 不发布每日 Nightly。产品四应用分配一个共同版本和 `v` Tag，官网独立分配版本和 `www-v` Tag；即使业务源码没有变化，每日仍递增版本。
 
