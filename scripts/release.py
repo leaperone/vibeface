@@ -8,7 +8,7 @@ import gzip
 import io
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
 import subprocess
@@ -155,7 +155,7 @@ def safe_name(name):
 
 def files(directory, exclude=()):
     result = {}
-    for path in sorted(directory.rglob('*')):
+    for path in sorted(directory.rglob('*'), key=lambda path: path.relative_to(directory).as_posix()):
         require(not path.is_symlink(), 'symlinks are not allowed in release assets')
         if path.is_file():
             name = path.relative_to(directory).as_posix()
@@ -634,7 +634,7 @@ def verify_product_release(directory, expected):
                     'CLI bundle must contain the browser cryptography SDK')
             content = files(bundle, ('FILES.sha256',))
             require((bundle / 'FILES.sha256').read_text(encoding='utf-8') == ''.join(f'{value}  {name}\n' for name, value in content.items()),
-                    'CLI bundled content changed')
+                    f'{target} CLI bundled content changed')
             verify_component(unpack(directory / core_name, tmp / f'core-{index}'), 'core', dict(pins, target=target))
             if target in DESKTOP_TARGETS:
                 verify_desktop_receipt(directory, target, pins, digest(directory / bundle_name))
@@ -847,6 +847,16 @@ def self_test():
         with patch.object(Path, 'read_text', windows_default_read):
             accepts(lambda: require(read_version('mobile', root) == '1.2.3-nightly.20261107.1',
                                     'UTF-8 mobile configuration must ignore the host default codepage'))
+
+    with tempfile.TemporaryDirectory(prefix='vibeface-release-order-') as temporary:
+        root = Path(temporary)
+        (root / 'README.md').write_bytes(b'readme')
+        (root / 'docs').mkdir()
+        (root / 'docs/node.md').write_bytes(b'node')
+        with patch.object(type(root), '__lt__',
+                          lambda left, right: PureWindowsPath(str(left)) < PureWindowsPath(str(right))):
+            accepts(lambda: require(list(files(root)) == ['README.md', 'docs/node.md'],
+                                    'sealed file order must ignore host path comparison rules'))
 
     accepts(lambda: require(parse_tag(product_tag) == ('product', product_version, channel), 'product tag'))
     accepts(lambda: require(parse_tag(www_tag) == ('www', www_version, version(www_version)), 'www tag'))
