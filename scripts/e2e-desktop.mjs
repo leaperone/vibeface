@@ -201,7 +201,9 @@ async function waitLauncher() {
         if (await inPage(launcher, `(async () => {
           if (document.readyState !== 'complete' || typeof window.vibefaceLauncher !== 'object') return false;
           const status = await window.vibefaceLauncher.getStatus();
-          return ['ready', 'failed'].includes(status.discovery.kind) && status.backgroundNode.kind !== 'checking';
+          if (!['ready', 'failed'].includes(status.discovery.kind) || status.backgroundNode.kind === 'checking') return false;
+          const opensClient = status.nodeMode !== 'undecided' && status.preferences.openBusinessOnConnect;
+          return !opensClient || status.businessOpen;
         })()`)) return;
         last = 'launcher preload is not ready';
       } catch (error) { last = error instanceof Error ? error.message : String(error); }
