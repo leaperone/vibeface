@@ -63,7 +63,7 @@ module.exports = {
     identity: signed ? undefined : null,
     // Notarization uses the existing Developer ID and App Store Connect key, then staples the app.
     notarize: signed,
-    extendInfo: { NSHighResolutionCapable: true },
+    extendInfo: { NSHighResolutionCapable: true, NSCameraUsageDescription: '扫描加入链接，连接你的 Vibeface 网络。' },
   },
   win: {
     target: [{ target: 'nsis', arch: [arch] }, { target: 'zip', arch: [arch] }],

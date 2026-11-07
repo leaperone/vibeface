@@ -113,7 +113,11 @@ async function waitLauncher() {
     const launcher = await launcherPage();
     if (launcher) {
       try {
-        if (await inPage(launcher, 'document.readyState === "complete" && typeof window.vibefaceLauncher === "object"')) return;
+        if (await inPage(launcher, `(async () => {
+          if (document.readyState !== 'complete' || typeof window.vibefaceLauncher !== 'object') return false;
+          const status = await window.vibefaceLauncher.getStatus();
+          return ['ready', 'failed'].includes(status.discovery.kind) && status.backgroundNode.kind !== 'checking';
+        })()`)) return;
         last = 'launcher preload is not ready';
       } catch (error) { last = error instanceof Error ? error.message : String(error); }
     }

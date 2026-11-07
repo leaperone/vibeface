@@ -33,7 +33,10 @@ const unavailable = (node: Extract<LocalNode, { kind: 'unavailable' }>): string 
 function rows(status: LauncherStatus): NodeRow[] {
   if (status.discovery.kind !== 'ready') return []
   return status.discovery.nodes.map((node) => {
-    if (node.kind === 'running') return { node, status: '正在运行', detail: `节点 ${node.deviceId.slice(0, 12)} · ${node.coreVersion}`, actions: [action('connect', '连接', true, false, node.id)] }
+    if (node.kind === 'running') {
+      const selected = status.selectedNode?.deviceId === node.deviceId && status.selectedNode.dataDir === node.dataDir
+      return { node, status: selected ? '已选择' : '正在运行', detail: `节点 ${node.deviceId.slice(0, 12)} · ${node.coreVersion}`, actions: [action('connect', selected ? '已选择' : '连接', true, selected, node.id)] }
+    }
     if (node.kind === 'stopped') return { node, status: '已停止', detail: `节点 ${node.deviceId.slice(0, 12)} · ${node.coreVersion}`, actions: [action('start-discovered', '启动并连接', true, false, node.id)] }
     return { node, status: '暂不可用', detail: unavailable(node), actions: [action('discover', '重新检查')] }
   })
@@ -75,28 +78,34 @@ export function describe(status: LauncherStatus): View {
 
   const isLocal = status.nodeMode === 'local'
   const hasCore = status.core.kind === 'owned' || status.core.kind === 'attached'
+  const selected = status.selectedNode
   const failed = status.discovery.kind === 'failed'
   const actions: Action[] = [
-    ...(status.clientAvailable ? [action('open', hasCore ? '打开 Vibeface' : '连接节点', true)] : []),
+    ...(status.clientAvailable ? [action('open', '打开 Vibeface', true)] : []),
     action('discover', '重新检查本机节点'),
-    ...(isLocal && !hasCore ? [action('start-owned', '在此电脑新建节点'), action('choose', '选择已有数据目录…')] : []),
+    ...(!isLocal ? [action('local', '管理本机节点')] : []),
+    ...(!hasCore ? [action('choose', '选择已有节点目录…')] : []),
+    ...(isLocal && !hasCore ? [action('start-owned', '在此电脑启用节点')] : []),
     ...(status.core.kind === 'owned' ? [action('stop-owned', '停止随 App 运行的节点')] : []),
   ]
   const core = status.core
   const failure = core.kind === 'failed' ? core.message : failed ? status.discovery.kind === 'failed' ? status.discovery.message : null : null
-  const tone: Tone = failure ? 'bad' : hasCore ? 'live' : status.discovery.kind === 'scanning' ? 'busy' : 'idle'
-  const headline = hasCore ? '节点已连接' : status.nodeMode === 'controller' ? '连接你的 Vibeface 节点' : '在这台电脑启用节点'
-  const explain = hasCore
-    ? '控制端连接与本机节点运行彼此独立；切换连接目标不会停止本机节点。'
+  const tone: Tone = failure ? 'bad' : selected ? 'live' : status.discovery.kind === 'scanning' ? 'busy' : 'idle'
+  const headline = selected ? '已选择本机节点' : status.nodeMode === 'controller' ? '连接你的 Vibeface 节点' : '在这台电脑启用节点'
+  const explain = selected
+    ? '打开 Vibeface 即可访问这个节点。首次使用需要确认身份并保存恢复文件。'
     : status.nodeMode === 'controller'
       ? '选择一个正在运行的节点即可开始。已停止的节点只会在你明确选择后启动。'
       : '可以连接已有节点，或在此电脑创建新节点。退出 App 会停止由 App 临时运行的节点。'
+  const facts: View['facts'] = []
+  if (selected) facts.push(['访问节点 ID', selected.deviceId], ['访问节点目录', selected.dataDir])
+  if (core.kind === 'owned') facts.push(['随 App 运行的节点 ID', core.deviceId], ['运行目录', core.dataDir])
   return {
-    tone, indicator: hasCore ? '已连接' : failed ? '检查未完成' : '等待连接', headline, explain,
-    facts: core.kind === 'owned' || core.kind === 'attached' ? [['节点 ID', core.deviceId], ['数据目录', core.dataDir]] : [],
+    tone, indicator: selected ? '节点可用' : failed ? '检查未完成' : '等待连接', headline, explain,
+    facts,
     failure, actions, rows: rows(status), discoveryMessage,
     backgroundMessage: isLocal || background.kind !== 'absent' ? backgroundMessage : '',
     backgroundActions: isLocal ? backgroundActions : [],
-    scope: isLocal ? '这台电脑可以运行节点，也可以连接其他节点。' : '此模式只控制节点，不会在这台电脑启用节点。',
+    scope: isLocal ? '这台电脑可以运行节点，也可以连接其他节点。' : '连接已有节点，或使用邀请链接加入个人网络。',
   }
 }

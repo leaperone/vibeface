@@ -12,6 +12,7 @@ const status = (overrides: Partial<LauncherStatus> = {}): LauncherStatus => ({
   attachOnly: false,
   clientAvailable: true,
   nodeMode: 'undecided',
+  selectedNode: null,
   discovery: { kind: 'idle' },
   backgroundNode: { kind: 'absent' },
   ...overrides,
@@ -59,6 +60,17 @@ describe('launcher view', () => {
     expect(toView(status({ nodeMode: 'local', core })).actions.map((item) => item.id)).toContain('stop-owned')
     const attached: CoreState = { ...core, kind: 'attached' }
     expect(toView(status({ nodeMode: 'local', core: attached })).actions.map((item) => item.id)).not.toContain('stop-owned')
+  })
+
+  it('shows the selected client target while preserving a different App-owned Node', () => {
+    const core: CoreState = { kind: 'owned', dataDir: '/app/node', deviceId: 'app-node', origin: 'http://127.0.0.1:4791' }
+    const selectedNode = { dataDir: '/existing/node', deviceId: 'existing-node' }
+    const view = toView(status({ nodeMode: 'controller', core, selectedNode }))
+    expect(view.headline).toBe('已选择本机节点')
+    expect(view.facts).toContainEqual(['访问节点目录', '/existing/node'])
+    expect(view.facts).toContainEqual(['运行目录', '/app/node'])
+    expect(view.actions.map(item => item.id)).toContain('stop-owned')
+    expect(view.actions.map(item => item.id)).toContain('local')
   })
 
   it('shows installed background ownership even in controller mode and never offers its removal there', () => {

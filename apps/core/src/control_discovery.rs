@@ -108,11 +108,17 @@ pub async fn discover(app_profile_dir: &Path, remembered: &[PathBuf]) -> Result<
         Err(_) => warnings.push("running_process_metadata_unavailable"),
     }
     ensure!(paths.len() <= MAX_PATHS, "too many local Node candidates");
+    inspect_candidates(paths, warnings).await
+}
 
+async fn inspect_candidates(
+    paths: BTreeMap<PathBuf, Vec<Source>>,
+    mut warnings: Vec<&'static str>,
+) -> Result<Value> {
     let mut nodes = Vec::new();
     for (path, sources) in paths {
         // Missing/uninitialized defaults are ordinary absence, not phantom Nodes.
-        if !path.join("config.toml").is_file() || !path.join("identity.json").is_file() {
+        if !path.join("config.json").is_file() || !path.join("identity.json").is_file() {
             continue;
         }
         match owned_by_current_user(&path) {
@@ -205,7 +211,11 @@ fn user_service_data_dir() -> std::result::Result<Option<PathBuf>, ()> {
     use plist::Value;
     let home = current_home().ok_or(())?;
     let plist = home.join("Library/LaunchAgents/com.leaperone.vibeface.node.plist");
-    let metadata = fs::symlink_metadata(&plist).map_err(|_| ())?;
+    let metadata = match fs::symlink_metadata(&plist) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.len() > 64 * 1024
@@ -233,7 +243,11 @@ fn user_service_data_dir() -> std::result::Result<Option<PathBuf>, ()> {
 fn user_service_data_dir() -> std::result::Result<Option<PathBuf>, ()> {
     let home = current_home().ok_or(())?;
     let unit = home.join(".config/systemd/user/vibeface.service");
-    let metadata = fs::symlink_metadata(&unit).map_err(|_| ())?;
+    let metadata = match fs::symlink_metadata(&unit) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.len() > 64 * 1024
@@ -262,7 +276,7 @@ fn parse_linux_service_unit(text: &str) -> std::result::Result<Option<PathBuf>, 
     // involved, and escape decoding is limited to the escaping used by the service installer.
     let line = starts[0];
     let program = first_systemd_argument(line).ok_or(())?;
-    if Path::new(program).file_name().and_then(|v| v.to_str()) != Some("vibeface-core")
+    if Path::new(program).file_name().and_then(|v| v.to_str()) != Some("vibeface")
         || !line.split_whitespace().any(|arg| arg == "serve")
         || line.matches("--data-dir ").count() != 1
     {
@@ -307,10 +321,10 @@ fn user_service_data_dir() -> std::result::Result<Option<PathBuf>, ()> {
     let task: Task = serde_json::from_slice(&output).map_err(|_| ())?;
     for action in task.actions.into_iter().take(8) {
         if action.sid != task.current_sid
-            || !action
-                .command
-                .to_ascii_lowercase()
-                .ends_with("vibeface-core.exe")
+            || !Path::new(&action.command)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("vibeface.exe"))
         {
             continue;
         }
@@ -360,7 +374,7 @@ fn known_server_args(args: &[String]) -> bool {
     args.first()
         .and_then(|p| Path::new(p).file_name())
         .and_then(|n| n.to_str())
-        == Some("vibeface-core")
+        == Some("vibeface")
         && args.iter().any(|a| a == "serve")
 }
 
@@ -430,6 +444,30 @@ fn owned_by_current_user(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn initialized_json_node_is_discovered_read_only() {
+        let root =
+            std::env::temp_dir().join(format!("vibeface-discovery-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("已有 Node");
+        super::super::control::prepare_start(&dir).unwrap();
+        let canonical = fs::canonicalize(&dir).unwrap();
+        let config = fs::read(dir.join("config.json")).unwrap();
+        let identity = fs::read(dir.join("identity.json")).unwrap();
+        let epoch = fs::read(dir.join("data-epoch.json")).unwrap();
+        let mut paths = BTreeMap::new();
+        paths.insert(canonical.clone(), vec![Source::Remembered]);
+        let observed = inspect_candidates(paths, Vec::new()).await.unwrap();
+        assert_eq!(observed["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(observed["nodes"][0]["status"], "stopped");
+        assert_eq!(observed["nodes"][0]["data_dir"], json!(canonical));
+        assert_eq!(observed["nodes"][0]["sources"], json!(["remembered"]));
+        assert_eq!(fs::read(dir.join("config.json")).unwrap(), config);
+        assert_eq!(fs::read(dir.join("identity.json")).unwrap(), identity);
+        assert_eq!(fs::read(dir.join("data-epoch.json")).unwrap(), epoch);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn candidate_limit_and_absolute_path_are_enforced() {
         let mut paths = BTreeMap::new();
@@ -451,7 +489,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn systemd_fixture_extracts_unicode_spaced_data_dir() {
-        let fixture = "[Service]\nExecStart=\"/opt/Vibeface/vibeface-core\" serve --data-dir \"/home/user/Node 数据 2\"\n";
+        let fixture = "[Service]\nExecStart=\"/opt/Vibeface/vibeface\" serve --data-dir \"/home/user/Node 数据 2\"\n";
         assert_eq!(
             parse_linux_service_unit(fixture).unwrap().unwrap(),
             PathBuf::from("/home/user/Node 数据 2")
@@ -466,7 +504,7 @@ mod tests {
 
     #[test]
     fn systemd_fixture_extracts_only_known_node_and_spaced_path() {
-        let fixture = "[Service]\nExecStart=\"/opt/Vibeface/vibeface-core\" serve --data-dir \"/home/user/Node 数据 2\"\n";
+        let fixture = "[Service]\nExecStart=\"/opt/Vibeface/vibeface\" serve --data-dir \"/home/user/Node 数据 2\"\n";
         assert_eq!(
             parse_linux_service_unit(fixture).unwrap().unwrap(),
             PathBuf::from("/home/user/Node 数据 2")

@@ -299,7 +299,7 @@ mod windows {
         let mut found = Vec::new();
         for row in rows.processes.into_iter().take(MAX_PROCESSES) {
             if row.owner_sid != row.current_sid
-                || row.name.to_ascii_lowercase() != "vibeface-core.exe"
+                || !row.name.eq_ignore_ascii_case("vibeface-core.exe")
             {
                 continue;
             }
@@ -315,7 +315,7 @@ mod windows {
             if argv.is_null() {
                 continue;
             }
-            let args = unsafe { std::slice::from_raw_parts(argv, argc.max(0).min(256) as usize) }
+            let args = unsafe { std::slice::from_raw_parts(argv, argc.clamp(0, 256) as usize) }
                 .iter()
                 .map(|arg| {
                     let mut n = 0;
@@ -348,7 +348,7 @@ mod windows {
         if argv.is_null() {
             return None;
         }
-        let count = argc.max(0).min(256) as usize;
+        let count = argc.clamp(0, 256) as usize;
         let args = unsafe { std::slice::from_raw_parts(argv, count) }
             .iter()
             .map(|arg| {

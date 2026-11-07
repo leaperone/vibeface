@@ -152,6 +152,20 @@ jobs:
           # ownership; the application keeps its Chromium sandbox enabled throughout the test.
           sudo chown root:root .artifacts/desktop-app/squashfs-root/chrome-sandbox
           sudo chmod 4755 .artifacts/desktop-app/squashfs-root/chrome-sandbox
+      - name: Prepare the hosted Linux current-user service session
+        if: runner.os == 'Linux'
+        run: |
+          user_id="$(id -u)"
+          test "$user_id" -gt 0
+          command -v systemctl
+          # user@ starts the real logind-managed user session and its D-Bus socket.
+          # Reusing an existing manager is idempotent; the test removes only its own services.
+          sudo systemctl start "user@$user_id.service"
+          export XDG_RUNTIME_DIR="/run/user/$user_id"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          test -S "$XDG_RUNTIME_DIR/bus"
+          systemctl --user show-environment >/dev/null
+          printf 'XDG_RUNTIME_DIR=%s\nDBUS_SESSION_BUS_ADDRESS=%s\n' "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
       - name: Drive the real desktop window end to end
         env:
           VIBEFACE_E2E_DESKTOP_APP: ${{ steps.application.outputs.path }}

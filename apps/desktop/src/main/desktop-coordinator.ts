@@ -6,7 +6,7 @@ import { discoverLocalNodes, type LocalNodes } from './local-nodes.js'
 import type { ManagedNodeController, ManagedNodeStatus } from './managed-node.js'
 import { loadClientPreferences, saveClientPreferences, type ClientPreferences } from './client-preferences.js'
 import type { CoreProgram } from './control-client.js'
-import type { BackgroundNode, LocalNode, NodeDiscovery } from '../shared/contract.js'
+import type { BackgroundNode, LauncherStatus, LocalNode, NodeDiscovery } from '../shared/contract.js'
 
 export type SelectedLocalNode = { inspect: Inspect; access: Access }
 export type DesktopCoordinatorOptions = {
@@ -102,10 +102,10 @@ export class DesktopCoordinator {
     await Promise.all([this.refreshBackground(), this.discover()])
   }
 
-  status(): { clientAvailable: boolean; nodeMode: ClientPreferences['nodeMode']; discovery: NodeDiscovery; backgroundNode: BackgroundNode } {
+  status(): Pick<LauncherStatus, 'nodeMode' | 'selectedNode' | 'discovery' | 'backgroundNode'> {
     return {
-      clientAvailable: true,
       nodeMode: this.preferences.nodeMode,
+      selectedNode: this.preferences.selectedNode,
       discovery: this.discovery,
       backgroundNode: this.backgroundNode,
     }
@@ -119,8 +119,13 @@ export class DesktopCoordinator {
     this.discovery = { kind: 'scanning' }
     this.options.onChange?.()
     try {
-      const catalog = await this.discoverImpl(this.options.controlProgram, this.options.profileDir, this.preferences.rememberedDataDirs)
+      const remembered = [...new Set([...this.preferences.rememberedDataDirs,
+        ...(this.preferences.selectedNode ? [this.preferences.selectedNode.dataDir] : [])])]
+      const catalog = await this.discoverImpl(this.options.controlProgram, this.options.profileDir, remembered)
       this.discovery = { kind: 'ready', nodes: catalog.nodes, warnings: catalog.warnings }
+      if (catalog.nodes.length && this.preferences.nodeMode === 'undecided') {
+        this.preferences = { ...this.preferences, nodeMode: 'controller' }
+      }
       const selected = await this.resolveCandidate(catalog.nodes, this.preferences.selectedNode)
       if (selected) {
         this.preferences = {
@@ -130,7 +135,8 @@ export class DesktopCoordinator {
         }
         await this.persist()
       } else {
-        const running = catalog.nodes.filter((node) => node.kind === 'running')
+        this.preferences = { ...this.preferences, selectedNode: null }
+        const running = catalog.nodes.filter((node) => node.kind === 'running' && node.webEnabled)
         if (running.length === 1) {
           const candidate = running[0]
           if (candidate) {
@@ -144,12 +150,11 @@ export class DesktopCoordinator {
               await this.persist()
             }
           }
-        } else {
-          this.preferences = { ...this.preferences, selectedNode: null }
-          await this.persist()
         }
+        await this.persist()
       }
     } catch (error) {
+      this.preferences = { ...this.preferences, selectedNode: null }
       this.discovery = { kind: 'failed', message: message(error) }
     }
     this.options.onChange?.()
@@ -164,7 +169,33 @@ export class DesktopCoordinator {
   }
 
   async startOwnedAppNode(): Promise<void> {
-    await this.serial(() => this.options.startOwnedAppNode())
+    await this.serial(async () => {
+      await this.options.startOwnedAppNode()
+      await this.discoverInner()
+    })
+  }
+
+  async rememberDirectory(dataDir: string): Promise<void> {
+    if (!isAbsolute(dataDir)) throw new Error('请选择已有节点的绝对路径。')
+    await this.serial(async () => {
+      const canonical = await realpath(dataDir)
+      const inspected = await this.options.inspect(canonical)
+      if (inspected.dataDir !== canonical || !/^[a-f0-9]{64}$/.test(inspected.deviceId)) throw new Error('目录未能通过节点身份检查。')
+      this.preferences = { ...this.preferences,
+        nodeMode: this.preferences.nodeMode === 'undecided' ? 'controller' : this.preferences.nodeMode,
+        rememberedDataDirs: [...new Set([...this.preferences.rememberedDataDirs, canonical])].slice(-16),
+      }
+      await this.persist()
+      await this.discoverInner()
+    })
+  }
+
+  async clearSelection(): Promise<void> {
+    await this.serial(async () => {
+      this.preferences = { ...this.preferences, selectedNode: null, rememberedDataDirs: [] }
+      await this.persist()
+      this.changed()
+    })
   }
 
   async connect(candidateId: string): Promise<void> {
@@ -270,6 +301,7 @@ export class DesktopCoordinator {
       }
       this.backgroundNode = backgroundNodeFromStatus(result, this.platform)
       await this.refreshBackground()
+      await this.discoverInner()
       this.changed()
     })
   }

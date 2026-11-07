@@ -8,7 +8,9 @@ import {
   type LauncherStatus,
   type PreferenceKey,
 } from '../shared/contract.js'
-import { ActivationQueue, type JoinActivation } from './activation-queue.js'
+import { ActivationQueue } from './activation-queue.js'
+import { createClientHost, CLIENT_SCHEME_DESCRIPTOR } from './client-host.js'
+import { CLIENT_ORIGIN } from '../shared/client-contract.js'
 import { parseArgs } from './cli.js'
 import { DesktopCoordinator, prepareAppProfileNode } from './desktop-coordinator.js'
 import { runControl } from './control-client.js'
@@ -17,17 +19,16 @@ import { deepLinkFromArgv, parseDeepLink, type DeepLink } from './deeplink.js'
 import { isTrustedLauncherCall, readBoolean, readExternalUrl, readNoArguments, readString } from './ipc-guard.js'
 import { registerLauncherScheme, serveLauncher } from './launcher-protocol.js'
 import { applyApplicationMenu } from './menu.js'
-import { cliBinary, controlProgram, runtimeState, serviceProgram } from './paths.js'
+import { cliBinary, coreBinary, runtimeRoot, controlProgram, runtimeState, serviceProgram } from './paths.js'
 import { CoreSession } from './session.js'
 import { ManagedNodeController } from './managed-node.js'
 import { createTray } from './tray.js'
 import {
-  createBusinessWindow,
+  createClientWindow,
   createLauncherWindow,
   guardPermissions,
   launcherAssets,
   openExternally,
-  sameOrigin,
 } from './windows.js'
 
 const MAX_PATH = 1024
@@ -40,6 +41,9 @@ let tray: Tray | null = null
 let quitting = false
 let coreSession: CoreSession | null = null
 let coordinator: DesktopCoordinator | null = null
+let clientHost: ReturnType<typeof createClientHost> | null = null
+let clientIpcInstalled = false
+let shutdownPending = false
 
 function profileDirectory(explicit: string | null): string {
   if (explicit) return explicit
@@ -58,7 +62,7 @@ app.setName(PRODUCT_NAME)
 app.setAppUserModelId(APP_ID)
 app.setPath('userData', profileDir)
 app.setPath('sessionData', join(profileDir, 'chromium'))
-registerLauncherScheme()
+registerLauncherScheme([CLIENT_SCHEME_DESCRIPTOR])
 
 function requireSession(): CoreSession {
   if (!coreSession) throw new Error('桌面会话还没有就绪')
@@ -66,9 +70,7 @@ function requireSession(): CoreSession {
 }
 
 function businessOrigin(): string | null {
-  const state = coreSession?.state()
-  if (!state) return null
-  return (state.kind === 'owned' || state.kind === 'attached') && state.origin ? state.origin : null
+  return businessWindow && !businessWindow.isDestroyed() ? CLIENT_ORIGIN : null
 }
 
 function status(): LauncherStatus {
@@ -76,6 +78,7 @@ function status(): LauncherStatus {
   const client = coordinator?.status() ?? {
     clientAvailable: true,
     nodeMode: 'undecided' as const,
+    selectedNode: null,
     discovery: { kind: 'idle' as const },
     backgroundNode: { kind: 'checking' as const },
   }
@@ -88,6 +91,7 @@ function status(): LauncherStatus {
     version: app.getVersion(),
     attachOnly: args.attachOnly,
     ...client,
+    clientAvailable: clientHost !== null,
   }
 }
 
@@ -113,14 +117,17 @@ function showLauncher(): void {
   broadcast()
 }
 
-async function loadBusiness(target: string): Promise<void> {
-  const origin = new URL(target).origin
-  if (businessWindow && !businessWindow.isDestroyed() && !sameOrigin(businessWindow.webContents.getURL(), origin)) {
+async function loadBusiness(target: string, replace = false): Promise<void> {
+  if (replace && businessWindow && !businessWindow.isDestroyed()) {
     businessWindow.destroy()
     businessWindow = null
   }
   if (!businessWindow || businessWindow.isDestroyed()) {
-    businessWindow = createBusinessWindow(origin)
+    businessWindow = createClientWindow(mainDir)
+    if (!clientIpcInstalled) {
+      clientHost?.installIpc()
+      clientIpcInstalled = true
+    }
     businessWindow.on('close', (event) => {
       if (quitting) return
       event.preventDefault()
@@ -138,11 +145,20 @@ async function loadBusiness(target: string): Promise<void> {
 }
 
 /**
- * Open Core's private UI origin. An invite enters the ordinary join flow directly.
+ * The first-party client always opens, independently of the optional Node host.
  */
-async function openBusiness(): Promise<void> {
-  const target = await requireSession().businessTarget()
-  await loadBusiness(target.url)
+async function openBusiness(reconnect = false): Promise<void> {
+  if (!clientHost) throw new Error('客户端界面尚未就绪。')
+  if (!reconnect && businessWindow && !businessWindow.isDestroyed()) {
+    businessWindow.show()
+    businessWindow.focus()
+    broadcast()
+    return
+  }
+  const destination = new URL(clientHost.clientUrl)
+  const selected = await requireCoordinator().resolveSelectedNode()
+  if (selected && selected.access.kind === 'local') destination.hash = new URL(selected.access.url).hash
+  await loadBusiness(destination.toString(), reconnect)
 }
 
 function openBusinessSafely(): void {
@@ -156,44 +172,18 @@ function reportFailure(title: string, error: unknown): void {
 }
 
 /**
- * An invite published by this machine's own Core continues inside the desktop window. One
- * published by another entry belongs to that origin, which this window never navigates to,
- * so the user decides whether it opens in their browser.
+ * Keep the original invitation while the client stays at its fixed first-party origin.
  */
 async function handleJoin(link: DeepLink): Promise<void> {
   if (link.kind !== 'join') return
   try {
-    const target = await requireSession().businessTarget(link).catch((error: unknown) => {
-      if (link.origin !== null) {
-        return { kind: 'external' as const, url: `${link.origin}/join#${link.ticket}` }
-      }
-      throw error
-    })
-    if (target.kind === 'external') {
-      showLauncher()
-      const origin = new URL(target.url).origin
-      const answer = await dialog.showMessageBox({
-        type: 'question',
-        title: '收到其他入口的加入链接',
-        message: '这条加入链接指向另一个入口地址。',
-        detail: `${origin}\n\n可以在系统浏览器中打开它继续加入流程。`,
-        buttons: ['在浏览器中打开', '取消'],
-        defaultId: 1,
-        cancelId: 1,
-      })
-      if (answer.response === 0) openExternally(target.url)
-      return
-    }
-    await loadBusiness(target.url)
+    if (!clientHost) throw new Error('客户端界面尚未就绪。')
+    const target = new URL('/join', clientHost.clientUrl)
+    target.hash = new URLSearchParams({ invitation: link.origin === null ? link.ticket : `${link.origin}/join#${link.ticket}` }).toString()
+    await loadBusiness(target.toString(), true)
   } catch (error) {
     reportFailure('无法打开加入链接', error)
   }
-}
-
-function canHandleJoin(link: JoinActivation): boolean {
-  if (link.origin !== null) return true
-  const state = coreSession?.state()
-  return state?.kind === 'owned' || state?.kind === 'attached'
 }
 
 function trusted(event: IpcMainInvokeEvent): void {
@@ -245,35 +235,42 @@ function registerIpc(): void {
       properties: ['openDirectory', 'createDirectory'],
     })
     const chosen = picked.canceled ? null : picked.filePaths[0]
-    if (chosen) await requireSession().useDataDir(chosen)
+    if (chosen) {
+      await requireCoordinator().rememberDirectory(chosen)
+      if (requireSession().preferences().openBusinessOnConnect) await openBusiness(true)
+    }
     return status()
   })
   handle(IPC.useDataDir, async (passed) => {
-    await requireSession().useDataDir(readString(passed[0], '数据目录', MAX_PATH))
+    await requireCoordinator().rememberDirectory(stringArgument(passed, '数据目录', MAX_PATH))
+    if (requireSession().preferences().openBusinessOnConnect) await openBusiness(true)
     return status()
   })
   handle(IPC.forgetDataDir, async (passed) => {
     readNoArguments(passed, IPC.forgetDataDir)
-    await requireSession().forgetDataDir()
+    await requireCoordinator().clearSelection()
+    if (businessWindow && !businessWindow.isDestroyed()) await openBusiness(true)
     return status()
   })
   handle(IPC.startOwned, async (passed) => {
     readNoArguments(passed, IPC.startOwned)
     const current = requireSession()
     await requireCoordinator().startOwnedAppNode()
-    if (current.preferences().openBusinessOnConnect) await openBusiness()
+    if (current.preferences().openBusinessOnConnect) await openBusiness(true)
     return status()
   })
   handle(IPC.attachExisting, async (passed) => {
     readNoArguments(passed, IPC.attachExisting)
     const current = requireSession()
     await current.attachExisting()
-    if (current.preferences().openBusinessOnConnect) await openBusiness()
+    if (current.preferences().openBusinessOnConnect) await openBusiness(true)
     return status()
   })
   handle(IPC.stopOwned, async (passed) => {
     readNoArguments(passed, IPC.stopOwned)
     await requireSession().stopOwned()
+    await requireCoordinator().discover()
+    if (businessWindow && !businessWindow.isDestroyed()) await openBusiness(true)
     return status()
   })
   handle(IPC.openBusiness, async (passed) => {
@@ -291,30 +288,37 @@ function registerIpc(): void {
   handle(IPC.discoverNodes, async (passed) => {
     readNoArguments(passed, IPC.discoverNodes)
     await requireCoordinator().discover()
+    if (requireSession().preferences().openBusinessOnConnect && requireCoordinator().status().selectedNode) await openBusiness(true)
     return status()
   })
   handle(IPC.chooseNodeMode, async (passed) => {
     const mode = stringArgument(passed, '节点模式', 16)
     if (mode !== 'controller' && mode !== 'local') throw new TypeError('未知的节点模式')
     await requireCoordinator().chooseMode(mode)
+    if (mode === 'controller') await openBusiness()
     return status()
   })
   handle(IPC.connectDiscoveredNode, async (passed) => {
     await requireCoordinator().connect(stringArgument(passed, '节点标识', 64))
+    if (requireSession().preferences().openBusinessOnConnect) await openBusiness(true)
     return status()
   })
   handle(IPC.startDiscoveredNode, async (passed) => {
     await requireCoordinator().start(stringArgument(passed, '节点标识', 64))
+    if (requireSession().preferences().openBusinessOnConnect) await openBusiness(true)
     return status()
   })
   handle(IPC.installBackgroundNode, async (passed) => {
     readNoArguments(passed, IPC.installBackgroundNode)
     await requireCoordinator().installBackground()
+    await requireCoordinator().discover()
+    if (requireSession().preferences().openBusinessOnConnect) await openBusiness(true)
     return status()
   })
   handle(IPC.startBackgroundNode, async (passed) => {
     readNoArguments(passed, IPC.startBackgroundNode)
     await requireCoordinator().startBackground()
+    if (requireSession().preferences().openBusinessOnConnect) await openBusiness(true)
     return status()
   })
   handle(IPC.stopBackgroundNode, async (passed) => {
@@ -358,10 +362,6 @@ async function start(): Promise<void> {
   }
 
   const activations = new ActivationQueue(async (link) => {
-    if (!canHandleJoin(link)) {
-      showLauncher()
-      return 'defer'
-    }
     await handleJoin(link)
     return 'handled'
   })
@@ -412,7 +412,10 @@ async function start(): Promise<void> {
     inspect: async (dataDir) => parseInspect(await runControl(controlProgram(), { command: 'inspect', data_dir: dataDir })),
     access: async (dataDir) => parseAccess(await runControl(controlProgram(), { command: 'access', data_dir: dataDir, json: true })),
     startDiscovered: async (node) => requireSession().startDiscoveredNode(node.dataDir, node.deviceId),
-    startOwnedAppNode: async () => requireSession().startOwned(),
+    startOwnedAppNode: async () => {
+      await requireSession().useDataDir(join(profileDir, 'node'))
+      await requireSession().startOwned()
+    },
     beforeInstallBackground: async (node) => {
       const current = requireSession()
       const state = current.state()
@@ -425,6 +428,14 @@ async function start(): Promise<void> {
     },
     onChange: broadcast,
   })
+  clientHost = createClientHost({
+    runtimeRoot: join(runtimeRoot(), 'web'),
+    resolveSelectedNode: () => requireCoordinator().resolveSelectedNode(),
+    clientBridgeProgram: coreBinary,
+    getClientContents: () => businessWindow && !businessWindow.isDestroyed() ? businessWindow.webContents : null,
+    showNodePanel: showLauncher,
+  })
+  clientHost.registerProtocol()
 
   applyApplicationMenu({ showLauncher, openBusiness: openBusinessSafely, quit })
   tray = createTray({ showLauncher, openBusiness: openBusinessSafely, quit })
@@ -442,12 +453,14 @@ async function start(): Promise<void> {
   })
 
   app.on('before-quit', (event) => {
-    quitting = true
-    if (!coreSession?.ownsCore()) return
     event.preventDefault()
-    void coreSession.shutdown().then(
+    if (shutdownPending) return
+    shutdownPending = true
+    quitting = true
+    void (async () => { await coreSession?.shutdown(); await clientHost?.dispose() })().then(
       () => app.exit(0),
       (error: unknown) => {
+        shutdownPending = false
         quitting = false
         reportFailure('暂时无法退出 Vibeface', error)
       }
@@ -459,8 +472,7 @@ async function start(): Promise<void> {
   await coreSession.restore()
   broadcast()
 
-  const state = coreSession.state()
-  if (coreSession.preferences().openBusinessOnConnect && (state.kind === 'attached' || state.kind === 'owned')) {
+  if (coordinator.status().nodeMode !== 'undecided' && coreSession.preferences().openBusinessOnConnect) {
     await openBusiness().catch(() => {
       /* the launcher already shows why the window could not open */
     })

@@ -6,6 +6,8 @@ import { lstat, mkdir, open, readFile, rm, writeFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { test as base } from 'e2e';
+import type { LauncherStatus } from '../../apps/desktop/src/shared/contract';
+export type { LauncherStatus } from '../../apps/desktop/src/shared/contract';
 
 const root = resolve(import.meta.dirname, '../..');
 const artifacts = resolve(root, '.artifacts/e2e/desktop');
@@ -21,12 +23,6 @@ export type Inspection = {
   pages: Page[];
 };
 export type FixtureNode = { dataDir: string; peerPort: number; localPort: number; deviceId: string; running: boolean };
-export type LauncherStatus = {
-  core: { kind: string; dataDir?: string; deviceId?: string; origin?: string };
-  nodeMode: string;
-  discovery: { kind: string; nodes: Array<{ kind: string; id?: string; deviceId?: string; dataDir?: string }> };
-  backgroundNode: { kind: string; nodeId?: string; dataDir?: string; health?: string };
-};
 export type Desktop = {
   inspect(): Promise<Inspection>;
   status(): Promise<LauncherStatus>;

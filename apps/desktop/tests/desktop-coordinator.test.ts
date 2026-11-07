@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -42,6 +42,7 @@ describe('Desktop coordinator', () => {
     const instance = coordinator(profile, [local(dataDir)], new Map([[dataDir, inspect(dataDir)]]))
     await instance.value.initialize()
     expect(instance.value.status().nodeMode).toBe('controller')
+    expect(instance.value.status().selectedNode).toEqual({ dataDir, deviceId })
     expect(await instance.value.resolveSelectedNode()).toMatchObject({ inspect: { dataDir, deviceId } })
     await instance.value.chooseMode('controller')
     expect(await instance.value.resolveSelectedNode()).toMatchObject({ inspect: { deviceId } })
@@ -55,6 +56,7 @@ describe('Desktop coordinator', () => {
       new Map([[first, inspect(first)], [second, inspect(second, 'b'.repeat(64))]]), start)
     await instance.value.initialize()
     expect(await instance.value.resolveSelectedNode()).toBeNull()
+    expect(instance.value.status().nodeMode).toBe('controller')
     const stopped = instance.value.status().discovery
     expect(stopped.kind).toBe('ready')
     if (stopped.kind !== 'ready') return
@@ -72,6 +74,34 @@ describe('Desktop coordinator', () => {
     const installed: ManagedNodeStatus = { ok: true, state: 'installed', device_id: deviceId, data_dir: dataDir,
       service_id: 'desktop-profile', managed_root: '/managed', service_running: true, core_status: 'stopped' }
     expect(backgroundNodeFromStatus(installed, 'darwin')).toMatchObject({ kind: 'installed', health: 'unhealthy', manager: 'launchd' })
+  })
+
+  it('clears a previously selected Node when its on-disk identity changes', async () => {
+    const profile = await temp(), dataDir = await temp()
+    const identities = new Map([[dataDir, inspect(dataDir)]])
+    const instance = coordinator(profile, [local(dataDir)], identities)
+    await instance.value.initialize()
+    expect(instance.value.status().selectedNode?.deviceId).toBe(deviceId)
+    identities.set(dataDir, inspect(dataDir, 'b'.repeat(64)))
+    await instance.value.discover()
+    expect(instance.value.status().selectedNode).toBeNull()
+    expect(await instance.value.resolveSelectedNode()).toBeNull()
+    expect(instance.managed.start).not.toHaveBeenCalled()
+    expect(instance.managed.stop).not.toHaveBeenCalled()
+  })
+
+  it('remembers only an existing inspected directory and forgets the client target without stopping a Node', async () => {
+    const profile = await temp(), dataDir = await realpath(await temp())
+    const instance = coordinator(profile, [local(dataDir)], new Map([[dataDir, inspect(dataDir)]]))
+    await instance.value.initialize()
+    await instance.value.rememberDirectory(dataDir)
+    const stored = JSON.parse(await readFile(join(profile, 'client-preferences.json'), 'utf8'))
+    expect(stored.rememberedDataDirs).toEqual([await realpath(dataDir)])
+    await instance.value.clearSelection()
+    expect(instance.value.status().selectedNode).toBeNull()
+    expect(instance.managed.stop).not.toHaveBeenCalled()
+    expect(instance.managed.uninstall).not.toHaveBeenCalled()
+    await expect(instance.value.rememberDirectory(join(dataDir, 'missing'))).rejects.toThrow()
   })
 
   it('initializes a fresh App node, inspects it stopped, then installs the same identity without starting a child', async () => {

@@ -29,12 +29,13 @@ const POLICY = [
   "frame-ancestors 'none'",
 ].join('; ')
 
-export function registerLauncherScheme(): void {
+export function registerLauncherScheme(additional: Parameters<typeof protocol.registerSchemesAsPrivileged>[0] = []): void {
   protocol.registerSchemesAsPrivileged([
     {
       scheme: LAUNCHER_SCHEME,
       privileges: { standard: true, secure: true, supportFetchAPI: false, corsEnabled: false },
     },
+    ...additional,
   ])
 }
 

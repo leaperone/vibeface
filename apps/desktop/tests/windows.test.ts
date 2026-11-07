@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { shell } from 'electron'
-import { createBusinessWindow, createLauncherWindow } from '../src/main/windows.js'
+import { createClientWindow, createLauncherWindow } from '../src/main/windows.js'
 
 vi.mock('electron', async () => {
   const { EventEmitter } = await import('node:events')
@@ -18,15 +18,15 @@ beforeEach(() => vi.clearAllMocks())
 
 describe.each(['will-navigate', 'will-redirect'])('%s boundary', (eventName) => {
   it('keeps a same-origin page in the business window', () => {
-    const window = createBusinessWindow('http://127.0.0.1:4791')
+    const window = createClientWindow('/fixture/main')
     const event = { preventDefault: vi.fn() }
-    window.webContents.emit(eventName, event, 'http://127.0.0.1:4791/join')
+    window.webContents.emit(eventName, event, 'vibeface-app://app/join')
     expect(event.preventDefault).not.toHaveBeenCalled()
     expect(shell.openExternal).not.toHaveBeenCalled()
   })
 
   it('cancels external navigation and opens it in the system browser', () => {
-    const window = createBusinessWindow('http://127.0.0.1:4791')
+    const window = createClientWindow('/fixture/main')
     const event = { preventDefault: vi.fn() }
     window.webContents.emit(eventName, event, 'https://outside.example/path')
     expect(event.preventDefault).toHaveBeenCalledOnce()
@@ -35,7 +35,7 @@ describe.each(['will-navigate', 'will-redirect'])('%s boundary', (eventName) => 
   })
 
   it('cancels a non-web scheme without invoking the system opener', () => {
-    const window = createBusinessWindow('http://127.0.0.1:4791')
+    const window = createClientWindow('/fixture/main')
     const event = { preventDefault: vi.fn() }
     window.webContents.emit(eventName, event, 'file:///private/example')
     expect(event.preventDefault).toHaveBeenCalledOnce()

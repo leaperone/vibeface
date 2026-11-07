@@ -7,16 +7,22 @@ import { expect } from 'e2e';
 import { evaluate, screenshot, test, type Inspection, type Page } from '../desktop';
 
 const ELECTRON_VERSION = '45.2.3';
-const CLIENT_ORIGIN = 'vibeface-app://app';
 const BUILD_INFO_FIELDS = ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch',
   'core_version', 'core_source_commit', 'app_version', 'app_source_commit'];
 
+function isClientUrl(raw: string): boolean {
+  const url = new URL(raw);
+  return url.protocol === 'vibeface-app:' && url.host === 'app';
+}
+
 function windows(current: Inspection) {
   const pages = current.pages.filter(entry => entry.type === 'page');
-  const client = pages.filter(entry => new URL(entry.url).origin === CLIENT_ORIGIN);
-  const launcher = pages.filter(entry => new URL(entry.url).origin !== CLIENT_ORIGIN);
+  const client = pages.filter(entry => isClientUrl(entry.url));
+  const launcher = pages.filter(entry => entry.url.startsWith('vibeface-launcher://app/'));
   assert.equal(launcher.length, 1, 'exactly one trusted launcher window exists');
-  return { client: client[0], launcher: launcher[0] as Page };
+  const launcherPage = launcher[0];
+  assert(launcherPage);
+  return { client: client[0], launcher: launcherPage };
 }
 
 async function text(target: Page, expression: string) {
@@ -60,13 +66,13 @@ test('a fresh packaged desktop is a controller without initializing a Node', asy
   const connected = await desktop.inspect();
   const client = windows(connected).client;
   assert(client, 'the controller opens its packaged private client page');
-  assert.equal(new URL(client.url).origin, CLIENT_ORIGIN);
+  assert(isClientUrl(client.url));
   expect(await evaluate(client, 'typeof window.vibefaceClient')).toBe('object');
   const clientBridge = await evaluate(client, 'Object.keys(window.vibefaceClient).sort().join(",")');
   assert(typeof clientBridge === 'string');
   const bridgeKeys = clientBridge.split(',');
-  assert.deepEqual(bridgeKeys.map(key => key.toLowerCase()), ['carrier', 'lan', 'localpage', 'shownodepanel'],
-    'the private client bridge contains only its four fixed controller methods');
+  assert.deepEqual(bridgeKeys, ['carrier', 'local', 'showNodePanel'],
+    'the private client bridge contains only its purpose-specific controller operations');
   for (const global of ['require', 'process', 'module', 'Buffer', 'global', '__dirname']) {
     expect(await evaluate(client, `typeof ${global}`)).toBe('undefined');
   }
@@ -108,12 +114,14 @@ test('explicit local enable owns one bundled Node and restart keeps its identity
   assert.deepEqual(tray.cores, started.cores, 'closing windows keeps the app-owned child running');
   const closedWindowState = await desktop.status();
   assert.equal(closedWindowState.businessOpen, false);
+  assert.equal(closedWindowState.core.kind, 'owned');
   assert.equal(closedWindowState.core.deviceId, nodeId);
   const stopped = await desktop.invoke('stopOwned');
   assert.equal(stopped.core.kind, 'offline');
   assert.equal((await desktop.inspect()).cores.length, 0, 'explicit stop ends the app-owned child');
   await desktop.invoke('startOwned');
   const restarted = await desktop.inspect();
+  assert.equal(restarted.status.core.kind, 'owned');
   assert.equal(restarted.status.core.deviceId, nodeId, 'starting again preserves the original Node identity');
   assert.deepEqual(await desktop.snapshotNode(dataDir), identity);
   const exited = await desktop.quit();
@@ -122,6 +130,7 @@ test('explicit local enable owns one bundled Node and restart keeps its identity
   assert.equal(exited.owned.length, 1, 'quit reports only the Core owned by this app');
   assert.deepEqual(exited.surviving, [], 'explicit app quit stops its owned Core');
   const after = await desktop.start();
+  assert.equal(after.status.core.kind, 'offline');
   assert.equal(after.status.core.deviceId, nodeId, 'the identity survives a full application restart');
   assert.equal(after.profile, before.profile);
 });
@@ -144,6 +153,7 @@ test('local discovery chooses among healthy Nodes and explicitly starts a stoppe
   await desktop.invoke('discoverNodes');
   const choice = await desktop.status();
   assert.equal(choice.core.kind, 'none', 'discovery never chooses arbitrarily among multiple healthy Nodes');
+  assert.equal(choice.selectedNode, null);
   assert.equal(choice.discovery.kind, 'ready');
   const healthy = choice.discovery.nodes.filter(node => node.kind === 'running');
   assert.equal(healthy.length, 2, 'the chooser presents both healthy fixture Nodes exactly once');
@@ -155,9 +165,9 @@ test('local discovery chooses among healthy Nodes and explicitly starts a stoppe
   assert(candidate && typeof candidate.id === 'string');
   await desktop.invoke('connectDiscoveredNode', candidate.id);
   const attached = await desktop.status();
-  assert.equal(attached.core.kind, 'attached');
-  assert.equal(attached.core.deviceId, first.deviceId);
-  assert.equal(attached.core.dataDir, first.dataDir, 'the attached Node is in its custom path outside the app profile');
+  assert.equal(attached.core.kind, 'none', 'selecting a client target does not change App child ownership');
+  assert.equal(attached.selectedNode?.deviceId, first.deviceId);
+  assert.equal(attached.selectedNode?.dataDir, first.dataDir, 'the selected Node is in its custom path outside the app profile');
   const attachedWindows = windows(await desktop.inspect());
   assert(attachedWindows.client);
   await screenshot(attachedWindows.client, 'desktop-discovered-node-status');
@@ -165,30 +175,51 @@ test('local discovery chooses among healthy Nodes and explicitly starts a stoppe
   await desktop.stopFixture(first.dataDir);
   await desktop.invoke('discoverNodes');
   const stoppedChoice = await desktop.status();
+  assert.equal(stoppedChoice.discovery.kind, 'ready');
   const stoppedNode = stoppedChoice.discovery.nodes.find(node => node.deviceId === first.deviceId);
   assert.equal(stoppedNode?.kind, 'stopped', 'the existing fixture is identified as stopped');
-  assert.equal(stoppedChoice.core.kind, 'attached', 'a stopped alternative does not silently replace the current connection');
+  assert(stoppedNode);
+  assert.equal(stoppedChoice.core.kind, 'none', 'rescanning never starts a child');
+  assert.equal(stoppedChoice.selectedNode?.deviceId, second.deviceId, 'the sole remaining healthy Node is selected');
   const stoppedLauncher = windows(await desktop.inspect()).launcher;
   expect(await evaluate(stoppedLauncher, 'document.querySelectorAll("#nodes button[data-action=\\"start-discovered\\"]").length')).toBe(1);
   await desktop.invoke('startDiscoveredNode', stoppedNode.id);
   const explicitlyStarted = await desktop.status();
-  assert.equal(explicitlyStarted.core.kind, 'attached');
+  assert.equal(explicitlyStarted.core.kind, 'owned', 'the explicit start action owns only the child it starts');
   assert.equal(explicitlyStarted.core.deviceId, first.deviceId);
+  assert.equal(explicitlyStarted.selectedNode?.deviceId, first.deviceId);
   assert.equal((await desktop.snapshotNode(first.dataDir)).deviceId, firstState.deviceId);
   assert.deepEqual(await desktop.snapshotNode(first.dataDir), firstState, 'explicit start changes neither Node identity nor config');
   assert.deepEqual(await desktop.snapshotNode(second.dataDir), secondState, 'connecting and starting another Node leaves the second untouched');
 
   const quit = await desktop.quit();
   assert.equal(quit.forced, false, 'the app exited through its explicit menu quit action');
-  assert.deepEqual(quit.owned, [], 'the application did not own either fixture Core');
+  assert.equal(quit.owned.length, 1, 'only the Core explicitly started by the App is owned');
   assert.deepEqual(quit.surviving, [], 'the app has no owned Core to leave behind');
   for (const fixture of [first, second]) {
     const state = await desktop.snapshotNode(fixture.dataDir);
     assert.equal(state.deviceId, fixture.deviceId);
-    assert.equal(state.status, 'running', 'quitting the desktop leaves each task-owned fixture Core healthy');
+    assert.equal(state.status, fixture === first ? 'stopped' : 'running', 'quit stops its own child and leaves the other Core running');
   }
   await desktop.start();
   assert.equal((await desktop.inspect()).profile, original.profile);
+});
+
+test('one existing healthy Node is discovered and selected when the desktop opens', async ({ desktop }) => {
+  await desktop.quit();
+  const fixture = await desktop.createFixture(true);
+  const before = await desktop.snapshotNode(fixture.dataDir);
+  const opened = await desktop.start();
+  assert.equal(opened.status.nodeMode, 'controller');
+  assert.deepEqual(opened.status.selectedNode, { dataDir: fixture.dataDir, deviceId: fixture.deviceId });
+  assert.equal(opened.status.core.kind, 'none');
+  assert.deepEqual(opened.cores, [], 'automatic connection starts no App-owned Core');
+  const client = windows(opened).client;
+  assert(client, 'the existing Node opens in the packaged client automatically');
+  const discoveredId = await evaluate(client, '(async () => (await window.vibefaceClient.local.discoverLocalSetup())?.entry.device_id ?? null)()');
+  assert.equal(discoveredId, fixture.deviceId, 'the native client reaches the selected existing Node');
+  await desktop.quit();
+  assert.deepEqual(await desktop.snapshotNode(fixture.dataDir), before, 'connecting and quitting preserve the existing running Node');
 });
 
 test('the optional background Node survives app quit and removal preserves its Node data', async ({ desktop }) => {
@@ -196,6 +227,7 @@ test('the optional background Node survives app quit and removal preserves its N
   await desktop.invoke('chooseNodeMode', 'local');
   await desktop.invoke('startOwned');
   const provisioned = await desktop.status();
+  assert.equal(provisioned.core.kind, 'owned');
   const nodeId = provisioned.core.deviceId;
   assert(typeof nodeId === 'string' && nodeId.length > 0);
   await desktop.invoke('stopOwned');
@@ -246,6 +278,7 @@ test('the optional background Node survives app quit and removal preserves its N
 
   const relaunched = await desktop.start();
   const observed = await desktop.status();
+  assert.equal(observed.backgroundNode.kind, 'installed');
   assert.equal(observed.backgroundNode.nodeId, nodeId);
   assert.equal(observed.backgroundNode.health, 'running');
   assert.equal((await desktop.serviceStatus(nodeId)).service_id, serviceId, 'relaunch reads the same native registration');

@@ -107,6 +107,8 @@ export type LauncherStatus = {
   clientAvailable: boolean
   /** User's first-run decision and whether this App may host an optional local Node. */
   nodeMode: 'undecided' | 'controller' | 'local'
+  /** Last verified client target, independently of the App's Core child. */
+  selectedNode: Pick<LocalNode, 'deviceId' | 'dataDir'> | null
   discovery: NodeDiscovery
   backgroundNode: BackgroundNode
 }

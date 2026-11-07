@@ -5,7 +5,7 @@ import type { LauncherStatus } from '../shared/contract.js'
 
 export type ClientPreferences = {
   nodeMode: LauncherStatus['nodeMode']
-  selectedNode: { dataDir: string; deviceId: string } | null
+  selectedNode: LauncherStatus['selectedNode']
   rememberedDataDirs: string[]
 }
 const FILE = 'client-preferences.json'
