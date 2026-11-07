@@ -100,10 +100,13 @@ $ErrorActionPreference = 'Stop'
 $sidType = [System.Security.Principal.SecurityIdentifier]
 $current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $acl = Get-Acl -LiteralPath $env:VIBEFACE_ACL_FIXTURE
-$allow = @($acl.GetAccessRules($true, $true, $sidType) | Where-Object {
+$rules = @($acl.GetAccessRules($true, $true, $sidType))
+$allow = @($rules | Where-Object {
     $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow
 } | ForEach-Object { $_.IdentityReference.Value })
-@{ owner = $acl.GetOwner($sidType).Value; current = $current; allow = $allow } | ConvertTo-Json -Compress
+@{ owner = $acl.GetOwner($sidType).Value; current = $current; allow = $allow;
+   protected = $acl.AreAccessRulesProtected;
+   inherited = @($rules | Where-Object { $_.IsInherited }).Count } | ConvertTo-Json -Compress
 """
     encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
     result = run(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
@@ -112,6 +115,8 @@ $allow = @($acl.GetAccessRules($true, $true, $sidType) | Where-Object {
     require(acl['owner'] == acl['current'], 'the private path is owned by this Windows SID')
     require(acl['allow'] and all(sid == acl['current'] for sid in acl['allow']),
             'the private path grants access only to this Windows SID')
+    require(acl['protected'] and acl['inherited'] == 0,
+            'the private path has a protected DACL with no inherited rules')
     return True
 
 
@@ -145,7 +150,7 @@ if os.environ.get("VIBEFACE_FAKE_PROVIDER_CHILD"):
 if len(sys.argv) != 4 or sys.argv[1:3] != ["app-server", "--listen"] or not sys.argv[3].startswith("unix://"):
     raise SystemExit("The fixture only accepts the documented Unix socket transport")
 (marks / "provider.pid").write_text(str(os.getpid()))
-(marks / "argv.json").write_text(repr(sys.argv[1:]))
+(marks / "argv.json").write_text(__import__("json").dumps(sys.argv[1:]))
 environment = {**os.environ, "VIBEFACE_FAKE_PROVIDER_CHILD": "1"}
 subprocess.Popen([sys.executable, __file__], env=environment,
                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -178,6 +183,16 @@ time.sleep(900)
                 if text.isdigit():
                     found[name] = int(text)
         return found
+
+    def stop_children(self):
+        """Stop only processes recorded by this private fixture, including its child tree."""
+        for pid in self.pids().values():
+            if process_is_running(pid):
+                subprocess.run(
+                    [str(Path(os.environ["SystemRoot"]) / "System32/taskkill.exe"),
+                     "/PID", str(pid), "/T", "/F"],
+                    capture_output=True, timeout=30, check=False,
+                )
 
 
 class Node:
@@ -256,7 +271,7 @@ class Node:
     def status(self):
         result = run([self.cli, "status", "--json", "--data-dir", self.directory], check=False,
                      env=self.environment())
-        require(result.returncode == 0, "status reads a running node")
+        require(result.returncode == 0, "status inspects the initialized node")
         return json.loads(result.stdout)
 
     def ask_to_stop(self):
@@ -350,13 +365,15 @@ def check_provider_tree_is_cleared(node):
 def check_service_scripts(package, node, skip_service):
     shell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
     require(shell.is_file(), "Windows PowerShell is available")
-    installer = package / "scripts/install.ps1"
+    # The release package intentionally omits its bootstrap installer. Exercise the
+    # repository source script directly so Windows acceptance still covers it.
+    installer = Path(__file__).resolve().with_name("install.ps1")
     service = package / "scripts/install-node-service.ps1"
     checks = {}
-    if installer.is_file():
-        result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                      "-File", installer, "-SelfTest"], timeout=180)
-        checks["installer_self_test"] = result.stdout.decode(errors="replace").strip()
+    require(installer.is_file(), "the source Windows installer is available for its self-test")
+    result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                  "-File", installer, "-SelfTest"], timeout=180)
+    checks["installer_self_test"] = result.stdout.decode(errors="replace").strip()
     if not service.is_file():
         return checks
     usage = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
@@ -364,10 +381,25 @@ def check_service_scripts(package, node, skip_service):
     checks["service_usage"] = "install-node-service.ps1" in usage.stdout.decode(errors="replace")
     if skip_service:
         return checks
+
+    task_probe = r"""
+$ErrorActionPreference = 'Stop'
+Import-Module ScheduledTasks
+$task = Get-ScheduledTask -TaskName 'Node' -TaskPath '\Vibeface\' -ErrorAction SilentlyContinue
+if ($task) { 'present' } else { 'absent' }
+"""
+    task_probe_encoded = base64.b64encode(task_probe.encode("utf-16le")).decode("ascii")
+    task_state = run([shell, "-NoProfile", "-NonInteractive", "-EncodedCommand", task_probe_encoded])
+    if task_state.stdout.decode("utf-8-sig").strip().lower() != "absent":
+        checks["service_task"] = "skipped; existing task preserved"
+        return checks
+
     def service_call(*arguments, check=True):
         return run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                     "-File", service, *arguments], timeout=180, check=check)
     try:
+        require(node.status()["status"] == "stopped",
+                "service installation starts from a stopped fixture node")
         service_call("install", "--binary", package / "vibeface.exe",
                      "--data-dir", node.directory)
         query = run([Path(os.environ["SystemRoot"]) / "System32/schtasks.exe",
@@ -384,9 +416,19 @@ def check_service_scripts(package, node, skip_service):
         refused = service_call("stop", "--data-dir", other, check=False)
         require(refused.returncode != 0,
                 "a service command naming another data directory is refused")
+        wait_for("the scheduled task to start this node",
+                 lambda: node.status() if node.status().get("status") == "running" else None)
+        service_call("stop", "--data-dir", node.directory)
+        wait_for("the scheduled task to stop this node",
+                 lambda: node.status() if node.status().get("status") == "stopped" else None)
+        service_call("start", "--data-dir", node.directory)
+        wait_for("the scheduled task to restart this node",
+                 lambda: node.status() if node.status().get("status") == "running" else None)
         checks["service_task"] = True
     finally:
         service_call("uninstall", "--data-dir", node.directory, check=False)
+    wait_for("the scheduled task to leave the node stopped",
+             lambda: node.status() if node.status().get("status") == "stopped" else None)
     return checks
 
 
@@ -404,9 +446,11 @@ def main():
     package = options.package.resolve()
     checks = {"programs": check_programs(package)}
 
-    workspace = Path(tempfile.mkdtemp(prefix="vibeface-win-")) / WORKSPACE_NAME
+    scratch = Path(tempfile.mkdtemp(prefix="vibeface-win-"))
+    workspace = scratch / WORKSPACE_NAME
     workspace.mkdir(parents=True)
     node = None
+    failure = None
     try:
         provider = FakeProvider(workspace / "fake provider")
         node = Node(package, workspace, NODE_NAME, provider)
@@ -414,7 +458,8 @@ def main():
         node.start()
         status = node.status()
         require(status["status"] == "running", f"status reports a running node: {status}")
-        checks["pipe"] = check_private_endpoint(node, status)
+        check_private_endpoint(node, status)
+        checks["pipe"] = "owner-only named pipe probe passed"
         check_second_node_refused(node)
         node.ask_to_stop()
         checks["restart"] = node.start()["device_id"] == node.device_id
@@ -422,14 +467,37 @@ def main():
 
         node.use_fake_provider()
         node.start()
-        checks["provider_tree"] = check_provider_tree_is_cleared(node)
-        checks["provider_arguments"] = (provider.marks / "argv.json").read_text()
+        check_provider_tree_is_cleared(node)
+        checks["provider_tree"] = "child process tree cleared"
+        checks["provider_arguments"] = json.loads((provider.marks / "argv.json").read_text())
         checks["service"] = check_service_scripts(package, node, options.skip_service)
+    except BaseException as error:
+        failure = error
+        if options.artifacts:
+            options.artifacts.mkdir(parents=True, exist_ok=True)
+            # Assertions can include structured runtime values. Keep those out of artifacts;
+            # the isolated fixture process log below carries the actionable local context.
+            diagnostic = {"status": "failed", "error_type": type(error).__name__}
+            (options.artifacts / "windows-node-failure.json").write_text(
+                json.dumps(diagnostic, indent=2) + "\n", encoding="utf-8"
+            )
+            # This log belongs to the isolated fake-provider fixture. Do not archive
+            # config, identity, status, or command output that may contain identifiers.
+            if node is not None and node.log:
+                node.log.flush()
+            process_log = node.directory / "process.log" if node is not None else None
+            if process_log and process_log.is_file():
+                shutil.copyfile(process_log, options.artifacts / "windows-node-process.log")
     finally:
         if node is not None:
             node.kill()
+            if hasattr(node, "provider"):
+                node.provider.stop_children()
         if not options.keep:
-            shutil.rmtree(workspace.parent, ignore_errors=True)
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    if failure is not None:
+        raise failure
 
     summary = {"status": "passed", "checks": checks, "real_provider_calls": 0}
     if options.artifacts:

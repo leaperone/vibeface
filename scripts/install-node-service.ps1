@@ -15,8 +15,9 @@ function Show-Usage {
     @'
 Usage: install-node-service.ps1 install --binary C:\absolute\vibeface.exe --data-dir C:\absolute\data
        install-node-service.ps1 install-updater --binary C:\install-root\current\vibeface.exe --data-dir C:\absolute\data
-       install-node-service.ps1 start|stop|restart|status [--data-dir C:\absolute\data]
-       install-node-service.ps1 uninstall-updater|uninstall [--data-dir C:\absolute\data]
+       install-node-service.ps1 start|stop|restart [--data-dir C:\absolute\data]
+       install-node-service.ps1 status
+       install-node-service.ps1 uninstall-updater|uninstall --data-dir C:\absolute\data
 
 Installs scheduled tasks for the account that runs this script. Initialize the node first.
 '@
@@ -56,10 +57,17 @@ function Invoke-Scheduler {
 # readable listing it prints.
 function Get-TaskCommandLine {
     param([string] $Name)
+    $separator = $Name.LastIndexOf('\')
+    $taskName = $Name.Substring($separator + 1)
+    $taskPath = $Name.Substring(0, $separator + 1)
+    $task = Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath `
+        -ErrorAction SilentlyContinue
+    if (-not $task) { return $null }
     $result = Invoke-Scheduler @('/Query', '/TN', $Name, '/XML', 'ONE')
-    if ($result.Code -ne 0) { return $null }
+    if ($result.Code -ne 0) { Fail "could not inspect existing task $Name; it was preserved." }
     # The declaration the scheduler writes names an encoding this text no longer has.
-    $document = [xml] ($result.Output -replace '<\?xml[^>]*\?>', '')
+    try { $document = [xml] ($result.Output -replace '<\?xml[^>]*\?>', '') }
+    catch { Fail "could not read existing task $Name; it was preserved." }
     $exec = $document.Task.Actions.Exec
     if (-not $exec) { Fail "the registered task $Name runs no program." }
     $line = [string] $exec.Command
@@ -218,16 +226,25 @@ if (@('install', 'install-updater', 'start', 'stop', 'restart', 'status', 'unins
 }
 $binary = ''
 $dataDir = ''
+$seen = @{}
 $index = 1
 while ($index -lt $arguments.Count) {
     $name = $arguments[$index]
     if (($name -ne '--binary' -and $name -ne '--data-dir') -or ($index + 1) -ge $arguments.Count) {
         Fail-Usage "unknown argument: $name"
     }
+    if ($seen.ContainsKey($name)) { Fail-Usage "duplicate argument: $name" }
+    $seen[$name] = $true
     if ($name -eq '--binary') { $binary = $arguments[$index + 1] } else { $dataDir = $arguments[$index + 1] }
     $index += 2
 }
 if ($dataDir) { $dataDir = Resolve-DataDir -Value $dataDir }
+if ($binary -and $action -notin @('install', 'install-updater')) {
+    Fail-Usage '--binary is only valid when installing a task.'
+}
+if ($action -ne 'status' -and -not $dataDir) {
+    Fail-Usage 'An initialized absolute --data-dir is required for this action.'
+}
 
 if ($action -eq 'install' -or $action -eq 'install-updater') {
     if (-not $binary -or -not [System.IO.Path]::IsPathRooted($binary) -or
