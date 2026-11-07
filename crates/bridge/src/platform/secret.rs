@@ -5,8 +5,8 @@
 //! read turns echo off for as long as it lasts and turns it back on afterwards, on both
 //! families. A handed-over channel is refused unless only this account can read or write it:
 //! Unix names it by descriptor number and checks the owning uid and mode, Windows names it by
-//! handle value and checks the access control list of a file or accepts an unnamed pipe, which
-//! no other process can open.
+//! handle value, checks a file's access control list, and checks that a pipe's connected peer
+//! belongs to this account.
 
 use anyhow::{Context, Result, ensure};
 use std::{
