@@ -2766,8 +2766,8 @@ pub(super) mod tests {
         let reopened = Claude::open(&place.dir, &place.env());
         assert_eq!(reopened.projects(), Some(projects_a));
         assert_eq!(
-            reopened.native_directory(&session).await?,
-            place.dir.join("work")
+            reopened.native_directory(&session).await?.canonicalize()?,
+            place.dir.join("work").canonicalize()?
         );
         assert!(
             reopened
@@ -3149,10 +3149,16 @@ pub(super) mod tests {
         let mut configuration =
             Config::local("127.0.0.1:0".parse()?, vec![place.dir.join("work")], false);
         // Nothing listens there: the Node never reaches this computer's own App Server.
+        #[cfg(unix)]
         let socket = format!(
             "/tmp/vf-{}.sock",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         );
+        #[cfg(windows)]
+        let socket =
+            vibeface_bridge::platform::ipc::Endpoint::in_private_dir(&place.dir, "absent-codex")?
+                .path()
+                .to_owned();
         configuration.providers.codex_app_server.socket = Some(socket.into());
         configuration.providers.execution = [Provider::Claude].into();
         configuration.bins.insert(Provider::Claude, fixture());

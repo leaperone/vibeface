@@ -120,6 +120,12 @@ jobs:
           mkdir -p .artifacts/desktop-app
           if [[ "$RUNNER_OS" == Linux ]]; then
             unzip -q "${archives[0]}" -d .artifacts/desktop-app
+          elif [[ "$RUNNER_OS" == Windows ]]; then
+            "$PY" - "${archives[0]}" .artifacts/desktop-app <<'PY'
+          import os, pathlib, subprocess, sys
+          tar = pathlib.Path(os.environ['SystemRoot']) / 'System32/tar.exe'
+          subprocess.run([str(tar), '-xf', sys.argv[1], '-C', sys.argv[2]], check=True)
+          PY
           else
             tar -xf "${archives[0]}" -C .artifacts/desktop-app
           fi
