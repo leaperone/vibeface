@@ -607,6 +607,31 @@ class Client:
             self.process = None
 
 
+def node_startup_failure_facts(log_path, exit_code):
+    facts = {"exit_code": exit_code, "log_available": False, "truncated": False,
+             "os_error_codes": [], "log_markers": []}
+    try:
+        with log_path.open("rb") as source:
+            size = source.seek(0, os.SEEK_END)
+            source.seek(max(0, size - 65536))
+            tail = source.read(65536)
+    except OSError:
+        return facts
+    facts["log_available"] = True
+    facts["truncated"] = size > 65536
+    facts["os_error_codes"] = list(dict.fromkeys(
+        int(code) for code in re.findall(rb"\(os error ([0-9]{1,5})\)", tail)))[:8]
+    lowered = tail.lower()
+    facts["log_markers"] = [label for label, marker in (
+        ("address_in_use", b"address already in use"),
+        ("permission_denied", b"permission denied"),
+        ("no_space", b"no space left on device"),
+        ("data_locked", b"database is locked"),
+        ("panicked", b"panicked"),
+    ) if marker in lowered]
+    return facts
+
+
 class Node:
     def __init__(self, run, name, binary, workspace, helper, *, init_args=None, port=None):
         self.name = name
@@ -682,6 +707,15 @@ class Node:
         else:
             def listener():
                 if self.process.poll() is not None:
+                    facts = node_startup_failure_facts(self.directory / "process.log", self.process.returncode)
+                    try:
+                        private_json(self.directory / "startup-failure.json", facts)
+                    except OSError:
+                        pass
+                    try:
+                        print("NODE_STARTUP_FAILURE", json.dumps(facts), flush=True)
+                    except OSError:
+                        pass
                     raise RuntimeError(f"{self.name}: Node exited {self.process.returncode}; inspect {self.directory / 'process.log'}")
                 return self.client.request("/api/info")
             info = wait_for(f"{self.name} HTTP listener", listener)

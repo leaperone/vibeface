@@ -303,6 +303,7 @@ jobs:
             .artifacts/macos-process/*.log
             .artifacts/ci-web/web-process-*/report.json
             .artifacts/ci-web/web-process-*/WEB/process.log
+            .artifacts/ci-multi-node/node-acceptance-*/C/startup-failure.json
             .artifacts/ci-node/phase1-process-*/report.json
             .artifacts/ci-node/phase1-process-*/A/process.log
             .artifacts/ci-node/phase1-process-*/fixture-manager-*.stderr.log
