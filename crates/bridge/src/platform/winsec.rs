@@ -147,6 +147,8 @@ impl Drop for LocalAcl {
 /// A security descriptor granting the current account full access and no other account any
 /// access, with inheritance blocked so a permissive parent cannot widen it.
 pub struct OwnerOnly {
+    // SECURITY_DESCRIPTOR stores this SID by pointer; it must outlive kernel object creation.
+    _owner: Sid,
     acl: LocalAcl,
     descriptor: Box<SECURITY_DESCRIPTOR>,
 }
@@ -197,7 +199,11 @@ impl OwnerOnly {
                 && SetSecurityDescriptorDaclChecked(&mut descriptor, acl.0)
                 && SetSecurityDescriptorProtected(&mut descriptor)
         } {
-            Ok(Self { acl, descriptor })
+            Ok(Self {
+                _owner: user,
+                acl,
+                descriptor,
+            })
         } else {
             Err(io::Error::last_os_error())
         }

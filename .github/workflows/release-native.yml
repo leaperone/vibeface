@@ -44,8 +44,12 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(rustc -vV | sed -n 's/^host: //p')" = "$TARGET"
           CARGO_ENCODED_RUSTFLAGS="$("$PY" -B scripts/release-rustflags.py)"
+          if [[ "$TARGET" == *-windows-msvc ]]; then CARGO_ENCODED_RUSTFLAGS+=$'\x1f-C\x1ftarget-feature=+crt-static'; fi
           export CARGO_ENCODED_RUSTFLAGS
           cargo build --release --locked -p vibeface -p vibeface-core --target "$TARGET"
+          if [[ "$TARGET" == *-windows-msvc ]]; then
+            "$PY" -B scripts/verify-windows-imports.py "target/$TARGET/release/vibeface.exe" "target/$TARGET/release/vibeface-core.exe"
+          fi
       - name: Sign and notarize both macOS programs
         if: runner.os == 'macOS'
         env:

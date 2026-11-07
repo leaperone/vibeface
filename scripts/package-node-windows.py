@@ -37,10 +37,13 @@ def build(target_dir):
     helper('build-inputs.py', 'check', 'web')
     flags = subprocess.check_output([sys.executable, '-B', str(ROOT / 'scripts/release-rustflags.py')],
                                     cwd=ROOT, text=True).strip()
+    flags += '\x1f-C\x1ftarget-feature=+crt-static'
     subprocess.run(['cargo', 'build', '--release', '--locked', '-p', 'vibeface', '-p', 'vibeface-core',
                     '--target', TARGET], cwd=ROOT, check=True,
                    env=dict(os.environ, CARGO_ENCODED_RUSTFLAGS=flags))
-    return [target_dir / TARGET / 'release' / name for name in release.program_names(TARGET)]
+    binaries = [target_dir / TARGET / 'release' / name for name in release.program_names(TARGET)]
+    helper('verify-windows-imports.py', *(str(binary) for binary in binaries))
+    return binaries
 
 
 def stage(package, binaries, web):
