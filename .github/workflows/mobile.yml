@@ -368,6 +368,15 @@ jobs:
               code = error.get("code")
               result = {"code": code if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) else "UNCLASSIFIED_ERROR"}
               message = error.get("message")
+              if isinstance(message, str):
+                  fixture = re.search(r"Native fixture failure ([A-Za-z_]{1,50}) \[([^\]]{0,500})\]", message)
+                  if fixture:
+                      frames = []
+                      for raw in fixture[2].split(";"):
+                          frame = re.fullmatch(r"verify-node\.py:([1-9][0-9]{0,4}):([A-Za-z_][A-Za-z0-9_]{0,70})", raw)
+                          if frame and len(frames) < 4:
+                              frames.append({"file": "verify-node.py", "line": int(frame[1]), "function": frame[2]})
+                      result["fixture"] = {"error_type": fixture[1], "frames": frames}
               if code == "ENGINE_FAILURE" and isinstance(message, str):
                   lowered = message.lower()
                   result["engine_timeout_kind"] = next((kind for needle, kind in (

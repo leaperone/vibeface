@@ -107,6 +107,13 @@ const test = base.extend<{ network: NativeNetwork }>({
       try {
         assert(line.length <= 65536, 'Native fixture response is bounded');
         const value = record(JSON.parse(line));
+        if (value.ok === false) {
+          const kind = typeof value.error === 'string' && /^[A-Za-z_]{1,50}$/.test(value.error) ? value.error : 'Error';
+          const frames = Array.isArray(value.frames) ? value.frames.filter((frame: unknown): frame is string =>
+            typeof frame === 'string' && /^verify-node\.py:[1-9][0-9]{0,4}:[A-Za-z_][A-Za-z0-9_]{0,70}$/.test(frame)).slice(0, 4) : [];
+          current.reject(new Error(`Native fixture failure ${kind} [${frames.join(';')}]`));
+          return;
+        }
         assert('ready' in value || value.ok === true, 'Native fixture operation succeeds');
         current.resolve(record(value.ready ?? value.result));
       } catch { current.reject(new Error('Native fixture returned an invalid response')); }
