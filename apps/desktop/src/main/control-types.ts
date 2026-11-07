@@ -5,6 +5,7 @@
  */
 
 export type ControlRequest =
+  | { command: 'discover_local_nodes'; app_profile_dir: string; remembered_data_dirs: string[] }
   | { command: 'init'; options: InitOptions }
   | { command: 'inspect'; data_dir: string }
   | { command: 'access'; data_dir: string; json: boolean }
