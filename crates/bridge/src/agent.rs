@@ -1293,13 +1293,23 @@ async fn supervise(
         _ = process.child.wait() => {}
         _ = kill.notified() => {}
     }
+    let token = process.tree.as_ref().map(|tree| tree.token().to_owned());
     if let Some(mut tree) = process.tree.take() {
-        let token = tree.token().to_owned();
         if !terminate_process_tree(&mut process.child, &mut tree).await {
             // Something of the tree is left; keeping the handle lets the drop of the process
             // end it rather than leaving it unowned.
             process.tree = Some(tree);
         }
+    }
+    // The process exit signal is also the bridge's teardown barrier. Reap the output tasks before
+    // publishing it so their pipe handles, along with the child and job handles below, cannot
+    // outlive SdkBridge::stop and race its owner removing the bridge state directory.
+    process.stdout.abort();
+    process.stderr.abort();
+    let _ = (&mut process.stdout).await;
+    let _ = (&mut process.stderr).await;
+    drop(process);
+    if let Some(token) = token {
         processes.forget(&token);
     }
     let _ = exited.send(true);
