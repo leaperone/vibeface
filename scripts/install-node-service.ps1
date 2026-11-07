@@ -104,12 +104,25 @@ function Confirm-TaskData {
     }
 }
 
+# Task Scheduler and older PowerShell hosts expect ordinary DOS or UNC spelling, not verbatim paths.
+function Convert-RegisteredPath {
+    param([string] $Value)
+    if (-not $Value) { return $Value }
+    if ($Value.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $Value.Substring(8)
+    }
+    if ($Value.StartsWith('\\?\')) { return $Value.Substring(4) }
+    return $Value
+}
+
 function Resolve-DataDir {
     param([string] $Value)
-    if (-not [System.IO.Path]::IsPathRooted($Value)) { Fail-Usage 'An initialized absolute --data-dir is required.' }
+    $opened = Convert-RegisteredPath $Value
+    if (-not [System.IO.Path]::IsPathRooted($opened)) { Fail-Usage 'An initialized absolute --data-dir is required.' }
     $resolved = $null
-    try { $resolved = (Get-Item -LiteralPath $Value -Force).FullName } catch { }
+    try { $resolved = (Get-Item -LiteralPath $opened -Force).FullName } catch { }
     if (-not $resolved) { Fail-Usage 'An initialized absolute --data-dir is required.' }
+    $resolved = Convert-RegisteredPath $resolved
     foreach ($name in @('config.json', 'identity.json')) {
         if (-not (Test-Path -LiteralPath (Join-Path $resolved $name) -PathType Leaf)) {
             Fail-Usage 'An initialized absolute --data-dir is required.'
@@ -296,11 +309,12 @@ if ($action -ne 'status' -and -not $dataDir) {
 }
 
 if ($binary) {
-    if (-not $binary -or -not [System.IO.Path]::IsPathRooted($binary) -or
-        -not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+    $opened = Convert-RegisteredPath $binary
+    if (-not $opened -or -not [System.IO.Path]::IsPathRooted($opened) -or
+        -not (Test-Path -LiteralPath $opened -PathType Leaf)) {
         Fail-Usage 'An absolute --binary that exists is required.'
     }
-    $binary = (Get-Item -LiteralPath $binary -Force).FullName
+    $binary = Convert-RegisteredPath (Get-Item -LiteralPath $opened -Force).FullName
 }
 if ($action -eq 'install' -or $action -eq 'install-updater') {
     if (-not $binary) { Fail-Usage 'An absolute --binary that exists is required.' }

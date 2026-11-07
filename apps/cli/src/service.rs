@@ -2,6 +2,7 @@ use crate::update;
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use update::release::{PROGRAMS, SERVICE_SCRIPT};
@@ -141,11 +142,37 @@ fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Resul
     };
     let binary = package.join(PROGRAMS[0]);
     let mut command = service_script(&package.join(SERVICE_SCRIPT))?;
-    command.arg(action.argument()).arg("--data-dir").arg(data);
+    command
+        .arg(action.argument())
+        .arg("--data-dir")
+        .arg(script_os_argument(data));
     if matches!(action, Action::Install | Action::InstallUpdater) {
-        command.arg("--binary").arg(binary);
+        command.arg("--binary").arg(script_os_argument(&binary));
     }
     Ok(command)
+}
+
+/// Windows canonical paths can carry a verbatim `\\?\` prefix that PowerShell 5 `-File` and Task
+/// Scheduler reject; spell them as ordinary DOS or UNC paths at the script boundary.
+fn strip_verbatim_windows_path(path: &str) -> Cow<'_, str> {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        Cow::Borrowed(rest)
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
+fn script_os_argument(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(strip_verbatim_windows_path(&path.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
 }
 
 /// A command that runs the service script a package carries.
@@ -182,7 +209,7 @@ pub(crate) fn service_script(script: &Path) -> Result<Command> {
                 "Bypass",
                 "-File",
             ])
-            .arg(script);
+            .arg(script_os_argument(script));
         Ok(command)
     }
 }
@@ -232,7 +259,24 @@ pub async fn run(options: Service) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use vibeface_bridge::platform::privatefs;
+
+    #[test]
+    fn strip_verbatim_windows_path_returns_dos_and_unc_spelling() {
+        assert_eq!(
+            strip_verbatim_windows_path(r"\\?\D:\Vibeface\current\scripts\install-node-service.ps1"),
+            r"D:\Vibeface\current\scripts\install-node-service.ps1"
+        );
+        assert_eq!(
+            strip_verbatim_windows_path(r"\\?\UNC\server\share\data"),
+            r"\\server\share\data"
+        );
+        assert_eq!(
+            strip_verbatim_windows_path(r"D:\ordinary\path"),
+            r"D:\ordinary\path"
+        );
+    }
 
     /// Marks `path` as a program this account can run, where that is something a file carries.
     fn mark_runnable(path: &Path) {
@@ -265,9 +309,39 @@ mod tests {
                 "-ExecutionPolicy".into(),
                 "Bypass".into(),
                 "-File".into(),
-                script.as_os_str().to_owned(),
+                script_os_argument(script).into_os_string(),
             ]
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn command_spells_verbatim_windows_paths_for_script_arguments() {
+        let root = std::env::temp_dir().join(format!("vibeface-verbatim-{}", uuid::Uuid::new_v4()));
+        let package = root.join("releases/fixture");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(package.join("scripts")).unwrap();
+        std::fs::write(package.join(PROGRAMS[0]), b"binary").unwrap();
+        mark_runnable(&package.join(PROGRAMS[0]));
+        std::fs::write(package.join(SERVICE_SCRIPT), b"script").unwrap();
+        privatefs::link_dir(&package, &root.join("current")).unwrap();
+        let data = root.join("data");
+        std::fs::create_dir(&data).unwrap();
+        let executable = package.join(PROGRAMS[0]);
+        let install = command(&root, &data, &executable, Action::Install).unwrap();
+        let args: Vec<_> = install
+            .as_std()
+            .get_args()
+            .skip(1)
+            .map(|value| value.to_owned())
+            .collect();
+        let verbatim = OsStr::new("data-dir");
+        let position = args.iter().position(|value| value == verbatim).unwrap();
+        assert!(!args[position + 1].to_string_lossy().starts_with(r"\\?\"));
+        let binary_flag = OsStr::new("binary");
+        let position = args.iter().position(|value| value == binary_flag).unwrap();
+        assert!(!args[position + 1].to_string_lossy().starts_with(r"\\?\"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Everything `command` built, the program first and then its arguments.
