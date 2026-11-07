@@ -51,10 +51,41 @@ RESULT_GATE = os.environ.get("FAKE_CLAUDE_RESULT_GATE")
 DELAY_RESULT = [False]
 
 
+def append_observation(path, value):
+    if not path:
+        return
+    data = (value + "\n").encode("utf-8")
+    if os.name != "nt":
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            if os.write(descriptor, data) != len(data):
+                raise OSError("incomplete observation append")
+        finally:
+            os.close(descriptor)
+        return
+    import ctypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+    kernel.CreateFileW.restype = ctypes.c_void_p
+    kernel.WriteFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p]
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel.CreateFileW(path, 0x0004, 0x0007, None, 4, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        written = ctypes.c_ulong()
+        buffer = ctypes.create_string_buffer(data)
+        if not kernel.WriteFile(handle, buffer, len(data), ctypes.byref(written), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if written.value != len(data):
+            raise OSError("incomplete observation append")
+    finally:
+        kernel.CloseHandle(handle)
+
+
 def log(entry):
     if LOG:
-        with open(LOG, "a") as handle:
-            handle.write(json.dumps(entry) + "\n")
+        append_observation(LOG, json.dumps(entry))
 
 
 def emit(frame):

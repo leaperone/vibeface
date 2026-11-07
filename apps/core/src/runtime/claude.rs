@@ -2357,14 +2357,14 @@ pub(super) mod tests {
                 let count = std::fs::read_dir(&gate)
                     .map(|entries| entries.filter_map(Result::ok).count())
                     .unwrap_or_default();
-                if count >= 16 {
+                if count >= 16 && place.user_frames() >= 16 {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .context("all Claude turns reached the fixture gate")
+        .context("all Claude turns reached the fixture gate with their prompts observed")
     }
 
     async fn wait_for_interrupt(place: &Place) -> Result<()> {

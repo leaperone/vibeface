@@ -1437,7 +1437,16 @@ mod tests {
             assert!(seen(&node).await?.1.dynamic.is_none());
             let persisted = Arc::new(std::sync::Mutex::new(None::<String>));
             let started = Arc::new(tokio::sync::Notify::new());
+            let bridge_ready = Arc::new(tokio::sync::Notify::new());
+            let bridge_ready_hook = bridge_ready.clone();
             let mut running_config = config.clone();
+            running_config.process_started = Some(Arc::new(move |_| {
+                let bridge_ready_hook = bridge_ready_hook.clone();
+                Box::pin(async move {
+                    bridge_ready_hook.notify_waiters();
+                    Ok(())
+                })
+            }));
             let mut observer =
                 crate::scheduler::turn_recorder(&node, &network, &job, "", shown, None);
             let original_started = observer.started.take().context("started callback")?;
@@ -1484,6 +1493,9 @@ mod tests {
                 )
                 .await
             });
+            tokio::time::timeout(Duration::from_secs(10), bridge_ready.notified())
+                .await
+                .context("controlled Cursor SDK bridge process did not report ready")?;
             let observed = tokio::select! {
                 observed = tokio::time::timeout(Duration::from_secs(5), started.notified()) => observed,
                 result = &mut task => {
