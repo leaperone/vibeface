@@ -15,6 +15,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import plistlib
+import zipfile
 
 sys.dont_write_bytecode = True
 
@@ -507,6 +509,64 @@ def apk_asset_names(version_value):
     return {name, name + '.sha256', name + '.provenance.json'}
 
 
+def ios_asset_names(version_value, signed=False):
+    state = 'signed' if signed else 'unsigned'
+    payloads = [f'vibeface-{version_value}-ios-device-{state}.xcarchive.zip']
+    if signed:
+        payloads.append(f'vibeface-{version_value}-ios.ipa')
+    return {name + suffix for name in payloads for suffix in ('', '.sha256', '.provenance.json')}
+
+
+def verify_ios_assets(directory, pins):
+    version_value = pins['version']
+    signed = (directory / f'vibeface-{version_value}-ios.ipa').is_file()
+    mobile = json.loads((ROOT / 'apps/mobile/app.json').read_text())['expo']
+    identity_fields = dict(schema=1, platform='ios-device', source_sha=pins['source_commit'],
+                           release_version=version_value, bundle_identifier=mobile['ios']['bundleIdentifier'],
+                           bundle_short_version=mobile['version'], build_number=mobile['ios']['buildNumber'])
+    state = 'signed' if signed else 'unsigned'
+    payloads = [f'vibeface-{version_value}-ios-device-{state}.xcarchive.zip']
+    if signed:
+        payloads.append(f'vibeface-{version_value}-ios.ipa')
+    for index, name in enumerate(payloads):
+        payload = directory / name
+        require(payload.is_file() and not payload.is_symlink(), 'missing regular iOS payload')
+        verify_checksum_file(directory, name)
+        receipt = json.loads((directory / (name + '.provenance.json')).read_text())
+        fields = set(identity_fields) | {'artifact', 'sha256', 'signed', 'installable', 'kind'}
+        if index:
+            fields |= {'distribution_method', 'team_id', 'provisioning_profile_uuid', 'provisioning_profile_expiration', 'testflight_eligible'}
+        require(set(receipt) == fields, 'unsupported iOS receipt fields')
+        require(all(receipt.get(key) == value for key, value in identity_fields.items()), 'iOS source, version or app identity mismatch')
+        require(receipt.get('artifact') == name and receipt.get('sha256') == digest(payload), 'iOS receipt payload digest mismatch')
+        require(receipt.get('signed') is signed, 'iOS signing claim mismatch')
+        installable = bool(index) and receipt.get('distribution_method') == 'ad-hoc'
+        require(receipt.get('installable') is installable, 'iOS installability claim mismatch')
+        if index:
+            require(receipt.get('testflight_eligible') is (receipt.get('distribution_method') == 'app-store-connect'),
+                    'iOS TestFlight eligibility claim mismatch')
+        expected_kind = 'signed-ios-ipa' if index else f'{state}-xcarchive-inspection-only'
+        require(receipt.get('kind') == expected_kind, 'iOS receipt must distinguish an archive from an installable IPA')
+        if index:
+            require(receipt.get('distribution_method') in ('app-store-connect', 'ad-hoc'), 'unsupported iOS distribution method')
+            require(isinstance(receipt.get('team_id'), str) and re.fullmatch(r'[A-Z0-9]{10}', receipt['team_id']), 'invalid iOS signing team')
+            require(isinstance(receipt.get('provisioning_profile_uuid'), str) and receipt['provisioning_profile_uuid'], 'missing iOS provisioning profile')
+        with zipfile.ZipFile(payload) as archive:
+            entries = archive.infolist()
+            names = [entry.filename for entry in entries]
+            require(len(names) == len(set(names)) and len(names) <= 32768, 'iOS archive has duplicate or excessive entries')
+            require(all(not PurePosixPath(name).is_absolute() and '..' not in PurePosixPath(name).parts and '\\' not in name for name in names), 'unsafe iOS archive member path')
+            info_name = 'Payload/Vibeface.app/Info.plist' if index else 'Vibeface.xcarchive/Products/Applications/Vibeface.app/Info.plist'
+            profile_name = info_name.rsplit('/', 1)[0] + '/embedded.mobileprovision'
+            require((profile_name in names) is signed, 'iOS archive provisioning state differs from its signing claim')
+            info = plistlib.loads(archive.read(info_name))
+            require((info.get('CFBundleIdentifier'), info.get('CFBundleShortVersionString'), str(info.get('CFBundleVersion')))
+                    == (mobile['ios']['bundleIdentifier'], mobile['version'], str(mobile['ios']['buildNumber'])),
+                    'iOS archive app metadata mismatch')
+            require(info.get('CFBundleSupportedPlatforms') == ['iPhoneOS'], 'iOS device archive must not contain a simulator app')
+    return signed
+
+
 def www_asset_names(version_value):
     name = f'vibeface-www-{version_value}.tar.gz'
     return {name, name + '.sha256', 'release.json'}
@@ -523,8 +583,8 @@ def native_asset_names(version_value, target):
     return {bundle, bundle + '.sha256', core, core + '.sha256'}
 
 
-def product_asset_names(version_value):
-    names = app_asset_names(version_value) | apk_asset_names(version_value) | {'release.json'}
+def product_asset_names(version_value, ios_signed=False):
+    names = app_asset_names(version_value) | apk_asset_names(version_value) | ios_asset_names(version_value, ios_signed) | {'release.json'}
     for target in TARGETS:
         names |= native_asset_names(version_value, target)
     for target in DESKTOP_TARGETS:
@@ -532,8 +592,8 @@ def product_asset_names(version_value):
     return names
 
 
-def expected_asset_names(release_app, version_value):
-    return product_asset_names(version_value) if release_app == 'product' else www_asset_names(version_value)
+def expected_asset_names(release_app, version_value, ios_signed=False):
+    return product_asset_names(version_value, ios_signed) if release_app == 'product' else www_asset_names(version_value)
 
 
 def verify_checksum_file(directory, name):
@@ -548,7 +608,8 @@ def verify_product_release(directory, expected):
     product_version = info['version']
     source_commit = info['source_commit']
     pins = dict(version=product_version, tag=info['tag'], source_commit=source_commit, channel=info['channel'])
-    require({p.name for p in directory.iterdir()} == product_asset_names(product_version),
+    ios_signed = verify_ios_assets(directory, pins)
+    require({p.name for p in directory.iterdir()} == product_asset_names(product_version, ios_signed),
             'product asset set is incomplete or carries extra files')
     with tempfile.TemporaryDirectory(prefix='vibeface-verify-') as tmp:
         tmp = Path(tmp)
@@ -622,7 +683,8 @@ def verify_public(release_app, destination, repo=GITHUB_REPO):
     destination.mkdir(parents=True)
     subprocess.run(['gh', 'release', 'download', tag, f'--repo={repo}', '--dir', str(destination)], check=True)
     names = {asset['name'] for asset in view['assets']}
-    require(len(view['assets']) == len(names) and names == expected_asset_names(release_app, expected['version']),
+    require(len(view['assets']) == len(names) and names == expected_asset_names(release_app, expected['version'],
+                f'vibeface-{expected["version"]}-ios.ipa' in names),
             'public release contains unexpected, duplicate or missing assets')
     return verify_release(release_app, destination, expected)
 
@@ -684,8 +746,8 @@ def assemble_product(input_root, output):
     expected = identity('product')
     product_version = expected['version']
     pins = {key: expected[key] for key in ('app', 'version', 'tag', 'source_commit', 'channel')}
-    require({p.name for p in input_root.iterdir()} == {'app', 'native', 'mobile', 'desktop'},
-            'input-root must contain exactly app, native, mobile and desktop')
+    require({p.name for p in input_root.iterdir()} == {'app', 'native', 'mobile', 'desktop', 'ios'},
+            'input-root must contain exactly app, native, mobile, desktop and ios')
     native_root = input_root / 'native'
     desktop_root = input_root / 'desktop'
     require({p.name for p in native_root.iterdir()} == set(TARGETS), 'native must contain one directory per target')
@@ -693,6 +755,8 @@ def assemble_product(input_root, output):
             'desktop must contain one directory per desktop target')
     producers = [(input_root / 'app', app_asset_names(product_version)),
                  (input_root / 'mobile', apk_asset_names(product_version))]
+    ios_signed = verify_ios_assets(input_root / 'ios', pins)
+    producers.append((input_root / 'ios', ios_asset_names(product_version, ios_signed)))
     for target in TARGETS:
         producers.append((native_root / target, native_asset_names(product_version, target)))
     for target in DESKTOP_TARGETS:
@@ -1077,12 +1141,58 @@ def self_test():
                     mobile_provenance(apk)
             rejects('foreign APK identity', foreign_badging)
 
+        ios_dir = collected / 'ios'
+        ios_dir.mkdir()
+        ios_name = f'vibeface-{product_version}-ios-device-unsigned.xcarchive.zip'
+        ios_info = dict(CFBundleIdentifier=expo['ios']['bundleIdentifier'], CFBundleShortVersionString=expo['version'],
+                        CFBundleVersion=expo['ios']['buildNumber'], CFBundleSupportedPlatforms=['iPhoneOS'])
+        with zipfile.ZipFile(ios_dir / ios_name, 'w') as archive:
+            archive.writestr('Vibeface.xcarchive/Products/Applications/Vibeface.app/Info.plist', plistlib.dumps(ios_info))
+        (ios_dir / (ios_name + '.sha256')).write_text(f'{digest(ios_dir / ios_name)}  {ios_name}\n')
+        ios_receipt = dict(schema=1, platform='ios-device', source_sha=source, release_version=product_version,
+            bundle_identifier=expo['ios']['bundleIdentifier'], bundle_short_version=expo['version'],
+            build_number=expo['ios']['buildNumber'], artifact=ios_name, sha256=digest(ios_dir / ios_name),
+            signed=False, installable=False, kind='unsigned-xcarchive-inspection-only')
+        write_json(ios_dir / (ios_name + '.provenance.json'), ios_receipt)
+        accepts(lambda: verify_ios_assets(ios_dir, desktop_pins))
+        accepts(lambda: manifest('product', ios_dir))
+
+        for field, changed in [('source_sha', foreign), ('installable', True), ('signed', True)]:
+            ios_receipt_path = ios_dir / (ios_name + '.provenance.json')
+            write_json(ios_receipt_path, ios_receipt | {field: changed})
+            rejects('an invalid iOS archive claim for ' + field, lambda: verify_ios_assets(ios_dir, desktop_pins))
+            write_json(ios_receipt_path, ios_receipt)
+        for method in ('ad-hoc', 'app-store-connect'):
+            signed_dir = tmp / ('ios-' + method)
+            signed_dir.mkdir()
+            signed_name = f'vibeface-{product_version}-ios-device-signed.xcarchive.zip'
+            shutil.copy2(ios_dir / ios_name, signed_dir / signed_name)
+            with zipfile.ZipFile(signed_dir / signed_name, 'a') as archive:
+                archive.writestr('Vibeface.xcarchive/Products/Applications/Vibeface.app/embedded.mobileprovision', b'signed profile fixture')
+            (signed_dir / (signed_name + '.sha256')).write_text(f'{digest(signed_dir / signed_name)}  {signed_name}\n')
+            write_json(signed_dir / (signed_name + '.provenance.json'), ios_receipt | {
+                'artifact': signed_name, 'sha256': digest(signed_dir / signed_name), 'signed': True, 'kind': 'signed-xcarchive-inspection-only'})
+            ipa_name = f'vibeface-{product_version}-ios.ipa'
+            with zipfile.ZipFile(signed_dir / ipa_name, 'w') as archive:
+                archive.writestr('Payload/Vibeface.app/Info.plist', plistlib.dumps(ios_info))
+                archive.writestr('Payload/Vibeface.app/embedded.mobileprovision', b'signed profile fixture')
+            (signed_dir / (ipa_name + '.sha256')).write_text(f'{digest(signed_dir / ipa_name)}  {ipa_name}\n')
+            ipa_receipt = ios_receipt | dict(artifact=ipa_name, sha256=digest(signed_dir / ipa_name), signed=True,
+                installable=method == 'ad-hoc', testflight_eligible=method == 'app-store-connect',
+                kind='signed-ios-ipa', distribution_method=method, team_id='TESTTEAM00',
+                provisioning_profile_uuid='profile-fixture', provisioning_profile_expiration='2099-01-01T00:00:00')
+            write_json(signed_dir / (ipa_name + '.provenance.json'), ipa_receipt)
+            accepts(lambda: verify_ios_assets(signed_dir, desktop_pins))
+            write_json(signed_dir / (ipa_name + '.provenance.json'), ipa_receipt | {'installable': method != 'ad-hoc'})
+            rejects('an IPA claiming the wrong installation method', lambda: verify_ios_assets(signed_dir, desktop_pins),
+                    'iOS installability claim mismatch')
+
         # Assembly: the complete product, then every way a producer set can be wrong.
         assembled = tmp / 'assembled'
         info = accepts(lambda: assemble_product(collected, assembled))
         require({p.name for p in assembled.iterdir()} == product_asset_names(product_version), 'assembled asset set')
-        require(len(info['assets']) == 41 and len(product_asset_names(product_version)) == 42,
-                'the product publishes exactly 41 payloads plus its manifest')
+        require(len(info['assets']) == 44 and len(product_asset_names(product_version)) == 45,
+                'the product publishes exactly 44 payloads plus its manifest')
         rejects('assembling into a populated output', lambda: assemble_product(collected, assembled))
 
         def assemble(label, mutate):

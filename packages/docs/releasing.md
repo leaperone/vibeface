@@ -13,12 +13,12 @@ Core、CLI、Web App 和 Mobile 共享一个版本、一个 `v<version>` Tag 与
 
 | 发布组 | Tag | 交付物 |
 | --- | --- | --- |
-| product | `v<version>` | 四个平台的完整 CLI/Core 包、macOS、Windows 与两个 Linux 架构的桌面安装包、Web App 归档、Android APK，以及各自校验信息 |
+| product | `v<version>` | 四个平台的完整 CLI/Core 包、macOS、Windows 与两个 Linux 架构的桌面安装包、Web App 归档、Android APK、iOS 设备归档及配置签名后的 IPA，以及各自校验信息 |
 | www | `www-v<version>` | 静态官网与文档归档 |
 
 首个正式版为 `0.0.1`。Nightly 使用 `0.0.1-nightly.YYYYMMDD.N`，日期取 UTC 准备日期，序号按发布组递增。Mobile 的 `expo.version` 保持 `0.0.1`，Android versionCode 独立递增。当前 Mobile 发行目标是 Android APK，不代表 TestFlight、App Store 或 OTA 交付。
 
-身份检查后，Web、macOS 原生程序、Windows 原生程序、Linux x64 原生程序、Linux ARM64 原生程序和 Android 同时构建。原生任务一次编译本平台 CLI 与 Core。每个平台的组包只等自己的原生输入和 Web，不等待其他平台，也不读取另一个公开 Release。
+身份检查后，Web、macOS 原生程序、Windows 原生程序、Linux x64 原生程序、Linux ARM64 原生程序、Android 和 iOS 同时构建。原生任务一次编译本平台 CLI 与 Core。每个平台的组包只等自己的原生输入和 Web，不等待其他平台，也不读取另一个公开 Release。
 
 流水线按不可变 artifact ID 传递输入，核对源码、版本、目标平台、完整文件集合及 SHA-256。所有目标通过后汇总 17 个载荷文件与一个 `release.json`，由唯一发布任务上传、回读验证，再公开 Release。缺失、错源、损坏或失败目标都会阻止公开。
 
@@ -224,3 +224,14 @@ gh workflow run npm-publish.yml --repo leaperone/vibeface --ref v<version> \
 Windows 签名使用可选仓库 secrets `WINDOWS_CERTIFICATE_PFX_BASE64` 和 `WINDOWS_CERTIFICATE_PASSWORD`，证书密码可以为空。可通过 `WINDOWS_CERTIFICATE_SUBJECT` 和 `WINDOWS_CERTIFICATE_THUMBPRINT` 约束签名身份。配置证书后，原生任务先使用现有 Windows SDK 的 signtool 签名和添加时间戳，再封存程序；桌面任务签名应用与安装器，并在 Windows 上验证 Authenticode、时间戳和配置的身份。
 
 没有 Windows 证书时，Nightly 和 RC 可以生成标注为未签名开发预览的桌面包。Stable 产品在身份检查阶段拒绝缺少证书的构建。脚本不会购买证书、修改信任配置或把未签名包声明为已签名。
+
+
+## iOS 设备归档与分发包
+
+iOS 与 Android、桌面和原生程序独立并行构建。`release-ios.yml` 构建 iPhoneOS ARM64 设备归档，校验真正的设备架构、App 标识、版本和构建号，并核对上传 ZIP 内的实际程序摘要。所有输出都进入产品汇总。模拟器包不能充当 iPhone 安装包。
+
+未配置 iOS 签名时，Nightly 收集 `*-ios-device-unsigned.xcarchive.zip`、校验摘要和来源收据。收据明确写入 `signed=false`、`installable=false`。这个归档用于构建检查，无法直接安装到手机。
+
+配置 `IOS_CERTIFICATE_P12_BASE64`、`IOS_CERTIFICATE_PASSWORD` 和 `IOS_PROVISIONING_PROFILE_BASE64` 后，工作流可签名并导出 IPA。三项必须完整，证书须为匹配 App 与 team 的 Apple Distribution 身份。Stable 产品在缺少该配置时提前失败。macOS Developer ID 证书和公证 API key 不能替代 iOS 签名材料。
+
+默认导出 `app-store-connect` IPA，收据为 `testflight_eligible=true`、`installable=false`，仍需另行授权并上传 TestFlight 才能安装。`ad-hoc` 仅适用于描述文件中已注册的设备，收据才标记 `installable=true`。本流程只构建和校验，不上传到 TestFlight 或 App Store。详见 [iOS 构建与分发](ios.md)。

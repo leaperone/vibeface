@@ -405,7 +405,7 @@ def run_test(packages, tier):
         command = ["cargo", "test", "--locked", "-p", test_package, "--lib", "--", "--exact", "--include-ignored", *SLOW_TESTS]
     else:
         skips = [argument for name in SLOW_TESTS for argument in ("--skip", name)]
-        command = ["cargo", "test", "--locked", *selected, "--", *skips]
+        command = ["cargo", "test", "--locked", "--no-fail-fast", *selected, "--", *skips]
     subprocess.run(command, check=True)
 
 

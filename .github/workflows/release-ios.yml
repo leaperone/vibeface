@@ -84,7 +84,7 @@ jobs:
             --output ".artifacts/ios/$archive_name.provenance.json" "${verify_args[@]}"
           if (( configured == 3 )); then
             ipa_name="vibeface-${RELEASE_VERSION}-ios.ipa"
-            cp .artifacts/ios/export/Vibeface.ipa ".artifacts/ios/$ipa_name"
+            cp .artifacts/ios-build/export/Vibeface.ipa ".artifacts/ios/$ipa_name"
             python3 -B scripts/verify-ios-ipa.py \
               --ipa ".artifacts/ios/$ipa_name" \
               --source-sha "$SOURCE_SHA" \

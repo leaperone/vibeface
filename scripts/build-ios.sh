@@ -146,6 +146,7 @@ fi
 scripts/build-mobile-secure.sh ios
 cd "$root/apps/mobile"
 npx expo prebuild --platform ios --no-install
+(cd ios && pod install)
 mkdir -p "$(dirname "$archive")"
 rm -rf "$archive"
 signing_args=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='')

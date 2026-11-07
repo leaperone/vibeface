@@ -44,6 +44,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
           WINDOWS_SIGNING_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
+          IOS_SIGNING_CONFIGURED: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' && secrets.IOS_CERTIFICATE_PASSWORD != '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 != '' }}
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 -B - <<'PY'
@@ -60,6 +61,8 @@ jobs:
           result = json.loads(subprocess.check_output(command, text=True))
           if scope == 'product' and result['channel'] == 'stable' and os.environ['WINDOWS_SIGNING_CONFIGURED'] != 'true':
               raise SystemExit('Stable product builds require a Windows Authenticode certificate before any producers start')
+          if scope == 'product' and result['channel'] == 'stable' and os.environ['IOS_SIGNING_CONFIGURED'] != 'true':
+              raise SystemExit('Stable product builds require the iOS distribution identity and provisioning profile')
           if result['source_commit'] != os.environ['GITHUB_SHA']:
               raise SystemExit('Build source differs from the workflow commit')
           if publish:
@@ -171,6 +174,17 @@ jobs:
       source_sha: ${{ needs.identity.outputs.source_sha }}
       version: ${{ needs.identity.outputs.version }}
       tag: ${{ needs.identity.outputs.tag }}
+  ios:
+    needs: [identity]
+    if: needs.identity.outputs.app == 'product'
+    uses: ./.github/workflows/release-ios.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      version: ${{ needs.identity.outputs.version }}
+    secrets:
+      IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+      IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+      IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
   compose-macos:
     needs: [identity, static, native-macos]
     if: needs.identity.outputs.app == 'product'
@@ -261,7 +275,7 @@ jobs:
       target: aarch64-unknown-linux-gnu
       native_artifact_id: ${{ needs.compose-linux-arm64.outputs.artifact_id }}
   collect:
-    needs: [identity, static, compose-macos, compose-linux-x64, compose-linux-arm64, compose-windows, desktop-macos, desktop-windows, desktop-linux-x64, desktop-linux-arm64, android]
+    needs: [identity, static, compose-macos, compose-linux-x64, compose-linux-arm64, compose-windows, desktop-macos, desktop-windows, desktop-linux-x64, desktop-linux-arm64, android, ios]
     if: >-
       always() && !cancelled() && needs.identity.result == 'success' && needs.static.result == 'success' &&
       (needs.identity.outputs.app == 'www' ||
@@ -269,7 +283,7 @@ jobs:
       needs.compose-linux-arm64.result == 'success' && needs.compose-windows.result == 'success' &&
       needs.desktop-macos.result == 'success' && needs.desktop-windows.result == 'success' &&
       needs.desktop-linux-x64.result == 'success' && needs.desktop-linux-arm64.result == 'success' &&
-      needs.android.result == 'success'))
+      needs.ios.result == 'success' && needs.android.result == 'success'))
     runs-on: ubuntu-24.04
     outputs:
       release_artifact_id: ${{ steps.release-artifact.outputs.artifact-id }}
@@ -340,6 +354,12 @@ jobs:
           artifact-ids: ${{ needs.android.outputs.artifact_id }}
           merge-multiple: true
           path: .artifacts/input/mobile
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.identity.outputs.app == 'product'
+        with:
+          artifact-ids: ${{ needs.ios.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/input/ios
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with: {node-version: '24'}
       - name: Assemble the complete release without rebuilding

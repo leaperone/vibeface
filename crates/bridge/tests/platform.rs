@@ -151,20 +151,23 @@ fn a_private_path_refuses_a_link_left_in_its_place() -> Result<()> {
         privatefs::create_dir(&planted).is_err(),
         "a private directory is never taken from a link"
     );
-    assert_eq!(privatefs::read_dir_link(&planted)?, elsewhere);
+    assert_eq!(
+        privatefs::read_dir_link(&planted)?.canonicalize()?,
+        elsewhere.canonicalize()?
+    );
 
     let copied = directory.join("copied");
     privatefs::copy_link(&planted, &copied)?;
     assert_eq!(
-        privatefs::read_dir_link(&copied)?,
-        elsewhere,
+        privatefs::read_dir_link(&copied)?.canonicalize()?,
+        elsewhere.canonicalize()?,
         "a copy carries the link across instead of reading through it"
     );
 
     privatefs::point_dir_link(&directory, &planted)?;
     assert_eq!(
-        privatefs::read_dir_link(&planted)?,
-        directory,
+        privatefs::read_dir_link(&planted)?.canonicalize()?,
+        directory.canonicalize()?,
         "an activation link is repointed in place"
     );
     std::fs::remove_dir_all(&directory)?;

@@ -61,7 +61,7 @@ def check(source, helpers):
     workflow = jobs(source)
     require('release-${{ inputs.tag || github.ref_name }}-' in source,
             'tag pushes and manual publication must share the same concurrency group')
-    producers = ['static', 'android', *('native-' + target for target in TARGETS)]
+    producers = ['static', 'android', 'ios', *('native-' + target for target in TARGETS)]
     for producer in producers:
         require(needs(workflow[producer]) == {'identity'}, producer + ' waits on an unrelated build')
     for target in TARGETS:
@@ -70,7 +70,7 @@ def check(source, helpers):
     for target in DESKTOP_TARGETS:
         require(needs(workflow['desktop-' + target]) == {'identity', 'compose-' + target},
                 target + ' desktop packaging waits on another platform')
-    collection_needs = {'identity', 'static', 'android', *('compose-' + target for target in TARGETS),
+    collection_needs = {'identity', 'static', 'android', 'ios', *('compose-' + target for target in TARGETS),
                         *('desktop-' + target for target in DESKTOP_TARGETS)}
     require(needs(workflow['collect']) == collection_needs, 'collection is missing a required producer')
     require(needs(workflow['publish']) == {'identity', 'collect'}, 'publisher must consume the complete collection')
@@ -113,6 +113,7 @@ def self_test(source, helpers):
         source.replace('needs: [identity, static, native-macos]', 'needs: [identity, static, native-macos, native-linux-x64]'),
         source.replace('needs: [identity, compose-macos]', 'needs: [identity, compose-macos, compose-windows]'),
         source.replace("needs.android.result == 'success'", "True"),
+        source.replace("needs.ios.result == 'success' &&", ''),
         source.replace("needs.desktop-windows.result == 'success' &&", ''),
         source.replace("needs.desktop-linux-x64.result == 'success' &&", ''),
         source.replace("needs.desktop-linux-arm64.result == 'success' &&", ''),
@@ -139,7 +140,7 @@ def main():
     source = (directory / 'release.yml').read_text()
     helpers = {name: (directory / name).read_text()
                for name in ('release-native.yml', 'release-compose.yml', 'release-desktop.yml',
-                            'release-apps.yml', 'npm-publish.yml', 'deploy-app.yml', 'deploy-www.yml')}
+                            'release-apps.yml', 'release-ios.yml', 'npm-publish.yml', 'deploy-app.yml', 'deploy-www.yml')}
     self_test(source, helpers) if args.self_test else check(source, helpers)
     print('Release DAG passed: parallel native, desktop, Web and Android producers, per-platform composition, '
           'exact artifacts and complete-only publication')

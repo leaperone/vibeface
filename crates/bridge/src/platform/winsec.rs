@@ -956,11 +956,17 @@ pub fn read_junction(alias: &Path) -> io::Result<std::path::PathBuf> {
         .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
-    let target = std::ffi::OsString::from_wide(&units);
-    let text = target.to_string_lossy();
-    Ok(std::path::PathBuf::from(
-        text.strip_prefix(r"\??\").unwrap_or(&text).to_string(),
-    ))
+    let nt_prefix: Vec<u16> = r"\??\".encode_utf16().collect();
+    if !units.starts_with(&nt_prefix) {
+        return Err(io::Error::other(
+            "junction target is not an absolute NT path",
+        ));
+    }
+    let mut windows_path: Vec<u16> = r"\\?\".encode_utf16().collect();
+    windows_path.extend_from_slice(&units[nt_prefix.len()..]);
+    Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+        &windows_path,
+    )))
 }
 
 /// `ReparseTag`, `ReparseDataLength`, and `Reserved`.
@@ -969,9 +975,32 @@ const REPARSE_HEADER_LEN: usize = 8;
 const MOUNT_POINT_FIELDS_LEN: usize = 8;
 
 fn mount_point_buffer(target: &Path) -> io::Result<Vec<u8>> {
+    use std::{
+        os::windows::ffi::OsStrExt as _,
+        path::{Component, Prefix},
+    };
     use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
-    let mut substitute: Vec<u16> =
-        wide(std::ffi::OsString::from(format!(r"\??\{}", target.display())).as_os_str());
+    let encoded: Vec<u16> = target.as_os_str().encode_wide().collect();
+    let mut substitute: Vec<u16> = r"\??\".encode_utf16().collect();
+    match target.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _) => {
+                substitute.extend_from_slice(&encoded[4..])
+            }
+            Prefix::Disk(_) => substitute.extend_from_slice(&encoded),
+            Prefix::UNC(_, _) => {
+                substitute.extend("UNC\\".encode_utf16());
+                substitute.extend_from_slice(&encoded[2..]);
+            }
+            _ => {
+                return Err(io::Error::other(
+                    "a junction target must name an absolute disk or share directory",
+                ));
+            }
+        },
+        _ => return Err(io::Error::other("a junction target must be absolute")),
+    }
+    substitute.push(0);
     // The print name a person sees in Explorer is the plain path.
     let print: Vec<u16> = wide(target.as_os_str());
     let substitute_bytes = (substitute.len() - 1) * 2;

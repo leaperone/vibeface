@@ -118,7 +118,11 @@ jobs:
           archives=(.artifacts/desktop/*.zip)
           [[ "${#archives[@]}" == 1 ]]
           mkdir -p .artifacts/desktop-app
-          tar -xf "${archives[0]}" -C .artifacts/desktop-app
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            unzip -q "${archives[0]}" -d .artifacts/desktop-app
+          else
+            tar -xf "${archives[0]}" -C .artifacts/desktop-app
+          fi
           if [[ "$TARGET" == *-apple-darwin ]]; then
             application="$PWD/.artifacts/desktop-app/Vibeface.app"
           elif [[ "$TARGET" == *-windows-* ]]; then

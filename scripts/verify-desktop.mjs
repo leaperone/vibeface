@@ -144,7 +144,8 @@ function verifySignature(application, target, receipt) {
 
 function extract(archive, destination) {
   fs.mkdirSync(destination, { recursive: true });
-  run('tar', ['-xf', archive, '-C', destination]);
+  if (process.platform === 'linux') run('unzip', ['-q', archive, '-d', destination]);
+  else run('tar', ['-xf', archive, '-C', destination]);
   return destination;
 }
 
