@@ -63,7 +63,7 @@ module.exports = {
     identity: signed ? undefined : null,
     // Notarization uses the existing Developer ID and App Store Connect key, then staples the app.
     notarize: signed,
-    extendInfo: { NSHighResolutionCapable: true, LSMinimumSystemVersion: '12.0.0' },
+    extendInfo: { NSHighResolutionCapable: true },
   },
   win: {
     target: [{ target: 'nsis', arch: [arch] }, { target: 'zip', arch: [arch] }],
