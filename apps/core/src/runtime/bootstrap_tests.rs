@@ -497,13 +497,24 @@ async fn a_node_without_public_infrastructure_starts_locally_and_keeps_seeking()
         Some(node.config.public_url.clone()),
         "without an admitted entry this Node advertises itself"
     );
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    match node.bootstrap_state().context("bootstrap is on")? {
-        BootstrapState::Seeking { reason, .. } => {
-            assert!(reason.is_some(), "the failure is reported, not hidden");
+    // Startup can finish while discovery is still awaiting its bounded HTTP fallback.
+    let mut states = node.net()?.bootstrap().subscribe();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let state = states.borrow_and_update().clone();
+            match state {
+                BootstrapState::Seeking {
+                    reason: Some(_), ..
+                } => return Ok::<(), anyhow::Error>(()),
+                BootstrapState::Seeking { reason: None, .. } => {
+                    states.changed().await.context("bootstrap stopped")?;
+                }
+                other => anyhow::bail!("unexpected bootstrap state: {other:?}"),
+            }
         }
-        other => panic!("unexpected bootstrap state: {other:?}"),
-    }
+    })
+    .await
+    .context("the failure must be reported after discovery and HTTP have failed")??;
     assert!(node.net()?.bootstrap().admitted().is_none());
     stop_node(node, dir).await?;
     Ok(())
