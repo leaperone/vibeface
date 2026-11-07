@@ -9,7 +9,17 @@ permissions:
   contents: read
 jobs:
   rust:
-    name: windows rust
+    name: windows rust (${{ matrix.scope }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scope: core
+            packages: vibeface-core
+          - scope: bridge
+            packages: vibeface-protocol vibeface-bridge vibeface-secure vibeface-control
+          - scope: cli
+            packages: vibeface
     runs-on: windows-2025
     timeout-minutes: 120
     defaults:
@@ -24,7 +34,7 @@ jobs:
         with: {components: clippy}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
-          key: ci-windows-native
+          key: ci-windows-native-${{ matrix.scope }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
@@ -37,10 +47,18 @@ jobs:
           rustc -vV
           test "$(rustc -vV | sed -n 's/^host: //p')" = x86_64-pc-windows-msvc
           cl.exe 2>&1 | head -n 1 | grep -q 'Microsoft (R) C/C++'
-      - name: Lint the Windows Core, CLI and platform crates
-        run: '"$PY" -B scripts/ci.py check --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface-core vibeface-control vibeface'
-      - name: Run the native Windows tests
-        run: '"$PY" -B scripts/ci.py test --tier fast --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface-core vibeface-control vibeface'
+      - name: Lint this native Windows scope
+        env:
+          PACKAGES: ${{ matrix.packages }}
+        run: |
+          read -ra selected <<< "$PACKAGES"
+          "$PY" -B scripts/ci.py check --packages "${selected[@]}"
+      - name: Run this scope's native Windows tests
+        env:
+          PACKAGES: ${{ matrix.packages }}
+        run: |
+          read -ra selected <<< "$PACKAGES"
+          "$PY" -B scripts/ci.py test --tier fast --packages "${selected[@]}"
 
   process:
     if: inputs.package_artifact != ''
