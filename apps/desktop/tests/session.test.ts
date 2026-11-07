@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -150,12 +150,8 @@ describe('CoreSession against protocol fixtures', () => {
     await session.useDataDir(dataDir)
     await session.startOwned()
     await session.businessTarget()
-    const settings = await import('node:fs/promises').then((fs) =>
-      fs.readFile(join(profileDir, 'desktop-settings.json'), 'utf8')
-    )
-    expect(settings).not.toContain('local=')
-    expect(settings).not.toContain('4791')
-    expect(settings).toContain(dataDir)
+    const settings = JSON.parse(await readFile(join(profileDir, 'desktop-settings.json'), 'utf8'))
+    expect(settings).toEqual({ lastDataDir: dataDir, preferences: { openBusinessOnConnect: true } })
   })
 
   it('reports a missing runtime instead of guessing a program', async () => {

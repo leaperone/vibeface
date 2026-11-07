@@ -49,14 +49,12 @@ describe('CoreLifecycle with a real child process', () => {
     delete process.env['FIXTURE_CRASH_AFTER_MS']
     delete process.env['FIXTURE_IGNORE_PARENT_EOF']
     delete process.env['FIXTURE_IGNORE_SIGTERM']
-    delete process.env['FIXTURE_TERM_DELAY_MS']
   })
 
   afterEach(async () => {
     delete process.env['FIXTURE_CRASH_AFTER_MS']
     delete process.env['FIXTURE_IGNORE_PARENT_EOF']
     delete process.env['FIXTURE_IGNORE_SIGTERM']
-    delete process.env['FIXTURE_TERM_DELAY_MS']
     await lifecycle.stopOwned('quit').catch(() => {
       /* tests that force unknown outcomes clean up the child explicitly */
     })
@@ -151,25 +149,38 @@ describe('CoreLifecycle with a real child process', () => {
   })
 
   it('waits for a confirmed exit before clearing owned state during fallback stop', async () => {
-    lifecycle =
-      process.platform === 'win32'
-        ? new CoreLifecycle({ replaceGraceMs: 120, sigtermGraceMs: 900, sigkillGraceMs: 300 })
-        : new CoreLifecycle({ replaceGraceMs: 120, sigtermGraceMs: 200, sigkillGraceMs: 300 })
+    lifecycle = new CoreLifecycle({ replaceGraceMs: 120, sigtermGraceMs: 900, sigkillGraceMs: 300 })
 
     process.env['FIXTURE_IGNORE_PARENT_EOF'] = '1'
-    if (process.platform === 'win32') process.env['FIXTURE_TERM_DELAY_MS'] = '500'
-    else process.env['FIXTURE_IGNORE_SIGTERM'] = '1'
+    process.env['FIXTURE_IGNORE_SIGTERM'] = '1'
 
     lifecycle.startOwned(serviceFixture(dataDir), dataDir)
     await settled(() => existsSync(markerPath(dataDir)))
     const pid = await runningPid(dataDir)
+    const call = vi.mocked(spawn).mock.results.at(-1)
+    if (!call || call.type !== 'return') throw new Error('expected a real spawned child')
+    const child = call.value
+    const realKill = child.kill.bind(child)
+    let requestedSignal: (() => void) | undefined
+    const signalRequested = new Promise<void>((resolve) => {
+      requestedSignal = resolve
+    })
+    const kill = vi.spyOn(child, 'kill').mockImplementation((signal) => {
+      if (signal === 'SIGTERM') {
+        requestedSignal?.()
+        return true
+      }
+      return realKill(signal)
+    })
 
     const stopping = lifecycle.stopOwned('replace')
-    await new Promise((resolve) => setTimeout(resolve, 180))
+    await signalRequested
 
     expect(lifecycle.state().kind).toBe('owned')
     expect(pidAlive(pid)).toBe(true)
 
+    kill.mockRestore()
+    realKill('SIGTERM')
     await stopping
     expect(lifecycle.state().kind).toBe('idle')
     expect(pidAlive(pid)).toBe(false)
@@ -179,7 +190,6 @@ describe('CoreLifecycle with a real child process', () => {
     lifecycle = new CoreLifecycle({ replaceGraceMs: 80, sigtermGraceMs: 80, sigkillGraceMs: 80 })
     process.env['FIXTURE_IGNORE_PARENT_EOF'] = '1'
     if (process.platform !== 'win32') process.env['FIXTURE_IGNORE_SIGTERM'] = '1'
-    else process.env['FIXTURE_TERM_DELAY_MS'] = '1000'
 
     lifecycle.startOwned(serviceFixture(dataDir), dataDir)
     await settled(() => existsSync(markerPath(dataDir)))
