@@ -55,6 +55,7 @@ const MAX_ADMITTED: usize = 4096;
 /// How long the client waits for the UDP discovery session before it turns to HTTPS.
 const UDP_WAIT: Duration = Duration::from_secs(3);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const RELAY_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// A relay denial right after a renewal waits for the backoff instead of renewing again.
@@ -1284,7 +1285,12 @@ impl Worker {
                     match register(&credential.gateway_url, &credential.token).await {
                         Ok(()) => {
                             self.install(&credential).await;
-                            return Ok(credential);
+                            match self.wait_relay_ready(&credential).await {
+                                Ok(()) => return Ok(credential),
+                                Err(error) => {
+                                    failures.push(format!("{}: {error:#}", entry.relay_url));
+                                }
+                            }
                         }
                         Err(error) => failures.push(format!("{}: {error:#}", entry.gateway_url)),
                     }
@@ -1296,6 +1302,34 @@ impl Worker {
             "no catalogue entry registered access: {}",
             failures.join("; ")
         )
+    }
+
+    /// Registration grants access; only the relay handshake makes this route usable. This
+    /// wait belongs to the background worker so local and LAN startup never wait for it.
+    async fn wait_relay_ready(&self, credential: &Credential) -> Result<()> {
+        let remaining = credential.expires_at_ms - now_ms();
+        ensure!(remaining > 0, "the relay grant expired before connecting");
+        let timeout = RELAY_READY_TIMEOUT.min(Duration::from_millis(remaining as u64));
+        let mut status = self.endpoint.home_relay_status();
+        tokio::time::timeout(timeout, async {
+            loop {
+                let connected = status
+                    .get()
+                    .iter()
+                    .any(|relay| relay.url() == &credential.relay && relay.is_connected());
+                if connected {
+                    return Ok(());
+                }
+                tokio::select! {
+                    changed = status.updated() => {
+                        changed.context("relay status stopped before connecting")?;
+                    }
+                    _ = self.endpoint.closed() => bail!("endpoint closed before relay connection"),
+                }
+            }
+        })
+        .await
+        .context("the registered relay has not connected yet")?
     }
 
     /// Puts the granted relay into the endpoint's relay map, replacing any bare copy.

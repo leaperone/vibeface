@@ -172,14 +172,7 @@ impl Infra {
 }
 
 impl Runtime {
-    /// Drops every relay connection the way a relay deployment does: the server restarts on the
-    /// same address and every Node reconnects with the token its relay actor still holds.
-    async fn restart_relay(self: &Arc<Self>) -> Result<()> {
-        let listen = self
-            .config
-            .network
-            .relay_listen
-            .context("this Node runs no relay")?;
+    async fn stop_entry_relay(self: &Arc<Self>) -> Result<()> {
         let relay = self
             .relay
             .lock()
@@ -190,6 +183,15 @@ impl Runtime {
             .shutdown()
             .await
             .map_err(|error| anyhow!("relay shutdown failed: {error}"))?;
+        Ok(())
+    }
+
+    async fn start_entry_relay(self: &Arc<Self>) -> Result<()> {
+        let listen = self
+            .config
+            .network
+            .relay_listen
+            .context("this Node runs no relay")?;
         let access = Arc::new(RelayAccess(Arc::downgrade(self)));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -205,6 +207,13 @@ impl Runtime {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Drops every relay connection the way a relay deployment does: the server restarts on the
+    /// same address and every Node reconnects with the token its relay actor still holds.
+    async fn restart_relay(self: &Arc<Self>) -> Result<()> {
+        self.stop_entry_relay().await?;
+        self.start_entry_relay().await
     }
 }
 
@@ -270,6 +279,63 @@ async fn stop_node(node: Arc<Runtime>, dir: PathBuf) {
         net.close().await;
     }
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_waits_for_the_public_relay_listener_before_reporting_ready() -> Result<()> {
+    let infra = Infra::start(bootstrap::DEFAULT_GRANT_TTL_MS).await?;
+    infra.entry.stop_entry_relay().await?;
+    let relay = infra.relay()?;
+    let started = tokio::time::Instant::now();
+    let (node, dir) = tokio::time::timeout(Duration::from_secs(5), fresh_node(infra.source(true)))
+        .await
+        .context("network start must not wait for a cold public relay")??;
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let endpoint_id = node.net()?.endpoint.id();
+    let admission = infra
+        .entry
+        .net()?
+        .grant_admission()
+        .context("the entry admits by grants")?;
+    tokio::time::timeout(Duration::from_secs(40), async {
+        loop {
+            if admission.admitted_until(&endpoint_id).is_some() {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("the entry never registered a grant for this endpoint")??;
+    assert!(
+        wait_admitted(&node, Duration::from_secs(1)).await.is_err(),
+        "bootstrap must not admit while the relay listener is still down"
+    );
+    assert_eq!(
+        node.gateway_url().as_deref(),
+        Some(node.config.public_url.as_str()),
+        "without a live relay this Node keeps advertising itself"
+    );
+    assert!(
+        !connected(&node.net()?.endpoint.home_relay_status().get(), &relay),
+        "grant registration alone must not look like a connected relay"
+    );
+    infra.entry.start_entry_relay().await?;
+    let admitted = wait_admitted(&node, Duration::from_secs(40)).await?;
+    assert!(
+        connected(&node.net()?.endpoint.home_relay_status().get(), &relay),
+        "admission must align with relay connectivity, not only grant registration"
+    );
+    assert_eq!(admitted.gateway_url, infra.gateway_url);
+    assert_eq!(admitted.relay_url, infra.relay_url);
+    assert_eq!(
+        node.gateway_url().as_deref(),
+        Some(infra.gateway_url.as_str()),
+        "after admission the catalogue gateway is advertised"
+    );
+    stop_node(node, dir).await;
+    infra.stop().await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
