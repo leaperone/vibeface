@@ -214,21 +214,26 @@ def activate(service, output):
                      str(output / f'{component}.image.tar.gz'), f'{remote}:{stage}/'], stdout=subprocess.DEVNULL)
             checked(['scp', *options, '-P', port, '-r', str(ROOT / 'deploy'), f'{remote}:{stage}/'],
                     stdout=subprocess.DEVNULL)
+            archive_digest = release.digest(output / f'{component}.image.tar.gz')
             command = ['python3', stage + '/deploy-activate.py', '--config', stage + '/config.json',
                        '--image', identity, '--tag', info['tag'], '--source-sha', info['source_sha'],
-                       '--version', info['version']]
+                       '--version', info['version'], '--archive', stage + f'/{component}.image.tar.gz',
+                       '--archive-sha256', archive_digest]
             # A dropped SSH connection leaves activation state for reconciliation, never an automatic retry.
-            shell = ('set -eu; if [ "$(id -u)" != 0 ]; then sudo -n true; fi; '
-                     'gzip -dc ' + shlex.quote(stage + f'/{component}.image.tar.gz') +
-                     ' | ' + ('docker load >/dev/null; ' if user == 'root' else 'sudo -n docker load >/dev/null; ') +
+            shell = ('set -eu; if [ "$(id -u)" != 0 ]; then sudo -n true; fi; ' +
                      ('exec ' if user == 'root' else 'exec sudo -n ') + shlex.join(command))
-            checked([*ssh, shell])
+            receipt = json.loads(subprocess.check_output([*ssh, shell], text=True))
+            release.require(receipt.get('status') in ('activated', 'already_active')
+                            and re.fullmatch(r'sha256:[0-9a-f]{64}', receipt.get('image', ''))
+                            and receipt.get('source_sha') == info['source_sha']
+                            and receipt.get('version') == info['version'], 'invalid remote activation receipt')
             succeeded = True
         finally:
             if succeeded:
                 subprocess.run([*ssh, 'rm -rf -- ' + shlex.quote(stage)],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return {'service': service, 'tag': info['tag'], 'source_sha': info['source_sha'], 'image': identity}
+    return {'service': service, 'tag': info['tag'], 'source_sha': info['source_sha'],
+            'image': receipt['image'], 'prepared_image': identity}
 
 
 def self_test():

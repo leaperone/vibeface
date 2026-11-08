@@ -59,3 +59,5 @@ python3 deploy/runtime.py self-test
 python3 deploy/static-config.py --self-test
 python3 scripts/deploy-activate.py --self-test
 ```
+
+镜像跨 Docker 存储后端传输时，接收端的不可变 ID 可能与构建端不同。导入流程应先校验传输归档的 SHA-256，再使用 Docker 返回的实际导入 ID 执行激活检查。

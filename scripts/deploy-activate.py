@@ -133,6 +133,21 @@ def docker(*args, **kwargs):
     return command(*DOCKER, *args, **kwargs).stdout.strip()
 
 
+def import_image(archive, digest):
+    require(re.fullmatch(r'[0-9a-f]{64}', digest), 'invalid image archive digest')
+    archive = checked_path(canonical_path(archive))
+    require(archive.is_file(), 'image archive is not a regular file')
+    checksum = hashlib.sha256()
+    with archive.open('rb') as source:
+        while block := source.read(1024 * 1024):
+            checksum.update(block)
+    require(checksum.hexdigest() == digest, 'transferred image archive digest differs')
+    result = docker('load', '--input', str(archive), timeout=300)
+    match = re.fullmatch(r'Loaded image ID: (' + IMAGE + r')', result)
+    require(match is not None, 'Docker did not return one immutable imported image ID')
+    return match[1]
+
+
 def compose(manifest, *args):
     directory = Path(manifest['directory'])
     return docker('compose', '--project-name', manifest['project'], '--env-file', str(directory / 'image.env'),
@@ -598,6 +613,30 @@ def self_test():
     import copy
     import tempfile
     from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as temporary:
+        archive = Path(temporary).resolve() / 'image.tar.gz'
+        archive.write_bytes(b'verified archive')
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        imported = 'sha256:' + 'c' * 64
+        with patch(__name__ + '.docker', return_value='Loaded image ID: ' + imported) as load:
+            assert import_image(str(archive), digest) == imported
+            load.assert_called_once_with('load', '--input', str(archive), timeout=300)
+        with patch(__name__ + '.docker') as load:
+            try:
+                import_image(str(archive), '0' * 64)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('imported an unverified archive')
+            load.assert_not_called()
+        for result in ('Loaded image: moving:tag', 'Loaded image ID: ' + imported + '\nLoaded image ID: ' + imported):
+            with patch(__name__ + '.docker', return_value=result):
+                try:
+                    import_image(str(archive), digest)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError('accepted an ambiguous imported image')
     config = {'project': 'official-entry', 'role': 'entry', 'deploy_dir': '/srv/service-control/entry',
               'listen': '127.0.0.1:4900', 'data_dir': '/var/lib/official-entry', 'device_id': 'a' * 64,
               'uid': 1001, 'gid': 1001, 'legacy_service': 'official-entry.service',
@@ -765,6 +804,8 @@ def main():
     parser.add_argument('--self-test', action='store_true')
     parser.add_argument('--config', help='Private JSON file, or - for standard input')
     parser.add_argument('--image', help='Already imported sha256 image ID')
+    parser.add_argument('--archive', help='Import this verified image archive before activation')
+    parser.add_argument('--archive-sha256')
     parser.add_argument('--tag')
     parser.add_argument('--source-sha')
     parser.add_argument('--version')
@@ -778,6 +819,9 @@ def main():
     require(len(raw) <= 65536, 'deployment configuration is too large')
     config = validate_config(json.loads(raw))
     require(args.tag == ('www-v' if config['role'] == 'www' else 'v') + args.version, 'tag and version differ')
+    require(bool(args.archive) == bool(args.archive_sha256), 'archive and its digest must be supplied together')
+    if args.archive:
+        args.image = import_image(args.archive, args.archive_sha256)
     print(json.dumps(activate(config, args.image, args.tag, args.source_sha, args.version)))
 
 
