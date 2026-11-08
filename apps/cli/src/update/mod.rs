@@ -755,15 +755,16 @@ fn desktop_managed_policy(managed_root: &Path) -> Result<Policy> {
 /// Desktop recovery runs only while Core reports a stopped Node.
 pub(crate) async fn recover_desktop_managed(data: &Path, managed_root: &Path) -> Result<()> {
     let pending = data.join("update-pending.json");
-    if !pending.exists() {
-        return Ok(());
-    }
-    let policy = desktop_managed_policy(managed_root)?;
-    let metadata = fs::symlink_metadata(&pending)?;
+    let metadata = match fs::symlink_metadata(&pending) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
     ensure!(
         metadata.is_file() && metadata.len() <= 64 * 1024,
         "invalid pending update journal"
     );
+    let policy = desktop_managed_policy(managed_root)?;
     let journal: Journal = serde_json::from_slice(&fs::read(&pending)?)?;
     let current = installed(&policy.install_root)?;
     let inspected = inspect(data, &current.join(PROGRAMS[1])).await?;
@@ -2384,6 +2385,27 @@ mod tests {
             }
             fs::remove_dir_all(policy.install_root).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn desktop_recovery_refuses_a_dangling_journal_without_clearing_it() {
+        let root = sandbox();
+        let data = root.join("data");
+        private_dir(&data).unwrap();
+        let pending = data.join("update-pending.json");
+        let missing = root.join("not-a-journal");
+        std::os::unix::fs::symlink(&missing, &pending).unwrap();
+        let error = recover_desktop_managed(&data, &root).await.unwrap_err();
+        assert!(error.to_string().contains("invalid pending update journal"));
+        assert!(
+            fs::symlink_metadata(&pending)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!missing.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
