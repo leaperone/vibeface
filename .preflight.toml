@@ -54,5 +54,5 @@ language = "zh"
 
 [[domain_check]]
 name = "Official deployment command"
-trigger_paths = ["scripts/deploy.py", ".github/workflows/deploy-services.yml", ".github/workflows/release.yml", "scripts/check-release-workflow.py"]
-command = "python3 -B scripts/deploy.py self-test && python3 -B scripts/check-release-workflow.py --self-test"
+trigger_paths = ["scripts/deploy.py", "scripts/deploy-run.py", "scripts/deploy-activate.py", "deploy/**", ".github/workflows/deploy-services.yml", ".github/workflows/release.yml", "scripts/check-release-workflow.py"]
+command = "python3 -B scripts/deploy.py self-test && python3 -B scripts/deploy-run.py self-test && python3 -B scripts/deploy-activate.py --self-test && python3 -B deploy/runtime.py self-test && python3 -B deploy/static-config.py --self-test && python3 -B scripts/check-release-workflow.py --self-test"

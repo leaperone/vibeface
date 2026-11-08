@@ -7,6 +7,9 @@ import re
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
+import tarfile
+import shutil
 from unittest.mock import patch
 
 import release
@@ -16,7 +19,9 @@ REPOSITORY = 'leaperone/vibeface'
 
 
 def gh(*args):
-    return subprocess.check_output(['gh', *args], text=True)
+    result = subprocess.run(['gh', *args], capture_output=True, text=True)
+    release.require(result.returncode == 0, 'GitHub request failed; inspect authenticated CLI access and retry the read-only plan')
+    return result.stdout
 
 
 def verify(tag, manifest, published, source_sha):
@@ -123,8 +128,10 @@ def prepare(service, tag, output):
         name = f"vibeface-{component}-{info['version']}{suffix}.tar.gz"
         entry = next(a for a in manifest['assets'] if a['name'] == name)
         download = output / 'downloads'; download.mkdir(exist_ok=True)
-        subprocess.run(['gh', 'release', 'download', tag, '--repo', REPOSITORY,
-                        '--pattern', name, '--pattern', name + '.sha256', '--dir', str(download)], check=True)
+        result = subprocess.run(['gh', 'release', 'download', tag, '--repo', REPOSITORY,
+                                 '--pattern', name, '--pattern', name + '.sha256', '--dir', str(download)],
+                                capture_output=True, text=True)
+        release.require(result.returncode == 0, 'published component download failed')
         archive = download / name
         release.require(archive.stat().st_size == entry['size'] and release.digest(archive) == entry['sha256'],
                         'downloaded component checksum mismatch')
@@ -228,6 +235,53 @@ def self_test():
             pass
         else:
             raise AssertionError('accepted wrong deployment group')
+    scratch = release.ROOT / '.artifacts'
+    scratch.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=scratch, prefix='deploy-check-') as temp:
+        root = Path(temp)
+        directory = root / 'vibeface-app'; (directory / 'web').mkdir(parents=True)
+        (directory / 'web/_shell.html').write_text('released fixture')
+        component = {'app': 'app', 'schema': 1, 'tag': tag, 'version': tag[1:],
+                     'source_commit': sha, 'channel': 'nightly', 'target': None,
+                     'files': release.files(directory)}
+        def fixture(source=sha, corrupt=False, bad_checksum=False):
+            component['source_commit'] = source
+            (directory / 'COMPONENT-INFO.json').write_text(json.dumps(component))
+            name = f'vibeface-app-{tag[1:]}.tar.gz'
+            archive = root / name
+            with tarfile.open(archive, 'w:gz') as output:
+                output.add(directory, arcname=directory.name)
+            if corrupt:
+                archive.write_bytes(b'invalid gzip')
+            checksum = root / (name + '.sha256')
+            checksum.write_text(('0' * 64 if bad_checksum else release.digest(archive)) + '  ' + name + '\n')
+            m = copy.deepcopy(historical)
+            for a in m['assets']:
+                if a['name'] in (name, name + '.sha256'):
+                    path = root / a['name']; a.update(size=path.stat().st_size, sha256=release.digest(path))
+            content = json.dumps(m)
+            published = {'tag_name': tag, 'draft': False, 'prerelease': True, 'assets':
+                         [dict(a, digest='sha256:' + a['sha256']) for a in m['assets']] +
+                         [{'name': 'release.json', 'id': 1, 'size': len(content.encode()),
+                           'digest': 'sha256:' + hashlib.sha256(content.encode()).hexdigest()}]}
+            return json.dumps(published), content
+        def download(args, **kwargs):
+            destination = Path(args[args.index('--dir') + 1])
+            for name in (f'vibeface-app-{tag[1:]}.tar.gz', f'vibeface-app-{tag[1:]}.tar.gz.sha256'):
+                shutil.copy2(root / name, destination / name)
+            return subprocess.CompletedProcess(args, 0, '', '')
+        for index, values in enumerate(({}, {'corrupt': True}, {'bad_checksum': True}, {'source': 'f' * 40})):
+            remote, payload = fixture(**values)
+            with patch(__name__ + '.execute', return_value={'tag': tag, 'source_sha': sha, 'version': tag[1:],
+                       'channel': 'nightly', 'targets': ['app']}), \
+                    patch(__name__ + '.gh', side_effect=[remote, payload]), \
+                    patch('subprocess.run', side_effect=download):
+                try:
+                    prepare('app', tag, root / f'prepared-{index}')
+                except (ValueError, OSError, tarfile.TarError):
+                    assert index != 0, 'valid component was refused'
+                else:
+                    assert index == 0, 'corrupt, bad-checksum or foreign component was accepted'
     print('deployment command self-test passed')
 
 

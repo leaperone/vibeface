@@ -74,7 +74,8 @@ PARTS = {
 
 def check(source, helpers):
     workflow = jobs(source)
-    require(not any('deploy' in name or 'dispatches' in block or 'scripts/deploy.py' in block
+    require(not any('deploy' in name or 'dispatches' in block or 'scripts/deploy.py' in block or 'scripts/deploy-run.py' in block
+                    or './.github/workflows/deploy-' in block
                     for name, block in workflow.items()), 'artifact publication must not deploy services')
     require('release-${{ inputs.tag || github.ref_name }}-' in source,
             'tag pushes and manual publication must share the same concurrency group')
@@ -245,8 +246,6 @@ def self_test(source, helpers):
         source.replace('scripts/release.py publish product .artifacts/release', 'scripts/release.py publish www .artifacts/release'),
         source.replace("if: always() && !cancelled() && needs.identity.result == 'success' && needs.identity.outputs.app == 'www'",
                        "if: needs.identity.outputs.app == 'www'"),
-        source.replace("if: always() && !cancelled() && needs.identity.result == 'success' && needs.publish.result",
-                       'if: needs.publish.result'),
     ]
     broken_helpers = [helper.replace('artifact-ids: ${{ inputs.artifact_id }}', 'pattern: release-*'),
                       helper.replace('actions: read', 'contents: read'),
@@ -263,6 +262,24 @@ def self_test(source, helpers):
             raise AssertionError('Unsafe release dependency or gate was accepted')
 
 
+def check_deployment(source):
+    workflow = jobs(source)
+    require('workflow_dispatch:' in source and '  push:' not in source and '  workflow_call:' not in source,
+            'deployment must be explicitly dispatched')
+    require('contents: write' not in source and 'repository_dispatch' not in source,
+            'deployment must not publish or dispatch another repository')
+    gate = guard(workflow['plan'])
+    for branch in ('refs/heads/main', 'refs/heads/feature', 'refs/tags/v0.0.1'):
+        for apply in (True, False):
+            expression = gate.replace('github.ref', repr(branch)).replace('inputs.apply', repr(apply))
+            require(evaluate(expression, {}) == (branch == 'refs/heads/main' or not apply),
+                    'deployment activation must require main; branches may only validate')
+    activate = source.split('      - name: Activate the pinned container on the configured host', 1)
+    require(len(activate) == 2 and re.search(r'^        if: inputs\.apply$', activate[1], re.M),
+            'production activation must be disabled for validation runs')
+    require("|| 'vibeface-validation'" in source, 'validation must not use a production environment')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--self-test', action='store_true')
@@ -273,6 +290,17 @@ def main():
                for name in ('release-native.yml', 'release-compose.yml', 'release-desktop.yml', 'release-publish-part.yml',
                             'release-apps.yml', 'release-ios.yml', 'npm-publish.yml', 'deploy-services.yml')}
     self_test(source, helpers) if args.self_test else check(source, helpers)
+    deployment = helpers['deploy-services.yml']
+    check_deployment(deployment)
+    if args.self_test:
+        for candidate in (deployment.replace("github.ref == 'refs/heads/main' || !inputs.apply", 'true'),
+                          deployment.replace('if: inputs.apply', 'if: always()')):
+            try:
+                check_deployment(candidate)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('unsafe deployment gate was accepted')
     print('Release DAG passed: parallel native, desktop, Web and Android producers, per-platform composition, '
           'exact artifacts, progressive uploads and complete-only automatic consumption')
 

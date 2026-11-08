@@ -54,6 +54,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         service: ${{ fromJSON(needs.plan.outputs.targets) }}
     environment: ${{ inputs.apply && format('vibeface-{0}', matrix.service) || 'vibeface-validation' }}

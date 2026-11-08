@@ -51,7 +51,7 @@ gh workflow run deploy-services.yml --ref '<BRANCH>' -f service=app -f tag='<PRO
 | `DEPLOY_USER` | 有 Docker、Nginx 与服务管理权限的账号；非 root 账号需对应免密 sudo |
 | `DEPLOY_SSH_KEY` | 该目标的 SSH 私钥 |
 | `DEPLOY_KNOWN_HOSTS` | 预先核验的完整 SSH host key，不在运行中接受未知主机 |
-| `DEPLOY_CONFIG` | 目标运行配置 JSON，格式见 `deploy/examples.json` |
+| `DEPLOY_CONFIG` | 目标运行配置 JSON，格式见 [`deploy/README.md`](../../deploy/README.md) |
 
 真实主机、用户、身份、数据路径及证据不写入公共仓库。服务器需要 Docker Compose v2、Python 3 和既有 Nginx。Core 镜像使用 Ubuntu 24.04 运行时，静态镜像使用 Nginx；它们都不安装 AI Provider 或带入模型凭证。
 

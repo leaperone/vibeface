@@ -14,6 +14,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 import deploy
 import release
@@ -39,8 +40,8 @@ def build(service, tag, output):
         context = output / component
         if not context.exists():
             continue
+        shutil.copy2(ROOT / 'deploy/runtime.py', context / 'runtime.py')
         if component == 'core':
-            shutil.copy2(ROOT / 'deploy/runtime.py', context / 'runtime.py')
             dockerfile = ROOT / 'deploy/core.Dockerfile'
         else:
             checked([sys.executable, '-B', str(ROOT / 'deploy/static-config.py'),
@@ -63,8 +64,9 @@ def build(service, tag, output):
             refused = subprocess.run(['docker', 'run', '--rm', '--platform', 'linux/amd64', identity],
                                      capture_output=True, timeout=60)
             release.require(refused.returncode != 0, 'Core container initialized missing deployment data')
+            core_smoke(identity, info)
         else:
-            checked(['docker', 'run', '--rm', '--platform', 'linux/amd64', identity, 'nginx', '-t'])
+            checked(['docker', 'run', '--rm', '--platform', 'linux/amd64', '--entrypoint', 'nginx', identity, '-t'])
             static_smoke(identity, context / 'component', component, info['source_sha'])
         archive = output / f'{component}.image.tar.gz'
         with gzip.open(archive, 'wb') as compressed:
@@ -75,6 +77,58 @@ def build(service, tag, output):
     info['images'] = images
     (output / 'deployment.json').write_text(json.dumps(info, indent=2) + '\n')
     return info
+
+
+def core_smoke(identity, info):
+    volume = 'vibeface-deploy-check-' + uuid.uuid4().hex
+    def docker(*args, **kwargs):
+        return subprocess.check_output(['docker', *args], text=True, **kwargs)
+    docker('volume', 'create', volume)
+    container = None
+    base = ['--platform', 'linux/amd64', '--network', 'none', '-v', volume + ':/data']
+    try:
+        options = {'data_dir': '/data', 'public_entry': True, 'listen': '127.0.0.1:4793',
+                   'public_url': 'http://127.0.0.1:4793', 'relay_mode': 'discovery-only',
+                   'relay_listen': '127.0.0.1:4792', 'bootstrap': 'off', 'no_web': True}
+        result = json.loads(docker('run', '--rm', '-i', *base, '--entrypoint',
+                                  '/opt/vibeface/vibeface-core', identity, '--control',
+                                  input=json.dumps({'command': 'init', 'options': options})))
+        release.require(result.get('ok') is True, 'isolated Core fixture initialization failed')
+        docker('run', '--rm', *base, '--entrypoint', 'python3', identity, '-c',
+               "from pathlib import Path; import os; p=Path('/data'); os.chmod(p,0o700); (p/'node.lock').touch()")
+        result = json.loads(docker('run', '--rm', '-i', *base, '--entrypoint',
+                                  '/opt/vibeface/vibeface-core', identity, '--control',
+                                  input='{"command":"inspect","data_dir":"/data"}'))
+        device = result['result']['device_id']
+        environment = ['-e', 'VIBEFACE_ROLE=discovery', '-e', 'VIBEFACE_LISTEN=127.0.0.1:4793',
+                       '-e', 'VIBEFACE_EXPECTED_VERSION=' + info['version'],
+                       '-e', 'VIBEFACE_EXPECTED_SOURCE=' + info['source_sha'],
+                       '-e', 'VIBEFACE_EXPECTED_DEVICE=' + device]
+        container = docker('run', '-d', *base, *environment, identity).strip()
+        for _ in range(30):
+            health = subprocess.run(['docker', 'exec', container, 'python3', '/opt/vibeface/runtime.py', 'health'],
+                                    capture_output=True, text=True)
+            if health.returncode == 0:
+                break
+            time.sleep(1)
+        release.require(health.returncode == 0 and json.loads(health.stdout)['device_id'] == device,
+                        'Core fixture health or identity mismatch')
+        docker('stop', '--time', '30', container)
+        state = json.loads(docker('inspect', container))[0]['State']
+        release.require(state['ExitCode'] == 0 and not state['OOMKilled'], 'Core did not stop gracefully')
+        docker('start', container)
+        for _ in range(30):
+            health = subprocess.run(['docker', 'exec', container, 'python3', '/opt/vibeface/runtime.py', 'health'],
+                                    capture_output=True, text=True)
+            if health.returncode == 0:
+                break
+            time.sleep(1)
+        release.require(health.returncode == 0 and json.loads(health.stdout)['device_id'] == device,
+                        'Core identity changed after restart')
+    finally:
+        if container:
+            docker('rm', '-f', container)
+        docker('volume', 'rm', volume)
 
 
 def static_smoke(identity, component, role, sha):
@@ -150,6 +204,7 @@ def activate(service, output):
         ssh = ['ssh', *options, '-p', port, remote]
         stage = subprocess.check_output([*ssh, 'umask 077; mktemp -d /tmp/vibeface-deploy.XXXXXXXX'], text=True).strip()
         release.require(re.fullmatch(r'/tmp/vibeface-deploy\.[a-zA-Z0-9]+', stage), 'invalid remote staging directory')
+        succeeded = False
         try:
             checked(['scp', *options, '-P', port, str(settings), str(ROOT / 'scripts/deploy-activate.py'),
                      str(output / f'{component}.image.tar.gz'), f'{remote}:{stage}/'], stdout=subprocess.DEVNULL)
@@ -164,9 +219,11 @@ def activate(service, output):
                      ' | ' + ('docker load >/dev/null; ' if user == 'root' else 'sudo -n docker load >/dev/null; ') +
                      ('exec ' if user == 'root' else 'exec sudo -n ') + shlex.join(command))
             checked([*ssh, shell])
+            succeeded = True
         finally:
-            subprocess.run([*ssh, 'rm -rf -- ' + shlex.quote(stage)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if succeeded:
+                subprocess.run([*ssh, 'rm -rf -- ' + shlex.quote(stage)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {'service': service, 'tag': info['tag'], 'source_sha': info['source_sha'], 'image': identity}
 
 

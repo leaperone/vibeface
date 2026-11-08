@@ -281,8 +281,7 @@ def transform_nginx(text, config):
     for node in targets[0]['children']:
         words = node['words']
         if words[0] != 'location':
-            if config['role'] in ('app', 'www') and (words[0] in ('root', 'index')
-                    or words[0] == 'add_header' and len(words) >= 3 and words[1].lower() in HEADER_NAMES):
+            if words[0] in ('root', 'index') or config['role'] in ('app', 'www') and (words[0] == 'add_header' and len(words) >= 3 and words[1].lower() in HEADER_NAMES):
                 edits.append((node['start'], node['end'], ''))
             continue
         selector = ' '.join(words[1:])
@@ -290,6 +289,8 @@ def transform_nginx(text, config):
         is_catchall = words == ['location', '/']
         catchall += int(is_catchall)
         if config['role'] == 'relay':
+            require(is_catchall or words == ['location', '~', '^/(relay|ping|generate_204)$'],
+                    'pure Relay refuses extra frontend or API routes')
             if not is_catchall:
                 continue
             body = 'return 404;'
@@ -301,6 +302,13 @@ def transform_nginx(text, config):
             directives = {n['words'][0] for n in node['children'] or []}
             require('try_files' not in directives or is_static, 'unrecognized static nginx location')
             if not is_static:
+                infra = (len(words) == 3 and words[1] == '=' and words[2] in
+                         ('/api/info', '/api/client', '/api/relay/grant', '/api/decision')) \
+                        or words == ['location', '^~', '/bootstrap/'] \
+                        or words == ['location', '~', '^/(relay|ping|generate_204)$']
+                denied = all(n['words'] == ['return', '404'] for n in node['children'] or [])
+                require((infra and not directives & {'try_files', 'alias', 'root', 'index', 'include'}) or denied,
+                        'unrecognized static or gateway nginx location')
                 continue
             require(directives <= {'try_files', 'types', 'default_type', 'add_header', 'expires', 'access_log',
                                    'root', 'index', 'proxy_pass', 'proxy_set_header', 'proxy_http_version',
@@ -407,13 +415,20 @@ def rollback(journal, journal_path):
         journal['phase'] = 'rolled_back'
         write_json(journal_path, journal)
         return
-    if phase != 'stopping_previous':
+    previous = journal['previous']
+    restored = False
+    if previous:
+        try:
+            healthy(previous)
+            restored = True
+        except (ValueError, KeyError, json.JSONDecodeError):
+            pass
+    if phase != 'stopping_previous' and not restored:
         stop(target)
     if phase == 'switching_nginx' and journal.get('nginx_backup'):
         path = checked_path(Path(config['nginx_config']))
         nginx_apply(config, Path(journal['nginx_backup']).read_bytes(), path.stat())
-    previous = journal['previous']
-    if config['role'] in CORE_ROLES:
+    if config['role'] in CORE_ROLES and not restored:
         with node_lock(config):
             require(hashlib.sha256((Path(config['data_dir']) / 'identity.json').read_bytes()).hexdigest()
                     == journal['identity_sha256'], 'identity changed; automatic rollback was refused')
@@ -425,7 +440,7 @@ def rollback(journal, journal_path):
             if journal['legacy_enabled']:
                 command('systemctl', 'enable', config['legacy_service'])
             command('systemctl', 'is-active', '--quiet', config['legacy_service'])
-    elif previous:
+    elif previous and not restored:
         compose(previous, 'up', '-d', '--no-build', '--pull', 'never', 'service')
         wait_healthy(previous)
     current_path = journal_path.parent / 'current.json'
@@ -435,6 +450,13 @@ def rollback(journal, journal_path):
         current_path.unlink(missing_ok=True)
     journal['phase'] = 'rolled_back'
     write_json(journal_path, journal)
+
+
+def nginx_matches(config, manifest):
+    if 'nginx_config' in config:
+        nginx = checked_path(Path(config['nginx_config']))
+        require(hashlib.sha256(nginx.read_bytes()).hexdigest() == manifest['nginx_sha256'],
+                'active nginx configuration differs; reconcile before retrying')
 
 
 def activate(config, image, tag, source, version):
@@ -459,6 +481,7 @@ def activate(config, image, tag, source, version):
                 raise ValueError('interrupted activation was rolled back; rerun after checking the previous service')
         if current and current['fingerprint'] == fingerprint:
             healthy(current)
+            nginx_matches(config, current)
             return {'status': 'already_active', 'image': image, 'source_sha': source, 'version': version}
         if current:
             require(current['project'] == config['project'] and current['role'] == config['role'], 'current service ownership differs')
@@ -486,6 +509,7 @@ def activate(config, image, tag, source, version):
             command('nginx', '-t')
             old_nginx = nginx.read_bytes()
             nginx_data = transform_nginx(old_nginx.decode(), config).encode()
+            target['nginx_sha256'] = hashlib.sha256(nginx_data).hexdigest()
             atomic_write(release / 'nginx.before', old_nginx)
             journal['nginx_backup'] = str(release / 'nginx.before')
         if config['role'] in CORE_ROLES:
@@ -521,6 +545,7 @@ def activate(config, image, tag, source, version):
             if config['role'] in CORE_ROLES and not current and journal['legacy_enabled']:
                 command('systemctl', 'disable', config['legacy_service'])
             healthy(target)
+            nginx_matches(config, target)
             write_json(current_path, target)
             journal['phase'] = 'confirmed'; write_json(journal_path, journal)
         except BaseException:
@@ -576,8 +601,28 @@ server {
         if node['words'][0] == 'location' and any(token in ' '.join(node['words']) for token in ('api/client', 'bootstrap', 'relay|')):
             assert nginx[node['start']:node['end']] in updated
     assert transform_nginx(updated, app) == updated
-    relay = transform_nginx(nginx, dict(app, role='relay'))
+    relay_source = '''server { listen 443 ssl; server_name app.example.invalid; root /old;
+    location ~ ^/(relay|ping|generate_204)$ { proxy_pass http://127.0.0.1:3340; }
+    location / { proxy_pass http://127.0.0.1:4900; }
+}'''
+    relay = transform_nginx(relay_source, dict(app, role='relay'))
     assert 'location / {\n        return 404;' in relay and 'location ~ ^/(relay|ping|generate_204)$' in relay
+    for selector in ('location = /index.html { try_files $uri =404; }',
+                     'location ^~ /assets/ { alias /old/; }'):
+        try:
+            transform_nginx(relay_source.replace('root /old;', 'root /old; ' + selector), dict(app, role='relay'))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Relay kept a frontend route')
+    for selector in ('location = /favicon.ico { alias /old/icon.ico; }',
+                     'location /old/ { include /old/static.conf; }'):
+        try:
+            transform_nginx(nginx.replace('location / {', selector + '\n    location / {', 1), app)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('unknown static route accepted')
     for bad in (nginx.replace('app.example.invalid', 'other.example.invalid'), nginx + '\nserver {'):
         try:
             transform_nginx(bad, app)
@@ -590,9 +635,20 @@ server {
     artifact_root.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=artifact_root, prefix='activate-check-') as temporary:
         directory = Path(temporary)
+        nginx_file = directory / 'nginx.conf'; nginx_file.write_text('confirmed')
+        nginx_state = {'nginx_sha256': hashlib.sha256(b'confirmed').hexdigest()}
+        nginx_matches({'nginx_config': str(nginx_file)}, nginx_state)
+        nginx_file.write_text('drifted')
+        try:
+            nginx_matches({'nginx_config': str(nginx_file)}, nginx_state)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('nginx drift reported as already active')
         state = {'schema': 1, 'phase': 'starting', 'target': {'project': 'owned'}, 'config': {'role': 'app'},
                  'previous': {'project': 'previous'}}
-        with patch(__name__ + '.stop', side_effect=lambda target: events.append('stop-new')), \
+        with patch(__name__ + '.healthy', side_effect=ValueError('previous not running')), \
+                patch(__name__ + '.stop', side_effect=lambda target: events.append('stop-new')), \
                 patch(__name__ + '.compose', side_effect=lambda *a: events.append('start-previous')), \
                 patch(__name__ + '.wait_healthy', side_effect=lambda *a: events.append('check-previous')):
             rollback(copy.deepcopy(state), directory / 'activation.json')
@@ -600,11 +656,18 @@ server {
         assert read_json(directory / 'activation.json')['phase'] == 'rolled_back'
         assert read_json(directory / 'current.json') == state['previous']
         events.clear()
+        with patch(__name__ + '.healthy', return_value='restored'), \
+                patch(__name__ + '.stop', side_effect=lambda *a: events.append('unsafe-stop')), \
+                patch(__name__ + '.compose', side_effect=lambda *a: events.append('unsafe-restart')):
+            rollback(copy.deepcopy(state), directory / 'activation.json')
+        assert not events and read_json(directory / 'activation.json')['phase'] == 'rolled_back'
+        events.clear()
         with patch(__name__ + '.stop', side_effect=lambda target: events.append('unsafe-stop')):
             rollback(dict(state, phase='prepared'), directory / 'activation.json')
         assert not events
         events.clear()
-        with patch(__name__ + '.stop', side_effect=ValueError('new process still running')), \
+        with patch(__name__ + '.healthy', side_effect=ValueError('previous not running')), \
+                patch(__name__ + '.stop', side_effect=ValueError('new process still running')), \
                 patch(__name__ + '.compose', side_effect=lambda *a: events.append('unsafe-start')):
             try:
                 rollback(copy.deepcopy(state), directory / 'activation.json')
