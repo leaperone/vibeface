@@ -14,6 +14,16 @@ import sys
 SESSION = "vdp-native-acceptance"
 LIMIT = 262144
 HEALTH_REASONS = {"runner_not_connected", "endpoint_probe_failed", "unknown"}
+XCODE_FAILURES = {
+    "empty_supported_platforms": r"Supported platforms for the buildables in the current scheme is empty",
+    "runtime_not_installed": r"(?:iOS|runtime)[^\n]{0,120}(?:not installed|not available)",
+    "destination_not_found": r"Unable to find a destination matching|no available devices matched",
+    "service_hub_unavailable": r"Failed to bless service hub|DTServiceHubClient",
+    "sdk_not_found": r"SDK[^\n]{0,120}(?:cannot be located|not found)|unable to find sdk",
+    "architecture_mismatch": r"incompatible architecture|does not contain[^\n]{0,80}architecture",
+    "signing_configuration": r"requires a development team|requires a provisioning profile",
+    "test_host_missing": r"test host[^\n]{0,120}does not exist|failed to find[^\n]{0,80}test bundle",
+}
 
 
 def number(value):
@@ -75,7 +85,12 @@ def project_error(error):
     xcodebuild_result = details.get("xcodebuild")
     value = xcodebuild_result.get("exitCode") if isinstance(xcodebuild_result, dict) else None
     if type(value) is int and 0 <= value <= 255:
-        projected["xcodebuild"] = {"exitCode": value}
+        kind = xcodebuild_result.get("failure_kind")
+        kind = kind if isinstance(kind, str) and kind in XCODE_FAILURES else "unknown"
+        stderr = xcodebuild_result.get("stderr")
+        if isinstance(stderr, str) and len(stderr.encode("utf-8", "replace")) <= 32768:
+            kind = next((key for key, pattern in XCODE_FAILURES.items() if re.search(pattern, stderr, re.IGNORECASE)), "unknown")
+        projected["xcodebuild"] = {"exitCode": value, "failure_kind": kind}
     if projected:
         result["details"] = projected
     return result
@@ -175,6 +190,10 @@ def self_test():
             raise AssertionError("accepted another request")
     assert project_health({**expected, "duration_ms": float("inf"), "timeout_ms": True, "session_ready": marker}) == dict(status="captured", reason="runner_not_connected", cache_invalidated=True)
     assert project_health({**expected, "duration_ms": 10**1000}) == {key: value for key, value in expected.items() if key != "duration_ms"}
+    for kind, message in (("destination_not_found", "Unable to find a destination matching the provided destination specifier"), ("runtime_not_installed", "iOS 26.5 is not installed"), ("unknown", marker)):
+        projected = project_error({"code": "COMMAND_FAILED", "details": {"xcodebuild": {"exitCode": 70, "stderr": message}}})
+        assert projected["details"]["xcodebuild"] == {"exitCode": 70, "failure_kind": kind}
+        assert project_error(projected) == projected and marker not in json.dumps(projected)
     with TemporaryDirectory(prefix="ios-prepare-projection-") as temporary:
         root = Path(temporary)
         raw = root / ".artifacts/native/private/prepare.json"
@@ -247,6 +266,23 @@ def probe():
         result["prepare_exit_code"] = prepare_code
         result["error"] = read_error(repo, raw) if prepare_code else None
         result["status"] = "prepare_failed" if prepare_code else "prepare_command_succeeded"
+        toolchain = {"runtime_version": selected["version"] if re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", selected["version"]) else "unknown"}
+        for label, arguments in (("xcode-version", ["xcodebuild", "-version"]), ("simulator-sdk-version", ["xcrun", "--sdk", "iphonesimulator", "--show-sdk-version"])):
+            try:
+                with (private / (label + ".stdout")).open("xb") as output, (private / (label + ".stderr")).open("xb") as error:
+                    version = subprocess.run(arguments, cwd=repo, env=environment, stdout=output, stderr=error, timeout=15)
+                content = bounded_file(repo, private / (label + ".stdout")).decode("ascii").strip()
+                if label == "xcode-version":
+                    match = re.fullmatch(r"Xcode ([0-9]+(?:\.[0-9]+){1,3})\nBuild version ([A-Za-z0-9]{1,20})", content)
+                    toolchain["xcode"] = {"version": match[1], "build": match[2]} if version.returncode == 0 and match else {"status": "unavailable"}
+                else:
+                    toolchain["simulator_sdk_version"] = content if version.returncode == 0 and re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", content) else "unknown"
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                if label == "xcode-version":
+                    toolchain["xcode"] = {"status": "unavailable"}
+                else:
+                    toolchain["simulator_sdk_version"] = "unknown"
+        result["toolchain"] = toolchain
     except (OSError, ValueError, TypeError, AttributeError, KeyError, AssertionError, RuntimeError):
         result["status"] = "probe_failed"
     finally:
