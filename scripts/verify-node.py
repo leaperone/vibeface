@@ -652,10 +652,7 @@ class Node:
             configuration["providers"]["codex_app_server"] = app_server
             configuration["providers"]["execution"] = ["codex"]
             if app_server["mode"] == "spawn":
-                env_path = self.directory / "provider-env.json"
-                providers = json.loads(env_path.read_text()) if env_path.exists() else {}
-                providers.setdefault("codex", {})["CODEX_HOME"] = str(self.directory / "home/.codex")
-                private_json(env_path, providers)
+                configuration.setdefault("provider_env", {}).setdefault("codex", {})["CODEX_HOME"] = str(self.directory / "home/.codex")
         private_json(path, configuration)
 
     def configure_network(self, **values):
