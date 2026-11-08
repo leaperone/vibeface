@@ -30,10 +30,31 @@ def number(value):
     return type(value) in {int, float} and 0 <= value <= 600000 and math.isfinite(value)
 
 
+STARTUP_PHASES = {"adopt_detached_runner", "ensure_booted", "verify_device_readiness", "verify_host_dev_tools_security", "cleanup_stale_bundles", "ensure_xctestrun", "build_xctestrun", "allocate_port", "prepare_xctestrun_env", "launch_xcodebuild"}
+LAUNCH_MARKERS = {"HEADLESS_STARTUP", "LISTENER_CONFIGURATION_MISSING", "LISTENER_READY", "PORT_NOT_SET", "LISTENER_FAILED", "WAITING"}
+
+
+def project_startup(value):
+    if not isinstance(value, dict) or value.get("status") not in {"captured", "ambiguous"}:
+        return {"status": "unavailable"}
+    result = {"status": value["status"]}
+    if value["status"] == "captured":
+        if type(value.get("ready")) is bool:
+            result["ready"] = value["ready"]
+        if number(value.get("duration_ms")):
+            result["duration_ms"] = value["duration_ms"]
+        timings = value.get("timings")
+        if isinstance(timings, dict):
+            result["timings"] = {key: item for key, item in timings.items() if key in STARTUP_PHASES and number(item)}
+    return result
+
+
 def project_health(value):
     if not isinstance(value, dict) or value.get("status") not in {"captured", "not_recorded", "unavailable", "ambiguous"}:
         return {"status": "unavailable"}
     result = {"status": value["status"]}
+    if "startup" in value:
+        result["startup"] = project_startup(value["startup"])
     if value["status"] == "captured":
         result["reason"] = value.get("reason") if value.get("reason") in HEALTH_REASONS else "unknown"
         for key in ("duration_ms", "timeout_ms"):
@@ -97,7 +118,7 @@ def project_error(error):
 
 
 
-def bounded_file(root, path):
+def bounded_file(root, path, *, tail=False):
     relative = path.absolute().relative_to(root.absolute())
     descriptors = [os.open(root.resolve(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)]
     try:
@@ -107,10 +128,12 @@ def bounded_file(root, path):
             descriptors.append(os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptors[-1]))
         descriptors.append(os.open(relative.parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptors[-1]))
         info = os.fstat(descriptors[-1])
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > LIMIT:
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or not tail and info.st_size > LIMIT:
             raise ValueError("invalid task file")
-        data = os.read(descriptors[-1], LIMIT + 1)
-        if len(data) > LIMIT:
+        if tail:
+            os.lseek(descriptors[-1], max(0, info.st_size - 65536), os.SEEK_SET)
+        data = os.read(descriptors[-1], 65536 if tail else LIMIT + 1)
+        if not tail and len(data) > LIMIT:
             raise ValueError("task file too large")
         return data
     finally:
@@ -123,6 +146,7 @@ def health_records(raw, session, request_id):
     invalidated = False
     sends = 0
     invalidated_before_send = False
+    startup = []
     for line in raw.decode("utf-8").splitlines():
         if not line:
             continue
@@ -132,6 +156,8 @@ def health_records(raw, session, request_id):
         data = row.get("data")
         if not isinstance(data, dict):
             continue
+        if row.get("phase") == "ios_runner_session_startup_timings":
+            startup.append(project_startup({"status": "captured", "ready": data.get("ready"), "duration_ms": row.get("durationMs"), "timings": data.get("timings")}))
         if row.get("phase") == "ios_runner_session_invalidated" and data.get("reason") == "prepare_cached_runner_health_failed":
             invalidated = True
             invalidated_before_send = invalidated_before_send or first is None
@@ -143,7 +169,10 @@ def health_records(raw, session, request_id):
                 first = project_health({"status": "captured", "reason": reason, "duration_ms": row.get("durationMs"), "timeout_ms": data.get("timeoutMs"), "session_ready": data.get("sessionReady")})
     if sends > 1 or invalidated_before_send:
         return {"status": "ambiguous"}
-    return {**(first or {"status": "not_recorded"}), "cache_invalidated": invalidated}
+    result = {**(first or {"status": "not_recorded"}), "cache_invalidated": invalidated}
+    if startup:
+        result["startup"] = startup[0] if len(startup) == 1 else {"status": "ambiguous"}
+    return result
 
 
 def read_error(repo, raw_path):
@@ -179,6 +208,12 @@ def self_test():
     encode = lambda rows: ("\n".join(json.dumps(item) for item in rows) + "\n").encode()
     expected = dict(status="captured", reason="runner_not_connected", duration_ms=451.5, timeout_ms=300, session_ready=False, cache_invalidated=True)
     assert health_records(encode([row, invalidated]), SESSION, request_id) == expected
+    timing = dict(session=SESSION, requestId=request_id, command="prepare", phase="ios_runner_session_startup_timings", durationMs=800,
+                  data=dict(ready=False, timings=dict(ensure_xctestrun=400, build_xctestrun=300, launch_xcodebuild=200, unknown=marker)))
+    observed = health_records(encode([timing, row, invalidated]), SESSION, request_id)
+    assert observed["startup"] == dict(status="captured", ready=False, duration_ms=800, timings=dict(ensure_xctestrun=400, build_xctestrun=300, launch_xcodebuild=200))
+    assert project_health(observed) == observed and marker not in json.dumps(observed)
+    assert health_records(encode([timing, timing, row]), SESSION, request_id)["startup"] == {"status": "ambiguous"}
     other = {**row, "data": {**row["data"], "error": marker}}
     assert health_records(encode([other]), SESSION, request_id)["reason"] == "unknown"
     for bad in ({**row, "requestId": "other"}, {**row, "session": "other"}, {**row, "command": "open"}):
@@ -202,6 +237,9 @@ def self_test():
         error = dict(code="COMMAND_FAILED", message=marker, details=dict(reason="prepare_deadline_expired", phase="runner_rebuild", raw=marker), diagnosticsRecord=dict(session=SESSION, requestId=request_id))
         raw.write_text(json.dumps(dict(success=False, error=error)))
         record.write_bytes(encode([row, invalidated]))
+        large = root / "bounded-runner.log"
+        large.write_bytes(b"x" * LIMIT + b"AGENT_DEVICE_RUNNER_LISTENER_READY")
+        assert bounded_file(root, large, tail=True) == large.read_bytes()[-65536:]
         result = read_error(root, raw)
         assert result["initial_health"] == expected and result["details"]["reason"] == "prepare_deadline_expired"
         assert marker not in json.dumps(result) and request_id not in json.dumps(result)
@@ -266,6 +304,36 @@ def probe():
         result["prepare_exit_code"] = prepare_code
         result["error"] = read_error(repo, raw) if prepare_code else None
         result["status"] = "prepare_failed" if prepare_code else "prepare_command_succeeded"
+        runner_tail = b""
+        try:
+            runner_tail = bounded_file(repo, state / "sessions" / SESSION / "runner.log", tail=True)
+            decoded = runner_tail.decode("utf-8", errors="replace")
+            result["launch_markers"] = {"status": "tail_captured", "bytes": len(runner_tail), "read_bound_reached": len(runner_tail) == 65536,
+                                        "reported": sorted(marker for marker in LAUNCH_MARKERS if "AGENT_DEVICE_RUNNER_" + marker in decoded)}
+        except (OSError, ValueError):
+            result["launch_markers"] = {"status": "unavailable"}
+        try:
+            payload = json.dumps({"prepare_result": bounded_file(repo, raw).decode("utf-8", errors="replace"),
+                                  "runner_tail": runner_tail.decode("utf-8", errors="replace"), "simulator": simulator}).encode()
+            assert len(payload) <= 393216
+            program = "import {readFileSync} from 'node:fs'; import {randomBytes,createCipheriv,publicEncrypt,constants} from 'node:crypto'; const key=randomBytes(32),nonce=randomBytes(12),aad=process.argv[2],cipher=createCipheriv('aes-256-gcm',key,nonce); cipher.setAAD(Buffer.from(aad)); const body=Buffer.concat([cipher.update(readFileSync(0)),cipher.final()]); const wrapped=publicEncrypt({key:Buffer.from(process.argv[1],'base64'),oaepHash:'sha256',padding:constants.RSA_PKCS1_OAEP_PADDING},key); process.stdout.write(JSON.stringify({schema:1,aad,nonce:nonce.toString('base64'),tag:cipher.getAuthTag().toString('base64'),key:wrapped.toString('base64'),body:body.toString('base64')}));"
+            aad = "vibeface:" + source + ":" + run_id + ":" + attempt + ":runner-launch-v1"
+            envelope = root / "public/runner-launch.sealed.json"
+            with envelope.open("xb") as output, (private / "seal.stderr").open("xb") as error:
+                sealed = subprocess.run(["node", "--input-type=module", "-e", program, 'LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUlJQm9qQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FZOEFNSUlCaWdLQ0FZRUF2SGxya0JoOEhObWFtMnFnL0lHRQpMSlM0WjNCYi9ZV3VTbjM5N1hZT1ZYeEY0RjNOQTBUUmZJbEdHZkhsa0RtUko3MHN0VnRQeS81blZ0Nk04Z0lzCkRjam0wRlJxa2NONks0cWE4L3V6VWxRK1ZlWTNZa1lBS0YxQ1M2SzY5MXRLQzNqTjdwc1JWVzgwYW10c21XTmUKQmZZc3d0Y01uQ0VRZjAxazkxdjF2Q1pPb2YveFVEbHpCaUU5REU1L1VIOGFXV1pTd3dkQUFqVzJzL2g1eER5UQpzamFiU3BGOG9PaGx5dHFPN1hwNXkrcThiV1pacEEyVjNQWDlINWdQTFlKSWVvM2t1dEorU3dlSzNjYStHVVZHClZheTRYc0NqSE50ZTczRXVoQTN4YkJNYzYwMTJNR1gzZVVDeTVvTGJKYzdMZUdvTnlxcjc1SGFTOFRxRWFpUW8KRWduTmRPak9rbnp5WWlCUjFnU2tjSzQyYnp3b3dZWW5iMjJJbG1MTFQvTVNFUEpZQlNHSjZMUzRuV0owbURjTwpiY3NDbFAwSk1QSDVrZzVCUVduR1NESWNldkU3TVBEb2owTjRaS212RCtKV2ZkOWFqSVowcHFVSHpOMzRKaWdRCi81cHhYRDFXMDlaeXBLY1ZaS2NRbzBEa1dEUDhIK25CR1o5SnhLQWtVUHZ0QWdNQkFBRT0KLS0tLS1FTkQgUFVCTElDIEtFWS0tLS0tCg==', aad], input=payload,
+                                        cwd=repo, env=environment, stdout=output, stderr=error, timeout=15)
+            if sealed.returncode != 0:
+                raise RuntimeError("encryption failed")
+            sealed_value = json.loads(envelope.read_bytes())
+            assert set(sealed_value) == {"schema", "aad", "nonce", "tag", "key", "body"} and sealed_value["schema"] == 1 and sealed_value["aad"] == aad
+            decode = lambda key: __import__("base64").b64decode(sealed_value[key], validate=True)
+            assert len(decode("nonce")) == 12 and len(decode("tag")) == 16 and len(decode("key")) == 384 and len(decode("body")) == len(payload)
+            result["sealed_launch_evidence"] = {"status": "sealed", "sha256": __import__("hashlib").sha256(envelope.read_bytes()).hexdigest()}
+        except (OSError, ValueError, TypeError, KeyError, AssertionError, RuntimeError, subprocess.TimeoutExpired):
+            envelope = root / "public/runner-launch.sealed.json"
+            if envelope.exists():
+                envelope.unlink()
+            result["sealed_launch_evidence"] = {"status": "unavailable"}
         toolchain = {"runtime_version": selected["version"] if re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", selected["version"]) else "unknown"}
         for label, arguments in (("xcode-version", ["xcodebuild", "-version"]), ("simulator-sdk-version", ["xcrun", "--sdk", "iphonesimulator", "--show-sdk-version"])):
             try:
