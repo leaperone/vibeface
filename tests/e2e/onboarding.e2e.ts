@@ -6,7 +6,7 @@ import { test } from './fixtures';
 import { expect, secrets } from 'e2e';
 
 test('creates a persistent Bot without a model and shows triage budget state', async ({ app, node, screen, browser }) => {
-  await app.open(node.entry);
+  await app.open(node.url);
   await screen.getByRole('button', '新建我的网络').click();
   await screen.getByLabel('这个节点叫什么？').fill('E2E Node');
   await screen.getByRole('button', '下一步').click();
@@ -174,16 +174,14 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     seed('q-decision-three', three);
     await browser.goto(`${node.url}/inbox`);
     await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toBeVisible();
-    const choices = screen.getByRole('group', '选一个回答').getByRole('button');
-    // The page holds a hidden second answer box; only the shown one counts.
-    const answer = screen.getByLabel('你的回答', { visible: true });
-    await expect(choices).toHaveCount(3);
-    await expect(answer).toHaveValue('');
+    await expect(screen.getByRole('group', '选一个回答').getByRole('button')).toHaveCount(3);
+    await expect(screen.getByRole('textbox', '你的回答')).toBeVisible();
     await expect(screen.getByRole('button', '发送回答', { exact: true })).toBeDisabled();
+    await expect(screen.getByRole('button', '忽略', { exact: true })).toBeVisible();
     assert.equal(readAnswer.get(identity.network_id, 'q-decision-three'), undefined);
     await app.screenshot('decision-three-desktop');
     await screen.getByRole('button', three[1], { exact: true }).click();
-    await expect(choices).toHaveCount(0);
+    await expect(screen.getByRole('group', '选一个回答')).toHaveCount(0);
     await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toHaveCount(0);
     assert.equal(readAnswer.get(identity.network_id, 'q-decision-three')?.text, three[1]);
 
@@ -195,29 +193,29 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     await expect(screen.getByRole('button', '发送回答', { exact: true })).toHaveCount(1);
     await expect(screen.getByText('问题待确认', { exact: true })).toHaveCount(0);
     await expect(screen.getByText('2 项任务', { exact: true })).toBeVisible();
-    await expect(answer).toHaveCount(1);
+    await expect(screen.getByRole('textbox', '你的回答')).toHaveCount(1);
     await app.screenshot('task-overview-single-question-and-turn');
     await browser.goto(`${node.url}/inbox`);
     await browser.setViewport({ width: 375, height: 812 });
-    await expect(choices).toHaveCount(4);
-    await answer.fill('1');
-    await answer.press('Enter');
-    await expect(answer).toHaveValue('1\n');
-    await answer.fill('1\n１');
-    await expect(answer).toHaveValue('1\n１');
+    await expect(screen.getByRole('group', '选一个回答').getByRole('button')).toHaveCount(4);
+    await screen.getByRole('textbox', '你的回答').fill('1');
+    await screen.getByRole('textbox', '你的回答').press('Enter');
+    await expect(screen.getByRole('textbox', '你的回答')).toHaveValue('1\n');
+    await screen.getByRole('textbox', '你的回答').fill('1\n１');
+    await expect(screen.getByRole('textbox', '你的回答')).toHaveValue('1\n１');
     assert.equal(readAnswer.get(identity.network_id, 'q-decision-four'), undefined);
     await app.screenshot('decision-four-custom-narrow');
     await screen.getByRole('button', '发送回答', { exact: true }).click();
-    await expect(choices).toHaveCount(0);
+    await expect(screen.getByRole('group', '选一个回答')).toHaveCount(0);
     await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toHaveCount(0);
     assert.equal(readAnswer.get(identity.network_id, 'q-decision-four')?.text, '1\n１');
 
     seed('q-decision-text', []);
     await browser.reload();
-    await expect(answer).toBeVisible();
-    await answer.fill('先说明收件人是否能编辑，再确认交付格式。');
+    await expect(screen.getByRole('textbox', '你的回答')).toBeVisible();
+    await screen.getByRole('textbox', '你的回答').fill('先说明收件人是否能编辑，再确认交付格式。');
     await screen.getByRole('button', '发送回答', { exact: true }).click();
-    await expect(answer).toHaveCount(0);
+    await expect(screen.getByRole('textbox', '你的回答')).toHaveCount(0);
     await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toHaveCount(0);
     assert.equal(readAnswer.get(identity.network_id, 'q-decision-text')?.text, '先说明收件人是否能编辑，再确认交付格式。');
   } finally { decisionDb.close(); }
