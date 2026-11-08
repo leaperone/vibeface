@@ -642,7 +642,8 @@ def progressive_part_inventory(version_value, ios_signed=False):
 
 
 def product_building_notes(info):
-    return (f'{BUILDING_MARKER}; not eligible for installation or update.\n\n'
+    return (f'{BUILDING_MARKER}; manual verified platform downloads may be available on this Release; '
+            f'automated install or update waits for the global release manifest.\n\n'
             f"product {info['version']}; source {info['source_commit']}.")
 
 
@@ -669,9 +670,41 @@ def release_view(tag, repo=GITHUB_REPO):
     return json.loads(view.stdout)
 
 
+def release_record(tag, repo=GITHUB_REPO):
+    return json.loads(run('gh', 'api', f'repos/{repo}/releases/tags/{tag}'))
+
+
 def list_release_assets(tag, repo=GITHUB_REPO):
-    payload = json.loads(run('gh', 'api', f'repos/{repo}/releases/tags/{tag}'))
-    return payload['assets']
+    return list(remote_assets_by_name(release_record(tag, repo)['assets']).values())
+
+
+def remote_assets_by_name(assets):
+    by_name = {}
+    for asset in assets:
+        name = asset['name']
+        require(name not in by_name, 'duplicate remote asset name')
+        size = asset.get('size')
+        require(isinstance(size, int) or (isinstance(size, str) and str(size).isdigit()),
+                'invalid remote asset size')
+        field = asset.get('digest')
+        if field is not None:
+            require(isinstance(field, str) and re.fullmatch(r'sha256:[a-f0-9]{64}', field),
+                    'invalid remote asset digest')
+        by_name[name] = asset
+    return by_name
+
+
+def product_cohort_pins(expected):
+    return {key: expected[key] for key in ('version', 'tag', 'source_commit', 'channel')}
+
+
+def public_part_summary(part):
+    summary = {key: part[key] for key in ('kind', 'version', 'tag', 'source_commit', 'channel', 'ios_signed')
+               if key in part}
+    if part.get('target') is not None:
+        summary['target'] = part['target']
+    summary['names'] = sorted(part['names'])
+    return summary
 
 
 def remote_asset_sha256(asset):
@@ -690,9 +723,62 @@ def confirm_remote_asset(tag, repo, asset, expected_sha, expected_size, scratch)
     if remote_sha:
         require(remote_sha == expected_sha, 'existing published bytes differ')
         return
+    local_path = scratch / name
+    if local_path.is_file() and digest(local_path) == expected_sha:
+        require(local_path.stat().st_size == expected_size, 'existing published size differs')
+        return
     subprocess.run(['gh', 'release', 'download', tag, f'--repo={repo}', '--pattern', name, '--dir', str(scratch)],
                    check=True)
-    require(digest(scratch / name) == expected_sha, 'existing published bytes differ')
+    require(digest(local_path) == expected_sha, 'existing published bytes differ')
+
+
+def verify_app_part_payload(directory, cohort):
+    product_version = cohort['version']
+    app_archive = f'vibeface-app-{product_version}.tar.gz'
+    verify_checksum_file(directory, app_archive)
+    with tempfile.TemporaryDirectory(prefix='vibeface-verify-app-') as tmp:
+        verify_component(unpack(directory / app_archive, Path(tmp) / 'app'), 'app', dict(cohort, target=None))
+
+
+def verify_native_part_payload(directory, target, cohort):
+    product_version = cohort['version']
+    source_commit = cohort['source_commit']
+    bundle_name = f'vibeface-{product_version}-{target}.tar.gz'
+    core_name = f'vibeface-core-{product_version}-{target}.tar.gz'
+    verify_checksum_file(directory, bundle_name)
+    verify_checksum_file(directory, core_name)
+    with tempfile.TemporaryDirectory(prefix='vibeface-verify-native-') as tmp:
+        tmp_path = Path(tmp)
+        bundle = unpack(directory / bundle_name, tmp_path / 'cli')
+        build = json.loads((bundle / 'BUILD-INFO.json').read_text(encoding='utf-8'))
+        verify_build_info(build)
+        require(build['version'] == product_version and build['source_commit'] == source_commit
+                and build['target'] == target, 'CLI bundle version, source or target mismatch')
+        for name in program_names(target):
+            program = bundle / name
+            require(program.is_file() and not program.is_symlink(), 'CLI bundle must contain both native programs')
+        require((bundle / 'web').is_dir(), 'CLI bundle must contain the Web App')
+        require((bundle / 'web/vibeface_secure.js').is_file() and (bundle / 'web/vibeface_secure_bg.wasm').is_file(),
+                'CLI bundle must contain the browser cryptography SDK')
+        content = files(bundle, ('FILES.sha256',))
+        require((bundle / 'FILES.sha256').read_text(encoding='utf-8') == ''.join(
+            f'{value}  {name}\n' for name, value in content.items()),
+                f'{target} CLI bundled content changed')
+        verify_component(unpack(directory / core_name, tmp_path / 'core'), 'core', dict(cohort, target=target))
+
+
+def verify_remote_product_manifest(tag, repo, expected, remote_by_name, scratch):
+    require('release.json' in remote_by_name, 'complete release missing manifest')
+    manifest_path = scratch / 'release.json'
+    remote_sha = remote_asset_sha256(remote_by_name['release.json'])
+    if not (manifest_path.is_file() and remote_sha and digest(manifest_path) == remote_sha):
+        subprocess.run(['gh', 'release', 'download', tag, f'--repo={repo}', '--pattern', 'release.json',
+                        '--dir', str(scratch)], check=True)
+    info = json.loads(manifest_path.read_text(encoding='utf-8'))
+    verify_release_identity(info)
+    require(all(info[key] == expected[key] for key in ('app', 'version', 'tag', 'source_commit', 'channel')),
+            'public release manifest identity mismatch')
+    return info
 
 
 def verify_part_directory(kind, directory, target=None):
@@ -701,6 +787,7 @@ def verify_part_directory(kind, directory, target=None):
     expected = identity('product')
     product_version = expected['version']
     pins = {key: expected[key] for key in ('app', 'version', 'tag', 'source_commit', 'channel')}
+    cohort = product_cohort_pins(expected)
     if kind in ('native', 'desktop'):
         require(target, 'native and desktop parts require --target')
         require(target in TARGETS if kind == 'native' else target in DESKTOP_TARGETS, 'unsupported part target')
@@ -708,7 +795,7 @@ def verify_part_directory(kind, directory, target=None):
         require(target is None, 'target is forbidden for this part kind')
     ios_signed = False
     if kind == 'ios':
-        ios_signed = verify_ios_assets(directory, pins)
+        ios_signed = verify_ios_assets(directory, cohort)
         payload = ios_asset_names(product_version, ios_signed)
     else:
         payload = part_asset_names(kind, product_version, target)
@@ -718,15 +805,19 @@ def verify_part_directory(kind, directory, target=None):
     for name in sorted(payload):
         if (directory / (name + '.sha256')).is_file():
             verify_checksum_file(directory, name)
-    if kind == 'android':
+    if kind == 'app':
+        verify_app_part_payload(directory, cohort)
+    elif kind == 'native':
+        verify_native_part_payload(directory, target, cohort)
+    elif kind == 'android':
         apk = directory / f'vibeface-{product_version}-android.apk'
         provenance = json.loads((directory / (apk.name + '.provenance.json')).read_text(encoding='utf-8'))
         require(provenance == mobile_provenance(apk), 'APK provenance mismatch')
         require(provenance['version'] == product_version and provenance['sourceCommit'] == pins['source_commit'],
                 'APK is not part of this product cohort')
     elif kind == 'desktop':
-        verify_desktop_receipt(directory, target, pins)
-    return dict(pins, kind=kind, target=target, names=frozenset(payload), ios_signed=ios_signed)
+        verify_desktop_receipt(directory, target, cohort)
+    return dict(cohort, kind=kind, target=target, names=frozenset(payload), ios_signed=ios_signed)
 
 
 def append_only_assets(tag, repo, upload_map, remote_by_name, scratch):
@@ -741,7 +832,7 @@ def append_only_assets(tag, repo, upload_map, remote_by_name, scratch):
         result = subprocess.run(['gh', 'release', 'upload', tag, f'--repo={repo}', str(path)],
                                 capture_output=True, text=True)
         if result.returncode:
-            refreshed = {asset['name']: asset for asset in list_release_assets(tag, repo)}
+            refreshed = remote_assets_by_name(list_release_assets(tag, repo))
             if name in refreshed:
                 confirm_remote_asset(tag, repo, refreshed[name], expected_sha, size, scratch)
                 continue
@@ -759,16 +850,29 @@ def begin_product(repo=GITHUB_REPO):
     prerelease = str(expected['channel'] != 'stable').lower()
     view = release_view(tag, repo)
     if view is None:
-        subprocess.run(['gh', 'release', 'create', tag, f'--repo={repo}', '--verify-tag', '--draft=false',
-                        '--title', tag, '--notes', notes, '--latest=false', f'--prerelease={prerelease}'], check=True)
-        return expected
+        result = subprocess.run(['gh', 'release', 'create', tag, f'--repo={repo}', '--verify-tag', '--draft=false',
+                                 '--title', tag, '--notes', notes, '--latest=false', f'--prerelease={prerelease}'],
+                                capture_output=True, text=True)
+        if result.returncode:
+            view = release_view(tag, repo)
+            require(view is not None and not view.get('isDraft'), 'cannot reconcile release create outcome')
+        else:
+            view = release_view(tag, repo)
+            require(view is not None, 'release missing after create')
+    record = release_record(tag, repo)
+    require(not record.get('immutable'), 'release is immutable')
+    require(not view['isDraft'], 'begin-product requires a public product release')
     source = json.loads(run('gh', 'api', f'repos/{repo}/commits/{tag}'))['sha']
     require(source == expected['source_commit'], 'public tag source mismatch')
-    remote = {asset['name'] for asset in list_release_assets(tag, repo)}
+    remote_by_name = remote_assets_by_name(list_release_assets(tag, repo))
+    remote = set(remote_by_name)
     ios_signed = f'vibeface-{expected["version"]}-ios.ipa' in remote
     if 'release.json' in remote:
         require(remote == product_asset_names(expected['version'], ios_signed),
                 'immutable complete release cannot change')
+        with tempfile.TemporaryDirectory(prefix='vibeface-begin-') as temporary:
+            verify_remote_product_manifest(tag, repo, expected, remote_by_name, Path(temporary))
+        return expected
     if BUILDING_MARKER not in (view.get('body') or ''):
         subprocess.run(['gh', 'release', 'edit', tag, f'--repo={repo}', '--notes', notes], check=True)
     return expected
@@ -785,12 +889,21 @@ def publish_part(kind, directory, target=None, repo=GITHUB_REPO):
     require(view is not None, 'release must be opened with begin-product first')
     require(not view['isDraft'], 'progressive parts require a public building release')
     remote = list_release_assets(tag, repo)
-    remote_by_name = {asset['name']: asset for asset in remote}
-    require('release.json' not in remote_by_name, 'cannot publish parts after release manifest is public')
+    remote_by_name = remote_assets_by_name(remote)
     upload_map = {name: directory / name for name in sorted(part['names'])}
     with tempfile.TemporaryDirectory(prefix='vibeface-part-') as temporary:
-        append_only_assets(tag, repo, upload_map, remote_by_name, Path(temporary))
-    return part
+        scratch = Path(temporary)
+        if 'release.json' in remote_by_name:
+            ios_signed = part.get('ios_signed', False)
+            payload_names = product_payload_names(expected['version'], ios_signed)
+            require(set(remote_by_name) == payload_names | {'release.json'},
+                    'complete release asset set mismatch')
+            for name in sorted(part['names']):
+                confirm_remote_asset(tag, repo, remote_by_name[name], digest(upload_map[name]),
+                                     upload_map[name].stat().st_size, scratch)
+            return public_part_summary(part)
+        append_only_assets(tag, repo, upload_map, remote_by_name, scratch)
+    return public_part_summary(part)
 
 
 def finalize_progressive_product(directory, expected, info, repo=GITHUB_REPO):
@@ -799,13 +912,16 @@ def finalize_progressive_product(directory, expected, info, repo=GITHUB_REPO):
     ios_signed = any(asset['name'].endswith('-ios.ipa') for asset in info['assets'])
     payload_names = product_payload_names(info['version'], ios_signed)
     manifest_assets = {asset['name']: asset for asset in info['assets']}
+    require(len(manifest_assets) == len(info['assets']), 'duplicate staged manifest asset name')
     remote = list_release_assets(tag, repo)
-    remote_by_name = {asset['name']: asset for asset in remote}
+    remote_by_name = remote_assets_by_name(remote)
     require(payload_names <= set(remote_by_name), 'cannot finalize before every payload is public')
     extra = set(remote_by_name) - payload_names - {'release.json'}
     require(not extra, 'public release contains unexpected assets')
     staged_manifest = directory / 'release.json'
     require(staged_manifest.is_file(), 'missing release manifest')
+    manifest_sha = digest(staged_manifest)
+    manifest_size = staged_manifest.stat().st_size
     with tempfile.TemporaryDirectory(prefix='vibeface-finalize-') as temporary:
         scratch = Path(temporary)
         for name in sorted(payload_names):
@@ -816,13 +932,17 @@ def finalize_progressive_product(directory, expected, info, repo=GITHUB_REPO):
             require(digest(staged_manifest) == manifest['sha256'] and staged_manifest.stat().st_size == manifest['size'],
                     'release manifest checksum mismatch')
         if 'release.json' in remote_by_name:
-            confirm_remote_asset(tag, repo, remote_by_name['release.json'], digest(staged_manifest),
-                                 staged_manifest.stat().st_size, scratch)
+            confirm_remote_asset(tag, repo, remote_by_name['release.json'], manifest_sha, manifest_size, scratch)
         else:
-            subprocess.run(['gh', 'release', 'upload', tag, f'--repo={repo}', str(staged_manifest)], check=True)
-            matches = [asset for asset in list_release_assets(tag, repo) if asset['name'] == 'release.json']
-            require(len(matches) == 1, 'uploaded manifest missing after write')
-            confirm_remote_asset(tag, repo, matches[0], digest(staged_manifest), staged_manifest.stat().st_size, scratch)
+            result = subprocess.run(['gh', 'release', 'upload', tag, f'--repo={repo}', str(staged_manifest)],
+                                    capture_output=True, text=True)
+            if result.returncode:
+                remote_by_name = remote_assets_by_name(list_release_assets(tag, repo))
+                require('release.json' in remote_by_name, 'cannot determine manifest upload outcome')
+            else:
+                remote_by_name = remote_assets_by_name(list_release_assets(tag, repo))
+                require('release.json' in remote_by_name, 'uploaded manifest missing after write')
+            confirm_remote_asset(tag, repo, remote_by_name['release.json'], manifest_sha, manifest_size, scratch)
     subprocess.run(['gh', 'release', 'edit', tag, f'--repo={repo}', '--notes', product_complete_notes(info),
                     '--latest=false', f'--prerelease={str(info["channel"] != "stable").lower()}'], check=True)
     return info
@@ -845,30 +965,11 @@ def verify_product_release(directory, expected):
             'product asset set is incomplete or carries extra files')
     with tempfile.TemporaryDirectory(prefix='vibeface-verify-') as tmp:
         tmp = Path(tmp)
-        app_archive = f'vibeface-app-{product_version}.tar.gz'
-        verify_checksum_file(directory, app_archive)
-        verify_component(unpack(directory / app_archive, tmp / 'app'), 'app', dict(pins, target=None))
-        for index, target in enumerate(TARGETS):
-            bundle_name = f'vibeface-{product_version}-{target}.tar.gz'
-            core_name = f'vibeface-core-{product_version}-{target}.tar.gz'
-            verify_checksum_file(directory, bundle_name)
-            verify_checksum_file(directory, core_name)
-            bundle = unpack(directory / bundle_name, tmp / f'cli-{index}')
-            build = json.loads((bundle / 'BUILD-INFO.json').read_text(encoding='utf-8'))
-            verify_build_info(build)
-            require(build['version'] == product_version and build['source_commit'] == source_commit
-                    and build['target'] == target, 'CLI bundle version, source or target mismatch')
-            for name in program_names(target):
-                program = bundle / name
-                require(program.is_file() and not program.is_symlink(), 'CLI bundle must contain both native programs')
-            require((bundle / 'web').is_dir(), 'CLI bundle must contain the Web App')
-            require((bundle / 'web/vibeface_secure.js').is_file() and (bundle / 'web/vibeface_secure_bg.wasm').is_file(),
-                    'CLI bundle must contain the browser cryptography SDK')
-            content = files(bundle, ('FILES.sha256',))
-            require((bundle / 'FILES.sha256').read_text(encoding='utf-8') == ''.join(f'{value}  {name}\n' for name, value in content.items()),
-                    f'{target} CLI bundled content changed')
-            verify_component(unpack(directory / core_name, tmp / f'core-{index}'), 'core', dict(pins, target=target))
+        verify_app_part_payload(directory, pins)
+        for target in TARGETS:
+            verify_native_part_payload(directory, target, pins)
             if target in DESKTOP_TARGETS:
+                bundle_name = f'vibeface-{product_version}-{target}.tar.gz'
                 verify_desktop_receipt(directory, target, pins, digest(directory / bundle_name))
         apk = directory / f'vibeface-{product_version}-android.apk'
         verify_checksum_file(directory, apk.name)
@@ -933,12 +1034,23 @@ def publish(release_app, directory, repo=GITHUB_REPO):
     if release_app == 'product':
         existing_view = release_view(tag, repo)
         if existing_view is not None and not existing_view['isDraft']:
-            ios_signed = f'vibeface-{info["version"]}-ios.ipa' in {asset['name'] for asset in info['assets']}
-            payload_names = product_payload_names(info['version'], ios_signed)
+            body = existing_view.get('body') or ''
             remote = {asset['name'] for asset in existing_view['assets']}
-            if (payload_names <= remote and 'release.json' not in remote
-                    and (directory / 'release.json').is_file()):
-                return finalize_progressive_product(directory, expected, info, repo)
+            ios_signed = f'vibeface-{info["version"]}-ios.ipa' in remote
+            payload_names = product_payload_names(info['version'], ios_signed)
+            progressive = BUILDING_MARKER in body
+            if progressive:
+                require((directory / 'release.json').is_file(), 'progressive finalize requires release manifest')
+                if payload_names <= remote and 'release.json' not in remote:
+                    return finalize_progressive_product(directory, expected, info, repo)
+                if remote == payload_names | {'release.json'}:
+                    record = release_record(tag, repo)
+                    require(not record.get('immutable'), 'release is immutable')
+                    with tempfile.TemporaryDirectory(prefix='vibeface-publish-') as temporary:
+                        verify_remote_product_manifest(tag, repo, expected,
+                                                       remote_assets_by_name(existing_view['assets']), Path(temporary))
+                    return info
+                require(False, 'progressive product publish requires every payload before finalize')
     view = subprocess.run(['gh', 'release', 'view', tag, f'--repo={repo}', '--json', 'isDraft,assets'],
                           capture_output=True, text=True)
     if view.returncode:
@@ -1779,7 +1891,7 @@ def main():
     elif args.command == 'begin-product':
         print(json.dumps(begin_product()))
     elif args.command == 'publish-part':
-        print(json.dumps(publish_part(args.kind, args.input, target=args.target)))
+        print(json.dumps(publish_part(args.kind, args.input, target=args.target), sort_keys=True))
     elif args.command == 'verify-public':
         print(json.dumps(verify_public(args.app, args.output, repo=args.repo)))
     elif args.command == 'mobile-provenance':
