@@ -420,6 +420,9 @@ server = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
 startup_phase("server-bound")
 server.daemon_threads = True
 time.sleep(int(os.environ.get("FAKE_BRIDGE_STARTUP_MS", "0")) / 1000)
+startup_gate = os.environ.get("FAKE_BRIDGE_STARTUP_GATE")
+while startup_gate and not os.path.exists(startup_gate):
+    time.sleep(0.01)
 if os.environ.get("FAKE_BRIDGE_EXIT_BEFORE_READY"):
     sys.exit(7)
 discovery = {"schemaVersion": 1, "transport": "tcp", "protocol": "connect",

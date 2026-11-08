@@ -241,9 +241,16 @@ async fn a_local_endpoint_admits_this_account_and_refuses_a_second_holder() -> R
 
 #[tokio::test]
 async fn a_process_tree_is_cleared_when_the_node_ends_it() -> Result<()> {
+    let directory = scratch("unconfirmed-journal");
+    let journal = directory.join("cursor.pid");
     let (mut spawned, mut child) = tree::Tree::spawn(long_lived(), "platform-test", true)?;
     let root = spawned.root();
     assert!(spawned.is_running());
+
+    let record = format!("{} never-matches-this-owned-tree\n", spawned.token());
+    privatefs::write_atomic(&journal, record.as_bytes())?;
+    vibeface_bridge::agent::SdkBridge::kill_orphan(&journal);
+    assert_eq!(std::fs::read_to_string(&journal)?, record);
     assert!(tree::root_is_running(root));
     assert!(tree::token_is_running(spawned.token()));
 
@@ -259,6 +266,29 @@ async fn a_process_tree_is_cleared_when_the_node_ends_it() -> Result<()> {
     child.wait().await?;
     eventually("the tree to be cleared", || !spawned.is_running());
     assert!(!tree::token_is_running(spawned.token()));
+    vibeface_bridge::agent::SdkBridge::kill_orphan(&journal);
+    assert!(!journal.exists());
+    privatefs::write_atomic(&journal, b"unqueryable-tree fixture\n")?;
+    vibeface_bridge::agent::SdkBridge::kill_orphan(&journal);
+    assert!(tree::token_is_running("unqueryable-tree"));
+    assert_eq!(
+        std::fs::read_to_string(&journal)?,
+        "unqueryable-tree fixture\n"
+    );
+    let bridge = vibeface_bridge::agent::SdkBridge::new(
+        Default::default(),
+        vibeface_bridge::agent::ToolCallbackConfig {
+            url: "http://127.0.0.1:9".into(),
+            auth_token: "fixture-callback-token-".repeat(2),
+        },
+        Some(journal.clone()),
+    )?;
+    bridge.stop().await;
+    assert!(
+        journal.exists(),
+        "stopping a new owner preserves an unconfirmed old tree"
+    );
+    std::fs::remove_dir_all(directory)?;
     Ok(())
 }
 

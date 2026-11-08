@@ -2,7 +2,7 @@
 //! process idles between turns, and each turn starts with its own environment and instructions.
 //! Before a prompt is sent the Node keeps where pi writes the session, so after a restart it
 //! reads the turn back from that file and never sends it again.
-use super::claude::Processes;
+use super::claude::{Guide, Processes};
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::*;
 use crate::manager::{CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
@@ -41,7 +41,7 @@ const STEER_LEAD: &str =
 
 /// The pi turns of this Node: where each session is written, and the turns running now.
 pub struct Pi {
-    /// Per session: its pointer (`<session>.json`) and the bot's instructions (`<session>.md`).
+    /// Session pointers and private guides whose processes still read them.
     dir: PathBuf,
     sessions: PathBuf,
     processes: Arc<Processes>,
@@ -92,6 +92,24 @@ struct Live {
     stopping: Arc<AtomicBool>,
 }
 
+struct LiveTurn<'a> {
+    owner: &'a Pi,
+    session: String,
+    turn: String,
+}
+
+impl Drop for LiveTurn<'_> {
+    fn drop(&mut self) {
+        let mut live = lock(&self.owner.live);
+        if live
+            .get(&self.session)
+            .is_some_and(|live| live.turn == self.turn)
+        {
+            live.remove(&self.session);
+        }
+    }
+}
+
 /// Where pi writes a session, kept before a prompt is sent into it.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Pointer {
@@ -137,17 +155,31 @@ struct Launch {
     cwd: PathBuf,
     env: BTreeMap<String, String>,
     args: Vec<String>,
+    guide: Option<Arc<Guide>>,
 }
 
 struct Process {
     child: Child,
     tree: tree::Tree,
+    reaped: bool,
     _tracked: Tracked,
     rpc: Arc<Rpc>,
     /// Everything pi writes but the responses.
     events: mpsc::UnboundedReceiver<Value>,
     /// The end of what pi wrote to stderr, once it closed it.
-    stderr: tokio::task::JoinHandle<String>,
+    stderr: Option<tokio::task::JoinHandle<String>>,
+    _guide: Option<Arc<Guide>>,
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        if !self.reaped {
+            self.tree.kill();
+        }
+        if let Some(stderr) = self.stderr.take() {
+            stderr.abort();
+        }
+    }
 }
 
 /// How a prompt went in.
@@ -517,6 +549,9 @@ impl Process {
                 format!("could not start pi at {}: {error:#}", launch.bin.display()),
             )
         })?;
+        if let Some(guide) = &launch.guide {
+            guide.started(tree.token());
+        }
         processes
             .track(tree.token(), &launch.bin)
             .map_err(|error| ExecFailure::new(FailureKind::Unknown, format!("{error:#}")))?;
@@ -545,10 +580,12 @@ impl Process {
         Ok(Self {
             child,
             tree,
+            reaped: false,
             _tracked: tracked,
             rpc,
             events,
-            stderr,
+            stderr: Some(stderr),
+            _guide: launch.guide.clone(),
         })
     }
 
@@ -556,14 +593,12 @@ impl Process {
     /// ended with its tree. Returns the end of its stderr.
     async fn end(mut self) -> String {
         self.rpc.stdin.lock().await.take();
-        let exited = matches!(
-            tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await,
-            Ok(Ok(_))
-        );
-        if !exited {
-            agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
-        }
-        match tokio::time::timeout(Duration::from_secs(1), self.stderr).await {
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+        self.reaped = agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
+        let Some(stderr) = self.stderr.take() else {
+            return String::new();
+        };
+        match tokio::time::timeout(Duration::from_secs(1), stderr).await {
             Ok(Ok(tail)) => tail,
             _ => String::new(),
         }
@@ -1012,14 +1047,17 @@ impl Pi {
             &config.custom_tools,
             &config.instructions,
         );
-        if !guide.is_empty() {
-            let path = self.dir.join(format!("{session}.md"));
-            config::private_dir(&self.dir)
+        let guide = if guide.is_empty() {
+            None
+        } else {
+            let guide = Guide::write(&self.dir.join("guides"), &guide)
                 .map_err(|error| ManagerError::not_started_at(ProviderStage::Record, error))?;
-            config::private_write(&path, guide.as_bytes())
-                .map_err(|error| ManagerError::not_started_at(ProviderStage::Record, error))?;
-            args.extend(["--append-system-prompt".into(), path.display().to_string()]);
-        }
+            args.extend([
+                "--append-system-prompt".into(),
+                guide.path.display().to_string(),
+            ]);
+            Some(guide)
+        };
         if !config.model.is_empty() {
             args.extend(["--model".into(), config.model.clone()]);
         }
@@ -1036,6 +1074,7 @@ impl Pi {
             cwd: config.workspace.clone(),
             env,
             args,
+            guide,
         };
         if *cancel.borrow() {
             return Err(stopped(previous));
@@ -1134,6 +1173,11 @@ impl Pi {
                 stopping: Default::default(),
             },
         );
+        let live = LiveTurn {
+            owner: self,
+            session: session.clone(),
+            turn: turn.clone(),
+        };
         stage.enter(ProviderStage::Record);
         let recorded = match &config.codex_turn {
             Some(record) => {
@@ -1212,7 +1256,7 @@ impl Pi {
                 }
             }
         };
-        lock(&self.live).remove(&session);
+        drop(live);
         process.end().await;
         Ok(AgentResult {
             session_id: Some(session),
@@ -1270,6 +1314,11 @@ impl Pi {
                 stopping: stopping.clone(),
             },
         );
+        let live = LiveTurn {
+            owner: &self,
+            session: session.clone(),
+            turn: turn.clone(),
+        };
         send(Report::Signal(Signal::TurnStarted {
             turn_id: turn.clone(),
             epoch: 0,
@@ -1311,7 +1360,7 @@ impl Pi {
                 break true;
             }
         };
-        lock(&self.live).remove(&session);
+        drop(live);
         process.end().await;
         if !settled {
             return send(Report::Probe);
@@ -1498,6 +1547,7 @@ impl Executor for Pi {
                 },
                 env: node.provider_env(Provider::Pi),
                 args: launch_args,
+                guide: None,
             };
             let (sender, mut reports) = mpsc::unbounded_channel();
             let (stop, cancel) = watch::channel(false);
@@ -1912,6 +1962,7 @@ mod tests {
             cwd: dir.to_owned(),
             env: env(dir, mode),
             args: vec!["--session-id".into(), session.into()],
+            guide: None,
         }
     }
 
@@ -2196,7 +2247,12 @@ mod tests {
             .position(|a| a == "--append-system-prompt")
             .context("guide")?
             + 1];
-        assert_eq!(std::fs::read_to_string(guide)?, "Answer briefly.");
+        assert_eq!(starts[0]["guide"], "Answer briefly.");
+        assert_eq!(starts[0]["guide_private"], true);
+        assert!(
+            !Path::new(guide).exists(),
+            "an ended process releases its guide"
+        );
         assert_eq!(second[3], "--session");
         assert!(second[4].ends_with(&format!("_{session}.jsonl")));
         assert_eq!(starts[0]["run"], "1");
@@ -2354,6 +2410,58 @@ mod tests {
             assert_eq!(result.output, format!("done: marker-{index}"));
         }
         assert_eq!(sessions.len(), 16);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aborting_a_bot_future_clears_only_its_live_turn() -> Result<()> {
+        let dir = scratch("future-abort");
+        let pi = Arc::new(Pi::new(&dir));
+        let mut tasks = Vec::new();
+        let mut turns = Vec::new();
+        let mut stops = Vec::new();
+        for index in 0..2 {
+            let recorded = Turns::default();
+            let mut config = bot(&dir, &pi, "wait", Some(&recorded));
+            config.codex_turn.as_mut().unwrap().client_id = format!("client-{index}");
+            let (stop, cancel) = watch::channel(false);
+            stops.push(stop);
+            turns.push(recorded);
+            tasks.push(tokio::spawn(async move {
+                run_manager(
+                    &config,
+                    "wait",
+                    None,
+                    |_| async { anyhow::Ok(()) },
+                    cancel,
+                    |_| async { anyhow::Ok(()) },
+                )
+                .await
+            }));
+        }
+        let first = started(&turns[0]).await;
+        let second = started(&turns[1]).await;
+        assert!(pi.live_turn(&first.0, &first.1).is_some());
+        assert_eq!(std::fs::read_dir(pi.dir.join("guides"))?.count(), 2);
+        drop(LiveTurn {
+            owner: &pi,
+            session: second.0.clone(),
+            turn: "superseded-turn".into(),
+        });
+        assert!(pi.live_turn(&second.0, &second.1).is_some());
+        let aborted = tasks.remove(0);
+        aborted.abort();
+        assert!(aborted.await.err().context("aborted task")?.is_cancelled());
+        assert!(pi.live_turn(&first.0, &first.1).is_none());
+        assert!(pi.live_turn(&second.0, &second.1).is_some());
+        assert_eq!(
+            pi.probe_reply(&first.0, Some(&first.1), "client-0").await?,
+            Probe::Missing
+        );
+        stops[1].send(true)?;
+        assert!(tasks.remove(0).await?.is_err());
+        assert!(lock(&pi.live).is_empty());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -2863,7 +2971,10 @@ mod tests {
         std::fs::write(&pidfile, recorded)?;
         let restarted = Pi::new(&data);
         assert!(ended(&left).await, "the restart ended the pi it left");
-        assert!(!pidfile.exists());
+        assert!(
+            std::fs::read_to_string(&pidfile)?.contains(&format!("{} ", stranger.id())),
+            "an unconfirmed record is retained"
+        );
         assert!(
             stranger.try_wait()?.is_none(),
             "a process the Node did not start is left alone"
@@ -2955,7 +3066,7 @@ mod tests {
                     let file = dir.join("session.jsonl");
                     std::fs::write(&file, "")?;
                     pi.keep("s-1", &file, &dir, "")?;
-                    std::fs::create_dir(pi.dir.join("s-1.md"))?;
+                    std::fs::write(pi.dir.join("guides"), "not a directory")?;
                     Some("s-1")
                 }
                 "pointer-error" => {
@@ -3013,6 +3124,9 @@ mod tests {
             if pending == 1 {
                 if mode == "instructions-error" {
                     std::fs::remove_file(&pi.dir)?;
+                }
+                if mode == "instructions-write-error" {
+                    std::fs::remove_file(pi.dir.join("guides"))?;
                 }
                 config.provider_env = env(&dir, "reply");
                 let TriageAdmission::Claimed(retry) =

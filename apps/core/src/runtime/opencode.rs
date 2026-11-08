@@ -2,7 +2,7 @@
 //! or a work first needs it, and starts again when it died or its program or variables changed.
 //! Sessions live in opencode's own store, so a work is read back from there after a restart and
 //! never sent again. v2 keeps a shell environment per session; each turn replaces it before
-//! prompting, blanks model keys and injects only that turn's Node tool credentials.
+//! prompting with platform basics, private provider roots and that turn's Node tool credentials.
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::*;
 use crate::manager::{self, ManagerConfig, ManagerError, ManagerFailure, Sdk};
@@ -124,6 +124,7 @@ struct Conn {
     password: String,
     /// A message created before this ran on a serve that is gone.
     started_ms: i64,
+    tool_base_env: BTreeMap<String, String>,
 }
 
 struct Serve {
@@ -131,22 +132,26 @@ struct Serve {
     conn: Conn,
     child: tokio::process::Child,
     tree: tree::Tree,
+    reaped: bool,
     pidfile: PathBuf,
 }
 
 impl Serve {
     /// Asks the tree to stop, then the drop ends what is left after a grace period.
     async fn stop(mut self) {
-        self.tree.ask_to_stop();
-        let _ = tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await;
+        self.reaped = agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
     }
 }
 
 impl Drop for Serve {
     /// The tools the serve started belong to its tree and end with it.
     fn drop(&mut self) {
-        self.tree.kill();
-        let _ = std::fs::remove_file(&self.pidfile);
+        if !self.reaped {
+            self.tree.kill();
+        }
+        if matches!(tree::Leftover::find(self.tree.token()), Ok(None)) {
+            let _ = std::fs::remove_file(&self.pidfile);
+        }
     }
 }
 
@@ -171,7 +176,9 @@ fn kill_orphan(pidfile: &Path) {
             "the opencode serve left by an earlier run was not ended"
         ),
     }
-    let _ = std::fs::remove_file(pidfile);
+    if matches!(tree::Leftover::find(token.trim()), Ok(None)) {
+        let _ = std::fs::remove_file(pidfile);
+    }
 }
 
 /// A bot turn in progress.
@@ -328,6 +335,10 @@ impl Opencode {
     }
 
     pub(crate) fn release_work(&self, work_id: &str) {
+        self.cancelled_inputs
+            .lock()
+            .expect("cancelled inputs")
+            .remove(&work_message(work_id));
         self.unresolved_uses
             .lock()
             .expect("unresolved uses")
@@ -399,6 +410,21 @@ impl Opencode {
 
     async fn spawn(&self, launch: Launch) -> Result<Serve> {
         config::private_dir(&self.dir)?;
+        let pidfile = self.dir.join(PIDFILE);
+        kill_orphan(&pidfile);
+        if let Ok(token) = std::fs::read_to_string(&pidfile) {
+            for _ in 0..20 {
+                if matches!(tree::Leftover::find(token.trim()), Ok(None)) {
+                    std::fs::remove_file(&pidfile)?;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        ensure!(
+            !pidfile.exists(),
+            "the previous opencode process tree has not been confirmed stopped"
+        );
         for (name, value) in self.roots.env(Provider::Opencode) {
             if value == "true" {
                 continue;
@@ -444,16 +470,19 @@ impl Opencode {
             .stderr(std::process::Stdio::piped());
         let (tree, mut child) = tree::Tree::spawn(command, SERVE_TREE_KEY, true)?;
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let tool_base_env = tool_base_environment(&launch.env);
         let mut serve = Serve {
             launch,
             conn: Conn {
                 base: String::new(),
                 password,
                 started_ms: now_ms(),
+                tool_base_env,
             },
             child,
-            pidfile: dir.join(PIDFILE),
+            pidfile,
             tree,
+            reaped: false,
         };
         config::private_write(&serve.pidfile, serve.tree.token().as_bytes())?;
         if let Some(stderr) = stderr {
@@ -691,34 +720,9 @@ impl Opencode {
         session: &str,
         tool_env: &BTreeMap<String, String>,
     ) -> Result<()> {
-        let launch = self.launch.lock().expect("launch").current.clone();
-        let mut variables: BTreeMap<String, String> = std::env::vars_os()
-            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
-            .chain(launch.env)
-            .map(|(name, value)| {
-                let value = if secret_name(&name)
-                    || matches!(
-                        name.as_str(),
-                        "OPENCODE_SERVER_USERNAME" | "OPENCODE_CONFIG_CONTENT"
-                    ) {
-                    String::new()
-                } else {
-                    value
-                };
-                (name, value)
-            })
-            .collect();
-        variables.insert("OPENCODE_SERVER_PASSWORD".into(), String::new());
+        let mut variables = conn.tool_base_env.clone();
         variables.extend(tool_env.clone());
         variables.extend(self.roots.env(Provider::Opencode));
-        for name in [
-            "OPENCODE_CONFIG",
-            "OPENCODE_CLI_CONFIG_CONTENT",
-            "OPENCODE_CONFIG_CONTENT",
-            "OPENCODE_TEST_HOME",
-        ] {
-            variables.insert(name.into(), String::new());
-        }
         let (status, body) = self
             .call(
                 conn,
@@ -1089,8 +1093,14 @@ impl Opencode {
                 ));
             }
         };
-        let (conn, serving) = (self.conn_for(Some(expected)).await)
-            .map_err(|e| failed(previous, launch_failure(&e)))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
+        let (conn, serving) = tokio::select! {
+            biased;
+            _ = agent::wait_for_cancel(&mut cancel) => return Err(stopped(previous)),
+            _ = tokio::time::sleep_until(deadline) => return Err(failed(previous,
+                ExecFailure::new(FailureKind::TimedOut, "opencode management timed out before the turn started"))),
+            result = self.conn_for(Some(expected)) => result.map_err(|e| failed(previous, launch_failure(&e)))?,
+        };
         stage.enter(ProviderStage::SessionStart);
         let resumed = match previous {
             Some(id) => self.session(&conn, id).await.map_err(|e| {
@@ -1249,7 +1259,6 @@ impl Opencode {
         }
         stage.enter(ProviderStage::Run);
         let mut seen = Seen::default();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
         let mut ticks = tokio::time::interval(TICK);
         let mut streaming = true;
         let mut reported_start = false;
@@ -1313,7 +1322,13 @@ impl Opencode {
             if !check && (!native_start_event || reported_start) {
                 continue;
             }
-            if (self.running().await).is_none_or(|now| now.started_ms != conn.started_ms) {
+            let running = tokio::select! {
+                biased;
+                _ = agent::wait_for_cancel(&mut cancel) => continue,
+                _ = tokio::time::sleep_until(deadline) => continue,
+                running = self.running() => running,
+            };
+            if running.is_none_or(|now| now.started_ms != conn.started_ms) {
                 guard.terminal = true;
                 self.close(&session);
                 let lost = ExecFailure::new(
@@ -1682,12 +1697,49 @@ fn parse_model(model: &str) -> Result<Option<Value>, ExecFailure> {
     }
 }
 
-/// Whether a variable looks like it holds a key, by the words Codex's shell policy reads.
-fn secret_name(name: &str) -> bool {
-    let name = name.to_ascii_uppercase();
-    ["KEY", "SECRET", "TOKEN", "PASSWORD"]
-        .iter()
-        .any(|word| name.contains(word))
+fn tool_base_environment(launch: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    [
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "TZ",
+        "SystemRoot",
+        "SystemDrive",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        let value = launch
+            .get(name)
+            .cloned()
+            .or_else(|| {
+                if cfg!(windows) {
+                    launch
+                        .iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                        .map(|(_, value)| value.clone())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| std::env::var(name).ok())?;
+        Some((name.into(), value))
+    })
+    .collect()
 }
 
 /// An ID opencode takes, the same for the same seed.
@@ -1951,7 +2003,7 @@ impl Executor for Opencode {
                 .cancelled_inputs
                 .lock()
                 .expect("cancelled inputs")
-                .remove(&id)
+                .contains(&id)
             {
                 return Ok(Probe::Terminal {
                     turn_id: id,
@@ -2606,6 +2658,9 @@ mod tests {
                 ),
                 ("FAKE_OPENCODE_PORT".into(), self.port.to_string()),
                 ("FAKE_API_KEY".into(), "fixture-key".into()),
+                ("DATABASE_URL".into(), "postgres://fixture-private".into()),
+                ("GH_PAT".into(), "fixture-pat".into()),
+                ("NODE_PRIVATE_VALUE".into(), "fixture-node-private".into()),
             ])
         }
 
@@ -2749,7 +2804,9 @@ mod tests {
             .into_iter()
             .map(|(name, value)| (name, Some(value)));
         env.apply(Provider::Opencode, variables.collect())?;
-        env.save(&data)?;
+        let mut configuration = Config::load(&data)?;
+        configuration.provider_env = env;
+        configuration.save(&data)?;
         let node = Arc::new(Runtime::open(&data).await?);
         let admin = LocalIdentity::generate();
         let state = NetworkState::new(Genesis::create(
@@ -2945,8 +3002,19 @@ mod tests {
         );
         assert_eq!(sent["env"]["VIBEFACE_NODE_URL"], "http://127.0.0.1:9");
         assert_eq!(sent["env"]["VIBEFACE_TOOL_TOKEN"], "tool-token-fixture");
-        assert_eq!(sent["env"]["FAKE_API_KEY"], "");
-        assert_eq!(sent["env"]["OPENCODE_SERVER_PASSWORD"], "");
+        for name in [
+            "FAKE_API_KEY",
+            "OPENCODE_SERVER_PASSWORD",
+            "DATABASE_URL",
+            "GH_PAT",
+            "NODE_PRIVATE_VALUE",
+        ] {
+            assert!(
+                sent["env"].get(name).is_none(),
+                "{name} reached the tool session"
+            );
+        }
+        assert!(sent["env"]["PATH"].is_string());
         assert!(
             place
                 .recorded("argv")
@@ -3180,7 +3248,17 @@ mod tests {
         let (stop, cancel) = watch::channel(false);
         let stopping = async {
             started(&turns).await;
+            let serving = server.serve.lock().await;
+            tokio::time::sleep(TICK + Duration::from_millis(50)).await;
             stop.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while place.fake.lock().unwrap().aborts == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("cancellation does not wait for the serve startup lock");
+            drop(serving);
         };
         let ((result, _, _), ()) =
             tokio::join!(turn(&place, &config, "HOLD", None, cancel), stopping);
@@ -3316,8 +3394,18 @@ mod tests {
                 prompt["env"]["VIBEFACE_TOOL_TOKEN"],
                 format!("token-{index}")
             );
-            assert_eq!(prompt["env"]["FAKE_API_KEY"], "");
-            assert_eq!(prompt["env"]["OPENCODE_SERVER_PASSWORD"], "");
+            for name in [
+                "FAKE_API_KEY",
+                "OPENCODE_SERVER_PASSWORD",
+                "DATABASE_URL",
+                "GH_PAT",
+                "NODE_PRIVATE_VALUE",
+            ] {
+                assert!(
+                    prompt["env"].get(name).is_none(),
+                    "{name} reached the tool session"
+                );
+            }
         }
         Ok(())
     }
@@ -3510,7 +3598,31 @@ mod tests {
             .get_mut(&session)
             .unwrap()
             .busy = false;
+        node.store.lock().await.connection.execute_batch(
+            "CREATE TEMP TRIGGER refuse_terminal_work BEFORE INSERT ON work_runs WHEN NEW.state='finished' BEGIN SELECT RAISE(FAIL,'fixture terminal write failure'); END;"
+        )?;
         node.interrupt_work(&network, &work.work_id).await?;
+        let interrupted = Probe::Terminal {
+            turn_id: work_message(&work.work_id),
+            status: TurnStatus::Interrupted,
+            text: String::new(),
+            error: None,
+        };
+        assert_eq!(node.opencode.probe(&running).await?, interrupted);
+        assert_eq!(node.opencode.probe(&running).await?, interrupted);
+        assert!(
+            node.signal_work(&network, &work.work_id, Signal::Probed(interrupted.clone()))
+                .await
+                .is_err()
+        );
+        assert_eq!(node.opencode.probe(&running).await?, interrupted);
+        node.store
+            .lock()
+            .await
+            .connection
+            .execute_batch("DROP TRIGGER refuse_terminal_work;")?;
+        node.signal_work(&network, &work.work_id, Signal::Probed(interrupted))
+            .await?;
         let stopped = until(&node, WorkState::finished).await?;
         assert_eq!(
             stopped.state,
@@ -3524,6 +3636,14 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(place.prompts().len(), 1);
+        assert!(
+            !node
+                .opencode
+                .cancelled_inputs
+                .lock()
+                .unwrap()
+                .contains(&work_message(&work.work_id))
+        );
         Ok(())
     }
 
@@ -3573,6 +3693,19 @@ mod tests {
         assert_eq!(record.text, "re:do it");
         let prompts = place.prompts();
         assert_eq!(prompts.len(), 1);
+        for name in [
+            "FAKE_API_KEY",
+            "OPENCODE_SERVER_PASSWORD",
+            "DATABASE_URL",
+            "GH_PAT",
+            "NODE_PRIVATE_VALUE",
+        ] {
+            assert!(
+                prompts[0]["env"].get(name).is_none(),
+                "{name} reached the work session"
+            );
+        }
+        assert!(prompts[0]["env"]["PATH"].is_string());
         let session = prompts[0]["session"].as_str().context("session")?;
         let rules = place.fake.lock().unwrap().sessions[session]
             .permission
@@ -3989,6 +4122,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_startup_is_serial_and_a_waiting_turn_can_be_cancelled() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let gate = place.dir.join("startup-release");
+        let mut launch = server.launch.lock().expect("launch").current.clone();
+        launch.env.insert(
+            "FAKE_OPENCODE_STARTUP_GATE".into(),
+            gate.display().to_string(),
+        );
+        server.set_launch(launch.bin, launch.env);
+        let turns = Turns::default();
+        let config = bot(&place, &server, "attempt-startup", &turns);
+        let (stop, cancel) = watch::channel(false);
+        let stopping = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while place.recorded("argv").is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            stop.send(true)?;
+            anyhow::Ok(())
+        };
+        let ((result, _, _), stopped) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                turn(&place, &config, "must not send", None, cancel),
+                stopping
+            )
+        })
+        .await?;
+        stopped?;
+        assert!(
+            result
+                .err()
+                .context("cancelled launch")?
+                .downcast_ref::<ManagerError>()
+                .context("manager error")?
+                .cancelled()
+        );
+        assert!(place.prompts().is_empty());
+        let release = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while place.recorded("argv").lines().count() < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            std::fs::write(&gate, "")?;
+            anyhow::Ok(())
+        };
+        let (first, second, released) = tokio::join!(server.conn(), server.conn(), release);
+        released?;
+        let (first, _one) = first?;
+        let (second, _two) = second?;
+        assert_eq!(first.started_ms, second.started_ms);
+        assert_eq!(
+            place.recorded("argv").lines().count(),
+            2,
+            "the cancelled launch and one shared replacement"
+        );
+        server.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_changed_launch_waits_until_nothing_runs_on_the_serve() -> Result<()> {
         let place = Place::new().await?;
         let server = place.opencode()?;
@@ -4001,6 +4199,10 @@ mod tests {
         let (running, serving) = server.conn().await?;
         let Launch { bin, mut env } = old;
         env.insert("VIBEFACE_FAKE_LAUNCH".into(), "2".into());
+        env.insert(
+            "HOME".into(),
+            place.dir.join("next-home").display().to_string(),
+        );
         let expected = Launch {
             bin: bin.clone(),
             env: env.clone(),
@@ -4015,6 +4217,7 @@ mod tests {
             "a new generation cannot run with the active generation's environment"
         );
         let (during, _) = server.conn().await?;
+        assert_eq!(during.tool_base_env, running.tool_base_env);
         assert_eq!(
             (during.base, during.started_ms),
             (running.base.clone(), running.started_ms),
@@ -4022,6 +4225,10 @@ mod tests {
         );
         drop(serving);
         let (after, _) = server.conn_for(Some(expected)).await?;
+        assert_eq!(
+            after.tool_base_env["HOME"],
+            place.dir.join("next-home").display().to_string()
+        );
         assert_ne!(
             (after.base, after.started_ms),
             (running.base, running.started_ms),

@@ -9,7 +9,6 @@ use std::{
     collections::BTreeMap,
     future::Future,
     hash::{BuildHasher, RandomState},
-    io::Write,
     net::IpAddr,
     path::{Path, PathBuf},
     process::Stdio,
@@ -198,8 +197,8 @@ fn provider_cancel_failure(native_terminal: Option<AgentFailure>) -> AgentFailur
 /// later attempt, or the next run of the Node, ends it rather than losing track of it.
 pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree::Tree) -> bool {
     let token = tree.token().to_owned();
-    tree.stop();
-    let reaped = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    tree.ask_to_stop();
+    let reaped = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
     if !matches!(reaped, Ok(Ok(_))) {
         tree.kill();
         if !matches!(
@@ -238,6 +237,7 @@ pub struct SdkBridge {
 
 struct OwnerSlot {
     slot: Mutex<Slot>,
+    admission: Mutex<()>,
     /// Cursor's callback is process-wide. Serializing a bot's turns prevents a later callback
     /// bearer from retagging an earlier stream.
     turn: Arc<Semaphore>,
@@ -259,6 +259,7 @@ impl OwnerSlot {
     fn new() -> Self {
         Self {
             slot: Mutex::default(),
+            admission: Mutex::new(()),
             turn: Arc::new(Semaphore::new(1)),
             last_used: std::sync::Mutex::new(Instant::now()),
         }
@@ -373,6 +374,7 @@ impl Drop for Abandon {
 struct Processes {
     pidfile: Option<PathBuf>,
     running: std::sync::Mutex<BTreeMap<String, Tracked>>,
+    unconfirmed: String,
 }
 
 struct Tracked {
@@ -399,17 +401,28 @@ impl Processes {
         let Some(pidfile) = &self.pidfile else {
             return Ok(());
         };
-        if running.is_empty() {
+        if running.is_empty() && self.unconfirmed.is_empty() {
             return match std::fs::remove_file(pidfile) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
                 _ => Ok(()),
             };
         }
-        let lines: String = running
-            .iter()
-            .map(|(token, tracked)| format!("{token} {}\n", tracked.executable.display()))
+        let mut lines: String = self
+            .unconfirmed
+            .lines()
+            .filter(|line| {
+                !line
+                    .split_once(' ')
+                    .is_some_and(|(token, _)| running.contains_key(token))
+            })
+            .map(|line| format!("{line}\n"))
             .collect();
-        platform::privatefs::create_or_truncate(pidfile)?.write_all(lines.as_bytes())
+        lines.extend(
+            running
+                .iter()
+                .map(|(token, tracked)| format!("{token} {}\n", tracked.executable.display())),
+        );
+        platform::privatefs::write_atomic(pidfile, lines.as_bytes()).map_err(std::io::Error::other)
     }
 }
 
@@ -423,6 +436,13 @@ impl SdkBridge {
     ) -> Result<Self> {
         validate_env(&env)?;
         validate_callback(&tool_callback)?;
+        let unconfirmed = match pidfile.as_ref().map(std::fs::read_to_string) {
+            Some(Ok(recorded)) => recorded,
+            Some(Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error).context("read the Cursor SDK process journal");
+            }
+            _ => String::new(),
+        };
         Ok(Self {
             env,
             callback: tool_callback,
@@ -431,6 +451,7 @@ impl SdkBridge {
             processes: Arc::new(Processes {
                 pidfile,
                 running: Default::default(),
+                unconfirmed,
             }),
         })
     }
@@ -555,7 +576,7 @@ impl SdkBridge {
         }
     }
 
-    /// Kills every bridge process group this Node started and removes the pidfile.
+    /// Ends every bridge this Node started; unconfirmed trees stay in the pidfile.
     pub async fn stop(&self) {
         let running: Vec<_> = self
             .processes
@@ -569,9 +590,6 @@ impl SdkBridge {
             kill.notify_one();
             let _ = exited.wait_for(|exited| *exited).await;
         }
-        if let Some(pidfile) = &self.processes.pidfile {
-            let _ = std::fs::remove_file(pidfile);
-        }
     }
 
     /// Ends the bridge trees an earlier Node run recorded in `pidfile`, but only those still
@@ -581,13 +599,16 @@ impl SdkBridge {
         let Ok(recorded) = std::fs::read_to_string(pidfile) else {
             return;
         };
+        let mut unconfirmed = String::new();
         for line in recorded.lines() {
             // A journal record never contains a space, so the rest of the line is the whole
             // program path even when a directory in it has one.
             let Some((token, executable)) = line.split_once(' ') else {
+                unconfirmed.push_str(&format!("{line}\n"));
                 continue;
             };
             if executable.is_empty() {
+                unconfirmed.push_str(&format!("{line}\n"));
                 continue;
             }
             let stopped =
@@ -599,8 +620,17 @@ impl SdkBridge {
                     "a recorded Cursor SDK bridge was not ended"
                 );
             }
+            if !matches!(platform::tree::Leftover::find(token), Ok(None)) {
+                unconfirmed.push_str(&format!("{line}\n"));
+            }
         }
-        let _ = std::fs::remove_file(pidfile);
+        if unconfirmed.is_empty() {
+            let _ = std::fs::remove_file(pidfile);
+        } else if let Err(error) =
+            platform::privatefs::write_atomic(pidfile, unconfirmed.as_bytes())
+        {
+            tracing::warn!(%error, "could not preserve the unconfirmed process journal");
+        }
     }
 
     /// Runs the prompt with the turn's tools on the resident bridge.
@@ -1014,6 +1044,7 @@ impl SdkBridge {
         api_key: &str,
         env: &BTreeMap<String, String>,
     ) -> Result<Admission> {
+        let _admission = owner_slot.admission.lock().await;
         let key = self
             .hasher
             .hash_one((executable, workspace, local_store_root, api_key, env));
@@ -1140,11 +1171,9 @@ impl SdkBridge {
             .context("Cursor SDK stderr unavailable")?;
         let (ready_tx, ready_rx) = oneshot::channel();
         let startup_diagnostics = Arc::new(std::sync::Mutex::new(String::new()));
-        let startup_secrets = std::iter::once(api_key)
-            .chain(env.values().map(String::as_str))
-            .chain(self.env.values().map(String::as_str))
-            .chain(std::iter::once(self.callback.auth_token.as_str()))
-            .filter(|secret| !secret.is_empty())
+        let startup_secrets = self
+            .secrets(api_key, env, "")
+            .into_iter()
             .map(str::to_owned)
             .collect();
         let process = SdkProcess {
@@ -1273,8 +1302,11 @@ impl SdkBridge {
         bearer: &'a str,
     ) -> Vec<&'a str> {
         let mut secrets = vec![api_key, bearer, self.callback.auth_token.as_str()];
-        secrets.extend(self.env.values().map(String::as_str));
-        secrets.extend(env.values().map(String::as_str));
+        secrets.extend(
+            self.env.iter().chain(env).filter_map(|(name, value)| {
+                credential_value(name, value).then_some(value.as_str())
+            }),
+        );
         secrets.retain(|secret| !secret.is_empty());
         secrets
     }
@@ -1299,13 +1331,16 @@ async fn supervise(
         _ = kill.notified() => JoinedIo::Neither,
     };
     let token = process.tree.as_ref().map(|tree| tree.token().to_owned());
-    if let Some(mut tree) = process.tree.take()
-        && !terminate_process_tree(&mut process.child, &mut tree).await
-    {
-        // Something of the tree is left; keeping the handle lets the drop of the process
-        // end it rather than leaving it unowned.
-        process.tree = Some(tree);
-    }
+    let gone = if let Some(mut tree) = process.tree.take() {
+        if terminate_process_tree(&mut process.child, &mut tree).await {
+            true
+        } else {
+            process.tree = Some(tree);
+            false
+        }
+    } else {
+        true
+    };
     // The process exit signal is also the bridge's teardown barrier. Reap the output tasks before
     // publishing it so their pipe handles, along with the child and job handles below, cannot
     // outlive SdkBridge::stop and race its owner removing the bridge state directory.
@@ -1318,7 +1353,7 @@ async fn supervise(
         let _ = (&mut process.stderr).await;
     }
     drop(process);
-    if let Some(token) = token {
+    if gone && let Some(token) = token {
         processes.forget(&token);
     }
     let _ = exited.send(true);
@@ -2374,6 +2409,64 @@ fn safe_progress_event(kind: &str, event: &Value) -> Option<Value> {
     (output.len() > 1).then_some(Value::Object(output))
 }
 
+fn credential_value(name: &str, value: &str) -> bool {
+    if ["_KEY", "_TOKEN", "_SECRET", "_PASSWORD"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+    {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    if [
+        "-----begin",
+        "bearer ",
+        "password=",
+        "password:",
+        "passwd=",
+        "secret=",
+        "api_key=",
+        "apikey=",
+        "token=",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+    value
+        .split(|c: char| c.is_whitespace() || "\"'`,;()[]{}<>".contains(c))
+        .any(|word| {
+            let lower = word.to_ascii_lowercase();
+            (word.len() >= 20
+                && [
+                    "sk-",
+                    "sk_",
+                    "ghp_",
+                    "gho_",
+                    "ghs_",
+                    "ghu_",
+                    "github_pat_",
+                    "xoxb-",
+                    "xoxp-",
+                    "xapp-",
+                    "akia",
+                    "aiza",
+                    "glpat-",
+                    "hf_",
+                    "npm_",
+                ]
+                .iter()
+                .any(|prefix| lower.starts_with(prefix)))
+                || (word.len() >= 32
+                    && word
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-_+/=".contains(c))
+                    && word.chars().any(|c| c.is_ascii_digit())
+                    && word.chars().any(|c| c.is_ascii_uppercase())
+                    && word.chars().any(|c| c.is_ascii_lowercase()))
+        })
+}
+
 fn redact_text(mut text: String, secrets: &[&str]) -> String {
     for secret in secrets.iter().copied().filter(|secret| !secret.is_empty()) {
         text = text.replace(secret, "[redacted]");
@@ -2892,6 +2985,74 @@ mod tests {
         assert_eq!(
             redacted,
             json!({"text": "prefix [redacted] [redacted]", "items": ["[redacted]"]})
+        );
+        let bridge = SdkBridge::new(
+            BTreeMap::from([
+                ("DEBUG".into(), "1".into()),
+                ("NODE_ENV".into(), "production".into()),
+            ]),
+            ToolCallbackConfig {
+                url: "http://127.0.0.1:9".into(),
+                auth_token: "callback-secret-".repeat(3),
+            },
+            None,
+        )
+        .unwrap();
+        let env = BTreeMap::from([
+            ("STATE_PATH".into(), "/normal/provider/path".into()),
+            ("API_KEY".into(), "a!".into()),
+            ("ATTEMPT_TOKEN".into(), "t!".into()),
+            (
+                "PRIVATE_VALUE".into(),
+                "ghp_syntheticcredential123456".into(),
+            ),
+        ]);
+        let secrets = bridge.secrets("k!", &env, "b!");
+        assert_eq!(
+            redact_text(
+                "1 production /normal/provider/path k! a! t! b! ghp_syntheticcredential123456"
+                    .into(),
+                &secrets
+            ),
+            "1 production /normal/provider/path [redacted] [redacted] [redacted] [redacted] [redacted]"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_redaction_keeps_normal_environment_values() {
+        let bridge = SdkBridge::new(
+            BTreeMap::from([
+                ("DEBUG".into(), "1".into()),
+                ("NODE_ENV".into(), "production".into()),
+            ]),
+            ToolCallbackConfig {
+                url: "http://127.0.0.1:9".into(),
+                auth_token: "callback-secret-".repeat(3),
+            },
+            None,
+        )
+        .unwrap();
+        let env = BTreeMap::from([("API_KEY".into(), "k!".into())]);
+        let secrets = bridge
+            .secrets("a!", &env, "")
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let diagnostics = Arc::new(std::sync::Mutex::new(String::new()));
+        let (ready, _) = oneshot::channel();
+        assert!(
+            read_discovery(
+                &b"1 production a! k!\n"[..],
+                ready,
+                diagnostics.clone(),
+                secrets
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            *diagnostics.lock().unwrap(),
+            "1 production [redacted] [redacted]\n"
         );
     }
 

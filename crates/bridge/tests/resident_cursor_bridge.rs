@@ -146,6 +146,124 @@ async fn provider_observation_fixture(
 }
 
 #[tokio::test]
+async fn concurrent_admission_starts_one_replacement_and_cancel_enters_a_live_turn() {
+    let root = std::env::temp_dir().join(format!(
+        "vibeface-cursor-admission-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let log = root.join("starts.log");
+    let gate = root.join("startup-release");
+    let journal = root.join("bridge.pid");
+    vibeface_bridge::platform::privatefs::write_atomic(&journal, b"unqueryable-tree fixture\n")
+        .unwrap();
+    let bridge = SdkBridge::new(
+        BTreeMap::new(),
+        ToolCallbackConfig {
+            url: "http://127.0.0.1:9".into(),
+            auth_token: "fixture-callback-token-".repeat(2),
+        },
+        Some(journal.clone()),
+    )
+    .unwrap();
+    let mut turn = SdkTurn {
+        owner: "work:admission".into(),
+        executable: fixture_executable(),
+        workspace: root.join("workspace"),
+        local_store_root: root.join("private-instance"),
+        api_key: "fixture-api-key".into(),
+        env: BTreeMap::from([("FAKE_BRIDGE_LOG".into(), log.display().to_string())]),
+        model: "fixture-model".into(),
+        timeout_secs: 10,
+        custom_tools: BTreeMap::new(),
+        callback_token: None,
+        process_started: None,
+        run_started: None,
+    };
+    bridge
+        .prewarm(
+            &turn.owner,
+            &turn.executable,
+            &turn.workspace,
+            &turn.local_store_root,
+            &turn.api_key,
+            &turn.env,
+        )
+        .await
+        .unwrap();
+    turn.env.insert(
+        "FAKE_BRIDGE_STARTUP_GATE".into(),
+        gate.display().to_string(),
+    );
+    let release = async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while starts(&log).len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::write(&gate, b"").unwrap();
+    };
+    let (run, probe, cancel, _) = tokio::join!(
+        reply(&bridge, &turn, "race"),
+        bridge.probe(&turn, "agent-probe", "run-probe"),
+        bridge.cancel(&turn, "agent-probe", "run-probe"),
+        release,
+    );
+    assert_eq!(run.0.unwrap(), "done: race");
+    probe.unwrap();
+    cancel.unwrap();
+    assert_eq!(starts(&log).len(), 2, "only one replacement was published");
+    let agent = Arc::new(Mutex::new(None));
+    let native_run = Arc::new(Mutex::new(None));
+    let recorded_run = native_run.clone();
+    turn.run_started = Some(Arc::new(move |run| {
+        *recorded_run.lock().unwrap() = Some(run);
+        Box::pin(async { Ok(()) })
+    }));
+    let running = bridge.run(
+        &turn,
+        "cancelhang",
+        None,
+        |id| {
+            *agent.lock().unwrap() = Some(id);
+            async { Ok(()) }
+        },
+        watch::channel(false).1,
+        |_| async { Ok(()) },
+    );
+    let cancelling = async {
+        let (agent, run) = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let (Some(agent), Some(run)) = (
+                    agent.lock().unwrap().clone(),
+                    native_run.lock().unwrap().clone(),
+                ) {
+                    break (agent, run);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), bridge.cancel(&turn, &agent, &run))
+            .await
+            .unwrap()
+            .unwrap();
+    };
+    let (result, _) = tokio::join!(running, cancelling);
+    assert!(result.is_err());
+    assert_eq!(starts(&log).len(), 2);
+    bridge.stop().await;
+    assert_eq!(
+        std::fs::read_to_string(journal).unwrap(),
+        "unqueryable-tree fixture\n"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn one_bridge_serves_consecutive_turns_and_is_replaced_when_it_dies() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -98,9 +98,19 @@ def option(name):
     return args[args.index(name) + 1] if name in args else None
 
 
+guide = option("--append-system-prompt-file")
+guide_text = None
+guide_private = None
+if guide:
+    with open(guide) as file:
+        guide_text = file.read()
+    if os.name != "nt":
+        guide_private = os.stat(guide).st_mode & 0o077 == 0
 log({
     "argv": sys.argv[1:],
     "cwd": os.getcwd(),
+    "guide": guide_text,
+    "guide_private": guide_private,
     "env": {name: name in os.environ for name in
             ("VIBEFACE_TOOL_TOKEN", "VIBEFACE_NODE_URL", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "FAKE_MARK")},
 })
