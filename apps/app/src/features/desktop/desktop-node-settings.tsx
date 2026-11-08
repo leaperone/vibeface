@@ -42,8 +42,10 @@ export function DesktopNodeSettings() {
     </SettingsGroup>
   }
 
+  const hostStarting = status?.hostPhase === 'starting'
+
   const run = (work: () => Promise<DesktopStatus | void>, action?: ActionId) => {
-    if (busy) return
+    if (busy || hostStarting) return
     setBusy(true)
     setError(null)
     void work()
@@ -91,10 +93,11 @@ export function DesktopNodeSettings() {
         <SettingsRow icon={Laptop} label={view.headline} description={view.explain}>
           <span className="text-meta text-muted-foreground">{view.indicator}</span>
         </SettingsRow>
+        {hostStarting ? <p className="px-4 text-meta text-muted-foreground">正在完成桌面启动，节点操作暂时不可用…</p> : null}
         {view.failure ? <p className="px-4 text-body text-danger" role="alert">{view.failure}</p> : null}
         {error ? <p className="px-4 text-body text-danger" role="alert">{error}</p> : null}
         {view.discoveryMessage ? <p className="px-4 text-meta text-muted-foreground">{view.discoveryMessage}</p> : null}
-        <ActionList actions={view.actions} busy={busy} onAction={(action) => run(() => invoke(action.id, action.nodeId), action.id)} />
+        <ActionList actions={view.actions} busy={busy || hostStarting} onAction={(action) => run(() => invoke(action.id, action.nodeId), action.id)} />
       </> : error ? <>
         <p className="px-4 text-body text-danger" role="alert">{error}</p>
         <div className="px-4 pb-4">
@@ -111,12 +114,12 @@ export function DesktopNodeSettings() {
         <p className="text-body font-medium text-foreground">{row.status} · {row.node.deviceId.slice(0, 12)}</p>
         <p className="text-meta text-muted-foreground">{row.detail}</p>
         <p className="mt-1 break-all font-mono text-meta text-muted-foreground">{row.node.dataDir}</p>
-        <ActionList actions={row.actions} busy={busy} onAction={(action) => run(() => invoke(action.id, action.nodeId), action.id)} className="mt-3" />
+        <ActionList actions={row.actions} busy={busy || hostStarting} onAction={(action) => run(() => invoke(action.id, action.nodeId), action.id)} className="mt-3" />
       </div>)}
     </SettingsGroup> : null}
 
     {view && (view.backgroundMessage || view.backgroundActions.length > 0) ? <SettingsGroup title="后台节点" footer={view.backgroundMessage}>
-      <ActionList actions={view.backgroundActions} busy={busy} onAction={(action) => run(() => invoke(action.id, action.nodeId), action.id)} />
+      <ActionList actions={view.backgroundActions} busy={busy || hostStarting} onAction={(action) => run(() => invoke(action.id, action.nodeId), action.id)} />
     </SettingsGroup> : null}
 
     {status ? <SettingsGroup title="桌面偏好">
@@ -127,12 +130,12 @@ export function DesktopNodeSettings() {
           className="switch"
           aria-label="连接后自动回到 Vibeface"
           checked={status.preferences.openBusinessOnConnect}
-          disabled={busy}
+          disabled={busy || hostStarting}
           onChange={(event) => run(() => api.setPreference('openBusinessOnConnect', event.target.checked))}
         />
       </SettingsRow>
       <SettingsRow icon={Laptop} label="清除访问节点选择" description="不会删除节点数据">
-        <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => run(() => api.forgetDataDir())}>清除</Button>
+        <Button type="button" size="sm" variant="outline" disabled={busy || hostStarting} onClick={() => run(() => api.forgetDataDir())}>清除</Button>
       </SettingsRow>
       <SettingsRow icon={Laptop} label="发行版本">
         <Button type="button" size="sm" variant="ghost" onClick={() => void api.openExternal(RELEASES)}>查看</Button>

@@ -5,6 +5,7 @@ import type { BackgroundNode, CoreState, DesktopStatus, LocalNode } from '../src
 const status = (overrides: Partial<DesktopStatus> = {}): DesktopStatus => ({
   runtime: { kind: 'ready', corePath: '/app/resources/runtime/vibeface-core' },
   core: { kind: 'none' },
+  hostPhase: 'ready',
   clientVisible: true,
   preferences: { openBusinessOnConnect: true },
   profileDir: '/tmp/profile',
@@ -30,6 +31,10 @@ const node = (kind: LocalNode['kind'], id = 'candidate-1'): LocalNode => {
 describe('desktop node settings view', () => {
   it('offers controller-only and local-node choices on first open', () => {
     expect(toView(status()).actions.map((item) => item.id)).toEqual(['controller', 'local'])
+  })
+
+  it('still describes undecided mode while the desktop host is starting', () => {
+    expect(toView(status({ hostPhase: 'starting' })).headline).toBe('Vibeface')
   })
 
   it('keeps the controller available without a Core runtime and discovers healthy choices', () => {

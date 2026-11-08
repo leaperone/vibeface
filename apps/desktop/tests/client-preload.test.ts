@@ -12,7 +12,7 @@ vi.mock('electron', () => ({
   ipcRenderer: { invoke: mocks.invoke, send: mocks.send, on: mocks.on, removeListener: mocks.removeListener },
 }))
 const confirmed: DesktopStatus = {
-  runtime: { kind: 'ready', corePath: '/fixture/core' }, core: { kind: 'none' }, clientVisible: true,
+  runtime: { kind: 'ready', corePath: '/fixture/core' }, core: { kind: 'none' }, hostPhase: 'ready', clientVisible: true,
   preferences: { openBusinessOnConnect: true }, profileDir: '/fixture/profile', version: '0.0.1',
   attachOnly: false, clientAvailable: true, nodeMode: 'controller', selectedNode: null,
   discovery: { kind: 'ready', nodes: [], warnings: [] }, backgroundNode: { kind: 'absent' },

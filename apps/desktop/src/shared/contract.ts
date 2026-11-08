@@ -108,6 +108,8 @@ export type PreferenceKey = (typeof PREFERENCE_KEYS)[number]
 export type DesktopStatus = {
   runtime: RuntimeState
   core: CoreState
+  /** Host startup has finished navigation and may accept native mutations. */
+  hostPhase: 'starting' | 'ready'
   /** True while the sole client window is visible. */
   clientVisible: boolean
   preferences: Preferences

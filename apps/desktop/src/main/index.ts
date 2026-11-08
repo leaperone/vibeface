@@ -29,6 +29,7 @@ import {
   guardPermissions,
   openExternally,
 } from './windows.js'
+import { waitForWebContentsLoad } from './client-navigation.js'
 
 const MAX_PATH = 1024
 
@@ -42,6 +43,11 @@ let coordinator: DesktopCoordinator | null = null
 let clientHost: ReturnType<typeof createClientHost> | null = null
 let clientIpcInstalled = false
 let shutdownPending = false
+let hostPhase: DesktopStatus['hostPhase'] = 'starting'
+
+function requireHostReady(): void {
+  if (hostPhase !== 'ready') throw new Error('桌面宿主仍在启动，请稍后再试。')
+}
 
 function profileDirectory(explicit: string | null): string {
   if (explicit) return explicit
@@ -82,6 +88,7 @@ function status(): DesktopStatus {
   return {
     runtime: runtimeState(),
     core: current.state(),
+    hostPhase,
     clientVisible: Boolean(clientWindow && !clientWindow.isDestroyed() && clientWindow.isVisible()),
     preferences: current.preferences(),
     profileDir,
@@ -127,6 +134,7 @@ async function focusClientApp(reconnect = false, showChat = true): Promise<void>
     clientHost.disconnect()
     await window.webContents.executeJavaScript(`history.replaceState(null, '', ${JSON.stringify(destination.toString())})`)
     window.webContents.reload()
+    await waitForWebContentsLoad(window.webContents)
   }
   window.show()
   window.focus()
@@ -154,6 +162,15 @@ async function ensureClientWindow(): Promise<void> {
 }
 
 function focusClientSafely(): void {
+  if (hostPhase !== 'ready') {
+    void ensureClientWindow()
+      .then(() => {
+        clientWindow?.show()
+        clientWindow?.focus()
+      })
+      .catch((error: unknown) => reportFailure('无法显示 Vibeface 窗口', error))
+    return
+  }
   void focusClientApp().catch((error: unknown) => reportFailure('无法显示 Vibeface 窗口', error))
 }
 
@@ -227,6 +244,7 @@ function registerIpc(): void {
     let showChat: boolean
     try {
       trusted(event)
+      if (hostPhase !== 'ready') return
       if (args.length !== 1) return
       showChat = readBoolean(args[0], '显示聊天')
     } catch { return }
@@ -237,6 +255,7 @@ function registerIpc(): void {
     return status()
   })
   handle(IPC.chooseDataDir, async (passed) => {
+    requireHostReady()
     readNoArguments(passed, IPC.chooseDataDir)
     const picked = await dialog.showOpenDialog({
       title: '选择 Core 数据目录',
@@ -249,37 +268,44 @@ function registerIpc(): void {
     return status()
   })
   handle(IPC.useDataDir, async (passed) => {
+    requireHostReady()
     await requireCoordinator().rememberDirectory(stringArgument(passed, '数据目录', MAX_PATH))
     return status()
   })
   handle(IPC.forgetDataDir, async (passed) => {
+    requireHostReady()
     readNoArguments(passed, IPC.forgetDataDir)
     await requireCoordinator().clearSelection()
     return status()
   })
   handle(IPC.startOwned, async (passed) => {
+    requireHostReady()
     readNoArguments(passed, IPC.startOwned)
     await requireCoordinator().startOwnedAppNode()
     return status()
   })
   handle(IPC.attachExisting, async (passed) => {
+    requireHostReady()
     readNoArguments(passed, IPC.attachExisting)
     const current = requireSession()
     await current.attachExisting()
     return status()
   })
   handle(IPC.stopOwned, async (passed) => {
+    requireHostReady()
     readNoArguments(passed, IPC.stopOwned)
     await requireSession().stopOwned()
     await requireCoordinator().discover()
     return status()
   })
   handle(IPC.focusClient, async (passed) => {
+    requireHostReady()
     readNoArguments(passed, IPC.focusClient)
     await focusClientApp()
     return status()
   })
   handle(IPC.setPreference, async (passed) => {
+    requireHostReady()
     await requireSession().setPreference(preferenceKey(passed[0]), readBoolean(passed[1], '设置值'))
     return status()
   })
@@ -287,47 +313,56 @@ function registerIpc(): void {
     openExternally(readExternalUrl(passed[0]))
   })
   handle(IPC.discoverNodes, async (passed) => {
+    requireHostReady()
     readNoArguments(passed, IPC.discoverNodes)
     await requireCoordinator().refreshBackground()
     await requireCoordinator().discover()
     return status()
   })
   handle(IPC.chooseNodeMode, async (passed) => {
+    requireHostReady()
     const mode = stringArgument(passed, '节点模式', 16)
     if (mode !== 'controller' && mode !== 'local') throw new TypeError('未知的节点模式')
     await requireCoordinator().chooseMode(mode)
     return status()
   })
   handle(IPC.connectDiscoveredNode, async (passed) => {
+    requireHostReady()
     await requireCoordinator().connect(stringArgument(passed, '节点标识', 64))
     return status()
   })
   handle(IPC.startDiscoveredNode, async (passed) => {
+    requireHostReady()
     await requireCoordinator().start(stringArgument(passed, '节点标识', 64))
     return status()
   })
   handle(IPC.installBackgroundNode, async (passed) => {
+    requireHostReady()
     readNoArguments(passed, IPC.installBackgroundNode)
     await requireCoordinator().installBackground()
     await requireCoordinator().discover()
     return status()
   })
   handle(IPC.startBackgroundNode, async (passed) => {
+    requireHostReady()
     readNoArguments(passed, IPC.startBackgroundNode)
     await requireCoordinator().startBackground()
     return status()
   })
   handle(IPC.stopBackgroundNode, async (passed) => {
+    requireHostReady()
     readNoArguments(passed, IPC.stopBackgroundNode)
     await requireCoordinator().stopBackground()
     return status()
   })
   handle(IPC.removeBackgroundNode, async (passed) => {
+    requireHostReady()
     readNoArguments(passed, IPC.removeBackgroundNode)
     await requireCoordinator().removeBackground()
     return status()
   })
   handle(IPC.updateBackgroundNode, async (passed) => {
+    requireHostReady()
     readNoArguments(passed, IPC.updateBackgroundNode)
     await requireCoordinator().updateBackground()
     return status()
@@ -445,6 +480,15 @@ async function start(): Promise<void> {
   app.setAsDefaultProtocolClient('vibeface')
 
   app.on('activate', () => {
+    if (hostPhase !== 'ready') {
+      void ensureClientWindow()
+        .then(() => {
+          clientWindow?.show()
+          clientWindow?.focus()
+        })
+        .catch((error: unknown) => reportFailure('无法显示 Vibeface 窗口', error))
+      return
+    }
     if (clientWindow && !clientWindow.isDestroyed() && clientWindow.isVisible()) clientWindow.focus()
     else focusClientSafely()
   })
@@ -469,19 +513,26 @@ async function start(): Promise<void> {
   })
 
   await ensureClientWindow()
+  await navigateClient(DESKTOP_NODE_SETTINGS_PATH)
   clientWindow?.show()
+  broadcast()
+
   await coordinator.initialize()
   await coreSession.restore()
   broadcast()
 
   if (coordinator.status().nodeMode === 'undecided') {
-    await openNodeSettings()
+    await navigateClient(DESKTOP_NODE_SETTINGS_PATH)
   } else if (coreSession.preferences().openBusinessOnConnect) {
     await focusClientApp(true).catch(() => {
       /* node settings explain why the client could not open */
     })
+  } else {
+    await navigateClient(DESKTOP_NODE_SETTINGS_PATH)
   }
 
+  hostPhase = 'ready'
+  broadcast()
   activations.setReady()
   await activations.flush()
 }

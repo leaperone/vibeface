@@ -214,7 +214,7 @@ async function waitClient() {
           const api = window.vibefaceClient?.desktop;
           if (document.readyState !== 'complete' || typeof api?.getStatus !== 'function') return false;
           const status = await api.getStatus();
-          if (!['ready', 'failed'].includes(status.discovery.kind) || status.backgroundNode.kind === 'checking') return false;
+          if (status.hostPhase !== 'ready') return false;
           const opensClient = status.nodeMode !== 'undecided' && status.preferences.openBusinessOnConnect;
           return !opensClient || status.clientVisible;
         })()`)) return;

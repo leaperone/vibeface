@@ -15,7 +15,7 @@ test('desktop invitation fragments preserve the original join URL and origin, th
     local: { discoverLocalSetup: async () => null, localEntry: async () => null },
     carrier: { open: async () => '', openGateway: async () => null, openLan: async () => '', send: async () => {}, receive: async () => null, close: () => {} },
     desktop: {
-      getStatus: async () => ({ runtime: { kind: 'ready', corePath: '/core' }, core: { kind: 'none' }, clientVisible: true, preferences: { openBusinessOnConnect: true }, profileDir: '/profile', version: '0.0.1', attachOnly: false, clientAvailable: true, nodeMode: 'controller', selectedNode: null, discovery: { kind: 'idle' }, backgroundNode: { kind: 'absent' } }),
+      getStatus: async () => ({ runtime: { kind: 'ready', corePath: '/core' }, core: { kind: 'none' }, hostPhase: 'ready', clientVisible: true, preferences: { openBusinessOnConnect: true }, profileDir: '/profile', version: '0.0.1', attachOnly: false, clientAvailable: true, nodeMode: 'controller', selectedNode: null, discovery: { kind: 'idle' }, backgroundNode: { kind: 'absent' } }),
       chooseDataDir: unavailable, useDataDir: unavailable, forgetDataDir: unavailable,
       startOwned: unavailable, attachExisting: unavailable, stopOwned: unavailable,
       focusClient: unavailable, setPreference: unavailable, openExternal: async () => {},
