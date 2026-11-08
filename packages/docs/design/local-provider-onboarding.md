@@ -1,5 +1,9 @@
 # 本机 AI 服务接入
 
+## 订阅接入目标
+
+本机接入优先支持 Codex、Claude Code 和 Cursor，保留现有 Pi、OpenCode，不扩展 Agent 目录。程序自动发现与登录复用分别检查，找到程序不能作为认证有效的证据。复用已有登录时，Node 的会话、hooks 和执行记录仍由 Node 管理，凭证不进入共享记录。Cursor 订阅接入使用本机 Agent 的官方认证路径。
+
 本设计约束 Node 如何发现已经安装的 Codex 和 Cursor，并在设备设置中说明接入结果。
 
 ## 接入目标
