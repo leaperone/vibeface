@@ -73,6 +73,78 @@ function Select-Release {
     return ($ordered | Sort-Object Major, Minor, Patch, Day, Build)
 }
 
+function Get-InstallerFixture {
+    param([string] $Url)
+    $root = $env:VIBEFACE_INSTALL_FIXTURE
+    if (-not $root) { return $null }
+    $fixture = $root.TrimEnd('\', '/')
+    if ($Url -match '^https://api\.github\.com/repos/leaperone/vibeface/releases\?per_page=100&page=([0-9]+)$') {
+        $page = $Matches[1]
+        $path = if ($page -eq '1') { 'releases.json' } else { "page$page.json" }
+        return (Join-Path $fixture $path)
+    }
+    if ($Url -match '^https://api\.github\.com/repos/leaperone/vibeface/commits/') {
+        return Join-Path $fixture 'commit.json'
+    }
+    if ($Url -match '^https://github\.com/leaperone/vibeface/releases/download/([^/]+)/release\.json$') {
+        $tag = $Matches[1]
+        $codePath = Join-Path (Join-Path $fixture 'marker-code') $tag
+        $bodyPath = Join-Path (Join-Path $fixture 'marker-body') "$tag.json"
+        $default = Join-Path $fixture 'release.json'
+        return [pscustomobject]@{ Tag = $tag; CodePath = $codePath; BodyPath = $bodyPath; DefaultPath = $default }
+    }
+    if ($Url -match '^https://github\.com/leaperone/vibeface/releases/download/([^/]+)/(.+)$') {
+        $leaf = $Matches[2]
+        if ($leaf -match '\.sha256$') { return Join-Path $fixture 'checksum' }
+        if ($leaf -match '\.tar\.gz$') { return Join-Path $fixture 'package.tar.gz' }
+    }
+    return $null
+}
+
+function Copy-InstallerFixture {
+    param([string] $Url, [string] $Path, [switch] $Optional)
+    $fixture = Get-InstallerFixture -Url $Url
+    if (-not $fixture) { return $false }
+    if ($fixture -is [string]) {
+        if (-not (Test-Path -LiteralPath $fixture -PathType Leaf)) {
+            if ($Optional) { return $false }
+            Fail "installer fixture is missing: $fixture"
+        }
+        Copy-Item -LiteralPath $fixture -Destination $Path -Force
+        return $true
+    }
+    $code = 200
+    if (Test-Path -LiteralPath $fixture.CodePath -PathType Leaf) {
+        $code = [int]((Get-Content -LiteralPath $fixture.CodePath -Raw).Trim())
+    }
+    if ($code -eq 404) {
+        if ($Optional) { Set-Content -LiteralPath $Path -Value '' -NoNewline; return $false }
+        Fail "completion manifest request failed with HTTP 404"
+    }
+    if ($code -ne 200) { Fail "completion manifest request failed with HTTP $code" }
+    $source = if (Test-Path -LiteralPath $fixture.BodyPath -PathType Leaf) { $fixture.BodyPath }
+    elseif (Test-Path -LiteralPath $fixture.DefaultPath -PathType Leaf) { $fixture.DefaultPath }
+    else { Fail "installer fixture is missing: release.json for $($fixture.Tag)" }
+    Copy-Item -LiteralPath $source -Destination $Path -Force
+    return $true
+}
+
+function Get-OptionalDownload {
+    param([string] $Url, [string] $Path, [int64] $Limit)
+    if ($env:VIBEFACE_INSTALL_FIXTURE -and (Copy-InstallerFixture -Url $Url -Path $Path -Optional)) { return $true }
+    try {
+        Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing -MaximumRedirection 5 `
+            -UserAgent 'vibeface-installer' -TimeoutSec 180
+    } catch {
+        $status = 0
+        if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+        if ($status -eq 404) { return $false }
+        Fail 'completion manifest download failed (network or GitHub API limit)'
+    }
+    if ((Get-Item -LiteralPath $Path).Length -gt $Limit) { Fail 'release completion manifest exceeds limit' }
+    return $true
+}
+
 function Confirm-Completion {
     param([object] $Release, [string] $Tag, [string] $Version, [string] $Archive, [string] $Target)
     $marker = @($Release.assets | Where-Object { $_.name -eq 'release.json' })
@@ -80,14 +152,8 @@ function Confirm-Completion {
     if ($marker.Count -ne 1) { Fail 'release contains duplicate completion markers' }
     if ($marker[0].size -gt 1MB) { Fail 'release completion manifest exceeds limit' }
     $manifestPath = Join-Path $script:Scratch 'completion.json'
-    try {
-        Invoke-WebRequest -Uri "$Downloads/$Tag/release.json" -OutFile $manifestPath -UseBasicParsing `
-            -MaximumRedirection 5 -UserAgent 'vibeface-installer' -TimeoutSec 180
-    } catch {
-        $status = 0
-        if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
-        if ($status -eq 404) { return $false }
-        Fail 'completion manifest download failed (network or GitHub API limit)'
+    if (-not (Get-OptionalDownload -Url "$Downloads/$Tag/release.json" -Path $manifestPath -Limit 1MB)) {
+        return $false
     }
     if ((Get-Item -LiteralPath $manifestPath).Length -gt 1MB) { Fail 'release completion manifest exceeds limit' }
     try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -ErrorAction Stop }
@@ -128,6 +194,10 @@ function Get-Json {
 function Get-Download {
     param([string] $Url, [string] $Path, [int64] $Limit, [string] $Accept = '*/*')
     if (-not $Url.StartsWith('https://')) { Fail "refusing a download that is not over HTTPS: $Url" }
+    if ($env:VIBEFACE_INSTALL_FIXTURE -and (Copy-InstallerFixture -Url $Url -Path $Path)) {
+        if ((Get-Item -LiteralPath $Path).Length -gt $Limit) { Fail "download exceeds its size limit: $Url" }
+        return
+    }
     try {
         Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing -MaximumRedirection 5 `
             -Headers @{ Accept = $Accept } -UserAgent 'vibeface-installer' -TimeoutSec 180
@@ -424,6 +494,73 @@ function Invoke-SelfTest {
         }
     } finally {
         Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $fixture = Join-Path ([System.IO.Path]::GetTempPath()) ('vibeface-installer-fixture-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $fixture | Out-Null
+    $env:VIBEFACE_INSTALL_FIXTURE = $fixture
+    try {
+        $version = '0.0.1-nightly.20261017.10'
+        $tag = "v$version"
+        $archive = "vibeface-$version-$Target.tar.gz"
+        $marker = [pscustomobject]@{ name = 'release.json'; size = 512 }
+        $archiveAsset = [pscustomobject]@{ name = $archive; size = 123 }
+        $checksumAsset = [pscustomobject]@{ name = "$archive.sha256"; size = 64 }
+        $building = [pscustomobject]@{
+            tag_name = 'v0.0.1-nightly.20261017.99'
+            draft = $false; prerelease = $true
+            assets = @()
+        }
+        $buildingMarked = [pscustomobject]@{
+            tag_name = 'v0.0.1-nightly.20261017.99'
+            draft = $false; prerelease = $true
+            assets = @($marker)
+        }
+        $complete = [pscustomobject]@{
+            tag_name = $tag
+            draft = $false; prerelease = $true
+            assets = @($marker, $archiveAsset, $checksumAsset)
+        }
+        $manifest = [pscustomobject]@{
+            app = 'product'
+            version = $version
+            tag = $tag
+            source_commit = 'a' * 40
+            channel = 'nightly'
+            schema = 1
+            assets = @(
+                [pscustomobject]@{ name = $archive; size = 123; sha256 = 'a' * 64 }
+                [pscustomobject]@{ name = "$archive.sha256"; size = 64; sha256 = 'b' * 64 }
+            )
+        }
+        $manifest | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $fixture 'release.json')
+        New-Item -ItemType Directory -Path (Join-Path $fixture 'marker-code') | Out-Null
+        Set-Content -LiteralPath (Join-Path $fixture 'marker-code/v0.0.1-nightly.20261017.99') -Value '404' -NoNewline
+        if (Confirm-Completion -Release $building -Tag $building.tag_name -Version '0.0.1-nightly.20261017.99' `
+                -Archive "vibeface-0.0.1-nightly.20261017.99-$Target.tar.gz" -Target $Target) {
+            Fail 'self-test: release without marker asset was accepted'
+        }
+        if (Confirm-Completion -Release $buildingMarked -Tag $buildingMarked.tag_name -Version '0.0.1-nightly.20261017.99' `
+                -Archive "vibeface-0.0.1-nightly.20261017.99-$Target.tar.gz" -Target $Target) {
+            Fail 'self-test: HTTP 404 marker was treated as complete'
+        }
+        if (-not (Confirm-Completion -Release $complete -Tag $tag -Version $version -Archive $archive -Target $Target)) {
+            Fail 'self-test: complete marker was rejected'
+        }
+        $badPath = Join-Path $script:Scratch 'bad-completion.json'
+        Set-Content -LiteralPath (Join-Path $fixture 'marker-code/v0.0.1-nightly.20261017.99') -Value '200' -NoNewline
+        New-Item -ItemType Directory -Path (Join-Path $fixture 'marker-body') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $fixture 'marker-body/v0.0.1-nightly.20261017.99.json') -Value '{bad-json' -NoNewline
+        if (Get-OptionalDownload -Url "$Downloads/$($buildingMarked.tag_name)/release.json" -Path $badPath -Limit 1MB) {
+            if (($badPath | Get-Content -Raw | ConvertFrom-Json -ErrorAction SilentlyContinue)) {
+                Fail 'self-test: corrupt marker JSON was accepted'
+            }
+        } else {
+            Fail 'self-test: corrupt marker was treated as missing'
+        }
+    } finally {
+        Remove-Item Env:\VIBEFACE_INSTALL_FIXTURE -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
     }
     'Installer self-test passed.'
 }

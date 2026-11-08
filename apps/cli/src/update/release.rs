@@ -211,30 +211,9 @@ async fn resolve_release(
         source_commit == manifest.source_commit,
         "completion manifest source does not match the release tag"
     );
-    let archive_record = manifest
-        .assets
-        .iter()
-        .find(|item| item.name == name)
-        .context("completion manifest omits target archive")?;
-    let checksum_record = manifest
-        .assets
-        .iter()
-        .find(|item| item.name == format!("{name}.sha256"))
-        .context("completion manifest omits target checksum")?;
+    let (archive_record, checksum_record) = manifest_target_pair(&manifest, &name)?;
     ensure!(
-        manifest
-            .assets
-            .iter()
-            .filter(|item| item.name == name || item.name == format!("{name}.sha256"))
-            .count()
-            == 2,
-        "completion manifest contains duplicate target assets"
-    );
-    ensure!(
-        archive_record.size == asset.size
-            && checksum_record.size == checksum.size
-            && valid_digest(&archive_record.sha256)
-            && valid_digest(&checksum_record.sha256),
+        archive_record.size == asset.size && checksum_record.size == checksum.size,
         "completion manifest target asset metadata mismatch"
     );
     ensure!(
@@ -298,6 +277,36 @@ fn valid_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn manifest_target_pair<'a>(
+    manifest: &'a CompletionManifest,
+    name: &str,
+) -> Result<(&'a CompletionAsset, &'a CompletionAsset)> {
+    let archive_record = manifest
+        .assets
+        .iter()
+        .find(|item| item.name == name)
+        .context("completion manifest omits target archive")?;
+    let checksum_record = manifest
+        .assets
+        .iter()
+        .find(|item| item.name == format!("{name}.sha256"))
+        .context("completion manifest omits target checksum")?;
+    ensure!(
+        manifest
+            .assets
+            .iter()
+            .filter(|item| item.name == name || item.name == format!("{name}.sha256"))
+            .count()
+            == 2,
+        "completion manifest contains duplicate target assets"
+    );
+    ensure!(
+        valid_digest(&archive_record.sha256) && valid_digest(&checksum_record.sha256),
+        "completion manifest target asset metadata mismatch"
+    );
+    Ok((archive_record, checksum_record))
 }
 
 fn parse_completion_manifest(
@@ -1097,6 +1106,94 @@ mod tests {
         assert!(
             Version::parse("1.2.3").unwrap() > Version::parse("1.2.3-nightly.20260102.1").unwrap()
         );
+    }
+
+    #[test]
+    fn optional_unique_asset_distinguishes_missing_duplicate_and_unique() {
+        let assets = [
+            Asset {
+                name: "release.json".to_owned(),
+                browser_download_url: String::new(),
+                size: 1,
+            },
+            Asset {
+                name: "release.json".to_owned(),
+                browser_download_url: String::new(),
+                size: 2,
+            },
+        ];
+        assert!(optional_unique_asset(&assets, "release.json").is_err());
+        assert!(optional_unique_asset(&assets[..1], "missing.tar.gz")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            optional_unique_asset(&assets[..1], "release.json")
+                .unwrap()
+                .unwrap()
+                .size,
+            1
+        );
+    }
+
+    #[test]
+    fn manifest_target_pair_accepts_exactly_one_archive_and_checksum() {
+        let source = "a".repeat(40);
+        let digest = "a".repeat(64);
+        let mut manifest = CompletionManifest {
+            app: "product".to_owned(),
+            version: "1.2.3".to_owned(),
+            tag: "v1.2.3".to_owned(),
+            source_commit: source,
+            channel: "stable".to_owned(),
+            schema: 1,
+            assets: vec![
+                CompletionAsset {
+                    name: "vibeface-1.2.3-x86_64-unknown-linux-gnu.tar.gz".to_owned(),
+                    size: 10,
+                    sha256: digest.clone(),
+                },
+                CompletionAsset {
+                    name: "vibeface-1.2.3-x86_64-unknown-linux-gnu.tar.gz.sha256".to_owned(),
+                    size: 11,
+                    sha256: digest,
+                },
+            ],
+        };
+        let (archive, checksum) = manifest_target_pair(
+            &manifest,
+            "vibeface-1.2.3-x86_64-unknown-linux-gnu.tar.gz",
+        )
+        .unwrap();
+        assert_eq!(archive.size, 10);
+        assert_eq!(checksum.size, 11);
+        manifest.assets.push(CompletionAsset {
+            name: "vibeface-1.2.3-x86_64-unknown-linux-gnu.tar.gz".to_owned(),
+            size: 12,
+            sha256: "b".repeat(64),
+        });
+        assert!(manifest_target_pair(
+            &manifest,
+            "vibeface-1.2.3-x86_64-unknown-linux-gnu.tar.gz"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn canonical_public_verified_manifest_binds_one_host_target() {
+        let path = std::path::Path::new("/tmp/vibeface-release-20261108/public-verified/release.json");
+        if !path.is_file() {
+            return;
+        }
+        let body = fs::read(path).unwrap();
+        let version = Version::parse("0.0.1-nightly.20261108.1").unwrap();
+        let manifest = parse_completion_manifest(&body, "v0.0.1-nightly.20261108.1", &version).unwrap();
+        let target = host_target().unwrap();
+        let name = format!("vibeface-{}-{target}.tar.gz", version);
+        let (archive, checksum) = manifest_target_pair(&manifest, &name).unwrap();
+        assert!(archive.size > 0 && checksum.size > 0);
+        for item in &manifest.assets {
+            assert!(valid_digest(&item.sha256), "{}", item.name);
+        }
     }
 
     #[test]

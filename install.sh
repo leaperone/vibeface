@@ -384,7 +384,20 @@ case "$url" in
   *'/releases?per_page=100&page=1') cp "$VIBEFACE_INSTALL_FIXTURE/releases.json" "$output" ;;
   *'/releases?per_page=100&page=2') cp "$VIBEFACE_INSTALL_FIXTURE/page2.json" "$output" ;;
   *'/commits/'*) printf '{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","nested":{"sha":"ignored"}}' > "$output" ;;
-  */release.json) cp "$VIBEFACE_INSTALL_FIXTURE/release.json" "$output" ;;
+  */releases/download/*/release.json)
+    tag=${url#*://github.com/leaperone/vibeface/releases/download/}
+    tag=${tag%/release.json}
+    mcode=200
+    if [[ -f "$VIBEFACE_INSTALL_FIXTURE/marker-code/$tag" ]]; then mcode=$(tr -d '[:space:]' < "$VIBEFACE_INSTALL_FIXTURE/marker-code/$tag"); fi
+    if [[ $mcode == 404 ]]; then
+      : > "$output"
+    elif [[ -f "$VIBEFACE_INSTALL_FIXTURE/marker-body/$tag.json" ]]; then
+      cp "$VIBEFACE_INSTALL_FIXTURE/marker-body/$tag.json" "$output"
+    else
+      cp "$VIBEFACE_INSTALL_FIXTURE/release.json" "$output"
+    fi
+    [[ ${writeout:-} != '%{http_code}' ]] || printf '%s' "$mcode"
+    exit 0 ;;
   *.tar.gz.sha256) cp "$VIBEFACE_INSTALL_FIXTURE/checksum" "$output" ;;
   *.tar.gz) cp "$VIBEFACE_INSTALL_FIXTURE/package.tar.gz" "$output" ;;
   *) exit 22 ;;
@@ -588,7 +601,87 @@ JSON
   : > "$fixture/http-failure"
   expect_failure stable 'download failed (HTTP/network or GitHub API limit)'
   rm "$fixture/http-failure"
-  printf 'Public installer self-test passed: channels, numeric sorting, layout, SHA256, manifest, links, paths, and existing-install protection.\n'
+  reset_progressive_markers() { rm -rf "$fixture/marker-code" "$fixture/marker-body"; }
+  marker_code() {
+    mkdir -p "$fixture/marker-code"
+    printf '%s' "$2" > "$fixture/marker-code/$1"
+  }
+  progressive_releases() {
+    cat > "$fixture/releases.json" <<'JSON'
+[
+ {"tag_name":"v0.0.1-nightly.20261017.99","draft":false,"prerelease":true},
+ {"tag_name":"v0.0.1-nightly.20261017.10","draft":false,"prerelease":true},
+ {"tag_name":"v1.9.0","draft":false,"prerelease":false}
+]
+JSON
+  }
+  cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
+  repack_fixture
+  production_manifest=/tmp/vibeface-release-20261108/public-verified/release.json
+  if [[ -f $production_manifest ]]; then
+    json_fields "$production_manifest" completion > "$test_dir/production.fields" ||
+      fail 'self-test: production release.json failed completion parse'
+    awk -F '\t' '
+      $2=="name" && $3 ~ /-unknown-linux-gnu\.tar\.gz$/ && $3 !~ /\.sha256$/ { found=1 }
+      END { exit !found }
+    ' "$test_dir/production.fields" || fail 'self-test: production manifest missing linux-gnu archive binding'
+  else
+    fail 'self-test: production release.json fixture is missing'
+  fi
+  progressive_releases
+  reset_progressive_markers
+  marker_code v0.0.1-nightly.20261017.99 404
+  case_dir="$test_dir/progressive-fallback"
+  mkdir -p "$case_dir/root" "$case_dir/bin"
+  bash "$script" --channel nightly --install-root "$case_dir/root" --bin-dir "$case_dir/bin" > "$case_dir/output"
+  [[ $("$case_dir/bin/vibeface" --version) == "vibeface $version" ]] || fail 'self-test: progressive fallback installed older complete release'
+  reset_progressive_markers
+  marker_code v0.0.1-nightly.20261017.99 200
+  mkdir -p "$fixture/marker-body"
+  printf '{not-json' > "$fixture/marker-body/v0.0.1-nightly.20261017.99.json"
+  case_dir="$test_dir/corrupt-marker"
+  mkdir "$case_dir"
+  expect_failure nightly 'invalid release completion manifest JSON'
+  [[ ! -e "$case_dir/root/current" && ! -L "$case_dir/root/current" ]] || fail 'self-test: corrupt marker left a partial installation'
+  reset_progressive_markers
+  progressive_releases
+  marker_code v0.0.1-nightly.20261017.99 200
+  write_marker
+  mkdir -p "$fixture/marker-body"
+  cp "$fixture/release.json" "$fixture/marker-body/v0.0.1-nightly.20261017.99.json"
+  sed 's/"tag":"v'"$version"'"/"tag":"v0.0.1-nightly.20261017.99"/' \
+    "$fixture/marker-body/v0.0.1-nightly.20261017.99.json" > "$fixture/marker-body/v0.0.1-nightly.20261017.99.json.tmp"
+  mv "$fixture/marker-body/v0.0.1-nightly.20261017.99.json.tmp" "$fixture/marker-body/v0.0.1-nightly.20261017.99.json"
+  case_dir="$test_dir/marker-identity"
+  mkdir "$case_dir"
+  expect_failure nightly 'release completion manifest identity or target binding is invalid'
+  reset_progressive_markers
+  printf '[{"tag_name":"v%s","draft":false,"prerelease":true}]\n' "$version" > "$fixture/releases.json"
+  marker_code "v$version" 503
+  case_dir="$test_dir/marker-transport"
+  mkdir "$case_dir"
+  expect_failure nightly 'completion manifest request failed with HTTP 503'
+  reset_progressive_markers
+  repack_fixture
+  marker_code "v$version" 200
+  mkdir -p "$fixture/marker-body"
+  write_marker
+  cp "$fixture/release.json" "$fixture/marker-body/v$version.json"
+  sed 's/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/' \
+    "$fixture/marker-body/v$version.json" > "$fixture/marker-body/v$version.json.tmp"
+  mv "$fixture/marker-body/v$version.json.tmp" "$fixture/marker-body/v$version.json"
+  case_dir="$test_dir/manifest-source"
+  mkdir "$case_dir"
+  expect_failure nightly 'completion manifest source does not match release tag'
+  reset_progressive_markers
+  progressive_releases
+  marker_code v0.0.1-nightly.20261017.99 404
+  marker_code v0.0.1-nightly.20261017.10 404
+  case_dir="$test_dir/no-complete-channel"
+  mkdir "$case_dir"
+  expect_failure nightly 'no published Nightly release'
+  reset_progressive_markers
+  printf 'Public installer self-test passed: channels, numeric sorting, layout, SHA256, manifest, links, paths, progressive completion, and existing-install protection.\n'
 )
 
 if [[ ${1:-} == --self-test ]]; then
