@@ -25,13 +25,18 @@ fn provider_setup(
     local: &providers::Local,
     roots: &ProviderRoots,
 ) -> Option<Value> {
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    if provider == Provider::Cursor {
+        return Some(
+            json!({"directory":null,"command":format!("{} login",quote(&local.bin(provider).to_string_lossy()))}),
+        );
+    }
     let directory = match provider {
         Provider::Codex if local.launches(provider) => &roots.codex_home,
         Provider::Claude => &roots.claude_config,
         Provider::Opencode => &roots.opencode,
         Provider::Codex | Provider::Cursor | Provider::Pi => return None,
     };
-    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
     let mut argv = vec!["env".to_owned()];
     if provider == Provider::Opencode {
         for name in [
@@ -208,7 +213,7 @@ impl Runtime {
             Provider::Codex => self.codex.configuration_pending(&local.codex_target(true)),
             Provider::Opencode => self
                 .opencode
-                .configuration_pending(&local.bin(provider), local.env.get(provider)),
+                .configuration_pending(&local.bin(provider), &local.launch_env(provider)),
             Provider::Cursor | Provider::Claude | Provider::Pi => false,
         }
     }
@@ -261,6 +266,7 @@ impl Runtime {
         settings: ManagerSettings,
         local: &providers::Local,
     ) -> Result<ManagerConfig> {
+        let provider_env = local.launch_env(settings.provider);
         let sdk = match settings.provider {
             Provider::Cursor => Sdk::Cursor {
                 bridge: self.cursor.get().cloned(),
@@ -290,7 +296,7 @@ impl Runtime {
                 bin: local.bin(Provider::Opencode),
                 launch: Some(std::sync::Arc::new(self.opencode.lease(
                     &local.bin(Provider::Opencode),
-                    local.env.get(Provider::Opencode),
+                    &local.launch_env(Provider::Opencode),
                 )?)),
             },
         };
@@ -305,15 +311,42 @@ impl Runtime {
             instructions: String::new(),
             tool_env: self.agent_env(),
             tool_token: None,
-            provider_env: local.launch_env(settings.provider),
+            provider_env,
             process_started: None,
             codex_turn: None,
         })
     }
 
+    pub(crate) async fn prepare_manager_login(&self, config: &mut ManagerConfig) -> Result<()> {
+        if let Sdk::Claude { bin, .. } = &config.sdk {
+            config.provider_env = self
+                .prepare_claude_login(bin, std::mem::take(&mut config.provider_env))
+                .await?;
+        }
+        Ok(())
+    }
+
     /// The variables this Node sets for `provider`, and only that provider.
     pub(crate) fn provider_env(&self, provider: Provider) -> BTreeMap<String, String> {
         self.providers().launch_env(provider)
+    }
+
+    pub(crate) async fn refresh_provider_login(&self, provider: Provider) -> Result<()> {
+        if provider != Provider::Codex {
+            return Ok(());
+        }
+        let local = self.providers();
+        ProviderRoots::new(&self.data_dir).prepare_login(provider, &local, &self.host)?;
+        let desired = local.codex_target(
+            self.manager()
+                .is_some_and(|manager| manager.provider.on_app_server()),
+        );
+        if self.codex.configuration_pending(&desired) {
+            self.pending_provider_launches
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.apply_provider_launches().await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn manager_backend_ready(&self, provider: Provider) -> bool {
@@ -461,6 +494,7 @@ impl Runtime {
             "sessions":codex.then(|| self.triage.config().codex_sessions),
             "env":env, "state":state, "issues":issues, "probe":probe, "readiness":readiness,
             "execution_model":execution_model, "execution_readiness":execution_readiness,
+            "authentication_source":roots.authentication_source(provider, local),
             "setup":setup,
         })
     }
@@ -563,13 +597,19 @@ impl Runtime {
         let change = change.expand(&self.host);
         let provider = change.provider;
         ensure!(
-            !change.connect_local || matches!(provider, Provider::Codex | Provider::Cursor),
-            "local connection is available for Codex and Cursor"
+            !change.connect_local
+                || matches!(
+                    provider,
+                    Provider::Codex | Provider::Claude | Provider::Cursor
+                ),
+            "local connection is available for Codex, Claude Code and Cursor"
         );
-        let connect = (matches!(provider, Provider::Codex | Provider::Cursor)
-            && (change.connect_local
-                || change.bot == Some(true)
-                || change.execution == Some(true)))
+        let connect = (matches!(
+            provider,
+            Provider::Codex | Provider::Claude | Provider::Cursor
+        ) && (change.connect_local
+            || change.bot == Some(true)
+            || change.execution == Some(true)))
         .then(|| discovery::LocalConnect {
             provider,
             explicit_env_names: change.env.keys().cloned().collect(),
@@ -672,6 +712,11 @@ impl Runtime {
             .map(|projected| roots.publish_codex_config(projected))
             .transpose()?
             .unwrap_or(false);
+        let login_created = if requested == Some(Provider::Codex) {
+            roots.prepare_login(Provider::Codex, &next, &self.host)?
+        } else {
+            false
+        };
         if !filled.is_empty() {
             tracing::info!(event = "providers.discovered", filled = ?filled.names(), "filled missing provider paths from this computer");
         }
@@ -686,10 +731,11 @@ impl Runtime {
         if triage != previous_triage {
             self.triage.set_config(triage);
         }
-        if config_created {
+        if config_created || login_created && requested == Some(Provider::Codex) {
             self.codex.configuration_changed();
         }
         if config_created
+            || login_created
             || manager_changed
             || next.switches != previous.switches
             || next.bins != previous.bins
@@ -754,9 +800,8 @@ impl Runtime {
         self.codex.retarget(local.codex_target(codex_agent));
         self.opencode.set_launch(
             local.bin(Provider::Opencode),
-            local.env.get(Provider::Opencode).clone(),
+            local.launch_env(Provider::Opencode),
         );
-        self.refresh_cursor();
         self.pending_provider_launches.store(false, SeqCst);
         Ok(true)
     }

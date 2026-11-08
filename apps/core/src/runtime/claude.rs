@@ -125,7 +125,7 @@ impl Processes {
 
     /// Ends the processes an earlier Node run left in `pidfile` before tracking this run's.
     pub(super) fn open(pidfile: PathBuf) -> Self {
-        vibeface_bridge::agent::SdkBridge::kill_orphan(&pidfile);
+        vibeface_bridge::agent::kill_recorded_programs(&pidfile);
         Self::new(pidfile)
     }
 
@@ -141,7 +141,7 @@ impl Processes {
         }
         let pidfile = self.pidfile.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            vibeface_bridge::agent::SdkBridge::kill_orphan(&pidfile)
+            vibeface_bridge::agent::kill_recorded_programs(&pidfile)
         })
         .await;
     }
@@ -1631,7 +1631,13 @@ impl Executor for Claude {
         Box::pin(async move {
             let work_id = work.work_id.as_str();
             let reject = |failure: ExecFailure| -> Result<bool> { Err(failure.into()) };
-            let env = node.provider_env(Provider::Claude);
+            let local = node.providers();
+            let env = node
+                .prepare_claude_login(
+                    &local.bin(Provider::Claude),
+                    local.launch_env(Provider::Claude),
+                )
+                .await?;
             let projects = projects_dir(&env);
             *self.projects.lock().unwrap_or_else(PoisonError::into_inner) = projects.clone();
             let session = thread.map_or_else(|| derived(SESSION_SEED, work_id), str::to_owned);

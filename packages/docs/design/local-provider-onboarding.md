@@ -1,38 +1,49 @@
 # 本机 AI 服务接入
 
-本设计约束 Node 如何发现已经安装的 Codex 和 Cursor，并在设备设置中说明接入结果。
+本机接入支持 Codex、Claude Code、Cursor，保留 Pi、OpenCode。发现、认证来源与实际可用性分别呈现。自动接入不安装程序，也不启用 Bot 或任务执行。
 
-## 接入目标
+## 程序与设置
 
-启动时发现本机程序和已有的模型服务配置。已配置的 Node 保留自己的选择；未配置的服务提供可用来源和下一步操作，避免要求本人重新寻找程序路径。
+启动为已有用途补缺，设备页的 `configure_provider {provider, connect_local:true}` 可以单独准备服务。Web 按 Codex、Claude Code、Cursor 顺序处理，一项失败仍继续其余服务；写入结果未知时先读完整设置对账。手机开启相应用途走同一接入路径。
 
-启动只补已经启用用途的 Codex/Cursor。设备页通过既有 `configure_provider` 请求增加 `connect_local:true`，可为尚未启用的服务准备程序和私有环境，不开启 Bot 或任务执行。开启用途使用同一补缺路径。返回仍为完整 `NodeSettingsResponse`，不新增凭证来源状态或独立写接口。
+程序先使用保存的选择和 PATH，再查进程 PATH、常见用户目录、Homebrew、npm/Volta/Bun/NVM 安装。Cursor 支持官方 `agent`、`cursor-agent` 入口；Windows 使用 PATHEXT。NVM 按有效 Node 版本降序选择。npm wrapper 启动时补齐 sibling Node 或其他已发现的 Node 目录；仅能从登录 shell 找到所需 Node 时，保存受限 PATH 快照。已选择的绝对程序路径即使失效也不覆盖。
 
-程序存在、配置可复用、认证有效和模型可用是不同的状态。设备页分别呈现这些事实，不能用找到程序或读取文件代替实际可用性检查。
+仍找不到程序且没有保存 bin/PATH 时，仅查询操作系统登记登录 shell 的 PATH。Codex 的声明认证变量也沿用既有补缺流程。只读取验证过的固定名称，不导出整个环境或执行任意命令。shell 使用随机 NUL 帧、输出与时限限制，结束时回收进程树；用户启动脚本可能有自身副作用。
 
-## 本机边界
+保存的显式认证优先，其次是 Node 真实继承的命名认证环境，最后才复用本机 CLI 登录。Cursor 不从登录 shell 自动捕获 API key。`null` 只删除私有环境覆盖，不禁止进程继承或后续补缺。认证值不回读，不进入共享事件、工作记录或日志。
 
-- Node 保留自己的会话、hooks 和工作记录，不接管个人交互会话。
-- 已保存的程序、模型和认证不被发现结果覆盖。
-- 凭证只存在运行 Node 的设备，不进入共享事件、接口回读或日志。
-- 检查配置不调用模型，不执行历史工作，不自动安装程序。
-- 发现服务不等于启用执行权限，运行 Bot 与执行任务保持独立选择。
-- 不存在可复用登录时，直接给出该服务需要的操作，不声称已接入。
+## Codex 与 Claude Code
 
-## 环境补缺
+Node 的 CODEX_HOME、CLAUDE_CONFIG_DIR、会话和 hooks 继续私有。模型配置投影与认证导入是两件事；投影不复制个人会话、hooks、MCP 或项目权限。
 
-Codex 只读取私有配置中当前模型服务声明的 `env_key` 与 `env_http_headers` 变量名；Cursor 只读取 `CURSOR_API_KEY`。已有 `ProviderEnv` 值优先，再取 Node 继承值，最后仅为缺口启动操作系统登记的 `zsh`、`bash` 或 `sh` 交互登录 shell。shell 使用 Node 的 `HOME`，不继承 `ZDOTDIR`；固定脚本只输出验证过的所需名称和值，不执行全量环境导出或任意 RPC 命令。
+Codex 从本机 CODEX_HOME 或默认 `.codex/auth.json` 读取 CLI 登录。私有镜像采用官方 `chatgptAuthTokens` 外部认证模式，保留访问令牌、ID token 与账户信息，必填的 refresh_token 写为空字符串。该模式不执行原 CLI 的 managed refresh。不能仅清空 refresh_token 并保留 managed `chatgpt` 模式。仅有系统 Keychain 的 Codex 登录目前需要为 Node 独立登录。
 
-输出使用随机 NUL 帧隔离启动杂音，stdin 关闭，stderr 丢弃，并限制总输出、单值长度和时限，完成或取消时回收进程组。值先注册日志脱敏，再经既有私有文件写入。无变量是正常缺失；来源异常是固定安全错误，启动告警后继续运行，按钮保留失败反馈。shell 启动脚本仍可能有自身副作用。
+Claude 默认 macOS CLI 登录从当前 OS 用户的 `Claude Code-credentials` Keychain 项读取，跳过需要交互授权的项目，不弹出授权窗口。只有未设置 CLAUDE_CONFIG_DIR 且 HOME 是实际 OS 账户目录时才查询默认 Keychain。显式配置目录只读取其中 `.credentials.json`，不猜其 Keychain 命名空间。其他平台读取官方 credential 文件。Node 专属访问快照移除单次使用的 refreshToken，只保留访问令牌和元数据，不创建或覆盖 Claude CLI 的 `.credentials.json`。
 
-本次请求明确编辑的名称包含 `null`，均不自动补回。`null` 保持删除私有覆盖的语义，不永久禁止后续导入。补入值保存在当前 Node，不持续跟随来源更新。Codex system 模式跳过私有接入。OAuth 文件、钥匙串、GUI token、个人 sessions/hooks、固定认证头不在导入范围；无声明环境认证时使用私有登录或填写密钥的兜底。
+Codex 的导入标记保存首次私有 auth.json 的摘要，该文件以不覆盖方式创建。后续检查或必要启动只更新 Node 专属的 local-login-access.json。文件仍匹配导入标记时，Codex 把 external auth 作为启动目标的一部分，在空闲切换后、发布 App Server endpoint 之前通过官方 account/login/start 写入内存。用户后来独立登录或修改 auth.json 后，Node 放弃借用，不再替换该文件。
 
-只有实际变化才保存。新建 Codex 配置即使没有 bin/env 变化，也使旧探针失效，在管理回合、外部工作、调度任务和进程租约全部空闲后重载同一托管目标，再观察账户与模型。恢复不重发 prompt。
+Claude 在检查或每次必要启动前，先用不含借用令牌的官方 `auth status --json` 检查私有登录，包括私有目录对应的 Keychain。只有明确未登录且没有私有 `.credentials.json` 时，才更新 Node 的访问快照，并临时注入 CLAUDE_CODE_OAUTH_TOKEN。私有登录成功、检查失败或状态不明时均不借用。后来为 Node 独立登录后，下一次检查或启动会自动使用该私有登录。
 
-## 设备页
+原 CLI 始终保有刷新权，Node 不消耗源刷新令牌，也不替原 CLI 登录。源令牌没有更新且借用快照过期时显示需登录，可先在原 CLI 完成刷新再检查，或使用设备页的私有登录命令。
 
-设备列表顶部突出当前连接的电脑和 AI 服务，后方分组电脑、手机与浏览器。复用同一 `AiSettings` 读写状态，程序、认证、模型分别显示证据；远端接入明确目标电脑名。程序路径、私有目录和完整诊断按需展开。
+认证存在不能证明有效。探针仍使用实际运行目录和环境，发现和导入不会把状态设为 ready。Codex 新认证与配置变化使用既有空闲重载边界，保留活跃任务，不重发提示。
 
-按钮依次处理 Codex/Cursor，一项失败仍处理另一项；写入结果未知时先读取完整设置对账，读取失败时先重新读取再允许重试。持续结果通过 `role=status` 呈现。未验证不显示为可用，保存成功不等于认证或模型验证通过。
+## Cursor
 
-状态变化提供明确的文字反馈。窄屏、键盘操作和减少动态效果模式保留相同功能，不通过颜色或动画单独表达结果。
+Cursor 通过官方 `agent acp` 接入，直接复用 CLI 登录。缺少 API key 时自然使用订阅；保存或继承的 CURSOR_API_KEY/CURSOR_AUTH_TOKEN 仍可显式使用。显式认证在官方 memory credential store 中运行，避免改变个人 CLI 的凭据存储。缺认证时给出 `agent login` 命令，不自动打开浏览器。
+
+订阅检查运行 `agent status --format json`，只保留状态枚举和认证布尔值，丢弃身份及消息。未登录也可能退出 0，退出码不能作为已认证证据。只有完整本地登录才继续 ACP 初始化，显式 key/token 则独立检查会话初始化结果。默认检查和执行从不调用会触发浏览器登录的 ACP authenticate。
+
+ACP 会话使用每个 Node owner 的私有 CURSOR_CONFIG_DIR 和 CURSOR_DATA_DIR，保持真实 HOME 供官方 CLI 读取认证。该目录行为由 Cursor `2026.11.05-86047df` 官方发行源码确认；ACP 历史实际在 config 根的 `acp-sessions` 下，不能仅设置数据根。Node 只新建或加载自己持久记录归属的会话，不扫描个人历史。官方 CLI 仍可读取用户及项目的 MCP、规则或 hooks，私有根不代表禁用这些 CLI 资源。
+
+检查可以创建私有空 ACP 会话以取得模型目录，不提交 prompt 或调用模型。模型目录失败不等于确定认证失败。本地登录状态、元数据检查与真实订阅调用分别报告。
+
+Node 工具通过仅回环监听的 `/mcp` 接入，所有请求使用当前 attempt 的 bearer，调用同一 Runtime.tool 路径，保留个人网络、聊天、任务、撤销和 call_ref 去重规则。加载旧会话只提供当前 token；历史 update 不作为本轮回复，加载期间的权限请求不授予执行。当前已授权任务的已知工具仅选择 allow_once，未知工具、未知请求与阻塞交互均明确拒绝或取消，不授予持续权限。
+
+## 提交、停止与恢复
+
+Cursor 每轮使用独立受管 ACP 进程，同一 owner 串行，不同 owner 可并行。会话归属先落盘，再保存 Node 提交凭证，之后才能发送 prompt；真实活动出现后才记录启动证据。终态先写私有 journal，再向调用方报告完成。
+
+Node 的提交凭证不是 Cursor 原生 run ID。ACP 没有持久 run 查询或幂等 prompt 契约；恢复只读取精确 journal，不新发 prompt，不加载历史来推断某个提交成功。断流或崩溃缺少终态时保持待核对。停止只有收到原 prompt 的 cancelled 终态才算确认，杀掉进程不能证明取消。
+
+受控夹具验证以上边界，不读取个人认证、不调用真实模型。真实订阅、Keychain 访问授权及其他平台制品需单独核验，不能由程序发现、文件存在或 HTTP 成功替代。

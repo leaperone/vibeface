@@ -34,7 +34,7 @@ ScheduleControlled { schedule_id, action: pause | resume | delete, attestation }
 
 ## 2. 联网
 
-- **搜索。** Codex SDK 的协调回合打开原生搜索：`web_search="live"`。Cursor SDK 用它自己的默认工具集，Node 不开关它的原生搜索；两条路径都有 `fetch_url`。
+- **搜索。** Codex SDK 的协调回合打开原生搜索：`web_search="live"`。Cursor CLI 用它自己的默认工具集，Node 不开关它的原生搜索；两条路径都有 `fetch_url`。
 - **`fetch_url`。** Node 进程里执行的只读工具，所有轮次都可用：
   - 只允许 `http` 和 `https`，只发 `GET`，不带 cookie、认证头和代理。
   - 解析域名后每个地址都必须是公网单播地址：回环、私有、链路本地、CGNAT、组播、文档与保留段、IPv4 映射的 IPv6 和唯一本地 IPv6 都拒绝。连接固定到检查过的地址，防止 DNS 重绑定；跳转最多 5 次，每次重新检查。所以它进不了局域网，也打不到本机 Node 的 API。
