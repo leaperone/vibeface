@@ -1797,6 +1797,35 @@ mod tests {
     }
 
     #[test]
+    fn a_revoked_manager_cannot_backdate_a_derived_manager() -> Result<()> {
+        let (_, a, _, mut state) = setup()?;
+        let (b, derived) = (identity(), identity());
+        state.append(GovernanceEvent::grant(
+            &a,
+            &state.project()?,
+            Member::client(&b, "b", true)?,
+        )?)?;
+        let before_removal = state.clone();
+        state.append(GovernanceEvent::revoke(
+            &b,
+            &state.project()?,
+            cut(&a, 0),
+        )?)?;
+        let attack = GovernanceEvent::grant(
+            &a,
+            &before_removal.project()?,
+            Member::client(&derived, "derived", true)?,
+        )?;
+        let attack_hash = attack.hash()?;
+        state.append(attack)?;
+        let view = state.project()?;
+        assert!(view.member(&id(&derived)).is_err());
+        assert!(!view.attester(&id(&derived)));
+        assert!(state.events.iter().any(|event| event.hash().ok().as_ref() == Some(&attack_hash)));
+        Ok(())
+    }
+
+    #[test]
     fn revocation_wins_and_records_the_largest_cutoff() -> Result<()> {
         let (_, a, node, base) = setup()?;
         let b = identity();
