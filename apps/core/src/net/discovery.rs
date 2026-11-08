@@ -26,12 +26,18 @@ const MAX_REQUEST: usize = 2048;
 const MAX_REPLY: usize = bootstrap::MAX_SIGNED_CATALOG_BYTES + 512;
 const MAX_SESSIONS: usize = 512;
 const MAX_PER_IP: usize = 8;
+/// Requests other than lookups per session; lookups are rate limited instead, so a dialer that
+/// keeps resolving peers does not lose its registration.
 const MAX_REQUESTS: usize = 60;
+const LOOKUPS_PER_SECOND: usize = 20;
 const LEASE: Duration = Duration::from_secs(60);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const NOTICE_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_HOME_RELAYS: usize = 4;
 const MAX_RELAY_URL: usize = 256;
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(1);
+const RETRY_MIN: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Server {
@@ -296,6 +302,7 @@ impl Discovery {
             let observations = observations.clone();
             let own_relay = own_relay.clone();
             tasks.push(tokio::spawn(async move {
+                let mut retry = RETRY_MIN;
                 while !endpoint.is_closed() {
                     let result = register(
                         &endpoint,
@@ -306,12 +313,24 @@ impl Discovery {
                         own_relay.as_ref(),
                     )
                     .await;
-                    *client.connection.lock().expect("discovery connection") = None;
+                    if client
+                        .connection
+                        .lock()
+                        .expect("discovery connection")
+                        .take()
+                        .is_some()
+                    {
+                        retry = RETRY_MIN;
+                    }
                     // A session that ended normally (lease, request budget, new home relay)
                     // reconnects at once: until then lookups and relay joiners find nothing.
+                    // Failures back off with jitter, so an unreachable server is not hammered
+                    // by every device in step.
                     if let Err(error) = result {
                         tracing::debug!(%error, "discovery registration ended");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let jitter = rand::random::<f64>() * 0.5 + 0.5;
+                        tokio::time::sleep(retry.mul_f64(jitter)).await;
+                        retry = (retry * 2).min(RETRY_MAX);
                     }
                 }
             }));
@@ -350,7 +369,11 @@ impl Discovery {
                         relays,
                     } if found == device_id => {
                         validate_address(address)?;
-                        validate_relays(&relays, local(&connection))?;
+                        let count = relays.len();
+                        let relays = usable_relays(relays, local(&connection));
+                        if relays.len() < count {
+                            tracing::debug!(%device_id, dropped = count - relays.len(), "dropped relays from a discovery record");
+                        }
                         Ok::<_, anyhow::Error>(Some(Located { address, relays }))
                     }
                     Reply::Missing {} => Ok(None),
@@ -391,8 +414,10 @@ impl Discovery {
             };
             let mut work = JoinSet::new();
             let mut registered = false;
+            let mut requests = 0;
+            let mut lookups = (Instant::now(), 0);
             async {
-                for _ in 0..MAX_REQUESTS {
+                loop {
                     let streams = tokio::select! {
                         _ = connection.closed() => break,
                         streams = connection.accept_bi() => streams?,
@@ -402,6 +427,13 @@ impl Discovery {
                         tokio::time::timeout(CONTROL_TIMEOUT, read(&mut recv, MAX_REQUEST))
                             .await
                             .context("discovery request timed out")??;
+                    let counted = !matches!(request, Request::Lookup { .. });
+                    if !counted {
+                        if lookups.0.elapsed() >= Duration::from_secs(1) {
+                            lookups = (Instant::now(), 0);
+                        }
+                        lookups.1 += 1;
+                    }
                     match request {
                         Request::Probe {} => {
                             write(&mut send, &Reply::Probed {}, MAX_REPLY).await?;
@@ -448,7 +480,16 @@ impl Discovery {
                             send.finish()?;
                         }
                         Request::Register { relays } if self.server && !registered => {
-                            validate_relays(&relays, !crate::fetch::public(address.ip()))?;
+                            let count = relays.len();
+                            let relays =
+                                registered_relays(relays, !crate::fetch::public(address.ip()))
+                                    .await;
+                            if relays.len() < count {
+                                tracing::debug!(
+                                    dropped = count - relays.len(),
+                                    "dropped relays from a discovery registration"
+                                );
+                            }
                             registered = true;
                             let (notices, mut incoming) = mpsc::channel(8);
                             let device_id = connection.remote_id();
@@ -484,6 +525,13 @@ impl Discovery {
                                 }
                                 Ok::<_, anyhow::Error>(())
                             });
+                        }
+                        Request::Lookup { .. } if self.server && lookups.1 > LOOKUPS_PER_SECOND => {
+                            let reply = Reply::Refused {
+                                reason: "too many discovery lookups".into(),
+                            };
+                            write(&mut send, &reply, MAX_REPLY).await?;
+                            send.finish()?;
                         }
                         Request::Lookup { device_id } if self.server => {
                             let found = {
@@ -521,6 +569,12 @@ impl Discovery {
                         _ => bail!("this endpoint only accepts discovery probes"),
                     }
                     while work.try_join_next().is_some() {}
+                    if counted {
+                        requests += 1;
+                        if requests == MAX_REQUESTS {
+                            break;
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -540,35 +594,65 @@ pub(super) struct Located {
     pub relays: Vec<RelayUrl>,
 }
 
-/// Dialers use registered relays as given, so a record must not point them at this host or a
-/// private network, unless the registering device or the queried server is itself on one.
-fn validate_relays(relays: &[RelayUrl], local: bool) -> Result<()> {
-    ensure!(
-        relays.len() <= MAX_HOME_RELAYS,
-        "too many relays in a discovery record"
-    );
-    for url in relays {
-        ensure!(
-            url.as_str().len() <= MAX_RELAY_URL,
-            "relay URL in a discovery record is too long"
-        );
-        super::relay_url(url.as_str())?;
-        let host = url
-            .host_str()
-            .unwrap_or_default()
-            .trim_matches(['[', ']'])
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
-        let public = match host.parse::<IpAddr>() {
-            Ok(ip) => crate::fetch::public(ip),
-            Err(_) => !host.is_empty() && host != "localhost" && !host.ends_with(".localhost"),
-        };
-        ensure!(
-            public || local,
-            "relay in a discovery record is on a local or private network"
-        );
+/// Dialers use registered relays as given, so a record keeps only relays off this host and
+/// private networks, unless the registering device or the queried server is itself on one.
+/// Dropping a relay leaves the rest of the record usable.
+fn usable_relays(relays: Vec<RelayUrl>, local: bool) -> Vec<RelayUrl> {
+    relays
+        .into_iter()
+        .filter(|url| {
+            url.as_str().len() <= MAX_RELAY_URL
+                && super::relay_url(url.as_str()).is_ok()
+                && (local || public_host(url))
+        })
+        .take(MAX_HOME_RELAYS)
+        .collect()
+}
+
+fn public_host(url: &RelayUrl) -> bool {
+    let host = url
+        .host_str()
+        .unwrap_or_default()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    match host.parse::<IpAddr>() {
+        Ok(ip) => crate::fetch::public(ip),
+        Err(_) => !host.is_empty() && host != "localhost" && !host.ends_with(".localhost"),
     }
-    Ok(())
+}
+
+/// The relays a registration may publish: names must also resolve only to public addresses.
+async fn registered_relays(relays: Vec<RelayUrl>, local: bool) -> Vec<RelayUrl> {
+    let relays = usable_relays(relays, local);
+    if local {
+        return relays;
+    }
+    let public = futures_util::future::join_all(relays.iter().map(resolves_public)).await;
+    relays
+        .into_iter()
+        .zip(public)
+        .filter_map(|(url, public)| public.then_some(url))
+        .collect()
+}
+
+/// A name that fails to resolve in time is dropped: a dialer cannot use it either.
+async fn resolves_public(url: &RelayUrl) -> bool {
+    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
+    let port = url.port_or_known_default().unwrap_or(443);
+    let Ok(Ok(addresses)) =
+        tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port))).await
+    else {
+        return false;
+    };
+    let mut any = false;
+    for address in addresses {
+        if !crate::fetch::public(address.ip()) {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 /// Whether the peer of `connection` is on this host or a private network.
@@ -607,18 +691,27 @@ async fn register(
     own_relay: Option<&RelayUrl>,
 ) -> Result<()> {
     let mut addr = endpoint.watch_addr();
-    let home = |addr: &EndpointAddr| {
+    let connection = server.connect(endpoint).await?;
+    // A public server keeps only public relays, so non-public ones never reach it.
+    let local = local(&connection);
+    let candidates = |addr: &EndpointAddr| {
         let mut relays = addr.relay_urls().cloned().collect::<Vec<_>>();
         if let Some(own) = own_relay
             && !relays.contains(own)
         {
             relays.push(own.clone());
         }
-        relays.truncate(MAX_HOME_RELAYS);
         relays
     };
-    let relays = home(&addr.get());
-    let connection = server.connect(endpoint).await?;
+    let home = |addr: &EndpointAddr| usable_relays(candidates(addr), local);
+    let all = candidates(&addr.get());
+    let relays = usable_relays(all.clone(), local);
+    if relays.len() < all.len() {
+        tracing::debug!(
+            dropped = all.len() - relays.len(),
+            "relays left out of the discovery registration"
+        );
+    }
     let (mut send, mut recv) = connection.open_bi().await?;
     write(
         &mut send,
@@ -856,14 +949,27 @@ mod tests {
                 })
                 .collect()
         };
-        validate_relays(&relays(MAX_HOME_RELAYS), false)?;
-        assert!(validate_relays(&relays(MAX_HOME_RELAYS + 1), false).is_err());
-        assert!(validate_relays(&["ftp://relay.example/".parse()?], false).is_err());
+        let parsed = |urls: &[&str]| -> Vec<RelayUrl> {
+            urls.iter()
+                .map(|url| url.parse().expect("relay URL"))
+                .collect()
+        };
+        assert_eq!(
+            usable_relays(relays(MAX_HOME_RELAYS + 1), false),
+            relays(MAX_HOME_RELAYS)
+        );
         let long: RelayUrl =
             format!("https://relay.example/{}", "a".repeat(MAX_RELAY_URL)).parse()?;
-        assert!(validate_relays(&[long], true).is_err());
-        validate_relays(&["https://203.0.113.9.sslip.io/".parse()?], false)?;
-        for local in [
+        // A bad relay is dropped, and the rest of the record stays.
+        let mut mixed = parsed(&["ftp://relay.example/", "http://127.0.0.1:3340/"]);
+        mixed.push(long);
+        mixed.extend(relays(1));
+        assert_eq!(usable_relays(mixed.clone(), false), relays(1));
+        assert_eq!(
+            usable_relays(mixed, true),
+            [parsed(&["http://127.0.0.1:3340/"]), relays(1)].concat()
+        );
+        let local = parsed(&[
             "http://127.0.0.1:3340/",
             "http://10.0.0.2/",
             "http://192.168.1.5:3340/",
@@ -873,14 +979,9 @@ mod tests {
             "http://[fe80::1]/",
             "http://localhost:3340/",
             "http://relay.localhost/",
-        ] {
-            let url: RelayUrl = local.parse()?;
-            assert!(
-                validate_relays(std::slice::from_ref(&url), false).is_err(),
-                "{local}"
-            );
-            validate_relays(&[url], true)?;
-        }
+        ]);
+        assert!(usable_relays(local.clone(), false).is_empty());
+        assert_eq!(usable_relays(local.clone(), true), local[..MAX_HOME_RELAYS]);
         // Four relay URLs at the length limit still fit one registration frame.
         let longest: RelayUrl = format!(
             "https://relay.example/{}",
@@ -893,6 +994,34 @@ mod tests {
         };
         assert!(serde_json::to_vec(&register)?.len() <= MAX_REQUEST);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_drops_relays_that_resolve_to_private_addresses() {
+        let parsed = |urls: &[&str]| -> Vec<RelayUrl> {
+            urls.iter()
+                .map(|url| url.parse().expect("relay URL"))
+                .collect()
+        };
+        // IP literals and `localhost` resolve without the network.
+        assert!(resolves_public(&"https://1.1.1.1/".parse().expect("relay URL")).await);
+        for url in parsed(&[
+            "http://127.0.0.1/",
+            "http://[::1]/",
+            "http://localhost:3340/",
+        ]) {
+            assert!(!resolves_public(&url).await, "{url}");
+        }
+        let urls = parsed(&[
+            "https://1.1.1.1/",
+            "http://10.0.0.2/",
+            "https://[2606:4700::1111]/",
+        ]);
+        assert_eq!(
+            registered_relays(urls.clone(), false).await,
+            [urls[0].clone(), urls[2].clone()]
+        );
+        assert_eq!(registered_relays(urls.clone(), true).await, urls);
     }
 
     #[test]

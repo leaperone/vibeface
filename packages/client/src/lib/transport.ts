@@ -8,7 +8,7 @@ export type DeviceChannel = {
   idle(): boolean
   close(): void
 }
-/** `origin`: the Gateway the link was opened from; the ticket itself names only the entry Node's device ID. */
+/** The ticket names the entry Node only by its device ID. */
 export type JoinLink = { entryId: string; inviteId: string; inviteHash: string; secret: string }
 /** This device's Ed25519 key as its platform keeps it: made once, it only ever signs. */
 export type DeviceKeys = {

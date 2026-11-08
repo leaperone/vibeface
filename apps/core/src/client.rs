@@ -1513,12 +1513,14 @@ impl JoinLink {
     async fn open(node: &Runtime, ticket: &Ticket) -> Result<Self> {
         let entry = ticket.entry_id();
         let token = net::relay_token(&ticket.invite_hash());
+        // The entry Node may run any configured relay, and iroh reads a relay's token only when
+        // it first connects, so the invite token goes in before binding.
         let mut relays = node
             .config
             .network
             .relays
             .iter()
-            .map(|url| Ok((net::relay_url(url)?, None)))
+            .map(|url| Ok((net::relay_url(url)?, Some(token.clone()))))
             .collect::<Result<Vec<_>>>()?;
         if node.config.network.n0_relays {
             relays.extend(
@@ -2069,7 +2071,6 @@ mod tests {
         #[derive(Default)]
         struct PrivateRelay {
             attempts: std::sync::Mutex<Vec<(iroh::EndpointId, Option<String>)>>,
-            without_token: std::sync::Mutex<Option<iroh::EndpointId>>,
         }
         impl std::fmt::Debug for PrivateRelay {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2084,16 +2085,10 @@ mod tests {
                     .expect("relay attempts")
                     .push((request.endpoint_id(), token.clone()));
                 let invite_token = net::relay_token(&vibeface_secure::join::invite_hash(&[7; 32]));
-                let allowed = match token {
-                    Some(token) => {
-                        net::same_token(&token, OPERATOR_TOKEN)
-                            || net::same_token(&token, &invite_token)
-                    }
-                    None => {
-                        *self.without_token.lock().expect("relay allowance")
-                            == Some(request.endpoint_id())
-                    }
-                };
+                let allowed = token.is_some_and(|token| {
+                    net::same_token(&token, OPERATOR_TOKEN)
+                        || net::same_token(&token, &invite_token)
+                });
                 if allowed {
                     Access::Allow
                 } else {
@@ -2325,7 +2320,13 @@ mod tests {
                     OPERATOR_TOKEN,
                     Some(OPERATOR_TOKEN),
                 ),
-                ("configured-relay", false, None, OPERATOR_TOKEN, None),
+                (
+                    "configured-relay",
+                    false,
+                    None,
+                    OPERATOR_TOKEN,
+                    Some(invite_token.as_str()),
+                ),
             ] {
                 let configuration = NetworkConfig {
                     bind: Some("127.0.0.1:0".parse()?),
@@ -2342,10 +2343,6 @@ mod tests {
                     ..Default::default()
                 };
                 let joining = node(&dir.join(name), configuration, token).await?;
-                if entry_relay.is_none() {
-                    *access.without_token.lock().expect("relay allowance") =
-                        Some(net::endpoint_id(&joining.identity.device_id()?)?);
-                }
                 check(&joining, &ticket, &access, expected_token)
                     .await
                     .with_context(|| format!("relay case {name}"))?;
