@@ -157,7 +157,8 @@ impl Drop for Serve {
 
 /// A serve an earlier run of the Node left is killed, not adopted: its runs died with that Node
 /// and probes read them back from the store. Only a tree whose own command line is such a serve
-/// is touched, so a recorded identifier that now belongs to something else is left alone.
+/// is touched; a recorded identifier that now belongs to something else is left running and its
+/// stale record dropped, so a reused process group never blocks the next start.
 fn kill_orphan(pidfile: &Path) {
     let Ok(token) = std::fs::read_to_string(pidfile) else {
         return;
@@ -169,12 +170,17 @@ fn kill_orphan(pidfile: &Path) {
             event = "opencode.leftover_stopped",
             "stopping the opencode serve left by an earlier run"
         ),
-        Ok(None) => {}
-        Err(error) => tracing::warn!(
-            event = "opencode.leftover_left_alone",
-            %error,
-            "the opencode serve left by an earlier run was not ended"
-        ),
+        Ok(None) => {
+            let _ = std::fs::remove_file(pidfile);
+        }
+        Err(error) => {
+            tracing::warn!(
+                event = "opencode.leftover_left_alone",
+                %error,
+                "the opencode serve left by an earlier run was not ended"
+            );
+            let _ = std::fs::remove_file(pidfile);
+        }
     }
     if matches!(tree::Leftover::find(token.trim()), Ok(None)) {
         let _ = std::fs::remove_file(pidfile);
