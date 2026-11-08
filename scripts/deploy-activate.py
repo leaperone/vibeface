@@ -285,6 +285,7 @@ def transform_nginx(text, config):
     for node in targets[0]['children']:
         words = node['words']
         if words[0] != 'location':
+            require(words[0] != 'include', 'target nginx server must not include unverified routes')
             if words[0] in ('root', 'index') or config['role'] in ('app', 'www') and (words[0] == 'add_header' and len(words) >= 3 and words[1].lower() in HEADER_NAMES):
                 edits.append((node['start'], node['end'], ''))
             continue
@@ -310,7 +311,7 @@ def transform_nginx(text, config):
                          ('/api/info', '/api/client', '/api/relay/grant', '/api/decision')) \
                         or words == ['location', '^~', '/bootstrap/'] \
                         or words == ['location', '~', '^/(relay|ping|generate_204)$']
-                denied = all(n['words'] == ['return', '404'] for n in node['children'] or [])
+                denied = bool(node['children']) and all(n['words'] == ['return', '404'] for n in node['children'])
                 require((infra and not directives & {'try_files', 'alias', 'root', 'index', 'include'}) or denied,
                         'unrecognized static or gateway nginx location')
                 continue
@@ -349,34 +350,39 @@ def lease(config, previous):
                 process.terminate()
                 process.wait(timeout=5)
     else:
-        endpoint = checked_path(Path(config['maintenance_socket']))
-        metadata, parent = endpoint.lstat(), endpoint.parent.lstat()
-        require(stat.S_ISSOCK(metadata.st_mode) and metadata.st_uid == config['uid']
-                and stat.S_IMODE(metadata.st_mode) == 0o600 and parent.st_uid == config['uid']
-                and stat.S_IMODE(parent.st_mode) == 0o700, 'legacy maintenance socket is not private')
-        stream = socket.socket(socket.AF_UNIX)
-        stream.settimeout(15)
-        try:
-            os.setegid(config['gid']); os.seteuid(config['uid'])
-            stream.connect(str(endpoint))
-        finally:
-            os.seteuid(0); os.setegid(0)
-        try:
-            _, uid, _ = struct.unpack('3i', stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-            require(uid == config['uid'], 'legacy maintenance peer differs')
-            stream.sendall(b'{"protocol":1,"command":"acquire"}\n')
-            packet = bytearray()
-            while not packet.endswith(b'\n') and len(packet) <= 4096:
-                part = stream.recv(4096)
-                require(part, 'legacy maintenance connection ended early')
-                packet.extend(part)
-            value = json.loads(packet)
-            require(len(packet) <= 4096 and value.get('protocol') == 1 and value.get('status') == 'ready'
-                    and value['health']['device_id'] == config['device_id'], 'legacy maintenance lease was refused')
-            yield
-        finally:
-            stream.close()
+        with legacy_channel(config, 'acquire') as health:
+            yield health
 
+
+@contextmanager
+def legacy_channel(config, request):
+    endpoint = checked_path(Path(config['maintenance_socket']))
+    metadata, parent = endpoint.lstat(), endpoint.parent.lstat()
+    require(stat.S_ISSOCK(metadata.st_mode) and metadata.st_uid == config['uid']
+            and stat.S_IMODE(metadata.st_mode) == 0o600 and parent.st_uid == config['uid']
+            and stat.S_IMODE(parent.st_mode) == 0o700, 'legacy maintenance socket is not private')
+    stream = socket.socket(socket.AF_UNIX)
+    stream.settimeout(15)
+    try:
+        os.setegid(config['gid']); os.seteuid(config['uid'])
+        stream.connect(str(endpoint))
+    finally:
+        os.seteuid(0); os.setegid(0)
+    try:
+        _, uid, _ = struct.unpack('3i', stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        require(uid == config['uid'], 'legacy maintenance peer differs')
+        stream.sendall((json.dumps({'protocol': 1, 'command': request}) + '\n').encode())
+        packet = bytearray()
+        while not packet.endswith(b'\n') and len(packet) <= 4096:
+            part = stream.recv(4096)
+            require(part, 'legacy maintenance connection ended early')
+            packet.extend(part)
+        value = json.loads(packet)
+        require(len(packet) <= 4096 and value.get('protocol') == 1 and value.get('status') == ('ready' if request == 'acquire' else 'healthy')
+                and value['health']['device_id'] == config['device_id'], 'legacy maintenance lease was refused')
+        yield value['health']
+    finally:
+        stream.close()
 
 @contextmanager
 def node_lock(config):
@@ -425,6 +431,16 @@ def restored_previous(previous):
     return True
 
 
+def previous_stopped(previous):
+    if not previous:
+        return False
+    try:
+        _, info = container_info(previous)
+    except (ValueError, KeyError, json.JSONDecodeError):
+        return False
+    return not info['State']['Running'] and info['State']['Pid'] == 0
+
+
 def rollback(journal, journal_path):
     target, config = journal['target'], journal['config']
     phase = journal['phase']
@@ -434,12 +450,19 @@ def rollback(journal, journal_path):
         return
     previous = journal['previous']
     restored = restored_previous(previous)
-    if phase != 'stopping_previous' and not restored:
+    legacy_restored = False
+    if not previous and config['role'] in CORE_ROLES:
+        if command('systemctl', 'is-active', '--quiet', config['legacy_service'], check=False).returncode == 0:
+            with legacy_channel(config, 'probe') as health:
+                require(health['version'] == journal['legacy_version'], 'legacy running version differs')
+            stopped(target)
+            legacy_restored = True
+    if phase != 'stopping_previous' and not restored and not legacy_restored and not previous_stopped(previous):
         stop(target)
     if phase == 'switching_nginx' and journal.get('nginx_backup'):
         path = checked_path(Path(config['nginx_config']))
         nginx_apply(config, Path(journal['nginx_backup']).read_bytes(), path.stat())
-    if config['role'] in CORE_ROLES and not restored:
+    if config['role'] in CORE_ROLES and not restored and not legacy_restored:
         with node_lock(config):
             require(hashlib.sha256((Path(config['data_dir']) / 'identity.json').read_bytes()).hexdigest()
                     == journal['identity_sha256'], 'identity changed; automatic rollback was refused')
@@ -454,6 +477,8 @@ def rollback(journal, journal_path):
     elif previous and not restored:
         compose(previous, 'up', '-d', '--no-build', '--pull', 'never', 'service')
         wait_healthy(previous)
+    if legacy_restored and journal['legacy_enabled']:
+        command('systemctl', 'enable', config['legacy_service'])
     current_path = journal_path.parent / 'current.json'
     if previous:
         write_json(current_path, previous)
@@ -531,7 +556,9 @@ def activate(config, image, tag, source, version):
         write_json(journal_path, journal)
         try:
             if config['role'] in CORE_ROLES:
-                with lease(config, current):
+                with lease(config, current) as health:
+                    if not current:
+                        journal['legacy_version'] = health['version']
                     journal['phase'] = 'stopping_previous'; write_json(journal_path, journal)
                     if current:
                         stop(current)
@@ -627,14 +654,15 @@ server {
         else:
             raise AssertionError('Relay kept a frontend route')
     for selector in ('location = /favicon.ico { alias /old/icon.ico; }',
-                     'location /old/ { include /old/static.conf; }'):
+                     'location /old/ { include /old/static.conf; }', 'location /old/ {}'):
         try:
             transform_nginx(nginx.replace('location / {', selector + '\n    location / {', 1), app)
         except ValueError:
             pass
         else:
             raise AssertionError('unknown static route accepted')
-    for bad in (nginx.replace('app.example.invalid', 'other.example.invalid'), nginx + '\nserver {'):
+    for bad in (nginx.replace('app.example.invalid', 'other.example.invalid'), nginx + '\nserver {',
+                nginx.replace('location / {', 'include /old/routes.conf; location / {', 1)):
         try:
             transform_nginx(bad, app)
         except ValueError:
@@ -672,6 +700,7 @@ server {
         state = {'schema': 1, 'phase': 'starting', 'target': {'project': 'owned'}, 'config': {'role': 'app'},
                  'previous': {'project': 'previous'}}
         with patch(__name__ + '.restored_previous', return_value=False), \
+                patch(__name__ + '.previous_stopped', return_value=False), \
                 patch(__name__ + '.stop', side_effect=lambda target: events.append('stop-new')), \
                 patch(__name__ + '.compose', side_effect=lambda *a: events.append('start-previous')), \
                 patch(__name__ + '.wait_healthy', side_effect=lambda *a: events.append('check-previous')):
@@ -686,11 +715,32 @@ server {
             rollback(copy.deepcopy(state), directory / 'activation.json')
         assert not events and read_json(directory / 'activation.json')['phase'] == 'rolled_back'
         events.clear()
+        with patch(__name__ + '.restored_previous', return_value=False), \
+                patch(__name__ + '.previous_stopped', return_value=True), \
+                patch(__name__ + '.stop', side_effect=lambda *a: events.append('unsafe-stop')), \
+                patch(__name__ + '.compose', side_effect=lambda *a: events.append('start-previous')), \
+                patch(__name__ + '.wait_healthy', side_effect=lambda *a: events.append('check-previous')):
+            rollback(copy.deepcopy(state), directory / 'activation.json')
+        assert events == ['start-previous', 'check-previous']
+        events.clear()
+        @contextmanager
+        def restored_legacy(*args):
+            yield {'version': '1.0.0'}
+        legacy_state = dict(state, previous=None, legacy_version='1.0.0', legacy_enabled=False,
+                            config={'role': 'entry', 'legacy_service': 'fixture.service'})
+        with patch(__name__ + '.legacy_channel', side_effect=restored_legacy), \
+                patch(__name__ + '.command', return_value=subprocess.CompletedProcess([], 0, '', '')), \
+                patch(__name__ + '.stopped', side_effect=lambda *a: events.append('verify-target-stopped')), \
+                patch(__name__ + '.stop', side_effect=lambda *a: events.append('unsafe-stop')):
+            rollback(legacy_state, directory / 'activation.json')
+        assert events == ['verify-target-stopped']
+        events.clear()
         with patch(__name__ + '.stop', side_effect=lambda target: events.append('unsafe-stop')):
             rollback(dict(state, phase='prepared'), directory / 'activation.json')
         assert not events
         events.clear()
         with patch(__name__ + '.restored_previous', return_value=False), \
+                patch(__name__ + '.previous_stopped', return_value=False), \
                 patch(__name__ + '.stop', side_effect=ValueError('new process still running')), \
                 patch(__name__ + '.compose', side_effect=lambda *a: events.append('unsafe-start')):
             try:
