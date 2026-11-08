@@ -24,6 +24,7 @@ enum OperationFailure {
     Lock,
     Registration,
     UpdateRefused,
+    RecoveryRequired,
 }
 
 impl std::fmt::Display for OperationFailure {
@@ -35,6 +36,7 @@ impl std::fmt::Display for OperationFailure {
             Self::Lock => "desktop_node_lock_unconfirmed",
             Self::Registration => "desktop_node_registration_unconfirmed",
             Self::UpdateRefused => "desktop_node_update_refused",
+            Self::RecoveryRequired => "desktop_node_recovery_required",
         })
     }
 }
@@ -77,6 +79,7 @@ struct RuntimeUpdateJson {
     installed_version: Option<String>,
     running_version: Option<String>,
     availability: &'static str,
+    recovery_required: bool,
 }
 
 #[derive(Serialize)]
@@ -511,7 +514,20 @@ fn runtime_update_for_packages(
         installed_version,
         running_version: running_version.map(str::to_owned),
         availability,
+        recovery_required: false,
     })
+}
+
+fn recovery_required(data: &Path) -> bool {
+    data.join("update-pending.json").exists()
+}
+
+fn refuse_pending_journal(data: &Path) -> Result<()> {
+    if recovery_required(data) {
+        Err(OperationFailure::RecoveryRequired.into())
+    } else {
+        Ok(())
+    }
 }
 
 fn managed_current(root: &Path) -> Result<PathBuf> {
@@ -682,7 +698,11 @@ fn runtime_update_for_receipt(
     let installed = receipt
         .map(|value| managed_current(&value.managed_root))
         .transpose()?;
-    runtime_update_for_packages(bundled, installed.as_deref(), running_version)
+    let mut runtime_update =
+        runtime_update_for_packages(bundled, installed.as_deref(), running_version)?;
+    runtime_update.recovery_required =
+        receipt.is_some_and(|value| recovery_required(&value.data_dir));
+    Ok(runtime_update)
 }
 
 fn emit(
@@ -755,9 +775,17 @@ fn update_refused(error: &anyhow::Error) -> bool {
             "registered service and Core health disagree",
             "stopped node service is not registered to the current program",
             "node identity changed",
+            "desktop_node_recovery_required",
         ]
         .iter()
         .any(|needle| error.to_string().contains(needle))
+}
+
+fn recovery_required_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<OperationFailure>()
+        .is_some_and(|failure| matches!(failure, OperationFailure::RecoveryRequired))
+        || error.to_string().contains("desktop_node_recovery_required")
 }
 
 async fn prove_switched_release(
@@ -906,6 +934,12 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
             let data = data_dir(&profile)?;
             let _update_lock = crate::update::update_lock(&data)
                 .context("another Node updater is active; retry the Desktop operation")?;
+            match action {
+                Action::Install | Action::Start | Action::Uninstall => {
+                    refuse_pending_journal(&data)?;
+                }
+                Action::Status | Action::Update | Action::Stop => {}
+            }
             let inspected = inspect(&data, bundled).await?;
             ensure!(
                 inspected.device_id == expected,
@@ -1003,18 +1037,16 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                         receipt.managed_root == profile.join("node-runtime"),
                         "managed runtime root is not owned by this profile"
                     );
-                    if data.join("update-pending.json").exists()
-                        && let Err(error) =
-                            crate::update::recover_desktop_managed(&data, &receipt.managed_root)
-                                .await
-                    {
-                        if update_refused(&error) {
-                            anyhow::bail!(OperationFailure::UpdateRefused);
+                    let installed = managed_current(&receipt.managed_root)?;
+                    if recovery_required(&data) {
+                        let native = native_service(&installed, &data, &receipt.service_id).await?;
+                        if native.running || inspected.status == "running" {
+                            anyhow::bail!(OperationFailure::RecoveryRequired);
                         }
-                        return Err(error);
+                        crate::update::recover_desktop_managed(&data, &receipt.managed_root)
+                            .await?;
                     }
                     let source = bundled.to_path_buf();
-                    let installed = managed_current(&receipt.managed_root)?;
                     let fresh = inspect(&data, bundled).await?;
                     if fresh.device_id != expected {
                         anyhow::bail!(OperationFailure::UpdateRefused);
@@ -1121,6 +1153,9 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                     )
                     .await;
                     if let Err(error) = activation {
+                        if recovery_required_error(&error) {
+                            anyhow::bail!(OperationFailure::RecoveryRequired);
+                        }
                         if update_refused(&error) {
                             anyhow::bail!(OperationFailure::UpdateRefused);
                         }
@@ -1259,6 +1294,11 @@ mod tests {
                 public_failure(anyhow::anyhow!("private fixture contents"))
             ),
             "desktop_node_operation_failed"
+        );
+        let recovery = anyhow::anyhow!("detail").context(OperationFailure::RecoveryRequired);
+        assert_eq!(
+            format!("{:?}", public_failure(recovery)),
+            "desktop_node_recovery_required"
         );
     }
 
@@ -1677,6 +1717,104 @@ mod tests {
         fs::write(package.join("FILES.sha256"), files.join("\n") + "\n").unwrap();
     }
 
+    #[test]
+    fn runtime_update_reports_recovery_required_from_pending_metadata() {
+        let root = temp("runtime-recovery-flag");
+        let profile_path = root.join("profile");
+        fs::create_dir(&profile_path).unwrap();
+        privatefs::restrict_dir(&profile_path).unwrap();
+        let profile = fs::canonicalize(&profile_path).unwrap();
+        let data = profile.join("node");
+        fs::create_dir(&data).unwrap();
+        privatefs::restrict_dir(&data).unwrap();
+        let managed_root = profile.join("node-runtime");
+        fs::create_dir(&managed_root).unwrap();
+        privatefs::restrict_dir(&managed_root).unwrap();
+        let bundled = sealed_fixture(&root.join("bundled"));
+        ensure_runtime(&managed_root, &bundled).unwrap();
+        let receipt = install_test_receipt(&profile, &data, &managed_root);
+        privatefs::write_atomic(
+            &data.join("update-pending.json"),
+            br#"{"phase":"prepared"}"#,
+        )
+        .unwrap();
+        let runtime = runtime_update_for_receipt(Some(&receipt), &bundled, None).unwrap();
+        assert!(runtime.recovery_required);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_journal_blocks_start_without_service_effects() {
+        let root = temp("pending-blocks-start");
+        let profile_path = root.join("profile");
+        fs::create_dir(&profile_path).unwrap();
+        privatefs::restrict_dir(&profile_path).unwrap();
+        let profile = fs::canonicalize(&profile_path).unwrap();
+        let data = profile.join("node");
+        fs::create_dir(&data).unwrap();
+        privatefs::restrict_dir(&data).unwrap();
+        fs::write(data.join("config.json"), b"config").unwrap();
+        fs::write(
+            data.join("identity.json"),
+            br#"{"device_id":"device-fixture"}"#,
+        )
+        .unwrap();
+        let managed_root = profile.join("node-runtime");
+        fs::create_dir(&managed_root).unwrap();
+        privatefs::restrict_dir(&managed_root).unwrap();
+        let bundled = sealed_fixture(&root.join("bundled-start-block"));
+        ensure_runtime(&managed_root, &bundled).unwrap();
+        let package = fs::canonicalize(managed_root.join("current")).unwrap();
+        crate::update::bind_desktop_install_root(&data, &managed_root).unwrap();
+        let calls = root.join("service.calls");
+        let script = if cfg!(windows) {
+            format!(
+                "Add-Content -LiteralPath '{}' -Value $args[0]\nif ($args[0] -eq 'verify') {{ '{{\"installed\":true,\"running\":false}}' }}\n",
+                calls.display()
+            )
+        } else {
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\nif [ \"$1\" = verify ]; then printf '%s\\n' '{{\"installed\":true,\"running\":false}}'; fi\nexit 0\n",
+                calls.display()
+            )
+        };
+        let script_path = package.join(crate::update::release::SERVICE_SCRIPT);
+        fs::write(&script_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        reseal(&package);
+        let receipt = install_test_receipt(&profile, &data, &managed_root);
+        privatefs::write_atomic(
+            &receipt_path(&managed_root),
+            &serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        privatefs::write_atomic(
+            &data.join("update-pending.json"),
+            br#"{"phase":"prepared"}"#,
+        )
+        .unwrap();
+        let error = dispatch(
+            DesktopNode {
+                profile_dir: profile.clone(),
+                expected_device_id: Some("device-fixture".into()),
+                action: Action::Start,
+            },
+            &bundled,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            format!("{:?}", public_failure(error)),
+            "desktop_node_recovery_required"
+        );
+        assert!(!calls.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn status_with_prepared_journal_does_not_stop_a_running_service() {
         let root = temp("status-journal");
@@ -1744,6 +1882,11 @@ mod tests {
             .await
             .unwrap();
         }
+        assert!(
+            runtime_update_for_receipt(Some(&receipt), &source, None)
+                .unwrap()
+                .recovery_required
+        );
         let proof = prove_switched_release(
             &receipt,
             &data,

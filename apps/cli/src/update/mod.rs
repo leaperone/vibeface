@@ -636,18 +636,27 @@ async fn activate(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RecoveryMode {
+    /// Ordinary CLI recovery follows `resume_service` in the journal.
+    ResumeJournal,
+    /// Desktop explicit recovery never starts or stops the service.
+    KeepStopped,
+}
+
 async fn recover(policy: &Policy, data: &Path) -> Result<()> {
     if !data.join("update-pending.json").exists() {
         return Ok(());
     }
     let service = Service::load(data).await?;
-    recover_with_service(policy, data, &service).await
+    recover_with_service(policy, data, &service, RecoveryMode::ResumeJournal).await
 }
 
 async fn recover_with_service(
     policy: &Policy,
     data: &Path,
     service: &impl ServiceControl,
+    mode: RecoveryMode,
 ) -> Result<()> {
     let pending = data.join("update-pending.json");
     if !pending.exists() {
@@ -688,7 +697,8 @@ async fn recover_with_service(
     } else {
         journal.previous.clone()
     };
-    if !journal.resume_service {
+    let keep_stopped = matches!(mode, RecoveryMode::KeepStopped) || !journal.resume_service;
+    if keep_stopped {
         let _node_lock =
             lock_data_dir(data).context("stop the Node before recovering a stopped update")?;
         if installed(&root)? != wanted {
@@ -742,7 +752,7 @@ fn desktop_managed_policy(managed_root: &Path) -> Result<Policy> {
 }
 
 /// Reconcile an interrupted App-managed release. Status must not call this.
-/// A running node is stopped only after an idle lease; a busy node keeps its journal.
+/// Desktop recovery runs only while Core reports a stopped Node.
 pub(crate) async fn recover_desktop_managed(data: &Path, managed_root: &Path) -> Result<()> {
     let pending = data.join("update-pending.json");
     if !pending.exists() {
@@ -757,24 +767,16 @@ pub(crate) async fn recover_desktop_managed(data: &Path, managed_root: &Path) ->
     let journal: Journal = serde_json::from_slice(&fs::read(&pending)?)?;
     let current = installed(&policy.install_root)?;
     let inspected = inspect(data, &current.join(PROGRAMS[1])).await?;
-    if inspected.status == "running" {
-        ensure!(
-            inspected.device_id == journal.device_id,
-            "running node identity changed"
-        );
-        let lease = match maintenance::acquire(&inspected.maintenance_socket).await {
-            Ok(lease) => lease,
-            Err(error) if error.downcast_ref::<maintenance::Busy>().is_some() => {
-                bail!("update deferred; the node could not become idle: {error:#}");
-            }
-            Err(error) => return Err(error.context("request node maintenance")),
-        };
-        let service = Service::load(data).await?;
-        let result = recover_with_service(&policy, data, &service).await;
-        drop(lease);
-        return result;
-    }
-    recover(&policy, data).await
+    ensure!(
+        inspected.status != "running",
+        "desktop_node_recovery_required"
+    );
+    ensure!(
+        inspected.device_id == journal.device_id,
+        "update journal belongs to another node"
+    );
+    let service = Service::load(data).await?;
+    recover_with_service(&policy, data, &service, RecoveryMode::KeepStopped).await
 }
 
 pub(crate) struct DesktopManagedRelease<'a> {
@@ -850,7 +852,7 @@ async fn reconcile_running(
     service: &impl ServiceControl,
     error: anyhow::Error,
 ) -> Result<()> {
-    match recover_with_service(policy, data, service).await {
+    match recover_with_service(policy, data, service, RecoveryMode::ResumeJournal).await {
         Ok(()) => {
             bail!("update failed; previous program restored, data was kept: {error:#}")
         }
@@ -892,6 +894,13 @@ where
         "stopped node service is not registered to the current program"
     );
     let policy = desktop_managed_policy(release.managed_root)?;
+    if data.join("update-pending.json").exists() && release.resume_service {
+        let inspected = inspect(data, &release.previous.join(PROGRAMS[1])).await?;
+        ensure!(
+            inspected.status != "running",
+            "desktop_node_recovery_required"
+        );
+    }
     recover_desktop_managed(data, release.managed_root).await?;
     let root = fs::canonicalize(release.managed_root)?;
     ensure!(
@@ -2129,7 +2138,7 @@ mod tests {
             if failure == "backup" {
                 assert_eq!(installed(&policy.install_root).unwrap(), journal.previous);
             }
-            recover_with_service(&policy, &data, &service)
+            recover_with_service(&policy, &data, &service, RecoveryMode::ResumeJournal)
                 .await
                 .unwrap();
             assert_eq!(installed(&policy.install_root).unwrap(), journal.previous);
@@ -2153,13 +2162,13 @@ mod tests {
         let lock = update_lock(&data).unwrap();
         assert!(update_lock(&data).is_err());
         switch(&policy.install_root, &journal.candidate).unwrap();
-        recover_with_service(&policy, &data, &service)
+        recover_with_service(&policy, &data, &service, RecoveryMode::ResumeJournal)
             .await
             .unwrap();
         assert_eq!(installed(&policy.install_root).unwrap(), journal.previous);
         journal.phase = Phase::Confirmed;
         persist(&data.join("update-pending.json"), &journal).unwrap();
-        recover_with_service(&policy, &data, &service)
+        recover_with_service(&policy, &data, &service, RecoveryMode::ResumeJournal)
             .await
             .unwrap();
         assert_eq!(installed(&policy.install_root).unwrap(), journal.candidate);
@@ -2255,7 +2264,7 @@ mod tests {
         );
         fs::write(data.join("node.sqlite3"), b"new-user-writes-must-survive").unwrap();
         persist(&data.join("update-pending.json"), &journal).unwrap();
-        recover_with_service(&policy, &data, &service)
+        recover_with_service(&policy, &data, &service, RecoveryMode::ResumeJournal)
             .await
             .unwrap();
         assert_eq!(service.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -2364,7 +2373,9 @@ mod tests {
                 );
             }
             if failure == "stop" {
-                let recovered = recover_with_service(&policy, &data, &service).await;
+                let recovered =
+                    recover_with_service(&policy, &data, &service, RecoveryMode::ResumeJournal)
+                        .await;
                 assert!(
                     recovered.is_err(),
                     "an uncertain stop is not a successful rollback"
@@ -2390,7 +2401,7 @@ mod tests {
         let held = lock_data_dir(&data).unwrap();
         let pending_before = fs::read(data.join("update-pending.json")).unwrap();
         assert!(
-            recover_with_service(&policy, &data, &service)
+            recover_with_service(&policy, &data, &service, RecoveryMode::ResumeJournal)
                 .await
                 .is_err()
         );
@@ -2400,7 +2411,7 @@ mod tests {
             pending_before
         );
         drop(held);
-        recover_with_service(&policy, &data, &service)
+        recover_with_service(&policy, &data, &service, RecoveryMode::ResumeJournal)
             .await
             .unwrap();
         assert_eq!(service.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -2442,6 +2453,71 @@ mod tests {
             fs::read(data.join("node.sqlite3")).unwrap(),
             b"tasks-and-deduplication"
         );
+        fs::remove_dir_all(policy.install_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn desktop_keep_stopped_recovery_ignores_resume_service() {
+        let (policy, data, mut journal) = activation_fixture();
+        journal.resume_service = true;
+        switch(&policy.install_root, &journal.candidate).unwrap();
+        persist(&data.join("update-pending.json"), &journal).unwrap();
+        fs::write(data.join("providers.json"), b"provider-material").unwrap();
+        fs::write(
+            data.join("update.json"),
+            br#"{"channel":"stable","automatic":false}"#,
+        )
+        .unwrap();
+        let preserved = [
+            data.join("identity.json"),
+            data.join("config.json"),
+            data.join("node.sqlite3"),
+            data.join("node.sqlite3-wal"),
+            data.join("providers.json"),
+            data.join("update.json"),
+        ];
+        let before: Vec<_> = preserved
+            .iter()
+            .map(|path| fs::read(path).unwrap())
+            .collect();
+        let service = FakeService {
+            candidate: journal.candidate.clone(),
+            failure: "none",
+            starts: std::sync::atomic::AtomicUsize::new(0),
+            stops: std::sync::atomic::AtomicUsize::new(0),
+        };
+        recover_with_service(&policy, &data, &service, RecoveryMode::KeepStopped)
+            .await
+            .unwrap();
+        assert_eq!(service.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(service.stops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(installed(&policy.install_root).unwrap(), journal.previous);
+        assert!(!data.join("update-pending.json").exists());
+        for (path, bytes) in preserved.iter().zip(before) {
+            if path.exists() {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+        }
+        fs::remove_dir_all(policy.install_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn desktop_keep_stopped_recovery_leaves_journal_on_bad_device() {
+        let (policy, data, mut journal) = activation_fixture();
+        journal.device_id = "other-device".into();
+        persist(&data.join("update-pending.json"), &journal).unwrap();
+        let service = FakeService {
+            candidate: journal.candidate.clone(),
+            failure: "none",
+            starts: std::sync::atomic::AtomicUsize::new(0),
+            stops: std::sync::atomic::AtomicUsize::new(0),
+        };
+        assert!(
+            recover_with_service(&policy, &data, &service, RecoveryMode::KeepStopped)
+                .await
+                .is_err()
+        );
+        assert!(data.join("update-pending.json").exists());
         fs::remove_dir_all(policy.install_root).unwrap();
     }
 
