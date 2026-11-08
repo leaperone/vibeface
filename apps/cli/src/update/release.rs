@@ -1123,9 +1123,11 @@ mod tests {
             },
         ];
         assert!(optional_unique_asset(&assets, "release.json").is_err());
-        assert!(optional_unique_asset(&assets[..1], "missing.tar.gz")
-            .unwrap()
-            .is_none());
+        assert!(
+            optional_unique_asset(&assets[..1], "missing.tar.gz")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             optional_unique_asset(&assets[..1], "release.json")
                 .unwrap()
@@ -1159,11 +1161,9 @@ mod tests {
                 },
             ],
         };
-        let (archive, checksum) = manifest_target_pair(
-            &manifest,
-            "vibeface-1.2.3-x86_64-unknown-linux-gnu.tar.gz",
-        )
-        .unwrap();
+        let (archive, checksum) =
+            manifest_target_pair(&manifest, "vibeface-1.2.3-x86_64-unknown-linux-gnu.tar.gz")
+                .unwrap();
         assert_eq!(archive.size, 10);
         assert_eq!(checksum.size, 11);
         manifest.assets.push(CompletionAsset {
@@ -1171,26 +1171,30 @@ mod tests {
             size: 12,
             sha256: "b".repeat(64),
         });
-        assert!(manifest_target_pair(
-            &manifest,
-            "vibeface-1.2.3-x86_64-unknown-linux-gnu.tar.gz"
-        )
-        .is_err());
+        assert!(
+            manifest_target_pair(&manifest, "vibeface-1.2.3-x86_64-unknown-linux-gnu.tar.gz")
+                .is_err()
+        );
     }
 
     #[test]
-    fn canonical_public_verified_manifest_binds_one_host_target() {
-        let path = std::path::Path::new("/tmp/vibeface-release-20261108/public-verified/release.json");
-        if !path.is_file() {
-            return;
-        }
-        let body = fs::read(path).unwrap();
+    fn canonical_manifest_binds_target_archive_and_checksum() {
+        let body = include_bytes!("../../../../scripts/fixtures/product-release-completion.json");
         let version = Version::parse("0.0.1-nightly.20261108.1").unwrap();
-        let manifest = parse_completion_manifest(&body, "v0.0.1-nightly.20261108.1", &version).unwrap();
-        let target = host_target().unwrap();
-        let name = format!("vibeface-{}-{target}.tar.gz", version);
-        let (archive, checksum) = manifest_target_pair(&manifest, &name).unwrap();
-        assert!(archive.size > 0 && checksum.size > 0);
+        let manifest =
+            parse_completion_manifest(body, "v0.0.1-nightly.20261108.1", &version).unwrap();
+        let name = "vibeface-0.0.1-nightly.20261108.1-x86_64-unknown-linux-gnu.tar.gz";
+        let (archive, checksum) = manifest_target_pair(&manifest, name).unwrap();
+        assert_eq!(archive.size, 29_685_481);
+        assert_eq!(checksum.size, 132);
+        assert_eq!(
+            archive.sha256,
+            "b9bc64ce56273a9a987fb8394decfaeab8c282b81e5ee29b8cb13e46422b0b0e"
+        );
+        assert_eq!(
+            manifest.source_commit,
+            "7845e46d9c5b04b66eb7a66bcda31572e1ef7f4a"
+        );
         for item in &manifest.assets {
             assert!(valid_digest(&item.sha256), "{}", item.name);
         }

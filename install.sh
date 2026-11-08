@@ -617,7 +617,7 @@ JSON
   }
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
-  production_manifest=/tmp/vibeface-release-20261108/public-verified/release.json
+  production_manifest="$(dirname "$script")/scripts/fixtures/product-release-completion.json"
   if [[ -f $production_manifest ]]; then
     json_fields "$production_manifest" completion > "$test_dir/production.fields" ||
       fail 'self-test: production release.json failed completion parse'
