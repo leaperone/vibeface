@@ -4,6 +4,8 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage: package-node.sh [--target RUST_TARGET] [--output DIRECTORY]
+       package-node.sh --target RUST_TARGET --native-output ARCHIVE
+       package-node.sh --target RUST_TARGET --native-input VERIFIED_DIRECTORY
 
 Builds and packages the CLI, Core binary, web client, docs, and user service installer.
 The default output is .artifacts/packages. Provider runtimes and credentials are not bundled.
@@ -13,6 +15,8 @@ USAGE
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 output="$repo/.artifacts/packages"
 target=''
+native_output=''
+native_input=''
 while (($#)); do
   case "$1" in
     --target|--output)
@@ -20,10 +24,16 @@ while (($#)); do
       if [[ "$1" == '--target' ]]; then target="$2"; else output="$2"; fi
       shift 2
       ;;
+    --native-output|--native-input)
+      (($# >= 2)) || { usage >&2; exit 2; }
+      if [[ "$1" == '--native-output' ]]; then native_output="$2"; else native_input="$2"; fi
+      shift 2
+      ;;
     --help|-h) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
 done
+[[ -z "$native_output" || -z "$native_input" ]] || { usage >&2; exit 2; }
 
 notary_vars=0
 for var in VIBEFACE_NOTARY_KEY VIBEFACE_NOTARY_KEY_ID VIBEFACE_NOTARY_ISSUER; do
@@ -39,8 +49,10 @@ if ((notary_vars == 3)) && [[ -z "${VIBEFACE_CODESIGN_IDENTITY:-}" ]]; then
 fi
 
 cd "$repo"
-python3 "$repo/scripts/build-inputs.py" check crypto
-python3 "$repo/scripts/build-inputs.py" check web
+if [[ -z "$native_output" ]]; then
+  python3 "$repo/scripts/build-inputs.py" check crypto
+  python3 "$repo/scripts/build-inputs.py" check web
+fi
 build_args=(build --release -p vibeface -p vibeface-core --locked)
 target_dir="${CARGO_TARGET_DIR:-$repo/target}"
 if [[ -n "$target" ]]; then
@@ -52,6 +64,21 @@ else
   cli_binary="$target_dir/release/vibeface"
   core_binary="$target_dir/release/vibeface-core"
 fi
+if [[ -n "$native_input" ]]; then
+  input_args=(check native --input "$native_input" --target "$target")
+  if [[ -n "${VIBEFACE_INPUT_ATTEMPT:-}" ]]; then input_args+=(--producer-attempt "$VIBEFACE_INPUT_ATTEMPT"); fi
+  python3 "$repo/scripts/build-inputs.py" "${input_args[@]}"
+  cli_binary="$native_input/vibeface"
+  core_binary="$native_input/vibeface-core"
+else
+  release_rustflags="$(python3 "$repo/scripts/release-rustflags.py")"
+  CARGO_ENCODED_RUSTFLAGS="$release_rustflags" cargo "${build_args[@]}"
+fi
+[[ -x "$cli_binary" && -x "$core_binary" ]] || { printf 'Release binaries are missing: %s and %s\n' "$cli_binary" "$core_binary" >&2; exit 1; }
+if [[ -n "$native_output" ]]; then
+  python3 "$repo/scripts/build-inputs.py" seal native --source "$(dirname "$cli_binary")" --target "$target" --output "$native_output"
+  exit 0
+fi
 web="$repo/apps/app/dist/client"
 [[ -s "$web/vibeface_secure.js" && -s "$web/vibeface_secure_bg.wasm" ]] || {
   echo 'Browser cryptography is missing from the static output. Run scripts/build-web-crypto.sh and scripts/build-web.sh before building a package.' >&2
@@ -61,9 +88,6 @@ web="$repo/apps/app/dist/client"
   echo 'Web client is missing. Run scripts/build-web.sh before building a package.' >&2
   exit 1
 }
-release_rustflags="$(python3 "$repo/scripts/release-rustflags.py")"
-CARGO_ENCODED_RUSTFLAGS="$release_rustflags" cargo "${build_args[@]}"
-[[ -x "$cli_binary" && -x "$core_binary" ]] || { printf 'Release binaries are missing: %s and %s\n' "$cli_binary" "$core_binary" >&2; exit 1; }
 version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$repo/apps/cli/Cargo.toml" | head -n 1)"
 [[ -n "$version" && -n "$target" ]] || { echo 'Could not determine package version or target.' >&2; exit 1; }
 case "$version$target" in *[!a-zA-Z0-9._-]*) echo 'Invalid package version or target.' >&2; exit 1 ;; esac

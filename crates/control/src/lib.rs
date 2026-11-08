@@ -258,7 +258,7 @@ mod tests {
         Ok(())
     }
 
-    /// A one-megabyte-and-one-byte file the fixtures below pour into their standard output.
+    #[cfg(windows)]
     fn oversized_file() -> Result<PathBuf> {
         let path =
             std::env::temp_dir().join(format!("vibeface-control-bulk-{}", uuid::Uuid::new_v4()));
@@ -266,27 +266,13 @@ mod tests {
         Ok(path)
     }
 
-    /// Writes an executable fixture that behaves the same on either family, and returns its path.
-    ///
-    /// A shell script is the shortest way to ask for exactly the output size and exit status a
-    /// test needs, and the two families spell that differently.
-    fn fixture(name: &str, unix_body: &str, windows_body: &str) -> Result<PathBuf> {
-        let _ = windows_body;
-        let _ = unix_body;
-        #[cfg(unix)]
-        let (suffix, body) = ("", format!("#!/bin/sh\n{unix_body}"));
-        #[cfg(windows)]
-        let (suffix, body) = (".cmd", format!("@echo off\r\n{windows_body}"));
+    #[cfg(windows)]
+    fn fixture(name: &str, body: &str) -> Result<PathBuf> {
         let path = std::env::temp_dir().join(format!(
-            "vibeface-control-{name}-{}{suffix}",
+            "vibeface-control-{name}-{}.cmd",
             uuid::Uuid::new_v4()
         ));
-        std::fs::write(&path, body)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
-        }
+        std::fs::write(&path, format!("@echo off\r\n{body}"))?;
         Ok(path)
     }
 
@@ -309,13 +295,13 @@ mod tests {
 
     #[tokio::test]
     async fn control_client_bounds_child_output_before_waiting_for_exit() -> Result<()> {
+        #[cfg(unix)]
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/control-oversized-output.sh");
+        #[cfg(windows)]
         let bulk = oversized_file()?;
-        let quoted = bulk.display();
-        let path = fixture(
-            "output",
-            &format!("cat '{quoted}'\n"),
-            &format!("type \"{quoted}\"\r\n"),
-        )?;
+        #[cfg(windows)]
+        let path = fixture("output", &format!("type \"{}\"\r\n", bulk.display()))?;
         let error = request(
             &path,
             &ControlRequest::Inspect {
@@ -325,16 +311,22 @@ mod tests {
         .await
         .expect_err("oversized child output must be rejected");
         assert!(error.to_string().contains("stdout exceeds"), "{error:#}");
-        std::fs::remove_file(path)?;
-        std::fs::remove_file(bulk)?;
+        #[cfg(windows)]
+        {
+            std::fs::remove_file(path)?;
+            std::fs::remove_file(bulk)?;
+        }
         Ok(())
     }
 
     #[tokio::test]
     async fn control_client_rejects_ok_response_from_nonzero_child() -> Result<()> {
+        #[cfg(unix)]
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/control-nonzero-response.sh");
+        #[cfg(windows)]
         let path = fixture(
             "status",
-            "cat >/dev/null\nprintf '%s\\n' '{\"ok\":true,\"result\":{}}'\nexit 7\n",
             "more > nul\r\necho {\"ok\":true,\"result\":{}}\r\nexit /b 7\r\n",
         )?;
         let error = request(
@@ -349,6 +341,7 @@ mod tests {
             error.to_string().contains("core control process failed"),
             "{error:#}"
         );
+        #[cfg(windows)]
         std::fs::remove_file(path)?;
         Ok(())
     }

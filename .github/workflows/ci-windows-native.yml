@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       source_sha: {type: string, required: true}
-      package_artifact: {type: string, default: ''}
+      package_artifact_id: {type: string, default: ''}
       package_run_id: {type: string, default: ''}
       rust_checks: {type: boolean, default: true}
 permissions:
@@ -65,7 +65,7 @@ jobs:
           "$PY" -B scripts/ci.py test --tier fast --packages "${selected[@]}"
 
   process:
-    if: inputs.package_artifact != '' || inputs.package_run_id != ''
+    if: inputs.package_artifact_id != '' || inputs.package_run_id != ''
     name: windows packaged processes
     runs-on: windows-2025
     timeout-minutes: 60
@@ -81,12 +81,12 @@ jobs:
         with: {python-version: '3.12'}
       - name: Validate the package source mode
         env:
-          PACKAGE_ARTIFACT: ${{ inputs.package_artifact }}
+          PACKAGE_ARTIFACT_ID: ${{ inputs.package_artifact_id }}
           PACKAGE_RUN_ID: ${{ inputs.package_run_id }}
           RUST_CHECKS: ${{ inputs.rust_checks }}
         run: |
           if [[ -n "$PACKAGE_RUN_ID" ]]; then
-            [[ -z "$PACKAGE_ARTIFACT" && "$RUST_CHECKS" == false ]] || {
+            [[ -z "$PACKAGE_ARTIFACT_ID" && "$RUST_CHECKS" == false ]] || {
               echo '::error::A prior-run package diagnostic must select one run and skip native Rust checks.'
               exit 1
             }
@@ -95,6 +95,10 @@ jobs:
               exit 1
             }
           else
+            [[ "$PACKAGE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || {
+              echo '::error::This run requires an exact successful package producer artifact ID.'
+              exit 1
+            }
             [[ "$RUST_CHECKS" == true ]] || {
               echo '::error::Native Rust checks can only be skipped for a prior-run package diagnostic.'
               exit 1
@@ -140,11 +144,12 @@ jobs:
           run-id: ${{ inputs.package_run_id }}
           github-token: ${{ github.token }}
           path: .artifacts/packages
-      - name: Download this run's package by name
-        if: inputs.package_run_id == '' && inputs.package_artifact != ''
+      - name: Download this run's package by artifact ID
+        if: inputs.package_run_id == '' && inputs.package_artifact_id != ''
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: ${{ inputs.package_artifact }}
+          artifact-ids: ${{ inputs.package_artifact_id }}
+          merge-multiple: true
           path: .artifacts/packages
       - name: Select this platform's Python
         run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"

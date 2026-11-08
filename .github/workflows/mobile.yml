@@ -4,20 +4,27 @@ name: mobile
 on:
   workflow_dispatch:
     inputs:
+      feedback:
+        description: 'Replace older ordinary mobile feedback on this branch'
+        type: boolean
+        default: false
       platforms:
         description: Native mobile platforms to build and verify
         type: choice
         options: [all, android, ios]
         default: all
   workflow_call:
+    outputs:
+      android_artifact_id:
+        value: ${{ jobs.android.outputs.artifact_id }}
     inputs:
       android_only:
         type: boolean
         default: false
 
 concurrency:
-  group: mobile-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'automatic' }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  group: mobile-${{ github.ref }}-${{ inputs.android_only && 'android-only' || inputs.platforms || 'all' }}-${{ github.event_name == 'workflow_dispatch' && !inputs.android_only && inputs.feedback && github.run_attempt == 1 && 'feedback' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && !inputs.android_only && inputs.feedback && github.run_attempt == 1 }}
 
 permissions:
   contents: read
@@ -27,6 +34,8 @@ env:
 
 jobs:
   android:
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     if: inputs.android_only || (github.event_name == 'workflow_dispatch' && inputs.platforms != 'ios')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -67,16 +76,20 @@ jobs:
         env:
           SOURCE_COMMIT: ${{ github.sha }}
         run: python3 scripts/run-delivery-live.py --record-android-apk apps/mobile/android/app/build/outputs/apk/release --source-commit "$SOURCE_COMMIT"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: vibeface-android-${{ github.sha }}
+          name: vibeface-android-${{ github.sha }}-${{ github.run_attempt }}
           path: .artifacts/mobile-android/
           if-no-files-found: error
 
-  ios:
+  ios-build:
+    outputs:
+      artifact_id: ${{ steps.inputs.outputs.artifact-id }}
+      producer_attempt: ${{ github.run_attempt }}
     if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' && inputs.platforms != 'android' }}
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -86,7 +99,10 @@ jobs:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          cache-on-failure: true
+          key: ios-host-target-v1
+          workspaces: |
+            . -> target
+            . -> .artifacts/native/target
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.9.0
@@ -111,7 +127,7 @@ jobs:
           zip -qry "$GITHUB_WORKSPACE/.artifacts/native/vibeface-ios-simulator.zip" Vibeface.app
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: vibeface-ios-simulator-${{ github.sha }}
+          name: vibeface-ios-simulator-${{ github.sha }}-${{ github.run_attempt }}
           path: .artifacts/native/vibeface-ios-simulator.zip
           if-no-files-found: error
       - name: Build the same-source host Node and browser cryptography
@@ -119,20 +135,62 @@ jobs:
           SOURCE_COMMIT: ${{ github.sha }}
           CARGO_TARGET_DIR: ${{ github.workspace }}/.artifacts/native/target
         run: |
-          umask 077
-          mkdir -p .artifacts/native/private
-          chmod 700 .artifacts/native .artifacts/native/private
-          printf '%s\n' host-source > .artifacts/native/private/stage.txt
           test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
           test -z "$(git status --porcelain --untracked-files=normal)"
           test "$(uname -m)" = arm64
-          printf '%s\n' host-build > .artifacts/native/private/stage.txt
           cargo install wasm-bindgen-cli --version 0.2.129 --locked
           bash scripts/build-web-crypto.sh
           bash scripts/build-web.sh
-          CARGO_ENCODED_RUSTFLAGS="$(python3 scripts/release-rustflags.py)" cargo build --release -p vibeface -p vibeface-core --locked
+          bash scripts/package-node.sh --target aarch64-apple-darwin --native-output .artifacts/native/host.tar.gz
+      - name: Seal the complete public iOS acceptance input
+        run: python3 scripts/build-inputs.py seal ios --app .artifacts/native/vibeface-ios-simulator.zip --native .artifacts/native/host.tar.gz --output .artifacts/native/ios-input.tar.gz
+      - id: inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ios-input-${{ github.sha }}-${{ github.run_attempt }}
+          path: .artifacts/native/ios-input.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  ios-accept:
+    needs: ios-build
+    if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' }}
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile --filter .
+      - name: Require explicit producer artifact IDs
+        env:
+          ARTIFACT_IDS: ${{ needs.ios-build.outputs.artifact_id }}
+        run: '[[ "$ARTIFACT_IDS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.ios-build.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/native-download
+      - name: Restore and verify the successful producer input
+        env:
+          PRODUCER_ATTEMPT: ${{ needs.ios-build.outputs.producer_attempt }}
+        run: |
+          python3 scripts/build-inputs.py restore ios --input .artifacts/native-download/ios-input.tar.gz --output .artifacts/ios-input --producer-attempt "$PRODUCER_ATTEMPT"
+          app=.artifacts/native/ios-build/Build/Products/Release-iphonesimulator/Vibeface.app
+          codesign --verify --strict "$app"
+          otool -l "$app/Vibeface" | grep -q 'sectname __entitlements'
           .artifacts/native/target/release/vibeface --version
           .artifacts/native/target/release/vibeface-core --version
+          umask 077
+          mkdir -p .artifacts/native/private
       - name: Create the dedicated iOS Provider simulator
         env:
           VIBEFACE_E2E_SOURCE_COMMIT: ${{ github.sha }}
@@ -189,9 +247,17 @@ jobs:
           raw_path = pathlib.Path(".artifacts/native/private/ios-runner-prepare.raw.json")
           error_path = pathlib.Path(".artifacts/native/private/ios-runner-prepare.stderr.log")
           summary_path = pathlib.Path(".artifacts/native/private/ios-runner-prepare.json")
-          def write_failure(reason, exit_code):
-              summary_path.write_text(json.dumps({"status": "failed", "reason": reason,
-                                                  "exit_code": exit_code}) + "\n")
+          prepare_module = __import__("runpy").run_path("scripts/ios-runner-prepare.py")
+          prepare_error_detail = prepare_module["project_error"]
+
+          def read_prepare_error():
+              return prepare_module["read_error"](pathlib.Path.cwd(), raw_path)
+
+          def write_failure(reason, exit_code, error=None):
+              summary = {"status": "failed", "reason": reason, "exit_code": exit_code}
+              if error is not None:
+                  summary["error"] = error
+              summary_path.write_text(json.dumps(summary) + "\n")
               print("iOS XCTest runner preparation failed: " + reason, file=sys.stderr)
               raise SystemExit(1)
 
@@ -212,7 +278,7 @@ jobs:
                   ("runner did not accept connection", "runner_connect_failed"),
                   ("daemon request timed out", "daemon_request_timeout"),
               ) if needle in text), "prepare_command_failed")
-              write_failure(reason, exit_code)
+              write_failure(reason, exit_code, read_prepare_error())
           try:
               text = raw_path.read_text(encoding="utf-8")
               try:
@@ -263,7 +329,9 @@ jobs:
           print("iOS XCTest runner healthy: " + json.dumps(summary, sort_keys=True))
           PY
       - name: Check bounded iOS actor diagnostics
-        run: python3 scripts/ios-actor-census.py --self-test
+        run: |
+          python3 scripts/ios-actor-census.py --self-test
+          python3 scripts/ios-runner-prepare.py --self-test
       - name: Verify Provider settings and cancellation in the installed iOS app
         env:
           VIBEFACE_E2E_SOURCE_COMMIT: ${{ github.sha }}
@@ -284,12 +352,13 @@ jobs:
           PY
           printf '%s\n' ui-run > .artifacts/native/private/stage.txt
           set +e
-          pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' --action-timeout 240000 --trace off --video off --retries 0 > .artifacts/native/private/ui.log 2>&1
+          pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' --action-timeout 240000 --trace off --video off --retries 0 --reporter json > .artifacts/native/private/ui.json 2> .artifacts/native/private/ui.log
           result=$?
           set -e
+          printf '%s\n' "$result" > .artifacts/native/private/ui-exit-code.txt
           echo "Native Provider e2e exit code: $result"
           exit "$result"
-      - name: Remove only this task simulator and private acceptance state
+      - name: Clean up this task and require final UI acceptance
         id: native_cleanup
         if: always()
         env:
@@ -362,6 +431,21 @@ jobs:
               except (OSError, ValueError, TypeError, AssertionError):
                   diagnostics["navigation"] = {"stage": "invalid"}
 
+          clipboard_path = public / "provider-clipboard.json"
+          if clipboard_path.exists() or clipboard_path.is_symlink():
+              try:
+                  info = clipboard_path.lstat()
+                  assert stat.S_ISREG(info.st_mode) and info.st_size <= 1024
+                  clipboard = json.loads(clipboard_path.read_text(encoding="utf-8"))
+                  counts = {"started", "fulfilled", "rejected", "equal", "empty", "other"}
+                  flags = {"capped", "inflight_at_poll_failure"}
+                  assert isinstance(clipboard, dict) and set(clipboard) == counts | flags
+                  assert all(type(clipboard[key]) is int and 0 <= clipboard[key] <= 4096 for key in counts)
+                  assert all(type(clipboard[key]) is bool for key in flags)
+                  diagnostics["clipboard"] = {key: clipboard[key] for key in counts | flags}
+              except (OSError, ValueError, TypeError, AssertionError):
+                  diagnostics["clipboard"] = {"status": "invalid"}
+
           def safe_error(error, source=None, api=None):
               if not isinstance(error, dict):
                   return None
@@ -377,7 +461,7 @@ jobs:
                           if frame and len(frames) < 4:
                               frames.append({"file": "verify-node.py", "line": int(frame[1]), "function": frame[2]})
                       result["fixture"] = {"error_type": fixture[1], "frames": frames}
-              if code == "ENGINE_FAILURE" and isinstance(message, str):
+              if code in {"ENGINE_FAILURE", "ENVIRONMENT_UNAVAILABLE"} and isinstance(message, str):
                   lowered = message.lower()
                   result["engine_timeout_kind"] = next((kind for needle, kind in (
                       ("timed out while reading snapshot viewport on the xctest main thread", "snapshot-viewport"),
@@ -419,7 +503,7 @@ jobs:
                   line = source.get("line")
                   if type(line) is int and 1 <= line <= 100000:
                       result.update(file=source["file"], line=line)
-              if api in {"app.open", "app.screenshot", "device.installApp", "device.clearKeychain", "device.openLink", "device.dismissKeyboard",
+              if api in {"app.open", "app.screenshot", "device.installApp", "device.clearKeychain", "device.openLink", "device.dismissKeyboard", "device.clipboard",
                          "screen.scrollUntilVisible", "locator.click", "locator.tap", "locator.fill", "expect.toBeVisible", "expect.toBeHidden",
                          "expect.toHaveAccessibleName", "expect.toEqual", "expect.toBe", "expect.poll"}:
                   result["api"] = api
@@ -503,12 +587,18 @@ jobs:
               except (OSError, ValueError, TypeError, AssertionError):
                   return {"status": "unreadable"}
 
+          prepare_module = __import__("runpy").run_path("scripts/ios-runner-prepare.py")
+          prepare_error_detail = prepare_module["project_error"]
+
           def safe_runner_prepare():
               path = root / "private/ios-runner-prepare.json"
               if path.is_symlink() or not path.is_file():
                   return {"status": "missing"}
               try:
-                  result = json.loads(path.read_text(encoding="utf-8"))
+                  with path.open("rb") as stream:
+                      raw = stream.read(8193)
+                  assert len(raw) <= 8192
+                  result = json.loads(raw)
                   assert isinstance(result, dict)
                   if result.get("status") == "failed":
                       reason = result.get("reason")
@@ -518,7 +608,10 @@ jobs:
                                          "prepare_reported_failure", "runner_prepare_required_recovery"}
                               or type(exit_code) is not int or not 0 <= exit_code <= 255):
                           return {"status": "invalid"}
-                      return {"status": "failed", "reason": reason, "exit_code": exit_code}
+                      summary = {"status": "failed", "reason": reason, "exit_code": exit_code}
+                      if "error" in result:
+                          summary["error"] = prepare_error_detail(result["error"])
+                      return summary
                   assert result.get("status") == "healthy"
                   assert result.get("cache") in {"exact", "miss", "external", "unknown"}
                   assert result.get("artifact") in {"valid", "rebuilt", "unknown"}
@@ -532,7 +625,7 @@ jobs:
                           return {"status": "invalid"}
                       summary[key] = int(value)
                   return summary
-              except (OSError, ValueError, TypeError, AssertionError, KeyError):
+              except (OSError, ValueError, TypeError, AssertionError, KeyError, RecursionError):
                   return {"status": "invalid"}
 
           def safe_actor_census():
@@ -566,12 +659,29 @@ jobs:
 
           runner_root = pathlib.Path("tests/e2e/.artifacts/native")
           report_path = runner_root / "e2e/report.json"
+          canonical_report = report_path.exists()
+          exit_path = root / "private/ui-exit-code.txt"
+          ui_log = root / "private/ui.log"
+          if exit_path.exists():
+              value = exit_path.read_text().strip()
+              if re.fullmatch(r"[0-9]{1,3}", value) and int(value) <= 255:
+                  diagnostics["runner_exit_code"] = int(value)
+          if not canonical_report and ui_log.exists():
+              logged = ui_log.read_text(errors="replace")
+              for code in ("ENVIRONMENT_UNAVAILABLE", "ENGINE_FAILURE", "CONFIG_LOAD_FAILED", "INVALID_CONFIG", "SESSION_UNAVAILABLE", "SESSION_CONTRACT", "INTERNAL_ERROR"):
+                  match = re.search(r"(?m)^" + code + r": ([^\n]*)", logged)
+                  if match:
+                      diagnostics["failures"].append(safe_error({"code": code, "message": match[1]}))
+                      break
+
+          if not canonical_report:
+              report_path = root / "private/ui.json"
           if report_path.exists():
               try:
                   run = json.loads(report_path.read_text())["run"]
-                  diagnostics["report"] = "present"
+                  diagnostics["report"] = "present" if canonical_report else "stdout_only"
                   summary = run["summary"]
-                  selected_passed = run["exitCode"] == 0 and not run["errors"] and summary["selected"] == summary["passed"] == 1 and all(
+                  selected_passed = canonical_report and run["exitCode"] == 0 and not run["errors"] and summary["selected"] == summary["passed"] == 1 and all(
                       summary[key] == 0 for key in ("failed", "skipped", "interrupted", "flaky"))
                   failures = [safe_error(error) for error in run["errors"]]
                   for result in run["results"]:
@@ -629,6 +739,7 @@ jobs:
                                       ("welcome", None, "连接你的网络"), ("ready", None, "已填入加入链接"),
                                       ("invitation", "textbox", "加入链接"), ("device_name", "textbox", "这台设备的名字"),
                                       ("join", "button", "加入"), ("invalid_link", None, "这不是有效的加入链接"),
+                                      ("add_device", None, "添加设备"), ("open_button", "button", "Open"), ("cancel_button", "button", "Cancel"),
                                       ("spent_link", None, "这条加入链接已用过或已过期。在已有设备上点“添加设备”重新生成。"),
                                   ):
                                       prefix = r"^\s*#\S+ " + (re.escape(role) + " " if role else r"(?:[a-z-]+ )?")
@@ -691,7 +802,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ always() && !cancelled() && steps.native_cleanup.outputs.safe_public_artifacts == 'true' }}
         with:
-          name: native-provider-ios-${{ github.sha }}
+          name: native-provider-ios-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             .artifacts/native/public/provider.json
             .artifacts/native/public/provider-probe.json
@@ -702,3 +813,16 @@ jobs:
             .artifacts/native/public/terminology-device-kinds.png
           if-no-files-found: error
           retention-days: 7
+
+  mobile-gate:
+    if: always()
+    needs: [android, ios-build, ios-accept]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Require all selected mobile jobs
+        env:
+          MOBILE_NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci.py mobile-gate --needs-env MOBILE_NEEDS --platforms "${{ inputs.platforms || 'all' }}" ${{ inputs.android_only && '--android-only' || '' }}

@@ -118,13 +118,15 @@ def maintenance(node, command):
 
 
 _port_base = [int(os.environ.get("VIBEFACE_PORT_BASE", "0"))]
+_port_limit = int(os.environ.get("VIBEFACE_PORT_LIMIT", "65536"))
+require(0 <= _port_base[0] < _port_limit <= 65536, "valid exclusive port range")
 _assigned_ports = set()
 
 
 def available_port():
-    """A free TCP/UDP loopback port; VIBEFACE_PORT_BASE pins a known range."""
     while True:
         port = _port_base[0]
+        require(port < _port_limit, "the assigned port range is not exhausted")
         if port:
             _port_base[0] += 1
         with socket.socket() as stream, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
@@ -608,6 +610,31 @@ class Client:
             self.process = None
 
 
+def node_startup_failure_facts(log_path, exit_code):
+    facts = {"exit_code": exit_code, "log_available": False, "truncated": False,
+             "os_error_codes": [], "log_markers": []}
+    try:
+        with log_path.open("rb") as source:
+            size = source.seek(0, os.SEEK_END)
+            source.seek(max(0, size - 65536))
+            tail = source.read(65536)
+    except OSError:
+        return facts
+    facts["log_available"] = True
+    facts["truncated"] = size > 65536
+    facts["os_error_codes"] = list(dict.fromkeys(
+        int(code) for code in re.findall(rb"\(os error ([0-9]{1,5})\)", tail)))[:8]
+    lowered = tail.lower()
+    facts["log_markers"] = [label for label, marker in (
+        ("address_in_use", b"address already in use"),
+        ("permission_denied", b"permission denied"),
+        ("no_space", b"no space left on device"),
+        ("data_locked", b"database is locked"),
+        ("panicked", b"panicked"),
+    ) if marker in lowered]
+    return facts
+
+
 class Node:
     def __init__(self, run, name, binary, workspace, helper, *, init_args=None, port=None):
         self.name = name
@@ -695,6 +722,15 @@ class Node:
         else:
             def listener():
                 if self.process.poll() is not None:
+                    facts = node_startup_failure_facts(self.directory / "process.log", self.process.returncode)
+                    try:
+                        private_json(self.directory / "startup-failure.json", facts)
+                    except OSError:
+                        pass
+                    try:
+                        print("NODE_STARTUP_FAILURE", json.dumps(facts), flush=True)
+                    except OSError:
+                        pass
                     raise RuntimeError(f"{self.name}: Node exited {self.process.returncode}; inspect {self.directory / 'process.log'}")
                 return self.client.request("/api/info")
             info = wait_for(f"{self.name} HTTP listener", listener)
@@ -1205,6 +1241,23 @@ def fixture_codex(arguments):
     # A bot thread's Shell environment holds its tool token, so it stays in memory only, as do
     # the developer instructions it was started or resumed with.
     bot_env, bot_guide, bot_stops = {}, {}, {}
+    native_stop = None
+
+    def record_native_stop(thread_id, turn_id, stopped, *, interrupted=False, terminal=None):
+        # All three writers hold state_lock; atomic replacement alone cannot serialize updates.
+        if native_stop is None or (native_stop["thread_id"], native_stop["turn_id"]) != (thread_id, turn_id):
+            return
+        native_stop["stop_event_set"] = stopped.is_set()
+        native_stop["interrupt_received"] |= interrupted
+        if terminal is not None:
+            native_stop["terminal_status"] = terminal
+        try:
+            private_json(run / "native-provider-stop.json", native_stop)
+        except OSError:
+            try:
+                (run / "native-provider-stop.json").unlink(missing_ok=True)
+            except OSError:
+                pass
 
     class BotTurn:
         """One bot turn: progress and its end go to the connection that started it."""
@@ -1212,6 +1265,14 @@ def fixture_codex(arguments):
         def __init__(self, stream, thread, turn):
             self.stream, self.thread, self.turn = stream, thread, turn
             self.stopped = bot_stops[turn["id"]] = threading.Event()
+
+        def observe_native_stop(self):
+            nonlocal native_stop
+            with state_lock:
+                native_stop = {"thread_id": self.thread["id"], "turn_id": self.turn["id"], "process_id": os.getpid(),
+                               "instance_id": hashlib.sha256(str(socket_path).encode()).hexdigest(),
+                               "stop_event_set": self.stopped.is_set(), "interrupt_received": False, "terminal_status": None}
+                record_native_stop(self.thread["id"], self.turn["id"], self.stopped)
 
         def send(self, method, params):
             try:
@@ -1226,12 +1287,13 @@ def fixture_codex(arguments):
 
         def end(self, status, text=None):
             with state_lock:
-                bot_stops.pop(self.turn["id"], None)
                 if text is not None:
                     item = {"id": "fixture-answer", "type": "agentMessage", "text": text}
                     self.turn["items"].append(item)
                     self.send("item/completed", {"item": item})
                 self.turn["status"] = status
+                record_native_stop(self.thread["id"], self.turn["id"], self.stopped, terminal=self.turn["status"])
+                bot_stops.pop(self.turn["id"], None)
                 self.thread["status"] = {"type": "idle"}
                 private_json(state_path, state)
                 fixture_record(run, "codex-inputs.jsonl", {"event": "turn_completed", "thread_id": self.thread["id"],
@@ -1483,7 +1545,9 @@ def fixture_codex(arguments):
                             return
                         continue
                     elif method == "turn/interrupt" and params.get("turnId") in bot_stops:
-                        bot_stops[params["turnId"]].set()
+                        stopped = bot_stops[params["turnId"]]
+                        stopped.set()
+                        record_native_stop(thread["id"], params["turnId"], stopped, interrupted=True)
                         result = {}
                     elif method == "turn/interrupt":
                         require(thread["turns"][-1]["id"] == params["turnId"], "interrupt selects the original turn")
@@ -1758,6 +1822,10 @@ def fixture_manager(run, initial, bot):
                    "trigger": trigger, "kind": kind, "advertised": sorted(initial["custom_tools"]),
                    "available": sorted(catalog), "unavailable": sorted((SETTINGS_TOOLS | WAKE_TOOLS | WORK_TOOLS) - expected_tools),
                    "cli_matches_api": True})
+    if context["conversation_id"] == "native-provider" and trigger == "message:native-running" and main_human \
+            and directive == {"phase1": True, "label": "native-running", "gate": str(run / "native-never-release")} \
+            and (run / "native-provider-stage.json").is_file():
+        bot.observe_native_stop()
     fixture_record(run, "manager-invocations.jsonl", record)
 
     def work_cli(arguments, expected=True, rejection="", *, name="dispatch_work"):
@@ -3193,7 +3261,7 @@ def chat_agent_acceptance(options):
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     nodes = []
     report = {"status": "running", "source_binary": str(binary), "binary_sha256": file_sha256(binary),
-              "provider_calls": 0, "coverage": "one real Node; fixture SDK driving the real vibeface CLIs against a managed fixture App Server",
+              "provider_calls": 0, "coverage": "two isolated real Nodes; fixture SDK driving the real vibeface CLIs against a managed fixture App Server",
               "evidence": [], "not_checked": ["real provider model behavior", "rendered browser UI",
                   "cross-device work (phase 2)", "OS sandboxing of SDK host tools"]}
 
@@ -8667,6 +8735,76 @@ class BootstrapSite:
         require(not self.thread.is_alive(), "bootstrap site stops its own thread")
 
 
+def native_running_stop(run, client, queue, conversation, calls, receiver):
+    if queue is None:
+        return None
+
+    def enum(value, allowed):
+        return value if isinstance(value, str) and value in allowed else "unknown"
+
+    def identifier(value, pattern):
+        return value if isinstance(value, str) and re.fullmatch(pattern, value) else None
+
+    jobs = [row for row in conversation["scheduler"]["jobs"]
+            if row.get("conversation_id") == "native-provider" and row.get("trigger") == "message:native-running"]
+    job = None
+    if len(jobs) == 1:
+        row = jobs[0]
+        runtime, attempt, failure, scope = (row[key] if isinstance(row.get(key), dict) else {}
+                                            for key in ("runtime", "attempt", "failure", "scope"))
+        job = {"conversation_id": "native-provider", "trigger": "message:native-running",
+               "kind": enum(row.get("kind"), ("human", "answer", "work_result", "agent_task", "workspace_task", "schedule", "bot_message")),
+               "scope": enum(scope.get("kind"), ("main", "workspace_task", "task", "routine")),
+               "state": enum(row.get("state"), ("queued", "steering", "steered", "claimed", "running", "cancelling", "reconciling",
+                                               "completed", "failed", "cancelled", "interrupted", "pending_delivery")),
+               "attempt_id": identifier(attempt.get("id"), r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"),
+               "runtime": {"provider": enum(runtime.get("provider"), ("codex", "cursor", "claude", "pi", "opencode")),
+                           "stage": enum(runtime.get("stage"), ("validate", "install", "launch", "authentication", "model_list", "session_start",
+                                                               "turn_start", "run", "read_back", "interrupt", "compact", "handoff", "record")),
+                           "execution": enum(runtime.get("execution"), ("not_started", "started", "unknown"))} if runtime else None,
+               "pending_check": row.get("pending_check") if type(row.get("pending_check")) is bool else None,
+               "failure_kind": enum(failure.get("kind"), ("missing_key", "auth_failed", "quota", "missing_binary", "execution_disabled", "no_model",
+                                                          "no_bot", "writer_busy", "rejected", "transport", "timed_out", "restarted", "lost", "unknown")) if failure else None}
+    receipt = None
+    try:
+        saved = client.rpc("input_receipt", conversation_id="native-provider", message_id="native-running", target=queue["target"])
+        if saved["message_id"] == "native-running" and saved["target"] == {"kind": "bot_main", "bot_id": "native-provider"}:
+            receipt = {"stage": enum(saved.get("stage"), ("entry_accepted", "owner_accepted", "submitting", "provider_accepted", "associated", "refused", "unknown")),
+                       "reason": enum(saved["reason"], ("deferred", "cancelled_before_delivery", "awaiting_admission", "awaiting_owner",
+                                                       "native_delivery_unconfirmed", "execution_result_unconfirmed")) if saved.get("reason") is not None else None,
+                       "actual_turn_id": identifier(saved.get("actual_turn_id"), r"fixture-turn-[0-9a-f]{32}"),
+                       "control_event": identifier(saved.get("control_event"), r"[0-9a-f]{64}"),
+                       "retry_safe": saved.get("retry_safe") if type(saved.get("retry_safe")) is bool else None}
+    except (OSError, ValueError, AssertionError, KeyError, TypeError, http.client.HTTPException):
+        pass
+    fixture = None
+    try:
+        path = run / "native-provider-stop.json"
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 2048 or metadata.st_mode & 0o077:
+            raise ValueError("unavailable")
+        marker = json.loads(path.read_text())
+        running = [row for row in calls if row["conversation_id"] == "native-provider" and row["trigger"] == "message:native-running"]
+        if len(running) == 1 and set(marker) == {"thread_id", "turn_id", "process_id", "instance_id", "stop_event_set", "interrupt_received", "terminal_status"} \
+                and marker["thread_id"] == running[0]["native_session_id"] and marker["process_id"] == running[0]["pid"] \
+                and identifier(marker["thread_id"], r"fixture-thread-[0-9a-f]{32}") and identifier(marker["turn_id"], r"fixture-turn-[0-9a-f]{32}") \
+                and identifier(marker["instance_id"], r"[0-9a-f]{64}") \
+                and type(marker["process_id"]) is int and 0 < marker["process_id"] <= 2147483647 \
+                and type(marker["stop_event_set"]) is bool and type(marker["interrupt_received"]) is bool:
+            servers = [row for row in fixture_records(run, "codex-server.jsonl") if isinstance(row, dict)
+                       and isinstance(row.get("socket"), str) and len(row["socket"]) <= 4096
+                       and hashlib.sha256(row["socket"].encode()).hexdigest() == marker["instance_id"]]
+            current_pid = servers[-1].get("pid") if servers else None
+            fixture = {**marker, "terminal_status": enum(marker["terminal_status"], ("completed", "interrupted", "failed"))
+                       if marker["terminal_status"] is not None else None, "gate_exists": (run / "native-never-release").exists(),
+                       "process_current": current_pid == marker["process_id"] if type(current_pid) is int and 0 < current_pid <= 2147483647 else None}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    owner = conversation["conversation"].get("owner")
+    return {"job": job, "receipt": receipt, "fixture": fixture,
+            "owner_is_receiver": owner == receiver if isinstance(owner, str) and owner else None}
+
+
 def e2e_fixture(options):
     program = shutil.which(str(options.binary)) if len(options.binary.parts) == 1 else str(options.binary)
     require(program is not None, "the isolated e2e Node binary exists on PATH or at its explicit path")
@@ -8698,6 +8836,32 @@ def e2e_fixture(options):
             role: {"url": node.url, "peer": node.device_id, "directory": str(node.directory)}
             for role, node in nodes.items()
         }, **({"gates": {name: str(path) for name, path in workspace_gates.items()}} if workspace_gates else {})}
+
+    def native_deferred_input(client):
+        if native_queue is None:
+            return None
+        rows = [row for row in client.rpc("workspace_state")["inputs"]
+                if row["input"]["message_id"] == native_queue["deferred_message_id"]]
+        require(len(rows) == 1, "the native deferred message has one real workspace input")
+        queued = rows[0]
+        saved = queued["input"]
+        require(queued["conversation_id"] == native_queue["conversation_id"]
+                and saved["target"] == native_queue["target"] and saved["intent"] == "defer",
+                "the native deferred input preserves its exact conversation, target and intent")
+        require(all(isinstance(queued[key], str) and re.fullmatch(r"[0-9a-f]{64}", queued[key])
+                    for key in ("source_event", "control_event"))
+                and type(queued["deferred"]) is bool and type(queued["cancelled"]) is bool,
+                "the native deferred input has exact control events and boolean state")
+        receipt = client.rpc("input_receipt", conversation_id=queued["conversation_id"],
+                             message_id=saved["message_id"], target=saved["target"])
+        require(receipt["message_id"] == saved["message_id"] and receipt["target"] == saved["target"]
+                and receipt["control_event"] == queued["control_event"],
+                "the owner receipt identifies the exact native deferred input and control event")
+        return {"message_id": saved["message_id"], "conversation_id": queued["conversation_id"],
+                "target": saved["target"], "intent": saved["intent"],
+                **{key: queued[key] for key in ("deferred", "cancelled", "source_event", "control_event")},
+                "receipt": {key: receipt[key] for key in
+                            ("message_id", "target", "control_event", "stage", "reason", "actual_turn_id", "retry_safe")}}
 
     def stop(*_):
         raise SystemExit(0)
@@ -8932,29 +9096,40 @@ def e2e_fixture(options):
                     require(manager is not None and manager["provider"] == "codex",
                             "the native UI must enable the controlled manager before queue preparation")
                     native_queue = {"bot_id": "native-provider", "conversation_id": "native-provider",
-                                    "running_trigger": "message:native-running",
-                                    "deferred_message_id": "native-deferred-input"}
+                                    "target": {"kind": "bot_main", "bot_id": "native-provider"},
+                                    "running_trigger": "message:native-running", "deferred_message_id": "native-deferred-input"}
                     client.rpc("create_bot", bot_id=native_queue["bot_id"], conversation_id=native_queue["conversation_id"],
                                name="Native Provider", instructions="Controlled native acceptance", project=None)
-                    directive = {"phase1": True, "label": "native-running", "gate": str(run / "native-never-release")}
-                    running = client.rpc("message", conversation_id=native_queue["conversation_id"],
-                                         message_id="native-running", text=json.dumps(directive), report_results=False)
-                    require(running["trigger"] == native_queue["running_trigger"],
-                            "native running input preserves its accepted trigger")
-                    wait_for("native running input reaches its actual job state", lambda:
-                        any(job["trigger"] == running["trigger"] and job["state"] == "running"
-                            for job in client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"]))
-                    wait_for("the native queue has one positive controlled invocation", lambda:
-                        len([row for row in fixture_records(run) if row["conversation_id"] == native_queue["conversation_id"]
-                             and row["trigger"] == native_queue["running_trigger"]]) == 1)
-                    deferred = client.rpc("message", conversation_id=native_queue["conversation_id"],
-                        message_id=native_queue["deferred_message_id"], target={"kind": "bot_main", "bot_id": native_queue["bot_id"]},
-                        intent="defer", sequence=2, text="Native deferred input", report_results=False)
-                    require(deferred["accepted"] is True and deferred["message_id"] == native_queue["deferred_message_id"],
-                            "native deferred input is accepted through the signed message API")
-                    wait_for("native deferred input is persisted without becoming a job", lambda:
-                        any(row["input"]["message_id"] == native_queue["deferred_message_id"] and row["deferred"] and not row["cancelled"]
-                            for row in client.rpc("workspace_state")["inputs"]))
+                    for label in ("native-running", native_queue["deferred_message_id"]):
+                        directive = {"phase1": True, "label": label}
+                        if label == "native-running":
+                            directive["gate"] = str(run / "native-never-release")
+                        receipt = client.rpc("message", conversation_id=native_queue["conversation_id"],
+                                             message_id=label, target=native_queue["target"],
+                                             intent="continue" if label == "native-running" else "defer",
+                                             text=json.dumps(directive), report_results=False)
+                        require(receipt["accepted"] is True and receipt["message_id"] == label
+                                and receipt["trigger"] == "message:" + label
+                                and receipt["receipt"]["network_id"] == client.network_id
+                                and receipt["receipt"]["conversation_id"] == native_queue["conversation_id"]
+                                and receipt["receipt"]["trigger"] == receipt["trigger"]
+                                and receipt["receipt"]["state"] == receipt["state"],
+                                "native messages preserve their exact accepted admission identity")
+                        if label == "native-running":
+                            wait_for("native message reaches its actual running state", lambda:
+                                any(job["trigger"] == receipt["trigger"] and job["state"] == "running"
+                                    for job in client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"]))
+                            wait_for("the native queue has one positive controlled invocation", lambda:
+                                len([row for row in fixture_records(run) if row["conversation_id"] == native_queue["conversation_id"]
+                                     and row["trigger"] == native_queue["running_trigger"]]) == 1)
+                        else:
+                            require(receipt["state"] == "deferred", "the native second message is saved as a deferred input")
+                    deferred = native_deferred_input(client)
+                    require(deferred["deferred"] is True and deferred["cancelled"] is False
+                            and deferred["source_event"] == deferred["control_event"]
+                            and deferred["receipt"]["stage"] == "owner_accepted" and deferred["receipt"]["reason"] == "deferred"
+                            and deferred["receipt"]["actual_turn_id"] is None and deferred["receipt"]["retry_safe"] is True,
+                            "the real owner confirms its unsent native deferred input")
                     result = native_queue
                 elif op == "native_provider_inspect":
                     require(set(request) == {"op"} and native_provider, "native inspection reads only its controlled receiver")
@@ -8962,11 +9137,15 @@ def e2e_fixture(options):
                     settings = client.call("node_settings")
                     provider = next(item for item in settings["providers"] if item["provider"] == "codex")
                     manager = settings["settings"]["manager"]
-                    jobs = client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"] if native_queue else []
-                    inputs = client.rpc("workspace_state")["inputs"] if native_queue else []
-                    deferred_input = next((row for row in inputs
-                        if row["input"]["message_id"] == native_queue["deferred_message_id"]), None) if native_queue else None
+                    conversation = client.rpc("conversation", conversation_id=native_queue["conversation_id"]) if native_queue else None
+                    jobs = conversation["scheduler"]["jobs"] if conversation else []
                     calls = [row for row in fixture_records(run) if native_queue and row["conversation_id"] == native_queue["conversation_id"]]
+                    running_trigger = native_queue["running_trigger"] if native_queue else None
+                    deferred_trigger = "message:" + native_queue["deferred_message_id"] if native_queue else None
+                    try:
+                        running_stop = native_running_stop(run, client, native_queue, conversation, calls, nodes["receiver"].device_id)
+                    except (OSError, ValueError, AssertionError, KeyError, TypeError, http.client.HTTPException):
+                        running_stop = None
                     result = {"manager": {key: manager[key] for key in ("provider", "model", "reasoning_effort")} if manager is not None else None,
                               "roles": provider["roles"], "execution_model": provider["execution_model"], "setup": provider["setup"],
                               "login_count": len(fixture_records(run, "native-provider-login.jsonl")),
@@ -8975,14 +9154,10 @@ def e2e_fixture(options):
                               "authentication": provider["probe"]["authentication"],
                               "checked_at_ms": provider["probe"]["checked_at_ms"],
                               "jobs": [{"trigger": row["trigger"], "state": row["state"]} for row in jobs],
-                              "deferred_input": ({"message_id": deferred_input["input"]["message_id"],
-                                                  "target": deferred_input["input"]["target"],
-                                                  "deferred": deferred_input["deferred"], "cancelled": deferred_input["cancelled"]}
-                                                 if deferred_input else None),
-                              "total_invocations": len(calls),
-                              "running_invocations": sum(row["trigger"] == native_queue["running_trigger"] for row in calls),
-                              "deferred_invocations": sum(row["trigger"] == "message:" + native_queue["deferred_message_id"]
-                                                           for row in calls)}
+                              "deferred_input": native_deferred_input(client),
+                              "running_stop": running_stop, "total_invocations": len(calls),
+                              "running_invocations": sum(row["trigger"] == running_trigger for row in calls),
+                              "deferred_invocations": sum(row["trigger"] == deferred_trigger for row in calls)}
                 elif op == "native_send":
                     require(native_ready, "native delivery is scoped to the initialized fixture")
                     intent = str(uuid.uuid4())
@@ -9022,6 +9197,11 @@ if __name__ == "__main__":
     if "--fixture-codex" in sys.argv:
         fixture_codex(sys.argv[1:])
     else:
+        def interrupt_acceptance(*_):
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGINT, interrupt_acceptance)
+        signal.signal(signal.SIGTERM, interrupt_acceptance)
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--binary", type=Path, required=True,
                             help="the vibeface CLI binary used to create and run the isolated Nodes")

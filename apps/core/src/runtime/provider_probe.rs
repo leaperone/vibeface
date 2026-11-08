@@ -807,7 +807,7 @@ mod tests {
             ));
             assert!(readiness.can_attempt());
         }
-        node.cursor.get().unwrap().stop().await;
+        node.cursor.get().unwrap().stop().await?;
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -825,7 +825,7 @@ mod tests {
         assert!(matches!(probe.launch, LaunchCheck::Failed { .. }));
         assert_eq!(probe.authentication, Authentication::Unverified);
         assert_eq!(probe.catalog, ModelCatalog::default());
-        node.cursor.get().unwrap().stop().await;
+        node.cursor.get().unwrap().stop().await?;
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -879,7 +879,7 @@ mod tests {
         let current = node.provider_probe_snapshot(provider).await;
         std::fs::write(release, b"ready")?;
         let returned = pending.await?;
-        node.cursor.get().unwrap().stop().await;
+        node.cursor.get().unwrap().stop().await?;
         drop(node);
         std::fs::remove_dir_all(dir)?;
         assert_ne!(first.config_id, current.config_id);

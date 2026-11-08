@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import type { E2EConfig } from 'e2e';
-import { mobile } from '@e2e-dev/mobile';
+import { mobile, type DeviceProvider } from '@e2e-dev/mobile';
 
 const root = resolve(import.meta.dirname, '../..');
 const localArtifacts = resolve(import.meta.dirname, '.artifacts');
@@ -20,9 +20,22 @@ const invitation = process.env.VIBEFACE_E2E_NATIVE_INVITATION_FILE ?? resolve(ro
 const inside = relative(resolve(root, '.artifacts/native'), resolve(invitation));
 assert(inside && !inside.startsWith('..') && !inside.startsWith('/'), 'Native invitation remains in this task');
 
+const nativeDebugDevice: DeviceProvider = {
+  name: 'native-acceptance-debug',
+  async acquire(request) {
+    request.signal.throwIfAborted();
+    assert(request.platform === 'ios' && request.slot === 0 && request.slots === 1
+      && request.env.VIBEFACE_E2E_SIMULATOR === simulator, 'Debug uses the single assigned acceptance simulator');
+    return { id: 'vdp-native-acceptance-debug-0', deviceId: simulator, client: { debug: true } };
+  },
+  async release() {
+    // The workflow owns this device; pool.finish and always cleanup retain their existing responsibilities.
+  },
+};
+
 export default {
   tests: ['native-transfers.e2e.ts'],
-  targets: [{ name: 'vdp-ios', engine: mobile({ platform: 'ios', device: simulator, session: 'vdp-native-acceptance', transition: 1000 }),
+  targets: [{ name: 'vdp-ios', engine: mobile({ platform: 'ios', device: nativeDebugDevice, session: 'vdp-native-acceptance', transition: 1000 }),
     app: { appPath: resolve(app), bundleId: 'one.leaper.vibeface' } }],
   workers: 1,
   retries: 0,

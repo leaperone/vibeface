@@ -29,6 +29,8 @@ def fail(request, code):
     send({"id": request["id"], "error": {"code": code, "message": "controlled failure"}})
 
 def models():
+    if os.environ.get("FAKE_BRIDGE_MODELS") == "oversize":
+        return {"models": {"availableModels": [{"modelId": "fixture-model", "name": "x" * 1_048_576}]}}
     return {"models": {"currentModelId": "composer-2", "availableModels": [
         {"modelId": "composer-2", "name": "Composer 2"},
         {"modelId": "fixture-model", "name": "Fixture"}]}}
@@ -119,6 +121,10 @@ for raw in sys.stdin:
             assert any(json.loads(path.read_text())["status"]["state"] == "submitted" for path in (pathlib.Path(journal) / "prompts").glob("*.json")), "prompt must be journaled before submission"
         log("FAKE_BRIDGE_SEND_LOG", {"session": session, "text": text})
         pending = (request, session, text)
+        if reason := os.environ.get("FAKE_ACP_TERMINAL_FIRST"):
+            reply(request, {"stopReason": reason})
+            pending = None
+            continue
         update(session, {"sessionUpdate": "tool_call", "toolCallId": "controlled-start", "kind": "execute", "title": "controlled task", "status": "in_progress"})
         if text == "disconnect":
             sys.exit(3)

@@ -176,6 +176,7 @@ struct Processes {
 #[derive(Clone)]
 struct Tracked {
     executable: PathBuf,
+    store: PathBuf,
     identity: ProcessIdentity,
     kill: watch::Sender<bool>,
     exited: watch::Receiver<bool>,
@@ -189,6 +190,7 @@ enum ProcessIdentity {
     #[cfg(windows)]
     WindowsJob,
     Exited,
+    Unconfirmed,
 }
 #[derive(Serialize, Deserialize)]
 struct ProcessRecord {
@@ -233,11 +235,6 @@ impl Processes {
             .collect();
         platform::privatefs::write_atomic(path, &serde_json::to_vec(&records)?)
     }
-    fn track(&self, token: String, tracked: Tracked) -> Result<()> {
-        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
-        running.insert(token, tracked);
-        self.save(&running)
-    }
     fn forget(&self, token: &str) {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         running.remove(token);
@@ -263,9 +260,13 @@ impl Rpc {
             .await
             .map_err(|_| anyhow!("Cursor ACP transport closed"))
     }
-    async fn close(mut self) {
+    async fn close(mut self) -> Result<()> {
         let _ = self.kill.send(true);
-        let _ = self.exited.wait_for(|v| *v).await;
+        self.exited
+            .wait_for(|v| *v)
+            .await
+            .context("the Cursor process-tree exit is unconfirmed")?;
+        Ok(())
     }
 }
 
@@ -367,44 +368,65 @@ impl CursorAgent {
             stopped: AtomicBool::new(false),
         })
     }
-    pub fn kill_orphan(pidfile: &Path) {
-        let Ok(bytes) = std::fs::read(pidfile) else {
-            return;
+    pub fn kill_orphan(pidfile: &Path) -> Result<()> {
+        let bytes = match std::fs::read(pidfile) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("read the recorded Cursor process journal"),
         };
-        let Ok(records) = serde_json::from_slice::<Vec<ProcessRecord>>(&bytes) else {
-            return;
-        };
+        let records = serde_json::from_slice::<Vec<ProcessRecord>>(&bytes)
+            .context("the recorded Cursor process journal is malformed")?;
+        let mut failure = None;
         for record in records {
-            let same = match record.identity {
-                #[cfg(unix)]
-                ProcessIdentity::UnixStart(expected) => record
-                    .token
-                    .parse()
-                    .ok()
-                    .and_then(|pid| process_start(pid).ok())
-                    .is_some_and(|current| current == expected),
-                #[cfg(windows)]
-                ProcessIdentity::WindowsJob => true,
-                ProcessIdentity::Exited => false,
-            };
-            if same {
-                #[cfg(unix)]
-                let accepted = |member: &str| {
-                    member.contains(&record.executable.to_string_lossy().to_string())
+            let stopped = (|| {
+                let same = match record.identity {
+                    #[cfg(unix)]
+                    ProcessIdentity::UnixStart(expected) => {
+                        platform::tree::Leftover::find(&record.token)?.is_some()
+                            && process_start(record.token.parse()?)? == expected
+                    }
+                    #[cfg(windows)]
+                    ProcessIdentity::WindowsJob => true,
+                    ProcessIdentity::Exited | ProcessIdentity::Unconfirmed => {
+                        ensure!(
+                            platform::tree::Leftover::find(&record.token)?.is_none(),
+                            "the recorded Cursor process-tree exit is unconfirmed"
+                        );
+                        false
+                    }
                 };
-                // The Windows job token already binds the root's creation time and job key.
-                #[cfg(windows)]
-                let accepted = |_: &str| true;
-                let _ = platform::tree::stop_recorded(&record.token, accepted);
+                if same {
+                    #[cfg(unix)]
+                    let accepted = |member: &str| {
+                        member.contains(&record.executable.to_string_lossy().to_string())
+                    };
+                    // The Windows job token already binds the root's creation time and job key.
+                    #[cfg(windows)]
+                    let accepted = |_: &str| true;
+                    platform::tree::stop_recorded(&record.token, accepted)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = stopped {
+                failure.get_or_insert(error);
             }
         }
-        let _ = std::fs::remove_file(pidfile);
+        if let Some(error) = failure {
+            return Err(error)
+                .context("Cursor process-tree exit is unconfirmed; the journal was retained");
+        }
+        match std::fs::remove_file(pidfile) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(error).context("remove the stopped Cursor process journal")
+            }
+            _ => Ok(()),
+        }
     }
-    pub async fn stop(&self) {
+    pub async fn stop(&self) -> Result<()> {
         self.stopped.store(true, Ordering::SeqCst);
-        self.retire_all().await;
+        self.retire_all().await
     }
-    pub async fn retire_all(&self) {
+    pub async fn retire_all(&self) -> Result<()> {
         let running: Vec<_> = self
             .processes
             .running
@@ -416,9 +438,23 @@ impl CursorAgent {
         for tracked in &running {
             let _ = tracked.kill.send(true);
         }
+        let mut confirmed = true;
         for mut tracked in running {
-            let _ = tracked.exited.wait_for(|v| *v).await;
+            if tracked.exited.wait_for(|v| *v).await.is_err() {
+                confirmed = false;
+            }
         }
+        ensure!(confirmed, "the Cursor process-tree exit is unconfirmed");
+        let running = self
+            .processes
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        ensure!(
+            running.is_empty(),
+            "Cursor process-tree exit is unconfirmed; the journal was retained"
+        );
+        self.processes.save(&running)
     }
     async fn spawn(
         &self,
@@ -429,76 +465,116 @@ impl CursorAgent {
         model: &str,
         mode: CursorCommand,
     ) -> Result<Rpc> {
-        ensure!(
-            !self.stopped.load(Ordering::SeqCst),
-            "Cursor agent is stopped"
-        );
-        ensure!(
-            workspace.is_absolute() && workspace.is_dir() && root.is_absolute(),
-            "Cursor needs an existing absolute workspace and private store"
-        );
-        for directory in [root.to_path_buf(), root.join("config"), root.join("data")] {
-            platform::privatefs::create_dir(&directory)?;
-        }
-        validate_launch_env(env)?;
-        let mut command = std::process::Command::new(executable);
-        command
-            .current_dir(workspace)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (name, _) in std::env::vars_os() {
-            let text = name.to_string_lossy();
-            if text.starts_with("VIBEFACE_")
-                || text.starts_with("CURSOR_")
-                || text == "AGENT_CLI_CREDENTIAL_STORE"
-            {
-                command.env_remove(name);
+        let (outgoing, mut requests) = mpsc::channel::<Value>(32);
+        let (responses, incoming) = mpsc::channel(128);
+        let (kill, mut killed) = watch::channel(false);
+        let (exit, exited) = watch::channel(false);
+        let (mut tree, mut child, group, token, recorded) = {
+            let mut running = self
+                .processes
+                .running
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            ensure!(
+                !self.stopped.load(Ordering::SeqCst),
+                "Cursor agent is stopped"
+            );
+            ensure!(
+                !running.values().any(|tracked| tracked.store == root),
+                "the previous Cursor process-tree exit is unconfirmed"
+            );
+            ensure!(
+                workspace.is_absolute() && workspace.is_dir() && root.is_absolute(),
+                "Cursor needs an existing absolute workspace and private store"
+            );
+            for directory in [root.to_path_buf(), root.join("config"), root.join("data")] {
+                platform::privatefs::create_dir(&directory)?;
             }
-        }
-        command
-            .envs(env)
-            .envs(&self.env)
-            .env("CURSOR_CONFIG_DIR", root.join("config"))
-            .env("CURSOR_DATA_DIR", root.join("data"));
-        if env.contains_key("CURSOR_API_KEY") || env.contains_key("CURSOR_AUTH_TOKEN") {
-            command.env("AGENT_CLI_CREDENTIAL_STORE", "memory");
-        }
-        if !model.is_empty() {
-            command.args(["--model", model]);
-        }
-        match mode {
-            CursorCommand::Acp => {
-                command.arg("acp");
-            }
-            CursorCommand::Status => {
-                command.args(["status", "--format", "json"]);
-            }
-        }
-        let key = format!(
-            "cursor-acp-{}-{}-{}",
-            std::process::id(),
-            NEXT_PROCESS.fetch_add(1, Ordering::SeqCst),
-            digest(root.to_string_lossy().as_bytes())
-        );
-        let (mut tree, mut child) = platform::tree::Tree::spawn(command, &key, true)?;
-        let group = child.id().context("Cursor ACP process has no ID")?;
-        #[cfg(unix)]
-        let identity = match process_start(group) {
-            Ok(start) => ProcessIdentity::UnixStart(start),
-            Err(error) => {
-                if child.try_wait()?.is_some() {
-                    ProcessIdentity::Exited
-                } else {
-                    tree.kill();
-                    let _ = child.wait().await;
-                    return Err(error);
+            validate_launch_env(env)?;
+            let mut command = std::process::Command::new(executable);
+            command
+                .current_dir(workspace)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            for (name, _) in std::env::vars_os() {
+                let text = name.to_string_lossy();
+                if text.starts_with("VIBEFACE_")
+                    || text.starts_with("CURSOR_")
+                    || text == "AGENT_CLI_CREDENTIAL_STORE"
+                {
+                    command.env_remove(name);
                 }
             }
+            command
+                .envs(env)
+                .envs(&self.env)
+                .env("CURSOR_CONFIG_DIR", root.join("config"))
+                .env("CURSOR_DATA_DIR", root.join("data"));
+            if env.contains_key("CURSOR_API_KEY") || env.contains_key("CURSOR_AUTH_TOKEN") {
+                command.env("AGENT_CLI_CREDENTIAL_STORE", "memory");
+            }
+            if !model.is_empty() {
+                command.args(["--model", model]);
+            }
+            match mode {
+                CursorCommand::Acp => {
+                    command.arg("acp");
+                }
+                CursorCommand::Status => {
+                    command.args(["status", "--format", "json"]);
+                }
+            }
+            let key = format!(
+                "cursor-acp-{}-{}-{}",
+                std::process::id(),
+                NEXT_PROCESS.fetch_add(1, Ordering::SeqCst),
+                digest(root.to_string_lossy().as_bytes())
+            );
+            let (tree, child) = platform::tree::Tree::spawn(command, &key, true)?;
+            let group = child.id().context("Cursor ACP process has no ID")?;
+            #[cfg(unix)]
+            let mut child = child;
+            #[cfg(unix)]
+            let (identity, startup_error) = match process_start(group) {
+                Ok(start) => (ProcessIdentity::UnixStart(start), None),
+                Err(error) => {
+                    if child.try_wait().is_ok_and(|status| status.is_some()) {
+                        (ProcessIdentity::Exited, None)
+                    } else {
+                        (ProcessIdentity::Unconfirmed, Some(error))
+                    }
+                }
+            };
+            #[cfg(windows)]
+            let (identity, startup_error) = (ProcessIdentity::WindowsJob, None::<anyhow::Error>);
+            let token = tree.token().to_owned();
+            running.insert(
+                token.clone(),
+                Tracked {
+                    executable: executable.into(),
+                    store: root.into(),
+                    identity,
+                    kill: kill.clone(),
+                    exited: exited.clone(),
+                },
+            );
+            let recorded = self.processes.save(&running);
+            (
+                tree,
+                child,
+                group,
+                token,
+                startup_error.map_or(recorded, Err),
+            )
         };
-        #[cfg(windows)]
-        let identity = ProcessIdentity::WindowsJob;
-        let token = tree.token().to_owned();
+        if let Err(error) = recorded {
+            if terminate_process_tree(&mut child, &mut tree).await {
+                self.processes.forget(&token);
+                let _ = exit.send(true);
+            }
+            return Err(error);
+        }
         let mut stdin = child.stdin.take().context("Cursor ACP stdin unavailable")?;
         let stdout = child
             .stdout
@@ -508,23 +584,6 @@ impl CursorAgent {
             .stderr
             .take()
             .context("Cursor ACP stderr unavailable")?;
-        let (outgoing, mut requests) = mpsc::channel::<Value>(32);
-        let (responses, incoming) = mpsc::channel(128);
-        let (kill, mut killed) = watch::channel(false);
-        let (exit, exited) = watch::channel(false);
-        if let Err(error) = self.processes.track(
-            token.clone(),
-            Tracked {
-                executable: executable.into(),
-                identity,
-                kill: kill.clone(),
-                exited: exited.clone(),
-            },
-        ) {
-            tree.kill();
-            let _ = child.wait().await;
-            return Err(error);
-        }
         let processes = self.processes.clone();
         tokio::spawn(async move {
             let mut stdout_joined = false;
@@ -573,7 +632,7 @@ impl CursorAgent {
                     }
                 }
             }
-            let _ = terminate_process_tree(&mut child, &mut tree).await;
+            let stopped = terminate_process_tree(&mut child, &mut tree).await;
             stdout_task.abort();
             stderr_task.abort();
             if !stdout_joined {
@@ -583,8 +642,10 @@ impl CursorAgent {
             drop(stdin);
             drop(child);
             drop(tree);
-            processes.forget(&token);
-            let _ = exit.send(true);
+            if stopped {
+                processes.forget(&token);
+                let _ = exit.send(true);
+            }
         });
         Ok(Rpc {
             group,
@@ -608,7 +669,7 @@ impl CursorAgent {
             .await
             .ok()
             .flatten();
-        rpc.close().await;
+        rpc.close().await?;
         let Some(value) = result else {
             return Ok(CursorAuthentication::Unknown);
         };
@@ -722,7 +783,7 @@ impl CursorAgent {
         let result = tokio::time::timeout(STARTUP_TIMEOUT, operation)
             .await
             .map_err(|_| anyhow!("Cursor authentication check timed out"))?;
-        rpc.close().await;
+        rpc.close().await?;
         result
     }
     pub async fn run<F, P, PF>(
@@ -743,6 +804,7 @@ impl CursorAgent {
         let mut session = previous.map(str::to_owned);
         let mut submitted = false;
         let mut observed = false;
+        let mut native_terminal = None;
         let secrets: Vec<&str> = turn
             .env
             .values()
@@ -773,6 +835,12 @@ impl CursorAgent {
                     "Cursor prompt reference was reused with different input"
                 );
                 session = Some(receipt.session.clone());
+                if matches!(
+                    receipt.status,
+                    PromptStatus::Completed | PromptStatus::Cancelled | PromptStatus::Failed { .. }
+                ) {
+                    native_terminal = Some(receipt.clone());
+                }
                 if receipt.status == PromptStatus::Completed {
                     return Ok(AgentResult {
                         session_id: session.clone(),
@@ -857,7 +925,7 @@ impl CursorAgent {
                 Err(_) => Err(anyhow!("Cursor ACP session setup timed out")),
             }?;
             if *cancel.borrow() {
-                rpc.close().await;
+                rpc.close().await?;
                 bail!("Cursor cancelled before prompt submission");
             }
             let mut receipt = PromptReceipt {
@@ -884,11 +952,11 @@ impl CursorAgent {
             let result = {
                 let running = prompt_response(
                     &mut rpc,
-                    &session_id,
-                    &id,
                     turn,
                     &mut receipt,
                     &mut observed,
+                    &mut native_terminal,
+                    &secrets,
                     &mut update,
                 );
                 tokio::pin!(running);
@@ -900,6 +968,7 @@ impl CursorAgent {
             };
             let result = match result {
                 Some(result) => result,
+                None if native_terminal.is_some() => Ok(()),
                 None => {
                     stage = ProviderStage::Interrupt;
                     rpc.send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session_id}})).await?;
@@ -907,11 +976,11 @@ impl CursorAgent {
                         STOP_TIMEOUT,
                         prompt_response(
                             &mut rpc,
-                            &session_id,
-                            &id,
                             turn,
                             &mut receipt,
                             &mut observed,
+                            &mut native_terminal,
+                            &secrets,
                             &mut update,
                         ),
                     )
@@ -927,19 +996,12 @@ impl CursorAgent {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&(turn.local_store_root.clone(), id.clone()));
-            rpc.close().await;
-            let stop_reason = result?;
-            receipt.output = redact_text(receipt.output, &secrets);
-            receipt.status = match stop_reason.as_str() {
-                "end_turn" => PromptStatus::Completed,
-                "cancelled" => PromptStatus::Cancelled,
-                "max_tokens" | "max_turn_requests" => PromptStatus::Failed {
-                    detail: "Cursor stopped at its turn limit".into(),
-                },
-                _ => bail!("Cursor ACP returned an unknown stop reason"),
-            };
-            // The terminal is committed before callbacks or the caller can observe completion.
-            write_receipt(&turn.local_store_root, &receipt)?;
+            let closed = rpc.close().await;
+            if let Err(error) = &closed {
+                tracing::warn!(event = "cursor.process_exit_unconfirmed", reason = %redact_text(format!("{error:#}"), &secrets), "Cursor process-tree exit is unconfirmed; its owner and journal were retained");
+            }
+            closed?;
+            result?;
             if receipt.status == PromptStatus::Cancelled {
                 bail!("Cursor prompt was cancelled by the provider");
             }
@@ -956,7 +1018,7 @@ impl CursorAgent {
                 usage: None,
             })
         };
-        let problem = match operation.await {
+        let mut problem = match operation.await {
             Ok(result) => return Ok(result),
             Err(error) => error,
         };
@@ -965,7 +1027,24 @@ impl CursorAgent {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&(turn.local_store_root.clone(), id.clone()));
-        let terminal = read_receipt(&turn.local_store_root, &id).ok().flatten();
+        let terminal = native_terminal;
+        if let Some(receipt) = &terminal {
+            tracing::debug!(event = "cursor.native_terminal_retained", reason = %redact_text(format!("{problem:#}"), &secrets), "Cursor kept its recorded native terminal after a follow-up error");
+            match &receipt.status {
+                PromptStatus::Completed => {
+                    return Ok(AgentResult {
+                        session_id: Some(receipt.session.clone()),
+                        output: receipt.output.clone(),
+                        usage: None,
+                    });
+                }
+                PromptStatus::Cancelled => {
+                    problem = anyhow!("Cursor prompt was cancelled by the provider");
+                }
+                PromptStatus::Failed { detail } => problem = anyhow!(detail.clone()),
+                _ => {}
+            }
+        }
         let outcome = if terminal
             .as_ref()
             .is_some_and(|r| r.status == PromptStatus::Cancelled)
@@ -1140,13 +1219,13 @@ where
 }
 async fn prompt_response<P, PF>(
     rpc: &mut Rpc,
-    session: &str,
-    id: &str,
     turn: &CursorTurn,
     receipt: &mut PromptReceipt,
     observed: &mut bool,
+    native_terminal: &mut Option<PromptReceipt>,
+    secrets: &[&str],
     progress: &mut P,
-) -> Result<String>
+) -> Result<()>
 where
     P: FnMut(Value) -> PF,
     PF: Future<Output = Result<()>>,
@@ -1157,16 +1236,44 @@ where
             .recv()
             .await
             .context("Cursor ACP disconnected; result is unknown")?;
-        let matching_update =
-            message["method"] == "session/update" && message["params"]["sessionId"] == session;
+        let matching_update = message["method"] == "session/update"
+            && message["params"]["sessionId"] == receipt.session;
         let matching_response = message["id"] == 4 && message.get("method").is_none();
-        if (matching_update || matching_response) && !*observed {
+        let first = (matching_update || matching_response) && !*observed;
+        if first {
             *observed = true;
             receipt.status = PromptStatus::Running;
             write_receipt(&turn.local_store_root, receipt)?;
-            if let Some(started) = &turn.run_started {
-                started(id.into()).await?;
-            }
+        }
+        let reply: Option<Result<()>> = if matching_response {
+            Some((|| {
+                if let Some(error) = message.get("error") {
+                    return Err(AcpError {
+                        code: error["code"].as_i64().unwrap_or(-32603),
+                    }
+                    .into());
+                }
+                receipt.status = match message["result"]["stopReason"]
+                    .as_str()
+                    .context("Cursor prompt returned no stop reason")?
+                {
+                    "end_turn" => PromptStatus::Completed,
+                    "cancelled" => PromptStatus::Cancelled,
+                    "max_tokens" | "max_turn_requests" => PromptStatus::Failed {
+                        detail: "Cursor stopped at its turn limit".into(),
+                    },
+                    _ => bail!("Cursor ACP returned an unknown stop reason"),
+                };
+                receipt.output = redact_text(std::mem::take(&mut receipt.output), secrets);
+                write_receipt(&turn.local_store_root, receipt)?;
+                *native_terminal = Some(receipt.clone());
+                Ok(())
+            })())
+        } else {
+            None
+        };
+        if first && let Some(started) = &turn.run_started {
+            started(receipt.id.clone()).await?;
         }
         if matching_update
             && message["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
@@ -1179,21 +1286,13 @@ where
             receipt.output.push_str(text);
         }
         if message.get("method").is_some() {
-            handle_message(rpc, &message, Some(session), true, progress).await?;
-        } else if matching_response {
-            if let Some(error) = message.get("error") {
-                return Err(AcpError {
-                    code: error["code"].as_i64().unwrap_or(-32603),
-                }
-                .into());
-            }
-            return message["result"]["stopReason"]
-                .as_str()
-                .map(str::to_owned)
-                .context("Cursor prompt returned no stop reason");
+            handle_message(rpc, &message, Some(&receipt.session), true, progress).await?;
+        } else if let Some(reply) = reply {
+            return reply;
         }
     }
 }
+
 async fn handle_message<P, PF>(
     rpc: &Rpc,
     message: &Value,
@@ -1340,19 +1439,42 @@ fn validate_origin(origin: &str) -> Result<()> {
     Ok(())
 }
 
-/// Existing line-based journals used by the Claude process owner.
-pub fn kill_recorded_programs(pidfile: &Path) {
-    let Ok(recorded) = std::fs::read_to_string(pidfile) else {
-        return;
+/// Line-based journals used by the Claude process owner.
+pub fn kill_recorded_programs(pidfile: &Path) -> Result<()> {
+    let recorded = match std::fs::read_to_string(pidfile) {
+        Ok(recorded) => recorded,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("read the recorded agent process journal"),
     };
+    let mut failure = None;
     for line in recorded.lines() {
-        if let Some((token, executable)) = line.split_once(' ')
-            && !executable.is_empty()
-        {
-            let _ = platform::tree::stop_recorded(token, |member| member.contains(executable));
+        if line.trim().is_empty() {
+            continue;
+        }
+        let stopped = (|| {
+            let (token, executable) = line
+                .split_once(' ')
+                .context("the recorded agent process journal is malformed")?;
+            ensure!(
+                !executable.is_empty(),
+                "the recorded agent program is missing"
+            );
+            platform::tree::stop_recorded(token, |member| member.contains(executable))
+        })();
+        if let Err(error) = stopped {
+            failure.get_or_insert(error);
         }
     }
-    let _ = std::fs::remove_file(pidfile);
+    if let Some(error) = failure {
+        return Err(error)
+            .context("agent process-tree exit is unconfirmed; the journal was retained");
+    }
+    match std::fs::remove_file(pidfile) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error).context("remove the stopped agent process journal")
+        }
+        _ => Ok(()),
+    }
 }
 
 pub async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
@@ -1372,7 +1494,10 @@ pub async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
 /// later attempt, or the next run of the Node, ends it rather than losing track of it.
 pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree::Tree) -> bool {
     let token = tree.token().to_owned();
-    tree.stop();
+    if let Err(error) = tree.stop() {
+        tracing::warn!(%error, "could not confirm managed process-tree exit");
+        return false;
+    }
     let reaped = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
     if !matches!(reaped, Ok(Ok(_))) {
         tree.kill();
@@ -1384,8 +1509,8 @@ pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree
         }
     }
     for _ in 0..20 {
-        // Windows Tree::kill drops its Job handle after terminating it. Query the recorded job
-        // by token so this checks the whole tree, including children of a `.cmd` launcher.
+        // Windows stop already waited on member handles before releasing its Job. Also confirm
+        // the recorded tree is gone after the root is reaped.
         match platform::tree::Leftover::find(&token) {
             Ok(None) => return true,
             Ok(Some(_)) => {}
@@ -1482,4 +1607,580 @@ pub(crate) async fn bounded_line(
         "line exceeds the configured size limit"
     );
     Ok(line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::FutureExt as _;
+
+    fn fixture_agent(pidfile: Option<PathBuf>) -> CursorAgent {
+        CursorAgent::new(BTreeMap::new(), "http://127.0.0.1:9".into(), pidfile).unwrap()
+    }
+
+    fn fixture_root() -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("cursor-stop-{}", uuid::Uuid::new_v4()));
+        platform::privatefs::create_dir(&root).unwrap();
+        root.canonicalize().unwrap()
+    }
+
+    fn track(
+        agent: &CursorAgent,
+        token: &str,
+        store: PathBuf,
+        kill: watch::Sender<bool>,
+        exited: watch::Receiver<bool>,
+    ) {
+        let mut running = agent.processes.running.lock().unwrap();
+        running.insert(
+            token.into(),
+            Tracked {
+                executable: "fixture".into(),
+                store,
+                identity: ProcessIdentity::Unconfirmed,
+                kill,
+                exited,
+            },
+        );
+        agent.processes.save(&running).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_requests_every_owned_process_and_rejects_an_unconfirmed_exit() {
+        let agent = fixture_agent(None);
+        let (first, first_kill) = watch::channel(false);
+        let (second, second_kill) = watch::channel(false);
+        let (first_exit, exited) = watch::channel(false);
+        track(&agent, "first", "first-store".into(), first, exited);
+        let (second_exit, exited) = watch::channel(false);
+        track(&agent, "second", "second-store".into(), second, exited);
+        let stopping = agent.stop();
+        tokio::pin!(stopping);
+        assert!(stopping.as_mut().now_or_never().is_none());
+        assert!(*first_kill.borrow());
+        assert!(*second_kill.borrow());
+        drop(first_exit);
+        assert!(stopping.as_mut().now_or_never().is_none());
+        second_exit.send(true).unwrap();
+        assert!(stopping.await.is_err());
+        assert_eq!(agent.processes.running.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retirement_keeps_a_journal_created_by_concurrent_tracking() {
+        let root = fixture_root();
+        let pidfile = root.join("agent.pid");
+        let agent = fixture_agent(Some(pidfile.clone()));
+        let (first_exit, exited) = watch::channel(false);
+        track(
+            &agent,
+            "first",
+            root.join("first"),
+            watch::channel(false).0,
+            exited,
+        );
+        let stopping = agent.retire_all();
+        tokio::pin!(stopping);
+        assert!(stopping.as_mut().now_or_never().is_none());
+        let (_new_exit, exited) = watch::channel(false);
+        track(
+            &agent,
+            "new",
+            root.join("new"),
+            watch::channel(false).0,
+            exited,
+        );
+        agent.processes.forget("first");
+        first_exit.send(true).unwrap();
+        assert!(stopping.await.is_err());
+        let records: Vec<ProcessRecord> =
+            serde_json::from_slice(&std::fs::read(&pidfile).unwrap()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].token, "new");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_store_blocks_repeated_cli_admission() {
+        let root = fixture_root();
+        let store = root.join("owner");
+        let agent = fixture_agent(None);
+        let (exit, exited) = watch::channel(false);
+        drop(exit);
+        track(
+            &agent,
+            "unconfirmed",
+            store.clone(),
+            watch::channel(false).0,
+            exited,
+        );
+        for _ in 0..2 {
+            let error = agent
+                .spawn(
+                    &root.join("missing-cli"),
+                    &root,
+                    &store,
+                    &BTreeMap::new(),
+                    "",
+                    CursorCommand::Acp,
+                )
+                .await
+                .err()
+                .expect("an unconfirmed owner refuses another CLI");
+            assert!(error.to_string().contains("exit is unconfirmed"));
+            assert!(
+                !store.exists(),
+                "replacement did not create a private store"
+            );
+            assert_eq!(agent.processes.running.lock().unwrap().len(), 1);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rpc_close_requires_a_confirmed_exit() {
+        for confirmed in [false, true] {
+            let (kill, killed) = watch::channel(false);
+            let (exit, exited) = watch::channel(confirmed);
+            let rpc = Rpc {
+                group: 0,
+                outgoing: mpsc::channel(1).0,
+                incoming: mpsc::channel(1).1,
+                kill,
+                exited,
+            };
+            drop(exit);
+            assert_eq!(rpc.close().await.is_ok(), confirmed);
+            assert!(*killed.borrow());
+        }
+    }
+
+    #[test]
+    fn orphan_failures_retain_both_journal_formats() {
+        let root = fixture_root();
+        let pidfile = root.join("agent.pid");
+        let invalid_record = serde_json::to_vec(&vec![ProcessRecord {
+            token: "invalid-process-tree-record".into(),
+            executable: "fixture".into(),
+            identity: ProcessIdentity::Unconfirmed,
+        }])
+        .unwrap();
+        for bytes in [b"malformed-record".as_slice(), invalid_record.as_slice()] {
+            platform::privatefs::write_atomic(&pidfile, bytes).unwrap();
+            for _ in 0..2 {
+                assert!(CursorAgent::kill_orphan(&pidfile).is_err());
+                assert_eq!(std::fs::read(&pidfile).unwrap(), bytes);
+            }
+        }
+        platform::privatefs::write_atomic(&pidfile, b"[]").unwrap();
+        CursorAgent::kill_orphan(&pidfile).unwrap();
+        assert!(!pidfile.exists());
+        for bytes in [
+            b"malformed-record\n".as_slice(),
+            b"invalid-process-tree-record fixture\n".as_slice(),
+        ] {
+            platform::privatefs::write_atomic(&pidfile, bytes).unwrap();
+            for _ in 0..2 {
+                assert!(kill_recorded_programs(&pidfile).is_err());
+                assert_eq!(std::fs::read(&pidfile).unwrap(), bytes);
+            }
+        }
+        platform::privatefs::write_atomic(&pidfile, b"").unwrap();
+        kill_recorded_programs(&pidfile).unwrap();
+        assert!(!pidfile.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn r11_turn(root: &Path, client: &str) -> CursorTurn {
+        CursorTurn {
+            owner: "fixture-owner".into(),
+            client_id: client.into(),
+            executable: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) {
+                "tests/fixtures/fake-cursor-agent.cmd"
+            } else {
+                "tests/fixtures/fake-cursor-agent"
+            }),
+            workspace: root.into(),
+            local_store_root: root.join("owner"),
+            env: BTreeMap::from([
+                ("CURSOR_API_KEY".into(), "synthetic-r11-secret".into()),
+                (
+                    "FAKE_BRIDGE_SEND_LOG".into(),
+                    root.join("sent.jsonl").display().to_string(),
+                ),
+                (
+                    "FAKE_ACP_JOURNAL_ROOT".into(),
+                    root.join("owner").display().to_string(),
+                ),
+            ]),
+            model: "fixture-model".into(),
+            timeout_secs: 10,
+            custom_tools: BTreeMap::new(),
+            callback_token: None,
+            process_started: None,
+            run_started: None,
+        }
+    }
+
+    fn r11_matches(
+        result: &Result<AgentResult, AgentRunError>,
+        status: &PromptStatus,
+        output: &str,
+    ) -> bool {
+        match (status, result) {
+            (PromptStatus::Completed, Ok(result)) => result.output == output,
+            (PromptStatus::Cancelled, Err(error)) => error.outcome == AgentFailure::Cancelled,
+            (PromptStatus::Failed { .. }, Err(error)) => error.outcome == AgentFailure::Failed,
+            _ => false,
+        }
+    }
+
+    fn r11_cases() -> [(String, PromptStatus); 4] {
+        [
+            ("end_turn".into(), PromptStatus::Completed),
+            ("cancelled".into(), PromptStatus::Cancelled),
+            (
+                "max_tokens".into(),
+                PromptStatus::Failed {
+                    detail: "Cursor stopped at its turn limit".into(),
+                },
+            ),
+            (
+                "max_turn_requests".into(),
+                PromptStatus::Failed {
+                    detail: "Cursor stopped at its turn limit".into(),
+                },
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn r11_known_terminals_survive_unconfirmed_close_and_reconcile_without_replay() {
+        let mut failures = Vec::new();
+        for (reason, expected) in r11_cases() {
+            let root = fixture_root();
+            let pidfile = root.join("agent.pid");
+            let agent = fixture_agent(Some(pidfile.clone()));
+            let mut turn = r11_turn(&root, "known");
+            turn.executable = root.join("must-not-launch");
+            let prompt = "controlled prompt";
+            let mut receipt = PromptReceipt {
+                session: "fixture-session".into(),
+                id: receipt_id(&turn.client_id),
+                input_hash: digest(
+                    &serde_json::to_vec(&(prompt, &turn.model, &turn.workspace)).unwrap(),
+                ),
+                status: PromptStatus::Running,
+                output: "answer synthetic-r11-secret".into(),
+            };
+            record_session_owner(&turn, &receipt.session).unwrap();
+            write_receipt(&turn.local_store_root, &receipt).unwrap();
+            let (outgoing, mut requests) = mpsc::channel(1);
+            let (responses, incoming) = mpsc::channel(1);
+            responses
+                .send(json!({"jsonrpc":"2.0", "id":4, "result":{"stopReason":reason}}))
+                .await
+                .unwrap();
+            drop(responses);
+            let (kill, _killed) = watch::channel(false);
+            let (exit, exited) = watch::channel(false);
+            drop(exit);
+            track(
+                &agent,
+                "unconfirmed-native",
+                turn.local_store_root.clone(),
+                kill.clone(),
+                exited.clone(),
+            );
+            let journal = std::fs::read(&pidfile).unwrap();
+            let mut rpc = Rpc {
+                group: 0,
+                outgoing,
+                incoming,
+                kill,
+                exited,
+            };
+            let session = receipt.session.clone();
+            let id = receipt.id.clone();
+            let mut observed = true;
+            let mut native_terminal = None;
+            let parsed = prompt_response(
+                &mut rpc,
+                &turn,
+                &mut receipt,
+                &mut observed,
+                &mut native_terminal,
+                &["synthetic-r11-secret"],
+                &mut |_| async { Ok(()) },
+            )
+            .await;
+            assert!(parsed.is_ok(), "the controlled native terminal is valid");
+            assert!(
+                rpc.close().await.is_err(),
+                "the process exit remains unconfirmed"
+            );
+            let saved = read_receipt(&turn.local_store_root, &id).unwrap().unwrap();
+            if saved.status != expected
+                || saved.output != "answer [redacted]"
+                || saved.session != session
+                || saved.id != id
+                || saved.input_hash != receipt.input_hash
+            {
+                failures.push(format!("{reason}: exact durable terminal/output"));
+            }
+            let probed = agent.probe(&turn, &session, &id).await.unwrap();
+            if probed.status != expected || probed.output.as_deref() != Some("answer [redacted]") {
+                failures.push(format!("{reason}: probe must preserve the known terminal"));
+            }
+            let repeat = agent
+                .run(
+                    &turn,
+                    prompt,
+                    None,
+                    |_| async { Ok(()) },
+                    watch::channel(false).1,
+                    |_| async { Ok(()) },
+                )
+                .await;
+            if !r11_matches(&repeat, &expected, "answer [redacted]") {
+                failures.push(format!(
+                    "{reason}: same-client result must reconcile without launching"
+                ));
+            }
+            if matches!(
+                expected,
+                PromptStatus::Cancelled | PromptStatus::Failed { .. }
+            ) && !matches!(&repeat, Err(error) if error.start == StartEvidence::Unknown)
+            {
+                failures.push(format!(
+                    "{reason}: recorded terminal must not become a new launch failure"
+                ));
+            }
+            let mut next = turn.clone();
+            next.client_id = "different-client".into();
+            let blocked = agent
+                .run(
+                    &next,
+                    prompt,
+                    Some(&session),
+                    |_| async { Ok(()) },
+                    watch::channel(false).1,
+                    |_| async { Ok(()) },
+                )
+                .await;
+            assert!(
+                matches!(blocked, Err(error) if error.to_string().contains("exit is unconfirmed"))
+            );
+            assert!(requests.try_recv().is_err(), "no further prompt is sent");
+            assert!(agent.stop().await.is_err());
+            assert_eq!(agent.processes.running.lock().unwrap().len(), 1);
+            assert_eq!(std::fs::read(&pidfile).unwrap(), journal);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    #[tokio::test]
+    async fn r11_first_terminal_callback_failure_preserves_native_result_and_readback() {
+        let mut failures = Vec::new();
+        for (reason, expected) in r11_cases() {
+            let root = fixture_root();
+            let agent = fixture_agent(Some(root.join("agent.pid")));
+            let mut turn = r11_turn(&root, "first-terminal");
+            turn.env
+                .insert("FAKE_ACP_TERMINAL_FIRST".into(), reason.clone());
+            let id = receipt_id(&turn.client_id);
+            let snapshot = Arc::new(std::sync::Mutex::new(None));
+            let recorded = snapshot.clone();
+            let store = turn.local_store_root.clone();
+            turn.run_started = Some(Arc::new(move |id| {
+                let recorded = recorded.clone();
+                let store = store.clone();
+                Box::pin(async move {
+                    *recorded.lock().unwrap() = read_receipt(&store, &id)?;
+                    bail!("controlled first-terminal callback failure")
+                })
+            }));
+            let saved_session = Arc::new(std::sync::Mutex::new(None));
+            let recorded = saved_session.clone();
+            let result = agent
+                .run(
+                    &turn,
+                    "controlled first terminal",
+                    None,
+                    move |session| {
+                        *recorded.lock().unwrap() = Some(session);
+                        async { Ok(()) }
+                    },
+                    watch::channel(false).1,
+                    |_| async { Ok(()) },
+                )
+                .await;
+            if !r11_matches(&result, &expected, "") {
+                failures.push(format!("{reason}: immediate run result"));
+            }
+            let session = saved_session.lock().unwrap().clone().unwrap();
+            if snapshot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_none_or(|receipt| receipt.status != expected)
+            {
+                failures.push(format!(
+                    "{reason}: terminal must be durable before first callback"
+                ));
+            }
+            let receipt = read_receipt(&turn.local_store_root, &id).unwrap().unwrap();
+            if receipt.status != expected
+                || !receipt.output.is_empty()
+                || receipt.session != session
+            {
+                failures.push(format!("{reason}: exact terminal receipt"));
+            }
+            if agent.probe(&turn, &session, &id).await.unwrap().status != expected {
+                failures.push(format!("{reason}: readback terminal"));
+            }
+            let repeat = agent
+                .run(
+                    &turn,
+                    "controlled first terminal",
+                    None,
+                    |_| async { Ok(()) },
+                    watch::channel(false).1,
+                    |_| async { Ok(()) },
+                )
+                .await;
+            if !r11_matches(&repeat, &expected, "") {
+                failures.push(format!("{reason}: same-client result"));
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("sent.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            agent.stop().await.unwrap();
+            let reopened = fixture_agent(Some(root.join("agent.pid")));
+            if reopened.probe(&turn, &session, &id).await.unwrap().status != expected {
+                failures.push(format!("{reason}: restart readback terminal"));
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    #[tokio::test]
+    async fn r11_final_progress_failure_preserves_the_redacted_completed_result() {
+        let root = fixture_root();
+        let agent = fixture_agent(Some(root.join("agent.pid")));
+        let turn = r11_turn(&root, "final-progress");
+        let result = agent
+            .run(
+                &turn,
+                "synthetic-r11-secret",
+                None,
+                |_| async { Ok(()) },
+                watch::channel(false).1,
+                |update| async move {
+                    ensure!(
+                        update["type"] != "text_snapshot",
+                        "controlled final progress failure"
+                    );
+                    Ok(())
+                },
+            )
+            .await;
+        let id = receipt_id(&turn.client_id);
+        let receipt = read_receipt(&turn.local_store_root, &id).unwrap().unwrap();
+        let probe = agent.probe(&turn, &receipt.session, &id).await.unwrap();
+        let repeat = agent
+            .run(
+                &turn,
+                "synthetic-r11-secret",
+                None,
+                |_| async { Ok(()) },
+                watch::channel(false).1,
+                |_| async { Ok(()) },
+            )
+            .await;
+        agent.stop().await.unwrap();
+        let sends = std::fs::read_to_string(root.join("sent.jsonl"))
+            .unwrap()
+            .lines()
+            .count();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(receipt.status, PromptStatus::Completed);
+        assert_eq!(receipt.output, "done: [redacted]");
+        assert_eq!(probe.status, PromptStatus::Completed);
+        assert_eq!(probe.output.as_deref(), Some("done: [redacted]"));
+        assert!(
+            r11_matches(&result, &PromptStatus::Completed, "done: [redacted]"),
+            "a native completion survives a later progress error"
+        );
+        assert!(r11_matches(
+            &repeat,
+            &PromptStatus::Completed,
+            "done: [redacted]"
+        ));
+        assert_eq!(sends, 1);
+    }
+
+    #[tokio::test]
+    async fn r11_terminal_persistence_failure_is_never_reported_as_durable_completion() {
+        let root = fixture_root();
+        let agent = fixture_agent(Some(root.join("agent.pid")));
+        let mut turn = r11_turn(&root, "failed-write");
+        let store = turn.local_store_root.clone();
+        turn.run_started = Some(Arc::new(move |id| {
+            let store = store.clone();
+            Box::pin(async move {
+                let path = receipt_path(&store, &id)?;
+                std::fs::remove_file(&path)?;
+                std::fs::create_dir(&path)?;
+                Ok(())
+            })
+        }));
+        let result = agent
+            .run(
+                &turn,
+                "controlled failed write",
+                None,
+                |_| async { Ok(()) },
+                watch::channel(false).1,
+                |_| async { Ok(()) },
+            )
+            .await;
+        let id = receipt_id(&turn.client_id);
+        let receipt = read_receipt(&turn.local_store_root, &id);
+        let repeat = agent
+            .run(
+                &turn,
+                "controlled failed write",
+                None,
+                |_| async { Ok(()) },
+                watch::channel(false).1,
+                |_| async { Ok(()) },
+            )
+            .await;
+        agent.stop().await.unwrap();
+        let sends = std::fs::read_to_string(root.join("sent.jsonl"))
+            .unwrap()
+            .lines()
+            .count();
+        let tracked = agent.processes.running.lock().unwrap().len();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            matches!(result, Err(error) if error.outcome == AgentFailure::Unknown && error.start == StartEvidence::Started)
+        );
+        assert!(receipt.is_err(), "no durable terminal can be read");
+        assert!(repeat.is_err());
+        assert_eq!(sends, 1);
+        assert_eq!(
+            tracked, 0,
+            "confirmed OS exit does not turn the failed receipt write into success"
+        );
+    }
 }

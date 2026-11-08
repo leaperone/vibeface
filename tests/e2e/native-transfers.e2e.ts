@@ -1,15 +1,15 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
-import { copyFile, mkdir, readFile, readdir, readlink, unlink, writeFile } from 'node:fs/promises';
+import { constants, createWriteStream } from 'node:fs';
+import { copyFile, lstat, mkdir, open, readFile, readdir, readlink, realpath, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
-import { join, relative, resolve } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 import { test as base } from '@e2e-dev/mobile';
-import { expect, secrets } from 'e2e';
+import { expect, secrets, type Locator } from 'e2e';
 
 const root = resolve(import.meta.dirname, '../..');
 const execute = promisify(execFile);
@@ -69,6 +69,154 @@ async function recordInitialActorCensus(simulator: string): Promise<void> {
   }
 }
 function text(value: unknown): string { assert(typeof value === 'string' && value.length > 0); return value; }
+const jobStates = ['queued', 'steering', 'steered', 'claimed', 'running', 'cancelling', 'reconciling', 'completed', 'failed', 'cancelled', 'interrupted', 'pending_delivery', 'unknown'];
+function enumText(value: unknown, allowed: string[]) { const found = text(value); assert(allowed.includes(found)); return found; }
+function nullableIdentifier(value: unknown, pattern: RegExp) {
+  assert(value === null || typeof value === 'string' && pattern.test(value));
+  return value;
+}
+const nativeDriverCodes = new Set(['ENGINE_FAILURE', 'COMMAND_FAILED', 'IOS_SNAPSHOT_ENGINE_FAILED', 'RUNNER_WEDGED', 'SESSION_NOT_FOUND', 'INVALID_ARGS', 'CANCELLED', 'UNSUPPORTED_CAPABILITY']);
+function welcomeDriverErrors(cause: unknown) {
+  const context = { phase: 'body', operation: 'welcome-snapshot' };
+  try {
+    const reasons = new Set(['malformed-graph', 'invalid-viewport', 'missing-viewport', 'invalid-presented-payload', 'invalid-quality-payload',
+      'runner_busy', 'runner_main_thread_timeout', 'regular-degenerate-actionable-node', 'regular-node-outside-cumulative-clip', 'projection-mismatch']);
+    const runnerKinds = new Map([['RUNNER_BUSY', 'runner_busy'], ['MAIN_THREAD_TIMEOUT', 'runner_main_thread_timeout'], ['APP_NOT_RUNNING', 'app_not_running'],
+      ['APP_SCREEN_WINDOW_UNRESOLVED', 'app_screen_window_unresolved'], ['APP_SCREEN_UNRESOLVED', 'app_screen_unresolved'], ['APP_SCREEN_CAPTURE_UNRENDERABLE', 'app_screen_capture_unrenderable']]);
+    const failures: Record<string, string | number>[] = [], seen = new Set<Error>();
+    for (let error = cause; error instanceof Error && failures.length < 8 && !seen.has(error); error = error.cause) {
+      seen.add(error);
+      const code = 'code' in error && typeof error.code === 'string' && nativeDriverCodes.has(error.code) ? error.code : 'unknown';
+      const details = 'details' in error && error.details !== null && typeof error.details === 'object' && !Array.isArray(error.details) ? record(error.details) : {};
+      const kind = typeof details.reason === 'string' && reasons.has(details.reason) ? details.reason
+        : typeof details.runnerErrorCode === 'string' ? runnerKinds.get(details.runnerErrorCode) ?? 'unknown'
+        : code === 'RUNNER_WEDGED' ? 'runner_wedged' : 'unknown';
+      const failure: Record<string, string | number> = { ...context, code, kind };
+      for (const [key, minimum, maximum] of [['timeoutMs', 1, 1800000], ['exitCode', 0, 255]] satisfies [string, number, number][]) {
+        const value = details[key];
+        if (typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum && value <= maximum) failure[key] = value;
+      }
+      failures.push(failure);
+    }
+    return failures.length ? failures : [{ ...context, code: 'unknown', kind: 'unknown' }];
+  } catch { return [{ ...context, code: 'unknown', kind: 'unavailable' }]; }
+}
+type WelcomeRequestDiagnostic = {
+  status: 'read' | 'request-id-missing' | 'request-id-invalid' | 'request-id-ambiguous' | 'ownership-unproven' | 'missing' | 'unreadable' | 'size-limit' | 'unavailable';
+  bytes_read: number; lines_read: number; invalid_lines: number; incomplete_lines: number; ignored_events: number; capped: boolean;
+  events: Record<string, string | number | boolean>[];
+};
+async function welcomeRequestDiagnostic(cause: unknown): Promise<WelcomeRequestDiagnostic> {
+  const summary: WelcomeRequestDiagnostic = { status: 'unavailable', bytes_read: 0, lines_read: 0, invalid_lines: 0,
+    incomplete_lines: 0, ignored_events: 0, capped: false, events: [] };
+  try {
+    const requestIds = new Set<string>(), seen = new Set<Error>();
+    let error = cause, missingId = false, invalidId = false;
+    for (let depth = 0; error instanceof Error && depth < 8; error = error.cause, depth++) {
+      if (seen.has(error)) return summary;
+      seen.add(error);
+      if (!('code' in error) || error.code !== 'COMMAND_FAILED' || !('details' in error)
+        || error.details === null || typeof error.details !== 'object' || Array.isArray(error.details)) continue;
+      const details = record(error.details);
+      if (details.reason !== 'daemon_transport_timeout') continue;
+      if (details.requestId === undefined) missingId = true;
+      else if (typeof details.requestId !== 'string' || !/^[0-9a-f]{16}$/.test(details.requestId)) invalidId = true;
+      else requestIds.add(details.requestId);
+    }
+    if (error instanceof Error) return summary;
+    if (invalidId) { summary.status = 'request-id-invalid'; return summary; }
+    if (missingId || requestIds.size === 0) { summary.status = 'request-id-missing'; return summary; }
+    if (requestIds.size !== 1) { summary.status = 'request-id-ambiguous'; return summary; }
+    const requestId = requestIds.values().next().value;
+    assert(requestId !== undefined);
+    const native = resolve(root, '.artifacts/native'), rawState = process.env.AGENT_DEVICE_STATE_DIR;
+    summary.status = 'ownership-unproven';
+    if (!rawState || root.toLowerCase().includes('trash') || rawState.toLowerCase().includes('trash') || !process.getuid) return summary;
+    const state = resolve(rawState), inside = relative(native, state), uid = process.getuid();
+    if (!inside || inside.startsWith('..') || inside.startsWith(sep)) return summary;
+    const directory = join(state, 'sessions/vdp-native-acceptance-0/requests');
+    const directories = [];
+    let location = root;
+    for (const part of ['', ...relative(root, directory).split(sep)]) {
+      location = join(location, part);
+      const stat = await lstat(location);
+      if (stat.isSymbolicLink() || !stat.isDirectory() || stat.uid !== uid || await realpath(location) !== location) return summary;
+      directories.push({ location, stat });
+    }
+    const path = join(directory, `${requestId}.ndjson`), stat = await lstat(path);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.uid !== uid || stat.nlink !== 1 || await realpath(path) !== path) return summary;
+    if (!Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > 1048576) {
+      summary.status = 'size-limit'; summary.capped = true; return summary;
+    }
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const opened = await file.stat();
+      if (!opened.isFile() || opened.uid !== uid || opened.nlink !== 1 || opened.dev !== stat.dev || opened.ino !== stat.ino) return summary;
+      for (const saved of directories) {
+        const current = await lstat(saved.location);
+        if (current.isSymbolicLink() || !current.isDirectory() || current.uid !== uid || current.dev !== saved.stat.dev
+          || current.ino !== saved.stat.ino || await realpath(saved.location) !== saved.location) return summary;
+      }
+      const current = await lstat(path);
+      if (current.isSymbolicLink() || current.dev !== opened.dev || current.ino !== opened.ino || await realpath(path) !== path) return summary;
+      const bytes = Buffer.alloc(stat.size);
+      summary.bytes_read = (await file.read(bytes, 0, stat.size, 0)).bytesRead;
+      if (summary.bytes_read !== stat.size) { summary.status = 'unreadable'; return summary; }
+      const phases = new Set(['request_start', 'request_success', 'request_failed', 'ios.snapshot-source.prepare', 'ios.snapshot-source.acquire',
+        'ios.snapshot-source.present', 'ios_runner_session_startup', 'ios_runner_session_reuse', 'ios_runner_session_startup_timings']);
+      const levels = new Set(['info', 'debug', 'warn', 'error']);
+      for (let offset = 0; offset < stat.size;) {
+        if (summary.lines_read === 10000 || summary.events.length === 128) { summary.capped = true; break; }
+        const end = bytes.indexOf(10, offset);
+        if (end === -1) { summary.incomplete_lines = 1; break; }
+        summary.lines_read++;
+        const line = bytes.subarray(offset, end); offset = end + 1;
+        if (line.length > 131072) { summary.invalid_lines++; summary.capped = true; continue; }
+        let event: Record<string, unknown>;
+        try { event = record(JSON.parse(line.toString('utf8'))); } catch { summary.invalid_lines++; continue; }
+        if (event.requestId !== requestId || event.session !== 'vdp-native-acceptance-0' || event.command !== 'snapshot') {
+          summary.events = []; return summary;
+        }
+        if (typeof event.phase !== 'string' || !phases.has(event.phase) || typeof event.level !== 'string' || !levels.has(event.level)) {
+          summary.ignored_events++; continue;
+        }
+        const data = event.data !== null && typeof event.data === 'object' && !Array.isArray(event.data) ? record(event.data) : {};
+        const safe: Record<string, string | number | boolean> = { phase: event.phase, level: event.level, command: 'snapshot' };
+        if (typeof event.durationMs === 'number' && Number.isFinite(event.durationMs) && event.durationMs >= 0 && event.durationMs <= 3600000) safe.duration_ms = event.durationMs;
+        if (event.phase === 'request_failed') safe.code = typeof data.code === 'string' && nativeDriverCodes.has(data.code) ? data.code : 'unknown';
+        if (event.phase.startsWith('ios.snapshot-source.')) {
+          if (data.producer !== 'simulator-ax-bridge') { summary.ignored_events++; continue; }
+          safe.producer = 'simulator-ax-bridge';
+        }
+        if (event.phase === 'ios_runner_session_reuse' || event.phase === 'ios_runner_session_startup_timings') {
+          if (typeof data.ready === 'boolean') safe.ready = data.ready;
+          if (data.cache === 'exact' || data.cache === 'miss' || data.cache === 'external') safe.cache = data.cache;
+        }
+        summary.events.push(safe);
+      }
+      summary.status = 'read';
+      return summary;
+    } finally { await file.close().catch(() => {}); }
+  } catch (error) {
+    summary.events = [];
+    summary.status = 'unavailable';
+    try {
+      if (error instanceof Error && 'code' in error) {
+        if (error.code === 'ENOENT') summary.status = 'missing';
+        else if (error.code === 'EACCES' || error.code === 'EPERM') summary.status = 'unreadable';
+      }
+    } catch {}
+    return summary;
+  }
+}
+async function recordProviderFailure(path: string, source: string, driverErrors: unknown, welcomeRequest?: WelcomeRequestDiagnostic) {
+  try {
+    await writeFile(join(path, 'provider.json'), `${JSON.stringify({ source_commit: source, status: 'failed', driver_errors: driverErrors,
+      ...(welcomeRequest === undefined ? {} : { welcome_request: welcomeRequest }) })}\n`, { mode: 0o600 });
+  } catch {
+    try { process.stderr.write('Native failure diagnostic unavailable\n'); } catch {}
+  }
+}
 type NativeNetwork = { invitation: string; receiver: string; call(request: Record<string, unknown>): Promise<Record<string, unknown>> };
 const test = base.extend<{ network: NativeNetwork }>({
   network: async ({}, use) => {
@@ -163,7 +311,77 @@ async function bundleManifest(directory: string): Promise<Record<string, string>
   return files;
 }
 
+function providerDeferredInput(value: unknown) {
+  if (value === null) return null;
+  const input = record(value), receipt = record(input.receipt);
+  assert.deepEqual(Object.keys(input).sort(), ['message_id', 'conversation_id', 'target', 'intent', 'deferred', 'cancelled', 'source_event', 'control_event', 'receipt'].sort());
+  assert(input.message_id === 'native-deferred-input' && input.conversation_id === 'native-provider' && input.intent === 'defer');
+  assert.deepEqual(input.target, { kind: 'bot_main', bot_id: 'native-provider' });
+  assert(typeof input.deferred === 'boolean' && typeof input.cancelled === 'boolean');
+  const sourceEvent = text(input.source_event), controlEvent = text(input.control_event);
+  assert(/^[0-9a-f]{64}$/.test(sourceEvent) && /^[0-9a-f]{64}$/.test(controlEvent));
+  assert.deepEqual(Object.keys(receipt).sort(), ['message_id', 'target', 'control_event', 'stage', 'reason', 'actual_turn_id', 'retry_safe'].sort());
+  assert(receipt.message_id === input.message_id && receipt.control_event === controlEvent);
+  assert.deepEqual(receipt.target, input.target);
+  const stage = text(receipt.stage);
+  assert(['entry_accepted', 'owner_accepted', 'submitting', 'provider_accepted', 'associated', 'refused', 'unknown'].includes(stage));
+  assert(receipt.reason === null || typeof receipt.reason === 'string');
+  assert(receipt.actual_turn_id === null || typeof receipt.actual_turn_id === 'string' && receipt.actual_turn_id.length > 0);
+  assert(typeof receipt.retry_safe === 'boolean' && (stage !== 'unknown' || receipt.retry_safe === false));
+  return { message_id: input.message_id, conversation_id: input.conversation_id,
+    target: { kind: 'bot_main', bot_id: 'native-provider' }, intent: input.intent,
+    deferred: input.deferred, cancelled: input.cancelled, source_event: sourceEvent, control_event: controlEvent,
+    receipt: { message_id: receipt.message_id, target: { kind: 'bot_main', bot_id: 'native-provider' }, control_event: controlEvent,
+      stage, reason: receipt.reason, actual_turn_id: receipt.actual_turn_id, retry_safe: receipt.retry_safe } };
+}
+
+function providerRunningStop(value: unknown) {
+  if (value === null) return null;
+  const stop = record(value);
+  assert.deepEqual(Object.keys(stop).sort(), ['job', 'receipt', 'fixture', 'owner_is_receiver'].sort());
+  assert(stop.owner_is_receiver === null || typeof stop.owner_is_receiver === 'boolean');
+  const job = stop.job === null ? null : (() => {
+    const item = record(stop.job);
+    assert.deepEqual(Object.keys(item).sort(), ['conversation_id', 'trigger', 'kind', 'scope', 'state', 'attempt_id', 'runtime', 'pending_check', 'failure_kind'].sort());
+    assert(item.conversation_id === 'native-provider' && item.trigger === 'message:native-running');
+    assert(item.pending_check === null || typeof item.pending_check === 'boolean');
+    const runtime = item.runtime === null ? null : (() => {
+      const saved = record(item.runtime);
+      assert.deepEqual(Object.keys(saved).sort(), ['provider', 'stage', 'execution'].sort());
+      return { provider: enumText(saved.provider, ['codex', 'cursor', 'claude', 'pi', 'opencode', 'unknown']),
+        stage: enumText(saved.stage, ['validate', 'install', 'launch', 'authentication', 'model_list', 'session_start', 'turn_start', 'run', 'read_back', 'interrupt', 'compact', 'handoff', 'record', 'unknown']),
+        execution: enumText(saved.execution, ['not_started', 'started', 'unknown']) };
+    })();
+    return { kind: enumText(item.kind, ['human', 'answer', 'work_result', 'agent_task', 'workspace_task', 'schedule', 'bot_message', 'unknown']),
+      scope: enumText(item.scope, ['main', 'workspace_task', 'task', 'routine', 'unknown']), state: enumText(item.state, jobStates),
+      attempt_id: nullableIdentifier(item.attempt_id, /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/), runtime, pending_check: item.pending_check,
+      failure_kind: item.failure_kind === null ? null : enumText(item.failure_kind, ['missing_key', 'auth_failed', 'quota', 'missing_binary', 'execution_disabled', 'no_model', 'no_bot', 'writer_busy', 'rejected', 'transport', 'timed_out', 'restarted', 'lost', 'unknown']) };
+  })();
+  const receipt = stop.receipt === null ? null : (() => {
+    const item = record(stop.receipt);
+    assert.deepEqual(Object.keys(item).sort(), ['stage', 'reason', 'actual_turn_id', 'control_event', 'retry_safe'].sort());
+    assert(item.retry_safe === null || typeof item.retry_safe === 'boolean');
+    return { stage: enumText(item.stage, ['entry_accepted', 'owner_accepted', 'submitting', 'provider_accepted', 'associated', 'refused', 'unknown']),
+      reason: item.reason === null ? null : enumText(item.reason, ['deferred', 'cancelled_before_delivery', 'awaiting_admission', 'awaiting_owner', 'native_delivery_unconfirmed', 'execution_result_unconfirmed', 'unknown']),
+      actual_turn_id: nullableIdentifier(item.actual_turn_id, /^fixture-turn-[0-9a-f]{32}$/), control_event: nullableIdentifier(item.control_event, /^[0-9a-f]{64}$/), retry_safe: item.retry_safe };
+  })();
+  const fixture = stop.fixture === null ? null : (() => {
+    const item = record(stop.fixture);
+    assert.deepEqual(Object.keys(item).sort(), ['thread_id', 'turn_id', 'process_id', 'instance_id', 'stop_event_set', 'interrupt_received', 'terminal_status', 'gate_exists', 'process_current'].sort());
+    const threadId = nullableIdentifier(item.thread_id, /^fixture-thread-[0-9a-f]{32}$/), turnId = nullableIdentifier(item.turn_id, /^fixture-turn-[0-9a-f]{32}$/);
+    const instanceId = nullableIdentifier(item.instance_id, /^[0-9a-f]{64}$/);
+    assert(threadId !== null && turnId !== null && instanceId !== null);
+    assert(typeof item.process_id === 'number' && Number.isSafeInteger(item.process_id) && item.process_id > 0 && item.process_id <= 2147483647);
+    assert(typeof item.stop_event_set === 'boolean' && typeof item.interrupt_received === 'boolean' && typeof item.gate_exists === 'boolean');
+    assert(item.process_current === null || typeof item.process_current === 'boolean');
+    return { thread_id: threadId, turn_id: turnId, process_id: item.process_id, instance_id: instanceId, stop_event_set: item.stop_event_set, interrupt_received: item.interrupt_received,
+      terminal_status: item.terminal_status === null ? null : enumText(item.terminal_status, ['completed', 'interrupted', 'failed', 'unknown']), gate_exists: item.gate_exists, process_current: item.process_current };
+  })();
+  return { job, receipt, fixture, owner_is_receiver: stop.owner_is_receiver };
+}
+
 function providerInspection(value: Record<string, unknown>) {
+  assert.deepEqual(Object.keys(value).sort(), ['manager', 'roles', 'execution_model', 'setup', 'login_count', 'app_server_link_state', 'readiness', 'catalog', 'authentication', 'checked_at_ms', 'jobs', 'deferred_input', 'running_stop', 'total_invocations', 'running_invocations', 'deferred_invocations'].sort());
   let manager: { provider: string; model: string; reasoning_effort: string | null } | null = null;
   if (value.manager !== null) {
     const saved = record(value.manager);
@@ -173,15 +391,6 @@ function providerInspection(value: Record<string, unknown>) {
   }
   assert(value.checked_at_ms === null || typeof value.checked_at_ms === 'number' && Number.isSafeInteger(value.checked_at_ms) && value.checked_at_ms >= 0);
   assert(Array.isArray(value.jobs));
-  assert(value.deferred_input === null || isRecord(value.deferred_input));
-  const deferredInput = value.deferred_input === null ? null : (() => {
-    const input = record(value.deferred_input);
-    assert(typeof input.deferred === 'boolean' && typeof input.cancelled === 'boolean');
-    const target = record(input.target);
-    assert(target.kind === 'bot_main');
-    return { message_id: text(input.message_id), target: { kind: 'bot_main' as const, bot_id: text(target.bot_id) },
-      deferred: input.deferred, cancelled: input.cancelled };
-  })();
   assert(typeof value.total_invocations === 'number' && Number.isSafeInteger(value.total_invocations) && value.total_invocations >= 0);
   assert(typeof value.running_invocations === 'number' && Number.isSafeInteger(value.running_invocations) && value.running_invocations >= 0);
   assert(typeof value.deferred_invocations === 'number' && Number.isSafeInteger(value.deferred_invocations) && value.deferred_invocations >= 0);
@@ -196,11 +405,37 @@ function providerInspection(value: Record<string, unknown>) {
     app_server_link_state: link, readiness: text(value.readiness), authentication: text(value.authentication), catalog: text(value.catalog),
     checked_at_ms: value.checked_at_ms, checked: value.checked_at_ms !== null,
     jobs: value.jobs.map((item: unknown) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state) }; }),
-    deferred_input: deferredInput, total_invocations: value.total_invocations,
+    deferred_input: providerDeferredInput(value.deferred_input),
+    running_stop: providerRunningStop(value.running_stop), total_invocations: value.total_invocations,
     running_invocations: value.running_invocations, deferred_invocations: value.deferred_invocations };
 }
 
-test('provider settings and queued cancellation work in the installed native app', { platforms: ['ios'], timeout: 600000 }, async ({ app, device, network, screen }) => {
+function providerStopEvidence(value: ReturnType<typeof providerInspection> | null, baseline: ReturnType<typeof providerRunningStop>) {
+  if (value === null) return { availability: 'unavailable' };
+  const stop = value.running_stop, job = stop?.job, receipt = stop?.receipt, fixture = stop?.fixture;
+  const same = (left: unknown, right: unknown) => left == null || right == null ? null : left === right;
+  const threadSame = same(fixture?.thread_id, baseline?.fixture?.thread_id), turnSame = same(fixture?.turn_id, baseline?.fixture?.turn_id);
+  const processSame = same(fixture?.process_id, baseline?.fixture?.process_id);
+  const instanceSame = same(fixture?.instance_id, baseline?.fixture?.instance_id), identities = [threadSame, turnSame, processSame, instanceSame];
+  const state = value.jobs.find(item => item.trigger === 'message:native-running')?.state;
+  return { availability: stop === null ? 'unavailable' : 'available', state: state === undefined ? null : jobStates.includes(state) ? state : 'unknown',
+    running_invocations: value.running_invocations <= 1000000 ? value.running_invocations : null,
+    deferred_invocations: value.deferred_invocations <= 1000000 ? value.deferred_invocations : null,
+    job: job ? { kind: job.kind, scope: job.scope, state: job.state, same_attempt: same(job.attempt_id, baseline?.job?.attempt_id),
+      runtime: job.runtime, pending_check: job.pending_check, failure_kind: job.failure_kind } : null,
+    receipt: receipt ? { stage: receipt.stage, reason: receipt.reason, retry_safe: receipt.retry_safe,
+      same_control_event: same(receipt.control_event, baseline?.receipt?.control_event), same_actual_turn: same(receipt.actual_turn_id, baseline?.receipt?.actual_turn_id),
+      matches_fixture_turn: same(receipt.actual_turn_id, fixture?.turn_id) } : null,
+    fixture: fixture ? { stop_event_set: fixture.process_current === true ? fixture.stop_event_set : null,
+      interrupt_received: fixture.process_current === true ? fixture.interrupt_received : null,
+      terminal_status: fixture.process_current === true ? fixture.terminal_status : 'unknown', gate_exists: fixture.gate_exists,
+      process_current: fixture.process_current, same_thread: threadSame, same_turn: turnSame, same_process: processSame, same_instance: instanceSame,
+      identity_changed: fixture.process_current === false || identities.includes(false) ? true
+        : fixture.process_current === null || identities.includes(null) ? null : false } : null,
+    owner_is_receiver: stop?.owner_is_receiver ?? null };
+}
+
+test('provider settings and deferred input cancellation work in the installed native app', { platforms: ['ios'], timeout: 600000 }, async ({ app, device, network, screen }) => {
   const simulator = process.env.VIBEFACE_E2E_SIMULATOR, appPath = process.env.VIBEFACE_E2E_IOS_APP;
   const source = process.env.VIBEFACE_E2E_SOURCE_COMMIT;
   const binary = process.env.VIBEFACE_E2E_BINARY, crypto = process.env.VIBEFACE_E2E_CRYPTO_MODULE;
@@ -210,7 +445,7 @@ test('provider settings and queued cancellation work in the installed native app
   const driverFailurePath = resolve(root, '.artifacts/native/private/ios-driver-failure.json');
   await unlink(driverFailurePath).catch(error => { if (error.code !== 'ENOENT') throw error; });
   await unlink(resolve(root, '.artifacts/native/private/ios-actor-census.json')).catch(error => { if (error.code !== 'ENOENT') throw error; });
-  for (const name of ['provider.json', 'provider-navigation.json', 'provider-probe.json', 'provider-initial.png', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png', 'terminology-device-kinds.png']) {
+  for (const name of ['provider.json', 'provider-navigation.json', 'provider-clipboard.json', 'provider-probe.json', 'provider-initial.png', 'provider-selectable.png', 'provider-controlled.png', 'provider-typed.png', 'terminology-device-kinds.png']) {
     await unlink(join(publicPath, name)).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
   const wasm = crypto.replace(/\.js$/, '_bg.wasm');
@@ -229,24 +464,9 @@ test('provider settings and queued cancellation work in the installed native app
   await assert.rejects(network.call({ op: 'native_provider_setup' }));
   await assert.rejects(network.call({ op: 'native_provider_stage', stage: 'invalid' }));
   await assert.rejects(network.call({ op: 'native_provider_stage', stage: 'ready', role: 'source' }));
-  await device.installApp(undefined, { reinstall: true });
-  const installedPath = (await execute('xcrun', ['simctl', 'get_app_container', simulator, 'one.leaper.vibeface', 'app'])).stdout.trim();
-  assert(installedPath.startsWith('/') && installedPath.toLowerCase().includes(simulator.toLowerCase()), 'Inspect only the assigned simulator installed bundle');
-  expect(await bundleManifest(installedPath)).toEqual(built);
-  await device.clearKeychain();
-  await app.open();
-  // Capture the fresh-install screen through CoreSimulator before asking the
-  // UI daemon for an accessibility tree. This image contains no invitation.
-  await execute('xcrun', ['simctl', 'io', simulator, 'screenshot', join(publicPath, 'provider-initial.png')]);
-  try {
-    await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
-  } catch (error: unknown) {
-    await recordDriverFailure(error);
-    await recordInitialActorCensus(simulator);
-    throw error;
-  }
+  const ci = process.env.GITHUB_ACTIONS === 'true';
   const run = process.env.GITHUB_RUN_ID, attempt = process.env.GITHUB_RUN_ATTEMPT;
-  if (run !== undefined || attempt !== undefined) {
+  if (ci || run !== undefined || attempt !== undefined) {
     assert(run && attempt && /^[0-9]+$/.test(run) && /^[0-9]+$/.test(attempt));
     assert.equal((await readFile(resolve(root, '.artifacts/native/simulator.txt'), 'utf8')).trim(), simulator);
     const devices = record(record(JSON.parse((await execute('xcrun', ['simctl', 'list', 'devices', '--json'])).stdout)).devices);
@@ -255,10 +475,51 @@ test('provider settings and queued cancellation work in the installed native app
     assert.equal(assigned[0].name, `vibeface-provider-${run}-${attempt}`);
     assert.equal(assigned[0].state, 'Booted');
   }
-  await network.call({ op: 'native_provider_clipboard' });
-  const pasteInvitation = screen.getByRole('button', /^(Paste|粘贴)$/);
-  await expect(pasteInvitation).toBeEnabled({ timeout: 30000 });
-  await pasteInvitation.click();
+  try {
+    if (ci) await device.installApp();
+    else await device.installApp(undefined, { reinstall: true });
+  } catch (cause) {
+    const failures: Record<string, string | number>[] = [];
+    for (let error: unknown = cause, depth = 0; error instanceof Error && depth < 8; error = error.cause, depth++) {
+      if (!('code' in error) || error.code !== 'COMMAND_FAILED' || !('details' in error)
+        || error.details === null || typeof error.details !== 'object' || Array.isArray(error.details)) continue;
+      const details = record(error.details);
+      const failure: Record<string, string | number> = { code: 'COMMAND_FAILED', operation: 'unknown' };
+      const args = details.args;
+      if (typeof details.cmd === 'string' && details.cmd.split('/').at(-1) === 'xcrun' && Array.isArray(args) && args[0] === 'simctl') {
+        if (args[1] === 'install' || args[1] === 'uninstall' || args[1] === 'bootstatus') failure.operation = `simctl-${args[1]}`;
+        else if (args[1] === 'list' && args[2] === 'devices') failure.operation = 'simctl-list-devices';
+      }
+      if (details.kind === 'daemon_startup_failed') failure.kind = details.kind;
+      if (details.reason === 'startup-exited' || details.reason === 'startup-stalled' || details.reason === 'startup-ceiling'
+        || details.reason === 'daemon_transport_timeout') failure.reason = details.reason;
+      const limits: Record<string, [number, number]> = { timeoutMs: [1, 1800000], startupTimeoutMs: [1, 1800000], exitCode: [0, 255], startupAttempts: [1, 2] };
+      for (const [key, [minimum, maximum]] of Object.entries(limits)) {
+        const value = details[key];
+        if (typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum && value <= maximum) failure[key] = value;
+      }
+      failures.push(failure);
+    }
+    await writeFile(join(publicPath, 'provider.json'), `${JSON.stringify({ source_commit: source, status: 'failed', driver_errors: failures })}\n`, { mode: 0o600 })
+      .catch(() => { process.stderr.write('Native driver failure diagnostic could not be recorded\n'); });
+    throw cause;
+  }
+  const installedPath = (await execute('xcrun', ['simctl', 'get_app_container', simulator, 'one.leaper.vibeface', 'app'])).stdout.trim();
+  assert(installedPath.startsWith('/') && installedPath.toLowerCase().includes(simulator.toLowerCase()), 'Inspect only the assigned simulator installed bundle');
+  expect(await bundleManifest(installedPath)).toEqual(built);
+  await device.clearKeychain();
+  await app.open();
+  // Capture the fresh install before the driver requests an accessibility tree.
+  await execute('xcrun', ['simctl', 'io', simulator, 'screenshot', join(publicPath, 'provider-initial.png')]);
+  try {
+    await expect(screen.getByText('连接你的网络', { exact: true })).toBeVisible({ timeout: 30000 });
+  } catch (cause) {
+    await recordProviderFailure(publicPath, source, welcomeDriverErrors(cause), await welcomeRequestDiagnostic(cause));
+    await recordDriverFailure(cause);
+    await recordInitialActorCensus(simulator);
+    throw cause;
+  }
+  await screen.getByRole('textbox', /^加入链接(?:$|[\s,，])/).fill(secrets.get('nativeInvitation'), { timeout: 30000 });
   await expect(screen.getByText('已填入加入链接', { exact: true })).toBeVisible();
   const deviceName = screen.getByRole('textbox', /^这台设备的名字(?:$|[\s,，])/);
   await deviceName.fill('VDP native receiver');
@@ -270,12 +531,14 @@ test('provider settings and queued cancellation work in the installed native app
   await expect(screen.getByLabel(`安全码 ${code.split('').join(' ')}`)).toBeVisible();
   await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
   await expect(screen.getByRole('link', '设置', { exact: true })).toBeVisible({ timeout: 30000 });
-  const openLink = async (url: string) => {
+  const openLink = async (url: string, destination: Locator) => {
     await device.openLink(url);
-    const consent = screen.getByRole('alert', /Open in.*Vibeface/);
+    const consent = screen.getByRole('alert', /Open in.*Vibeface/, { visible: true });
+    await expect(consent.or(destination).first()).toBeVisible();
     if (await consent.isVisible()) await consent.getByRole('button', 'Open', { exact: true }).click();
+    await expect(destination).toBeVisible();
   };
-  await openLink('vibeface://add-device');
+  await openLink('vibeface://add-device', screen.getByText('添加设备', { exact: true, visible: true }).first());
   await expect(screen.getByText('添加设备', { exact: true }).first()).toBeVisible();
   const clientKind = screen.getByRole('button', '客户端', { exact: true });
   const nodeKind = screen.getByRole('button', '节点', { exact: true });
@@ -318,7 +581,35 @@ test('provider settings and queued cancellation work in the installed native app
     const details = screen.getByRole('button', '详细信息', { exact: true });
     await details.click();
     await screen.getByRole('button', '复制设备编号', { exact: true }).click();
-    await expect.poll(() => device.clipboard()).toBe(network.receiver);
+    const clipboard = { started: 0, fulfilled: 0, rejected: 0, equal: 0, empty: 0, other: 0, capped: false };
+    let clipboardInflight = false;
+    const bumpClipboard = (key: Exclude<keyof typeof clipboard, 'capped'>) => {
+      if (clipboard[key] < 4096) clipboard[key]++;
+      else clipboard.capped = true;
+    };
+    try {
+      await expect.poll(async () => {
+        bumpClipboard('started');
+        clipboardInflight = true;
+        try {
+          const value = await device.clipboard();
+          bumpClipboard('fulfilled');
+          bumpClipboard(value === network.receiver ? 'equal' : value === '' ? 'empty' : 'other');
+          return value;
+        } catch (cause) {
+          bumpClipboard('rejected');
+          throw cause;
+        } finally {
+          clipboardInflight = false;
+        }
+      }).toBe(network.receiver);
+    } catch (cause) {
+      const frozen = { ...clipboard, inflight_at_poll_failure: clipboardInflight };
+      try {
+        await writeFile(join(publicPath, 'provider-clipboard.json'), `${JSON.stringify(frozen)}\n`, { mode: 0o600 });
+      } catch {}
+      throw cause;
+    }
     await details.click();
     const link = screen.getByRole('link', 'Bot 与任务', { exact: true });
     await screen.scrollUntilVisible(link, { direction: 'down', timeout: 30000 });
@@ -399,7 +690,7 @@ test('provider settings and queued cancellation work in the installed native app
   expect(firstProbe.authentication).toBe('sign_in_required');
   const setup = (await inspect()).setup;
   await expect(screen.getByText(setup.command, { exact: true })).toBeVisible();
-  await screen.getByRole('button', '复制Codex 私有目录认证命令', { exact: true }).click();
+  await screen.getByRole('button', '复制Codex 登录命令', { exact: true }).click();
   await expect.poll(() => device.clipboard()).toBe(setup.command);
   const copied = await device.clipboard();
   assert.equal(copied, setup.command);
@@ -523,52 +814,112 @@ test('provider settings and queued cancellation work in the installed native app
   await save('native-selectable', 'high');
   const queue = await network.call({ op: 'native_provider_queue' });
   await assert.rejects(network.call({ op: 'native_provider_queue' }));
-  const botId = text(queue.bot_id), runningTrigger = text(queue.running_trigger);
-  const deferredMessageId = text(queue.deferred_message_id);
-  await openLink(`vibeface://b/${botId}`);
-  const optionsButton = screen.getByRole('button', /^输入目标 Native Provider · 主聊天，/);
-  await optionsButton.click();
-  const optionsSheet = screen.getByTestId('input-options-sheet', { visible: true });
-  await expect(optionsSheet.getByText('目标和队列', { exact: true })).toBeVisible();
-  await expect.poll(async () => (await inspect()).deferred_input).toEqual({
-    message_id: deferredMessageId, target: { kind: 'bot_main', bot_id: botId }, deferred: true, cancelled: false,
+  assert.deepEqual(Object.keys(queue).sort(), ['bot_id', 'conversation_id', 'target', 'running_trigger', 'deferred_message_id'].sort());
+  const botId = text(queue.bot_id), conversationId = text(queue.conversation_id);
+  const runningTrigger = text(queue.running_trigger), deferredMessageId = text(queue.deferred_message_id);
+  assert(botId === 'native-provider' && conversationId === 'native-provider'
+    && runningTrigger === 'message:native-running' && deferredMessageId === 'native-deferred-input');
+  const target = { kind: 'bot_main', bot_id: botId };
+  assert.deepEqual(queue.target, target);
+  const prepared = await inspect(), deferred = prepared.deferred_input;
+  assert(deferred, 'The fixture reads the real deferred input and its owner receipt');
+  expect(prepared.jobs).toEqual([{ trigger: runningTrigger, state: 'running' }]);
+  expect(prepared.total_invocations).toBe(1);
+  expect(prepared.running_invocations).toBe(1);
+  expect(prepared.deferred_invocations).toBe(0);
+  expect(deferred).toEqual({ message_id: deferredMessageId, conversation_id: conversationId, target, intent: 'defer',
+    deferred: true, cancelled: false, source_event: deferred.source_event, control_event: deferred.source_event,
+    receipt: { message_id: deferredMessageId, target, control_event: deferred.source_event,
+      stage: 'owner_accepted', reason: 'deferred', actual_turn_id: null, retry_safe: true } });
+  const composer = screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/, { visible: true });
+  await openLink(`vibeface://b/${botId}`, composer);
+  const targetSheet = screen.getByTestId('input-options-sheet', { visible: true });
+  const inputOptions = screen.getByRole('button', /^输入目标 Native Provider · 主聊天，/, { visible: true });
+  await inputOptions.click();
+  await expect(targetSheet).toHaveCount(1);
+  const queued = targetSheet.getByText('稍后处理 1 条', { exact: true });
+  const cancel = targetSheet.getByRole('button', '取消稍后输入', { exact: true, visible: true });
+  const queueScroll = device.locator('role=scroll-area').filter({
+    has: screen.getByRole('button', '取消稍后输入', { exact: true }),
   });
-  expect((await inspect()).jobs).toEqual([{ trigger: runningTrigger, state: 'running' }]);
-  expect((await inspect()).total_invocations).toBe(1);
-  const cancel = optionsSheet.getByRole('button', '取消稍后输入', { exact: true, visible: true });
-  const deferredScroll = device.locator('role=scroll-area').filter({ has: cancel });
-  await expect(deferredScroll).toHaveCount(1);
-  await deferredScroll.scrollUntilVisible(cancel, { direction: 'down' });
+  await expect(queueScroll).toHaveCount(1);
+  await queueScroll.scrollUntilVisible(queued, { direction: 'down' });
+  await expect(queued).toBeVisible();
+  await queueScroll.scrollUntilVisible(cancel, { direction: 'down' });
+  await expect(cancel).toHaveCount(1);
   await expect(cancel).toBeEnabled();
+  let previousCancelBounds = '';
+  await expect.poll(async () => {
+    const bounds = await cancel.boundingBox(), pane = await queueScroll.boundingBox();
+    assert(bounds && pane, 'Deferred input Cancel and its scroll pane expose bounds');
+    const observed = JSON.stringify([bounds, pane]), stable = observed === previousCancelBounds;
+    previousCancelBounds = observed;
+    return stable && bounds.x >= pane.x && bounds.y >= pane.y && bounds.x + bounds.width <= pane.x + pane.width && bounds.y + bounds.height <= pane.y + pane.height;
+  }).toBe(true);
   await cancel.click();
-  await expect.poll(async () => (await inspect()).deferred_input).toEqual({
-    message_id: deferredMessageId, target: { kind: 'bot_main', bot_id: botId }, deferred: true, cancelled: true,
-  });
-  await expect(optionsSheet).toHaveCount(1);
-  await optionsSheet.getByRole('button', '关闭目标和队列', { exact: true }).click();
-  await expect(optionsSheet).toHaveCount(0);
-  expect((await inspect()).total_invocations).toBe(1);
-  expect((await inspect()).deferred_invocations).toBe(0);
+  await expect.poll(async () => (await inspect()).deferred_input?.cancelled, { timeout: 15000 }).toBe(true);
+  const cancelled = await inspect(), cancelledInput = cancelled.deferred_input;
+  assert(cancelledInput);
+  expect(cancelledInput).toEqual({ ...deferred, cancelled: true, control_event: cancelledInput.control_event,
+    receipt: { ...deferred.receipt, control_event: cancelledInput.control_event, stage: 'refused', reason: 'cancelled_before_delivery', retry_safe: false } });
+  expect(cancelledInput.control_event).not.toBe(deferred.control_event);
+  expect(cancelled.jobs).toEqual(prepared.jobs);
+  expect(cancelled.total_invocations).toBe(1);
+  expect(cancelled.running_invocations).toBe(1);
+  expect(cancelled.deferred_invocations).toBe(0);
+  await expect(queued).toHaveCount(0);
+  await expect(cancel).toHaveCount(0);
+  await expect(targetSheet).toHaveCount(1);
+  await targetSheet.getByRole('button', '关闭目标和队列', { exact: true }).click();
+  await expect(targetSheet).toHaveCount(0);
+  await expect(inputOptions).toBeEnabled();
   await screen.getByRole('button', '停止', { exact: true }).click();
-  await expect.poll(async () => (await inspect()).jobs.find(job => job.trigger === runningTrigger)?.state, { timeout: 30000 }).toBe('cancelled');
+  let lastStopInspection: Awaited<ReturnType<typeof inspect>> | null = null, stopSamples = 0;
+  try {
+    await expect.poll(async () => {
+      const observed = await inspect();
+      lastStopInspection = observed;
+      stopSamples++;
+      return observed.jobs.find(job => job.trigger === runningTrigger)?.state;
+    }, { timeout: 30000 }).toBe('cancelled');
+  } catch (cause) {
+    let failedStopInspection: Awaited<ReturnType<typeof inspect>> | null = null;
+    try { failedStopInspection = await inspect(); } catch {}
+    let stopRenderAvailable = false;
+    try {
+      const image = await app.screenshot('native-stop-failure');
+      const directory = resolve(root, '.artifacts/native/private');
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await writeFile(join(directory, 'native-stop-failure.png'), await readFile(image), { mode: 0o600, flag: 'wx' });
+      stopRenderAvailable = true;
+    } catch {}
+    try {
+      await recordProviderFailure(publicPath, source, [{ phase: 'body', operation: 'running-stop', kind: 'stop_poll',
+        code: cause instanceof Error && 'code' in cause && cause.code === 'ASSERTION_FAILED' ? 'ASSERTION_FAILED' : 'unknown', expected: 'cancelled',
+        completed_poll_samples: stopSamples <= 1000000 ? stopSamples : null, stop_render_available: stopRenderAvailable,
+        running_stop: { before: providerStopEvidence(cancelled, cancelled.running_stop), last_sample: providerStopEvidence(lastStopInspection, cancelled.running_stop),
+          after_failure: providerStopEvidence(failedStopInspection, cancelled.running_stop) } }]);
+    } catch {
+      await recordProviderFailure(publicPath, source, [{ phase: 'body', operation: 'running-stop', kind: 'unavailable', code: 'unknown', stop_render_available: stopRenderAvailable }]);
+    }
+    throw cause;
+  }
   await expect(screen.getByRole('button', '停止', { exact: true })).toBeHidden();
   const after = await inspect();
   expect(after.jobs).toEqual([{ trigger: runningTrigger, state: 'cancelled' }]);
+  expect(after.deferred_input).toEqual(cancelledInput);
   expect(after.total_invocations).toBe(1);
   expect(after.running_invocations).toBe(1);
   expect(after.deferred_invocations).toBe(0);
-  expect(after.deferred_input).toEqual({
-    message_id: deferredMessageId, target: { kind: 'bot_main', bot_id: botId }, deferred: true, cancelled: true,
-  });
-  await openLink('vibeface://settings');
-  await openLink(`vibeface://b/${botId}`);
+  await openLink('vibeface://settings', screen.getByText('我的设备', { exact: true, visible: true }));
+  await openLink(`vibeface://b/${botId}`, composer);
   await expect(screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/)).toBeVisible();
   const reopened = await inspect();
   expect(reopened.jobs).toEqual(after.jobs);
+  expect(reopened.deferred_input).toEqual(cancelledInput);
   expect(reopened.total_invocations).toBe(1);
   expect(reopened.running_invocations).toBe(1);
   expect(reopened.deferred_invocations).toBe(0);
-  expect(reopened.deferred_input).toEqual(after.deferred_input);
   expect(reopened.execution_model).toBe('');
   expect(reopened.login_count).toBe(1);
   expect(await bundleManifest(installedPath)).toEqual(built);
@@ -592,11 +943,9 @@ test('provider settings and queued cancellation work in the installed native app
     private_login_command_copied_exactly: true, controlled_bin_and_private_codex_home_verified: true,
     synthetic_login_count: reopened.login_count, native_authenticated_recheck: true, trimmed_controlled_cleared_effort: true,
     real_provider_model_calls: 0, not_checked: ['real Provider authentication', 'Claude-specific native login'],
-    running_trigger: runningTrigger, deferred_message_id: deferredMessageId, jobs: reopened.jobs,
-    total_invocations: reopened.total_invocations,
-    running_invocations: reopened.running_invocations, deferred_input: reopened.deferred_input,
-    deferred_invocations: reopened.deferred_invocations,
-    native_cancelled_queue: true, native_stopped_running: true, reopened_without_execution: true }, null, 2)}\n`, { mode: 0o600 });
+    running_trigger: runningTrigger, deferred_message_id: deferredMessageId, deferred_input: reopened.deferred_input, jobs: reopened.jobs,
+    total_invocations: reopened.total_invocations, running_invocations: reopened.running_invocations, deferred_invocations: reopened.deferred_invocations,
+    native_cancelled_deferred_input: true, native_stopped_running: true, reopened_without_execution: true }, null, 2)}\n`, { mode: 0o600 });
 });
 
 test('receives a charity file through a real native pairing and verifies the saved bytes', { platforms: ['ios'], timeout: 240000 }, async ({ app, device, network, screen }) => {

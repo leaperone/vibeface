@@ -8,26 +8,33 @@
 //! recorded one.
 
 use anyhow::{Context as _, Result, bail, ensure};
-use std::io;
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, GetLastError, HANDLE},
+    Foundation::{
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, GetLastError, HANDLE,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
+    },
     System::{
         JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, OpenJobObjectW,
-            QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+            AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicProcessIdList,
+            JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
+            SetInformationJobObject, TerminateJobObject,
         },
         SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE},
         Threading::{
-            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-            QueryFullProcessImageNameW,
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            QueryFullProcessImageNameW, WaitForSingleObject,
         },
     },
 };
 
-/// The most members a managed tree is read back with. A provider that starts more than this has
-/// already escaped what the Node models, and the job still ends all of them.
+/// The most members a managed tree is read back with. An incomplete list cannot confirm exit;
+/// terminating or closing the job still ends all its members.
 const MAX_MEMBERS: usize = 1024;
 
 /// An owned kernel handle.
@@ -165,7 +172,6 @@ impl Job {
     fn members(&self) -> Result<Vec<u32>> {
         let header = std::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
         let mut buffer = vec![0_usize; header.div_ceil(std::mem::size_of::<usize>()) + MAX_MEMBERS];
-        let mut returned = 0u32;
         // SAFETY: the buffer is sized for the list header plus MAX_MEMBERS entries.
         if unsafe {
             QueryInformationJobObject(
@@ -173,26 +179,24 @@ impl Job {
                 JobObjectBasicProcessIdList,
                 buffer.as_mut_ptr().cast(),
                 std::mem::size_of_val(buffer.as_slice()) as u32,
-                &mut returned,
+                std::ptr::null_mut(),
             )
         } == 0
         {
-            // A partially filled list still answers the question of what is running.
-            let error = io::Error::last_os_error();
-            if returned == 0 {
-                return Err(error.into());
-            }
+            return Err(io::Error::last_os_error().into());
         }
         // SAFETY: the usize allocation aligns this pointer-sized Windows structure; the kernel filled its complete header.
         let list = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
-        let count = (list.NumberOfProcessIdsInList as usize).min(MAX_MEMBERS);
+        let count = list.NumberOfProcessIdsInList as usize;
+        ensure!(
+            count <= MAX_MEMBERS && list.NumberOfAssignedProcesses == list.NumberOfProcessIdsInList,
+            "the managed job's process list is incomplete"
+        );
         let mut ids = Vec::with_capacity(count);
         let first = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList)
             / std::mem::size_of::<usize>();
         for id in buffer[first..first + count].iter().copied() {
-            if let Ok(id) = u32::try_from(id) {
-                ids.push(id);
-            }
+            ids.push(u32::try_from(id).context("the managed job returned an invalid process id")?);
         }
         Ok(ids)
     }
@@ -203,18 +207,72 @@ impl Job {
     }
 
     /// The image path of every program still running in the job.
-    pub fn member_images(&self) -> Vec<String> {
-        self.members()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|id| image_of(id).ok())
-            .collect()
+    pub fn member_images(&self) -> Result<Vec<String>> {
+        self.members()?.into_iter().map(image_of).collect()
     }
 
     /// Ends every program in the job at once.
-    pub fn terminate(&self) {
+    pub fn terminate(&self) -> Result<()> {
         // SAFETY: the job handle is open; the exit code is arbitrary.
-        unsafe { TerminateJobObject(self.handle.0, 1) };
+        if unsafe { TerminateJobObject(self.handle.0, 1) } == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    /// Ends the job and waits for its original members, even after they leave the job's list.
+    pub fn stop(&self, grace: Duration) -> Result<()> {
+        let deadline = Instant::now() + grace;
+        let mut processes = Vec::new();
+        for id in self.members()? {
+            // SAFETY: only query and exit-observation rights are requested, without inheritance.
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    0,
+                    id,
+                )
+            };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error().into());
+            }
+            let process = Owned(handle);
+            let mut belongs = 0;
+            // SAFETY: both handles and the output variable remain valid through the call.
+            if unsafe { IsProcessInJob(process.0, self.handle.0, &mut belongs) } == 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            ensure!(
+                belongs != 0,
+                "the managed job's process identity changed before stop"
+            );
+            processes.push(process);
+        }
+        self.terminate()?;
+        for process in processes {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .try_into()
+                .unwrap_or(u32::MAX - 1);
+            // SAFETY: the owned process handle remains open for this bounded wait.
+            match unsafe { WaitForSingleObject(process.0, remaining) } {
+                WAIT_OBJECT_0 => {}
+                WAIT_TIMEOUT => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the managed job's process exit was not confirmed within the grace period",
+                    )
+                    .into());
+                }
+                _ => return Err(io::Error::last_os_error().into()),
+            }
+        }
+        ensure!(
+            self.member_count()? == 0,
+            "the managed job still has running processes after stop"
+        );
+        Ok(())
     }
 
     /// Whether the root process the journal recorded is still a member of this job and still

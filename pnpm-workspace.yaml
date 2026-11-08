@@ -2,7 +2,7 @@ packages:
   - packages/*
   - apps/*
 overrides:
-  '@e2e-dev/mobile@0.12.4>agent-device': 0.21.32
+  '@e2e-dev/mobile@0.12.4>agent-device': 0.21.36
 allowBuilds:
   electron: false
   electron-winstaller: false

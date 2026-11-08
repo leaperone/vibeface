@@ -12,6 +12,65 @@ use vibeface_bridge::agent::{
     StartEvidence,
 };
 
+#[cfg(windows)]
+fn fixture_process_handle(
+    log: &std::path::Path,
+) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+
+    let recorded = std::fs::read_to_string(log)?;
+    let pid = recorded
+        .lines()
+        .last()
+        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .and_then(|record| record["pid"].as_u64())
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0)
+        .ok_or(std::io::ErrorKind::InvalidData)?;
+    // SAFETY: only termination-observation rights are requested, without inheritance.
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: OpenProcess returned a valid owned handle, transferred exactly once.
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+enum FixtureExit {
+    Exited,
+    StillRunning,
+    Unobserved,
+    QueryFailed,
+}
+
+#[cfg(windows)]
+fn fixture_exit(
+    process: &std::io::Result<std::os::windows::io::OwnedHandle>,
+) -> (FixtureExit, Option<i32>) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::WaitForSingleObject,
+    };
+
+    let process = match process {
+        Ok(process) => process,
+        Err(error) => return (FixtureExit::Unobserved, error.raw_os_error()),
+    };
+    // SAFETY: the handle stays owned through this nonblocking status query.
+    match unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } {
+        WAIT_OBJECT_0 => (FixtureExit::Exited, None),
+        WAIT_TIMEOUT => (FixtureExit::StillRunning, None),
+        _ => (
+            FixtureExit::QueryFailed,
+            std::io::Error::last_os_error().raw_os_error(),
+        ),
+    }
+}
+
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) {
         "tests/fixtures/fake-cursor-agent.cmd"
@@ -103,7 +162,7 @@ async fn official_subscription_probe_observes_authentication_and_models_without_
     );
     assert_eq!(rejected.catalog, CursorCatalog::Unavailable);
     assert!(!root.join("prompts.jsonl").exists());
-    agent.stop().await;
+    agent.stop().await?;
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -198,7 +257,7 @@ async fn prompt_receipts_are_durable_before_send_and_terminal_before_reply_and_n
     assert!(vibeface_bridge::platform::privatefs::is_private(
         &turn.local_store_root.join("config")
     )?);
-    agent.stop().await;
+    agent.stop().await?;
     assert!(!root.join("agent.pid").exists());
     std::fs::remove_dir_all(root)?;
     Ok(())
@@ -269,7 +328,7 @@ async fn cancellation_requires_the_original_prompt_terminal_and_disconnect_stays
     assert_eq!(error.outcome, AgentFailure::Unknown);
     let session = error.session_id.context("unknown session")?;
     let id = locator.lock().unwrap().clone().context("unknown receipt")?;
-    agent.stop().await;
+    agent.stop().await?;
     let restarted = CursorAgent::new(
         BTreeMap::new(),
         "http://127.0.0.1:9".into(),
@@ -294,7 +353,7 @@ async fn cancellation_requires_the_original_prompt_terminal_and_disconnect_stays
         .context("no replay")?;
     assert_eq!(error.outcome, AgentFailure::Unknown);
     assert_eq!(lines(&root.join("prompts.jsonl")).len(), before);
-    restarted.stop().await;
+    restarted.stop().await?;
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -361,7 +420,7 @@ async fn scoped_permissions_and_blocking_extensions_always_receive_safe_response
         .await;
     assert!(error.is_err());
     assert_eq!(lines(&root.join("prompts.jsonl")).len(), 1);
-    agent.stop().await;
+    agent.stop().await?;
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -416,7 +475,7 @@ async fn cursor_stream_and_journal_redact_fragmented_credentials() -> Result<()>
     for entry in std::fs::read_dir(turn.local_store_root.join("prompts"))? {
         assert!(!std::fs::read_to_string(entry?.path())?.contains("synthetic-sensitive-token"));
     }
-    agent.stop().await;
+    agent.stop().await?;
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -455,7 +514,7 @@ async fn a_signed_out_or_partial_status_never_starts_acp_and_explicit_auth_stays
         assert_eq!(result.authentication, CursorAuthentication::Authenticated);
         assert!(result.launchable);
     }
-    agent.stop().await;
+    agent.stop().await?;
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -499,7 +558,7 @@ async fn a_process_exit_after_cancel_does_not_confirm_cancellation() -> Result<(
         agent.probe(&turn, &session, &id).await?.status,
         PromptStatus::Unknown
     );
-    agent.stop().await;
+    agent.stop().await?;
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -568,7 +627,7 @@ async fn mcp_reconnect_uses_the_current_attempt_bearer_without_persisting_it() -
         };
         assert!(!bytes.contains(&first) && !bytes.contains(&next));
     }
-    agent.stop().await;
+    agent.stop().await?;
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -609,21 +668,95 @@ async fn orphan_recovery_checks_the_recorded_process_before_ending_its_tree() ->
         let mut wrong: Value = serde_json::from_slice(&recorded)?;
         wrong[0]["identity"]["value"] = serde_json::json!("another-process-start");
         vibeface_bridge::platform::privatefs::write_atomic(&file, &serde_json::to_vec(&wrong)?)?;
-        CursorAgent::kill_orphan(&file);
+        CursorAgent::kill_orphan(&file)?;
         assert!(
             !pending.is_finished(),
             "a stale identifier cannot end another CLI process"
         );
         vibeface_bridge::platform::privatefs::write_atomic(&file, &recorded)?;
     }
-    CursorAgent::kill_orphan(&file);
+    CursorAgent::kill_orphan(&file)?;
     let error = pending
         .await?
         .err()
         .context("orphan completion stays unknown")?;
     assert_eq!(error.outcome, AgentFailure::Unknown);
     assert_eq!(lines(&root.join("prompts.jsonl")).len(), 1);
-    agent.stop().await;
+    agent.stop().await?;
     std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_observation_bounds_oversize_catalog_response_and_confirms_the_cli_tree_exit()
+-> Result<()> {
+    let root = root()?;
+    let agent = Arc::new(agent(&root)?);
+    let log = root.join("processes.jsonl");
+    let ready = root.join("ready");
+    let release = root.join("release");
+    let env = BTreeMap::from([
+        ("FAKE_BRIDGE_MODELS".into(), "oversize".into()),
+        ("FAKE_BRIDGE_LOG".into(), log.display().to_string()),
+        ("FAKE_BRIDGE_ME_READY".into(), ready.display().to_string()),
+        (
+            "FAKE_BRIDGE_ME_RELEASE".into(),
+            release.display().to_string(),
+        ),
+    ]);
+    let worker = agent.clone();
+    let workspace = root.clone();
+    let probe = tokio::spawn(async move {
+        worker
+            .provider_observation(&fixture(), &workspace, &workspace.join("probe"), &env)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !ready.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let pidfile = root.join("agent.pid");
+    let records: Vec<Value> = serde_json::from_slice(&std::fs::read(&pidfile)?)?;
+    assert_eq!(records.len(), 1);
+    let token = records[0]["token"]
+        .as_str()
+        .context("CLI tree token")?
+        .to_owned();
+    #[cfg(windows)]
+    let fixture_process = fixture_process_handle(&log);
+    std::fs::write(release, b"")?;
+    let observation = probe.await??;
+    assert_eq!(
+        observation.authentication,
+        CursorAuthentication::Authenticated
+    );
+    assert_eq!(observation.catalog, CursorCatalog::Unavailable);
+    agent.stop().await?;
+    #[cfg(windows)]
+    let (fixture_exit_after_stop, fixture_probe_os_code) = fixture_exit(&fixture_process);
+    assert!(
+        matches!(
+            vibeface_bridge::platform::tree::Leftover::find(&token),
+            Ok(None)
+        ),
+        "CursorAgent::stop returns only after the CLI wrapper and child tree have exited"
+    );
+    assert!(!pidfile.exists());
+    let cleanup = std::fs::remove_dir_all(root);
+    #[cfg(windows)]
+    if let Err(error) = &cleanup {
+        eprintln!(
+            "stage=remove_dir_all path_class=cleanup_root_failed_entry_unknown os_code={:?} fixture_exit_after_stop={fixture_exit_after_stop:?} fixture_probe_os_code={fixture_probe_os_code:?}",
+            error.raw_os_error()
+        );
+    }
+    cleanup?;
+    #[cfg(windows)]
+    assert!(
+        matches!(fixture_exit_after_stop, FixtureExit::Exited),
+        "fixture_exit_after_stop={fixture_exit_after_stop:?}"
+    );
     Ok(())
 }
