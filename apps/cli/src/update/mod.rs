@@ -2333,9 +2333,7 @@ mod tests {
                 stops: std::sync::atomic::AtomicUsize::new(0),
             };
             assert!(
-                handoff(&policy, &data, &service, &journal)
-                    .await
-                    .is_err(),
+                handoff(&policy, &data, &service, &journal).await.is_err(),
                 "{failure}"
             );
             assert!(data.join("update-pending.json").exists(), "{failure}");
