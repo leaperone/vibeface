@@ -871,8 +871,8 @@ pub(crate) fn append_from(
     let event = check_event(network, &envelope).context("appended event is invalid")?;
     super::workspace::authorize_event(connection, network, &event)?;
     authorize_memory(connection, network, &event)?;
-    authorize_cause(connection, network, &event)?;
-    authorize_owner(connection, network, &event)?;
+    authorize_cause(connection, &view, &event)?;
+    authorize_owner(connection, &view, &event)?;
     ensure!(
         insert_event(connection, &view, &envelope, &event, created_at_ms, true)?,
         "this Node's log has forked and it no longer writes"

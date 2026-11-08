@@ -2599,7 +2599,7 @@ fn narrowed_attesters_disable_stored_signatures_and_their_causes_without_erasing
                 message_id: "request".into(),
             }),
         },
-        vec![request.hash.clone()],
+        vec![],
         3,
     )?;
     let parent = net.a.sign_event(Event {

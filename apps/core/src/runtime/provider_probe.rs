@@ -661,7 +661,9 @@ mod tests {
                 .map(|(name, value)| (name, Some(value)))
                 .collect(),
         )?;
-        variables.save(&dir)?;
+        let mut configuration = crate::config::Config::load(&dir)?;
+        configuration.provider_env = variables;
+        configuration.save(&dir)?;
         let node = std::sync::Arc::new(Runtime::open(&dir).await?);
         node.tools_ready("http://127.0.0.1:9".into())?;
         Ok((node, dir))

@@ -3,7 +3,7 @@
 //! snapshot in the data directory and
 //! never reach events, logs or the web, which only learns which names are set.
 use crate::scheduling::TriggerKind;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{

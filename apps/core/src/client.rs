@@ -3121,7 +3121,6 @@ mod tests {
                 .is_err(),
             "only the owner changes providers"
         );
-        assert!(!dir.join(crate::providers::ENV_FILE).exists());
 
         let mut owner = session(&admin)?;
         let set_node = json!({"roots":[user_codex_home.canonicalize()?],"manager":null});
@@ -3136,12 +3135,10 @@ mod tests {
             let mut queued = Box::pin(dispatch(&node, &mut owner, method, params));
             assert!(futures_util::poll!(queued.as_mut()).is_pending());
             assert_eq!(std::fs::read(dir.join("config.json"))?, before_config);
-            assert!(!dir.join(crate::providers::ENV_FILE).exists());
-            drop(queued);
+                drop(queued);
             drop(active);
             assert_eq!(std::fs::read(dir.join("config.json"))?, before_config);
-            assert!(!dir.join(crate::providers::ENV_FILE).exists());
-            assert_eq!(
+                assert_eq!(
                 serde_json::to_value(node.settings_snapshot())?,
                 before_settings
             );
@@ -3167,7 +3164,7 @@ mod tests {
             Config::load(&dir)?.bins.get(&Provider::Codex),
             Some(&std::path::PathBuf::from("/fixture/codex"))
         );
-        assert!(crate::providers::ProviderEnv::load(&dir)? == node.providers().env);
+        assert!(Config::load(&dir)?.provider_env == node.providers().env);
         let cursor = dispatch(
             &node,
             &mut owner,
@@ -3176,9 +3173,9 @@ mod tests {
         )
         .await?;
         let read = dispatch(&node, &mut owner, "node_settings", json!({})).await?;
-        let private_env = std::fs::read(dir.join(crate::providers::ENV_FILE))?;
+        let private_env = std::fs::read(dir.join("config.json"))?;
         let private_env_modified =
-            std::fs::metadata(dir.join(crate::providers::ENV_FILE))?.modified()?;
+            std::fs::metadata(dir.join("config.json"))?.modified()?;
         let repeated = dispatch(
             &node,
             &mut owner,
@@ -3187,9 +3184,9 @@ mod tests {
         )
         .await?;
         assert_eq!(repeated["providers"][1]["roles"], json!([]));
-        assert!(std::fs::read(dir.join(crate::providers::ENV_FILE))? == private_env);
+        assert!(std::fs::read(dir.join("config.json"))? == private_env);
         assert_eq!(
-            std::fs::metadata(dir.join(crate::providers::ENV_FILE))?.modified()?,
+            std::fs::metadata(dir.join("config.json"))?.modified()?,
             private_env_modified
         );
         for reply in [&saved, &cursor, &read] {
@@ -3300,7 +3297,7 @@ mod tests {
                 }
                 continue;
             }
-            if path.file_name() == Some(std::ffi::OsStr::new(crate::providers::ENV_FILE)) {
+            if path.file_name() == Some(std::ffi::OsStr::new("config.json")) {
                 continue;
             }
             let bytes = std::fs::read(&path).with_context(|| {
@@ -3322,8 +3319,8 @@ mod tests {
         }
         assert!(checked >= 3 && logs.join("node.log").is_file());
         vibeface_bridge::platform::privatefs::ensure_private(
-            &dir.join(crate::providers::ENV_FILE),
-            "the saved provider environment",
+            &dir.join("config.json"),
+            "the saved private configuration",
         )?;
         let node = Arc::new(
             Runtime::reopen(&dir)

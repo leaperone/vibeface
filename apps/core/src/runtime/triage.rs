@@ -679,7 +679,7 @@ fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 impl Runtime {
-    async fn network_id(&self) -> Result<String> {
+    pub(crate) async fn network_id(&self) -> Result<String> {
         Ok(self.membership_state().await?.genesis.network_id)
     }
 

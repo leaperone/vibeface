@@ -2481,7 +2481,8 @@ mod tests {
             assert!(b.store.lock().await.accept_work_fixture(&target, &network, spec.clone(), now_ms()).is_err(),
                 "missing admission evidence cannot start the old dispatch again");
             let finished = a.store.lock().await.events_from(&network, &entry_id, 1, 100)?.into_iter()
-                .filter(|event| matches!(&event.event.body, EventBody::WorkFinished { work_id, outcome: WorkOutcome::Completed, .. } if work_id == &spec.work_id)).count();
+                .filter_map(|event| serde_json::from_str::<crate::model::Event>(&event.canonical_body).ok())
+                .filter(|event| matches!(&event.body, EventBody::WorkFinished { work_id, outcome: WorkOutcome::Completed, .. } if work_id == &spec.work_id)).count();
             assert_eq!(finished, 1);
 
             let mut unknown = spec.clone();

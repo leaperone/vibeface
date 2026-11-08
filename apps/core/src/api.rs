@@ -1398,7 +1398,7 @@ mod tests {
             node.local_access.set_enabled(true)?;
             let launched: Value = request().send().await?.json().await?;
             assert_eq!(launched["entry"], initialized["entry"]);
-            assert_eq!(launched["local_launch"]["url"], local_origin);
+            assert_eq!(launched["local_launch"]["url"], *local_origin);
             assert_eq!(launched["local_launch"]["device_id"], node.identity.device_id()?);
             let token = launched["local_launch"]["token"].as_str().context("local token missing")?;
             assert!(token.len() == 64 && hex::decode(token).is_ok());

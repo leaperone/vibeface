@@ -629,10 +629,8 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
     } else {
         configuration.public_url.clone()
     };
+    configuration.provider_env = provider_env;
     initialize(&options.data_dir, configuration, entry_token)?;
-    if provider_env != ProviderEnv::default() {
-        provider_env.save(&options.data_dir)?;
-    }
     let data_dir = fs::canonicalize(&options.data_dir)?;
     let device_id = config::identity(&data_dir)?.device_id()?;
     Ok(json!({
