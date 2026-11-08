@@ -63,7 +63,7 @@ pub(super) async fn missing(names: &[String], host: &Host) -> Result<BTreeMap<St
 pub(super) async fn program_path(host: &Host) -> Result<Option<std::ffi::OsString>> {
     #[cfg(test)]
     {
-        return Ok(host.inherited_env.get("PATH").map(Into::into));
+        Ok(host.inherited_env.get("PATH").map(Into::into))
     }
     #[cfg(all(unix, not(test)))]
     {

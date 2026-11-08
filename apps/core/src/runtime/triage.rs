@@ -1722,14 +1722,17 @@ impl Runtime {
             .manager()
             .context("no coordination Agent is configured")
             .map_err(manager::ManagerError::not_started)?;
-        crate::scheduler::ensure_readiness(
-            &self
-                .provider_readiness(settings.provider, &settings.model)
-                .await,
-        )?;
-        let config = self
+        let mut config = self
             .manager_config(settings, &providers)
             .map_err(manager::ManagerError::not_started)?;
+        self.prepare_manager_login(&mut config)
+            .await
+            .map_err(manager::ManagerError::not_started)?;
+        crate::scheduler::ensure_readiness(
+            &self
+                .provider_readiness(config.sdk.provider(), &config.model)
+                .await,
+        )?;
         drop(launch);
         self.run_coordination(config, attempt, prompt).await
     }
@@ -1920,6 +1923,9 @@ impl Runtime {
             "coordination Agent permission was revoked"
         );
         drop(self.answer_permission_lease(control).await?);
+        self.prepare_manager_login(&mut config)
+            .await
+            .map_err(manager::ManagerError::not_started)?;
         config.timeout_secs = config.timeout_secs.min(AGENT_ANSWER_WITHIN.as_secs());
         self.run_coordination(config, Some(attempt), |cli| {
             Ok(format!(
@@ -2996,7 +3002,7 @@ pub(super) mod tests {
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
     }
 
-    pub(in crate::runtime) async fn node() -> Result<(Arc<Runtime>, LocalIdentity, PathBuf)> {
+    pub(crate) async fn node() -> Result<(Arc<Runtime>, LocalIdentity, PathBuf)> {
         let (node, dir) = bare_node().await?;
         let admin = LocalIdentity::generate();
         let state = NetworkState::new(Genesis::create(
@@ -3018,7 +3024,7 @@ pub(super) mod tests {
         });
     }
 
-    pub(in crate::runtime) async fn bot(
+    pub(crate) async fn bot(
         node: &Runtime,
         admin: &LocalIdentity,
         scope: &str,
@@ -5945,7 +5951,7 @@ pub(super) mod tests {
         Ok(())
     }
 
-    pub(in crate::runtime) async fn start_reply(
+    pub(crate) async fn start_reply(
         node: &Runtime,
         admin: &LocalIdentity,
         id: &str,

@@ -60,12 +60,12 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 
 先安装所选 Provider，再配置程序路径、工作目录和认证环境。修改已有 `config.json` 时保留未列出的字段。
 
-用到 Codex 或 Cursor 而程序路径缺失时，Node 在 `init`、启动和网页打开用途开关时从本机找出并写进配置。设备页的**自动接入**也能为尚未启用的服务准备设置，不开启 Bot 或任务执行。之后照写下的路径使用。Codex 的运行数据由 Node 隔离管理：
+用到 Codex、Claude Code 或 Cursor 而程序路径缺失时，Node 在 `init`、启动和网页打开用途开关时从本机找出并写进配置。设备页的**自动接入**也能为尚未启用的服务准备设置，不开启 Bot 或任务执行。之后照写下的路径使用。Codex 的运行数据由 Node 隔离管理：
 
 - 默认 App Server 模式是 `spawn`，Node 使用 `<data-dir>/providers/codex` 作为 `CODEX_HOME`，并在 `<data-dir>/providers/codex/sessions` 保存自己的会话。
 - Node 不扫描用户的会话或 control socket。只有明确选择 `system` 并填写绝对 socket 才连接外部 App Server。
-- 只写了名字的程序（`codex`、`cursor-sdk-bridge`）在 PATH 里找不到时，再找 `~/.local/bin`、`/opt/homebrew/bin` 和 `/usr/local/bin`。Codex 还查找 NVM 的 Node 安装目录和 `/Applications/Codex.app/Contents/Resources`。NVM 根目录取 `NVM_DIR`，未设置时取 `~/.nvm`。
-- NVM 安装的程序使用同一 `bin` 目录下的 Node。程序发现无需加载 shell 配置，也不依赖终端中执行过 `nvm use`。
+- 程序先查 PATH，再查用户安装、Homebrew、npm、Volta 和 NVM 目录。Cursor 使用官方 `agent` 或 `cursor-agent`。Codex 另查 `/Applications/Codex.app/Contents/Resources`。NVM 根取 `NVM_DIR`，默认 `~/.nvm`；Windows 使用 PATHEXT。
+- npm wrapper 使用同一 `bin` 目录下的 Node。无保存程序或 PATH 且常见目录仍找不到时，仅查询登记登录 shell 的 PATH。
 
 已写下的程序路径、模型和用途不被替换。Node-owned Codex 运行目录由 Node 创建和维护，不从用户目录查找，也不在普通 Provider 环境变量中修改。
 
@@ -94,17 +94,17 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 
 Node 只连接这个 socket，不搜索其他正在运行的会话，也不启动或停止其所属进程。
 
-由 Node 启动自己的 App Server 时只需保持 `spawn`。Node 会在启动边界注入 Node-owned `CODEX_HOME`，覆盖普通 Provider 环境里的同名值。Provider 的其他认证环境通过设备设置或服务配置填写。不要把密钥写入源码、URL、共享记录或命令历史。Cursor 的 bridge 路径和协调 Agent 工作目录也由本机配置指定。
+由 Node 启动自己的 App Server 时只需保持 `spawn`。Node 会在启动边界注入 Node-owned `CODEX_HOME`，覆盖普通 Provider 环境里的同名值。Provider 的其他认证环境通过设备设置或服务配置填写。不要把密钥写入源码、URL、共享记录或命令历史。Cursor 的 CLI 程序和协调 Agent 工作目录也由本机配置指定。
 
 ## 为 Node 私有目录登录
 
 Codex spawn、Claude Code 和 OpenCode 的本机 CLI 已登录，不代表 Node 的私有目录已登录。打开设备 **AI** 设置，复制对应服务的认证命令，在运行该 Node 的电脑上执行，再点**检查可用性**。命令包含实际程序与私有目录的绝对路径，不包含凭证。
 
-Codex 命令设置 `<data-dir>/providers/codex` 的 `CODEX_HOME` 后执行 `codex login`。Claude Code 设置 `<data-dir>/providers/claude` 的 `CLAUDE_CONFIG_DIR` 后执行 `claude auth login`。OpenCode 命令固定 `<data-dir>/providers/opencode` 内的 XDG 与数据库路径，清除外部 config override，再执行 `opencode --standalone auth login`，防止登录到用户已有后台服务。Node 不读取或复制个人 OAuth 登录文件、钥匙串或 GUI 令牌。Codex 内置登录不能只凭环境变量存在推断成功；没有可复用的声明变量时仍使用私有目录登录命令。
+Codex 命令设置 `<data-dir>/providers/codex` 的 `CODEX_HOME` 后执行 `codex login`。Claude Code 设置 `<data-dir>/providers/claude` 的 `CLAUDE_CONFIG_DIR` 后执行 `claude auth login`。OpenCode 命令固定 `<data-dir>/providers/opencode` 内的 XDG 与数据库路径，清除外部 config override，再执行 `opencode --standalone auth login`，防止登录到用户已有后台服务。Codex 和 Claude Code 自动接入可从官方 CLI store 准备访问令牌镜像，已有私有登录优先；不复制个人会话，不消费源刷新令牌。Codex 仅有 Keychain 的登录、Claude 自定义目录的 Keychain 登录需独立登录。镜像不会替原 CLI 刷新，源无新访问令牌且过期时需重新检查或独立登录。详见[接入边界](design/local-provider-onboarding.md)。
 
 pi 的认证目录不变，只有 session 目录固定为 `<data-dir>/providers/pi/sessions`。OpenCode 的数据、配置、状态和缓存分别位于私有根的 `data`、`config`、`state` 和 `cache`，项目配置不会覆盖此运行配置。Codex system 模式共享明确指定的外部服务会话，使用该服务自身的登录入口。
 
-Cursor 自动接入只复用 `CURSOR_API_KEY`，不会把桌面应用登录当作 SDK 密钥。未找到时在设备设置填写控制台创建的 API key。**检查可用性**启动 SDK bridge，并查询账户和模型目录，不创建 Agent 或发送模型请求。账户验证与模型目录分别显示结果，目录查询失败不会抹掉已确认的认证状态。目录不完整时，未列出的模型仍可手动填写。
+Cursor 使用官方 Agent CLI 的已有订阅登录，缺认证时提供 `agent login`，不要求 API key，也不自动打开浏览器。保存或继承的 API key/token 仍优先。检查先读官方 status JSON，再按需初始化私有空 ACP 会话取得模型目录，不发送模型提示。Node 设置私有 CURSOR_CONFIG_DIR 和 CURSOR_DATA_DIR，保持真实 HOME 供 CLI 读取认证。CLI 自身用户和项目资源仍按官方规则加载；Node 工具只取得当前 attempt 的作用域认证。
 
 ## 配置会话扫描和 hooks
 

@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 use static_assets::{DEFAULT_CONTENT_SECURITY_POLICY, StaticAssets};
 
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
-/// The Cursor SDK posts tool calls to this path; `vibeface tool` posts the same shape.
+/// The scoped CLI posts tool calls to this private path.
 pub const TOOL_PATH: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
 const MAX_CLIENT_SOCKETS: usize = 256;
 const HOOKS: &str = "/api/hooks";
@@ -232,6 +232,7 @@ fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
     let app = App::new(node, vec![site], None);
     Router::new()
         .route(TOOL_PATH, post(tool))
+        .route("/mcp", post(mcp))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES / 2))
         .layer(middleware::from_fn_with_state(app.clone(), boundary))
         .with_state(app)
@@ -432,7 +433,10 @@ async fn check_boundary(
                 "application/json required".into(),
             ));
         }
-        let is_tool = path == TOOL_PATH || path == "/api/local/launch" || path == "/api/decision";
+        let is_tool = path == TOOL_PATH
+            || path == "/mcp"
+            || path == "/api/local/launch"
+            || path == "/api/decision";
         let bearer_call = (is_tool && bearer(headers).is_some())
             || path == HOOKS
             || path == HOOKS_WAIT
@@ -879,6 +883,75 @@ async fn tool(
     }
 }
 
+/// Stateless Streamable HTTP MCP, on the private tool listener only. Every request uses the
+/// current attempt's bearer; loading a Cursor session never restores a previous bearer.
+async fn mcp(State(app): State<App>, headers: HeaderMap, Json(input): Json<Value>) -> Response {
+    let Some(token) = bearer(&headers) else {
+        return ApiError::auth().into_response();
+    };
+    let Some(access) = app.node.tool_access(token, "mcp").await else {
+        return ApiError::auth().into_response();
+    };
+    let id = input.get("id").cloned().unwrap_or(Value::Null);
+    let error = |code, message: &str| {
+        Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}))
+            .into_response()
+    };
+    if input["jsonrpc"] != "2.0"
+        || !input.is_object()
+        || !matches!(id, Value::Null | Value::String(_) | Value::Number(_))
+    {
+        return error(-32600, "Invalid Request");
+    }
+    let Some(method) = input["method"].as_str() else {
+        return error(-32600, "Invalid Request");
+    };
+    if id.is_null() {
+        return if method.starts_with("notifications/") {
+            StatusCode::ACCEPTED.into_response()
+        } else {
+            error(-32600, "A request ID is required")
+        };
+    }
+    let result = match method {
+        "initialize" => {
+            json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"vibeface","version":env!("CARGO_PKG_VERSION")}})
+        }
+        "ping" => json!({}),
+        "tools/list" => {
+            let tools: Vec<Value> = crate::providers::Provider::Cursor.tools_for(crate::scheduling::TriggerKind::Human)
+                .into_iter().map(|(name,tool)| json!({"name":name,"description":tool.description,"inputSchema":tool.input_schema})).collect();
+            json!({"tools":tools})
+        }
+        "tools/call" => {
+            let Some(name) = input["params"]["name"].as_str() else {
+                return error(-32602, "A tool name is required");
+            };
+            let args = input["params"]
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if !args.is_object() {
+                return error(-32602, "Tool arguments must be an object");
+            }
+            match app.node.tool(access, name, args).await {
+                Ok(result) => {
+                    json!({"content":[{"type":"text","text":result.to_string()}],"isError":false})
+                }
+                Err(error) => {
+                    let result = error
+                        .downcast_ref::<crate::tools::ToolFailure>()
+                        .map(|error| error.response.clone())
+                        .unwrap_or_else(|| json!({"error":"Node tool call failed"}));
+                    json!({"content":[{"type":"text","text":result.to_string()}],"isError":true})
+                }
+            }
+        }
+        _ => return error(-32601, "Method not found"),
+    };
+    Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
+}
+
 async fn hooks(State(app): State<App>, Json(mut input): Json<Value>) -> ApiResult<Json<Value>> {
     let schema = input
         .as_object_mut()
@@ -1030,6 +1103,71 @@ fn static_response(file: static_assets::StaticFile, cache: &'static str) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mcp_reuses_the_scoped_write_journal_and_revokes_access() -> Result<()> {
+        use crate::runtime::{
+            Access, test_bot as bot, test_node as node, test_start_reply as start_reply,
+        };
+        let (node, admin, dir) = node().await?;
+        bot(&node, &admin, "c", "Ops", &[]).await?;
+        let network = node.store.lock().await.network()?.context("network")?;
+        let (trigger, attempt) = start_reply(&node, &admin, "mcp-trigger").await?;
+        node.register_manager_attempt_fixture(
+            "mcp-current-attempt".into(),
+            Access {
+                network_id: network.clone(),
+                human: false,
+                conversation_id: Some("c".into()),
+                manager: None,
+            },
+            &attempt,
+            &trigger,
+            crate::providers::Provider::Cursor,
+        )
+        .await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let app = tool_router(node.clone(), Site::parse(&origin)?);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let url = format!("{origin}/mcp");
+        let result=async {
+            let call=|input:Value|client.post(&url).bearer_auth("mcp-current-attempt").json(&input).send();
+            let initialize:Value=call(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}})).await?.json().await?;
+            assert_eq!(initialize["result"]["capabilities"]["tools"]["listChanged"],false);
+            let request=json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tool_call","arguments":{"tool":"create_bot","arguments":{"name":"Docs"},"call_ref":"one-intent"}}});
+            let first:Value=call(request.clone()).await?.json().await?;
+            assert_eq!(first["result"]["isError"],false);
+            let basis=node.store.lock().await.version_vector(&network)?;
+            let replay:Value=call(request).await?.json().await?;
+            assert_eq!(first,replay);
+            assert_eq!(basis,node.store.lock().await.version_vector(&network)?);
+            let missing_ref:Value=call(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_bot","arguments":{"name":"Duplicate"}}})).await?.json().await?;
+            assert_eq!(missing_ref["result"]["isError"],true);
+            assert_eq!(basis,node.store.lock().await.version_vector(&network)?);
+            let mut wrong=node.agent_tokens.lock().await.get("mcp-current-attempt").cloned().context("token")?;
+            wrong.network_id="another-personal-network".into();
+            node.agent_tokens.lock().await.insert("wrong-network".into(),wrong);
+            let wrong:Value=client.post(&url).bearer_auth("wrong-network").json(&json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"context","arguments":{}}})).send().await?.json().await?;
+            assert_eq!(wrong["result"]["isError"],true);
+            node.agent_tokens.lock().await.remove("mcp-current-attempt");
+            assert_eq!(call(json!({"jsonrpc":"2.0","id":5,"method":"tools/list"})).await?.status(),StatusCode::UNAUTHORIZED);
+            Ok::<_,anyhow::Error>(())
+        }.await;
+        server.abort();
+        let _ = server.await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
 
     #[test]
     fn static_cache_policy_keeps_shell_crypto_and_assets_distinct() {

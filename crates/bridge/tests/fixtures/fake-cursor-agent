@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Controlled official ACP protocol fixture. It never reads host authentication."""
+import json
+import hashlib
+import os
+import pathlib
+import sys
+import time
+import uuid
+
+root = pathlib.Path(os.environ["CURSOR_CONFIG_DIR"])
+data = pathlib.Path(os.environ["CURSOR_DATA_DIR"])
+assert root.is_absolute() and data.is_absolute() and root != data
+root.mkdir(parents=True, exist_ok=True)
+data.mkdir(parents=True, exist_ok=True)
+
+def log(variable, value):
+    if path := os.environ.get(variable):
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(value) + "\n")
+
+def send(value):
+    print(json.dumps({"jsonrpc": "2.0", **value}), flush=True)
+
+def reply(request, result):
+    send({"id": request["id"], "result": result})
+
+def fail(request, code):
+    send({"id": request["id"], "error": {"code": code, "message": "controlled failure"}})
+
+def models():
+    return {"models": {"currentModelId": "composer-2", "availableModels": [
+        {"modelId": "composer-2", "name": "Composer 2"},
+        {"modelId": "fixture-model", "name": "Fixture"}]}}
+
+def update(session, value):
+    send({"method": "session/update", "params": {"sessionId": session, "update": value}})
+
+def complete():
+    global pending
+    request, session, text = pending
+    update(session, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "done: "}})
+    size = int(os.environ.get("FAKE_ACP_CHUNK_SIZE", str(max(1, len(text)))))
+    for offset in range(0, len(text), size):
+        update(session, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text[offset:offset + size]}})
+    reply(request, {"stopReason": "end_turn"})
+    pending = None
+
+if sys.argv[1:4] == ["status", "--format", "json"]:
+    if os.environ.get("FAKE_BRIDGE_EXIT_BEFORE_READY"):
+        sys.exit(2)
+    signed_in = os.environ.get("FAKE_BRIDGE_ME") != "401" and not os.environ.get("FAKE_STATUS_SIGNED_OUT") and not os.environ.get("FAKE_STATUS_PARTIAL")
+    status = {"status": "authenticated" if signed_in else "unauthenticated", "isAuthenticated": signed_in,
+              "hasAccessToken": signed_in, "hasRefreshToken": signed_in,
+              "userInfo": {"email": "private-identity@example.invalid"}}
+    if os.environ.get("FAKE_BRIDGE_ME") == "malformed":
+        status = {"status": "error", "message": "synthetic-private-error"}
+    if os.environ.get("FAKE_STATUS_PARTIAL"):
+        status.update(status="partially-authenticated", hasAccessToken=True)
+    print(json.dumps(status, indent=2), flush=True)
+    sys.exit(0)
+
+if os.environ.get("CURSOR_API_KEY") or os.environ.get("CURSOR_AUTH_TOKEN"):
+    assert os.environ.get("AGENT_CLI_CREDENTIAL_STORE") == "memory"
+log("FAKE_BRIDGE_LOG", {"pid": os.getpid(), "config": str(root), "data": str(data)})
+if os.environ.get("FAKE_BRIDGE_EXIT_BEFORE_READY"):
+    sys.exit(2)
+
+pending = None
+interactions = set()
+for raw in sys.stdin:
+    request = json.loads(raw)
+    method = request.get("method")
+    if not method:
+        log("FAKE_ACP_REPLIES", request)
+        interactions.discard(request.get("id"))
+        if pending and not interactions:
+            complete()
+        continue
+    log("FAKE_BRIDGE_REQUEST_LOG", method)
+    if method == "initialize":
+        reply(request, {"protocolVersion": 1, "agentCapabilities": {"loadSession": True, "mcpCapabilities": {"http": True}}, "authMethods": [{"id": "cursor_login", "name": "Cursor CLI login"}]})
+    elif method == "authenticate":
+        raise AssertionError("default checks and tasks must never start browser login")
+    elif method in ["session/new", "session/load"]:
+        if ready := os.environ.get("FAKE_BRIDGE_ME_READY"):
+            pathlib.Path(ready).touch()
+            release = pathlib.Path(os.environ["FAKE_BRIDGE_ME_RELEASE"])
+            while not release.exists():
+                time.sleep(0.01)
+        if os.environ.get("FAKE_BRIDGE_ME") == "401":
+            fail(request, -32000)
+            continue
+        if os.environ.get("FAKE_BRIDGE_ME") == "malformed":
+            fail(request, -32603)
+            continue
+        params = request["params"]
+        logged = json.loads(json.dumps(params))
+        for server in logged.get("mcpServers", []):
+            for header in server.get("headers", []):
+                header["value"] = hashlib.sha256(header["value"].encode()).hexdigest()
+        log("FAKE_ACP_SESSION_LOG", logged)
+        if method == "session/new":
+            session = str(uuid.uuid4())
+            store = root / "acp-sessions" / session
+            store.mkdir(parents=True)
+            (store / "meta.json").write_text(json.dumps({"sessionId": session}))
+        else:
+            session = params["sessionId"]
+            assert (root / "acp-sessions" / session / "meta.json").is_file()
+            update(session, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "HISTORICAL REPLAY MUST BE IGNORED"}})
+            send({"id": "history-permission", "method": "session/request_permission", "params": {"sessionId": session, "toolCall": {"kind": "execute"}, "options": [{"kind": "allow_once", "optionId": "allow"}, {"kind": "reject_once", "optionId": "reject"}]}})
+        reply(request, {"sessionId": session, **({} if os.environ.get("FAKE_BRIDGE_MODELS") == "500" else models())})
+    elif method == "session/prompt":
+        params = request["params"]
+        session = params["sessionId"]
+        text = "".join(block.get("text", "") for block in params["prompt"])
+        if journal := os.environ.get("FAKE_ACP_JOURNAL_ROOT"):
+            assert any(json.loads(path.read_text())["status"]["state"] == "submitted" for path in (pathlib.Path(journal) / "prompts").glob("*.json")), "prompt must be journaled before submission"
+        log("FAKE_BRIDGE_SEND_LOG", {"session": session, "text": text})
+        pending = (request, session, text)
+        update(session, {"sessionUpdate": "tool_call", "toolCallId": "controlled-start", "kind": "execute", "title": "controlled task", "status": "in_progress"})
+        if text == "disconnect":
+            sys.exit(3)
+        if text.startswith("hang"):
+            continue
+        if text == "interactions":
+            for identifier, kind in [("permission", "execute"), ("unknown-permission", "unknown-kind")]:
+                interactions.add(identifier)
+                send({"id": identifier, "method": "session/request_permission", "params": {"sessionId": session, "toolCall": {"kind": kind}, "options": [{"kind": "allow_once", "optionId": "allow"}, {"kind": "reject_once", "optionId": "reject"}]}})
+            for identifier, method in [("ask", "cursor/ask_question"), ("plan", "cursor/create_plan"), ("unknown", "future/request")]:
+                interactions.add(identifier)
+                send({"id": identifier, "method": method, "params": {"sessionId": session}})
+        else:
+            complete()
+    elif method == "session/cancel":
+        if os.environ.get("FAKE_ACP_EXIT_ON_CANCEL"):
+            sys.exit(3)
+        if pending and not os.environ.get("FAKE_ACP_IGNORE_CANCEL"):
+            reply(pending[0], {"stopReason": "cancelled"})
+            pending = None
+    else:
+        fail(request, -32601)

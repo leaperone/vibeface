@@ -1,5 +1,5 @@
 //! Why an execution failed, as the person can act on it. This repository's own failures name
-//! their kind where they happen; the wording of upstream errors (Cursor SDK, Codex App Server)
+//! their kind where they happen; the wording of upstream errors (Cursor ACP, Codex App Server)
 //! is recognized here and nowhere else.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

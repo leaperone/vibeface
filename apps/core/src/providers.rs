@@ -12,9 +12,12 @@ use std::{
 };
 use vibeface_bridge::agent::CustomToolConfig;
 
+mod login;
+pub use login::AuthenticationSource;
+pub use login::ExternalCodexLogin;
+
 pub const ENV_FILE: &str = "provider-env.json";
 const MAX_VARIABLES: usize = 64;
-const CURSOR_KEY: &str = "CURSOR_API_KEY";
 
 /// A coding agent product: what a bot runs on, what dispatched work runs on, or whose session
 /// the Node watches. Its methods say most of what the runtime needs to know about the product;
@@ -712,7 +715,7 @@ impl Provider {
     pub fn default_bin(self) -> &'static str {
         match self {
             Provider::Codex => "codex",
-            Provider::Cursor => "cursor-sdk-bridge",
+            Provider::Cursor => "agent",
             Provider::Claude => "claude",
             Provider::Pi => "pi",
             Provider::Opencode => "opencode",
@@ -725,8 +728,7 @@ impl Provider {
     pub fn key_variables(self, env: &BTreeMap<String, String>) -> Result<Vec<String>> {
         match self {
             Provider::Codex => crate::manager::provider_environment_keys(env),
-            Provider::Cursor => Ok(vec![CURSOR_KEY.into()]),
-            Provider::Claude | Provider::Pi | Provider::Opencode => Ok(vec![]),
+            Provider::Cursor | Provider::Claude | Provider::Pi | Provider::Opencode => Ok(vec![]),
         }
     }
 
@@ -884,7 +886,7 @@ impl Provider {
     /// Name prefixes of the variables the Node sets itself for this provider's processes.
     fn reserved_env(self) -> &'static [&'static str] {
         match self {
-            Provider::Cursor => &["CURSOR_SDK_", "CURSOR_DATA_DIR"],
+            Provider::Cursor => &["CURSOR_CONFIG_DIR", "CURSOR_DATA_DIR"],
             Provider::Opencode => &["OPENCODE_SERVER_", "OPENCODE_CONFIG_CONTENT"],
             Provider::Codex | Provider::Claude | Provider::Pi => &[],
         }
@@ -1130,21 +1132,12 @@ pub fn validate_bin(provider: Provider, bin: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The Cursor key the bridge is started with and the rest of the Cursor variables. A key set
-/// here wins over the one the Node process inherited.
-pub fn cursor_launch(env: &BTreeMap<String, String>) -> (Option<String>, BTreeMap<String, String>) {
-    let mut env = env.clone();
-    let key = env
-        .remove(CURSOR_KEY)
-        .or_else(|| std::env::var(CURSOR_KEY).ok());
-    (key, env)
-}
-
 /// What the Node's App Server is started with.
 #[derive(Clone, PartialEq)]
 pub struct CodexLaunch {
     pub bin: PathBuf,
     pub env: BTreeMap<String, String>,
+    pub external_auth: Option<ExternalCodexLogin>,
 }
 
 /// The App Server the Node talks to right now.
@@ -1314,6 +1307,9 @@ impl ProviderRoots {
 }
 
 impl Local {
+    pub(crate) fn codex_external_auth(&self) -> Option<ExternalCodexLogin> {
+        login::external_codex_login(self)
+    }
     pub fn bin(&self, provider: Provider) -> PathBuf {
         self.bins
             .get(&provider)
@@ -1324,11 +1320,39 @@ impl Local {
     /// npm wrappers use `env node`; keep the selected installation's Node ahead of
     /// any inherited version without changing the saved environment.
     pub fn launch_env(&self, provider: Provider) -> BTreeMap<String, String> {
+        self.launch_env_on(provider, &crate::discovery::Host::current())
+    }
+
+    pub(crate) fn launch_env_on(
+        &self,
+        provider: Provider,
+        host: &crate::discovery::Host,
+    ) -> BTreeMap<String, String> {
         let mut env = self.env.get(provider).clone();
+        if provider == Provider::Cursor && !cfg!(test) {
+            if !["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"]
+                .iter()
+                .any(|name| env.contains_key(*name))
+            {
+                for name in ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"] {
+                    if let Ok(value) = std::env::var(name)
+                        && !value.is_empty()
+                    {
+                        env.insert(name.into(), value);
+                    }
+                }
+            }
+            if !env.contains_key("AGENT_CLI_CREDENTIAL_STORE")
+                && let Ok(value) = std::env::var("AGENT_CLI_CREDENTIAL_STORE")
+                && !value.is_empty()
+            {
+                env.insert("AGENT_CLI_CREDENTIAL_STORE".into(), value);
+            }
+        }
         let path = env
             .get("PATH")
             .map(std::ffi::OsString::from)
-            .or_else(|| crate::discovery::Host::current().path);
+            .or_else(|| host.path.clone());
         let mut program = self.bin(provider);
         if program.components().count() == 1
             && !program.is_absolute()
@@ -1343,13 +1367,33 @@ impl Local {
         let Some(bin) = program.parent().filter(|bin| bin.is_absolute()) else {
             return env;
         };
-        if !crate::discovery::executable_file(&bin.join("node")) {
-            return env;
-        }
-        let paths = std::iter::once(bin.to_path_buf()).chain(
+        let sibling = vibeface_bridge::platform::program::candidates(&bin.join("node"))
+            .iter()
+            .any(|node| crate::discovery::executable_file(node));
+        let bin = if sibling {
+            bin.to_path_buf()
+        } else {
+            if !crate::discovery::uses_path_node(&program)
+                || crate::discovery::runnable(Path::new("node"), path.as_ref())
+            {
+                return env;
+            }
+            let Some(node) = (crate::discovery::Host {
+                path: path.clone(),
+                ..host.clone()
+            })
+            .program("node") else {
+                return env;
+            };
+            let Some(bin) = node.parent() else {
+                return env;
+            };
+            bin.to_path_buf()
+        };
+        let paths = std::iter::once(bin.clone()).chain(
             path.iter()
                 .flat_map(std::env::split_paths)
-                .filter(|dir| dir != bin),
+                .filter(|dir| dir != &bin),
         );
         if let Some(path) = std::env::join_paths(paths)
             .ok()
@@ -1382,6 +1426,7 @@ impl Local {
             (true, AppServerMode::Spawn) => CodexTarget::Spawn(CodexLaunch {
                 bin: self.bin(Provider::Codex),
                 env: self.launch_env(Provider::Codex),
+                external_auth: self.codex_external_auth(),
             }),
         }
     }
@@ -1390,6 +1435,158 @@ impl Local {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_cli_logins_update_only_owned_access_snapshots_and_do_not_import_sessions() -> Result<()>
+    {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("local-login-{}", uuid::Uuid::new_v4()));
+        let host = crate::discovery::Host {
+            home: Some(dir.join("person")),
+            ..Default::default()
+        };
+        let roots = ProviderRoots::new(&dir.join("node"));
+        let mut local = Local {
+            switches: Providers::default(),
+            bins: BTreeMap::new(),
+            env: ProviderEnv::default(),
+        };
+        roots.apply(&mut local)?;
+        for (provider, source, target, credential) in [
+            (
+                Provider::Codex,
+                dir.join("person/.codex/auth.json"),
+                roots.codex_home.join("auth.json"),
+                json!({"auth_mode":"chatgpt", "tokens":{"access_token":"synthetic-access", "refresh_token":"synthetic-refresh", "account_id":"fixture-account"}, "unrelated":"not-imported"}),
+            ),
+            (
+                Provider::Claude,
+                dir.join("person/.claude/.credentials.json"),
+                roots.claude_config.join("local-login-access.json"),
+                json!({"claudeAiOauth":{"accessToken":"synthetic-access", "refreshToken":"synthetic-refresh", "expiresAt":0}, "unrelated":"not-imported"}),
+            ),
+        ] {
+            let executable = dir.join(if cfg!(windows) {
+                format!("{}.cmd", provider.default_bin())
+            } else {
+                provider.default_bin().into()
+            });
+            crate::config::private_dir(&dir)?;
+            crate::config::private_write(&executable, b"#!/bin/sh\nexit 0\n")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+            }
+            local.bins.insert(provider, executable);
+            assert!(!roots.prepare_login(provider, &local, &host)?);
+            crate::config::private_dir(source.parent().unwrap())?;
+            crate::config::private_write(&source, &serde_json::to_vec(&credential)?)?;
+            std::fs::write(source.with_file_name("sessions"), "personal-session")?;
+            assert!(roots.prepare_login(provider, &local, &host)?);
+            assert!(vibeface_bridge::platform::privatefs::is_private(&target)?);
+            let imported: Value = serde_json::from_slice(&std::fs::read(&target)?)?;
+            assert!(imported.get("unrelated").is_none());
+            if provider == Provider::Codex {
+                assert_eq!(imported["auth_mode"], "chatgptAuthTokens");
+                assert_eq!(imported["tokens"]["refresh_token"], "");
+            } else {
+                assert!(imported["claudeAiOauth"].get("refreshToken").is_none());
+                assert!(!roots.claude_config.join(".credentials.json").exists());
+                assert!(roots.imported_login_expired(Provider::Claude, &local));
+            }
+            assert!(!target.with_file_name("sessions").exists());
+            assert_eq!(
+                roots.authentication_source(provider, &local),
+                AuthenticationSource::ImportedCliLogin
+            );
+            let original_target = std::fs::read(&target)?;
+            let mut refreshed = credential.clone();
+            if provider == Provider::Codex {
+                refreshed["tokens"]["access_token"] = json!("synthetic-new-access");
+            } else {
+                refreshed["claudeAiOauth"]["accessToken"] = json!("synthetic-new-access");
+                refreshed["claudeAiOauth"]["expiresAt"] =
+                    json!(vibeface_protocol::now_ms() + 3_600_000);
+            }
+            let original = serde_json::to_vec(&refreshed)?;
+            crate::config::private_write(&source, &original)?;
+            assert!(roots.prepare_login(provider, &local, &host)?);
+            assert!(!roots.prepare_login(provider, &local, &host)?);
+            assert_eq!(
+                std::fs::read(&source)?,
+                original,
+                "the source alone retains refresh ownership"
+            );
+            if provider == Provider::Codex {
+                assert_eq!(
+                    std::fs::read(&target)?,
+                    original_target,
+                    "source updates never overwrite the CLI credential file"
+                );
+            } else {
+                assert!(!roots.claude_config.join(".credentials.json").exists());
+            }
+            let updated: Value = serde_json::from_slice(&std::fs::read(
+                target.parent().unwrap().join("local-login-access.json"),
+            )?)?;
+            if provider == Provider::Claude {
+                assert_eq!(
+                    roots.borrowed_claude_environment(&local)?["CLAUDE_CODE_OAUTH_TOKEN"],
+                    "synthetic-new-access"
+                );
+            } else {
+                assert_eq!(
+                    local
+                        .codex_external_auth()
+                        .context("external snapshot")?
+                        .access_token,
+                    "synthetic-new-access"
+                );
+            }
+            assert!(updated.to_string().contains("synthetic-new-access"));
+            assert!(!updated.to_string().contains("synthetic-refresh"));
+            assert!(!roots.imported_login_expired(Provider::Claude, &local));
+            let private_target = if provider == Provider::Claude {
+                roots.claude_config.join(".credentials.json")
+            } else {
+                target.clone()
+            };
+            crate::config::private_write(&private_target, b"private-refreshed-login")?;
+            assert!(!roots.prepare_login(provider, &local, &host)?);
+            assert_eq!(std::fs::read(&private_target)?, b"private-refreshed-login");
+            assert_eq!(
+                roots.authentication_source(provider, &local),
+                AuthenticationSource::PrivateLogin
+            );
+            std::fs::remove_file(&private_target)?;
+            let name = if provider == Provider::Codex {
+                "CODEX_API_KEY"
+            } else {
+                "CLAUDE_CODE_OAUTH_TOKEN"
+            };
+            local.env.apply(
+                provider,
+                BTreeMap::from([(name.into(), Some("explicit-private".into()))]),
+            )?;
+            assert!(!roots.prepare_login(provider, &local, &host)?);
+            assert_eq!(
+                roots.authentication_source(provider, &local),
+                AuthenticationSource::Environment
+            );
+            local
+                .env
+                .apply(provider, BTreeMap::from([(name.into(), None)]))?;
+            crate::config::private_write(&source, b"synthetic-secret-invalid-json")?;
+            let error = roots.prepare_login(provider, &local, &host).unwrap_err();
+            assert!(error.is::<crate::discovery::LocalSourceError>());
+            assert!(!format!("{error:#}").contains("synthetic-secret"));
+            assert!(!private_target.exists());
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[test]
     fn readiness_keeps_unknowns_attemptable_and_blocks_only_proven_failures() {
@@ -1475,6 +1672,7 @@ mod tests {
     fn threads_belong_to_the_app_server_that_keeps_them() {
         let own = |home: Option<&str>| {
             CodexTarget::Spawn(CodexLaunch {
+                external_auth: None,
                 bin: "codex".into(),
                 env: home
                     .map(|home| ("CODEX_HOME".to_owned(), home.to_owned()))
@@ -1510,7 +1708,7 @@ mod tests {
         )?;
         for (provider, name) in [
             (Provider::Codex, "VIBEFACE_DATA_DIR"),
-            (Provider::Cursor, "CURSOR_SDK_PORT"),
+            (Provider::Cursor, "CURSOR_CONFIG_DIR"),
             (Provider::Cursor, "CURSOR_DATA_DIR"),
             (Provider::Codex, "1KEY"),
             (Provider::Codex, "A-B"),
@@ -1533,9 +1731,10 @@ mod tests {
         let loaded = ProviderEnv::load(&dir)?;
         assert!(!loaded.get(Provider::Cursor).contains_key("CPA_API_KEY"));
         assert!(!loaded.get(Provider::Codex).contains_key("CURSOR_API_KEY"));
-        let (key, rest) = cursor_launch(loaded.get(Provider::Cursor));
-        assert_eq!(key.as_deref(), Some("fixture-cursor-value"));
-        assert!(rest.is_empty());
+        assert_eq!(
+            loaded.get(Provider::Cursor)["CURSOR_API_KEY"],
+            "fixture-cursor-value"
+        );
         let mut removed = loaded.clone();
         removed.apply(
             Provider::Codex,
@@ -1615,6 +1814,61 @@ mod tests {
         assert!(local.codex_target(false) == CodexTarget::System("/tmp/kept.sock".into()));
         local.switches.codex_app_server.socket = Some("relative.sock".into());
         assert!(local.switches.validate(false).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_global_npm_wrapper_launches_with_node_from_another_directory() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("separate-node-{}", uuid::Uuid::new_v4()));
+        let wrapper = dir.join(".npm-global/bin/claude");
+        let node = dir.join(".local/bin/node");
+        for (path, source) in [
+            (&wrapper, "#!/usr/bin/env node\n"),
+            (&node, "#!/bin/sh\nprintf 'external-node:%s\\n' \"$1\"\n"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(path, source)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let host = crate::discovery::Host {
+            home: Some(dir.clone()),
+            path: Some("/usr/bin:/bin".into()),
+            ..Default::default()
+        };
+        let mut local = Local {
+            switches: Providers::default(),
+            bins: BTreeMap::from([(Provider::Claude, wrapper.clone())]),
+            env: ProviderEnv::default(),
+        };
+        let saved = dir.join("empty").display().to_string();
+        local.env.apply(
+            Provider::Claude,
+            BTreeMap::from([("PATH".into(), Some(saved.clone()))]),
+        )?;
+        let launch = local.launch_env_on(Provider::Claude, &host);
+        let output = std::process::Command::new(&wrapper)
+            .env_clear()
+            .envs(&launch)
+            .output()?;
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout)?,
+            format!("external-node:{}\n", wrapper.display())
+        );
+        assert_eq!(
+            local.env.get(Provider::Claude)["PATH"],
+            saved,
+            "saved PATH is preserved"
+        );
+        assert_eq!(
+            std::env::split_paths(&launch["PATH"]).next(),
+            node.parent().map(Path::to_path_buf)
+        );
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 
@@ -2128,10 +2382,7 @@ requires_openai_auth = false
         };
         assert_eq!(local.bin(Provider::Pi), PathBuf::from("/opt/pi/bin/pi"));
         assert_eq!(local.bin(Provider::Opencode), PathBuf::from("opencode"));
-        assert_eq!(
-            local.bin(Provider::Cursor),
-            PathBuf::from("cursor-sdk-bridge")
-        );
+        assert_eq!(local.bin(Provider::Cursor), PathBuf::from("agent"));
         assert!(local.launches(Provider::Claude) && local.launches(Provider::Codex));
         Ok(())
     }

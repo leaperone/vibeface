@@ -41,6 +41,10 @@ mod provider_probe;
 mod schedule_delivery;
 mod settings;
 mod triage;
+#[cfg(test)]
+pub(crate) use triage::tests::{
+    bot as test_bot, node as test_node, start_reply as test_start_reply,
+};
 mod work;
 mod work_input;
 mod workspace;
@@ -485,10 +489,9 @@ pub struct Runtime {
     schedule_wakeup: tokio::sync::Notify,
     observation: std::sync::Mutex<observation::ObservationState>,
     pub tool_url: std::sync::OnceLock<String>,
-    /// The resident Cursor SDK bridge, created with the tool listener it calls back to.
-    pub(crate) cursor: Arc<std::sync::OnceLock<Arc<vibeface_bridge::agent::SdkBridge>>>,
+    /// The local Cursor ACP controller, created with its scoped tool listener.
+    pub(crate) cursor: Arc<std::sync::OnceLock<Arc<vibeface_bridge::agent::CursorAgent>>>,
     cursor_executor: cursor::CursorExecutor,
-    cursor_callback_token: String,
     pub maintenance: Arc<Gate>,
     pub(crate) codex: Arc<codex_server::CodexServer>,
     pub(crate) claude: claude::Claude,
@@ -595,7 +598,7 @@ impl Runtime {
         let store = Arc::new(Mutex::new(store));
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
-        vibeface_bridge::agent::SdkBridge::kill_orphan(&dir.join(cursor::PIDFILE));
+        vibeface_bridge::agent::CursorAgent::kill_orphan(&dir.join(cursor::PIDFILE));
         let mut local = crate::providers::Local {
             switches: config.providers.clone(),
             bins: config.bins.clone(),
@@ -624,7 +627,7 @@ impl Runtime {
             None
         };
         let mut completed_env = false;
-        for provider in [Provider::Codex, Provider::Cursor] {
+        for provider in [Provider::Codex, Provider::Claude, Provider::Cursor] {
             let enabled = if provider == Provider::Codex {
                 local.switches.app_server_used(codex_agent)
             } else {
@@ -671,6 +674,24 @@ impl Runtime {
         }
         if let Some(projected) = codex_config {
             provider_roots.publish_codex_config(&projected)?;
+        }
+        {
+            let provider = Provider::Codex;
+            let enabled = local.switches.execution.contains(&provider)
+                || config
+                    .manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.provider == provider);
+            if enabled && let Err(error) = provider_roots.prepare_login(provider, &local, &host) {
+                if !error.is::<crate::discovery::LocalSourceError>() {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    event = "providers.local_login_unavailable",
+                    provider = provider.name(),
+                    "could not reuse the local CLI login; sign in for this Node"
+                );
+            }
         }
         if !config.triage.scan_codex_sessions {
             config.triage.codex_sessions = Some(provider_roots.codex_sessions.clone());
@@ -755,7 +776,6 @@ impl Runtime {
             tool_url: std::sync::OnceLock::new(),
             cursor,
             cursor_executor,
-            cursor_callback_token: hex::encode(rand::random::<[u8; 32]>()),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             codex,
             claude,
@@ -778,7 +798,6 @@ impl Runtime {
         if let Some(token) = &node.entry_token {
             crate::logging::add_credential(token);
         }
-        crate::logging::add_credential(&node.cursor_callback_token);
         Ok(node)
     }
     /// Opens a data directory this process has just closed. On Linux a child that another test

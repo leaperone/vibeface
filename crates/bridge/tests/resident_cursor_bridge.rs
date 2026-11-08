@@ -1,985 +1,602 @@
+//! Real controlled ACP children, with private config/data and the production prompt journal.
+use anyhow::{Context, Result};
+use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use vibeface_bridge::agent::{
-    AgentFailure, AgentRunError, NativeStatus, SdkBridge, SdkCatalog, SdkProviderAuthentication,
-    SdkProviderObservation, SdkTurn, StartEvidence, ToolCallbackConfig,
+    AgentFailure, CursorAgent, CursorAuthentication, CursorCatalog, CursorTurn, PromptStatus,
+    StartEvidence,
 };
-use vibeface_bridge::failure::FailureKind;
 
-fn starts(log: &Path) -> Vec<u32> {
-    std::fs::read_to_string(log)
-        .unwrap_or_default()
-        .lines()
-        .map(|line| line.parse().unwrap())
-        .collect()
-}
-
-fn fixture_executable() -> PathBuf {
+fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) {
-        "tests/fixtures/fake-cursor-sdk-bridge.cmd"
+        "tests/fixtures/fake-cursor-agent.cmd"
     } else {
-        "tests/fixtures/fake-cursor-sdk-bridge"
+        "tests/fixtures/fake-cursor-agent"
     })
 }
-
-fn signal(group: u32, signal: &str, pidfile: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::process::{Command, Stdio};
-        let _ = pidfile;
-        Command::new("/bin/kill")
-            .args([signal, "--", &format!("-{group}")])
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
-    }
-    #[cfg(windows)]
-    {
-        use vibeface_bridge::platform::tree;
-        if signal == "-0" {
-            return tree::root_is_running(group);
-        }
-        assert_eq!(signal, "-KILL");
-        let recorded = std::fs::read_to_string(pidfile).unwrap();
-        let tokens: Vec<_> = recorded
-            .lines()
-            .map(|line| line.split_once(' ').unwrap().0)
-            .collect();
-        let root = group.to_string();
-        let matching = tokens
-            .iter()
-            .copied()
-            .find(|token| token.split('|').next() == Some(root.as_str()));
-        // A .cmd launcher owns the Python worker. A single-owner fixture can use that
-        // worker's observation PID; a multi-owner fixture must name the exact root.
-        let token = matching
-            .or_else(|| (tokens.len() == 1).then(|| tokens[0]))
-            .expect("the fixture's owned tree");
-        tree::stop_recorded(token, |image| {
-            tree::names_program(image, Path::new("cmd.exe"))
-                || tree::names_program(image, Path::new("python.exe"))
-        })
-        .unwrap()
-        .is_some()
-    }
+fn root() -> Result<PathBuf> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.artifacts")
+        .join(format!("cursor-acp-{}", uuid::Uuid::new_v4()));
+    vibeface_bridge::platform::privatefs::create_dir(&root)?;
+    root.canonicalize().map_err(Into::into)
 }
-
-async fn gone(group: u32) -> bool {
-    for _ in 0..50 {
-        if !signal(group, "-0", Path::new("")) {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    false
-}
-
-async fn wait_sends(log: &Path, prefix: &str, expected: usize) {
-    for _ in 0..500 {
-        let seen = std::fs::read_to_string(log)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter(|line| {
-                line["text"]
-                    .as_str()
-                    .is_some_and(|text| text.starts_with(prefix))
-            })
-            .count();
-        if seen == expected {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("expected {expected} concurrent fixture sends starting with {prefix}");
-}
-
-async fn reply(
-    bridge: &SdkBridge,
-    turn: &SdkTurn,
-    prompt: &str,
-) -> (Result<String, AgentRunError>, Duration) {
-    let started = Instant::now();
-    let result = bridge
-        .run(
-            turn,
-            prompt,
-            None,
-            |_| async { Ok(()) },
-            watch::channel(false).1,
-            |_| async { Ok(()) },
-        )
-        .await
-        .map(|result| result.output);
-    (result, started.elapsed())
-}
-
-async fn provider_observation_fixture(
-    root: &Path,
-    env: BTreeMap<String, String>,
-) -> anyhow::Result<(SdkBridge, SdkProviderObservation)> {
-    let executable = fixture_executable();
-    let bridge = SdkBridge::new(
-        BTreeMap::new(),
-        ToolCallbackConfig {
-            url: "http://127.0.0.1:9".into(),
-            auth_token: "fixture-callback-token-".repeat(2),
-        },
-        Some(root.join("bridge.pid")),
-    )?;
-    let observation = bridge
-        .provider_observation(
-            &executable,
-            &root.join("workspace"),
-            &root.join("private-probe"),
-            "fixture-api-key",
-            &env,
-        )
-        .await?;
-    Ok((bridge, observation))
-}
-
-#[tokio::test]
-async fn one_bridge_serves_consecutive_turns_and_is_replaced_when_it_dies() {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("vibeface-resident-bridge-{nanos}"));
-    std::fs::create_dir_all(&root).unwrap();
-    let log = root.join("starts.log");
-    let pidfile = root.join("cursor-sdk-bridge.pid");
-    let startup_ms: u64 = std::env::var("FAKE_BRIDGE_STARTUP_MS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1500);
-    let executable = fixture_executable();
-    let bridge = SdkBridge::new(
-        BTreeMap::from([("FAKE_BRIDGE_STARTUP_MS".into(), startup_ms.to_string())]),
-        ToolCallbackConfig {
-            url: "http://127.0.0.1:9".into(),
-            auth_token: "fixture-callback-token-".repeat(2),
-        },
-        Some(pidfile.clone()),
-    )
-    .unwrap();
-    let recorded = Arc::new(Mutex::new(Vec::new()));
-    let recorder = recorded.clone();
-    let mut turn = SdkTurn {
-        owner: "bot:network:conversation".into(),
-        executable: executable.clone(),
-        workspace: root.join("workspace"),
-        local_store_root: root.join("cursor-instance"),
-        api_key: "fixture-api-key".into(),
+fn turn(root: &std::path::Path, client: &str) -> CursorTurn {
+    CursorTurn {
+        owner: "fixture-owner".into(),
+        client_id: client.into(),
+        executable: fixture(),
+        workspace: root.into(),
+        local_store_root: root.join("owner"),
         env: BTreeMap::from([
-            ("FAKE_BRIDGE_LOG".into(), log.display().to_string()),
+            (
+                "FAKE_BRIDGE_LOG".into(),
+                root.join("processes.jsonl").display().to_string(),
+            ),
             (
                 "FAKE_BRIDGE_SEND_LOG".into(),
-                root.join("sends.log").display().to_string(),
+                root.join("prompts.jsonl").display().to_string(),
+            ),
+            (
+                "FAKE_ACP_REPLIES".into(),
+                root.join("replies.jsonl").display().to_string(),
+            ),
+            (
+                "FAKE_ACP_JOURNAL_ROOT".into(),
+                root.join("owner").display().to_string(),
             ),
         ]),
         model: "fixture-model".into(),
         timeout_secs: 10,
         custom_tools: BTreeMap::new(),
-        callback_token: Some("fixture-attempt-token-".repeat(2)),
-        process_started: Some(Arc::new(move |group| {
-            recorder.lock().unwrap().push(group);
-            Box::pin(async { Ok(()) })
-        })),
+        callback_token: None,
+        process_started: None,
         run_started: None,
-    };
-
-    let (first, first_took) = reply(&bridge, &turn, "first").await;
-    let (second, second_took) = reply(&bridge, &turn, "second").await;
-    eprintln!("startup delay {startup_ms}ms");
-    eprintln!("turn 1 (cold start): {first_took:?}");
-    eprintln!("turn 2 (resident bridge): {second_took:?}");
-    assert_eq!(first.unwrap(), "done: first");
-    assert_eq!(second.unwrap(), "done: second");
-    let bridge_group = starts(&log)[0];
-    assert_eq!(
-        starts(&log),
-        vec![bridge_group],
-        "both turns used one bridge"
-    );
-    #[cfg(unix)]
-    assert_eq!(*recorded.lock().unwrap(), vec![bridge_group, bridge_group]);
-    #[cfg(windows)]
-    {
-        let observed = recorded.lock().unwrap();
-        assert_eq!(observed.len(), 2);
-        assert_eq!(
-            observed[0], observed[1],
-            "both calls belong to the same launcher"
-        );
-        assert!(vibeface_bridge::platform::tree::root_is_running(
-            observed[0]
-        ));
     }
-    assert!(second_took < Duration::from_millis(startup_ms / 2));
-
-    assert!(signal(bridge_group, "-KILL", &pidfile));
-    assert!(gone(bridge_group).await);
-    let (third, third_took) = reply(&bridge, &turn, "third").await;
-    eprintln!("turn 3 (bridge killed before it): {third_took:?}");
-    assert_eq!(third.unwrap(), "done: third");
-    let restarted = starts(&log)[1];
-    assert_eq!(starts(&log), vec![bridge_group, restarted]);
-    assert_ne!(restarted, bridge_group);
-
-    turn.timeout_secs = 1;
-    let (hung, _) = reply(&bridge, &turn, "hang").await;
-    let hung = hung.unwrap_err();
-    assert_eq!(hung.outcome, AgentFailure::Unknown);
-    assert_eq!(hung.failure.kind, FailureKind::TimedOut);
-    assert!(
-        gone(restarted).await,
-        "a bridge left with an unknown turn ends after it"
-    );
-    turn.timeout_secs = 10;
-    let (fourth, _) = reply(&bridge, &turn, "fourth").await;
-    assert_eq!(fourth.unwrap(), "done: fourth");
-    let last = starts(&log)[2];
-    #[cfg(unix)]
-    assert_eq!(
-        std::fs::read_to_string(&pidfile).unwrap(),
-        format!("{last} {}\n", executable.display())
-    );
-    #[cfg(windows)]
-    {
-        let record = std::fs::read_to_string(&pidfile).unwrap();
-        let (token, program) = record.trim_end().split_once(' ').unwrap();
-        assert_eq!(program, executable.display().to_string());
-        assert!(vibeface_bridge::platform::tree::token_is_running(token));
-    }
-
-    turn.env
-        .insert("FIXTURE_ENGINE_VAR".into(), "changed".into());
-    let (fifth, _) = reply(&bridge, &turn, "fifth").await;
-    assert_eq!(fifth.unwrap(), "done: fifth");
-    let relaunched = starts(&log)[3];
-    assert_ne!(
-        relaunched, last,
-        "changed engine variables start a new bridge"
-    );
-    assert!(gone(last).await, "the bridge with the old variables ends");
-    let last = relaunched;
-
-    let sends_before = std::fs::read_to_string(root.join("sends.log")).unwrap();
-    let before_send = bridge
-        .run(
-            &turn,
-            "must-not-send",
-            None,
-            |_| async { anyhow::bail!("fixture persist rejected before Send") },
-            watch::channel(false).1,
-            |_| async { Ok(()) },
-        )
-        .await
-        .err()
-        .expect("persist callback refuses the run");
-    assert_eq!(before_send.start, StartEvidence::NotStarted);
-    assert!(
-        before_send.session_id.is_some(),
-        "a created agent alone is not a started model turn"
-    );
-    assert_eq!(
-        std::fs::read_to_string(root.join("sends.log")).unwrap(),
-        sends_before
-    );
-
-    bridge.stop().await;
-    assert!(gone(last).await);
-    assert!(!pidfile.exists());
-    std::fs::remove_dir_all(root).unwrap();
 }
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn owners_have_private_bridges_and_one_crash_does_not_stop_the_other_fifteen() {
-    let root = std::env::temp_dir().join(format!(
-        "vibeface-cursor-owners-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let starts_log = root.join("starts.log");
-    let stores_log = root.join("stores.log");
-    let sends_log = root.join("sends.log");
-    let gates = root.join("gates");
-    std::fs::create_dir(&gates).unwrap();
-    let pidfile = root.join("cursor-sdk-bridge.pid");
-    let executable = fixture_executable();
-    let bridge = Arc::new(
-        SdkBridge::new(
-            BTreeMap::from([("FAKE_BRIDGE_DELAY_MS".into(), "100".into())]),
-            ToolCallbackConfig {
-                url: "http://127.0.0.1:9".into(),
-                auth_token: "fixture-callback-token-".repeat(2),
-            },
-            Some(pidfile.clone()),
-        )
-        .unwrap(),
-    );
-    let recorded = Arc::new(Mutex::new(Vec::<(String, u32)>::new()));
-    let mut turns = Vec::new();
-    for index in 0..16 {
-        let owner = format!("bot:network:{index}");
-        let recorder = recorded.clone();
-        let owner_for_callback = owner.clone();
-        turns.push(SdkTurn {
-            owner,
-            executable: executable.clone(),
-            workspace: root.join(format!("workspace-{index}")),
-            local_store_root: root.join(format!("instance-{index}")),
-            api_key: "fixture-api-key".into(),
-            env: BTreeMap::from([
-                ("FAKE_BRIDGE_LOG".into(), starts_log.display().to_string()),
-                (
-                    "FAKE_BRIDGE_STORE_LOG".into(),
-                    stores_log.display().to_string(),
-                ),
-                (
-                    "FAKE_BRIDGE_SEND_LOG".into(),
-                    sends_log.display().to_string(),
-                ),
-                ("FAKE_BRIDGE_GATE_DIR".into(), gates.display().to_string()),
-            ]),
-            model: "fixture-model".into(),
-            timeout_secs: 10,
-            custom_tools: BTreeMap::new(),
-            callback_token: Some(format!(
-                "fixture-attempt-token-{index:02}-{}",
-                "x".repeat(32)
-            )),
-            process_started: Some(Arc::new(move |group| {
-                recorder
-                    .lock()
-                    .unwrap()
-                    .push((owner_for_callback.clone(), group));
-                Box::pin(async { Ok(()) })
-            })),
-            run_started: None,
-        });
-    }
-    let first: Vec<_> = turns
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, turn)| {
-            let bridge = bridge.clone();
-            tokio::spawn(async move { reply(&bridge, &turn, &format!("first-{index}")).await })
-        })
-        .collect();
-    wait_sends(&sends_log, "first-", 16).await;
-    std::fs::write(gates.join("first"), b"").unwrap();
-    let first = futures_util::future::join_all(first).await;
-    for (index, result) in first.into_iter().enumerate() {
-        assert_eq!(result.unwrap().0.unwrap(), format!("done: first-{index}"));
-    }
-    let groups: std::collections::BTreeSet<_> = recorded
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(_, group)| *group)
-        .collect();
-    assert_eq!(groups.len(), 16, "each owner starts its own process group");
-    let stores: std::collections::BTreeSet<String> = std::fs::read_to_string(&stores_log)
-        .unwrap()
+fn agent(root: &std::path::Path) -> Result<CursorAgent> {
+    CursorAgent::new(
+        BTreeMap::new(),
+        "http://127.0.0.1:9".into(),
+        Some(root.join("agent.pid")),
+    )
+}
+fn lines(path: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
         .lines()
-        .map(|line| {
-            serde_json::from_str::<serde_json::Value>(line).unwrap()["rootDir"]
-                .as_str()
-                .unwrap()
-                .to_owned()
-        })
-        .collect();
-    assert_eq!(stores.len(), 16, "each owner gets a private JSONL root");
-    let instance_prefix = root.join("instance-").display().to_string();
-    assert!(
-        stores
-            .iter()
-            .all(|store| !store.contains(".sdk") && store.starts_with(&instance_prefix))
-    );
-
-    let crash_owner = "bot:network:0";
-    let crash_group = recorded
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|(owner, group)| (owner == crash_owner).then_some(*group))
-        .unwrap();
-    let mut second = Vec::new();
-    for (index, turn) in turns.iter().cloned().enumerate() {
-        let prompt = if index == 0 {
-            "hang".to_owned()
-        } else {
-            format!("second-{index}")
-        };
-        let bridge = bridge.clone();
-        second.push(tokio::spawn(
-            async move { reply(&bridge, &turn, &prompt).await },
-        ));
-    }
-    wait_sends(&sends_log, "second-", 15).await;
-    wait_sends(&sends_log, "hang", 1).await;
-    assert!(signal(crash_group, "-KILL", &pidfile));
-    std::fs::write(gates.join("second"), b"").unwrap();
-    let second: Vec<_> = futures_util::future::join_all(second)
-        .await
-        .into_iter()
-        .map(|result| result.unwrap())
-        .collect();
-    assert!(second[0].0.is_err());
-    for (index, (result, _)) in second.into_iter().enumerate().skip(1) {
-        assert_eq!(result.unwrap(), format!("done: second-{index}"));
-    }
-    let (cancel_one, cancelled) = watch::channel(false);
-    let third: Vec<_> = turns
-        .into_iter()
-        .enumerate()
-        .map(|(index, turn)| {
-            let bridge = bridge.clone();
-            let cancel = if index == 0 {
-                cancelled.clone()
-            } else {
-                watch::channel(false).1
-            };
-            tokio::spawn(async move {
-                let prompt = if index == 0 {
-                    "cancelhang-0".to_owned()
-                } else {
-                    format!("cancel-{index}")
-                };
-                bridge
-                    .run(
-                        &turn,
-                        &prompt,
-                        None,
-                        |_| async { Ok(()) },
-                        cancel,
-                        |_| async { Ok(()) },
-                    )
-                    .await
-            })
-        })
-        .collect();
-    wait_sends(&sends_log, "cancel", 16).await;
-    cancel_one.send(true).unwrap();
-    std::fs::write(gates.join("cancel"), b"").unwrap();
-    let third = futures_util::future::join_all(third).await;
-    for (index, result) in third.into_iter().enumerate() {
-        if index == 0 {
-            let error = match result.unwrap() {
-                Err(error) => error,
-                Ok(_) => panic!("cancelled owner unexpectedly completed"),
-            };
-            assert_eq!(error.outcome, AgentFailure::Unknown);
-            assert_ne!(
-                error.start,
-                StartEvidence::NotStarted,
-                "a sent Cursor run never restores its charge"
-            );
-        } else {
-            assert_eq!(
-                result.unwrap().unwrap().output,
-                format!("done: cancel-{index}")
-            );
-        }
-    }
-    assert_eq!(
-        std::fs::read_to_string(&sends_log).unwrap().lines().count(),
-        48,
-        "no crash or cancellation replays a Send"
-    );
-    bridge.stop().await;
-    assert!(!pidfile.exists());
-    std::fs::remove_dir_all(root).unwrap();
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 #[tokio::test]
-async fn one_owner_serializes_attempt_callbacks_and_resumes_its_private_store_after_restart() {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("vibeface-cursor-resume-{nanos}"));
-    let gates = root.join("gates");
-    std::fs::create_dir_all(&gates).unwrap();
-    let sends = root.join("sends.log");
-    let starts_log = root.join("starts.log");
-    let bridge = Arc::new(
-        SdkBridge::new(
-            BTreeMap::new(),
-            ToolCallbackConfig {
-                url: "http://127.0.0.1:9".into(),
-                auth_token: "fixture-callback-token-".repeat(2),
-            },
-            Some(root.join("bridge.pid")),
-        )
-        .unwrap(),
+async fn official_subscription_probe_observes_authentication_and_models_without_a_prompt()
+-> Result<()> {
+    let root = root()?;
+    let agent = agent(&root)?;
+    let observation = agent
+        .provider_observation(&fixture(), &root, &root.join("probe"), &BTreeMap::new())
+        .await?;
+    assert_eq!(
+        observation.authentication,
+        CursorAuthentication::Authenticated
     );
-    let token_a = "fixture-first-attempt-token-".repeat(2);
-    let token_b = "fixture-second-attempt-token-".repeat(2);
-    let turn = SdkTurn {
-        owner: "bot:network:resume".into(),
-        executable: fixture_executable(),
-        workspace: root.join("workspace"),
-        local_store_root: root.join("private-instance"),
-        api_key: "fixture-api-key".into(),
-        env: BTreeMap::from([
-            ("FAKE_BRIDGE_LOG".into(), starts_log.display().to_string()),
-            ("FAKE_BRIDGE_SEND_LOG".into(), sends.display().to_string()),
-            ("FAKE_BRIDGE_GATE_DIR".into(), gates.display().to_string()),
-        ]),
-        model: "fixture-model".into(),
-        timeout_secs: 10,
-        custom_tools: BTreeMap::new(),
-        callback_token: Some(token_a.clone()),
-        process_started: None,
-        run_started: None,
-    };
-    let first_bridge = bridge.clone();
-    let first_turn = turn.clone();
-    let (native_tx, native_rx) = tokio::sync::oneshot::channel();
-    let before_send_log = sends.clone();
-    let first = tokio::spawn(async move {
-        first_bridge
+    assert!(
+        matches!(observation.catalog,CursorCatalog::Available{models} if models.iter().any(|m|m.id=="composer-2"))
+    );
+    let rejected = agent
+        .provider_observation(
+            &fixture(),
+            &root,
+            &root.join("signed-out"),
+            &BTreeMap::from([("FAKE_BRIDGE_ME".into(), "401".into())]),
+        )
+        .await?;
+    assert_eq!(
+        rejected.authentication,
+        CursorAuthentication::SignInRequired
+    );
+    assert_eq!(rejected.catalog, CursorCatalog::Unavailable);
+    assert!(!root.join("prompts.jsonl").exists());
+    agent.stop().await;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn prompt_receipts_are_durable_before_send_and_terminal_before_reply_and_never_replay()
+-> Result<()> {
+    let root = root()?;
+    let agent = agent(&root)?;
+    let mut turn = turn(&root, "first");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let recorded = starts.clone();
+    let journal = turn.local_store_root.join("prompts");
+    turn.run_started = Some(Arc::new(move |id| {
+        let recorded = recorded.clone();
+        let journal = journal.clone();
+        Box::pin(async move {
+            let receipt: Value =
+                serde_json::from_slice(&std::fs::read(journal.join(format!("{id}.json")))?)?;
+            assert_eq!(receipt["status"]["state"], "running");
+            recorded.lock().unwrap().push(id);
+            Ok(())
+        })
+    }));
+    let result = agent
+        .run(
+            &turn,
+            "first answer",
+            None,
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await?;
+    assert_eq!(result.output, "done: first answer");
+    let session = result.session_id.context("session")?;
+    let receipt = starts.lock().unwrap()[0].clone();
+    assert_eq!(
+        agent.probe(&turn, &session, &receipt).await?.status,
+        PromptStatus::Completed
+    );
+    let repeat = agent
+        .run(
+            &turn,
+            "first answer",
+            None,
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await?;
+    assert_eq!(repeat.output, "done: first answer");
+    assert_eq!(lines(&root.join("prompts.jsonl")).len(), 1);
+    assert!(
+        agent
             .run(
-                &first_turn,
-                "first-memory",
+                &turn,
+                "changed intention",
                 None,
-                move |native| async move {
-                    assert!(
-                        !before_send_log.exists(),
-                        "native id is durable before Send"
-                    );
-                    native_tx.send(native).unwrap();
-                    Ok(())
+                |_| async { Ok(()) },
+                watch::channel(false).1,
+                |_| async { Ok(()) }
+            )
+            .await
+            .is_err()
+    );
+    turn.client_id = "continuation".into();
+    let updates = Arc::new(Mutex::new(Vec::new()));
+    let seen = updates.clone();
+    let continued = agent
+        .run(
+            &turn,
+            "new answer",
+            Some(&session),
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            move |update| {
+                seen.lock().unwrap().push(update);
+                async { Ok(()) }
+            },
+        )
+        .await?;
+    assert_eq!(continued.output, "done: new answer");
+    assert!(!serde_json::to_string(&*updates.lock().unwrap())?.contains("HISTORICAL"));
+    assert!(
+        lines(&root.join("replies.jsonl"))
+            .iter()
+            .any(|r| r["id"] == "history-permission"
+                && r["result"]["outcome"]["optionId"] == "reject")
+    );
+    assert_eq!(lines(&root.join("prompts.jsonl")).len(), 2);
+    assert!(vibeface_bridge::platform::privatefs::is_private(
+        &turn.local_store_root.join("config")
+    )?);
+    agent.stop().await;
+    assert!(!root.join("agent.pid").exists());
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_requires_the_original_prompt_terminal_and_disconnect_stays_unknown_after_restart()
+-> Result<()> {
+    let root = root()?;
+    let agent = Arc::new(agent(&root)?);
+    let mut turn = turn(&root, "cancel");
+    let ready = Arc::new(Notify::new());
+    let started = ready.clone();
+    let locator = Arc::new(Mutex::new(None));
+    let saved = locator.clone();
+    turn.run_started = Some(Arc::new(move |id| {
+        let started = started.clone();
+        let saved = saved.clone();
+        Box::pin(async move {
+            *saved.lock().unwrap() = Some(id);
+            started.notify_one();
+            Ok(())
+        })
+    }));
+    let session = Arc::new(Mutex::new(None));
+    let saved_session = session.clone();
+    let worker = agent.clone();
+    let running = turn.clone();
+    let pending = tokio::spawn(async move {
+        worker
+            .run(
+                &running,
+                "hang here",
+                None,
+                move |id| {
+                    *saved_session.lock().unwrap() = Some(id);
+                    async { Ok(()) }
                 },
                 watch::channel(false).1,
                 |_| async { Ok(()) },
             )
             .await
     });
-    let native = native_rx.await.unwrap();
-    wait_sends(&sends, "first-", 1).await;
-    let mut second_turn = turn.clone();
-    second_turn.callback_token = Some(token_b.clone());
-    let second_bridge = bridge.clone();
-    let second_native = native.clone();
-    let second = tokio::spawn(async move {
-        second_bridge
+    tokio::time::timeout(std::time::Duration::from_secs(10), ready.notified()).await?;
+    let session = session.lock().unwrap().clone().context("session saved")?;
+    let id = locator.lock().unwrap().clone().context("receipt saved")?;
+    agent.cancel(&turn, &session, &id).await?;
+    let error = pending.await?.err().context("provider cancellation")?;
+    assert_eq!(error.outcome, AgentFailure::Cancelled);
+    assert_eq!(error.start, StartEvidence::Started);
+    assert_eq!(
+        agent.probe(&turn, &session, &id).await?.status,
+        PromptStatus::Cancelled
+    );
+    turn.client_id = "unknown".into();
+    let error = agent
+        .run(
+            &turn,
+            "disconnect",
+            None,
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await
+        .err()
+        .context("unknown completion")?;
+    assert_eq!(error.outcome, AgentFailure::Unknown);
+    let session = error.session_id.context("unknown session")?;
+    let id = locator.lock().unwrap().clone().context("unknown receipt")?;
+    agent.stop().await;
+    let restarted = CursorAgent::new(
+        BTreeMap::new(),
+        "http://127.0.0.1:9".into(),
+        Some(root.join("agent.pid")),
+    )?;
+    assert_eq!(
+        restarted.probe(&turn, &session, &id).await?.status,
+        PromptStatus::Unknown
+    );
+    let before = lines(&root.join("prompts.jsonl")).len();
+    let error = restarted
+        .run(
+            &turn,
+            "disconnect",
+            None,
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await
+        .err()
+        .context("no replay")?;
+    assert_eq!(error.outcome, AgentFailure::Unknown);
+    assert_eq!(lines(&root.join("prompts.jsonl")).len(), before);
+    restarted.stop().await;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_permissions_and_blocking_extensions_always_receive_safe_responses() -> Result<()> {
+    let root = root()?;
+    let agent = agent(&root)?;
+    let turn = turn(&root, "interactions");
+    let result = agent
+        .run(
+            &turn,
+            "interactions",
+            None,
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await?;
+    assert_eq!(result.output, "done: interactions");
+    let replies = lines(&root.join("replies.jsonl"));
+    for (id, selected) in [("permission", "allow"), ("unknown-permission", "reject")] {
+        assert!(
+            replies
+                .iter()
+                .any(|r| r["id"] == id && r["result"]["outcome"]["optionId"] == selected)
+        );
+    }
+    assert!(
+        replies
+            .iter()
+            .any(|r| r["id"] == "ask" && r["result"]["outcome"]["outcome"] == "cancelled")
+    );
+    assert!(
+        replies
+            .iter()
+            .any(|r| r["id"] == "plan" && r["result"]["outcome"]["outcome"] == "rejected")
+    );
+    assert!(
+        replies
+            .iter()
+            .any(|r| r["id"] == "unknown" && r["error"]["code"] == -32601)
+    );
+    let error = agent
+        .run(
+            &turn,
+            "different",
+            Some("foreign-personal-session"),
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await;
+    assert!(error.is_err());
+    assert_eq!(lines(&root.join("prompts.jsonl")).len(), 1);
+    agent.stop().await;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cursor_stream_and_journal_redact_fragmented_credentials() -> Result<()> {
+    let root = root()?;
+    let agent = agent(&root)?;
+    let mut turn = turn(&root, "redaction");
+    turn.env
+        .insert("FIXTURE_SECRET".into(), "synthetic-sensitive-token".into());
+    turn.env.insert("FAKE_ACP_CHUNK_SIZE".into(), "1".into());
+    let updates = Arc::new(Mutex::new(Vec::new()));
+    let seen = updates.clone();
+    let result = agent
+        .run(
+            &turn,
+            "synthetic-sensitive-token",
+            None,
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            move |value| {
+                seen.lock().unwrap().push(value);
+                async { Ok(()) }
+            },
+        )
+        .await?;
+    assert_eq!(result.output, "done: [redacted]");
+    let joined = updates
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["text"].as_str())
+        .collect::<String>();
+    assert!(!joined.contains("synthetic-sensitive-token"));
+    for entry in std::fs::read_dir(turn.local_store_root.join("prompts"))? {
+        assert!(!std::fs::read_to_string(entry?.path())?.contains("synthetic-sensitive-token"));
+    }
+    agent.stop().await;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_signed_out_or_partial_status_never_starts_acp_and_explicit_auth_stays_supported()
+-> Result<()> {
+    let root = root()?;
+    let agent = agent(&root)?;
+    for state in ["FAKE_STATUS_SIGNED_OUT", "FAKE_STATUS_PARTIAL"] {
+        let env = BTreeMap::from([
+            (state.into(), "1".into()),
+            (
+                "FAKE_BRIDGE_LOG".into(),
+                root.join("acp-starts").display().to_string(),
+            ),
+        ]);
+        let result = agent
+            .provider_observation(&fixture(), &root, &root.join(state), &env)
+            .await?;
+        assert_eq!(result.authentication, CursorAuthentication::SignInRequired);
+        assert!(!result.launchable);
+        assert!(
+            !root.join("acp-starts").exists(),
+            "status exit 0 does not authorize starting ACP"
+        );
+    }
+    for name in ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"] {
+        let env = BTreeMap::from([
+            (name.into(), "synthetic-explicit-auth".into()),
+            ("FAKE_STATUS_SIGNED_OUT".into(), "1".into()),
+        ]);
+        let result = agent
+            .provider_observation(&fixture(), &root, &root.join(name), &env)
+            .await?;
+        assert_eq!(result.authentication, CursorAuthentication::Authenticated);
+        assert!(result.launchable);
+    }
+    agent.stop().await;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_process_exit_after_cancel_does_not_confirm_cancellation() -> Result<()> {
+    let root = root()?;
+    let agent = agent(&root)?;
+    let mut turn = turn(&root, "cancel-without-terminal");
+    turn.env
+        .insert("FAKE_ACP_EXIT_ON_CANCEL".into(), "1".into());
+    let (cancel, receiver) = watch::channel(false);
+    let locator = Arc::new(Mutex::new(None));
+    let saved = locator.clone();
+    turn.run_started = Some(Arc::new(move |id| {
+        let saved = saved.clone();
+        let cancel = cancel.clone();
+        Box::pin(async move {
+            *saved.lock().unwrap() = Some(id);
+            cancel.send(true)?;
+            Ok(())
+        })
+    }));
+    let error = agent
+        .run(
+            &turn,
+            "hang without terminal",
+            None,
+            |_| async { Ok(()) },
+            receiver,
+            |_| async { Ok(()) },
+        )
+        .await
+        .err()
+        .context("unknown cancellation")?;
+    assert_eq!(error.outcome, AgentFailure::Unknown);
+    assert_eq!(error.start, StartEvidence::Started);
+    let session = error.session_id.context("session")?;
+    let id = locator.lock().unwrap().clone().context("receipt")?;
+    assert_eq!(
+        agent.probe(&turn, &session, &id).await?.status,
+        PromptStatus::Unknown
+    );
+    agent.stop().await;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_reconnect_uses_the_current_attempt_bearer_without_persisting_it() -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use vibeface_bridge::agent::CustomToolConfig;
+    let root = root()?;
+    let agent = agent(&root)?;
+    let mut turn = turn(&root, "tool-first");
+    turn.env.insert(
+        "FAKE_ACP_SESSION_LOG".into(),
+        root.join("sessions.jsonl").display().to_string(),
+    );
+    turn.custom_tools.insert(
+        "tool_search".into(),
+        CustomToolConfig {
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+        },
+    );
+    let first = "a".repeat(64);
+    let next = "b".repeat(64);
+    turn.callback_token = Some(first.clone());
+    let reply = agent
+        .run(
+            &turn,
+            "first tools",
+            None,
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await?;
+    turn.client_id = "tool-next".into();
+    turn.callback_token = Some(next.clone());
+    agent
+        .run(
+            &turn,
+            "next tools",
+            reply.session_id.as_deref(),
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await?;
+    let sessions = lines(&root.join("sessions.jsonl"));
+    for (row, token) in sessions.iter().zip([&first, &next]) {
+        assert_eq!(
+            row["mcpServers"][0]["headers"][0]["value"],
+            format!("{:x}", Sha256::digest(format!("Bearer {token}").as_bytes()))
+        );
+    }
+    for path in [
+        root.join("sessions.jsonl"),
+        turn.local_store_root.join("prompts"),
+    ] {
+        let bytes = if path.is_dir() {
+            std::fs::read_dir(path)?
+                .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+                .collect::<String>()
+        } else {
+            std::fs::read_to_string(path)?
+        };
+        assert!(!bytes.contains(&first) && !bytes.contains(&next));
+    }
+    agent.stop().await;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn orphan_recovery_checks_the_recorded_process_before_ending_its_tree() -> Result<()> {
+    let root = root()?;
+    let agent = Arc::new(agent(&root)?);
+    let mut turn = turn(&root, "orphan");
+    let ready = Arc::new(Notify::new());
+    let started = ready.clone();
+    turn.run_started = Some(Arc::new(move |_| {
+        let started = started.clone();
+        Box::pin(async move {
+            started.notify_one();
+            Ok(())
+        })
+    }));
+    let worker = agent.clone();
+    let running = turn.clone();
+    let pending = tokio::spawn(async move {
+        worker
             .run(
-                &second_turn,
-                "second-memory",
-                Some(&second_native),
+                &running,
+                "hang as orphan",
+                None,
                 |_| async { Ok(()) },
                 watch::channel(false).1,
                 |_| async { Ok(()) },
             )
             .await
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        std::fs::read_to_string(&sends).unwrap().lines().count(),
-        1,
-        "the second attempt cannot enter Send while the owner's first turn is live"
-    );
-    std::fs::write(gates.join("first"), b"").unwrap();
-    assert_eq!(first.await.unwrap().unwrap().output, "done: first-memory");
-    wait_sends(&sends, "second-", 1).await;
-    std::fs::write(gates.join("second"), b"").unwrap();
-    assert_eq!(
-        second.await.unwrap().unwrap().session_id.as_deref(),
-        Some(native.as_str())
-    );
-    let callbacks: Vec<_> = std::fs::read_to_string(&sends)
-        .unwrap()
-        .lines()
-        .map(|line| {
-            serde_json::from_str::<serde_json::Value>(line).unwrap()["callback"]
-                .as_str()
-                .unwrap()
-                .to_owned()
-        })
-        .collect();
-    assert_eq!(callbacks, vec![token_a, token_b]);
-    let first_group = starts(&starts_log)[0];
-    assert!(signal(first_group, "-KILL", &root.join("bridge.pid")));
-    assert!(gone(first_group).await);
-    std::fs::write(gates.join("recall"), b"").unwrap();
-    let result = bridge
-        .run(
-            &turn,
-            "recall",
-            Some(&native),
-            |_| async { Ok(()) },
-            watch::channel(false).1,
-            |_| async { Ok(()) },
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.session_id.as_deref(), Some(native.as_str()));
-    assert_eq!(result.output, "remembered: second-memory");
-    assert_eq!(
-        starts(&starts_log).len(),
-        2,
-        "resume starts an independent replacement process"
-    );
-    assert!(!turn.workspace.join(".sdk").exists());
-    bridge.stop().await;
-    for group in starts(&starts_log) {
-        assert!(gone(group).await);
+    tokio::time::timeout(std::time::Duration::from_secs(10), ready.notified()).await?;
+    let file = root.join("agent.pid");
+    let recorded = std::fs::read(&file)?;
+    #[cfg(unix)]
+    {
+        let mut wrong: Value = serde_json::from_slice(&recorded)?;
+        wrong[0]["identity"]["value"] = serde_json::json!("another-process-start");
+        vibeface_bridge::platform::privatefs::write_atomic(&file, &serde_json::to_vec(&wrong)?)?;
+        CursorAgent::kill_orphan(&file);
+        assert!(
+            !pending.is_finished(),
+            "a stale identifier cannot end another CLI process"
+        );
+        vibeface_bridge::platform::privatefs::write_atomic(&file, &recorded)?;
     }
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn run_id_callback_precedes_progress_and_known_run_probe_reads_terminal_state() {
-    let root = std::env::temp_dir().join(format!(
-        "vibeface-cursor-run-query-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let executable = fixture_executable();
-    let bridge = SdkBridge::new(
-        BTreeMap::new(),
-        ToolCallbackConfig {
-            url: "http://127.0.0.1:9".into(),
-            auth_token: "fixture-callback-token-".repeat(2),
-        },
-        Some(root.join("bridge.pid")),
-    )
-    .unwrap();
-    let order = Arc::new(Mutex::new(Vec::<String>::new()));
-    let run_id = Arc::new(Mutex::new(None));
-    let starts_log = root.join("starts.log");
-    let callback_order = order.clone();
-    let callback_run = run_id.clone();
-    let turn = SdkTurn {
-        owner: "work:network:conversation:root".into(),
-        executable,
-        workspace: root.join("workspace"),
-        local_store_root: root.join("private-instance"),
-        api_key: "fixture-api-key".into(),
-        env: BTreeMap::from([
-            (
-                "FAKE_BRIDGE_GET_RUN_STATUS".into(),
-                "RUN_LIFECYCLE_STATUS_FINISHED".into(),
-            ),
-            ("FAKE_BRIDGE_REJECT_RESUME".into(), "1".into()),
-            ("FAKE_BRIDGE_LOG".into(), starts_log.display().to_string()),
-        ]),
-        model: "fixture-model".into(),
-        timeout_secs: 10,
-        custom_tools: BTreeMap::new(),
-        callback_token: None,
-        process_started: None,
-        run_started: Some(Arc::new(move |id| {
-            callback_order.lock().unwrap().push("run".into());
-            *callback_run.lock().unwrap() = Some(id);
-            Box::pin(async { Ok(()) })
-        })),
-    };
-    let progress_order = order.clone();
-    let result = bridge
-        .run(
-            &turn,
-            "query me",
-            None,
-            |_| async { Ok(()) },
-            watch::channel(false).1,
-            move |_| {
-                progress_order.lock().unwrap().push("progress".into());
-                async { Ok(()) }
-            },
-        )
-        .await
-        .unwrap();
-    let run_id = run_id.lock().unwrap().clone().unwrap();
-    assert_eq!(result.output, "done: query me");
-    let order = order.lock().unwrap().clone();
-    assert_eq!(order.first().map(String::as_str), Some("run"));
-    bridge.retire_all().await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let native = bridge
-        .probe(&turn, result.session_id.as_deref().unwrap(), &run_id)
-        .await
-        .unwrap();
-    assert_eq!(native.status, NativeStatus::Completed);
-    assert_eq!(native.output.as_deref(), Some("done: query me"));
-    assert!(
-        starts(&starts_log).len() >= 2,
-        "probe restarted the resident bridge"
-    );
-    bridge
-        .cancel(&turn, result.session_id.as_deref().unwrap(), &run_id)
-        .await
-        .unwrap();
-    bridge.stop().await;
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn provider_observation_reads_metadata_without_an_agent_turn() {
-    let root = std::env::temp_dir().join(format!(
-        "vibeface-cursor-provider-probe-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let requests = root.join("requests.log");
-    let (bridge, observation) = provider_observation_fixture(
-        &root,
-        BTreeMap::from([
-            (
-                "FAKE_BRIDGE_REQUEST_LOG".into(),
-                requests.display().to_string(),
-            ),
-            ("FAKE_BRIDGE_MODELS".into(), "id_only".into()),
-        ]),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        observation.authentication,
-        SdkProviderAuthentication::Authenticated
-    );
-    assert!(matches!(
-        observation.catalog,
-        SdkCatalog::Available { ref models } if models.iter().any(|model| model.id == "composer-2" && model.display_name == "composer-2")
-    ));
-    let calls = std::fs::read_to_string(&requests).unwrap();
-    assert!(calls.contains("Me") && calls.contains("ListModels"));
-    assert!(calls.lines().all(|method| {
-        matches!(
-            method,
-            "GetVersion" | "SetToolCallback" | "Me" | "ListModels"
-        )
-    }));
-    let shown = format!("{observation:?}");
-    assert!(!shown.contains("private@example.invalid"));
-    bridge.stop().await;
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn provider_observation_keeps_authentication_when_catalog_fails() {
-    let root = std::env::temp_dir().join(format!(
-        "vibeface-cursor-provider-catalog-failure-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let (bridge, observation) = provider_observation_fixture(
-        &root,
-        BTreeMap::from([("FAKE_BRIDGE_MODELS".into(), "500".into())]),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        observation.authentication,
-        SdkProviderAuthentication::Authenticated
-    );
-    assert_eq!(observation.catalog, SdkCatalog::Unavailable);
-    bridge.stop().await;
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn provider_observation_maps_only_http_auth_status_to_sign_in_required() {
-    let root = std::env::temp_dir().join(format!(
-        "vibeface-cursor-provider-auth-failure-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let (bridge, observation) = provider_observation_fixture(
-        &root,
-        BTreeMap::from([
-            ("FAKE_BRIDGE_ME".into(), "401".into()),
-            ("FAKE_BRIDGE_MODELS".into(), "500".into()),
-        ]),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        observation.authentication,
-        SdkProviderAuthentication::SignInRequired
-    );
-    assert_eq!(observation.catalog, SdkCatalog::Unavailable);
-    bridge.stop().await;
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn provider_observation_keeps_malformed_metadata_unknown() {
-    let root = std::env::temp_dir().join(format!(
-        "vibeface-cursor-provider-malformed-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let (bridge, observation) = provider_observation_fixture(
-        &root,
-        BTreeMap::from([
-            ("FAKE_BRIDGE_ME".into(), "malformed".into()),
-            ("FAKE_BRIDGE_MODELS".into(), "malformed".into()),
-        ]),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        observation.authentication,
-        SdkProviderAuthentication::Unknown
-    );
-    assert_eq!(observation.catalog, SdkCatalog::Unavailable);
-    bridge.stop().await;
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn provider_observation_bounds_oversize_catalog_response() {
-    let root = std::env::temp_dir().join(format!(
-        "vibeface-cursor-provider-oversize-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let (bridge, observation) = provider_observation_fixture(
-        &root,
-        BTreeMap::from([("FAKE_BRIDGE_MODELS".into(), "oversize".into())]),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        observation.authentication,
-        SdkProviderAuthentication::Authenticated
-    );
-    assert_eq!(observation.catalog, SdkCatalog::Unavailable);
-    let token = std::fs::read_to_string(root.join("bridge.pid"))
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_owned();
-    bridge.stop().await;
-    assert!(
-        matches!(
-            vibeface_bridge::platform::tree::Leftover::find(&token),
-            Ok(None)
-        ),
-        "Bridge::stop returns only after the SDK wrapper and child tree have exited"
-    );
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn provider_observation_times_out_catalog_without_downgrading_authentication() {
-    let root = std::env::temp_dir().join(format!(
-        "vibeface-cursor-provider-timeout-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let (bridge, observation) = provider_observation_fixture(
-        &root,
-        BTreeMap::from([("FAKE_BRIDGE_MODELS".into(), "timeout".into())]),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        observation.authentication,
-        SdkProviderAuthentication::Authenticated
-    );
-    assert_eq!(observation.catalog, SdkCatalog::Unavailable);
-    bridge.stop().await;
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn provider_observation_does_not_wait_for_an_active_agent_owner() {
-    let root = std::env::temp_dir().join(format!(
-        "vibeface-cursor-provider-active-owner-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(root.join("gates")).unwrap();
-    let sends = root.join("sends.log");
-    let env = BTreeMap::from([
-        ("FAKE_BRIDGE_SEND_LOG".into(), sends.display().to_string()),
-        (
-            "FAKE_BRIDGE_GATE_DIR".into(),
-            root.join("gates").display().to_string(),
-        ),
-    ]);
-    let (bridge, _) = provider_observation_fixture(&root, env.clone())
-        .await
-        .unwrap();
-    let bridge = Arc::new(bridge);
-    let executable = fixture_executable();
-    let turn = SdkTurn {
-        owner: "coordination".into(),
-        executable: executable.clone(),
-        workspace: root.join("workspace"),
-        local_store_root: root.join("private-agent"),
-        api_key: "fixture-api-key".into(),
-        env: env.clone(),
-        model: "fixture-model".into(),
-        timeout_secs: 10,
-        custom_tools: BTreeMap::new(),
-        callback_token: None,
-        process_started: None,
-        run_started: None,
-    };
-    let running_bridge = bridge.clone();
-    let running = tokio::spawn(async move { reply(&running_bridge, &turn, "first-active").await });
-    wait_sends(&sends, "first-", 1).await;
-    let observation = tokio::time::timeout(
-        Duration::from_secs(2),
-        bridge.provider_observation(
-            &executable,
-            &root.join("workspace"),
-            &root.join("private-probe"),
-            "fixture-api-key",
-            &env,
-        ),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(
-        observation.authentication,
-        SdkProviderAuthentication::Authenticated
-    );
-    assert!(!running.is_finished());
-    std::fs::write(root.join("gates/first"), b"").unwrap();
-    assert_eq!(running.await.unwrap().0.unwrap(), "done: first-active");
-    bridge.stop().await;
-    std::fs::remove_dir_all(root).unwrap();
+    CursorAgent::kill_orphan(&file);
+    let error = pending
+        .await?
+        .err()
+        .context("orphan completion stays unknown")?;
+    assert_eq!(error.outcome, AgentFailure::Unknown);
+    assert_eq!(lines(&root.join("prompts.jsonl")).len(), 1);
+    agent.stop().await;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
 }

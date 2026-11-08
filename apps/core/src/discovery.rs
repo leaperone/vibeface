@@ -66,19 +66,39 @@ pub(crate) async fn complete_local(
     }
     let mut next = local.clone();
     let bin = local.bin(connect.provider);
-    if !local.bins.contains_key(&connect.provider)
-        && !local.env.get(connect.provider).contains_key("PATH")
+    let selected = bare(&bin)
+        .and_then(|name| host.program(name))
+        .unwrap_or_else(|| bin.clone());
+    let needs_program = !local.bins.contains_key(&connect.provider) && !host.installed(&bin);
+    let needs_node = uses_path_node(&selected)
+        && !runnable(Path::new("node"), host.path.as_ref())
+        && host.program("node").is_none();
+    if !local.env.get(connect.provider).contains_key("PATH")
         && !connect.explicit_env_names.contains("PATH")
-        && !host.installed(&bin)
-        && let Some(name) = bare(&bin)
+        && (needs_program || needs_node)
         && let Some(path) = environment::program_path(host).await?
-        && let Some(found) = (Host {
-            path: Some(path),
-            ..host.clone()
-        })
-        .program(name)
     {
-        next.bins.insert(connect.provider, found);
+        let discovered = Host {
+            path: Some(path.clone()),
+            ..host.clone()
+        };
+        if needs_program && let Some(found) = bare(&bin).and_then(|name| discovered.program(name)) {
+            next.bins.insert(connect.provider, found);
+        }
+        let selected = next
+            .bins
+            .get(&connect.provider)
+            .cloned()
+            .unwrap_or(selected);
+        if uses_path_node(&selected) && runnable(Path::new("node"), Some(&path)) {
+            next.env.apply(
+                connect.provider,
+                BTreeMap::from([(
+                    "PATH".into(),
+                    Some(path.into_string().map_err(|_| LocalSourceError)?),
+                )]),
+            )?;
+        }
     }
     let names = connect.names(local, codex_config)?;
     let values = environment::missing(&names, host).await?;
@@ -121,6 +141,7 @@ impl std::error::Error for CodexMissing {}
 #[derive(Clone, Debug, Default)]
 pub struct Host {
     pub codex_home: Option<PathBuf>,
+    pub claude_config: Option<PathBuf>,
     pub home: Option<PathBuf>,
     pub nvm_dir: Option<PathBuf>,
     pub path: Option<OsString>,
@@ -142,6 +163,7 @@ impl Host {
         };
         Self {
             codex_home: dir(CODEX_HOME),
+            claude_config: dir("CLAUDE_CONFIG_DIR"),
             home: dir("HOME").or_else(|| dir("USERPROFILE")),
             nvm_dir: dir("NVM_DIR"),
             path: std::env::var_os("PATH"),
@@ -173,16 +195,33 @@ impl Host {
             "opencode" => home(".opencode/bin"),
             _ => None,
         });
-        for directory in [".npm-global/bin", ".volta/bin", "AppData/Roaming/npm"] {
+        for directory in [
+            ".npm-global/bin",
+            ".bun/bin",
+            ".volta/bin",
+            "AppData/Roaming/npm",
+        ] {
             dirs.extend(home(directory));
         }
-        dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
-        if name == "codex" {
+        if !cfg!(test) {
+            dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+        }
+        if name == "codex" && !cfg!(test) {
             dirs.push("/Applications/Codex.app/Contents/Resources".into());
         }
         dirs.extend(self.nvm_bins());
+        let names: &[&str] = if name == "agent" {
+            &["agent", "cursor-agent"]
+        } else {
+            &[name]
+        };
         dirs.into_iter()
-            .flat_map(|dir| vibeface_bridge::platform::program::candidates(&dir.join(name)))
+            .filter(|dir| dir.is_absolute())
+            .flat_map(|dir| {
+                names.iter().flat_map(move |name| {
+                    vibeface_bridge::platform::program::candidates(&dir.join(name))
+                })
+            })
             .find(|path| executable_file(path))
     }
 
@@ -205,7 +244,10 @@ impl Host {
                 let name = entry.file_name();
                 let version = semver::Version::parse(name.to_str()?.strip_prefix('v')?).ok()?;
                 let bin = entry.path().join("bin");
-                executable_file(&bin.join("node")).then_some((version, bin))
+                vibeface_bridge::platform::program::candidates(&bin.join("node"))
+                    .iter()
+                    .any(|node| executable_file(node))
+                    .then_some((version, bin))
             })
             .collect();
         versions.sort_by(|(a, path_a), (b, path_b)| b.cmp(a).then(path_a.cmp(path_b)));
@@ -282,6 +324,20 @@ impl Host {
         }
         shown
     }
+}
+
+pub(crate) fn uses_path_node(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if file.take(256).read_to_end(&mut bytes).is_err() {
+        return false;
+    }
+    let prefix = String::from_utf8_lossy(&bytes);
+    let line = prefix.lines().next().unwrap_or_default();
+    line.starts_with("#!/usr/bin/env ") && line.split_ascii_whitespace().any(|word| word == "node")
 }
 
 pub(crate) fn executable_file(path: &Path) -> bool {
@@ -751,7 +807,7 @@ exec /bin/sh -c "$2"
             provider: Provider::Cursor,
             explicit_env_names: BTreeSet::new(),
         };
-        assert_eq!(cursor.names(&local, None)?, vec!["CURSOR_API_KEY"]);
+        assert!(cursor.names(&local, None)?.is_empty());
         local.env.apply(
             Provider::Cursor,
             BTreeMap::from([("CURSOR_API_KEY".into(), Some("synthetic-private".into()))]),
@@ -759,6 +815,45 @@ exec /bin/sh -c "$2"
         assert!(cursor.names(&local, None)?.is_empty());
         local.switches.codex_app_server.mode = AppServerMode::System;
         assert!(connect.names(&local, None)?.is_empty());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_custom_login_path_keeps_the_node_needed_by_its_wrapper() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, mut host, _) = environment_fixture("separate-node-path", "exit 1");
+        let wrapper = dir.join("custom-agent/claude");
+        let node = dir.join("custom-runtime/node");
+        for (path, source) in [
+            (&wrapper, "#!/usr/bin/env node\n"),
+            (&node, "#!/bin/sh\nprintf 'separate-runtime:%s\\n' \"$1\"\n"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(path, source)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let search = std::env::join_paths([wrapper.parent().unwrap(), node.parent().unwrap()])?
+            .into_string()
+            .unwrap();
+        host.inherited_env.insert("PATH".into(), search.clone());
+        let connect = LocalConnect {
+            provider: Provider::Claude,
+            explicit_env_names: BTreeSet::new(),
+        };
+        let mut local = local();
+        assert!(complete_local(&mut local, &connect, None, &host).await?);
+        assert_eq!(local.env.get(Provider::Claude)["PATH"], search);
+        let output = std::process::Command::new(local.bin(Provider::Claude))
+            .env_clear()
+            .envs(local.launch_env_on(Provider::Claude, &host))
+            .output()?;
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout)?,
+            format!("separate-runtime:{}\n", wrapper.display())
+        );
+        assert_eq!(local.env.get(Provider::Claude)["PATH"], search);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -802,7 +897,7 @@ exec /bin/sh -c "$2"
     #[test]
     fn requested_local_service_is_discovered_without_enabling_a_use() -> Result<()> {
         let (dir, host, _) = environment_fixture("disabled", "exit 1");
-        let bridge = dir.join(".local/bin/cursor-sdk-bridge");
+        let bridge = dir.join(".local/bin/agent");
         program(&bridge);
         let (mut local, mut manager, mut triage) = (local(), None, TriageConfig::default());
         let found = missing(
@@ -969,7 +1064,7 @@ exec /bin/sh -c "$2"
     #[test]
     fn programs_named_only_are_found_where_a_service_path_does_not_look() -> Result<()> {
         let root = scratch("programs");
-        let bridge = root.join(".local/bin/cursor-sdk-bridge");
+        let bridge = root.join(".local/bin/agent");
         program(&bridge);
         let host = Host {
             codex_home: None,
@@ -997,7 +1092,7 @@ exec /bin/sh -c "$2"
         assert_eq!(found.bins, BTreeMap::from([(Provider::Cursor, bridge)]));
         local
             .bins
-            .insert(Provider::Cursor, root.join("chosen/cursor-sdk-bridge"));
+            .insert(Provider::Cursor, root.join("chosen/agent"));
         assert!(
             missing(
                 &Target {
@@ -1034,6 +1129,9 @@ exec /bin/sh -c "$2"
             let name = path.file_name().unwrap().to_str().unwrap();
             assert_eq!(host.program(name), Some(path.clone()));
         }
+        let cursor = root.join(".local/bin/cursor-agent");
+        program(&cursor);
+        assert_eq!(host.program("agent"), Some(cursor));
         let native = root.join(".local/bin/claude");
         program(&native);
         assert_eq!(

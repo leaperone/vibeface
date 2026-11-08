@@ -12,7 +12,7 @@ use std::{
 use tokio::sync::watch;
 pub use vibeface_bridge::agent::{AgentFailure as ManagerFailure, StartEvidence};
 use vibeface_bridge::{
-    agent::{self, AgentResult, CustomToolConfig, SdkBridge, SdkTurn},
+    agent::{self, AgentResult, CursorAgent, CursorTurn, CustomToolConfig},
     codex::DirectSession,
     failure::{ExecFailure, FailureKind, ProviderStage},
     turn::{TurnStatus, turn_snapshot},
@@ -113,7 +113,7 @@ pub enum Sdk {
     /// Each stable owner runs on its private resident bridge; the active attempt supplies the
     /// process-wide custom-tool callback bearer before Send.
     Cursor {
-        bridge: Option<Arc<SdkBridge>>,
+        bridge: Option<Arc<CursorAgent>>,
         sdk_bin: PathBuf,
         owner: Option<String>,
         local_store_root: Option<PathBuf>,
@@ -349,29 +349,22 @@ where
                 not_started(
                     ProviderStage::Launch,
                     FailureKind::MissingBinary,
-                    "this Node has no Cursor SDK bridge yet",
+                    "this Node has no Cursor ACP bridge yet",
                 )
             })?;
-            let (api_key, env) = crate::providers::cursor_launch(&config.provider_env);
-            let api_key = api_key.ok_or_else(|| {
-                not_started(
-                    ProviderStage::Authentication,
-                    FailureKind::MissingKey,
-                    "CURSOR_API_KEY is required for the Cursor SDK manager",
-                )
-            })?;
+            let env = config.provider_env.clone();
             let owner = owner.as_deref().ok_or_else(|| {
                 not_started(
                     ProviderStage::Validate,
                     FailureKind::Unknown,
-                    "Cursor SDK manager has no stable process owner",
+                    "Cursor ACP manager has no stable process owner",
                 )
             })?;
             let local_store_root = local_store_root.as_ref().ok_or_else(|| {
                 not_started(
                     ProviderStage::Validate,
                     FailureKind::Unknown,
-                    "Cursor SDK manager has no private native store",
+                    "Cursor ACP manager has no private native store",
                 )
             })?;
             let native_agent = Arc::new(std::sync::Mutex::new(None::<String>));
@@ -410,12 +403,15 @@ where
                     });
                     callback
                 });
-            let turn = SdkTurn {
+            let turn = CursorTurn {
                 owner: owner.into(),
+                client_id: config.codex_turn.as_ref().map_or_else(
+                    || uuid::Uuid::new_v4().to_string(),
+                    |turn| turn.client_id.clone(),
+                ),
                 executable: sdk_bin.clone(),
                 workspace: config.workspace.clone(),
                 local_store_root: local_store_root.clone(),
-                api_key,
                 env,
                 model: config.model.clone(),
                 timeout_secs: config.timeout_secs,

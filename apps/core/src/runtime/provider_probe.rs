@@ -19,7 +19,7 @@ use tokio::{
     process::{Child, ChildStderr},
     task::JoinHandle,
 };
-use vibeface_bridge::agent::{SdkCatalog, SdkProviderAuthentication, SdkProviderObservation};
+use vibeface_bridge::agent::{CursorAuthentication, CursorCatalog, CursorObservation};
 use vibeface_bridge::platform::tree;
 
 const OUTPUT_LIMIT: u64 = 64 * 1024;
@@ -29,6 +29,7 @@ const PROBE_LIMIT: Duration = Duration::from_secs(5);
 struct ProbeInput {
     bin: PathBuf,
     env: BTreeMap<String, String>,
+    authentication: Option<String>,
     server: Option<AppServer>,
     epoch: u64,
     manager: Option<ManagerSettings>,
@@ -39,6 +40,7 @@ enum LaunchIdentity<'a> {
     Process {
         bin: PathBuf,
         env: &'a BTreeMap<String, String>,
+        authentication: Option<String>,
     },
     System {
         socket: Option<&'a std::path::Path>,
@@ -50,11 +52,79 @@ pub(super) struct CachedProviderProbe {
     probe: ProviderProbe,
 }
 
+struct ClaudeLogin {
+    input: ProbeInput,
+    observation: Result<Option<Authentication>, ProbeIssue>,
+}
+
 impl Runtime {
+    pub(crate) async fn prepare_claude_login(
+        &self,
+        bin: &std::path::Path,
+        env: BTreeMap<String, String>,
+    ) -> anyhow::Result<BTreeMap<String, String>> {
+        let prepared = self
+            .prepare_claude_probe(ProbeInput {
+                bin: bin.into(),
+                env,
+                authentication: None,
+                server: None,
+                epoch: 0,
+                manager: None,
+            })
+            .await?;
+        anyhow::ensure!(
+            prepared.observation != Ok(Some(Authentication::SignInRequired)),
+            "Claude Code requires sign-in; refresh the local CLI login or sign in for this Node"
+        );
+        Ok(prepared.input.env)
+    }
+
+    async fn prepare_claude_probe(&self, mut input: ProbeInput) -> anyhow::Result<ClaudeLogin> {
+        let roots = providers::ProviderRoots::new(&self.data_dir);
+        roots.clear_claude_borrow()?;
+        let mut observation = claude_authentication(&input, &self.data_dir).await;
+        if observation == Ok(Some(Authentication::SignInRequired)) {
+            let mut local = providers::Local {
+                switches: Default::default(),
+                bins: BTreeMap::from([(Provider::Claude, input.bin.clone())]),
+                env: Default::default(),
+            };
+            local.env.apply(
+                Provider::Claude,
+                input
+                    .env
+                    .iter()
+                    .map(|(name, value)| (name.clone(), Some(value.clone())))
+                    .collect(),
+            )?;
+            roots.prepare_login(Provider::Claude, &local, &self.host)?;
+            anyhow::ensure!(
+                !roots.imported_login_expired(Provider::Claude, &local),
+                "the borrowed Claude CLI login has expired; refresh the local CLI login or sign in for this Node"
+            );
+            let env = roots.borrowed_claude_environment(&local)?;
+            if env != input.env {
+                input.env = env;
+                observation = claude_authentication(&input, &self.data_dir).await;
+            }
+        }
+        Ok(ClaudeLogin { input, observation })
+    }
+
     fn probe_input(&self, provider: Provider, local: &providers::Local) -> ProbeInput {
         ProbeInput {
             bin: local.bin(provider),
-            env: local.launch_env(provider),
+            env: if provider == Provider::Claude {
+                providers::ProviderRoots::new(&self.data_dir)
+                    .borrowed_claude_environment(local)
+                    .unwrap_or_else(|_| local.launch_env(provider))
+            } else {
+                local.launch_env(provider)
+            },
+            authentication: (provider == Provider::Codex)
+                .then(|| local.codex_external_auth().map(|auth| auth.fingerprint()))
+                .flatten(),
             server: provider
                 .on_app_server()
                 .then(|| local.switches.codex_app_server.clone()),
@@ -105,6 +175,9 @@ impl Runtime {
             LaunchIdentity::Process {
                 bin: local.bin(provider),
                 env: &env,
+                authentication: (provider == Provider::Codex)
+                    .then(|| local.codex_external_auth().map(|auth| auth.fingerprint()))
+                    .flatten(),
             }
         };
         self.identity
@@ -114,6 +187,9 @@ impl Runtime {
     pub(crate) async fn provider_probe_snapshot(&self, provider: Provider) -> ProviderProbe {
         let local = self.providers();
         let mut probe = self.cached_probe(provider, &local);
+        if providers::ProviderRoots::new(&self.data_dir).imported_login_expired(provider, &local) {
+            probe.authentication = Authentication::SignInRequired;
+        }
         if let Some(issue) = prerequisites(provider, &local) {
             probe.launch = LaunchCheck::Failed { issue };
             return probe;
@@ -173,9 +249,48 @@ impl Runtime {
 
     pub(crate) async fn probe_provider(&self, provider: Provider) -> ProviderProbe {
         let _refresh = self.provider_probe_locks[&provider].lock().await;
+        if provider == Provider::Codex && self.refresh_provider_login(provider).await.is_err() {
+            tracing::warn!(
+                event = "providers.local_login_unavailable",
+                "could not refresh the imported Codex access token"
+            );
+        }
         let local = self.providers();
-        let input = self.probe_input(provider, &local);
+        let original_input = self.probe_input(provider, &local);
         let mut probe = self.provider_probe_snapshot(provider).await;
+        let claude_observation = if provider == Provider::Claude {
+            let mut input = original_input.clone();
+            input.env = local.launch_env(provider);
+            match self.prepare_claude_probe(input).await {
+                Ok(prepared) => Some(prepared.observation),
+                Err(_) => {
+                    tracing::warn!(
+                        event = "providers.local_login_unavailable",
+                        "could not reuse the local Claude CLI access token"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let input = self.probe_input(provider, &local);
+        if input != original_input {
+            let mut cache = self
+                .provider_probes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = cache.get_mut(&provider)
+                && entry.input == original_input
+                && entry.probe.config_id == probe.config_id
+            {
+                *entry = CachedProviderProbe {
+                    input: input.clone(),
+                    probe: unchecked(provider),
+                };
+                probe = entry.probe.clone();
+            }
+        }
         probe.authentication = Authentication::Unverified;
         probe.catalog = ModelCatalog::default();
         if !provider.on_app_server()
@@ -184,7 +299,9 @@ impl Runtime {
         {
             probe.launch = LaunchCheck::Unchecked;
         }
-        if provider.on_app_server() && matches!(probe.launch, LaunchCheck::Launchable) {
+        if providers::ProviderRoots::new(&self.data_dir).imported_login_expired(provider, &local) {
+            probe.authentication = Authentication::SignInRequired;
+        } else if provider.on_app_server() && matches!(probe.launch, LaunchCheck::Launchable) {
             let (authentication, catalog) = self.codex.provider_observation().await;
             probe.authentication = authentication;
             probe.catalog = catalog;
@@ -194,7 +311,10 @@ impl Runtime {
         ) {
             probe.launch = LaunchCheck::Unchecked;
             match provider {
-                Provider::Claude => match claude_authentication(&input, &self.data_dir).await {
+                Provider::Claude => match match claude_observation {
+                    Some(observation) => observation,
+                    None => claude_authentication(&input, &self.data_dir).await,
+                } {
                     Ok(Some(authentication)) => {
                         probe.launch = LaunchCheck::Launchable;
                         probe.authentication = authentication;
@@ -211,25 +331,26 @@ impl Runtime {
                     Ok(None) => {}
                 },
                 Provider::Cursor => {
-                    let (api_key, env) = providers::cursor_launch(&input.env);
-                    if let (Some(bridge), Some(api_key)) = (self.cursor.get(), api_key) {
+                    let env = input.env.clone();
+                    if let Some(bridge) = self.cursor.get() {
                         let workspace = input
                             .manager
                             .as_ref()
                             .map(|manager| manager.workspace.clone())
-                            .unwrap_or_else(|| self.data_dir.join("manager-workspace"));
+                            .unwrap_or_else(|| self.data_dir.clone());
                         match bridge
                             .provider_observation(
                                 &input.bin,
                                 &workspace,
                                 &self.data_dir.join("cursor/provider-probe"),
-                                &api_key,
                                 &env,
                             )
                             .await
                         {
                             Ok(observation) => {
-                                probe.launch = LaunchCheck::Launchable;
+                                if observation.launchable {
+                                    probe.launch = LaunchCheck::Launchable;
+                                }
                                 probe.authentication = cursor_authentication(&observation);
                                 probe.catalog = cursor_catalog(&observation);
                             }
@@ -265,16 +386,16 @@ impl Runtime {
     }
 }
 
-fn cursor_authentication(observation: &SdkProviderObservation) -> Authentication {
+fn cursor_authentication(observation: &CursorObservation) -> Authentication {
     match observation.authentication {
-        SdkProviderAuthentication::Authenticated => Authentication::Authenticated,
-        SdkProviderAuthentication::SignInRequired => Authentication::SignInRequired,
-        SdkProviderAuthentication::Unknown => Authentication::Unverified,
+        CursorAuthentication::Authenticated => Authentication::Authenticated,
+        CursorAuthentication::SignInRequired => Authentication::SignInRequired,
+        CursorAuthentication::Unknown => Authentication::Unverified,
     }
 }
 
-fn cursor_catalog(observation: &SdkProviderObservation) -> ModelCatalog {
-    let SdkCatalog::Available { models } = &observation.catalog else {
+fn cursor_catalog(observation: &CursorObservation) -> ModelCatalog {
+    let CursorCatalog::Available { models } = &observation.catalog else {
         return ModelCatalog::default();
     };
     let models = models
@@ -350,6 +471,14 @@ fn spawn_probe(
     args: &[&str],
 ) -> Result<ProbeChild, ProbeIssue> {
     let mut command = std::process::Command::new(&input.bin);
+    #[cfg(test)]
+    for name in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ] {
+        command.env_remove(name);
+    }
     for (name, _) in std::env::vars_os() {
         let text = name.to_string_lossy();
         if text.starts_with("VIBEFACE_")
@@ -621,7 +750,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
-    use vibeface_bridge::agent::{SdkModel, SdkProviderAuthentication};
+    use vibeface_bridge::agent::{CursorAuthentication, CursorModel};
 
     async fn cursor_probe_node(
         env: BTreeMap<String, String>,
@@ -637,7 +766,7 @@ mod tests {
         configuration.bins.insert(
             Provider::Cursor,
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../crates/bridge/tests/fixtures/fake-cursor-sdk-bridge"),
+                .join("../../crates/bridge/tests/fixtures/fake-cursor-agent"),
         );
         configuration.save(&dir)?;
         crate::config::private_write(
@@ -762,10 +891,11 @@ mod tests {
 
     #[test]
     fn cursor_metadata_maps_to_authenticated_partial_catalog_without_inventing_auto() {
-        let observation = SdkProviderObservation {
-            authentication: SdkProviderAuthentication::Authenticated,
-            catalog: SdkCatalog::Available {
-                models: vec![SdkModel {
+        let observation = CursorObservation {
+            launchable: true,
+            authentication: CursorAuthentication::Authenticated,
+            catalog: CursorCatalog::Available {
+                models: vec![CursorModel {
                     id: "composer-2".into(),
                     display_name: "Composer 2".into(),
                 }],
@@ -786,9 +916,10 @@ mod tests {
 
     #[test]
     fn cursor_metadata_unknowns_do_not_become_auth_failures() {
-        let observation = SdkProviderObservation {
-            authentication: SdkProviderAuthentication::Unknown,
-            catalog: SdkCatalog::Unavailable,
+        let observation = CursorObservation {
+            launchable: true,
+            authentication: CursorAuthentication::Unknown,
+            catalog: CursorCatalog::Unavailable,
         };
         assert_eq!(
             cursor_authentication(&observation),
@@ -988,6 +1119,7 @@ exit 1
             ProbeInput {
                 bin,
                 env: BTreeMap::new(),
+                authentication: None,
                 server: None,
                 epoch: 0,
                 manager: None,
@@ -1017,6 +1149,117 @@ exit 1
             None
         );
         assert_eq!(claude_authentication_response(b"not json", false), None);
+    }
+
+    #[tokio::test]
+    async fn claude_borrowing_yields_to_private_keychain_login_before_each_launch()
+    -> anyhow::Result<()> {
+        let (node, _, dir) = super::super::triage::tests::node().await?;
+        let mut node = std::sync::Arc::try_unwrap(node)
+            .map_err(|_| anyhow::anyhow!("fixture runtime is shared"))?;
+        let (fixture_dir, input) = fixture(
+            r#"
+[ "$*" = "auth status --json" ] || exit 9
+if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+  printf '%s\n' borrowed >> "$PROBE_LOGIN_CALLS"
+else
+  printf '%s\n' private >> "$PROBE_LOGIN_CALLS"
+fi
+if [ -f "$PROBE_PRIVATE_LOGIN" ]; then
+  [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] || exit 8
+  printf '%s\n' '{"loggedIn":true}'
+elif [ -f "$PROBE_UNKNOWN_LOGIN" ]; then
+  printf '%s\n' '{unreadable'
+  exit 2
+elif [ "$CLAUDE_CODE_OAUTH_TOKEN" = 'synthetic-borrowed-access' ]; then
+  printf '%s\n' '{"loggedIn":true}'
+else
+  printf '%s\n' '{"loggedIn":false}'
+  exit 1
+fi
+"#,
+        )?;
+        let private_login = fixture_dir.join("private-keychain-login");
+        let unknown_login = fixture_dir.join("unknown-private-login");
+        let calls = fixture_dir.join("calls");
+        node.host.home = Some(fixture_dir.join("person"));
+        let source = fixture_dir.join("person/.claude/.credentials.json");
+        crate::config::private_dir(source.parent().unwrap())?;
+        crate::config::private_write(
+            &source,
+            &serde_json::to_vec(&json!({"claudeAiOauth":{
+                "accessToken":"synthetic-borrowed-access",
+                "refreshToken":"synthetic-source-refresh",
+                "expiresAt":vibeface_protocol::now_ms() + 3_600_000,
+            }}))?,
+        )?;
+        let mut local = node.providers();
+        local.bins.insert(Provider::Claude, input.bin.clone());
+        local.switches.execution.insert(Provider::Claude);
+        local.env.apply(
+            Provider::Claude,
+            BTreeMap::from([
+                (
+                    "PROBE_PRIVATE_LOGIN".into(),
+                    Some(private_login.display().to_string()),
+                ),
+                (
+                    "PROBE_UNKNOWN_LOGIN".into(),
+                    Some(unknown_login.display().to_string()),
+                ),
+                (
+                    "PROBE_LOGIN_CALLS".into(),
+                    Some(calls.display().to_string()),
+                ),
+            ]),
+        )?;
+        *node.providers.lock().unwrap() = local.clone();
+        let env = local.launch_env(Provider::Claude);
+        let borrowed = node.prepare_claude_login(&input.bin, env.clone()).await?;
+        assert_eq!(
+            borrowed["CLAUDE_CODE_OAUTH_TOKEN"],
+            "synthetic-borrowed-access"
+        );
+        assert_eq!(std::fs::read_to_string(&calls)?, "private\nborrowed\n");
+        let roots = providers::ProviderRoots::new(&dir);
+        let private_file = roots.claude_config.join(".credentials.json");
+        assert!(
+            !private_file.exists(),
+            "borrowing never creates a CLI credential"
+        );
+        assert_eq!(
+            roots.authentication_source(Provider::Claude, &local),
+            providers::AuthenticationSource::ImportedCliLogin
+        );
+
+        std::fs::write(&private_login, b"private-keychain-fixture")?;
+        let private = node.prepare_claude_login(&input.bin, env.clone()).await?;
+        assert!(!private.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+        let observed = node.probe_provider(Provider::Claude).await;
+        assert_eq!(observed.authentication, Authentication::Authenticated);
+        assert_eq!(
+            roots.authentication_source(Provider::Claude, &local),
+            providers::AuthenticationSource::PrivateLogin
+        );
+        assert!(!private_file.exists());
+
+        std::fs::remove_file(&private_login)?;
+        std::fs::write(&unknown_login, b"unknown-private-status")?;
+        let unknown = node.prepare_claude_login(&input.bin, env.clone()).await?;
+        assert!(!unknown.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+        assert_eq!(
+            roots.authentication_source(Provider::Claude, &local),
+            providers::AuthenticationSource::PrivateLogin
+        );
+
+        std::fs::remove_file(&unknown_login)?;
+        crate::config::private_write(&private_file, b"synthetic-private-login")?;
+        assert!(node.prepare_claude_login(&input.bin, env).await.is_err());
+        assert_eq!(std::fs::read(&private_file)?, b"synthetic-private-login");
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        std::fs::remove_dir_all(fixture_dir)?;
+        Ok(())
     }
 
     #[tokio::test]

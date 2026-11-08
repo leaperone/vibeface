@@ -4,7 +4,7 @@ import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
-import { availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, effortOptions, probeIssueText, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderChange, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
+import { authenticationSourceLabels, availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, effortOptions, probeIssueText, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderChange, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { ErrorText } from '@/components/action'
 import { CopyableId, Details, EmptyState, Skeleton, providerIcons, toneText, type Tone } from '@/components/kit'
@@ -135,11 +135,12 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
         : open ? null : <Button variant="link" className="px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
     </View> : null}
     <View className="gap-1 px-4 pb-3">
+      <Text className="text-meta text-muted-foreground">{authenticationSourceLabels[item.authentication_source]}</Text>
       {'issue' in readiness ? <Text className="text-meta text-muted-foreground">{probeIssueText(item.provider, readiness.issue)}</Text> : null}
       {item.setup && (assistant || execution) && ['needs_setup', 'unverified'].includes(readiness.state) ? <View className="gap-2">
-        <Text className="text-meta text-muted-foreground">在运行该节点的电脑或服务器上执行以下命令，为独立目录登录或配置，再点“检查可用性”。不会复制已有登录信息。</Text>
-        <Text selectable className="font-mono text-meta text-muted-foreground">{item.setup.directory}</Text>
-        <CopyableId value={item.setup.command} label={`${name} 私有目录认证命令`} />
+        <Text className="text-meta text-muted-foreground">在运行该节点的电脑或服务器上执行以下命令，为节点登录，再点“检查可用性”。已有私有登录不会被自动接入覆盖。</Text>
+        {item.setup.directory ? <Text selectable className="font-mono text-meta text-muted-foreground">{item.setup.directory}</Text> : null}
+        <CopyableId value={item.setup.command} label={`${name} 登录命令`} />
       </View> : null}
       <Text className="text-meta text-muted-foreground">{item.probe.checked_at_ms === null ? '尚未主动检查' : `检查于 ${new Date(item.probe.checked_at_ms).toLocaleString()}`}</Text>
       <Button variant="ghost" className="self-start" accessibilityLabel={`${name} 检查可用性`} disabled={busy !== ''} onPress={() => void probe()}><Icon as={busy === `${item.provider}:probe` ? LoaderCircle : PlugZap} /><Text>检查可用性</Text></Button>

@@ -35,7 +35,7 @@
 | `manager` | Bot 配置，`provider` 是运行 Bot 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`），关闭时为 `null` |
 | `providers.execution` | 执行派发工作的产品列表，默认为空，只能列 `supports` 含 `execution` 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`）；为空时不提供派发执行能力。`providers.execution_models` 按 Provider 保存执行任务默认模型，空值跟随 Provider 默认；它与 Bot 的 `manager.model` 分开 |
 | `providers.codex_app_server` | `{mode, socket}`：整个对象省略时默认 `spawn`，提供对象时 `mode` 必填；`system` 只有显式绝对 `socket` 才连接外部 App Server；`spawn` 时 Node 使用 `<data-dir>/providers/codex` 作为 Node-owned `CODEX_HOME`，不扫描或复用用户 App Server |
-| `bins` | 各产品的程序，键为产品名 `codex`、`cursor`、`claude`、`pi` 或 `opencode`；没写的用同名程序，Cursor 为 `cursor-sdk-bridge`。后台运行时用绝对路径 |
+| `bins` | 各产品的程序，键为产品名 `codex`、`cursor`、`claude`、`pi` 或 `opencode`；没写的用同名程序，Cursor 为官方 `agent` CLI。后台运行时用绝对路径 |
 | `timeout_secs` | 单次 SDK 调用超时，默认 600 秒 |
 | `daily_decision_limit` | 本 Node 每个网络的 UTC 每日非本人触发的管理调用次数，默认 20；本人主动聊天不受此额度限制；协调 Agent 的分诊唤醒按同一上限另行计数 |
 
@@ -72,7 +72,7 @@
 
 `reasoning_effort` 为可选推理档位。`backup` 保存本机备用策略，默认关闭。候选项为 `{provider, model, reasoning_effort}`，最多 5 个不同的 Provider 与模型组合，自动策略只允许原回合已确认未执行时尝试一次。
 
-`provider` 可为 `codex`、`cursor`、`claude`、`pi` 或 `opencode`。Codex Bot 回合在 Codex App Server 上运行（`turn/start`，`clientUserMessageId` 为 attempt ID）。`manager_capabilities` 声明本机 SDK 能力，包含流式进度、取消请求、本机原生会话延续和 steer；Codex、Claude Code、pi 与 opencode 支持活动补充，分别使用原生 steer 或持续输入；Cursor 的 standalone Bridge 尚未暴露所需 RPC，活动补充明确拒绝。接纳与回合归属分别记录，不代表模型已读。`cancel_confirmation=true` 表示取消可被确认，Codex 以 App Server 回合结束为证据，Cursor 必须收到 Provider 终态；本地进程组退出不等于 Provider 确认取消，结果仍须按待核对路径结算。配置存在、进程可达和真实模型可用是不同状态。
+`provider` 可为 `codex`、`cursor`、`claude`、`pi` 或 `opencode`。Codex Bot 回合在 Codex App Server 上运行（`turn/start`，`clientUserMessageId` 为 attempt ID）。`manager_capabilities` 声明本机适配器能力，包含流式进度、取消请求、本机原生会话延续和 steer；Codex、Claude Code、pi 与 opencode 支持活动补充，分别使用原生 steer 或持续输入；当前 Cursor ACP 适配器未提供原生 steer，活动补充明确拒绝。接纳与回合归属分别记录，不代表模型已读。`cancel_confirmation=true` 表示取消可被确认，Codex 以 App Server 回合结束为证据，Cursor 必须收到 Provider 终态；本地进程组退出不等于 Provider 确认取消，结果仍须按待核对路径结算。配置存在、进程可达和真实模型可用是不同状态。
 
 Cursor 的常驻进程按个人网络与 Bot 会话隔离，设备的 coordination Agent 使用独立进程。任务也使用独立进程和存储，续接同一本机任务会话时复用原有 owner。同一个 Bot 只允许一轮活跃回合，不同 Bot 可同时运行。每个进程使用数据目录下独立的 JSONL store 和 bridge state，工作目录仍是用户选择的项目，不在项目的 `.sdk` 或 `~/.cursor` 写 SDK 状态。回合先保存原生 agent ID，再发送提示；进程重启仍从同一私有 store 续接。会话键包含实际 JSONL root，store 改变时清空旧原生 ID 与覆盖向量，从 DAG 重建上下文，不读取或迁移旧的默认 SQLite store。Node 按 10 分钟间隔回收空闲至少 10 分钟的进程及内存槽，保留 JSONL 历史；退出时停止全部受管进程组。
 
@@ -100,11 +100,13 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `delivery/objects/`、`delivery/private/` | 交付对象与本机私密材料，目录 0700、文件 0600；完整恢复需保留整个 `delivery/` |
 | `join.json` | `vibeface join` 或本机网页进行中的加入请求，重试时沿用同一请求 |
 | `codex-app-server.pid` | 托管 App Server 的进程组号 |
-| `cursor-sdk-bridge.pid` | 常驻 Cursor SDK Bridge 的进程组号和程序路径，Node 启动时结束上次遗留且命令相符的进程组 |
-| `cursor/instances/<owner 摘要>/` | 每个 Cursor Bot、coordination Agent 或任务会话的私有 JSONL store；`bridge-state/` 保存 bridge discovery、令牌和 SDK 本机数据，目录 0700，不进入共享 DAG |
+| `cursor-agent.pid` | 受管 Cursor Agent CLI 的进程组号和程序路径，Node 启动时结束上次遗留且命令相符的进程组 |
+| `cursor/instances/<owner 摘要>/` | 每个 Cursor Bot、coordination Agent 或任务 owner 的私有目录；`config/`、`data/` 是官方 CLI 根，`sessions/` 记录归属，`prompts/` 保存发送前及终态 journal，目录 0700，不进入共享 DAG |
+| `providers/codex/local-login.json`、`providers/claude/local-login.json` | 首次导入的 CLI 凭据文件摘要标记，不含认证值；用户独立修改后不再借用本机登录 |
+| `providers/codex/local-login-access.json`、`providers/claude/local-login-access.json` | Node 专属访问令牌快照，0600，不含源刷新令牌；后续更新不写入 CLI 的 auth.json 或 .credentials.json |
 | `providers/pi/sessions/` | pi 原生会话文件，Node 的 `pi/` 仍保存恢复指针 |
 | `providers/opencode/` | OpenCode 私有 XDG 数据、配置、状态、缓存及数据库，不复制用户认证 |
-| `cursor/work-owners.json` | 本机 Cursor 任务到原生 Agent、会话 owner 和工作目录的映射，0600；不含模型密钥，不进入共享 DAG |
+| `cursor/work-owners.json` | 本机 Cursor 任务到 ACP 会话、owner 和工作目录的映射，0600；不含模型密钥，不进入共享 DAG |
 | `node.log`、`node.log.1`…`node.log.4` | Node 日志，JSON lines，0600，8 MiB 轮转，共保留 5 个 |
 | `service.*.log`、`update.*.log` | macOS 服务和更新器的标准输出与错误 |
 
@@ -127,7 +129,8 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `/api/relay/grant` | POST | `grants` 策略的公共入口：登记一张许可 `{grant}`，回 `{device_id, expires_at_ms}`，无效回 403 |
 | `/api/local/setup` | POST | 本机网页读取一次性初始化邀请或已有网络的当前入口；公共入口回 404 |
 | `/api/client` | GET，WebSocket upgrade | 浏览器网关 |
-| `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的随机回环端口上提供，是协调工具的唯一入口；Cursor SDK 回调和 `vibeface tool` 都发 `{toolName, args, agentId}`，回 `{result}`；Cursor 的 owner 进程在每轮发送前安装该 attempt 的 bearer，回调按 bearer 授权，`agentId` 不授予权限 |
+| `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的回环工具端口上提供；`vibeface tool` 发 `{toolName, args, agentId}`，回 `{result}`；按当前 attempt bearer 授权，`agentId` 不授予权限 |
+| `/mcp` | POST | 只在同一私有回环工具端口提供的无状态 Streamable HTTP MCP；initialize、tools/list、tools/call 均验证当前 attempt bearer，调用同一 Runtime.tool 与 call_ref 去重路径 |
 
 网站不提供用户名密码注册或明文业务 RPC。`/api/local/setup` 要求正文为 `{}`，实际 TCP 来源为 loopback，Host 为字面 localhost 或 loopback 地址，Origin 与该入口完整一致，且不带 `Forwarded`、`X-Forwarded-*` 或 `X-Real-IP`。未初始化时返回 `{ kind: "uninitialized", invitation: { url, device_id, capability } }`，已有网络时返回 `{ kind: "initialized", entry, removed, local_launch? }`，`removed` 表示这台电脑已被移出。该响应不授予成员资格。
 
@@ -281,7 +284,7 @@ steer 状态只在本机调度日志保存，同步和恢复不重放输入。�
 
 跨重启的 `running` 与 `cancelling` 进入 `reconciling` 并登记待核对，只查询原回合。Bot 回答与 job 终态在同一事务提交，`status` 为 `completed`、`failed`、`stopped` 或 `interrupted`，停止或中断保留已输出部分。`failed` 与 `interrupted` 带失败类别，原始错误留在本机 job 与 `node.log`，客户端按类别说明。
 
-失败类别 `failure` 取 `missing_key`、`auth_failed`、`quota`、`missing_binary`、`execution_disabled`、`no_model`、`no_bot`、`writer_busy`、`rejected`、`transport`、`timed_out`、`restarted`、`lost` 或 `unknown`。本仓库自己的错误在产生处直接给出类别；Cursor SDK 与 Codex App Server 的上游错误只在 `crates/bridge/src/failure.rs` 一处识别，Codex 回合错误先看 `codexErrorInfo`。回复、工作结果（`WorkFinished.failure`）、本机 job（`failure {kind, detail}`）和被拒的派发（含 `deliveries` 与 `workspace_overview.tasks`）都带同一类别。目标设备没有 Bot 接任务时拒绝派发并给出 `no_bot`；客户端按类别判断能否到那台设备的设置里修复，不匹配原因文字。
+失败类别 `failure` 取 `missing_key`、`auth_failed`、`quota`、`missing_binary`、`execution_disabled`、`no_model`、`no_bot`、`writer_busy`、`rejected`、`transport`、`timed_out`、`restarted`、`lost` 或 `unknown`。本仓库自己的错误在产生处直接给出类别；Cursor ACP 与 Codex App Server 的上游错误只在 `crates/bridge/src/failure.rs` 一处识别，Codex 回合错误先看 `codexErrorInfo`。回复、工作结果（`WorkFinished.failure`）、本机 job（`failure {kind, detail}`）和被拒的派发（含 `deliveries` 与 `workspace_overview.tasks`）都带同一类别。目标设备没有 Bot 接任务时拒绝派发并给出 `no_bot`；客户端按类别判断能否到那台设备的设置里修复，不匹配原因文字。
 
 ```text
 queued → claimed → running ─→ completed | failed

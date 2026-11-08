@@ -1,78 +1,64 @@
+//! Cursor's official local Agent over ACP. Authentication remains with the official CLI;
+//! this Node owns private ACP stores and a durable prompt journal. ACP has no native run query,
+//! so a submitted prompt without a recorded terminal stays unknown and is never sent again.
 use crate::{
     failure::{ExecFailure, FailureKind, ProviderStage},
     platform,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     future::Future,
-    hash::{BuildHasher, RandomState},
-    io::Write,
     net::IpAddr,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc, PoisonError,
-        atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Child,
-    sync::{Mutex, Notify, Semaphore, oneshot, watch},
-    task::JoinHandle,
-    time::Instant,
+    sync::{Mutex, mpsc, watch},
 };
 
 const MAX_FRAME_BYTES: usize = 1_048_576;
-const MAX_STREAM_BYTES: usize = 16_777_216;
 const MAX_RESULT_BYTES: usize = 65_536;
-const MAX_PROMPT_BYTES: usize = 86_016;
-const AGENT_SERVICE: &str = "SdkAgentService";
-const CONTROL_SERVICE: &str = "SdkBridgeControlService";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
-const STARTUP_DIAGNOSTIC_BYTES: usize = 2_048;
-const PING_TIMEOUT: Duration = Duration::from_secs(5);
-const METADATA_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_METADATA_BYTES: usize = 65_536;
-const MAX_METADATA_MODELS: usize = 512;
-/// Names the job objects the Cursor SDK bridges of this account run in.
-const SDK_TREE_KEY: &str = "cursor-sdk";
-const OWNER_IDLE_RETIRE: Duration = Duration::from_secs(10 * 60);
-const PROVIDER_PROBE_OWNER: &str = "provider-probe";
+const STOP_TIMEOUT: Duration = Duration::from_secs(6);
+static NEXT_PROCESS: AtomicU64 = AtomicU64::new(0);
 
-/// Durably records an SDK process group before the agent can act.
-pub type ProcessStarted = std::sync::Arc<
-    dyn Fn(u32) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
->;
+#[derive(Clone, Copy)]
+enum CursorCommand {
+    Acp,
+    Status,
+}
 
-/// Called after Cursor accepts a prompt and exposes its native run ID.
-pub type RunStarted = std::sync::Arc<
-    dyn Fn(String) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
->;
+pub type ProcessStarted =
+    Arc<dyn Fn(u32) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
+/// Called after actual provider activity is observed. Cursor supplies its Node prompt-receipt
+/// locator, not a native run ID: ACP has no such ID or durable run-query contract.
+pub type RunStarted =
+    Arc<dyn Fn(String) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
-/// One Cursor SDK turn on an owner-specific resident bridge.
 #[derive(Clone)]
-pub struct SdkTurn {
-    /// Stable process owner. Turns for different owners never share a bridge process.
+pub struct CursorTurn {
     pub owner: String,
+    pub client_id: String,
     pub executable: PathBuf,
     pub workspace: PathBuf,
-    /// Private Node directory containing this owner's bridge state and JSONL store.
     pub local_store_root: PathBuf,
-    pub api_key: String,
-    /// The engine's own variables for the bridge process; a different set starts a new bridge.
     pub env: BTreeMap<String, String>,
     pub model: String,
     pub timeout_secs: u64,
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
-    /// The attempt bearer used by this turn's custom-tool callback.
     pub callback_token: Option<String>,
     pub process_started: Option<ProcessStarted>,
-    /// The work journal's callback. It runs before any progress from this native run is exposed.
     pub run_started: Option<RunStarted>,
 }
 
@@ -86,51 +72,39 @@ pub struct CustomToolConfig {
     pub output_schema: Option<Value>,
 }
 
-#[derive(Clone)]
-pub struct ToolCallbackConfig {
-    pub url: String,
-    pub auth_token: String,
-}
-
 pub struct AgentResult {
     pub session_id: Option<String>,
     pub output: String,
     pub usage: Option<Value>,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SdkProviderAuthentication {
+pub enum CursorAuthentication {
     Unknown,
     Authenticated,
     SignInRequired,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SdkModel {
+pub struct CursorModel {
     pub id: String,
     pub display_name: String,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SdkCatalog {
+pub enum CursorCatalog {
     Unavailable,
-    Available { models: Vec<SdkModel> },
+    Available { models: Vec<CursorModel> },
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SdkProviderObservation {
-    pub authentication: SdkProviderAuthentication,
-    pub catalog: SdkCatalog,
+pub struct CursorObservation {
+    pub launchable: bool,
+    pub authentication: CursorAuthentication,
+    pub catalog: CursorCatalog,
 }
-
-/// How certain the end of a failed turn is; `ExecFailure` says why it failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentFailure {
     Failed,
     Cancelled,
     Unknown,
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartEvidence {
@@ -138,7 +112,6 @@ pub enum StartEvidence {
     Started,
     Unknown,
 }
-
 #[derive(Debug)]
 pub struct AgentRunError {
     pub stage: ProviderStage,
@@ -147,33 +120,1234 @@ pub struct AgentRunError {
     pub session_id: Option<String>,
     pub failure: ExecFailure,
 }
+impl std::fmt::Display for AgentRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.failure.fmt(f)
+    }
+}
+impl std::error::Error for AgentRunError {}
 
-/// The status a read of a known Cursor run can prove.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NativeStatus {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PromptStatus {
+    Submitted,
     Running,
     Completed,
     Cancelled,
     Failed { detail: String },
     Unknown,
 }
-
-/// A native Cursor run read by its persisted agent and run IDs.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NativeRun {
-    pub agent_id: String,
-    pub run_id: String,
-    pub status: NativeStatus,
+pub struct CursorPrompt {
+    pub session_id: String,
+    pub receipt_id: String,
+    pub status: PromptStatus,
     pub output: Option<String>,
 }
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptReceipt {
+    session: String,
+    id: String,
+    input_hash: String,
+    status: PromptStatus,
+    output: String,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionOwner {
+    session: String,
+    owner: String,
+    workspace: PathBuf,
+}
 
-impl std::fmt::Display for AgentRunError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.failure.fmt(formatter)
+pub struct CursorAgent {
+    env: BTreeMap<String, String>,
+    tool_origin: String,
+    processes: Arc<Processes>,
+    owners: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    active: std::sync::Mutex<BTreeMap<(PathBuf, String), watch::Sender<bool>>>,
+    stopped: AtomicBool,
+}
+struct Processes {
+    pidfile: Option<PathBuf>,
+    running: std::sync::Mutex<BTreeMap<String, Tracked>>,
+}
+#[derive(Clone)]
+struct Tracked {
+    executable: PathBuf,
+    identity: ProcessIdentity,
+    kill: watch::Sender<bool>,
+    exited: watch::Receiver<bool>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum ProcessIdentity {
+    #[cfg(unix)]
+    UnixStart(String),
+    #[cfg(windows)]
+    WindowsJob,
+    Exited,
+}
+#[derive(Serialize, Deserialize)]
+struct ProcessRecord {
+    token: String,
+    executable: PathBuf,
+    identity: ProcessIdentity,
+}
+
+#[cfg(unix)]
+fn process_start(process: u32) -> Result<String> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "lstart=", "-p", &process.to_string()])
+        .env("LC_ALL", "C")
+        .output()?;
+    ensure!(
+        output.status.success() && output.stdout.len() <= 128,
+        "could not identify the Cursor process start"
+    );
+    let value = String::from_utf8(output.stdout)?.trim().to_owned();
+    ensure!(!value.is_empty(), "Cursor process already exited");
+    Ok(value)
+}
+impl Processes {
+    fn save(&self, running: &BTreeMap<String, Tracked>) -> Result<()> {
+        let Some(path) = &self.pidfile else {
+            return Ok(());
+        };
+        if running.is_empty() {
+            return match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            };
+        }
+        let records: Vec<_> = running
+            .iter()
+            .map(|(token, tracked)| ProcessRecord {
+                token: token.clone(),
+                executable: tracked.executable.clone(),
+                identity: tracked.identity.clone(),
+            })
+            .collect();
+        platform::privatefs::write_atomic(path, &serde_json::to_vec(&records)?)
+    }
+    fn track(&self, token: String, tracked: Tracked) -> Result<()> {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        running.insert(token, tracked);
+        self.save(&running)
+    }
+    fn forget(&self, token: &str) {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        running.remove(token);
+        let _ = self.save(&running);
+    }
+}
+struct Rpc {
+    group: u32,
+    outgoing: mpsc::Sender<Value>,
+    incoming: mpsc::Receiver<Value>,
+    kill: watch::Sender<bool>,
+    exited: watch::Receiver<bool>,
+}
+impl Drop for Rpc {
+    fn drop(&mut self) {
+        let _ = self.kill.send(true);
+    }
+}
+impl Rpc {
+    async fn send(&self, value: Value) -> Result<()> {
+        self.outgoing
+            .send(value)
+            .await
+            .map_err(|_| anyhow!("Cursor ACP transport closed"))
+    }
+    async fn close(mut self) {
+        let _ = self.kill.send(true);
+        let _ = self.exited.wait_for(|v| *v).await;
     }
 }
 
-impl std::error::Error for AgentRunError {}
+fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+fn receipt_id(client_id: &str) -> String {
+    format!("acp-{}", digest(client_id.as_bytes()))
+}
+fn receipt_path(root: &Path, id: &str) -> Result<PathBuf> {
+    vibeface_protocol::validate_id(id).map_err(anyhow::Error::msg)?;
+    Ok(root.join("prompts").join(format!("{id}.json")))
+}
+fn write_receipt(root: &Path, receipt: &PromptReceipt) -> Result<()> {
+    let path = receipt_path(root, &receipt.id)?;
+    platform::privatefs::create_dir(path.parent().context("prompt journal has no parent")?)?;
+    platform::privatefs::write_atomic(&path, &serde_json::to_vec(receipt)?)
+}
+fn read_receipt(root: &Path, id: &str) -> Result<Option<PromptReceipt>> {
+    let file = match platform::privatefs::open_no_follow(&receipt_path(root, id)?) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => bail!("could not read Cursor prompt journal"),
+    };
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take((MAX_RESULT_BYTES * 2) as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= MAX_RESULT_BYTES * 2,
+        "Cursor prompt journal is too large"
+    );
+    let receipt: PromptReceipt =
+        serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid Cursor prompt journal"))?;
+    ensure!(receipt.id == id, "Cursor prompt journal identity changed");
+    Ok(Some(receipt))
+}
+fn owner_path(turn: &CursorTurn, session: &str) -> Result<PathBuf> {
+    vibeface_protocol::validate_id(session).map_err(anyhow::Error::msg)?;
+    Ok(turn
+        .local_store_root
+        .join("sessions")
+        .join(format!("{session}.json")))
+}
+fn validate_session_owner(turn: &CursorTurn, session: &str) -> Result<()> {
+    let file = platform::privatefs::open_no_follow(&owner_path(turn, session)?)
+        .map_err(|_| anyhow!("Cursor session is not owned by this Node instance"))?;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(8193).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 8192, "invalid Cursor session owner");
+    let owner: SessionOwner =
+        serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid Cursor session owner"))?;
+    ensure!(
+        owner.session == session && owner.owner == turn.owner && owner.workspace == turn.workspace,
+        "Cursor session belongs to a different owner or workspace"
+    );
+    Ok(())
+}
+fn record_session_owner(turn: &CursorTurn, session: &str) -> Result<()> {
+    let path = owner_path(turn, session)?;
+    platform::privatefs::create_dir(path.parent().context("session owner has no parent")?)?;
+    platform::privatefs::write_atomic(
+        &path,
+        &serde_json::to_vec(&SessionOwner {
+            session: session.into(),
+            owner: turn.owner.clone(),
+            workspace: turn.workspace.clone(),
+        })?,
+    )
+}
+
+impl CursorAgent {
+    pub fn new(
+        env: BTreeMap<String, String>,
+        tool_origin: String,
+        pidfile: Option<PathBuf>,
+    ) -> Result<Self> {
+        validate_origin(&tool_origin)?;
+        ensure!(
+            env.len() <= 64
+                && env.iter().all(|(name, value)| name.starts_with("VIBEFACE_")
+                    && name != "VIBEFACE_TOOL_TOKEN"
+                    && name.len() <= 256
+                    && name.bytes().all(|c| c == b'_' || c.is_ascii_alphanumeric())
+                    && value.len() <= 4096
+                    && !value.contains('\0')),
+            "invalid Cursor host tool environment"
+        );
+        Ok(Self {
+            env,
+            tool_origin,
+            processes: Arc::new(Processes {
+                pidfile,
+                running: Default::default(),
+            }),
+            owners: Mutex::default(),
+            active: Default::default(),
+            stopped: AtomicBool::new(false),
+        })
+    }
+    pub fn kill_orphan(pidfile: &Path) {
+        let Ok(bytes) = std::fs::read(pidfile) else {
+            return;
+        };
+        let Ok(records) = serde_json::from_slice::<Vec<ProcessRecord>>(&bytes) else {
+            return;
+        };
+        for record in records {
+            let same = match record.identity {
+                #[cfg(unix)]
+                ProcessIdentity::UnixStart(expected) => record
+                    .token
+                    .parse()
+                    .ok()
+                    .and_then(|pid| process_start(pid).ok())
+                    .is_some_and(|current| current == expected),
+                #[cfg(windows)]
+                ProcessIdentity::WindowsJob => true,
+                ProcessIdentity::Exited => false,
+            };
+            if same {
+                #[cfg(unix)]
+                let accepted = |member: &str| {
+                    member.contains(&record.executable.to_string_lossy().to_string())
+                };
+                // The Windows job token already binds the root's creation time and job key.
+                #[cfg(windows)]
+                let accepted = |_: &str| true;
+                let _ = platform::tree::stop_recorded(&record.token, accepted);
+            }
+        }
+        let _ = std::fs::remove_file(pidfile);
+    }
+    pub async fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.retire_all().await;
+    }
+    pub async fn retire_all(&self) {
+        let running: Vec<_> = self
+            .processes
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for tracked in &running {
+            let _ = tracked.kill.send(true);
+        }
+        for mut tracked in running {
+            let _ = tracked.exited.wait_for(|v| *v).await;
+        }
+    }
+    async fn spawn(
+        &self,
+        executable: &Path,
+        workspace: &Path,
+        root: &Path,
+        env: &BTreeMap<String, String>,
+        model: &str,
+        mode: CursorCommand,
+    ) -> Result<Rpc> {
+        ensure!(
+            !self.stopped.load(Ordering::SeqCst),
+            "Cursor agent is stopped"
+        );
+        ensure!(
+            workspace.is_absolute() && workspace.is_dir() && root.is_absolute(),
+            "Cursor needs an existing absolute workspace and private store"
+        );
+        for directory in [root.to_path_buf(), root.join("config"), root.join("data")] {
+            platform::privatefs::create_dir(&directory)?;
+        }
+        validate_launch_env(env)?;
+        let mut command = std::process::Command::new(executable);
+        command
+            .current_dir(workspace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (name, _) in std::env::vars_os() {
+            let text = name.to_string_lossy();
+            if text.starts_with("VIBEFACE_")
+                || text.starts_with("CURSOR_")
+                || text == "AGENT_CLI_CREDENTIAL_STORE"
+            {
+                command.env_remove(name);
+            }
+        }
+        command
+            .envs(env)
+            .envs(&self.env)
+            .env("CURSOR_CONFIG_DIR", root.join("config"))
+            .env("CURSOR_DATA_DIR", root.join("data"));
+        if env.contains_key("CURSOR_API_KEY") || env.contains_key("CURSOR_AUTH_TOKEN") {
+            command.env("AGENT_CLI_CREDENTIAL_STORE", "memory");
+        }
+        if !model.is_empty() {
+            command.args(["--model", model]);
+        }
+        match mode {
+            CursorCommand::Acp => {
+                command.arg("acp");
+            }
+            CursorCommand::Status => {
+                command.args(["status", "--format", "json"]);
+            }
+        }
+        let key = format!(
+            "cursor-acp-{}-{}-{}",
+            std::process::id(),
+            NEXT_PROCESS.fetch_add(1, Ordering::SeqCst),
+            digest(root.to_string_lossy().as_bytes())
+        );
+        let (mut tree, mut child) = platform::tree::Tree::spawn(command, &key, true)?;
+        let group = child.id().context("Cursor ACP process has no ID")?;
+        #[cfg(unix)]
+        let identity = match process_start(group) {
+            Ok(start) => ProcessIdentity::UnixStart(start),
+            Err(error) => {
+                if child.try_wait()?.is_some() {
+                    ProcessIdentity::Exited
+                } else {
+                    tree.kill();
+                    let _ = child.wait().await;
+                    return Err(error);
+                }
+            }
+        };
+        #[cfg(windows)]
+        let identity = ProcessIdentity::WindowsJob;
+        let token = tree.token().to_owned();
+        let mut stdin = child.stdin.take().context("Cursor ACP stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Cursor ACP stdout unavailable")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Cursor ACP stderr unavailable")?;
+        let (outgoing, mut requests) = mpsc::channel::<Value>(32);
+        let (responses, incoming) = mpsc::channel(128);
+        let (kill, mut killed) = watch::channel(false);
+        let (exit, exited) = watch::channel(false);
+        if let Err(error) = self.processes.track(
+            token.clone(),
+            Tracked {
+                executable: executable.into(),
+                identity,
+                kill: kill.clone(),
+                exited: exited.clone(),
+            },
+        ) {
+            tree.kill();
+            let _ = child.wait().await;
+            return Err(error);
+        }
+        let processes = self.processes.clone();
+        tokio::spawn(async move {
+            let mut stdout_joined = false;
+            let mut stdout_task = tokio::spawn(async move {
+                let mut reader = BufReader::new(stdout);
+                if matches!(mode, CursorCommand::Status) {
+                    let mut bytes = Vec::new();
+                    reader.take(65_537).read_to_end(&mut bytes).await?;
+                    ensure!(bytes.len() <= 65_536, "Cursor status response is too large");
+                    let value: Value = serde_json::from_slice(&bytes)
+                        .map_err(|_| anyhow!("Cursor status response is invalid"))?;
+                    let _ = responses.send(value).await;
+                    return Ok::<(), anyhow::Error>(());
+                }
+                loop {
+                    let frame = bounded_line(&mut reader, MAX_FRAME_BYTES).await?;
+                    ensure!(!frame.is_empty(), "Cursor ACP stdout closed");
+                    let value: Value = serde_json::from_slice(&frame)
+                        .map_err(|_| anyhow!("Cursor ACP returned invalid JSON"))?;
+                    ensure!(
+                        value.is_object() && value["jsonrpc"] == "2.0",
+                        "invalid Cursor ACP message"
+                    );
+                    if responses.send(value).await.is_err() {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                }
+            });
+            let stderr_task = tokio::spawn(async move {
+                let mut stderr = stderr;
+                let mut chunk = [0u8; 4096];
+                while matches!(stderr.read(&mut chunk).await, Ok(n) if n > 0) {}
+            });
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = wait_for_cancel(&mut killed) => break,
+                    _ = &mut stdout_task => { stdout_joined = true; break; },
+                    value = requests.recv() => {
+                        let Some(value) = value else { break; };
+                        let Ok(mut bytes) = serde_json::to_vec(&value) else { break; };
+                        if bytes.len() > MAX_FRAME_BYTES { break; }
+                        bytes.push(b'\n');
+                        let written = tokio::select! { result = stdin.write_all(&bytes) => result.is_ok(), _ = wait_for_cancel(&mut killed) => false };
+                        if !written { break; }
+                    }
+                }
+            }
+            let _ = terminate_process_tree(&mut child, &mut tree).await;
+            stdout_task.abort();
+            stderr_task.abort();
+            if !stdout_joined {
+                let _ = stdout_task.await;
+            }
+            let _ = stderr_task.await;
+            drop(stdin);
+            drop(child);
+            drop(tree);
+            processes.forget(&token);
+            let _ = exit.send(true);
+        });
+        Ok(Rpc {
+            group,
+            outgoing,
+            incoming,
+            kill,
+            exited,
+        })
+    }
+    async fn subscription_authentication(
+        &self,
+        executable: &Path,
+        workspace: &Path,
+        root: &Path,
+        env: &BTreeMap<String, String>,
+    ) -> Result<CursorAuthentication> {
+        let mut rpc = self
+            .spawn(executable, workspace, root, env, "", CursorCommand::Status)
+            .await?;
+        let result = tokio::time::timeout(Duration::from_secs(5), rpc.incoming.recv())
+            .await
+            .ok()
+            .flatten();
+        rpc.close().await;
+        let Some(value) = result else {
+            return Ok(CursorAuthentication::Unknown);
+        };
+        // status exits 0 for authenticated, partial and signed-out states. Discard identity,
+        // messages and all other fields; only its explicit local-login schema is evidence.
+        let valid = matches!(value["isAuthenticated"], Value::Bool(_))
+            && matches!(value["hasAccessToken"], Value::Bool(_))
+            && matches!(value["hasRefreshToken"], Value::Bool(_));
+        Ok(
+            if valid
+                && value["status"] == "authenticated"
+                && value["isAuthenticated"] == true
+                && value["hasAccessToken"] == true
+                && value["hasRefreshToken"] == true
+            {
+                CursorAuthentication::Authenticated
+            } else if valid
+                && value["isAuthenticated"] == false
+                && matches!(
+                    value["status"].as_str(),
+                    Some("partially-authenticated" | "unauthenticated")
+                )
+            {
+                CursorAuthentication::SignInRequired
+            } else {
+                CursorAuthentication::Unknown
+            },
+        )
+    }
+    async fn initialize(&self, rpc: &mut Rpc) -> Result<Value> {
+        rpc.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"vibeface","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}}})).await?;
+        let response = rpc_response(rpc, 1, None, false, &mut |_| async { Ok(()) }).await?;
+        ensure!(
+            response["protocolVersion"] == 1,
+            "Cursor ACP protocol is unsupported"
+        );
+        Ok(response)
+    }
+    fn mcp_servers(&self, capabilities: &Value, turn: &CursorTurn) -> Result<Value> {
+        if turn.custom_tools.is_empty() {
+            return Ok(json!([]));
+        }
+        ensure!(
+            capabilities["agentCapabilities"]["mcpCapabilities"]["http"] == true,
+            "Cursor ACP does not support HTTP MCP tools"
+        );
+        let token = turn
+            .callback_token
+            .as_ref()
+            .context("Cursor tools need a scoped attempt bearer")?;
+        ensure!(
+            (32..=4096).contains(&token.len()) && !token.chars().any(char::is_control),
+            "invalid Cursor tool bearer"
+        );
+        Ok(
+            json!([{"type":"http","name":"vibeface","url":format!("{}/mcp", self.tool_origin.trim_end_matches('/')),"headers":[{"name":"Authorization","value":format!("Bearer {token}")}]}]),
+        )
+    }
+    pub async fn provider_observation(
+        &self,
+        executable: &Path,
+        workspace: &Path,
+        root: &Path,
+        env: &BTreeMap<String, String>,
+    ) -> Result<CursorObservation> {
+        let mut authentication = CursorAuthentication::Unknown;
+        if !env.contains_key("CURSOR_API_KEY") && !env.contains_key("CURSOR_AUTH_TOKEN") {
+            authentication = self
+                .subscription_authentication(executable, workspace, root, env)
+                .await?;
+            if authentication != CursorAuthentication::Authenticated {
+                return Ok(CursorObservation {
+                    launchable: false,
+                    authentication,
+                    catalog: CursorCatalog::Unavailable,
+                });
+            }
+        }
+        let mut rpc = self
+            .spawn(executable, workspace, root, env, "", CursorCommand::Acp)
+            .await?;
+        let operation = async {
+            self.initialize(&mut rpc).await?;
+            // The official CLI checks its existing authentication on session/new. Calling
+            // authenticate would start browser login when credentials are missing.
+            rpc.send(json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":workspace,"mcpServers":[]}})).await?;
+            match rpc_response(&mut rpc, 3, None, false, &mut |_| async { Ok(()) }).await {
+                Ok(response) => Ok(CursorObservation {
+                    launchable: true,
+                    authentication: CursorAuthentication::Authenticated,
+                    catalog: cursor_models(&response, env),
+                }),
+                Err(error)
+                    if error
+                        .downcast_ref::<AcpError>()
+                        .is_some_and(|e| e.code == -32000) =>
+                {
+                    Ok(CursorObservation {
+                        launchable: true,
+                        authentication: CursorAuthentication::SignInRequired,
+                        catalog: CursorCatalog::Unavailable,
+                    })
+                }
+                Err(_) => Ok(CursorObservation {
+                    launchable: true,
+                    authentication,
+                    catalog: CursorCatalog::Unavailable,
+                }),
+            }
+        };
+        let result = tokio::time::timeout(STARTUP_TIMEOUT, operation)
+            .await
+            .map_err(|_| anyhow!("Cursor authentication check timed out"))?;
+        rpc.close().await;
+        result
+    }
+    pub async fn run<F, P, PF>(
+        &self,
+        turn: &CursorTurn,
+        prompt: &str,
+        previous: Option<&str>,
+        persist_session: impl FnOnce(String) -> F,
+        mut cancel: watch::Receiver<bool>,
+        mut progress: P,
+    ) -> Result<AgentResult, AgentRunError>
+    where
+        F: Future<Output = Result<()>>,
+        P: FnMut(Value) -> PF,
+        PF: Future<Output = Result<()>>,
+    {
+        let mut stage = ProviderStage::Validate;
+        let mut session = previous.map(str::to_owned);
+        let mut submitted = false;
+        let mut observed = false;
+        let secrets: Vec<&str> = turn
+            .env
+            .values()
+            .chain(self.env.values())
+            .map(String::as_str)
+            .chain(turn.callback_token.as_deref())
+            .collect();
+        let operation = async {
+            validate_turn(turn, prompt)?;
+            let id = receipt_id(&turn.client_id);
+            let input_hash = digest(&serde_json::to_vec(&(
+                prompt,
+                &turn.model,
+                &turn.workspace,
+            ))?);
+            let owner = {
+                let mut owners = self.owners.lock().await;
+                owners.retain(|_, owner| Arc::strong_count(owner) > 1);
+                owners
+                    .entry(turn.owner.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone()
+            };
+            let _owner = tokio::select! { guard = owner.lock() => guard, _ = wait_for_cancel(&mut cancel) => bail!("Cursor cancelled before prompt submission") };
+            if let Some(receipt) = read_receipt(&turn.local_store_root, &id)? {
+                ensure!(
+                    receipt.input_hash == input_hash,
+                    "Cursor prompt reference was reused with different input"
+                );
+                session = Some(receipt.session.clone());
+                if receipt.status == PromptStatus::Completed {
+                    return Ok(AgentResult {
+                        session_id: session.clone(),
+                        output: receipt.output,
+                        usage: None,
+                    });
+                }
+                submitted = true;
+                bail!(
+                    "Cursor prompt was already submitted; reconcile its recorded result before retrying"
+                );
+            }
+            if let Some(previous) = previous {
+                validate_session_owner(turn, previous)?;
+            }
+            if *cancel.borrow() {
+                bail!("Cursor cancelled before prompt submission");
+            }
+            if !turn.env.contains_key("CURSOR_API_KEY")
+                && !turn.env.contains_key("CURSOR_AUTH_TOKEN")
+            {
+                stage = ProviderStage::Authentication;
+                ensure!(
+                    self.subscription_authentication(
+                        &turn.executable,
+                        &turn.workspace,
+                        &turn.local_store_root,
+                        &turn.env
+                    )
+                    .await?
+                        == CursorAuthentication::Authenticated,
+                    "Cursor CLI login is missing or unverified; run agent login explicitly"
+                );
+            }
+            stage = ProviderStage::Launch;
+            let mut rpc = self
+                .spawn(
+                    &turn.executable,
+                    &turn.workspace,
+                    &turn.local_store_root,
+                    &turn.env,
+                    &turn.model,
+                    CursorCommand::Acp,
+                )
+                .await?;
+            let setup = async {
+                if let Some(record) = &turn.process_started {
+                    record(rpc.group).await?;
+                }
+                let capabilities = self.initialize(&mut rpc).await?;
+                stage = ProviderStage::SessionStart;
+                let servers = self.mcp_servers(&capabilities, turn)?;
+                let reply = if let Some(previous) = previous {
+                    ensure!(
+                        capabilities["agentCapabilities"]["loadSession"] == true,
+                        "Cursor ACP does not support loading this session"
+                    );
+                    rpc.send(json!({"jsonrpc":"2.0","id":3,"method":"session/load","params":{"sessionId":previous,"cwd":turn.workspace,"mcpServers":servers}})).await?;
+                    rpc_response(&mut rpc, 3, Some(previous), false, &mut |_| async {
+                        Ok(())
+                    })
+                    .await?;
+                    previous.to_owned()
+                } else {
+                    rpc.send(json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":turn.workspace,"mcpServers":servers}})).await?;
+                    let created =
+                        rpc_response(&mut rpc, 3, None, false, &mut |_| async { Ok(()) }).await?;
+                    let session = created["sessionId"]
+                        .as_str()
+                        .context("Cursor ACP returned no session ID")?
+                        .to_owned();
+                    record_session_owner(turn, &session)?;
+                    session
+                };
+                session = Some(reply.clone());
+                stage = ProviderStage::Record;
+                persist_session(reply.clone()).await?;
+                Ok::<_, anyhow::Error>(reply)
+            };
+            let session_id = match tokio::time::timeout(STARTUP_TIMEOUT, setup).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!("Cursor ACP session setup timed out")),
+            }?;
+            if *cancel.borrow() {
+                rpc.close().await;
+                bail!("Cursor cancelled before prompt submission");
+            }
+            let mut receipt = PromptReceipt {
+                session: session_id.clone(),
+                id: id.clone(),
+                input_hash,
+                status: PromptStatus::Submitted,
+                output: String::new(),
+            };
+            write_receipt(&turn.local_store_root, &receipt)?;
+            submitted = true;
+            stage = ProviderStage::TurnStart;
+            let (stop, mut stopped) = watch::channel(false);
+            self.active
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert((turn.local_store_root.clone(), id.clone()), stop);
+            rpc.send(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":session_id,"prompt":[{"type":"text","text":prompt}]}})).await?;
+            let mut pending = BTreeMap::new();
+            let mut update = |value: Value| {
+                let value = redact_stream_progress(value, &secrets, &mut pending);
+                progress(value)
+            };
+            let result = {
+                let running = prompt_response(
+                    &mut rpc,
+                    &session_id,
+                    &id,
+                    turn,
+                    &mut receipt,
+                    &mut observed,
+                    &mut update,
+                );
+                tokio::pin!(running);
+                tokio::select! {
+                    result = tokio::time::timeout(Duration::from_secs(turn.timeout_secs),&mut running) => result.ok(),
+                    _ = wait_for_cancel(&mut cancel) => None,
+                    _ = wait_for_cancel(&mut stopped) => None,
+                }
+            };
+            let result = match result {
+                Some(result) => result,
+                None => {
+                    stage = ProviderStage::Interrupt;
+                    rpc.send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session_id}})).await?;
+                    tokio::time::timeout(
+                        STOP_TIMEOUT,
+                        prompt_response(
+                            &mut rpc,
+                            &session_id,
+                            &id,
+                            turn,
+                            &mut receipt,
+                            &mut observed,
+                            &mut update,
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(anyhow!(
+                            "Cursor cancellation has no confirmed terminal; result is unknown"
+                        ))
+                    })
+                }
+            };
+            self.active
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&(turn.local_store_root.clone(), id.clone()));
+            rpc.close().await;
+            let stop_reason = result?;
+            receipt.output = redact_text(receipt.output, &secrets);
+            receipt.status = match stop_reason.as_str() {
+                "end_turn" => PromptStatus::Completed,
+                "cancelled" => PromptStatus::Cancelled,
+                "max_tokens" | "max_turn_requests" => PromptStatus::Failed {
+                    detail: "Cursor stopped at its turn limit".into(),
+                },
+                _ => bail!("Cursor ACP returned an unknown stop reason"),
+            };
+            // The terminal is committed before callbacks or the caller can observe completion.
+            write_receipt(&turn.local_store_root, &receipt)?;
+            if receipt.status == PromptStatus::Cancelled {
+                bail!("Cursor prompt was cancelled by the provider");
+            }
+            if let PromptStatus::Failed { detail } = &receipt.status {
+                bail!("{detail}");
+            }
+            progress(json!({"type":"text_snapshot","item_id":id,"text":receipt.output})).await?;
+            Ok(AgentResult {
+                session_id: Some(session_id),
+                output: receipt.output,
+                usage: None,
+            })
+        };
+        let problem = match operation.await {
+            Ok(result) => return Ok(result),
+            Err(error) => error,
+        };
+        let id = receipt_id(&turn.client_id);
+        self.active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(turn.local_store_root.clone(), id.clone()));
+        let terminal = read_receipt(&turn.local_store_root, &id).ok().flatten();
+        let outcome = if terminal
+            .as_ref()
+            .is_some_and(|r| r.status == PromptStatus::Cancelled)
+        {
+            AgentFailure::Cancelled
+        } else if terminal
+            .as_ref()
+            .is_some_and(|r| matches!(r.status, PromptStatus::Failed { .. }))
+        {
+            AgentFailure::Failed
+        } else if submitted {
+            AgentFailure::Unknown
+        } else if *cancel.borrow() {
+            AgentFailure::Cancelled
+        } else {
+            AgentFailure::Failed
+        };
+        let kind = if stage == ProviderStage::Authentication
+            || problem
+                .downcast_ref::<AcpError>()
+                .is_some_and(|error| error.code == -32000)
+        {
+            FailureKind::AuthFailed
+        } else if problem
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            FailureKind::MissingBinary
+        } else {
+            FailureKind::Unknown
+        };
+        Err(AgentRunError {
+            stage,
+            outcome,
+            start: if observed {
+                StartEvidence::Started
+            } else if submitted {
+                StartEvidence::Unknown
+            } else {
+                StartEvidence::NotStarted
+            },
+            session_id: session,
+            failure: ExecFailure::upstream(redact_text(format!("{problem:#}"), &secrets), kind),
+        })
+    }
+    pub async fn probe(&self, turn: &CursorTurn, session: &str, id: &str) -> Result<CursorPrompt> {
+        validate_session_owner(turn, session)?;
+        let receipt = read_receipt(&turn.local_store_root, id)?
+            .context("Cursor prompt receipt is missing")?;
+        ensure!(
+            receipt.session == session,
+            "Cursor prompt belongs to another session"
+        );
+        let status = if matches!(
+            receipt.status,
+            PromptStatus::Submitted | PromptStatus::Running
+        ) {
+            if self
+                .active
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&(turn.local_store_root.clone(), id.into()))
+            {
+                PromptStatus::Running
+            } else {
+                PromptStatus::Unknown
+            }
+        } else {
+            receipt.status
+        };
+        Ok(CursorPrompt {
+            session_id: session.into(),
+            receipt_id: id.into(),
+            status,
+            output: Some(receipt.output),
+        })
+    }
+    pub async fn cancel(&self, turn: &CursorTurn, session: &str, id: &str) -> Result<()> {
+        validate_session_owner(turn, session)?;
+        let receipt = read_receipt(&turn.local_store_root, id)?
+            .context("Cursor prompt receipt is missing")?;
+        ensure!(
+            receipt.session == session,
+            "Cursor prompt belongs to another session"
+        );
+        if let Some(stop) = self
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(turn.local_store_root.clone(), id.into()))
+        {
+            let _ = stop.send(true);
+        }
+        Ok(())
+    }
+}
+
+fn cursor_models(response: &Value, env: &BTreeMap<String, String>) -> CursorCatalog {
+    let Some(models) = response["models"]["availableModels"]
+        .as_array()
+        .filter(|models| models.len() <= 512)
+    else {
+        return CursorCatalog::Unavailable;
+    };
+    let mut parsed = Vec::new();
+    for model in models {
+        let valid = |value: &&str| {
+            !value.is_empty()
+                && value.len() <= 256
+                && !value.chars().any(char::is_control)
+                && !env
+                    .values()
+                    .any(|secret| !secret.is_empty() && value.contains(secret))
+        };
+        let Some(id) = model["modelId"].as_str().filter(valid) else {
+            return CursorCatalog::Unavailable;
+        };
+        let Some(name) = model["name"].as_str().filter(valid) else {
+            return CursorCatalog::Unavailable;
+        };
+        parsed.push(CursorModel {
+            id: id.into(),
+            display_name: name.into(),
+        });
+    }
+    CursorCatalog::Available { models: parsed }
+}
+
+#[derive(Debug)]
+struct AcpError {
+    code: i64,
+}
+impl std::fmt::Display for AcpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Cursor ACP request rejected ({})", self.code)
+    }
+}
+impl std::error::Error for AcpError {}
+async fn rpc_response<P, PF>(
+    rpc: &mut Rpc,
+    id: u64,
+    session: Option<&str>,
+    running: bool,
+    progress: &mut P,
+) -> Result<Value>
+where
+    P: FnMut(Value) -> PF,
+    PF: Future<Output = Result<()>>,
+{
+    loop {
+        let message = rpc
+            .incoming
+            .recv()
+            .await
+            .context("Cursor ACP disconnected; result is unknown")?;
+        if message.get("method").is_some() {
+            handle_message(rpc, &message, session, running, progress).await?;
+        } else if message["id"] == id {
+            if let Some(error) = message.get("error") {
+                return Err(AcpError {
+                    code: error["code"].as_i64().unwrap_or(-32603),
+                }
+                .into());
+            }
+            return message
+                .get("result")
+                .filter(|v| v.is_object())
+                .cloned()
+                .context("Cursor ACP response has no result");
+        }
+    }
+}
+async fn prompt_response<P, PF>(
+    rpc: &mut Rpc,
+    session: &str,
+    id: &str,
+    turn: &CursorTurn,
+    receipt: &mut PromptReceipt,
+    observed: &mut bool,
+    progress: &mut P,
+) -> Result<String>
+where
+    P: FnMut(Value) -> PF,
+    PF: Future<Output = Result<()>>,
+{
+    loop {
+        let message = rpc
+            .incoming
+            .recv()
+            .await
+            .context("Cursor ACP disconnected; result is unknown")?;
+        let matching_update =
+            message["method"] == "session/update" && message["params"]["sessionId"] == session;
+        let matching_response = message["id"] == 4 && message.get("method").is_none();
+        if (matching_update || matching_response) && !*observed {
+            *observed = true;
+            receipt.status = PromptStatus::Running;
+            write_receipt(&turn.local_store_root, receipt)?;
+            if let Some(started) = &turn.run_started {
+                started(id.into()).await?;
+            }
+        }
+        if matching_update
+            && message["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+            && let Some(text) = message["params"]["update"]["content"]["text"].as_str()
+        {
+            ensure!(
+                receipt.output.len() + text.len() <= MAX_RESULT_BYTES,
+                "Cursor reply exceeds the output limit"
+            );
+            receipt.output.push_str(text);
+        }
+        if message.get("method").is_some() {
+            handle_message(rpc, &message, Some(session), true, progress).await?;
+        } else if matching_response {
+            if let Some(error) = message.get("error") {
+                return Err(AcpError {
+                    code: error["code"].as_i64().unwrap_or(-32603),
+                }
+                .into());
+            }
+            return message["result"]["stopReason"]
+                .as_str()
+                .map(str::to_owned)
+                .context("Cursor prompt returned no stop reason");
+        }
+    }
+}
+async fn handle_message<P, PF>(
+    rpc: &Rpc,
+    message: &Value,
+    session: Option<&str>,
+    running: bool,
+    progress: &mut P,
+) -> Result<()>
+where
+    P: FnMut(Value) -> PF,
+    PF: Future<Output = Result<()>>,
+{
+    let method = message["method"].as_str().unwrap_or_default();
+    let params = &message["params"];
+    let current = running && session.is_some_and(|id| params["sessionId"] == id);
+    if let Some(id) = message.get("id") {
+        let result = match method {
+            "session/request_permission" => permission_response(params, current),
+            "cursor/ask_question" => json!({"outcome":{"outcome":"cancelled"}}),
+            "cursor/create_plan" => {
+                json!({"outcome":{"outcome":"rejected","reason":"Continue with the Node task and use its decision tools when user input is required."}})
+            }
+            _ => {
+                rpc.send(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Client method is not supported"}})).await?;
+                return Ok(());
+            }
+        };
+        rpc.send(json!({"jsonrpc":"2.0","id":id,"result":result}))
+            .await?;
+        if current && matches!(method, "cursor/ask_question" | "cursor/create_plan") {
+            progress(json!({"type":"status","status":"interaction_declined","text":"Cursor 请求的交互已取消；需要本人决定时请通过节点提问。"})).await?;
+        }
+    } else if method == "session/update" && current {
+        let update = &params["update"];
+        match update["sessionUpdate"].as_str() {
+            Some("agent_message_chunk") => {
+                if let Some(text) = update["content"]["text"].as_str() {
+                    progress(json!({"type":"text_delta","item_id":"cursor-answer","text":text}))
+                        .await?;
+                }
+            }
+            Some("tool_call" | "tool_call_update") => {
+                let mut value = json!({"type":"tool"});
+                for (source, target) in [
+                    ("title", "name"),
+                    ("status", "status"),
+                    ("toolCallId", "item_id"),
+                ] {
+                    if let Some(text) = update[source]
+                        .as_str()
+                        .filter(|v| v.len() <= 256 && !v.chars().any(char::is_control))
+                    {
+                        value[target] = json!(text);
+                    }
+                }
+                progress(value).await?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+fn permission_response(params: &Value, current: bool) -> Value {
+    let known = matches!(
+        params["toolCall"]["kind"].as_str(),
+        Some("read" | "edit" | "delete" | "move" | "search" | "execute" | "fetch" | "think")
+    );
+    let preferred = if current && known {
+        "allow_once"
+    } else {
+        "reject_once"
+    };
+    if let Some(option) = params["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|option| option["kind"] == preferred)
+        && let Some(id) = option["optionId"]
+            .as_str()
+            .filter(|v| !v.is_empty() && v.len() <= 256)
+    {
+        json!({"outcome":{"outcome":"selected","optionId":id}})
+    } else {
+        json!({"outcome":{"outcome":"cancelled"}})
+    }
+}
+fn validate_turn(turn: &CursorTurn, prompt: &str) -> Result<()> {
+    ensure!(
+        !turn.owner.is_empty() && turn.owner.len() <= 512,
+        "invalid Cursor owner"
+    );
+    vibeface_protocol::validate_id(&turn.client_id).map_err(anyhow::Error::msg)?;
+    ensure!(
+        !prompt.trim().is_empty() && prompt.len() <= 86_016 && turn.timeout_secs > 0,
+        "invalid Cursor prompt or timeout"
+    );
+    ensure!(
+        turn.workspace.is_absolute()
+            && turn.workspace.is_dir()
+            && turn.local_store_root.is_absolute(),
+        "Cursor requires private absolute paths"
+    );
+    validate_launch_env(&turn.env)
+}
+fn validate_launch_env(env: &BTreeMap<String, String>) -> Result<()> {
+    ensure!(env.len() <= 64, "too many Cursor environment entries");
+    for (name, value) in env {
+        ensure!(
+            !name.is_empty()
+                && name.len() <= 256
+                && name.bytes().enumerate().all(|(i, c)| c == b'_'
+                    || c.is_ascii_alphabetic()
+                    || (i > 0 && c.is_ascii_digit()))
+                && !name.starts_with("VIBEFACE_")
+                && !matches!(name.as_str(), "CURSOR_CONFIG_DIR" | "CURSOR_DATA_DIR")
+                && value.len() <= 4096
+                && !value.contains('\0'),
+            "invalid or reserved Cursor environment entry"
+        );
+    }
+    Ok(())
+}
+fn validate_origin(origin: &str) -> Result<()> {
+    let url = reqwest::Url::parse(origin)?;
+    let host: IpAddr = url
+        .host_str()
+        .unwrap_or_default()
+        .trim_matches(['[', ']'])
+        .parse()
+        .map_err(|_| anyhow!("Cursor tool origin must be a loopback IP"))?;
+    ensure!(
+        url.scheme() == "http"
+            && host.is_loopback()
+            && url.port().is_some_and(|p| p > 0)
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.username().is_empty()
+            && url.password().is_none(),
+        "Cursor tools require a local HTTP origin"
+    );
+    Ok(())
+}
+
+/// Existing line-based journals used by the Claude process owner.
+pub fn kill_recorded_programs(pidfile: &Path) {
+    let Ok(recorded) = std::fs::read_to_string(pidfile) else {
+        return;
+    };
+    for line in recorded.lines() {
+        if let Some((token, executable)) = line.split_once(' ')
+            && !executable.is_empty()
+        {
+            let _ = platform::tree::stop_recorded(token, |member| member.contains(executable));
+        }
+    }
+    let _ = std::fs::remove_file(pidfile);
+}
 
 pub async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
     loop {
@@ -184,12 +1358,6 @@ pub async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
             std::future::pending::<()>().await;
         }
     }
-}
-
-/// A local process reap is not a provider terminal state. Cancellation stays
-/// `Unknown` until the provider reports `Cancelled`, `Failed`, or another finish.
-fn provider_cancel_failure(native_terminal: Option<AgentFailure>) -> AgentFailure {
-    native_terminal.unwrap_or(AgentFailure::Unknown)
 }
 
 /// Reaps this bridge's own process tree only; already accepted external work is unaffected.
@@ -216,2162 +1384,13 @@ pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree
             Ok(None) => return true,
             Ok(Some(_)) => {}
             Err(error) => {
-                tracing::warn!(%error, "could not confirm Cursor SDK process-tree exit");
+                tracing::warn!(%error, "could not confirm Cursor process-tree exit");
             }
         }
         tree.kill();
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     false
-}
-
-/// The Node's resident Cursor SDK bridges. Each stable owner has one process group and store;
-/// a dead or unresponsive bridge is replaced with backoff, and a bridge left holding an agent of
-/// unknown state is retired so only that owner's process group ends.
-pub struct SdkBridge {
-    env: BTreeMap<String, String>,
-    callback: ToolCallbackConfig,
-    hasher: RandomState,
-    slots: Arc<Mutex<BTreeMap<String, Arc<OwnerSlot>>>>,
-    processes: Arc<Processes>,
-}
-
-struct OwnerSlot {
-    slot: Mutex<Slot>,
-    /// Cursor's callback is process-wide. Serializing a bot's turns prevents a later callback
-    /// bearer from retagging an earlier stream.
-    turn: Arc<Semaphore>,
-    last_used: std::sync::Mutex<Instant>,
-}
-
-struct OwnerTurn {
-    owner: Arc<OwnerSlot>,
-    _permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-impl Drop for OwnerTurn {
-    fn drop(&mut self) {
-        self.owner.touch();
-    }
-}
-
-impl OwnerSlot {
-    fn new() -> Self {
-        Self {
-            slot: Mutex::default(),
-            turn: Arc::new(Semaphore::new(1)),
-            last_used: std::sync::Mutex::new(Instant::now()),
-        }
-    }
-
-    fn touch(&self) {
-        *self
-            .last_used
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Instant::now();
-    }
-
-    fn idle_time(&self) -> bool {
-        self.last_used
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .elapsed()
-            >= OWNER_IDLE_RETIRE
-    }
-}
-
-#[derive(Default)]
-struct Slot {
-    live: Option<Arc<Live>>,
-    failures: u32,
-    retry_at: Option<Instant>,
-}
-
-impl Slot {
-    /// Each failure doubles the wait before the next start, up to 30s; a bridge that ran for
-    /// a minute clears the earlier failures.
-    fn failed(&mut self, ran: Duration) {
-        if ran > Duration::from_secs(60) {
-            self.failures = 0;
-        }
-        self.failures += 1;
-        let delay = (1u64 << (self.failures - 1).min(5)).min(30);
-        self.retry_at = Some(Instant::now() + Duration::from_secs(delay));
-    }
-}
-
-struct Live {
-    key: u64,
-    group: u32,
-    rpc: Rpc,
-    agents: Option<Arc<Semaphore>>,
-    started: Instant,
-    turns: AtomicUsize,
-    retired: AtomicBool,
-    kill: Arc<Notify>,
-    exited: watch::Receiver<bool>,
-}
-
-impl Live {
-    fn exited(&self) -> bool {
-        *self.exited.borrow()
-    }
-
-    fn admit(self: &Arc<Self>) -> Admission {
-        self.turns.fetch_add(1, SeqCst);
-        Admission(self.clone())
-    }
-
-    /// Admits no new turn; the process ends with its last running turn.
-    fn retire(&self) {
-        self.retired.store(true, SeqCst);
-        if self.turns.load(SeqCst) == 0 {
-            self.kill.notify_one();
-        }
-    }
-
-    async fn healthy(&self) -> bool {
-        !self.exited()
-            && matches!(
-                tokio::time::timeout(
-                    PING_TIMEOUT,
-                    self.rpc.unary(CONTROL_SERVICE, "Ping", json!({}))
-                )
-                .await,
-                Ok(Ok(_))
-            )
-    }
-}
-
-struct Admission(Arc<Live>);
-
-impl Drop for Admission {
-    fn drop(&mut self) {
-        if self.0.turns.fetch_sub(1, SeqCst) == 1 && self.0.retired.load(SeqCst) {
-            self.0.kill.notify_one();
-        }
-    }
-}
-
-/// Kills a bridge whose startup did not finish, also when the waiting turn is cancelled.
-struct Abandon(Option<Arc<Notify>>);
-
-impl Drop for Abandon {
-    fn drop(&mut self) {
-        if let Some(kill) = self.0.take() {
-            kill.notify_one();
-        }
-    }
-}
-
-/// Bridge process trees still running, mirrored to the pidfile for `kill_orphan`.
-///
-/// Each journal line carries the record the platform needs to find the same tree again plus the
-/// program it was started from. The record is what proves a leftover is still this Node's own
-/// bridge, so a process identifier the operating system has since handed to something else is
-/// never acted on.
-struct Processes {
-    pidfile: Option<PathBuf>,
-    running: std::sync::Mutex<BTreeMap<String, Tracked>>,
-}
-
-struct Tracked {
-    executable: PathBuf,
-    kill: Arc<Notify>,
-    exited: watch::Receiver<bool>,
-}
-
-impl Processes {
-    fn track(&self, token: String, tracked: Tracked) -> Result<()> {
-        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
-        running.insert(token, tracked);
-        self.save(&running)
-            .context("record the Cursor SDK bridge process tree")
-    }
-
-    fn forget(&self, token: &str) {
-        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
-        running.remove(token);
-        let _ = self.save(&running);
-    }
-
-    fn save(&self, running: &BTreeMap<String, Tracked>) -> std::io::Result<()> {
-        let Some(pidfile) = &self.pidfile else {
-            return Ok(());
-        };
-        if running.is_empty() {
-            return match std::fs::remove_file(pidfile) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-                _ => Ok(()),
-            };
-        }
-        let lines: String = running
-            .iter()
-            .map(|(token, tracked)| format!("{token} {}\n", tracked.executable.display()))
-            .collect();
-        platform::privatefs::create_or_truncate(pidfile)?.write_all(lines.as_bytes())
-    }
-}
-
-impl SdkBridge {
-    /// `env` reaches every agent shell of the bridge, and the bridge calls `tool_callback`
-    /// for the custom tools of every turn.
-    pub fn new(
-        env: BTreeMap<String, String>,
-        tool_callback: ToolCallbackConfig,
-        pidfile: Option<PathBuf>,
-    ) -> Result<Self> {
-        validate_env(&env)?;
-        validate_callback(&tool_callback)?;
-        Ok(Self {
-            env,
-            callback: tool_callback,
-            hasher: RandomState::new(),
-            slots: Arc::new(Mutex::default()),
-            processes: Arc::new(Processes {
-                pidfile,
-                running: Default::default(),
-            }),
-        })
-    }
-
-    /// Starts the bridge before the first turn needs it.
-    pub async fn prewarm(
-        &self,
-        owner: &str,
-        executable: &Path,
-        workspace: &Path,
-        local_store_root: &Path,
-        api_key: &str,
-        env: &BTreeMap<String, String>,
-    ) -> Result<()> {
-        validate_owner(owner)?;
-        validate_api_key(api_key)?;
-        validate_launch_env(env)?;
-        validate_private_directory(local_store_root)?;
-        let owner_slot = self.owner_slot(owner).await?;
-        let permit = owner_slot
-            .turn
-            .clone()
-            .acquire_owned()
-            .await
-            .context("Cursor SDK owner slot closed")?;
-        let _turn = OwnerTurn {
-            owner: owner_slot.clone(),
-            _permit: permit,
-        };
-        self.admit(
-            &owner_slot,
-            executable,
-            workspace,
-            local_store_root,
-            api_key,
-            env,
-        )
-        .await
-        .map(drop)
-        .map_err(|error| {
-            anyhow!(redact_text(
-                format!("{error:#}"),
-                &self.secrets(api_key, env, "")
-            ))
-        })
-    }
-
-    /// Reads Cursor account and model metadata without creating an agent or sending a prompt.
-    /// The dedicated owner keeps a readiness check from waiting behind an active Agent turn.
-    pub async fn provider_observation(
-        &self,
-        executable: &Path,
-        workspace: &Path,
-        local_store_root: &Path,
-        api_key: &str,
-        env: &BTreeMap<String, String>,
-    ) -> Result<SdkProviderObservation> {
-        validate_api_key(api_key)
-            .and_then(|_| validate_launch_env(env))
-            .and_then(|_| validate_private_directory(local_store_root))
-            .map_err(|_| anyhow!("cursor_provider_probe_config_invalid"))?;
-        let owner_slot = self
-            .owner_slot(PROVIDER_PROBE_OWNER)
-            .await
-            .map_err(|_| anyhow!("cursor_provider_probe_unavailable"))?;
-        let permit = owner_slot
-            .turn
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow!("cursor_provider_probe_unavailable"))?;
-        let _turn = OwnerTurn {
-            owner: owner_slot.clone(),
-            _permit: permit,
-        };
-        let admission = self
-            .admit(
-                &owner_slot,
-                executable,
-                workspace,
-                local_store_root,
-                api_key,
-                env,
-            )
-            .await
-            .map_err(|_| anyhow!("cursor_bridge_launch_failed"))?;
-        let live = &admission.0;
-        let mut authentication = metadata_authentication(
-            &live
-                .rpc
-                .metadata_unary("SdkCursorService", "Me", json!({}))
-                .await,
-        );
-        let models = live
-            .rpc
-            .metadata_unary("SdkCursorService", "ListModels", json!({}))
-            .await;
-        if authentication != SdkProviderAuthentication::Authenticated
-            && matches!(models, MetadataReply::Status(401 | 403))
-        {
-            authentication = SdkProviderAuthentication::SignInRequired;
-        }
-        Ok(SdkProviderObservation {
-            authentication,
-            catalog: metadata_catalog(&models, &self.secrets(api_key, env, &live.rpc.bearer)),
-        })
-    }
-
-    /// Lets running turns finish on every owner bridge, then ends them; the next turn starts anew.
-    pub async fn retire_all(&self) {
-        let slots: Vec<_> = self.slots.lock().await.values().cloned().collect();
-        for owner_slot in slots {
-            let _turn = owner_slot
-                .turn
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("Cursor owner slot semaphore is never closed");
-            if let Some(live) = owner_slot.slot.lock().await.live.as_ref() {
-                live.retire();
-            }
-        }
-    }
-
-    /// Kills every bridge process group this Node started and removes the pidfile.
-    pub async fn stop(&self) {
-        let running: Vec<_> = self
-            .processes
-            .running
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .map(|tracked| (tracked.kill.clone(), tracked.exited.clone()))
-            .collect();
-        for (kill, mut exited) in running {
-            kill.notify_one();
-            let _ = exited.wait_for(|exited| *exited).await;
-        }
-        if let Some(pidfile) = &self.processes.pidfile {
-            let _ = std::fs::remove_file(pidfile);
-        }
-    }
-
-    /// Ends the bridge trees an earlier Node run recorded in `pidfile`, but only those still
-    /// running the recorded program. A record whose identifier the operating system has since
-    /// handed to something else is left alone.
-    pub fn kill_orphan(pidfile: &Path) {
-        let Ok(recorded) = std::fs::read_to_string(pidfile) else {
-            return;
-        };
-        for line in recorded.lines() {
-            // A journal record never contains a space, so the rest of the line is the whole
-            // program path even when a directory in it has one.
-            let Some((token, executable)) = line.split_once(' ') else {
-                continue;
-            };
-            if executable.is_empty() {
-                continue;
-            }
-            let stopped =
-                platform::tree::stop_recorded(token, |member| member.contains(executable));
-            if let Err(error) = stopped {
-                tracing::debug!(
-                    event = "sdk.leftover_left_alone",
-                    %error,
-                    "a recorded Cursor SDK bridge was not ended"
-                );
-            }
-        }
-        let _ = std::fs::remove_file(pidfile);
-    }
-
-    /// Runs the prompt with the turn's tools on the resident bridge.
-    /// The callback commits the native ID before the first mutating Send request.
-    pub async fn run<F, P, PF>(
-        &self,
-        turn: &SdkTurn,
-        prompt: &str,
-        previous_session_id: Option<&str>,
-        persist_session: impl FnOnce(String) -> F,
-        mut cancel: watch::Receiver<bool>,
-        mut progress: P,
-    ) -> Result<AgentResult, AgentRunError>
-    where
-        F: Future<Output = Result<()>>,
-        P: FnMut(Value) -> PF,
-        PF: Future<Output = Result<()>>,
-    {
-        let stage = Arc::new(crate::failure::ProviderTrace::new(
-            "cursor",
-            ProviderStage::Validate,
-        ));
-        let not_sent = |outcome, failure: ExecFailure| {
-            let mut secrets = self.secrets(&turn.api_key, &turn.env, "");
-            secrets.extend(turn.callback_token.as_deref());
-            AgentRunError {
-                stage: stage.current(),
-                outcome,
-                start: StartEvidence::NotStarted,
-                session_id: previous_session_id.map(str::to_owned),
-                failure: ExecFailure {
-                    detail: redact_text(failure.detail, &secrets),
-                    ..failure
-                },
-            }
-        };
-        let cancelled_before_send = || {
-            not_sent(
-                AgentFailure::Cancelled,
-                ExecFailure::new(
-                    FailureKind::Unknown,
-                    "Cursor SDK management cancelled before Send",
-                ),
-            )
-        };
-        if let Err(failure) = validate_turn(turn, prompt, previous_session_id) {
-            return Err(not_sent(AgentFailure::Failed, failure));
-        }
-        if *cancel.borrow() {
-            return Err(cancelled_before_send());
-        }
-        let owner_slot = match self.owner_slot(&turn.owner).await {
-            Ok(slot) => slot,
-            Err(error) => return Err(not_sent(AgentFailure::Failed, start_failure(&error))),
-        };
-        let _owner_turn = tokio::select! {
-            permit = owner_slot.turn.clone().acquire_owned() => permit.ok(),
-            _ = wait_for_cancel(&mut cancel) => return Err(cancelled_before_send()),
-        };
-        let Some(permit) = _owner_turn else {
-            return Err(not_sent(
-                AgentFailure::Failed,
-                ExecFailure::new(FailureKind::Unknown, "Cursor SDK owner slot closed"),
-            ));
-        };
-        let _owner_turn = OwnerTurn {
-            owner: owner_slot.clone(),
-            _permit: permit,
-        };
-        stage.enter(ProviderStage::Launch);
-        let admission = tokio::select! {
-            admitted = self.admit(
-                &owner_slot,
-                &turn.executable,
-                &turn.workspace,
-                &turn.local_store_root,
-                &turn.api_key,
-                &turn.env,
-            ) => {
-                admitted.map_err(|error| not_sent(AgentFailure::Failed, start_failure(&error)))?
-            }
-            _ = wait_for_cancel(&mut cancel) => return Err(cancelled_before_send()),
-        };
-        let live = &admission.0;
-        let _agent_slot = match live.agents.clone() {
-            Some(agents) => tokio::select! {
-                permit = agents.acquire_owned() => permit.ok(),
-                _ = wait_for_cancel(&mut cancel) => return Err(cancelled_before_send()),
-            },
-            None => None,
-        };
-        stage.enter(ProviderStage::Record);
-        if let Some(record) = &turn.process_started
-            && let Err(error) = record(live.group).await
-        {
-            return Err(not_sent(
-                AgentFailure::Failed,
-                ExecFailure::new(
-                    FailureKind::Unknown,
-                    format!("record Cursor SDK process group before sending: {error:#}"),
-                ),
-            ));
-        }
-        let rpc = &live.rpc;
-        let mut secrets = self.secrets(&turn.api_key, &turn.env, &rpc.bearer);
-        secrets.extend(turn.callback_token.as_deref());
-        let mut agent_id = previous_session_id.map(str::to_owned);
-        let mut state = RunState::default();
-        let mut send_started = false;
-        let record_stage = stage.clone();
-        let run_started = turn.run_started.clone();
-        let run_started: RunStarted = Arc::new(move |run| {
-            let stage = record_stage.clone();
-            let record = run_started.clone();
-            Box::pin(async move {
-                stage.enter(ProviderStage::Record);
-                if let Some(record) = record {
-                    record(run).await?;
-                }
-                stage.enter(ProviderStage::Run);
-                Ok(())
-            })
-        });
-        let operation = async {
-            let options = sdk_options(turn)?;
-            if let Some(token) = &turn.callback_token {
-                validate_callback_token(token)?;
-                rpc.unary(
-                    CONTROL_SERVICE,
-                    "SetToolCallback",
-                    json!({"url": self.callback.url, "authToken": token}),
-                )
-                .await?;
-            }
-            stage.enter(ProviderStage::SessionStart);
-            let reply = if let Some(id) = previous_session_id {
-                rpc.unary(
-                    AGENT_SERVICE,
-                    "ResumeAgent",
-                    json!({"agentId": id, "options": options}),
-                )
-                .await?
-            } else {
-                rpc.unary(AGENT_SERVICE, "CreateAgent", json!({"options": options}))
-                    .await?
-            };
-            let id = reply
-                .get("agentId")
-                .and_then(Value::as_str)
-                .context("Cursor SDK returned no agent id")?;
-            validate_sdk_id(id)?;
-            if let Some(previous) = previous_session_id {
-                ensure!(previous == id, "Cursor SDK resumed a different agent");
-            }
-            agent_id = Some(id.to_owned());
-            stage.enter(ProviderStage::Record);
-            persist_session(id.to_owned())
-                .await
-                .context("persist Cursor SDK session before sending management prompt")?;
-            stage.enter(ProviderStage::TurnStart);
-            send_started = true;
-            let mut pending_text = BTreeMap::new();
-            let mut emit_progress =
-                |value| progress(redact_stream_progress(value, &secrets, &mut pending_text));
-            rpc.send(
-                id,
-                prompt,
-                &mut state,
-                &mut emit_progress,
-                Some(&run_started),
-            )
-            .await?;
-            let mut result = state.finish(id)?;
-            result.output = redact_text(result.output, &secrets);
-            result.usage = result.usage.map(|usage| redact_progress(usage, &secrets));
-            Ok(result)
-        };
-        let mut cancellation_requested = false;
-        let mut exited = live.exited.clone();
-        let outcome = tokio::select! {
-            biased;
-            result = tokio::time::timeout(Duration::from_secs(turn.timeout_secs), operation) => match result {
-                Ok(result) => result.map_err(|error| ExecFailure::upstream(format!("{error:#}"), FailureKind::Unknown)),
-                Err(_) => Err(ExecFailure::new(FailureKind::TimedOut, "Cursor SDK manager timed out; completion is unknown")),
-            },
-            _ = exited.wait_for(|exited| *exited) => {
-                Err(ExecFailure::new(FailureKind::Lost, "Cursor SDK bridge exited unexpectedly; completion is unknown"))
-            }
-            _ = wait_for_cancel(&mut cancel) => {
-                stage.enter(ProviderStage::Interrupt);
-                cancellation_requested = true;
-                Err(ExecFailure::new(FailureKind::Unknown, "Cursor SDK management cancellation requested"))
-            }
-        };
-        let mut native_terminal = None;
-        if outcome.is_err()
-            && let Some(run_id) = &state.run_id
-        {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(3),
-                rpc.unary(
-                    AGENT_SERVICE,
-                    "CancelRun",
-                    json!({"runId": run_id, "agentId": agent_id}),
-                ),
-            )
-            .await;
-            if cancellation_requested && let Some(agent_id) = &agent_id {
-                native_terminal = tokio::time::timeout(Duration::from_secs(3), async {
-                    loop {
-                        let reply = rpc
-                            .unary(AGENT_SERVICE, "GetRun", json!({"runId":run_id}))
-                            .await?;
-                        let snapshot = reply
-                            .get("run")
-                            .context("Cursor SDK returned no run snapshot")?;
-                        let mut identity = RunState {
-                            run_id: Some(run_id.clone()),
-                            ..RunState::default()
-                        };
-                        identity.identity(snapshot, agent_id, true)?;
-                        if cancelled(snapshot.get("status")) {
-                            return Ok::<AgentFailure, anyhow::Error>(AgentFailure::Cancelled);
-                        }
-                        if finished(snapshot.get("status")) {
-                            return Ok(AgentFailure::Unknown);
-                        }
-                        if failed(snapshot.get("status")) {
-                            return Ok(AgentFailure::Failed);
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                })
-                .await
-                .ok()
-                .and_then(Result::ok);
-            }
-        }
-        if let Some(id) = &agent_id {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(3),
-                rpc.unary(AGENT_SERVICE, "CloseAgent", json!({"agentId": id})),
-            )
-            .await;
-        }
-        outcome.map_err(|failure| {
-            let outcome = if cancellation_requested {
-                provider_cancel_failure(native_terminal)
-            } else if send_started {
-                AgentFailure::Unknown
-            } else {
-                AgentFailure::Failed
-            };
-            // The agent may still act; its pending check closes only once the bridge group ends.
-            if outcome == AgentFailure::Unknown && !live.exited() {
-                live.retire();
-            }
-            AgentRunError {
-                stage: stage.current(),
-                outcome,
-                start: if !send_started {
-                    StartEvidence::NotStarted
-                } else if state.run_id.is_some() {
-                    StartEvidence::Started
-                } else {
-                    StartEvidence::Unknown
-                },
-                session_id: agent_id,
-                failure: ExecFailure {
-                    detail: redact_text(failure.detail, &secrets),
-                    ..failure
-                },
-            }
-        })
-    }
-
-    /// Reads one known native run without sending a prompt or selecting another run.
-    pub async fn probe(&self, turn: &SdkTurn, agent_id: &str, run_id: &str) -> Result<NativeRun> {
-        validate_control_turn(turn, agent_id, run_id)?;
-        let owner_slot = self.owner_slot(&turn.owner).await?;
-        let base_secrets = self.secrets(&turn.api_key, &turn.env, "");
-        let admission = self
-            .admit(
-                &owner_slot,
-                &turn.executable,
-                &turn.workspace,
-                &turn.local_store_root,
-                &turn.api_key,
-                &turn.env,
-            )
-            .await
-            .map_err(|error| anyhow!(redact_text(format!("{error:#}"), &base_secrets)))?;
-        let live = &admission.0;
-        let rpc = &live.rpc;
-        let mut secrets = self.secrets(&turn.api_key, &turn.env, &rpc.bearer);
-        secrets.extend(turn.callback_token.as_deref());
-        let reply = rpc
-            .unary(
-                AGENT_SERVICE,
-                "GetRun",
-                json!({"runId":run_id,"options":run_options(turn, agent_id)}),
-            )
-            .await
-            .map_err(|error| anyhow!(redact_text(format!("{error:#}"), &secrets)))?;
-        let snapshot = reply
-            .get("run")
-            .context("Cursor SDK returned no run snapshot")?;
-        let mut identity = RunState {
-            run_id: Some(run_id.into()),
-            ..RunState::default()
-        };
-        identity.identity(snapshot, agent_id, true)?;
-        let snapshot_agent = snapshot
-            .get("agentId")
-            .or_else(|| snapshot.get("agent_id"))
-            .and_then(Value::as_str)
-            .context("Cursor SDK run snapshot has no agent id")?;
-        ensure!(
-            snapshot_agent == agent_id,
-            "Cursor SDK run belongs to a different agent"
-        );
-        Ok(native_run(snapshot, agent_id, run_id, &secrets))
-    }
-
-    /// Requests cancellation of one known native run. Terminal evidence is read separately.
-    pub async fn cancel(&self, turn: &SdkTurn, agent_id: &str, run_id: &str) -> Result<()> {
-        validate_control_turn(turn, agent_id, run_id)?;
-        let owner_slot = self.owner_slot(&turn.owner).await?;
-        let base_secrets = self.secrets(&turn.api_key, &turn.env, "");
-        let admission = self
-            .admit(
-                &owner_slot,
-                &turn.executable,
-                &turn.workspace,
-                &turn.local_store_root,
-                &turn.api_key,
-                &turn.env,
-            )
-            .await
-            .map_err(|error| anyhow!(redact_text(format!("{error:#}"), &base_secrets)))?;
-        let live = &admission.0;
-        let mut secrets = self.secrets(&turn.api_key, &turn.env, &live.rpc.bearer);
-        secrets.extend(turn.callback_token.as_deref());
-        live.rpc
-            .unary(
-                AGENT_SERVICE,
-                "CancelRun",
-                json!({"runId":run_id,"agentId":agent_id}),
-            )
-            .await
-            .map_err(|error| anyhow!(redact_text(format!("{error:#}"), &secrets)))?;
-        Ok(())
-    }
-
-    async fn owner_slot(&self, owner: &str) -> Result<Arc<OwnerSlot>> {
-        validate_owner(owner)?;
-        let mut slots = self.slots.lock().await;
-        if let Some(slot) = slots.get(owner) {
-            slot.touch();
-            return Ok(slot.clone());
-        }
-        let slot = Arc::new(OwnerSlot::new());
-        slots.insert(owner.to_owned(), slot.clone());
-        let owner = owner.to_owned();
-        let all_slots = Arc::downgrade(&self.slots);
-        let weak = Arc::downgrade(&slot);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(OWNER_IDLE_RETIRE).await;
-                let Some(all_slots) = all_slots.upgrade() else {
-                    break;
-                };
-                let Some(slot) = weak.upgrade() else {
-                    break;
-                };
-                let Ok(_turn) = slot.turn.clone().try_acquire_owned() else {
-                    continue;
-                };
-                if Arc::strong_count(&slot) != 2 || !slot.idle_time() {
-                    continue;
-                }
-                let live = match slot.slot.try_lock() {
-                    Ok(mut state) => state.live.take(),
-                    Err(_) => continue,
-                };
-                if let Some(live) = live {
-                    live.retire();
-                    let mut exited = live.exited.clone();
-                    let _ = exited.wait_for(|exited| *exited).await;
-                }
-                let mut slots = all_slots.lock().await;
-                if slots
-                    .get(&owner)
-                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &slot))
-                    && Arc::strong_count(&slot) == 2
-                {
-                    slots.remove(&owner);
-                    break;
-                }
-            }
-        });
-        Ok(slot)
-    }
-
-    async fn admit(
-        &self,
-        owner_slot: &OwnerSlot,
-        executable: &Path,
-        workspace: &Path,
-        local_store_root: &Path,
-        api_key: &str,
-        env: &BTreeMap<String, String>,
-    ) -> Result<Admission> {
-        let key = self
-            .hasher
-            .hash_one((executable, workspace, local_store_root, api_key, env));
-        let existing = owner_slot.slot.lock().await.live.clone();
-        if let Some(live) = existing {
-            let admission = live.admit();
-            let current = live.key == key && !live.retired.load(SeqCst);
-            if current && live.healthy().await {
-                return Ok(admission);
-            }
-            let mut slot = owner_slot.slot.lock().await;
-            if slot
-                .live
-                .as_ref()
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, &live))
-            {
-                slot.live = None;
-                if current {
-                    slot.failed(live.started.elapsed());
-                    live.kill.notify_one();
-                }
-            }
-            live.retire();
-            drop(admission);
-            if !live.exited() {
-                let mut exited = live.exited.clone();
-                let _ = exited.wait_for(|exited| *exited).await;
-            }
-        }
-        let mut slot = owner_slot.slot.lock().await;
-        if let Some(retry_at) = slot.retry_at {
-            tokio::time::sleep_until(retry_at).await;
-        }
-        match self
-            .start(executable, workspace, local_store_root, api_key, env, key)
-            .await
-        {
-            Ok(live) => {
-                let admission = live.admit();
-                slot.live = Some(live);
-                Ok(admission)
-            }
-            Err(error) => {
-                slot.failed(Duration::ZERO);
-                Err(error)
-            }
-        }
-    }
-
-    async fn start(
-        &self,
-        executable: &Path,
-        workspace: &Path,
-        local_store_root: &Path,
-        api_key: &str,
-        env: &BTreeMap<String, String>,
-        key: u64,
-    ) -> Result<Arc<Live>> {
-        let bridge_state_root = local_store_root.join("bridge-state");
-        prepare_sdk_workspace(workspace, local_store_root, &bridge_state_root).await?;
-        let mut command = std::process::Command::new(executable);
-        command
-            .arg("--workspace")
-            .arg(workspace)
-            .arg("--state-root")
-            .arg(&bridge_state_root)
-            .arg("--local-store")
-            .arg(serde_json::to_string(&json!({
-                "type":"jsonl", "rootDir":local_store_root
-            }))?)
-            .args(["--host", "127.0.0.1", "--port", "0"])
-            .current_dir(workspace)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy();
-            if name.starts_with("VIBEFACE_")
-                || name.starts_with("CURSOR_SDK_")
-                || matches!(
-                    name.as_ref(),
-                    "CURSOR_API_KEY"
-                        | "HTTP_PROXY"
-                        | "HTTPS_PROXY"
-                        | "ALL_PROXY"
-                        | "NO_PROXY"
-                        | "http_proxy"
-                        | "https_proxy"
-                        | "all_proxy"
-                        | "no_proxy"
-                )
-            {
-                command.env_remove(key);
-            }
-        }
-        command
-            .envs(env)
-            .envs(&self.env)
-            .env("CURSOR_API_KEY", api_key)
-            .env("CURSOR_DATA_DIR", bridge_state_root.join("cursor-data"))
-            .env("CURSOR_SDK_CLIENT_LANGUAGE", "rust");
-        let (tree, mut child) =
-            platform::tree::Tree::spawn(command, &format!("{SDK_TREE_KEY}-{key:016x}"), true)
-                .map_err(|error| {
-                    let kind = if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                    {
-                        FailureKind::MissingBinary
-                    } else {
-                        FailureKind::Unknown
-                    };
-                    ExecFailure::new(kind, format!("could not start cursor-sdk-bridge: {error}"))
-                })?;
-        let group = child.id().context("Cursor SDK process has no group")?;
-        let token = tree.token().to_owned();
-        let stdout = child
-            .stdout
-            .take()
-            .context("Cursor SDK stdout unavailable")?;
-        let stderr = child
-            .stderr
-            .take()
-            .context("Cursor SDK stderr unavailable")?;
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let startup_diagnostics = Arc::new(std::sync::Mutex::new(String::new()));
-        let startup_secrets = std::iter::once(api_key)
-            .chain(env.values().map(String::as_str))
-            .chain(self.env.values().map(String::as_str))
-            .chain(std::iter::once(self.callback.auth_token.as_str()))
-            .filter(|secret| !secret.is_empty())
-            .map(str::to_owned)
-            .collect();
-        let process = SdkProcess {
-            child,
-            tree: Some(tree),
-            stdout: tokio::spawn(drain(stdout)),
-            stderr: tokio::spawn(read_discovery(
-                stderr,
-                ready_tx,
-                startup_diagnostics.clone(),
-                startup_secrets,
-            )),
-        };
-        let kill = Arc::new(Notify::new());
-        let (exited_tx, exited) = watch::channel(false);
-        let tracked = self.processes.track(
-            token,
-            Tracked {
-                executable: executable.to_owned(),
-                kill: kill.clone(),
-                exited: exited.clone(),
-            },
-        );
-        tokio::spawn(supervise(
-            process,
-            kill.clone(),
-            exited_tx,
-            self.processes.clone(),
-        ));
-        let mut abandon = Abandon(Some(kill.clone()));
-        tracked?;
-        let mut died = exited.clone();
-        let (rpc, agents) = tokio::select! {
-            ready = tokio::time::timeout(STARTUP_TIMEOUT, self.connect(ready_rx)) => ready.map_err(|_| {
-                let diagnostics = startup_diagnostics
-                    .lock()
-                    .map(|diagnostics| diagnostics.clone())
-                    .unwrap_or_default();
-                let diagnostics = if diagnostics.is_empty() {
-                    "no stderr output before discovery".to_owned()
-                } else {
-                    format!("stderr before discovery: {diagnostics}")
-                };
-                ExecFailure::new(
-                    FailureKind::TimedOut,
-                    format!(
-                        "Cursor SDK bridge did not start within {}s; the reply did not start ({diagnostics})",
-                        STARTUP_TIMEOUT.as_secs()
-                    ),
-                )
-            })??,
-            _ = died.wait_for(|exited| *exited) => bail!("Cursor SDK bridge exited during startup"),
-        };
-        abandon.0 = None;
-        Ok(Arc::new(Live {
-            key,
-            group,
-            rpc,
-            agents,
-            started: Instant::now(),
-            turns: AtomicUsize::new(0),
-            retired: AtomicBool::new(false),
-            kill,
-            exited,
-        }))
-    }
-
-    /// Reads the discovery line and sets a callback that is unauthorized until a turn installs
-    /// its attempt bearer.
-    async fn connect(
-        &self,
-        ready: oneshot::Receiver<Result<Discovery>>,
-    ) -> Result<(Rpc, Option<Arc<Semaphore>>)> {
-        let discovery = ready
-            .await
-            .context("Cursor SDK stopped before discovery")??;
-        let endpoint = discovery.endpoint()?;
-        let token_file = discovery.auth_token_file.clone();
-        let bearer = tokio::task::spawn_blocking(move || {
-            platform::privatefs::read_private_bounded(&token_file, 4096, "Cursor SDK token file")
-        })
-        .await?
-        .map_err(|error| anyhow!("could not read Cursor SDK token file: {error:#}"))?;
-        let bearer = String::from_utf8(bearer)
-            .context("Cursor SDK token file must be UTF-8")?
-            .trim()
-            .to_owned();
-        ensure!(
-            !bearer.is_empty() && bearer.len() <= 4096,
-            "invalid Cursor SDK bridge authentication token"
-        );
-        let client = reqwest::Client::builder()
-            .http1_only()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(3))
-            .build()
-            .map_err(|_| anyhow!("could not create Cursor SDK HTTP client"))?;
-        let rpc = Rpc {
-            endpoint,
-            bearer,
-            client,
-        };
-        let version = rpc.unary(CONTROL_SERVICE, "GetVersion", json!({})).await?;
-        ensure!(
-            version.get("protocolVersion").and_then(Value::as_str) == Some("sdk.v1"),
-            "unsupported Cursor SDK protocol version"
-        );
-        rpc.unary(
-            CONTROL_SERVICE,
-            "SetToolCallback",
-            json!({"url": self.callback.url, "authToken": self.callback.auth_token}),
-        )
-        .await?;
-        let agents = discovery
-            .max_concurrent_agents
-            .filter(|limit| *limit > 0)
-            .map(|limit| Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS))));
-        Ok((rpc, agents))
-    }
-
-    fn secrets<'a>(
-        &'a self,
-        api_key: &'a str,
-        env: &'a BTreeMap<String, String>,
-        bearer: &'a str,
-    ) -> Vec<&'a str> {
-        let mut secrets = vec![api_key, bearer, self.callback.auth_token.as_str()];
-        secrets.extend(self.env.values().map(String::as_str));
-        secrets.extend(env.values().map(String::as_str));
-        secrets.retain(|secret| !secret.is_empty());
-        secrets
-    }
-}
-
-/// Owns the bridge process: exit, closed output or a kill request ends its whole group.
-async fn supervise(
-    mut process: SdkProcess,
-    kill: Arc<Notify>,
-    exited: watch::Sender<bool>,
-    processes: Arc<Processes>,
-) {
-    enum JoinedIo {
-        Stdout,
-        Stderr,
-        Neither,
-    }
-    let joined = tokio::select! {
-        _ = &mut process.stdout => JoinedIo::Stdout,
-        _ = &mut process.stderr => JoinedIo::Stderr,
-        _ = process.child.wait() => JoinedIo::Neither,
-        _ = kill.notified() => JoinedIo::Neither,
-    };
-    let token = process.tree.as_ref().map(|tree| tree.token().to_owned());
-    if let Some(mut tree) = process.tree.take()
-        && !terminate_process_tree(&mut process.child, &mut tree).await
-    {
-        // Something of the tree is left; keeping the handle lets the drop of the process
-        // end it rather than leaving it unowned.
-        process.tree = Some(tree);
-    }
-    // The process exit signal is also the bridge's teardown barrier. Reap the output tasks before
-    // publishing it so their pipe handles, along with the child and job handles below, cannot
-    // outlive SdkBridge::stop and race its owner removing the bridge state directory.
-    process.stdout.abort();
-    process.stderr.abort();
-    if !matches!(joined, JoinedIo::Stdout) {
-        let _ = (&mut process.stdout).await;
-    }
-    if !matches!(joined, JoinedIo::Stderr) {
-        let _ = (&mut process.stderr).await;
-    }
-    drop(process);
-    if let Some(token) = token {
-        processes.forget(&token);
-    }
-    let _ = exited.send(true);
-}
-
-async fn prepare_sdk_workspace(
-    workspace: &Path,
-    local_store_root: &Path,
-    bridge_state_root: &Path,
-) -> Result<()> {
-    tokio::fs::create_dir_all(workspace)
-        .await
-        .context("create Cursor SDK workspace")?;
-    let workspace_metadata = tokio::fs::symlink_metadata(workspace)
-        .await
-        .context("read Cursor SDK workspace")?;
-    ensure!(
-        workspace_metadata.is_dir() && !workspace_metadata.file_type().is_symlink(),
-        "Cursor SDK workspace must be a real directory"
-    );
-    for directory in [local_store_root, bridge_state_root] {
-        let directory = directory.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let metadata = std::fs::symlink_metadata(&directory).ok();
-            ensure!(
-                metadata
-                    .is_none_or(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink()),
-                "Cursor SDK workspace must be a real directory"
-            );
-            platform::privatefs::create_dir(&directory).context("create Cursor SDK workspace")
-        })
-        .await??;
-    }
-    Ok(())
-}
-
-fn validate_turn(
-    turn: &SdkTurn,
-    prompt: &str,
-    previous_session_id: Option<&str>,
-) -> Result<(), ExecFailure> {
-    validate_owner(&turn.owner)
-        .map_err(|error| ExecFailure::new(FailureKind::Unknown, error.to_string()))?;
-    if turn.model.trim().is_empty() {
-        return Err(ExecFailure::new(
-            FailureKind::NoModel,
-            "Cursor SDK requires an explicit model",
-        ));
-    }
-    validate_api_key(&turn.api_key)
-        .map_err(|error| ExecFailure::new(FailureKind::MissingKey, error.to_string()))?;
-    (|| {
-        ensure!(turn.timeout_secs > 0, "Cursor SDK timeout must be positive");
-        ensure!(
-            !prompt.trim().is_empty() && prompt.len() <= MAX_PROMPT_BYTES,
-            "invalid management prompt"
-        );
-        validate_launch_env(&turn.env)?;
-        validate_private_directory(&turn.local_store_root)?;
-        if let Some(token) = &turn.callback_token {
-            validate_callback_token(token)?;
-        }
-        validate_tools(&turn.custom_tools)?;
-        if let Some(id) = previous_session_id {
-            validate_sdk_id(id)?;
-        }
-        Ok(())
-    })()
-    .map_err(|error: anyhow::Error| ExecFailure::new(FailureKind::Unknown, format!("{error:#}")))
-}
-
-/// A bridge that did not start: its own kind when it named one, else by the SDK's words.
-fn start_failure(error: &anyhow::Error) -> ExecFailure {
-    match error.downcast_ref::<ExecFailure>() {
-        Some(failure) => failure.clone(),
-        None => ExecFailure::upstream(format!("{error:#}"), FailureKind::Unknown),
-    }
-}
-
-fn validate_api_key(api_key: &str) -> Result<()> {
-    ensure!(
-        !api_key.trim().is_empty() && api_key.len() <= 4096,
-        "CURSOR_API_KEY is missing or invalid"
-    );
-    Ok(())
-}
-
-fn validate_owner(owner: &str) -> Result<()> {
-    ensure!(
-        !owner.is_empty()
-            && owner.len() <= 512
-            && owner
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:/".contains(&byte)),
-        "invalid Cursor SDK owner"
-    );
-    Ok(())
-}
-
-fn validate_callback_token(token: &str) -> Result<()> {
-    ensure!(
-        (32..=4096).contains(&token.len()) && !token.chars().any(char::is_control),
-        "invalid Cursor SDK callback token"
-    );
-    Ok(())
-}
-
-fn validate_private_directory(path: &Path) -> Result<()> {
-    ensure!(path.is_absolute(), "Cursor SDK store root must be absolute");
-    ensure!(
-        path.components().all(|component| !matches!(
-            component,
-            std::path::Component::ParentDir | std::path::Component::CurDir
-        )),
-        "Cursor SDK store root must be normalized"
-    );
-    Ok(())
-}
-
-/// The engine's variables may name anything but what the bridge itself sets.
-fn validate_launch_env(env: &BTreeMap<String, String>) -> Result<()> {
-    ensure!(env.len() <= 64, "too many Cursor environment entries");
-    for (key, value) in env {
-        ensure!(
-            !key.is_empty()
-                && key.len() <= 256
-                && key.bytes().enumerate().all(|(index, byte)| {
-                    byte == b'_'
-                        || byte.is_ascii_alphabetic()
-                        || (index > 0 && byte.is_ascii_digit())
-                })
-                && key != "CURSOR_API_KEY"
-                && key != "CURSOR_DATA_DIR"
-                && !key.starts_with("CURSOR_SDK_")
-                && !key.starts_with("VIBEFACE_")
-                && value.len() <= 4096
-                && !value.contains('\0'),
-            "invalid or reserved Cursor environment entry"
-        );
-    }
-    Ok(())
-}
-
-fn validate_env(env: &BTreeMap<String, String>) -> Result<()> {
-    ensure!(env.len() <= 64, "too many tool environment entries");
-    for (key, value) in env {
-        ensure!(
-            !key.is_empty()
-                && key.len() <= 256
-                && key.bytes().enumerate().all(|(index, byte)| {
-                    byte == b'_'
-                        || byte.is_ascii_alphabetic()
-                        || (index > 0 && byte.is_ascii_digit())
-                })
-                && !matches!(
-                    key.as_str(),
-                    "CODEX_HOME"
-                        | "CODEX_API_KEY"
-                        | "CURSOR_API_KEY"
-                        | "HOME"
-                        | "PATH"
-                        | "OPENAI_API_KEY"
-                        | "OPENAI_BASE_URL"
-                )
-                && value.len() <= 4096
-                && !value.contains('\0'),
-            "invalid or reserved tool environment entry"
-        );
-    }
-    Ok(())
-}
-
-fn validate_callback(callback: &ToolCallbackConfig) -> Result<()> {
-    let url = reqwest::Url::parse(&callback.url).context("invalid custom tool callback URL")?;
-    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
-    let ip: IpAddr = host
-        .parse()
-        .map_err(|_| anyhow!("custom tool callback must use a loopback IP"))?;
-    ensure!(
-        url.scheme() == "http"
-            && ip.is_loopback()
-            && url.port().is_some_and(|port| port > 0)
-            && url.path() == "/"
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && url.username().is_empty()
-            && url.password().is_none(),
-        "custom tool callback must be a local HTTP origin"
-    );
-    ensure!(
-        (32..=4096).contains(&callback.auth_token.len())
-            && !callback.auth_token.chars().any(char::is_control),
-        "invalid custom tool callback token"
-    );
-    Ok(())
-}
-
-fn validate_tools(tools: &BTreeMap<String, CustomToolConfig>) -> Result<()> {
-    ensure!(tools.len() <= 32, "too many custom tools");
-    for (name, tool) in tools {
-        ensure!(
-            !name.is_empty()
-                && name.len() <= 64
-                && name
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
-            "invalid custom tool name"
-        );
-        ensure!(
-            tool.input_schema.is_object()
-                && tool.output_schema.as_ref().is_none_or(Value::is_object),
-            "custom tool schemas must be objects"
-        );
-        ensure!(
-            serde_json::to_vec(tool)?.len() <= 32_768,
-            "custom tool definition is too large"
-        );
-    }
-    Ok(())
-}
-
-fn sdk_options(turn: &SdkTurn) -> Result<Value> {
-    let workspace = turn
-        .workspace
-        .to_str()
-        .context("Cursor SDK workspace path must be UTF-8")?;
-    let store_root = turn
-        .local_store_root
-        .to_str()
-        .context("Cursor SDK store root must be UTF-8")?;
-    Ok(json!({"apiKey":turn.api_key,"model":{"id":turn.model},
-        "local":{"cwd":[workspace],"settingSources":[],"customTools":turn.custom_tools,
-            "store":{"type":"jsonl","rootDir":store_root}},"mcpServers":{}}))
-}
-
-fn run_options(turn: &SdkTurn, agent_id: &str) -> Value {
-    json!({
-        "runtime": "RUNTIME_LOCAL",
-        "cwd": turn.workspace,
-        "agentId": agent_id,
-        "apiKey": turn.api_key,
-    })
-}
-
-fn validate_control_turn(turn: &SdkTurn, agent_id: &str, run_id: &str) -> Result<()> {
-    validate_owner(&turn.owner)?;
-    validate_sdk_id(agent_id)?;
-    validate_sdk_id(run_id)?;
-    validate_api_key(&turn.api_key)?;
-    ensure!(turn.timeout_secs > 0, "Cursor SDK timeout must be positive");
-    validate_launch_env(&turn.env)?;
-    validate_private_directory(&turn.local_store_root)?;
-    if let Some(token) = &turn.callback_token {
-        validate_callback_token(token)?;
-    }
-    validate_tools(&turn.custom_tools)?;
-    Ok(())
-}
-
-fn native_run(snapshot: &Value, agent_id: &str, run_id: &str, secrets: &[&str]) -> NativeRun {
-    let status = snapshot
-        .get("status")
-        .map(native_status)
-        .unwrap_or(NativeStatus::Unknown);
-    let status = match status {
-        NativeStatus::Failed { detail } => NativeStatus::Failed {
-            detail: redact_text(detail, secrets),
-        },
-        other => other,
-    };
-    let output = snapshot
-        .get("result")
-        .and_then(Value::as_str)
-        .map(|text| redact_text(text.to_owned(), secrets));
-    NativeRun {
-        agent_id: agent_id.into(),
-        run_id: run_id.into(),
-        status,
-        output,
-    }
-}
-
-fn native_status(status: &Value) -> NativeStatus {
-    let code = status.as_u64().or_else(|| match status.as_str()? {
-        "RUN_LIFECYCLE_STATUS_CREATING" => Some(1),
-        "RUN_LIFECYCLE_STATUS_RUNNING" => Some(2),
-        "RUN_LIFECYCLE_STATUS_FINISHED" => Some(3),
-        "RUN_LIFECYCLE_STATUS_ERROR" => Some(4),
-        "RUN_LIFECYCLE_STATUS_CANCELLED" => Some(5),
-        "RUN_LIFECYCLE_STATUS_EXPIRED" => Some(6),
-        _ => None,
-    });
-    match code {
-        Some(1 | 2) => NativeStatus::Running,
-        Some(3) => NativeStatus::Completed,
-        Some(5) => NativeStatus::Cancelled,
-        Some(4 | 6) => NativeStatus::Failed {
-            detail: format!("Cursor SDK run ended with status {status}"),
-        },
-        _ => NativeStatus::Unknown,
-    }
-}
-
-fn validate_sdk_id(id: &str) -> Result<()> {
-    ensure!(
-        !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control),
-        "invalid Cursor SDK id"
-    );
-    Ok(())
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Discovery {
-    schema_version: u32,
-    transport: String,
-    protocol: String,
-    url: String,
-    auth_token_file: PathBuf,
-    /// Present only when the bridge was launched with `--max-concurrent-agents`.
-    max_concurrent_agents: Option<usize>,
-}
-
-impl Discovery {
-    fn endpoint(&self) -> Result<reqwest::Url> {
-        ensure!(
-            self.schema_version == 1 && self.transport == "tcp" && self.protocol == "connect",
-            "unsupported Cursor SDK discovery protocol"
-        );
-        let url =
-            reqwest::Url::parse(&self.url).map_err(|_| anyhow!("invalid Cursor SDK endpoint"))?;
-        let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
-        let ip: IpAddr = host
-            .parse()
-            .map_err(|_| anyhow!("Cursor SDK endpoint must use a loopback IP"))?;
-        ensure!(
-            url.scheme() == "http"
-                && ip.is_loopback()
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.port().is_some_and(|port| port > 0)
-                && url.path() == "/"
-                && url.query().is_none()
-                && url.fragment().is_none(),
-            "Cursor SDK endpoint must be a local HTTP origin"
-        );
-        Ok(url)
-    }
-}
-
-struct SdkProcess {
-    child: Child,
-    tree: Option<platform::tree::Tree>,
-    stdout: JoinHandle<Result<()>>,
-    stderr: JoinHandle<Result<()>>,
-}
-impl Drop for SdkProcess {
-    fn drop(&mut self) {
-        self.stdout.abort();
-        self.stderr.abort();
-        if let Some(mut tree) = self.tree.take() {
-            tree.kill();
-        }
-    }
-}
-
-async fn read_discovery(
-    stderr: impl AsyncRead + Unpin,
-    ready: oneshot::Sender<Result<Discovery>>,
-    diagnostics: Arc<std::sync::Mutex<String>>,
-    secrets: Vec<String>,
-) -> Result<()> {
-    let mut reader = BufReader::new(stderr);
-    loop {
-        let line = bounded_line(&mut reader, 16_384).await?;
-        if line.is_empty() {
-            bail!("Cursor SDK closed stderr before discovery");
-        }
-        if let Some(payload) = line.strip_prefix(b"cursor-sdk-bridge ready ") {
-            let discovery = serde_json::from_slice(payload)
-                .map_err(|_| anyhow!("Cursor SDK emitted invalid discovery JSON"));
-            let _ = ready.send(discovery);
-            return forward(reader).await;
-        }
-        let line = String::from_utf8_lossy(&line);
-        let secret_refs = secrets.iter().map(String::as_str).collect::<Vec<_>>();
-        let line = redact_text(line.into_owned(), &secret_refs);
-        if let Ok(mut diagnostics) = diagnostics.lock() {
-            let available = STARTUP_DIAGNOSTIC_BYTES.saturating_sub(diagnostics.len());
-            if available > 0 {
-                let line = format!("{}\n", line.trim_end());
-                let end = line
-                    .char_indices()
-                    .map(|(index, character)| index + character.len_utf8())
-                    .take_while(|end| *end <= available)
-                    .last()
-                    .unwrap_or(0);
-                diagnostics.push_str(&line[..end]);
-            }
-        }
-    }
-}
-
-/// The bridge's diagnostics after discovery, one log record per line.
-async fn forward(mut reader: impl AsyncBufRead + Unpin) -> Result<()> {
-    loop {
-        let mut line = Vec::new();
-        if (&mut reader)
-            .take(16_384)
-            .read_until(b'\n', &mut line)
-            .await?
-            == 0
-        {
-            return Ok(());
-        }
-        let line = String::from_utf8_lossy(&line);
-        let line = line.trim_end();
-        if !line.is_empty() {
-            tracing::info!(source = "cursor", event = "cursor.stderr", "{line}");
-        }
-    }
-}
-
-async fn drain(mut output: impl AsyncRead + Unpin) -> Result<()> {
-    let mut buffer = [0; 4096];
-    while output.read(&mut buffer).await? != 0 {}
-    Ok(())
-}
-
-struct Rpc {
-    endpoint: reqwest::Url,
-    bearer: String,
-    client: reqwest::Client,
-}
-
-enum MetadataReply {
-    Json(Value),
-    Status(u16),
-    Unavailable,
-}
-
-fn metadata_authentication(reply: &MetadataReply) -> SdkProviderAuthentication {
-    match reply {
-        MetadataReply::Json(value) if value.get("user").is_some_and(metadata_user) => {
-            SdkProviderAuthentication::Authenticated
-        }
-        MetadataReply::Status(401 | 403) => SdkProviderAuthentication::SignInRequired,
-        _ => SdkProviderAuthentication::Unknown,
-    }
-}
-
-fn metadata_user(user: &Value) -> bool {
-    user.get("userId").is_some_and(|id| {
-        id.as_u64()
-            .or_else(|| id.as_str().and_then(|id| id.parse::<u64>().ok()))
-            .is_some_and(|id| id > 0)
-    }) || user
-        .get("userEmail")
-        .and_then(Value::as_str)
-        .is_some_and(metadata_text)
-}
-
-fn metadata_catalog(reply: &MetadataReply, secrets: &[&str]) -> SdkCatalog {
-    let MetadataReply::Json(value) = reply else {
-        return SdkCatalog::Unavailable;
-    };
-    let Some(items) = value.get("items").and_then(Value::as_array) else {
-        return SdkCatalog::Unavailable;
-    };
-    if items.len() > MAX_METADATA_MODELS {
-        return SdkCatalog::Unavailable;
-    }
-    let mut models = Vec::with_capacity(items.len());
-    for item in items {
-        let Some(id) = item.get("id").and_then(Value::as_str) else {
-            return SdkCatalog::Unavailable;
-        };
-        let display_name = match item.get("displayName") {
-            None => id,
-            Some(Value::String(name)) if name.is_empty() => id,
-            Some(Value::String(name)) => name,
-            _ => return SdkCatalog::Unavailable,
-        };
-        if !metadata_text(id)
-            || !metadata_text(display_name)
-            || secrets
-                .iter()
-                .any(|secret| id.contains(secret) || display_name.contains(secret))
-        {
-            return SdkCatalog::Unavailable;
-        }
-        models.push(SdkModel {
-            id: id.to_owned(),
-            display_name: display_name.to_owned(),
-        });
-    }
-    SdkCatalog::Available { models }
-}
-
-fn metadata_text(value: &str) -> bool {
-    !value.trim().is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
-}
-
-impl Rpc {
-    fn request(&self, service: &str, method: &str) -> Result<reqwest::RequestBuilder> {
-        let url = self
-            .endpoint
-            .join(&format!("sdk.v1.{service}/{method}"))
-            .map_err(|_| anyhow!("invalid Cursor SDK RPC endpoint"))?;
-        Ok(self
-            .client
-            .post(url)
-            .bearer_auth(&self.bearer)
-            .header("Connect-Protocol-Version", "1"))
-    }
-
-    async fn unary(&self, service: &str, method: &str, body: Value) -> Result<Value> {
-        let mut response = self
-            .request(service, method)?
-            .json(&body)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|error| anyhow!("Cursor SDK {method} transport failed: {error}"))?;
-        ensure!(
-            response.status().is_success(),
-            "Cursor SDK {method} failed with HTTP {}",
-            response.status().as_u16()
-        );
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| anyhow!("Cursor SDK {method} response failed"))?
-        {
-            ensure!(
-                bytes.len() + chunk.len() <= MAX_FRAME_BYTES,
-                "Cursor SDK unary response is too large"
-            );
-            bytes.extend_from_slice(&chunk);
-        }
-        serde_json::from_slice(&bytes)
-            .map_err(|_| anyhow!("Cursor SDK {method} returned invalid JSON"))
-    }
-
-    async fn metadata_unary(&self, service: &str, method: &str, body: Value) -> MetadataReply {
-        let request = match self.request(service, method) {
-            Ok(request) => request,
-            Err(_) => return MetadataReply::Unavailable,
-        };
-        let mut response = match request.json(&body).timeout(METADATA_TIMEOUT).send().await {
-            Ok(response) => response,
-            Err(_) => return MetadataReply::Unavailable,
-        };
-        let status = response.status();
-        if !status.is_success() {
-            return MetadataReply::Status(status.as_u16());
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = match response.chunk().await {
-            Ok(chunk) => chunk,
-            Err(_) => return MetadataReply::Unavailable,
-        } {
-            if bytes.len() + chunk.len() > MAX_METADATA_BYTES {
-                return MetadataReply::Unavailable;
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        serde_json::from_slice(&bytes).map_or(MetadataReply::Unavailable, MetadataReply::Json)
-    }
-
-    async fn send<P, PF>(
-        &self,
-        agent_id: &str,
-        text: &str,
-        state: &mut RunState,
-        progress: &mut P,
-        run_started: Option<&RunStarted>,
-    ) -> Result<()>
-    where
-        P: FnMut(Value) -> PF,
-        PF: Future<Output = Result<()>>,
-    {
-        let body = encode_frame(
-            0,
-            &json!({"agentId": agent_id, "message": {"text": text}, "options":{"enableDeltas":true}}),
-        )?;
-        let mut response = self
-            .request(AGENT_SERVICE, "Send")?
-            .header("Content-Type", "application/connect+json")
-            .header("Connect-Accept-Encoding", "identity")
-            .body(body)
-            .send()
-            .await
-            .map_err(|_| anyhow!("Cursor SDK Send transport failed; completion is unknown"))?;
-        ensure!(
-            response.status().is_success(),
-            "Cursor SDK Send failed with HTTP {}",
-            response.status().as_u16()
-        );
-        let mut decoder = FrameDecoder::default();
-        let mut total = 0;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| anyhow!("Cursor SDK run stream disconnected; completion is unknown"))?
-        {
-            total += chunk.len();
-            ensure!(
-                total <= MAX_STREAM_BYTES,
-                "Cursor SDK run stream limit exceeded"
-            );
-            for (flags, message) in decoder.push(&chunk)? {
-                state
-                    .accept_with_run_started(flags, message, agent_id, progress, run_started)
-                    .await?;
-            }
-        }
-        decoder.finish()?;
-        ensure!(
-            state.ended,
-            "Cursor SDK stream ended without an EndStream trailer; completion is unknown"
-        );
-        Ok(())
-    }
-}
-
-fn encode_frame(flags: u8, value: &Value) -> Result<Vec<u8>> {
-    let payload = serde_json::to_vec(value)?;
-    ensure!(
-        payload.len() <= MAX_FRAME_BYTES,
-        "Cursor SDK frame is too large"
-    );
-    let mut frame = Vec::with_capacity(payload.len() + 5);
-    frame.push(flags);
-    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
-}
-
-#[derive(Default)]
-struct FrameDecoder {
-    pending: Vec<u8>,
-}
-impl FrameDecoder {
-    fn push(&mut self, bytes: &[u8]) -> Result<Vec<(u8, Value)>> {
-        ensure!(
-            self.pending.len() + bytes.len() <= MAX_STREAM_BYTES,
-            "Cursor SDK frame buffer limit exceeded"
-        );
-        self.pending.extend_from_slice(bytes);
-        let mut frames = Vec::new();
-        let mut consumed = 0;
-        while self.pending.len() - consumed >= 5 {
-            let flags = self.pending[consumed];
-            ensure!(
-                matches!(flags, 0 | 2),
-                "unsupported Cursor SDK Connect frame flags"
-            );
-            let size =
-                u32::from_be_bytes(self.pending[consumed + 1..consumed + 5].try_into().unwrap())
-                    as usize;
-            ensure!(size <= MAX_FRAME_BYTES, "Cursor SDK frame is too large");
-            if self.pending.len() - consumed < size + 5 {
-                break;
-            }
-            let value = serde_json::from_slice(&self.pending[consumed + 5..consumed + 5 + size])
-                .map_err(|_| anyhow!("Cursor SDK frame contains invalid JSON"))?;
-            frames.push((flags, value));
-            consumed += size + 5;
-        }
-        self.pending.drain(..consumed);
-        Ok(frames)
-    }
-    fn finish(&self) -> Result<()> {
-        ensure!(
-            self.pending.is_empty(),
-            "Cursor SDK stream ended within a frame; completion is unknown"
-        );
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct RunState {
-    run_id: Option<String>,
-    output: Option<String>,
-    usage: Option<Value>,
-    done: bool,
-    ended: bool,
-    text_deltas: bool,
-    assistant_text: String,
-}
-impl RunState {
-    async fn identity_and_record(
-        &mut self,
-        message: &Value,
-        expected_agent: &str,
-        required: bool,
-        run_started: Option<&RunStarted>,
-    ) -> Result<()> {
-        let had_run = self.run_id.is_some();
-        self.identity(message, expected_agent, required)?;
-        if !had_run && let (Some(run_id), Some(callback)) = (&self.run_id, run_started) {
-            callback(run_id.clone()).await?;
-        }
-        Ok(())
-    }
-
-    fn identity(&mut self, message: &Value, expected_agent: &str, required: bool) -> Result<()> {
-        if let Some(agent_id) = message
-            .get("agentId")
-            .or_else(|| message.get("agent_id"))
-            .and_then(Value::as_str)
-        {
-            ensure!(
-                agent_id == expected_agent,
-                "Cursor SDK stream contains a different agent"
-            );
-        } else {
-            ensure!(!required, "Cursor SDK terminal envelope has no agent id");
-        }
-        if let Some(run_id) = message
-            .get("runId")
-            .or_else(|| message.get("run_id"))
-            .and_then(Value::as_str)
-        {
-            validate_sdk_id(run_id)?;
-            if let Some(previous) = &self.run_id {
-                ensure!(
-                    previous == run_id,
-                    "Cursor SDK stream contains a different run"
-                );
-            }
-            self.run_id = Some(run_id.into());
-        } else {
-            ensure!(!required, "Cursor SDK terminal envelope has no run id");
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    async fn accept<P, PF>(
-        &mut self,
-        flags: u8,
-        message: Value,
-        expected_agent: &str,
-        progress: &mut P,
-    ) -> Result<()>
-    where
-        P: FnMut(Value) -> PF,
-        PF: Future<Output = Result<()>>,
-    {
-        self.accept_with_run_started(flags, message, expected_agent, progress, None)
-            .await
-    }
-
-    async fn accept_with_run_started<P, PF>(
-        &mut self,
-        flags: u8,
-        message: Value,
-        expected_agent: &str,
-        progress: &mut P,
-        run_started: Option<&RunStarted>,
-    ) -> Result<()>
-    where
-        P: FnMut(Value) -> PF,
-        PF: Future<Output = Result<()>>,
-    {
-        ensure!(!self.ended, "Cursor SDK emitted data after EndStream");
-        if flags == 2 {
-            if let Some(error) = message.get("error").filter(|value| !value.is_null()) {
-                let code = error
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                let detail: String = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("stream failed")
-                    .chars()
-                    .take(1024)
-                    .collect();
-                bail!("Cursor SDK Connect error {code}: {detail}");
-            }
-            ensure!(
-                message.is_object() && message.get("error").is_none_or(Value::is_null),
-                "Cursor SDK Connect stream failed"
-            );
-            ensure!(
-                self.output.is_some() && self.done,
-                "Cursor SDK stream closed before result and done"
-            );
-            self.ended = true;
-            progress(json!({"type":"status","status":"completed"})).await?;
-            return Ok(());
-        }
-        ensure!(!self.done, "Cursor SDK emitted data after done");
-        if let Some(result) = message.get("result") {
-            ensure!(
-                self.output.is_none(),
-                "Cursor SDK emitted duplicate terminal results"
-            );
-            self.identity_and_record(result, expected_agent, true, run_started)
-                .await?;
-            ensure!(
-                finished(result.get("status")),
-                "Cursor SDK run did not finish successfully"
-            );
-            ensure!(
-                result
-                    .get("errorCode")
-                    .and_then(Value::as_str)
-                    .is_none_or(str::is_empty),
-                "Cursor SDK run reported a terminal error"
-            );
-            let result = result
-                .get("result")
-                .context("Cursor SDK terminal envelope has no result")?;
-            self.identity_and_record(result, expected_agent, true, run_started)
-                .await?;
-            ensure!(
-                finished(result.get("status")),
-                "Cursor SDK result did not finish successfully"
-            );
-            let text = result
-                .get("result")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            ensure!(
-                text.len() <= MAX_RESULT_BYTES,
-                "Cursor SDK result is too large"
-            );
-            self.output = Some(text.into());
-            progress(json!({"type":"text_snapshot","item_id":"assistant-0","text":safe_text(&json!(text)).unwrap_or_default()})).await?;
-            self.usage = result
-                .get("usage")
-                .filter(|value| !value.is_null())
-                .and_then(safe_usage);
-            let mut event = Map::new();
-            event.insert("type".into(), Value::String("status".into()));
-            event.insert("status".into(), Value::String("finishing".into()));
-            if let Some(run_id) = &self.run_id {
-                event.insert("run_id".into(), Value::String(run_id.clone()));
-            }
-            if let Some(usage) = &self.usage {
-                event.insert("usage".into(), usage.clone());
-            }
-            progress(Value::Object(event)).await?;
-        } else if let Some(done) = message.get("done") {
-            self.identity_and_record(done, expected_agent, true, run_started)
-                .await?;
-            ensure!(
-                self.output.is_some(),
-                "Cursor SDK emitted done before a successful result"
-            );
-            self.done = true;
-        } else if let Some(envelope) = message.get("sdkMessage") {
-            let Some(event) = envelope.get("message") else {
-                return Ok(());
-            };
-            self.identity_and_record(event, expected_agent, false, run_started)
-                .await?;
-            if let Some(status) = event.get("status").and_then(Value::as_str) {
-                ensure!(
-                    !matches!(
-                        status.to_ascii_uppercase().as_str(),
-                        "ERROR"
-                            | "CANCELLED"
-                            | "EXPIRED"
-                            | "RUN_LIFECYCLE_STATUS_ERROR"
-                            | "RUN_LIFECYCLE_STATUS_CANCELLED"
-                            | "RUN_LIFECYCLE_STATUS_EXPIRED"
-                    ),
-                    "Cursor SDK run reported failure or cancellation"
-                );
-            }
-            let kind = envelope
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if kind == "assistant" {
-                // The bridge can mirror each text fragment in both envelopes.
-                if !self.text_deltas
-                    && let Some(mut progress_event) = safe_progress_event(kind, event)
-                {
-                    self.assistant_text
-                        .push_str(progress_event["text"].as_str().unwrap_or_default());
-                    self.assistant_text = self.assistant_text.chars().take(16_384).collect();
-                    progress_event["item_id"] = json!("assistant-0");
-                    progress_event["text"] = json!(self.assistant_text);
-                    progress(progress_event).await?;
-                }
-            } else if let Some(progress_event) = safe_progress_event(kind, event) {
-                progress(progress_event).await?;
-            }
-        } else if let Some(envelope) = message.get("interactionUpdate") {
-            let kind = envelope
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if kind == "text-delta"
-                && let Some(event) = envelope.get("update")
-            {
-                self.identity_and_record(event, expected_agent, false, run_started)
-                    .await?;
-                if let Some(text) = event.get("text").and_then(safe_text) {
-                    if !self.text_deltas {
-                        self.text_deltas = true;
-                        if !self.assistant_text.is_empty() {
-                            progress(
-                                json!({"type":"text_snapshot","item_id":"assistant-0","text":""}),
-                            )
-                            .await?;
-                            self.assistant_text.clear();
-                        }
-                    }
-                    progress(json!({"type":"text_delta","item_id":"assistant-0","text":text}))
-                        .await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(&self, agent_id: &str) -> Result<AgentResult> {
-        ensure!(
-            self.done && self.ended,
-            "Cursor SDK run has no successful stream completion"
-        );
-        Ok(AgentResult {
-            session_id: Some(agent_id.into()),
-            usage: self.usage.clone(),
-            output: self
-                .output
-                .clone()
-                .context("Cursor SDK run has no result")?,
-        })
-    }
-}
-
-fn safe_label(value: &Value) -> Option<Value> {
-    match value {
-        Value::String(text)
-            if !text.is_empty() && text.len() <= 128 && !text.chars().any(char::is_control) =>
-        {
-            Some(Value::String(text.clone()))
-        }
-        _ => None,
-    }
-}
-
-fn safe_usage(value: &Value) -> Option<Value> {
-    let object = value.as_object()?;
-    let mut output = Map::new();
-    for key in [
-        "inputTokens",
-        "outputTokens",
-        "cacheReadTokens",
-        "totalTokens",
-        "costCents",
-    ] {
-        let Some(value) = object.get(key) else {
-            continue;
-        };
-        let valid = match value {
-            Value::Number(_) => true,
-            Value::String(text) => {
-                text.len() <= 64
-                    && !text.is_empty()
-                    && text
-                        .chars()
-                        .all(|ch| ch.is_ascii_digit() || ".-".contains(ch))
-            }
-            _ => false,
-        };
-        if valid {
-            output.insert(key.into(), value.clone());
-        }
-    }
-    (!output.is_empty()).then_some(Value::Object(output))
-}
-
-fn safe_text(value: &Value) -> Option<String> {
-    let text = value.as_str()?;
-    Some(
-        text.chars()
-            .filter(|ch| !ch.is_control() || matches!(*ch, '\n' | '\r' | '\t'))
-            .take(16_384)
-            .collect(),
-    )
-}
-
-fn safe_progress_event(kind: &str, event: &Value) -> Option<Value> {
-    let object = event.as_object()?;
-    let mut output = Map::new();
-    match kind {
-        "assistant" => {
-            let blocks = object.get("message")?.get("content")?.as_array()?;
-            let text: String = blocks
-                .iter()
-                .filter(|block| block["type"] == "text")
-                .filter_map(|block| block.get("text").and_then(safe_text))
-                .collect();
-            output.insert("type".into(), json!("text_snapshot"));
-            output.insert(
-                "text".into(),
-                json!(text.chars().take(16_384).collect::<String>()),
-            );
-        }
-        "tool_call" => {
-            output.insert("type".into(), json!("tool"));
-            for key in ["name", "status"] {
-                if let Some(value) = object.get(key).and_then(safe_label) {
-                    output.insert(key.into(), value);
-                }
-            }
-            if !output.contains_key("name") && !output.contains_key("status") {
-                return None;
-            }
-            if let Some(id) = object
-                .get("call_id")
-                .or_else(|| object.get("id"))
-                .and_then(safe_label)
-            {
-                output.insert("item_id".into(), id);
-            }
-        }
-        "system" | "status" => {
-            output.insert("type".into(), json!("status"));
-            if let Some(value) = object
-                .get("status")
-                .or_else(|| object.get("subtype"))
-                .and_then(safe_label)
-            {
-                output.insert("status".into(), value);
-            }
-            if kind == "status"
-                && let Some(text) = object.get("message").and_then(safe_text)
-                && !text.is_empty()
-            {
-                output.insert("text".into(), json!(text));
-            }
-            if !output.contains_key("status") && !output.contains_key("text") {
-                return None;
-            }
-        }
-        _ => return None,
-    }
-    if let Some(usage) = object.get("usage").and_then(safe_usage) {
-        output.insert("usage".into(), usage);
-    }
-    (output.len() > 1).then_some(Value::Object(output))
 }
 
 fn redact_text(mut text: String, secrets: &[&str]) -> String {
@@ -2443,27 +1462,6 @@ fn redact_stream_progress(
     redact_progress(value, secrets)
 }
 
-fn finished(status: Option<&Value>) -> bool {
-    status.is_some_and(|status| {
-        status.as_str() == Some("RUN_LIFECYCLE_STATUS_FINISHED") || status.as_u64() == Some(3)
-    })
-}
-
-fn cancelled(status: Option<&Value>) -> bool {
-    status.is_some_and(|status| {
-        status.as_str() == Some("RUN_LIFECYCLE_STATUS_CANCELLED") || status.as_u64() == Some(5)
-    })
-}
-
-fn failed(status: Option<&Value>) -> bool {
-    status.is_some_and(|status| {
-        matches!(
-            status.as_str(),
-            Some("RUN_LIFECYCLE_STATUS_ERROR" | "RUN_LIFECYCLE_STATUS_EXPIRED")
-        ) || matches!(status.as_u64(), Some(4 | 6))
-    })
-}
-
 pub(crate) async fn bounded_line(
     reader: &mut (impl AsyncBufRead + Unpin),
     limit: usize,
@@ -2478,544 +1476,4 @@ pub(crate) async fn bounded_line(
         "line exceeds the configured size limit"
     );
     Ok(line)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn metadata_authentication_requires_a_profile_identity_and_exact_auth_status() {
-        for user in [
-            json!({"userId":"42"}),
-            json!({"userEmail":"private@example.invalid"}),
-        ] {
-            assert_eq!(
-                metadata_authentication(&MetadataReply::Json(json!({"user":user}))),
-                SdkProviderAuthentication::Authenticated
-            );
-        }
-        for value in [json!({}), json!({"user":{}}), json!({"user":null})] {
-            assert_eq!(
-                metadata_authentication(&MetadataReply::Json(value)),
-                SdkProviderAuthentication::Unknown
-            );
-        }
-        for status in [401, 403] {
-            assert_eq!(
-                metadata_authentication(&MetadataReply::Status(status)),
-                SdkProviderAuthentication::SignInRequired
-            );
-        }
-        assert_eq!(
-            metadata_authentication(&MetadataReply::Status(500)),
-            SdkProviderAuthentication::Unknown
-        );
-    }
-
-    #[test]
-    fn metadata_catalog_rejects_secret_or_invalid_model_fields() {
-        for item in [
-            json!({"id":"fixture-secret","displayName":"Model"}),
-            json!({"id":"model","displayName":"fixture-secret"}),
-            json!({"id":"model\ninvalid","displayName":"Model"}),
-            json!({"id":"model","displayName":42}),
-            json!({"id":"model","displayName":"\n"}),
-        ] {
-            assert_eq!(
-                metadata_catalog(
-                    &MetadataReply::Json(json!({"items":[item]})),
-                    &["fixture-secret"]
-                ),
-                SdkCatalog::Unavailable
-            );
-        }
-        assert_eq!(
-            metadata_catalog(&MetadataReply::Json(json!({"items":[]})), &[]),
-            SdkCatalog::Available { models: vec![] }
-        );
-        for item in [
-            json!({"id":"model"}),
-            json!({"id":"model","displayName":""}),
-        ] {
-            assert_eq!(
-                metadata_catalog(&MetadataReply::Json(json!({"items":[item]})), &[]),
-                SdkCatalog::Available {
-                    models: vec![SdkModel {
-                        id: "model".into(),
-                        display_name: "model".into()
-                    }]
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn run_snapshots_accept_numeric_and_named_lifecycle_statuses() {
-        let read = |status| native_run(&json!({"status": status}), "agent", "run", &[]).status;
-        for status in [
-            json!(1),
-            json!(2),
-            json!("RUN_LIFECYCLE_STATUS_CREATING"),
-            json!("RUN_LIFECYCLE_STATUS_RUNNING"),
-        ] {
-            assert_eq!(read(status), NativeStatus::Running);
-        }
-        for status in [json!(3), json!("RUN_LIFECYCLE_STATUS_FINISHED")] {
-            assert_eq!(read(status), NativeStatus::Completed);
-        }
-        for status in [json!(5), json!("RUN_LIFECYCLE_STATUS_CANCELLED")] {
-            assert_eq!(read(status), NativeStatus::Cancelled);
-        }
-        for status in [
-            json!(4),
-            json!(6),
-            json!("RUN_LIFECYCLE_STATUS_ERROR"),
-            json!("RUN_LIFECYCLE_STATUS_EXPIRED"),
-        ] {
-            assert!(matches!(read(status), NativeStatus::Failed { .. }));
-        }
-        for status in [
-            json!(0),
-            json!(7),
-            json!(-1),
-            json!(3.5),
-            json!(true),
-            Value::Null,
-            json!("UNFINISHED"),
-        ] {
-            assert_eq!(read(status), NativeStatus::Unknown);
-        }
-    }
-    fn result(status: Value) -> Value {
-        json!({"result": {"agentId": "a", "runId": "r", "status": status,
-            "result": {"agentId": "a", "runId": "r", "status": status, "result": "Needs approval", "usage": {"inputTokens": "42", "outputTokens": "7"}}}})
-    }
-
-    #[tokio::test]
-    async fn fragmented_connect_stream_requires_result_done_and_trailer() {
-        let messages = [
-            (0, result(json!("RUN_LIFECYCLE_STATUS_FINISHED"))),
-            (0, json!({"done": {"agentId": "a", "runId": "r"}})),
-            (2, json!({})),
-        ];
-        let bytes: Vec<_> = messages
-            .iter()
-            .flat_map(|(flags, value)| encode_frame(*flags, value).unwrap())
-            .collect();
-        let mut decoder = FrameDecoder::default();
-        let mut state = RunState::default();
-        let mut progress = |_| async { Ok(()) };
-        for byte in bytes {
-            for (flags, message) in decoder.push(&[byte]).unwrap() {
-                state
-                    .accept(flags, message, "a", &mut progress)
-                    .await
-                    .unwrap();
-            }
-        }
-        decoder.finish().unwrap();
-        let output = state.finish("a").unwrap();
-        assert_eq!(output.session_id.as_deref(), Some("a"));
-        assert_eq!(output.output, "Needs approval");
-        assert_eq!(
-            output.usage,
-            Some(json!({"inputTokens":"42","outputTokens":"7"}))
-        );
-        let mut missing_trailer = RunState::default();
-        let mut progress = |_| async { Ok(()) };
-        missing_trailer
-            .accept(0, result(json!(3)), "a", &mut progress)
-            .await
-            .unwrap();
-        missing_trailer
-            .accept(
-                0,
-                json!({"done": {"agentId": "a", "runId": "r"}}),
-                "a",
-                &mut progress,
-            )
-            .await
-            .unwrap();
-        assert!(missing_trailer.finish("a").is_err());
-    }
-
-    #[tokio::test]
-    async fn connect_errors_and_unsuccessful_runs_never_complete() {
-        for status in [
-            "RUN_LIFECYCLE_STATUS_ERROR",
-            "RUN_LIFECYCLE_STATUS_CANCELLED",
-            "RUN_LIFECYCLE_STATUS_EXPIRED",
-        ] {
-            let mut state = RunState::default();
-            let mut progress = |_| async { Ok(()) };
-            assert!(
-                state
-                    .accept(0, result(json!(status)), "a", &mut progress)
-                    .await
-                    .is_err()
-            );
-        }
-        let mut state = RunState::default();
-        let mut progress = |_| async { Ok(()) };
-        state
-            .accept(0, result(json!(3)), "a", &mut progress)
-            .await
-            .unwrap();
-        state
-            .accept(
-                0,
-                json!({"done": {"agentId": "a", "runId": "r"}}),
-                "a",
-                &mut progress,
-            )
-            .await
-            .unwrap();
-        assert!(
-            state
-                .accept(
-                    2,
-                    json!({"error": {"code": "internal"}}),
-                    "a",
-                    &mut progress
-                )
-                .await
-                .is_err()
-        );
-        let mut decoder = FrameDecoder::default();
-        decoder.push(&[0, 0, 0]).unwrap();
-        assert!(decoder.finish().is_err());
-        assert!(
-            FrameDecoder::default()
-                .push(&[0, 0xff, 0xff, 0xff, 0xff])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn native_custom_tools_need_a_private_local_callback_and_no_mcp_server() {
-        let turn = SdkTurn {
-            owner: "coordination".into(),
-            executable: "/sdk".into(),
-            workspace: "/manager".into(),
-            local_store_root: "/private/cursor/coordination".into(),
-            api_key: "fixture-key".into(),
-            env: BTreeMap::new(),
-            timeout_secs: 5,
-            model: "fixture-model".into(),
-            callback_token: Some("x".repeat(32)),
-            process_started: None,
-            run_started: None,
-            custom_tools: BTreeMap::from([(
-                "context".into(),
-                CustomToolConfig {
-                    description: Some("Read visible business context".into()),
-                    input_schema: json!({"type":"object"}),
-                    output_schema: None,
-                },
-            )]),
-        };
-        let options = sdk_options(&turn).unwrap();
-        assert_eq!(options["mcpServers"], json!({}));
-        assert_eq!(options["local"]["store"]["type"], "jsonl");
-        assert_eq!(
-            options["local"]["store"]["rootDir"],
-            "/private/cursor/coordination"
-        );
-        assert!(options.get("tools").is_none());
-        assert_eq!(
-            options["local"]["customTools"]["context"]["inputSchema"],
-            json!({"type":"object"})
-        );
-        let callback = ToolCallbackConfig {
-            url: "http://127.0.0.1:1234".into(),
-            auth_token: "x".repeat(32),
-        };
-        assert!(SdkBridge::new(BTreeMap::new(), callback.clone(), None).is_ok());
-        let reserved = BTreeMap::from([("CURSOR_API_KEY".into(), "override".into())]);
-        assert!(SdkBridge::new(reserved, callback.clone(), None).is_err());
-        let remote = ToolCallbackConfig {
-            url: "http://192.0.2.1:1234".into(),
-            ..callback
-        };
-        assert!(SdkBridge::new(BTreeMap::new(), remote, None).is_err());
-    }
-
-    #[tokio::test]
-    async fn progress_callback_only_receives_bounded_whitelisted_fields() {
-        let mut state = RunState::default();
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = captured.clone();
-        let mut progress = move |value| {
-            sink.lock().unwrap().push(value);
-            async { Ok(()) }
-        };
-        state
-            .accept(
-                0,
-                json!({"sdkMessage":{"type":"assistant","message":{"message":{"content":[{"type":"text","text":"x".repeat(20000)}]},"secret":"do-not-forward"}}}),
-                "a",
-                &mut progress,
-            )
-            .await
-            .unwrap();
-        let events = captured.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["type"], "text_snapshot");
-        assert!(events[0]["text"].as_str().unwrap().len() <= 16_384);
-        assert!(events[0].get("secret").is_none());
-    }
-
-    #[tokio::test]
-    async fn cursor_text_deltas_ignore_mirrored_assistant_content_and_keep_newlines() {
-        let mut state = RunState::default();
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = captured.clone();
-        let mut progress = move |value| {
-            sink.lock().unwrap().push(value);
-            async { Ok(()) }
-        };
-        state.accept(0,json!({"interactionUpdate":{"type":"text-delta","update":{"type":"text-delta","text":"first\n\tsecond\u{0000}"}}}),"a",&mut progress).await.unwrap();
-        state.accept(0,json!({"sdkMessage":{"type":"assistant","message":{"message":{"content":[{"type":"text","text":"first\n\tsecond"},{"type":"tool_use","input":{"secret":"hidden"}}]}}}}),"a",&mut progress).await.unwrap();
-        state
-            .accept(
-                0,
-                json!({"interactionUpdate":{"type":"thinking-delta","update":{"text":"private"}}}),
-                "a",
-                &mut progress,
-            )
-            .await
-            .unwrap();
-        let events = captured.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0],
-            json!({"type":"text_delta","item_id":"assistant-0","text":"first\n\tsecond"})
-        );
-        assert!(
-            !events
-                .iter()
-                .any(|event| event.to_string().contains("hidden"))
-        );
-        assert!(cancelled(Some(&json!(5))));
-        assert!(!cancelled(Some(&json!(3))));
-    }
-
-    #[tokio::test]
-    async fn cursor_unkeyed_assistant_fragments_and_deltas_render_exactly_once() {
-        for deltas in [false, true] {
-            for assistant_first in [false, true] {
-                let mut state = RunState::default();
-                let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-                let sink = captured.clone();
-                let mut progress = move |value| {
-                    sink.lock().unwrap().push(value);
-                    async { Ok(()) }
-                };
-                for text in ["first\n", "\tsecond", "!"] {
-                    let assistant = json!({"sdkMessage":{"type":"assistant","message":{"type":"assistant","agent_id":"a","run_id":"r","message":{"role":"assistant","content":[{"type":"text","text":text}]}}}});
-                    let delta = json!({"interactionUpdate":{"type":"text-delta","update":{"type":"text-delta","text":text}}});
-                    let messages = if !deltas {
-                        vec![assistant]
-                    } else if assistant_first {
-                        vec![assistant, delta]
-                    } else {
-                        vec![delta, assistant]
-                    };
-                    for message in messages {
-                        state.accept(0, message, "a", &mut progress).await.unwrap();
-                    }
-                }
-                let mut preview = String::new();
-                for event in captured.lock().unwrap().iter() {
-                    assert_eq!(event["item_id"], "assistant-0");
-                    let text = event["text"].as_str().unwrap();
-                    match event["type"].as_str().unwrap() {
-                        "text_snapshot" => preview = text.to_owned(),
-                        "text_delta" => preview.push_str(text),
-                        kind => panic!("unexpected text event {kind}"),
-                    }
-                }
-                assert_eq!(
-                    preview, "first\n\tsecond!",
-                    "deltas={deltas},assistant_first={assistant_first}"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn cursor_final_snapshot_restores_safe_secret_prefix_tail() {
-        for (text, expected) in [("yes", "yes"), ("sk-secret", "[redacted]")] {
-            let mut state = RunState::default();
-            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let sink = captured.clone();
-            let mut pending = BTreeMap::new();
-            let mut progress = move |value| {
-                sink.lock().unwrap().push(redact_stream_progress(
-                    value,
-                    &["sk-secret"],
-                    &mut pending,
-                ));
-                async { Ok(()) }
-            };
-            state
-                .accept(
-                    0,
-                    json!({"interactionUpdate":{"type":"text-delta","update":{"text":text}}}),
-                    "a",
-                    &mut progress,
-                )
-                .await
-                .unwrap();
-            let mut terminal = result(json!(3));
-            terminal["result"]["result"]["result"] = json!(text);
-            state.accept(0, terminal, "a", &mut progress).await.unwrap();
-            let mut preview = String::new();
-            for event in captured.lock().unwrap().iter() {
-                match event["type"].as_str().unwrap() {
-                    "text_snapshot" => preview = event["text"].as_str().unwrap().to_owned(),
-                    "text_delta" => preview.push_str(event["text"].as_str().unwrap()),
-                    _ => {}
-                }
-            }
-            assert_eq!(preview, expected);
-        }
-    }
-
-    #[test]
-    fn progress_redaction_covers_nested_values() {
-        let redacted = redact_progress(
-            json!({"text": "prefix api-key bearer-token", "items": ["api-key"]}),
-            &["api-key", "bearer-token"],
-        );
-        assert_eq!(
-            redacted,
-            json!({"text": "prefix [redacted] [redacted]", "items": ["[redacted]"]})
-        );
-    }
-
-    #[test]
-    fn cursor_status_and_tool_fields_match_the_live_progress_contract() {
-        assert_eq!(
-            safe_progress_event("system", &json!({"subtype":"init"})),
-            Some(json!({"type":"status","status":"init"}))
-        );
-        assert_eq!(
-            safe_progress_event("status", &json!({"status":"RUNNING","message":""})),
-            Some(json!({"type":"status","status":"RUNNING"}))
-        );
-        assert_eq!(
-            safe_progress_event(
-                "tool_call",
-                &json!({"call_id":"call-1","name":"context","status":"completed","args":{"secret":"hidden"},"result":{"secret":"hidden"}})
-            ),
-            Some(json!({"type":"tool","item_id":"call-1","name":"context","status":"completed"}))
-        );
-        assert!(
-            safe_progress_event(
-                "tool_call",
-                &json!({"name":"","status":3,"call_id":"call-1"})
-            )
-            .is_none()
-        );
-        assert!(safe_progress_event("status", &json!({"status":3,"message":""})).is_none());
-        assert!(safe_progress_event("usage", &json!({"usage":{"inputTokens":3}})).is_none());
-    }
-
-    #[tokio::test]
-    async fn cursor_terminal_progress_reports_canonical_status_without_native_numbers() {
-        let mut state = RunState::default();
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = captured.clone();
-        let mut progress = move |value| {
-            sink.lock().unwrap().push(value);
-            async { Ok(()) }
-        };
-        for (flags, message) in [
-            (0, result(json!(3))),
-            (0, json!({"done":{"agentId":"a","runId":"r"}})),
-            (2, json!({})),
-        ] {
-            state
-                .accept(flags, message, "a", &mut progress)
-                .await
-                .unwrap();
-        }
-        let events = captured.lock().unwrap();
-        let statuses: Vec<_> = events
-            .iter()
-            .filter(|value| value["type"] == "status")
-            .cloned()
-            .collect();
-        assert_eq!(
-            statuses,
-            vec![
-                json!({"type":"status","status":"finishing","run_id":"r","usage":{"inputTokens":"42","outputTokens":"7"}}),
-                json!({"type":"status","status":"completed"})
-            ]
-        );
-    }
-
-    #[test]
-    fn local_reap_without_provider_terminal_stays_unknown() {
-        assert_eq!(provider_cancel_failure(None), AgentFailure::Unknown);
-        assert_eq!(
-            provider_cancel_failure(Some(AgentFailure::Cancelled)),
-            AgentFailure::Cancelled
-        );
-        assert_eq!(
-            provider_cancel_failure(Some(AgentFailure::Failed)),
-            AgentFailure::Failed
-        );
-    }
-
-    #[test]
-    fn text_delta_redaction_holds_partial_secrets_across_frames() {
-        for (secret, fragments) in [
-            ("sk-secret", vec!["prefix sk-", "sec", "ret suffix"]),
-            ("aba", vec!["a", "b", "a"]),
-            ("密钥", vec!["密", "钥"]),
-        ] {
-            let mut pending = BTreeMap::new();
-            let output: String = fragments
-                .into_iter()
-                .map(|text| {
-                    redact_stream_progress(
-                        json!({"type":"text_delta","item_id":"a","text":text}),
-                        &[secret],
-                        &mut pending,
-                    )["text"]
-                        .as_str()
-                        .unwrap()
-                        .to_owned()
-                })
-                .collect();
-            assert!(!output.contains(secret));
-            assert!(output.contains("[redacted]"));
-        }
-    }
-
-    #[test]
-    fn discovery_rejects_nonlocal_and_redirectable_endpoints() {
-        let mut ready = Discovery {
-            schema_version: 1,
-            transport: "tcp".into(),
-            protocol: "connect".into(),
-            url: "http://127.0.0.1:1234".into(),
-            auth_token_file: "/token".into(),
-            max_concurrent_agents: None,
-        };
-        assert!(ready.endpoint().is_ok());
-        for url in [
-            "https://127.0.0.1:1234",
-            "http://example.com:1234",
-            "http://192.0.2.1:1234",
-            "http://secret@127.0.0.1:1234",
-            "http://127.0.0.1:1234/path",
-        ] {
-            ready.url = url.into();
-            assert!(ready.endpoint().is_err());
-        }
-    }
 }
