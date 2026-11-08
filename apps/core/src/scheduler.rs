@@ -471,6 +471,7 @@ async fn prepare_turn_from(
         )
     };
     let provider = settings.provider;
+    node.refresh_provider_login(provider).await?;
     let stable_tools = provider.tools_for(TriggerKind::Human);
     let stable_tool_values = tools(TriggerKind::Human)
         .into_iter()
@@ -543,6 +544,7 @@ async fn prepare_turn_from(
         },
         ..node.manager_config(settings.clone(), &provider_local)?
     };
+    node.prepare_manager_login(&mut config).await?;
     if let Some(instance) = &instance {
         config = config.for_cursor_instance(instance.clone(), node.cursor_store_root(instance));
     }

@@ -7,7 +7,7 @@ import { lostKeyText } from '@vibeface/client/identity/copy.ts'
 import { indexedOutbox } from './indexed-outbox'
 import { localPage } from './local-page'
 import { joinTabs } from './tabs'
-import { desktopLocalPage } from './desktop-local-page'
+import { desktopGatewayCarrier, desktopLocalPage } from './desktop-local-page'
 import type { ClientPreloadApi } from '../../../desktop/src/shared/client-contract.ts'
 
 const secure: SecureApi = wasm
@@ -132,7 +132,6 @@ const browserPlatform: Platform = {
 }
 
 function desktopPlatform(native: ClientPreloadApi): Platform {
-  let localGatewayOrigin: string | null = null
   const stream = (id: string): LanStream => {
     let closed = false
     let sending = 0
@@ -154,16 +153,11 @@ function desktopPlatform(native: ClientPreloadApi): Platform {
   }
   const nativeLan: LanDial = async (deviceId, addrs, timeoutMs) => stream(await native.carrier.openLan(deviceId, addrs, timeoutMs))
   const nativeLocal: NativeLocalCarrier = async (entry, timeoutMs) => stream(await native.carrier.open(entry.device_id, timeoutMs))
-  const nativeLocalGateway: NativeLocalGatewayCarrier = async (entry, target, timeoutMs) => {
-    if (entry.address !== localGatewayOrigin) return null
-    const id = await native.carrier.openGateway(target, entry.address, timeoutMs)
-    if (!id) throw new Error('本机节点已切换。刷新后重试。')
-    return stream(id)
-  }
+  const nativeLocalGateway: NativeLocalGatewayCarrier = desktopGatewayCarrier(native.carrier, stream)
   return {
     ...browserPlatform,
     transport: createTransport(secure, browserKeys, nativeLan, nativeLocal, nativeLocalGateway),
-    page: desktopLocalPage(native, origin => { localGatewayOrigin = origin }),
+    page: desktopLocalPage(native),
   }
 }
 

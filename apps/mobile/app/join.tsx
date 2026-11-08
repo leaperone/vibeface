@@ -50,7 +50,7 @@ export default function JoinScreen() {
         : device.ready && device.recovered ? <RecoveredStep />
         : device.recovery ? <RecoveryWaiting />
         : device.review?.kind === 'recovery' ? <RecoveryReview />
-        : session.phase === 'joining' ? <Waiting code={session.code} admin={session.admin} reached={Boolean(device.info)} onCancel={workspace.actions.cancelJoin} />
+        : session.phase === 'joining' ? <Waiting code={session.code} admin={session.admin} reached={Boolean(device.info)} error={device.error} reconnecting={device.phase === 'reconnecting'} onCancel={workspace.actions.cancelJoin} />
         : lane === 'recovery' ? <Panel icon={ArchiveRestore} title="用恢复文件找回"><RecoveryRestore link={url} /></Panel>
         : <JoinForm />}
       {choosing ? <View className="gap-1 border-t border-border pt-4">
@@ -184,11 +184,13 @@ function Paste({ onText }: { onText: (text: string) => void }) {
   </Button>
 }
 
-function Waiting({ code, admin, reached, onCancel }: { code: string | null; admin?: string; reached: boolean; onCancel: () => void }) {
+function Waiting({ code, admin, reached, error, reconnecting, onCancel }: { code: string | null; admin?: string; reached: boolean; error: string; reconnecting: boolean; onCancel: () => void }) {
   return <Panel icon={Hourglass} title={joinCopy.waiting}>
     {reached ? <View className="flex-row items-center gap-2"><Icon as={ShieldCheck} className="size-4 text-success" /><Text className="text-meta text-muted-foreground">{joinCopy.reached}</Text></View> : null}
     <Text role="status" className="text-muted-foreground">{code ? joinCopy.compareCode(admin) : joinCopy.showCode}</Text>
     {code ? <SafetyCode code={code} /> : <Skeleton className="h-8 w-40" />}
+    {reconnecting ? <Text className="text-meta text-muted-foreground">连接已断开，正在重连；批准后仍会继续完成加入。</Text> : null}
+    <ErrorText error={error} />
     <Button variant="ghost" className="-ms-3 self-start" onPress={onCancel}><Text>取消</Text></Button>
   </Panel>
 }

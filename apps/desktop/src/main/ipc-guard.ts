@@ -1,10 +1,9 @@
-import { LAUNCHER_URL } from '../shared/contract.js'
+import { CLIENT_HOST, CLIENT_SCHEME } from '../shared/client-contract.js'
 
 /**
- * Privileged IPC is reachable from exactly one place: the top frame of the trusted launcher
- * window, loaded from the launcher's own fixed URL. Identity of the WebContents and of the
- * frame is checked together with that URL, because a `file:`-style origin serializes to
- * `null` and an origin alone would also accept a subframe or another window.
+ * Privileged node IPC is reachable only from the top frame of the trusted first-party client
+ * window at the fixed CLIENT origin. WebContents identity is checked together with frame URL,
+ * because origin checks alone would accept subframes or another window.
  */
 export type SenderIdentity = {
   sender: object | null
@@ -13,17 +12,27 @@ export type SenderIdentity = {
   frameParent: object | null
 }
 
-export type LauncherIdentity = {
+export type ClientIdentity = {
   contents: object | null
   mainFrame: object | null
 }
 
-export function isTrustedLauncherCall(sender: SenderIdentity, launcher: LauncherIdentity): boolean {
-  if (!launcher.contents || !launcher.mainFrame) return false
-  if (sender.sender !== launcher.contents) return false
-  if (sender.senderFrame !== launcher.mainFrame) return false
+function sameClientOrigin(raw: string | null): boolean {
+  if (!raw) return false
+  try {
+    const url = new URL(raw)
+    return url.protocol === `${CLIENT_SCHEME}:` && url.host === CLIENT_HOST && !url.username && !url.password && !url.port
+  } catch {
+    return false
+  }
+}
+
+export function isTrustedClientCall(sender: SenderIdentity, client: ClientIdentity): boolean {
+  if (!client.contents || !client.mainFrame) return false
+  if (sender.sender !== client.contents) return false
+  if (sender.senderFrame !== client.mainFrame) return false
   if (sender.frameParent !== null) return false
-  return sender.frameUrl === LAUNCHER_URL
+  return sameClientOrigin(sender.frameUrl)
 }
 
 /** Reject anything that is not a plain string of a sane length before it reaches Core. */

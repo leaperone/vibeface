@@ -1,3 +1,5 @@
+import type { DesktopNodeApi } from './contract.js'
+
 /** Purpose-specific client window contract shared with its isolated preload. */
 export const CLIENT_SCHEME = 'vibeface-app'
 export const CLIENT_HOST = 'app'
@@ -35,5 +37,6 @@ export type ClientPreloadApi = {
     receive(id: string): Promise<ClientFrame | null>
     close(id: string): void
   }
+  desktop: DesktopNodeApi
   showNodePanel(): Promise<void>
 }

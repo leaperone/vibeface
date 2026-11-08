@@ -3,7 +3,13 @@ import { once } from 'node:events'
 import type { Readable } from 'node:stream'
 
 const MAX_RESULT_BYTES = 64 * 1024
-const COMMAND_TIMEOUT_MS = 30_000
+const STATUS_COMMAND_TIMEOUT_MS = 30_000
+/** Covers lock wait, health, and acknowledgement. A timeout is an unknown outcome: the controller does not write or restart. */
+const UPDATE_COMMAND_TIMEOUT_MS = 120_000
+
+export function commandTimeoutMs(action: string): number {
+  return action === 'update' ? UPDATE_COMMAND_TIMEOUT_MS : STATUS_COMMAND_TIMEOUT_MS
+}
 
 const CLI_FAILURES: Record<string, string> = {
   desktop_node_package_invalid: '安装包校验未通过，请重新安装桌面 App。',
@@ -11,21 +17,40 @@ const CLI_FAILURES: Record<string, string> = {
   desktop_node_health_unconfirmed: '后台节点尚未确认就绪，请重新核对状态。',
   desktop_node_lock_unconfirmed: '无法确认节点是否已退出，请重新核对状态。',
   desktop_node_registration_unconfirmed: '无法确认系统中的节点服务，请重新核对状态。',
+  desktop_node_update_refused: '当前无法更新本机后台节点，请先核对运行状态。',
+  desktop_node_recovery_required: '上次更新尚未完成，请在后台节点停止后点击“继续更新”核对。',
 }
 class CliOperationFailure extends Error {}
 
 export type ManagedNodeProgram = { command: string; args?: readonly string[] }
 type CoreStatus = 'running' | 'stopped' | 'unavailable' | null
+
+export type RuntimeUpdateAvailability =
+  | 'not_installed'
+  | 'current'
+  | 'newer_available'
+  | 'immutable_conflict'
+  | 'downgrade_refused'
+
+export type ManagedNodeRuntimeUpdate = {
+  bundledVersion: string
+  installedVersion: string | null
+  runningVersion: string | null
+  availability: RuntimeUpdateAvailability
+  recoveryRequired: boolean
+}
+
 type ManagedNodeIdentity = { device_id: string; data_dir: string; service_id: string; managed_root: string }
 export type ManagedNodeStatus =
-  | { ok: true; state: 'not_installed'; device_id: null; data_dir: null; service_id: null; managed_root: null; service_running: null; core_status: null }
-  | ({ ok: true; state: 'installed' | 'installed_stopped' | 'partial'; service_running: boolean; core_status: CoreStatus } & ManagedNodeIdentity)
-  | ({ ok: true; state: 'conflict' | 'unavailable'; service_running: boolean | null; core_status: CoreStatus } & ManagedNodeIdentity)
+  | { ok: true; state: 'not_installed'; device_id: null; data_dir: null; service_id: null; managed_root: null; service_running: null; core_status: null; runtime_update: ManagedNodeRuntimeUpdate }
+  | ({ ok: true; state: 'installed' | 'installed_stopped' | 'partial'; service_running: boolean; core_status: CoreStatus; runtime_update: ManagedNodeRuntimeUpdate } & ManagedNodeIdentity)
+  | ({ ok: true; state: 'conflict' | 'unavailable'; service_running: boolean | null; core_status: CoreStatus; runtime_update: ManagedNodeRuntimeUpdate } & ManagedNodeIdentity)
 
 type Options = {
   profileDir: string
   bundledCli: ManagedNodeProgram
   onChange?: (status: ManagedNodeStatus) => void
+  commandTimeoutMs?: (action: string) => number
 }
 
 async function readBounded(stream: Readable, limit: number): Promise<string> {
@@ -40,34 +65,104 @@ async function readBounded(stream: Readable, limit: number): Promise<string> {
   return Buffer.concat(chunks, size).toString('utf8')
 }
 
-function isStatus(value: unknown): value is ManagedNodeStatus {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
-  if (!('ok' in value) || !('state' in value) || !('device_id' in value) || !('data_dir' in value) ||
-      !('service_id' in value) || !('managed_root' in value) || !('service_running' in value) || !('core_status' in value)) return false
-  if (Object.keys(value).length !== 8 || value.ok !== true) return false
-  if (value.state === 'not_installed') {
-    return value.device_id === null && value.data_dir === null && value.service_id === null &&
-      value.managed_root === null && value.service_running === null && value.core_status === null
+function runtimeUpdateAvailability(value: unknown): RuntimeUpdateAvailability {
+  if (value === 'not_installed' || value === 'current' || value === 'newer_available' || value === 'immutable_conflict' || value === 'downgrade_refused') {
+    return value
   }
-  const identityValid = typeof value.device_id === 'string' && typeof value.data_dir === 'string' &&
-    typeof value.service_id === 'string' && typeof value.managed_root === 'string'
-  const coreStatusValid = value.core_status === null || value.core_status === 'running' ||
-    value.core_status === 'stopped' || value.core_status === 'unavailable'
-  if (!identityValid || !coreStatusValid) return false
-  switch (value.state) {
-    case 'installed':
-    case 'installed_stopped':
-    case 'partial':
-      return typeof value.service_running === 'boolean'
-    case 'conflict':
-    case 'unavailable':
-      return value.service_running === null || typeof value.service_running === 'boolean'
-    default:
-      return false
+  throw new Error('desktop Node returned unsupported runtime update availability')
+}
+
+function runtimeUpdate(value: unknown): ManagedNodeRuntimeUpdate {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('desktop Node returned invalid runtime update metadata')
+  }
+  const source = value as Record<string, unknown>
+  if (!('bundled_version' in source) || !('availability' in source)) {
+    throw new Error('desktop Node returned invalid runtime update metadata')
+  }
+  if (typeof source.bundled_version !== 'string' || !source.bundled_version) {
+    throw new Error('desktop Node returned invalid bundled runtime version')
+  }
+  const installedVersion = source.installed_version
+  if (!(installedVersion === null || (typeof installedVersion === 'string' && installedVersion))) {
+    throw new Error('desktop Node returned invalid installed runtime version')
+  }
+  const runningVersion = source.running_version
+  if (!(runningVersion === null || (typeof runningVersion === 'string' && runningVersion))) {
+    throw new Error('desktop Node returned invalid running runtime version')
+  }
+  if (typeof source.recovery_required !== 'boolean') {
+    throw new Error('desktop Node returned invalid recovery state')
+  }
+  return {
+    bundledVersion: source.bundled_version,
+    installedVersion,
+    runningVersion,
+    availability: runtimeUpdateAvailability(source.availability),
+    recoveryRequired: source.recovery_required,
   }
 }
 
-async function invoke(program: ManagedNodeProgram, args: readonly string[]): Promise<unknown> {
+export function parseManagedNodeStatus(value: unknown): ManagedNodeStatus {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('desktop Node returned an unsupported result')
+  }
+  const raw = value as Record<string, unknown>
+  if (Object.keys(raw).length !== 9 || raw.ok !== true || typeof raw.state !== 'string') {
+    throw new Error('desktop Node returned an unsupported result')
+  }
+  const runtime = runtimeUpdate(raw.runtime_update)
+  const state = raw.state
+  if (state === 'not_installed') {
+    if (raw.device_id !== null || raw.data_dir !== null || raw.service_id !== null || raw.managed_root !== null ||
+        raw.service_running !== null || raw.core_status !== null || runtime.availability !== 'not_installed' || runtime.recoveryRequired) {
+      throw new Error('desktop Node returned an unsupported result')
+    }
+    return {
+      ok: true,
+      state,
+      device_id: null,
+      data_dir: null,
+      service_id: null,
+      managed_root: null,
+      service_running: null,
+      core_status: null,
+      runtime_update: runtime,
+    }
+  }
+  if (typeof raw.device_id !== 'string' || typeof raw.data_dir !== 'string' || typeof raw.service_id !== 'string' ||
+      typeof raw.managed_root !== 'string') {
+    throw new Error('desktop Node returned an unsupported result')
+  }
+  let coreStatus: CoreStatus
+  if (raw.core_status === null || raw.core_status === 'running' || raw.core_status === 'stopped' || raw.core_status === 'unavailable') {
+    coreStatus = raw.core_status
+  } else {
+    throw new Error('desktop Node returned an unsupported result')
+  }
+  const serviceRunning = raw.service_running
+  const identity = {
+    device_id: raw.device_id,
+    data_dir: raw.data_dir,
+    service_id: raw.service_id,
+    managed_root: raw.managed_root,
+    core_status: coreStatus,
+    runtime_update: runtime,
+  }
+  if (state === 'installed' || state === 'installed_stopped' || state === 'partial') {
+    if (typeof serviceRunning !== 'boolean') throw new Error('desktop Node returned an unsupported result')
+    return { ok: true, state, service_running: serviceRunning, ...identity }
+  }
+  if (state === 'conflict' || state === 'unavailable') {
+    if (!(serviceRunning === null || typeof serviceRunning === 'boolean')) {
+      throw new Error('desktop Node returned an unsupported result')
+    }
+    return { ok: true, state, service_running: serviceRunning, ...identity }
+  }
+  throw new Error('desktop Node returned an unsupported result')
+}
+
+async function invoke(program: ManagedNodeProgram, args: readonly string[], timeoutMs: number): Promise<unknown> {
   const child = spawn(program.command, [...(program.args ?? []), ...args], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
   const { stdout, stderr } = child
   if (!stdout || !stderr) throw new Error('desktop Node command streams are unavailable')
@@ -82,7 +177,7 @@ async function invoke(program: ManagedNodeProgram, args: readonly string[]): Pro
     const timer = setTimeout(() => {
       child.kill('SIGKILL')
       reject(new Error('desktop Node command timed out'))
-    }, COMMAND_TIMEOUT_MS)
+    }, timeoutMs)
     void closePromise.finally(() => clearTimeout(timer))
   })
   try {
@@ -110,15 +205,17 @@ export class ManagedNodeController {
   readonly #profileDir: string
   readonly #bundledCli: ManagedNodeProgram
   readonly #onChange?: (status: ManagedNodeStatus) => void
+  readonly #commandTimeoutMs: (action: string) => number
 
   constructor(options: Options) {
     this.#profileDir = options.profileDir
     this.#bundledCli = options.bundledCli
     this.#onChange = options.onChange
+    this.#commandTimeoutMs = options.commandTimeoutMs ?? commandTimeoutMs
   }
 
   async prepareProfile(): Promise<void> {
-    const result = await invoke(this.#bundledCli, ['desktop-profile', '--profile-dir', this.#profileDir])
+    const result = await invoke(this.#bundledCli, ['desktop-profile', '--profile-dir', this.#profileDir], this.#commandTimeoutMs('profile'))
     if (typeof result !== 'object' || result === null || Array.isArray(result) || Object.keys(result).length !== 1 || !('ok' in result) || result.ok !== true) {
       throw new Error('Desktop profile permissions could not be prepared')
     }
@@ -130,6 +227,10 @@ export class ManagedNodeController {
 
   async installBackground(expectedNodeId: string): Promise<ManagedNodeStatus> {
     return this.#run('install', expectedNodeId)
+  }
+
+  async updateBackground(expectedNodeId: string): Promise<ManagedNodeStatus> {
+    return this.#run('update', expectedNodeId)
   }
 
   async start(expectedNodeId: string): Promise<ManagedNodeStatus> {
@@ -148,9 +249,9 @@ export class ManagedNodeController {
     const args = ['desktop-node', '--profile-dir', this.#profileDir]
     if (expectedNodeId !== undefined) args.push('--expected-device-id', expectedNodeId)
     args.push(action)
-    const result = await invoke(this.#bundledCli, args)
-    if (!isStatus(result)) throw new Error('desktop Node returned an unsupported result')
-    this.#onChange?.(result)
-    return result
+    const result = await invoke(this.#bundledCli, args, this.#commandTimeoutMs(action))
+    const status = parseManagedNodeStatus(result)
+    this.#onChange?.(status)
+    return status
   }
 }

@@ -80,11 +80,9 @@ bash scripts/build-web.sh
 
 网页在每个服务那一行列出所需程序和准备状态。Codex 打开执行任务且选择由 Vibeface 启动时，Node 启动私有 App Server，但不会安装 Provider、执行账户登录、调用模型或扩大节点角色。程序可用也不代表 Provider 已登录。确认安装和授权前提后，再通过真实对话核验。下面的初始化参数是可选备用方式，字段说明见 [本机配置](node-protocol.md#本机配置)。
 
-### 使用 Cursor SDK
+### 使用 Cursor CLI
 
-从 [Cursor SDK Bridge v1.2.0 发布页](https://github.com/cursor/sdk-bridge/releases/tag/v1.2.0) 下载对应平台的 standalone 包，用发布页的 `SHA256SUMS.txt` 核对后解压。可执行文件位于 `bin/cursor-sdk-bridge`。例如，Apple Silicon Mac 的包名是 `cursor-sdk-bridge-standalone-darwin-arm64.tar.gz`。此处指向官方发布包，不代表已在你的环境完成模型调用验收。
-
-在运行 Node 的环境中配置 `CURSOR_API_KEY`。不要把密钥写进命令行、URL、Git 或聊天记录。模型使用账户实际可用的名称。
+Node 使用已安装的官方 Cursor Agent CLI，通过 ACP 复用 `agent login` 的已有订阅登录，不要求 API key。程序可用时点设备页的**自动接入**，或显式配置程序绝对路径。Vibeface 不安装 Agent，不自动执行登录。
 
 ```sh
 ./vibeface init \
@@ -92,16 +90,16 @@ bash scripts/build-web.sh
     --manager cursor \
     --workspace /absolute/path/to/manager-workspace \
     --model auto \
-    --bin cursor=/absolute/path/to/bin/cursor-sdk-bridge
+    --bin cursor=/absolute/path/to/agent
 ```
 
-此命令用于尚未初始化的 Node。默认使用 `auto` 模型。SDK 程序在本机运行，模型请求仍发往 Cursor 服务，消耗 Cursor 额度。
+此命令用于尚未初始化的 Node。Cursor 请求使用本机 CLI 当前选择的账户额度；保存或继承的 CURSOR_API_KEY/CURSOR_AUTH_TOKEN 仍优先于订阅登录。凭据不得写入命令行、URL、Git 或聊天记录。检查只观察 CLI 状态并初始化私有空会话和模型目录，不发送模型提示。需要本人登录时，设备页提供官方登录命令。
 
-Cursor 使用 SDK 原生自定义工具回调连接 Rust Node。产品链路不启动 MCP Server，也不要求 Bot 或浏览器支持 MCP。协调工具限定到当前个人网络及机器人聊天，本机工作使用 SDK 宿主工具。Agent 不能替本人授权自动后续。
+每个 Bot 和任务 owner 使用私有 ACP 配置、数据和 Node journal。各轮使用独立进程，同一 owner 串行，不同 owner 可并行。Node 工具经私有回环 MCP 入口使用当前 attempt 认证，保留网络、聊天、任务和写操作去重边界。CLI 自身的用户及项目 MCP、规则与 hooks 仍按官方行为加载。
 
-Cursor 的 Bot、协调 Agent 和任务会话分别使用独立的 SDK Bridge 进程与私有 JSONL 存储。同一 Bot 的回合串行运行，不同 Bot 可以并行。任务通过 `dispatch_work` 的 `agent: "cursor"` 选择 Cursor，`continues` 或本机已有任务的 `thread` 可续接原会话；同一会话一次只运行一项工作。当前 Cursor 任务支持文本提示和模型选择，不支持图片、推理档位或运行中插话。
+任务先保存会话归属和提交凭证，再发送提示；终态先落盘后报告完成。ACP 没有持久原生 run 查询，断流后缺终态的提交保持待核对，不重发。历史加载只用于明确的后续回合，历史消息不会算作新回复。只有原 prompt 返回 cancelled 才确认停止，结束进程不能替代。任务支持文本与模型选择，运行中插话仍排队。
 
-已设置 `CURSOR_API_KEY` 且选择 Cursor 运行 Bot 时，Node 会预热协调 Agent；任务按需启动自己的 Bridge。一个 Bridge 退出只影响对应的 Bot、协调 Agent 或任务会话。启动失败按 1 至 30 秒退避，空闲进程会回收，JSONL 历史保留供后续续接。任务先保存原生 Agent ID，再发送提示，取得 Run ID 后立即保存。断流或重启后只按已知 Run ID 核对结果；无法确认的任务保持待核对，不重发提示。设置变更只影响后续操作，不回收正在运行的任务。进程和存储边界见[协议说明](node-protocol.md)。
+认证镜像与目录的厂商契约边界见[本机接入设计](design/local-provider-onboarding.md)。
 
 ### 使用 Codex SDK
 
@@ -117,19 +115,19 @@ Codex Bot 的回合在 Codex App Server 上运行。装好并登录 Codex 后，
 
 可用 `--model` 指定模型，省略时使用 Codex 配置中的默认模型。
 
-Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的协调工具，工具令牌和地址经线程的 Shell 环境传入，Provider 凭证不放进 Shell 环境。Cursor SDK 与 Codex 的工具运行方式不同，不承诺相同的系统隔离。
+Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的协调工具，Codex 等 CLI 工具的令牌和地址经线程的 Shell 环境传入，Cursor 使用当前 attempt 的 MCP bearer。Provider 凭据按官方 CLI 认证途径使用，不进入 Node 工具载荷或共享记录；各 Provider 不承诺相同的系统隔离。
 
 ### 使用 Claude Code、pi 或 opencode
 
-三者都像 Codex 一样经 `vibeface tool` 调用协调工具，Bot 和执行任务都能用。Node 在本机运行它们，不安装、不登录。先安装所选程序。Claude Code 与 OpenCode 使用 Node 私有目录，需按设备 AI 设置中可复制的命令在这台电脑上登录或配置，再点**检查可用性**；Node 不复制用户凭证。pi 只隔离会话目录，继续读取用户本机认证配置。已有显式认证环境仍按对应 Provider 使用。
+三者都像 Codex 一样经 `vibeface tool` 调用协调工具，Bot 和执行任务都能用。Node 在本机运行它们，不安装、不登录。先安装所选程序。Claude Code 与 OpenCode 使用 Node 私有目录。Claude 可在私有登录明确未建立时借用本机 CLI 的访问令牌，保留原 CLI 的刷新权；OpenCode 仍使用私有登录。需要登录时按设备 AI 设置提供的命令在这台电脑上操作，再点**检查可用性**。pi 只隔离会话目录，继续读取用户本机认证配置。已有显式认证环境仍按对应 Provider 使用。
 
 | 产品 | 程序 | 登录 | Node 怎么运行 |
 |---|---|---|---|
-| Claude Code | `claude` | AI 设置提供带私有 `CLAUDE_CONFIG_DIR` 的 `claude auth login`，或现有认证环境 | 每轮和每个任务一个 `claude -p` 进程，`bypassPermissions` |
+| Claude Code | `claude` | 先用私有登录；明确未登录时借用本机 CLI 访问令牌，或使用现有认证环境。AI 设置提供带私有 `CLAUDE_CONFIG_DIR` 的 `claude auth login` | 每轮和每个任务一个 `claude -p` 进程，`bypassPermissions` |
 | pi | npm 包 `@earendil-works/pi-coding-agent` 的 `pi` | pi 里的 `/login`，或所用服务的密钥变量 | 每轮和每个任务一个 `pi --mode rpc --no-extensions` 进程 |
 | opencode | `opencode` | AI 设置提供带私有 XDG 与 DB 路径的 `opencode --standalone auth login`，或现有认证环境 | 回环地址上的一个 `opencode serve`；Node 建的会话允许全部工具、拒绝提问，规则排在本人配置之后。子 Agent 的会话不带这些规则 |
 
-程序先在 Node 的 PATH 里找，再找 `~/.local/bin`、`~/.claude/local`（Claude Code）、`~/.opencode/bin`（opencode）、`/opt/homebrew/bin` 和 `/usr/local/bin`。后台服务没有交互式 shell 的 PATH：nvm 或自定义 npm 前缀装的 pi 要在设置里填绝对路径，并在 pi 的变量里设含 `node` 所在目录的 `PATH`。
+程序先使用保存的路径和 PATH，再查 Node 的 PATH、常见用户目录、Homebrew、npm/Volta/Bun/NVM 安装。npm wrapper 的启动环境会补齐所需 Node；必要时只向登记登录 shell 查询 PATH。自定义安装仍无法发现时，在设置里填程序绝对路径和所需 PATH。
 
 模型留空时用各自的默认模型；opencode 写成 `provider/model`。Codex 和 pi 可在检查状态后提供模型列表，网页和手机保留手填模型。目录未取得或不完整时，不会清空已有配置。登录未确认时显示提醒并允许尝试，只有程序缺失、明确需要登录等已确认的问题才阻止发送。Claude Code 的进度按整条消息更新，Bot 回复中收到的新消息等这轮结束再处理。
 
@@ -163,7 +161,7 @@ Node 把每个事件作为 JSON 正文 POST 到该地址，附带 `X-Vibeface-Ev
 
 每个 Node 和每个浏览器有独立密钥，设备编号就是设备公钥。本人设备列表来自已签名的成员目录，设备名称、IP 和中继返回的地址不证明所有权。
 
-在管理设备打开**添加设备**，页面随即生成一条 `https://<gateway>/join#vibeface1…` 加入链接和一个二维码；已有设备在申请加入时先列出申请，不自动生成，需要时再点**生成链接**。入口有公网 HTTPS 地址时，二维码就是这条链接，手机相机扫码即可打开；只有本机或局域网地址时，二维码是 `vibeface://join?link=vibeface1…`，下方提示“用手机 App 扫码”，用 Vibeface App 扫码加入。链接含一次性 secret，只交给自己的设备。新浏览器打开链接时，先向发出邀请的 Node 问一次链接还能不能用；已用过或已过期就直接说明，不用等填完名称。这一问不占用链接，之后的批准和安全码比对照常进行。确认名称后显示 6 位安全码和“等待批准”。管理设备上出现“X 想加入”和同一个安全码：一致就点**一致，允许**，浏览器可同时勾选**设为管理员**；不一致或不认识的请求点**拒绝**，该请求随即作废。只有发出链接的面板会自动开始比对，其他管理页面需先点**显示安全码**。新设备伪造或替换随机数时请求也会作废。
+在管理设备打开**添加设备**，页面随即生成一条 `https://app.vibeface.dev/join#vibeface1…` 加入链接和一个二维码；已有设备在申请加入时先列出申请，不自动生成，需要时再点**生成链接**。链接前缀只负责打开 App，怎样连到发出邀请的 Node 由链接里的票据决定：浏览器先经票据所写 Node 的 relay 接入，再试本页、链接地址和服务目录。只有本机或局域网入口时，链接保留该入口地址，因为 App 站点连不到它。入口有公网 HTTPS 地址时，二维码就是这条链接，手机相机扫码即可打开；只有本机或局域网地址时，二维码是 `vibeface://join?link=vibeface1…`，下方提示“用手机 App 扫码”，用 Vibeface App 扫码加入。链接含一次性 secret，只交给自己的设备。新浏览器打开链接时，先向发出邀请的 Node 问一次链接还能不能用；已用过或已过期就直接说明，不用等填完名称。这一问不占用链接，之后的批准和安全码比对照常进行。确认名称后显示 6 位安全码和“等待批准”。管理设备上出现“X 想加入”和同一个安全码：一致就点**一致，允许**，浏览器可同时勾选**设为管理员**；不一致或不认识的请求点**拒绝**，该请求随即作废。只有发出链接的面板会自动开始比对，其他管理页面需先点**显示安全码**。新设备伪造或替换随机数时请求也会作废。
 
 App 扫这种二维码后，按邀请里写的局域网地址直接连发出邀请的 Node，手机要和这台电脑在同一局域网，见 [手机 App 局域网直连](#手机-app-局域网直连)。手机浏览器打不开本机或局域网地址；要在外网用手机浏览器加入，见 [配置公共入口](#配置公共入口)。`localhost` 与 `127.0.0.1` 仅指向各自本机。
 
@@ -173,7 +171,7 @@ App 扫这种二维码后，按邀请里写的局域网地址直接连发出邀�
 - 终端方式：点**复制命令**，在新机器的终端执行，Node 运行与否都可以。Node 正在运行时，命令交给它加入，加入后它直接开始同步，不用重启。数据目录为空或不存在时，`join` 先按直接启动的默认配置初始化；要预设执行目录或 relay，可先运行 `vibeface init`。命令的完整写法：
 
 ```sh
-vibeface join 'https://gateway.example/join#vibeface1…' --name '<设备显示名称>'
+vibeface join 'https://app.vibeface.dev/join#vibeface1…' --name '<设备显示名称>'
 ```
 
 链接也可以是手机 App 复制的 `vibeface://join?link=…` 或单独的 `vibeface1…`。CLI 解码邀请票据，通过 iroh 连接票据中的目标设备；链接前面的网页地址用于浏览器打开页面，不决定 CLI 的连接地址。
@@ -528,7 +526,7 @@ Node 用自身的业务 UDP 端口登记。发现服务只交换它从已认证�
 - **停止当前回复**只请求取消当前管理轮，并撤销该轮的 Node 工具权限。已输出的部分回复保留为一条标记“已停止”的回答。取消待确认时不能当作已经停止，也不停止已派发的工作。
 - **停止工作**作用于选中的工作，中断它的原生 turn，并一并停止它委派出的工作。任何入口都能停止其他设备上的工作。停止请求先存在本机再发送，直到工作结束都不会放弃：目标离线时入口以 3 秒起、最长 1 分钟的间隔持续投递，设备上线后照样收到并停下；执行设备在 `turn/interrupt` 失败或重启后先读回合再重发，回合已结束就不再中断。页面显示“停止中”，30 秒仍未确认显示“还在尝试停止”。执行器接受中断后 30 秒回合仍未结束时再读一次：仍在运行就再发，读不到则进入待核对。
 
-Codex、Claude Code、pi 和 OpenCode 的活动输入走各自原生补充路径。每条输入区分设备保存、执行设备接纳、服务接受、实际回合归属和结果未知，不能仅凭提交成功显示 Bot 已读。完整附件按同目标顺序交付。Cursor 的新版 SDK 有文本 steer，但当前独立 Bridge 未暴露该能力，活动补充仍有缺口。Codex 线程创建时把本轮工具令牌和本机工具地址写进 Shell 环境，续接同一线程沿用该令牌；每次使用仍核验当前 attempt 和权限围栏。Node 重启沿用上次的工具端口，端口变化时开新线程。Codex 以 App Server 回合结束确认停止。Claude Code、pi 和 OpenCode 以 Provider 终态或受管进程退出确认，Cursor 须 Provider 终态。无法确认时进入待确认并保留部分回复。停止回复与停止已派发工作分别操作。
+Codex、Claude Code、pi 和 OpenCode 的活动输入走各自原生补充路径。每条输入区分设备保存、执行设备接纳、服务接受、实际回合归属和结果未知，不能仅凭提交成功显示 Bot 已读。完整附件按同目标顺序交付。当前 Cursor ACP 适配器未提供原生 steer，活动补充仍有缺口。Codex 线程创建时把本轮工具令牌和本机工具地址写进 Shell 环境，续接同一线程沿用该令牌；每次使用仍核验当前 attempt 和权限围栏。Node 重启沿用上次的工具端口，端口变化时开新线程。Codex 以 App Server 回合结束确认停止。Claude Code、pi 和 OpenCode 以 Provider 终态或受管进程退出确认，Cursor 须 Provider 终态。无法确认时进入待确认并保留部分回复。停止回复与停止已派发工作分别操作。
 
 Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool dispatch_work --json '{"title":"跑测试","prompt":"...","cwd":"...","call_ref":"REF","target_node":"<设备编号>"}'`。`title` 是给本人看的几个字，任务卡片以它为名，`prompt` 放在详细信息里。省略 `target_node` 时派发到本机，由 `agent` 指定的产品执行（本机只开了一个执行产品时可省略）：Codex 工作由 CLI 先向 Node 登记，再直接连本机 App Server 开线程、以完全访问（`approvalPolicy=never`、`danger-full-access`）发一个 turn，Node 记录并观察它。`target_node` 是另一台设备时，任务交给那台设备的协调 Agent，作为它的一轮执行，由它在本机派发，不能再向其他设备派发；远端任务由目标 Bot 选择并冻结模型。`continues` 填原工作编号时，在原工作的 thread 上继续；`thread` 填本机已有线程时，消息进入该线程，与 `continues` 互斥。目标 Node 核对派发方仍是成员且处于进行中的调度轮次，并要求 `cwd` 位于目标自己 `config.json` 的 `roots` 内，不满足时拒绝，页面显示“未接收”。同一轮用同一 `call_ref` 重试得到同一工作，不会启动第二个 turn；结果不明时用 `call_lookup` 查询。
 

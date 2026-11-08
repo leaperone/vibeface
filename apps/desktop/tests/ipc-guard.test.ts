@@ -1,33 +1,33 @@
 import { describe, expect, it } from 'vitest'
-import { LAUNCHER_URL } from '../src/shared/contract.js'
+import { CLIENT_ORIGIN } from '../src/shared/client-contract.js'
 import {
-  isTrustedLauncherCall,
+  isTrustedClientCall,
   readBoolean,
   readExternalUrl,
   readNoArguments,
   readString,
 } from '../src/main/ipc-guard.js'
 
-const contents = { id: 'launcher-contents' }
-const mainFrame = { id: 'launcher-main-frame' }
-const launcher = { contents, mainFrame }
+const contents = { id: 'client-contents' }
+const mainFrame = { id: 'client-main-frame' }
+const client = { contents, mainFrame }
 
-const call = (overrides: Partial<Parameters<typeof isTrustedLauncherCall>[0]> = {}) =>
-  isTrustedLauncherCall(
-    { sender: contents, senderFrame: mainFrame, frameUrl: LAUNCHER_URL, frameParent: null, ...overrides },
-    launcher
+const call = (overrides: Partial<Parameters<typeof isTrustedClientCall>[0]> = {}) =>
+  isTrustedClientCall(
+    { sender: contents, senderFrame: mainFrame, frameUrl: `${CLIENT_ORIGIN}/settings`, frameParent: null, ...overrides },
+    client
   )
 
-describe('isTrustedLauncherCall', () => {
-  it('accepts the launcher main frame at its own URL', () => {
+describe('isTrustedClientCall', () => {
+  it('accepts the client main frame at the fixed client origin', () => {
     expect(call()).toBe(true)
   })
 
   it('rejects another window’s WebContents', () => {
-    expect(call({ sender: { id: 'business' } })).toBe(false)
+    expect(call({ sender: { id: 'other' } })).toBe(false)
   })
 
-  it('rejects a subframe of the launcher', () => {
+  it('rejects a subframe of the client', () => {
     expect(call({ senderFrame: { id: 'iframe' } })).toBe(false)
   })
 
@@ -35,7 +35,7 @@ describe('isTrustedLauncherCall', () => {
     expect(call({ frameParent: { id: 'parent' } })).toBe(false)
   })
 
-  it('rejects a frame that navigated away from the launcher URL', () => {
+  it('rejects a frame that navigated away from the client origin', () => {
     expect(call({ frameUrl: 'http://127.0.0.1:4791/' })).toBe(false)
   })
 
@@ -43,10 +43,10 @@ describe('isTrustedLauncherCall', () => {
     expect(call({ frameUrl: null })).toBe(false)
   })
 
-  it('rejects everything while no launcher window exists', () => {
+  it('rejects everything while no client window exists', () => {
     expect(
-      isTrustedLauncherCall(
-        { sender: contents, senderFrame: mainFrame, frameUrl: LAUNCHER_URL, frameParent: null },
+      isTrustedClientCall(
+        { sender: contents, senderFrame: mainFrame, frameUrl: `${CLIENT_ORIGIN}/`, frameParent: null },
         { contents: null, mainFrame: null }
       )
     ).toBe(false)
@@ -69,7 +69,7 @@ describe('payload readers', () => {
   })
 
   it('rejects extra arguments on a no-argument channel', () => {
-    expect(() => readNoArguments(['/etc/passwd'], 'launcher:get-status')).toThrow(/no arguments/)
+    expect(() => readNoArguments(['/etc/passwd'], 'desktop:get-status')).toThrow(/no arguments/)
   })
 
   it('opens only http and https links', () => {

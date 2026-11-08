@@ -7,7 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 const repository = 'leaperone/vibeface';
 const workflow = '.github/workflows/release.yml';
 const producerJob = 'collect';
-const publisherJob = 'publish';
+const publisherJob = 'publish-product';
 const registry = 'https://registry.npmjs.org/';
 const packageName = '@leaperone/vibeface';
 
@@ -169,7 +169,7 @@ async function selfTest() {
   assert.throws(() => resolveArtifact(context, withJobs([jobs[0], { ...jobs[1], conclusion: 'failure' }])), /published before npm/);
   assert.throws(() => resolveArtifact(context, withJobs([jobs[1]])), /exactly one collect job/);
   assert.throws(() => resolveArtifact(context, withJobs([jobs[0], jobs[0], jobs[1]])), /exactly one collect job/);
-  assert.throws(() => resolveArtifact(context, withJobs([jobs[0], { name: 'publish-native', status: 'completed', conclusion: 'success' }])), /exactly one publish job/);
+  assert.throws(() => resolveArtifact(context, withJobs([jobs[0], { name: 'publish', status: 'completed', conclusion: 'skipped' }])), /exactly one publish-product job/);
   assert.throws(() => resolveArtifact(manual, () => []), /one completed release run/);
   assert.throws(() => resolveArtifact(manual, (endpoint, key) => key === 'workflow_runs'
     ? [api(endpoint, key)[0], api(endpoint, key)[0]] : api(endpoint, key)), /one completed release run/);

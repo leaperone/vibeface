@@ -45,6 +45,12 @@ export type ManagerSettings = { provider: ProviderId; workspace: string; model: 
 export type NodeSettings = { roots: string[]; manager: ManagerSettings | null }
 export type ProviderId = 'codex' | 'cursor' | 'claude' | 'pi' | 'opencode'
 export const providerNames: Record<ProviderId, string> = { codex: 'Codex', cursor: 'Cursor', claude: 'Claude Code', pi: 'pi', opencode: 'opencode' }
+export const localProviderIds = ['codex', 'claude', 'cursor'] as const satisfies readonly ProviderId[]
+const authenticationSources = ['environment', 'imported_cli_login', 'private_login', 'local_cli_login', 'system_server', 'provider_default'] as const
+export const authenticationSourceLabels: Record<typeof authenticationSources[number], string> = {
+  environment: '使用已配置的环境认证', imported_cli_login: '已复用本机 CLI 登录，凭据由节点私有保存',
+  private_login: '使用节点独立登录', local_cli_login: '使用本机 Cursor CLI 登录', system_server: '使用所选 App Server 的登录', provider_default: '使用程序默认认证',
+}
 type ProviderRole = 'agent' | 'execution'
 export type ProviderIssue = { code: 'bin_missing'; path: string } | { code: 'env_missing'; name: string } | { code: 'launch_failed'; detail: string } | { code: 'config_invalid' }
   | { code: 'app_server_not_found' } | { code: 'app_server_unreachable'; detail: string }
@@ -74,7 +80,8 @@ export const providerObservationStates: Record<ProviderObservation['status'], st
 export type ProviderStatus = {
   provider: ProviderId; roles: ProviderRole[]; supports: ProviderRole[]; bin: string; app_server: AppServer | null
   execution_model: string; execution_readiness: ProviderReadiness
-  setup: { directory: string; command: string } | null
+  setup: { directory: string | null; command: string } | null
+  authentication_source: typeof authenticationSources[number]
   /** Whether its program is on that device. */
   installed: boolean
   /** Codex only: the Codex folder and the sessions folder the device uses. */
@@ -363,7 +370,8 @@ export function parseProvider(value: unknown): ProviderStatus {
   const observed = record(v.observed)
   return {
     provider,
-    setup: setup === null ? null : { directory: text(setup.directory), command: text(setup.command) },
+    authentication_source: oneOf(v.authentication_source, authenticationSources),
+    setup: setup === null ? null : { directory: setup.directory === null ? null : text(setup.directory), command: text(setup.command) },
     roles: array(v.roles).map(role => oneOf(role, providerRoles)), supports: array(v.supports).map(role => oneOf(role, providerRoles)),
     installed: boolean(v.installed), bin: text(v.bin), app_server: parseAppServer(v.app_server),
     home: v.home === null ? null : text(v.home), sessions: v.sessions === null ? null : text(v.sessions),

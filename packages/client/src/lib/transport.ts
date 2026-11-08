@@ -8,8 +8,11 @@ export type DeviceChannel = {
   idle(): boolean
   close(): void
 }
-/** `direct`: the `ip:port` the entry Node listened on when it made the ticket, for the app to dial on the LAN. */
-export type JoinLink = { origin: string | null; entryId: string; inviteId: string; inviteHash: string; secret: string; direct: string[] }
+/**
+ * `relay`: the origin of the entry Node's relay from the ticket, whose Core also takes browsers at `/api/client`.
+ * `direct`: the `ip:port` the entry Node listened on when it made the ticket, for the app to dial on the LAN.
+ */
+export type JoinLink = { origin: string | null; relay: string | null; entryId: string; inviteId: string; inviteHash: string; secret: string; direct: string[] }
 /** This device's Ed25519 key as its platform keeps it: made once, it only ever signs. */
 export type DeviceKeys = {
   /** The key, made on first use. Throws an error with `code: 'key_lost'` when a key this device made is gone, unless replacing it. */
@@ -232,9 +235,10 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     const found = joinTicket(value)
     if (!found) throw new Error('这不是 Vibeface 加入链接。')
     const ticket = JSON.parse(secure.ticketDecode(found.ticket))
-    let origin: string | null = null
+    let origin: string | null = null, relay: string | null = null
     try { origin = found.origin && validEndpoint(found.origin) } catch {}
-    return { origin, entryId: ticket.entry_id, inviteId: ticket.invite_id, inviteHash: ticket.invite_hash, secret: ticket.secret, direct: lanAddrs(ticket.direct_addrs) }
+    try { relay = typeof ticket.relay_url === 'string' ? validEndpoint(ticket.relay_url) : null } catch {}
+    return { origin, relay, entryId: ticket.entry_id, inviteId: ticket.invite_id, inviteHash: ticket.invite_hash, secret: ticket.secret, direct: lanAddrs(ticket.direct_addrs) }
   }
 
   async function carry(entry: ConnectionEntry, target: string, signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number): Promise<Carrier> {

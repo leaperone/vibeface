@@ -60,6 +60,31 @@ pub(super) async fn missing(names: &[String], host: &Host) -> Result<BTreeMap<St
     missing_from(names, host, &inherited, shell.as_ref(), READ_LIMIT).await
 }
 
+pub(super) async fn program_path(host: &Host) -> Result<Option<std::ffi::OsString>> {
+    #[cfg(test)]
+    {
+        Ok(host.inherited_env.get("PATH").map(Into::into))
+    }
+    #[cfg(all(unix, not(test)))]
+    {
+        let Some(shell) = registered_login_shell()? else {
+            return Ok(None);
+        };
+        Ok(read_shell(&["PATH".into()], host, &shell, READ_LIMIT)
+            .await?
+            .remove("PATH")
+            .map(Into::into))
+    }
+    #[cfg(all(windows, not(test)))]
+    {
+        let _ = host;
+        Ok(vibeface_bridge::platform::account::stored(&["PATH".into()])
+            .map_err(|_| LocalSourceError)?
+            .remove("PATH")
+            .map(Into::into))
+    }
+}
+
 pub(super) async fn missing_from(
     names: &[String],
     host: &Host,

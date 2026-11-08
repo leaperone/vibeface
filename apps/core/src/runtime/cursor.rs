@@ -8,37 +8,37 @@ use std::sync::{Mutex as StdMutex, PoisonError, Weak, atomic::Ordering};
 use tokio::sync::{Mutex, watch};
 use vibeface_bridge::{
     agent::{
-        AgentFailure, AgentRunError, NativeRun, NativeStatus, RunStarted, SdkBridge, SdkTurn,
-        StartEvidence, ToolCallbackConfig,
+        AgentFailure, AgentRunError, CursorAgent, CursorPrompt, CursorTurn, PromptStatus,
+        RunStarted, StartEvidence,
     },
     failure::{ExecFailure, FailureKind},
 };
 
-fn native_probe(native: NativeRun) -> Probe {
+fn native_probe(native: CursorPrompt) -> Probe {
     match native.status {
-        NativeStatus::Running => Probe::Running {
-            turn_id: native.run_id,
+        PromptStatus::Running => Probe::Running {
+            turn_id: native.receipt_id,
             epoch: 0,
         },
-        NativeStatus::Completed => Probe::Terminal {
-            turn_id: native.run_id,
+        PromptStatus::Completed => Probe::Terminal {
+            turn_id: native.receipt_id,
             status: vibeface_bridge::turn::TurnStatus::Completed,
             text: native.output.unwrap_or_default(),
             error: None,
         },
-        NativeStatus::Cancelled => Probe::Terminal {
-            turn_id: native.run_id,
+        PromptStatus::Cancelled => Probe::Terminal {
+            turn_id: native.receipt_id,
             status: vibeface_bridge::turn::TurnStatus::Interrupted,
             text: native.output.unwrap_or_default(),
             error: None,
         },
-        NativeStatus::Failed { detail } => Probe::Terminal {
-            turn_id: native.run_id,
+        PromptStatus::Failed { detail } => Probe::Terminal {
+            turn_id: native.receipt_id,
             status: vibeface_bridge::turn::TurnStatus::Failed,
             text: native.output.unwrap_or_default(),
             error: Some(ExecFailure::upstream(detail, FailureKind::Unknown)),
         },
-        NativeStatus::Unknown => Probe::Missing,
+        PromptStatus::Submitted | PromptStatus::Unknown => Probe::Missing,
     }
 }
 
@@ -53,16 +53,8 @@ struct ReplyLocator {
     provider_identity: String,
 }
 
-fn provider_identity(
-    api_key: &str,
-    env: &BTreeMap<String, String>,
-    configured_key: bool,
-) -> Result<String> {
-    Ok(crate::crypto::digest(&serde_json::to_vec(&(
-        api_key,
-        env,
-        configured_key,
-    ))?))
+fn provider_identity(env: &BTreeMap<String, String>) -> Result<String> {
+    Ok(crate::crypto::digest(&serde_json::to_vec(env)?))
 }
 
 fn reply_locator_path(cursor_dir: &Path, client_id: &str) -> Result<PathBuf> {
@@ -74,7 +66,7 @@ fn reply_locator_path(cursor_dir: &Path, client_id: &str) -> Result<PathBuf> {
 }
 
 pub(crate) fn record_reply(
-    turn: &SdkTurn,
+    turn: &CursorTurn,
     configured_env: &BTreeMap<String, String>,
     client_id: &str,
     agent: &str,
@@ -107,11 +99,7 @@ pub(crate) fn record_reply(
         workspace: turn.workspace.clone(),
         executable: turn.executable.clone(),
         local_store_root: turn.local_store_root.clone(),
-        provider_identity: provider_identity(
-            &turn.api_key,
-            &turn.env,
-            configured_env.contains_key("CURSOR_API_KEY"),
-        )?,
+        provider_identity: provider_identity(configured_env)?,
     };
     let path = reply_locator_path(cursor_dir, client_id)?;
     config::private_dir(
@@ -150,27 +138,19 @@ pub(crate) async fn probe_recorded_reply(
         return Ok(Probe::Missing);
     }
     let configured_env = node.provider_env(Provider::Cursor);
-    let (Some(api_key), env) = crate::providers::cursor_launch(&configured_env) else {
-        return Ok(Probe::Missing);
-    };
-    if api_key.is_empty()
-        || provider_identity(
-            &api_key,
-            &env,
-            configured_env.contains_key("CURSOR_API_KEY"),
-        )? != locator.provider_identity
-    {
+    let env = configured_env;
+    if provider_identity(&env)? != locator.provider_identity {
         return Ok(Probe::Missing);
     }
     let Some(bridge) = node.cursor.get() else {
         return Ok(Probe::Missing);
     };
-    let turn = SdkTurn {
+    let turn = CursorTurn {
         owner: locator.owner,
+        client_id: client_id.into(),
         executable: locator.executable,
         workspace: locator.workspace,
         local_store_root: locator.local_store_root,
-        api_key,
         env,
         model: String::new(),
         timeout_secs: node.cursor_executor.timeout_secs,
@@ -186,7 +166,7 @@ pub(crate) async fn probe_recorded_reply(
 }
 
 /// Process groups of the running bridges, with the program each one runs.
-pub(super) const PIDFILE: &str = "cursor-sdk-bridge.pid";
+pub(super) const PIDFILE: &str = "cursor-agent.pid";
 const WORK_OWNERS: &str = "cursor/work-owners.json";
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -208,13 +188,13 @@ struct OwnerJournal {
 
 struct LiveWork {
     owner: CursorInstance,
-    turn: SdkTurn,
+    turn: CursorTurn,
     cancel: watch::Sender<bool>,
 }
 
 #[derive(Clone)]
 pub(super) struct CursorExecutor {
-    bridge: Arc<std::sync::OnceLock<Arc<SdkBridge>>>,
+    bridge: Arc<std::sync::OnceLock<Arc<CursorAgent>>>,
     providers: Arc<StdMutex<crate::providers::Local>>,
     data_dir: PathBuf,
     timeout_secs: u64,
@@ -268,7 +248,7 @@ impl CursorExecutor {
     }
 
     pub(super) fn new(
-        bridge: Arc<std::sync::OnceLock<Arc<SdkBridge>>>,
+        bridge: Arc<std::sync::OnceLock<Arc<CursorAgent>>>,
         providers: Arc<StdMutex<crate::providers::Local>>,
         data_dir: PathBuf,
         timeout_secs: u64,
@@ -355,21 +335,22 @@ impl CursorExecutor {
         }
     }
 
-    fn bridge(&self) -> Result<Arc<SdkBridge>> {
+    fn bridge(&self) -> Result<Arc<CursorAgent>> {
         self.bridge
             .get()
             .cloned()
-            .context("Cursor SDK bridge is not ready; waiting for reconciliation")
+            .context("Cursor ACP bridge is not ready; waiting for reconciliation")
     }
 
     fn turn(
         &self,
         owner: &CursorInstance,
+        client_id: &str,
         workspace: PathBuf,
         model: String,
         callback_token: Option<String>,
         run_started: Option<RunStarted>,
-    ) -> Result<SdkTurn> {
+    ) -> Result<CursorTurn> {
         ensure!(
             workspace.is_absolute() && workspace.is_dir(),
             "Cursor work directory must be an existing absolute directory"
@@ -379,10 +360,10 @@ impl CursorExecutor {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        let (api_key, env) = crate::providers::cursor_launch(local.env.get(Provider::Cursor));
-        let api_key = api_key.context("CURSOR_API_KEY is required for Cursor execution")?;
-        Ok(SdkTurn {
+        let env = local.launch_env(Provider::Cursor);
+        Ok(CursorTurn {
             owner: owner.key(),
+            client_id: client_id.into(),
             executable: local.bin(Provider::Cursor),
             workspace,
             local_store_root: self
@@ -390,7 +371,6 @@ impl CursorExecutor {
                 .join("cursor")
                 .join("instances")
                 .join(crate::crypto::digest(owner.key().as_bytes())),
-            api_key,
             env,
             model: Provider::Cursor.model(&model),
             timeout_secs: self.timeout_secs,
@@ -517,7 +497,7 @@ impl CursorExecutor {
         node: Weak<Runtime>,
         network: String,
         work: WorkSpec,
-        turn: SdkTurn,
+        turn: CursorTurn,
         previous: Option<String>,
         cancel: watch::Receiver<bool>,
     ) {
@@ -601,7 +581,7 @@ impl CursorExecutor {
                         .state
                         .handle()
                         .is_some_and(|handle| handle.turn_id == id),
-                    "Cursor work no longer tracks this native run"
+                    "Cursor work no longer tracks this prompt receipt"
                 );
                 Ok(())
             })
@@ -701,7 +681,7 @@ impl Executor for CursorExecutor {
                 ensure!(
                     !live.values().any(|entry| entry.owner.key() == key)
                         && starting.insert(key.clone()),
-                    "Cursor SDK still runs another work in this session"
+                    "Cursor ACP still runs another work in this session"
                 );
             }
             if let Err(error) = self.save_owner(&work.work_id, owner.clone()) {
@@ -711,6 +691,7 @@ impl Executor for CursorExecutor {
             let (cancel, cancel_rx) = watch::channel(false);
             let turn = match self.turn(
                 &instance,
+                &work.work_id,
                 owner.workspace.clone(),
                 work.execution_model().unwrap_or_default().into(),
                 None,
@@ -765,7 +746,14 @@ impl Executor for CursorExecutor {
                 None => {
                     let owner = self.owner_for_work(&work.work_id)?;
                     let instance = Self::instance(&owner);
-                    self.turn(&instance, owner.workspace, String::new(), None, None)?
+                    self.turn(
+                        &instance,
+                        &work.work_id,
+                        owner.workspace,
+                        String::new(),
+                        None,
+                        None,
+                    )?
                 }
             };
             let bridge = self.bridge()?;
@@ -798,8 +786,15 @@ impl Executor for CursorExecutor {
                 .state
                 .handle()
                 .map(|handle| handle.turn_id.as_str())
-                .context("Cursor work has no native run ID")?;
-            let turn = self.turn(&instance, owner.workspace, String::new(), None, None)?;
+                .context("Cursor work has no prompt receipt ID")?;
+            let turn = self.turn(
+                &instance,
+                &work.work_id,
+                owner.workspace,
+                String::new(),
+                None,
+                None,
+            )?;
             self.bridge()?.cancel(&turn, agent_id, run_id).await
         })
     }
@@ -811,7 +806,7 @@ impl Executor for CursorExecutor {
         _: &'a SteerInput,
     ) -> BoxFuture<'a, SteerAck> {
         Box::pin(async {
-            SteerAck::Refused("the current Cursor SDK Bridge exposes no native steer".into())
+            SteerAck::Refused("the current Cursor ACP Bridge exposes no native steer".into())
         })
     }
 
@@ -852,57 +847,19 @@ impl Runtime {
 
     /// The tool listener is up, so the bridge can call back and turns may start.
     pub(crate) fn tools_ready(&self, url: String) -> Result<()> {
-        let bridge = SdkBridge::new(
+        let bridge = CursorAgent::new(
             self.agent_env(),
-            ToolCallbackConfig {
-                url: url.clone(),
-                auth_token: self.cursor_callback_token.clone(),
-            },
+            url.clone(),
             Some(self.data_dir.join(PIDFILE)),
         )?;
         // The bridge goes first: a turn that sees the tool URL must find the bridge too.
         self.cursor
             .set(Arc::new(bridge))
-            .map_err(|_| anyhow::anyhow!("Cursor SDK bridge is already initialized"))?;
+            .map_err(|_| anyhow::anyhow!("Cursor ACP bridge is already initialized"))?;
         self.tool_url
             .set(url)
             .map_err(|_| anyhow::anyhow!("tool listener is already initialized"))?;
-        self.refresh_cursor();
         Ok(())
-    }
-
-    pub(super) fn refresh_cursor(&self) {
-        let Some(bridge) = self.cursor.get().cloned() else {
-            return;
-        };
-        let launch = self
-            .manager()
-            .filter(|manager| manager.provider == Provider::Cursor)
-            .and_then(|manager| {
-                let (key, env) =
-                    crate::providers::cursor_launch(&self.provider_env(manager.provider));
-                Some((manager, key?, env))
-            });
-        let bin = self.providers().bin(Provider::Cursor);
-        let owner = CursorInstance::Coordination;
-        let owner_key = owner.key();
-        let store_root = self.cursor_store_root(&owner);
-        tokio::spawn(async move {
-            if let Some((manager, api_key, env)) = launch
-                && let Err(error) = bridge
-                    .prewarm(
-                        &owner_key,
-                        &bin,
-                        &manager.workspace,
-                        &store_root,
-                        &api_key,
-                        &env,
-                    )
-                    .await
-            {
-                tracing::warn!(event = "cursor.prewarm_failed", %error, "Cursor SDK bridge did not start ahead of a reply");
-            }
-        });
     }
 
     /// Access for a tool call. Cursor installs the active attempt bearer on its owner bridge;
@@ -1057,7 +1014,10 @@ mod tests {
         let journal = calls.lock().unwrap_or_else(PoisonError::into_inner).clone();
         assert_eq!(journal.len(), 2);
         assert_eq!(journal[0], (agent.clone(), None));
-        let run = journal[1].1.as_deref().context("native run ID journaled")?;
+        let run = journal[1]
+            .1
+            .as_deref()
+            .context("prompt receipt ID journaled")?;
         assert_eq!(
             probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
             Probe::Terminal {
@@ -1185,9 +1145,9 @@ mod tests {
 
     fn fake_bridge() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) {
-            "../../crates/bridge/tests/fixtures/fake-cursor-sdk-bridge.cmd"
+            "../../crates/bridge/tests/fixtures/fake-cursor-agent.cmd"
         } else {
-            "../../crates/bridge/tests/fixtures/fake-cursor-sdk-bridge"
+            "../../crates/bridge/tests/fixtures/fake-cursor-agent"
         })
     }
 
@@ -1513,7 +1473,7 @@ mod tests {
             if ready.is_err() {
                 cancel.send(true)?;
                 let _ = task.await;
-                bail!("controlled Cursor SDK bridge admission did not complete");
+                bail!("controlled Cursor ACP bridge admission did not complete");
             }
             let observed = tokio::select! {
                 observed = tokio::time::timeout(Duration::from_secs(5), started.notified()) => observed,
@@ -1573,7 +1533,7 @@ mod tests {
             );
             assert!(
                 early.turn.is_some(),
-                "the early locator keeps the actual native run"
+                "the early locator keeps the actual prompt receipt"
             );
             assert_eq!(execution, TurnExecution::Started);
             assert!(covers.is_empty());
@@ -1823,7 +1783,7 @@ mod tests {
             }
         })
         .await
-        .context("Cursor work did not expose a native run ID")??;
+        .context("Cursor work did not expose a prompt receipt ID")??;
         node.interrupt_work(&network, &spec.work_id).await?;
         let finished = until_finished(&node, &spec.work_id).await?;
         assert_eq!(

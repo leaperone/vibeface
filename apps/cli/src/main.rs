@@ -2745,7 +2745,7 @@ mod tests {
                 "--workspace",
                 ".",
                 "--bin",
-                "cursor=/opt/bin/cursor-sdk-bridge"
+                "cursor=/opt/bin/agent"
             ])
             .is_ok()
         );

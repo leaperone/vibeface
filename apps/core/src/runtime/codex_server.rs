@@ -719,7 +719,12 @@ impl Inner {
                 return false;
             }
         }
-        self.point(Some(self.spawn_endpoint.path().to_owned()));
+        self.point(
+            launch
+                .external_auth
+                .is_none()
+                .then(|| self.spawn_endpoint.path().to_owned()),
+        );
         let mut child = match self.spawn(launch) {
             Ok(child) => child,
             Err(error) => {
@@ -730,6 +735,40 @@ impl Inner {
                 return false;
             }
         };
+        if let Some(auth) = &launch.external_auth {
+            // The endpoint stays private until external authentication is installed. The
+            // target/lease boundary has already kept active turns on their original launch.
+            let bootstrap = async {
+                let mut session = loop {
+                    match vibeface_bridge::codex::DirectSession::connect(self.spawn_endpoint.path())
+                        .await
+                    {
+                        Ok(session) => break session,
+                        Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+                    }
+                };
+                let result=session.request("account/login/start",json!({"type":"chatgptAuthTokens","accessToken":auth.access_token,"chatgptAccountId":auth.account_id,"chatgptPlanType":auth.plan_type})).await;
+                session.close().await;
+                result
+                    .map(|_| ())
+                    .map_err(|_| anyhow::anyhow!("Codex rejected the imported access token"))
+            };
+            let authenticated = tokio::select! {
+                result=tokio::time::timeout(START_LIMIT,bootstrap)=>matches!(result,Ok(Ok(()))),
+                _=self.changed.notified()=>false,
+                _=child.wait()=>false,
+            };
+            if !authenticated {
+                let tree = self.tree.lock().expect("tree lock").take();
+                if let Some(mut tree) = tree {
+                    vibeface_bridge::agent::terminate_process_tree(&mut child, &mut tree).await;
+                }
+                let _ = std::fs::remove_file(&self.pidfile);
+                self.set_link(Link::LaunchFailed {reason:"Codex external authentication could not be prepared; refresh the source CLI login or sign in for this Node".into()});
+                return false;
+            }
+            self.point(Some(self.spawn_endpoint.path().to_owned()));
+        }
         {
             let mut target = self.target.lock().expect("target lock");
             target.applied = Some(CodexTarget::Spawn(launch.clone()));
@@ -1550,11 +1589,130 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn external_authentication_precedes_endpoint_publication_and_changes_after_leases_end()
+    -> Result<()> {
+        let dir = artifacts("codex-external-login")?;
+        let (program, ran) = recording_codex(&dir)?;
+        let first = CodexTarget::Spawn(CodexLaunch {
+            bin: program.clone(),
+            env: BTreeMap::new(),
+            external_auth: Some(crate::providers::ExternalCodexLogin {
+                access_token: "synthetic-first-access".into(),
+                account_id: "fixture-account".into(),
+                plan_type: None,
+            }),
+        });
+        let (events, _events) = mpsc::unbounded_channel();
+        let server = CodexServer::open(first.clone(), &LocalIdentity::generate(), &dir, events)?;
+        let listener = tokio::net::UnixListener::bind(server.inner.spawn_endpoint.path())?;
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let login_seen = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = captured.clone();
+        let seen = login_seen.clone();
+        let gate = release.clone();
+        let fixture = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                let calls = calls.clone();
+                let seen = seen.clone();
+                let gate = gate.clone();
+                connections.spawn(async move {
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    while let Some(Ok(frame)) = socket.next().await {
+                        let Ok(input) = serde_json::from_slice::<Value>(&frame.into_data()) else {
+                            continue;
+                        };
+                        if input.get("id").is_none() {
+                            continue;
+                        }
+                        let result = if input["method"] == "initialize" {
+                            json!({"userAgent":"controlled-external-auth"})
+                        } else if input["method"] == "account/login/start" {
+                            let first = {
+                                let mut calls = calls.lock().unwrap();
+                                calls.push(input["params"].clone());
+                                calls.len() == 1
+                            };
+                            if first {
+                                seen.notify_one();
+                                gate.notified().await;
+                            }
+                            json!({"type":"chatgptAuthTokens"})
+                        } else {
+                            json!({"data":[]})
+                        };
+                        if socket
+                            .send(json!({"id":input["id"],"result":result}).to_string().into())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        server.start();
+        tokio::time::timeout(Duration::from_secs(5), login_seen.notified()).await?;
+        assert!(
+            server.inner.endpoint.borrow().is_none(),
+            "no Node client can use the server before authentication"
+        );
+        release.notify_one();
+        link_becomes(&server, |link| matches!(link, Link::Connected { .. })).await;
+        assert_eq!(
+            captured.lock().unwrap()[0],
+            json!({"type":"chatgptAuthTokens","accessToken":"synthetic-first-access","chatgptAccountId":"fixture-account","chatgptPlanType":null})
+        );
+        lines(&ran, 1).await;
+        let lease = server.lease("manager:external-fixture".into(), &first)?;
+        let second = CodexTarget::Spawn(CodexLaunch {
+            bin: program,
+            env: BTreeMap::new(),
+            external_auth: Some(crate::providers::ExternalCodexLogin {
+                access_token: "synthetic-next-access".into(),
+                account_id: "fixture-account".into(),
+                plan_type: None,
+            }),
+        });
+        server.retarget(second.clone());
+        assert!(server.inner.target.lock().unwrap().current == first);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while captured.lock().unwrap().len() != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            captured.lock().unwrap()[1]["accessToken"],
+            "synthetic-next-access"
+        );
+        assert!(
+            lines(&ran, 2)
+                .await
+                .iter()
+                .all(|arguments| !arguments.contains("synthetic-")),
+            "credentials never enter program arguments"
+        );
+        server.stop().await;
+        fixture.abort();
+        let _ = fixture.await;
+        std::fs::remove_dir_all(server.socket().parent().unwrap())?;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn new_private_configuration_does_not_block_a_deferred_system_or_off_target() -> Result<()>
     {
         let dir = artifacts("codex-config-retarget")?;
         let (program, ran) = recording_codex(&dir)?;
         let target = CodexTarget::Spawn(CodexLaunch {
+            external_auth: None,
             bin: program,
             env: BTreeMap::new(),
         });
