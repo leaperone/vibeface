@@ -41,6 +41,8 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
   const settled = settledAnswer(standing, workspace.answered[id], question.answer?.author, ready?.principal.device_id)
   const displayAnswer = (value: string) => { const choice = question.choices.find((choice) => choice.label === value); return choice?.action === 'allow_once' ? '允许本次' : choice?.action === 'deny' ? '拒绝' : value }
   const approvalChoices = question.choices.filter((choice) => choice.action === 'allow_once' || choice.action === 'deny')
+  // The Node takes only an approval's own actions for a live request; 拒绝 clears it there.
+  const ignorable = !approvalChoices.length && !(question.attention?.kind === "approval" && question.about.request_id)
   const { ask, detail } = questionParts(question.text)
   const node = nodeName(question.about.node, { nodes: workspace.nodes, directory })
   // Read back later, an answered approval says which task on which device it settled.
@@ -119,7 +121,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
           <Button type="button" size="icon" className="size-11 shrink-0" aria-label="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "answer" || undefined} onClick={() => void send("answer", text)}><BusyIcon busy={action.busy === "answer"} icon={SendHorizontal} /></Button>
         </div>
       </>}
-      <Button type="button" variant="ghost" className="min-h-11 justify-self-start text-muted-foreground" disabled={disabled} aria-busy={action.busy === "ignore" || undefined} onClick={() => void send("ignore", ignoredAnswer)}><BusyIcon busy={action.busy === "ignore"} icon={X} />忽略</Button>
+      {ignorable ? <Button type="button" variant="ghost" className="min-h-11 justify-self-start text-muted-foreground" disabled={disabled} aria-busy={action.busy === "ignore" || undefined} onClick={() => void send("ignore", ignoredAnswer)}><BusyIcon busy={action.busy === "ignore"} icon={X} />忽略</Button> : null}
     </div>}
     <InlineError error={action.error} />
   </ActionCard>
@@ -147,7 +149,7 @@ function Settled({ ask, detail, about, mark, focus = false, role, children }: { 
   </details>
 }
 
-const row = "flex min-h-12 w-full min-w-0 cursor-pointer items-start gap-3 rounded-lg border bg-card px-3 py-3 text-start font-medium transition-colors hover:bg-muted outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
+const row = "flex min-h-12 [&_svg]:size-4 w-full min-w-0 cursor-pointer items-start gap-3 rounded-lg border bg-card px-3 py-3 text-start font-medium transition-colors hover:bg-muted outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
 
 /** `compact`: on a phone it gives way to the task link, so the line keeps to one row. */
 function Meta({ icon: Icon, label, title, compact = false, children }: { icon: LucideIcon; label: string; title?: string; compact?: boolean; children: ReactNode }) {

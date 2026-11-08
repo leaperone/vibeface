@@ -48,6 +48,8 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const settled = settledAnswer(standing, shared?.answered[id] ?? result?.text, question.answer?.author, ready?.principal.device_id)
   const displayAnswer = (value: string) => { const choice = question.choices.find((choice) => choice.label === value); return choice?.action === 'allow_once' ? '允许本次' : choice?.action === 'deny' ? '拒绝' : value }
   const approvalChoices = question.choices.filter((choice) => choice.action === 'allow_once' || choice.action === 'deny')
+  // The Node takes only an approval's own actions for a live request; 拒绝 clears it there.
+  const ignorable = !approvalChoices.length && !(question.attention?.kind === 'approval' && question.about.request_id)
   const raced = result?.status === 'already_answered' && settled?.text === result.text && result.text !== attempted.current
   const elsewhere = settled?.elsewhere || raced
   const warned = settled?.beaten || raced
@@ -118,9 +120,9 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
           </Button>
         </View>
       </>}
-      <Button variant="ghost" className="min-h-11 self-start" accessibilityLabel="忽略" disabled={disabled} accessibilityState={{ disabled, busy: busy === 'ignore' }} onPress={() => void send('ignore', ignoredAnswer)}>
+      {ignorable ? <Button variant="ghost" className="min-h-11 self-start" accessibilityLabel="忽略" disabled={disabled} accessibilityState={{ disabled, busy: busy === 'ignore' }} onPress={() => void send('ignore', ignoredAnswer)}>
         <Icon as={busy === 'ignore' ? LoaderCircle : X} className="text-muted-foreground" /><Text className="text-muted-foreground">忽略</Text>
-      </Button>
+      </Button> : null}
     </View>}
     <ErrorText error={error} />
   </ActionCard>

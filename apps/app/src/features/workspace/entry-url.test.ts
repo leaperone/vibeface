@@ -3059,6 +3059,7 @@ test('bound permission choices show readable actions and return their original s
       assert.match(componentText(elements), /拒绝/)
       assert.doesNotMatch(componentText(elements), /decision|accept|decline/)
       assert.equal(elements.some(({ type }) => type === 'textarea' || type === 'TextInput'), false)
+      assert.doesNotMatch(componentText(elements), /忽略/, 'a held approval takes only its own actions')
       shared.writable = false; press(); assert.equal(sent.length, 0)
       shared.writable = true; press(); assert.deepEqual(sent, [raw])
       shared.pendingAnswers = [{ question_id: question.question_id, text: raw }]
