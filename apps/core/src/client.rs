@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use iroh::{
-    EndpointAddr, RelayUrl, TransportAddr,
+    EndpointAddr, TransportAddr,
     endpoint::{Connection, ReadExactError, RecvStream, SendStream},
 };
 use serde::{Deserialize, Serialize};
@@ -1513,23 +1513,6 @@ impl JoinLink {
     async fn open(node: &Runtime, ticket: &Ticket) -> Result<Self> {
         let entry = ticket.entry_id();
         let token = net::relay_token(&ticket.invite_hash());
-        // The entry Node may run any configured relay, and iroh reads a relay's token only when
-        // it first connects, so the invite token goes in before binding.
-        let mut relays = node
-            .config
-            .network
-            .relays
-            .iter()
-            .map(|url| Ok((net::relay_url(url)?, Some(token.clone()))))
-            .collect::<Result<Vec<_>>>()?;
-        if node.config.network.n0_relays {
-            relays.extend(
-                iroh::defaults::prod::default_relay_map()
-                    .urls::<Vec<_>>()
-                    .into_iter()
-                    .map(|url| (url, None)),
-            );
-        }
         let config = NetworkConfig {
             discovery: node.config.network.discovery_servers()?,
             bind: node
@@ -1539,6 +1522,22 @@ impl JoinLink {
                 .map(|address| SocketAddr::new(address.ip(), 0)),
             ..NetworkConfig::default()
         };
+        // Without Discovery the entry Node may run any configured relay. With it, only the
+        // relays the entry registered get the invite token, so the others never see it.
+        let discovery = !config.discovery.is_empty();
+        let mut relays = node
+            .config
+            .network
+            .relays
+            .iter()
+            .map(|url| Ok((net::relay_url(url)?, (!discovery).then(|| token.clone()))))
+            .collect::<Result<Vec<_>>>()?;
+        let n0 = if node.config.network.n0_relays {
+            iroh::defaults::prod::default_relay_map().urls::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        relays.extend(n0.iter().map(|url| (url.clone(), None)));
         if let (Some(entry), Some(token)) = (&node.config.network.entry, &node.entry_token) {
             let url = net::relay_url(&entry.relay)?;
             relays.retain(|(known, _)| *known != url);
@@ -1549,33 +1548,38 @@ impl JoinLink {
             relays.retain(|(known, _)| *known != url);
             relays.push((url, Some(grant)));
         }
-        let mut addrs: Vec<TransportAddr> = relays
-            .iter()
-            .map(|(url, _)| TransportAddr::Relay(url.clone()))
-            .collect();
         ensure!(
-            !addrs.is_empty() || !config.discovery.is_empty(),
+            !relays.is_empty() || discovery,
             "no relay or discovery server is configured to find the invite's entry Node"
         );
-        let credentialed: Vec<RelayUrl> = relays
-            .iter()
-            .filter(|(_, token)| token.is_some())
-            .map(|(url, _)| url.clone())
-            .collect();
-        let link = Arc::new(Net::bind(&node.identity.secret_key_hex, &config, 0, relays).await?);
-        // The entry Node's own relay knows the invite and admits its token; it goes in before
-        // the first dial through it.
-        if !config.discovery.is_empty() {
+        // iroh reads a relay's token only when it first connects, and it connects to a relay
+        // in its map on its own once bound. With Discovery the endpoint binds without relays
+        // and they go in, with their tokens, once the entry's registered relays are known.
+        let initial = if discovery {
+            Vec::new()
+        } else {
+            relays.clone()
+        };
+        let link = Arc::new(Net::bind(&node.identity.secret_key_hex, &config, 0, initial).await?);
+        if discovery {
             for url in link.discovered_relays(&entry, net::DIAL_TIMEOUT).await? {
-                if !credentialed.contains(&url) {
-                    link.insert_relay(url.clone(), Some(token.clone())).await;
+                if n0.contains(&url) {
+                    continue;
                 }
-                let addr = TransportAddr::Relay(url);
-                if !addrs.contains(&addr) {
-                    addrs.push(addr);
+                match relays.iter_mut().find(|(known, _)| *known == url) {
+                    Some((_, credential @ None)) => *credential = Some(token.clone()),
+                    Some(_) => {}
+                    None => relays.push((url, Some(token.clone()))),
                 }
             }
+            for (url, credential) in &relays {
+                link.insert_relay(url.clone(), credential.clone()).await;
+            }
         }
+        let addrs: Vec<TransportAddr> = relays
+            .into_iter()
+            .map(|(url, _)| TransportAddr::Relay(url))
+            .collect();
         let router = link.discovery_router();
         link.learn(&EndpointAddr::from_parts(net::endpoint_id(&entry)?, addrs))
             .await;

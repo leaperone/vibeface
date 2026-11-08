@@ -176,7 +176,7 @@ vibeface join 'vibeface://join/vibeface1…' --name '<设备显示名称>'
 
 链接也可以是单独的 `vibeface1…` 票据。CLI 解码邀请票据，按其中的设备编号通过 iroh 连接目标：向配置的发现服务查询它的 relay 和 IP，再用配置的 relay、入口 relay 和公共许可 relay。没有配置任何 relay 或发现服务时，`vibeface join` 直接报错。
 
-发现服务查到的入口 Node relay 会带上邀请令牌加入，让入口 Node 自己的 relay 认得新 Node；此外 Node 复用新 Node 已配置的 `network.entry`、`network.relays`，以及显式启用的 `n0_relays`。使用同一 relay 要求两端都能到达它并具备对应授权；`network.entry` 还要求匹配的 `entry-token`。发现服务只提供地址提示，不授予私有 relay 使用权。
+Node 复用新 Node 已配置的 `network.entry`、`network.relays`，以及显式启用的 `n0_relays`，并加入发现服务查到的入口 Node relay。邀请令牌让入口 Node 自己的 relay 认得新 Node：配置了发现服务时，只有发现服务查到的入口 Node relay 带邀请令牌，已配置但没查到的 relay 不带；没配置发现服务时，`network.relays` 都带邀请令牌。`n0_relays` 从不带邀请令牌，公共 relay 用发现服务许可。使用同一 relay 要求两端都能到达它并具备对应授权；`network.entry` 用匹配的 `entry-token`，不用邀请令牌。发现服务只提供地址提示，不授予私有 relay 使用权。
 
 命令显示 6 位安全码并等待批准；在管理设备上比对安全码一致后点**一致，允许**，命令完成加入。Node 原本没在运行时，再启动它（后台服务用 `vibeface service start`）。`--name` 必须明确指定设备名，不读取系统主机名。设备名和已有设备或进行中的请求重名时，Node 自动加序号，例如“我的电脑 2”，重试同一请求沿用该名称。连接中断或按了 Ctrl-C 时，用同一链接、名称和目录重跑，命令先核对原请求，不重新创建；Node 正在运行时，按 Ctrl-C 不会取消加入，批准后照样完成。链接已用过、过期或被拒绝时，命令说明原因，请在管理设备上重新生成链接。
 

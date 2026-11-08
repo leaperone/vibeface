@@ -6,6 +6,7 @@ use super::{
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr, Watcher as _,
+    dns::DnsResolver,
     endpoint::{Connection, RecvStream, SendStream},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -36,6 +37,9 @@ const NOTICE_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_HOME_RELAYS: usize = 4;
 const MAX_RELAY_URL: usize = 256;
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Registrations from every session share this, so names that never answer hold at most this many
+/// lookups; a registration that finds none free drops the relay.
+static RESOLVES: Semaphore = Semaphore::const_new(16);
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 
@@ -265,6 +269,7 @@ pub(super) struct Discovery {
     /// Signs the catalogue and grants when this service publishes a catalogue.
     issuer: Option<Arc<Issuer>>,
     registry: Arc<Mutex<Registry>>,
+    dns: DnsResolver,
     sessions: Semaphore,
     clients: Vec<(Server, Arc<Client>)>,
     tasks: Vec<JoinHandle<()>>,
@@ -339,6 +344,7 @@ impl Discovery {
             server,
             issuer,
             registry: Default::default(),
+            dns: endpoint.dns_resolver()?.clone(),
             sessions: Semaphore::new(MAX_SESSIONS),
             clients,
             tasks,
@@ -481,9 +487,12 @@ impl Discovery {
                         }
                         Request::Register { relays } if self.server && !registered => {
                             let count = relays.len();
-                            let relays =
-                                registered_relays(relays, !crate::fetch::public(address.ip()))
-                                    .await;
+                            let relays = registered_relays(
+                                &self.dns,
+                                relays,
+                                !crate::fetch::public(address.ip()),
+                            )
+                            .await;
                             if relays.len() < count {
                                 tracing::debug!(
                                     dropped = count - relays.len(),
@@ -623,12 +632,13 @@ fn public_host(url: &RelayUrl) -> bool {
 }
 
 /// The relays a registration may publish: names must also resolve only to public addresses.
-async fn registered_relays(relays: Vec<RelayUrl>, local: bool) -> Vec<RelayUrl> {
+async fn registered_relays(dns: &DnsResolver, relays: Vec<RelayUrl>, local: bool) -> Vec<RelayUrl> {
     let relays = usable_relays(relays, local);
     if local {
         return relays;
     }
-    let public = futures_util::future::join_all(relays.iter().map(resolves_public)).await;
+    let public =
+        futures_util::future::join_all(relays.iter().map(|url| resolves_public(dns, url))).await;
     relays
         .into_iter()
         .zip(public)
@@ -637,17 +647,24 @@ async fn registered_relays(relays: Vec<RelayUrl>, local: bool) -> Vec<RelayUrl> 
 }
 
 /// A name that fails to resolve in time is dropped: a dialer cannot use it either.
-async fn resolves_public(url: &RelayUrl) -> bool {
+/// The lookup is async and cancelled on drop, unlike `getaddrinfo` on the blocking pool.
+async fn resolves_public(dns: &DnsResolver, url: &RelayUrl) -> bool {
+    if !public_host(url) {
+        return false;
+    }
     let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
-    let port = url.port_or_known_default().unwrap_or(443);
-    let Ok(Ok(addresses)) =
-        tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port))).await
-    else {
+    if host.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    let Ok(_permit) = RESOLVES.try_acquire() else {
+        return false;
+    };
+    let Ok(addresses) = dns.lookup_ipv4_ipv6(host, RESOLVE_TIMEOUT).await else {
         return false;
     };
     let mut any = false;
     for address in addresses {
-        if !crate::fetch::public(address.ip()) {
+        if !crate::fetch::public(address) {
             return false;
         }
         any = true;
@@ -1004,13 +1021,14 @@ mod tests {
                 .collect()
         };
         // IP literals and `localhost` resolve without the network.
-        assert!(resolves_public(&"https://1.1.1.1/".parse().expect("relay URL")).await);
+        let dns = DnsResolver::new();
+        assert!(resolves_public(&dns, &"https://1.1.1.1/".parse().expect("relay URL")).await);
         for url in parsed(&[
             "http://127.0.0.1/",
             "http://[::1]/",
             "http://localhost:3340/",
         ]) {
-            assert!(!resolves_public(&url).await, "{url}");
+            assert!(!resolves_public(&dns, &url).await, "{url}");
         }
         let urls = parsed(&[
             "https://1.1.1.1/",
@@ -1018,10 +1036,10 @@ mod tests {
             "https://[2606:4700::1111]/",
         ]);
         assert_eq!(
-            registered_relays(urls.clone(), false).await,
+            registered_relays(&dns, urls.clone(), false).await,
             [urls[0].clone(), urls[2].clone()]
         );
-        assert_eq!(registered_relays(urls.clone(), true).await, urls);
+        assert_eq!(registered_relays(&dns, urls.clone(), true).await, urls);
     }
 
     #[test]
