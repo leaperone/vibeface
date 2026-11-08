@@ -42,7 +42,7 @@ function HomePage() {
               <div className="hero-logo"><img src="/logo.svg" width="136" height="136" alt="" /></div>
               <a className="visual-node visual-node-top" href="/docs/bot-and-execution"><span>Conversation</span><small>Shape the request, then hand it off</small></a>
               <a className="visual-node visual-node-left" href="/docs/bot-and-execution#工作如何回到原聊天"><span>Selected computer</span><small>Your Agent uses local tools</small></a>
-              <a className="visual-node visual-node-right" href="/docs/history-sync"><span>Shared history</span><small>Progress and results come back here</small></a>
+              <a className="visual-node visual-node-right" href="/docs/history-sync"><span>Shared history</span><small>Stages and results return here</small></a>
             </div>
             <figcaption>From request to result, in one conversation.</figcaption>
           </figure>
@@ -64,7 +64,7 @@ function HomePage() {
           </div>
         </section>
 
-        <section className="landing-section landing-system" id="system" aria-labelledby="system-title">
+        <section className="landing-section landing-system" aria-labelledby="system-title">
           <h2 id="system-title" className="statement">Continue the conversation elsewhere. <em>Choose where the work runs.</em></h2>
           <dl className="fact-rows">
             <div><dt>Conversation and execution</dt><dd>Use a bot to coordinate work while Codex, Claude Code, pi, opencode, or Cursor runs it on the computer you choose.<br /><a className="text-link" href="/docs/bot-and-execution">See how work is split <ArrowRight size={16} aria-hidden="true" /></a></dd></div>
@@ -90,7 +90,7 @@ function HomePage() {
               <dl className="trust-facts">
                 <div><dt>Every device has its own identity</dt><dd>Each device holds a separate key. You approve new devices before they join.</dd></div>
                 <div><dt>Connections are encrypted</dt><dd>A public entry point can relay encrypted traffic without joining your private network.</dd></div>
-                <div><dt>Credentials stay local</dt><dd>AI service settings never sync. A secret you send in chat does become part of the shared conversation.</dd></div>
+                <div><dt>Credentials stay local</dt><dd>AI service settings do not sync. A secret you send in chat does become part of the shared conversation.</dd></div>
               </dl>
               <aside className="trust-boundary" aria-label="Permission boundaries to know before you start">
                 <p>Approved computers and the model service you choose handle your task content. Use devices and websites you trust.</p>
