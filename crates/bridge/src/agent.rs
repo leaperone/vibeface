@@ -2437,26 +2437,27 @@ fn credential_value(name: &str, value: &str) -> bool {
         .split(|c: char| c.is_whitespace() || "\"'`,;()[]{}<>".contains(c))
         .any(|word| {
             let lower = word.to_ascii_lowercase();
-            (word.len() >= 20
-                && [
-                    "sk-",
-                    "sk_",
-                    "ghp_",
-                    "gho_",
-                    "ghs_",
-                    "ghu_",
-                    "github_pat_",
-                    "xoxb-",
-                    "xoxp-",
-                    "xapp-",
-                    "akia",
-                    "aiza",
-                    "glpat-",
-                    "hf_",
-                    "npm_",
-                ]
-                .iter()
-                .any(|prefix| lower.starts_with(prefix)))
+            url_with_password(word)
+                || (word.len() >= 20
+                    && [
+                        "sk-",
+                        "sk_",
+                        "ghp_",
+                        "gho_",
+                        "ghs_",
+                        "ghu_",
+                        "github_pat_",
+                        "xoxb-",
+                        "xoxp-",
+                        "xapp-",
+                        "akia",
+                        "aiza",
+                        "glpat-",
+                        "hf_",
+                        "npm_",
+                    ]
+                    .iter()
+                    .any(|prefix| lower.starts_with(prefix)))
                 || (word.len() >= 32
                     && word
                         .chars()
@@ -2465,6 +2466,20 @@ fn credential_value(name: &str, value: &str) -> bool {
                     && word.chars().any(|c| c.is_ascii_uppercase())
                     && word.chars().any(|c| c.is_ascii_lowercase()))
         })
+}
+
+/// A connection string such as `postgres://user:pass@host/db` carries its password in the
+/// authority, so the whole value is a credential whatever its variable is called.
+fn url_with_password(word: &str) -> bool {
+    let Some((_, rest)) = word.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority.rsplit_once('@').is_some_and(|(userinfo, _)| {
+        userinfo
+            .split_once(':')
+            .is_some_and(|(_, pass)| !pass.is_empty())
+    })
 }
 
 fn redact_text(mut text: String, secrets: &[&str]) -> String {
@@ -3024,6 +3039,10 @@ mod tests {
             BTreeMap::from([
                 ("DEBUG".into(), "1".into()),
                 ("NODE_ENV".into(), "production".into()),
+                (
+                    "DATABASE_URL".into(),
+                    "postgres://app:s3cret@db.internal/app".into(),
+                ),
             ]),
             ToolCallbackConfig {
                 url: "http://127.0.0.1:9".into(),
@@ -3042,7 +3061,7 @@ mod tests {
         let (ready, _) = oneshot::channel();
         assert!(
             read_discovery(
-                &b"1 production a! k!\n"[..],
+                &b"1 production a! k! postgres://app:s3cret@db.internal/app\n"[..],
                 ready,
                 diagnostics.clone(),
                 secrets
@@ -3052,7 +3071,7 @@ mod tests {
         );
         assert_eq!(
             *diagnostics.lock().unwrap(),
-            "1 production [redacted] [redacted]\n"
+            "1 production [redacted] [redacted] [redacted]\n"
         );
     }
 
