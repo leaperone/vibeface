@@ -6,6 +6,7 @@ use release::{Channel, PROGRAMS, SERVICE_SCRIPT};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
+    future::Future,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
@@ -84,9 +85,10 @@ struct Journal {
     phase: Phase,
     previous: PathBuf,
     candidate: PathBuf,
-
     device_id: String,
     backup: PathBuf,
+    /// Whether reconciliation may start the service. A stopped update never does.
+    resume_service: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,6 +361,7 @@ pub async fn run(options: Update) -> Result<()> {
                 candidate,
                 device_id: health.device_id.clone(),
                 backup: backups.join(uuid::Uuid::new_v4().to_string()),
+                resume_service: true,
             };
             persist(&data.join("update-pending.json"), &journal)?;
             // The open lease closes admission until the service has actually stopped.
@@ -591,11 +594,12 @@ fn switch(root: &Path, package: &Path) -> Result<()> {
     privatefs::point_dir_link(&package, &root.join("current"))
 }
 
-async fn activate(
+/// Stop, switch, start, and prove health. The journal stays prepared until `acknowledge`.
+async fn handoff(
     policy: &Policy,
     data: &Path,
     service: &impl ServiceControl,
-    journal: &mut Journal,
+    journal: &Journal,
 ) -> Result<()> {
     service.stop().await?;
     let lock = wait_for_node_lock(data).await?;
@@ -606,10 +610,29 @@ async fn activate(
     service
         .healthy(data, &journal.candidate, &journal.device_id)
         .await?;
-    // Confirm durably before opening admission; recovery must never undo a committed update.
+    Ok(())
+}
+
+/// Confirm and open admission only after the caller has proved the final state.
+async fn acknowledge(
+    data: &Path,
+    service: &impl ServiceControl,
+    journal: &mut Journal,
+) -> Result<()> {
     journal.phase = Phase::Confirmed;
     persist(&data.join("update-pending.json"), journal)?;
     service.commit(data).await?;
+    Ok(())
+}
+
+async fn activate(
+    policy: &Policy,
+    data: &Path,
+    service: &impl ServiceControl,
+    journal: &mut Journal,
+) -> Result<()> {
+    handoff(policy, data, service, journal).await?;
+    acknowledge(data, service, journal).await?;
     Ok(())
 }
 
@@ -665,6 +688,22 @@ async fn recover_with_service(
     } else {
         journal.previous.clone()
     };
+    if !journal.resume_service {
+        if installed(&root)? != wanted {
+            switch(&root, &wanted)?;
+        }
+        ensure!(
+            installed(&root)? == wanted,
+            "restored program does not match the journal"
+        );
+        fs::remove_file(&pending)?;
+        privatefs::sync_dir(data)?;
+        eprintln!(
+            "Recovered {} program; business data was kept.",
+            if confirmed { "confirmed" } else { "previous" }
+        );
+        return Ok(());
+    }
     if confirmed
         && installed(&root)? == wanted
         && service
@@ -685,7 +724,7 @@ async fn recover_with_service(
     journal.phase = Phase::Confirmed;
     persist(&pending, &journal)?;
     service.commit(data).await?;
-    println!(
+    eprintln!(
         "Recovered {} program; business data was kept.",
         if confirmed { "confirmed" } else { "previous" }
     );
@@ -700,9 +739,40 @@ fn desktop_managed_policy(managed_root: &Path) -> Result<Policy> {
     })
 }
 
-/// Reconcile an interrupted App-managed release journal before status or another update attempt.
+/// Reconcile an interrupted App-managed release. Status must not call this.
+/// A running node is stopped only after an idle lease; a busy node keeps its journal.
 pub(crate) async fn recover_desktop_managed(data: &Path, managed_root: &Path) -> Result<()> {
-    recover(&desktop_managed_policy(managed_root)?, data).await
+    let pending = data.join("update-pending.json");
+    if !pending.exists() {
+        return Ok(());
+    }
+    let policy = desktop_managed_policy(managed_root)?;
+    let metadata = fs::symlink_metadata(&pending)?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= 64 * 1024,
+        "invalid pending update journal"
+    );
+    let journal: Journal = serde_json::from_slice(&fs::read(&pending)?)?;
+    let current = installed(&policy.install_root)?;
+    let inspected = inspect(data, &current.join(PROGRAMS[1])).await?;
+    if inspected.status == "running" {
+        ensure!(
+            inspected.device_id == journal.device_id,
+            "running node identity changed"
+        );
+        let lease = match maintenance::acquire(&inspected.maintenance_socket).await {
+            Ok(lease) => lease,
+            Err(error) if error.downcast_ref::<maintenance::Busy>().is_some() => {
+                bail!("update deferred; the node could not become idle: {error:#}");
+            }
+            Err(error) => return Err(error.context("request node maintenance")),
+        };
+        let service = Service::load(data).await?;
+        let result = recover_with_service(&policy, data, &service).await;
+        drop(lease);
+        return result;
+    }
+    recover(&policy, data).await
 }
 
 pub(crate) struct DesktopManagedRelease<'a> {
@@ -711,20 +781,82 @@ pub(crate) struct DesktopManagedRelease<'a> {
     pub candidate: PathBuf,
     pub device_id: String,
     pub resume_service: bool,
+    /// The installed service program is already the managed `current` link.
+    pub tracks_current: bool,
 }
 
-async fn activate_stopped(
-    policy: &Policy,
-    data: &Path,
-    journal: &mut Journal,
-) -> Result<()> {
+const DESKTOP_ACTIVATION_BUDGET: Duration = Duration::from_secs(60);
+
+enum Admission {
+    Idle,
+    Busy,
+}
+
+/// The only writer of a prepared desktop journal. Busy admission leaves the data directory unchanged.
+fn persist_after_admission(data: &Path, journal: &Journal, admission: Admission) -> Result<()> {
+    match admission {
+        Admission::Busy => bail!("update deferred; the node could not become idle"),
+        Admission::Idle => persist(&data.join("update-pending.json"), journal)?,
+    }
+    Ok(())
+}
+
+fn discard_unswitched_prepare(data: &Path, root: &Path, previous: &Path) -> Result<()> {
+    if installed(root)? == previous {
+        let pending = data.join("update-pending.json");
+        if pending.exists() {
+            fs::remove_file(&pending)?;
+            privatefs::sync_dir(data)?;
+        }
+    }
+    Ok(())
+}
+
+fn prepare_backup_dir(backups: &Path) -> Result<()> {
+    if !backups.exists() {
+        fs::create_dir(backups)?;
+    }
+    ensure!(
+        fs::symlink_metadata(backups)?.is_dir(),
+        "backup directory must not be a symlink"
+    );
+    private_dir(backups)?;
+    Ok(())
+}
+
+async fn switch_stopped(policy: &Policy, data: &Path, journal: &Journal) -> Result<()> {
     let lock = lock_data_dir(data).context("stop the Node before updating")?;
     backup(data, &journal.backup)?;
     switch(&policy.install_root, &journal.candidate)?;
     drop(lock);
-    journal.phase = Phase::Confirmed;
-    persist(&data.join("update-pending.json"), journal)?;
     Ok(())
+}
+
+fn restore_stopped(policy: &Policy, journal: &Journal) -> Result<()> {
+    if installed(&policy.install_root)? != journal.previous {
+        switch(&policy.install_root, &journal.previous)?;
+    }
+    ensure!(
+        installed(&policy.install_root)? == journal.previous,
+        "restored program does not match the journal"
+    );
+    Ok(())
+}
+
+async fn reconcile_running(
+    policy: &Policy,
+    data: &Path,
+    service: &impl ServiceControl,
+    error: anyhow::Error,
+) -> Result<()> {
+    match recover_with_service(policy, data, service).await {
+        Ok(()) => {
+            bail!("update failed; previous program restored, data was kept: {error:#}")
+        }
+        Err(rollback) => bail!(
+            "update failed: {error:#}; recovery also failed: {rollback:#}; keep update-pending.json and run update again"
+        ),
+    }
 }
 
 /// Drop a confirmed App-managed journal after the service registration reflects the new package.
@@ -743,41 +875,41 @@ pub(crate) fn complete_desktop_managed_release(data: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Stage, switch, and confirm an App-managed runtime using the same journal as the CLI updater.
-pub(crate) async fn apply_desktop_managed_release(
+/// Switch an App-managed runtime. `prove` runs before the journal is cleared.
+/// A stopped release is refused when the service is not already registered to `current`.
+pub(crate) async fn apply_desktop_managed_release<F, Fut>(
     data: &Path,
     release: DesktopManagedRelease<'_>,
-) -> Result<()> {
+    prove: F,
+) -> Result<()>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    ensure!(
+        release.tracks_current,
+        "stopped node service is not registered to the current program"
+    );
     let policy = desktop_managed_policy(release.managed_root)?;
-    recover(&policy, data).await?;
-    let service = Service::load(data).await?;
+    recover_desktop_managed(data, release.managed_root).await?;
     let root = fs::canonicalize(release.managed_root)?;
     ensure!(
         !root.starts_with(data),
         "managed runtime must not live inside node data"
     );
-    let backups = root.join("backups");
-    if !backups.exists() {
-        fs::create_dir(&backups)?;
-    }
-    ensure!(
-        fs::symlink_metadata(&backups)?.is_dir(),
-        "backup directory must not be a symlink"
-    );
-    private_dir(&backups)?;
     manifest(&release.previous)?;
     manifest(&release.candidate)?;
+    let backups = root.join("backups");
     let mut journal = Journal {
         phase: Phase::Prepared,
         previous: release.previous.clone(),
         candidate: release.candidate.clone(),
         device_id: release.device_id.clone(),
         backup: backups.join(uuid::Uuid::new_v4().to_string()),
+        resume_service: release.resume_service,
     };
-    persist(&data.join("update-pending.json"), &journal)?;
     if release.resume_service {
-        let core = release.previous.join(PROGRAMS[1]);
-        let inspected = inspect(data, &core).await?;
+        let inspected = inspect(data, &release.previous.join(PROGRAMS[1])).await?;
         ensure!(
             inspected.device_id == release.device_id,
             "running node identity changed"
@@ -789,7 +921,7 @@ pub(crate) async fn apply_desktop_managed_release(
         let lease = match maintenance::acquire(&inspected.maintenance_socket).await {
             Ok(lease) => lease,
             Err(error) if error.downcast_ref::<maintenance::Busy>().is_some() => {
-                bail!("update deferred; the node could not become idle: {error:#}");
+                return persist_after_admission(data, &journal, Admission::Busy);
             }
             Err(error) => return Err(error.context("request node maintenance")),
         };
@@ -803,27 +935,65 @@ pub(crate) async fn apply_desktop_managed_release(
             health.device_id == release.device_id,
             "running node identity changed"
         );
-        let applied = activate(&policy, data, &service, &mut journal).await;
-        drop(lease);
-        if let Err(error) = applied {
-            match recover(&policy, data).await {
-                Ok(()) if installed(&root)? == journal.candidate => {
-                    maintenance_commit(data)
-                        .await
-                        .context("confirmed update must reopen admission")?;
-                    healthy(data, &journal.candidate, &journal.device_id).await?;
-                }
-                Ok(()) => {
-                    bail!("update failed; previous program restored, data was kept: {error:#}")
-                }
-                Err(rollback) => bail!(
-                    "update failed: {error:#}; recovery also failed: {rollback:#}; keep update-pending.json and run update again"
-                ),
-            }
+        prepare_backup_dir(&backups)?;
+        if let Err(error) = persist_after_admission(data, &journal, Admission::Idle) {
+            drop(lease);
+            return Err(error);
         }
-    } else {
-        activate_stopped(&policy, data, &mut journal).await?;
+        let service = match Service::load(data).await {
+            Ok(service) => service,
+            Err(error) => {
+                drop(lease);
+                discard_unswitched_prepare(data, &root, &journal.previous)?;
+                return Err(error);
+            }
+        };
+        let handed = match tokio::time::timeout(
+            DESKTOP_ACTIVATION_BUDGET,
+            handoff(&policy, data, &service, &journal),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "desktop node update deadline expired before activation finished"
+            )),
+        };
+        if let Err(error) = handed {
+            drop(lease);
+            if error.to_string().contains("deadline expired") {
+                return Err(error);
+            }
+            return reconcile_running(&policy, data, &service, error).await;
+        }
+        if let Err(error) = prove(journal.candidate.clone()).await {
+            drop(lease);
+            return reconcile_running(&policy, data, &service, error).await;
+        }
+        acknowledge(data, &service, &mut journal).await?;
+        drop(lease);
+        return Ok(());
     }
+    prepare_backup_dir(&backups)?;
+    persist_after_admission(data, &journal, Admission::Idle)?;
+    if let Err(error) = switch_stopped(&policy, data, &journal).await {
+        discard_unswitched_prepare(data, &root, &journal.previous)?;
+        return Err(error);
+    }
+    if let Err(error) = prove(journal.candidate.clone()).await {
+        if let Err(rollback) = restore_stopped(&policy, &journal) {
+            return Err(error.context(rollback));
+        }
+        let pending = data.join("update-pending.json");
+        if pending.exists() {
+            fs::remove_file(pending)?;
+            privatefs::sync_dir(data)?;
+        }
+        return Err(error);
+    }
+    journal.phase = Phase::Confirmed;
+    persist(&data.join("update-pending.json"), &journal)?;
+    complete_desktop_managed_release(data)?;
     Ok(())
 }
 
@@ -1470,7 +1640,7 @@ mod tests {
 
     #[test]
     fn device_id_journal_uses_only_the_current_field() -> Result<()> {
-        let wire = r#"{"phase":"prepared","previous":"old","candidate":"new","device_id":"device","backup":"backup"}"#;
+        let wire = r#"{"phase":"prepared","previous":"old","candidate":"new","device_id":"device","backup":"backup","resume_service":true}"#;
         let journal: Journal = serde_json::from_str(wire)?;
         assert_eq!(journal.device_id, "device");
         assert_eq!(serde_json::to_string(&journal)?, wire);
@@ -1854,6 +2024,7 @@ mod tests {
     impl ServiceControl for FakeService {
         async fn stop(&self) -> Result<()> {
             self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ensure!(self.failure != "stop", "simulated uncertain service stop");
             Ok(())
         }
         async fn start(&self) -> Result<()> {
@@ -1911,6 +2082,7 @@ mod tests {
             candidate,
             device_id: "device".into(),
             backup: root.join("backups/fixture"),
+            resume_service: true,
         };
         persist(&data.join("update-pending.json"), &journal).unwrap();
         (
@@ -2003,20 +2175,52 @@ mod tests {
     async fn desktop_stopped_managed_release_switches_without_service_restart() {
         let (policy, data, journal) = activation_fixture();
         fs::remove_file(data.join("update-pending.json")).unwrap();
+        let pending = data.join("update-pending.json");
+        let preserved = [
+            data.join("identity.json"),
+            data.join("config.json"),
+            data.join("node.sqlite3"),
+            data.join("node.sqlite3-wal"),
+        ];
+        let before: Vec<_> = preserved
+            .iter()
+            .map(|path| fs::read(path).unwrap())
+            .collect();
+        let policy_bytes = br#"{"channel":"nightly","automatic":false}"#.to_vec();
+        fs::write(data.join("update.json"), &policy_bytes).unwrap();
+        fs::write(data.join("providers.json"), b"provider-material").unwrap();
         let release = super::DesktopManagedRelease {
             managed_root: &policy.install_root,
             previous: journal.previous.clone(),
             candidate: journal.candidate.clone(),
             device_id: journal.device_id.clone(),
             resume_service: false,
+            tracks_current: true,
         };
-        super::apply_desktop_managed_release(&data, release)
-            .await
-            .unwrap();
+        let during_proof = pending.clone();
+        super::apply_desktop_managed_release(&data, release, move |_| {
+            let during_proof = during_proof.clone();
+            async move {
+                assert!(during_proof.exists());
+                let stored: Journal =
+                    serde_json::from_slice(&fs::read(&during_proof).unwrap()).unwrap();
+                assert_eq!(stored.phase, Phase::Prepared);
+                assert!(!stored.resume_service);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(installed(&policy.install_root).unwrap(), journal.candidate);
-        assert!(data.join("update-pending.json").exists());
-        super::complete_desktop_managed_release(&data).unwrap();
-        assert!(!data.join("update-pending.json").exists());
+        assert!(!pending.exists());
+        for (path, bytes) in preserved.iter().zip(before) {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        assert_eq!(fs::read(data.join("update.json")).unwrap(), policy_bytes);
+        assert_eq!(
+            fs::read(data.join("providers.json")).unwrap(),
+            b"provider-material"
+        );
         fs::remove_dir_all(policy.install_root).unwrap();
     }
 
@@ -2053,6 +2257,200 @@ mod tests {
             fs::read(data.join("node.sqlite3")).unwrap(),
             b"new-user-writes-must-survive"
         );
+        fs::remove_dir_all(policy.install_root).unwrap();
+    }
+
+    #[test]
+    fn busy_admission_does_not_write_prepared_journal() {
+        let (policy, data, journal) = activation_fixture();
+        let pending = data.join("update-pending.json");
+        fs::remove_file(&pending).unwrap();
+        let error = persist_after_admission(&data, &journal, Admission::Busy).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("update deferred; the node could not become idle")
+        );
+        assert!(!pending.exists());
+        assert_eq!(installed(&policy.install_root).unwrap(), journal.previous);
+        persist_after_admission(&data, &journal, Admission::Idle).unwrap();
+        assert!(pending.exists());
+        let stored: Journal = serde_json::from_slice(&fs::read(&pending).unwrap()).unwrap();
+        assert_eq!(stored.phase, Phase::Prepared);
+        fs::remove_dir_all(policy.install_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn running_handoff_starts_once_and_keeps_the_journal_until_acknowledgement() {
+        let (policy, data, mut journal) = activation_fixture();
+        fs::write(data.join("providers.json"), b"provider-material").unwrap();
+        let service = FakeService {
+            candidate: journal.candidate.clone(),
+            failure: "none",
+            starts: std::sync::atomic::AtomicUsize::new(0),
+            stops: std::sync::atomic::AtomicUsize::new(0),
+        };
+        handoff(&policy, &data, &service, &journal).await.unwrap();
+        assert!(data.join("update-pending.json").exists());
+        let stored: Journal =
+            serde_json::from_slice(&fs::read(data.join("update-pending.json")).unwrap()).unwrap();
+        assert_eq!(stored.phase, Phase::Prepared);
+        assert_eq!(service.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(service.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        acknowledge(&data, &service, &mut journal).await.unwrap();
+        assert!(!data.join("update-pending.json").exists());
+        assert_eq!(service.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(service.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(installed(&policy.install_root).unwrap(), journal.candidate);
+        assert_eq!(
+            fs::read(data.join("providers.json")).unwrap(),
+            b"provider-material"
+        );
+        fs::remove_dir_all(policy.install_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn uncertain_stop_switch_start_and_health_keep_the_journal() {
+        for failure in ["stop", "switch", "start", "health"] {
+            let (policy, data, mut journal) = activation_fixture();
+            fs::write(data.join("providers.json"), b"provider-material").unwrap();
+            let update_policy = br#"{"channel":"stable","automatic":false}"#;
+            fs::write(data.join("update.json"), update_policy).unwrap();
+            if failure == "switch" {
+                fs::remove_file(journal.candidate.join("BUILD-INFO.json")).unwrap();
+            }
+            let service = FakeService {
+                candidate: journal.candidate.clone(),
+                failure,
+                starts: std::sync::atomic::AtomicUsize::new(0),
+                stops: std::sync::atomic::AtomicUsize::new(0),
+            };
+            assert!(
+                handoff(&policy, &data, &service, &mut journal)
+                    .await
+                    .is_err(),
+                "{failure}"
+            );
+            assert!(data.join("update-pending.json").exists(), "{failure}");
+            let stored: Journal =
+                serde_json::from_slice(&fs::read(data.join("update-pending.json")).unwrap())
+                    .unwrap();
+            assert_eq!(stored.phase, Phase::Prepared, "{failure}");
+            assert_eq!(
+                fs::read(data.join("providers.json")).unwrap(),
+                b"provider-material",
+                "{failure}"
+            );
+            assert_eq!(
+                fs::read(data.join("update.json")).unwrap(),
+                update_policy,
+                "{failure}"
+            );
+            if failure == "stop" || failure == "switch" {
+                assert_eq!(
+                    installed(&policy.install_root).unwrap(),
+                    journal.previous,
+                    "{failure}"
+                );
+                assert_eq!(
+                    service.starts.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "{failure}"
+                );
+            }
+            if failure == "stop" {
+                let recovered = recover_with_service(&policy, &data, &service).await;
+                assert!(
+                    recovered.is_err(),
+                    "an uncertain stop is not a successful rollback"
+                );
+                assert!(data.join("update-pending.json").exists());
+            }
+            fs::remove_dir_all(policy.install_root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_journal_recovery_does_not_start_the_service() {
+        let (policy, data, mut journal) = activation_fixture();
+        journal.resume_service = false;
+        switch(&policy.install_root, &journal.candidate).unwrap();
+        persist(&data.join("update-pending.json"), &journal).unwrap();
+        let service = FakeService {
+            candidate: journal.candidate.clone(),
+            failure: "none",
+            starts: std::sync::atomic::AtomicUsize::new(0),
+            stops: std::sync::atomic::AtomicUsize::new(0),
+        };
+        recover_with_service(&policy, &data, &service)
+            .await
+            .unwrap();
+        assert_eq!(service.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(service.stops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(installed(&policy.install_root).unwrap(), journal.previous);
+        assert!(!data.join("update-pending.json").exists());
+        assert_eq!(
+            fs::read(data.join("identity.json")).unwrap(),
+            b"opaque identity fixture"
+        );
+        fs::remove_dir_all(policy.install_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_release_refuses_before_effects_when_service_does_not_track_current() {
+        let (policy, data, journal) = activation_fixture();
+        fs::remove_file(data.join("update-pending.json")).unwrap();
+        let release = super::DesktopManagedRelease {
+            managed_root: &policy.install_root,
+            previous: journal.previous.clone(),
+            candidate: journal.candidate.clone(),
+            device_id: journal.device_id.clone(),
+            resume_service: false,
+            tracks_current: false,
+        };
+        let error = super::apply_desktop_managed_release(&data, release, |_| async {
+            panic!("a refused stopped update must not switch or start");
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("stopped node service is not registered to the current program")
+        );
+        assert!(!data.join("update-pending.json").exists());
+        assert_eq!(installed(&policy.install_root).unwrap(), journal.previous);
+        assert_eq!(
+            fs::read(data.join("node.sqlite3")).unwrap(),
+            b"tasks-and-deduplication"
+        );
+        fs::remove_dir_all(policy.install_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_stopped_proof_restores_previous_without_starting() {
+        let (policy, data, journal) = activation_fixture();
+        fs::remove_file(data.join("update-pending.json")).unwrap();
+        let release = super::DesktopManagedRelease {
+            managed_root: &policy.install_root,
+            previous: journal.previous.clone(),
+            candidate: journal.candidate.clone(),
+            device_id: journal.device_id.clone(),
+            resume_service: false,
+            tracks_current: true,
+        };
+        let error = super::apply_desktop_managed_release(&data, release, |_| async {
+            Err(anyhow::anyhow!("candidate failed its stopped-state proof"))
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("candidate failed its stopped-state proof")
+        );
+        assert!(!data.join("update-pending.json").exists());
+        assert_eq!(installed(&policy.install_root).unwrap(), journal.previous);
         fs::remove_dir_all(policy.install_root).unwrap();
     }
 }

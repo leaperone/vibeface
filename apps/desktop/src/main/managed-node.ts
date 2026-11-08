@@ -3,7 +3,13 @@ import { once } from 'node:events'
 import type { Readable } from 'node:stream'
 
 const MAX_RESULT_BYTES = 64 * 1024
-const COMMAND_TIMEOUT_MS = 30_000
+const STATUS_COMMAND_TIMEOUT_MS = 30_000
+/** Covers lock wait, health, and acknowledgement. A timeout is an unknown outcome: the controller does not write or restart. */
+const UPDATE_COMMAND_TIMEOUT_MS = 120_000
+
+export function commandTimeoutMs(action: string): number {
+  return action === 'update' ? UPDATE_COMMAND_TIMEOUT_MS : STATUS_COMMAND_TIMEOUT_MS
+}
 
 const CLI_FAILURES: Record<string, string> = {
   desktop_node_package_invalid: '安装包校验未通过，请重新安装桌面 App。',
@@ -42,6 +48,7 @@ type Options = {
   profileDir: string
   bundledCli: ManagedNodeProgram
   onChange?: (status: ManagedNodeStatus) => void
+  commandTimeoutMs?: (action: string) => number
 }
 
 async function readBounded(stream: Readable, limit: number): Promise<string> {
@@ -121,34 +128,35 @@ export function parseManagedNodeStatus(value: unknown): ManagedNodeStatus {
       typeof raw.managed_root !== 'string') {
     throw new Error('desktop Node returned an unsupported result')
   }
-  const coreStatus = raw.core_status
-  if (!(coreStatus === null || coreStatus === 'running' || coreStatus === 'stopped' || coreStatus === 'unavailable')) {
-    throw new Error('desktop Node returned an unsupported result')
-  }
-  const serviceRunning = raw.service_running
-  if (state === 'installed' || state === 'installed_stopped' || state === 'partial') {
-    if (typeof serviceRunning !== 'boolean') throw new Error('desktop Node returned an unsupported result')
-  } else if (state === 'conflict' || state === 'unavailable') {
-    if (!(serviceRunning === null || typeof serviceRunning === 'boolean')) {
-      throw new Error('desktop Node returned an unsupported result')
-    }
+  let coreStatus: CoreStatus
+  if (raw.core_status === null || raw.core_status === 'running' || raw.core_status === 'stopped' || raw.core_status === 'unavailable') {
+    coreStatus = raw.core_status
   } else {
     throw new Error('desktop Node returned an unsupported result')
   }
-  return {
-    ok: true,
-    state: state as ManagedNodeStatus['state'],
+  const serviceRunning = raw.service_running
+  const identity = {
     device_id: raw.device_id,
     data_dir: raw.data_dir,
     service_id: raw.service_id,
     managed_root: raw.managed_root,
-    service_running: serviceRunning as boolean | null,
-    core_status: coreStatus as CoreStatus,
+    core_status: coreStatus,
     runtime_update: runtime,
   }
+  if (state === 'installed' || state === 'installed_stopped' || state === 'partial') {
+    if (typeof serviceRunning !== 'boolean') throw new Error('desktop Node returned an unsupported result')
+    return { ok: true, state, service_running: serviceRunning, ...identity }
+  }
+  if (state === 'conflict' || state === 'unavailable') {
+    if (!(serviceRunning === null || typeof serviceRunning === 'boolean')) {
+      throw new Error('desktop Node returned an unsupported result')
+    }
+    return { ok: true, state, service_running: serviceRunning, ...identity }
+  }
+  throw new Error('desktop Node returned an unsupported result')
 }
 
-async function invoke(program: ManagedNodeProgram, args: readonly string[]): Promise<unknown> {
+async function invoke(program: ManagedNodeProgram, args: readonly string[], timeoutMs: number): Promise<unknown> {
   const child = spawn(program.command, [...(program.args ?? []), ...args], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
   const { stdout, stderr } = child
   if (!stdout || !stderr) throw new Error('desktop Node command streams are unavailable')
@@ -163,7 +171,7 @@ async function invoke(program: ManagedNodeProgram, args: readonly string[]): Pro
     const timer = setTimeout(() => {
       child.kill('SIGKILL')
       reject(new Error('desktop Node command timed out'))
-    }, COMMAND_TIMEOUT_MS)
+    }, timeoutMs)
     void closePromise.finally(() => clearTimeout(timer))
   })
   try {
@@ -191,15 +199,17 @@ export class ManagedNodeController {
   readonly #profileDir: string
   readonly #bundledCli: ManagedNodeProgram
   readonly #onChange?: (status: ManagedNodeStatus) => void
+  readonly #commandTimeoutMs: (action: string) => number
 
   constructor(options: Options) {
     this.#profileDir = options.profileDir
     this.#bundledCli = options.bundledCli
     this.#onChange = options.onChange
+    this.#commandTimeoutMs = options.commandTimeoutMs ?? commandTimeoutMs
   }
 
   async prepareProfile(): Promise<void> {
-    const result = await invoke(this.#bundledCli, ['desktop-profile', '--profile-dir', this.#profileDir])
+    const result = await invoke(this.#bundledCli, ['desktop-profile', '--profile-dir', this.#profileDir], this.#commandTimeoutMs('profile'))
     if (typeof result !== 'object' || result === null || Array.isArray(result) || Object.keys(result).length !== 1 || !('ok' in result) || result.ok !== true) {
       throw new Error('Desktop profile permissions could not be prepared')
     }
@@ -233,7 +243,7 @@ export class ManagedNodeController {
     const args = ['desktop-node', '--profile-dir', this.#profileDir]
     if (expectedNodeId !== undefined) args.push('--expected-device-id', expectedNodeId)
     args.push(action)
-    const result = await invoke(this.#bundledCli, args)
+    const result = await invoke(this.#bundledCli, args, this.#commandTimeoutMs(action))
     const status = parseManagedNodeStatus(result)
     this.#onChange?.(status)
     return status
