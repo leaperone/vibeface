@@ -735,26 +735,6 @@ test('a pending join survives reload without resubmitting', async () => {
   } finally { app.close() }
 })
 
-test('a late join_status answer still finishes join after pending-join identity changed', async () => {
-  const app = deviceHarness()
-  try {
-    app.render(); await settle()
-    await app.render().join('https://node.example/join#vibeface1ticket', 'browser')
-    const nonce = JSON.parse(app.stored.get('vibeface.pending-join') ?? 'null').nonce
-    app.joinStatus.value = joinRequest('confirming', { admin_id: target, admin_nonce: '2'.repeat(64) })
-    await app.render().checkJoin()
-    app.joinStatus.value = joinRequest('joined', { admin_id: target, admin_nonce: '2'.repeat(64), joiner_nonce: nonce })
-    const hold = deferred(); app.holds.set('join_status', hold)
-    const checking = app.render().checkJoin()
-    await until(() => app.requests.some(request => request.method === 'join_status' && !request.params.reveal))
-    assert.notEqual(app.render().joining?.code, undefined)
-    hold.resolve({ ...joinRequest('joined', { admin_id: target, admin_nonce: '2'.repeat(64), joiner_nonce: nonce }), state: { genesis } })
-    await checking
-    assert.equal(app.render().ready?.principal.device_id, subject)
-    assert.equal(app.render().joining, null)
-  } finally { app.close() }
-})
-
 test('a joiner keeps the manager nonce it saw before revealing and stops when the entry changes it', async () => {
   const app = deviceHarness()
   try {

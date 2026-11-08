@@ -1,35 +1,45 @@
 import { EventEmitter } from 'node:events'
-import { describe, expect, it } from 'vitest'
-import { waitForWebContentsLoad } from '../src/main/client-navigation.js'
+import { describe, expect, it, vi } from 'vitest'
+import { reloadClientContents } from '../src/main/client-navigation.js'
 
-type MockContents = EventEmitter & {
-  isDestroyed: () => boolean
-  isLoadingMainFrame: () => boolean
-}
+const contents = () => Object.assign(new EventEmitter(), { isDestroyed: () => false, reload: vi.fn() })
 
-const contents = (loading: boolean): MockContents => {
-  const emitter = new EventEmitter() as MockContents
-  emitter.isDestroyed = () => false
-  emitter.isLoadingMainFrame = () => loading
-  return emitter
-}
-
-describe('waitForWebContentsLoad', () => {
-  it('resolves immediately when the main frame is not loading', async () => {
-    await expect(waitForWebContentsLoad(contents(false) as never)).resolves.toBeUndefined()
-  })
-
-  it('waits for did-finish-load before resolving', async () => {
-    const live = contents(true)
-    const pending = waitForWebContentsLoad(live as never, 500)
+describe('client reload readiness', () => {
+  it('waits for the main frame even when reload has not started loading yet', async () => {
+    const live = contents()
+    let resolved = false
+    const pending = reloadClientContents(live, 500).then(() => { resolved = true })
+    expect(live.reload).toHaveBeenCalledTimes(1)
+    await Promise.resolve()
+    expect(resolved).toBe(false)
+    live.emit('did-fail-load', {}, -3, 'child aborted', 'https://example.test', false)
+    await Promise.resolve()
+    expect(resolved).toBe(false)
     live.emit('did-finish-load')
-    await expect(pending).resolves.toBeUndefined()
+    await pending
+    expect(live.listenerCount('did-fail-load')).toBe(0)
   })
 
-  it('rejects when did-fail-load fires', async () => {
-    const live = contents(true)
-    const pending = waitForWebContentsLoad(live as never, 500)
-    live.emit('did-fail-load', {}, -3, 'aborted')
+  it('observes a load that completes inside the reload call', async () => {
+    const live = contents()
+    live.reload.mockImplementation(() => { live.emit('did-finish-load') })
+    await expect(reloadClientContents(live)).resolves.toBeUndefined()
+  })
+
+  it('reports main-frame failure and removes all navigation listeners', async () => {
+    const live = contents()
+    const pending = reloadClientContents(live, 500)
+    live.emit('did-fail-load', {}, -3, 'aborted', 'vibeface-app://app/', true)
     await expect(pending).rejects.toThrow(/加载失败/)
+    expect(live.listenerCount('did-finish-load')).toBe(0)
+    expect(live.listenerCount('destroyed')).toBe(0)
+  })
+
+  it('reports window destruction instead of waiting for a load that cannot finish', async () => {
+    const live = contents()
+    const pending = reloadClientContents(live, 500)
+    live.emit('destroyed')
+    await expect(pending).rejects.toThrow(/窗口已关闭/)
+    expect(live.listenerCount('did-finish-load')).toBe(0)
   })
 })

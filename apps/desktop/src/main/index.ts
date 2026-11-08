@@ -29,7 +29,7 @@ import {
   guardPermissions,
   openExternally,
 } from './windows.js'
-import { waitForWebContentsLoad } from './client-navigation.js'
+import { reloadClientContents } from './client-navigation.js'
 
 const MAX_PATH = 1024
 
@@ -46,7 +46,7 @@ let shutdownPending = false
 let hostPhase: DesktopStatus['hostPhase'] = 'starting'
 
 function requireHostReady(): void {
-  if (hostPhase !== 'ready') throw new Error('桌面宿主仍在启动，请稍后再试。')
+  if (hostPhase !== 'ready') throw new Error('Vibeface 仍在启动，请稍后再试。')
 }
 
 function profileDirectory(explicit: string | null): string {
@@ -133,8 +133,7 @@ async function focusClientApp(reconnect = false, showChat = true): Promise<void>
     if (selected && selected.access.kind === 'local') destination.hash = new URL(selected.access.url).hash
     clientHost.disconnect()
     await window.webContents.executeJavaScript(`history.replaceState(null, '', ${JSON.stringify(destination.toString())})`)
-    window.webContents.reload()
-    await waitForWebContentsLoad(window.webContents)
+    await reloadClientContents(window.webContents)
   }
   window.show()
   window.focus()
