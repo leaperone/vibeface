@@ -2914,8 +2914,15 @@ mod tests {
             assert!(Path::new(&expected["OPENCODE_DB"]).is_file());
             let fake = place.fake.lock().unwrap();
             let environment = &fake.sessions[&session].environment;
-            assert_eq!(environment["OPENCODE_DB"], expected["OPENCODE_DB"]);
-            assert_eq!(environment["OPENCODE_CONFIG"], "");
+            for (key, value) in &expected {
+                assert_eq!(environment[key], json!(value), "{key}");
+            }
+            for name in ["OPENCODE_CONFIG", "OPENCODE_TEST_HOME"] {
+                assert!(
+                    environment.get(name).is_none(),
+                    "{name} reached the tool environment"
+                );
+            }
             drop(fake);
             servers.push(server);
         }

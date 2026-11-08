@@ -679,7 +679,7 @@ impl Runtime {
             .clone();
         local.validate(codex_agent)?;
         let claude_env = local.env.get(Provider::Claude).clone();
-        let claude = claude::Claude::open(dir, &claude_env);
+        let claude = claude::Claude::open(dir, &claude_env).await;
         let codex_target = local.codex_target(codex_agent);
         let codex = Arc::new(codex_server::CodexServer::open(
             codex_target,
@@ -756,7 +756,7 @@ impl Runtime {
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             codex,
             claude,
-            pi: Arc::new(pi::Pi::new(dir)),
+            pi: Arc::new(pi::Pi::new(dir).await),
             opencode,
             progress_sequence: std::sync::atomic::AtomicU64::new(0),
             stop_retries: std::sync::Mutex::new(HashMap::new()),
